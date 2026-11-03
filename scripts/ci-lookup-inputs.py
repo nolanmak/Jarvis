@@ -298,6 +298,8 @@ class LookupCensus:
 
     def _members(self,path):
         prefix=path.rstrip(b'/')+b'/'
+        if any(name.startswith(prefix) and b'/' not in name[len(prefix):]
+                for name in self._routes if name not in self._nodes):_hold()
         return tuple(sorted((name[len(prefix):],node[0]) for name,node in self._nodes.items()
             if name.startswith(prefix) and b'/' not in name[len(prefix):]))
 
@@ -398,12 +400,15 @@ class FrozenLookupIndex:
     quiescence. Neither a root-owned tree nor this index proves complete inputs
     or grants artifact reuse. Unknown bases and mount aliases are refused.
     """
-    def __init__(self,namespaces,*,anchors=None,kernel_roots=None,owner,overlays=False):
+    def __init__(self,namespaces,*,anchors=None,kernel_roots=None,owner,overlays=False,opaque=()):
         spec=importlib.util.spec_from_file_location('lookup_views',Path(__file__).with_name('ci-cargo-views.py'))
         self.views=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.views)
         self.owner=owner;self._trees=[];self._identities=[];self._bases={};self._objects={}
         try:
             if type(owner) is not int or not 0<=owner<2**32 or type(namespaces) is not dict or not 0<len(namespaces)<=64 or type(overlays) is not bool:_hold()
+            if type(opaque) not in (list,tuple) or len(opaque)>64:_hold()
+            opaque=tuple(sorted(_path(prefix.encode(),absolute=True).rstrip(b'/') or b'/' for prefix in opaque))
+            if len(set(opaque))!=len(opaque):_hold()
             prefixes=[_path(value[0].encode(),absolute=True).rstrip(b'/') or b'/' for value in namespaces.values()]
             if len(set(prefixes))!=len(prefixes):_hold()
             content={}
@@ -417,6 +422,8 @@ class FrozenLookupIndex:
                     virtual=prefix if relative==b'.' else prefix.rstrip(b'/')+b'/'+relative
                     if overlays and any(other!=prefix and other.startswith(prefix.rstrip(b'/')+b'/')
                             and (virtual==other or virtual.startswith(other+b'/')) for other in prefixes):continue
+                    if any((virtual==mask or virtual.startswith(mask.rstrip(b'/')+b'/'))
+                            and not (prefix==mask or prefix.startswith(mask.rstrip(b'/')+b'/')) for mask in opaque):continue
                     visible.append(row)
                     info=physical.lstat();self._remember(physical,info)
                     self._objects[virtual]=self._object(info)
@@ -445,8 +452,17 @@ class FrozenLookupIndex:
                 if key in self._bases and self._bases[key]!=b'/':_hold()
                 self._bases[key]=b'/'
             self.census=LookupCensus.from_inventory(content)
+            # A mounted subtree can hide otherwise complete source inventory.
+            # Route to explicitly frozen descendants, but never infer absence,
+            # contents or directory membership from hidden source placeholders.
+            for mask in opaque:
+                current=mask
+                while True:
+                    if current not in self.census._nodes:self.census._routes.add(current)
+                    if current==b'/':break
+                    current=current.rpartition(b'/')[0] or b'/'
             if any(virtual not in self.census._nodes and virtual not in self.census._routes for virtual in self._bases.values()):_hold()
-            self._layout=tuple(sorted(self.census._roots));self._verify()
+            self._layout=tuple(sorted(self.census._roots))+tuple(b'opaque:'+mask for mask in opaque);self._verify()
         except (OSError,ValueError,TypeError,KeyError,UnicodeError,IndexError,AttributeError,self.views.FreshnessHold):_hold()
 
     @staticmethod
@@ -555,7 +571,8 @@ class FrozenLookupIndex:
             if (event['pid']!=pid or event['uid']!=uid or event['syscall'] not in (2,257,437)
                     or arguments['user_namespace']!=user_namespace or arguments['mount_namespace']!=mount_namespace
                     or type(arguments['flags']) is not int or arguments['flags']&~(0x80000|0x8000|0x100|0x800|0x20000)
-                    or event['result']<0):_hold()
+                    or type(event['result']) is not int
+                    or event['result']<0 and event['result'] not in (-2,-20,-40)):_hold()
             bases=[]
             for attempt in event['lookup_attempts']:
                 base=attempt['base']
@@ -570,6 +587,12 @@ class FrozenLookupIndex:
             path=_path(event['path']);directory=bases[0]
             if path.startswith(b'/') and directory!=b'/':_hold()
             resolved,node,error,_facts=self.census._resolve(path,directory)
+            if event['result']<0:
+                failure={-2:'ENOENT',-20:'ENOTDIR',-40:'ELOOP'}[event['result']]
+                if installed is not None or error!=failure:_hold()
+                return {'syscall':{2:'open',257:'openat',437:'openat2'}[event['syscall']],
+                    'pid':pid,'path':path,'directory':directory,'intent':'read','outcome':'failure','errno':failure,
+                    'result':event['result'],'arguments':''}
             if (error is not None or node[0]!='file' or installed is None or installed['fd']!=event['result']
                     or not installed['file_mode']&1 or installed['flags']&0x200000
                     or installed['user_namespace']!=user_namespace or installed['mount_namespace']!=mount_namespace

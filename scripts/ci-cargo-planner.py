@@ -1932,7 +1932,8 @@ def frozen_input_index(source,bindings,scope):
         name=os.fsdecode(bytes.fromhex(raw));root=unit_views.literal(original)
         rows=expected[2] if expected[1]=='tree' else [['2e','file',*expected[2:]]]
         namespaces['generated_'+str(ordinal)]=('/workspace/'+name,root,rows)
-    return lookup_inputs.FrozenLookupIndex(namespaces,kernel_roots={'/':scope['root_identity']},owner=os.geteuid(),overlays=True)
+    return lookup_inputs.FrozenLookupIndex(namespaces,kernel_roots={'/':scope['root_identity']},owner=os.geteuid(),
+        overlays=True,opaque=('/workspace/target',))
 
 
 def record_selected_revalidation(root,source,lease,checkpoint,bindings,outputs,refs):
@@ -2036,7 +2037,7 @@ class CommandObservation:
             selected=None;unbound=[];selected_metadata=None;unbound_metadata=[]
             if mapping['kind']=='compile':
                 index=frozen_input_index(executor.source,executor.source_bindings,item)
-                selected,unbound=index.select_read_subset([event for event in queries if kernel_observer.readable_open(event)
+                selected,unbound=index.select_read_subset([event for event in queries if event['syscall'] in (2,257,437)
                     and event['pid']==pid],pid=pid,uid=uid,user_namespace=self.observer.user_namespace,
                     mount_namespace=int(item['namespaces']['mnt']['unit'].split('[',1)[1][:-1]))
                 if not selected.record()['queries']:raise FreshnessHold('input_census_unknown',b'compiler read selection absent')

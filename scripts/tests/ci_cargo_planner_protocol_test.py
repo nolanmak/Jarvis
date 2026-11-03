@@ -24,6 +24,44 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def test_command_capture_retains_failed_open_inputs_and_unbound_failures(self):
+        fixtures=planner._load('negative_open_kernel_fixtures','tests/ci_cargo_observer_test.py')
+        sample=fixtures.census_sample('all');census={'before':sample,'after':copy.deepcopy(sample)}
+        binding=self.publication_binding();command=str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'input-observations').mkdir(mode=0o700)
+            source=root/'source';source.mkdir();(source/'lib.rs').write_bytes(b'original')
+            (source/'lib.rs').chmod(0o444);source.chmod(0o555)
+            identity=lambda info:{'device':(os.major(info.st_dev)<<20)|os.minor(info.st_dev),
+                'inode':info.st_ino,'mode':info.st_mode}
+            successful={'uid':2000,'pid':101,'tid':102,'syscall':257,'sequence':1,'result':3,'path':b'lib.rs',
+                'lookup_attempts':[{'init_result':0,'dfd':-100,'user_namespace':100,'mount_namespace':50,
+                    'base':dict(identity(source.stat()),flags=257,path_seq=2,dentry_seq=2)}],
+                'open':{'arguments':{'dfd':-100,'flags':32768,'user_namespace':100,'mount_namespace':50},
+                    'installed':dict(identity((source/'lib.rs').stat()),fd=3,flags=32768,file_mode=1,
+                        user_namespace=100,mount_namespace=50)}}
+            missing=copy.deepcopy(successful);missing.update(sequence=2,result=-2,path=b'preferred.rs')
+            missing['open']['installed']=None
+            unsupported=copy.deepcopy(missing);unsupported.update(sequence=3,path=b'/runtime/unknown')
+            events=[successful,missing,unsupported]
+            observation=object.__new__(planner.CommandObservation)
+            observation.admission=SimpleNamespace(binding=binding,command=command)
+            observation.observer=SimpleNamespace(capture=lambda:(events,[],[],census),root=root,
+                program=planner.kernel_observer.observation_program('all'),binary_sha256='1'*64,user_namespace=100)
+            unit={'finished':True,'pid':101,'mapping':{'kind':'compile','role':'library','source':b'/workspace/lib.rs',
+                'request_sha256':'2'*64},'namespaces':{'mnt':{'unit':'mnt:[50]'}},
+                'root_identity':{'device':12,'inode':3456789,'mode':0o40755},'returncode':0,
+                'scope_evidence':{'status':{'command':command,'ordinal':0},'cleanup_sha256':planner.ExecutionLease.cleanup_digest()}}
+            summary=observation.finish(SimpleNamespace(root=root,source=source,source_bindings=[],units={0:unit}))
+            planner.validate_command_observation(summary,binding,command,{0})
+            record=planner.cache._read_record(root/'input-observations'/(command+'.json'),max_bytes=16*1024**2)
+            selected=record['scopes'][0]['selected_reads'];unbound=record['scopes'][0]['unbound_read_opens']
+            self.assertEqual(len(selected['queries']),2)
+            self.assertEqual(selected['queries'][1]['errno'],'ENOENT')
+            self.assertEqual(unbound,[{key:unsupported[key] for key in ('pid','tid','uid','syscall','sequence')}])
+            self.assertEqual(summary['units'][0]['queries'],3)
+            self.assertFalse(record['input_closure_complete']);self.assertFalse(record['shipping_authority'])
+
     def test_original_command_capture_persists_unit_scope_and_rejects_foreign_or_missing_source(self):
         fixtures=planner._load('capture_kernel_fixtures','tests/ci_cargo_observer_test.py')
         sample=fixtures.census_sample('all');census={'before':sample,'after':copy.deepcopy(sample)}

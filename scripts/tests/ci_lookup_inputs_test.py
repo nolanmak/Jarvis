@@ -17,6 +17,105 @@ def load(name):
 
 
 class LookupInputTests(unittest.TestCase):
+    def test_mounted_unknown_subtree_cannot_certify_source_placeholder_or_absence(self):
+        import copy
+        views=load('ci_cargo_views');source=self.root/'source';source.mkdir()
+        (source/'target').mkdir();(source/'target/hidden.rs').write_bytes(b'hidden source placeholder')
+        (source/'lib.rs').write_bytes(b'visible source')
+        frozen=self.root/'frozen';frozen.mkdir();(frozen/'input.rs').write_bytes(b'visible declared artifact')
+        for root in (source,frozen):
+            for path in root.rglob('*'):path.chmod(0o555 if path.is_dir() else 0o444)
+            root.chmod(0o555)
+        namespaces={'source':('/workspace',source,views.inventory(source,owner=os.getuid(),sealed=True)),
+            'artifact':('/workspace/target/deps',frozen,views.inventory(frozen,owner=os.getuid(),sealed=True))}
+        def index(masked=True):return self.inputs.FrozenLookupIndex(namespaces,owner=os.getuid(),overlays=True,
+            opaque=('/workspace/target',) if masked else ())
+        original=index()
+        identity=lambda info:{'device':(os.major(info.st_dev)<<20)|os.minor(info.st_dev),
+            'inode':info.st_ino,'mode':info.st_mode}
+        def event(path,result,info=None):
+            return {'pid':101,'tid':102,'uid':2000,'syscall':257,'sequence':1,'result':result,'path':path,
+                'lookup_attempts':[{'init_result':0,'dfd':-100,'user_namespace':100,'mount_namespace':50,
+                    'base':dict(identity(source.stat()),flags=257,path_seq=2,dentry_seq=2)}],
+                'open':{'arguments':{'dfd':-100,'flags':32768,'user_namespace':100,'mount_namespace':50},
+                    'installed':None if info is None else dict(identity(info),fd=result,flags=32768,file_mode=1,
+                        user_namespace=100,mount_namespace=50)}}
+        args={'pid':101,'uid':2000,'user_namespace':100,'mount_namespace':50}
+        for e in (event(b'target/missing.rs',-2),event(b'target/hidden.rs',7,(source/'target/hidden.rs').stat()),
+                event(b'target/unknown/../deps/input.rs',-2)):
+            with self.subTest(path=e['path']):
+                selected,unbound=original.select_read_subset([e],**args)
+                self.assertEqual(len(unbound),1);self.assertEqual(selected.record()['queries'],[])
+        for path in (b'target/deps/input.rs',b'target/../target/deps/input.rs'):
+            selected,unbound=original.select_read_subset([event(path,7,(frozen/'input.rs').stat())],**args)
+            self.assertEqual(unbound,[])
+            record=json.loads(json.dumps(selected.record()))
+            self.assertEqual(selected.observation,self.inputs._ContentSelection.restore(record,index()).observation)
+            with self.assertRaises(self.inputs.FreshnessHold):self.inputs._ContentSelection.restore(record,index(False))
+        # Metadata selectors must respect the same mount boundary.
+        e=event(b'target/missing.rs',-2);e['syscall']=262;e.pop('open')
+        stat_record={key:e[key] for key in ('uid','pid','tid','syscall','sequence','path','result')}
+        stat_record.update(fd=-100,flags=256,mask=0,user_namespace=100,stat=None,copy_result=None)
+        selected,unbound=original.select_metadata_subset([e],[stat_record],**args,threaded=True)
+        self.assertEqual(len(unbound),1);self.assertEqual(selected.record()['queries'],[])
+
+    def test_failed_read_open_selection_tracks_absence_and_not_directory_after_recovery(self):
+        import copy
+        views=load('ci_cargo_views')
+        args={'pid':101,'uid':2000,'user_namespace':100,'mount_namespace':50}
+        for syscall in (2,257,437):
+            for result,path in ((-2,b'preferred'),(-20,b'route/preferred')):
+                with self.subTest(syscall=syscall,result=result):
+                    def tree(label,change=False,unread=False):
+                        root=self.root/(str(syscall)+'_'+str(-result)+'_'+label);root.mkdir()
+                        (root/'fallback').write_bytes(b'OLD')
+                        if result==-20:
+                            if change:(root/'route').mkdir();(root/'route/preferred').write_bytes(b'NEW')
+                            else:(root/'route').write_bytes(b'route is a file')
+                        elif change:(root/'preferred').write_bytes(b'NEW')
+                        if unread:(root/'unread').write_bytes(b'unused')
+                        for child in root.rglob('*'):
+                            if child.is_file():os.utime(child,ns=(946684800000000000,946684800000000000))
+                            child.chmod(0o555 if child.is_dir() else 0o444)
+                        root.chmod(0o555);return root
+                    old=tree('old');unrelated=tree('unrelated',unread=True);changed=tree('changed',change=True)
+                    def index(root):return self.inputs.FrozenLookupIndex({'generated':('/workspace/generated',root,
+                        views.inventory(root,owner=os.getuid(),sealed=True))},owner=os.getuid())
+                    identity=lambda info:{'device':(os.major(info.st_dev)<<20)|os.minor(info.st_dev),
+                        'inode':info.st_ino,'mode':info.st_mode}
+                    event={'pid':101,'tid':102,'uid':2000,'syscall':syscall,'sequence':1,'result':result,'path':path,
+                        'lookup_attempts':[{'init_result':0,'dfd':-100,'user_namespace':100,'mount_namespace':50,
+                            'base':dict(identity(old.stat()),flags=257,path_seq=2,dentry_seq=2)}],
+                        'open':{'arguments':{'dfd':-100,'flags':32768,'user_namespace':100,'mount_namespace':50},
+                            'installed':None}}
+                    fallback=copy.deepcopy(event);fallback.update(sequence=2,result=7,path=b'fallback')
+                    fallback['open']['installed']=dict(identity((old/'fallback').stat()),fd=7,flags=32768,
+                        file_mode=1,user_namespace=100,mount_namespace=50)
+                    original=index(old);selected,unbound=original.select_read_subset([event,fallback],**args)
+                    self.assertEqual(unbound,[])
+                    self.assertEqual(len(selected.record()['queries']),2)
+                    record=json.loads(json.dumps(selected.record()))
+                    restored=self.inputs._ContentSelection.restore(record,original)
+                    self.assertEqual(selected.observation,restored.observation)
+                    self.assertEqual(selected.observation['sha256'],restored.refresh(index(unrelated))['sha256'])
+                    self.assertNotEqual(selected.observation['sha256'],restored.refresh(index(changed))['sha256'])
+                    self.assertEqual(views._read(old/'fallback',os.getuid(),True),
+                        views._read(changed/'fallback',os.getuid(),True))
+                    self.assertEqual((old/'fallback').stat().st_mtime_ns,(changed/'fallback').stat().st_mtime_ns)
+                    self.assertFalse(record['input_closure_complete']);self.assertFalse(record['shipping_authority'])
+                    for fault in ('installed','descriptor','namespace','outside','errno','path-only','write'):
+                        wrong=copy.deepcopy(event)
+                        if fault=='installed':wrong['open']['installed']=copy.deepcopy(fallback['open']['installed'])
+                        elif fault=='descriptor':wrong['open']['arguments']['dfd']=3
+                        elif fault=='namespace':wrong['lookup_attempts'][0]['mount_namespace']=51
+                        elif fault=='outside':wrong['path']=b'/runtime/unknown'
+                        elif fault=='errno':wrong['result']=-13
+                        elif fault=='path-only':wrong['open']['arguments']['flags']|=0x200000
+                        else:wrong['open']['arguments']['flags']|=1
+                        with self.subTest(fault=fault):
+                            rejected,unsupported=original.select_read_subset([wrong],**args)
+                            self.assertEqual(len(unsupported),1);self.assertEqual(rejected.record()['queries'],[])
+
     def test_metadata_subset_persists_missing_module_and_retains_unbound_queries(self):
         import copy
         views=load('ci_cargo_views')

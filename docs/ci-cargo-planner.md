@@ -1649,3 +1649,41 @@ when positive input content does not change. Their 44/70 unbound read opens and
 shipping flags remain false. No fingerprint retirement or complete revalidation
 is claimed. Existing positive-read and other compatibility replays for this
 source remain pending.
+
+
+### Failed opens and mounted-directory boundaries
+
+The original collector already records failed `open`, `openat` and `openat2`
+calls. Compiler selection now retains supported read-only `ENOENT`/`ENOTDIR`
+outcomes using the same original flags, namespace, lookup base and result;
+failures with an installed descriptor or an inconsistent census stay unbound.
+These selectors survive protected recovery and refresh against the later
+forest, so a newly present path can invalidate relevance even when all files
+previously read retain their bytes and timestamps. Unsupported error/flag/path
+combinations remain explicit, rather than disappearing before selection.
+
+The actual compiler index also treats `/workspace/target` as an opaque mounted
+subtree. Source placeholders beneath that mount cannot establish content or
+absence in the mounted artifact view. Explicitly frozen descendant roots remain
+selectable; unknown children hold. The opaque layout is part of the persisted
+selector identity, so recovery cannot silently remove that boundary. Both read
+and metadata selection use it. This is still incomplete input observation;
+`input_closure_complete`, `full_ci` and `shipping_authority` remain false.
+
+Regressions were run red before implementation: all three open syscalls dropped
+both absent-file and non-directory outcomes; the actual command adapter omitted
+the failed open from its persisted selection. New tests cover recovery, an
+unrelated sibling, same-timestamp introduction, hidden source placeholders,
+namespace/descriptor/result mismatch, and explicitly frozen descendants through
+an opaque mount. An early new-test run correctly hit the frozen-tree atime guard
+after its own ordinary byte read; the test now compares through the existing
+no-atime inventory reader. The guard remains unchanged.
+
+Compatibility at source `a50724f1`, evidence head `44a4d622`, completed before
+these edits: original positive generated replay **162.33s**, original private
+publication/retry replay **110.40s**, and original structured success/failing
+replay **190.63s**, all passed. Receipts are under
+`/tmp/augmentagent-ci-negative-positive-20261103192758`,
+`/tmp/augmentagent-ci-negative-protocol-20261103193041`, and
+`/tmp/augmentagent-ci-negative-structured-20261103193233` respectively.
+These are compatibility evidence for that source, not results for later edits.
