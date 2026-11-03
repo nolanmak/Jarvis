@@ -730,3 +730,28 @@ but the name-filter probe still exceeded the limit. Fixed prefix reads at
 the 127-byte truncation boundary refuse. The seven parser/startup tests and 31
 focused Rust tests passed at that revision; these do not establish native
 lookup coverage. The captured records still need inspection and correction.
+
+Follow-up capture inspection found both positive and negative original-unit
+opens, but bpftrace failed to detach because guest tracefs was absent. The
+private observer now mounts tracefs before loading. Directory lookup spellings
+ending in `/` are preserved exactly. Rust also queries real output names longer
+than 127 bytes, so retaining the old string limit would keep the real graph
+unavailable. Names now use sequenced 63-byte chunks, an explicit total length
+up to 4,095 bytes, exact offset/length checks and one final sum of emitted
+records. Missing or duplicate chunks, truncation, loss and mismatched counters
+still refuse. The startup nonce name is longer than 128 bytes; the original
+UID-2004 unit additionally issues a 4,095-byte raw lookup whose full bytes and
+ENOENT result must be observed before its report can validate.
+
+The initial byte scan hit the kernel's 8,193-jump complexity limit. Word scanning
+removed that limit, but the combined scan/emission program exceeded the
+one-million-instruction verifier limit. The current candidate separates those
+loops into two return probes, bound by the original TID, syscall-entry sequence
+and kernel filename pointer. Actual probe ordering and complete native success
+remain unproved. Startup now waits for bpftrace's attachment marker before the
+mandatory captured nonce lookup; that marker alone grants no authority.
+The strict helper-error decoder accepts only bpftrace's documented null map
+lookup/default-zero record. Read, update and delete failures still refuse.
+This is explicit map initialization semantics, not an input equivalence rule.
+Ten observer tests pass. At `a974f3d2`, 258 CI Python tests passed with native
+helpers and no skips; the current split-probe build/VM validation is pending.
