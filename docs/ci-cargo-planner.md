@@ -1267,4 +1267,16 @@ four passes or a changed grant after reopening. The unchanged warm command and
 its failed retry use two passes in this diagnostic; this does not prove the
 original in-command publication harness. Live selector recovery, opaque tools,
 general CI entry dispatch, full input closure and final passing-CI publication
-remain unfinished. Native validation of this integration is pending.
+remain unfinished.
+
+Native replay at `147c891c` passed in **113.90 seconds**. The protected receipt
+contains five preserved producer records: four actually executed units and one
+explicit root-created diagnostic snapshot. Four producers remain active after
+the namespace transition. The selector callback durably marked library/binary
+pending before activation; the failed library rebuild then ran as pass two
+under the unchanged bootstrap grant and four-pass ceiling. Original cold/warm
+counts `[3,0]`, build-script counts `[1,0]`, two applications, E0761/Cargo101,
+original cleanup, sealed history/metadata and sixteen zero-miss kernel
+programs/links remained verified. All 296 Python CI tests and 31 focused managed
+Rust tests passed (15 opt-in cases excluded). This is the integrated controlled
+replay, not the original in-command publication exit or production activation.
