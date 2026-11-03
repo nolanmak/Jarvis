@@ -601,8 +601,13 @@ mount of the original sealed executable at Cargo's exact requested alias. Its
 attempt to write fingerprint data must affect only its own private target.
 Root observations require one compiler execution on the first run, zero on the
 unchanged second run, two application executions, unchanged actual fingerprint
-contents, sealed artifact integrity and original cleanup. Native validation of
-this new checkpoint is pending; host mapping tests do not establish it.
+contents, sealed artifact integrity and original cleanup. Native validation is
+still unsatisfied: `ccd97c8d` stops at `planner_cargo_request` after 92.18 seconds.
+Host mapping tests do not establish the real Cargo checkpoint. Earlier native
+runs exposed the installed toolchain's private UID1000/0700 root; read-only
+mounts of its existing public child directories now expose the pinned runtime
+without changing host permissions. This virtual runtime root is an execution
+prototype, not the final metadata/runtime-equivalence policy.
 
 The in-command publication regression at `43fd246e` did produce a valid native
 RED: warm two consumer compiles, unchanged zero, then zero consumer compiles and
