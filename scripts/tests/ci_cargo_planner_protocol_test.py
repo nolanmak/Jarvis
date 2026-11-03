@@ -22,6 +22,16 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def test_cargo_run_relative_executable_keeps_its_original_request(self):
+        # Cargo 1.94.1 cargo_run.rs strips the caller's cwd from its executable.
+        file=b'target/debug/private-cargo-probe'
+        request=(file,[file],{},b'/workspace',b'/toolchain/bin:/usr/bin:/bin',0,0)
+        self.assertEqual(planner.fixture_request(request),{'kind':'application'})
+        self.assertEqual(request[0],file)
+        for unknown in (b'../target/debug/private-cargo-probe',b'other/debug/private-cargo-probe',b'private-cargo-probe'):
+            with self.subTest(file=unknown),self.assertRaises(planner.FreshnessHold):
+                planner.fixture_request((unknown,[unknown],{},b'/workspace',request[4],0,0))
+
     def test_rejected_mapping_closes_original_request_control_descriptors(self):
         class Reject:
             def prepare(self,*args):raise planner.FreshnessHold('input_census_unknown')

@@ -194,11 +194,13 @@ def fixture_request(request):
     input-closure authority. Preserve the original command and its virtual paths.
     """
     file,argv,_environment,cwd,search,_ignored,_blocked=request
-    # POSIX spawnp/execvp preserve their search request even for absolute files.
-    # An absolute executable ignores PATH; keep the original payload untouched.
+    # POSIX spawnp/execvp preserve their search request for files containing '/'.
+    # Such files ignore PATH; keep the original executable and payload untouched.
     if cwd!=b'/workspace' or not argv or argv[0]!=file:
         raise FreshnessHold('input_census_unknown')
-    if file==b'/workspace/target/debug/private-cargo-probe' and len(argv)==1:
+    # cargo_run.rs at Cargo commit29ea6fb6a strips the caller's cwd prefix.
+    # Both literal paths resolve to this one planned mount under /workspace.
+    if file in (b'/workspace/target/debug/private-cargo-probe',b'target/debug/private-cargo-probe') and len(argv)==1:
         return {'kind':'application'}
     if file!=b'/toolchain/bin/rustc':raise FreshnessHold('input_census_unknown')
     args=argv[1:]
