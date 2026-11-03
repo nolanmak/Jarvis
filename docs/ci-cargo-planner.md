@@ -718,8 +718,25 @@ or final C API. It deliberately does not claim complete syscall/fd/directory/
 metadata/runtime coverage, kernel missed-kretprobe accounting or compatibility.
 Long/unknown path spellings and malformed/lost/count-mismatched observations
 have no proof. The existing generic input-closure and shipping flags remain
-false. Native feasibility is pending; reuse, invalidation and passing-proof
-publication remain blocked on the complete collector and original regressions.
+false. The pinned native feasibility replay below passes; reuse, invalidation
+and passing-proof publication remain blocked on the complete collector and
+original regressions.
+
+At `4086c4c9`, the admitted native replay passed in **103.29 seconds** on
+`7.0.0-31-generic`. Its receipt records 532 kernel-copied lookup observations,
+the actual long nonce witness, original-unit positive/negative queries, the
+complete 4,095-byte lookup, actual build-script/library/binary source queries
+and the library's generated input. Both observer exit and allocation removal
+passed. The unchanged graph retained three-to-zero compiler calls and
+one-to-zero build-script executions, with two application runs, nine distinct
+tool UIDs, original cleanup, detached sealed artifacts and preserved actual
+planner/generated-tree metadata. The kernel and helper/program digests bind
+this result; it is not a portable kernel ABI claim or a passing-CI capability.
+All full-filesystem, missed-probe census, input-closure and shipping flags remain
+false. **260 CI Python tests passed with native helpers and no skips**, and 31
+focused Rust tests passed (15 opt-in tests excluded). Complete collection,
+runtime equivalence, selective invalidation and original regression fixes are
+still required before passing-proof publication or autoship activation.
 
 Actual VM startup at `33729c22` failed because the BPF exit probe exceeded the
 kernel stack limit. Reducing the capture capacity at `6a49996d` did not resolve
@@ -744,14 +761,17 @@ UID-2004 unit additionally issues a 4,095-byte raw lookup whose full bytes and
 ENOENT result must be observed before its report can validate.
 
 The initial byte scan hit the kernel's 8,193-jump complexity limit. Word scanning
-removed that limit, but the combined scan/emission program exceeded the
+got farther, but the combined scan/emission program exceeded the
 one-million-instruction verifier limit. The current candidate separates those
 loops into two return probes, bound by the original TID, syscall-entry sequence
-and kernel filename pointer. Actual probe ordering and complete native success
-remain unproved. Startup now waits for bpftrace's attachment marker before the
+and kernel filename pointer. The pinned native result above establishes ordering
+for that graph/runtime; general coverage remains unproved. Startup waits for bpftrace's attachment marker before the
 mandatory captured nonce lookup; that marker alone grants no authority.
 The strict helper-error decoder accepts only bpftrace's documented null map
 lookup/default-zero record. Read, update and delete failures still refuse.
 This is explicit map initialization semantics, not an input equivalence rule.
-Ten observer tests pass. At `a974f3d2`, 258 CI Python tests passed with native
-helpers and no skips; the current split-probe build/VM validation is pending.
+Eleven observer tests pass, including exact bounded loader summaries. Unknown
+loader output cannot replace events or the final counter. The private verifier
+buffer is 3 MiB inside the existing 4 MiB per-stream log limit; this avoids
+losing the kernel's load result to bpftrace's original 1,000,000-byte diagnostic
+buffer. Target memory, image, storage, timeout and shipping limits are unchanged.
