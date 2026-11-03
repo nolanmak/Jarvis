@@ -26,17 +26,34 @@ impl SwitchValue {
 }
 
 pub fn parse_switch(raw: Option<&str>) -> SwitchValue {
-    let _ = raw;
-    todo!()
+    match raw.map(str::trim) {
+        None | Some("") => SwitchValue::Off,
+        Some(v) if v.eq_ignore_ascii_case("on") => SwitchValue::On,
+        Some(v) if v.eq_ignore_ascii_case("off") => SwitchValue::Off,
+        Some(_) => SwitchValue::Unrecognised,
+    }
+}
+
+fn switch_from_env(key: &str) -> bool {
+    let raw = std::env::var(key).ok();
+    let value = parse_switch(raw.as_deref());
+    if value == SwitchValue::Unrecognised {
+        tracing::warn!(
+            key,
+            value = raw.as_deref().unwrap_or_default(),
+            "unrecognised switch value; only `on` enables it, so it stays off"
+        );
+    }
+    value.enabled()
 }
 
 /// D1 master switch. Call once at startup.
 pub fn master_switch_from_env() -> bool {
-    todo!()
+    switch_from_env(AUTONOMY_ENV)
 }
 
 /// D16 heartbeat outreach: on only when its own switch *and* the master
 /// switch are `on`.
 pub fn heartbeat_outreach_from_env() -> bool {
-    todo!()
+    switch_from_env(HEARTBEAT_OUTREACH_ENV) && master_switch_from_env()
 }

@@ -54,7 +54,11 @@ fn problem_for<'a>(r: &'a LoadReport, slug: &str) -> &'a str {
 #[test]
 fn parse_error_loads_empty_and_alerts() {
     let r = report(&format!("{JANE}\n[[contact]\nwiki = broken"));
-    assert!(r.contacts.is_empty(), "a parse error must load nothing: {:?}", r.contacts);
+    assert!(
+        r.contacts.is_empty(),
+        "a parse error must load nothing: {:?}",
+        r.contacts
+    );
     let fatal = r.fatal.as_deref().expect("parse error must be fatal");
     assert!(!fatal.is_empty());
     let alerts = r.alerts();
@@ -114,7 +118,11 @@ fn noncanonical_handle_rejected() {
             "[[contact]]\nwiki = \"jane-doe\"\ntier = \"full\"\nhandles = [\"{handle}\"]\n"
         ));
         assert!(r.contacts.is_empty(), "{handle} must be rejected");
-        assert!(problem_for(&r, "jane-doe").contains("handle"), "{handle}: {:?}", r.problems);
+        assert!(
+            problem_for(&r, "jane-doe").contains("handle"),
+            "{handle}: {:?}",
+            r.problems
+        );
     }
 }
 
@@ -145,7 +153,11 @@ tier = "full"
 handles = ["imessage:+12025550100"]
 "#;
     let r = report(&format!("{JANE}{twin}{SAM}"));
-    assert_eq!(slugs(&r), ["sam-roe"], "both sharers disabled, the rest loads");
+    assert_eq!(
+        slugs(&r),
+        ["sam-roe"],
+        "both sharers disabled, the rest loads"
+    );
     assert!(problem_for(&r, "jane-doe").contains("imessage:+12025550100"));
     assert!(problem_for(&r, "jane-twin").contains("imessage:+12025550100"));
 }
@@ -184,7 +196,10 @@ fn defaults_preferred_channel_and_daily_cap() {
     assert_eq!(jane.tier, Tier::Actions);
     assert_eq!(jane.daily_cap, 10);
     assert_eq!(jane.preferred_handle.canonical(), "imessage:+12025550100");
-    assert_eq!(jane.calendar_email.as_deref(), Some("jane@work.example.test"));
+    assert_eq!(
+        jane.calendar_email.as_deref(),
+        Some("jane@work.example.test")
+    );
     assert!(jane.allows("calendar.add_guest"));
     assert!(!jane.allows("reply"));
     let sam = r.contact("sam-roe").unwrap();
@@ -217,7 +232,13 @@ fn missing_wiki_slug_keeps_contact_and_notices() {
     assert!(snap.slug_notices[0].contains("trust sync"));
 
     // The contact stays loaded and, once confirmed, trusted.
-    let snap = reconcile(&store, report(&format!("{JANE}{SAM}")), Some(&people), NOW + 1).unwrap();
+    let snap = reconcile(
+        &store,
+        report(&format!("{JANE}{SAM}")),
+        Some(&people),
+        NOW + 1,
+    )
+    .unwrap();
     assert!(snap.is_active("jane-doe"), "missing page must not untrust");
     // One-time: the next load does not repeat the notice.
     assert!(snap.slug_notices.is_empty(), "{:?}", snap.slug_notices);
@@ -238,7 +259,12 @@ fn normalize_email_lowercases() {
 
 #[test]
 fn normalize_imessage_phone_to_e164() {
-    for raw in ["(202) 555-0100", "202-555-0100", "+1 202 555 0100", "+12025550100"] {
+    for raw in [
+        "(202) 555-0100",
+        "202-555-0100",
+        "+1 202 555 0100",
+        "+12025550100",
+    ] {
         let h = normalize_handle("imessage", raw).unwrap();
         assert_eq!(h.canonical(), "imessage:+12025550100", "{raw}");
     }
@@ -251,7 +277,10 @@ fn normalize_imessage_appleid_lowercases() {
     assert_eq!(h.canonical(), "imessage:sam@icloud.example.test");
     assert_eq!(h.platform(), Platform::Imessage);
     // Same address on email is a different handle.
-    assert_ne!(h, normalize_handle("email", "sam@icloud.example.test").unwrap());
+    assert_ne!(
+        h,
+        normalize_handle("email", "sam@icloud.example.test").unwrap()
+    );
     assert!(normalize_handle("whatsapp", "x").is_err());
 }
 
@@ -277,7 +306,10 @@ fn changed_entry_becomes_pending_until_confirm() {
     assert!(confirm_contact(&store, &snap.report, "jane-doe", NOW).unwrap());
     let snap = reconcile(&store, report(JANE), None, NOW + 1).unwrap();
     assert!(snap.newly_pending.is_empty());
-    assert_eq!(snap.active_contact_for(&h).map(|c| c.slug.as_str()), Some("jane-doe"));
+    assert_eq!(
+        snap.active_contact_for(&h).map(|c| c.slug.as_str()),
+        Some("jane-doe")
+    );
 
     // Tier change → pending again, until confirmed.
     let widened = JANE.replace(
@@ -286,7 +318,10 @@ fn changed_entry_becomes_pending_until_confirm() {
     );
     let snap = reconcile(&store, report(&widened), None, NOW + 2).unwrap();
     assert_eq!(snap.newly_pending, ["jane-doe"]);
-    assert!(snap.active_contact_for(&h).is_none(), "changed entry must not stay trusted");
+    assert!(
+        snap.active_contact_for(&h).is_none(),
+        "changed entry must not stay trusted"
+    );
     assert!(confirm_contact(&store, &snap.report, "jane-doe", NOW + 3).unwrap());
     let snap = reconcile(&store, report(&widened), None, NOW + 4).unwrap();
     assert_eq!(snap.active_contact_for(&h).unwrap().tier, Tier::Full);
@@ -337,7 +372,8 @@ fn hash_change_while_down_detected_at_startup() {
 
 #[test]
 fn example_config_parses_and_contains_only_example_domains() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/trusted-contacts.example.toml");
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/trusted-contacts.example.toml");
     let text = std::fs::read_to_string(&path).unwrap();
     let r = load_config(&path);
     assert!(r.fatal.is_none(), "{:?}", r.fatal);
@@ -364,6 +400,9 @@ fn example_config_parses_and_contains_only_example_domains() {
     let re = regex::Regex::new(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+)").unwrap();
     for cap in re.captures_iter(&text) {
         let d = &cap[1];
-        assert!(d.ends_with("example.test"), "non-example domain `{d}` in example config");
+        assert!(
+            d.ends_with("example.test"),
+            "non-example domain `{d}` in example config"
+        );
     }
 }

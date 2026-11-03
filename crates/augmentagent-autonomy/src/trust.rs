@@ -71,8 +71,37 @@ pub fn reconcile(
     people_dir: Option<&Path>,
     now_ms: i64,
 ) -> Result<TrustSnapshot, TrustError> {
-    let _ = (store, report, people_dir, now_ms);
-    todo!()
+    let stored = store.autonomy_config_hash()?;
+    let file_changed = stored != report.file_hash;
+    if file_changed {
+        store.set_autonomy_config_hash(report.file_hash.as_deref(), now_ms)?;
+    }
+    let mut snap = TrustSnapshot {
+        file_changed,
+        ..TrustSnapshot::default()
+    };
+    for contact in &report.contacts {
+        if store.ensure_trust_pending(&contact.slug, &contact.entry_hash, now_ms)? {
+            snap.newly_pending.push(contact.slug.clone());
+        }
+        match store.trust_state(&contact.slug, &contact.entry_hash)? {
+            Some(TrustState::Active) => snap.active.push(contact.clone()),
+            _ => snap.pending.push(contact.clone()),
+        }
+        if let Some(dir) = people_dir {
+            if dir.join(format!("{}.md", contact.slug)).is_file() {
+                store.clear_slug_missing_notice(&contact.slug)?;
+            } else if store.mark_slug_missing_noticed(&contact.slug, &contact.entry_hash, now_ms)? {
+                snap.slug_notices.push(format!(
+                    "trusted contact `{0}`: people/{0}.md is missing; the contact stays trusted as configured. \
+                     Run `augmentagent trust sync {0}` after fixing the page.",
+                    contact.slug
+                ));
+            }
+        }
+    }
+    snap.report = report;
+    Ok(snap)
 }
 
 /// `trust confirm <slug>`: activate the contact's *current* entry. Returns
@@ -83,6 +112,8 @@ pub fn confirm_contact(
     slug: &str,
     now_ms: i64,
 ) -> Result<bool, TrustError> {
-    let _ = (store, report, slug, now_ms);
-    todo!()
+    let contact = report
+        .contact(slug)
+        .ok_or_else(|| TrustError::UnknownContact(slug.to_string()))?;
+    Ok(store.confirm_trust(&contact.slug, &contact.entry_hash, now_ms)?)
 }

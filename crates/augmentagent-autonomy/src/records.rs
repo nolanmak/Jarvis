@@ -16,6 +16,21 @@ pub fn idem_key(
     candidate_ref: Option<&str>,
     created_at_ms: i64,
 ) -> String {
-    let _ = (contact_slug, thread_key, plan_kind, candidate_ref, created_at_ms);
-    todo!()
+    use sha2::{Digest, Sha256};
+    let window = created_at_ms.div_euclid(IDEM_WINDOW_MS);
+    let mut h = Sha256::new();
+    for field in [contact_slug, thread_key, plan_kind] {
+        h.update((field.len() as u64).to_be_bytes());
+        h.update(field.as_bytes());
+    }
+    match candidate_ref {
+        Some(c) => {
+            h.update([1u8]);
+            h.update((c.len() as u64).to_be_bytes());
+            h.update(c.as_bytes());
+        }
+        None => h.update([0u8]),
+    }
+    h.update(window.to_be_bytes());
+    hex::encode(h.finalize())
 }

@@ -28,11 +28,14 @@
 //! A loaded contact is only *eligible*: whether it is trusted (active) or
 //! pending is decided by [`crate::trust::reconcile`] against the store.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::handle::Handle;
+use crate::handle::{Handle, Platform};
+use crate::registry;
 
 /// Override for the config path.
 pub const CONFIG_ENV: &str = "AUGMENTAGENT_TRUSTED_CONTACTS";
@@ -119,8 +122,12 @@ impl TrustedContact {
     /// (D2): `full` allows every registry action and `reply`; `actions`
     /// allows exactly its `allowed_actions`.
     pub fn allows(&self, action: &str) -> bool {
-        let _ = action;
-        todo!()
+        match self.tier {
+            Tier::Full => registry::is_known(action),
+            Tier::Actions => {
+                registry::is_listable(action) && self.allowed_actions.iter().any(|a| a == action)
+            }
+        }
     }
 }
 
@@ -162,7 +169,19 @@ impl LoadReport {
     /// Owner-facing alert lines: the fatal error, then one line per
     /// disabled contact.
     pub fn alerts(&self) -> Vec<String> {
-        todo!()
+        let mut out = Vec::new();
+        if let Some(fatal) = &self.fatal {
+            out.push(format!(
+                "trusted contacts: {} could not be loaded, so nobody is trusted: {fatal}",
+                self.path.display()
+            ));
+        }
+        out.extend(
+            self.problems
+                .iter()
+                .map(|p| format!("trusted contacts: {p}")),
+        );
+        out
     }
 
     pub fn contact(&self, slug: &str) -> Option<&TrustedContact> {
@@ -176,34 +195,282 @@ impl LoadReport {
 
     /// Parse and validate `text` as if it had been read from `path`.
     pub fn from_text(path: &Path, text: &str) -> LoadReport {
-        let _ = (path, text);
-        todo!()
+        let mut report = LoadReport {
+            path: path.to_path_buf(),
+            file_hash: Some(file_hash(text.as_bytes())),
+            ..LoadReport::default()
+        };
+        let tables = match parse_tables(text) {
+            Ok(t) => t,
+            Err(e) => {
+                report.fatal = Some(e);
+                return report;
+            }
+        };
+
+        // Validate each entry on its own.
+        let mut valid: Vec<(usize, TrustedContact)> = Vec::new();
+        for (index, table) in tables.into_iter().enumerate() {
+            let slug = table
+                .get("wiki")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let entry = match ContactEntry::deserialize(toml::Value::Table(table)) {
+                Ok(e) => e,
+                Err(e) => {
+                    report.problems.push(ContactProblem {
+                        index,
+                        slug,
+                        reason: one_line(&e.to_string()),
+                    });
+                    continue;
+                }
+            };
+            match validate_entry(&entry) {
+                Ok(c) => valid.push((index, c)),
+                Err(reason) => report.problems.push(ContactProblem {
+                    index,
+                    slug,
+                    reason,
+                }),
+            }
+        }
+
+        // Cross-contact: a handle or slug on more than one contact disables
+        // every contact that shares it.
+        let mut by_handle: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut by_slug: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for (pos, (_, c)) in valid.iter().enumerate() {
+            for h in &c.handles {
+                by_handle.entry(h.canonical()).or_default().push(pos);
+            }
+            by_slug.entry(c.slug.as_str()).or_default().push(pos);
+        }
+        let mut reasons: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        for (handle, owners) in &by_handle {
+            if owners.len() > 1 {
+                for &pos in owners {
+                    reasons
+                        .entry(pos)
+                        .or_default()
+                        .push(format!("handle {handle} is also on another contact"));
+                }
+            }
+        }
+        for (slug, owners) in &by_slug {
+            if owners.len() > 1 {
+                for &pos in owners {
+                    reasons
+                        .entry(pos)
+                        .or_default()
+                        .push(format!("wiki slug `{slug}` appears more than once"));
+                }
+            }
+        }
+        for (pos, (index, contact)) in valid.into_iter().enumerate() {
+            match reasons.remove(&pos) {
+                Some(r) => report.problems.push(ContactProblem {
+                    index,
+                    slug: Some(contact.slug),
+                    reason: r.join("; "),
+                }),
+                None => report.contacts.push(contact),
+            }
+        }
+        report.problems.sort_by_key(|p| p.index);
+        report
     }
 }
 
 /// `AUGMENTAGENT_TRUSTED_CONTACTS` when set and non-empty, else
 /// [`DEFAULT_CONFIG_PATH`] relative to the working directory.
 pub fn config_path() -> PathBuf {
-    todo!()
+    match std::env::var(CONFIG_ENV) {
+        Ok(v) if !v.trim().is_empty() => PathBuf::from(v.trim()),
+        _ => PathBuf::from(DEFAULT_CONFIG_PATH),
+    }
 }
 
 /// Read and validate the file. A missing file is an empty config with no
 /// alert (autonomy simply has nobody to act for).
 pub fn load_config(path: &Path) -> LoadReport {
-    let _ = path;
-    todo!()
+    match std::fs::read(path) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => LoadReport::from_text(path, &text),
+            Err(e) => LoadReport {
+                path: path.to_path_buf(),
+                file_hash: Some(file_hash(e.as_bytes())),
+                fatal: Some("file is not valid UTF-8".into()),
+                ..LoadReport::default()
+            },
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LoadReport {
+            path: path.to_path_buf(),
+            ..LoadReport::default()
+        },
+        Err(e) => LoadReport {
+            path: path.to_path_buf(),
+            fatal: Some(format!("cannot read: {e}")),
+            ..LoadReport::default()
+        },
+    }
+}
+
+/// The `[[contact]]` tables of a config file. Any TOML error, a top-level
+/// key other than `contact`, or a `contact` that is not an array of tables
+/// is a whole-file (fatal) error.
+pub(crate) fn parse_tables(text: &str) -> Result<Vec<toml::Table>, String> {
+    let doc: toml::Table = toml::from_str(text).map_err(|e| one_line(&e.to_string()))?;
+    let mut tables = Vec::new();
+    for (key, value) in doc {
+        if key != "contact" {
+            return Err(format!(
+                "unknown top-level key `{key}` (expected only [[contact]] tables)"
+            ));
+        }
+        let toml::Value::Array(items) = value else {
+            return Err("`contact` must be an array of tables ([[contact]])".into());
+        };
+        for item in items {
+            let toml::Value::Table(t) = item else {
+                return Err("`contact` must be an array of tables ([[contact]])".into());
+            };
+            tables.push(t);
+        }
+    }
+    Ok(tables)
+}
+
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Validate one entry on its own (no cross-contact duplicate check). The
 /// CLI runs this before writing so it never writes an entry the loader
 /// would disable.
 pub fn validate_entry(entry: &ContactEntry) -> Result<TrustedContact, String> {
-    let _ = entry;
-    todo!()
+    let slug = entry.wiki.trim();
+    if slug.is_empty() || slug != entry.wiki || slug.contains(['/', '\\']) || slug.starts_with('.')
+    {
+        return Err(format!(
+            "`wiki` must be a bare people/ slug, got `{}`",
+            entry.wiki
+        ));
+    }
+    let tier = match entry.tier.as_deref() {
+        None => return Err("missing `tier` (required: \"actions\" or \"full\")".into()),
+        Some(t) => Tier::parse(t)
+            .ok_or_else(|| format!("unknown tier `{t}` (expected \"actions\" or \"full\")"))?,
+    };
+    for action in &entry.allowed_actions {
+        if !registry::is_listable(action) {
+            return Err(if action == registry::REPLY {
+                "`reply` cannot be listed in allowed_actions; it comes only with tier = \"full\""
+                    .into()
+            } else {
+                format!("unknown action `{action}` in allowed_actions")
+            });
+        }
+    }
+    if tier == Tier::Full && !entry.allowed_actions.is_empty() {
+        return Err("tier = \"full\" must have an empty or omitted allowed_actions".into());
+    }
+    if entry.handles.is_empty() {
+        return Err("no handles".into());
+    }
+    let mut handles: Vec<Handle> = Vec::with_capacity(entry.handles.len());
+    for raw in &entry.handles {
+        let h = Handle::parse_canonical(raw).map_err(|e| format!("bad handle `{raw}`: {e}"))?;
+        if handles.contains(&h) {
+            return Err(format!("handle {h} is listed twice"));
+        }
+        handles.push(h);
+    }
+    let calendar_email = match &entry.calendar_email {
+        None => None,
+        Some(addr) => {
+            let want = format!("email:{addr}");
+            if !handles.iter().any(|h| h.canonical() == want) {
+                return Err(format!(
+                    "calendar_email `{addr}` is not among the handles (need `{want}`)"
+                ));
+            }
+            Some(addr.clone())
+        }
+    };
+    if calendar_email.is_none()
+        && entry
+            .allowed_actions
+            .iter()
+            .any(|a| a == registry::ADD_GUEST)
+    {
+        return Err("calendar.add_guest is allowed but calendar_email is missing".into());
+    }
+    let preferred_handle = match &entry.preferred_channel {
+        Some(p) => handles
+            .iter()
+            .find(|h| h.canonical() == *p)
+            .cloned()
+            .ok_or_else(|| format!("preferred_channel `{p}` is not among the handles"))?,
+        None => handles
+            .iter()
+            .find(|h| h.platform() == Platform::Imessage)
+            .or_else(|| handles.iter().find(|h| h.platform() == Platform::Email))
+            .cloned()
+            .expect("handles is non-empty"),
+    };
+    let daily_cap = entry.daily_cap.unwrap_or(DEFAULT_DAILY_CAP);
+    let entry_hash = entry_hash(
+        slug,
+        tier,
+        &entry.allowed_actions,
+        &handles,
+        calendar_email.as_deref(),
+        &preferred_handle,
+        daily_cap,
+    );
+    Ok(TrustedContact {
+        slug: slug.to_string(),
+        tier,
+        allowed_actions: entry.allowed_actions.clone(),
+        handles,
+        calendar_email,
+        preferred_handle,
+        daily_cap,
+        entry_hash,
+    })
+}
+
+/// Hash of the entry's normalised content. Order of handles and actions
+/// does not matter; every field that affects what may happen does.
+fn entry_hash(
+    slug: &str,
+    tier: Tier,
+    allowed_actions: &[String],
+    handles: &[Handle],
+    calendar_email: Option<&str>,
+    preferred: &Handle,
+    daily_cap: u32,
+) -> String {
+    let mut actions: Vec<&str> = allowed_actions.iter().map(String::as_str).collect();
+    actions.sort_unstable();
+    actions.dedup();
+    let mut hs: Vec<String> = handles.iter().map(Handle::canonical).collect();
+    hs.sort_unstable();
+    let canonical = serde_json::json!({
+        "v": 1,
+        "wiki": slug,
+        "tier": tier.as_str(),
+        "allowed_actions": actions,
+        "handles": hs,
+        "calendar_email": calendar_email,
+        "preferred_channel": preferred.canonical(),
+        "daily_cap": daily_cap,
+    });
+    hex::encode(Sha256::digest(canonical.to_string().as_bytes()))
 }
 
 /// `sha256` hex of the file bytes.
 pub fn file_hash(bytes: &[u8]) -> String {
-    let _ = bytes;
-    todo!()
+    hex::encode(Sha256::digest(bytes))
 }

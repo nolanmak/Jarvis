@@ -85,8 +85,21 @@ impl Handle {
     /// Parse a stored handle string and require it to be canonical already:
     /// `normalize_handle(platform, value)` must reproduce it byte for byte.
     pub fn parse_canonical(s: &str) -> Result<Handle, HandleError> {
-        let _ = s;
-        todo!()
+        let (platform, value) = s
+            .split_once(':')
+            .ok_or_else(|| HandleError::Malformed(s.to_string()))?;
+        // Only the handle prefixes, not inbound aliases like `gmail`.
+        if !matches!(platform, "email" | "imessage") {
+            return Err(HandleError::UnknownPlatform(platform.to_string()));
+        }
+        let handle = normalize_handle(platform, value)?;
+        if handle.canonical() != s {
+            return Err(HandleError::NotCanonical {
+                given: s.to_string(),
+                canonical: handle.canonical(),
+            });
+        }
+        Ok(handle)
     }
 }
 
@@ -100,6 +113,46 @@ impl fmt::Display for Handle {
 /// `imessage`) into its canonical handle. An email sender in
 /// `Name <addr>` form is reduced to `addr` first.
 pub fn normalize_handle(platform: &str, raw: &str) -> Result<Handle, HandleError> {
-    let _ = (platform, raw);
-    todo!()
+    let platform = Platform::parse(platform)
+        .ok_or_else(|| HandleError::UnknownPlatform(platform.to_string()))?;
+    let value = match platform {
+        Platform::Email => email_value(raw)?,
+        Platform::Imessage if raw.contains('@') => email_value(raw)?,
+        Platform::Imessage => augmentagent_messages::handles::e164(
+            raw,
+            augmentagent_messages::handles::default_region(),
+        )
+        .ok_or_else(|| HandleError::InvalidPhone(raw.trim().to_string()))?,
+    };
+    Ok(Handle { platform, value })
+}
+
+/// Trim + lowercase the whole address; `Name <addr>` reduces to `addr`.
+/// No dot or plus folding (D4).
+fn email_value(raw: &str) -> Result<String, HandleError> {
+    let trimmed = raw.trim();
+    let addr = match (trimmed.rfind('<'), trimmed.ends_with('>')) {
+        (Some(open), true) => trimmed[open + 1..trimmed.len() - 1].trim(),
+        _ => trimmed,
+    };
+    let addr = addr.to_lowercase();
+    let valid = match addr.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty()
+                && !domain.is_empty()
+                && !domain.contains('@')
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+                && !addr.chars().any(|c| {
+                    c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | ',' | ';' | '"')
+                })
+        }
+        None => false,
+    };
+    if valid {
+        Ok(addr)
+    } else {
+        Err(HandleError::InvalidEmail(raw.trim().to_string()))
+    }
 }
