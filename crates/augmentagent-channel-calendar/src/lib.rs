@@ -9,10 +9,12 @@
 //! nightly sweep, recurrence collapse, multi-calendar, and backfill.
 
 pub mod alerts;
+pub mod candidates;
 pub mod channel;
 pub mod filter;
 pub mod gcal;
 pub mod google_direct;
+pub mod guest;
 pub mod recurrence;
 pub mod rsvp;
 pub mod trigger;
@@ -23,6 +25,12 @@ pub mod types;
 pub const PLATFORM: &str = "gcal";
 
 pub use alerts::{AlertCandidate, AlertSink};
+pub use candidates::{
+    connected_google_calendar_accounts, Candidate, CandidateSet, CandidateWindow, EventRef,
+    WindowSource, MAX_CANDIDATES,
+};
+pub use google_direct::{CallOptions, CallResponse, GoogleCalendar, GoogleTokens};
+pub use guest::GuestOutcome;
 pub use channel::{
     poll_window, synthetic_attendee_email, CalendarChannel, CalendarChannelConfig,
     PollOutcome,

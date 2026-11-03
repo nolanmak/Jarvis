@@ -36,6 +36,27 @@ impl GoogleTokens for augmentagent_channel_email::google::GoogleGmail {
     }
 }
 
+/// Per-call options for [`GoogleCalendar::call_with`] (#1833 C4). The
+/// default is exactly what [`GoogleCalendar::call`] has always done.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CallOptions<'a> {
+    /// Send `If-Match: <etag>`; a 412 then surfaces as
+    /// [`CalendarError::PreconditionFailed`] (nothing was written).
+    pub if_match: Option<&'a str>,
+    /// Treat a non-GET whose outcome is unknown (transport error, 5xx,
+    /// unreadable 2xx body) as [`CalendarError::Unconfirmed`], as creates
+    /// already are. Such a write is never retried.
+    pub unconfirmed_writes: bool,
+}
+
+/// A successful call's body plus the resource's etag (`ETag` header, else
+/// the body's `etag` field).
+#[derive(Debug, Clone)]
+pub struct CallResponse {
+    pub body: serde_json::Value,
+    pub etag: Option<String>,
+}
+
 pub struct GoogleCalendar {
     http: reqwest::Client,
     base: String,
@@ -133,6 +154,20 @@ impl GoogleCalendar {
             }
             return Err(CalendarError::Google { message });
         }
+    }
+
+    /// [`Self::call`] with conditional-write and etag support (#1833 C4).
+    pub async fn call_with(
+        &self,
+        email: &str,
+        method: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<serde_json::Value>,
+        opts: CallOptions<'_>,
+    ) -> Result<CallResponse, CalendarError> {
+        let _ = (email, method, path, query, body, opts);
+        todo!("C4 call_with")
     }
 
     /// A call whose success has no body (`events.delete` → 204).
