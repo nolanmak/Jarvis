@@ -22,6 +22,15 @@ def lookup(uid,pid,tid,call,sequence,result,path,*,reverse=False):
 
 
 class KernelObserverTests(unittest.TestCase):
+    def test_fixed_loader_summaries_never_replace_nonce_events_or_hide_unknown_output(self):
+        logs=(b'\nProgram ID: 4\n\nThe verifier log: \n'
+            b'processed 298 insns (limit 1000000) max_states_per_insn 1 total_states 24 peak_states 24 mark_read 0\n')
+        data=lookup(2004,101,101,257,1,3,'/workspace/input')+frame('map',{'@emitted':2})
+        self.assertEqual(len(observer.decode(logs+data)),1)
+        for value in (logs,logs*17+data,b'unknown loader output\n'+data,
+                b'Program ID: 4 forged\n'+data,b'The verifier log: unverified\n'+data):
+            with self.subTest(value=value),self.assertRaises(observer.ObservationUnavailable):observer.decode(value)
+
     def test_expected_empty_map_default_does_not_hide_read_or_update_failures(self):
         normal={'type':'helper_error','msg':'Map lookup failed','helper':'map_lookup_elem','retcode':0,'line':5,'col':2}
         data=lookup(2004,101,101,257,1,3,'/workspace/input')+frame('map',{'@emitted':2})

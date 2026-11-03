@@ -49,9 +49,15 @@ def decode(data,*,complete=True):
     if not complete and not data.endswith(b'\n'):data=data.rpartition(b'\n')[0]+b'\n'
     try:lines=data.decode('ascii').splitlines()
     except UnicodeError:raise ObservationUnavailable('unknown pathname encoding') from None
-    pairs={};count=None;records=0
+    pairs={};count=None;records=0;loader_records=0
     for line in lines:
         if not line:continue
+        if (re.fullmatch(r'Program ID: [1-9][0-9]{0,9}',line)
+                or line in ('The verifier log:','The verifier log: ')
+                or re.fullmatch(r'processed [0-9]{1,10} insns \(limit 1000000\) max_states_per_insn [0-9]{1,10} total_states [0-9]{1,10} peak_states [0-9]{1,10} mark_read [0-9]{1,10}',line)):
+            loader_records+=1
+            if loader_records>48:raise ObservationUnavailable('unbounded loader summaries')
+            continue
         try:record=json.loads(line,object_pairs_hook=cache._unique_object)
         except (ValueError,TypeError):raise ObservationUnavailable('invalid kernel record framing') from None
         if type(record) is dict and record.get('type')=='helper_error':
@@ -127,7 +133,7 @@ struct observer_filename { const char *name; };
 rawtracepoint:sys_enter / (uid >= 2000 && uid < 6096) || uid == 1999 / {
  @number[tid] = arg1;
  @sequence[tid] = @sequence[tid] + 1;
- @seen[tid]=0; @ready[tid]=0;
+ @seen[tid]=(uint64)0; @ready[tid]=(uint64)0;
 }
 kretprobe:getname_flags
 / ((uid >= 2000 && uid < 6096) || uid == 1999) && (uint64)retval > 4095 && (uint64)retval < (uint64)0xfffffffffffff001 / {
@@ -147,8 +153,12 @@ kretprobe:getname_flags
    $length=$length+8;
    if ($length<4096) { $word=*(uint64 *)($name+$length); }
   }
-  $tail=(uint64)0;
-  while ($tail<8 && $length<4096 && *(uint8 *)($name+$length)!=0) { $length=$length+1; $tail=$tail+1; }
+  if ($length<4096) {
+   $zeros=($word-(uint64)0x0101010101010101) & ~$word & (uint64)0x8080808080808080;
+   if (($zeros & (uint64)0xffffffff)==0) { $length=$length+4; $zeros=$zeros>>32; }
+   if (($zeros & (uint64)0xffff)==0) { $length=$length+2; $zeros=$zeros>>16; }
+   if (($zeros & (uint64)0xff)==0) { $length=$length+1; }
+  }
   @length[tid]=$length;
   @original_name[tid]=(uint64)$name;
   @ready[tid]=@sequence[tid];
@@ -174,7 +184,7 @@ kretprobe:getname_flags
    printf("invalid kernel pathname length\n"); $chunks=1;
   }
   @emitted=sum($chunks);
-  @ready[tid]=0;
+  @ready[tid]=(uint64)0;
   @seen[tid] = 1;
  }
 }
@@ -182,7 +192,7 @@ rawtracepoint:sys_exit / (uid >= 2000 && uid < 6096) || uid == 1999 / {
  if (@seen[tid]) {
   printf("E %u %u %u %lld %llu %lld\n",uid,pid,tid,(int64)@number[tid],@sequence[tid],(int64)arg1);
   @emitted = sum(1);
-  @seen[tid]=0;
+  @seen[tid]=(uint64)0;
  }
 }
 END { clear(@seen); clear(@ready); clear(@original_name); clear(@length); clear(@sequence); clear(@number); }
@@ -252,7 +262,7 @@ class Observer:
         finally:os.close(descriptor)
         self.output=self.stdout.open('xb');self.error=self.stderr.open('xb')
         os.chmod(self.stdout,0o600);os.chmod(self.stderr,0o600)
-        self.child=subprocess.Popen([str(binary),'-kk','-q','-B','none','-f','json','-e',self.program],
+        self.child=subprocess.Popen([str(binary),'-v','-kk','-q','-B','none','-f','json','-e',self.program],
             stdin=subprocess.DEVNULL,stdout=self.output,stderr=self.error,start_new_session=True,
             env={'PATH':os.defpath,'BPFTRACE_MAX_STRLEN':'64','BPFTRACE_STR_TRUNC_TRAILER':'',
                 '__BPFTRACE_NOTIFY_PROBES_ATTACHED':'1','HOME':'/tmp'})
