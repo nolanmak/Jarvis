@@ -22,6 +22,7 @@ use tracing::{info, warn};
 use crate::checklist;
 use crate::config::HeartbeatConfig;
 use crate::decision::{self, Decision};
+use crate::outreach::{Outreach, OutreachResult};
 use crate::store_ext::{status, HeartbeatStore, Outcome};
 
 /// How often the loop checks whether a run is due. The cadence itself comes
@@ -68,6 +69,10 @@ pub struct RunReport {
     pub decision: Option<String>,
     pub message: Option<String>,
     pub run_id: Option<i64>,
+    /// D16 — what became of each proposed outreach message. Empty (and
+    /// absent from the JSON) whenever outreach is off.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub outreach: Vec<OutreachResult>,
 }
 
 /// Read-only wiki access on the fast tier: the heartbeat checks facts, it
@@ -87,6 +92,7 @@ impl RunReport {
             decision: None,
             message: None,
             run_id: None,
+            outreach: Vec::new(),
         }
     }
 
@@ -147,6 +153,8 @@ pub struct HeartbeatRunner<R: Reasoner + ?Sized> {
     config: HeartbeatConfig,
     clock: Arc<dyn Clock>,
     holder: String,
+    /// D16 — set only when outreach is enabled (both switches on).
+    outreach: Option<Arc<dyn Outreach>>,
 }
 
 impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
@@ -165,6 +173,7 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
             config,
             clock: Arc::new(SystemClock),
             holder: format!("pid:{}", std::process::id()),
+            outreach: None,
         }
     }
 
@@ -175,6 +184,14 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
 
     pub fn with_holder(mut self, holder: impl Into<String>) -> Self {
         self.holder = holder.into();
+        self
+    }
+
+    /// D16 — enable proactive outreach through `outreach`. The CLI calls
+    /// this only when `AUGMENTAGENT_HEARTBEAT_OUTREACH=on` and the autonomy
+    /// master switch is on; without it the heartbeat is unchanged.
+    pub fn with_outreach(mut self, outreach: Arc<dyn Outreach>) -> Self {
+        self.outreach = Some(outreach);
         self
     }
 
