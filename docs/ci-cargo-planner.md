@@ -420,6 +420,28 @@ intermittent EINVAL before the fix; sixteen observations in the regression and
 100 direct observations pass afterward. Capability observations still confer no
 execution enforcement, complete input closure or CI authority.
 
+## In-command generated-publication regression
+
+`live_shared_ci_in_command_generated_publication` adds the scheduling case that
+pre-Cargo validation alone cannot cover. Its fixed workspace warms one consumer,
+verifies an unchanged repeat performs zero consumer compiler calls, then builds
+an independent publisher in the same Cargo invocation as that cached consumer.
+The publisher introduces a conflicting generated module with the same old
+mtime. The fixture checks that Cargo reported the consumer fresh before the
+publication, that all previously read generated files retained bytes and mtimes,
+and that the independent compiler rejects the resulting ambiguity with E0761.
+The required exit is Cargo/compiler failure, rather than execution of the old
+binary. The original between-command regressions remain independent gates.
+
+Two managed host preflights reproduced the false green: one initial consumer
+compile, zero on an unchanged repeat, and then zero consumer calls / `OLD` after
+the in-command publication. The second fixture revision verifies event order
+without a mutable cross-unit handshake, so it does not require breaking the new
+unit filesystem isolation. Event timestamps and worker-owned counters are only
+fixture observations; they do not authorize reuse or establish trusted input
+closure. The first real isolated-adapter run is pending. A successful ordinary
+host harness run means the bug was reproduced, not fixed.
+
 ## Private unit records and cleanup
 
 The proposed internal record has these distinct identities: source generation,

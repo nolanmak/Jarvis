@@ -383,6 +383,70 @@ async fn live_shared_ci_generated_module_lookup_trace()->Result<()> {
     generated_input_mutation(false,true,true).await
 }
 
+/// A publication inside one Cargo invocation must revoke a prior fresh
+/// decision even when its consumer was skipped and never reached the relay.
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_in_command_generated_publication()->Result<()> {
+    let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private fixture evidence required");
+    std::fs::create_dir(&evidence)?;std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"shared-ci-in-command-publication",None)?;
+    audit.require_run_resources()?;
+    let target=crate::build_storage::effective_target(&owner);
+    let storage=crate::build_storage::admit_ci(&owner,&target).await?;
+    let fixture=tempfile::Builder::new().prefix("cargo-publication-fixture-").tempdir_in(&target)?;
+    let root=fixture.path();
+    let driver=root.join("publication_fixture.py");
+    std::fs::write(&driver,include_bytes!("ci_cargo_publication_fixture.py"))?;
+    let prepared=tokio::process::Command::new("python3").args(["-I"]).arg(&driver).arg("prepare")
+        .current_dir(root).output().await?;
+    ensure!(prepared.status.success(),"fixed publication fixture preparation failed");
+    git(root,&["-c","init.templateDir=","init","-q"]).await?;
+    git(root,&["add","."]).await?;
+    git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","core.hooksPath=/dev/null",
+        "-c","commit.gpgsign=false","commit","-qm","in-command publication fixture"]).await?;
+    let head=git(root,&["rev-parse","HEAD"]).await?.trim().to_owned();
+    git(root,&["update-ref","refs/remotes/origin/main",&head]).await?;
+    let bound=binding(root).await?;let session=vm::Session::prepare(root,&target)?;
+    let source=snapshot(root,&bound,&target).await?;let timeout=std::time::Duration::from_secs(180);
+    let seeded=session.run("repository",&source,root,&bound,None,&[],&[],&[],
+        Some("python3 -I publication_fixture.py seed"),&storage,&target,&audit,timeout).await?;
+    ensure!(seeded.status=="passed","fixture initial generator failed");
+    let warm=session.run("repository",&source,root,&bound,None,&[],&[],&[],
+        Some("python3 -I publication_fixture.py warm"),&storage,&target,&audit,timeout).await?;
+    let first:serde_json::Value=serde_json::from_str(warm.stdout.trim())?;
+    ensure!(warm.status=="passed" && first["cargo_exit"]==0 && first["consumer_actual_rustc_calls"]==1
+        && first["binary_output"]=="OLD","initial consumer did not compile and execute");
+    let unchanged=session.run("repository",&source,root,&bound,None,&[],&[],&[],
+        Some("python3 -I publication_fixture.py warm"),&storage,&target,&audit,timeout).await?;
+    let compatible:serde_json::Value=serde_json::from_str(unchanged.stdout.trim())?;
+    ensure!(unchanged.status=="passed" && compatible["cargo_exit"]==0 && compatible["consumer_actual_rustc_calls"]==0
+        && compatible["binary_output"]=="OLD","unchanged consumer failed minimum reuse");
+    let observed=session.run("repository",&source,root,&bound,None,&[],&[],&[],
+        Some("python3 -I publication_fixture.py publish"),&storage,&target,&audit,timeout).await?;
+    let actual:serde_json::Value=serde_json::from_str(observed.stdout.trim())?;
+    ensure!(actual["publication_after_fresh_decision"]==true && actual["original_read_file_mtimes_unchanged"]==true
+        && actual["original_read_file_bytes_unchanged"]==true && actual["conflict_mtime_ns"]==946684800000000000_u64,
+        "fixture did not establish its in-command old-mtime publication order");
+    let direct=&actual["direct_compiler_control"];
+    ensure!(direct["e0761"]==true && direct["exit"].as_i64().is_some_and(|value|value!=0),
+        "independent compiler did not reject the generated conflict");
+    let fixed=observed.status=="failed" && actual["cargo_exit"].as_i64().is_some_and(|value|value!=0)
+        && actual["diagnostics"].as_array().is_some_and(|values|values.iter().any(|value|value=="E0761"))
+        && actual["consumer_actual_rustc_calls"].as_u64().is_some_and(|value|value>0);
+    let report=serde_json::json!({"version":1,"kind":"real_shared_ci_in_command_generated_publication",
+        "head":head,"generation":source.generation(),"adapter_authority":session.authority_sha256,
+        "warm":first,"unchanged":compatible,"observed":actual,"status":observed.status,"passed":fixed,
+        "input_behavior_fixed":fixed,"actual_vm_commands":4,"fixture_observations_are_not_input_proof":true,
+        "trusted_input_closure":false,"cargo_metadata_isolation_established":false,"full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
+    audit.record_controller(report.clone())?;audit.protected_health()?;
+    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&report)?)?;
+    ensure!(fixed,"in-command generated publication left a skipped consumer unverified; see private receipt");
+    Ok(())
+}
+
 async fn generated_input_mutation(build_script:bool,resolution:bool,read_trace:bool)->Result<()> {
     let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
     let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
