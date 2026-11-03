@@ -1206,4 +1206,13 @@ compilers and the failed library retry. Its original cold/warm and error
 criteria remain unchanged. `--no-deps` does not admit registry dependencies;
 opaque tools, complete input closure, general graph execution dispatch,
 publication-time restart and the original in-command fixture remain unfinished.
-Native validation of this extension is pending.
+Native replay at `e7d6af74` passed in **109.98 seconds**. The protected receipt
+binds one metadata package and three declared targets to all four actual
+compiler admissions: build-script, library, binary and failed library retry.
+Original metadata cleanup is verified separately. The existing successful
+cold/warm counts `[3,0]`, build-script counts `[1,0]`, two applications and actual
+E0761/Cargo101 retry all remain intact, together with unchanged original kernel
+programs/links and sealed-publication/metadata preservation. All 288 Python CI
+tests and 31 focused managed Rust tests passed (15 opt-in Rust cases excluded).
+This evidence exercises the pinned workspace and does not admit registry
+dependencies, general graph dispatch, complete input closure or shipping.
