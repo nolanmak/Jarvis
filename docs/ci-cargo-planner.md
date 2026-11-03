@@ -1586,3 +1586,27 @@ that diagnostic bound from the required probe count. The original mode retains
 its exact prior bound; general mode remains bounded and still requires all 18
 original attachments and zero misses. The retained actual stream now decodes
 successfully under the corrected bound.
+
+Native validation at `070c0b21` passed in **162.06 seconds** with the full general
+18-probe set. Original compiler counts `[1,0,1]` and cross-VM unchanged `[0,0]`
+remained intact. The compiled source opens now require the actual readable
+installed objects, not pathname/access observations alone. The original test
+executed again, and the same-mtime generated change remained held.
+
+Read-only inspection of that stopped image under the managed lease verified the
+actual persisted revalidation report: **exactly two active compiler
+fingerprints** had changed selected-content digests. Each retained its original
+capture SHA-256, command, ordinal and binding. The report explicitly retained
+**44 and 70 unbound read opens**, respectively, and kept complete-input/full-CI/
+shipping flags false. It did not retire fingerprints or alter old input bytes.
+
+Compatibility at the same source passed: the original private publication/retry
+case completed in **111.30 seconds**, retaining its **16** original zero-miss
+programs/links, real E0761/Cargo101, immutable history and cleanup criteria. The
+structured success/failing-test case completed in **197.29 seconds** with **18**
+original programs/links, original build/test argv, compiler counts `[2,1]` and
+actual Cargo test exits 0/101. All **321 Python CI tests passed without skips**,
+and **31 focused managed Rust tests passed** with 18 opt-in cases excluded; these
+three VM cases were explicitly run. Complete input revalidation, actual selective
+invalidation/restart, opaque wrapper/producer mediation, the unchanged original
+in-command regression and final proof/merge enforcement remain unfinished.
