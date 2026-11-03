@@ -1504,3 +1504,24 @@ Cargo/compiled-unit result. Read-only inspection of the stopped image retained
 1,932 pathname observations, 32 directory reads and 554 metadata observations
 across three information units, two compilers and one application, with unchanged
 zero-miss kernel programs. The failed host validation granted no CI authority.
+
+Native validation at `de36b714` passed in **162.50 seconds** across the original
+five-command generated-forest sequence with general collection enabled. Both
+compilers opened `arbitrary/source.rs` in the original kernel records; their
+unit captures contained **417 and 1,341 pathname lookups**. Three information
+units and one application remained separately attributed. The first driver
+retained compiler counts `[1,0,1]`. The next VM retained the previous observations,
+compiled neither library nor test (`[0,0]`), and executed the test again. The new
+same-mtime generated producer still held before incompatible reuse. Capture and
+recovery grant no complete-input or passing-CI authority.
+
+The unchanged private publication/retry replay passed in **109.57 seconds**,
+including actual E0761/Cargo101, original cleanup, selective retry and all sixteen
+original zero-miss programs/links. The structured success/failing-test replay
+passed in **192.50 seconds** with general captures, original argv, compiler
+counts `[2,1]`, and actual test exits 0/101. All **319 Python CI tests passed
+without skips**, and **31 focused managed Rust tests passed** with 18 opt-in
+cases excluded; these three VM cases were explicitly executed. Durable selected
+input revalidation, opaque producer/wrapper mediation, complete input closure,
+the original in-command regression, final proof API/audit and production merge
+enforcement remain unfinished. Production remains disabled.
