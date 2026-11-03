@@ -1926,12 +1926,89 @@ def capture_command(child,deadline,*,limit=8*1024**2):
     return bytes(output['stdout']),bytes(output['stderr'])
 
 
+def artifact_input_bindings(store_root,entries,context,*,current=False):
+    """Authenticate mounted inputs against original successful retained units.
+
+    `context` must come from PublicationStore._retained for this command/binding.
+    No pathname, root ownership or matching byte hash alone is producer proof.
+    """
+    try:
+        if type(entries) is not list or len(entries)>4096 or type(current) is not bool:raise ValueError()
+        state,publications,rows,_digest=context;objects=unit_views.literal(store_root)/'objects';result=[];seen=set()
+        for entry in entries:
+            if type(entry) is not list or len(entry)!=3:raise ValueError()
+            raw,original,expected=entry;name=unit_views.relative(bytes.fromhex(raw));literal=str(name)
+            if bytes.fromhex(raw).hex()!=raw or raw in seen:raise ValueError()
+            seen.add(raw);original=unit_views.literal(original);parts=original.relative_to(objects).parts
+            if len(parts)<2 or parts[0] not in publications:raise ValueError()
+            producer=parts[0];publication=publications[producer]
+            if original!=publication['root']/name or type(expected) is not list or len(expected)<2 or expected[0]!=raw:raise ValueError()
+            if expected[1]=='file':
+                if (publication['action'] not in ('library','check') or literal not in rows[producer]
+                        or expected!=[raw,*rows[producer][literal][1:]]):raise ValueError()
+                if current:
+                    producer=state['files'].get(literal)
+                    if producer not in publications or publications[producer]['action'] not in ('library','check'):raise ValueError()
+                    original=publications[producer]['root']/name;expected=[raw,*rows[producer][literal][1:]]
+            elif expected[1]=='tree':
+                if (publication['action']!='generated' or literal not in publication['roots'] or len(expected)!=3
+                        or expected[2]!=unit_views.inventory(original,owner=os.geteuid(),sealed=True)):raise ValueError()
+                if current:
+                    producer=state['namespaces'].get(literal)
+                    if producer not in publications or publications[producer]['action']!='generated':raise ValueError()
+                    original=publications[producer]['root']/name
+                    expected=[raw,'tree',unit_views.inventory(original,owner=os.geteuid(),sealed=True)]
+            else:raise ValueError()
+            result.append([raw,str(original),copy.deepcopy(expected)])
+        return result
+    except (OSError,ValueError,KeyError,TypeError,IndexError,AttributeError):
+        raise FreshnessHold('artifact_provenance_unknown') from None
+
+
+def compiler_artifact_bindings(executor,binding,command):
+    """Read the exact root-private mount manifests used by original compilers."""
+    result={};context=None
+    try:
+        for ordinal,item in executor.units.items():
+            if item['mapping']['kind']!='compile':continue
+            view=item['view'];record=cache._read_record(Path(view['mounts']),max_bytes=16*1024**2)
+            if (set(record)!={'version','binding','command','ordinal','entries','source_entries','declared_outputs'}
+                    or type(record['version']) is not int or record['version']!=1
+                    or record['binding']!=binding or record['command']!=command
+                    or type(record['ordinal']) is not int or record['ordinal']!=ordinal
+                    or type(view['ordinal']) is not int or view['ordinal']!=ordinal
+                    or record['source_entries']!=executor.source_bindings or record['declared_outputs']!=executor.declared_outputs
+                    or type(record['entries']) is not list or len(record['entries'])>4096):raise ValueError()
+            entries=record['entries']
+            if entries:
+                if context is None:context=PublicationStore._retained(executor.store.root,binding=binding,command=command)
+                entries=artifact_input_bindings(executor.store.root,entries,context)
+            result[ordinal]=entries
+        return result
+    except (OSError,ValueError,KeyError,TypeError,AttributeError):raise FreshnessHold('input_census_unknown') from None
+
+
 def frozen_input_index(source,bindings,scope):
+    """Index original immutable mounts; caller authenticates their producers."""
     namespaces={'source':('/workspace',source,unit_views.inventory(source,owner=os.geteuid(),sealed=True))}
     for ordinal,(raw,original,expected) in enumerate(bindings):
         name=os.fsdecode(bytes.fromhex(raw));root=unit_views.literal(original)
         rows=expected[2] if expected[1]=='tree' else [['2e','file',*expected[2:]]]
         namespaces['generated_'+str(ordinal)]=('/workspace/'+name,root,rows)
+    artifacts=scope.get('artifact_bindings',[])
+    if type(artifacts) is not list or len(artifacts)>4096:raise FreshnessHold('input_census_unknown')
+    seen=set()
+    for ordinal,entry in enumerate(artifacts):
+        try:
+            if type(entry) is not list or len(entry)!=3:raise ValueError()
+            raw,original,expected=entry;name=unit_views.relative(bytes.fromhex(raw))
+            if bytes.fromhex(raw).hex()!=raw or raw in seen or type(original) is not str:raise ValueError()
+            if (type(expected) is not list or len(expected)<2 or expected[0]!=raw
+                    or expected[1] not in ('tree','file') or len(expected)!=(3 if expected[1]=='tree' else 5)):raise ValueError()
+            root=unit_views.literal(original);seen.add(raw)
+            rows=expected[2] if expected[1]=='tree' else [['2e','file',*expected[2:]]]
+            namespaces['artifact_'+str(ordinal)]=('/workspace/target/'+str(name),root,rows)
+        except (ValueError,TypeError,KeyError,IndexError):raise FreshnessHold('input_census_unknown') from None
     return lookup_inputs.FrozenLookupIndex(namespaces,kernel_roots={'/':scope['root_identity']},owner=os.geteuid(),
         overlays=True,opaque=('/workspace/target',))
 
@@ -1944,7 +2021,8 @@ def record_selected_revalidation(root,source,lease,checkpoint,bindings,outputs,r
     No fingerprints, producer history or old input inodes are modified here.
     """
     previous,_record=GeneratedForests(lease,outputs).load(checkpoint['forests'],require_public=False)
-    state,_records,_rows,_digest=PublicationStore._retained(root/'publications',binding=lease.binding,command=checkpoint['command'])
+    context=PublicationStore._retained(root/'publications',binding=lease.binding,command=checkpoint['command'])
+    state,_records,_rows,_digest=context
     active=set()
     for producer in set(state['files'].values())|set(state['namespaces'].values()):
         publication=cache._read_record(root/'publications/records'/(producer+'.json'),max_bytes=PublicationStore.LIMIT)
@@ -1963,7 +2041,10 @@ def record_selected_revalidation(root,source,lease,checkpoint,bindings,outputs,r
         record_sha=hashlib.sha256(json.dumps(record,sort_keys=True,separators=(',',':')).encode()).hexdigest()
         for scope in record['scopes']:
             if scope['mapping']['kind']!='compile' or (record['command'],scope['ordinal']) not in active:continue
-            before=frozen_input_index(source,previous,scope);following=frozen_input_index(source,bindings,scope)
+            original_artifacts=artifact_input_bindings(root/'publications',scope.get('artifact_bindings',[]),context)
+            current_artifacts=artifact_input_bindings(root/'publications',original_artifacts,context,current=True)
+            before=frozen_input_index(source,previous,dict(scope,artifact_bindings=original_artifacts))
+            following=frozen_input_index(source,bindings,dict(scope,artifact_bindings=current_artifacts))
             selected=lookup_inputs._ContentSelection.restore(scope['selected_reads'],before)
             metadata=lookup_inputs._ContentSelection.restore(scope['selected_metadata'],before)
             refreshed=selected.refresh(following);refreshed_metadata=metadata.refresh(following)
@@ -2017,6 +2098,7 @@ class CommandObservation:
         except (kernel_observer.ObservationUnavailable,OSError) as error:
             raise FreshnessHold('input_census_unknown',b'original kernel capture incomplete') from error
         units=[];scopes=[];known=set()
+        mounted={} if executor is None else compiler_artifact_bindings(executor,self.admission.binding,self.admission.command)
         for ordinal,item in sorted(({} if executor is None else executor.units).items()):
             if not item['finished']:raise FreshnessHold('cleanup_uncertain')
             pid=item['pid'];uid=2000+ordinal;known.add(uid)
@@ -2036,7 +2118,7 @@ class CommandObservation:
                 'source_open_observed':observed})
             selected=None;unbound=[];selected_metadata=None;unbound_metadata=[]
             if mapping['kind']=='compile':
-                index=frozen_input_index(executor.source,executor.source_bindings,item)
+                index=frozen_input_index(executor.source,executor.source_bindings,dict(item,artifact_bindings=mounted[ordinal]))
                 selected,unbound=index.select_read_subset([event for event in queries if event['syscall'] in (2,257,437)
                     and event['pid']==pid],pid=pid,uid=uid,user_namespace=self.observer.user_namespace,
                     mount_namespace=int(item['namespaces']['mnt']['unit'].split('[',1)[1][:-1]))
@@ -2046,6 +2128,7 @@ class CommandObservation:
                     pid=pid,uid=uid,user_namespace=self.observer.user_namespace,
                     mount_namespace=int(item['namespaces']['mnt']['unit'].split('[',1)[1][:-1]),threaded=True)
             scopes.append({'ordinal':ordinal,'pid':pid,'uid':uid,'mapping':{key:mapping[key] for key in ('kind','role','source','fingerprint','request_sha256','dependencies','generated_root') if key in mapping},
+                'artifact_bindings':mounted.get(ordinal,[]),
                 'selected_reads':None if selected is None else selected.record(),'unbound_read_opens':unbound,
                 'selected_metadata':None if selected_metadata is None else selected_metadata.record(),
                 'unbound_metadata_queries':unbound_metadata,

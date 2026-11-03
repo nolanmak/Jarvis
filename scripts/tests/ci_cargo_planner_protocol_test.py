@@ -24,6 +24,129 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def compiler_mounts(self,root,binding,command,entries=()):
+        path=root/('mounts-'+str(uuid.uuid4())+'.json')
+        planner.cache._write_record(path,{'version':1,'binding':binding,'command':command,'ordinal':0,
+            'entries':list(entries),'source_entries':[],'declared_outputs':{}})
+        return {'mounts':str(path),'ordinal':0}
+
+    def library_publication(self,store,value=b'compiler artifact'):
+        identity,root=store.allocate();name='debug/deps/libdependency.rlib';(root/'debug/deps').mkdir(parents=True)
+        (root/name).write_bytes(value)
+        for path in root.rglob('*'):path.chmod(0o555 if path.is_dir() else 0o444)
+        root.chmod(0o555)
+        publication={'root':root,'manifest':planner.unit_views.inventory(root,owner=os.getuid(),sealed=True),
+            'files':[name],'roots':[],'action':'library','generated_root':None,
+            'cargo_target':{'package_id':'dependency','target_name':'dependency','target_kind':['lib'],
+                'manifest_path':'/workspace/dependency/Cargo.toml','source_path':'/workspace/dependency/lib.rs'}}
+        scope=store.unit_root/str(uuid.uuid4());scope.mkdir(mode=0o700)
+        (scope/'cleanup').write_bytes(b'all-descendants-reaped\n');(scope/'cleanup').chmod(0o600)
+        planner.cache._write_record(scope/'exit-status.json',{'version':3,'binding':store.binding,
+            'command':store.command,'ordinal':len(store.state()['history']),'returncode':0,'exec_observed':True})
+        store.publish(identity,publication,scope=scope,ordinal=len(store.state()['history']))
+        raw=name.encode().hex();return [raw,str(root/name),[raw,'file',*planner.unit_views._read(root/name,os.getuid(),True)]]
+
+    def test_artifact_input_binding_requires_retained_original_successful_producer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);units=root/'units';units.mkdir(mode=0o700)
+            binding=self.publication_binding();command=str(uuid.uuid4())
+            store=planner.PublicationStore(root/'publications',binding=binding,command=command,unit_root=units)
+            entry=self.library_publication(store)
+            context=planner.PublicationStore._retained(store.root,binding=binding,command=command)
+            self.assertEqual(planner.artifact_input_bindings(store.root,[entry],context),[entry])
+            foreign=root/'foreign.rlib';foreign.write_bytes(b'compiler artifact');foreign.chmod(0o444)
+            for fault in ('foreign','alias','digest','shape'):
+                value=copy.deepcopy(entry)
+                if fault=='foreign':value[1]=str(foreign)
+                elif fault=='alias':value[0]=value[2][0]=b'debug/deps/other.rlib'.hex()
+                elif fault=='digest':value[2][4]='a'*64
+                else:value.append('unknown')
+                with self.subTest(fault=fault),self.assertRaises(planner.FreshnessHold):
+                    planner.artifact_input_bindings(store.root,[value],context)
+            old=copy.deepcopy(entry);self.library_publication(store,b'new compiler artifact')
+            current=planner.PublicationStore._retained(store.root,binding=binding,command=command)
+            changed=planner.artifact_input_bindings(store.root,[old],current,current=True)
+            self.assertNotEqual(changed[0][1],old[1]);self.assertNotEqual(changed[0][2][4],old[2][4])
+            self.assertEqual(Path(old[1]).read_bytes(),b'compiler artifact')
+
+    def test_generated_artifact_tree_retargets_only_to_retained_current_producer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);units=root/'units';units.mkdir(mode=0o700)
+            binding=self.publication_binding();command=str(uuid.uuid4())
+            store=planner.PublicationStore(root/'publications',binding=binding,command=command,unit_root=units)
+            entries=[]
+            for value in (b'old',b'changed'):
+                identity,publication=self.stored_publication(store,value=value)
+                scope=units/str(uuid.uuid4());scope.mkdir(mode=0o700)
+                (scope/'cleanup').write_bytes(b'all-descendants-reaped\n');(scope/'cleanup').chmod(0o600)
+                ordinal=len(store.state()['history'])
+                planner.cache._write_record(scope/'exit-status.json',{'version':3,'binding':binding,
+                    'command':command,'ordinal':ordinal,'returncode':0,'exec_observed':True})
+                store.publish(identity,publication,scope=scope,ordinal=ordinal)
+                name=publication['roots'][0];raw=name.encode().hex();path=publication['root']/name
+                entries.append([raw,str(path),[raw,'tree',planner.unit_views.inventory(path,owner=os.getuid(),sealed=True)]])
+            context=planner.PublicationStore._retained(store.root,binding=binding,command=command)
+            self.assertEqual(planner.artifact_input_bindings(store.root,[entries[0]],context),[entries[0]])
+            self.assertEqual(planner.artifact_input_bindings(store.root,[entries[0]],context,current=True),[entries[1]])
+            unsupported=copy.deepcopy(entries[0]);unsupported[0]=unsupported[2][0]=b'debug/build/pkg-aaaaaaaaaaaaaaaa'.hex()
+            with self.assertRaises(planner.FreshnessHold):planner.artifact_input_bindings(store.root,[unsupported],context)
+            self.assertEqual((Path(entries[0][1])/'value.rs').read_bytes(),b'old')
+
+    def test_compiler_mount_capture_refuses_changed_scope_or_nonexecuted_producer(self):
+        for fault in ('none','command','ordinal','view-ordinal','missing-view','unsafe-file','failed-producer','diagnostic-producer'):
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);units=root/'units';units.mkdir(mode=0o700)
+                binding=self.publication_binding();command=str(uuid.uuid4())
+                store=planner.PublicationStore(root/'publications',binding=binding,command=command,unit_root=units)
+                entry=self.library_publication(store);view=self.compiler_mounts(root,binding,command,[entry])
+                unit={'mapping':{'kind':'compile'},'view':view}
+                if fault=='missing-view':unit.pop('view')
+                elif fault=='view-ordinal':view['ordinal']=False
+                elif fault in ('command','ordinal'):
+                    path=Path(view['mounts']);record=planner.cache._read_record(path,max_bytes=16*1024**2)
+                    record[fault]=str(uuid.uuid4()) if fault=='command' else True;planner.cache._write_record(path,record)
+                elif fault=='unsafe-file':Path(view['mounts']).chmod(0o664)
+                elif fault in ('failed-producer','diagnostic-producer'):
+                    path=next((store.root/'records').iterdir());record=planner.cache._read_record(path,max_bytes=store.LIMIT)
+                    if fault=='failed-producer':record['evidence']['status']['returncode']=1
+                    else:record['evidence']['kind']='diagnostic'
+                    planner.cache._write_record(path,record)
+                executor=SimpleNamespace(source_bindings=[],declared_outputs={},units={0:unit},store=store)
+                if fault=='none':self.assertEqual(planner.compiler_artifact_bindings(executor,binding,command),{0:[entry]})
+                else:
+                    with self.assertRaises(planner.FreshnessHold):planner.compiler_artifact_bindings(executor,binding,command)
+
+    def test_frozen_compiler_index_includes_only_the_original_declared_artifact_mounts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/'source';source.mkdir();(source/'lib.rs').write_bytes(b'original source')
+            (source/'lib.rs').chmod(0o444);source.chmod(0o555)
+            artifact=root/'sealed.rlib';artifact.write_bytes(b'original compiler artifact');artifact.chmod(0o444)
+            name='debug/deps/libdependency.rlib';raw=name.encode().hex()
+            entry=[raw,str(artifact),[raw,'file',*planner.unit_views._read(artifact,os.getuid(),True)]]
+            scope={'root_identity':{'device':12,'inode':3456789,'mode':0o40755},'artifact_bindings':[entry]}
+            index=planner.frozen_input_index(source,[],scope)
+            inode=artifact.stat()
+            identity=lambda info:{'device':(os.major(info.st_dev)<<20)|os.minor(info.st_dev),'inode':info.st_ino,'mode':info.st_mode}
+            event={'uid':2000,'pid':101,'tid':102,'syscall':257,'sequence':1,'result':3,
+                'path':b'/workspace/target/'+name.encode(),
+                'lookup_attempts':[{'init_result':0,'dfd':-100,'user_namespace':100,'mount_namespace':50,
+                    'base':dict(scope['root_identity'],flags=257,path_seq=2,dentry_seq=2)}],
+                'open':{'arguments':{'dfd':-100,'flags':32768,'user_namespace':100,'mount_namespace':50},
+                    'installed':dict(identity(inode),fd=3,flags=32768,file_mode=1,user_namespace=100,mount_namespace=50)}}
+            args={'pid':101,'uid':2000,'user_namespace':100,'mount_namespace':50}
+            selected,unbound=index.select_read_subset([event],**args)
+            self.assertEqual(unbound,[]);self.assertEqual(len(selected.record()['queries']),1)
+            self.assertEqual(selected.observation,planner.lookup_inputs._ContentSelection.restore(selected.record(),index).observation)
+            newer=root/'newer.rlib';newer.write_bytes(b'changed compiler artifact');newer.chmod(0o444)
+            replacement=[raw,str(newer),[raw,'file',*planner.unit_views._read(newer,os.getuid(),True)]]
+            following=planner.frozen_input_index(source,[],dict(scope,artifact_bindings=[replacement]))
+            self.assertNotEqual(selected.observation['sha256'],selected.refresh(following)['sha256'])
+            absent=copy.deepcopy(event);absent.update(path=b'/workspace/target/debug/deps/unknown.rlib',result=-2)
+            absent['open']['installed']=None
+            selected,unbound=index.select_read_subset([absent],**args)
+            self.assertEqual(len(unbound),1);self.assertEqual(selected.record()['queries'],[])
+            self.assertEqual(artifact.read_bytes(),b'original compiler artifact')
+
     def test_command_capture_retains_failed_open_inputs_and_unbound_failures(self):
         fixtures=planner._load('negative_open_kernel_fixtures','tests/ci_cargo_observer_test.py')
         sample=fixtures.census_sample('all');census={'before':sample,'after':copy.deepcopy(sample)}
@@ -43,7 +166,17 @@ class PlannerProtocolTests(unittest.TestCase):
             missing=copy.deepcopy(successful);missing.update(sequence=2,result=-2,path=b'preferred.rs')
             missing['open']['installed']=None
             unsupported=copy.deepcopy(missing);unsupported.update(sequence=3,path=b'/runtime/unknown')
-            events=[successful,missing,unsupported]
+            units=root/'units';units.mkdir(mode=0o700);producer_command=str(uuid.uuid4())
+            store=planner.PublicationStore(root/'publications',binding=binding,command=producer_command,unit_root=units)
+            entry=self.library_publication(store)
+            checkpoint=planner.PublicationStore.checkpoint(store.root,binding=binding,command=producer_command)
+            store=planner.PublicationStore.recover(store.root,binding=binding,command=command,
+                predecessor=producer_command,unit_root=units,expected_sha256=checkpoint)
+            artifact=copy.deepcopy(successful);artifact.update(sequence=4,path=b'/workspace/target/'+bytes.fromhex(entry[0]))
+            artifact['lookup_attempts'][0]['base']={'device':12,'inode':3456789,'mode':0o40755,
+                'flags':257,'path_seq':2,'dentry_seq':2}
+            artifact['open']['installed'].update(identity(Path(entry[1]).stat()))
+            events=[successful,missing,unsupported,artifact]
             observation=object.__new__(planner.CommandObservation)
             observation.admission=SimpleNamespace(binding=binding,command=command)
             observation.observer=SimpleNamespace(capture=lambda:(events,[],[],census),root=root,
@@ -52,14 +185,16 @@ class PlannerProtocolTests(unittest.TestCase):
                 'request_sha256':'2'*64},'namespaces':{'mnt':{'unit':'mnt:[50]'}},
                 'root_identity':{'device':12,'inode':3456789,'mode':0o40755},'returncode':0,
                 'scope_evidence':{'status':{'command':command,'ordinal':0},'cleanup_sha256':planner.ExecutionLease.cleanup_digest()}}
-            summary=observation.finish(SimpleNamespace(root=root,source=source,source_bindings=[],units={0:unit}))
+            unit['view']=self.compiler_mounts(root,binding,command,[entry])
+            summary=observation.finish(SimpleNamespace(root=root,source=source,source_bindings=[],declared_outputs={},units={0:unit},store=store))
             planner.validate_command_observation(summary,binding,command,{0})
             record=planner.cache._read_record(root/'input-observations'/(command+'.json'),max_bytes=16*1024**2)
             selected=record['scopes'][0]['selected_reads'];unbound=record['scopes'][0]['unbound_read_opens']
-            self.assertEqual(len(selected['queries']),2)
+            self.assertEqual(record['scopes'][0]['artifact_bindings'],[entry])
+            self.assertEqual(len(selected['queries']),3)
             self.assertEqual(selected['queries'][1]['errno'],'ENOENT')
             self.assertEqual(unbound,[{key:unsupported[key] for key in ('pid','tid','uid','syscall','sequence')}])
-            self.assertEqual(summary['units'][0]['queries'],3)
+            self.assertEqual(summary['units'][0]['queries'],4)
             self.assertFalse(record['input_closure_complete']);self.assertFalse(record['shipping_authority'])
 
     def test_original_command_capture_persists_unit_scope_and_rejects_foreign_or_missing_source(self):
@@ -93,7 +228,8 @@ class PlannerProtocolTests(unittest.TestCase):
                     'source':b'/workspace/arbitrary/source.rs','request_sha256':'2'*64},
                     'namespaces':{'mnt':{'unit':'mnt:[50]'}},'root_identity':{'device':12,'inode':3456789,'mode':0o40755},'returncode':0,
                     'scope_evidence':{'status':{'command':command,'ordinal':0},'cleanup_sha256':planner.ExecutionLease.cleanup_digest()}}
-                executor=SimpleNamespace(root=root,source=source,source_bindings=[],units={0:unit})
+                unit['view']=self.compiler_mounts(root,binding,command)
+                executor=SimpleNamespace(root=root,source=source,source_bindings=[],declared_outputs={},units={0:unit})
                 if fault!='none':
                     with self.assertRaises(planner.FreshnessHold):observation.finish(executor)
                     self.assertEqual(list(captured.iterdir()),[]);continue

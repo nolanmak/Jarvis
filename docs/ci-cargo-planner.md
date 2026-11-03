@@ -1998,3 +1998,34 @@ SHA-256 `656c3a7c66d687a3a7f727a511bbca5b32024146c2f83fc4c7a7120df79a68ac`.
 The reporting carrier and explicit worker opt-in are now native-validated.
 Production is unchanged, the actual required application-plan sufficiency gate
 remains open, and no input-completeness, full-CI or shipping authority is granted.
+
+### Compiler artifact input bindings
+
+Compiler read/metadata selection now includes the exact immutable artifact mounts
+used by the original unit. The controller reads its original root-private mount
+manifest and validates command, source binding, ordinal and declared outputs.
+Referenced libraries and generated trees must belong to retained successful unit
+publications with original execution/cleanup evidence; matching root-owned bytes
+or a path outside that history are insufficient. The target subtree remains
+opaque around the explicitly mounted leaves/trees, so an unknown sibling cannot
+be recorded as proven absent.
+
+The raw version-3 kernel record persists `artifact_bindings` inside each scope.
+Older records without this field retain an empty artifact selection and their
+unbound observations; they are not upgraded to complete input evidence. Restoring
+an original selection authenticates those original inputs against immutable
+history. Refresh resolves the same virtual paths through current active retained
+producers, allowing changed library/tree contents to change selected relevance
+without rewriting original captures or modifying prior artifact bytes. This is
+input-observation plumbing, not an artifact-reuse or passing-CI capability.
+
+Real-filesystem regressions cover mounted-file reads, opaque unknown siblings,
+replacement artifact relevance, retained generated-tree replacement, forged
+paths/aliases/digests, mismatched/malformed mount headers, and failed/diagnostic
+producer evidence. The capture/recovery regression also uses an artifact from a
+retained predecessor command. **374 Python CI tests pass without skips and 32
+focused managed Rust tests pass** (20 native cases excluded). The actual command
+adapter replay for this revision is pending. Toolchain/runtime/directory/FD and
+other unsupported inputs, the unchanged original opaque-wrapper/in-command
+publication regression, selective invalidation/restart and final C proof/API/audit
+remain open. All completeness/full-CI/shipping flags stay false.
