@@ -1433,8 +1433,7 @@ The new opt-in `live_shared_ci_generated_forest_execution` case exercises a
 completed seed, real build/unchanged build/test, cross-VM unchanged reuse, a new
 same-mtime producer and a typed hold before incompatible reuse. The existing
 repository recovery and original in-command generated-publication tests retain
-their criteria. Native results for the new case are pending; production modes
-remain disabled, and opaque wrapper execution, selector recovery, full input
+their criteria. Production modes remain disabled, and opaque wrapper execution, selector recovery, full input
 closure and the final passing-CI/merge enforcement remain unfinished.
 
 The first generated-forest native run held before publication: the actual source
@@ -1444,3 +1443,21 @@ an allocated empty object and no published record. Copying now distinguishes
 explicit frozen controller prefixes from worker-owned generated outputs; both
 retain their own ownership/mode checks. Snapshot timestamp updates are fsynced
 before publication. This failure did not grant input or shipping authority.
+
+
+Native validation at `5ccaf6f8` passed in **145.63 seconds** across five actual
+VM commands. The original successful seed published one generated forest after
+worker cleanup. The actual repository driver compiled library/build/test with
+counts **`[1,0,1]`**, and the following VM recovered both unchanged units with
+counts **`[0,0]`** while executing the original test again. It retained the seed's
+exact producer reference. A later completed producer changed the generated file
+while preserving its timestamp, published a different reference, and left the
+old sealed snapshot intact. The next Cargo attempt returned the expected typed
+`InputCensusUnknown` hold before incompatible compiled output could pass. This
+hold is an interim boundary, not completed selective revalidation or D8.
+
+All **316 Python CI tests passed without skips**, and **31 focused managed Rust
+tests passed** with 18 opt-in cases excluded; this new VM case was explicitly
+executed. The original in-command counter/publication harness remains unchanged
+and unfinished. Complete input closure, opaque wrapper execution, passing-CI
+proof and merge enforcement still gate production activation.
