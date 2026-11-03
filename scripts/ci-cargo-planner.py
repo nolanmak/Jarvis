@@ -1926,6 +1926,67 @@ def capture_command(child,deadline,*,limit=8*1024**2):
     return bytes(output['stdout']),bytes(output['stderr'])
 
 
+def frozen_input_index(source,bindings,scope):
+    namespaces={'source':('/workspace',source,unit_views.inventory(source,owner=os.geteuid(),sealed=True))}
+    for ordinal,(raw,original,expected) in enumerate(bindings):
+        name=os.fsdecode(bytes.fromhex(raw));root=unit_views.literal(original)
+        rows=expected[2] if expected[1]=='tree' else [['2e','file',*expected[2:]]]
+        namespaces['generated_'+str(ordinal)]=('/workspace/'+name,root,rows)
+    return lookup_inputs.FrozenLookupIndex(namespaces,kernel_roots={'/':scope['root_identity']},owner=os.geteuid(),overlays=True)
+
+
+def record_selected_revalidation(root,source,lease,checkpoint,bindings,outputs,refs):
+    """Persist changed selected facts before holding incomplete revalidation.
+
+    The retained executor checkpoint has already been verified by the caller.
+    These partial selections can prove relevance changed, never complete reuse.
+    No fingerprints, producer history or old input inodes are modified here.
+    """
+    previous,_record=GeneratedForests(lease,outputs).load(checkpoint['forests'],require_public=False)
+    state,_records,_rows,_digest=PublicationStore._retained(root/'publications',binding=lease.binding,command=checkpoint['command'])
+    active=set()
+    for producer in set(state['files'].values())|set(state['namespaces'].values()):
+        publication=cache._read_record(root/'publications/records'/(producer+'.json'),max_bytes=PublicationStore.LIMIT)
+        status=publication['evidence']['status'];active.add((status['command'],status['ordinal']))
+    paths=sorted((root/'input-observations').iterdir())
+    if len(paths)>1024:raise FreshnessHold('input_census_unknown')
+    observations=[];affected=set()
+    for path in paths:
+        if not path.name.endswith('.json') or not cache._uuid(path.stem):raise FreshnessHold('artifact_provenance_unknown')
+        record=cache._read_record(path,max_bytes=16*1024**2)
+        if (record.get('version')!=2 or record.get('kind')!='ci-command-kernel-record'
+                or record.get('binding')!=lease.binding or record.get('command')!=path.stem
+                or record.get('input_closure_complete') is not False or record.get('shipping_authority') is not False
+                or record.get('original_observer_cleanup') is not True):raise FreshnessHold('artifact_provenance_unknown')
+        kernel_observer.validate_census(record['probe_census'],path_scope='all')
+        record_sha=hashlib.sha256(json.dumps(record,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        for scope in record['scopes']:
+            if scope['mapping']['kind']!='compile' or (record['command'],scope['ordinal']) not in active:continue
+            before=frozen_input_index(source,previous,scope);following=frozen_input_index(source,bindings,scope)
+            selected=lookup_inputs._ContentSelection.restore(scope['selected_reads'],before)
+            refreshed=selected.refresh(following);changed=refreshed['sha256']!=selected.observation['sha256']
+            fingerprint=scope['mapping']['fingerprint']
+            if changed:affected.add(fingerprint)
+            observations.append({'source_command':record['command'],'ordinal':scope['ordinal'],
+                'capture_sha256':record_sha,'binding_sha256':selected.binding_sha256,'fingerprint':fingerprint,
+                'previous_sha256':selected.observation['sha256'],'current_sha256':refreshed['sha256'],
+                'relevance_changed':changed,'unbound_read_opens':len(scope['unbound_read_opens']),
+                'input_closure_complete':False,'shipping_authority':False})
+    report={'version':1,'kind':'ci-selected-input-revalidation','binding':lease.binding,'command':lease.command,
+        'checkpoint_command':checkpoint['command'],'previous_forests':checkpoint['forests'],'current_forests':refs,
+        'observations':observations,'affected_fingerprints':sorted(affected),
+        'action':'hold_for_complete_input_revalidation','input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+    directory=root/'selected-revalidation'
+    if not directory.exists():directory.mkdir(mode=0o700)
+    info=directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or stat.S_IMODE(info.st_mode)!=0o700:
+        raise FreshnessHold('artifact_provenance_unknown')
+    path=directory/(lease.command+'.json')
+    if path.exists() or path.is_symlink():raise FreshnessHold('cleanup_uncertain')
+    cache._write_record(path,report)
+    return report
+
+
 class CommandObservation:
     """Original-unit kernel facts for later selectors, never complete inputs."""
     def __init__(self,admission,deadline):
@@ -1955,18 +2016,29 @@ class CommandObservation:
             mapping=item['mapping'];source=mapping.get('source');observed=False
             if mapping['kind']=='compile':
                 names={os.fsencode(source),os.fsencode(source).removeprefix(b'/workspace/')}
-                observed=any(event['pid']==pid and event['syscall'] in (2,257,439) and event['result']>=0 and event['path'] in names for event in queries)
+                original=unit_views.literal(executor.source/os.fsdecode(os.fsencode(source).removeprefix(b'/workspace/'))).stat()
+                identity=((os.major(original.st_dev)<<20)|os.minor(original.st_dev),original.st_ino,original.st_mode)
+                observed=any(event['pid']==pid and event['path'] in names and kernel_observer.readable_open(event)
+                    and tuple(event['open']['installed'][key] for key in ('device','inode','mode'))==identity for event in queries)
                 if not observed:raise FreshnessHold('input_census_unknown',b'original compiler source open absent')
             units.append({'ordinal':ordinal,'pid':pid,'uid':uid,'kind':mapping['kind'],
                 'queries':len(queries),'directory_reads':len(reads),'metadata_queries':len(stats),
                 'source_open_observed':observed})
+            selected=None;unbound=[]
+            if mapping['kind']=='compile':
+                index=frozen_input_index(executor.source,executor.source_bindings,item)
+                selected,unbound=index.select_read_subset([event for event in queries if kernel_observer.readable_open(event)
+                    and event['pid']==pid],pid=pid,uid=uid,user_namespace=self.observer.user_namespace,
+                    mount_namespace=int(item['namespaces']['mnt']['unit'].split('[',1)[1][:-1]))
+                if not selected.record()['queries']:raise FreshnessHold('input_census_unknown',b'compiler read selection absent')
             scopes.append({'ordinal':ordinal,'pid':pid,'uid':uid,'mapping':{key:mapping[key] for key in ('kind','role','source','fingerprint','request_sha256','dependencies','generated_root') if key in mapping},
+                'selected_reads':None if selected is None else selected.record(),'unbound_read_opens':unbound,
                 'scope_evidence':item['scope_evidence'],'namespaces':item['namespaces'],'root_identity':item['root_identity'],'returncode':item['returncode']})
         if any(event['uid']!=1999 and event['uid'] not in known
                 for event in [*events,*directories,*metadata]):
             raise FreshnessHold('input_census_unknown',b'kernel event outside original unit scopes')
         directory=self.observer.root if executor is None else executor.root/'input-observations'
-        record={'version':1,'kind':'ci-command-kernel-record','binding':self.admission.binding,
+        record={'version':2,'kind':'ci-command-kernel-record','binding':self.admission.binding,
             'command':self.admission.command,'path_scope':'all','scopes':lookup_inputs._wire(scopes),
             'events':lookup_inputs._wire(events),'directories':lookup_inputs._wire(directories),
             'metadata':lookup_inputs._wire(metadata),'probe_census':census,
@@ -1978,7 +2050,7 @@ class CommandObservation:
         path=directory/(self.admission.command+'.json')
         if path.exists() or path.is_symlink():raise FreshnessHold('artifact_provenance_unknown')
         cache._write_record(path,record)
-        return {'version':1,'kind':'ci-command-kernel-observation','binding':self.admission.binding,
+        return {'version':2,'kind':'ci-command-kernel-observation','binding':self.admission.binding,
             'command':self.admission.command,'record_sha256':hashlib.sha256(encoded).hexdigest(),
             'program_sha256':record['program_sha256'],'binary_sha256':record['binary_sha256'],
             'probe_census':census,'units':units,'original_observer_cleanup':True,
@@ -2003,12 +2075,12 @@ def validate_command_observation(value,binding,command,ordinals):
         if (type(value) is not dict or set(value)!={'version','kind','binding','command','record_sha256',
                 'program_sha256','binary_sha256','probe_census','units','original_observer_cleanup',
                 'input_closure_complete','full_ci','shipping_authority'}
-                or type(value['version']) is not int or value['version']!=1
+                or type(value['version']) is not int or value['version']!=2
                 or value['kind']!='ci-command-kernel-observation' or value['binding']!=binding or value['command']!=command
                 or any(not cache._digest(value[key]) for key in ('record_sha256','program_sha256','binary_sha256'))
                 or value['original_observer_cleanup'] is not True or type(value['units']) is not list or len(value['units'])>4096
                 or any(value[key] is not False for key in ('input_closure_complete','full_ci','shipping_authority'))):raise ValueError()
-        kernel_observer.validate_census(value['probe_census']);seen=set()
+        kernel_observer.validate_census(value['probe_census'],path_scope='all');seen=set()
         for unit in value['units']:
             if (type(unit) is not dict or set(unit)!={'ordinal','pid','uid','kind','queries','directory_reads','metadata_queries','source_open_observed'}
                     or type(unit['ordinal']) is not int or unit['ordinal'] not in ordinals or unit['ordinal'] in seen
@@ -2037,8 +2109,11 @@ class _CargoExecutor:
         self.declared_outputs={} if generated_outputs is None else dict(generated_outputs)
         self.source_bindings,self.forest_refs=lease.generated_inputs(self.declared_outputs) if lease is not None else ([],[])
         retained,checkpoint=lease.retained() if lease is not None else (None,None)
-        if checkpoint is not None and (checkpoint['forests']!=self.forest_refs or checkpoint['outputs']!=self.declared_outputs):
-            raise FreshnessHold('input_census_unknown')
+        if checkpoint is not None:
+            if checkpoint['outputs']!=self.declared_outputs:raise FreshnessHold('input_census_unknown')
+            if checkpoint['forests']!=self.forest_refs:
+                report=record_selected_revalidation(retained,self.source,lease,checkpoint,self.source_bindings,self.declared_outputs,self.forest_refs)
+                raise FreshnessHold('input_census_unknown',json.dumps(report,sort_keys=True,separators=(',',':')).encode())
         self.control={'version':1,'kind':'cargo-execution','binding':admission.binding,
             'command':admission.command,'shipping_authority':False}
         if retained is None:

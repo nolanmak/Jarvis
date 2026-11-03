@@ -26,25 +26,36 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 class PlannerProtocolTests(unittest.TestCase):
     def test_original_command_capture_persists_unit_scope_and_rejects_foreign_or_missing_source(self):
         fixtures=planner._load('capture_kernel_fixtures','tests/ci_cargo_observer_test.py')
-        sample=fixtures.census_sample();census={'before':sample,'after':copy.deepcopy(sample)}
+        sample=fixtures.census_sample('all');census={'before':sample,'after':copy.deepcopy(sample)}
         binding=self.publication_binding();command=str(uuid.uuid4())
         main={'pid':101,'tid':102,'uid':2000,'path':b'arbitrary/source.rs','syscall':257,'result':3,'sequence':1,'lookup_attempts':[]}
         child=dict(main,pid=103,tid=103,path=b'/toolchain/lib/runtime.so',sequence=2)
-        for fault in ('none','missing-source','foreign-uid'):
+        for fault in ('none','missing-source','foreign-uid','access-check','path-only','different-inode'):
             with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory:
                 root=Path(directory);captured=root/'input-observations';captured.mkdir(mode=0o700)
+                source=root/'source';(source/'arbitrary').mkdir(parents=True);(source/'arbitrary/source.rs').write_bytes(b'original')
+                (source/'arbitrary/source.rs').chmod(0o444);(source/'arbitrary').chmod(0o555);source.chmod(0o555)
+                info=(source/'arbitrary/source.rs').stat();base=source.stat()
                 observation=object.__new__(planner.CommandObservation)
                 observation.admission=SimpleNamespace(binding=binding,command=command)
                 events=[copy.deepcopy(main),copy.deepcopy(child)]
+                events[0]['lookup_attempts']=[{'init_result':0,'dfd':-100,'user_namespace':100,'mount_namespace':50,
+                    'base':{'device':(os.major(base.st_dev)<<20)|os.minor(base.st_dev),'inode':base.st_ino,'mode':base.st_mode,
+                        'flags':256,'path_seq':2,'dentry_seq':2}}]
+                events[0]['open']={'arguments':{'dfd':-100,'flags':32768,'user_namespace':100,'mount_namespace':50},'installed':{'fd':3,'flags':32768,'file_mode':1,
+                    'device':(os.major(info.st_dev)<<20)|os.minor(info.st_dev),'inode':info.st_ino,'mode':info.st_mode,'user_namespace':100,'mount_namespace':50}}
                 if fault=='missing-source':events[0]['path']=b'other.rs'
                 if fault=='foreign-uid':events[1]['uid']=2001
+                if fault=='access-check':events[0]['syscall']=439
+                if fault=='path-only':events[0]['open']['installed'].update(flags=0x200000,file_mode=0)
+                if fault=='different-inode':events[0]['open']['installed']['inode']+=1
                 observation.observer=SimpleNamespace(capture=lambda:(events,[],[],census),root=root,
-                    program=planner.kernel_observer.observation_program('all'),binary_sha256='1'*64)
+                    program=planner.kernel_observer.observation_program('all'),binary_sha256='1'*64,user_namespace=100)
                 unit={'finished':True,'pid':101,'mapping':{'kind':'compile','role':'library',
                     'source':b'/workspace/arbitrary/source.rs','request_sha256':'2'*64},
-                    'namespaces':{},'root_identity':{},'returncode':0,
+                    'namespaces':{'mnt':{'unit':'mnt:[50]'}},'root_identity':{'device':12,'inode':3456789,'mode':0o40755},'returncode':0,
                     'scope_evidence':{'status':{'command':command,'ordinal':0},'cleanup_sha256':planner.ExecutionLease.cleanup_digest()}}
-                executor=SimpleNamespace(root=root,units={0:unit})
+                executor=SimpleNamespace(root=root,source=source,source_bindings=[],units={0:unit})
                 if fault!='none':
                     with self.assertRaises(planner.FreshnessHold):observation.finish(executor)
                     self.assertEqual(list(captured.iterdir()),[]);continue

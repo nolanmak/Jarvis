@@ -51,15 +51,21 @@ def startup_errno(error):
     return errno.EINVAL
 
 
-def validate_census(value):
+def probe_roles(path_scope):
+    if path_scope not in ('fixture','all'):raise ObservationUnavailable('unknown pathname scope')
+    return PROBE_ROLES if path_scope=='fixture' else {**PROBE_ROLES,('do_filp_open',0):1,('fd_install',0):1}
+
+
+def validate_census(value,*,path_scope='fixture'):
+    expected_roles=probe_roles(path_scope);count=2+sum(expected_roles.values())
     if type(value) is not dict or set(value)!={'before','after'}:
         raise ObservationUnavailable('kernel census unavailable')
     for sample in value.values():
         if (type(sample) is not dict or set(sample)!={'pid','birth','programs','links'}
                 or type(sample['pid']) is not int or not 0<sample['pid']<2**31
                 or type(sample['birth']) is not int or not 0<sample['birth']<2**64
-                or type(sample['programs']) is not list or len(sample['programs'])!=PROBE_COUNT
-                or type(sample['links']) is not list or len(sample['links'])!=PROBE_COUNT):
+                or type(sample['programs']) is not list or len(sample['programs'])!=count
+                or type(sample['links']) is not list or len(sample['links'])!=count):
             raise ObservationUnavailable('original kernel objects unavailable')
         programs={};links=set();raw=set();linked=set();roles={}
         for program in sample['programs']:
@@ -89,11 +95,11 @@ def validate_census(value):
                         or any(type(link[key]) is not int for key in ('count','flags','missed'))
                         or (link['count'],link['missed'])!=(1,0)
                         or link['flags']!=(1 if link['type']=='kretprobe_multi' else 0)
-                        or (link['function'],link['flags']) not in PROBE_ROLES):
+                        or (link['function'],link['flags']) not in expected_roles):
                     raise ObservationUnavailable('kernel return probe census failed')
                 role=(link['function'],link['flags']);roles[role]=roles.get(role,0)+1
             else:raise ObservationUnavailable('unknown kernel attachment')
-        if raw!={'sys_enter','sys_exit'} or roles!=PROBE_ROLES or linked!=set(programs):
+        if raw!={'sys_enter','sys_exit'} or roles!=expected_roles or linked!=set(programs):
             raise ObservationUnavailable('kernel attachment census incomplete')
     if value['before']!=value['after']:
         raise ObservationUnavailable('kernel census identity or counters changed')
@@ -109,7 +115,7 @@ def _fdinfo(data):
         if re.fullmatch(r'cookie[ \t]+func',line):
             rows=lines[ordinal+1:]
             if (result.get('link_type') not in ('kprobe_multi','kretprobe_multi') or result.get('kprobe_cnt')!='1'
-                    or len(rows)!=1 or re.fullmatch(r'0[ \t]+(getname_flags|iterate_dir|filldir64|vfs_fstat|cp_new_stat|cp_statx|path_init)\+0x0/0x[1-9a-f][0-9a-f]{0,15}',rows[0]) is None):
+                    or len(rows)!=1 or re.fullmatch(r'0[ \t]+(getname_flags|iterate_dir|filldir64|vfs_fstat|cp_new_stat|cp_statx|path_init|do_filp_open|fd_install)\+0x0/0x[1-9a-f][0-9a-f]{0,15}',rows[0]) is None):
                 raise ObservationUnavailable('unknown kernel function table')
             result['function']=rows[0].split()[1].split('+',1)[0]
             table=True;break
@@ -133,8 +139,8 @@ def _birth(pid,owner):
     return int(fields[19])
 
 
-def _function_address():
-    found={name:[] for name,flags in PROBE_ROLES};names={name.encode():name for name in found};size=0
+def _function_address(path_scope='fixture'):
+    found={name:[] for name,flags in probe_roles(path_scope)};names={name.encode():name for name in found};size=0
     with Path('/proc/kallsyms').open('rb') as stream:
         for line in stream:
             size+=len(line)
@@ -173,7 +179,7 @@ def _return_link(identity,program,address,function,expected_flags):
     finally:os.close(descriptor)  # Never keep the observer's attachments alive.
 
 
-def kernel_census(child,owner,birth,address,diagnostic):
+def kernel_census(child,owner,birth,address,diagnostic,*,probe_count=PROBE_COUNT):
     if child.poll() is not None or _birth(child.pid,owner)!=birth:
         raise ObservationUnavailable('original observer is not live')
     root=Path('/proc',str(child.pid));programs=[];links=[];rows=[]
@@ -184,7 +190,7 @@ def kernel_census(child,owner,birth,address,diagnostic):
         if target not in ('anon_inode:bpf-prog','anon_inode:bpf_link','anon_inode:bpf-link'):
             continue
         data=(root/'fdinfo'/path.name).read_bytes()
-        if len(data)>16384 or len(rows)>=32:raise ObservationUnavailable('unbounded original BPF descriptor census')
+        if len(data)>16384 or len(rows)>=2*probe_count:raise ObservationUnavailable('unbounded original BPF descriptor census')
         rows.append({'fd':path.name,'target':target,'fdinfo':data.hex()})
     cache._write_record(diagnostic,{'descriptors':rows})
     for row in rows:
@@ -364,7 +370,7 @@ def lookup_bases(records,*,complete=True):
         if match is None:raise ObservationUnavailable('unknown lookup base record')
         kind=match[1];uid,pid,tid,call,sequence=map(int,match.groups()[1:6])
         if (not (uid==1999 or 2000<=uid<6096) or pid>=2**31 or tid>=2**31
-                or call not in SYSCALLS or sequence>=2**64
+                or call not in (SYSCALLS|{437}) or sequence>=2**64
                 or re.fullmatch(r'-?[0-9]{1,20}(?: -?[0-9]{1,20}){'+str(counts[kind]-1)+'}',match[7]) is None):
             raise ObservationUnavailable('foreign lookup base observation')
         values=tuple(map(int,match[7].split()));attempt=values[0]
@@ -575,6 +581,52 @@ def path_metadata_witness(queries,pid,uid,path,user_namespace,*,lookup,flags,dir
         if not matches:raise ObservationUnavailable('original path metadata witness missing')
 
 
+def open_queries(records,events,*,complete=True):
+    """Match copied kernel open arguments and installed objects to syscall exit."""
+    pairs={};keys=('uid','pid','tid','syscall','sequence')
+    for line in records:
+        match=re.fullmatch(r'([WV]) ([0-9]{1,4}) ([1-9][0-9]{0,9}) ([1-9][0-9]{0,9}) (2|257|437) ([1-9][0-9]{0,19}) (.*)',line)
+        if match is None:raise ObservationUnavailable('unknown kernel open record')
+        kind=match[1];key=tuple(map(int,match.groups()[1:6]));tail=match[7].split(' ')
+        if len(tail)!=(8 if kind=='W' else 11) or any(re.fullmatch(r'-?[0-9]{1,20}',part) is None for part in tail):
+            raise ObservationUnavailable('invalid kernel open arguments')
+        values=list(map(int,tail));pair=pairs.setdefault(key,{})
+        if kind in pair:raise ObservationUnavailable('duplicate kernel open record')
+        if kind=='W':
+            fields=('dfd','flags','mode','acc_mode','intent','lookup_flags','user_namespace','mount_namespace')
+            if not -2**31<=values[0]<2**31 or not 0<=values[2]<2**16 or any(not 0<=value<2**32 for value in values[1:6]):
+                raise ObservationUnavailable('kernel open argument outside ABI')
+        else:
+            fields=('fd','flags','file_mode','device','inode','mode','inode_generation','dentry','mount','user_namespace','mount_namespace')
+            if (not 0<=values[0]<2**31 or any(not 0<=values[i]<2**32 for i in (1,2,3,6))
+                    or not 0<values[4]<2**64 or not 0<=values[5]<2**16
+                    or any(not 0<values[i]<2**64 for i in (7,8))):
+                raise ObservationUnavailable('installed file outside ABI')
+        if any(not 0<value<2**64 for value in values[-2:]):raise ObservationUnavailable('open namespace absent')
+        pair[kind]=dict(zip(fields,values))
+    observed={tuple(event[key] for key in keys):event for event in events if event['syscall'] in (2,257,437)}
+    if complete and set(pairs)!=set(observed):raise ObservationUnavailable('open lacks original syscall')
+    for key,event in observed.items():
+        pair=pairs.get(key,{})
+        if 'W' not in pair or event['result']>=0 and 'V' not in pair:
+            if complete:raise ObservationUnavailable('open lacks original kernel evidence')
+            continue
+        arguments=pair['W'];installed=pair.get('V')
+        if (event['result']<0 and installed is not None or installed is not None and
+                (installed['fd']!=event['result'] or any(installed[name]!=arguments[name]
+                    for name in ('user_namespace','mount_namespace')))):
+            raise ObservationUnavailable('installed file differs from original syscall')
+        event['open']={'arguments':arguments,'installed':installed}
+
+
+def readable_open(event):
+    opened=event.get('open');installed=None if opened is None else opened.get('installed')
+    return (event.get('syscall') in (2,257,437) and type(event.get('result')) is int and event['result']>=0
+        and type(installed) is dict and installed.get('fd')==event['result']
+        and type(installed.get('file_mode')) is int and bool(installed['file_mode']&1)
+        and type(installed.get('flags')) is int and not installed['flags']&0x200000)
+
+
 def decode(data,*,complete=True,with_directories=False,with_metadata=False,path_scope='fixture'):
     if path_scope not in ('fixture','all'):raise ObservationUnavailable('unknown pathname scope')
     if not isinstance(data,bytes) or len(data)>MAX_BYTES:raise ObservationUnavailable('unbounded observation')
@@ -582,7 +634,7 @@ def decode(data,*,complete=True,with_directories=False,with_metadata=False,path_
     if not complete and not data.endswith(b'\n'):data=data.rpartition(b'\n')[0]+b'\n'
     try:lines=data.decode('ascii').splitlines()
     except UnicodeError:raise ObservationUnavailable('unknown pathname encoding') from None
-    pairs={};directories=[];metadata=[];bases=[];count=None;records=0;loader_records=0
+    pairs={};directories=[];metadata=[];bases=[];opens=[];count=None;records=0;loader_records=0
     for line in lines:
         if not line:continue
         if (re.fullmatch(r'Program ID: [1-9][0-9]{0,9}',line)
@@ -606,7 +658,7 @@ def decode(data,*,complete=True,with_directories=False,with_metadata=False,path_
         if type(record) is not dict or set(record)!={'type','data'}:raise ObservationUnavailable('unknown kernel record')
         if record['type']=='attached_probes':
             if (type(record['data']) is not dict or set(record['data'])!={'probes'}
-                    or type(record['data']['probes']) is not int or not 1<=record['data']['probes']<=PROBE_COUNT+1):
+                    or type(record['data']['probes']) is not int or not 1<=record['data']['probes']<=3+sum(probe_roles(path_scope).values())):
                 raise ObservationUnavailable('unknown attachment record')
             continue
         if record['type']=='map':
@@ -617,6 +669,10 @@ def decode(data,*,complete=True,with_directories=False,with_metadata=False,path_
         if record['type']!='printf' or type(record['data']) is not str or not record['data'].endswith('\n'):
             raise ObservationUnavailable('unknown kernel event')
         line=record['data'][:-1]  # Preserve embedded newlines; never reinterpret them as events.
+        if path_scope=='all' and line[:2] in ('W ','V '):
+            opens.append(line);records+=1
+            if records>40000:raise ObservationUnavailable('observation limit exceeded')
+            continue
         if line[:2] in ('Q ','R ','C '):
             bases.append(line);records+=1
             if records>40000:raise ObservationUnavailable('observation limit exceeded')
@@ -632,7 +688,7 @@ def decode(data,*,complete=True,with_directories=False,with_metadata=False,path_
         match=re.fullmatch(r'([NE]) ([0-9]{1,4}) ([1-9][0-9]{0,9}) ([1-9][0-9]{0,9}) ([0-9]{1,4}) ([1-9][0-9]{0,19}) (.*)',line)
         if match is None:raise ObservationUnavailable('unknown observation record')
         kind=match[1];uid,pid,tid,call,sequence=map(int,match.groups()[1:6])
-        if (pid>=2**31 or tid>=2**31 or call not in SYSCALLS or sequence>=2**64
+        if (pid>=2**31 or tid>=2**31 or call not in (SYSCALLS|({437} if path_scope=='all' else set())) or sequence>=2**64
                 or not (uid==1999 or 2000<=uid<6096)):
             raise ObservationUnavailable('foreign kernel observation')
         pair=pairs.setdefault((uid,pid,tid,call,sequence),{})
@@ -671,6 +727,7 @@ def decode(data,*,complete=True,with_directories=False,with_metadata=False,path_
                         or path in (b'src/lib.rs',b'src/main.rs',b'build.rs')))):
             raise ObservationUnavailable('foreign kernel pathname')
         events.append({'uid':uid,'pid':pid,'tid':tid,'syscall':call,'sequence':sequence,'result':pair['E'],'path':path})
+    if path_scope=='all':open_queries(opens,events,complete=complete)
     queries=directory_queries(directories,complete=complete)
     stats=metadata_queries(metadata,complete=complete)
     lookup={(e['uid'],e['pid'],e['tid'],e['syscall'],e['sequence']):e for e in events}
@@ -991,6 +1048,38 @@ finally:os.close(descriptor)
 '''
 
 
+_OPEN_PROGRAM=r'''
+kprobe:do_filp_o*pen
+/ ((uid>=2000 && uid<6096) || uid==1999) && @seen[tid] &&
+  (@number[tid]==2 || @number[tid]==257 || @number[tid]==437) / {
+ $name=(struct filename *)arg1;
+ if ((uint64)$name->name==@original_name[tid]) {
+  $op=(struct open_flags *)arg2; $task=(struct task_struct *)curtask;
+  printf("W %u %u %u %llu %llu %lld %llu %llu %llu %llu %llu %llu %llu\n",
+   uid,pid,tid,@number[tid],@sequence[tid],(int64)(int32)arg0,
+   (uint64)(uint32)$op->open_flag,(uint64)$op->mode,(uint64)(uint32)$op->acc_mode,
+   (uint64)(uint32)$op->intent,(uint64)(uint32)$op->lookup_flags,
+   (uint64)$task->cred->user_ns->ns.inum,(uint64)$task->nsproxy->mnt_ns->ns.inum);
+  @emitted=sum(1);
+ } else { printf("kernel open copied-name mismatch\n"); @emitted=sum(1); }
+}
+kprobe:fd_instal*l
+/ ((uid>=2000 && uid<6096) || uid==1999) && @seen[tid] &&
+  (@number[tid]==2 || @number[tid]==257 || @number[tid]==437) / {
+ $file=(struct file *)arg1; $inode=$file->f_inode; $task=(struct task_struct *)curtask;
+ if ((uint64)$inode>0 && (uint64)$file->f_path.dentry>0 && (uint64)$file->f_path.mnt>0) {
+  printf("V %u %u %u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+   uid,pid,tid,@number[tid],@sequence[tid],(uint64)(uint32)arg0,
+   (uint64)$file->f_flags,(uint64)$file->f_mode,(uint64)$inode->i_sb->s_dev,
+   (uint64)$inode->i_ino,(uint64)$inode->i_mode,(uint64)$inode->i_generation,
+   (uint64)$file->f_path.dentry,(uint64)$file->f_path.mnt,
+   (uint64)$task->cred->user_ns->ns.inum,(uint64)$task->nsproxy->mnt_ns->ns.inum);
+  @emitted=sum(1);
+ } else { printf("kernel installed file missing\n"); @emitted=sum(1); }
+}
+'''
+
+
 def observation_program(path_scope):
     if path_scope=='fixture':return _PROGRAM
     if path_scope!='all':raise ObservationUnavailable('unknown pathname scope')
@@ -998,7 +1087,7 @@ def observation_program(path_scope):
     # unit paths retain their literal spelling; resolution belongs to the index.
     marker='     (($prefix=='
     if _PROGRAM.count(marker)!=1:raise ObservationUnavailable('pathname gate changed')
-    return _PROGRAM.replace(marker,'     ((uid>=2000 && uid<6096) || ($prefix==')
+    return _PROGRAM.replace(marker,'     ((uid>=2000 && uid<6096) || ($prefix==').replace('@number[tid]==439)', '@number[tid]==439 || @number[tid]==437)')+_OPEN_PROGRAM
 
 
 class Observer:
@@ -1016,7 +1105,7 @@ class Observer:
             'command':admission.command,'shipping_authority':False}
         cache._write_record(self.root/'control.json',self.control)
         self.witness='/ci-observer-witness-'+str(uuid.uuid4())+'-'+'x'*192;self.witness_pid=None
-        self.path_scope=path_scope;self.program=observation_program(path_scope)
+        self.path_scope=path_scope;self.program=observation_program(path_scope);self.probe_count=2+sum(probe_roles(path_scope).values())
         self.stdout=self.root/'stdout';self.stderr=self.root/'stderr';self.output=None;self.error=None
         self.report=None;self.census_before=None;self.census_after=None;self.census_error=False
         self.birth=None;self.kernel_address=None
@@ -1045,7 +1134,7 @@ class Observer:
                 check=True,timeout=min(5,max(.001,self.deadline-time.monotonic())))
         if not (tracefs/'kprobe_events').is_file():
             raise OSError(errno.ENOENT,'private kernel trace filesystem unavailable')
-        self.kernel_address=_function_address()
+        self.kernel_address=_function_address(self.path_scope)
         self.directory_members={os.fsencode(p.name):(p.stat().st_ino,4 if p.is_dir() else 8)
             for p in self.directory_path.iterdir()}
         binary=Path('/usr/bin/bpftrace');info=binary.lstat()
@@ -1083,14 +1172,14 @@ class Observer:
                 time.sleep(.02);continue
             if self.census_before is None:
                 try:self.census_before=kernel_census(self.child,self.owner,self.birth,self.kernel_address,
-                    self.root/'census-descriptors-before.json')
+                    self.root/'census-descriptors-before.json',probe_count=self.probe_count)
                 except (OSError,ObservationUnavailable) as error:
                     cache._write_record(self.root/'census-failure.json',{'phase':'before-witness',
                         'category':type(error).__name__,'errno':getattr(error,'errno',None),
                         'reason':str(error) if isinstance(error,ObservationUnavailable) else None})
                     raise
                 cache._write_record(self.root/'census-before.json',self.census_before)
-                validate_census({'before':self.census_before,'after':self.census_before})
+                validate_census({'before':self.census_before,'after':self.census_before},path_scope=self.path_scope)
             witness=subprocess.Popen([sys.executable,'-I','-S','-c',_WITNESS,self.witness],
                 stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
                 env={'PATH':os.defpath},preexec_fn=drop)
@@ -1121,9 +1210,9 @@ class Observer:
                 if self.census_before is not None and self.census_after is None:
                     try:
                         self.census_after=kernel_census(self.child,self.owner,self.birth,self.kernel_address,
-                            self.root/'census-descriptors-after.json')
+                            self.root/'census-descriptors-after.json',probe_count=self.probe_count)
                         cache._write_record(self.root/'census-after.json',self.census_after)
-                        validate_census({'before':self.census_before,'after':self.census_after})
+                        validate_census({'before':self.census_before,'after':self.census_after},path_scope=self.path_scope)
                     except (OSError,ObservationUnavailable) as error:
                         self.census_error=True
                         try:cache._write_record(self.root/'census-failure.json',
@@ -1142,7 +1231,7 @@ class Observer:
         if self.child is None or self.child.returncode!=0 or self.witness_pid is None:
             raise ObservationUnavailable('original kernel observer did not finish')
         if self.census_error:raise ObservationUnavailable('original kernel census failed')
-        census=validate_census({'before':self.census_before,'after':self.census_after})
+        census=validate_census({'before':self.census_before,'after':self.census_after},path_scope=self.path_scope)
         events,queries,metadata=decode(self._data(),with_directories=True,with_metadata=True,path_scope=self.path_scope)
         if b'lost' in self.stderr.read_bytes().lower():raise ObservationUnavailable('lost kernel observations')
         directory_witness(queries,self.witness_pid,1999,self.directory_path,self.directory_members)

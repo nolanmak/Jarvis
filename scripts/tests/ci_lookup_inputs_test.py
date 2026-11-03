@@ -17,6 +17,66 @@ def load(name):
 
 
 class LookupInputTests(unittest.TestCase):
+    def test_read_open_selection_survives_serialization_and_refreshes_exact_generated_overlay(self):
+        import copy
+        views=load('ci_cargo_views');source=self.root/'source'
+        for name in ('arbitrary','node_modules','public'):(source/name).mkdir(parents=True)
+        (source/'arbitrary/source.rs').write_bytes(b'include generated')
+        (source/'public/tailwind.css').write_bytes(b'')
+        for path in source.rglob('*'):path.chmod(0o555 if path.is_dir() else 0o444)
+        source.chmod(0o555)
+        css=self.root/'generated.css';css.write_bytes(b'actual-css');css.chmod(0o444)
+        def generated(name,body,unread):
+            root=self.root/name;root.mkdir()
+            (root/'generated.rs').write_bytes(body);(root/'unread').write_bytes(unread)
+            for path in root.iterdir():
+                os.utime(path,ns=(946684800000000000,946684800000000000));path.chmod(0o444)
+            root.chmod(0o555);return root
+        old=generated('old',b'OLD',b'one');irrelevant=generated('irrelevant',b'OLD',b'two');changed=generated('changed',b'NEW',b'one')
+        def index(root,overlays=True):
+            return self.inputs.FrozenLookupIndex({
+                'source':('/workspace',source,views.inventory(source,owner=os.getuid(),sealed=True)),
+                'generated':('/workspace/node_modules',root,views.inventory(root,owner=os.getuid(),sealed=True)),
+                'style':('/workspace/public/tailwind.css',css,[['2e','file',*views._read(css,os.getuid(),True)]])},
+                owner=os.getuid(),overlays=overlays)
+        with self.assertRaises(self.inputs.FreshnessHold):index(old,overlays=False)
+        base=source.stat();file=(old/'generated.rs').stat()
+        identity=lambda info:{'device':(os.major(info.st_dev)<<20)|os.minor(info.st_dev),'inode':info.st_ino,'mode':info.st_mode}
+        event={'pid':101,'tid':102,'uid':2000,'syscall':257,'sequence':1,'result':7,
+            'path':b'arbitrary/../node_modules/generated.rs',
+            'lookup_attempts':[{'init_result':0,'dfd':-100,'user_namespace':100,'mount_namespace':50,
+                'base':dict(identity(base),flags=257,path_seq=2,dentry_seq=2)}],
+            'open':{'arguments':{'dfd':-100,'flags':32768,'user_namespace':100,'mount_namespace':50},
+                'installed':dict(identity(file),fd=7,flags=32768,file_mode=1,user_namespace=100,mount_namespace=50)}}
+        args={'pid':101,'uid':2000,'user_namespace':100,'mount_namespace':50}
+        original=index(old);selected=original.select_opens([event],**args)
+        record=json.loads(json.dumps(selected.record()));restored=self.inputs._ContentSelection.restore(record,original)
+        self.assertEqual(selected.observation,restored.observation)
+        self.assertEqual(selected.observation['sha256'],restored.refresh(index(irrelevant))['sha256'])
+        self.assertNotEqual(selected.observation['sha256'],restored.refresh(index(changed))['sha256'])
+        self.assertEqual(record['queries'][0]['path'],self.inputs._wire(event['path']))
+        self.assertFalse(record['input_closure_complete']);self.assertFalse(record['shipping_authority'])
+        style=copy.deepcopy(event);style['path']=b'public/tailwind.css'
+        style['open']['installed'].update(identity(css.stat()))
+        self.assertTrue(original.select_opens([style],**args).observation['facts'])
+        outside=copy.deepcopy(event);outside.update(path=b'/runtime/unknown',sequence=2)
+        subset,unbound=original.select_read_subset([event,outside],**args)
+        self.assertEqual(subset.observation,selected.observation);self.assertEqual(unbound[0]['sequence'],2)
+        for fault in ('descriptor','object','namespace','path-only','access-check'):
+            wrong=copy.deepcopy(event)
+            if fault=='descriptor':wrong['open']['installed']['fd']=8
+            elif fault=='object':wrong['open']['installed']['inode']+=1
+            elif fault=='namespace':wrong['open']['arguments']['mount_namespace']=51
+            elif fault=='path-only':wrong['open']['installed']['flags']=0x200000
+            else:wrong['syscall']=439
+            with self.subTest(fault=fault),self.assertRaises(self.inputs.FreshnessHold):original.select_opens([wrong],**args)
+        for fault in ('digest','query','authority'):
+            wrong=copy.deepcopy(record)
+            if fault=='digest':wrong['observation']['sha256']='f'*64
+            elif fault=='query':wrong['queries'][0]['path']['bytes_b64']='not base64!'
+            else:wrong['shipping_authority']=True
+            with self.subTest(fault=fault),self.assertRaises(self.inputs.FreshnessHold):self.inputs._ContentSelection.restore(wrong,original)
+
     def journal_binding(self):
         return {'generation':'12345678-1234-4234-8234-123456789abc','head':'a'*40,'tree':'b'*40,
             **{key:'c'*64 for key in ('contract_sha256','authority_sha256','cache_identity_sha256','source_inputs_sha256')}}

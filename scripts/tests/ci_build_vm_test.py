@@ -19,13 +19,13 @@ def kernel_observation(binding,command):
  programs=[];links=[]
  roles=[('raw_tracepoint','sys_enter',0),('raw_tracepoint','sys_exit',0)]
  roles.extend(('kretprobe_multi' if flags else 'kprobe_multi',name,flags)
-  for (name,flags),count in observer.PROBE_ROLES.items() for _ in range(count))
+  for (name,flags),count in observer.probe_roles('all').items() for _ in range(count))
  for i,(kind,name,flags) in enumerate(roles,1):
   programs.append({'id':i,'type':17 if kind=='raw_tracepoint' else 2,'tag':f'{i:016x}','recursion_misses':0})
   links.append({'id':100+i,'type':kind,'prog_id':i,'tag':f'{i:016x}',
    **({'tracepoint':name} if kind=='raw_tracepoint' else {'function':name,'count':1,'flags':flags,'missed':0})})
  census={'pid':42,'birth':1000,'programs':programs,'links':links}
- return {'version':1,'kind':'ci-command-kernel-observation','binding':binding,'command':command,
+ return {'version':2,'kind':'ci-command-kernel-observation','binding':binding,'command':command,
   'record_sha256':'1'*64,'program_sha256':'2'*64,'binary_sha256':'3'*64,
   'probe_census':{'before':census,'after':census},'units':[],'original_observer_cleanup':True,
   'input_closure_complete':False,'full_ci':False,'shipping_authority':False}

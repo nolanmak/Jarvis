@@ -1536,3 +1536,38 @@ pathname queries, 10 directory reads and 48 metadata observations for the actual
 application, with no invented compiler executions. The original raw names and
 scope evidence are inputs to the next selector step; they are not normalized
 into a compatibility or passing-CI verdict.
+
+General read collection now binds kernel-copied `do_filp_open` arguments and the
+`fd_install` file object to the original syscall's returned descriptor. It keeps
+open flags, read capability, inode/device/mode/generation, dentry/mount and
+namespace identities. General mode requires **18** original zero-miss
+programs/links; the unchanged private fixture keeps its original **16**. Missing,
+duplicate, crossed-descriptor or namespace evidence refuses capture. Syscall
+439 (`faccessat2`) cannot count as a source open; open/openat/openat2 are distinct.
+Compiler source evidence requires a readable installed object matching the
+actual frozen source inode, and excludes `O_PATH` handles.
+
+The kernel argument/installation relationship follows the original open path
+([Linux open.c](https://github.com/torvalds/linux/blob/v6.8/fs/open.c#L1307)); actual
+field layout, function identity and attachment counters must still pass against
+the pinned VM kernel. No caller-memory sample substitutes for the copied flags.
+The internal general capture envelope is version 2; old captures cannot provide
+the new read evidence.
+
+Frozen indexes now support declared nested directory and file overlays while
+still verifying each complete backing inventory. Hidden source placeholders
+cannot stand in for generated input objects. Literal parent components remain
+part of lookup resolution. A selected read binds original kernel bases, flags,
+installed inode and namespace to frozen content. Its serialized queries and
+content facts are rechecked against the original trees before refresh. Unknown
+reads remain explicit, so the selected subset never claims complete coverage.
+
+On a forest change the actual executor now rechecks selections for active
+compiled producers and persists a `selected-revalidation` record before holding.
+The record retains the original capture/command/unit binding, old/new content
+digests and affected fingerprint names. It neither retires fingerprints nor
+changes old snapshots/producer records, and unchanged selected facts do not grant
+reuse authority. Complete input coverage and durable invalidation/restart remain
+required before releasing that hold. Actual VM validation of this revision is
+pending. The original wrapper/publication harness remains unchanged and
+unfinished; production activation remains disabled.

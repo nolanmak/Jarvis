@@ -24,7 +24,7 @@ def lookup(uid,pid,tid,call,sequence,result,path,*,reverse=False):
     return outcome+name if reverse else name+outcome
 
 
-def census_sample():
+def census_sample(path_scope='fixture'):
     programs=[{'id':i,'type':17 if i in (1,4) else 2,'tag':f'{i:016x}','recursion_misses':0} for i in range(1,5)]
     links=[{'id':10+i,'type':'raw_tracepoint' if i in (1,4) else 'kretprobe_multi',
         'prog_id':i,'tag':f'{i:016x}',**({'tracepoint':'sys_enter' if i==1 else 'sys_exit'} if i in (1,4)
@@ -33,13 +33,54 @@ def census_sample():
         programs.append({'id':i,'type':2,'tag':f'{i:016x}','recursion_misses':0})
         links.append({'id':10+i,'type':'kretprobe_multi' if flags else 'kprobe_multi',
             'prog_id':i,'tag':f'{i:016x}','function':function,'count':1,'flags':flags,'missed':0})
+    if path_scope=='all':
+        for i,function in enumerate(('do_filp_open','fd_install'),17):
+            programs.append({'id':i,'type':2,'tag':f'{i:016x}','recursion_misses':0})
+            links.append({'id':10+i,'type':'kprobe_multi','prog_id':i,'tag':f'{i:016x}',
+                'function':function,'count':1,'flags':0,'missed':0})
     return {'pid':42,'birth':1000,'programs':programs,'links':links}
 
 
+def opened(uid=2003,pid=101,tid=102,call=257,sequence=1,fd=3):
+    head=f'{uid} {pid} {tid} {call} {sequence}'
+    return [f'W {head} -100 32768 0 4 256 1 100 50',
+        f'V {head} {fd} 32768 1 7 900 33060 4 4096 8192 100 50']
+
+
 class KernelObserverTests(unittest.TestCase):
+    def test_open_flags_and_installed_object_require_original_exit_and_census(self):
+        for call in (2,257,437):
+            rows=opened(call=call)
+            data=lookup(2003,101,102,call,1,3,b'/workspace/source.rs')
+            packed=lambda values:data+b''.join(frame('printf',row+'\n') for row in values)+frame('map',{'@emitted':2+len(values)})
+            event=observer.decode(packed(rows),path_scope='all')[0]
+            self.assertTrue(observer.readable_open(event))
+            self.assertEqual(event['open']['arguments']['flags'],32768)
+            self.assertEqual(event['open']['installed']['inode'],900)
+            self.assertFalse(observer.readable_open(event|{'syscall':439}))
+            for fault in ('missing-arguments','missing-object','duplicate','fd','namespace','flags'):
+                bad=list(rows)
+                if fault=='missing-arguments':bad=bad[1:]
+                elif fault=='missing-object':bad=bad[:1]
+                elif fault=='duplicate':bad+=bad[:1]
+                elif fault=='fd':bad[1]=bad[1].replace(' 3 32768',' 4 32768')
+                elif fault=='namespace':bad[1]=bad[1].removesuffix(' 100 50')+' 100 51'
+                else:bad[0]=bad[0].replace(' -100 32768',' -100 -1')
+                with self.subTest(call=call,fault=fault),self.assertRaises(observer.ObservationUnavailable):
+                    observer.decode(packed(bad),path_scope='all')
+            path_only=rows[:1]+[rows[1].replace(' 32768 1 7',' 2097152 0 7')]
+            self.assertFalse(observer.readable_open(observer.decode(packed(path_only),path_scope='all')[0]))
+        sample=census_sample('all');value={'before':sample,'after':copy.deepcopy(sample)}
+        observer.validate_census(value,path_scope='all')
+        with self.assertRaises(observer.ObservationUnavailable):observer.validate_census(value)
+        for collection in ('programs','links'):
+            broken=copy.deepcopy(value);broken['after'][collection].pop()
+            with self.assertRaises(observer.ObservationUnavailable):observer.validate_census(broken,path_scope='all')
+
     def test_general_path_scope_keeps_literal_runtime_relative_and_parent_components(self):
         for path in (b'/toolchain/lib/../lib/librustc.so',b'arbitrary/module.rs',b'./node_modules/generated.rs',b'../source.rs',b'/workspace//src/lib.rs'):
-            data=lookup(2003,101,102,257,1,3,path)+frame('map',{'@emitted':2})
+            data=(lookup(2003,101,102,257,1,3,path)
+                +b''.join(frame('printf',line+'\n') for line in opened())+frame('map',{'@emitted':4}))
             with self.subTest(path=path):
                 self.assertEqual(observer.decode(data,path_scope='all')[0]['path'],path)
                 with self.assertRaises(observer.ObservationUnavailable):observer.decode(data)

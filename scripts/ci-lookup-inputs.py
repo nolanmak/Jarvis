@@ -44,6 +44,20 @@ def _wire(value):
     return value
 
 
+def _unwire(value,depth=0):
+    if depth>64:_hold()
+    if type(value) is dict:
+        if set(value)=={'bytes_b64'}:
+            try:decoded=base64.b64decode(value['bytes_b64'],validate=True)
+            except (ValueError,TypeError):_hold()
+            if len(decoded)>4096 or base64.b64encode(decoded).decode('ascii')!=value['bytes_b64']:_hold()
+            return decoded
+        return {key:_unwire(item,depth+1) for key,item in value.items()}
+    if type(value) is list:return [_unwire(item,depth+1) for item in value]
+    if value is not None and type(value) not in (str,int,bool):_hold()
+    return value
+
+
 class UnitInvalidations:
     """Durable, monotonic invalidation intent for one admitted planner command.
 
@@ -353,6 +367,29 @@ class _ContentSelection:
         index._verify()
         return index.census.observe(self._queries,require_original_results=False)
 
+    def record(self):
+        return {'version':1,'kind':'ci-lookup-read-selection','queries':_wire(self._queries),
+            'observation':copy.deepcopy(self._observation),'binding_sha256':self.binding_sha256,
+            'layout':_wire(self._layout),'input_closure_complete':False,'shipping_authority':False}
+
+    @classmethod
+    def restore(cls,value,index):
+        """Recheck a caller-authenticated record against its original trees.
+
+        The record itself is not producer or collector authority. The caller
+        must bind it to the retained original command's protected capture.
+        """
+        try:
+            if (type(value) is not dict or set(value)!={'version','kind','queries','observation','binding_sha256',
+                    'layout','input_closure_complete','shipping_authority'} or type(value['version']) is not int
+                    or value['version']!=1 or value['kind']!='ci-lookup-read-selection'
+                    or not _cache._digest(value['binding_sha256']) or type(index) is not FrozenLookupIndex
+                    or value['input_closure_complete'] is not False or value['shipping_authority'] is not False):_hold()
+            index._verify();queries=_unwire(value['queries']);layout=_unwire(value['layout'])
+            if tuple(layout)!=index._layout or index.census.observe(queries)!=value['observation']:_hold()
+            return cls(queries,value['observation'],value['binding_sha256'],index._layout)
+        except (ValueError,TypeError,KeyError,AttributeError,UnicodeError):_hold()
+
 
 class FrozenLookupIndex:
     """Bind a selected query subset to controller-frozen literal inventories.
@@ -361,24 +398,30 @@ class FrozenLookupIndex:
     quiescence. Neither a root-owned tree nor this index proves complete inputs
     or grants artifact reuse. Unknown bases and mount aliases are refused.
     """
-    def __init__(self,namespaces,*,anchors=None,kernel_roots=None,owner):
+    def __init__(self,namespaces,*,anchors=None,kernel_roots=None,owner,overlays=False):
         spec=importlib.util.spec_from_file_location('lookup_views',Path(__file__).with_name('ci-cargo-views.py'))
         self.views=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.views)
         self.owner=owner;self._trees=[];self._identities=[];self._bases={};self._objects={}
         try:
-            if type(owner) is not int or not 0<=owner<2**32 or type(namespaces) is not dict or not 0<len(namespaces)<=64:_hold()
+            if type(owner) is not int or not 0<=owner<2**32 or type(namespaces) is not dict or not 0<len(namespaces)<=64 or type(overlays) is not bool:_hold()
+            prefixes=[_path(value[0].encode(),absolute=True).rstrip(b'/') or b'/' for value in namespaces.values()]
+            if len(set(prefixes))!=len(prefixes):_hold()
             content={}
             for name,(prefix,root,rows) in namespaces.items():
                 root=self.views.literal(root);rows=copy.deepcopy(rows)
-                if self.views.inventory(root,owner=owner,sealed=True)!=rows:_hold()
+                if self._inventory(root)!=rows:_hold()
                 prefix=_path(prefix.encode(),absolute=True).rstrip(b'/') or b'/'
-                self._trees.append((root,rows));content[name]=(prefix.decode(),rows)
+                self._trees.append((root,rows));visible=[]
                 for row in rows:
                     relative=bytes.fromhex(row[0]);physical=root if relative==b'.' else root/os.fsdecode(relative)
                     virtual=prefix if relative==b'.' else prefix.rstrip(b'/')+b'/'+relative
+                    if overlays and any(other!=prefix and other.startswith(prefix.rstrip(b'/')+b'/')
+                            and (virtual==other or virtual.startswith(other+b'/')) for other in prefixes):continue
+                    visible.append(row)
                     info=physical.lstat();self._remember(physical,info)
                     self._objects[virtual]=self._object(info)
                     if stat.S_ISDIR(info.st_mode):self._anchor(virtual,physical,info)
+                content[name]=(prefix.decode(),visible)
             anchors={} if anchors is None else anchors
             if type(anchors) is not dict or len(anchors)>64:_hold()
             for prefix,root in anchors.items():
@@ -409,6 +452,10 @@ class FrozenLookupIndex:
     @staticmethod
     def _object(info):return ((os.major(info.st_dev)<<20)|os.minor(info.st_dev),info.st_ino,info.st_mode)
 
+    def _inventory(self,root):
+        if root.is_file():return [['2e','file',*self.views._read(root,self.owner,True)]]
+        return self.views.inventory(root,owner=self.owner,sealed=True)
+
     def _remember(self,path,info):
         self._identities.append((path,(*self.views._key(info),info.st_nlink,info.st_atime_ns)))
 
@@ -419,7 +466,7 @@ class FrozenLookupIndex:
 
     def _verify(self):
         try:
-            if any(self.views.inventory(root,owner=self.owner,sealed=True)!=rows for root,rows in self._trees):_hold()
+            if any(self._inventory(root)!=rows for root,rows in self._trees):_hold()
             for path,identity in self._identities:
                 info=path.lstat()
                 if (*self.views._key(info),info.st_nlink,info.st_atime_ns)!=identity:_hold()
@@ -474,3 +521,51 @@ class FrozenLookupIndex:
             binding=hashlib.sha256(_encoded(_wire(contexts))).hexdigest()
             return _ContentSelection(queries,observation,binding,self._layout)
         except (ValueError,TypeError,KeyError,AttributeError,UnicodeError):_hold()
+
+    def _open_query(self,event,*,pid,uid,user_namespace,mount_namespace):
+        try:
+            opened=event['open'];arguments=opened['arguments'];installed=opened['installed']
+            if (event['pid']!=pid or event['uid']!=uid or event['syscall'] not in (2,257,437)
+                    or arguments['user_namespace']!=user_namespace or arguments['mount_namespace']!=mount_namespace
+                    or type(arguments['flags']) is not int or arguments['flags']&~(0x80000|0x8000|0x100|0x800|0x20000)
+                    or event['result']<0):_hold()
+            bases=[]
+            for attempt in event['lookup_attempts']:
+                base=attempt['base']
+                if (attempt['init_result']!=0 or attempt['dfd']!=arguments['dfd']
+                        or attempt['user_namespace']!=user_namespace or attempt['mount_namespace']!=mount_namespace
+                        or base is None or base['flags']&0x18000000
+                        or base['flags']&256 and (base['path_seq']!=base['dentry_seq'] or base['path_seq']&1)):_hold()
+                virtual=self._bases.get(tuple(base[key] for key in ('device','inode','mode')))
+                if virtual is None:_hold()
+                bases.append(virtual)
+            if not bases or len(set(bases))!=1:_hold()
+            path=_path(event['path']);directory=bases[0]
+            if path.startswith(b'/') and directory!=b'/':_hold()
+            resolved,node,error,_facts=self.census._resolve(path,directory)
+            if (error is not None or node[0]!='file' or installed is None or installed['fd']!=event['result']
+                    or not installed['file_mode']&1 or installed['flags']&0x200000
+                    or installed['user_namespace']!=user_namespace or installed['mount_namespace']!=mount_namespace
+                    or self._objects.get(resolved)!=tuple(installed[key] for key in ('device','inode','mode'))):_hold()
+            return {'syscall':{2:'open',257:'openat',437:'openat2'}[event['syscall']],
+                'pid':pid,'path':path,'directory':directory,'intent':'read','outcome':'success','errno':None,
+                'result':event['result'],'arguments':''}
+        except (ValueError,TypeError,KeyError,AttributeError,UnicodeError):_hold()
+
+    def select_opens(self,events,*,pid,uid,user_namespace,mount_namespace):
+        self._verify()
+        if type(events) is not list or not 0<len(events)<=200000:_hold()
+        queries=[self._open_query(event,pid=pid,uid=uid,user_namespace=user_namespace,mount_namespace=mount_namespace) for event in events]
+        return _ContentSelection(queries,self.census.observe(queries),hashlib.sha256(_encoded(_wire(events))).hexdigest(),self._layout)
+
+    def select_read_subset(self,events,*,pid,uid,user_namespace,mount_namespace):
+        """Retain unsupported queries explicitly; this never proves coverage."""
+        self._verify()
+        if type(events) is not list or len(events)>200000:_hold()
+        queries=[];selected=[];unbound=[]
+        for event in events:
+            try:query=self._open_query(event,pid=pid,uid=uid,user_namespace=user_namespace,mount_namespace=mount_namespace)
+            except FreshnessHold:unbound.append({key:event[key] for key in ('pid','tid','uid','syscall','sequence')})
+            else:queries.append(query);selected.append(event)
+        self._verify()
+        return _ContentSelection(queries,self.census.observe(queries),hashlib.sha256(_encoded(_wire(selected))).hexdigest(),self._layout),unbound
