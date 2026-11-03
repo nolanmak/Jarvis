@@ -33,7 +33,7 @@ class AdapterTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as directory:
    request=self.fixture(Path(directory))
    for change in ({'protected_cargo':True},{'protected_cargo':1},{'protected_cargo':'true'},
-    {'protected_cargo':True,'operation':'baseline','predecessor':str(uuid.uuid4())},
+    {'protected_cargo':True,'operation':'baseline','predecessor':'invalid'},
     {'protected_cargo':True,'planner_protocol_probe':True,'operation':'repository','command':'true'}):
     with self.subTest(change=change),patch.object(vm.Runtime,'load') as load:
      with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request|change)
@@ -55,6 +55,7 @@ class AdapterTests(unittest.TestCase):
      result['cargo_execution']={'version':1,'kind':'ci-cargo-execution','binding':generation['binding'],
       'command':generation['command'],'commands':[{'argv':argv,'context_sha256':'1'*64,'exit_code':0 if i==0 else 101,
        'compiler_calls':0,'units':[],'original_cargo_cleanup':True} for i,argv in enumerate(commands)],
+      'checkpoint':self.execution_checkpoint(generation,result['guest_worker_quiescence']['scopes'][-1]),
       'metadata_sha256':'2'*64,'original_metadata_cleanup':True,'input_closure_complete':False,'full_ci':False,
       'shipping_authority':False,'guest_worker_quiescence':result['guest_worker_quiescence']['scopes'][0 if borrowed else -1]}
      return result
@@ -71,7 +72,7 @@ class AdapterTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as directory:
    request=self.fixture(Path(directory))
    for change in ({'protected_repository':True},{'protected_repository':1},
-    {'protected_repository':True,'operation':'repository','command':'true','predecessor':str(uuid.uuid4())},
+    {'protected_repository':True,'operation':'repository','command':'true','predecessor':'invalid'},
     {'protected_repository':True,'operation':'repository','command':'true','planner_protocol_probe':True}):
     with self.subTest(change=change),patch.object(vm.Runtime,'load') as load:
      with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request|change)
@@ -88,7 +89,8 @@ class AdapterTests(unittest.TestCase):
      result=self.prepared_result(options,exit_code=0,stdout='original nested stdout',stderr='')
      generation=options['ci_context']['generation']
      result['repository_execution']={'version':1,'kind':'ci-repository-execution','binding':generation['binding'],
-      'command':generation['command'],'worker_units':[],'cargo_commands':[],'original_worker_cleanup':True,
+      'command':generation['command'],'checkpoint':self.execution_checkpoint(generation,result['guest_worker_quiescence']['scopes'][-1]),
+      'worker_units':[],'cargo_commands':[],'original_worker_cleanup':True,
       'input_closure_complete':False,'full_ci':False,'shipping_authority':False,
       'guest_worker_quiescence':result['guest_worker_quiescence']['scopes'][0 if borrowed else -1]}
      return result
@@ -132,6 +134,10 @@ class AdapterTests(unittest.TestCase):
     with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',
       side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
      with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=execute)
+ def execution_checkpoint(self,generation,scope):
+  return {'version':1,'kind':'ci-cargo-execution-checkpoint','binding':generation['binding'],'command':generation['command'],
+   'claim':str(uuid.uuid4()),'predecessor':generation['predecessor'],'scope_id':scope['scope_id'],
+   'retained_executor':True,'input_closure_complete':False,'shipping_authority':False}
  def prepared_result(self,options,**result):
   result.setdefault('seed_reclaimed',[])
   generation=options['ci_context']['generation']

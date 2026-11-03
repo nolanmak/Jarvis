@@ -188,13 +188,13 @@ def execute(request,run=vm.run,progress=None):
         raise cache_generation.FreshnessHold('invalidation_unsafe')
     protected=request.get('protected_cargo',False)
     if (type(protected) is not bool or protected and (request['operation'] not in ('targeted','baseline')
-            or request.get('planner_protocol_probe') or request['predecessor'] is not None)):
+            or request.get('planner_protocol_probe'))):
         # Existing executor state must be recovered/revalidated, never silently
         # replaced with another cold target to bypass missing reuse evidence.
         raise cache_generation.FreshnessHold('input_census_unknown')
     repository=request.get('protected_repository',False)
     if (type(repository) is not bool or repository and (request['operation']!='repository'
-            or request.get('planner_protocol_probe') or protected or request['predecessor'] is not None)):
+            or request.get('planner_protocol_probe') or protected)):
         raise cache_generation.FreshnessHold('input_census_unknown')
     dependency=dependency_action(request)
     if not cache_generation._uuid(request['source_generation']) or not cache_generation._uuid(request['command_id']) or (request['predecessor'] is not None and not cache_generation._uuid(request['predecessor'])):raise cache_generation.FreshnessHold('generation_mismatch')
@@ -357,13 +357,13 @@ def execute(request,run=vm.run,progress=None):
         planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
         try:result['cargo_execution']=planner.validate_execution(outcome.get('cargo_execution'),
             generation['binding'],generation['command'],cargo_commands(cargo),guest_workers,
-            observed_inputs['guest_worker_quiescence'],result['exit_code'])
+            observed_inputs['guest_worker_quiescence'],result['exit_code'],generation['predecessor'])
         except planner.FreshnessHold as error:raise cache_generation.FreshnessHold(error.reason) from None
     if repository:
         spec=importlib.util.spec_from_file_location('observed_repository_execution',BASE/'ci-cargo-planner.py')
         planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
         try:result['repository_execution']=planner.validate_repository_execution(outcome.get('repository_execution'),
-            generation['binding'],generation['command'],guest_workers,observed_inputs['guest_worker_quiescence'])
+            generation['binding'],generation['command'],guest_workers,observed_inputs['guest_worker_quiescence'],generation['predecessor'])
         except planner.FreshnessHold as error:raise cache_generation.FreshnessHold(error.reason) from None
     if dependency is not None:
         observed=outcome.get('dependency_result')

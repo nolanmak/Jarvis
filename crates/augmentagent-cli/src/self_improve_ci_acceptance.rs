@@ -1474,6 +1474,12 @@ except PermissionError:pass
 else:raise RuntimeError('worker can traverse protected Cargo state')
 print(json.dumps({'worker_uid':os.getuid(),'raw_exec_denied':True,'planner_metadata_denied':True}),flush=True)
 "#)?;
+    std::fs::write(root.join("followup_driver.py"),r#"import subprocess
+for command in (['cargo','build','-p','nested-consumer'],['cargo','test','-p','nested-consumer','--lib','--','--test-threads=1']):
+ result=subprocess.run(command)
+ assert result.returncode==0,result.returncode
+print('RECOVERED_ORIGINAL_EXECUTOR',flush=True)
+"#)?;
     git(root,&["-c","init.templateDir=","init","-q"]).await?;git(root,&["add","."]).await?;
     git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","core.hooksPath=/dev/null",
         "-c","commit.gpgsign=false","commit","-qm","nested repository Cargo fixture"]).await?;
@@ -1500,8 +1506,22 @@ print(json.dumps({'worker_uid':os.getuid(),'raw_exec_denied':True,'planner_metad
         && outcome.stdout.contains("\"planner_metadata_denied\": true"),"original execution guard/output absent");
     ensure!(execution["input_closure_complete"]==false && execution["full_ci"]==false && execution["shipping_authority"]==false,
         "partial repository routing acquired CI authority");
+    let resumed=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some("python3 -I followup_driver.py"),
+        &storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
+    let resumed_record=serde_json::json!({"status":&resumed.status,"stdout":&resumed.stdout,"stderr":&resumed.stderr,
+        "execution":&resumed.repository_execution,"shipping_authority":false});
+    std::fs::write(evidence.join("resumed.json"),serde_json::to_vec_pretty(&resumed_record)?)?;
+    ensure!(resumed.status=="passed" && resumed.stdout.contains("RECOVERED_ORIGINAL_EXECUTOR")
+        && resumed.stdout.contains("nested_original_case"),"original executor recovery failed; inspect resumed.json");
+    let recovered=resumed.repository_execution.as_ref().context("resumed repository evidence absent")?;
+    let recovered_commands=recovered["cargo_commands"].as_array().context("resumed commands absent")?;
+    ensure!(recovered_commands.len()==2 && recovered_commands.iter().all(|command|command["compiler_calls"]==0
+        && command["cargo_exit"]==0 && command["original_cargo_cleanup"]==true),"cross-VM unchanged units rebuilt or failed");
+    ensure!(recovered["checkpoint"]["retained_executor"]==true
+        && recovered["checkpoint"]["predecessor"]==execution["command"],"recovery did not bind original predecessor");
     std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({
-        "version":1,"kind":"repository-nested-cargo-adapter-replay","observed":record,
+        "version":1,"kind":"repository-nested-cargo-adapter-replay","observed":record,"resumed":resumed_record,
+        "cross_vm_unchanged_compiler_calls_zero":true,
         "raw_worker_exec_denied":true,"worker_metadata_ignored":true,"planner_metadata_denied":true,
         "input_closure_complete":false,"full_ci":false,"shipping_authority":false}))?)?;
     Ok(())

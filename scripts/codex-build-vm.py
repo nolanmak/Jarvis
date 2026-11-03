@@ -277,16 +277,29 @@ def run_worker(argv,input_roots=None):
     guest_worker_receipts.append(stopped.observation())
     return result
 
+ci_planner=None
+def execution_lease():
+    global ci_planner
+    if ci_planner is None:
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('guest_execution_lease','/ci-tools/ci-cargo-planner.py')
+        ci_planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(ci_planner)
+    return ci_planner.ExecutionLease(
+        private_cache/'ci-source-generations'/generation['binding']['generation']/'target',
+        generation['binding'],generation['command'],generation['predecessor'])
+
+
 def run_cargo_commands(commands,input_roots):
     # This replaces the normal structured Cargo driver, not an extra replay.
     # All candidate code still starts after planner/unit credential drops.
     import tempfile,time
-    root=Path(tempfile.mkdtemp(prefix='ci-run-',dir='/tmp'))
+    root=Path(tempfile.mkdtemp(prefix='ci-run-',dir='/tmp'));lease=execution_lease()
     scope=ci_workers.controller_execution_scope(worker_control,{
         'target':str(private_cache/'ci-source-generations'/generation['binding']['generation']/'target'),
         'binding':generation['binding'],'command':generation['command'],'root':str(root),
         'library':'/ci-tools/ci-cargo-planner.so','deadline':time.monotonic()+900,
-        'commands':commands,'environment':dict(environment),'cwd':'/workspace'})
+        'commands':commands,'environment':dict(environment),'cwd':'/workspace','execution_lease':lease.handle()})
+    lease.bind_scope(scope)
     journal=ci_inputs.ChangeJournal(input_roots,scope=scope)
     try:
         observed=_run_worker(scope.argv,scope);stopped=scope.verify()
@@ -301,18 +314,20 @@ def run_cargo_commands(commands,input_roots):
                 or any(type(result[key]) is not str for key in ('stdout','stderr'))):raise ValueError()
         result['cargo_execution']['guest_worker_quiescence']=stopped.observation()
     except (ValueError,KeyError,TypeError):raise ci_cache['FreshnessHold']('input_census_unknown') from None
+    result['cargo_execution']['checkpoint']=lease.finish(scope,stopped)
     result['input_write_observation']=writes
     return result
 
 
 def run_repository_command(argv,input_roots):
     import tempfile,time
-    root=Path(tempfile.mkdtemp(prefix='ci-repo-',dir='/tmp'))
+    root=Path(tempfile.mkdtemp(prefix='ci-repo-',dir='/tmp'));lease=execution_lease()
     scope=ci_workers.controller_repository_scope(worker_control,{
         'target':str(private_cache/'ci-source-generations'/generation['binding']['generation']/'target'),
         'binding':generation['binding'],'command':generation['command'],'root':str(root),
         'library':'/ci-tools/ci-cargo-planner.so','deadline':time.monotonic()+900,
-        'argv':argv,'environment':dict(environment),'cwd':'/workspace'})
+        'argv':argv,'environment':dict(environment),'cwd':'/workspace','execution_lease':lease.handle()})
+    lease.bind_scope(scope)
     journal=ci_inputs.ChangeJournal(input_roots,scope=scope)
     try:
         observed=_run_worker(scope.argv,scope);stopped=scope.verify();writes=journal.finish(stopped)
@@ -326,6 +341,7 @@ def run_repository_command(argv,input_roots):
                 or any(type(result[key]) is not str for key in ('stdout','stderr'))):raise ValueError()
         result['repository_execution']['guest_worker_quiescence']=stopped.observation()
     except (ValueError,KeyError,TypeError):raise ci_cache['FreshnessHold']('input_census_unknown') from None
+    result['repository_execution']['checkpoint']=lease.finish(scope,stopped)
     result['input_write_observation']=writes
     return result
 
@@ -482,7 +498,7 @@ try:
 except Exception as error:
     import errno
     # copytree aggregates per-file failures into shutil.Error without an errno.
-    hold_types=(ci_cache.get('FreshnessHold'),)+( (ci_dependency.FreshnessHold,) if ci_dependency is not None else () )+( (ci_workers.FreshnessHold,) if ci_workers is not None else () )+( (ci_inputs.FreshnessHold,) if ci_inputs is not None else () )
+    hold_types=(ci_cache.get('FreshnessHold'),)+( (ci_planner.FreshnessHold,) if ci_planner is not None else () )+( (ci_dependency.FreshnessHold,) if ci_dependency is not None else () )+( (ci_workers.FreshnessHold,) if ci_workers is not None else () )+( (ci_inputs.FreshnessHold,) if ci_inputs is not None else () )
     if job.get('ci_context') and isinstance(error,tuple(kind for kind in hold_types if kind is not None)):
         result={'error':'CI source/cache freshness unavailable','freshness_hold':error.diagnostic()}
     else:
@@ -626,13 +642,12 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
         if probe:planner_keys.add('planner_protocol_probe')
         if repository:
             planner_keys.add('repository_execution')
-            if ci_context['generation']['predecessor'] is not None:raise Unavailable('repository recovery unavailable')
         if execution is not None:
             planner_keys.add('cargo_execution')
             if (type(execution) is not list or not 1<=len(execution)<=2
                     or any(type(argv) is not list or not 2<=len(argv)<=4096 or argv[0]!='/toolchain/bin/cargo'
                         or any(type(arg) is not str or not arg or '\0' in arg or len(arg)>65536 for arg in argv) for argv in execution)
-                    or ci_context['generation']['predecessor'] is not None):raise Unavailable('invalid structured Cargo execution')
+                    ):raise Unavailable('invalid structured Cargo execution')
         if set(ci_context) not in (base_keys|planner_keys,base_keys|planner_keys|{'dependency_programs','dependency_action'}):
             raise Unavailable('invalid controller CI context')
         if probe or execution is not None or repository:

@@ -1370,3 +1370,28 @@ no skips**, and **31 focused Rust tests passed** with 17 opt-in cases excluded.
 The repository and protocol VM cases were then explicitly run. Both adapter
 modes remain disabled in production builds; the unchanged original in-command
 regression, complete input closure and passing-CI/merge authority remain open.
+
+Protected command recovery now uses a generation-owned execution checkpoint.
+A claim becomes active before controller launch and binds the actual controller
+scope. It closes only after that original scope has stopped and output
+observation has finished. A later host-acknowledged command must supply the exact
+predecessor; missing, active, stale or torn claims hold without allocating a new
+cold executor. The protected root is pinned by identity. Retained planner/home
+metadata, command records, sealed objects and producer history are checked
+before reopening. Cargo's internal hardlink aliases are retained; external
+aliases and unsupported entries refuse the checkpoint.
+
+Publication recovery reconstructs active indexes from the immutable producer
+records and checks original successful-exec/cleanup evidence, allocations and
+sealed content/metadata. Old records retain their original command binding.
+Incomplete allocations/transitions remain held. Each new command gets separate
+view slots and retains historical command directories. Per-command execution
+and restart limits are not reset inside the command by recovery.
+
+Stores with generated namespaces or selector registrations still hold on
+recovery: callback closures are not a persistent selector protocol. The actual
+repository adapter test now includes another VM/command on the same source and
+requires zero compiler calls for unchanged library and test units. Native
+validation of this extension is pending. This ownership/continuation mechanism
+is not a complete-input or passing-CI capability, and production activation
+remains disabled.

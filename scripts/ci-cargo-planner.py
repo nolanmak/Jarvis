@@ -378,12 +378,62 @@ class RestartGate:
     def state(self):return copy.deepcopy(self._state)
 
 
+def planner_snapshot(root,*,owner):
+    """Inventory protected mutable Cargo state without changing its metadata.
+
+    Cargo's internal hardlink aliases are retained. An alias outside the owned
+    tree, unsupported entry, xattr or inconsistent read refuses the checkpoint.
+    This inventory alone grants no artifact/input compatibility authority.
+    """
+    root=unit_views.literal(root);rows=[];links={};total=0
+    def walk(directory,prefix):
+        nonlocal total
+        info=directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=owner or info.st_mode&0o7000
+                or os.listxattr(directory,follow_symlinks=False)):raise FreshnessHold('artifact_provenance_unknown')
+        key=unit_views._key(info);rows.append([os.fsencode(prefix).hex(),'directory',list(key)])
+        fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NOATIME)
+        try:names=sorted(os.listdir(fd),key=os.fsencode)
+        finally:os.close(fd)
+        for name in names:
+            path=directory/name;relative=prefix/name;entry=path.lstat()
+            if stat.S_ISDIR(entry.st_mode):walk(path,relative)
+            elif stat.S_ISREG(entry.st_mode):
+                descriptor=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NOATIME|os.O_NONBLOCK)
+                try:
+                    before=os.fstat(descriptor)
+                    if (before.st_uid!=owner or before.st_mode&0o7000 or before.st_size>unit_views.MAX_BYTES
+                            or os.listxattr(descriptor)):raise FreshnessHold('artifact_provenance_unknown')
+                    digest=hashlib.sha256();size=0
+                    while True:
+                        block=os.read(descriptor,1024*1024)
+                        if not block:break
+                        size+=len(block);digest.update(block)
+                        if size>before.st_size:raise FreshnessHold('input_census_unknown')
+                    if (size!=before.st_size or unit_views._key(os.fstat(descriptor))!=unit_views._key(before)
+                            or unit_views._key(path.lstat())!=unit_views._key(before)):
+                        raise FreshnessHold('input_census_unknown')
+                    rows.append([os.fsencode(relative).hex(),'file',list(unit_views._key(before)),before.st_nlink,digest.hexdigest()])
+                    identity=(before.st_dev,before.st_ino);count,expected=links.get(identity,(0,before.st_nlink))
+                    if expected!=before.st_nlink:raise FreshnessHold('input_census_unknown')
+                    links[identity]=(count+1,expected);total+=size
+                finally:os.close(descriptor)
+            else:raise FreshnessHold('artifact_provenance_unknown')
+            if len(rows)>unit_views.MAX_ENTRIES or total>unit_views.MAX_BYTES:raise FreshnessHold('input_census_unknown')
+        if unit_views._key(directory.lstat())!=key:raise FreshnessHold('input_census_unknown')
+    walk(root,Path('.'))
+    if any(count!=expected for count,expected in links.values()):raise FreshnessHold('artifact_provenance_unknown')
+    encoded=json.dumps(rows,separators=(',',':')).encode()
+    return {'sha256':hashlib.sha256(encoded).hexdigest(),'entries':len(rows),'bytes':total}
+
+
 class PublicationStore:
     """Controller-owned producer history and active publication indexes.
 
     The caller establishes admission and producer identity. Diagnostic snapshots
-    are explicit and never claim execution. Reopening a store cannot restore
-    in-memory selectors or grant reuse; recovery remains a typed hold.
+    are explicit and never claim execution. Recovery checks retained actual
+    producers and immutable history; it cannot restore selector closures or
+    establish complete input/artifact compatibility authority.
     """
     LIMIT=16*1024**2
 
@@ -398,8 +448,108 @@ class PublicationStore:
         self.root.mkdir(mode=0o700)
         for name in ('objects','records','allocations'):(self.root/name).mkdir(mode=0o700)
         self.objects=self.root/'objects';self._state={'version':1,'binding':self.binding,'command':command,'epoch':0,
-            'history':[],'files':{},'namespaces':{},'transition':None,'last_affected':[],'shipping_authority':False}
+            'history':[],'files':{},'namespaces':{},'transition':None,'last_affected':[],'selector_namespaces':[],'shipping_authority':False}
         self._write(self.root/'state.json',self._state)
+
+    @classmethod
+    def _retained(cls,root,*,binding,command):
+        cache.validate_binding(binding);root=unit_views.literal(root)
+        for directory in (root,root/'objects',root/'records',root/'allocations'):
+            info=directory.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid()
+                    or stat.S_IMODE(info.st_mode)!=0o700):raise FreshnessHold('artifact_provenance_unknown')
+        state=cache._read_record(root/'state.json',max_bytes=cls.LIMIT)
+        keys={'version','binding','command','epoch','history','files','namespaces','transition','last_affected','selector_namespaces','shipping_authority'}
+        if (set(state)!=keys or type(state['version']) is not int or state['version']!=1 or state['binding']!=binding
+                or state['command']!=command or not cache._uuid(command) or state['transition'] is not None
+                or state['shipping_authority'] is not False or type(state['history']) is not list
+                or len(state['history'])>4096 or any(not cache._uuid(item) for item in state['history'])
+                or len(set(state['history']))!=len(state['history']) or type(state['epoch']) is not int
+                or state['epoch']!=len(state['history']) or type(state['files']) is not dict or type(state['namespaces']) is not dict
+                or type(state['last_affected']) is not list or any(not lookup_inputs.UnitInvalidations._name(item) for item in state['last_affected'])
+                or type(state['selector_namespaces']) is not list or len(set(state['selector_namespaces']))!=len(state['selector_namespaces'])
+                or any(item not in state['namespaces'] for item in state['selector_namespaces'])):raise FreshnessHold('metadata_torn')
+        history=set(state['history'])
+        if (set(path.name for path in (root/'objects').iterdir())!=history
+                or set(path.name for path in (root/'records').iterdir())!={item+'.json' for item in history}
+                or set(path.name for path in (root/'allocations').iterdir())!={item+'.json' for item in history}):
+            raise FreshnessHold('cleanup_uncertain')
+        records={};rows={};documents=[];active_files={};namespaces={}
+        for identity in state['history']:
+            record=cache._read_record(root/'records'/(identity+'.json'),max_bytes=cls.LIMIT)
+            if (set(record)!={'version','binding','command','producer','publication','evidence','input_closure_complete','shipping_authority'}
+                    or type(record['version']) is not int or record['version']!=1 or record['binding']!=binding
+                    or not cache._uuid(record['command']) or record['producer']!=identity
+                    or record['input_closure_complete'] is not False or record['shipping_authority'] is not False):
+                raise FreshnessHold('artifact_provenance_unknown')
+            allocation=cache._read_record(root/'allocations'/(identity+'.json'))
+            if type(allocation.get('version')) is not int or allocation!={'version':1,'binding':binding,'command':record['command'],'producer':identity,'state':'allocated','shipping_authority':False}:
+                raise FreshnessHold('artifact_provenance_unknown')
+            evidence=record['evidence'];status=evidence.get('status',{})
+            if (set(evidence)!={'kind','status','original_cleanup','cleanup_sha256'} or evidence['kind']!='unit'
+                    or evidence['original_cleanup'] is not True or evidence['cleanup_sha256']!=hashlib.sha256(b'all-descendants-reaped\n').hexdigest()
+                    or set(status)!={'version','binding','command','ordinal','returncode','exec_observed'}
+                    or type(status['version']) is not int or status['version']!=3 or status['binding']!=binding
+                    or status['command']!=record['command'] or type(status['ordinal']) is not int or not 0<=status['ordinal']<4096
+                    or type(status['returncode']) is not int or status['returncode']!=0 or status['exec_observed'] is not True):
+                raise FreshnessHold('artifact_provenance_unknown')
+            publication=record['publication']
+            if (type(publication) is not dict or set(publication)!={'manifest','files','roots','action','cargo_target','generated_root'}
+                    or publication['action'] not in ('library','check','binary','test','build-script','generated')
+                    or type(publication['files']) is not list or len(set(publication['files']))!=len(publication['files'])
+                    or type(publication['roots']) is not list or len(set(publication['roots']))!=len(publication['roots'])
+                    or bool(publication['roots'])!=(publication['action']=='generated')):raise FreshnessHold('artifact_provenance_unknown')
+            publication=dict(publication,root=root/'objects'/identity);family=cls._family(publication)
+            manifest=unit_views.inventory(publication['root'],owner=os.geteuid(),sealed=True)
+            names={os.fsdecode(bytes.fromhex(row[0])):row for row in manifest if row[1]=='file'}
+            if manifest!=publication['manifest'] or set(names)!=set(publication['files']):raise FreshnessHold('artifact_provenance_unknown')
+            for namespace in publication['roots']:
+                unit_views.relative(namespace)
+                for previous,producer in list(namespaces.items()):
+                    if previous==namespace:
+                        if cls._family(records[producer])!=family:raise FreshnessHold('artifact_provenance_unknown')
+                        active_files={name:item for name,item in active_files.items() if not name.startswith(namespace+'/')}
+                    elif previous.startswith(namespace+'/') or namespace.startswith(previous+'/'):raise FreshnessHold('artifact_provenance_unknown')
+                namespaces[namespace]=identity
+            for name in names:
+                previous=active_files.get(name)
+                if previous is not None and cls._family(records[previous])!=family:raise FreshnessHold('artifact_provenance_unknown')
+                for namespace,producer in namespaces.items():
+                    if name.startswith(namespace+'/') and producer!=identity and cls._family(records[producer])!=family:
+                        raise FreshnessHold('artifact_provenance_unknown')
+                active_files[name]=identity
+            records[identity]=publication;rows[identity]=names;documents.append(record)
+        if state['files']!=active_files or state['namespaces']!=namespaces:raise FreshnessHold('artifact_provenance_unknown')
+        digest=hashlib.sha256(json.dumps({'state':state,'records':documents,
+            'objects':planner_snapshot(root/'objects',owner=os.geteuid())},sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        return state,records,rows,digest
+
+    @classmethod
+    def checkpoint(cls,root,*,binding,command):
+        return cls._retained(root,binding=binding,command=command)[3]
+
+    @classmethod
+    def recover(cls,root,*,binding,command,predecessor,unit_root,expected_sha256):
+        state,records,rows,digest=cls._retained(root,binding=binding,command=predecessor)
+        if digest!=expected_sha256 or not cache._uuid(command) or command==predecessor:
+            raise FreshnessHold('artifact_provenance_unknown')
+        if state['selector_namespaces'] or state['namespaces']:
+            # Restoring callback closures from an old process is not recovery.
+            # Generated namespace reuse needs durable selector revalidation.
+            raise FreshnessHold('input_census_unknown')
+        store=object.__new__(cls);store.root=unit_views.literal(root);store.objects=store.root/'objects'
+        store.unit_root=unit_views.literal(unit_root);store.owner=os.geteuid();store.controller=os.getpid()
+        store.binding=copy.deepcopy(binding);store.command=command;store.allow_diagnostic=False
+        store._lock=threading.RLock();store._records=records;store._rows=rows;store._reserved=set();store._watches={}
+        store._state=copy.deepcopy(state);store._state['command']=command
+        store._write(store.root/'state.json',store._state)
+        return store
+
+    def history_commands(self):
+        with self._lock:
+            self._check()
+            return sorted({cache._read_record(self.root/'records'/(identity+'.json'),max_bytes=self.LIMIT)['command']
+                for identity in self._state['history']})
 
     def _write(self,path,value):
         if len(json.dumps(value,separators=(',',':')).encode())>self.LIMIT:raise FreshnessHold('metadata_torn')
@@ -427,6 +577,8 @@ class PublicationStore:
         with self._lock:
             self._check();unit_views.relative(namespace)
             if namespace not in self._state['namespaces'] or not callable(callback):raise FreshnessHold('input_census_unknown')
+            following=copy.deepcopy(self._state);following['selector_namespaces']=sorted(set(following['selector_namespaces'])|{namespace})
+            self._write(self.root/'state.json',following);self._state=following
             self._watches.setdefault(namespace,[]).append(callback)
 
     @staticmethod
@@ -522,6 +674,152 @@ class PublicationStore:
             for name,identity in self._state['files'].items():
                 files[name]=(identity,copy.deepcopy(self._rows[identity][name]))
             return publications,files
+
+
+class ExecutionLease:
+    """Durable ownership handoff across host-acknowledged CI commands.
+
+    Only original scope cleanup closes a claim. Reopening validates retained
+    protected state; this is not a complete-input/artifact compatibility proof.
+    """
+    LIMIT=16*1024**2
+
+    def __init__(self,target,binding,command,predecessor):
+        self.target=_source(target,binding,command);self.binding=copy.deepcopy(binding);self.command=command
+        self.path=self.target.parent/'cargo-execution-state.json';self.owner=os.getpid();self.scope=None
+        if not cache._uuid(command) or predecessor is not None and not cache._uuid(predecessor):raise FreshnessHold('metadata_torn')
+        if self.path.exists() or self.path.is_symlink():
+            prior=self._read(self.path,binding)
+            if (prior['phase']!='closed' or predecessor!=prior['command'] or command==predecessor
+                    or prior['scope'] is None or prior['scope']['cleanup_sha256']!=self.cleanup_digest()):
+                raise FreshnessHold('cleanup_uncertain')
+            root=prior['root'];checkpoint=prior['checkpoint']
+            if root is not None:self._verify_executor(self.target,binding,root,checkpoint)
+        else:
+            if predecessor is not None:raise FreshnessHold('cleanup_uncertain')
+            root=None;checkpoint=None
+        self.claim=str(uuid.uuid4())
+        self._state={'version':1,'binding':self.binding,'command':command,'predecessor':predecessor,
+            'claim':self.claim,'phase':'active','scope':None,'root':root,'checkpoint':checkpoint,
+            'input_closure_complete':False,'shipping_authority':False}
+        cache._write_record(self.path,self._state)
+
+    @staticmethod
+    def cleanup_digest():return hashlib.sha256(b'all-descendants-reaped\n').hexdigest()
+
+    @classmethod
+    def _read(cls,path,binding):
+        value=cache._read_record(path,max_bytes=cls.LIMIT)
+        if (set(value)!={'version','binding','command','predecessor','claim','phase','scope','root','checkpoint','input_closure_complete','shipping_authority'}
+                or type(value['version']) is not int or value['version']!=1 or value['binding']!=binding
+                or not cache._uuid(value['command']) or not cache._uuid(value['claim'])
+                or value['predecessor'] is not None and not cache._uuid(value['predecessor'])
+                or value['phase'] not in ('active','closed') or value['input_closure_complete'] is not False
+                or value['shipping_authority'] is not False or (value['root'] is None)!=(value['checkpoint'] is None)):
+            raise FreshnessHold('metadata_torn')
+        scope=value['scope']
+        if scope is not None and (type(scope) is not dict or set(scope)!={'id','receipt','cleanup_sha256'}
+                or not cache._uuid(scope['id']) or type(scope['receipt']) is not str or not Path(scope['receipt']).is_absolute()
+                or scope['cleanup_sha256'] not in (None,cls.cleanup_digest())):raise FreshnessHold('metadata_torn')
+        return value
+
+    def handle(self):
+        return {'version':1,'target':str(self.target),'binding':self.binding,'command':self.command,'claim':self.claim}
+
+    @classmethod
+    def attach(cls,handle):
+        if (type(handle) is not dict or set(handle)!={'version','target','binding','command','claim'}
+                or type(handle['version']) is not int or handle['version']!=1 or not cache._uuid(handle['claim'])):
+            raise FreshnessHold('metadata_torn')
+        lease=object.__new__(cls);lease.target=_source(handle['target'],handle['binding'],handle['command'])
+        lease.path=lease.target.parent/'cargo-execution-state.json';lease.binding=copy.deepcopy(handle['binding'])
+        lease.command=handle['command'];lease.claim=handle['claim'];lease.owner=os.getpid();lease.scope=None
+        lease._active(require_scope=True);return lease
+
+    def _active(self,*,require_scope=False):
+        _source(self.target,self.binding,self.command)
+        value=self._read(self.path,self.binding)
+        if (os.getpid()!=self.owner or value['phase']!='active' or value['command']!=self.command or value['claim']!=self.claim
+                or require_scope and value['scope'] is None):raise FreshnessHold('cleanup_uncertain')
+        return value
+
+    def bind_scope(self,scope):
+        value=self._active()
+        if value['scope'] is not None or scope.owner!=os.getpid() or scope.closed or scope._process is not None:
+            raise FreshnessHold('cleanup_uncertain')
+        identity=scope.directory.name.removeprefix('worker-')
+        if not cache._uuid(identity):raise FreshnessHold('cleanup_uncertain')
+        value['scope']={'id':identity,'receipt':str(scope.receipt),'cleanup_sha256':None}
+        cache._write_record(self.path,value);self.scope=scope
+
+    @staticmethod
+    def _identity(root):
+        info=root.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or info.st_gid!=1001
+                or stat.S_IMODE(info.st_mode)!=0o710):raise FreshnessHold('artifact_provenance_unknown')
+        return [info.st_dev,info.st_ino,info.st_uid,info.st_gid,info.st_mode]
+
+    @classmethod
+    def _root(cls,target,record):
+        if (type(record) is not dict or set(record)!={'name','identity'} or type(record['name']) is not str
+                or re.fullmatch(r'\.cargo-execution-[0-9a-f-]{36}',record['name']) is None
+                or not cache._uuid(record['name'][len('.cargo-execution-'):])):raise FreshnessHold('metadata_torn')
+        root=unit_views.literal(target/record['name'])
+        if cls._identity(root)!=record['identity']:raise FreshnessHold('artifact_provenance_unknown')
+        return root
+
+    @classmethod
+    def _snapshot(cls,root,binding,command):
+        if (root/'invalidations').exists() or (root/'invalidations').is_symlink():raise FreshnessHold('input_census_unknown')
+        commands=sorted((path for path in root.iterdir() if re.fullmatch(r'command-[0-9]+',path.name)),key=lambda p:int(p.name[8:]))
+        if len(commands)>1024 or [path.name for path in commands]!=['command-'+str(i) for i in range(len(commands))]:
+            raise FreshnessHold('metadata_torn')
+        return {'command':command,'store_sha256':PublicationStore.checkpoint(root/'publications',binding=binding,command=command),
+            'planner':planner_snapshot(root/'planner-target',owner=1001),'home':planner_snapshot(root/'home',owner=1001),
+            'cargo_home':planner_snapshot(root/'cargo-home',owner=1001),
+            'commands':[planner_snapshot(path,owner=os.geteuid()) for path in commands]}
+
+    @classmethod
+    def _verify_executor(cls,target,binding,record,checkpoint):
+        root=cls._root(target,record)
+        if (type(checkpoint) is not dict or not cache._uuid(checkpoint.get('command'))
+                or cache._read_record(root/'control.json')!={'version':1,'kind':'cargo-execution','binding':binding,
+                    'command':checkpoint['command'],'shipping_authority':False,'state':'closed'}
+                or cls._snapshot(root,binding,checkpoint['command'])!=checkpoint):raise FreshnessHold('artifact_provenance_unknown')
+        return root
+
+    def retained(self):
+        value=self._active(require_scope=True)
+        if value['root'] is None:return None,None
+        return self._verify_executor(self.target,self.binding,value['root'],value['checkpoint']),value['checkpoint']
+
+    def created(self,root):
+        value=self._active(require_scope=True)
+        if value['root'] is not None:raise FreshnessHold('cleanup_uncertain')
+        value['root']={'name':root.name,'identity':self._identity(root)}
+        # A root without a completed checkpoint is valid only in this active
+        # claim; another command cannot adopt it after a partial execution.
+        value['checkpoint']={'command':self.command,'creating':True}
+        cache._write_record(self.path,value)
+
+    def finish(self,scope,stopped):
+        value=self._active(require_scope=True)
+        if (self.scope is not scope or not stopped.matches(scope) or not scope.closed
+                or value['scope']!={'id':scope.directory.name.removeprefix('worker-'),'receipt':str(scope.receipt),'cleanup_sha256':None}):
+            raise FreshnessHold('cleanup_uncertain')
+        original_cargo_cleanup(scope.receipt,owner=os.geteuid())
+        if value['root'] is not None:
+            root=self._root(self.target,value['root']);control=cache._read_record(root/'control.json')
+            expected={'version':1,'kind':'cargo-execution','binding':self.binding,'command':self.command,'shipping_authority':False,'state':'active'}
+            if control==expected:
+                checkpoint=self._snapshot(root,self.binding,self.command)
+                cache._write_record(root/'control.json',expected|{'state':'closed'});value['checkpoint']=checkpoint
+            else:self._verify_executor(self.target,self.binding,value['root'],value['checkpoint'])
+        value['scope']['cleanup_sha256']=self.cleanup_digest();value['phase']='closed'
+        cache._write_record(self.path,value)
+        return {'version':1,'kind':'ci-cargo-execution-checkpoint','binding':self.binding,'command':self.command,
+            'claim':self.claim,'predecessor':value['predecessor'],'scope_id':value['scope']['id'],
+            'retained_executor':value['root'] is not None,'input_closure_complete':False,'shipping_authority':False}
 
 
 class CargoGraph:
@@ -1138,7 +1436,7 @@ class WorkerRelay(RootRelay):
         invocation=validate_invocation(['/toolchain/bin/cargo',*[os.fsdecode(arg) for arg in argv[1:]]],
             {os.fsdecode(key):os.fsdecode(value) for key,value in environment.items()},os.fsdecode(cwd))
         if self.executor is None:
-            self.executor=_CargoExecutor(self.planner_relay.admission);self.planner_relay.views=self.executor
+            self.executor=_CargoExecutor(self.planner_relay.admission,execution_lease=self.value.get('execution_lease'));self.planner_relay.views=self.executor
             self.executor.preparing_graph=True
             try:status,metadata,error=self.executor._command(dict(self.value,original_invocation=invocation),
                 self.planner_relay,operation='metadata')
@@ -1470,24 +1768,37 @@ def capture_command(child,deadline,*,limit=8*1024**2):
 
 class _CargoExecutor:
     """Graph-backed execution; incomplete input closure grants no reuse/CI proof."""
-    def __init__(self,admission,*,diagnostic=False):
+    def __init__(self,admission,*,diagnostic=False,execution_lease=None):
         if (type(admission) is not _Admission or admission.token is not _TOKEN
                 or admission.owner!=os.getpid() or os.getresuid()!=(0,0,0)):
             raise FreshnessHold('invalidation_unsafe')
         _source(admission.target,admission.binding,admission.command)
         self.admission=admission;self.owner=os.getpid();self.units={};self.commands=[]
-        self.graph=None;self.preparing_graph=False
-        self.source=admission.target.parent/'source-projection'
-        self.root=admission.target/('.cargo-execution-'+str(uuid.uuid4()));self.root.mkdir(mode=0o710)
-        os.chown(self.root,0,1001)
+        self.graph=None;self.preparing_graph=False;self.source=admission.target.parent/'source-projection'
+        lease=ExecutionLease.attach(execution_lease) if execution_lease is not None else None
+        retained,checkpoint=lease.retained() if lease is not None else (None,None)
         self.control={'version':1,'kind':'cargo-execution','binding':admission.binding,
             'command':admission.command,'shipping_authority':False}
-        cache._write_record(self.root/'control.json',{**self.control,'state':'active'})
-        self.store=PublicationStore(self.root/'publications',binding=admission.binding,command=admission.command,
-            unit_root=admission.root/'units',allow_diagnostic=diagnostic)
+        if retained is None:
+            self.root=admission.target/('.cargo-execution-'+str(uuid.uuid4()));self.root.mkdir(mode=0o710)
+            os.chown(self.root,0,1001)
+            cache._write_record(self.root/'control.json',{**self.control,'state':'active'})
+            self.store=PublicationStore(self.root/'publications',binding=admission.binding,command=admission.command,
+                unit_root=admission.root/'units',allow_diagnostic=diagnostic)
+            for name in ('planner-target','home','cargo-home'):
+                path=self.root/name;path.mkdir(mode=0o700);os.chown(path,1001,1001)
+            self.next_command=0
+            if lease is not None:lease.created(self.root)
+        else:
+            if diagnostic:raise FreshnessHold('invalidation_unsafe')
+            self.root=retained
+            self.store=PublicationStore.recover(self.root/'publications',binding=admission.binding,command=admission.command,
+                predecessor=checkpoint['command'],unit_root=admission.root/'units',expected_sha256=checkpoint['store_sha256'])
+            self.next_command=len(checkpoint['commands'])
+            cache._write_record(self.root/'control.json',{**self.control,'state':'active'})
         self.target=self.root/'planner-target'
-        for name in ('planner-target','home','cargo-home'):
-            path=self.root/name;path.mkdir(mode=0o700);os.chown(path,1001,1001)
+        self.slot_root=self.root if diagnostic else self.root/('views-'+admission.command)
+        if not diagnostic:self.slot_root.mkdir(mode=0o700)
 
 
     @property
@@ -1593,7 +1904,7 @@ class _CargoExecutor:
         admission=mapped.get('cargo_target')
         if self.preparing_graph:
             if mapped['kind']!='information':raise cargo_hold('planner_cargo_request')
-        slot=self.root/('unit-'+str(ordinal));slot.mkdir(mode=0o700)
+        slot=self.slot_root/('unit-'+str(ordinal));slot.mkdir(mode=0o700)
         unit=2000+ordinal;artifacts=slot/'artifacts';artifacts.mkdir(mode=0o700);os.chown(artifacts,unit,unit)
         for name in ('debug','debug/deps'):
             path=artifacts/name;path.mkdir(mode=0o700);os.chown(path,unit,unit)
@@ -1694,7 +2005,9 @@ class _CargoExecutor:
         global _PHASE,_CHILD_DIAGNOSTIC
         _PHASE='planner_cargo_supervisor'
         if self.owner!=os.getpid() or len(self.commands)>=4 or operation not in ('run','metadata','original'):raise FreshnessHold('invalidation_unsafe')
-        invocation=len(self.commands);directory=self.root/('command-'+str(invocation));directory.mkdir(mode=0o700)
+        invocation=self.next_command
+        if invocation>=1000:raise FreshnessHold('input_census_unknown')
+        self.next_command+=1;directory=self.root/('command-'+str(invocation));directory.mkdir(mode=0o700)
         control={'version':1,'binding':self.admission.binding,'command':self.admission.command,
             'invocation':invocation,'operation':operation}
         cache._write_record(directory/'control.json',control)
@@ -2452,7 +2765,7 @@ def _execute(arguments):
     admission=admit(value['target'],value['binding'],value['command'],value['root'])
     outputs=[];errors=[];receipts=[];exit_code=0
     with RootRelay(admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic()))) as relay:
-        executor=_CargoExecutor(admission);relay.views=executor
+        executor=_CargoExecutor(admission,execution_lease=value.get('execution_lease'));relay.views=executor
         first=validate_invocation(commands[0],environment,cwd)
         context=dict(value,original_invocation=first)
         executor.preparing_graph=True
@@ -2557,9 +2870,19 @@ def _execution_supervisor(arguments):
         forward_fds=(child,),close_after_spawn=(child,))
 
 
-def validate_repository_execution(value,binding,command,workers,scope):
+def validate_checkpoint(value,binding,command,predecessor,scope):
+    if (type(value) is not dict or set(value)!={'version','kind','binding','command','claim','predecessor','scope_id','retained_executor','input_closure_complete','shipping_authority'}
+            or type(value['version']) is not int or value['version']!=1 or value['kind']!='ci-cargo-execution-checkpoint'
+            or value['binding']!=binding or value['command']!=command or value['predecessor']!=predecessor
+            or not cache._uuid(value['claim']) or value['scope_id']!=scope['scope_id']
+            or type(value['retained_executor']) is not bool or value['input_closure_complete'] is not False
+            or value['shipping_authority'] is not False):raise FreshnessHold('cleanup_uncertain')
+    return value
+
+
+def validate_repository_execution(value,binding,command,workers,scope,predecessor=None):
     try:
-        keys={'version','kind','binding','command','worker_units','cargo_commands','original_worker_cleanup',
+        keys={'version','kind','binding','command','checkpoint','worker_units','cargo_commands','original_worker_cleanup',
             'input_closure_complete','full_ci','shipping_authority','guest_worker_quiescence'}
         if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
                 or value['kind']!='ci-repository-execution' or value['binding']!=binding or value['command']!=command
@@ -2568,6 +2891,7 @@ def validate_repository_execution(value,binding,command,workers,scope):
                 or value['guest_worker_quiescence']!=scope or scope not in workers['scopes']
                 or type(value['worker_units']) is not list or len(value['worker_units'])>4096
                 or type(value['cargo_commands']) is not list or len(value['cargo_commands'])>4096):raise ValueError()
+        validate_checkpoint(value['checkpoint'],binding,command,predecessor,scope)
         units={};cargo=set()
         for unit in value['worker_units']:
             ordinal=unit['ordinal']
@@ -2592,9 +2916,9 @@ def validate_repository_execution(value,binding,command,workers,scope):
     except (ValueError,TypeError,KeyError):raise FreshnessHold('input_census_unknown') from None
 
 
-def validate_execution(value,binding,command,commands,workers,scope,exit_code):
+def validate_execution(value,binding,command,commands,workers,scope,exit_code,predecessor=None):
     try:
-        keys={'version','kind','binding','command','commands','metadata_sha256','original_metadata_cleanup',
+        keys={'version','kind','binding','command','checkpoint','commands','metadata_sha256','original_metadata_cleanup',
             'input_closure_complete','full_ci','shipping_authority','guest_worker_quiescence'}
         if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
                 or value['kind']!='ci-cargo-execution' or value['binding']!=binding or value['command']!=command
@@ -2603,6 +2927,7 @@ def validate_execution(value,binding,command,commands,workers,scope,exit_code):
                 or value['guest_worker_quiescence']!=scope or scope not in workers['scopes']
                 or type(value['commands']) is not list or not 1<=len(value['commands'])<=len(commands)):
             raise ValueError()
+        validate_checkpoint(value['checkpoint'],binding,command,predecessor,scope)
         ordinals=set()
         for index,item in enumerate(value['commands']):
             if (type(item) is not dict or set(item)!={'argv','context_sha256','exit_code','original_cargo_cleanup','compiler_calls','units'}

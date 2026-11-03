@@ -24,6 +24,89 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def test_store_recovery_refuses_generated_namespaces_without_durable_selector_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);units=root/'units';units.mkdir(mode=0o700)
+            binding=self.publication_binding();command=str(uuid.uuid4())
+            store=planner.PublicationStore(root/'store',binding=binding,command=command,unit_root=units)
+            identity,publication=self.stored_publication(store)
+            scope=units/str(uuid.uuid4());scope.mkdir(mode=0o700)
+            (scope/'cleanup').write_bytes(b'all-descendants-reaped\n');(scope/'cleanup').chmod(0o600)
+            planner.cache._write_record(scope/'exit-status.json',{'version':3,'binding':binding,'command':command,
+                'ordinal':1,'returncode':0,'exec_observed':True})
+            store.publish(identity,publication,scope=scope,ordinal=1)
+            expected=planner.PublicationStore.checkpoint(store.root,binding=binding,command=command)
+            before=store.state()
+            with self.assertRaises(planner.FreshnessHold):planner.PublicationStore.recover(store.root,binding=binding,
+                command=str(uuid.uuid4()),predecessor=command,unit_root=units,expected_sha256=expected)
+            self.assertEqual(store.state(),before)
+            self.assertTrue(publication['root'].exists())
+
+    def test_execution_claim_requires_its_original_stopped_scope_and_exact_predecessor(self):
+        workers=planner._load('checkpoint_test_workers','ci-worker-scope.py')
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);generation=root/'generation';generation.mkdir(mode=0o711);target=generation/'target';target.mkdir()
+            control=root/'control';control.mkdir(mode=0o700);binding=self.publication_binding()
+            first=str(uuid.uuid4());second=str(uuid.uuid4())
+            with patch.object(planner,'_source',return_value=target):
+                lease=planner.ExecutionLease(target,binding,first,None)
+                with self.assertRaises(planner.FreshnessHold):planner.ExecutionLease(target,binding,second,first)
+                scope=workers.WorkerScope(control,os.getuid(),os.getgid(),['/usr/bin/true']);lease.bind_scope(scope)
+                process=subprocess.Popen(scope.argv);scope.attach(process);process.wait(timeout=5);stopped=scope.verify()
+                other=workers.WorkerScope(control,os.getuid(),os.getgid(),['/usr/bin/true'])
+                with self.assertRaises(planner.FreshnessHold):lease.finish(other,stopped)
+                receipt=lease.finish(scope,stopped)
+                self.assertEqual(receipt['scope_id'],stopped.observation()['scope_id'])
+                self.assertFalse(receipt['retained_executor'])
+                with self.assertRaises(planner.FreshnessHold):planner.ExecutionLease(target,binding,second,None)
+                with self.assertRaises(planner.FreshnessHold):planner.ExecutionLease(target,binding,second,str(uuid.uuid4()))
+                resumed=planner.ExecutionLease(target,binding,second,first)
+                self.assertNotEqual(lease.handle()['claim'],resumed.handle()['claim'])
+                with self.assertRaises(planner.FreshnessHold):planner.ExecutionLease.attach(lease.handle())
+
+    def test_planner_snapshot_preserves_internal_aliases_and_rejects_external_aliases_or_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);target=root/'target';target.mkdir(mode=0o700)
+            (target/'deps').mkdir();artifact=target/'deps/artifact';artifact.write_bytes(b'compiled')
+            os.link(artifact,target/'artifact')
+            first=planner.planner_snapshot(target,owner=os.getuid())
+            self.assertEqual(first,planner.planner_snapshot(target,owner=os.getuid()))
+            artifact.write_bytes(b'changed!')
+            self.assertNotEqual(first,planner.planner_snapshot(target,owner=os.getuid()))
+            os.link(artifact,root/'outside')
+            with self.assertRaises(planner.FreshnessHold):planner.planner_snapshot(target,owner=os.getuid())
+
+    def test_store_recovery_keeps_original_producer_evidence_and_refuses_incomplete_or_selector_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);units=root/'units';units.mkdir(mode=0o700)
+            binding=self.publication_binding();command=str(uuid.uuid4());following=str(uuid.uuid4())
+            store=planner.PublicationStore(root/'store',binding=binding,command=command,unit_root=units)
+            identity,output=store.allocate();(output/'debug/deps').mkdir(parents=True)
+            (output/'debug/deps/libpkg.rlib').write_bytes(b'artifact')
+            for path in output.rglob('*'):path.chmod(0o555 if path.is_dir() else 0o444)
+            output.chmod(0o555)
+            publication={'root':output,'manifest':planner.unit_views.inventory(output,owner=os.getuid(),sealed=True),
+                'files':['debug/deps/libpkg.rlib'],'roots':[],'action':'library','generated_root':None,
+                'cargo_target':{'package_id':'pkg','target_name':'pkg','target_kind':['lib'],'manifest_path':'/workspace/Cargo.toml','source_path':'/workspace/src/lib.rs'}}
+            scope=units/str(uuid.uuid4());scope.mkdir(mode=0o700)
+            (scope/'cleanup').write_bytes(b'all-descendants-reaped\n');(scope/'cleanup').chmod(0o600)
+            planner.cache._write_record(scope/'exit-status.json',{'version':3,'binding':binding,'command':command,
+                'ordinal':1,'returncode':0,'exec_observed':True})
+            store.publish(identity,publication,scope=scope,ordinal=1)
+            digest=planner.PublicationStore.checkpoint(store.root,binding=binding,command=command)
+            reopened=planner.PublicationStore.recover(store.root,binding=binding,command=following,
+                predecessor=command,unit_root=units,expected_sha256=digest)
+            self.assertEqual(reopened.history_commands(),[command])
+            self.assertEqual(reopened.record(identity)['manifest'],publication['manifest'])
+            record=planner.cache._read_record(store.root/'records'/(identity+'.json'),max_bytes=store.LIMIT)
+            self.assertEqual(record['command'],command)
+            self.assertEqual(record['evidence']['status']['command'],command)
+            self.assertFalse(reopened.state()['shipping_authority'])
+            with self.assertRaises(planner.FreshnessHold):planner.PublicationStore.recover(store.root,binding=binding,
+                command=str(uuid.uuid4()),predecessor=command,unit_root=units,expected_sha256=digest)
+            reopened.allocate()
+            with self.assertRaises(planner.FreshnessHold):planner.PublicationStore.checkpoint(store.root,binding=binding,command=following)
+
     def test_worker_message_credentials_refuse_a_transferred_connected_socket(self):
         for transferred in (False,True):
             with self.subTest(transferred=transferred):
