@@ -135,9 +135,9 @@ class AdapterTests(unittest.TestCase):
       side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
      with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=execute)
  def execution_checkpoint(self,generation,scope):
-  return {'version':1,'kind':'ci-cargo-execution-checkpoint','binding':generation['binding'],'command':generation['command'],
+  return {'version':2,'kind':'ci-cargo-execution-checkpoint','binding':generation['binding'],'command':generation['command'],
    'claim':str(uuid.uuid4()),'predecessor':generation['predecessor'],'scope_id':scope['scope_id'],
-   'retained_executor':True,'input_closure_complete':False,'shipping_authority':False}
+   'retained_executor':True,'completion_sha256':'5'*64,'generated_forests':[],'input_closure_complete':False,'shipping_authority':False}
  def prepared_result(self,options,**result):
   result.setdefault('seed_reclaimed',[])
   generation=options['ci_context']['generation']

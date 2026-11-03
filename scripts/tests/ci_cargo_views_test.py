@@ -14,6 +14,21 @@ views=importlib.util.module_from_spec(spec);spec.loader.exec_module(views)
 
 
 class UnitViewTests(unittest.TestCase):
+    def test_workspace_generated_mounts_are_readonly_exact_and_cannot_overlap_target_or_tracked_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/'sealed';self.tree(source)
+            workspace=root/'workspace';workspace.mkdir();(workspace/'node_modules').mkdir()
+            raw=b'node_modules'.hex();manifest=views.inventory(source,owner=os.getuid(),sealed=True)
+            binding=[raw,str(source),[raw,'tree',manifest]]
+            with patch.object(views,'_readonly') as mount:
+                views.source_mounts(workspace,[binding],{'node_modules':'directory'},owner=os.getuid())
+                mount.assert_called_once_with(source,workspace/'node_modules')
+            for name in ('target','.git','src','node_modules/child','../outside'):
+                bad=[name.encode().hex(),str(source),[name.encode().hex(),'tree',manifest]]
+                with self.subTest(name=name),patch.object(views,'_readonly') as mount,self.assertRaises(views.FreshnessHold):
+                    views.source_mounts(workspace,[bad],{'node_modules':'directory'},owner=os.getuid())
+                mount.assert_not_called()
+
     def test_tree_input_mount_requires_the_exact_sealed_directory_inventory(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);source=root/'sealed';self.tree(source)

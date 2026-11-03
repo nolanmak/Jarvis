@@ -207,6 +207,23 @@ def input_mount(source,destination,raw,expected,*,owner=0):
     _readonly(source,destination)
 
 
+def source_mounts(workspace,bindings,declared,*,owner=0):
+    """Readonly generated inputs, confined to controller-declared placeholders."""
+    workspace=literal(workspace);cache.validate_outputs(declared)
+    if type(bindings) is not list or len(bindings)>64:raise FreshnessHold('input_census_unknown')
+    seen=set()
+    for binding in bindings:
+        if type(binding) is not list or len(binding)!=3:raise FreshnessHold('input_census_unknown')
+        raw,original,expected=binding
+        try:name=relative(bytes.fromhex(raw));key=os.fsdecode(name)
+        except (ValueError,TypeError):raise FreshnessHold('input_census_unknown') from None
+        if (key not in declared or key in seen or name.parts[0] in ('target','.git')
+                or type(expected) is not list or len(expected)<2
+                or (expected[1]=='tree')!=(declared[key]=='directory')):raise FreshnessHold('input_census_unknown')
+        seen.add(key);destination=literal(workspace/name)
+        input_mount(original,destination,raw,expected,owner=owner)
+
+
 def toolchain_view(source,destination):
     """Expose pinned runtime children without chmod on the private source root.
 
@@ -225,14 +242,14 @@ def toolchain_view(source,destination):
     destination.chmod(0o555)
 
 
-def enter(root,unit,source,artifacts,bindings=()):
+def enter(root,unit,source,artifacts,bindings=(),source_bindings=None,declared_outputs=None):
     phase=['planner_view_enter']
-    try:return _enter(root,unit,source,artifacts,bindings,phase)
+    try:return _enter(root,unit,source,artifacts,bindings,phase,source_bindings,declared_outputs)
     except BaseException as error:
         error.unit_view_stage=phase[0];raise
 
 
-def _enter(root,unit,source,artifacts,bindings,phase):
+def _enter(root,unit,source,artifacts,bindings,phase,source_bindings=None,declared_outputs=None):
     """Root-only entry from a sealed admitted unit bootstrap, before UID drop.
 
     The caller supplies controller-owned paths, not candidate mount arguments.
@@ -282,6 +299,7 @@ def _enter(root,unit,source,artifacts,bindings,phase):
         original=literal(original)
         destination=root/'workspace/target'/name
         input_mount(original,destination,raw,expected)
+    source_mounts(root/'workspace',[] if source_bindings is None else source_bindings,{} if declared_outputs is None else declared_outputs)
     phase[0]='planner_view_proc'
     _mount('-t','proc','-o','ro,nosuid,nodev,noexec,hidepid=2','proc',root/'proc')
     phase[0]='planner_view_devices'

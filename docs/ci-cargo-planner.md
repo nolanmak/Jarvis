@@ -1410,3 +1410,29 @@ ownership/continuation mechanism is not a complete-input or passing-CI
 capability. Generated namespaces/selectors, frozen generated forests, opaque
 counter-wrapper execution and the original in-command regression remain open.
 Production activation remains disabled.
+
+Declared generated forests now have a separate controller-owned immutable store.
+A successful non-Cargo repository step publishes only after its original worker
+scope and input observation have closed. Its record binds the original command,
+claim, scope, declared namespaces, public metadata and sealed tree. A durable
+completed-command ledger preserves that producer evidence across later claims.
+Failed steps cannot publish new generated-input authority. Unchanged forests
+retain the original producer; changed forests receive a new identity without
+altering previous snapshots or their original file timestamps.
+
+The actual Cargo namespace and compiler/application views receive read-only
+binds of those exact sealed roots. A private manifest path carries the large
+inventory outside the bounded sealed bootstrap. Recovered planner metadata also
+binds the forest references it compiled against. Until persistent selector
+revalidation is implemented, a changed forest refuses that retained compiled
+state rather than running stale outputs or replacing the executor with a cold
+one. This is an intermediate execution mechanism, not completed D8 or complete
+input/provenance compatibility.
+
+The new opt-in `live_shared_ci_generated_forest_execution` case exercises a
+completed seed, real build/unchanged build/test, cross-VM unchanged reuse, a new
+same-mtime producer and a typed hold before incompatible reuse. The existing
+repository recovery and original in-command generated-publication tests retain
+their criteria. Native results for the new case are pending; production modes
+remain disabled, and opaque wrapper execution, selector recovery, full input
+closure and the final passing-CI/merge enforcement remain unfinished.

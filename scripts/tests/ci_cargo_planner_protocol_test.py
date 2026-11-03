@@ -24,6 +24,91 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def test_failed_generated_producer_cannot_publish_new_input_authority(self):
+        workers=planner._load('failed_forest_workers','ci-worker-scope.py')
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);generation=root/'generation';generation.mkdir(mode=0o711)
+            target=generation/'target';target.mkdir();control=root/'control';control.mkdir(mode=0o700)
+            workspace=root/'workspace';workspace.mkdir();(workspace/'dist').mkdir()
+            (workspace/'dist/partial').write_bytes(b'failed producer output')
+            command=str(uuid.uuid4());binding=self.publication_binding()
+            with patch.object(planner,'_source',return_value=target),patch.object(planner.GeneratedForests,'WORKSPACE',workspace):
+                lease=planner.ExecutionLease(target,binding,command,None)
+                scope=workers.WorkerScope(control,os.getuid(),os.getgid(),['/usr/bin/false']);lease.bind_scope(scope)
+                process=subprocess.Popen(scope.argv);scope.attach(process);self.assertEqual(process.wait(timeout=5),1)
+                stopped=scope.verify()
+                with self.assertRaises(planner.FreshnessHold):
+                    lease.finish(scope,stopped,outputs={'dist':'directory'},producer_succeeded=False)
+                self.assertFalse((generation/'completed-ci-commands'/(command+'.json')).exists())
+                self.assertEqual(planner.cache._read_record(lease.path)['phase'],'active')
+
+    def test_generated_forests_require_completed_original_scope_and_keep_sealed_inputs(self):
+        workers=planner._load('forest_test_workers','ci-worker-scope.py')
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);generation=root/'generation';generation.mkdir(mode=0o711)
+            target=generation/'target';target.mkdir();control=root/'control';control.mkdir(mode=0o700)
+            workspace=root/'workspace';workspace.mkdir();generated=workspace/'node_modules';generated.mkdir()
+            artifact=generated/'module.rs';artifact.write_text('pub const VALUE: u8 = 7;\n')
+            os.utime(artifact,ns=(946684800000000000,946684800000000000))
+            binding=self.publication_binding();first=str(uuid.uuid4());second=str(uuid.uuid4())
+            outputs={'node_modules':'directory'}
+            with patch.object(planner,'_source',return_value=target),patch.object(planner.GeneratedForests,'WORKSPACE',workspace):
+                lease=planner.ExecutionLease(target,binding,first,None)
+                scope=workers.WorkerScope(control,os.getuid(),os.getgid(),['/usr/bin/true']);lease.bind_scope(scope)
+                with self.assertRaises(planner.FreshnessHold):lease.generated_inputs(outputs)
+                process=subprocess.Popen(scope.argv);scope.attach(process);process.wait(timeout=5);stopped=scope.verify()
+                checkpoint=lease.finish(scope,stopped,outputs=outputs)
+                refs=checkpoint['generated_forests'];self.assertEqual(len(refs),1)
+                resumed=planner.ExecutionLease(target,binding,second,first)
+                following=workers.WorkerScope(control,os.getuid(),os.getgid(),['/usr/bin/true']);resumed.bind_scope(following)
+                mounts,recovered=planner.GeneratedForests(resumed,outputs).load(refs)
+                sealed=Path(mounts[0][1])/'module.rs'
+                self.assertEqual(sealed.read_bytes(),artifact.read_bytes())
+                self.assertEqual(sealed.stat().st_mtime_ns,artifact.stat().st_mtime_ns)
+                self.assertEqual(sealed.stat().st_mode&0o777,0o444)
+                self.assertEqual(recovered['command'],first)
+                self.assertEqual(recovered['scope_id'],stopped.observation()['scope_id'])
+                self.assertFalse(recovered['shipping_authority'])
+                original=sealed.read_bytes();mtime=artifact.stat().st_mtime_ns
+                artifact.write_text('pub const VALUE: u8 = 9;\n');os.utime(artifact,ns=(mtime,mtime))
+                with self.assertRaises(planner.FreshnessHold):resumed.generated_inputs(outputs)
+                self.assertEqual(sealed.read_bytes(),original)
+                # A valid byte snapshot cannot borrow another step's completed scope.
+                archive=generation/'completed-ci-commands'/(first+'.json')
+                saved=planner.cache._read_record(archive);changed=copy.deepcopy(saved)
+                changed['scope']['id']=str(uuid.uuid4());planner.cache._write_record(archive,changed)
+                with self.assertRaises(planner.FreshnessHold):planner.GeneratedForests(resumed,outputs).load(refs,require_public=False)
+                planner.cache._write_record(archive,saved)
+                # Original cleanup still applies to the second claim.
+                process=subprocess.Popen(following.argv);following.attach(process);process.wait(timeout=5);stopped=following.verify()
+                with self.assertRaises(planner.FreshnessHold):resumed.finish(following,stopped,outputs=outputs,invoked_cargo=True)
+
+    def test_generated_forest_reuse_keeps_producer_and_new_completed_steps_publish_new_identity(self):
+        workers=planner._load('forest_sequence_workers','ci-worker-scope.py')
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);generation=root/'generation';generation.mkdir(mode=0o711)
+            target=generation/'target';target.mkdir();control=root/'control';control.mkdir(mode=0o700)
+            workspace=root/'workspace';workspace.mkdir();(workspace/'dist').mkdir()
+            artifact=workspace/'dist/output';artifact.write_bytes(b'first')
+            outputs={'dist':'directory'};binding=self.publication_binding();previous=None;checkpoints=[]
+            with patch.object(planner,'_source',return_value=target),patch.object(planner.GeneratedForests,'WORKSPACE',workspace):
+                for index in range(3):
+                    command=str(uuid.uuid4());lease=planner.ExecutionLease(target,binding,command,previous)
+                    scope=workers.WorkerScope(control,os.getuid(),os.getgid(),['/usr/bin/true']);lease.bind_scope(scope)
+                    if index==2:
+                        original=artifact.stat();artifact.write_bytes(b'other')
+                        os.utime(artifact,ns=(original.st_atime_ns,original.st_mtime_ns))
+                    process=subprocess.Popen(scope.argv);scope.attach(process);process.wait(timeout=5);stopped=scope.verify()
+                    checkpoints.append(lease.finish(scope,stopped,outputs=outputs));previous=command
+                first,unchanged,changed=[item['generated_forests'] for item in checkpoints]
+                self.assertEqual(first,unchanged);self.assertNotEqual(first,changed)
+                forests=planner.GeneratedForests(lease,outputs)
+                old_mounts,old_record=forests.load(first,require_public=False)
+                new_mounts,new_record=forests.load(changed)
+                self.assertEqual((Path(old_mounts[0][1])/'output').read_bytes(),b'first')
+                self.assertEqual((Path(new_mounts[0][1])/'output').read_bytes(),b'other')
+                self.assertNotEqual(old_record['command'],new_record['command'])
+
     def test_store_recovery_refuses_generated_namespaces_without_durable_selector_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);units=root/'units';units.mkdir(mode=0o700)

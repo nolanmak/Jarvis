@@ -298,7 +298,7 @@ def run_cargo_commands(commands,input_roots):
         'target':str(private_cache/'ci-source-generations'/generation['binding']['generation']/'target'),
         'binding':generation['binding'],'command':generation['command'],'root':str(root),
         'library':'/ci-tools/ci-cargo-planner.so','deadline':time.monotonic()+900,
-        'commands':commands,'environment':dict(environment),'cwd':'/workspace','execution_lease':lease.handle()})
+        'commands':commands,'environment':dict(environment),'cwd':'/workspace','execution_lease':lease.handle(),'generated_outputs':generation['outputs']})
     lease.bind_scope(scope)
     journal=ci_inputs.ChangeJournal(input_roots,scope=scope)
     try:
@@ -314,7 +314,7 @@ def run_cargo_commands(commands,input_roots):
                 or any(type(result[key]) is not str for key in ('stdout','stderr'))):raise ValueError()
         result['cargo_execution']['guest_worker_quiescence']=stopped.observation()
     except (ValueError,KeyError,TypeError):raise ci_cache['FreshnessHold']('input_census_unknown') from None
-    result['cargo_execution']['checkpoint']=lease.finish(scope,stopped)
+    result['cargo_execution']['checkpoint']=lease.finish(scope,stopped,outputs=generation['outputs'],invoked_cargo=True)
     result['input_write_observation']=writes
     return result
 
@@ -326,7 +326,7 @@ def run_repository_command(argv,input_roots):
         'target':str(private_cache/'ci-source-generations'/generation['binding']['generation']/'target'),
         'binding':generation['binding'],'command':generation['command'],'root':str(root),
         'library':'/ci-tools/ci-cargo-planner.so','deadline':time.monotonic()+900,
-        'argv':argv,'environment':dict(environment),'cwd':'/workspace','execution_lease':lease.handle()})
+        'argv':argv,'environment':dict(environment),'cwd':'/workspace','execution_lease':lease.handle(),'generated_outputs':generation['outputs']})
     lease.bind_scope(scope)
     journal=ci_inputs.ChangeJournal(input_roots,scope=scope)
     try:
@@ -341,7 +341,8 @@ def run_repository_command(argv,input_roots):
                 or any(type(result[key]) is not str for key in ('stdout','stderr'))):raise ValueError()
         result['repository_execution']['guest_worker_quiescence']=stopped.observation()
     except (ValueError,KeyError,TypeError):raise ci_cache['FreshnessHold']('input_census_unknown') from None
-    result['repository_execution']['checkpoint']=lease.finish(scope,stopped)
+    result['repository_execution']['checkpoint']=lease.finish(scope,stopped,outputs=generation['outputs'],
+        invoked_cargo=bool(result['repository_execution']['cargo_commands']),producer_succeeded=result['exit_code']==0)
     result['input_write_observation']=writes
     return result
 

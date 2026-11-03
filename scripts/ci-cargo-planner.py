@@ -676,6 +676,110 @@ class PublicationStore:
             return publications,files
 
 
+class GeneratedForests:
+    """Immutable declared generated roots from an original completed step.
+
+    These records establish snapshot provenance, not complete compiler input or
+    artifact compatibility. Active producer changes remain refused at consume.
+    """
+    WORKSPACE=Path('/workspace')
+
+    def __init__(self,lease,outputs):
+        cache.validate_outputs(outputs);self.lease=lease;self.outputs=dict(outputs)
+        self.root=lease.target.parent/'generated-forests'
+        if self.root.exists() or self.root.is_symlink():
+            info=self.root.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or stat.S_IMODE(info.st_mode)!=0o700:
+                raise FreshnessHold('artifact_provenance_unknown')
+        else:self.root.mkdir(mode=0o700)
+        for name in ('objects','records'):
+            path=self.root/name
+            if not path.exists():path.mkdir(mode=0o700)
+            info=path.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or stat.S_IMODE(info.st_mode)!=0o700:
+                raise FreshnessHold('artifact_provenance_unknown')
+
+    def public(self):
+        result={}
+        for name,kind in sorted(self.outputs.items()):
+            path=unit_views.literal(self.WORKSPACE/name)
+            if kind=='directory':result[name]=planner_snapshot(path,owner=1000)
+            else:
+                mode,size,digest=unit_views._read(path,1000,False)
+                result[name]={'sha256':hashlib.sha256(json.dumps([list(unit_views._key(path.stat())),digest],separators=(',',':')).encode()).hexdigest(),
+                    'entries':1,'bytes':size}
+        return result
+
+    def load(self,refs,*,require_public=True):
+        if type(refs) is not list or len(refs)>1:raise FreshnessHold('metadata_torn')
+        if not refs:
+            # Initial controller-created empty placeholders have no generated
+            # producer authority and are already present in the source view.
+            for name,kind in self.outputs.items():
+                path=self.WORKSPACE/name
+                if kind=='directory':
+                    fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NOATIME)
+                    try:nonempty=bool(os.listdir(fd))
+                    finally:os.close(fd)
+                else:nonempty=path.stat().st_size!=0
+                if nonempty:raise FreshnessHold('artifact_provenance_unknown')
+            return [],None
+        reference=refs[0]
+        if (type(reference) is not dict or set(reference)!={'producer','sha256'}
+                or not cache._uuid(reference['producer']) or not cache._digest(reference['sha256'])):
+            raise FreshnessHold('metadata_torn')
+        record=cache._read_record(self.root/'records'/(reference['producer']+'.json'),max_bytes=PublicationStore.LIMIT)
+        encoded=json.dumps(record,sort_keys=True,separators=(',',':')).encode()
+        if (hashlib.sha256(encoded).hexdigest()!=reference['sha256']
+                or set(record)!={'version','binding','producer','command','claim','scope_id','outputs','public','manifest','sealed','input_closure_complete','shipping_authority'}
+                or type(record['version']) is not int or record['version']!=1 or record['binding']!=self.lease.binding
+                or record['producer']!=reference['producer'] or record['outputs']!=self.outputs
+                or not cache._uuid(record['command']) or not cache._uuid(record['claim']) or not cache._uuid(record['scope_id'])
+                or record['input_closure_complete'] is not False or record['shipping_authority'] is not False):
+            raise FreshnessHold('artifact_provenance_unknown')
+        completed=self.lease.completed(record['command'])
+        if (reference not in completed['forests'] or completed['claim']!=record['claim']
+                or completed['scope']['id']!=record['scope_id']):raise FreshnessHold('artifact_provenance_unknown')
+        data=unit_views.literal(self.root/'objects'/record['producer'])
+        if (unit_views.inventory(data,owner=os.geteuid(),sealed=True)!=record['manifest']
+                or planner_snapshot(data,owner=os.geteuid())!=record['sealed']
+                or require_public and self.public()!=record['public']):raise FreshnessHold('input_census_unknown')
+        bindings=[]
+        for name,kind in sorted(self.outputs.items()):
+            raw=os.fsencode(name).hex();original=data/name
+            expected=[raw,'tree',unit_views.inventory(original,owner=os.geteuid(),sealed=True)] if kind=='directory' else [raw,'file',*unit_views._read(original,os.geteuid(),True)]
+            bindings.append([raw,str(original),expected])
+        return bindings,record
+
+    def publish(self,scope):
+        if not self.outputs:return []
+        before=self.public();prior=self.lease._active(require_scope=True)['forests']
+        if prior:
+            _bindings,record=self.load(prior,require_public=False)
+            if record['public']==before:return prior
+        identity=str(uuid.uuid4());data=self.root/'objects'/identity;files=[];directories=[];times={}
+        for name,kind in sorted(self.outputs.items()):
+            original=self.WORKSPACE/name
+            if kind=='directory':
+                for row in unit_views.inventory(original,owner=1000,sealed=False):
+                    path=Path(name)/os.fsdecode(bytes.fromhex(row[0]));key=os.fsdecode(path)
+                    (directories if row[1]=='directory' else files).append(key);times[key]=(self.WORKSPACE/path).stat()
+            else:files.append(name);times[name]=original.stat()
+        manifest=unit_views.copy_outputs(self.WORKSPACE,data,files,owner=1000,controller=os.geteuid(),directories=directories)
+        for name,info in sorted(times.items(),key=lambda item:len(Path(item[0]).parts),reverse=True):
+            os.utime(data/name,ns=(info.st_atime_ns,info.st_mtime_ns),follow_symlinks=False)
+        if self.public()!=before:raise FreshnessHold('input_census_unknown')
+        record={'version':1,'binding':self.lease.binding,'producer':identity,'command':self.lease.command,
+            'claim':self.lease.claim,'scope_id':scope.directory.name.removeprefix('worker-'),'outputs':self.outputs,
+            'public':before,'manifest':manifest,'sealed':planner_snapshot(data,owner=os.geteuid()),
+            'input_closure_complete':False,'shipping_authority':False}
+        cache._write_record(self.root/'records'/(identity+'.json'),record)
+        descriptor=os.open(self.root/'objects',os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+        try:os.fsync(descriptor)
+        finally:os.close(descriptor)
+        return [{'producer':identity,'sha256':hashlib.sha256(json.dumps(record,sort_keys=True,separators=(',',':')).encode()).hexdigest()}]
+
+
 class ExecutionLease:
     """Durable ownership handoff across host-acknowledged CI commands.
 
@@ -693,15 +797,16 @@ class ExecutionLease:
             if (prior['phase']!='closed' or predecessor!=prior['command'] or command==predecessor
                     or prior['scope'] is None or prior['scope']['cleanup_sha256']!=self.cleanup_digest()):
                 raise FreshnessHold('cleanup_uncertain')
-            root=prior['root'];checkpoint=prior['checkpoint']
+            self._completed_check(prior)
+            root=prior['root'];checkpoint=prior['checkpoint'];forests=prior['forests']
             if root is not None:self._verify_executor(self.target,binding,root,checkpoint)
         else:
             if predecessor is not None:raise FreshnessHold('cleanup_uncertain')
-            root=None;checkpoint=None
+            root=None;checkpoint=None;forests=[]
         self.claim=str(uuid.uuid4())
-        self._state={'version':1,'binding':self.binding,'command':command,'predecessor':predecessor,
+        self._state={'version':2,'binding':self.binding,'command':command,'predecessor':predecessor,
             'claim':self.claim,'phase':'active','scope':None,'root':root,'checkpoint':checkpoint,
-            'input_closure_complete':False,'shipping_authority':False}
+            'forests':forests,'completion_sha256':None,'input_closure_complete':False,'shipping_authority':False}
         cache._write_record(self.path,self._state)
 
     @staticmethod
@@ -710,10 +815,12 @@ class ExecutionLease:
     @classmethod
     def _read(cls,path,binding):
         value=cache._read_record(path,max_bytes=cls.LIMIT)
-        if (set(value)!={'version','binding','command','predecessor','claim','phase','scope','root','checkpoint','input_closure_complete','shipping_authority'}
-                or type(value['version']) is not int or value['version']!=1 or value['binding']!=binding
+        if (set(value)!={'version','binding','command','predecessor','claim','phase','scope','root','checkpoint','forests','completion_sha256','input_closure_complete','shipping_authority'}
+                or type(value['version']) is not int or value['version']!=2 or value['binding']!=binding
                 or not cache._uuid(value['command']) or not cache._uuid(value['claim'])
                 or value['predecessor'] is not None and not cache._uuid(value['predecessor'])
+                or type(value['forests']) is not list or len(value['forests'])>1
+                or value['completion_sha256'] is not None and not cache._digest(value['completion_sha256'])
                 or value['phase'] not in ('active','closed') or value['input_closure_complete'] is not False
                 or value['shipping_authority'] is not False or (value['root'] is None)!=(value['checkpoint'] is None)):
             raise FreshnessHold('metadata_torn')
@@ -724,17 +831,43 @@ class ExecutionLease:
         return value
 
     def handle(self):
-        return {'version':1,'target':str(self.target),'binding':self.binding,'command':self.command,'claim':self.claim}
+        return {'version':2,'target':str(self.target),'binding':self.binding,'command':self.command,'claim':self.claim}
 
     @classmethod
     def attach(cls,handle):
         if (type(handle) is not dict or set(handle)!={'version','target','binding','command','claim'}
-                or type(handle['version']) is not int or handle['version']!=1 or not cache._uuid(handle['claim'])):
+                or type(handle['version']) is not int or handle['version']!=2 or not cache._uuid(handle['claim'])):
             raise FreshnessHold('metadata_torn')
         lease=object.__new__(cls);lease.target=_source(handle['target'],handle['binding'],handle['command'])
         lease.path=lease.target.parent/'cargo-execution-state.json';lease.binding=copy.deepcopy(handle['binding'])
         lease.command=handle['command'];lease.claim=handle['claim'];lease.owner=os.getpid();lease.scope=None
         lease._active(require_scope=True);return lease
+
+    def completed(self,command):
+        if not cache._uuid(command):raise FreshnessHold('metadata_torn')
+        record=cache._read_record(self.target.parent/'completed-ci-commands'/(command+'.json'),max_bytes=self.LIMIT)
+        if (set(record)!={'version','binding','command','claim','predecessor','scope','forests','input_closure_complete','shipping_authority'}
+                or type(record['version']) is not int or record['version']!=1 or record['binding']!=self.binding
+                or record['command']!=command or not cache._uuid(record['claim']) or type(record['scope']) is not dict
+                or set(record['scope'])!={'id','receipt','cleanup_sha256'}
+                or not cache._uuid(record['scope']['id']) or type(record['scope']['receipt']) is not str
+                or not Path(record['scope']['receipt']).is_absolute()
+                or record['scope']['cleanup_sha256']!=self.cleanup_digest() or type(record['forests']) is not list
+                or len(record['forests'])>1
+                or record['predecessor'] is not None and not cache._uuid(record['predecessor'])
+                or record['input_closure_complete'] is not False or record['shipping_authority'] is not False):
+            raise FreshnessHold('artifact_provenance_unknown')
+        return record
+
+    def _completed_check(self,state):
+        record=self.completed(state['command'])
+        digest=hashlib.sha256(json.dumps(record,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        if (digest!=state['completion_sha256'] or record['claim']!=state['claim'] or record['scope']!=state['scope']
+                or record['forests']!=state['forests']):raise FreshnessHold('artifact_provenance_unknown')
+
+    def generated_inputs(self,outputs):
+        value=self._active(require_scope=True);bindings,_record=GeneratedForests(self,outputs).load(value['forests'])
+        return bindings,value['forests']
 
     def _active(self,*,require_scope=False):
         _source(self.target,self.binding,self.command)
@@ -777,7 +910,9 @@ class ExecutionLease:
         return {'command':command,'store_sha256':PublicationStore.checkpoint(root/'publications',binding=binding,command=command),
             'planner':planner_snapshot(root/'planner-target',owner=1001),'home':planner_snapshot(root/'home',owner=1001),
             'cargo_home':planner_snapshot(root/'cargo-home',owner=1001),
-            'commands':[planner_snapshot(path,owner=os.geteuid()) for path in commands]}
+            'commands':[planner_snapshot(path,owner=os.geteuid()) for path in commands],
+            'forests':cache._read_record(root/'input-forests.json')['forests'],
+            'outputs':cache._read_record(root/'input-forests.json')['outputs']}
 
     @classmethod
     def _verify_executor(cls,target,binding,record,checkpoint):
@@ -802,12 +937,16 @@ class ExecutionLease:
         value['checkpoint']={'command':self.command,'creating':True}
         cache._write_record(self.path,value)
 
-    def finish(self,scope,stopped):
+    def finish(self,scope,stopped,*,outputs=None,invoked_cargo=False,producer_succeeded=True):
         value=self._active(require_scope=True)
         if (self.scope is not scope or not stopped.matches(scope) or not scope.closed
                 or value['scope']!={'id':scope.directory.name.removeprefix('worker-'),'receipt':str(scope.receipt),'cleanup_sha256':None}):
             raise FreshnessHold('cleanup_uncertain')
         original_cargo_cleanup(scope.receipt,owner=os.geteuid())
+        forests=GeneratedForests(self,{} if outputs is None else outputs)
+        if type(producer_succeeded) is not bool:raise FreshnessHold('artifact_provenance_unknown')
+        if invoked_cargo or not producer_succeeded:forests.load(value['forests']);following_forests=value['forests']
+        else:following_forests=forests.publish(scope)
         if value['root'] is not None:
             root=self._root(self.target,value['root']);control=cache._read_record(root/'control.json')
             expected={'version':1,'kind':'cargo-execution','binding':self.binding,'command':self.command,'shipping_authority':False,'state':'active'}
@@ -815,11 +954,23 @@ class ExecutionLease:
                 checkpoint=self._snapshot(root,self.binding,self.command)
                 cache._write_record(root/'control.json',expected|{'state':'closed'});value['checkpoint']=checkpoint
             else:self._verify_executor(self.target,self.binding,value['root'],value['checkpoint'])
-        value['scope']['cleanup_sha256']=self.cleanup_digest();value['phase']='closed'
+        value['scope']['cleanup_sha256']=self.cleanup_digest();value['phase']='closed';value['forests']=following_forests
+        record={'version':1,'binding':self.binding,'command':self.command,'claim':self.claim,'predecessor':value['predecessor'],
+            'scope':value['scope'],'forests':following_forests,'input_closure_complete':False,'shipping_authority':False}
+        directory=self.target.parent/'completed-ci-commands'
+        if not directory.exists():directory.mkdir(mode=0o700)
+        info=directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or stat.S_IMODE(info.st_mode)!=0o700:
+            raise FreshnessHold('artifact_provenance_unknown')
+        path=directory/(self.command+'.json')
+        if path.exists() or path.is_symlink():raise FreshnessHold('cleanup_uncertain')
+        cache._write_record(path,record)
+        value['completion_sha256']=hashlib.sha256(json.dumps(record,sort_keys=True,separators=(',',':')).encode()).hexdigest()
         cache._write_record(self.path,value)
-        return {'version':1,'kind':'ci-cargo-execution-checkpoint','binding':self.binding,'command':self.command,
+        return {'version':2,'kind':'ci-cargo-execution-checkpoint','binding':self.binding,'command':self.command,
             'claim':self.claim,'predecessor':value['predecessor'],'scope_id':value['scope']['id'],
-            'retained_executor':value['root'] is not None,'input_closure_complete':False,'shipping_authority':False}
+            'retained_executor':value['root'] is not None,'completion_sha256':value['completion_sha256'],
+            'generated_forests':following_forests,'input_closure_complete':False,'shipping_authority':False}
 
 
 class CargoGraph:
@@ -1436,7 +1587,7 @@ class WorkerRelay(RootRelay):
         invocation=validate_invocation(['/toolchain/bin/cargo',*[os.fsdecode(arg) for arg in argv[1:]]],
             {os.fsdecode(key):os.fsdecode(value) for key,value in environment.items()},os.fsdecode(cwd))
         if self.executor is None:
-            self.executor=_CargoExecutor(self.planner_relay.admission,execution_lease=self.value.get('execution_lease'));self.planner_relay.views=self.executor
+            self.executor=_CargoExecutor(self.planner_relay.admission,execution_lease=self.value.get('execution_lease'),generated_outputs=self.value.get('generated_outputs'));self.planner_relay.views=self.executor
             self.executor.preparing_graph=True
             try:status,metadata,error=self.executor._command(dict(self.value,original_invocation=invocation),
                 self.planner_relay,operation='metadata')
@@ -1445,7 +1596,7 @@ class WorkerRelay(RootRelay):
             self.executor.graph=CargoGraph(self.executor.source,metadata,owner=0)
         self.executor.graph._verify()
         return {'execution_role':'cargo','execution_uid':1001,'planner_first_unit':len(self.planner_relay.completed),'cargo_root':str(self.executor.root),
-            'source':str(self.executor.source)},self.planner_relay.config_fd()
+            'source':str(self.executor.source),'source_mounts':str(self.executor.source_mounts_path)},self.planner_relay.config_fd()
 
 
 def _unit(arguments):
@@ -1527,13 +1678,14 @@ def _stage(arguments):
         os.set_inheritable(descriptor,True)
         environment[b'JARVIS_CARGO_RELAY_FD']=str(descriptor).encode()
         environment[b'LD_PRELOAD']=os.fsencode(value['library'])+(b' '+environment[b'LD_PRELOAD'] if b'LD_PRELOAD' in environment else b'')
-        if role=='cargo':cargo_namespace(value['cargo_root'],value['source'])
+        if role=='cargo':cargo_namespace(value['cargo_root'],value['source'],value.get('source_mounts'))
     if 'view' in value:
         _PHASE='planner_view_enter';view=value['view']
         mounts=cache._read_record(Path(view['mounts']),max_bytes=16*1024**2)
         if (mounts.get('binding')!=value['binding'] or mounts.get('command')!=value['command']
                 or mounts.get('ordinal')!=value['ordinal']):raise FreshnessHold('generation_mismatch')
-        unit_views.enter(view['root'],2000+value['ordinal'],view['source'],view['artifacts'],mounts['entries'])
+        unit_views.enter(view['root'],2000+value['ordinal'],view['source'],view['artifacts'],mounts['entries'],
+            mounts.get('source_entries'),mounts.get('declared_outputs'))
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     _PHASE='planner_drop'
@@ -1768,7 +1920,7 @@ def capture_command(child,deadline,*,limit=8*1024**2):
 
 class _CargoExecutor:
     """Graph-backed execution; incomplete input closure grants no reuse/CI proof."""
-    def __init__(self,admission,*,diagnostic=False,execution_lease=None):
+    def __init__(self,admission,*,diagnostic=False,execution_lease=None,generated_outputs=None):
         if (type(admission) is not _Admission or admission.token is not _TOKEN
                 or admission.owner!=os.getpid() or os.getresuid()!=(0,0,0)):
             raise FreshnessHold('invalidation_unsafe')
@@ -1776,7 +1928,11 @@ class _CargoExecutor:
         self.admission=admission;self.owner=os.getpid();self.units={};self.commands=[]
         self.graph=None;self.preparing_graph=False;self.source=admission.target.parent/'source-projection'
         lease=ExecutionLease.attach(execution_lease) if execution_lease is not None else None
+        self.declared_outputs={} if generated_outputs is None else dict(generated_outputs)
+        self.source_bindings,self.forest_refs=lease.generated_inputs(self.declared_outputs) if lease is not None else ([],[])
         retained,checkpoint=lease.retained() if lease is not None else (None,None)
+        if checkpoint is not None and (checkpoint['forests']!=self.forest_refs or checkpoint['outputs']!=self.declared_outputs):
+            raise FreshnessHold('input_census_unknown')
         self.control={'version':1,'kind':'cargo-execution','binding':admission.binding,
             'command':admission.command,'shipping_authority':False}
         if retained is None:
@@ -1796,6 +1952,11 @@ class _CargoExecutor:
                 predecessor=checkpoint['command'],unit_root=admission.root/'units',expected_sha256=checkpoint['store_sha256'])
             self.next_command=len(checkpoint['commands'])
             cache._write_record(self.root/'control.json',{**self.control,'state':'active'})
+        if lease is not None:
+            cache._write_record(self.root/'input-forests.json',{'version':1,'binding':admission.binding,'forests':self.forest_refs,'outputs':self.declared_outputs})
+        self.source_mounts_path=None if diagnostic else self.root/'source-mounts.json'
+        if not diagnostic:cache._write_record(self.source_mounts_path,{'version':1,'binding':admission.binding,'command':admission.command,
+            'entries':self.source_bindings,'outputs':self.declared_outputs})
         self.target=self.root/'planner-target'
         self.slot_root=self.root if diagnostic else self.root/('views-'+admission.command)
         if not diagnostic:self.slot_root.mkdir(mode=0o700)
@@ -1927,7 +2088,8 @@ class _CargoExecutor:
             else:entries.append(self._generated_input(artifacts,unit,generated,admission['package_id'],publications=publications))
         root=slot/'root';root.mkdir(mode=0o700);mounts=slot/'mounts.json'
         cache._write_record(mounts,{'version':1,'binding':self.admission.binding,
-            'command':self.admission.command,'ordinal':ordinal,'entries':entries})
+            'command':self.admission.command,'ordinal':ordinal,'entries':entries,
+            'source_entries':self.source_bindings,'declared_outputs':self.declared_outputs})
         view={'root':str(root),'artifacts':str(artifacts),'source':str(self.source),
             'mounts':str(mounts),'ordinal':ordinal}
         self.units[ordinal]={'view':view,'mapping':mapped,'finished':False,'cargo_target':admission,'graph_dispatch':True}
@@ -2014,7 +2176,8 @@ class _CargoExecutor:
         client=relay.config_fd();bootstrap=None;child=None
         try:
             config=dict(value,kind='cargo-supervisor',parent=os.getpid(),invocation=invocation,
-                command_directory=str(directory),cargo_operation=operation,cargo_root=str(self.root),source=str(self.source))
+                command_directory=str(directory),cargo_operation=operation,cargo_root=str(self.root),source=str(self.source),
+                source_mounts=None if self.source_mounts_path is None else str(self.source_mounts_path))
             bootstrap=_sealed(config)
             child=subprocess.Popen([sys.executable,'-I',str(Path(__file__).resolve()),'--cargo-supervisor',str(bootstrap),str(client)],
                 pass_fds=(bootstrap,client),env={'PATH':os.defpath},stdin=subprocess.DEVNULL,
@@ -2370,7 +2533,7 @@ def _cargo_supervisor(arguments):
         forward_fds=(child_bootstrap,configuration),close_after_spawn=(child_bootstrap,))
 
 
-def cargo_namespace(root,source):
+def cargo_namespace(root,source,source_mounts=None):
     root=unit_views.literal(root);source=unit_views.literal(source)
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.unshare(0x00020000)!=0:raise OSError(ctypes.get_errno(),'planner mount namespace unavailable')
@@ -2385,6 +2548,13 @@ def cargo_namespace(root,source):
         destination.mkdir(mode=0o755,parents=True,exist_ok=True)
         unit_views._mount('--bind',original,destination)
         unit_views._mount('-o','remount,bind,rw,nosuid,nodev,noatime',destination)
+    if source_mounts is not None:
+        path=unit_views.literal(source_mounts)
+        if path!=root/'source-mounts.json':raise FreshnessHold('artifact_provenance_unknown')
+        document=cache._read_record(path,max_bytes=16*1024**2);control=cache._read_record(root/'control.json')
+        if (document.get('version')!=1 or document.get('binding')!=control.get('binding')
+                or document.get('command')!=control.get('command')):raise FreshnessHold('generation_mismatch')
+        unit_views.source_mounts(Path('/workspace'),document['entries'],document['outputs'])
 
 
 def _cargo(arguments):
@@ -2397,7 +2567,7 @@ def _cargo(arguments):
             or cache._read_record(root/'control.json')!={'version':1,'kind':'cargo-execution',
                 'binding':value['binding'],'command':value['command'],'shipping_authority':False,'state':'active'}):
         raise FreshnessHold('invalidation_unsafe')
-    _PHASE='planner_cargo_runtime';cargo_namespace(root,source);libc=ctypes.CDLL(None,use_errno=True)
+    _PHASE='planner_cargo_runtime';cargo_namespace(root,source,value.get('source_mounts'));libc=ctypes.CDLL(None,use_errno=True)
     invocation=value.get('original_invocation')
     if invocation is None:
         environment={'PATH':'/toolchain/bin:/usr/bin:/bin','HOME':'/home/worker','CARGO_HOME':'/ci-cargo-home',
@@ -2765,7 +2935,7 @@ def _execute(arguments):
     admission=admit(value['target'],value['binding'],value['command'],value['root'])
     outputs=[];errors=[];receipts=[];exit_code=0
     with RootRelay(admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic()))) as relay:
-        executor=_CargoExecutor(admission,execution_lease=value.get('execution_lease'));relay.views=executor
+        executor=_CargoExecutor(admission,execution_lease=value.get('execution_lease'),generated_outputs=value.get('generated_outputs'));relay.views=executor
         first=validate_invocation(commands[0],environment,cwd)
         context=dict(value,original_invocation=first)
         executor.preparing_graph=True
@@ -2871,11 +3041,12 @@ def _execution_supervisor(arguments):
 
 
 def validate_checkpoint(value,binding,command,predecessor,scope):
-    if (type(value) is not dict or set(value)!={'version','kind','binding','command','claim','predecessor','scope_id','retained_executor','input_closure_complete','shipping_authority'}
-            or type(value['version']) is not int or value['version']!=1 or value['kind']!='ci-cargo-execution-checkpoint'
+    if (type(value) is not dict or set(value)!={'version','kind','binding','command','claim','predecessor','scope_id','retained_executor','completion_sha256','generated_forests','input_closure_complete','shipping_authority'}
+            or type(value['version']) is not int or value['version']!=2 or value['kind']!='ci-cargo-execution-checkpoint'
             or value['binding']!=binding or value['command']!=command or value['predecessor']!=predecessor
             or not cache._uuid(value['claim']) or value['scope_id']!=scope['scope_id']
-            or type(value['retained_executor']) is not bool or value['input_closure_complete'] is not False
+            or not cache._digest(value['completion_sha256']) or type(value['generated_forests']) is not list
+            or len(value['generated_forests'])>1 or type(value['retained_executor']) is not bool or value['input_closure_complete'] is not False
             or value['shipping_authority'] is not False):raise FreshnessHold('cleanup_uncertain')
     return value
 
