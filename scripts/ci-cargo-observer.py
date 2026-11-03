@@ -23,9 +23,9 @@ import uuid
 spec=importlib.util.spec_from_file_location('observer_cache',Path(__file__).with_name('ci-cache-generation.py'))
 cache=importlib.util.module_from_spec(spec);spec.loader.exec_module(cache)
 MAX_BYTES=4*1024**2
-# Keep this candidate's string temporaries below the BPF stack ceiling. A path
-# reaching the terminator slot is rejected, never treated as a complete name.
-PATH_BYTES=96
+# Name and result records use separate probes to avoid copying map strings on
+# the BPF exit probe stack. The terminator slot never proves a complete name.
+PATH_BYTES=128
 SYSCALLS={2,4,6,21,89,257,262,267,269,332,439}
 
 
@@ -48,7 +48,7 @@ def decode(data,*,complete=True):
     if not complete and not data.endswith(b'\n'):data=data.rpartition(b'\n')[0]+b'\n'
     try:lines=data.decode('ascii').splitlines()
     except UnicodeError:raise ObservationUnavailable('unknown pathname encoding') from None
-    events=[];count=None
+    pairs={};count=None;records=0
     for line in lines:
         if not line:continue
         try:record=json.loads(line,object_pairs_hook=cache._unique_object)
@@ -61,53 +61,68 @@ def decode(data,*,complete=True):
             continue
         if record['type']=='map':
             if (count is not None or type(record['data']) is not dict or set(record['data'])!={'@emitted'}
-                    or type(record['data']['@emitted']) is not int or not 0<=record['data']['@emitted']<=20000):
+                    or type(record['data']['@emitted']) is not int or not 0<=record['data']['@emitted']<=40000):
                 raise ObservationUnavailable('invalid event counter')
             count=record['data']['@emitted'];continue
         if record['type']!='printf' or type(record['data']) is not str or not record['data'].endswith('\n'):
             raise ObservationUnavailable('unknown kernel event')
         line=record['data'][:-1]  # Preserve embedded newlines; never reinterpret them as events.
-        match=re.fullmatch(r'E ([0-9]{1,4}) ([1-9][0-9]{0,9}) ([1-9][0-9]{0,9}) ([0-9]{1,4}) (-?[0-9]{1,20}) ([A-Za-z0-9/._-]+)',line)
+        match=re.fullmatch(r'([NE]) ([0-9]{1,4}) ([1-9][0-9]{0,9}) ([1-9][0-9]{0,9}) ([0-9]{1,4}) ([1-9][0-9]{0,19}) ([-A-Za-z0-9/._]+)',line)
         if match is None:raise ObservationUnavailable('unknown observation record')
-        uid,pid,tid,call,result=map(int,match.groups()[:5]);path=match[6].encode()
-        if (pid>=2**31 or tid>=2**31 or call not in SYSCALLS or not -4095<=result<2**31
-                or len(path)>=PATH_BYTES-1 or any(part in (b'',b'.',b'..') for part in path.split(b'/')[1:])
-                or not (uid==1999 and re.fullmatch(rb'/ci-observer-witness-[a-z0-9-]+',path)
-                    or 2000<=uid<6096 and (path.startswith(b'/workspace/')
-                        or path in (b'src/lib.rs',b'src/main.rs',b'build.rs')))):
+        kind=match[1];uid,pid,tid,call,sequence=map(int,match.groups()[1:6])
+        if (pid>=2**31 or tid>=2**31 or call not in SYSCALLS or sequence>=2**64
+                or not (uid==1999 or 2000<=uid<6096)):
             raise ObservationUnavailable('foreign kernel observation')
-        events.append({'uid':uid,'pid':pid,'tid':tid,'syscall':call,'result':result,'path':path})
-        if len(events)>20000:raise ObservationUnavailable('observation limit exceeded')
-    if complete and (count is None or count!=len(events) or not events):
+        pair=pairs.setdefault((uid,pid,tid,call,sequence),{})
+        if kind in pair:raise ObservationUnavailable('duplicate kernel observation')
+        if kind=='N':
+            path=match[7].encode()
+            if (len(path)>=PATH_BYTES-1 or any(part in (b'',b'.',b'..') for part in path.split(b'/')[1:])
+                    or not (uid==1999 and re.fullmatch(rb'/ci-observer-witness-[a-z0-9-]+',path)
+                        or 2000<=uid<6096 and (path.startswith(b'/workspace/')
+                            or path in (b'src/lib.rs',b'src/main.rs',b'build.rs')))):
+                raise ObservationUnavailable('foreign kernel pathname')
+            pair[kind]=path
+        else:
+            if re.fullmatch(r'-?[0-9]{1,20}',match[7]) is None:raise ObservationUnavailable('unknown syscall result')
+            result=int(match[7])
+            if not -4095<=result<2**31:raise ObservationUnavailable('unknown syscall result')
+            pair[kind]=result
+        records+=1
+        if len(pairs)>20000 or records>40000:raise ObservationUnavailable('observation limit exceeded')
+    if complete and (count is None or count!=records or not pairs or any(set(pair)!={'N','E'} for pair in pairs.values())):
         raise ObservationUnavailable('event count unavailable')
-    return events
+    return [{'uid':uid,'pid':pid,'tid':tid,'syscall':call,'result':pair['E'],'path':pair['N']}
+        for (uid,pid,tid,call,sequence),pair in pairs.items() if set(pair)=={'N','E'}]
 
 
 _PROGRAM=r'''
 struct observer_filename { const char *name; };
 rawtracepoint:sys_enter / (uid >= 2000 && uid < 6096) || uid == 1999 / {
  @number[tid] = arg1;
- delete(@seen[tid]); delete(@path[tid]);
+ @sequence[tid] = @sequence[tid] + 1;
+ delete(@seen[tid]);
 }
 kretprobe:getname_flags
 / ((uid >= 2000 && uid < 6096) || uid == 1999) && (uint64)retval > 4095 && (uint64)retval < (uint64)0xfffffffffffff001 / {
- $value = str(((struct observer_filename *)retval)->name, 96);
+ $value = str(((struct observer_filename *)retval)->name, 128);
  if ((@number[tid]==2 || @number[tid]==4 || @number[tid]==6 || @number[tid]==21 ||
       @number[tid]==89 || @number[tid]==257 || @number[tid]==262 || @number[tid]==267 ||
       @number[tid]==269 || @number[tid]==332 || @number[tid]==439) &&
      (strncmp($value,"/workspace/",11)==0 || $value=="src/lib.rs" || $value=="src/main.rs" ||
       $value=="build.rs" || $value == __WITNESS__)) {
-  @path[tid] = $value; @seen[tid] = 1;
+  printf("N %u %u %u %lld %llu %s\n",uid,pid,tid,(int64)@number[tid],@sequence[tid],$value);
+  @emitted = count(); @seen[tid] = 1;
  }
 }
 rawtracepoint:sys_exit / (uid >= 2000 && uid < 6096) || uid == 1999 / {
  if (@seen[tid]) {
-  printf("E %u %u %u %lld %lld %s\n",uid,pid,tid,(int64)@number[tid],(int64)arg1,@path[tid]);
+  printf("E %u %u %u %lld %llu %lld\n",uid,pid,tid,(int64)@number[tid],@sequence[tid],(int64)arg1);
   @emitted = count();
  }
- delete(@seen[tid]); delete(@path[tid]); delete(@number[tid]);
+ delete(@seen[tid]); delete(@number[tid]);
 }
-END { clear(@seen); clear(@path); clear(@number); print(@emitted); clear(@emitted); }
+END { clear(@seen); clear(@sequence); clear(@number); print(@emitted); clear(@emitted); }
 '''
 _WITNESS=r'''
 import ctypes,errno,os,sys
