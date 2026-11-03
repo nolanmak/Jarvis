@@ -225,6 +225,20 @@ class KernelObserverTests(unittest.TestCase):
                 observer.directory_cursor_witness(bad,101,2004,path)
         with self.assertRaises(observer.ObservationUnavailable):observer.directory_cursor_witness(queries[:-1],101,2004,path)
 
+    def test_directory_identity_keeps_original_mount_and_user_namespaces(self):
+        rows=['B 2004 101 102 1 3 64','I 2004 101 102 1 7 900 16749 0 50 100',
+            'T 2004 101 102 1 0 0','G 2004 101 102 1 0']
+        query=observer.directory_queries(rows)[0]
+        self.assertEqual((query['mount_namespace'],query['user_namespace']),(50,100))
+        legacy=observer.directory_queries([r.replace('0 50 100','0') for r in rows])[0]
+        self.assertIsNone(legacy['mount_namespace']);self.assertIsNone(legacy['user_namespace'])
+        for value in ('0 100','50 0','4294967296 100','50 -1','50 100 1'):
+            with self.subTest(value=value),self.assertRaises(observer.ObservationUnavailable):
+                observer.directory_queries([r.replace('50 100',value) for r in rows])
+        program=observer.observation_program('all')
+        self.assertIn('(uint64)$task->nsproxy->mnt_ns->ns.inum',program)
+        self.assertIn('(uint64)$task->cred->user_ns->ns.inum',program)
+
     def test_kernel_path_chunks_keep_binary_whitespace_and_control_bytes(self):
         path=b'/workspace/raw-\xff \n\x01'
         data=(frame('printf',f'N 2004 101 101 257 1 0 {len(path)} '+path.hex(' ')+'\n')

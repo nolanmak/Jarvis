@@ -251,6 +251,9 @@ def directory_queries(records,*,complete=True):
             attempt['metadata']=metadata;attempt['chunks'][start]=data
         else:
             count,signed=layouts[kind]
+            # Old captures lack namespace identity. Preserve that absence;
+            # only the extended original record can bind a directory selector.
+            if kind=='I' and len(match[6].split())==6:count=6
             if re.fullmatch(('(-?[0-9]{1,20})' if signed else '([0-9]{1,20})')
                     +(' (-?[0-9]{1,20})' if signed else ' ([0-9]{1,20})')*(count-1),match[6]) is None:
                 raise ObservationUnavailable('invalid directory result')
@@ -274,7 +277,8 @@ def directory_queries(records,*,complete=True):
         if not ready:
             if complete:raise ObservationUnavailable('incomplete directory observation')
             continue
-        descriptor,capacity=pair['B'];device,inode,mode,start_position=pair['I']
+        descriptor,capacity=pair['B'];device,inode,mode,start_position=pair['I'][:4]
+        mount_namespace,user_namespace=pair['I'][4:] if len(pair['I'])==6 else (None,None)
         status,position=pair['T'];result,=pair['G']
         if (descriptor>=2**31 or capacity>=2**32 or not 0<=device<2**32 or not 0<=inode<2**64
                 or not 0<=mode<=65535 or not stat.S_ISDIR(mode) or not -2**31<=status<2**31
@@ -282,6 +286,8 @@ def directory_queries(records,*,complete=True):
                 or not -2**63<=position<2**63 or not -4095<=result<=capacity
                 or set(attempts)!=set(range(1,len(attempts)+1))):
             raise ObservationUnavailable('inconsistent directory call')
+        if mount_namespace is not None and not (0<mount_namespace<2**32 and 0<user_namespace<2**32):
+            raise ObservationUnavailable('invalid directory namespace')
         entries=[];ordered=[];rejected=False
         for ordinal in sorted(attempts):
             a=attempts[ordinal];ino,raw_type,offset,total=a['metadata']
@@ -299,6 +305,7 @@ def directory_queries(records,*,complete=True):
             entry['returned_offset']=entries[index+1]['offset'] if index+1<len(entries) else position
         queries.append({'uid':uid,'pid':pid,'tid':tid,'sequence':sequence,'syscall':217,
             'fd':descriptor,'capacity':capacity,'device':device,'inode':inode,'mode':mode,
+            'mount_namespace':mount_namespace,'user_namespace':user_namespace,
             'start_position':start_position,
             'iterator_result':status,'position':position,'result':result,'attempts':ordered,'entries':entries})
     return queries
@@ -784,10 +791,12 @@ rawtracepoint:sys_enter / (uid >= 2000 && uid < 6096) || uid == 1999 / {
 kprobe:iterate_di*r / ((uid >= 2000 && uid < 6096) || uid == 1999) && @number[tid]==217 / {
  $file=(struct file *)arg0;
  $inode=$file->f_inode;
+ $task=(struct task_struct *)curtask;
  @directory_context[tid]=arg1;
  @directory_active[tid]=@sequence[tid];
- printf("I %u %u %u %llu %llu %llu %llu %lld\n",uid,pid,tid,@sequence[tid],
-  (uint64)$inode->i_sb->s_dev,(uint64)$inode->i_ino,(uint64)$inode->i_mode,(int64)$file->f_pos);
+ printf("I %u %u %u %llu %llu %llu %llu %lld %llu %llu\n",uid,pid,tid,@sequence[tid],
+  (uint64)$inode->i_sb->s_dev,(uint64)$inode->i_ino,(uint64)$inode->i_mode,(int64)$file->f_pos,
+  (uint64)$task->nsproxy->mnt_ns->ns.inum,(uint64)$task->cred->user_ns->ns.inum);
  @emitted=sum(1);
 }
 kretprobe:iterate_di*r / ((uid >= 2000 && uid < 6096) || uid == 1999) && @number[tid]==217 / {
@@ -1302,6 +1311,7 @@ class Observer:
                 and e['result']>=0 and e['path'].endswith(b'/out/generated.rs') for e in events):
             raise ObservationUnavailable('original generated input lookup missing')
         content=content_probe.observe_content(events,metadata,unit_pid,self.user_namespace,mount_namespace)
+        directory_selection=content_probe.observe_directories(queries,unit_pid,self.user_namespace,mount_namespace)
         compiler_probe.record_invalidations(events,metadata,self.user_namespace)
         self.report={**self.control,'kernel_release':os.uname().release,'unit_pid':unit_pid,'unit_uid':2004,
             'program_sha256':hashlib.sha256(self.program.encode()).hexdigest(),'binary_sha256':self.binary_sha256,
@@ -1320,6 +1330,7 @@ class Observer:
             'lookup_base_attempts':sum(len(e['lookup_attempts']) for e in events),
             'lookup_base_query_observed':True,'lookup_changed_cwd_observed':True,'lookup_invalid_base_observed':True,
             'content_selection':content,
+            'directory_selection':directory_selection,
             'filesystem_coverage_complete':False,'missed_probe_census_complete':True,'probe_census':census,
             'input_closure_complete':False,'allocation_removed':False}
         if cache._read_record(self.root/'control.json')!=self.control:
@@ -1335,7 +1346,7 @@ def validate(value,binding,command):
         'after_kernel_copy','events','original_observer_cleanup','filesystem_coverage_complete',
         'missed_probe_census_complete','input_closure_complete','allocation_removed',
         'compiler_queries_observed','library_generated_query_observed','max_path_query_observed','probe_census',
-        'binary_path_query_observed','content_selection'}
+        'binary_path_query_observed','content_selection','directory_selection'}
     keys|={'directory_reads','directory_entries','directory_witness_observed','binary_directory_name_observed',
         'directory_short_read_observed','directory_eof_observed','cargo_directory_queries_observed','directory_cursor_query_observed'}
     keys|={'metadata_queries','fstat_query_observed','fstat_invalid_fd_observed','fstat_failed_copy_observed'}
@@ -1372,4 +1383,16 @@ def validate(value,binding,command):
             or any(content[key] is not True for key in ('kernel_bases_bound','unrelated_content_unchanged','negative_lookup_changed_identity'))
             or content['input_closure_complete'] is not False or content['shipping_authority'] is not False):
         raise ObservationUnavailable('bound content selection unavailable')
+    directories=value['directory_selection']
+    if (type(directories) is not dict or set(directories)!={'queries','unbound_calls','binding_sha256',
+            'content_sha256','unrelated_sha256','introduced_sha256','kernel_namespaces_bound',
+            'rewound_scan_unbound','membership_changed_identity','input_closure_complete','shipping_authority'}
+            or type(directories['queries']) is not int or not 5<=directories['queries']<=40000
+            or type(directories['unbound_calls']) is not int or not 3<=directories['unbound_calls']<=40000
+            or any(not cache._digest(directories[key]) for key in ('binding_sha256','content_sha256','unrelated_sha256','introduced_sha256'))
+            or directories['content_sha256']!=directories['unrelated_sha256']
+            or directories['content_sha256']==directories['introduced_sha256']
+            or any(directories[key] is not True for key in ('kernel_namespaces_bound','rewound_scan_unbound','membership_changed_identity'))
+            or directories['input_closure_complete'] is not False or directories['shipping_authority'] is not False):
+        raise ObservationUnavailable('bound directory selection unavailable')
     return value

@@ -619,3 +619,70 @@ class FrozenLookupIndex:
             else:queries.append(query);selected.append(event)
         self._verify()
         return _ContentSelection(queries,self.census.observe(queries),hashlib.sha256(_encoded(_wire(selected))).hexdigest(),self._layout),unbound
+
+    def _directory_scan(self,events,*,pid,uid,user_namespace,mount_namespace):
+        """Resolve one complete scan through original kernel object identity.
+
+        Only membership is selected here. Inode numbers, directory cookies,
+        ordering and other metadata remain separate incomplete-input duties.
+        A rewind, an interrupted scan or an unknown mounted child stays opaque.
+        """
+        try:
+            first=events[0];key=tuple(first[k] for k in ('device','inode','mode'))
+            virtual=self._bases.get(key)
+            if (virtual is None or self._objects.get(virtual)!=key
+                    or self.census._nodes.get(virtual,(None,))[0]!='directory'
+                    or first['start_position']!=0 or events[-1]['result']!=0):_hold()
+            members=dict(self.census._members(virtual));seen=set();queries=[]
+            types={4:'directory',8:'file',10:'symlink'};names={4:'DT_DIR',8:'DT_REG',10:'DT_LNK'}
+            position=0
+            for ordinal,event in enumerate(events):
+                if (event['pid']!=pid or event['uid']!=uid or event['syscall']!=217
+                        or event.get('mount_namespace')!=mount_namespace or event.get('user_namespace')!=user_namespace
+                        or tuple(event[k] for k in ('device','inode','mode'))!=key
+                        or event['iterator_result']!=0 or type(event['result']) is not int or event['result']<0
+                        or event['result']>event['capacity'] or event['start_position']!=position
+                        or ordinal<len(events)-1 and event['result']==0):_hold()
+                position=event['position'];entries=[];size=0
+                for entry in event['entries']:
+                    name=_path(entry['name']);kind=entry['type']
+                    if (b'/' in name or name in seen or kind not in types or entry['accepted'] is not True
+                        or entry['record_length']!=((20+len(name)+7)&~7)):_hold()
+                    seen.add(name);size+=entry['record_length']
+                    if name in (b'.',b'..'):
+                        if kind!=4 or name==b'.' and entry['inode']!=key[1]:_hold()
+                    else:
+                        path=virtual.rstrip(b'/')+b'/'+name;identity=self._objects.get(path)
+                        if members.get(name)!=types[kind] or identity is None or entry['inode']!=identity[1]:_hold()
+                    entries.append({'name':name,'type':names[kind]})
+                if size!=event['result'] or event['entries'] and event['entries'][-1]['returned_offset']!=position:_hold()
+                queries.append({'pid':pid,'syscall':'getdents64','directory':virtual,'intent':'directory',
+                    'outcome':'success','result':event['result'],'entries':entries})
+            if seen!={b'.',b'..',*members}:_hold()
+            self.census.observe(queries)
+            return queries
+        except (ValueError,TypeError,KeyError,IndexError,AttributeError,UnicodeError):_hold()
+
+    def select_directory_subset(self,events,*,pid,uid,user_namespace,mount_namespace):
+        """Select complete immutable scans; retain every other call as unbound."""
+        self._verify()
+        if (type(events) is not list or len(events)>200000
+                or any(type(value) is not int or value<=0 for value in (pid,uid,user_namespace,mount_namespace))):_hold()
+        keys=('pid','tid','uid','syscall','sequence');groups={};identities=set()
+        try:
+            for event in events:
+                identity=tuple(event[k] for k in keys)
+                if (any(type(value) is not int for value in identity) or identity in identities
+                        or not 0<event['tid']<2**31 or not 0<event['sequence']<2**64
+                        or type(event['fd']) is not int or not 0<=event['fd']<2**31):_hold()
+                identities.add(identity)
+                groups.setdefault(tuple(event[k] for k in ('pid','tid','uid','fd','device','inode','mode')),[]).append(event)
+        except (ValueError,TypeError,KeyError,AttributeError):_hold()
+        queries=[];selected=[];unbound=[]
+        for group in groups.values():
+            ordered=sorted(group,key=lambda event:event['sequence'])
+            try:following=self._directory_scan(ordered,pid=pid,uid=uid,user_namespace=user_namespace,mount_namespace=mount_namespace)
+            except FreshnessHold:unbound.extend({key:event[key] for key in keys} for event in ordered)
+            else:queries.extend(following);selected.extend(ordered)
+        self._verify()
+        return _ContentSelection(queries,self.census.observe(queries),hashlib.sha256(_encoded(_wire(selected))).hexdigest(),self._layout),unbound

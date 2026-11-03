@@ -153,15 +153,15 @@ class PlannerProtocolTests(unittest.TestCase):
         binding=self.publication_binding();command=str(uuid.uuid4())
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);(root/'input-observations').mkdir(mode=0o700)
-            source=root/'source';source.mkdir();(source/'lib.rs').write_bytes(b'original')
-            (source/'lib.rs').chmod(0o444);source.chmod(0o555)
+            source=root/'source';source.mkdir();(source/'src').mkdir();(source/'src/lib.rs').write_bytes(b'original')
+            (source/'src/lib.rs').chmod(0o444);(source/'src').chmod(0o555);source.chmod(0o555)
             identity=lambda info:{'device':(os.major(info.st_dev)<<20)|os.minor(info.st_dev),
                 'inode':info.st_ino,'mode':info.st_mode}
-            successful={'uid':2000,'pid':101,'tid':102,'syscall':257,'sequence':1,'result':3,'path':b'lib.rs',
+            successful={'uid':2000,'pid':101,'tid':102,'syscall':257,'sequence':1,'result':3,'path':b'src/lib.rs',
                 'lookup_attempts':[{'init_result':0,'dfd':-100,'user_namespace':100,'mount_namespace':50,
                     'base':dict(identity(source.stat()),flags=257,path_seq=2,dentry_seq=2)}],
                 'open':{'arguments':{'dfd':-100,'flags':32768,'user_namespace':100,'mount_namespace':50},
-                    'installed':dict(identity((source/'lib.rs').stat()),fd=3,flags=32768,file_mode=1,
+                    'installed':dict(identity((source/'src/lib.rs').stat()),fd=3,flags=32768,file_mode=1,
                         user_namespace=100,mount_namespace=50)}}
             missing=copy.deepcopy(successful);missing.update(sequence=2,result=-2,path=b'preferred.rs')
             missing['open']['installed']=None
@@ -177,11 +177,23 @@ class PlannerProtocolTests(unittest.TestCase):
                 'flags':257,'path_seq':2,'dentry_seq':2}
             artifact['open']['installed'].update(identity(Path(entry[1]).stat()))
             events=[successful,missing,unsupported,artifact]
+            entries=[]
+            for offset,(name,info,kind) in enumerate(((b'.',(source/'src').stat(),4),(b'..',source.stat(),4),
+                    (b'lib.rs',(source/'src/lib.rs').stat(),8))):
+                entries.append({'name':name,'inode':info.st_ino,'type':kind,'raw_type':kind,'offset':offset,
+                    'returned_offset':offset+1,'record_length':(20+len(name)+7)&~7,'accepted':True})
+            scan={'uid':2000,'pid':101,'tid':102,'syscall':217,'sequence':5,'fd':7,'capacity':288,
+                **identity((source/'src').stat()),'mount_namespace':50,'user_namespace':100,'iterator_result':0,
+                'start_position':0,'position':3,'result':sum(entry['record_length'] for entry in entries),
+                'entries':entries,'attempts':copy.deepcopy(entries)}
+            directories=[scan,dict(scan,sequence=6,start_position=3,result=0,entries=[],attempts=[])]
+            unknown=copy.deepcopy(scan);unknown.update(sequence=7,fd=8,inode=scan['inode']+1000)
+            directories.append(unknown)
             observation=object.__new__(planner.CommandObservation)
             observation.admission=SimpleNamespace(binding=binding,command=command)
-            observation.observer=SimpleNamespace(capture=lambda:(events,[],[],census),root=root,
+            observation.observer=SimpleNamespace(capture=lambda:(events,directories,[],census),root=root,
                 program=planner.kernel_observer.observation_program('all'),binary_sha256='1'*64,user_namespace=100)
-            unit={'finished':True,'pid':101,'mapping':{'kind':'compile','role':'library','source':b'/workspace/lib.rs',
+            unit={'finished':True,'pid':101,'mapping':{'kind':'compile','role':'library','source':b'/workspace/src/lib.rs',
                 'request_sha256':'2'*64},'namespaces':{'mnt':{'unit':'mnt:[50]'}},
                 'root_identity':{'device':12,'inode':3456789,'mode':0o40755},'returncode':0,
                 'scope_evidence':{'status':{'command':command,'ordinal':0},'cleanup_sha256':planner.ExecutionLease.cleanup_digest()}}
@@ -195,6 +207,11 @@ class PlannerProtocolTests(unittest.TestCase):
             self.assertEqual(selected['queries'][1]['errno'],'ENOENT')
             self.assertEqual(unbound,[{key:unsupported[key] for key in ('pid','tid','uid','syscall','sequence')}])
             self.assertEqual(summary['units'][0]['queries'],4)
+            self.assertEqual(summary['units'][0]['directory_reads'],3)
+            self.assertEqual(len(record['scopes'][0]['selected_directories']['queries']),2)
+            self.assertEqual(record['scopes'][0]['unbound_directory_reads'],[
+                {key:unknown[key] for key in ('pid','tid','uid','syscall','sequence')}])
+            self.assertEqual(record['directories'],planner.lookup_inputs._wire(directories))
             self.assertFalse(record['input_closure_complete']);self.assertFalse(record['shipping_authority'])
 
     def test_original_command_capture_persists_unit_scope_and_rejects_foreign_or_missing_source(self):
@@ -1069,6 +1086,10 @@ class PlannerProtocolTests(unittest.TestCase):
             'content_sha256':'2'*64,'unrelated_sha256':'2'*64,'introduced_sha256':'3'*64,
             'kernel_bases_bound':True,'unrelated_content_unchanged':True,'negative_lookup_changed_identity':True,
             'input_closure_complete':False,'shipping_authority':False}
+        value['kernel_observation']['directory_selection']={'queries':5,'unbound_calls':3,'binding_sha256':'1'*64,
+            'content_sha256':'2'*64,'unrelated_sha256':'2'*64,'introduced_sha256':'3'*64,
+            'kernel_namespaces_bound':True,'rewound_scan_unbound':True,'membership_changed_identity':True,
+            'input_closure_complete':False,'shipping_authority':False}
         census={'pid':100,'birth':1000,
             'programs':[{'id':i,'type':17 if i in (1,4) else 2,'tag':f'{i:016x}','recursion_misses':0} for i in range(1,5)],
             'links':[{'id':10+i,'type':'raw_tracepoint' if i in (1,4) else 'kretprobe_multi',
@@ -1088,7 +1109,9 @@ class PlannerProtocolTests(unittest.TestCase):
                 'cleanup','case-role','control-fds','jobserver','closure','authority','unknown',
                 'signal-status','signal-proxy','signal-number','signal-not-started','filesystem-namespace',
                 'filesystem-output','filesystem-cleanup','filesystem-removed','filesystem-authority','filesystem-case',
-                'kernel-binding','kernel-witness','kernel-loss','kernel-coverage','kernel-closure','kernel-cleanup','kernel-missed','kernel-census','kernel-binary-path','kernel-cursor','kernel-fstat','kernel-statx','kernel-base','kernel-content'):
+                'kernel-binding','kernel-witness','kernel-loss','kernel-coverage','kernel-closure','kernel-cleanup','kernel-missed','kernel-census','kernel-binary-path','kernel-cursor','kernel-fstat','kernel-statx','kernel-base','kernel-content',
+                'directory-selection-missing','directory-selection-namespace','directory-selection-membership',
+                'directory-selection-rewind','directory-selection-count','directory-selection-authority'):
             value=copy.deepcopy(original)
             if fault=='role-credential-missing':value.pop('credential_roles')
             elif fault=='role-credential-false':value['credential_roles']['worker_rejects_planner']=False
@@ -1132,6 +1155,12 @@ class PlannerProtocolTests(unittest.TestCase):
             elif fault=='kernel-statx':value['kernel_observation']['statx_copy_verified']=False
             elif fault=='kernel-base':value['kernel_observation']['lookup_changed_cwd_observed']=False
             elif fault=='kernel-content':value['kernel_observation']['content_selection']['introduced_sha256']='2'*64
+            elif fault=='directory-selection-missing':value['kernel_observation'].pop('directory_selection')
+            elif fault=='directory-selection-namespace':value['kernel_observation']['directory_selection']['kernel_namespaces_bound']=False
+            elif fault=='directory-selection-membership':value['kernel_observation']['directory_selection']['introduced_sha256']='2'*64
+            elif fault=='directory-selection-rewind':value['kernel_observation']['directory_selection']['rewound_scan_unbound']=False
+            elif fault=='directory-selection-count':value['kernel_observation']['directory_selection']['queries']=True
+            elif fault=='directory-selection-authority':value['kernel_observation']['directory_selection']['shipping_authority']=True
             with self.subTest(fault=fault),self.assertRaises(planner.FreshnessHold):
                 planner.validate_probe(value,binding,command,workers,writer,source)
 

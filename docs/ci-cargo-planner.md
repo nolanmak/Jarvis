@@ -2025,7 +2025,52 @@ paths/aliases/digests, mismatched/malformed mount headers, and failed/diagnostic
 producer evidence. The capture/recovery regression also uses an artifact from a
 retained predecessor command. **374 Python CI tests pass without skips and 32
 focused managed Rust tests pass** (20 native cases excluded). The actual command
-adapter replay for this revision is pending. Toolchain/runtime/directory/FD and
+adapter replay passed in **192.49 seconds** using the unchanged two-package
+structured build/test fixture. Read-only inspection under the original managed
+lease verified two actual compiler reads (`.rmeta` and `.rlib`) against one
+retained successful producer and its original command capture/cleanup. Both the
+passing build/test and failing test exits were preserved. Receipt:
+`/tmp/augmentagent-ci-artifact-structured-20261103231131/receipt.json`; inspection:
+`/tmp/autoship-1703-artifact-input-bindings-structured-inspection-1.json`. The
+original inspector used the wrong guest cache alias; correcting it to the actual
+controller-only `/root/managed-ci-cache` bind preserved every producer assertion.
+The single-library negative replay is compatibility evidence only because it
+has no dependency artifact mounts. Toolchain/runtime/directory/FD and
 other unsupported inputs, the unchanged original opaque-wrapper/in-command
 publication regression, selective invalidation/restart and final C proof/API/audit
 remain open. All completeness/full-CI/shipping flags stay false.
+
+
+### Original directory membership selectors
+
+The original `iterate_dir` record now carries the executing task's mount and
+user namespace identities alongside its inode, mode and starting cursor. Older
+four-field identities remain decodable with explicitly absent namespaces; they
+cannot acquire new directory-input authority.
+
+The existing frozen-input index selects only a complete original `getdents64`
+scan of a known immutable directory: original process and unit UID, original
+namespace identities, exact directory object, continuous cursor from zero to
+EOF, accepted byte counts, unique names and matching visible child inode/types.
+Short reads are supported when they form that complete chain. Interrupted,
+rewound, foreign, unknown-type or incomplete scans remain explicit unbound calls.
+A directory containing an opaque mounted child cannot prove membership from a
+hidden source placeholder. Multiple descriptor objects are reconciled separately;
+repeated scans of the same descriptor/object are conservatively unresolved.
+
+Selections persist in the original command record with the raw directory calls.
+Refresh compares logical membership and includes it in selected-input relevance
+and aggregate digests. An older capture without the field has unknown directory
+coverage, not zero unbound calls. This is membership relevance only: inode and
+cookie equivalence, returned ordering, other metadata and complete input closure
+remain separate requirements. No selector enables reuse or passing CI.
+
+The unchanged native unit's existing full scans, short reads, empty directory
+and rewind provide the VM gate. The additional controller assertions require
+real namespace-bound directory selections, retain the original rewind as
+unbound, restore the original selection, preserve relevance after an unread
+file's contents change, and detect an added member in the observed empty
+directory. The original tool program, argv, streams, counters and budgets are
+unchanged. **376 Python CI tests pass without skips.** The 32 focused managed Rust tests also pass (20 native opt-ins excluded).
+Actual native validation of this revision is pending; all complete-input/full-CI/
+shipping flags remain false and production remains disabled.

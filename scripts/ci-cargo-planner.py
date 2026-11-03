@@ -1785,6 +1785,34 @@ class _ViewProbe:
             'kernel_bases_bound':True,'unrelated_content_unchanged':True,'negative_lookup_changed_identity':True,
             'input_closure_complete':False,'shipping_authority':False}
 
+    def observe_directories(self,events,pid,user_namespace,mount_namespace):
+        """Apply the real selector to this unchanged native unit's scans."""
+        if self.owner!=os.getpid() or self.receipt is None:raise FreshnessHold('cleanup_uncertain')
+        selected,unbound=self.input_index.select_directory_subset([event for event in events
+            if event['uid']==2004 and event['pid']==pid],pid=pid,uid=2004,
+            user_namespace=user_namespace,mount_namespace=mount_namespace)
+        queries=lookup_inputs._unwire(selected.record()['queries'])
+        if {query['directory'] for query in queries}!={b'/workspace/target/deps',b'/workspace/target/deps/empty'}:
+            raise FreshnessHold('input_census_unknown')
+        cursor=(self.inputs/'deps/cursor').stat();cursor_calls=[event for event in events
+            if event['uid']==2004 and event['pid']==pid and event['inode']==cursor.st_ino
+                and event['device']==((os.major(cursor.st_dev)<<20)|os.minor(cursor.st_dev))]
+        if len(cursor_calls)!=3 or not all({key:event[key] for key in ('pid','tid','uid','syscall','sequence')}
+                in unbound for event in cursor_calls):raise FreshnessHold('input_census_unknown')
+        unrelated=self.root/'selector-unrelated'
+        following=self.root/'selector-directory-added';self._inputs(following,b'OLD')
+        empty=following/'deps/empty';empty.chmod(0o755);(empty/'member').write_bytes(b'new membership')
+        (empty/'member').chmod(0o444);empty.chmod(0o555)
+        before=selected.observation['sha256'];same=selected.refresh(self.lookup_index(unrelated))['sha256']
+        changed=selected.refresh(self.lookup_index(following))['sha256']
+        if before!=same or before==changed:raise FreshnessHold('input_census_unknown')
+        restored=lookup_inputs._ContentSelection.restore(selected.record(),self.input_index)
+        if restored.observation!=selected.observation:raise FreshnessHold('input_census_unknown')
+        return {'queries':len(queries),'unbound_calls':len(unbound),'binding_sha256':selected.binding_sha256,
+            'content_sha256':before,'unrelated_sha256':same,'introduced_sha256':changed,
+            'kernel_namespaces_bound':True,'rewound_scan_unbound':True,'membership_changed_identity':True,
+            'input_closure_complete':False,'shipping_authority':False}
+
     def prepare(self,ordinal,request=None):
         if self.owner!=os.getpid() or ordinal!=4:raise FreshnessHold('invalidation_unsafe')
         self.slot=self.root/'unit';self.slot.mkdir(mode=0o700)
@@ -2047,21 +2075,32 @@ def record_selected_revalidation(root,source,lease,checkpoint,bindings,outputs,r
             following=frozen_input_index(source,bindings,dict(scope,artifact_bindings=current_artifacts))
             selected=lookup_inputs._ContentSelection.restore(scope['selected_reads'],before)
             metadata=lookup_inputs._ContentSelection.restore(scope['selected_metadata'],before)
+            directory_record=scope.get('selected_directories')
+            if directory_record is None:
+                directories=lookup_inputs._ContentSelection([],before.census.observe([]),
+                    hashlib.sha256(lookup_inputs._encoded([])).hexdigest(),before._layout)
+            else:directories=lookup_inputs._ContentSelection.restore(directory_record,before)
             refreshed=selected.refresh(following);refreshed_metadata=metadata.refresh(following)
+            refreshed_directories=directories.refresh(following)
             read_changed=refreshed['sha256']!=selected.observation['sha256']
             metadata_changed=refreshed_metadata['sha256']!=metadata.observation['sha256']
-            changed=read_changed or metadata_changed
+            directory_changed=refreshed_directories['sha256']!=directories.observation['sha256']
+            changed=read_changed or metadata_changed or directory_changed
             fingerprint=scope['mapping']['fingerprint']
             if changed:affected.add(fingerprint)
             observations.append({'source_command':record['command'],'ordinal':scope['ordinal'],
                 'capture_sha256':record_sha,'binding_sha256':selected.binding_sha256,'fingerprint':fingerprint,
-                'previous_sha256':hashlib.sha256(lookup_inputs._encoded([selected.observation['sha256'],metadata.observation['sha256']])).hexdigest(),
-                'current_sha256':hashlib.sha256(lookup_inputs._encoded([refreshed['sha256'],refreshed_metadata['sha256']])).hexdigest(),
+                'previous_sha256':hashlib.sha256(lookup_inputs._encoded([selected.observation['sha256'],metadata.observation['sha256'],directories.observation['sha256']])).hexdigest(),
+                'current_sha256':hashlib.sha256(lookup_inputs._encoded([refreshed['sha256'],refreshed_metadata['sha256'],refreshed_directories['sha256']])).hexdigest(),
                 'read_relevance_changed':read_changed,'metadata_relevance_changed':metadata_changed,
+                'directory_relevance_changed':directory_changed,
+                'directory_binding_sha256':directories.binding_sha256,
+                'previous_directory_sha256':directories.observation['sha256'],'current_directory_sha256':refreshed_directories['sha256'],
                 'metadata_binding_sha256':metadata.binding_sha256,
                 'previous_metadata_sha256':metadata.observation['sha256'],'current_metadata_sha256':refreshed_metadata['sha256'],
                 'relevance_changed':changed,'unbound_read_opens':len(scope['unbound_read_opens']),
                 'unbound_metadata_queries':len(scope['unbound_metadata_queries']),
+                'unbound_directory_reads':None if directory_record is None else len(scope['unbound_directory_reads']),
                 'input_closure_complete':False,'shipping_authority':False})
     report={'version':2,'kind':'ci-selected-input-revalidation','binding':lease.binding,'command':lease.command,
         'checkpoint_command':checkpoint['command'],'previous_forests':checkpoint['forests'],'current_forests':refs,
@@ -2116,7 +2155,7 @@ class CommandObservation:
             units.append({'ordinal':ordinal,'pid':pid,'uid':uid,'kind':mapping['kind'],
                 'queries':len(queries),'directory_reads':len(reads),'metadata_queries':len(stats),
                 'source_open_observed':observed})
-            selected=None;unbound=[];selected_metadata=None;unbound_metadata=[]
+            selected=None;unbound=[];selected_metadata=None;unbound_metadata=[];selected_directories=None;unbound_directories=[]
             if mapping['kind']=='compile':
                 index=frozen_input_index(executor.source,executor.source_bindings,dict(item,artifact_bindings=mounted[ordinal]))
                 selected,unbound=index.select_read_subset([event for event in queries if event['syscall'] in (2,257,437)
@@ -2127,11 +2166,16 @@ class CommandObservation:
                     if event['pid']==pid and event['syscall'] in (262,332)],stats,
                     pid=pid,uid=uid,user_namespace=self.observer.user_namespace,
                     mount_namespace=int(item['namespaces']['mnt']['unit'].split('[',1)[1][:-1]),threaded=True)
+                selected_directories,unbound_directories=index.select_directory_subset([event for event in reads
+                    if event['pid']==pid],pid=pid,uid=uid,user_namespace=self.observer.user_namespace,
+                    mount_namespace=int(item['namespaces']['mnt']['unit'].split('[',1)[1][:-1]))
             scopes.append({'ordinal':ordinal,'pid':pid,'uid':uid,'mapping':{key:mapping[key] for key in ('kind','role','source','fingerprint','request_sha256','dependencies','generated_root') if key in mapping},
                 'artifact_bindings':mounted.get(ordinal,[]),
                 'selected_reads':None if selected is None else selected.record(),'unbound_read_opens':unbound,
                 'selected_metadata':None if selected_metadata is None else selected_metadata.record(),
                 'unbound_metadata_queries':unbound_metadata,
+                'selected_directories':None if selected_directories is None else selected_directories.record(),
+                'unbound_directory_reads':unbound_directories,
                 'scope_evidence':item['scope_evidence'],'namespaces':item['namespaces'],'root_identity':item['root_identity'],'returncode':item['returncode']})
         if any(event['uid']!=1999 and event['uid'] not in known
                 for event in [*events,*directories,*metadata]):

@@ -17,6 +17,65 @@ def load(name):
 
 
 class LookupInputTests(unittest.TestCase):
+    def test_directory_selection_binds_full_original_scan_and_refreshes_membership(self):
+        import copy
+        views=load('ci_cargo_views')
+        args={'pid':101,'uid':2000,'user_namespace':100,'mount_namespace':50}
+        def tree(name,*,extra=False,changed=False):
+            root=self.root/name;root.mkdir();(root/'raw-\udcff').write_bytes(b'changed' if changed else b'original')
+            if extra:(root/'new-entry').write_bytes(b'new')
+            for path in root.iterdir():path.chmod(0o444)
+            root.chmod(0o555);return root
+        old=tree('directory-old');same=tree('directory-same',changed=True);new=tree('directory-new',extra=True)
+        def index(root):return self.inputs.FrozenLookupIndex({'generated':('/workspace/generated',root,
+            views.inventory(root,owner=os.getuid(),sealed=True))},owner=os.getuid())
+        info=old.stat();child=(old/'raw-\udcff').stat()
+        def entry(name,inode,kind,offset,returned):
+            return {'name':name,'inode':inode,'type':kind,'raw_type':kind,'offset':offset,
+                'returned_offset':returned,'record_length':(20+len(name)+7)&~7,'accepted':True}
+        entries=[entry(b'.',info.st_ino,4,0,1),entry(b'..',old.parent.stat().st_ino,4,1,2),
+            entry(b'raw-\xff',child.st_ino,8,2,3)]
+        events=[]
+        for sequence,start,position,returned in ((1,0,2,entries[:2]),(2,2,3,entries[2:]),(3,3,3,[])):
+            events.append({'pid':101,'tid':102,'uid':2000,'syscall':217,'sequence':sequence,
+                'fd':3,'capacity':288,'device':(os.major(info.st_dev)<<20)|os.minor(info.st_dev),
+                'inode':info.st_ino,'mode':info.st_mode,'mount_namespace':50,'user_namespace':100,
+                'start_position':start,'position':position,'iterator_result':0,
+                'result':sum(e['record_length'] for e in returned),'entries':returned,'attempts':copy.deepcopy(returned)})
+        original=index(old);selected,unbound=original.select_directory_subset(events[::-1],**args)
+        self.assertEqual(unbound,[]);self.assertEqual(len(selected.record()['queries']),3)
+        restored=self.inputs._ContentSelection.restore(json.loads(json.dumps(selected.record())),original)
+        self.assertEqual(restored.observation,selected.observation)
+        self.assertEqual(restored.observation['sha256'],restored.refresh(index(same))['sha256'])
+        self.assertNotEqual(restored.observation['sha256'],restored.refresh(index(new))['sha256'])
+        for fault in ('no-eof','partial','rewind','namespace','user-namespace','legacy','pid','object',
+                'child-inode','missing-child','duplicate-child','result','cursor','unknown-type','opaque'):
+            bad=copy.deepcopy(events);target=original
+            if fault=='no-eof':bad.pop()
+            elif fault=='partial':bad[0]['start_position']=1
+            elif fault=='rewind':bad[1]['start_position']=0
+            elif fault=='namespace':bad[1]['mount_namespace']=51
+            elif fault=='user-namespace':bad[1]['user_namespace']=101
+            elif fault=='legacy':
+                for event in bad:event.pop('mount_namespace');event.pop('user_namespace')
+            elif fault=='pid':
+                for event in bad:event['pid']=103
+            elif fault=='object':
+                for event in bad:event['inode']+=1
+            elif fault=='child-inode':bad[1]['entries'][0]['inode']+=1
+            elif fault=='missing-child':bad.pop(1)
+            elif fault=='duplicate-child':bad[1]['entries'][0]['name']=b'.'
+            elif fault=='result':bad[1]['result']+=1
+            elif fault=='cursor':bad[1]['position']=99
+            elif fault=='unknown-type':bad[1]['entries'][0]['type']=0
+            else:target=self.inputs.FrozenLookupIndex({'generated':('/workspace/generated',old,
+                views.inventory(old,owner=os.getuid(),sealed=True))},owner=os.getuid(),opaque=('/workspace/generated/unknown-mounted-child',))
+            with self.subTest(fault=fault):
+                refused,unsupported=target.select_directory_subset(bad,**args)
+                self.assertEqual(refused.record()['queries'],[]);self.assertEqual(len(unsupported),len(bad))
+        with self.assertRaises(self.inputs.FreshnessHold):original.select_directory_subset(events+events[:1],**args)
+        self.assertFalse(selected.record()['input_closure_complete']);self.assertFalse(selected.record()['shipping_authority'])
+
     def test_mounted_unknown_subtree_cannot_certify_source_placeholder_or_absence(self):
         import copy
         views=load('ci_cargo_views');source=self.root/'source';source.mkdir()
