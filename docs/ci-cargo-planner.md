@@ -1494,3 +1494,13 @@ compiler source opens plus unchanged-unit reuse, covering paths outside the old
 fixture allowlist. Its native validation with the general collector is pending.
 Durable selector revalidation, opaque wrapper execution and the original
 in-command publication regression remain unfinished; production is disabled.
+
+The first general-capture native attempt completed collection and closed its
+original execution scope, but host receipt validation refused it. A validator
+loop reused the command-ID parameter name for each Cargo-command record; the new
+collector binding check then compared against that record. The loop now keeps
+the command ID intact, and the mocked transport regression includes a nonempty
+Cargo/compiled-unit result. Read-only inspection of the stopped image retained
+1,932 pathname observations, 32 directory reads and 554 metadata observations
+across three information units, two compilers and one application, with unchanged
+zero-miss kernel programs. The failed host validation granted no CI authority.

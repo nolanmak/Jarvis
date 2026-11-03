@@ -3187,13 +3187,13 @@ def validate_repository_execution(value,binding,command,workers,scope,predecesso
                     or unit['shipping_authority'] is not False or unit['input_closure_complete'] is not False
                     or type(unit['returncode']) is not int or not -64<=unit['returncode']<=255):raise ValueError()
             units[ordinal]=unit
-        for command in value['cargo_commands']:
-            ordinal=command['ordinal'];unit=units[ordinal]
-            if (ordinal in cargo or unit['uid']!=1001 or command['cargo_exit']!=unit['returncode']
-                    or command['original_cargo_cleanup'] is not True or type(command['compiler_calls']) is not int
-                    or type(command['units']) is not list or not 0<=command['compiler_calls']<=len(command['units'])):raise ValueError()
+        for cargo_command in value['cargo_commands']:
+            ordinal=cargo_command['ordinal'];unit=units[ordinal]
+            if (ordinal in cargo or unit['uid']!=1001 or cargo_command['cargo_exit']!=unit['returncode']
+                    or cargo_command['original_cargo_cleanup'] is not True or type(cargo_command['compiler_calls']) is not int
+                    or type(cargo_command['units']) is not list or not 0<=cargo_command['compiler_calls']<=len(cargo_command['units'])):raise ValueError()
             cargo.add(ordinal)
-            for compiler in command['units']:
+            for compiler in cargo_command['units']:
                 if (type(compiler['ordinal']) is not int or compiler['uid']!=2000+compiler['ordinal']
                         or compiler['original_cleanup'] is not True or compiler['shipping_authority'] is not False
                         or compiler['input_closure_complete'] is not False):raise ValueError()

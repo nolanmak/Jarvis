@@ -106,10 +106,17 @@ class AdapterTests(unittest.TestCase):
      self.assertTrue(options['ci_context']['repository_execution'])
      result=self.prepared_result(options,exit_code=0,stdout='original nested stdout',stderr='')
      generation=options['ci_context']['generation']
+     original={'started':True,'cancelled':False,'returncode':0,'original_cleanup':True,
+      'input_closure_complete':False,'shipping_authority':False}
+     compiler=dict(original,ordinal=0,uid=2000)
+     kernel=kernel_observation(generation['binding'],generation['command'])
+     kernel['units']=[{'ordinal':0,'pid':123,'uid':2000,'kind':'compile','queries':1,
+      'directory_reads':0,'metadata_queries':0,'source_open_observed':True}]
      result['repository_execution']={'version':1,'kind':'ci-repository-execution','binding':generation['binding'],
       'command':generation['command'],'checkpoint':self.execution_checkpoint(generation,result['guest_worker_quiescence']['scopes'][-1]),
-      'worker_units':[],'metadata_units':[],'cargo_commands':[],'original_worker_cleanup':True,
-      'kernel_observation':kernel_observation(generation['binding'],generation['command']),
+      'worker_units':[dict(original,ordinal=0,uid=1000),dict(original,ordinal=1,uid=1001)],'metadata_units':[],
+      'cargo_commands':[{'ordinal':1,'cargo_exit':0,'original_cargo_cleanup':True,'compiler_calls':1,'units':[compiler]}],
+      'original_worker_cleanup':True,'kernel_observation':kernel,
       'input_closure_complete':False,'full_ci':False,'shipping_authority':False,
       'guest_worker_quiescence':result['guest_worker_quiescence']['scopes'][0 if borrowed else -1]}
      return result
