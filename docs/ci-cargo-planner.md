@@ -642,6 +642,14 @@ or reuse authority.
 The fixed UID2004 VM unit now creates a filename containing its runtime PID and
 an empty directory beneath one declared root. The original root callback must
 discover and copy both after teardown, verify the exact sealed inventory and
-remove the original allocation. Native validation of this addition is pending.
-Actual Cargo build-script mapping, complete input collection and publication
-invalidation remain separate unfinished requirements.
+remove the original allocation. The real admitted VM replay at `d4a2d3f6`
+passed in **102.05 seconds**, including this exact directory/file inventory,
+original cleanup and allocation removal. The same run retained Cargo's one-then-
+zero compiler calls, two application runs and actual fingerprint preservation.
+There are **246 passing CI Python tests with native helpers and no skips**, and
+**31 focused Rust tests pass** (15 opt-in cases excluded). The preceding full
+CLI run at `4957bb69`, before the directory-root addition, passed all **1,700**
+unit tests (43 opt-in cases excluded) and every integration-test binary; 11
+integration cases remained opt-in. Actual Cargo build-script mapping, complete
+input collection and publication invalidation remain unfinished. This replay
+does not supply trusted input closure, a passing-CI proof or shipping authority.
