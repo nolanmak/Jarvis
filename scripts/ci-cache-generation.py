@@ -918,3 +918,222 @@ def reclaim(cache, protected_generations, worker_uid, worker_gid, *, limit=2):
             raise FreshnessHold("cleanup_uncertain") from None
         reclaimed.append(generation.name)
     return reclaimed
+
+
+# The legacy /target root was created by the privileged cache bootstrap under
+# the controller-owned mounted image. A worker can populate its derived output
+# namespaces, but cannot replace that root in the controller-owned parent.
+# This is cleanup ownership, never compiler provenance or reuse authority.
+_LEGACY_UNIT = r'[A-Za-z_][A-Za-z0-9_]*-[a-z0-9]{1,32}'
+_LEGACY_SESSION = r's-[a-z0-9]{1,32}-[a-z0-9]{1,32}-(?:[a-z0-9]{1,64}|working)'
+_LEGACY_PATH = re.compile(r'target/(?:debug|release)/incremental/'+_LEGACY_UNIT+'/'+_LEGACY_SESSION+r'\Z')
+_LEGACY_MAX_FILES = 4096
+_LEGACY_MAX_RECORD = 1024*1024
+_LEGACY_MAX_RETIREMENTS = 512
+
+
+def _legacy_identity(info):
+    return [info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid]
+
+
+def _legacy_directory(path,worker,device):
+    info=path.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_dev!=device or [info.st_uid,info.st_gid]!=worker
+            or info.st_mode&0o7022 or os.listxattr(path,follow_symlinks=False)):
+        raise FreshnessHold('invalidation_unsafe')
+    return _legacy_identity(info)
+
+
+def _legacy_files(path,worker,device):
+    import itertools
+    rows=[]
+    for child in itertools.islice(path.iterdir(),_LEGACY_MAX_FILES+1):
+        if (len(rows)>=_LEGACY_MAX_FILES or child.name not in ('dep-graph.bin','query-cache.bin','work-products.bin','metadata.rmeta')
+                and re.fullmatch(r'[a-z0-9]{1,64}\.o',child.name) is None):
+            raise FreshnessHold('invalidation_unsafe')
+        info=child.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_dev!=device or [info.st_uid,info.st_gid]!=worker
+                or info.st_mode&0o7022 or info.st_nlink!=1 or os.listxattr(child,follow_symlinks=False)):
+            raise FreshnessHold('invalidation_unsafe')
+        rows.append([child.name,*_legacy_identity(info),info.st_nlink,info.st_size,info.st_mtime_ns,info.st_ctime_ns])
+    return sorted(rows)
+
+
+def _legacy_lock(path,worker,device):
+    import fcntl
+    descriptor=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC)
+    try:
+        info=os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_dev!=device or [info.st_uid,info.st_gid]!=worker
+                or info.st_mode&0o7022 or info.st_nlink!=1 or info.st_size!=0
+                or _legacy_identity(path.lstat())!=_legacy_identity(info)):
+            raise FreshnessHold('invalidation_unsafe')
+        fcntl.flock(descriptor,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        return descriptor
+    except BaseException:
+        os.close(descriptor);raise
+
+
+def _validate_legacy_retirement(record,cache_binding):
+    common={'version','kind','state','binding','command','relative','worker','root','chain','session','bytes','shipping_authority'}
+    try:
+        if (type(record) is not dict or record.get('state') not in ('retiring','reclaimed')
+                or set(record)!=(common|({'files'} if record['state']=='retiring' else {'file_count','inventory_sha256'}))
+                or type(record['version']) is not int or record['version']!=1
+                or record['kind']!='ci-legacy-incremental-retirement' or record['shipping_authority'] is not False
+                or not _uuid(record['command']) or type(record['relative']) is not str
+                or _LEGACY_PATH.fullmatch(record['relative']) is None):raise ValueError()
+        validate_binding(record['binding'])
+        if (record['state']=='retiring'
+                and record['binding']['cache_identity_sha256']!=cache_binding['cache_identity_sha256']):raise ValueError()
+        if (type(record['worker']) is not list or len(record['worker'])!=2
+                or any(type(v) is not int or not 0<v<2**32 for v in record['worker'])
+                or type(record['bytes']) is not int or record['bytes']<0):raise ValueError()
+        for identity in [record['root'],record['session'],*record['chain']]:
+            if type(identity) is not list or len(identity)!=5 or any(type(v) is not int or v<0 for v in identity):raise ValueError()
+        if len(record['chain'])!=4:raise ValueError()
+        if record['state']=='retiring':
+            files=record['files']
+            if type(files) is not list or len(files)>_LEGACY_MAX_FILES or files!=sorted(files):raise ValueError()
+            names=set()
+            for row in files:
+                if (type(row) is not list or len(row)!=10 or type(row[0]) is not str or row[0] in names
+                        or '/' in row[0] or row[0] in ('.','..') or any(type(v) is not int for v in row[1:])):raise ValueError()
+                names.add(row[0])
+            if sum(row[7] for row in files)!=record['bytes']:raise ValueError()
+        elif (type(record['file_count']) is not int or not 0<=record['file_count']<=_LEGACY_MAX_FILES
+                or not _digest(record['inventory_sha256'])):raise ValueError()
+    except (ValueError,KeyError,TypeError):raise FreshnessHold('cleanup_uncertain') from None
+    return record
+
+
+def _finish_legacy_retirement(cache,allocation,record):
+    """Replay only a protected intent; no live worker may access this image."""
+    if _legacy_identity(cache.lstat())!=record['root']:raise FreshnessHold('cleanup_uncertain')
+    source=cache/record['relative'];parent=source.parent;parts=Path(record['relative']).parts
+    for ordinal,expected in enumerate(record['chain'],1):
+        if _legacy_directory(cache.joinpath(*parts[:ordinal]),record['worker'],record['root'][0])!=expected:
+            raise FreshnessHold('cleanup_uncertain')
+    lock=parent/('-'.join(source.name.split('-')[:3])+'.lock')
+    try:descriptor=_legacy_lock(lock,record['worker'],record['root'][0])
+    except (OSError,FreshnessHold):raise FreshnessHold('cleanup_uncertain') from None
+    try:
+        data=allocation/'data'
+        original=source.exists() or source.is_symlink();moved=data.exists() or data.is_symlink()
+        if original and moved:raise FreshnessHold('cleanup_uncertain')
+        if original:
+            if (_legacy_directory(source,record['worker'],record['root'][0])!=record['session']
+                    or _legacy_files(source,record['worker'],record['root'][0])!=record['files']):
+                raise FreshnessHold('cleanup_uncertain')
+            os.rename(source,data)
+            for directory in (parent,allocation):
+                fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+                try:os.fsync(fd)
+                finally:os.close(fd)
+            moved=True
+        if moved:
+            if _legacy_directory(data,record['worker'],record['root'][0])!=record['session']:raise FreshnessHold('cleanup_uncertain')
+            expected={row[0]:row for row in record['files']}
+            if any(row!=expected.get(row[0]) for row in _legacy_files(data,record['worker'],record['root'][0])):
+                raise FreshnessHold('cleanup_uncertain')
+            shutil.rmtree(data)
+            fd=os.open(allocation,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+            try:os.fsync(fd)
+            finally:os.close(fd)
+        completed={key:value for key,value in record.items() if key!='files'}
+        completed.update(state='reclaimed',file_count=len(record['files']),
+            inventory_sha256=hashlib.sha256(json.dumps(record['files'],sort_keys=True,separators=(',',':')).encode()).hexdigest())
+        _write_record(allocation/'receipt.json',completed)
+    except OSError as error:
+        if error.errno in (errno.ENOSPC,errno.EDQUOT):raise
+        raise FreshnessHold('cleanup_uncertain') from None
+    finally:os.close(descriptor)
+
+
+def reclaim_legacy_incremental(cache,binding,command,worker_uid,worker_gid,*,limit=32):
+    """Retire recognized derived sessions under original exclusive admission.
+
+    The privileged guest caller must already hold the original registered image
+    and target leases, have reconciled all prior cleanup holds, and call before
+    starting ANY workers. This function cannot manufacture those capabilities.
+    Compiled artifacts, fingerprints, downloads and unknown allocations stay.
+    Returned IDs acknowledge cleanup only and never authorize artifact reuse.
+    """
+    import itertools
+    validate_binding(binding)
+    if (not _uuid(command) or type(limit) is not int or not 1<=limit<=32
+            or any(type(v) is not int or not 0<v<2**32 for v in (worker_uid,worker_gid))
+            or not shutil.rmtree.avoids_symlink_attacks):raise FreshnessHold('cleanup_uncertain')
+    cache=Path(cache)
+    if not cache.is_absolute() or cache.resolve()!=cache:raise FreshnessHold('invalidation_unsafe')
+    _directory(cache,0o700,create=False);root_identity=_legacy_identity(cache.lstat());worker=[worker_uid,worker_gid]
+    retired=cache/'ci-legacy-incremental-retirements';reclaimed=[]
+    if retired.exists() or retired.is_symlink():
+        _directory(retired,0o700,create=False)
+        if stat.S_IMODE(retired.stat().st_mode)!=0o700:raise FreshnessHold('cleanup_uncertain')
+        allocations=list(itertools.islice(retired.iterdir(),_LEGACY_MAX_RETIREMENTS+1))
+        if len(allocations)>_LEGACY_MAX_RETIREMENTS:raise FreshnessHold('cleanup_uncertain')
+        for allocation in sorted(allocations):
+            if not _uuid(allocation.name):raise FreshnessHold('cleanup_uncertain')
+            _directory(allocation,0o700,create=False)
+            try:record=_read_record(allocation/'receipt.json',max_bytes=_LEGACY_MAX_RECORD)
+            except FreshnessHold as error:
+                if error.reason!='metadata_missing' or any(allocation.iterdir()):raise
+                # An empty controller-private envelope can remain if ENOSPC
+                # interrupted the initial intent write. No source was moved.
+                allocation.rmdir()
+                fd=os.open(retired,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+                try:os.fsync(fd)
+                finally:os.close(fd)
+                continue
+            record=_validate_legacy_retirement(record,binding)
+            if record['state']=='retiring':
+                _finish_legacy_retirement(cache,allocation,record);reclaimed.append(allocation.name)
+                if len(reclaimed)>=limit:return reclaimed
+    else:allocations=[]
+    target=cache/'target'
+    if not target.exists() and not target.is_symlink():return reclaimed
+    try:target_identity=_legacy_directory(target,worker,root_identity[0])
+    except (OSError,FreshnessHold):return reclaimed
+    inspected=0
+    for profile in ('debug','release'):
+        incremental=target/profile/'incremental'
+        try:
+            chain=[target_identity,*[_legacy_directory(path,worker,root_identity[0]) for path in (target/profile,incremental)]]
+            units=sorted(itertools.islice(incremental.iterdir(),1024))
+        except (OSError,FreshnessHold):continue
+        for unit in units:
+            if re.fullmatch(_LEGACY_UNIT,unit.name) is None:continue
+            try:
+                unit_identity=_legacy_directory(unit,worker,root_identity[0])
+                sessions=sorted(itertools.islice(unit.iterdir(),1024))
+            except (OSError,FreshnessHold):continue
+            for session in sessions:
+                if re.fullmatch(_LEGACY_SESSION,session.name) is None:continue
+                if inspected>=256:return reclaimed
+                inspected+=1
+                if len(reclaimed)>=limit:return reclaimed
+                if len(allocations)+len(reclaimed)>=_LEGACY_MAX_RETIREMENTS:raise FreshnessHold('cleanup_uncertain')
+                lock=unit/('-'.join(session.name.split('-')[:3])+'.lock')
+                try:
+                    descriptor=_legacy_lock(lock,worker,root_identity[0])
+                    try:
+                        session_identity=_legacy_directory(session,worker,root_identity[0]);files=_legacy_files(session,worker,root_identity[0])
+                    finally:os.close(descriptor)
+                except (OSError,FreshnessHold):continue
+                record={'version':1,'kind':'ci-legacy-incremental-retirement','state':'retiring','binding':binding,
+                    'command':command,'relative':str(session.relative_to(cache)),'worker':worker,'root':root_identity,
+                    'chain':[*chain,unit_identity],'session':session_identity,'files':files,
+                    'bytes':sum(row[7] for row in files),'shipping_authority':False}
+                if len(json.dumps(record).encode())>_LEGACY_MAX_RECORD:continue
+                _directory(retired,0o700,create=True)
+                identity=str(uuid.uuid4());allocation=retired/identity;allocation.mkdir(mode=0o700)
+                # Persist both namespace ancestors before committing intent.
+                # Fsync of receipt.json's own directory alone cannot do that.
+                for directory in (cache,retired):
+                    fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+                    try:os.fsync(fd)
+                    finally:os.close(fd)
+                _write_record(allocation/'receipt.json',record)
+                _finish_legacy_retirement(cache,allocation,record);reclaimed.append(identity)
+    return reclaimed

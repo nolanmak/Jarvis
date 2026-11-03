@@ -247,6 +247,8 @@ pub(super) struct Outcome {
     #[serde(default)]
     pub seed_reclaimed: Vec<String>,
     #[serde(default)]
+    pub legacy_incremental_reclaimed: Vec<String>,
+    #[serde(default)]
     pub dependency_result: Option<serde_json::Value>,
     #[serde(default)]
     source_kind:Option<String>,
@@ -379,7 +381,7 @@ impl Outcome {
                 .expect("bounded freshness protocol serializes");
         }
         if let Some(value)=&self.guest_diagnostic {
-            let stage=value["stage"].as_str().filter(|value|matches!(*value,"load_dependency_controller"|"reclaim_producers"|"prepare_producer"|"bind_producer_cache"|"hide_producer_cache"|"resolve_dependencies"|"freeze_resolution"|"compile_dependencies"|"record_producer"|"publish_dependencies"|"prepare_generation"|"execute_command"|"reclaim_seeds"|"planner_protocol_probe"|"planner_startup"|"planner_unit"|"planner_capture"|"planner_authorize"|"planner_drop"|"planner_arm_exec"|"planner_unit_exec"|"planner_client_start"|"planner_client_exec"|"planner_probe_stdin"|"planner_probe_jobserver"|"planner_probe_cancel"|"planner_probe_signal"|"planner_probe_supervisor"|"planner_probe_credentials"|"planner_probe_filter"|"planner_probe_exec_start"|"planner_probe_stream"|"planner_probe_wait"|"planner_probe_status"|"planner_request_receive"|"planner_request_cleanup"|"planner_tool_credentials"|"planner_tool_metadata"|"planner_tool_socket"|"planner_tool_jobserver"|"planner_tool_fds"|"planner_tool_environment"|"planner_tool_stdin"|"planner_probe_view"|"planner_tool_view"|"planner_view_prepare"|"planner_view_enter"|"planner_view_namespace"|"planner_view_runtime"|"planner_view_source"|"planner_view_inputs"|"planner_view_proc"|"planner_view_devices"|"planner_view_root"|"planner_view_publish"|"planner_cargo_request"|"planner_cargo_artifact"|"planner_cargo_runtime"|"planner_cargo_execute"|"planner_cargo_compile"|"planner_cargo_build_script"|"planner_cargo_application"|"planner_cargo_supervisor"|"planner_cargo_retire"|"planner_cargo_retry"|"planner_kernel_observer")).unwrap_or("unknown");
+            let stage=value["stage"].as_str().filter(|value|matches!(*value,"load_dependency_controller"|"reclaim_legacy_incremental"|"reclaim_producers"|"prepare_producer"|"bind_producer_cache"|"hide_producer_cache"|"resolve_dependencies"|"freeze_resolution"|"compile_dependencies"|"record_producer"|"publish_dependencies"|"prepare_generation"|"execute_command"|"reclaim_seeds"|"planner_protocol_probe"|"planner_startup"|"planner_unit"|"planner_capture"|"planner_authorize"|"planner_drop"|"planner_arm_exec"|"planner_unit_exec"|"planner_client_start"|"planner_client_exec"|"planner_probe_stdin"|"planner_probe_jobserver"|"planner_probe_cancel"|"planner_probe_signal"|"planner_probe_supervisor"|"planner_probe_credentials"|"planner_probe_filter"|"planner_probe_exec_start"|"planner_probe_stream"|"planner_probe_wait"|"planner_probe_status"|"planner_request_receive"|"planner_request_cleanup"|"planner_tool_credentials"|"planner_tool_metadata"|"planner_tool_socket"|"planner_tool_jobserver"|"planner_tool_fds"|"planner_tool_environment"|"planner_tool_stdin"|"planner_probe_view"|"planner_tool_view"|"planner_view_prepare"|"planner_view_enter"|"planner_view_namespace"|"planner_view_runtime"|"planner_view_source"|"planner_view_inputs"|"planner_view_proc"|"planner_view_devices"|"planner_view_root"|"planner_view_publish"|"planner_cargo_request"|"planner_cargo_artifact"|"planner_cargo_runtime"|"planner_cargo_execute"|"planner_cargo_compile"|"planner_cargo_build_script"|"planner_cargo_application"|"planner_cargo_supervisor"|"planner_cargo_retire"|"planner_cargo_retry"|"planner_kernel_observer")).unwrap_or("unknown");
             let category=value["category"].as_str().filter(|value|matches!(*value,"OSError"|"PermissionError"|"FileNotFoundError"|"FileExistsError"|"NotADirectoryError"|"IsADirectoryError"|"CalledProcessError"|"RuntimeError"|"TimeoutExpired"|"FreshnessHold"|"Unavailable"|"ValueError"|"KeyError"|"ModuleNotFoundError"|"ImportError")).unwrap_or("unknown");
             diagnostic["guest"]=serde_json::json!({"stage":stage,"category":category,
                 "errno":value["errno"].as_i64().filter(|value|(0..=4096).contains(value))});
@@ -909,15 +911,24 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             || outcome.seed_reclaimed.len()>2 || outcome.seed_reclaimed.iter().any(|value|
                 value.len()!=64 || !value.bytes().all(|byte|matches!(byte,b'0'..=b'9'|b'a'..=b'f'))
                     || dependency.is_some_and(|action|action["kind"]=="install" && action["seed"]==*value))
-            || outcome.seed_reclaimed.iter().collect::<BTreeSet<_>>().len()!=outcome.seed_reclaimed.len() {
+            || outcome.seed_reclaimed.iter().collect::<BTreeSet<_>>().len()!=outcome.seed_reclaimed.len()
+            || outcome.legacy_incremental_reclaimed.len()>32
+            || outcome.legacy_incremental_reclaimed.iter().any(|value|uuid::Uuid::parse_str(value).is_err())
+            || outcome.legacy_incremental_reclaimed.iter().collect::<BTreeSet<_>>().len()!=outcome.legacy_incremental_reclaimed.len() {
             return Err(crate::autoship_freshness::Hold::parse(&serde_json::json!({
                 "version":1,"reason":"cleanup_uncertain","recovery":"await_verified_cleanup",
-                "evidence_sha256":digest(&serde_json::to_vec(&(&outcome.cache_reclaimed,&outcome.producer_reclaimed,&outcome.seed_reclaimed))?)})).into());
+                "evidence_sha256":digest(&serde_json::to_vec(&(&outcome.cache_reclaimed,&outcome.producer_reclaimed,&outcome.seed_reclaimed,&outcome.legacy_incremental_reclaimed))?)})).into());
         }
         ensure!(
             output.status.success() == matches!(outcome.status.as_str(), "passed" | "planned" | "seed_produced" | "seed_published" | "seed_lookup"),
             "{PREREQUISITE}: VM process/receipt status mismatch"
         );
+        if !outcome.legacy_incremental_reclaimed.is_empty() {
+            audit.record_controller_receipt(serde_json::json!({"kind":"shared_ci_legacy_incremental_reclaimed","version":1,
+                "binding":binding,"command":command_id,"retirement_ids":outcome.legacy_incremental_reclaimed,
+                "physical_cache_sha256":self.cache_identity()?,"quiescence_receipt_sha256":quiescence_sha256,
+                "shipping_authority":false}))?;
+        }
         if !outcome.seed_reclaimed.is_empty() {
             audit.record_controller_receipt(serde_json::json!({"kind":"shared_ci_orphan_seeds_reclaimed","version":1,
                 "binding":binding,"command":command_id,"seed_ids":outcome.seed_reclaimed,

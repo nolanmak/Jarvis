@@ -1716,3 +1716,67 @@ worker has at most **37,564,416 bytes (about 36 MiB)** available. The image has
 `/target` and `/cargo-home` allocations and no new generation layout. This does not prove ownership of its contents for
 reclamation or implement migration. Bounded ownership-safe legacy recovery
 remains a rollout gate; no cache capacity/accounting/backoff was changed.
+
+
+### Bounded retirement of legacy incremental sessions
+
+The production image's older `/target` allocation comes from the privileged
+cache bootstrap. Its controller-owned image root protects creation/replacement
+of that delegated target root. Cleanup ownership here is distinct from artifact
+producer provenance: retiring a derived incremental session cannot certify any
+compiled artifact or make an old CI receipt current.
+
+The guest now has a pre-worker retirement path for recognized legacy Rust
+incremental sessions. It runs only after the existing registered-image/target
+admission and prior cleanup reconciliation, in the fresh guest before workers
+start. Host admission additionally verifies the image is beneath the exact
+physical target whose original inode lock is inherited and still held; an
+extra unrelated descriptor does not establish ownership. RAM, cache capacity,
+host disk floors, reservations and normal managed exclusion remain unchanged.
+
+Retirement covers only the legacy `target/{debug,release}/incremental` namespace,
+with matching original worker ownership/device, safe permissions, a held
+nonblocking session lock, flat recognized compiler files, no symlinks, no
+additional hard links and no extended attributes. Unknown entries retain the
+entire session. Compiled artifacts, fingerprints, Cargo downloads, source/audit
+evidence and new generation executors are outside this cleanup path.
+
+Before moving a selected session, root commits a versioned intent under a
+controller-private retirement allocation. The session is atomically moved into
+that allocation, then removed. Recovery validates the exact original directory
+chain and remaining file identities; changed/rebound state holds. A failed
+initial intent cannot move the source. An empty private envelope can be reconciled
+on retry; an envelope containing unknown data remains protected. Completed
+records are compact historical evidence with false shipping authority. Physical
+cache replacement fences pending retirement, while valid completed history
+stays readable without becoming current authorization.
+
+Each attempt acknowledges at most 32 sessions; discovery and per-session record
+sizes are bounded, and completed histories are compacted under a fixed record
+limit. Both Python transport layers and the Rust adapter validate the bounded,
+unique retirement identifiers. The Rust audit records them with the current
+binding, physical-cache identity and original quiescence receipt. These are
+cleanup acknowledgements, never passing-CI capabilities.
+
+Red/green tests cover interrupted moves/removals, ENOSPC before intent,
+post-intent mutation, cache replacement, unknown files/links/permissions,
+busy locks, bounded retirement and historical records. The pre-worker VM path
+and actual warm Cargo reuse after retirement still require native validation;
+filesystem tests alone do not close that gate. This code has not been applied
+to the production image and autoship restoration remains incomplete.
+
+
+A separate red/green admission regression found that a reopened lock pathname
+could borrow the appearance of a lock held through another open description.
+The adapter now checks the kernel's per-descriptor `fdinfo` flock ownership for
+the inherited global lease and exact physical-target lease. True duplicated
+inherited descriptions still pass; reopening `/proc/.../fd` does not. Independent
+contention probes remain in place. This matches the existing Rust parent-lease
+rule and does not acquire another build slot or weaken exclusion.
+
+The managed Rust verification begun before that final admission refinement
+ended with exit 75 while the normal worker had a live QEMU child. No live build
+was killed. A duplicate queued verification (no build descendants) was cancelled;
+verification of the latest helper bytes uses the same registered target and
+normal admission. Native legacy retirement and compatible-unit reuse remain
+unproven until their actual VM replay is run.

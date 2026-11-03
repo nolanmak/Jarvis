@@ -67,6 +67,22 @@ def private_bytes(path,limit=2*1024*1024):
 
 class InheritedStorage:
     """Keep the actual inherited open-file description; opening /proc/.../fd is NOT a dup."""
+    @staticmethod
+    def held_flock(descriptor,info):
+        """Kernel fdinfo attributes flock ownership to this open description."""
+        try:
+            with open('/proc/self/fdinfo/'+str(descriptor),'rb') as stream:data=stream.read(65537)
+            if len(data)>65536:return False
+            for line in data.decode('ascii').splitlines():
+                fields=line.split()
+                if (len(fields)!=9 or fields[0]!='lock:' or fields[2:5]!=['FLOCK','ADVISORY','WRITE']
+                        or fields[7:]!=['0','EOF']):continue
+                major,minor,inode=fields[6].split(':')
+                if (int(major,16),int(minor,16),int(inode))==(os.major(info.st_dev),os.minor(info.st_dev),info.st_ino):
+                    return True
+        except (OSError,ValueError,UnicodeError):pass
+        return False
+
     def __init__(self,policy,scratch):
         if set(policy)!={'fd','fds','path','device','inode','floor_bytes'}:raise vm.Unavailable('invalid inherited storage policy')
         if any(type(policy[key]) is not int or policy[key]<0 for key in ('fd','device','inode','floor_bytes')):raise vm.Unavailable('invalid inherited storage values')
@@ -87,6 +103,38 @@ class InheritedStorage:
             except BlockingIOError:pass
             else:raise vm.Unavailable('storage admission lock is not held')
         finally:os.close(probe)
+    def verify_cache_target(self,path):
+        """Bind the image's physical target to an actually held target lease."""
+        self.check()
+        refusal='managed CI cache target ownership unavailable'
+        path=Path(path);target=path.parent.parent
+        if path.name!='cache.img' or path.parent.name!='ci-vm' or target.resolve()!=target:
+            raise vm.Unavailable(refusal)
+        info=target.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o002:
+            raise vm.Unavailable(refusal)
+        uid=os.getuid();runtime=Path('/run/user')/str(uid)
+        base=runtime if runtime.is_dir() and runtime.stat().st_uid==uid else Path('/tmp')
+        directory=base/('augmentagent-storage-locks-'+str(uid))
+        try:
+            parent=directory.lstat()
+            if (directory.resolve()!=directory or not stat.S_ISDIR(parent.st_mode)
+                    or parent.st_uid!=uid or parent.st_mode&0o077):raise vm.Unavailable(refusal)
+            lock=directory/('inode-'+str(info.st_dev)+'-'+str(info.st_ino)+'.lock')
+            current=lock.lstat();identity=(current.st_dev,current.st_ino)
+            if (not stat.S_ISREG(current.st_mode) or current.st_uid!=uid or current.st_mode&0o077
+                    or current.st_nlink!=1 or not any(expected==identity and self.held_flock(fd,os.fstat(fd))
+                        for fd,expected in self.identities.items())):raise vm.Unavailable(refusal)
+            probe=os.open(lock,os.O_RDWR|os.O_NOFOLLOW|os.O_CLOEXEC)
+            try:
+                if (os.fstat(probe).st_dev,os.fstat(probe).st_ino)!=identity:raise vm.Unavailable(refusal)
+                try:fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                except BlockingIOError:return
+                fcntl.flock(probe,fcntl.LOCK_UN)
+            finally:os.close(probe)
+        except OSError as error:raise vm.Unavailable(refusal) from error
+        raise vm.Unavailable(refusal)
+
     def check(self):
         for fd,expected in self.identities.items():
             current=os.fstat(fd)
@@ -94,6 +142,7 @@ class InheritedStorage:
         info=os.fstat(self.fd);current=self.path.lstat()
         if (not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o022 or info.st_nlink!=1
                 or (info.st_dev,info.st_ino)!=self.identity or (current.st_dev,current.st_ino)!=self.identity):raise vm.Unavailable('inherited storage identity changed')
+        if not self.held_flock(self.fd,info):raise vm.Unavailable('original inherited storage lease unavailable')
         space=os.statvfs(self.scratch)
         if space.f_bavail*space.f_frsize<self.floor:raise vm.Unavailable('managed storage floor unavailable')
 
@@ -113,6 +162,7 @@ def ensure_cache(path, capacity, lease):
     # Target/path locks must accompany the global lease; controller owns their
     # registration. A global-only fixture cannot provision an arbitrary cache.
     if len(lease.fds)<2:raise vm.Unavailable('managed CI cache target lease missing')
+    lease.verify_cache_target(path)
     available=os.statvfs(parent);free=available.f_bavail*available.f_frsize
     if path.exists() or path.is_symlink():
         fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC)
@@ -315,6 +365,11 @@ def execute(request,run=vm.run,progress=None):
     outcome=run(runtime,workspace,command,{},timeout=None,scratch_dir=str(scratch),build_cache=request['build_cache'],storage_lease=lease,
                 ci_context=context)
     progress['stage']='receipt_validate'
+    reclaimed_legacy=outcome.get('legacy_incremental_reclaimed')
+    if (type(reclaimed_legacy) is not list or len(reclaimed_legacy)>32
+            or any(not cache_generation._uuid(value) for value in reclaimed_legacy)
+            or len(set(reclaimed_legacy))!=len(reclaimed_legacy)):
+        raise cache_generation.FreshnessHold('cleanup_uncertain')
     reclaimed_seeds=outcome.get('seed_reclaimed')
     protected_seed=dependency.get('seed') if dependency and dependency.get('kind')=='install' else None
     if (not isinstance(reclaimed_seeds,list) or len(reclaimed_seeds)>2
@@ -335,6 +390,7 @@ def execute(request,run=vm.run,progress=None):
             'cache_reclaimed':outcome.get('cache_reclaimed',[]),
             'producer_reclaimed':reclaimed_producers,
             'seed_reclaimed':reclaimed_seeds,
+            'legacy_incremental_reclaimed':reclaimed_legacy,
             'source_kind':'dependency_inputs' if request['operation']=='dependency' else 'git'}
     if request['operation'] not in ('plan','dependency'):
         try:observed_inputs=input_boundary.validate_observation(outcome.get('input_write_observation'),guest_workers,len(outputs))

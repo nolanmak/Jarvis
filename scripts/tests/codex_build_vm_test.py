@@ -17,7 +17,7 @@ class SnapshotValidationTests(unittest.TestCase):
     def test_source_projection_survives_transport_only_for_ci_and_unknown_fields_still_fail(self):
         ordinary={'exit_code':0,'stdout':'','stderr':''}
         projection={'version':1,'kind':'ci-git-source-projection'}
-        result={**ordinary,'cache_reclaimed':[],'producer_reclaimed':[],'seed_reclaimed':[],
+        result={**ordinary,'cache_reclaimed':[],'producer_reclaimed':[],'seed_reclaimed':[],'legacy_incremental_reclaimed':[],
             'guest_worker_quiescence':{},'cache_preparation':{},'input_write_observation':{},
             'source_projection':projection}
         vm.validate_result_shape(result,{})

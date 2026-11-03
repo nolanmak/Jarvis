@@ -39,7 +39,7 @@ class FreshnessUnavailable(Unavailable):
 
 def guest_diagnostic(value):
     value=value if isinstance(value,dict) else {}
-    stages={'load_dependency_controller','reclaim_producers','reclaim_seeds','prepare_producer','bind_producer_cache','hide_producer_cache',
+    stages={'load_dependency_controller','reclaim_legacy_incremental','reclaim_producers','reclaim_seeds','prepare_producer','bind_producer_cache','hide_producer_cache',
             'resolve_dependencies','freeze_resolution','compile_dependencies','record_producer',
             'publish_dependencies','prepare_generation','execute_command','planner_protocol_probe',
             'planner_startup','planner_unit','planner_capture','planner_authorize','planner_drop',
@@ -395,12 +395,17 @@ try:
     cache_reclaimed=[]
     producer_reclaimed=[]
     seed_reclaimed=[]
+    legacy_incremental_reclaimed=[]
     dependency_result=None
     cache_preparation=None
     source_projection=None
     planner_protocol_probe=None
     action=job.get('ci_dependency')
     if job.get('ci_context') and job.get('build_cache'):
+        guest_stage='reclaim_legacy_incremental'
+        if os.geteuid()!=0 or guest_worker_receipts:raise ci_cache['FreshnessHold']('cleanup_uncertain')
+        legacy_incremental_reclaimed=ci_cache['reclaim_legacy_incremental']('/build-cache',
+            job['ci_generation']['binding'],job['ci_generation']['command'],uid,gid)
         guest_stage='reclaim_producers'
         producer_reclaimed=ci_dependency.store.reclaim_producers('/build-cache',job['ci_generation']['retained_producers'],
             cache_identity=job['ci_generation']['binding']['cache_identity_sha256'],eligible=job['ci_generation']['producer_retirements'])
@@ -490,6 +495,7 @@ try:
         result['cache_reclaimed']=cache_reclaimed
         result['producer_reclaimed']=producer_reclaimed
         result['seed_reclaimed']=seed_reclaimed
+        result['legacy_incremental_reclaimed']=legacy_incremental_reclaimed
         result['guest_worker_quiescence']={'version':1,'kind':'ci-guest-command-quiescence',
             'worker_free':True,'scopes':guest_worker_receipts,'shipping_authority':False}
     if dependency_result is not None:result['dependency_result']=dependency_result
@@ -521,7 +527,7 @@ BUILD_CACHE_MOUNT = '/build-cache'
 
 
 def validate_result_shape(result,ci_context):
-    expected={'exit_code','stdout','stderr'}|({'cache_reclaimed','producer_reclaimed','seed_reclaimed','guest_worker_quiescence'} if ci_context is not None else set())
+    expected={'exit_code','stdout','stderr'}|({'cache_reclaimed','producer_reclaimed','seed_reclaimed','legacy_incremental_reclaimed','guest_worker_quiescence'} if ci_context is not None else set())
     if ci_context is not None and ci_context.get('dependency_action') is not None:expected.add('dependency_result')
     if ci_context is not None:
         for field in ('cache_preparation','input_write_observation','source_projection'):
@@ -829,6 +835,11 @@ poweroff -f
                     download_info.update(requests=broker.requests, bytes=broker.bytes)
                 validate_result_shape(result,ci_context)
                 if ci_context is not None:
+                    legacy=result['legacy_incremental_reclaimed']
+                    if (not isinstance(legacy,list) or len(legacy)>32
+                            or any(not isinstance(value,str) or re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',value) is None for value in legacy)
+                            or len(set(legacy))!=len(legacy)):
+                        raise Unavailable('invalid CI legacy incremental cleanup receipt')
                     seeds=result['seed_reclaimed']
                     action=ci_context.get('dependency_action')
                     protected_seed=action.get('seed') if action and action.get('kind')=='install' else None

@@ -31,6 +31,60 @@ def kernel_observation(binding,command):
   'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
 
 class AdapterTests(unittest.TestCase):
+ def test_reopened_lock_descriptions_cannot_borrow_global_or_target_ownership(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);request=self.fixture(root)
+   original=request['storage']['fd'];reopened=os.open('/proc/self/fd/'+str(original),os.O_RDWR|os.O_CLOEXEC)
+   self.addCleanup(os.close,reopened)
+   with self.assertRaises(vm.Unavailable):
+    adapter.InheritedStorage(request['storage']|{'fd':reopened,'fds':[reopened]},root/'scratch')
+   target=root/'target';(target/'ci-vm').mkdir(parents=True,mode=0o700)
+   self.hold_cache_target(request,target);held=request['storage']['fds'][-1]
+   reopened_target=os.open('/proc/self/fd/'+str(held),os.O_RDWR|os.O_CLOEXEC)
+   self.addCleanup(os.close,reopened_target)
+   borrowed=adapter.InheritedStorage(request['storage']|{'fds':[original,reopened_target]},root/'scratch')
+   with self.assertRaises(vm.Unavailable):borrowed.verify_cache_target(target/'ci-vm/cache.img')
+   duplicated=os.dup(held);self.addCleanup(os.close,duplicated)
+   owned=adapter.InheritedStorage(request['storage']|{'fds':[original,duplicated]},root/'scratch')
+   owned.verify_cache_target(target/'ci-vm/cache.img')
+
+ def test_cache_ownership_requires_the_original_physical_target_lock(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);request=self.fixture(root)
+   target=root/'target';(target/'ci-vm').mkdir(parents=True,mode=0o700)
+   image=target/'ci-vm/cache.img'
+   lease=adapter.InheritedStorage(request['storage'],root/'scratch')
+   with self.assertRaisesRegex(vm.Unavailable,'target ownership'):lease.verify_cache_target(image)
+   self.hold_cache_target(request,target)
+   lease=adapter.InheritedStorage(request['storage'],root/'scratch')
+   lease.verify_cache_target(image)
+   other=root/'other';(other/'ci-vm').mkdir(parents=True,mode=0o700)
+   with self.assertRaisesRegex(vm.Unavailable,'target ownership'):lease.verify_cache_target(other/'ci-vm/cache.img')
+
+ def hold_cache_target(self,request,target):
+  uid=os.getuid();runtime=Path('/run/user')/str(uid)
+  base=runtime if runtime.is_dir() and runtime.stat().st_uid==uid else Path('/tmp')
+  directory=base/('augmentagent-storage-locks-'+str(uid));directory.mkdir(mode=0o700,exist_ok=True)
+  info=target.stat();path=directory/('inode-'+str(info.st_dev)+'-'+str(info.st_ino)+'.lock')
+  descriptor=os.open(path,os.O_RDWR|os.O_CREAT|os.O_CLOEXEC,0o600)
+  fcntl.flock(descriptor,fcntl.LOCK_EX|fcntl.LOCK_NB);self.addCleanup(os.close,descriptor)
+  request['storage']['fds'].append(descriptor)
+
+ def test_legacy_incremental_cleanup_acknowledgement_is_required_typed_unique_and_bounded(self):
+  identity=str(uuid.uuid4())
+  for value in ('missing',None,{},[[]],['bad'],[identity,identity],[str(uuid.uuid4()) for _ in range(33)]):
+   with self.subTest(value=value),tempfile.TemporaryDirectory() as directory:
+    root=Path(directory);request=self.fixture(root)
+    request.update(operation='repository',command='true',build_cache=str(root/'registered-image'))
+    def execute(*args,**options):
+     result=self.prepared_result(options,exit_code=0,stdout='',stderr='')
+     if value=='missing':result.pop('legacy_incremental_reclaimed',None)
+     else:result['legacy_incremental_reclaimed']=value
+     return result
+    with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',
+      side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
+     with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=execute)
+
  def test_internal_probe_flag_is_typed_and_cannot_select_a_root_probe_from_other_operations(self):
   with tempfile.TemporaryDirectory() as directory:
    request=self.fixture(Path(directory))
@@ -166,6 +220,7 @@ class AdapterTests(unittest.TestCase):
    'retained_executor':True,'completion_sha256':'5'*64,'generated_forests':[],'input_closure_complete':False,'shipping_authority':False}
  def prepared_result(self,options,**result):
   result.setdefault('seed_reclaimed',[])
+  result.setdefault('legacy_incremental_reclaimed',[])
   generation=options['ci_context']['generation']
   result['guest_worker_quiescence']=stopped_workers()
   result['input_write_observation']=observed_inputs(result['guest_worker_quiescence'])
@@ -243,7 +298,7 @@ class AdapterTests(unittest.TestCase):
     seen.append((argv,options));self.assertIn('--probe-prerequisites',argv);self.assertEqual(environment,{})
     self.assertEqual(options['ci_context']['runner'],b'controller runner');self.assertIsNone(options['timeout'])
     plan={'head':request['head'],'base':request['base'],'contract_sha256':hashlib.sha256(b'{"version":1}').hexdigest(),'checks':[]}
-    return {'exit_code':0,'stdout':json.dumps(plan),'stderr':'','seed_reclaimed':[],'guest_worker_quiescence':stopped_workers()}
+    return {'exit_code':0,'stdout':json.dumps(plan),'stderr':'','seed_reclaimed':[],'legacy_incremental_reclaimed':[],'guest_worker_quiescence':stopped_workers()}
    with patch.object(vm.Runtime,'load',return_value=object()):result=adapter.execute(request,run=execute)
    self.assertEqual(result['status'],'planned');self.assertEqual(len(seen),1)
 
@@ -267,7 +322,7 @@ class AdapterTests(unittest.TestCase):
     seen.append(options)
     self.assertEqual(options['ci_context']['dependency_action']['kind'],'produce')
     self.assertIn('ci-dependency-store.py',options['ci_context']['dependency_programs'])
-    return {'exit_code':0,'stdout':'','stderr':'','cache_reclaimed':[],'seed_reclaimed':[],'guest_worker_quiescence':stopped_workers(),
+    return {'exit_code':0,'stdout':'','stderr':'','cache_reclaimed':[],'seed_reclaimed':[],'legacy_incremental_reclaimed':[],'guest_worker_quiescence':stopped_workers(),
      'dependency_result':{'version':1,'kind':'produced','producer':dependency['producer'],
       'command':request['command_id'],'dependency_inputs_sha256':dependency['dependency_inputs_sha256'],
       'shipping_authority':False}}
@@ -282,7 +337,7 @@ class AdapterTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as d:
    request=self.fixture(Path(d))
    with patch.object(vm.Runtime,'load',return_value=object()),self.assertRaisesRegex(vm.Unavailable,'binding mismatch'):
-    adapter.execute(request,run=lambda *a,**k:{'exit_code':0,'stdout':'{}','stderr':'','seed_reclaimed':[],'guest_worker_quiescence':stopped_workers()})
+    adapter.execute(request,run=lambda *a,**k:{'exit_code':0,'stdout':'{}','stderr':'','seed_reclaimed':[],'legacy_incremental_reclaimed':[],'guest_worker_quiescence':stopped_workers()})
  def test_real_inherited_lock_not_proc_reopen_and_fd_identity_refusal(self):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d);request=self.fixture(root);lease=adapter.InheritedStorage(request['storage'],root/'scratch');lease.check()
@@ -412,11 +467,10 @@ class AdapterTests(unittest.TestCase):
 
  def test_cache_reuse_capacity_and_private_identity(self):
   with tempfile.TemporaryDirectory() as d:
-   root=Path(d);image=root/'cache.img';capacity=64*1024*1024
-   class Lease:
-    fds=[4,5];floor=0
-    def check(self):pass
-   lease=Lease()
+   root=Path(d);request=self.fixture(root);target=root/'target';(target/'ci-vm').mkdir(parents=True,mode=0o700)
+   image=target/'ci-vm/cache.img';capacity=64*1024*1024
+   self.hold_cache_target(request,target)
+   lease=adapter.InheritedStorage(request['storage'],root/'scratch')
    def format_image(argv,**kwargs):
     fd=int(argv[-1].split('/')[-1]);header=bytearray(1024)
     import struct
@@ -431,13 +485,12 @@ class AdapterTests(unittest.TestCase):
     with self.assertRaisesRegex(vm.Unavailable,'identity'):adapter.ensure_cache(image,capacity,lease)
  def test_cache_refuses_symlink_and_missing_target_admission(self):
   with tempfile.TemporaryDirectory() as d:
-   root=Path(d);image=root/'cache.img'
-   class Lease:
-    fds=[4];floor=0
-    def check(self):pass
-   lease=Lease()
+   root=Path(d);request=self.fixture(root);target=root/'target';(target/'ci-vm').mkdir(parents=True,mode=0o700)
+   image=target/'ci-vm/cache.img'
+   lease=adapter.InheritedStorage(request['storage'],root/'scratch')
    with self.assertRaisesRegex(vm.Unavailable,'target lease'):adapter.ensure_cache(image,64*1024*1024,lease)
-   lease.fds=[4,5];image.symlink_to(root/'other')
+   self.hold_cache_target(request,target);lease=adapter.InheritedStorage(request['storage'],root/'scratch')
+   image.symlink_to(root/'other')
    with self.assertRaises(OSError):adapter.ensure_cache(image,64*1024*1024,lease)
 
  def test_fixed_targeted_and_baseline_argv_and_validation(self):
@@ -522,7 +575,7 @@ class BuildVMExtensionTests(unittest.TestCase):
     def __init__(self,argv,**kwargs):
      self.calls=0;self.returncode=None;cleanup=Path(argv[3]);cleanup.write_text('all-descendants-reaped\n')
      result=cleanup.parent/'control/outcome.json';result.write_text(json.dumps({'exit_code':0,'stdout':'finished','stderr':'',
-      'cache_reclaimed':receipt_reclaimed,'producer_reclaimed':[],'seed_reclaimed':[],'guest_worker_quiescence':stopped_workers()}));result.chmod(0o600)
+      'cache_reclaimed':receipt_reclaimed,'producer_reclaimed':[],'seed_reclaimed':[],'legacy_incremental_reclaimed':[],'guest_worker_quiescence':stopped_workers()}));result.chmod(0o600)
     def wait(self,timeout):
      self.calls+=1
      if self.calls<3:raise subprocess.TimeoutExpired('fixture',timeout)
