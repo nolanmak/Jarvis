@@ -243,6 +243,9 @@ pub struct GoogleGmail {
     app: OAuthApp,
     creds: Arc<dyn CredentialStore>,
     cache: Mutex<HashMap<String, CachedToken>>,
+    /// #1833 D12 — where fetched messages' sender authentication is
+    /// recorded (`email_sender_auth`). `None` records nothing.
+    sender_auth_store: Option<Arc<augmentagent_store::Store>>,
 }
 
 impl std::fmt::Debug for GoogleGmail {
@@ -266,6 +269,7 @@ impl GoogleGmail {
             app,
             creds: default_store(),
             cache: Mutex::new(HashMap::new()),
+            sender_auth_store: None,
         }
     }
 
@@ -284,6 +288,16 @@ impl GoogleGmail {
     /// default credential store.
     pub fn with_credential_store(mut self, creds: Arc<dyn CredentialStore>) -> Self {
         self.creds = creds;
+        self
+    }
+
+    /// #1833 D12 — record each fetched message's [`SenderAuth`] (from
+    /// Google's own `Authentication-Results` header) in `store`, keyed by
+    /// message id, for the autonomy gate. The `Email` struct is unchanged.
+    ///
+    /// [`SenderAuth`]: crate::sender_auth::SenderAuth
+    pub fn with_sender_auth_store(mut self, store: Arc<augmentagent_store::Store>) -> Self {
+        self.sender_auth_store = Some(store);
         self
     }
 
@@ -1706,6 +1720,40 @@ mod tests {
         assert_eq!(decode_base64url("aGk=").unwrap(), b"hi");
         assert_eq!(decode_base64url("-_8").unwrap(), decode_base64url("+/8=").unwrap());
         assert!(decode_base64url("not*base64").is_none());
+    }
+
+    /// #1833 D12 — a Gmail-direct fetch records Google's verdict per
+    /// message; a message without Google's header records nothing.
+    #[tokio::test]
+    async fn gmail_direct_fetch_records_sender_auth() {
+        let pass = "mx.google.com; dkim=pass header.i=@work.example.test; dmarc=pass header.from=work.example.test";
+        let forged_only = "relay.example.test; dmarc=pass header.from=work.example.test";
+        let fake = FakeGoogle::start(vec![
+            token_route("at-1"),
+            ("GET", "/users/me/messages?", 200,
+             r#"{"messages":[{"id":"m1"},{"id":"m2"}],"resultSizeEstimate":2}"#.into()),
+            ("GET", "/users/me/messages/m1", 200,
+             serde_json::json!({"id":"m1","threadId":"t1","internalDate":"1792850400000","payload":{
+                 "mimeType":"text/plain","headers":[
+                     {"name":"Authentication-Results","value":pass},
+                     {"name":"From","value":"Jane <jane@work.example.test>"},{"name":"Subject","value":"One"}],
+                 "body":{"data": b64url("first")}}}).to_string()),
+            ("GET", "/users/me/messages/m2", 200,
+             serde_json::json!({"id":"m2","threadId":"t2","internalDate":"1792850300000","payload":{
+                 "mimeType":"text/plain","headers":[
+                     {"name":"Authentication-Results","value":forged_only},
+                     {"name":"From","value":"b@example.test"},{"name":"Subject","value":"Two"}],
+                 "body":{"data": b64url("second")}}}).to_string()),
+        ])
+        .await;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(augmentagent_store::Store::open(db.path()).unwrap());
+        let g = client_with_token(&fake, Some(stored(MAILBOX))).with_sender_auth_store(Arc::clone(&store));
+        let emails = g.search(MAILBOX, "is:unread", 50).await.unwrap();
+        assert_eq!(emails.len(), 2);
+        let a = store.email_sender_auth("m1").unwrap().expect("m1 carries Google's header");
+        assert!(a.dmarc_pass && a.trusted());
+        assert_eq!(store.email_sender_auth("m2").unwrap(), None, "no Google header => None");
     }
 
     #[tokio::test]

@@ -2190,6 +2190,25 @@ mod tests {
         assert_eq!(emails[0].date, "1737147069000");
     }
 
+    /// #1833 D12 — Composio-backed mail never gets a sender-auth record,
+    /// even when the payload carries a Google header: the gate sees `None`
+    /// and returns `sender_unauthenticated`.
+    #[tokio::test]
+    async fn composio_account_none() {
+        use std::sync::Arc;
+        let body = r#"{"data":{"messages":[{"id":"MSGC","from":"jane@work.example.test","subject":"hi","messageTimestamp":"2026-01-17T21:11:09Z","messageText":"hi","payload":{"headers":[{"name":"Authentication-Results","value":"mx.google.com; dmarc=pass header.from=work.example.test"}]}}]}}"#;
+        let addr = spawn_repeating_http(200, body, "").await;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(augmentagent_store::Store::open(db.path()).unwrap());
+        let client = ComposioClient::new("ak_fake".into())
+            .with_base_url(format!("http://{addr}"))
+            .with_rate_limit_store(Arc::clone(&store));
+        let emails = client.fetch_with_query("entity-composio", "in:inbox", 1).await.unwrap();
+        assert_eq!(emails.len(), 1);
+        assert_eq!(emails[0].message_id, "MSGC");
+        assert_eq!(store.email_sender_auth("MSGC").unwrap(), None);
+    }
+
     #[tokio::test]
     async fn rate_limited_fetch_latches_entity_and_short_circuits_the_next_call() {
         use std::sync::Arc;

@@ -160,6 +160,7 @@ mod slack_serve;
 mod slack_subscriptions;
 mod slack_voice;
 mod status;
+mod trust_cmd;
 
 #[derive(Parser)]
 #[command(name = "augmentagent", version, about = "AugmentAgent Rust daemon")]
@@ -415,6 +416,12 @@ enum Cmd {
     TeamCoverage {
         #[command(subcommand)]
         op: TeamCoverageOp,
+    },
+    /// Trusted-contact autonomy (#1833): the owner-only trust config and
+    /// its confirm/pause controls.
+    Trust {
+        #[command(subcommand)]
+        op: trust_cmd::Op,
     },
     /// Structured cross-channel message index (#1095): backfill and health.
     Messages {
@@ -4693,6 +4700,7 @@ async fn main() -> Result<()> {
         Cmd::RepoDocs { .. } => unreachable!("handled before database initialization"),
         Cmd::Team { .. } => unreachable!("handled before database initialization"),
         Cmd::TeamCoverage { op } => team_coverage_cmd(&store, op),
+        Cmd::Trust { op } => trust_cmd::run(&store, op, cli.wiki_dir.as_deref()),
         Cmd::HandoffPrune { .. } => unreachable!("handled before database initialization"),
         Cmd::Disk { .. } => unreachable!("handled before database initialization"),
         Cmd::Deploy { .. } => unreachable!("handled before database initialization"),
