@@ -29,7 +29,7 @@ def census_sample():
     links=[{'id':10+i,'type':'raw_tracepoint' if i in (1,4) else 'kretprobe_multi',
         'prog_id':i,'tag':f'{i:016x}',**({'tracepoint':'sys_enter' if i==1 else 'sys_exit'} if i in (1,4)
             else {'function':'getname_flags','count':1,'flags':1,'missed':0})} for i in range(1,5)]
-    for i,(function,flags) in enumerate((('iterate_dir',0),('iterate_dir',1),('filldir64',0),('filldir64',1),('vfs_fstat',0),('vfs_fstat',1)),5):
+    for i,(function,flags) in enumerate((('iterate_dir',0),('iterate_dir',1),('filldir64',0),('filldir64',1),('vfs_fstat',0),('vfs_fstat',1),('cp_new_stat',0),('cp_new_stat',1),('cp_statx',0),('cp_statx',1)),5):
         programs.append({'id':i,'type':2,'tag':f'{i:016x}','recursion_misses':0})
         links.append({'id':10+i,'type':'kretprobe_multi' if flags else 'kprobe_multi',
             'prog_id':i,'tag':f'{i:016x}','function':function,'count':1,'flags':flags,'missed':0})
@@ -37,6 +37,36 @@ def census_sample():
 
 
 class KernelObserverTests(unittest.TestCase):
+    def test_path_metadata_keeps_original_arguments_final_statx_fields_and_copy_result(self):
+        rows=['U 2004 101 101 1 332 3 3 256 256 8191 8191 100','P 2004 101 101 1 1 100',
+            'J 2004 101 101 1 7 900 33060 1 0 0 0 6 4096 8 8191',
+            'K 2004 101 101 1 1 2 3 4 5 6',
+            'O 2004 101 101 1 9223372036854775808 1 7 8 999 10 11 512 4096 512 1 2 3 4',
+            'Y 2004 101 101 1 0','Z 2004 101 101 1 0',
+            'U 2004 101 101 2 262 3 3 0 0 0 0 100','Z 2004 101 101 2 -2']
+        queries=observer.metadata_queries(rows)
+        self.assertEqual([q['syscall'] for q in queries],[332,262])
+        self.assertEqual(queries[0]['flags'],256);self.assertEqual(queries[0]['mask'],8191)
+        self.assertEqual(queries[0]['stat']['mnt_id'],999)
+        self.assertEqual(queries[0]['stat']['attributes'],2**63)
+        self.assertIsNone(queries[1]['stat']);self.assertIsNone(queries[1]['copy_result'])
+        user=observer.statx_bytes(queries[0]['stat'])
+        self.assertEqual(len(user),256)
+        self.assertEqual(int.from_bytes(user[8:16],'little'),0)  # Kernel-only flag is masked by cp_statx.
+        self.assertEqual(int.from_bytes(user[144:152],'little'),999)
+        framed=(lookup(2004,101,101,332,1,0,'src/lib.rs')
+            +lookup(2004,101,101,262,2,-2,'/workspace/missing')
+            +b''.join(frame('printf',row+'\n') for row in rows)
+            +frame('map',{'@emitted':len(rows)+4}))
+        paths,dirs,observed=observer.decode(framed,with_metadata=True)
+        self.assertEqual([q['path'] for q in observed],[b'src/lib.rs',b'/workspace/missing'])
+        with self.assertRaises(observer.ObservationUnavailable):
+            observer.decode(framed.replace(b'332 1 0',b'332 1 -14'))
+        for bad in (rows[:-1],rows[:4]+rows[5:],rows+rows[:1],
+                [r.replace('332 3 3','332 3 4') for r in rows],
+                [r.replace('1 1 100','1 0 100') for r in rows]):
+            with self.subTest(rows=bad),self.assertRaises(observer.ObservationUnavailable):observer.metadata_queries(bad)
+
     def test_fstat_keeps_original_descriptor_metadata_namespace_and_delivery_outcome(self):
         rows=['F 2004 101 101 1 3 3','H 2004 101 101 1 3 100',
             'J 2004 101 101 1 7 900 33060 1 0 0 0 6 4096 8 2047',
@@ -179,7 +209,7 @@ class KernelObserverTests(unittest.TestCase):
                 data+b'0\t getname_flags+0x0/0x20\n',data.split(b'cookie')[0],data+b'missed:\t0\n'):
             with self.subTest(data=bad),self.assertRaises(observer.ObservationUnavailable):observer._fdinfo(bad)
 
-    def test_only_the_same_ten_original_links_and_programs_with_zero_misses_have_a_census(self):
+    def test_only_the_same_fourteen_original_links_and_programs_with_zero_misses_have_a_census(self):
         sample=census_sample();value={'before':sample,'after':copy.deepcopy(sample)}
         observer.validate_census(value)
         for fault in ('missed-before','missed-after','recursion','missing-link','duplicate-program',

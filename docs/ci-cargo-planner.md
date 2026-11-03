@@ -946,3 +946,35 @@ and allocations were removed. The 268-test CI Python suite passed with native
 helpers and no skips; 19 observer tests and 31 focused Rust tests passed
 (15 opt-in Rust cases excluded). Full-filesystem coverage, complete input
 closure, passing CI and shipping authority remain false.
+
+
+The pathname metadata extension observes selected `newfstatat`/`statx` queries
+at the original `cp_new_stat`/`cp_statx` entry and return. These kernel objects
+already contain the post-lookup mount-ID/attribute fields; observing only
+`vfs_getattr` would miss those updates. Original syscall registers bind the
+32-bit descriptor, flags and request mask without reading mutable user memory.
+The unmodified register values are retained alongside their explicit ABI-width
+interpretation. The metadata record joins the original copied-name/result by
+UID, PID, TID, syscall and sequence; missing or contradictory records refuse.
+
+The statx record includes raw attributes/mask, birth time, mount ID, change
+cookie, subvolume, direct-I/O alignment and atomic-write fields in addition to
+the basic metadata. A pinned x86-64 `cp_statx` serializer reproduces all 256
+user-copy bytes, including the kernel-only bit masks and zero padding; this is
+used only for the controlled witness. Root validation compares its digest with
+the original unit's observed buffer. A relative `src/lib.rs` exists in the
+sealed dependency directory as well as the tracked working-directory source.
+The unit fstats its directory descriptor, then queries that relative path with
+both syscalls. The collector must bind the original descriptor, flags/mask,
+sealed inode and copy outcome. A missing pathname never invents metadata; an
+EFAULT after the copy stage remains undelivered data.
+
+Four copy probes join the same original zero-loss census, for fourteen
+attachments. Loader-summary bounds scale with that exact expected attachment
+count; the original 4 MiB stream limit, 40,000 event bound, verifier limit and
+VM/storage/memory/deadline policy remain unchanged. Metadata is collected only
+for selected kernel-copied query names, avoiding an unbounded expansion into
+all runtime metadata. Startup requires both original copy paths before target
+execution. Generic descriptor lifecycle, concurrent cwd/namespace resolution,
+complete filesystem coverage and protected invalidation/reuse authority remain
+unproved. Native replay of this extension is pending.

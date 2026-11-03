@@ -597,9 +597,9 @@ class _ViewProbe:
         self.inputs=self.root/'inputs-v1';self._inputs(self.inputs,b'OLD')
         self.before=unit_views.inventory(self.inputs,owner=0,sealed=True)
         self.input_stat=(self.inputs/'deps/input').stat()
-        self.directory_stats={p:_CargoProbe._stat(p) for p in (self.inputs/'deps',self.inputs/'deps/empty',self.inputs/'deps/cursor')}
+        self.directory_stats={p:_CargoProbe._stat(p) for p in (self.inputs/'deps',self.inputs/'deps/empty',self.inputs/'deps/cursor',self.inputs/'deps/src')}
         self.directory_members={os.fsencode(name):((self.inputs/'deps'/name).stat().st_ino,
-            4 if name in ('empty','cursor') else 8) for name in ('input','one.rs','empty','cursor',os.fsdecode(b'raw-\xff'),'l'*255)}
+            4 if name in ('empty','cursor','src') else 8) for name in ('input','one.rs','empty','cursor','src',os.fsdecode(b'raw-\xff'),'l'*255)}
         self.abstract=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM|socket.SOCK_CLOEXEC)
         self.abstract.bind(b'\0jarvis-unit-view-probe');self.abstract.listen(1)
         if Path('/tmp/ci-unit-probe-private-marker').exists():raise FreshnessHold('invalidation_unsafe')
@@ -612,6 +612,8 @@ class _ViewProbe:
             (root/'deps'/name).write_bytes(b'entry\n');(root/'deps'/name).chmod(0o444)
         (root/'deps/empty').mkdir(mode=0o555)
         (root/'deps/cursor').mkdir(mode=0o555)
+        (root/'deps/src').mkdir(mode=0o700);(root/'deps/src/lib.rs').write_bytes(b'entry\n')
+        (root/'deps/src/lib.rs').chmod(0o444);(root/'deps/src').chmod(0o555)
         (root/'deps').chmod(0o555);root.chmod(0o555)
 
     def prepare(self,ordinal,request=None):
@@ -1043,6 +1045,19 @@ if is_view:
  binary_missing=libc.syscall(ctypes.c_long(257),ctypes.c_long(-100),
   ctypes.c_char_p(b'/workspace/target/deps/missing-\xff\n '),ctypes.c_long(os.O_RDONLY|os.O_CLOEXEC),ctypes.c_long(0))
  assert binary_missing==-1 and ctypes.get_errno()==errno.ENOENT
+ directory=os.open('/workspace/target/deps',os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+ try:
+  metadata=ctypes.create_string_buffer(144)
+  assert libc.syscall(ctypes.c_long(5),ctypes.c_long(directory),metadata)==0
+  assert libc.syscall(ctypes.c_long(262),ctypes.c_long(directory),ctypes.c_char_p(b'src/lib.rs'),metadata,ctypes.c_int(256))==0
+  extended=ctypes.create_string_buffer(256)
+  assert libc.syscall(ctypes.c_long(332),ctypes.c_long(directory),ctypes.c_char_p(b'src/lib.rs'),ctypes.c_uint(256),ctypes.c_uint(8191),extended)==0
+  result['statx_sha256']=hashlib.sha256(extended.raw).hexdigest()
+  assert libc.syscall(ctypes.c_long(332),ctypes.c_long(directory),ctypes.c_char_p(b'src/lib.rs'),ctypes.c_uint(256),ctypes.c_uint(8191),ctypes.c_void_p(0))==-1
+  assert ctypes.get_errno()==errno.EFAULT
+  assert libc.syscall(ctypes.c_long(332),ctypes.c_long(directory),ctypes.c_char_p(b'/workspace/target/deps/missing'),ctypes.c_uint(256),ctypes.c_uint(8191),extended)==-1
+  assert ctypes.get_errno()==errno.ENOENT
+ finally:os.close(directory)
  _PROBE_PHASE='planner_tool_view'
  from pathlib import Path
  import time
@@ -1068,7 +1083,7 @@ if is_view:
    raise AssertionError('directory EOF missing')
   finally:os.close(descriptor)
  names,reads=directory_names('/workspace/target/deps')
- assert len(names)==8 and set(names)=={b'.',b'..',b'input',b'one.rs',b'empty',b'cursor',b'raw-\xff',b'l'*255}
+ assert len(names)==9 and set(names)=={b'.',b'..',b'input',b'one.rs',b'empty',b'cursor',b'src',b'raw-\xff',b'l'*255}
  assert reads>=3
  names,reads=directory_names('/workspace/target/deps/empty')
  assert len(names)==2 and set(names)=={b'.',b'..'} and reads==2
@@ -1246,7 +1261,7 @@ def _probe(arguments):
     directories.extend((item['pid'],2000+ordinal,empty,{}) for ordinal,item in cargo_probe.units.items()
         if item['mapping']['kind']=='application')
     kernel=observer.finish(view_probe.original_pid,compilers,directories,view_probe.inputs/'deps/cursor',
-        view_probe.inputs/'deps'/os.fsdecode(b'raw-\xff'))
+        view_probe.inputs/'deps'/os.fsdecode(b'raw-\xff'),results[4]['statx_sha256'])
     view_probe.cleanup()
     cargo_probe.cleanup()
     print(json.dumps({'version':3,'kind':'ci-planner-protocol-probe','binding':value['binding'],
@@ -1353,7 +1368,7 @@ def validate_probe(value,binding,command,workers,writer,source_projection):
         else:
             case_keys={'uid','stdin_sha256','metadata_denied','root_socket_denied','control_fds_closed','jobserver'}
             if ordinal==3:case_keys|={'signal_forwarded','proxy_signal'}
-            if ordinal==4:case_keys|={'filesystem'}
+            if ordinal==4:case_keys|={'filesystem','statx_sha256'}
             if (type(case) is not dict or set(case)!=case_keys or type(case['uid']) is not int or case['uid']!=2000+ordinal
                     or case['stdin_sha256']!=expected or case['metadata_denied'] is not True
                     or case['root_socket_denied'] is not True or case['control_fds_closed'] is not True
@@ -1361,6 +1376,7 @@ def validate_probe(value,binding,command,workers,writer,source_projection):
                     or (ordinal==3 and (case['signal_forwarded']!=10 or case['proxy_signal']!=10))):
                 raise FreshnessHold('input_census_unknown')
             if ordinal==4:
+                if not cache._digest(case['statx_sha256']):raise FreshnessHold('input_census_unknown')
                 flags=case['filesystem'];expected_flags={'input_stable','input_metadata_stable','source_read_only',
                     'abstract_socket_isolated','private_temp','metadata_hidden','output_written'}
                 if type(flags) is not dict or set(flags)!=expected_flags or any(item is not True for item in flags.values()):

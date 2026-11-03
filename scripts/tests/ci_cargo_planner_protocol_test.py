@@ -157,7 +157,7 @@ class PlannerProtocolTests(unittest.TestCase):
             'abstract_socket_isolated':True,'private_temp':True,'metadata_hidden':True,'output_written':True}
         cases.append({'uid':2004,'stdin_sha256':hashlib.sha256(b'\xffstdin'*200000).hexdigest(),
             'metadata_denied':True,'root_socket_denied':True,'control_fds_closed':True,'jobserver':False,
-            'filesystem':filesystem_case})
+            'filesystem':filesystem_case,'statx_sha256':'1'*64})
         filesystem={'version':1,'input_bytes_preserved':True,'input_inode_metadata_preserved':True,
             'next_publication_distinct':True,'namespaces':{name:{'controller':name+':[1]','unit':name+':[2]'}
                 for name in ('mnt','ipc','net')},'outputs':[['2e','directory',0o555],
@@ -176,7 +176,8 @@ class PlannerProtocolTests(unittest.TestCase):
             'filesystem_coverage_complete':False,'missed_probe_census_complete':True,'input_closure_complete':False,
             'allocation_removed':True}
         value['kernel_observation'].update(directory_reads=14,directory_entries=17,binary_path_query_observed=True,
-            metadata_queries=4,fstat_query_observed=True,fstat_invalid_fd_observed=True,fstat_failed_copy_observed=True,
+            metadata_queries=8,path_metadata_query_observed=True,statx_copy_verified=True,
+            path_metadata_failed_copy_observed=True,path_metadata_lookup_failure_observed=True,fstat_query_observed=True,fstat_invalid_fd_observed=True,fstat_failed_copy_observed=True,
             directory_cursor_query_observed=True,
             directory_witness_observed=True,binary_directory_name_observed=True,
             directory_short_read_observed=True,directory_eof_observed=True,cargo_directory_queries_observed=True)
@@ -185,7 +186,7 @@ class PlannerProtocolTests(unittest.TestCase):
             'links':[{'id':10+i,'type':'raw_tracepoint' if i in (1,4) else 'kretprobe_multi',
                 'prog_id':i,'tag':f'{i:016x}',**({'tracepoint':'sys_enter' if i==1 else 'sys_exit'} if i in (1,4)
                     else {'function':'getname_flags','count':1,'flags':1,'missed':0})} for i in range(1,5)]}
-        for i,(function,flags) in enumerate((('iterate_dir',0),('iterate_dir',1),('filldir64',0),('filldir64',1),('vfs_fstat',0),('vfs_fstat',1)),5):
+        for i,(function,flags) in enumerate((('iterate_dir',0),('iterate_dir',1),('filldir64',0),('filldir64',1),('vfs_fstat',0),('vfs_fstat',1),('cp_new_stat',0),('cp_new_stat',1),('cp_statx',0),('cp_statx',1)),5):
             census['programs'].append({'id':i,'type':2,'tag':f'{i:016x}','recursion_misses':0})
             census['links'].append({'id':10+i,'type':'kretprobe_multi' if flags else 'kprobe_multi',
                 'prog_id':i,'tag':f'{i:016x}','function':function,'count':1,'flags':flags,'missed':0})
@@ -199,7 +200,7 @@ class PlannerProtocolTests(unittest.TestCase):
                 'cleanup','case-role','control-fds','jobserver','closure','authority','unknown',
                 'signal-status','signal-proxy','signal-number','signal-not-started','filesystem-namespace',
                 'filesystem-output','filesystem-cleanup','filesystem-removed','filesystem-authority','filesystem-case',
-                'kernel-binding','kernel-witness','kernel-loss','kernel-coverage','kernel-closure','kernel-cleanup','kernel-missed','kernel-census','kernel-binary-path','kernel-cursor','kernel-fstat'):
+                'kernel-binding','kernel-witness','kernel-loss','kernel-coverage','kernel-closure','kernel-cleanup','kernel-missed','kernel-census','kernel-binary-path','kernel-cursor','kernel-fstat','kernel-statx'):
             value=copy.deepcopy(original)
             if fault=='version':value['version']=True
             elif fault=='binding':value['binding']={}
@@ -237,6 +238,7 @@ class PlannerProtocolTests(unittest.TestCase):
             elif fault=='kernel-binary-path':value['kernel_observation']['binary_path_query_observed']=False
             elif fault=='kernel-cursor':value['kernel_observation']['directory_cursor_query_observed']=False
             elif fault=='kernel-fstat':value['kernel_observation']['fstat_failed_copy_observed']=False
+            elif fault=='kernel-statx':value['kernel_observation']['statx_copy_verified']=False
             with self.subTest(fault=fault),self.assertRaises(planner.FreshnessHold):
                 planner.validate_probe(value,binding,command,workers,writer,source)
 

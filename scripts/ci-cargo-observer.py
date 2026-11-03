@@ -2,7 +2,7 @@
 """Private kernel-copied pathname feasibility probe, not an input-proof API.
 
 Only selected lookup spellings and getdents64 actor results are observed. The
-ten original kernel attachments require a bounded miss census. This does not establish full
+fourteen original kernel attachments require a bounded miss census. This does not establish full
 syscall/metadata/device coverage, compatibility or reuse authority. It does not
 emulate or change the target's system calls.
 """
@@ -31,7 +31,8 @@ PATH_BYTES=4096
 CHUNK_BYTES=63
 SYSCALLS={2,4,6,21,89,257,262,267,269,332,439}
 PROBE_ROLES={('getname_flags',1):2,('iterate_dir',0):1,('iterate_dir',1):1,
-    ('filldir64',0):1,('filldir64',1):1,('vfs_fstat',0):1,('vfs_fstat',1):1}
+    ('filldir64',0):1,('filldir64',1):1,('vfs_fstat',0):1,('vfs_fstat',1):1,
+    ('cp_new_stat',0):1,('cp_new_stat',1):1,('cp_statx',0):1,('cp_statx',1):1}
 PROBE_COUNT=2+sum(PROBE_ROLES.values())
 
 
@@ -107,7 +108,7 @@ def _fdinfo(data):
         if re.fullmatch(r'cookie[ \t]+func',line):
             rows=lines[ordinal+1:]
             if (result.get('link_type') not in ('kprobe_multi','kretprobe_multi') or result.get('kprobe_cnt')!='1'
-                    or len(rows)!=1 or re.fullmatch(r'0[ \t]+(getname_flags|iterate_dir|filldir64|vfs_fstat)\+0x0/0x[1-9a-f][0-9a-f]{0,15}',rows[0]) is None):
+                    or len(rows)!=1 or re.fullmatch(r'0[ \t]+(getname_flags|iterate_dir|filldir64|vfs_fstat|cp_new_stat|cp_statx)\+0x0/0x[1-9a-f][0-9a-f]{0,15}',rows[0]) is None):
                 raise ObservationUnavailable('unknown kernel function table')
             result['function']=rows[0].split()[1].split('+',1)[0]
             table=True;break
@@ -132,13 +133,13 @@ def _birth(pid,owner):
 
 
 def _function_address():
-    found={name:[] for name in ('getname_flags','iterate_dir','filldir64','vfs_fstat')};size=0
+    found={name:[] for name,flags in PROBE_ROLES};names={name.encode():name for name in found};size=0
     with Path('/proc/kallsyms').open('rb') as stream:
         for line in stream:
             size+=len(line)
             if size>64*1024**2:raise ObservationUnavailable('unbounded kernel symbol census')
             parts=line.split()
-            if len(parts)==3 and parts[2] in (b'getname_flags',b'iterate_dir',b'filldir64',b'vfs_fstat') and parts[1] in (b't',b'T'):
+            if len(parts)==3 and parts[2] in names and parts[1] in (b't',b'T'):
                 found[parts[2].decode()].append(int(parts[0],16))
     if any(len(rows)!=1 or not 0<rows[0]<2**64 for rows in found.values()):
         raise ObservationUnavailable('kernel function identity unavailable')
@@ -346,6 +347,44 @@ def directory_cursor_witness(queries,pid,uid,path):
 
 STAT_FIELDS=('device','inode','mode','nlink','owner_uid','owner_gid','rdev','size','blksize','blocks','result_mask')
 STAT_TIMES=('atime_sec','atime_nsec','mtime_sec','mtime_nsec','ctime_sec','ctime_nsec')
+STATX_FIELDS=('attributes','attributes_mask','btime_sec','btime_nsec','mnt_id','change_cookie','subvol',
+    'dio_mem_align','dio_offset_align','dio_read_offset_align','atomic_write_unit_min','atomic_write_unit_max',
+    'atomic_write_unit_max_opt','atomic_write_segments_max')
+
+
+def _metadata_fields(pair,*,statx=False):
+    fields=dict(zip(STAT_FIELDS,pair['J']));fields.update(zip(STAT_TIMES,pair['K']))
+    limits={'device':32,'inode':64,'mode':16,'nlink':32,'owner_uid':32,'owner_gid':32,
+        'rdev':32,'blksize':32,'blocks':64,'result_mask':32}
+    times=STAT_TIMES
+    if statx:
+        fields.update(zip(STATX_FIELDS,pair['O']))
+        limits.update({key:64 for key in ('attributes','attributes_mask','mnt_id','change_cookie','subvol')})
+        limits.update({key:32 for key in STATX_FIELDS[7:]})
+        times=(*times,'btime_sec','btime_nsec')
+    if (any(not 0<=fields[key]<2**bits for key,bits in limits.items())
+            or not -2**63<=fields['size']<2**63
+            or any(not -2**63<=fields[key]<2**63 for key in times[::2])
+            or any(not 0<=fields[key]<10**9 for key in times[1::2])):
+        raise ObservationUnavailable('metadata fields outside original ABI')
+    return fields
+
+
+def statx_bytes(fields):
+    """Pinned x86-64 cp_statx ABI, for the controlled user-copy witness only."""
+    data=bytearray(256)
+    struct.pack_into('<IIQIIIH',data,0,fields['result_mask']&~0x40000000,fields['blksize'],
+        fields['attributes']&~(1<<63),fields['nlink'],fields['owner_uid'],fields['owner_gid'],fields['mode'])
+    struct.pack_into('<QQQQ',data,32,fields['inode'],fields['size']&((1<<64)-1),fields['blocks'],fields['attributes_mask'])
+    for name,offset in (('atime',64),('btime',80),('ctime',96),('mtime',112)):
+        struct.pack_into('<qI',data,offset,fields[name+'_sec'],fields[name+'_nsec'])
+    struct.pack_into('<IIII',data,128,fields['rdev']>>20,fields['rdev']&((1<<20)-1),
+        fields['device']>>20,fields['device']&((1<<20)-1))
+    for name,fmt,offset in (('mnt_id','Q',144),('dio_mem_align','I',152),('dio_offset_align','I',156),
+            ('subvol','Q',160),('atomic_write_unit_min','I',168),('atomic_write_unit_max','I',172),
+            ('atomic_write_segments_max','I',176),('dio_read_offset_align','I',180),('atomic_write_unit_max_opt','I',184)):
+        struct.pack_into('<'+fmt,data,offset,fields[name])
+    return bytes(data)
 
 
 def metadata_queries(records,*,complete=True):
@@ -355,10 +394,10 @@ def metadata_queries(records,*,complete=True):
     observes fstat only, not general statx, path resolution or input closure.
     """
     if type(records) is not list or len(records)>40000:raise ObservationUnavailable('unbounded metadata observation')
-    counts={'F':2,'H':2,'J':11,'K':6,'L':1,'Z':1};pairs={}
+    counts={'F':2,'H':2,'J':11,'K':6,'L':1,'Z':1,'U':8,'P':2,'O':14,'Y':1};pairs={}
     for line in records:
         if type(line) is not str or len(line)>1024:raise ObservationUnavailable('unbounded metadata record')
-        match=re.fullmatch(r'([FHJKLZ]) ([0-9]{1,4}) ([1-9][0-9]{0,9}) ([1-9][0-9]{0,9}) ([1-9][0-9]{0,19}) (.*)',line)
+        match=re.fullmatch(r'([FHJKLZUPOY]) ([0-9]{1,4}) ([1-9][0-9]{0,9}) ([1-9][0-9]{0,9}) ([1-9][0-9]{0,19}) (.*)',line)
         if match is None:raise ObservationUnavailable('unknown metadata record')
         kind=match[1];uid,pid,tid,sequence=map(int,match.groups()[1:5])
         if (not (uid==1999 or 2000<=uid<6096) or pid>=2**31 or tid>=2**31 or sequence>=2**64):
@@ -372,6 +411,35 @@ def metadata_queries(records,*,complete=True):
         pair[kind]=values
     queries=[]
     for (uid,pid,tid,sequence),pair in pairs.items():
+        if 'U' in pair:
+            if 'Z' not in pair:
+                if complete:raise ObservationUnavailable('incomplete pathname metadata')
+                continue
+            call,raw_fd,fd,raw_flags,flags,raw_mask,mask,user_namespace=pair['U'];result,=pair['Z']
+            if (call not in (262,332) or not 0<=raw_fd<2**64 or not -2**31<=fd<2**31
+                    or fd!=((raw_fd+2**31)%2**32)-2**31 or not 0<user_namespace<2**32
+                    or not 0<=raw_flags<2**64 or flags!=(raw_flags&0xffffffff)
+                    or not 0<=raw_mask<2**64 or mask!=(raw_mask&0xffffffff)
+                    or call==262 and (mask!=0 or raw_mask!=0) or not -4095<=result<=0):
+                raise ObservationUnavailable('pathname metadata arguments differ')
+            fields=None;copy_result=None
+            if 'P' in pair:
+                expected={'U','P','J','K','Y','Z'}|({'O'} if call==332 else set())
+                if set(pair)!=expected:
+                    if complete:raise ObservationUnavailable('incomplete copied metadata')
+                    continue
+                kind,namespace=pair['P'];copy_result,=pair['Y']
+                if kind!=(1 if call==332 else 0) or namespace!=user_namespace or copy_result!=result:
+                    raise ObservationUnavailable('metadata copy binding differs')
+                fields=_metadata_fields(pair,statx=call==332)
+            elif set(pair)!={'U','Z'} or result==0:
+                if complete:raise ObservationUnavailable('metadata copy unavailable')
+                continue
+            queries.append({'uid':uid,'pid':pid,'tid':tid,'sequence':sequence,'syscall':call,
+                'raw_fd':raw_fd,'fd':fd,'raw_flags':raw_flags,'flags':flags,'raw_mask':raw_mask,'mask':mask,
+                'user_namespace':user_namespace,'vfs_result':None,'copy_result':copy_result,'result':result,
+                'stat':fields,'delivered':result==0})
+            continue
         if not {'F','H','L','Z'}<=set(pair):
             if complete:raise ObservationUnavailable('incomplete metadata observation')
             continue
@@ -387,31 +455,51 @@ def metadata_queries(records,*,complete=True):
             continue
         fields=None
         if vfs_result==0:
-            fields=dict(zip(STAT_FIELDS,pair['J']));fields.update(zip(STAT_TIMES,pair['K']))
-            limits={'device':32,'inode':64,'mode':16,'nlink':32,'owner_uid':32,'owner_gid':32,
-                'rdev':32,'blksize':32,'blocks':64,'result_mask':32}
-            if (any(not 0<=fields[key]<2**bits for key,bits in limits.items())
-                    or not -2**63<=fields['size']<2**63
-                    or any(not -2**63<=fields[key]<2**63 for key in STAT_TIMES[::2])
-                    or any(not 0<=fields[key]<10**9 for key in STAT_TIMES[1::2])):
-                raise ObservationUnavailable('metadata fields outside original ABI')
+            fields=_metadata_fields(pair)
         queries.append({'uid':uid,'pid':pid,'tid':tid,'sequence':sequence,'syscall':5,
             'raw_fd':raw_fd,'fd':fd,'user_namespace':user_namespace,'vfs_result':vfs_result,
             'result':result,'stat':fields,'delivered':result==0})
     return queries
 
 
-def metadata_witness(queries,pid,uid,path,user_namespace):
+def _expected_metadata(path):
     info=path.stat();expected={'device':(os.major(info.st_dev)<<20)|os.minor(info.st_dev),'inode':info.st_ino,
         'mode':info.st_mode,'nlink':info.st_nlink,'owner_uid':info.st_uid,'owner_gid':info.st_gid,
         'rdev':(os.major(info.st_rdev)<<20)|os.minor(info.st_rdev),'size':info.st_size,
         'blksize':info.st_blksize,'blocks':info.st_blocks}
     for name,value in (('atime',info.st_atime_ns),('mtime',info.st_mtime_ns),('ctime',info.st_ctime_ns)):
         expected[name+'_sec'],expected[name+'_nsec']=divmod(value,10**9)
+    return expected
+
+
+def metadata_witness(queries,pid,uid,path,user_namespace):
+    expected=_expected_metadata(path)
     if not any(q['pid']==q['tid']==pid and q['uid']==uid and q['user_namespace']==user_namespace
-            and q['fd']>=0 and q['vfs_result']==q['result']==0 and q['stat'] is not None
+            and q['syscall']==5 and q['fd']>=0 and q['vfs_result']==q['result']==0 and q['stat'] is not None
             and all(q['stat'][key]==value for key,value in expected.items()) for q in queries):
         raise ObservationUnavailable('original fstat metadata witness missing')
+
+
+def path_metadata_witness(queries,pid,uid,path,user_namespace,*,lookup,flags,dirpath=None,digest=None):
+    expected=_expected_metadata(path)
+    selected=[q for q in queries if q['pid']==q['tid']==pid and q['uid']==uid
+        and q['user_namespace']==user_namespace]
+    directory=_expected_metadata(dirpath) if dirpath is not None else None
+    for call in (262,332):
+        matches=[]
+        for q in selected:
+            if (q['syscall']!=call or q.get('path')!=lookup or q.get('flags')!=flags
+                    or q.get('mask')!=(8191 if call==332 else 0)
+                    or q.get('copy_result')!=0 or q['result']!=0 or q['stat'] is None
+                    or any(q['stat'][key]!=value for key,value in expected.items())):continue
+            if directory is None:
+                if q['fd']!=-100:continue
+            elif not any(base['syscall']==5 and base['fd']==q['fd']>=0 and base['sequence']<q['sequence']
+                    and base['vfs_result']==base['result']==0 and base['stat'] is not None
+                    and all(base['stat'][key]==directory[key] for key in ('device','inode','mode')) for base in selected):continue
+            if call==332 and digest is not None and hashlib.sha256(statx_bytes(q['stat'])).hexdigest()!=digest:continue
+            matches.append(q)
+        if not matches:raise ObservationUnavailable('original path metadata witness missing')
 
 
 def decode(data,*,complete=True,with_directories=False,with_metadata=False):
@@ -428,7 +516,7 @@ def decode(data,*,complete=True,with_directories=False,with_metadata=False):
                 or line in ('The verifier log:','The verifier log: ')
                 or re.fullmatch(r'processed [0-9]{1,10} insns \(limit 1000000\) max_states_per_insn [0-9]{1,10} total_states [0-9]{1,10} peak_states [0-9]{1,10} mark_read [0-9]{1,10}',line)):
             loader_records+=1
-            if loader_records>48:raise ObservationUnavailable('unbounded loader summaries')
+            if loader_records>4*PROBE_COUNT+8:raise ObservationUnavailable('unbounded loader summaries')
             continue
         try:record=json.loads(line,object_pairs_hook=cache._unique_object)
         except (ValueError,TypeError):raise ObservationUnavailable('invalid kernel record framing') from None
@@ -455,7 +543,7 @@ def decode(data,*,complete=True,with_directories=False,with_metadata=False):
         if record['type']!='printf' or type(record['data']) is not str or not record['data'].endswith('\n'):
             raise ObservationUnavailable('unknown kernel event')
         line=record['data'][:-1]  # Preserve embedded newlines; never reinterpret them as events.
-        if line[:2] in ('F ','H ','J ','K ','L ','Z '):
+        if line[:2] in ('F ','H ','J ','K ','L ','Z ','U ','P ','O ','Y '):
             metadata.append(line);records+=1
             if records>40000:raise ObservationUnavailable('observation limit exceeded')
             continue
@@ -500,13 +588,23 @@ def decode(data,*,complete=True,with_directories=False,with_metadata=False):
         parts=path.split(b'/')
         if parts[-1]==b'':parts=parts[:-1]
         if (any(part in (b'',b'.',b'..') for part in parts[1:])
-                or not (uid==1999 and re.fullmatch(rb'/ci-observer-witness-[a-z0-9-]+',path)
+                or not (uid==1999 and (re.fullmatch(rb'/ci-observer-witness-[a-z0-9-]+',path) or path==b'/proc/sys/kernel/random')
                     or 2000<=uid<6096 and (path.startswith(b'/workspace/')
                         or path in (b'src/lib.rs',b'src/main.rs',b'build.rs')))):
             raise ObservationUnavailable('foreign kernel pathname')
-        events.append({'uid':uid,'pid':pid,'tid':tid,'syscall':call,'result':pair['E'],'path':path})
+        events.append({'uid':uid,'pid':pid,'tid':tid,'syscall':call,'sequence':sequence,'result':pair['E'],'path':path})
     queries=directory_queries(directories,complete=complete)
     stats=metadata_queries(metadata,complete=complete)
+    lookup={(e['uid'],e['pid'],e['tid'],e['syscall'],e['sequence']):e for e in events}
+    for query in stats:
+        if query['syscall'] in (262,332):
+            event=lookup.get(tuple(query[k] for k in ('uid','pid','tid','syscall','sequence')))
+            if event is None:
+                if complete:raise ObservationUnavailable('pathname metadata lacks original lookup')
+                query['path']=None
+            else:
+                if event['result']!=query['result']:raise ObservationUnavailable('pathname metadata outcome differs')
+                query['path']=event['path']
     if with_metadata:return events,queries,stats
     return (events,queries) if with_directories else events
 
@@ -523,6 +621,13 @@ rawtracepoint:sys_enter / (uid >= 2000 && uid < 6096) || uid == 1999 / {
  @seen[tid]=(uint64)0; @ready[tid]=(uint64)0;
  @directory_attempt[tid]=(uint64)0; @directory_active[tid]=(uint64)0;
  @fstat_active[tid]=(uint64)0;
+ @copy_active[tid]=(uint64)0;
+ if (arg1==262 || arg1==332) {
+  $regs=(struct pt_regs *)arg0;
+  @path_fd[tid]=(uint64)$regs->di;
+  if (arg1==262) { @path_flags[tid]=(uint64)$regs->r10; @path_mask[tid]=(uint64)0; }
+  else { @path_flags[tid]=(uint64)$regs->dx; @path_mask[tid]=(uint64)$regs->r10; }
+ }
  if (arg1==5) {
   $regs=(struct pt_regs *)arg0;
   printf("F %u %u %u %llu %llu %lld\n",uid,pid,tid,@sequence[tid],(uint64)$regs->di,(int64)(int32)$regs->di);
@@ -601,6 +706,7 @@ kretprobe:vfs*_fstat / ((uid >= 2000 && uid < 6096) || uid == 1999) && @number[t
   @emitted=sum(1); @fstat_active[tid]=(uint64)0;
  }
 }
+__COPY_METADATA_PROBES__
 kretprobe:getname_flags*
 / ((uid >= 2000 && uid < 6096) || uid == 1999) && (uint64)retval > 4095 && (uint64)retval < (uint64)0xfffffffffffff001 / {
  if (@ready[tid]>0 && @ready[tid]==@sequence[tid]) {
@@ -641,6 +747,7 @@ kretprobe:getname_flags*
       @number[tid]==89 || @number[tid]==257 || @number[tid]==262 || @number[tid]==267 ||
       @number[tid]==269 || @number[tid]==332 || @number[tid]==439) &&
      (($prefix==0x6170736b726f772f && *(uint16 *)($name+8)==0x6563 && *(uint8 *)($name+10)==47) ||
+      (uid==1999 && $prefix==0x79732f636f72702f) ||
       $prefix==0x6573626f2d69632f ||
       ($prefix==0x2e62696c2f637273 && *(uint16 *)($name+8)==0x7372 && *(uint8 *)($name+10)==0) ||
       ($prefix==0x6e69616d2f637273 && *(uint16 *)($name+8)==0x722e && *(uint16 *)($name+10)==0x73) ||
@@ -660,10 +767,21 @@ kretprobe:getname_flags*
   @length[tid]=$length;
   @original_name[tid]=(uint64)$name;
   @ready[tid]=@sequence[tid];
+  if (@number[tid]==262 || @number[tid]==332) {
+   $task=(struct task_struct *)curtask;
+   printf("U %u %u %u %llu %llu %llu %lld %llu %llu %llu %llu %llu\n",uid,pid,tid,@sequence[tid],@number[tid],
+    @path_fd[tid],(int64)(int32)@path_fd[tid],@path_flags[tid],(uint64)(uint32)@path_flags[tid],
+    @path_mask[tid],(uint64)(uint32)@path_mask[tid],(uint64)$task->cred->user_ns->ns.inum);
+   @emitted=sum(1);
+  }
  }
 }
 rawtracepoint:sys_exit / (uid >= 2000 && uid < 6096) || uid == 1999 / {
  if (@number[tid]==5) {
+  printf("Z %u %u %u %llu %lld\n",uid,pid,tid,@sequence[tid],(int64)arg1);
+  @emitted=sum(1);
+ }
+ if ((@number[tid]==262 || @number[tid]==332) && @seen[tid]) {
   printf("Z %u %u %u %llu %lld\n",uid,pid,tid,@sequence[tid],(int64)arg1);
   @emitted=sum(1);
  }
@@ -679,8 +797,44 @@ rawtracepoint:sys_exit / (uid >= 2000 && uid < 6096) || uid == 1999 / {
 }
 END { clear(@seen); clear(@ready); clear(@original_name); clear(@length); clear(@sequence); clear(@number);
  clear(@directory_attempt); clear(@directory_active); clear(@directory_context);
- clear(@fstat_active); clear(@fstat_stat); }
+ clear(@fstat_active); clear(@fstat_stat); clear(@copy_active); clear(@path_fd); clear(@path_flags); clear(@path_mask); }
 '''
+_COPY_BASIC=r'''
+ printf("J %u %u %u %llu %llu %llu %llu %llu %llu %llu %llu %lld %llu %llu %llu\n",uid,pid,tid,@sequence[tid],
+  (uint64)$stat->dev,(uint64)$stat->ino,(uint64)$stat->mode,(uint64)$stat->nlink,
+  (uint64)$stat->uid.val,(uint64)$stat->gid.val,(uint64)$stat->rdev,(int64)$stat->size,
+  (uint64)$stat->blksize,(uint64)$stat->blocks,(uint64)$stat->result_mask);
+ printf("K %u %u %u %llu %lld %lld %lld %lld %lld %lld\n",uid,pid,tid,@sequence[tid],
+  (int64)$stat->atime.tv_sec,(int64)$stat->atime.tv_nsec,(int64)$stat->mtime.tv_sec,
+  (int64)$stat->mtime.tv_nsec,(int64)$stat->ctime.tv_sec,(int64)$stat->ctime.tv_nsec);
+'''
+_COPY_EXTRA=r'''
+ printf("O %u %u %u %llu %llu %llu %lld %lld %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",uid,pid,tid,@sequence[tid],
+  (uint64)$stat->attributes,(uint64)$stat->attributes_mask,(int64)$stat->btime.tv_sec,(int64)$stat->btime.tv_nsec,
+  (uint64)$stat->mnt_id,(uint64)$stat->change_cookie,(uint64)$stat->subvol,(uint64)$stat->dio_mem_align,
+  (uint64)$stat->dio_offset_align,(uint64)$stat->dio_read_offset_align,(uint64)$stat->atomic_write_unit_min,
+  (uint64)$stat->atomic_write_unit_max,(uint64)$stat->atomic_write_unit_max_opt,(uint64)$stat->atomic_write_segments_max);
+'''
+_COPY_TEMPLATE=r'''
+kprobe:__FUNCTION__ / ((uid >= 2000 && uid < 6096) || uid == 1999) && @number[tid]==__CALL__ && @seen[tid] / {
+ @copy_active[tid]=@sequence[tid];
+ $stat=(struct kstat *)arg0; $task=(struct task_struct *)curtask;
+ printf("P %u %u %u %llu %u %llu\n",uid,pid,tid,@sequence[tid],__KIND__,(uint64)$task->cred->user_ns->ns.inum);
+ __BASIC__
+ __EXTRA__
+ @emitted=sum(__COUNT__);
+}
+kretprobe:__FUNCTION__ / ((uid >= 2000 && uid < 6096) || uid == 1999) && @number[tid]==__CALL__ && @seen[tid] / {
+ if (@copy_active[tid]>0 && @copy_active[tid]==@sequence[tid]) {
+  printf("Y %u %u %u %llu %lld\n",uid,pid,tid,@sequence[tid],(int64)(int32)retval);
+  @emitted=sum(1); @copy_active[tid]=(uint64)0;
+ }
+}
+'''
+_PROGRAM=_PROGRAM.replace('__COPY_METADATA_PROBES__','\n'.join(_COPY_TEMPLATE
+    .replace('__FUNCTION__',function).replace('__CALL__',str(call)).replace('__KIND__',str(kind))
+    .replace('__BASIC__',_COPY_BASIC).replace('__EXTRA__',_COPY_EXTRA if kind else '').replace('__COUNT__',str(3+kind))
+    for function,call,kind in (('cp*_new_stat',262,0),('cp*_statx',332,1))))
 _WITNESS=r'''
 import ctypes,errno,os,sys
 libc=ctypes.CDLL(None,use_errno=True);libc.syscall.restype=ctypes.c_long
@@ -691,6 +845,9 @@ descriptor=os.open('/proc/sys/kernel/random',os.O_RDONLY|os.O_DIRECTORY|os.O_CLO
 try:
  metadata=ctypes.create_string_buffer(144)
  assert libc.syscall(ctypes.c_long(5),ctypes.c_long(descriptor),metadata)==0
+ assert libc.syscall(ctypes.c_long(262),ctypes.c_long(-100),ctypes.c_char_p(b'/proc/sys/kernel/random'),metadata,ctypes.c_int(0))==0
+ extended=ctypes.create_string_buffer(256)
+ assert libc.syscall(ctypes.c_long(332),ctypes.c_long(-100),ctypes.c_char_p(b'/proc/sys/kernel/random'),ctypes.c_uint(0),ctypes.c_uint(8191),extended)==0
  buffer=ctypes.create_string_buffer(288)
  for _ in range(32):
   result=libc.syscall(ctypes.c_long(217),ctypes.c_long(descriptor),buffer,ctypes.c_uint(288))
@@ -805,6 +962,8 @@ class Observer:
                     try:
                         directory_witness(queries,witness.pid,1999,self.directory_path,self.directory_members)
                         metadata_witness(metadata,witness.pid,1999,self.directory_path,self.user_namespace)
+                        path_metadata_witness(metadata,witness.pid,1999,self.directory_path,self.user_namespace,
+                            lookup=b'/proc/sys/kernel/random',flags=0)
                     except ObservationUnavailable:pass
                     else:self.witness_pid=witness.pid;return
                 time.sleep(.01)
@@ -831,7 +990,7 @@ class Observer:
         for stream in (self.output,self.error):
             if stream is not None and not stream.closed:stream.close()
 
-    def finish(self,unit_pid,compilers,directories,cursor_directory,stat_file):
+    def finish(self,unit_pid,compilers,directories,cursor_directory,stat_file,statx_digest):
         self.stop()
         if self.child is None or self.child.returncode!=0 or self.witness_pid is None:
             raise ObservationUnavailable('original kernel observer did not finish')
@@ -845,6 +1004,9 @@ class Observer:
         directory_cursor_witness(queries,unit_pid,2004,cursor_directory)
         metadata_witness(metadata,self.witness_pid,1999,self.directory_path,self.user_namespace)
         metadata_witness(metadata,unit_pid,2004,stat_file,self.user_namespace)
+        if not cache._digest(statx_digest):raise ObservationUnavailable('statx user-copy witness missing')
+        path_metadata_witness(metadata,unit_pid,2004,stat_file.parent/'src/lib.rs',self.user_namespace,
+            lookup=b'src/lib.rs',flags=256,dirpath=stat_file.parent,digest=statx_digest)
         stats=[q for q in metadata if q['uid']==2004 and q['pid']==q['tid']==unit_pid
             and q['user_namespace']==self.user_namespace]
         if not any(q['fd']==-1 and q['vfs_result']==q['result']==-errno.EBADF and q['stat'] is None for q in stats):
@@ -852,6 +1014,12 @@ class Observer:
         if not any(q['fd']>=0 and q['vfs_result']==0 and q['result']==-errno.EFAULT
                 and q['stat'] is not None and q['stat']['inode']==stat_file.stat().st_ino for q in stats):
             raise ObservationUnavailable('original failed fstat copy witness missing')
+        if not any(q['syscall']==332 and q.get('path')==b'src/lib.rs'
+                and q.get('copy_result')==q['result']==-errno.EFAULT and q['stat'] is not None for q in stats):
+            raise ObservationUnavailable('original failed statx copy witness missing')
+        if not any(q['syscall']==332 and q.get('path')==b'/workspace/target/deps/missing'
+                and q['result']==-errno.ENOENT and q.get('copy_result') is None and q['stat'] is None for q in stats):
+            raise ObservationUnavailable('original statx lookup failure witness missing')
         if summaries[0]['reads']<3 or summaries[0]['rejected_attempts']<1:
             raise ObservationUnavailable('original directory short-read witness missing')
         selected=[e for e in events if e['uid']==2004 and e['pid']==unit_pid and e['tid']==unit_pid]
@@ -889,6 +1057,8 @@ class Observer:
             'directory_cursor_query_observed':True,
             'metadata_queries':len(metadata),'fstat_query_observed':True,
             'fstat_invalid_fd_observed':True,'fstat_failed_copy_observed':True,
+            'path_metadata_query_observed':True,'statx_copy_verified':True,
+            'path_metadata_failed_copy_observed':True,'path_metadata_lookup_failure_observed':True,
             'filesystem_coverage_complete':False,'missed_probe_census_complete':True,'probe_census':census,
             'input_closure_complete':False,'allocation_removed':False}
         if cache._read_record(self.root/'control.json')!=self.control:
@@ -908,6 +1078,7 @@ def validate(value,binding,command):
     keys|={'directory_reads','directory_entries','directory_witness_observed','binary_directory_name_observed',
         'directory_short_read_observed','directory_eof_observed','cargo_directory_queries_observed','directory_cursor_query_observed'}
     keys|={'metadata_queries','fstat_query_observed','fstat_invalid_fd_observed','fstat_failed_copy_observed'}
+    keys|={'path_metadata_query_observed','statx_copy_verified','path_metadata_failed_copy_observed','path_metadata_lookup_failure_observed'}
     if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
             or value['kind']!='kernel-copied-filename-probe' or value['binding']!=binding or value['command']!=command
             or type(value['unit_pid']) is not int or not 0<value['unit_pid']<2**31
@@ -923,6 +1094,8 @@ def validate(value,binding,command):
                 'directory_witness_observed','binary_directory_name_observed','directory_short_read_observed',
                 'directory_eof_observed','cargo_directory_queries_observed'))
             or any(value[key] is not True for key in ('fstat_query_observed','fstat_invalid_fd_observed','fstat_failed_copy_observed'))
+            or any(value[key] is not True for key in ('path_metadata_query_observed','statx_copy_verified',
+                'path_metadata_failed_copy_observed','path_metadata_lookup_failure_observed'))
             or value['directory_cursor_query_observed'] is not True
             or any(value[key] is not False for key in ('shipping_authority','filesystem_coverage_complete','input_closure_complete'))):
         raise ObservationUnavailable('kernel observation is incomplete or foreign')
