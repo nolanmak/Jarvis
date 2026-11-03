@@ -393,12 +393,15 @@ try:
                 observed=_run_worker(scope.argv,scope);stopped=scope.verify()
                 guest_worker_receipts.append(stopped.observation())
                 if observed.get('exit_code')!=0:
+                    probe_errno=71
                     for line in observed.get('stderr','').splitlines():
                         try:failure=json.loads(line)
                         except ValueError:continue
                         if type(failure) is dict and type(failure.get('planner_diagnostic')) is dict:
                             guest_stage=failure['planner_diagnostic'].get('stage','planner_protocol_probe')
-                    raise OSError(71,'private planner probe unavailable')
+                            number=failure['planner_diagnostic'].get('errno')
+                            probe_errno=number if type(number) is int and 1<=number<=4095 else 71
+                    raise OSError(probe_errno,'private planner probe unavailable')
                 try:planner_protocol_probe=json.loads(observed['stdout'])
                 except (ValueError,KeyError):raise ci_cache['FreshnessHold']('input_census_unknown') from None
                 planner_protocol_probe['guest_worker_quiescence']=stopped.observation()

@@ -112,6 +112,16 @@ exec(compile(module.guarded_probe(module._PLANNER_PROBE),'fixed-planner-probe','
                 'planner_request_cleanup'):
             self.assertEqual(planner.diagnostic({'stage':phase})['stage'],phase)
 
+    def test_worker_failure_is_not_masked_by_proxy_status_or_request_cleanup(self):
+        child={'stage':'planner_drop','category':'OSError','errno':13,'private':'PRIVATE_OWNER_CONTENTS'}
+        proxy={'stage':'planner_probe_status','category':'Unavailable','errno':None}
+        stderr=b'ignored private traceback\n'+json.dumps({'planner_diagnostic':child}).encode()+b'\n'+json.dumps({'planner_diagnostic':proxy}).encode()
+        request=[{'stage':'planner_unit','category':'FreshnessHold','errno':None}]
+        self.assertEqual(planner.failed_probe_diagnostic(stderr,request),{
+            'stage':'planner_drop','category':'OSError','errno':13})
+        self.assertEqual(planner.failed_probe_diagnostic(json.dumps({'planner_diagnostic':proxy}).encode(),request),request[0])
+        self.assertNotIn('PRIVATE',json.dumps(planner.failed_probe_diagnostic(stderr,request)))
+
     def test_staging_and_actual_exec_are_distinct_versioned_events(self):
         self.assertNotEqual(planner.event('staging_ready',0),planner.event('tool_started',0))
         self.assertEqual(planner.decode_event(planner.event('staging_ready',0)),('staging_ready',0))

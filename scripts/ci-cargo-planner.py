@@ -54,6 +54,19 @@ def diagnostic(value):
         'errno':value.get('errno') if type(value.get('errno')) is int and 0<=value['errno']<=4095 else None}
 
 
+def failed_probe_diagnostic(error,request_errors):
+    selected=None
+    for line in error[:8192].splitlines():
+        try:value=json.loads(line)
+        except ValueError:continue
+        if type(value) is dict and type(value.get('planner_diagnostic')) is dict:
+            candidate=diagnostic(value['planner_diagnostic'])
+            if selected is None or candidate['stage']!='planner_probe_status':selected=candidate
+    if request_errors and (selected is None or selected['stage']=='planner_probe_status'):
+        selected=diagnostic(request_errors[0])
+    return selected
+
+
 def guarded_probe(source):
     # This is only the fixed, measured probe body. No exception text, command
     # arguments or private payload is included in its bounded failure output.
@@ -252,6 +265,7 @@ class RootRelay:
                 env={'PATH':os.defpath,'JARVIS_SUPERVISOR_PARENT_PID':str(os.getpid())})
             with self._lock:self._children.add(child)
             os.close(bootstrap);bootstrap=None;child_control.close();legacy._close(descriptors);descriptors.clear()
+            phase[0]='planner_capture'
             while True:
                 if self._stop.is_set() or time.monotonic()>=deadline:cancelled=True
                 readers=select.select([connection]+([] if control_eof else [control]),[],[],.02)[0]
@@ -294,10 +308,10 @@ class RootRelay:
                         if (observed.get('command')!=self.admission.command or observed.get('binding')!=self.admission.binding
                                 or observed.get('ordinal')!=ordinal or observed.get('shipping_authority') is not False):
                             raise FreshnessHold('input_census_unknown')
-                        sealed=True
+                        sealed=True;phase[0]='planner_authorize'
                     elif stage==3 and authorized and not started and not received and child_pid==original_pid:
                         if not cancelled:
-                            connection.sendall(event('tool_started',0));os.write(exec_grant,b'go\n');started=True
+                            connection.sendall(event('tool_started',0));os.write(exec_grant,b'go\n');started=True;phase[0]='planner_unit_exec'
                     else:legacy._close(received);raise ValueError('out-of-order original control frame')
                     legacy._close(received)
                 if ready and sealed and not authorized and not cancelled:
@@ -539,14 +553,7 @@ def _probe(arguments):
                     stdout=subprocess.PIPE,stderr=subprocess.PIPE)
                 output,error=child.communicate(timeout=35)
                 if child.returncode!=0 or len(output)>8192 or len(error)>8192:
-                    for line in error[:8192].splitlines():
-                        try:decoded=json.loads(line)
-                        except ValueError:continue
-                        if type(decoded) is dict and 'planner_diagnostic' in decoded:
-                            candidate=diagnostic(decoded['planner_diagnostic'])
-                            if _CHILD_DIAGNOSTIC is None or candidate['stage']!='planner_probe_status':
-                                _CHILD_DIAGNOSTIC=candidate
-                    if relay.errors:_CHILD_DIAGNOSTIC=relay.errors[0]
+                    _CHILD_DIAGNOSTIC=failed_probe_diagnostic(error,relay.errors)
                     raise FreshnessHold('invalidation_unsafe')
                 results.append(json.loads(output))
             finally:
