@@ -408,6 +408,7 @@ dependencies = [
  "augmentagent-store",
  "augmentagent-wiki",
  "chrono",
+ "chrono-tz",
  "mockito",
  "reqwest",
  "rusqlite",
