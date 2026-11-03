@@ -342,7 +342,9 @@ class AdapterTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d);request=self.fixture(root);lease=adapter.InheritedStorage(request['storage'],root/'scratch');lease.check()
    fcntl.flock(lease.fd,fcntl.LOCK_UN)
-   with self.assertRaisesRegex(vm.Unavailable,'not held'):adapter.InheritedStorage(request['storage'],root/'scratch')
+   with self.assertRaisesRegex(vm.Unavailable,'original inherited storage lease unavailable'):lease.check()
+   with self.assertRaisesRegex(vm.Unavailable,'original inherited storage lease unavailable'):
+    adapter.InheritedStorage(request['storage'],root/'scratch')
  def test_rust_shaped_group_writable_data_directory_is_not_lock_authority(self):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d);request=self.fixture(root);target=root/'target';target.mkdir(mode=0o775);target.chmod(0o775)

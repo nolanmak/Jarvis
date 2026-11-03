@@ -1780,3 +1780,30 @@ was killed. A duplicate queued verification (no build descendants) was cancelled
 verification of the latest helper bytes uses the same registered target and
 normal admission. Native legacy retirement and compatible-unit reuse remain
 unproven until their actual VM replay is run.
+
+
+Validation at executable source `3cffbc52`: **31 focused managed Rust tests
+passed**, with 19 opt-in cases excluded from routine execution. After updating
+one existing unlocked-lease diagnostic assertion and checking that a retained
+lease also refuses after unlock, **337 Python CI tests passed with no skips**.
+The actual five-command adapter replay was explicitly run and passed in
+**161.56s**, after verifying all nine embedded helper payloads against source.
+It retained original compiler counts `[1,0,1]`, recovered `[0,0]`, original test
+execution and the later generated-change hold. Receipt:
+`/tmp/augmentagent-ci-legacy-incremental-20261103202518/receipt.json`.
+
+The protected audit recorded one real legacy retirement during that replay.
+Managed read-only inspection verified the compact completed receipt against
+its original command and physical cache: **259 files, 556,438,022 logical
+bytes**, under `target/debug/incremental/augmentagent-027wj69ei8meo`.
+Artifact and fingerprint namespaces remained present, and the subsequent
+current-generation compatible builds reused their units. This is not a
+before/after byte proof for the older legacy compiled artifacts, nor a test
+of their reuse as trusted artifacts. Audit extraction and inspection:
+`/tmp/autoship-1703-native-legacy-retirement-audit-1.json` and
+`/tmp/autoship-1703-native-legacy-retirement-inspection-1.log`.
+
+Only this registered test image was changed. No recovery was applied to the
+production image. Production capacity recovery, independent audit and the
+remaining source/provenance/merge gates remain open; this evidence cannot
+authorize an autonomous merge.
