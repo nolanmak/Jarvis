@@ -672,6 +672,14 @@ preserves them. Root records must require three compiler executions and one
 build-script execution on the first Cargo run, zero of either on the unchanged
 second run, two program executions, unchanged actual planner fingerprints and
 unchanged sealed-tree inode metadata. Both runs share the original admitted
-probe deadline. Native graph validation is pending. This fixed graph is not the
-general Cargo mapper, complete input collector, runtime-equivalence policy,
-in-command invalidation/restart implementation or final C proof/API.
+probe deadline. The real admitted VM replay at `0281601e` passed in **104.04
+seconds**, with three-then-zero compiler calls, one-then-zero build-script calls,
+two program executions and nine original-cleaned tool units under UIDs
+2005–2013. Root checks verified unchanged planner fingerprints, detached library
+inputs and unchanged sealed generated-tree inode metadata. The program's
+positive reads and failed write/rename attempts also passed. **249 CI Python
+tests passed with native helpers and no skips**, and **31 focused Rust tests
+passed** (15 opt-in cases excluded). This fixed graph is not the general Cargo
+mapper, complete input collector, runtime-equivalence policy, in-command
+invalidation/restart implementation or final C proof/API. All generic CI,
+trusted-input-closure and shipping-authority flags remain false.
