@@ -12,8 +12,21 @@ import time
 
 
 def supervise(receipt, argv, *, forward_fds=(), close_after_spawn=(),
-              return_raw_status=False, on_spawn=None):
+              return_raw_status=False, on_spawn=None, on_exec=None):
+    """Own descendants; optionally observe a trusted bootstrap's actual exec.
+
+    on_exec requires the single-threaded bootstrap to use PTRACE_TRACEME and
+    SIGSTOP immediately before its requested exec. Only the original child's
+    kernel PTRACE_EVENT_EXEC invokes the callback, while the tool is stopped.
+    Missing callbacks never prove execution, regardless of process exit status.
+    This observer detaches after the callback; it is not an input collector.
+    """
     libc = ctypes.CDLL(None, use_errno=True)
+    def ptrace(request,pid,data=None):
+        libc.ptrace.restype=ctypes.c_long
+        libc.ptrace.argtypes=(ctypes.c_uint,ctypes.c_int,ctypes.c_void_p,ctypes.c_void_p)
+        if libc.ptrace(request,pid,None,data)!=0:
+            raise OSError(ctypes.get_errno(),'original exec observation unavailable')
     stopping = False
 
     def stop(signum, frame):
@@ -98,8 +111,11 @@ def supervise(receipt, argv, *, forward_fds=(), close_after_spawn=(),
         os.environ.pop('JARVIS_NATIVE_VM_READY', None)
         os.environ.pop('JARVIS_NATIVE_VM_CONTINUE', None)
     try:
-        if type(return_raw_status) is not bool or (on_spawn is not None and not callable(on_spawn)):
+        if (type(return_raw_status) is not bool or (on_spawn is not None and not callable(on_spawn))
+                or (on_exec is not None and (not callable(on_exec) or vm_preflight))):
             raise RuntimeError('invalid internal supervisor observer')
+        if on_exec is not None and {entry.name for entry in Path('/proc/self/task').iterdir()}!={str(os.getpid())}:
+            raise RuntimeError('exec observation requires a single-threaded supervisor')
         # Trusted build broker carries the same flock open description through
         # supervisor and QEMU. A killed broker must not release build storage
         # before this subtree has actually exited.
@@ -124,9 +140,20 @@ def supervise(receipt, argv, *, forward_fds=(), close_after_spawn=(),
             raise RuntimeError('too many inherited child descriptors')
         for descriptor in forward_fds:
             os.fstat(descriptor)
+        attach=scope.attach_child if scope else None
+        if on_exec is not None:
+            origin=os.getpid()
+            def attach():
+                # EXITKILL cannot cover the interval before TRACEME/options.
+                # The private worker is single-threaded before this fork.
+                if libc.prctl(1,signal.SIGKILL,0,0,0)!=0 or os.getppid()!=origin:
+                    raise RuntimeError('exec bootstrap lost its original supervisor')
+                if scope:scope.attach_child()
+                if os.getppid()!=origin:
+                    raise RuntimeError('exec bootstrap lost its original supervisor')
         child = subprocess.Popen(argv, start_new_session=True,
                                  pass_fds=inherited,
-                                 preexec_fn=scope.attach_child if scope else None)
+                                 preexec_fn=attach)
     except BaseException:
         if scope:
             resource_path.write_text(json.dumps({'phase':'launch_failed', **scope.observation()}))
@@ -156,7 +183,47 @@ def supervise(receipt, argv, *, forward_fds=(), close_after_spawn=(),
             ready = Path(receipt).with_name('launch-ready')
             ready.write_text('ready\n')
             ready.chmod(0o600)
+        exec_armed=False
+        exec_observed=False
         while not stopping:
+            if on_exec is not None and not exec_observed:
+                # Popen.wait/poll treats a traced stop as process completion.
+                # This original parent must consume and distinguish stops until
+                # the requested exec is positively observed and detached.
+                pid,waited_status=os.waitpid(child.pid,os.WNOHANG|os.WUNTRACED)
+                if pid==0:
+                    time.sleep(.005)
+                    continue
+                if os.WIFEXITED(waited_status) or os.WIFSIGNALED(waited_status):
+                    status=os.waitstatus_to_exitcode(waited_status)
+                    child.returncode=status
+                    break
+                if not os.WIFSTOPPED(waited_status):
+                    raise RuntimeError('original exec wait state unavailable')
+                event=waited_status>>16
+                stopped_signal=os.WSTOPSIG(waited_status)
+                if not exec_armed:
+                    if (event or stopped_signal!=signal.SIGSTOP
+                            or {entry.name for entry in Path(f'/proc/{child.pid}/task').iterdir()}!={str(child.pid)}):
+                        raise RuntimeError('original exec bootstrap is not a single stopped thread')
+                    # TRACEEXEC distinguishes the actual kernel event from a
+                    # user SIGTRAP. EXITKILL owns the pre-exec death interval.
+                    ptrace(0x4200,child.pid,ctypes.c_void_p(0x10|0x100000))
+                    exec_armed=True
+                    ptrace(7,child.pid)
+                elif event==4 and stopped_signal==signal.SIGTRAP:
+                    former=ctypes.c_ulong()
+                    ptrace(0x4201,child.pid,ctypes.byref(former))
+                    if former.value!=child.pid:
+                        raise RuntimeError('exec changed the original supervised thread')
+                    on_exec(child)
+                    ptrace(17,child.pid)  # Tool cannot run before observer succeeds.
+                    exec_observed=True
+                else:
+                    # Signals during the armed interval cancel staging. They
+                    # cannot become a claimed tool start or be silently lost.
+                    raise RuntimeError('original exec staging was interrupted')
+                continue
             try:
                 status = child.wait(timeout=0.05)
                 break
@@ -204,8 +271,15 @@ def supervise(receipt, argv, *, forward_fds=(), close_after_spawn=(),
                     return status if status >= 0 else 128 - status
                 if pid == 0:
                     break
+                if os.WIFSTOPPED(waited_status):
+                    # A callback/setup failure may leave an original ptrace
+                    # stop pending. Reap only terminal states before receipt.
+                    try:os.kill(pid,signal.SIGKILL)
+                    except ProcessLookupError:pass
+                    continue
                 if return_raw_status and pid == child.pid and status is None:
                     status = os.waitstatus_to_exitcode(waited_status)
+                    child.returncode=status
             if time.monotonic() >= deadline:
                 raise RuntimeError('provider descendant cleanup did not complete')
             time.sleep(0.005)

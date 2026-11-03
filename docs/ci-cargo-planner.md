@@ -236,6 +236,30 @@ credential transition and frozen unit views remain unimplemented. This helper
 does not execute tools, provide a complete input closure or publish CI authority;
 it is not connected to the existing same-UID version-2 experiment.
 
+The original descendant supervisor now has a private `on_exec` hook for a
+single-threaded trusted bootstrap. That bootstrap arms tracing with TRACEME and
+SIGSTOP immediately before its requested exec. The original supervisor enables
+TRACEEXEC and EXITKILL, verifies the original thread at the kernel exec event,
+and calls the observer while the new tool remains stopped. Only then does it
+detach and resume. User SIGTRAP, a closed exec pipe and raw process exit are not
+exec observations. The distinction follows the Linux
+[ptrace exec-event contract](https://man7.org/linux/man-pages/man2/ptrace.2.html).
+The supervisor must itself be single-threaded; it sets a child parent-death
+SIGKILL and verifies the original parent before starting the bootstrap. This
+covers the interval before tracing can enable EXITKILL. Protected credential
+dropping must rearm and verify this guard after credential changes, which clear
+it (the Linux [parent-death signal rules](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html));
+that transition still needs its actual guest proof.
+
+Thirteen real subprocess tests cover short-lived exec, failed exec, stager death,
+forged stops/signals, observer failure, multi-thread refusal, original tracer
+death, and staged large stdin/cancellation. Existing supervisor callers retain
+their default path. A missing hook invocation remains unverified even when the
+bootstrap exits zero. The hook detaches after observation: it is not the complete
+syscall/input collector. Protected activation still requires the final launch
+and cancellation handshake, credential proof, frozen unit views and collection
+armed before any untrusted instruction; this hook alone cannot supply them.
+
 ## Private unit records and cleanup
 
 The proposed internal record has these distinct identities: source generation,
