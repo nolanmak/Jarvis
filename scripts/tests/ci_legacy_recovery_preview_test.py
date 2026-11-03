@@ -14,6 +14,11 @@ except FileNotFoundError:preview=None
 
 
 class RecoveryPreviewTests(unittest.TestCase):
+    def test_policy_cannot_be_truthy_coercion(self):
+        for policy in (1,'true',None):
+            with self.subTest(policy=policy),self.assertRaisesRegex(preview.PreviewUnavailable,'policy'):
+                preview.execute({'version':1,'allow_closed_links':policy})
+
     def test_kernel_descriptor_check_rejects_writeable_backing_before_guest_start(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);image=root/'cache.img';image.write_bytes(b'original')

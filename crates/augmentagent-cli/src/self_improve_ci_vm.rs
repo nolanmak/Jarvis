@@ -1325,7 +1325,7 @@ mod tests {
 #[cfg(test)]
 impl Session {
     pub(super) async fn preview_legacy_recovery(&self,source:&verifier_checkout::OwnedCheckout,root:&Path,binding:&Binding,
-        target:&Path,storage:&crate::build_storage::Lease,audit:&Arc<augmentagent_channel_core::AuditLogger>)
+        target:&Path,storage:&crate::build_storage::Lease,audit:&Arc<augmentagent_channel_core::AuditLogger>,allow_closed_links:bool)
         ->Result<serde_json::Value> {
         use std::os::fd::AsRawFd;
         let _execution=self.execution.lock().await;
@@ -1342,6 +1342,7 @@ impl Session {
         let objects=if objects.is_absolute(){objects}else{root.join(objects)}.canonicalize()?;
         let command_id=uuid::Uuid::new_v4().to_string();
         let specification=serde_json::json!({"version":1,"build_cache":self.cache,"cache_bytes":self.cache_bytes,
+            "allow_closed_links":allow_closed_links,
             "scratch":bundle.join("scratch"),"runtime_config":bundle.join("runtime.json"),
             "workspace":source,"git_objects":objects,"head":binding.verification_head,"tree":binding.index_tree,
             "contract_sha256":binding.contract_sha256,"authority_sha256":self.authority_sha256,
@@ -1376,6 +1377,7 @@ impl Session {
         let raw=std::fs::read(&result)?;ensure!(raw.len()<=1024*1024,"oversized recovery preview");
         let value:serde_json::Value=serde_json::from_slice(&raw)?;
         ensure!(value["kind"]=="ci-legacy-recovery-preview-receipt" && value["command"]==command_id
+            && value["policy"]==if allow_closed_links {"closed-links"}else{"strict-single-link"}
             && value["base_before"]==value["base_after"]
             && value["view"]["base_read_only_verified_before_guest"]==true
             && ["input_closure_complete","full_ci","shipping_authority"].iter().all(|key|value[*key]==false),

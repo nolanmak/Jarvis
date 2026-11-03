@@ -1865,3 +1865,29 @@ routine validation passed 343 Python CI tests without skips and 31 focused Rust
 tests, with 20 opt-in native cases excluded from that routine Rust run. The
 preview was explicitly executed separately. Original source/proof/merge gates
 remain open, and no production cache change or autonomous merge is claimed.
+
+### Closed-link recovery under validation
+
+The opt-in cleanup policy now censuses recognized sessions within one legacy
+incremental unit while retaining their actual lock descriptions. A linked file
+is eligible only if every inode alias is accounted for in safe locked sessions.
+Foreign aliases, unknown/busy peers, duplicate selected-file inodes and oversized
+censuses remain retained. One session is retired per ID, with the original
+32-session limit; the census is refreshed after each retirement. Version-2
+cleanup intent records peer directory/lock identities and indexed endpoints;
+partial deletion drops obligations only for selected files already removed.
+Version-1 selection remains the default and both known record versions replay.
+The ordinary pre-worker caller still selects that default during validation.
+
+Local validation passes 359 Python CI tests without skips and 31 focused managed
+Rust tests, with 20 opt-in native cases excluded. This includes real filesystem
+links, 41 linked sessions across the 32-session attempt boundary, intent and
+partial/completed-deletion interruptions, foreign/busy/changed peers, malformed
+records and strict-selection lock lifetime. The native comparison is pending:
+under one existing storage lease it runs two separately supervised commands,
+each with the original 180-second deadline, in fresh temporary views of the
+same base. It requires identical base/protected inventories and initial worker
+capacity, and a larger final capacity with closed-link cleanup. Neither command
+runs application CI or grants reuse/merge authority. The proposed contract is
+[ci-legacy-hardlink-recovery.md](ci-legacy-hardlink-recovery.md); its independent
+review is incomplete and production activation remains gated.

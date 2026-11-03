@@ -1855,12 +1855,25 @@ async fn live_shared_ci_legacy_recovery_preview()->Result<()> {
     git(root,&["update-ref","refs/remotes/origin/main",&head]).await?;
     let before=binding(root).await?;let source=snapshot(root,&before,&target).await?;
     let session=vm::Session::prepare(root,&target)?;
-    let receipt=session.preview_legacy_recovery(&source,root,&before,&target,&storage,&audit).await?;
-    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&receipt)?)?;
+    // Two separately supervised commands retain one original storage admission.
+    // Each gets the unchanged 180-second command deadline and a fresh COW view.
+    let reference=session.preview_legacy_recovery(&source,root,&before,&target,&storage,&audit,false).await?;
+    std::fs::write(evidence.join("strict-reference.json"),serde_json::to_vec_pretty(&reference)?)?;
+    let receipt=session.preview_legacy_recovery(&source,root,&before,&target,&storage,&audit,true).await?;
+    let comparison=serde_json::json!({"version":1,"kind":"ci-legacy-recovery-comparison",
+        "strict":reference,"closed":receipt,"input_closure_complete":false,"full_ci":false,"shipping_authority":false});
+    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&comparison)?)?;
     let outcome=&receipt["outcome"];
     ensure!(outcome["retired"].as_array().is_some_and(|rows|!rows.is_empty()),"preview did not exercise real legacy retirement");
     ensure!(outcome["available_after"].as_u64()>outcome["available_before"].as_u64(),"preview did not recover worker capacity");
     ensure!(outcome["protected_before"]==outcome["protected_after"],"protected artifacts changed during recovery");
+    ensure!(reference["base_before"]==receipt["base_before"] && reference["base_after"]==receipt["base_after"],
+        "recovery policies did not use the same immutable base");
+    ensure!(reference["outcome"]["protected_before"]==outcome["protected_before"],"policy protected inventories differ");
+    let reference_outcome=&reference["outcome"];
+    ensure!(reference_outcome["available_before"]==outcome["available_before"],"policy initial worker capacity differs");
+    ensure!(outcome["available_after"].as_u64()>reference_outcome["available_after"].as_u64(),
+        "closed-link recovery did not improve capacity over strict selection");
     ensure!(binding(root).await?==before,"diagnostic source changed");
     audit.protected_health()?;
     Ok(())

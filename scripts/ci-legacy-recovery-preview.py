@@ -125,7 +125,8 @@ try:
     cache={};exec(compile(Path('/ci-tools/cache-generation.py').read_bytes(),'/ci-tools/cache-generation.py','exec'),cache)
     job=json.loads(Path('/job.json').read_text());root=Path('/build-cache')
     before=protected_inventory(root);space=os.statvfs(root);available=space.f_bavail*space.f_frsize
-    retired=cache['reclaim_legacy_incremental'](root,job['binding'],job['command'],job['uid'],job['gid'])
+    retired=cache['reclaim_legacy_incremental'](root,job['binding'],job['command'],job['uid'],job['gid'],
+        allow_closed_links=job['allow_closed_links'])
     after=protected_inventory(root);space=os.statvfs(root)
     result={'version':1,'kind':'ci-legacy-recovery-preview','view':'temporary-writes',
         'protected_before':before,'protected_after':after,'available_before':available,
@@ -192,6 +193,8 @@ def preview_directories(scratch,runtime):
 
 def execute(specification):
     if specification.get('version')!=1:raise PreviewUnavailable('unsupported preview request')
+    allow_closed_links=specification.get('allow_closed_links',False)
+    if type(allow_closed_links) is not bool:raise PreviewUnavailable('invalid recovery policy')
     scratch=Path(specification['scratch']);image=Path(specification['build_cache'])
     if not image.is_file() or image.resolve()!=image:raise PreviewUnavailable('existing literal base required')
     lease=adapter.InheritedStorage(specification['storage'],scratch)
@@ -221,7 +224,7 @@ def execute(specification):
         modules=[]
         for index,path in enumerate(config['modules']):
             entries.append(('modules/'+str(index)+'.ko',stat.S_IFREG|0o600,Path(path).read_bytes(),0,0));modules.append('insmod /modules/'+str(index)+'.ko || poweroff -f')
-        job={'binding':binding,'command':command_id,'uid':os.getuid(),'gid':os.getgid()}
+        job={'binding':binding,'command':command_id,'uid':os.getuid(),'gid':os.getgid(),'allow_closed_links':allow_closed_links}
         entries += [('ci-tools/cache-generation.py',stat.S_IFREG|0o444,adapter.CACHE_PROGRAM,0,0),
             ('guest.py',stat.S_IFREG|0o400,GUEST.encode(),0,0),('job.json',stat.S_IFREG|0o400,json.dumps(job).encode(),0,0)]
         boot='''#!/bootstrap/sh
@@ -269,6 +272,7 @@ poweroff -f
         if observed!=original:raise PreviewUnavailable('base image integrity changed')
         lease.check()
         return {'version':1,'kind':'ci-legacy-recovery-preview-receipt','binding':binding,'command':command_id,
+            'policy':'closed-links' if allow_closed_links else 'strict-single-link',
             'view':lineage,'base_before':original,'base_after':observed,'outcome':result,
             'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
 
