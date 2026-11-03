@@ -1687,3 +1687,32 @@ replay **190.63s**, all passed. Receipts are under
 `/tmp/augmentagent-ci-negative-protocol-20261103193041`, and
 `/tmp/augmentagent-ci-negative-structured-20261103193233` respectively.
 These are compatibility evidence for that source, not results for later edits.
+
+
+Validation for executable source `c0238838`: **325 Python CI tests passed with
+no skips; 31 focused Rust tests passed**, with 19 opt-in native cases excluded
+from routine execution. The actual five-command generated-negative replay was
+explicitly run and passed in **159.68s**. It retained original compiler counts
+`[1,0,1]`, recovered `[0,0]`, original test rerun, worker metadata/direct-exec
+refusals and the later generated-change hold. Receipt:
+`/tmp/augmentagent-ci-negative-open-20261103194202/receipt.json`.
+
+Read-only inspection under the managed lease verified both active affected
+compiler records against the original capture digest and command, including the
+persisted opaque target boundary. Their read-content relevance remained equal
+and metadata relevance changed. These particular successful compiler scopes
+selected three opens each and no failed opens; failed-open behavior is covered
+by the red/green selector and command-adapter regressions, not claimed as
+native failed-open coverage. The scopes retain **77/105 unbound opens** and
+**68/104 unbound metadata queries**. The hold and false authority flags remain.
+Inspection log: `/tmp/autoship-1703-negative-open-revalidation-inspection-1.log`.
+
+The normal production worker separately retried workflow #1796 at generation
+71 and recorded `disk full`, failure count 27, with model calls still 58 and
+all five merge slots available. A read-only inspection under that cache's
+managed lease found 681,807,872 free filesystem bytes in its 12-GiB legacy
+image after the attempt. Of that, 157,286 blocks are reserved: the unprivileged
+worker has at most **37,564,416 bytes (about 36 MiB)** available. The image has
+`/target` and `/cargo-home` allocations and no new generation layout. This does not prove ownership of its contents for
+reclamation or implement migration. Bounded ownership-safe legacy recovery
+remains a rollout gate; no cache capacity/accounting/backoff was changed.
