@@ -23,11 +23,23 @@ import uuid
 spec=importlib.util.spec_from_file_location('observer_cache',Path(__file__).with_name('ci-cache-generation.py'))
 cache=importlib.util.module_from_spec(spec);spec.loader.exec_module(cache)
 MAX_BYTES=4*1024**2
+# Keep this candidate's string temporaries below the BPF stack ceiling. A path
+# reaching the terminator slot is rejected, never treated as a complete name.
+PATH_BYTES=96
 SYSCALLS={2,4,6,21,89,257,262,267,269,332,439}
 
 
 class ObservationUnavailable(RuntimeError):
     pass
+
+
+def startup_errno(error):
+    errors=b'\n'.join(line for line in error.lower().splitlines()
+        if not line.startswith(b'stdin:') and b'warning:' not in line)
+    if b'bpf stack limit is exceeded' in errors:return errno.E2BIG
+    if b'operation not permitted' in errors:return errno.EPERM
+    if b'not found' in errors or b'no such file or directory' in errors:return errno.ENOENT
+    return errno.EINVAL
 
 
 def decode(data,*,complete=True):
@@ -59,7 +71,7 @@ def decode(data,*,complete=True):
         if match is None:raise ObservationUnavailable('unknown observation record')
         uid,pid,tid,call,result=map(int,match.groups()[:5]);path=match[6].encode()
         if (pid>=2**31 or tid>=2**31 or call not in SYSCALLS or not -4095<=result<2**31
-                or len(path)>=127 or any(part in (b'',b'.',b'..') for part in path.split(b'/')[1:])
+                or len(path)>=PATH_BYTES-1 or any(part in (b'',b'.',b'..') for part in path.split(b'/')[1:])
                 or not (uid==1999 and re.fullmatch(rb'/ci-observer-witness-[a-z0-9-]+',path)
                     or 2000<=uid<6096 and (path.startswith(b'/workspace/')
                         or path in (b'src/lib.rs',b'src/main.rs',b'build.rs')))):
@@ -78,8 +90,8 @@ rawtracepoint:sys_enter / (uid >= 2000 && uid < 6096) || uid == 1999 / {
  delete(@seen[tid]); delete(@path[tid]);
 }
 kretprobe:getname_flags
-/ ((uid >= 2000 && uid < 6096) || uid == 1999) && (uint64)retval > 4095 && (uint64)retval < 0xfffffffffffff001 / {
- $value = str(((struct observer_filename *)retval)->name, 128);
+/ ((uid >= 2000 && uid < 6096) || uid == 1999) && (uint64)retval > 4095 && (uint64)retval < (uint64)0xfffffffffffff001 / {
+ $value = str(((struct observer_filename *)retval)->name, 96);
  if ((@number[tid]==2 || @number[tid]==4 || @number[tid]==6 || @number[tid]==21 ||
       @number[tid]==89 || @number[tid]==257 || @number[tid]==262 || @number[tid]==267 ||
       @number[tid]==269 || @number[tid]==332 || @number[tid]==439) &&
@@ -155,7 +167,7 @@ class Observer:
         os.chmod(self.stdout,0o600);os.chmod(self.stderr,0o600)
         self.child=subprocess.Popen([str(binary),'-q','-B','none','-f','json','-e',self.program],
             stdin=subprocess.DEVNULL,stdout=self.output,stderr=self.error,start_new_session=True,
-            env={'PATH':os.defpath,'BPFTRACE_MAX_STRLEN':'128','HOME':'/tmp'})
+            env={'PATH':os.defpath,'BPFTRACE_MAX_STRLEN':str(PATH_BYTES),'HOME':'/tmp'})
         deadline=min(self.deadline,time.monotonic()+10);origin=os.getpid()
         def drop():
             libc=ctypes.CDLL(None,use_errno=True)
@@ -164,10 +176,7 @@ class Observer:
             if libc.prctl(1,signal.SIGKILL,0,0,0)!=0 or os.getppid()!=origin:os._exit(125)
         while time.monotonic()<deadline:
             if self.child.poll() is not None:
-                error=self.stderr.read_bytes().lower()
-                code=(errno.EPERM if b'operation not permitted' in error else errno.ENOENT
-                    if b'not traceable' in error or b'not found' in error else errno.EINVAL)
-                raise OSError(code,'private kernel observer startup failed')
+                raise OSError(startup_errno(self.stderr.read_bytes()),'private kernel observer startup failed')
             witness=subprocess.Popen([sys.executable,'-I','-c',_WITNESS,self.witness],
                 stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
                 env={'PATH':os.defpath},preexec_fn=drop)

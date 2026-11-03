@@ -1,5 +1,6 @@
 """Kernel-copied pathname experiment; never a complete input/CI authority."""
 import importlib.util
+import errno
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,13 @@ def frame(kind,data):return (json.dumps({'type':kind,'data':data})+'\n').encode(
 
 
 class KernelObserverTests(unittest.TestCase):
+    def test_startup_error_is_not_classified_from_an_unrelated_probe_warning(self):
+        data=(b'stdin:6-7: WARNING: getname_flags is not traceable; attaching will likely fail\n'
+            b'error: in function rawtracepoint:sys_exit: Looks like the BPF stack limit is exceeded.\n')
+        self.assertEqual(observer.startup_errno(data),errno.E2BIG)
+        self.assertEqual(observer.startup_errno(b'ERROR: No such file or directory'),errno.ENOENT)
+        self.assertEqual(observer.startup_errno(b'WARNING: not found\nERROR: invalid argument'),errno.EINVAL)
+
     def test_counter_bound_kernel_records_keep_success_and_negative_queries(self):
         data=(frame('printf','E 1999 100 100 257 -2 /ci-observer-witness-test\n')
             +frame('printf','E 2004 101 101 257 3 /workspace/target/deps/input\n')
@@ -38,6 +46,15 @@ class KernelObserverTests(unittest.TestCase):
     def test_truncated_and_unbounded_streams_have_no_observation(self):
         for value in (b'',frame('printf','E 2004 101 101 257 3 /workspace/target/deps/input\n'),b'x'*(4*1024**2+1)):
             with self.subTest(size=len(value)),self.assertRaises(observer.ObservationUnavailable):observer.decode(value)
+
+    def test_path_at_capture_capacity_cannot_authorize_a_truncated_lookup(self):
+        prefix='/workspace/'
+        path=prefix+'x'*(95-len(prefix))
+        data=frame('printf','E 2004 101 101 257 3 '+path+'\n')+frame('map',{'@emitted':1})
+        with self.assertRaises(observer.ObservationUnavailable):observer.decode(data)
+        shorter=path[:-1]
+        self.assertEqual(observer.decode(frame('printf','E 2004 101 101 257 3 '+shorter+'\n')
+            +frame('map',{'@emitted':1}))[0]['path'],shorter.encode())
 
     @unittest.skipIf(os.geteuid()==0,'non-root refusal is exercised by a non-root caller')
     def test_no_host_caller_can_start_the_privileged_kernel_probe(self):
