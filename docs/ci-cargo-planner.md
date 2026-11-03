@@ -601,13 +601,23 @@ mount of the original sealed executable at Cargo's exact requested alias. Its
 attempt to write fingerprint data must affect only its own private target.
 Root observations require one compiler execution on the first run, zero on the
 unchanged second run, two application executions, unchanged actual fingerprint
-contents, sealed artifact integrity and original cleanup. Native validation is
-still unsatisfied: `ccd97c8d` stops at `planner_cargo_request` after 92.18 seconds.
-Host mapping tests do not establish the real Cargo checkpoint. Earlier native
-runs exposed the installed toolchain's private UID1000/0700 root; read-only
-mounts of its existing public child directories now expose the pinned runtime
-without changing host permissions. This virtual runtime root is an execution
-prototype, not the final metadata/runtime-equivalence policy.
+contents, sealed artifact integrity and original cleanup. The real admitted VM
+replay at `60efd6c7` passed in **98.61 seconds**: one actual compiler invocation
+then zero, two application runs, six root-recorded units under UIDs 2005–2010,
+preserved actual fingerprints, detached sealed artifact integrity and original
+cleanup/allocation removal. The five original transport/filesystem cases also
+passed. All generic metadata-isolation/input-closure/shipping claims remain false.
+
+Earlier native runs exposed the installed toolchain's private UID1000/0700
+root; read-only mounts of its existing public child directories now expose the
+pinned runtime without changing host permissions. `ccd97c8d` then stopped at
+`planner_cargo_request` after 92.18 seconds. The exact installed Cargo version
+[strips its caller's working-directory prefix from the executable](https://github.com/rust-lang/cargo/blob/29ea6fb6a/src/cargo/ops/cargo_run.rs#L94).
+The mapper now accepts that one known relative alias with its original argv and
+cwd, mounting the sealed artifact at the same resolved path. Other relative
+executables and escaping paths still hold. This virtual runtime root and fixed
+mapping are execution prototypes, not the final runtime/metadata-equivalence
+policy or a general Cargo mapper.
 
 The in-command publication regression at `43fd246e` did produce a valid native
 RED: warm two consumer compiles, unchanged zero, then zero consumer compiles and
