@@ -473,63 +473,63 @@
       "shell": "bash"
     },
     "rust/channels/14": {
-      "body": "cargo fmt -p augmentagent-heartbeat -- --check",
+      "body": "cargo test -p augmentagent-approval-discord --lib autonomy::\ncargo test -p augmentagent-channel-core --lib preset_is_pinned\ncargo test -p augmentagent-channel-core --lib no_daemon_preset_inherits_the_owners_interactive_model\ncargo test -p augmentagent-channel-core --test capability_inventory\ncargo test -p augmentagent-channel-imessage --lib imessage_receipt_attached_before_card\ncargo test -p augmentagent-channel-email --lib email_receipt_attached_before_card\ncargo test -p augmentagent-store --lib open_read_only\n",
       "shell": "bash"
     },
     "rust/channels/15": {
-      "body": "cargo clippy -p augmentagent-heartbeat --all-targets --no-deps -- -D warnings",
+      "body": "cargo fmt -p augmentagent-heartbeat -- --check",
       "shell": "bash"
     },
     "rust/channels/16": {
-      "body": "cargo test -p augmentagent-heartbeat",
+      "body": "cargo clippy -p augmentagent-heartbeat --all-targets --no-deps -- -D warnings",
       "shell": "bash"
     },
     "rust/channels/17": {
-      "body": "cargo test -p augmentagent-store --test heartbeat_schema\ncargo test -p augmentagent-channel-core --test capability_inventory -- inventory_accounts every_production\n",
+      "body": "cargo test -p augmentagent-heartbeat",
       "shell": "bash"
     },
     "rust/channels/18": {
-      "body": "cargo test -p augmentagent-cli --bin augmentagent heartbeat_cmd::tests\ncargo test -p augmentagent-cli --test heartbeat_cli\n",
+      "body": "cargo test -p augmentagent-store --test heartbeat_schema\ncargo test -p augmentagent-channel-core --test capability_inventory -- inventory_accounts every_production\n",
       "shell": "bash"
     },
     "rust/channels/19": {
+      "body": "cargo test -p augmentagent-cli --bin augmentagent heartbeat_cmd::tests\ncargo test -p augmentagent-cli --test heartbeat_cli\n",
+      "shell": "bash"
+    },
+    "rust/channels/20": {
       "body": "cargo test -p augmentagent-channel-linkedin --lib --tests --locked\ncargo test -p augmentagent-messages -p augmentagent-mcp-memory --lib --locked\ncargo test -p augmentagent-cli --test linkedin_archive_cli --locked\ncargo test -p augmentagent-cli --bin augmentagent linkedin --locked\ncargo test -p augmentagent-channel-core --lib ask_mode_social_card_allowlist_tests --locked\ncargo test -p augmentagent-store --lib --test email_recipients --test team_coverage_store --locked\ncargo test -p augmentagent-auth --lib --tests --locked\ncargo test -p augmentagent-cli --test team_cli --test team_coverage_cli --locked\ncargo test -p augmentagent-cli --bin augmentagent team_coverage --locked\ncargo test -p augmentagent-cli --bin augmentagent stale_reconcile_tests --locked\n",
       "shell": "bash"
     },
-    "rust/channels/21": {
+    "rust/channels/22": {
       "body": "python3 -m unittest discover -s scripts/tests -p phone_offline_ci_test.py -v",
       "shell": "bash"
     },
-    "rust/channels/22": {
+    "rust/channels/23": {
       "body": "python3 -m unittest discover -s scripts/tests -p phone_live_receipt_test.py -v",
       "shell": "bash"
     },
-    "rust/channels/23": {
+    "rust/channels/24": {
       "body": "python3 -m unittest scripts.tests.codex_tool_bridge_test.PortableGrepTests scripts.tests.codex_tool_bridge_test.TransportTests -v",
       "shell": "bash"
     },
-    "rust/channels/24": {
+    "rust/channels/25": {
       "body": "bash scripts/tests/aa-journal-guard.test.sh",
       "shell": "bash"
     },
-    "rust/channels/25": {
+    "rust/channels/26": {
       "body": "cargo test --locked -p augmentagent-channel-core --test phone_native_live --no-run",
       "shell": "bash"
     },
-    "rust/channels/26": {
+    "rust/channels/27": {
       "body": "python3 scripts/phone-offline-tests.py",
       "shell": "bash"
     },
-    "rust/channels/27": {
+    "rust/channels/28": {
       "body": "bash scripts/tests/install-autostart.test.sh",
       "shell": "bash"
     },
-    "rust/channels/28": {
-      "body": "python3 scripts/phone-upgrade-test.py",
-      "shell": "bash"
-    },
     "rust/channels/29": {
-      "body": "python3 scripts/phone-upgrade-test.py --live",
+      "body": "python3 scripts/phone-upgrade-test.py",
       "shell": "bash"
     },
     "rust/channels/3": {
@@ -537,26 +537,30 @@
       "shell": "bash"
     },
     "rust/channels/30": {
-      "body": "cargo check -p augmentagent-cli --locked",
+      "body": "python3 scripts/phone-upgrade-test.py --live",
       "shell": "bash"
     },
     "rust/channels/31": {
+      "body": "cargo check -p augmentagent-cli --locked",
+      "shell": "bash"
+    },
+    "rust/channels/32": {
       "body": "cargo clippy -p augmentagent-phone --all-targets --no-deps --locked -- -D warnings",
       "shell": "bash"
     },
-    "rust/channels/34": {
+    "rust/channels/35": {
       "body": "go mod verify\ngo test -mod=readonly ./...\ngo test -mod=readonly -race ./...\ngo vet -mod=readonly ./...\n",
       "shell": "bash"
     },
-    "rust/channels/35": {
+    "rust/channels/36": {
       "body": "go build -mod=readonly -trimpath -o \"$RUNNER_TEMP/wa-sidecar\" .\necho \"AUGMENTAGENT_WA_SIDECAR_TEST_BIN=$RUNNER_TEMP/wa-sidecar\" >> \"$GITHUB_ENV\"\n",
       "shell": "bash"
     },
-    "rust/channels/36": {
+    "rust/channels/37": {
       "body": "cargo test -p augmentagent-channel-whatsapp",
       "shell": "bash"
     },
-    "rust/channels/37": {
+    "rust/channels/38": {
       "body": "cargo clippy --no-deps -p augmentagent-channel-whatsapp --all-targets -- -D warnings",
       "shell": "bash"
     },
@@ -1842,30 +1846,35 @@
             {
               "command_id": "rust/channels/14",
               "if": "runner.os == 'Linux'",
-              "name": "Format heartbeat crate"
+              "name": "Autonomy gate C5-C9 preset, receipts and Discord notice"
             },
             {
               "command_id": "rust/channels/15",
               "if": "runner.os == 'Linux'",
-              "name": "Heartbeat lint"
+              "name": "Format heartbeat crate"
             },
             {
               "command_id": "rust/channels/16",
               "if": "runner.os == 'Linux'",
-              "name": "Heartbeat behavior"
+              "name": "Heartbeat lint"
             },
             {
               "command_id": "rust/channels/17",
               "if": "runner.os == 'Linux'",
-              "name": "Heartbeat store schema and capability manifest"
+              "name": "Heartbeat behavior"
             },
             {
               "command_id": "rust/channels/18",
               "if": "runner.os == 'Linux'",
-              "name": "Heartbeat CLI unit and process tests"
+              "name": "Heartbeat store schema and capability manifest"
             },
             {
               "command_id": "rust/channels/19",
+              "if": "runner.os == 'Linux'",
+              "name": "Heartbeat CLI unit and process tests"
+            },
+            {
+              "command_id": "rust/channels/20",
               "env": {
                 "AUGMENTAGENT_GH_DISABLE": "1"
               },
@@ -1879,7 +1888,7 @@
               }
             },
             {
-              "command_id": "rust/channels/21",
+              "command_id": "rust/channels/22",
               "env": {
                 "AUGMENTAGENT_GH_DISABLE": "1",
                 "AUGMENTAGENT_PHONE_ENABLED": "0"
@@ -1887,7 +1896,7 @@
               "name": "Check that the runner rejects missing or skipped coverage"
             },
             {
-              "command_id": "rust/channels/22",
+              "command_id": "rust/channels/23",
               "env": {
                 "AUGMENTAGENT_GH_DISABLE": "1",
                 "AUGMENTAGENT_PHONE_ENABLED": "0"
@@ -1895,7 +1904,7 @@
               "name": "Live receipt validator (synthetic fixtures only)"
             },
             {
-              "command_id": "rust/channels/23",
+              "command_id": "rust/channels/24",
               "env": {
                 "AUGMENTAGENT_GH_DISABLE": "1",
                 "AUGMENTAGENT_PHONE_ENABLED": "0"
@@ -1903,7 +1912,7 @@
               "name": "Portable bridge search and parent lifetime"
             },
             {
-              "command_id": "rust/channels/24",
+              "command_id": "rust/channels/25",
               "env": {
                 "AUGMENTAGENT_GH_DISABLE": "1",
                 "AUGMENTAGENT_PHONE_ENABLED": "0"
@@ -1911,7 +1920,7 @@
               "name": "Journal write guard including portable path resolution"
             },
             {
-              "command_id": "rust/channels/25",
+              "command_id": "rust/channels/26",
               "env": {
                 "AUGMENTAGENT_GH_DISABLE": "1",
                 "AUGMENTAGENT_PHONE_ENABLED": "0"
@@ -1919,7 +1928,7 @@
               "name": "Compile opt-in native phone probes (no model calls)"
             },
             {
-              "command_id": "rust/channels/26",
+              "command_id": "rust/channels/27",
               "env": {
                 "AUGMENTAGENT_GH_DISABLE": "1",
                 "AUGMENTAGENT_PHONE_ENABLED": "0"
@@ -1927,7 +1936,7 @@
               "name": "Required offline phone suites"
             },
             {
-              "command_id": "rust/channels/27",
+              "command_id": "rust/channels/28",
               "env": {
                 "AUGMENTAGENT_GH_DISABLE": "1",
                 "AUGMENTAGENT_PHONE_ENABLED": "0"
@@ -1935,7 +1944,7 @@
               "name": "Service installation preserves private phone configuration"
             },
             {
-              "command_id": "rust/channels/28",
+              "command_id": "rust/channels/29",
               "env": {
                 "AUGMENTAGENT_GH_DISABLE": "1",
                 "AUGMENTAGENT_PHONE_ENABLED": "0"
@@ -1943,7 +1952,7 @@
               "name": "Pre-phone database upgrade and rollback compatibility"
             },
             {
-              "command_id": "rust/channels/29",
+              "command_id": "rust/channels/30",
               "env": {
                 "AUGMENTAGENT_GH_DISABLE": "1",
                 "AUGMENTAGENT_PHONE_ENABLED": "0"
@@ -1951,7 +1960,7 @@
               "name": "ConversationRelay rollback preserves GPT-Live tasks and receipts"
             },
             {
-              "command_id": "rust/channels/30",
+              "command_id": "rust/channels/31",
               "env": {
                 "AUGMENTAGENT_GH_DISABLE": "1",
                 "AUGMENTAGENT_PHONE_ENABLED": "0"
@@ -1959,7 +1968,7 @@
               "name": "CLI integration compiles"
             },
             {
-              "command_id": "rust/channels/31",
+              "command_id": "rust/channels/32",
               "env": {
                 "AUGMENTAGENT_GH_DISABLE": "1",
                 "AUGMENTAGENT_PHONE_ENABLED": "0"
@@ -1984,7 +1993,7 @@
               }
             },
             {
-              "command_id": "rust/channels/34",
+              "command_id": "rust/channels/35",
               "env": {
                 "GOMAXPROCS": 2
               },
@@ -1992,7 +2001,7 @@
               "working-directory": "sidecars/wa-sidecar"
             },
             {
-              "command_id": "rust/channels/35",
+              "command_id": "rust/channels/36",
               "env": {
                 "GOMAXPROCS": 2
               },
@@ -2000,11 +2009,11 @@
               "working-directory": "sidecars/wa-sidecar"
             },
             {
-              "command_id": "rust/channels/36",
+              "command_id": "rust/channels/37",
               "name": "WhatsApp Rust channel and real Go-process contract tests"
             },
             {
-              "command_id": "rust/channels/37",
+              "command_id": "rust/channels/38",
               "name": "WhatsApp Rust channel lint"
             }
           ],
@@ -2177,7 +2186,7 @@
         }
       },
       "role": "validation",
-      "sha256": "4b49e3e32d8948f0510e406fd912952151ce36986029def8be914316785a0d97"
+      "sha256": "862d3f85f265a6e3d05e56bc5dab3ea7e3a3973b9528e7d95a53b71ee377fe34"
     }
   }
 }

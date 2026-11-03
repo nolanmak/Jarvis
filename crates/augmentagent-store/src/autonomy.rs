@@ -822,3 +822,36 @@ impl Store {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::Store;
+
+    /// `autonomy explain` opens the live store this way: it reads, gets
+    /// empty autonomy tables on a database that predates them, and never
+    /// writes the file.
+    #[test]
+    fn open_read_only_reads_and_never_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.db");
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE emails(messageId TEXT, threadId TEXT, fromEmail TEXT, receivedAt TEXT,
+                     firstSeenAt INTEGER, triageResult TEXT);
+                 INSERT INTO emails VALUES ('m1', 't1', 'me', '2026-11-03T10:00:00-05:00', 1, 'reply');",
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let ro = Store::open_read_only(&path).unwrap();
+        assert!(!ro.autonomy_global_pause().unwrap());
+        assert_eq!(ro.autonomous_plans_in_cap_window("jane-doe", 0).unwrap(), 0);
+        assert_eq!(ro.email_triage_result("m1").unwrap().as_deref(), Some("reply"));
+        assert_eq!(ro.owner_message_times_in_thread("t1", 10).unwrap().len(), 1);
+        assert!(ro.set_autonomy_global_pause(true, 1).is_err(), "query_only refuses writes");
+        drop(ro);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "the file is untouched");
+        assert!(!dir.path().join("data.db-wal").exists());
+    }
+}

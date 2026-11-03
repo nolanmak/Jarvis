@@ -123,10 +123,19 @@ pub fn plain(action_id: &str, email: &Email, draft: &str) -> Call {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // test fixture
 pub enum Call {
     /// `email` is the card email as JSON, so equality is byte equality.
-    Plain { action_id: String, email: String, draft: String },
-    Noted { action_id: String, draft: String, note: String },
+    Plain {
+        action_id: String,
+        email: String,
+        draft: String,
+    },
+    Noted {
+        action_id: String,
+        draft: String,
+        note: String,
+    },
     Notice(AutonomyNotice),
     Trust(TrustNotice),
     Other(&'static str),
@@ -141,7 +150,10 @@ pub struct Recording {
 
 impl Recording {
     pub fn new(notices: bool) -> Arc<Self> {
-        Arc::new(Self { calls: Mutex::new(Vec::new()), notices })
+        Arc::new(Self {
+            calls: Mutex::new(Vec::new()),
+            notices,
+        })
     }
     pub fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap().clone()
@@ -187,7 +199,12 @@ impl ApprovalBroker for Recording {
         self.push(Call::Other("post_owner_alert"));
         Ok("alert".into())
     }
-    async fn post_approval(&self, action_id: &str, email: &Email, draft: &str) -> Result<(), ApprovalError> {
+    async fn post_approval(
+        &self,
+        action_id: &str,
+        email: &Email,
+        draft: &str,
+    ) -> Result<(), ApprovalError> {
         self.push(plain(action_id, email, draft));
         Ok(())
     }
@@ -235,7 +252,11 @@ impl ApprovalBroker for Recording {
         draft: &str,
         note: &str,
     ) -> Result<(), ApprovalError> {
-        self.push(Call::Noted { action_id: action_id.into(), draft: draft.into(), note: note.into() });
+        self.push(Call::Noted {
+            action_id: action_id.into(),
+            draft: draft.into(),
+            note: note.into(),
+        });
         Ok(())
     }
     fn can_post_autonomy_notice(&self) -> bool {
@@ -263,7 +284,10 @@ pub struct FakeExecutor {
 
 impl FakeExecutor {
     pub fn new(store: Arc<Store>) -> Arc<Self> {
-        Arc::new(Self { store, approvals: Mutex::new(Vec::new()) })
+        Arc::new(Self {
+            store,
+            approvals: Mutex::new(Vec::new()),
+        })
     }
     pub fn approvals(&self) -> Vec<String> {
         self.approvals.lock().unwrap().clone()
@@ -274,7 +298,11 @@ impl FakeExecutor {
 impl AutonomyExecutor for FakeExecutor {
     async fn approve(&self, action_id: &str) -> ApprovalActionOutcome {
         self.approvals.lock().unwrap().push(action_id.to_string());
-        let row = self.store.get_action_with_email(action_id).unwrap().unwrap();
+        let row = self
+            .store
+            .get_action_with_email(action_id)
+            .unwrap()
+            .unwrap();
         if !self
             .store
             .claim_action_for_send(action_id, ActionStatus::Pending, "autonomy")
@@ -285,7 +313,12 @@ impl AutonomyExecutor for FakeExecutor {
                 detail: None,
             };
         }
-        let target = row.email.thread_id.unwrap().trim_start_matches("imessage:").to_string();
+        let target = row
+            .email
+            .thread_id
+            .unwrap()
+            .trim_start_matches("imessage:")
+            .to_string();
         let body = row.action.draft_body.unwrap();
         self.store
             .enqueue_imessage_outbox(&NewImessageOutboxItem {
@@ -312,7 +345,8 @@ pub fn outbox_bodies(store: &Store) -> Vec<(String, String)> {
     store
         .with_conn(|c| {
             let mut stmt = c.prepare("SELECT target, body FROM imessage_outbox ORDER BY id")?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             rows.collect::<Result<Vec<_>, _>>()
         })
         .unwrap()
@@ -328,7 +362,11 @@ pub struct FakePlanner {
 
 impl FakePlanner {
     pub fn new(answer: &str) -> Arc<Self> {
-        Arc::new(Self { answer: answer.into(), calls: Mutex::new(0), on_call: Mutex::new(None) })
+        Arc::new(Self {
+            answer: answer.into(),
+            calls: Mutex::new(0),
+            on_call: Mutex::new(None),
+        })
     }
     pub fn calls(&self) -> usize {
         *self.calls.lock().unwrap()
@@ -338,7 +376,10 @@ impl FakePlanner {
 #[async_trait]
 impl Reasoner for FakePlanner {
     async fn call(&self, opts: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
-        assert!(opts.allowed_tools.is_empty(), "the planner never holds a tool (NG3)");
+        assert!(
+            opts.allowed_tools.is_empty(),
+            "the planner never holds a tool (NG3)"
+        );
         *self.calls.lock().unwrap() += 1;
         if let Some(f) = self.on_call.lock().unwrap().as_mut() {
             f();
@@ -362,8 +403,14 @@ impl FakeCalendar {
             lookup,
             adds: Mutex::new(Vec::new()),
             removes: Mutex::new(Vec::new()),
-            add_outcome: GuestOutcome::Added { etag: None, attendees: vec![WORK_EMAIL.into()] },
-            remove_outcome: Mutex::new(GuestOutcome::Removed { etag: None, attendees: Vec::new() }),
+            add_outcome: GuestOutcome::Added {
+                etag: None,
+                attendees: vec![WORK_EMAIL.into()],
+            },
+            remove_outcome: Mutex::new(GuestOutcome::Removed {
+                etag: None,
+                attendees: Vec::new(),
+            }),
         })
     }
 }
@@ -374,11 +421,17 @@ impl CalendarOps for FakeCalendar {
         self.lookup.clone()
     }
     async fn add_guest(&self, event: &EventRef, email: &str) -> Result<GuestOutcome, String> {
-        self.adds.lock().unwrap().push((event.clone(), email.into()));
+        self.adds
+            .lock()
+            .unwrap()
+            .push((event.clone(), email.into()));
         Ok(self.add_outcome.clone())
     }
     async fn remove_guest(&self, event: &EventRef, email: &str) -> Result<GuestOutcome, String> {
-        self.removes.lock().unwrap().push((event.clone(), email.into()));
+        self.removes
+            .lock()
+            .unwrap()
+            .push((event.clone(), email.into()));
         Ok(self.remove_outcome.lock().unwrap().clone())
     }
 }
@@ -414,5 +467,11 @@ pub fn broker(
 }
 
 pub fn input<'a>(action_id: &'a str, email: &'a Email, draft: &'a str) -> GateInput<'a> {
-    GateInput { action_id, email, draft, now_ms: now_ms(), notices_deliverable: true }
+    GateInput {
+        action_id,
+        email,
+        draft,
+        now_ms: now_ms(),
+        notices_deliverable: true,
+    }
 }

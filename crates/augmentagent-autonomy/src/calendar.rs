@@ -34,7 +34,8 @@ pub struct GoogleCalendarOps {
 #[async_trait]
 impl CalendarOps for GoogleCalendarOps {
     async fn candidates(&self, text: &str) -> Result<CandidateSet, String> {
-        let accounts = connected_google_calendar_accounts(&self.store).map_err(|e| e.to_string())?;
+        let accounts =
+            connected_google_calendar_accounts(&self.store).map_err(|e| e.to_string())?;
         let window = CandidateWindow::parse(text, self.now.unwrap_or_else(Utc::now), self.tz);
         self.google
             .find_candidate_events(&accounts, &window, text)

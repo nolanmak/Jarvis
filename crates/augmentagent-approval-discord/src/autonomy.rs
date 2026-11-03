@@ -48,13 +48,42 @@ pub fn step_text(step: &StepRow) -> Option<String> {
 impl AutonomyNotice {
     /// D10: Undo is offered only while a reversible step is `executed`.
     pub fn undo_available(&self) -> bool {
-        todo!("C8: undo availability")
+        self.steps
+            .iter()
+            .any(|s| s.kind == STEP_ADD_GUEST && s.status == StepStatus::Executed)
     }
 
     /// The notice body: who, what ran, each step's status and the exact text
     /// sent.
     pub fn text(&self) -> String {
-        todo!("C8: notice text")
+        let mut out = format!(
+            "🤖 Acted for {} ({}) without a click — plan {} is **{}**.",
+            self.contact_display, self.channel, self.plan.id, self.plan.status
+        );
+        if let Some(event) = &self.event {
+            out.push_str(&format!("\nEvent: {event}"));
+        }
+        if let Some(note) = &self.note {
+            out.push_str(&format!("\n⚠ {note}"));
+        }
+        for step in &self.steps {
+            let what = match step.kind.as_str() {
+                STEP_ADD_GUEST => {
+                    let guest = serde_json::from_str::<serde_json::Value>(&step.payload_json)
+                        .ok()
+                        .and_then(|v| v.get("calendar_email")?.as_str().map(str::to_string))
+                        .unwrap_or_else(|| "the contact".into());
+                    format!("add {guest} as a guest")
+                }
+                STEP_SEND => format!("text {}", step.target_handle),
+                other => other.to_string(),
+            };
+            out.push_str(&format!("\n{}. {what} — {}", step.seq, step.status));
+            if let Some(text) = step_text(step) {
+                out.push_str(&format!("\n> {}", text.replace('\n', "\n> ")));
+            }
+        }
+        out
     }
 }
 

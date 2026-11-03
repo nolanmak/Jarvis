@@ -6,19 +6,20 @@ mod common;
 
 use std::sync::Arc;
 
+use augmentagent_approval_discord::ApprovalBroker;
 use augmentagent_autonomy::broker::STALE_NOTE;
 use augmentagent_autonomy::calendar::CalendarOps;
 use augmentagent_autonomy::gate::{admit, Admission, Reason, Verdict};
 use augmentagent_autonomy::registry::{ADD_GUEST, SEND_DETAILS};
+use augmentagent_autonomy::SenderAuth;
 use augmentagent_autonomy::{NewPlan, PlanInsert, PlanStatus, Tier};
-use augmentagent_approval_discord::ApprovalBroker;
 use augmentagent_channel_calendar::{Candidate, CandidateSet, CandidateWindow, EventRef};
 use augmentagent_channel_core::reasoner::Reasoner;
-use augmentagent_autonomy::SenderAuth;
 use augmentagent_store::{ActionStatus, Email, Store, TriageResult};
 use common::*;
 
-const CAL_PLAN: &str = r#"{"plan":"calendar","candidate":"cand_1","actions":["calendar.add_guest"]}"#;
+const CAL_PLAN: &str =
+    r#"{"plan":"calendar","candidate":"cand_1","actions":["calendar.add_guest"]}"#;
 const NO_PLAN: &str = r#"{"plan":"none"}"#;
 
 fn candidate_set(organizer: bool) -> CandidateSet {
@@ -83,7 +84,12 @@ impl Fx {
             paused: false,
             notices_deliverable: true,
             stale_notice: false,
-            email: imessage_email(PHONE, 4, "not seeing an invite for this meeting today", &minutes_ago(5)),
+            email: imessage_email(
+                PHONE,
+                4,
+                "not seeing an invite for this meeting today",
+                &minutes_ago(5),
+            ),
             draft: "Let me check on it.".into(),
             receipt: Some((true, vec![])),
             triage: None,
@@ -112,7 +118,10 @@ impl Fx {
             platform: "gmail".into(),
             kind: "dm".into(),
         };
-        self.gmail_auth = Some(SenderAuth { dmarc_pass: true, dkim_aligned: true });
+        self.gmail_auth = Some(SenderAuth {
+            dmarc_pass: true,
+            dkim_aligned: true,
+        });
         self
     }
 
@@ -127,16 +136,22 @@ impl Fx {
             self.receipt.as_ref().map(|(f, g)| (*f, g.as_slice())),
         );
         if let Some(t) = self.triage {
-            store.mark_email_processed(&self.email.message_id, t).unwrap();
+            store
+                .mark_email_processed(&self.email.message_id, t)
+                .unwrap();
         }
         if self.owner_texted_after {
             owner_texted(&store, PHONE, 5, &minutes_ago(1));
         }
         if let Some(auth) = self.gmail_auth {
-            store.record_email_sender_auth(&self.email.message_id, auth, now).unwrap();
+            store
+                .record_email_sender_auth(&self.email.message_id, auth, now)
+                .unwrap();
         }
         if self.list_header {
-            store.record_email_list_header(&self.email.message_id, now).unwrap();
+            store
+                .record_email_list_header(&self.email.message_id, now)
+                .unwrap();
         }
         if self.global_pause {
             store.set_autonomy_global_pause(true, now).unwrap();
@@ -155,16 +170,23 @@ impl Fx {
                 plan_json: "{}".into(),
                 steps: vec![],
             };
-            let PlanInsert::Inserted { plan_id, .. } =
-                store.insert_autonomous_plan(&plan, 10, now - 61 * 60 * 1000).unwrap()
+            let PlanInsert::Inserted { plan_id, .. } = store
+                .insert_autonomous_plan(&plan, 10, now - 61 * 60 * 1000)
+                .unwrap()
             else {
                 panic!()
             };
-            store.set_autonomous_plan_status(plan_id, PlanStatus::Executed, now - 61 * 60 * 1000).unwrap();
+            store
+                .set_autonomous_plan_status(plan_id, PlanStatus::Executed, now - 61 * 60 * 1000)
+                .unwrap();
         }
         let mut c = contact(self.tier, &self.allowed);
         c.daily_cap = self.daily_cap;
-        let trust = if self.trusted { snapshot(c) } else { augmentagent_autonomy::TrustSnapshot::default() };
+        let trust = if self.trusted {
+            snapshot(c)
+        } else {
+            augmentagent_autonomy::TrustSnapshot::default()
+        };
         let cal: Arc<dyn CalendarOps> = FakeCalendar::new(self.lookup.clone());
         let planner: Arc<dyn Reasoner> = FakePlanner::new(self.planner);
         let g = gate(&store, self.master_on, trust, Some(cal), Some(planner));
@@ -178,14 +200,27 @@ impl Fx {
                 if self.daily_cap == 1 {
                     let mut other = ready.new_plan.clone();
                     other.idem_key = "earlier-plan".into();
-                    assert!(matches!(store.insert_autonomous_plan(&other, 10, now).unwrap(), PlanInsert::Inserted { .. }));
+                    assert!(matches!(
+                        store.insert_autonomous_plan(&other, 10, now).unwrap(),
+                        PlanInsert::Inserted { .. }
+                    ));
                 }
-                assert_eq!(admit(&store, &ready, now, true), Admission::WouldInsert, "dry run writes nothing");
-                match admit(&store, &ready, now, false) {
-                    Admission::Inserted { .. } if self.admit_twice => match admit(&store, &ready, now, false) {
-                        Admission::Hold(r) => Err(r),
-                        other => panic!("second admission: {other:?}"),
-                    },
+                let dry = admit(&store, &ready, now, true);
+                let live = admit(&store, &ready, now, false);
+                // The dry run (autonomy explain) predicts the live answer and
+                // writes nothing.
+                match (&dry, &live) {
+                    (Admission::WouldInsert, Admission::Inserted { .. }) => {}
+                    (Admission::Hold(a), Admission::Hold(b)) => assert_eq!(a, b),
+                    other => panic!("dry run disagrees with admission: {other:?}"),
+                }
+                match live {
+                    Admission::Inserted { .. } if self.admit_twice => {
+                        match admit(&store, &ready, now, false) {
+                            Admission::Hold(r) => Err(r),
+                            other => panic!("second admission: {other:?}"),
+                        }
+                    }
                     Admission::Inserted { .. } => Ok(()),
                     Admission::Hold(r) => Err(r),
                     Admission::WouldInsert => unreachable!(),
@@ -280,7 +315,14 @@ async fn gate_check_order_table() {
     assert_eq!(run_named(Fx::new()).await.0, Ok(()));
     // Full tier with no calendar intent sends the drafter's reply.
     assert_eq!(
-        run_named(Fx { tier: Tier::Full, allowed: vec![], planner: NO_PLAN, ..Fx::new() }).await.0,
+        run_named(Fx {
+            tier: Tier::Full,
+            allowed: vec![],
+            planner: NO_PLAN,
+            ..Fx::new()
+        })
+        .await
+        .0,
         Ok(())
     );
     // Authenticated 1:1 Gmail passes too.
@@ -298,20 +340,34 @@ fn email_for(idx: usize, body: &str) -> Email {
 #[tokio::test]
 async fn untrusted_card_is_byte_identical() {
     let (_d, store) = store();
-    let email = imessage_email(OTHER_PHONE, 1, "not seeing an invite for this meeting today", &minutes_ago(5));
+    let email = imessage_email(
+        OTHER_PHONE,
+        1,
+        "not seeing an invite for this meeting today",
+        &minutes_ago(5),
+    );
     let action = seed(&store, &email, "Let me check.", Some((true, &[])));
     let inner = Recording::new(true);
     let planner = FakePlanner::new(CAL_PLAN);
     let cal = FakeCalendar::new(Ok(candidate_set(true)));
-    let g = gate(&store, true, snapshot(contact(Tier::Actions, &[ADD_GUEST])), Some(cal.clone()), Some(planner.clone()));
+    let g = gate(
+        &store,
+        true,
+        snapshot(contact(Tier::Actions, &[ADD_GUEST])),
+        Some(cal.clone()),
+        Some(planner.clone()),
+    );
     let exec = FakeExecutor::new(Arc::clone(&store));
     let b = broker(Arc::clone(&inner), g, Arc::clone(&exec));
-    b.post_approval(&action, &email, "Let me check.").await.unwrap();
+    b.post_approval(&action, &email, "Let me check.")
+        .await
+        .unwrap();
+    assert_eq!(inner.cards(), vec![plain(&action, &email, "Let me check.")]);
     assert_eq!(
-        inner.cards(),
-        vec![plain(&action, &email, "Let me check.")]
+        planner.calls(),
+        0,
+        "no planning call for an untrusted sender"
     );
-    assert_eq!(planner.calls(), 0, "no planning call for an untrusted sender");
     assert!(exec.approvals().is_empty());
     assert!(cal.adds.lock().unwrap().is_empty());
 }
@@ -323,14 +379,19 @@ async fn autonomy_off_card_is_byte_identical() {
     let action = seed(&store, &email, "Let me check.", Some((true, &[])));
     let inner = Recording::new(true);
     let planner = FakePlanner::new(CAL_PLAN);
-    let g = gate(&store, false, snapshot(contact(Tier::Actions, &[ADD_GUEST])), Some(FakeCalendar::new(Ok(candidate_set(true)))), Some(planner.clone()));
+    let g = gate(
+        &store,
+        false,
+        snapshot(contact(Tier::Actions, &[ADD_GUEST])),
+        Some(FakeCalendar::new(Ok(candidate_set(true)))),
+        Some(planner.clone()),
+    );
     let exec = FakeExecutor::new(Arc::clone(&store));
     let b = broker(Arc::clone(&inner), g, Arc::clone(&exec));
-    b.post_approval(&action, &email, "Let me check.").await.unwrap();
-    assert_eq!(
-        inner.cards(),
-        vec![plain(&action, &email, "Let me check.")]
-    );
+    b.post_approval(&action, &email, "Let me check.")
+        .await
+        .unwrap();
+    assert_eq!(inner.cards(), vec![plain(&action, &email, "Let me check.")]);
     assert_eq!(planner.calls(), 0);
     assert!(exec.approvals().is_empty());
 }
@@ -339,13 +400,30 @@ async fn autonomy_off_card_is_byte_identical() {
 async fn trusted_card_shows_note() {
     let (_d, store) = store();
     let email = email_for(1, "not seeing an invite for this meeting today");
-    let action = seed(&store, &email, "Let me check.", Some((true, &["The context check reached its time limit"])));
+    let action = seed(
+        &store,
+        &email,
+        "Let me check.",
+        Some((true, &["The context check reached its time limit"])),
+    );
     let inner = Recording::new(true);
-    let g = gate(&store, true, snapshot(contact(Tier::Actions, &[ADD_GUEST])), Some(FakeCalendar::new(Ok(candidate_set(true)))), Some(FakePlanner::new(CAL_PLAN)));
+    let g = gate(
+        &store,
+        true,
+        snapshot(contact(Tier::Actions, &[ADD_GUEST])),
+        Some(FakeCalendar::new(Ok(candidate_set(true)))),
+        Some(FakePlanner::new(CAL_PLAN)),
+    );
     let b = broker(Arc::clone(&inner), g, FakeExecutor::new(Arc::clone(&store)));
-    b.post_approval(&action, &email, "Let me check.").await.unwrap();
+    b.post_approval(&action, &email, "Let me check.")
+        .await
+        .unwrap();
     match inner.cards().as_slice() {
-        [Call::Noted { action_id, draft, note }] => {
+        [Call::Noted {
+            action_id,
+            draft,
+            note,
+        }] => {
             assert_eq!(action_id, &action);
             assert_eq!(draft, "Let me check.");
             assert_eq!(note, &Reason::EvidenceIncomplete.to_string());
@@ -361,14 +439,22 @@ async fn evidence_disabled_is_incomplete() {
     // no receipt reaches the action; and a receipt whose review did not
     // finish is no better.
     for receipt in [None, Some((false, vec![]))] {
-        let (got, _, _) = run_named(Fx { receipt, ..Fx::new() }).await;
+        let (got, _, _) = run_named(Fx {
+            receipt,
+            ..Fx::new()
+        })
+        .await;
         assert_eq!(got, Err(Reason::EvidenceIncomplete));
     }
 }
 
 #[tokio::test]
 async fn missing_receipt_is_incomplete() {
-    let (got, _, _) = run_named(Fx { receipt: None, ..Fx::new() }).await;
+    let (got, _, _) = run_named(Fx {
+        receipt: None,
+        ..Fx::new()
+    })
+    .await;
     assert_eq!(got, Err(Reason::EvidenceIncomplete));
 }
 
@@ -376,13 +462,33 @@ fn ready_broker(
     store: &Arc<Store>,
     tier: Tier,
     planner: Arc<FakePlanner>,
-) -> (augmentagent_autonomy::broker::AutonomyBroker, Arc<Recording>, Arc<FakeExecutor>, Arc<FakeCalendar>) {
+) -> (
+    augmentagent_autonomy::broker::AutonomyBroker,
+    Arc<Recording>,
+    Arc<FakeExecutor>,
+    Arc<FakeCalendar>,
+) {
     let inner = Recording::new(true);
     let cal = FakeCalendar::new(Ok(candidate_set(true)));
-    let allowed: &[&str] = if tier == Tier::Full { &[] } else { &[ADD_GUEST, SEND_DETAILS] };
-    let g = gate(store, true, snapshot(contact(tier, allowed)), Some(cal.clone()), Some(planner));
+    let allowed: &[&str] = if tier == Tier::Full {
+        &[]
+    } else {
+        &[ADD_GUEST, SEND_DETAILS]
+    };
+    let g = gate(
+        store,
+        true,
+        snapshot(contact(tier, allowed)),
+        Some(cal.clone()),
+        Some(planner),
+    );
     let exec = FakeExecutor::new(Arc::clone(store));
-    (broker(Arc::clone(&inner), g, Arc::clone(&exec)), inner, exec, cal)
+    (
+        broker(Arc::clone(&inner), g, Arc::clone(&exec)),
+        inner,
+        exec,
+        cal,
+    )
 }
 
 #[tokio::test]
@@ -392,11 +498,19 @@ async fn retry_reenters_gate_and_dedupes() {
     let action = seed(&store, &email, "Let me check.", Some((true, &[])));
     let planner = FakePlanner::new(CAL_PLAN);
     let (b, inner, exec, cal) = ready_broker(&store, Tier::Actions, Arc::clone(&planner));
-    b.post_approval(&action, &email, "Let me check.").await.unwrap();
+    b.post_approval(&action, &email, "Let me check.")
+        .await
+        .unwrap();
     assert_eq!(exec.approvals(), vec![action.clone()]);
     // `retry_once` re-runs triage and calls post_approval again.
-    b.post_approval(&action, &email, "Let me check.").await.unwrap();
-    assert_eq!(planner.calls(), 2, "the retry re-entered the gate from the start");
+    b.post_approval(&action, &email, "Let me check.")
+        .await
+        .unwrap();
+    assert_eq!(
+        planner.calls(),
+        2,
+        "the retry re-entered the gate from the start"
+    );
     assert_eq!(exec.approvals(), vec![action.clone()], "no second send");
     assert_eq!(cal.adds.lock().unwrap().len(), 1, "no second guest add");
     assert!(inner.cards().is_empty(), "a duplicate gets no card");
@@ -416,7 +530,10 @@ async fn followup_message_same_window_is_duplicate() {
     assert_eq!(exec.approvals(), vec![a1], "one plan per thread per window");
     assert!(inner.cards().is_empty(), "no card for the follow-up either");
     let row = store.get_action_with_email(&a2).unwrap().unwrap();
-    assert_eq!(row.action.status, "superseded", "the follow-up's card is retired, not left pending");
+    assert_eq!(
+        row.action.status, "superseded",
+        "the follow-up's card is retired, not left pending"
+    );
 }
 
 #[test]
@@ -450,8 +567,14 @@ fn cap_counted_in_same_txn_as_insert() {
         })
         .collect();
     let results: Vec<PlanInsert> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    let inserted = results.iter().filter(|r| matches!(r, PlanInsert::Inserted { .. })).count();
-    let capped = results.iter().filter(|r| matches!(r, PlanInsert::CapReached { .. })).count();
+    let inserted = results
+        .iter()
+        .filter(|r| matches!(r, PlanInsert::Inserted { .. }))
+        .count();
+    let capped = results
+        .iter()
+        .filter(|r| matches!(r, PlanInsert::CapReached { .. }))
+        .count();
     assert_eq!((inserted, capped), (1, 7), "{results:?}");
 }
 
@@ -459,14 +582,23 @@ fn cap_counted_in_same_txn_as_insert() {
 async fn owner_took_over_rechecked_before_approve() {
     let (_d, store) = store();
     let email = email_for(1, "can you send me the notes from earlier?");
-    let action = seed(&store, &email, "Sure — sending them over now.", Some((true, &[])));
+    let action = seed(
+        &store,
+        &email,
+        "Sure — sending them over now.",
+        Some((true, &[])),
+    );
     let planner = FakePlanner::new(NO_PLAN);
     // The owner texts the contact while the planning call is in flight:
     // after check 7 passed, before approve.
     let s = Arc::clone(&store);
-    *planner.on_call.lock().unwrap() = Some(Box::new(move || owner_texted(&s, PHONE, 2, &minutes_ago(0))));
+    *planner.on_call.lock().unwrap() = Some(Box::new(move || {
+        owner_texted(&s, PHONE, 2, &minutes_ago(0))
+    }));
     let (b, inner, exec, _cal) = ready_broker(&store, Tier::Full, planner);
-    b.post_approval(&action, &email, "Sure — sending them over now.").await.unwrap();
+    b.post_approval(&action, &email, "Sure — sending them over now.")
+        .await
+        .unwrap();
     assert!(exec.approvals().is_empty(), "approve never ran");
     assert!(outbox_bodies(&store).is_empty());
     match inner.cards().as_slice() {
@@ -482,10 +614,22 @@ async fn stale_planned_becomes_unknown_card_and_approve_cannot_double_send() {
     // A plan the daemon crashed in the middle of: its action was already
     // claimed and queued (sent), and one whose send never started.
     let sent_email = email_for(1, "invite?");
-    let sent = seed(&store, &sent_email, "Added you to Design review.", Some((true, &[])));
+    let sent = seed(
+        &store,
+        &sent_email,
+        "Added you to Design review.",
+        Some((true, &[])),
+    );
     let pending_email = imessage_email(OTHER_PHONE, 1, "invite?", &minutes_ago(30));
-    let pending = seed(&store, &pending_email, "Added you to Design review.", Some((true, &[])));
-    assert!(store.claim_action_for_send(&sent, ActionStatus::Pending, "autonomy").unwrap());
+    let pending = seed(
+        &store,
+        &pending_email,
+        "Added you to Design review.",
+        Some((true, &[])),
+    );
+    assert!(store
+        .claim_action_for_send(&sent, ActionStatus::Pending, "autonomy")
+        .unwrap());
     let old = now - 11 * 60 * 1000;
     for (i, action_id) in [&sent, &pending].into_iter().enumerate() {
         let plan = NewPlan {
@@ -498,7 +642,10 @@ async fn stale_planned_becomes_unknown_card_and_approve_cannot_double_send() {
             plan_json: "{}".into(),
             steps: vec![],
         };
-        assert!(matches!(store.insert_autonomous_plan(&plan, 10, old).unwrap(), PlanInsert::Inserted { .. }));
+        assert!(matches!(
+            store.insert_autonomous_plan(&plan, 10, old).unwrap(),
+            PlanInsert::Inserted { .. }
+        ));
     }
     let (b, inner, exec, _cal) = ready_broker(&store, Tier::Actions, FakePlanner::new(NO_PLAN));
     b.sweep(now).await;
@@ -515,7 +662,13 @@ async fn stale_planned_becomes_unknown_card_and_approve_cannot_double_send() {
     // …and approving the one that already went out cannot send it again.
     use augmentagent_autonomy::broker::AutonomyExecutor;
     let out = exec.approve(&sent).await;
-    assert!(matches!(out, augmentagent_approval_discord::ApprovalActionOutcome::AlreadyResolved { .. }), "{out:?}");
+    assert!(
+        matches!(
+            out,
+            augmentagent_approval_discord::ApprovalActionOutcome::AlreadyResolved { .. }
+        ),
+        "{out:?}"
+    );
     assert!(outbox_bodies(&store).is_empty());
 }
 
@@ -533,12 +686,11 @@ async fn global_pause_takes_effect_without_restart() {
     let mut other_thread = other_thread;
     other_thread.message_id = "imessage:+12025550100:9".into();
     let a2 = seed(&store, &other_thread, "Checking.", Some((true, &[])));
-    b.post_approval(&a2, &other_thread, "Checking.").await.unwrap();
+    b.post_approval(&a2, &other_thread, "Checking.")
+        .await
+        .unwrap();
     assert_eq!(exec.approvals().len(), 1, "paused: nothing more ran");
-    assert_eq!(
-        inner.cards(),
-        vec![plain(&a2, &other_thread, "Checking.")]
-    );
+    assert_eq!(inner.cards(), vec![plain(&a2, &other_thread, "Checking.")]);
 }
 
 /// Every `ApprovalBroker` method reaches the inner broker: a forgotten
@@ -547,7 +699,13 @@ async fn global_pause_takes_effect_without_restart() {
 async fn every_trait_method_is_forwarded() {
     let (_d, store) = store();
     let inner = Recording::new(true);
-    let g = gate(&store, false, augmentagent_autonomy::TrustSnapshot::default(), None, None);
+    let g = gate(
+        &store,
+        false,
+        augmentagent_autonomy::TrustSnapshot::default(),
+        None,
+        None,
+    );
     let b = broker(Arc::clone(&inner), g, FakeExecutor::new(Arc::clone(&store)));
     let email = email_for(1, "hi");
     assert!(b.is_available());
@@ -556,8 +714,16 @@ async fn every_trait_method_is_forwarded() {
     b.note_compose_activity("a", &email).await.unwrap();
     b.post_flag_notice(&email, "r").await.unwrap();
     b.post_digest("t", "b").await.unwrap();
-    assert_eq!(b.post_scheduled_notice("a", &email, "l", 1, "to").await.unwrap(), Some((1, 2)));
-    assert_eq!(b.post_approval_card("a", &email, "d", 0).await.unwrap(), Some((3, 4)));
+    assert_eq!(
+        b.post_scheduled_notice("a", &email, "l", 1, "to")
+            .await
+            .unwrap(),
+        Some((1, 2))
+    );
+    assert_eq!(
+        b.post_approval_card("a", &email, "d", 0).await.unwrap(),
+        Some((3, 4))
+    );
     b.delete_message(1, 2).await.unwrap();
     b.post_approval_noted("a", &email, "d", "n").await.unwrap();
     assert!(b.can_post_autonomy_notice());
@@ -575,24 +741,41 @@ async fn every_trait_method_is_forwarded() {
         })
         .collect();
     for want in [
-        "is_available", "can_post_notices", "post_imessage_owner_health", "note_compose_activity",
-        "post_flag_notice", "post_digest", "post_scheduled_notice", "post_approval_card",
-        "delete_message", "post_approval_noted", "post_trust_notice", "post_approval",
+        "is_available",
+        "can_post_notices",
+        "post_imessage_owner_health",
+        "note_compose_activity",
+        "post_flag_notice",
+        "post_digest",
+        "post_scheduled_notice",
+        "post_approval_card",
+        "delete_message",
+        "post_approval_noted",
+        "post_trust_notice",
+        "post_approval",
     ] {
-        assert!(names.iter().any(|n| n == want), "{want} not forwarded: {names:?}");
+        assert!(
+            names.iter().any(|n| n == want),
+            "{want} not forwarded: {names:?}"
+        );
     }
 
     // And no future trait method can be forgotten: every `fn` the trait
     // declares appears in the decorator's impl.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let lib = std::fs::read_to_string(root.join("crates/augmentagent-approval-discord/src/lib.rs")).unwrap();
+    let lib = std::fs::read_to_string(root.join("crates/augmentagent-approval-discord/src/lib.rs"))
+        .unwrap();
     let start = lib.find("pub trait ApprovalBroker").unwrap();
     let body = &lib[start..start + lib[start..].find("\n}\n").unwrap()];
-    let ours = std::fs::read_to_string(root.join("crates/augmentagent-autonomy/src/broker.rs")).unwrap();
+    let ours =
+        std::fs::read_to_string(root.join("crates/augmentagent-autonomy/src/broker.rs")).unwrap();
     let impl_start = ours.find("impl ApprovalBroker for AutonomyBroker").unwrap();
     let ours = &ours[impl_start..];
     let fn_name = regex::Regex::new(r"(?m)^\s*(?:async\s+)?fn\s+([a-z_0-9]+)").unwrap();
-    let declared: Vec<&str> = fn_name.captures_iter(body).map(|c| c.get(1).unwrap().as_str()).collect();
+    let declared: Vec<&str> = fn_name
+        .captures_iter(body)
+        .map(|c| c.get(1).unwrap().as_str())
+        .collect();
     assert!(declared.len() >= 14, "{declared:?}");
     for name in declared {
         assert!(
@@ -607,7 +790,10 @@ async fn every_trait_method_is_forwarded() {
 #[test]
 fn all_post_approval_sites_wrapped_or_exempt() {
     use augmentagent_autonomy::exempt::{Coverage, EXEMPT_CARD_PATHS};
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
     let found = augmentagent_autonomy::exempt::scan_card_sites(&root);
     let mut listed = std::collections::BTreeMap::new();
     for (file, marker, count, coverage) in EXEMPT_CARD_PATHS {
@@ -616,11 +802,25 @@ fn all_post_approval_sites_wrapped_or_exempt() {
         }
         *listed.entry((file.to_string(), *marker)).or_insert(0) += *count;
     }
-    assert_eq!(found, listed, "card-posting sites changed: wrap them or list them as exempt");
+    assert_eq!(
+        found, listed,
+        "card-posting sites changed: wrap them or list them as exempt"
+    );
     // The wrapped sites are wrapped because serve's broker is.
     let main = std::fs::read_to_string(root.join("crates/augmentagent-cli/src/main.rs")).unwrap();
     let build = &main[main.find("async fn build_approval_surfaces(").unwrap()..];
     let build = &build[..build.find("\n}\n").unwrap()];
-    assert!(build.contains("AutonomyBroker::new("), "build_approval_surfaces must wrap the broker");
-    assert!(build.contains("approver.broker.set(Arc::downgrade(&broker))"));
+    let wrap_at = build
+        .find("autonomy_cmd::wrap(")
+        .expect("build_approval_surfaces must wrap the broker");
+    let weak_at = build
+        .find("approver.broker.set(Arc::downgrade(&broker))")
+        .expect("approver gets the broker");
+    assert!(
+        wrap_at < weak_at,
+        "the approver must hold the wrapped broker"
+    );
+    let wiring =
+        std::fs::read_to_string(root.join("crates/augmentagent-cli/src/autonomy_cmd.rs")).unwrap();
+    assert!(wiring.contains("AutonomyBroker::new("));
 }

@@ -1,7 +1,9 @@
 //! #1833 C5 exit tests: the strict planner parser and the D8 templates.
 //! (`preset_is_pinned` lives beside the preset in channel-core.)
 
-use augmentagent_autonomy::planner::{event_fields, parse_plan, template_text, PlanOutput, PlanReject};
+use augmentagent_autonomy::planner::{
+    event_fields, parse_plan, template_text, PlanOutput, PlanReject,
+};
 use augmentagent_autonomy::registry::{ADD_GUEST, SEND_DETAILS};
 use augmentagent_channel_calendar::Candidate;
 use chrono::{DateTime, Utc};
@@ -12,14 +14,29 @@ fn known(id: &str) -> bool {
 
 #[test]
 fn valid_plans_parse() {
-    assert_eq!(parse_plan(r#"{"plan":"none"}"#, &known), Ok(PlanOutput::None));
     assert_eq!(
-        parse_plan(r#" {"plan":"calendar","candidate":"cand_2","actions":["calendar.add_guest"]} "#, &known),
-        Ok(PlanOutput::Calendar { candidate: "cand_2".into(), action: ADD_GUEST })
+        parse_plan(r#"{"plan":"none"}"#, &known),
+        Ok(PlanOutput::None)
     );
     assert_eq!(
-        parse_plan(r#"{"plan":"calendar","candidate":"cand_1","actions":["calendar.send_details"]}"#, &known),
-        Ok(PlanOutput::Calendar { candidate: "cand_1".into(), action: SEND_DETAILS })
+        parse_plan(
+            r#" {"plan":"calendar","candidate":"cand_2","actions":["calendar.add_guest"]} "#,
+            &known
+        ),
+        Ok(PlanOutput::Calendar {
+            candidate: "cand_2".into(),
+            action: ADD_GUEST
+        })
+    );
+    assert_eq!(
+        parse_plan(
+            r#"{"plan":"calendar","candidate":"cand_1","actions":["calendar.send_details"]}"#,
+            &known
+        ),
+        Ok(PlanOutput::Calendar {
+            candidate: "cand_1".into(),
+            action: SEND_DETAILS
+        })
     );
     // add_guest implies send_details: both listed is add_guest.
     assert_eq!(
@@ -27,15 +44,23 @@ fn valid_plans_parse() {
             r#"{"plan":"calendar","candidate":"cand_1","actions":["calendar.send_details","calendar.add_guest"]}"#,
             &known
         ),
-        Ok(PlanOutput::Calendar { candidate: "cand_1".into(), action: ADD_GUEST })
+        Ok(PlanOutput::Calendar {
+            candidate: "cand_1".into(),
+            action: ADD_GUEST
+        })
     );
 }
 
 #[test]
 fn unknown_candidate_id_is_no_plan() {
     for id in ["cand_3", "cand_0", "ev-sec-1", "", "CAND_1"] {
-        let raw = format!(r#"{{"plan":"calendar","candidate":"{id}","actions":["calendar.add_guest"]}}"#);
-        assert_eq!(parse_plan(&raw, &known), Err(PlanReject::UnknownCandidate(id.into())), "{id}");
+        let raw =
+            format!(r#"{{"plan":"calendar","candidate":"{id}","actions":["calendar.add_guest"]}}"#);
+        assert_eq!(
+            parse_plan(&raw, &known),
+            Err(PlanReject::UnknownCandidate(id.into())),
+            "{id}"
+        );
     }
 }
 
@@ -69,7 +94,11 @@ fn recipient_field_rejected() {
         let raw = format!(
             r#"{{"plan":"calendar","candidate":"cand_1","actions":["calendar.add_guest"],"{key}":"mallory@example.test"}}"#
         );
-        assert_eq!(parse_plan(&raw, &known), Err(PlanReject::RecipientField(key.into())), "{key}");
+        assert_eq!(
+            parse_plan(&raw, &known),
+            Err(PlanReject::RecipientField(key.into())),
+            "{key}"
+        );
     }
 }
 
@@ -88,7 +117,10 @@ fn templates_render_from_event_fields_only() {
         all_day: false,
         title: "Design review".into(),
         join_link: Some("https://meet.example.test/abc-defg-hij".into()),
-        attendees: vec!["secret-colleague@example.test".into(), "owner.work@example.test".into()],
+        attendees: vec![
+            "secret-colleague@example.test".into(),
+            "owner.work@example.test".into(),
+        ],
     };
     let fields = event_fields(&c, chrono_tz::America::New_York).expect("has a join link");
     assert_eq!(fields.title, "Design review");
@@ -101,10 +133,19 @@ fn templates_render_from_event_fields_only() {
         "Added you to Design review (Tue 3 Nov, 1:00 PM) — invite sent to jane@work.example.test. Join: https://meet.example.test/abc-defg-hij" // pii-ok synthetic
     );
     let details = template_text(SEND_DETAILS, &fields, "jane@work.example.test");
-    assert_eq!(details, "Design review — Tue 3 Nov, 1:00 PM. Join: https://meet.example.test/abc-defg-hij");
+    assert_eq!(
+        details,
+        "Design review — Tue 3 Nov, 1:00 PM. Join: https://meet.example.test/abc-defg-hij"
+    );
     for text in [&add, &details] {
-        assert!(!text.contains("secret-colleague"), "attendees never reach the text");
-        assert!(!text.contains("owner.work@"), "the owner's account never reaches the text");
+        assert!(
+            !text.contains("secret-colleague"),
+            "attendees never reach the text"
+        );
+        assert!(
+            !text.contains("owner.work@"),
+            "the owner's account never reaches the text"
+        );
     }
 
     // No join link: nothing to send, so no template (the gate holds it).
@@ -117,7 +158,9 @@ fn templates_render_from_event_fields_only() {
     all_day.all_day = true;
     all_day.start = utc("2026-11-03T05:00:00Z");
     assert_eq!(
-        event_fields(&all_day, chrono_tz::America::New_York).unwrap().local_time,
+        event_fields(&all_day, chrono_tz::America::New_York)
+            .unwrap()
+            .local_time,
         "Tue 3 Nov (all day)"
     );
 }
