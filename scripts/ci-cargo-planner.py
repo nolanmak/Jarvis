@@ -46,8 +46,8 @@ def diagnostic(value):
     phases={'planner_startup','planner_unit','planner_capture','planner_authorize','planner_drop',
         'planner_arm_exec','planner_unit_exec','planner_client_start','planner_client_exec',
         'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_supervisor',
-        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup'}
-    categories={'OSError','ValueError','KeyError','FreshnessHold','StagingUnavailable','RuntimeError','Unavailable'}
+        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin'}
+    categories={'OSError','ValueError','KeyError','FreshnessHold','StagingUnavailable','RuntimeError','TimeoutExpired','Unavailable'}
     value=value if type(value) is dict else {}
     return {'stage':value.get('stage') if value.get('stage') in phases else 'planner_startup',
         'category':value.get('category') if value.get('category') in categories else 'Unavailable',
@@ -439,6 +439,41 @@ def _stage(arguments):
     raise OSError(errno.EACCES if denied else errno.ENOENT,'unit exec unavailable')
 
 
+_TOOL_PROBE=r'''
+import ctypes,errno,hashlib,json,os,socket,sys
+metadata,socket_path,expected=sys.argv[1:];expected=int(expected)
+_PROBE_PHASE='planner_tool_credentials'
+assert os.getresuid()==(expected,expected,expected) and os.getresgid()==(expected,expected,expected) and os.getgroups()==[]
+assert ctypes.CDLL(None).prctl(39,0,0,0,0)==1
+_PROBE_PHASE='planner_tool_metadata'
+try:open(metadata,'a').write('bad')
+except OSError as error:assert error.errno in (errno.EACCES,errno.EPERM)
+else:raise AssertionError('unit wrote planner metadata')
+_PROBE_PHASE='planner_tool_socket'
+with socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET) as endpoint:
+ try:endpoint.connect(socket_path)
+ except OSError as error:assert error.errno in (errno.EACCES,errno.EPERM)
+ else:raise AssertionError('unit reached root planner socket')
+_PROBE_PHASE='planner_tool_jobserver'
+flags=os.environ.get('CARGO_MAKEFLAGS')
+if flags:
+ assert flags=='-j --jobserver-fds=3,4 --jobserver-auth=3,4'
+ assert os.read(3,1)==b'+';os.write(4,b'+')
+_PROBE_PHASE='planner_tool_fds'
+fds=[]
+for raw in os.listdir('/proc/self/fd'):
+ try:os.fstat(int(raw))
+ except OSError:continue
+ fds.append(int(raw))
+assert sorted(fds)==([0,1,2,3,4] if flags else [0,1,2]),fds
+_PROBE_PHASE='planner_tool_environment'
+assert os.environb[b'RAW']==b'\xffvalue'
+_PROBE_PHASE='planner_tool_stdin'
+print(json.dumps({'uid':expected,'stdin_sha256':hashlib.sha256(sys.stdin.buffer.read()).hexdigest(),
+ 'metadata_denied':True,'root_socket_denied':True,'control_fds_closed':True,'jobserver':bool(flags)}),flush=True)
+'''
+
+
 _PLANNER_PROBE=r'''
 import ctypes,errno,hashlib,json,os,signal,sys
 mode,metadata,socket_path,expected_uid=sys.argv[1:];expected_uid=int(expected_uid)
@@ -450,31 +485,7 @@ libc=ctypes.CDLL(None,use_errno=True);libc.syscall.restype=ctypes.c_long
 argv=(ctypes.c_char_p*2)(b'true',None);environment=(ctypes.c_char_p*1)(None)
 assert libc.syscall(ctypes.c_long(59),ctypes.c_char_p(b'/usr/bin/true'),argv,environment)==-1
 assert ctypes.get_errno()==errno.EPERM
-body=r"""import ctypes,errno,hashlib,json,os,socket,sys
-metadata,socket_path,expected=sys.argv[1:];expected=int(expected)
-assert os.getresuid()==(expected,expected,expected) and os.getresgid()==(expected,expected,expected) and os.getgroups()==[]
-assert ctypes.CDLL(None).prctl(39,0,0,0,0)==1
-try:open(metadata,'a').write('bad')
-except OSError as error:assert error.errno in (errno.EACCES,errno.EPERM)
-else:raise AssertionError('unit wrote planner metadata')
-with socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET) as endpoint:
- try:endpoint.connect(socket_path)
- except OSError as error:assert error.errno in (errno.EACCES,errno.EPERM)
- else:raise AssertionError('unit reached root planner socket')
-flags=os.environ.get('CARGO_MAKEFLAGS')
-if flags:
- assert flags=='-j --jobserver-fds=3,4 --jobserver-auth=3,4'
- assert os.read(3,1)==b'+';os.write(4,b'+')
-fds=[]
-for raw in os.listdir('/proc/self/fd'):
- try:os.fstat(int(raw))
- except OSError:continue
- fds.append(int(raw))
-assert sorted(fds)==([0,1,2,3,4] if flags else [0,1,2]),fds
-assert os.environb[b'RAW']==b'\xffvalue'
-print(json.dumps({'uid':expected,'stdin_sha256':hashlib.sha256(sys.stdin.buffer.read()).hexdigest(),
- 'metadata_denied':True,'root_socket_denied':True,'control_fds_closed':True,'jobserver':bool(flags)}),flush=True)
-"""
+body=__FIXED_TOOL_PROGRAM__
 source_read,source_write=os.pipe2(os.O_CLOEXEC);output_read,output_write=os.pipe2(os.O_CLOEXEC)
 start_read,start_write=os.pipe2(os.O_CLOEXEC)
 jobs=os.pipe2(os.O_CLOEXEC) if mode=='jobserver' else ()
@@ -514,6 +525,7 @@ else:
 for fd in jobs:os.close(fd)
 print(json.dumps(result),flush=True)
 '''
+_PLANNER_PROBE=_PLANNER_PROBE.replace('__FIXED_TOOL_PROGRAM__',repr(guarded_probe(_TOOL_PROBE)))
 
 
 def _planner(arguments):

@@ -122,6 +122,18 @@ exec(compile(module.guarded_probe(module._PLANNER_PROBE),'fixed-planner-probe','
         self.assertEqual(planner.failed_probe_diagnostic(json.dumps({'planner_diagnostic':proxy}).encode(),request),request[0])
         self.assertNotIn('PRIVATE',json.dumps(planner.failed_probe_diagnostic(stderr,request)))
 
+    def test_fixed_tool_refusal_reports_only_credentials_phase(self):
+        if os.getresuid()==(2000,2000,2000) and os.getresgid()==(2000,2000,2000):
+            self.skipTest('host happens to have the exact admitted unit credentials')
+        private='PRIVATE_OWNER_CONTENTS_AND_PATH'
+        result=subprocess.run([sys.executable,'-I','-c',planner.guarded_probe(planner._TOOL_PROBE),
+            private,private,'2000'],capture_output=True,timeout=3)
+        self.assertEqual(result.returncode,125)
+        self.assertEqual(json.loads(result.stderr),{'planner_diagnostic':{
+            'stage':'planner_tool_credentials','category':'Unavailable','errno':None}})
+        self.assertNotIn(private.encode(),result.stdout+result.stderr)
+        self.assertEqual(planner.diagnostic({'stage':'planner_unit_exec','category':'TimeoutExpired'})['category'],'TimeoutExpired')
+
     def test_staging_and_actual_exec_are_distinct_versioned_events(self):
         self.assertNotEqual(planner.event('staging_ready',0),planner.event('tool_started',0))
         self.assertEqual(planner.decode_event(planner.event('staging_ready',0)),('staging_ready',0))

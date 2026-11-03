@@ -35,7 +35,8 @@ class SnapshotValidationTests(unittest.TestCase):
     def test_fixed_planner_failure_phases_survive_guest_transport_without_private_fields(self):
         for phase in ('planner_probe_credentials','planner_probe_filter','planner_probe_exec_start',
                 'planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive',
-                'planner_request_cleanup'):
+                'planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket',
+                'planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin'):
             with self.subTest(phase=phase):
                 self.assertEqual(vm.guest_diagnostic({'stage':phase,'category':'OSError','errno':71,'private':'secret'}),
                     {'stage':phase,'category':'OSError','errno':71})

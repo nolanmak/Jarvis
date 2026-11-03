@@ -45,9 +45,9 @@ def guest_diagnostic(value):
             'planner_startup','planner_unit','planner_capture','planner_authorize','planner_drop',
             'planner_arm_exec','planner_unit_exec','planner_client_start','planner_client_exec',
             'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_supervisor',
-        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup'}
+        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin'}
     categories={'OSError','PermissionError','FileNotFoundError','FileExistsError','NotADirectoryError',
-                'IsADirectoryError','CalledProcessError','ValueError','KeyError','ModuleNotFoundError','ImportError'}
+                'IsADirectoryError','CalledProcessError','RuntimeError','TimeoutExpired','FreshnessHold','Unavailable','ValueError','KeyError','ModuleNotFoundError','ImportError'}
     return {'stage':value.get('stage') if value.get('stage') in stages else 'unknown',
             'category':value.get('category') if value.get('category') in categories else 'unknown',
             'errno':value.get('errno') if type(value.get('errno')) is int and 0<=value['errno']<=4096 else None}
@@ -141,7 +141,7 @@ if job.get('ci_context'):
             ci_dependency=importlib.util.module_from_spec(spec);spec.loader.exec_module(ci_dependency)
         except Exception as error:
             Path('/root/control/outcome.json').write_text(json.dumps({'error':'VM controller initialization unavailable',
-                'guest_diagnostic':{'stage':guest_stage,'category':type(error).__name__,'errno':getattr(error,'errno',None)}}))
+                'guest_diagnostic':{'stage':guest_stage,'category':getattr(error,'planner_category',type(error).__name__),'errno':getattr(error,'errno',None)}}))
             Path('/root/control/outcome.json').chmod(0o600)
             raise SystemExit(0)
 uid=job['uid'];gid=job['gid']
@@ -393,15 +393,17 @@ try:
                 observed=_run_worker(scope.argv,scope);stopped=scope.verify()
                 guest_worker_receipts.append(stopped.observation())
                 if observed.get('exit_code')!=0:
-                    probe_errno=71
+                    probe_errno=71;probe_category='Unavailable'
                     for line in observed.get('stderr','').splitlines():
                         try:failure=json.loads(line)
                         except ValueError:continue
                         if type(failure) is dict and type(failure.get('planner_diagnostic')) is dict:
                             guest_stage=failure['planner_diagnostic'].get('stage','planner_protocol_probe')
+                            probe_category=failure['planner_diagnostic'].get('category','Unavailable')
                             number=failure['planner_diagnostic'].get('errno')
                             probe_errno=number if type(number) is int and 1<=number<=4095 else 71
-                    raise OSError(probe_errno,'private planner probe unavailable')
+                    failure=OSError(probe_errno,'private planner probe unavailable');failure.planner_category=probe_category
+                    raise failure
                 try:planner_protocol_probe=json.loads(observed['stdout'])
                 except (ValueError,KeyError):raise ci_cache['FreshnessHold']('input_census_unknown') from None
                 planner_protocol_probe['guest_worker_quiescence']=stopped.observation()
@@ -432,7 +434,7 @@ except Exception as error:
     else:
         full=getattr(error,'errno',None) in (errno.ENOSPC,errno.EDQUOT) or 'No space left on device' in str(error)
         result={'error':'VM build cache is full' if full else 'VM command could not start',
-                'guest_diagnostic':{'stage':guest_stage,'category':type(error).__name__,'errno':getattr(error,'errno',None)}}
+                'guest_diagnostic':{'stage':guest_stage,'category':getattr(error,'planner_category',type(error).__name__),'errno':getattr(error,'errno',None)}}
 path=Path('/root/control/outcome.json')
 with path.open('w') as receipt:
     os.chmod(path,0o600);json.dump(result,receipt);receipt.flush();os.fsync(receipt.fileno())

@@ -372,8 +372,8 @@ impl Outcome {
                 .expect("bounded freshness protocol serializes");
         }
         if let Some(value)=&self.guest_diagnostic {
-            let stage=value["stage"].as_str().filter(|value|matches!(*value,"load_dependency_controller"|"reclaim_producers"|"prepare_producer"|"bind_producer_cache"|"hide_producer_cache"|"resolve_dependencies"|"freeze_resolution"|"compile_dependencies"|"record_producer"|"publish_dependencies"|"prepare_generation"|"execute_command"|"reclaim_seeds"|"planner_protocol_probe"|"planner_startup"|"planner_unit"|"planner_capture"|"planner_authorize"|"planner_drop"|"planner_arm_exec"|"planner_unit_exec"|"planner_client_start"|"planner_client_exec"|"planner_probe_stdin"|"planner_probe_jobserver"|"planner_probe_cancel"|"planner_probe_supervisor"|"planner_probe_credentials"|"planner_probe_filter"|"planner_probe_exec_start"|"planner_probe_stream"|"planner_probe_wait"|"planner_probe_status"|"planner_request_receive"|"planner_request_cleanup")).unwrap_or("unknown");
-            let category=value["category"].as_str().filter(|value|matches!(*value,"OSError"|"PermissionError"|"FileNotFoundError"|"FileExistsError"|"NotADirectoryError"|"IsADirectoryError"|"CalledProcessError"|"ValueError"|"KeyError"|"ModuleNotFoundError"|"ImportError")).unwrap_or("unknown");
+            let stage=value["stage"].as_str().filter(|value|matches!(*value,"load_dependency_controller"|"reclaim_producers"|"prepare_producer"|"bind_producer_cache"|"hide_producer_cache"|"resolve_dependencies"|"freeze_resolution"|"compile_dependencies"|"record_producer"|"publish_dependencies"|"prepare_generation"|"execute_command"|"reclaim_seeds"|"planner_protocol_probe"|"planner_startup"|"planner_unit"|"planner_capture"|"planner_authorize"|"planner_drop"|"planner_arm_exec"|"planner_unit_exec"|"planner_client_start"|"planner_client_exec"|"planner_probe_stdin"|"planner_probe_jobserver"|"planner_probe_cancel"|"planner_probe_supervisor"|"planner_probe_credentials"|"planner_probe_filter"|"planner_probe_exec_start"|"planner_probe_stream"|"planner_probe_wait"|"planner_probe_status"|"planner_request_receive"|"planner_request_cleanup"|"planner_tool_credentials"|"planner_tool_metadata"|"planner_tool_socket"|"planner_tool_jobserver"|"planner_tool_fds"|"planner_tool_environment"|"planner_tool_stdin")).unwrap_or("unknown");
+            let category=value["category"].as_str().filter(|value|matches!(*value,"OSError"|"PermissionError"|"FileNotFoundError"|"FileExistsError"|"NotADirectoryError"|"IsADirectoryError"|"CalledProcessError"|"RuntimeError"|"TimeoutExpired"|"FreshnessHold"|"Unavailable"|"ValueError"|"KeyError"|"ModuleNotFoundError"|"ImportError")).unwrap_or("unknown");
             diagnostic["guest"]=serde_json::json!({"stage":stage,"category":category,
                 "errno":value["errno"].as_i64().filter(|value|(0..=4096).contains(value))});
         }
@@ -1224,12 +1224,19 @@ mod tests {
             "planner_client_exec","planner_probe_stdin","planner_probe_jobserver","planner_probe_cancel",
             "planner_probe_supervisor","planner_probe_credentials","planner_probe_filter","planner_probe_exec_start",
             "planner_probe_stream","planner_probe_wait","planner_probe_status","planner_request_receive",
-            "planner_request_cleanup"] {
+            "planner_request_cleanup","planner_tool_credentials","planner_tool_metadata","planner_tool_socket",
+            "planner_tool_jobserver","planner_tool_fds","planner_tool_environment","planner_tool_stdin"] {
             let outcome:Outcome=serde_json::from_value(serde_json::json!({"version":1,"boundary":"existing-build-vm",
                 "status":"prerequisite_hold","stage":"vm_launch","category":"Unavailable",
                 "guest_diagnostic":{"stage":stage,"category":"OSError","errno":71,"private":"owner contents"}})).unwrap();
             assert_eq!(outcome.setup_diagnostic()["guest"],serde_json::json!({"stage":stage,"category":"OSError","errno":71}));
             assert!(!outcome.setup_diagnostic().to_string().contains("owner"));
+        }
+        for category in ["RuntimeError","TimeoutExpired","FreshnessHold","Unavailable"] {
+            let outcome:Outcome=serde_json::from_value(serde_json::json!({"version":1,"boundary":"existing-build-vm",
+                "status":"prerequisite_hold","stage":"vm_launch","category":"Unavailable",
+                "guest_diagnostic":{"stage":"planner_unit_exec","category":category,"errno":71}})).unwrap();
+            assert_eq!(outcome.setup_diagnostic()["guest"]["category"],category);
         }
     }
     #[test]
