@@ -597,6 +597,9 @@ class _ViewProbe:
         self.inputs=self.root/'inputs-v1';self._inputs(self.inputs,b'OLD')
         self.before=unit_views.inventory(self.inputs,owner=0,sealed=True)
         self.input_stat=(self.inputs/'deps/input').stat()
+        self.directory_stats={p:_CargoProbe._stat(p) for p in (self.inputs/'deps',self.inputs/'deps/empty')}
+        self.directory_members={os.fsencode(name):((self.inputs/'deps'/name).stat().st_ino,
+            4 if name=='empty' else 8) for name in ('input','one.rs','empty',os.fsdecode(b'raw-\xff'),'l'*255)}
         self.abstract=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM|socket.SOCK_CLOEXEC)
         self.abstract.bind(b'\0jarvis-unit-view-probe');self.abstract.listen(1)
         if Path('/tmp/ci-unit-probe-private-marker').exists():raise FreshnessHold('invalidation_unsafe')
@@ -605,6 +608,9 @@ class _ViewProbe:
     def _inputs(root,data):
         root.mkdir(mode=0o700);(root/'deps').mkdir(mode=0o700)
         (root/'deps/input').write_bytes(data);(root/'deps/input').chmod(0o444)
+        for name in ('one.rs',os.fsdecode(b'raw-\xff'),'l'*255):
+            (root/'deps'/name).write_bytes(b'entry\n');(root/'deps'/name).chmod(0o444)
+        (root/'deps/empty').mkdir(mode=0o555)
         (root/'deps').chmod(0o555);root.chmod(0o555)
 
     def prepare(self,ordinal,request=None):
@@ -612,6 +618,12 @@ class _ViewProbe:
         self.slot=self.root/'unit';self.slot.mkdir(mode=0o700)
         artifacts=self.slot/'artifacts'
         entries=unit_views.clone_inputs(self.inputs,artifacts,self.before,owner=0,unit=2004)
+        # One tree mount preserves directory identity and kernel membership.
+        # clone_inputs creates the detached placeholders; do not overlap its
+        # individual file bindings with the tree binding.
+        entries=[e for e in entries if not bytes.fromhex(e[0]).startswith(b'deps/')]
+        tree=unit_views.inventory(self.inputs/'deps',owner=0,sealed=True)
+        raw=b'deps'.hex();entries.append([raw,str(self.inputs/'deps'),[raw,'tree',tree]])
         root=self.slot/'root';root.mkdir(mode=0o700)
         manifest=self.slot/'mounts.json'
         cache._write_record(manifest,{'version':1,'binding':self.admission.binding,
@@ -645,6 +657,7 @@ class _ViewProbe:
             raise FreshnessHold('invalidation_unsafe')
         now=(self.inputs/'deps/input').stat();before=self.input_stat
         if (unit_views.inventory(self.inputs,owner=0,sealed=True)!=self.before
+                or any(_CargoProbe._stat(path)!=before for path,before in self.directory_stats.items())
                 or (now.st_ino,now.st_nlink,now.st_mtime_ns,now.st_ctime_ns,now.st_atime_ns)!=
                     (before.st_ino,before.st_nlink,before.st_mtime_ns,before.st_ctime_ns,before.st_atime_ns)):
             raise FreshnessHold('input_census_unknown')
@@ -678,6 +691,7 @@ CARGO_FIXTURE_SOURCE='''fn main(){
  let out=std::path::PathBuf::from(env!("OUT_DIR"));
  assert_eq!(std::fs::read(out.join("generated.rs")).unwrap(),b"pub const GENERATED:u8=7;\\n");
  assert!(out.join("empty").is_dir());
+ assert_eq!(std::fs::read_dir(out.join("empty")).unwrap().count(),0);
  assert!(std::fs::write(out.join("forbidden"),b"x").is_err());
  assert!(std::fs::rename(&out,out.with_extension("renamed")).is_err());
  let root=std::path::Path::new("target/debug/.fingerprint");
@@ -1019,7 +1033,31 @@ if is_view:
  input=Path('/workspace/target/deps/input')
  selected=lambda info:(info.st_ino,info.st_nlink,info.st_mode,info.st_size,info.st_mtime_ns,info.st_ctime_ns,info.st_atime_ns)
  before=selected(input.stat());assert input.read_bytes()==b'OLD'
- for operation in (lambda:input.open('wb'),lambda:input.unlink()):
+ import struct
+ def directory_names(path):
+  descriptor=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+  names=[];reads=0;buffer=ctypes.create_string_buffer(288)
+  try:
+   for _ in range(32):
+    amount=libc.syscall(ctypes.c_long(217),ctypes.c_long(descriptor),buffer,ctypes.c_uint(288))
+    assert amount>=0;reads+=1
+    if amount==0:return names,reads
+    offset=0
+    while offset<amount:
+     inode,next_offset,length,kind=struct.unpack_from('=QqHB',buffer.raw,offset)
+     assert length>=24 and length%8==0 and offset+length<=amount
+     name=buffer.raw[offset+19:offset+length].split(b'\0',1)[0]
+     assert name;names.append(name);offset+=length
+    assert offset==amount
+   raise AssertionError('directory EOF missing')
+  finally:os.close(descriptor)
+ names,reads=directory_names('/workspace/target/deps')
+ assert len(names)==7 and set(names)=={b'.',b'..',b'input',b'one.rs',b'empty',b'raw-\xff',b'l'*255}
+ assert reads>=3
+ names,reads=directory_names('/workspace/target/deps/empty')
+ assert len(names)==2 and set(names)=={b'.',b'..'} and reads==2
+ for operation in (lambda:input.open('wb'),lambda:input.unlink(),
+     lambda:Path('/workspace/target/deps/forbidden').mkdir()):
   try:operation()
   except OSError as error:assert error.errno in (errno.EROFS,errno.EACCES,errno.EPERM,errno.EBUSY)
   else:raise AssertionError('frozen input changed')
@@ -1169,12 +1207,18 @@ def _probe(arguments):
                     or completed['original_cleanup'] is not True):raise FreshnessHold('cleanup_uncertain')
         original_units=list(relay.completed)
         cargo_probe=_CargoProbe(admission);relay.views=cargo_probe;cargo_probe.run(value,relay)
-    view_probe.cleanup()
-    cargo_probe.cleanup()
     _PHASE='planner_kernel_observer'
     compilers={item['mapping']['role']:(item['pid'],2000+ordinal)
         for ordinal,item in cargo_probe.units.items() if item['mapping']['kind']=='compile'}
-    kernel=observer.finish(view_probe.original_pid,compilers)
+    generated=cargo_probe.publications['generated']
+    empty=generated['root']/generated['roots'][0]/'empty'
+    directories=[(view_probe.original_pid,2004,view_probe.inputs/'deps',view_probe.directory_members),
+        (view_probe.original_pid,2004,view_probe.inputs/'deps/empty',{})]
+    directories.extend((item['pid'],2000+ordinal,empty,{}) for ordinal,item in cargo_probe.units.items()
+        if item['mapping']['kind']=='application')
+    kernel=observer.finish(view_probe.original_pid,compilers,directories)
+    view_probe.cleanup()
+    cargo_probe.cleanup()
     print(json.dumps({'version':3,'kind':'ci-planner-protocol-probe','binding':value['binding'],
         'command':value['command'],'cases':results,'units':original_units,'filesystem':view_probe.receipt,
         'cargo':cargo_probe.report,'kernel_observation':kernel,

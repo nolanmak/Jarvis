@@ -35,6 +35,7 @@ async fn live_shared_ci_planner_protocol_v3()->Result<()> {
  let out=std::path::PathBuf::from(env!("OUT_DIR"));
  assert_eq!(std::fs::read(out.join("generated.rs")).unwrap(),b"pub const GENERATED:u8=7;\n");
  assert!(out.join("empty").is_dir());
+ assert_eq!(std::fs::read_dir(out.join("empty")).unwrap().count(),0);
  assert!(std::fs::write(out.join("forbidden"),b"x").is_err());
  assert!(std::fs::rename(&out,out.with_extension("renamed")).is_err());
  let root=std::path::Path::new("target/debug/.fingerprint");

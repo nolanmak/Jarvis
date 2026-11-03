@@ -27,10 +27,60 @@ def census_sample():
     links=[{'id':10+i,'type':'raw_tracepoint' if i in (1,4) else 'kretprobe_multi',
         'prog_id':i,'tag':str(i)*16,**({'tracepoint':'sys_enter' if i==1 else 'sys_exit'} if i in (1,4)
             else {'function':'getname_flags','count':1,'flags':1,'missed':0})} for i in range(1,5)]
+    for i,(function,flags) in enumerate((('iterate_dir',0),('iterate_dir',1),('filldir64',0),('filldir64',1)),5):
+        programs.append({'id':i,'type':2,'tag':str(i)*16,'recursion_misses':0})
+        links.append({'id':10+i,'type':'kretprobe_multi' if flags else 'kprobe_multi',
+            'prog_id':i,'tag':str(i)*16,'function':function,'count':1,'flags':flags,'missed':0})
     return {'pid':42,'birth':1000,'programs':programs,'links':links}
 
 
 class KernelObserverTests(unittest.TestCase):
+    def test_directory_capture_reconciles_kernel_entries_short_reads_and_eof(self):
+        rows=['B 2004 101 101 50 3 64','I 2004 101 101 50 7 900 16749',
+            'D 2004 101 101 50 1 900 4 0 0 1 2e','A 2004 101 101 50 1 1',
+            'D 2004 101 101 50 2 901 4104 1 0 2 ff 61','A 2004 101 101 50 2 1',
+            'D 2004 101 101 50 3 902 8 2 0 1 62','A 2004 101 101 50 3 0',
+            'T 2004 101 101 50 0 2','G 2004 101 101 50 48',
+            'B 2004 101 101 51 3 64','I 2004 101 101 51 7 900 16749',
+            'T 2004 101 101 51 0 2','G 2004 101 101 51 0']
+        queries=observer.directory_queries(rows)
+        self.assertEqual([q['result'] for q in queries],[48,0])
+        self.assertEqual([e['name'] for e in queries[0]['entries']],[b'.',b'\xffa'])
+        self.assertEqual([e['returned_offset'] for e in queries[0]['entries']],[1,2])
+        self.assertEqual(queries[0]['entries'][1]['raw_type'],4104)
+        self.assertEqual(queries[0]['entries'][1]['type'],8)
+        self.assertEqual(len(queries[0]['attempts']),3)
+        self.assertFalse(queries[0]['attempts'][2]['accepted'])
+        for bad in (rows[:-1],rows[:3]+rows[4:],rows+rows[:1],
+                [r.replace('50 48','50 56') for r in rows],
+                [r.replace('50 3 0','50 3 2') for r in rows],
+                [r.replace('ff 61','ff') for r in rows],
+                [r.replace('2 901 4104','2 902 4104') for r in rows]+[rows[4]],
+                [r.replace('51 0','51 24') for r in rows]):
+            with self.subTest(rows=bad),self.assertRaises(observer.ObservationUnavailable):observer.directory_queries(bad)
+        self.assertEqual(observer.directory_queries(rows[:1],complete=False),[])
+        framed=b''.join(frame('printf',row+'\n') for row in rows)+frame('map',{'@emitted':len(rows)})
+        paths,dirs=observer.decode(framed,with_directories=True)
+        self.assertEqual(paths,[]);self.assertEqual(dirs,queries)
+        with self.assertRaises(observer.ObservationUnavailable):
+            observer.decode(framed.replace(b'"@emitted": 14',b'"@emitted": 13'))
+
+    def test_directory_binary_name_chunks_require_exact_coverage_even_when_reordered(self):
+        name=b'\xff'*255
+        rows=['B 2004 101 101 1 3 288','I 2004 101 101 1 7 900 16749',
+            'A 2004 101 101 1 1 1','T 2004 101 101 1 0 99','G 2004 101 101 1 280']
+        chunks=[f'D 2004 101 101 1 1 901 8 0 {start} 255 '+name[start:start+63].hex(' ')
+            for start in range(0,len(name),63)]
+        result=observer.directory_queries((rows+chunks)[::-1])[0]
+        self.assertEqual(result['entries'][0]['name'],name)
+        self.assertEqual(result['entries'][0]['returned_offset'],99)
+        for bad in (rows+chunks[:-1],rows+chunks+chunks[:1],
+                rows+[c.replace('901 8','902 8') if i else c for i,c in enumerate(chunks)],
+                rows+[chunks[0].replace('ff ff','00 ff',1)]+chunks[1:],
+                rows+[chunks[0].replace('ff ff','2f ff',1)]+chunks[1:]):
+            with self.subTest(rows=bad),self.assertRaises(observer.ObservationUnavailable):
+                observer.directory_queries(bad)
+
     def test_kernel_return_link_fdinfo_requires_one_exact_function_table_row(self):
         data=(b'pos:\t0\nlink_type:\tkretprobe_multi\nlink_id:\t3\nprog_id:\t6\n'
             b'kprobe_cnt:\t1\nmissed:\t0\ncookie\t func\n0\t getname_flags+0x0/0x20\n')
@@ -40,12 +90,12 @@ class KernelObserverTests(unittest.TestCase):
                 data+b'0\t getname_flags+0x0/0x20\n',data.split(b'cookie')[0],data+b'missed:\t0\n'):
             with self.subTest(data=bad),self.assertRaises(observer.ObservationUnavailable):observer._fdinfo(bad)
 
-    def test_only_the_same_four_original_links_and_programs_with_zero_misses_have_a_census(self):
+    def test_only_the_same_eight_original_links_and_programs_with_zero_misses_have_a_census(self):
         sample=census_sample();value={'before':sample,'after':copy.deepcopy(sample)}
         observer.validate_census(value)
         for fault in ('missed-before','missed-after','recursion','missing-link','duplicate-program',
                 'changed-owner','changed-birth','changed-link','changed-tag','wrong-symbol','multiple-functions',
-                'entry-probe','foreign-raw-event','bool-misses','unknown-fields','absent-counter'):
+                'entry-probe','missing-iterator','duplicate-actor','foreign-raw-event','bool-misses','unknown-fields','absent-counter'):
             bad=copy.deepcopy(value);before=bad['before'];after=bad['after']
             if fault=='missed-before':before['links'][1]['missed']=1
             elif fault=='missed-after':after['links'][1]['missed']=1
@@ -59,6 +109,8 @@ class KernelObserverTests(unittest.TestCase):
             elif fault=='wrong-symbol':after['links'][1]['function']='other'
             elif fault=='multiple-functions':after['links'][1]['count']=2
             elif fault=='entry-probe':after['links'][1]['flags']=0
+            elif fault=='missing-iterator':after['links'][4]['function']='filldir64'
+            elif fault=='duplicate-actor':after['links'][5]['function']='filldir64'
             elif fault=='foreign-raw-event':after['links'][0]['tracepoint']='sched_switch'
             elif fault=='bool-misses':after['links'][1]['missed']=False
             elif fault=='unknown-fields':after['links'][1]['unknown']=True

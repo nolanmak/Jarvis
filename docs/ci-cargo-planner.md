@@ -820,3 +820,33 @@ loader output cannot replace events or the final counter. The private verifier
 buffer is 3 MiB inside the existing 4 MiB per-stream log limit; this avoids
 losing the kernel's load result to bpftrace's original 1,000,000-byte diagnostic
 buffer. Target memory, image, storage, timeout and shipping limits are unchanged.
+
+
+The directory collector extension requires eight original attachments: the two
+raw syscall probes, both original `getname_flags` return probes, and entry/return
+pairs for `iterate_dir` and `filldir64`. Before/after program and link identities,
+exact function addresses, entry/return flags, and zero loss counters remain
+mandatory. The previous four-attachment VM receipt does not validate this new
+program.
+
+`getdents64` records bind the original descriptor, buffer capacity, directory
+inode/device, kernel actor name bytes, raw and masked type, callback acceptance,
+iterator result/final position, and raw syscall result. The decoder reconciles
+accepted record lengths with returned bytes and reconstructs copied offsets
+from the next accepted actor and final iterator position. It rejects missing,
+duplicate, truncated or malformed records. Names are hexadecimal chunks of at
+most 63 bytes, including non-UTF-8 names and the full 255-byte component limit.
+This captures kernel names and acceptance without sampling a mutable user
+buffer. It grants no general filesystem or cache-reuse authority.
+
+Startup must capture both the original missing-path nonce and a complete
+`/proc/sys/kernel/random` enumeration through EOF from that same witness PID.
+The isolated unit fixture reads a readonly original directory tree with an
+empty child, binary filename and 255-byte filename using 288-byte buffers. Its
+root controller verifies original inode/type membership, a buffer-full rejected
+actor, multiple reads and EOF. Both original Cargo application runs also
+enumerate their sealed generated empty directory. Original input metadata,
+compiler calls `[3, 0]`, build-script calls `[1, 0]`, distinct unit credentials,
+and original descendant cleanup remain required. Full filesystem coverage,
+input closure, passing CI and shipping authority remain false. Native replay of
+this extension is pending; host decoding checks do not replace it.
