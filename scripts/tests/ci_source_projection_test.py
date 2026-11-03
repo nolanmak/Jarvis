@@ -71,6 +71,17 @@ class SourceProjectionTests(unittest.TestCase):
         with self.assertRaises(cache.FreshnessHold):self.project()
         self.assertFalse((self.target.parent/'source-projection').exists());self.assertFalse(marker.exists())
 
+    def test_privileged_projection_can_read_only_the_explicitly_admitted_foreign_owner_repository(self):
+        # Exercise Git's actual ownership check without needing root on the
+        # host. In the guest the controller is root and the 9p export is UID 1000.
+        original=subprocess.Popen
+        def foreign_owner(*args,**kwargs):
+            kwargs['env']={**kwargs.get('env',{}),'GIT_TEST_ASSUME_DIFFERENT_OWNER':'1'}
+            return original(*args,**kwargs)
+        with patch.object(subprocess,'Popen',side_effect=foreign_owner):
+            projected=self.project()
+        self.assertEqual(self.git('show','HEAD:src/main.rs',cwd=projected),'fn main(){println!("ORIGINAL");}')
+
     def test_changed_git_bytes_or_wrong_active_command_cannot_allocate_projection(self):
         (self.source/'src/main.rs').write_text('changed source')
         with self.assertRaises(cache.FreshnessHold):self.project()

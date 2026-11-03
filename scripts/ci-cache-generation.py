@@ -559,7 +559,7 @@ def _projection_pack(source,objects,destination,revisions,remaining):
     environment={'PATH':os.defpath,'GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null',
         'GIT_ALTERNATE_OBJECT_DIRECTORIES':str(objects),'GIT_TERMINAL_PROMPT':'0'}
     process=subprocess.Popen(['/usr/bin/git','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false',
-        '-C',str(source),'pack-objects','--revs','--stdout'],env=environment,stdin=subprocess.PIPE,
+        '-c','safe.directory='+str(source),'-C',str(source),'pack-objects','--revs','--stdout'],env=environment,stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,start_new_session=True)
     try:
         process.stdin.write(('\n'.join(revisions)+'\n').encode());process.stdin.close()
