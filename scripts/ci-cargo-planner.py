@@ -1027,6 +1027,14 @@ if is_view:
  longest=libc.syscall(ctypes.c_long(257),ctypes.c_long(-100),ctypes.c_char_p(long_path),
   ctypes.c_long(os.O_RDONLY|os.O_CLOEXEC),ctypes.c_long(0))
  assert longest==-1 and ctypes.get_errno()==errno.ENOENT
+ binary=libc.syscall(ctypes.c_long(257),ctypes.c_long(-100),
+  ctypes.c_char_p(b'/workspace/target/deps/raw-\xff'),ctypes.c_long(os.O_RDONLY|os.O_CLOEXEC),ctypes.c_long(0))
+ assert binary>=0
+ try:assert os.read(binary,64)==b'entry\n'
+ finally:os.close(binary)
+ binary_missing=libc.syscall(ctypes.c_long(257),ctypes.c_long(-100),
+  ctypes.c_char_p(b'/workspace/target/deps/missing-\xff\n '),ctypes.c_long(os.O_RDONLY|os.O_CLOEXEC),ctypes.c_long(0))
+ assert binary_missing==-1 and ctypes.get_errno()==errno.ENOENT
  _PROBE_PHASE='planner_tool_view'
  from pathlib import Path
  import time

@@ -860,3 +860,16 @@ skips) passed at `4c0db70b`; 31 focused Rust tests passed at `c6e542cf` with
 15 opt-in cases excluded. Full input closure, passing CI and shipping authority
 remain false. This receipt supersedes the four-attachment evidence for directory
 coverage only; it does not resolve the original invalidation regressions.
+
+
+The next private collector revision encodes kernel-copied pathname chunks as
+bounded lowercase hexadecimal bytes, using the same `%rh` kernel-buffer format
+as directory names. Chunk offsets and declared lengths count bytes; NUL remains
+invalid. This removes the old ASCII-only restriction without interpreting name
+bytes as output framing, collapsing components or sampling target user memory.
+The isolated original unit must open the sealed `raw-\xff` input and query a
+missing pathname containing non-UTF-8, newline and space bytes. The report and
+original Rust VM test require both original syscall outcomes. The captured
+namespace and syscall set remain partial, so complete input coverage and reuse
+or shipping authority remain false. Native validation of this pathname-wire
+extension is pending; the preceding directory receipt validates its own program.

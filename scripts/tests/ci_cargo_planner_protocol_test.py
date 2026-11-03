@@ -175,7 +175,7 @@ class PlannerProtocolTests(unittest.TestCase):
             'negative_query_observed':True,'max_path_query_observed':True,'compiler_queries_observed':True,'library_generated_query_observed':True,'after_kernel_copy':True,'events':3,'original_observer_cleanup':True,
             'filesystem_coverage_complete':False,'missed_probe_census_complete':True,'input_closure_complete':False,
             'allocation_removed':True}
-        value['kernel_observation'].update(directory_reads=8,directory_entries=13,
+        value['kernel_observation'].update(directory_reads=8,directory_entries=13,binary_path_query_observed=True,
             directory_witness_observed=True,binary_directory_name_observed=True,
             directory_short_read_observed=True,directory_eof_observed=True,cargo_directory_queries_observed=True)
         census={'pid':100,'birth':1000,
@@ -197,7 +197,7 @@ class PlannerProtocolTests(unittest.TestCase):
                 'cleanup','case-role','control-fds','jobserver','closure','authority','unknown',
                 'signal-status','signal-proxy','signal-number','signal-not-started','filesystem-namespace',
                 'filesystem-output','filesystem-cleanup','filesystem-removed','filesystem-authority','filesystem-case',
-                'kernel-binding','kernel-witness','kernel-loss','kernel-coverage','kernel-closure','kernel-cleanup','kernel-missed','kernel-census'):
+                'kernel-binding','kernel-witness','kernel-loss','kernel-coverage','kernel-closure','kernel-cleanup','kernel-missed','kernel-census','kernel-binary-path'):
             value=copy.deepcopy(original)
             if fault=='version':value['version']=True
             elif fault=='binding':value['binding']={}
@@ -232,6 +232,7 @@ class PlannerProtocolTests(unittest.TestCase):
             elif fault=='kernel-cleanup':value['kernel_observation']['original_observer_cleanup']=False
             elif fault=='kernel-missed':value['kernel_observation']['probe_census']['after']['links'][1]['missed']=1
             elif fault=='kernel-census':del value['kernel_observation']['probe_census']
+            elif fault=='kernel-binary-path':value['kernel_observation']['binary_path_query_observed']=False
             with self.subTest(fault=fault),self.assertRaises(planner.FreshnessHold):
                 planner.validate_probe(value,binding,command,workers,writer,source)
 

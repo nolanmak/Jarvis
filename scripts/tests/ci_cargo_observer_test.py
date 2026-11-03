@@ -17,7 +17,8 @@ def frame(kind,data):return (json.dumps({'type':kind,'data':data})+'\n').encode(
 
 
 def lookup(uid,pid,tid,call,sequence,result,path,*,reverse=False):
-    name=b''.join(frame('printf',f'N {uid} {pid} {tid} {call} {sequence} {offset} {len(path)} {path[offset:offset+63]}\n')
+    path=os.fsencode(path)
+    name=b''.join(frame('printf',f'N {uid} {pid} {tid} {call} {sequence} {offset} {len(path)} '+path[offset:offset+63].hex(' ')+'\n')
         for offset in range(0,len(path),63))
     outcome=frame('printf',f'E {uid} {pid} {tid} {call} {sequence} {result}\n')
     return outcome+name if reverse else name+outcome
@@ -36,6 +37,15 @@ def census_sample():
 
 
 class KernelObserverTests(unittest.TestCase):
+    def test_kernel_path_chunks_keep_binary_whitespace_and_control_bytes(self):
+        path=b'/workspace/raw-\xff \n\x01'
+        data=(frame('printf',f'N 2004 101 101 257 1 0 {len(path)} '+path.hex(' ')+'\n')
+            +frame('printf','E 2004 101 101 257 1 3\n')+frame('map',{'@emitted':2}))
+        self.assertEqual(observer.decode(data)[0]['path'],path)
+        for bad in (data.replace(b'ff 20',b'ff'),data.replace(b'ff 20',b'00 20'),
+                data.replace(b'ff 20',b'FF 20'),data.replace(b'ff 20',b'ff  20')):
+            with self.subTest(data=bad),self.assertRaises(observer.ObservationUnavailable):observer.decode(bad)
+
     def test_directory_identity_compares_linux_kernel_device_encoding_to_stat(self):
         rows=['B 2004 101 101 1 3 64','I 2004 101 101 1 265289728 900 16749',
             'D 2004 101 101 1 1 900 4 0 0 1 2e','A 2004 101 101 1 1 1',
@@ -172,8 +182,9 @@ class KernelObserverTests(unittest.TestCase):
         for bad in (data[:-1],data.replace(b'"@emitted": 6',b'"@emitted": 5'),
                 data.replace(b'"@emitted": 6',b'"@emitted": 7'),data+frame('map',{'@emitted':6}),
                 data.replace(b'2004 101',b'1001 101'),data.replace(b'257 10',b'999 10'),
-                data.replace(b'101 101',b'0 0'),data.replace(b'/input',b'/raw-\xff'),
-                data.replace(b'/input',b'/input\\nforged'),data.replace(b'/input',b'/input\\n'),
+                data.replace(b'101 101',b'0 0'),data.replace(b'69 6e 70 75 74',b'ff'),
+                data.replace(b'69 6e 70 75 74',b'69 6e\nforged'),
+                data.replace(b'69 6e 70 75 74',b'69 6e 00 75 74'),
                 data+frame('lost_events',{'events':1}),data+frame('map',{'@emitted':True})):
             with self.subTest(data=bad),self.assertRaises(observer.ObservationUnavailable):observer.decode(bad)
 
@@ -225,7 +236,7 @@ class KernelObserverTests(unittest.TestCase):
         self.assertEqual(observer.decode(count(records[::-1]))[0]['path'],path.encode())
         for rows in (records[1:],records+records[:1],
                 [records[0].replace(b' 0 ',b' 1 ')]+records[1:],
-                [records[0].replace(path[:63].encode(),path[:62].encode())]+records[1:]):
+                [records[0].replace(path[:63].encode().hex(' ').encode(),path[:62].encode().hex(' ').encode())]+records[1:]):
             with self.subTest(rows=rows),self.assertRaises(observer.ObservationUnavailable):observer.decode(count(rows))
 
     @unittest.skipIf(os.geteuid()==0,'non-root refusal is exercised by a non-root caller')

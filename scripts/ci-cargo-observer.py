@@ -370,12 +370,12 @@ def decode(data,*,complete=True,with_directories=False):
             raise ObservationUnavailable('foreign kernel observation')
         pair=pairs.setdefault((uid,pid,tid,call,sequence),{})
         if kind=='N':
-            chunk=re.fullmatch(r'([0-9]{1,4}) ([1-9][0-9]{0,3}) ([A-Za-z0-9/._-]+)',match[7])
+            chunk=re.fullmatch(r'([0-9]{1,4}) ([1-9][0-9]{0,3}) ([0-9a-f]{2}(?: [0-9a-f]{2})*)',match[7])
             if chunk is None:raise ObservationUnavailable('unknown pathname chunk')
-            offset,total=int(chunk[1]),int(chunk[2]);data=chunk[3].encode()
+            offset,total=int(chunk[1]),int(chunk[2]);data=bytes.fromhex(chunk[3])
             chunks=pair.setdefault('N',{})
             if (not 0<=offset<total<PATH_BYTES or offset%CHUNK_BYTES
-                    or len(data)!=min(CHUNK_BYTES,total-offset)
+                    or len(data)!=min(CHUNK_BYTES,total-offset) or b'\0' in data
                     or offset in chunks or pair.get('length',total)!=total):
                 raise ObservationUnavailable('incomplete pathname chunk')
             pair['length']=total;chunks[offset]=data
@@ -480,8 +480,10 @@ kretprobe:getname_flags*
   $chunks=(uint64)0;
   if ($length>0 && $length<=4096) {
    while ($offset<$length) {
-    printf("N %u %u %u %lld %llu %llu %llu %s\n",$owner_uid,$owner_pid,$owner_tid,(int64)$call,$entry,
-     $offset,$length,str($name+$offset,64));
+    $size=$length-$offset;
+    if ($size>63) { $size=63; }
+    printf("N %u %u %u %lld %llu %llu %llu %rh\n",$owner_uid,$owner_pid,$owner_tid,(int64)$call,$entry,
+     $offset,$length,buf($name+$offset,$size));
     $chunks=$chunks+1; $offset=$offset+63;
    }
   } else {
@@ -700,6 +702,11 @@ class Observer:
         if not any(e['syscall']==257 and e['result']==-errno.ENOENT
                 and e['path']==b'/workspace/'+b'x/'*2042 for e in selected):
             raise ObservationUnavailable('full length kernel pathname witness missing')
+        if (not any(e['syscall']==257 and e['result']>=0
+                and e['path']==b'/workspace/target/deps/raw-\xff' for e in selected)
+                or not any(e['syscall']==257 and e['result']==-errno.ENOENT
+                    and e['path']==b'/workspace/target/deps/missing-\xff\n ' for e in selected)):
+            raise ObservationUnavailable('binary kernel pathname witnesses missing')
         sources={'build-script':b'build.rs','library':b'src/lib.rs','binary':b'src/main.rs'}
         if set(compilers)!=set(sources):raise ObservationUnavailable('compiler scope unavailable')
         for role,path in sources.items():
@@ -714,6 +721,7 @@ class Observer:
         self.report={**self.control,'kernel_release':os.uname().release,'unit_pid':unit_pid,'unit_uid':2004,
             'program_sha256':hashlib.sha256(self.program.encode()).hexdigest(),'binary_sha256':self.binary_sha256,
             'witness_observed':True,'positive_query_observed':True,'negative_query_observed':True,'max_path_query_observed':True,
+            'binary_path_query_observed':True,
             'compiler_queries_observed':True,'library_generated_query_observed':True,
             'after_kernel_copy':True,'events':len(events),'original_observer_cleanup':True,
             'directory_reads':len(queries),'directory_entries':sum(len(q['entries']) for q in queries),
@@ -733,7 +741,8 @@ def validate(value,binding,command):
         'program_sha256','binary_sha256','witness_observed','positive_query_observed','negative_query_observed',
         'after_kernel_copy','events','original_observer_cleanup','filesystem_coverage_complete',
         'missed_probe_census_complete','input_closure_complete','allocation_removed',
-        'compiler_queries_observed','library_generated_query_observed','max_path_query_observed','probe_census'}
+        'compiler_queries_observed','library_generated_query_observed','max_path_query_observed','probe_census',
+        'binary_path_query_observed'}
     keys|={'directory_reads','directory_entries','directory_witness_observed','binary_directory_name_observed',
         'directory_short_read_observed','directory_eof_observed','cargo_directory_queries_observed'}
     if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
@@ -746,6 +755,7 @@ def validate(value,binding,command):
             or not cache._digest(value['program_sha256']) or not cache._digest(value['binary_sha256'])
             or any(value[key] is not True for key in ('witness_observed','positive_query_observed',
                 'negative_query_observed','after_kernel_copy','original_observer_cleanup','allocation_removed',
+                'binary_path_query_observed',
                 'compiler_queries_observed','library_generated_query_observed','max_path_query_observed','missed_probe_census_complete',
                 'directory_witness_observed','binary_directory_name_observed','directory_short_read_observed',
                 'directory_eof_observed','cargo_directory_queries_observed'))

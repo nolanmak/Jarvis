@@ -85,6 +85,7 @@ pub fn value()->u8{GENERATED}
         && probe["kernel_observation"]["positive_query_observed"]==true
         && probe["kernel_observation"]["negative_query_observed"]==true
         && probe["kernel_observation"]["max_path_query_observed"]==true
+        && probe["kernel_observation"]["binary_path_query_observed"]==true
         && probe["kernel_observation"]["missed_probe_census_complete"]==true
         && probe["kernel_observation"]["probe_census"]["before"]["links"].as_array().is_some_and(|values|values.len()==8)
         && probe["kernel_observation"]["probe_census"]["after"]["programs"].as_array().is_some_and(|values|values.len()==8)
