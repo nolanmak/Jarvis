@@ -715,14 +715,59 @@ or root execution flag. Original image/resource/deadline limits remain in force.
 
 This is a candidate observation experiment, not a selected complete collector
 or final C API. It deliberately does not claim complete syscall/fd/directory/
-metadata/runtime coverage, kernel missed-kretprobe accounting or compatibility.
+metadata/runtime coverage or compatibility. The original four attachments now
+have the scoped kernel-miss census below; that is not a census of the still
+unimplemented general filesystem collector.
 Long/unknown path spellings and malformed/lost/count-mismatched observations
 have no proof. The existing generic input-closure and shipping flags remain
 false. The pinned native feasibility replay below passes; reuse, invalidation
 and passing-proof publication remain blocked on the complete collector and
 original regressions.
 
-At `4086c4c9`, the admitted native replay passed in **103.29 seconds** on
+At `7bcba97a`, the native replay passed in **102.08 seconds** with **533 lookup
+observations**, the long nonce, the complete 4,095-byte lookup and the original
+Cargo graph. Both before/after samples contain the same four program IDs/tags,
+four link IDs, observer PID and process birth. The two `getname_flags` return
+links each report zero missed calls; all four programs report zero recursion
+misses. Compiler calls remain three-to-zero, build-script executions one-to-zero,
+and application runs two. Original cleanup, sealed inputs, actual planner and
+generated-tree metadata preservation and observer-allocation removal all pass.
+**262 CI Python tests passed with native helpers and no skips**; 31 focused Rust
+tests passed (15 opt-in cases excluded), including the original exec/relay cases.
+Thirteen observer tests reject positive counters, changed owners/objects/tags,
+unknown or duplicate objects, missing data and invalid function tables.
+
+The controller requires two original multi-return links plus `sys_enter` and
+`sys_exit`. Every link must map to exactly one of the observer process's four
+programs. Kernel link info must identify one return attachment at the exact
+`getname_flags` address, with the return flag and a readable missed-call counter.
+Program FD info must supply the recursion-miss counters; missing fields never
+mean zero. These use the kernel's
+[link counter interface](https://github.com/torvalds/linux/blob/v6.8/kernel/trace/bpf_trace.c)
+and [program miss counters](https://github.com/torvalds/linux/blob/v6.8/kernel/bpf/syscall.c).
+The live replay checks their actual ABI on the pinned `7.0.0-31-generic` runtime.
+Temporary link-query references are always closed so they cannot preserve an
+attachment after the original observer exits. The final census is sampled
+after original target-unit drain and before observer detach. All counters must
+be zero in both samples; unknown ownership or changed identities refuse.
+
+The supported kernel wildcard matcher is `getname_flags*`; it grants no broader
+function coverage because the kernel must report exactly one function and the
+original address. Kernel-7 FD info labels these links `kretprobe_multi` and adds
+a function table: exactly one zero-cookie `getname_flags+0x0` row is required.
+Its multi-return callbacks have a different order from the earlier perf probes.
+Emission is registered first so scanning runs first; the actual captured nonce
+must establish that order before target execution. The wrong order produced a
+valid zero-miss census but no nonce and was correctly held. This is a pinned
+runtime observation, not a portable ordering assumption.
+
+Only `missed_probe_census_complete` is now true for this four-attachment capture
+window. Full-filesystem coverage, input closure, full CI and shipping authority
+remain false. Directory/fd/symlink/metadata/runtime collection, equivalence,
+selective invalidation and the original generated-input regressions still gate
+activation; this is not the final shared C proof schema/API.
+
+Before that census was added, at `4086c4c9`, the admitted replay passed in **103.29 seconds** on
 `7.0.0-31-generic`. Its receipt records 532 kernel-copied lookup observations,
 the actual long nonce witness, original-unit positive/negative queries, the
 complete 4,095-byte lookup, actual build-script/library/binary source queries

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Private kernel-copied pathname feasibility probe, not an input-proof API.
 
-Only selected lookup spellings are observed. This does not establish full
-syscall/metadata/device coverage, missed-kretprobe accounting, compatibility or
-reuse authority. It does not emulate or change the target's system calls.
+Only selected lookup spellings are observed. The original four kernel
+attachments have a bounded miss census. This does not establish full
+syscall/metadata/device coverage, compatibility or reuse authority. It does not
+emulate or change the target's system calls.
 """
 import ctypes
 import errno
@@ -283,6 +284,10 @@ def decode(data,*,complete=True):
     return events
 
 
+# Multi-return callbacks run in reverse registration order on the pinned
+# runtime. Register emission first; the captured nonce must prove scan-before-
+# emission before target execution. Link info must resolve the wildcard to
+# exactly the original getname_flags address.
 _PROGRAM=r'''
 struct observer_filename { const char *name; };
 rawtracepoint:sys_enter / (uid >= 2000 && uid < 6096) || uid == 1999 / {
