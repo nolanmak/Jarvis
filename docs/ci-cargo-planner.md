@@ -1537,7 +1537,7 @@ application, with no invented compiler executions. The original raw names and
 scope evidence are inputs to the next selector step; they are not normalized
 into a compatibility or passing-CI verdict.
 
-General read collection now binds kernel-copied `do_filp_open` arguments and the
+General read collection now binds kernel-copied `do_file_open` arguments and the
 `fd_install` file object to the original syscall's returned descriptor. It keeps
 open flags, read capability, inode/device/mode/generation, dentry/mount and
 namespace identities. General mode requires **18** original zero-miss
@@ -1548,7 +1548,7 @@ Compiler source evidence requires a readable installed object matching the
 actual frozen source inode, and excludes `O_PATH` handles.
 
 The kernel argument/installation relationship follows the original open path
-([Linux open.c](https://github.com/torvalds/linux/blob/v6.8/fs/open.c#L1307)); actual
+([Linux open.c](https://github.com/torvalds/linux/blob/v7.0/fs/open.c#L1276)); actual
 field layout, function identity and attachment counters must still pass against
 the pinned VM kernel. No caller-memory sample substitutes for the copied flags.
 The internal general capture envelope is version 2; old captures cannot provide
@@ -1571,3 +1571,10 @@ reuse authority. Complete input coverage and durable invalidation/restart remain
 required before releasing that hold. Actual VM validation of this revision is
 pending. The original wrapper/publication harness remains unchanged and
 unfinished; production activation remains disabled.
+
+The first native attempt of the installed-open extension held before collector
+launch (**80.32 seconds** overall). The initial helper name was from an older
+kernel; the pinned VM is Linux 7.0 and requires `do_file_open`. Its original
+symbol census refused the missing symbol before creating collector output. The
+probe and required census now use the pinned kernel's function. No attachment
+requirement or miss check was relaxed.

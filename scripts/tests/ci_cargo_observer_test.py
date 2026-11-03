@@ -34,7 +34,7 @@ def census_sample(path_scope='fixture'):
         links.append({'id':10+i,'type':'kretprobe_multi' if flags else 'kprobe_multi',
             'prog_id':i,'tag':f'{i:016x}','function':function,'count':1,'flags':flags,'missed':0})
     if path_scope=='all':
-        for i,function in enumerate(('do_filp_open','fd_install'),17):
+        for i,function in enumerate(('do_file_open','fd_install'),17):
             programs.append({'id':i,'type':2,'tag':f'{i:016x}','recursion_misses':0})
             links.append({'id':10+i,'type':'kprobe_multi','prog_id':i,'tag':f'{i:016x}',
                 'function':function,'count':1,'flags':0,'missed':0})

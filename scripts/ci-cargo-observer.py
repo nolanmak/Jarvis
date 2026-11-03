@@ -53,7 +53,7 @@ def startup_errno(error):
 
 def probe_roles(path_scope):
     if path_scope not in ('fixture','all'):raise ObservationUnavailable('unknown pathname scope')
-    return PROBE_ROLES if path_scope=='fixture' else {**PROBE_ROLES,('do_filp_open',0):1,('fd_install',0):1}
+    return PROBE_ROLES if path_scope=='fixture' else {**PROBE_ROLES,('do_file_open',0):1,('fd_install',0):1}
 
 
 def validate_census(value,*,path_scope='fixture'):
@@ -115,7 +115,7 @@ def _fdinfo(data):
         if re.fullmatch(r'cookie[ \t]+func',line):
             rows=lines[ordinal+1:]
             if (result.get('link_type') not in ('kprobe_multi','kretprobe_multi') or result.get('kprobe_cnt')!='1'
-                    or len(rows)!=1 or re.fullmatch(r'0[ \t]+(getname_flags|iterate_dir|filldir64|vfs_fstat|cp_new_stat|cp_statx|path_init|do_filp_open|fd_install)\+0x0/0x[1-9a-f][0-9a-f]{0,15}',rows[0]) is None):
+                    or len(rows)!=1 or re.fullmatch(r'0[ \t]+(getname_flags|iterate_dir|filldir64|vfs_fstat|cp_new_stat|cp_statx|path_init|do_file_open|fd_install)\+0x0/0x[1-9a-f][0-9a-f]{0,15}',rows[0]) is None):
                 raise ObservationUnavailable('unknown kernel function table')
             result['function']=rows[0].split()[1].split('+',1)[0]
             table=True;break
@@ -1049,7 +1049,7 @@ finally:os.close(descriptor)
 
 
 _OPEN_PROGRAM=r'''
-kprobe:do_filp_o*pen
+kprobe:do_file_o*pen
 / ((uid>=2000 && uid<6096) || uid==1999) && @seen[tid] &&
   (@number[tid]==2 || @number[tid]==257 || @number[tid]==437) / {
  $name=(struct filename *)arg1;
