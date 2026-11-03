@@ -274,7 +274,7 @@ rawtracepoint:sys_enter / (uid >= 2000 && uid < 6096) || uid == 1999 / {
  @sequence[tid] = @sequence[tid] + 1;
  @seen[tid]=(uint64)0; @ready[tid]=(uint64)0;
 }
-kretprobe:getname_flag?
+kretprobe:getname_flag[s]
 / ((uid >= 2000 && uid < 6096) || uid == 1999) && (uint64)retval > 4095 && (uint64)retval < (uint64)0xfffffffffffff001 / {
  $name = ((struct observer_filename *)retval)->name;
  $prefix = *(uint64 *)$name;
@@ -303,7 +303,7 @@ kretprobe:getname_flag?
   @ready[tid]=@sequence[tid];
  }
 }
-kretprobe:getname_flag?
+kretprobe:getname_flag[s]
 / ((uid >= 2000 && uid < 6096) || uid == 1999) && (uint64)retval > 4095 && (uint64)retval < (uint64)0xfffffffffffff001 / {
  if (@ready[tid]>0 && @ready[tid]==@sequence[tid]) {
   $name=((struct observer_filename *)retval)->name;
