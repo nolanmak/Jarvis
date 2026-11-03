@@ -1916,3 +1916,24 @@ recovery, bounded pending-drain fencing and precise inventory field/exclusion
 definitions. The two retained-scope reporting findings remain one explicit
 R-owned blocking handoff; the ID-only normal result does not yet explain skipped
 scopes/bounds. No production activation or completed final C audit is claimed.
+
+The rerun at exact executable `c88829e3` passed the real same-base comparison in
+**254.30 seconds total**, as two separately supervised commands under one original
+storage admission and their unchanged individual deadlines. Both fresh views
+started at **20,660,224 available bytes**. Strict cleanup retired four sessions
+and ended at **53,309,440 bytes**; closed-link cleanup retired 32 sessions and
+ended at **2,124,406,784 bytes** (about 1.98 GiB). The original attempt limit was
+not raised. Both protected before/after inventories were identical to each other:
+**46,346 files / 4,167,370,136 unique logical content bytes**. The entire original
+raw image's identity/SHA stayed identical across both commands. Kernel backing
+descriptors were verified read-only before each guest continued; retirement IDs
+were unique and each result retained false completeness/full-CI/shipping flags.
+
+Receipt: `/tmp/augmentagent-ci-recovery-comparison-20261103215444/receipt.json`,
+SHA-256 `16bde525eaa0a5e2ec51751bd25554ea385fe0aeb3cdc7dd73e2c0939c8c176a`.
+This establishes the closed-link mechanism's measured capacity benefit and
+protected-inventory preservation on the production base. It does **not** apply
+recovery to production, validate legacy compiled units as current inputs, prove
+the intended application check plan fits, or authorize a merge. The retained-
+scope reporting carrier and ordinary pre-worker opt-in remain unfinished;
+source/proof/merge enforcement and the normal rollout/acceptance gates remain.

@@ -7,6 +7,11 @@ This component does not narrow epic #1703 or #1807 D1–D8. Source proof, merge
 admission/dispatch, normal main/updater rollout, original workflows, Discord
 commands/sessions/updates, and the full unattended/soak/merge acceptance remain open.
 
+Current implementation: opt-in mechanism and same-base native capacity comparison
+passed at `c88829e3`; normal-worker opt-in and the retained-scope reporting carrier
+are unfinished. The 57-seam review is complete with the reporting gate explicitly
+open. This component is not ready for production handoff.
+
 ## Evidence and premise
 
 The read-only production-image rehearsal at executable `6bf753bc` passed in
@@ -22,6 +27,16 @@ Five sessions had unrecognized file names. Samples show normal shared object
 inodes with link counts 2 and 52. Counting path bytes cannot predict freed space.
 Evidence: `/tmp/autoship-1703-production-retention-diagnosis-1.log` and
 `/tmp/augmentagent-ci-recovery-preview-20261103210041/receipt.json`.
+
+The implementation's same-base comparison at `c88829e3` subsequently passed in
+254.30 seconds total. Starting from 20,660,224 available bytes, strict selection
+retired four sessions and ended at 53,309,440 bytes; closed-link selection retired
+32 sessions and ended at 2,124,406,784 bytes. Both commands preserved the same
+46,346-file / 4,167,370,136-logical-byte protected inventory and original base
+identity/SHA. Receipt:
+`/tmp/augmentagent-ci-recovery-comparison-20261103215444/receipt.json`.
+This is the D9 mechanism benefit, not the C/R application working-set sufficiency
+gate or production activation.
 
 ## Decisions and ownership
 
