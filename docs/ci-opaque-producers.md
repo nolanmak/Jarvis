@@ -448,7 +448,13 @@ allocation preflight, owned staging/new-directory creation, old-inode-write
 integration, final metadata/materialization validation and alias/pause proof
 remain caller-owned and unfinished. The namespace master still records false
 materialization/input/CI/shipping flags. All 499 Python tests and 34 focused
-managed Rust tests pass. Expanded guest evidence is pending.
+managed Rust tests pass. At `d6721c51`, the expanded pinned-guest check passed
+all 32 cases (14 original step cases plus 18 sequence cases) in 89.48 seconds
+as UID1000 on the admitted cache filesystem. This includes both regressions
+above, each lost syscall/master-commit boundary, old-inode anonymous replacement
+and preservation of directory descendants. Original resource teardown positively
+verified. This establishes namespace sequencing, not whole-transfer allocation/
+image validation, staging creation, alias closure or checked parent resume.
 
 A rename is an identity-preserving namespace move in this graph, including
 rename-over-existing and directory descendants. Persist its original/final path
