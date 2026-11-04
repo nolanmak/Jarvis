@@ -1,6 +1,11 @@
 """Real filesystem capture mechanics; no test result is CI authority."""
 import importlib.util
 import os
+import mmap
+import errno
+import subprocess
+import sys
+import json
 from pathlib import Path
 import stat
 import tempfile
@@ -135,6 +140,140 @@ class CaptureRootsTests(unittest.TestCase):
             self.assertEqual((sealed/data.relative_to(source)).read_bytes(),b'binary\x00\xffpayload')
             self.assertTrue((working/'out/empty').is_dir())
             self.assertFalse(result['input_closure_complete']);self.assertFalse(result['shipping_authority'])
+
+    def retained(self,root):
+        source,data=self.tree(root);sealed=root/'capture';capture=self.capture(source,sealed)
+        working=root/'working';copy=views.materialize_capture(sealed,capture,working,
+            parent_uid=os.getuid(),unit_uid=os.getuid(),check=lambda:None)
+        descriptor=os.open(source,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+        try:held=views.RetainedInodes(descriptor,capture,working,copy,
+            parent_uid=os.getuid(),unit_uid=os.getuid(),check=lambda:None)
+        finally:os.close(descriptor)
+        return source,data,working,held
+
+    def test_retained_inode_snapshot_keeps_write_then_unlink_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data,working,held=self.retained(root)
+            parent=os.open(data,os.O_RDWR|os.O_CLOEXEC);mapping=mmap.mmap(parent,0)
+            try:
+                child=working/data.relative_to(source);child.write_bytes(b'changed before unlink');child.unlink()
+                with held:
+                    effect=held.snapshot_old(root/'old-effects',check=lambda:None)
+                    row=next(r for r in effect['entries'] if r['kind']=='file')
+                    self.assertEqual((root/'old-effects'/row['payload']).read_bytes(),b'changed before unlink')
+                    self.assertEqual(row['working_key'][2],len(b'changed before unlink'))
+                    self.assertEqual(row['working_links'],0)
+                    self.assertEqual(row['original_inode'],[data.stat().st_dev,data.stat().st_ino])
+                    self.assertFalse(effect['shipping_authority']);self.assertFalse(effect['effects_materialized'])
+                self.assertEqual(os.pread(parent,100,0),b'binary\x00\xffpayload')
+                self.assertEqual(mapping[:],b'binary\x00\xffpayload')
+            finally:mapping.close();os.close(parent);held.close()
+
+    def test_retained_inode_snapshot_distinguishes_rename_over_another_old_inode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data=self.tree(root);destination=source/'out/destination';destination.write_bytes(b'destination')
+            sealed=root/'capture';capture=self.capture(source,sealed);working=root/'working'
+            copy=views.materialize_capture(sealed,capture,working,parent_uid=os.getuid(),unit_uid=os.getuid(),check=lambda:None)
+            descriptor=os.open(source,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+            try:held=views.RetainedInodes(descriptor,capture,working,copy,parent_uid=os.getuid(),unit_uid=os.getuid(),check=lambda:None)
+            finally:os.close(descriptor)
+            with held:
+                child=working/data.relative_to(source);child.write_bytes(b'new source bytes');child.replace(working/'out/destination')
+                effect=held.snapshot_old(root/'old-effects',check=lambda:None)
+                files={r['path']:r for r in effect['entries'] if r['kind']=='file'}
+                old_source=files[os.fsencode(data.relative_to(source)).hex()];old_destination=files[b'out/destination'.hex()]
+                self.assertEqual((root/'old-effects'/old_source['payload']).read_bytes(),b'new source bytes')
+                self.assertEqual(old_source['working_links'],1);self.assertEqual(old_destination['working_links'],0)
+                self.assertEqual((root/'old-effects'/old_destination['payload']).read_bytes(),b'destination')
+                self.assertEqual(data.read_bytes(),b'binary\x00\xffpayload');self.assertEqual(destination.read_bytes(),b'destination')
+
+    def test_retained_inode_snapshot_keeps_directory_identity_after_rename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data,working,held=self.retained(root)
+            with held:
+                original=(working/'out/empty').stat();(working/'out/empty').rename(working/'out/renamed')
+                effect=held.snapshot_old(root/'old-effects',check=lambda:None)
+                row=next(r for r in effect['entries'] if r['path']==b'out/empty'.hex())
+                self.assertEqual(row['working_key'][:2],[original.st_dev,original.st_ino])
+                self.assertTrue((source/'out/empty').is_dir());self.assertFalse((source/'out/renamed').exists())
+
+    def test_retention_refuses_changed_parent_and_closes_partial_handles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data=self.tree(root);sealed=root/'capture';capture=self.capture(source,sealed);working=root/'working'
+            copy=views.materialize_capture(sealed,capture,working,parent_uid=os.getuid(),unit_uid=os.getuid(),check=lambda:None)
+            descriptor=os.open(source,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+            try:
+                data.write_bytes(b'changed parent')
+                before=set(os.listdir('/proc/self/fd'))
+                with self.assertRaises(views.FreshnessHold):views.RetainedInodes(descriptor,capture,working,copy,
+                    parent_uid=os.getuid(),unit_uid=os.getuid(),check=lambda:None)
+                self.assertEqual(set(os.listdir('/proc/self/fd')),before)
+            finally:os.close(descriptor)
+
+    def test_retained_snapshot_refuses_new_hardlinks_without_losing_parent_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data,working,held=self.retained(root)
+            with held:
+                child=working/data.relative_to(source);os.link(child,working/'out/extra-link')
+                with self.assertRaises(views.FreshnessHold):held.snapshot_old(root/'old-effects',check=lambda:None)
+                self.assertEqual(data.read_bytes(),b'binary\x00\xffpayload')
+
+    def test_retained_handles_are_not_inherited_across_an_actual_exec(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data,working,held=self.retained(root)
+            with held:
+                identities={(p.stat().st_dev,p.stat().st_ino) for p in (source,working,data,working/data.relative_to(source))}
+                code="""import os,json
+rows=[]
+for name in os.listdir('/proc/self/fd'):
+ try:
+  s=os.fstat(int(name));rows.append([s.st_dev,s.st_ino])
+ except OSError:pass
+print(json.dumps(rows))
+"""
+                child=subprocess.run([sys.executable,'-I','-c',code],close_fds=False,capture_output=True,check=True,text=True)
+                self.assertFalse(identities.intersection(map(tuple,json.loads(child.stdout))))
+
+    def test_cancelled_old_inode_capture_cannot_mutate_parent_or_leak_handles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);before=set(os.listdir('/proc/self/fd'));source,data,working,held=self.retained(root)
+            destination=root/'old-effects'
+            with held:
+                (working/data.relative_to(source)).write_bytes(b'uncommitted child bytes')
+                def cancelled():
+                    if destination.exists() and any(p.stat().st_size for p in destination.iterdir()):
+                        raise views.FreshnessHold('cleanup_uncertain')
+                with self.assertRaises(views.FreshnessHold):held.snapshot_old(destination,check=cancelled)
+                self.assertEqual(data.read_bytes(),b'binary\x00\xffpayload')
+            self.assertEqual(set(os.listdir('/proc/self/fd')),before)
+
+    def test_corrupted_retained_payload_is_refused_before_it_can_be_used(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data,working,held=self.retained(root);real_write=views.os.write;changed=[]
+            def corrupted(descriptor,body):
+                if not changed:
+                    changed.append(True);return real_write(descriptor,b'X'*len(body))
+                return real_write(descriptor,body)
+            with held,patch.object(views.os,'write',side_effect=corrupted),self.assertRaises(views.FreshnessHold):
+                held.snapshot_old(root/'old-effects',check=lambda:None)
+            self.assertEqual(data.read_bytes(),b'binary\x00\xffpayload')
+
+    def test_retention_exhaustion_closes_handles_and_does_not_raise_fd_ceiling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data=self.tree(root);sealed=root/'capture';capture=self.capture(source,sealed);working=root/'working'
+            copy=views.materialize_capture(sealed,capture,working,parent_uid=os.getuid(),unit_uid=os.getuid(),check=lambda:None)
+            descriptor=os.open(source,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC);real_open=views.os.open;calls=[]
+            def exhausted(*args,**kwargs):
+                calls.append(None)
+                if len(calls)==5:raise OSError(errno.EMFILE,'descriptor limit')
+                return real_open(*args,**kwargs)
+            try:
+                before=set(os.listdir('/proc/self/fd'))
+                with patch.object(views.os,'open',side_effect=exhausted),self.assertRaises(views.FreshnessHold):
+                    views.RetainedInodes(descriptor,capture,working,copy,parent_uid=os.getuid(),unit_uid=os.getuid(),check=lambda:None)
+                self.assertEqual(set(os.listdir('/proc/self/fd')),before)
+                self.assertEqual(data.read_bytes(),b'binary\x00\xffpayload')
+            finally:os.close(descriptor)
 
     def test_working_tree_refuses_a_changed_sealed_payload_before_execution(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1969,14 +1969,14 @@ class UnitPeerRelay(RootRelay):
             phase[0]='planner_capture'
             with self.mutation_lock:
                 self.staged_signals.pause(ordinal)
-                child_attempted=False
+                child_attempted=False;contained_views=None
                 try:
                     record['pause']=self.freezer.freeze(self.deadline)
                     cache._write_record(self.root/'admission.json',record)
                     record['capture']=self._capture(ordinal,record,descriptors[2:4])
                     cache._write_record(self.root/'admission.json',record)
                     if self._stop.is_set() or self.staged_signals.cancelled.is_set():raise FreshnessHold('cleanup_uncertain')
-                    self.views=_ContainedViews(self,ordinal);self.active_record=record
+                    contained_views=_ContainedViews(self,ordinal);self.views=contained_views;self.active_record=record
                     replacement=os.dup(captured.fileno());os.close(descriptors[1]);descriptors[1]=replacement
                     child_attempted=True
                     result=super()._run(connection,ordinal,descriptors,numbers,phase,staged=True,defer_terminal=True)
@@ -1988,6 +1988,7 @@ class UnitPeerRelay(RootRelay):
                     raise FreshnessHold('input_census_unknown')
                 finally:
                     self.active_record=None
+                    if contained_views is not None:contained_views.close()
                     if child_attempted:
                         record['parent_resume_held']=True;self.request_cancel()
                     else:
@@ -2050,7 +2051,7 @@ class UnitPeerRelay(RootRelay):
 class _ContainedViews:
     """Private working bytes for a contained call; no publication capability."""
     def __init__(self,relay,request):
-        self.relay=relay;self.request=request;self.units={}
+        self.relay=relay;self.request=request;self.units={};self.retained={}
         self.capture=cache._read_record(relay.captures/(str(request)+'.json'),max_bytes=16*1024**2)
         if (self.capture.get('binding')!=relay.admission.binding or self.capture.get('command')!=relay.admission.command
                 or self.capture.get('state')!='captured' or self.capture.get('parent_scope')!=relay.scope.name
@@ -2066,13 +2067,17 @@ class _ContainedViews:
         if ordinal!=self.request or relay._stop.is_set() or relay.staged_signals.cancelled.is_set():
             raise FreshnessHold('invalidation_unsafe')
         slot=self.root/str(ordinal);slot.mkdir(mode=0o700);working=slot/'working'
-        def check():
-            if relay.execution_cancelled() or time.monotonic()>=relay.deadline:
-                raise FreshnessHold('cleanup_uncertain')
-            if dict(line.split() for line in relay.freezer._read('cgroup.events').splitlines()).get(b'frozen')!=b'1':
-                raise FreshnessHold('cleanup_uncertain')
+        self.check()
         copied=unit_views.materialize_capture(relay.captures/str(ordinal),self.capture['filesystem'],working,
-            parent_uid=relay.peer_uid,unit_uid=2000+ordinal,check=check)
+            parent_uid=relay.peer_uid,unit_uid=2000+ordinal,check=self.check)
+        descriptor=os.open(f'/proc/{relay.freezer.original}/root',os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+        try:
+            root=os.fstat(descriptor)
+            if relay.scope_root!={'device':(os.major(root.st_dev)<<20)|os.minor(root.st_dev),'inode':root.st_ino,'mode':root.st_mode}:
+                raise FreshnessHold('invalidation_unsafe')
+            self.retained[ordinal]=unit_views.RetainedInodes(descriptor,self.capture['filesystem'],working,copied,
+                parent_uid=relay.peer_uid,unit_uid=2000+ordinal,check=self.check)
+        finally:os.close(descriptor)
         mounts=cache._read_record(Path(relay.view['mounts']),max_bytes=16*1024**2)
         if (mounts.get('binding')!=relay.admission.binding or mounts.get('command')!=relay.admission.command
                 or mounts.get('ordinal')!=relay.parent_ordinal):raise FreshnessHold('generation_mismatch')
@@ -2085,6 +2090,17 @@ class _ContainedViews:
             'mounts':str(path),'ordinal':ordinal,'working':str(working)}
         self.units[ordinal]=view;return view
 
+    def check(self):
+        relay=self.relay
+        if relay.execution_cancelled() or time.monotonic()>=relay.deadline:
+            raise FreshnessHold('cleanup_uncertain')
+        if dict(line.split() for line in relay.freezer._read('cgroup.events').splitlines()).get(b'frozen')!=b'1':
+            raise FreshnessHold('cleanup_uncertain')
+
+    def close(self):
+        for retained in self.retained.values():retained.close()
+        self.retained.clear()
+
     def running(self,view):pass
 
     def finish(self,view,directory,raw):
@@ -2093,7 +2109,14 @@ class _ContainedViews:
         if (record.get('binding')!=relay.admission.binding or record.get('command')!=relay.admission.command
                 or record.get('ordinal')!=view['ordinal'] or record.get('returncode')!=raw
                 or record.get('exec_observed') is not True):raise FreshnessHold('cleanup_uncertain')
-        cache._write_record(Path(view['root']).parent/'contained-result.json',{
+        self.check();slot=Path(view['root']).parent
+        retained=self.retained[view['ordinal']]
+        old_effects=retained.snapshot_old(slot/'old-inode-payload',check=self.check)
+        cache._write_record(slot/'old-inode-effects.json',{'version':1,'binding':relay.admission.binding,
+            'command':relay.admission.command,'parent_scope':relay.scope.name,'child_scope':directory.name,
+            'ordinal':view['ordinal'],'old_effects':old_effects,'effects_materialized':False,
+            'input_closure_complete':False,'shipping_authority':False})
+        cache._write_record(slot/'contained-result.json',{
             'version':1,'kind':'ci-contained-result-observation','binding':relay.admission.binding,
             'command':relay.admission.command,'parent_scope':relay.scope.name,'child_scope':directory.name,
             'ordinal':view['ordinal'],'uid':2000+view['ordinal'],'returncode':raw,

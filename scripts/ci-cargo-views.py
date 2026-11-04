@@ -346,6 +346,152 @@ def materialize_capture(source,capture,destination,*,parent_uid,unit_uid,check):
         'original_metadata_emulated':False,'input_closure_complete':False,'shipping_authority':False}
 
 
+
+def _open_beneath(root_fd,name,flags):
+    """Resolve each component through owned no-follow directory descriptors."""
+    name=relative(name);parent=os.dup(root_fd)
+    try:
+        for part in name.parts[:-1]:
+            child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=parent)
+            os.close(parent);parent=child
+        return os.open(name.name,flags|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK|getattr(os,'O_NOATIME',0),dir_fd=parent)
+    finally:os.close(parent)
+
+
+class RetainedInodes:
+    """Own both sides of the initial inode graph through child cleanup.
+
+    These descriptors preserve unlinked/replaced old objects. They are not
+    inherited by units, and never establish alias closure or merge authority.
+    Allocation uses the controller's unchanged kernel descriptor ceiling.
+    """
+    def __init__(self,root_fd,capture,working,copy,*,parent_uid,unit_uid,check):
+        self.owner=os.getpid();self.closed=False;self.entries=[];self.parent_uid=parent_uid;self.unit_uid=unit_uid
+        self.root_fd=None;self.working_fd=None
+        try:
+            if (type(root_fd) is not int or not stat.S_ISDIR(os.fstat(root_fd).st_mode)
+                    or type(capture) is not dict or capture.get('kind')!='ci-paused-root-capture'
+                    or capture.get('version')!=1 or capture.get('shipping_authority') is not False
+                    or type(copy) is not dict or copy.get('kind')!='ci-contained-working-copy'
+                    or copy.get('version')!=1 or copy.get('shipping_authority') is not False
+                    or type(capture.get('entries')) is not list or len(capture['entries'])>MAX_ENTRIES):
+                raise FreshnessHold('input_census_unknown')
+            maps=copy.get('mapping')
+            if (type(maps) is not list or len(maps)!=len(capture['entries'])
+                    or len({r[0] for r in maps})!=len(maps)):
+                raise FreshnessHold('input_census_unknown')
+            mapping={r[0]:r for r in maps};seen=set()
+            self.root_fd=os.dup(root_fd)
+            self.working_fd=os.open(literal(working),os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW)
+            for raw,kind,original,*digest in capture['entries']:
+                check();name=relative(bytes.fromhex(raw));pair=mapping.get(raw)
+                if (raw in seen or kind not in ('directory','file') or len(original)!=8 or pair is None
+                        or len(pair)!=4 or pair[:3]!=[raw,kind,original[:2]]):
+                    raise FreshnessHold('input_census_unknown')
+                seen.add(raw);entry={'path':raw,'kind':kind,'original_key':original,'initial_digest':digest,
+                    'original_fd':None,'working_fd':None};self.entries.append(entry)
+                for label,base in (('original',self.root_fd),('working',self.working_fd)):
+                    flags=os.O_RDONLY|os.O_DIRECTORY if kind=='directory' else os.O_RDONLY
+                    descriptor=_open_beneath(base,name,flags);entry[label+'_fd']=descriptor
+                    info=os.fstat(descriptor)
+                    if (stat.S_ISDIR(info.st_mode)!=(kind=='directory') or info.st_mode&0o7000
+                            or os.listxattr(descriptor) or kind=='file' and info.st_nlink!=1):
+                        raise FreshnessHold('invalidation_unsafe')
+                    if label=='original':
+                        if list(_key(info))!=original:raise FreshnessHold('input_census_unknown')
+                    else:
+                        owner=unit_uid if original[3]==parent_uid else original[3]
+                        group=unit_uid if original[4]==parent_uid else original[4]
+                        if ([info.st_dev,info.st_ino]!=pair[3] or (info.st_uid,info.st_gid)!=(owner,group)
+                                or stat.S_IMODE(info.st_mode)!=stat.S_IMODE(original[5]) or info.st_mtime_ns!=original[6]
+                                or kind=='file' and info.st_size!=original[2]):
+                            raise FreshnessHold('input_census_unknown')
+                    if kind=='file' and (len(digest)!=1 or self._read(descriptor,check)[1]!=digest[0]):
+                        raise FreshnessHold('input_census_unknown')
+                    if label=='working':entry['working_key']=list(_key(info))
+                check()
+        except BaseException as error:
+            self.close()
+            if isinstance(error,OSError) and error.errno in (errno.EMFILE,errno.ENFILE,errno.ELOOP,errno.ENOTDIR):
+                raise FreshnessHold('input_census_unknown') from None
+            raise
+
+    def _owned(self):
+        if self.owner!=os.getpid() or self.closed:raise FreshnessHold('invalidation_unsafe')
+
+    @staticmethod
+    def _read(descriptor,check,writer=None):
+        before=os.fstat(descriptor);count=0;digest=hashlib.sha256()
+        if not stat.S_ISREG(before.st_mode) or not 0<=before.st_size<=MAX_BYTES:
+            raise FreshnessHold('input_census_unknown')
+        while count<before.st_size:
+            check();block=os.pread(descriptor,min(1024**2,before.st_size-count),count)
+            if not block:raise FreshnessHold('input_census_unknown')
+            digest.update(block);count+=len(block)
+            if writer is not None:
+                remaining=memoryview(block)
+                while remaining:
+                    check();written=os.write(writer,remaining)
+                    if written<=0:raise OSError(errno.EIO,'retained inode capture failed')
+                    remaining=remaining[written:]
+        check()
+        if os.pread(descriptor,1,count) or _key(os.fstat(descriptor))!=_key(before):
+            raise FreshnessHold('input_census_unknown')
+        return count,digest.hexdigest()
+
+    def snapshot_old(self,destination,*,check):
+        """Seal post-child old inode bytes, including write→unlink/replacement.
+
+        The caller must prove original child cleanup and keep its parent paused.
+        No parent mutation or resume is authorized by this observation.
+        """
+        self._owned();destination=literal(destination);check();destination.mkdir(mode=0o700)
+        rows=[];total=0;record_bytes=0
+        for index,entry in enumerate(self.entries):
+            check();original=os.fstat(entry['original_fd']);working=os.fstat(entry['working_fd'])
+            if list(_key(original))!=entry['original_key']:raise FreshnessHold('input_census_unknown')
+            initial=entry['working_key'];kind=entry['kind']
+            if (list(_key(working))[:2]!=initial[:2] or (working.st_uid,working.st_gid)!=(initial[3],initial[4])
+                    or stat.S_IFMT(working.st_mode)!=stat.S_IFMT(initial[5]) or working.st_mode&0o7000
+                    or os.listxattr(entry['working_fd']) or kind=='file' and working.st_nlink not in (0,1)):
+                raise FreshnessHold('invalidation_unsafe')
+            row={'path':entry['path'],'kind':kind,'original_inode':entry['original_key'][:2],
+                'working_key':list(_key(working)),'working_links':working.st_nlink}
+            if kind=='file':
+                if self._read(entry['original_fd'],check)[1]!=entry['initial_digest'][0]:
+                    raise FreshnessHold('input_census_unknown')
+                if working.st_size>MAX_BYTES-total:raise FreshnessHold('input_census_unknown')
+                name=str(index);writer=os.open(destination/name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
+                try:
+                    size,digest=self._read(entry['working_fd'],check,writer)
+                    os.fchmod(writer,0o444);os.fsync(writer)
+                finally:os.close(writer)
+                if _read(destination/name,os.geteuid(),True)[1:]!=(size,digest):
+                    raise FreshnessHold('input_census_unknown')
+                total+=size;row.update(payload=name,size=size,sha256=digest)
+            rows.append(row);record_bytes+=len(json.dumps(row,separators=(',',':')).encode())
+            if record_bytes>16*1024**2:raise FreshnessHold('input_census_unknown')
+        check();destination.chmod(0o555);descriptor=os.open(destination,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+        try:os.fsync(descriptor)
+        finally:os.close(descriptor)
+        return {'version':1,'kind':'ci-retained-inode-effects','entries':rows,'copied_bytes':total,
+            'effects_materialized':False,'input_closure_complete':False,'shipping_authority':False}
+
+    def close(self):
+        if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
+        if self.closed:return
+        self.closed=True
+        for entry in self.entries:
+            for label in ('original_fd','working_fd'):
+                if entry[label] is not None:os.close(entry[label]);entry[label]=None
+        for label in ('root_fd','working_fd'):
+            descriptor=getattr(self,label)
+            if descriptor is not None:os.close(descriptor);setattr(self,label,None)
+
+    def __enter__(self):self._owned();return self
+    def __exit__(self,*_args):self.close()
+
+
 def validate_capture_stdio(capture,descriptors):
     """Refuse direct writable stdio aliases to captured original inodes."""
     if type(descriptors) is not list or len(descriptors)!=2:raise FreshnessHold('input_census_unknown')

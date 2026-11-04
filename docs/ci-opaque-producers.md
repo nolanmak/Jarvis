@@ -262,9 +262,15 @@ end in an infrastructure hold. Parent death cancels further child admission.
 Any controller exception fences the shared command, cancels its controllers and
 retains the original allowance slot through teardown; uncertain cleanup cannot
 admit replacement work. The 437 Python tests and 34 focused Rust tests pass.
-Guest execution evidence for this increment is still pending. This does not
-establish copyback, active-child signal routing, jobserver loan correctness,
-complete input closure, full CI or shipping authority.
+At `7a5ad263`, the unchanged native replay completed in 101.74 seconds and
+started four successive contained units (ordinals 9–12). Read-only inspection
+under the managed lease verified each original exec observation and grant,
+zero denied execs/notification errors, and original cleanup markers. The leaf
+returned zero. Its parent deliberately withheld the result and stayed frozen
+because effects were not materialized; command fencing cancelled the ancestors.
+The outer `planner_request_cleanup` hold therefore does not show a failed leaf
+cleanup. This does not establish copyback, active-child signal routing,
+jobserver loan correctness, complete input closure, full CI or shipping authority.
 
 An opaque parent stays stopped during its contained call. Child stdout/stderr
 use their original admitted descriptions; fd 0 uses staged bytes as above. The
@@ -312,6 +318,19 @@ apply its in-place changes before namespace replacement/removal. Unknown alias
 closure or insufficient descriptor capacity refuses admission. Test write→unlink
 and write→replace with retained FDs and mappings; neither lost effects nor a
 larger FD grant are acceptable.
+The current implementation retains no-follow descriptors to both original and
+working entries before child execution, after comparing the capture and clone
+identities, bytes and metadata. Descriptors use the existing kernel ceiling,
+close on partial admission failures, and do not survive exec into a unit. After
+verified child cleanup, `snapshot_old` reads the held working descriptors even
+when their original pathname was unlinked or replaced, verifies the unchanged
+parent side, seals the old inode payloads and verifies copied bytes by readback.
+The result is an observation with `effects_materialized:false`; it does not
+mutate the parent, resume it or complete the transfer intent below. Real host
+filesystem cases cover write→unlink, rename-over-existing, directory rename,
+parent drift, extra hardlinks, descriptor exhaustion, exec inheritance,
+cancellation and payload corruption. Guest retention evidence is pending.
+
 A rename is an identity-preserving namespace move in this graph, including
 rename-over-existing and directory descendants. Persist its original/final path
 sets, source/destination identities and staged-move progress in the transfer
