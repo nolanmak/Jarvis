@@ -1679,14 +1679,37 @@ def namespace_edges(plan):
         'effects_materialized':False,'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
 
 
-def validate_capture_stdio(capture,descriptors):
-    """Refuse direct writable stdio aliases to captured original inodes."""
-    if type(descriptors) is not list or len(descriptors)!=2:raise FreshnessHold('input_census_unknown')
-    inodes={(row[2][0],row[2][1]) for row in capture['entries'] if row[1]=='file'}
+def validate_capture_stdio(capture,descriptors,*,parent_uid=None):
+    """Refuse standard-stream aliases to the paused parent's private state.
+
+    A retained inode can be unnamed and absent from W's pathname census.
+    Read-only aliases also expose the original inode instead of the detached
+    working inode, so they cannot preserve coupled path/FD observations. The
+    root caller supplies its authenticated, uniquely assigned parent UID.
+    Legacy mechanics callers without that binding reject census owners
+    conservatively; this function never establishes writer/reuse authority.
+    """
+    if (type(descriptors) is not list or len(descriptors)!=2
+            or any(type(fd) is not int or fd<0 for fd in descriptors)
+            or parent_uid is not None and (type(parent_uid) is not int or not 0<parent_uid<2**32-1)
+            or type(capture) is not dict or type(capture.get('entries')) is not list
+            or len(capture['entries'])>MAX_ENTRIES):raise FreshnessHold('input_census_unknown')
+    inodes=set();owners={0}
+    for row in capture['entries']:
+        if (type(row) is not list or len(row) not in (3,4) or row[1] not in ('file','directory')
+                or type(row[2]) is not list or len(row[2])!=8):raise FreshnessHold('input_census_unknown')
+        if row[1]=='file':inodes.add(tuple(row[2][:2]))
+        if parent_uid is None:owners.add(row[2][3])
+        elif row[2][3] not in (0,parent_uid):raise FreshnessHold('invalidation_unsafe')
+    if parent_uid is not None:owners.add(parent_uid)
     for descriptor in descriptors:
         info=os.fstat(descriptor)
-        if (stat.S_ISREG(info.st_mode) and fcntl.fcntl(descriptor,fcntl.F_GETFL)&os.O_ACCMODE!=os.O_RDONLY
-                and (info.st_dev,info.st_ino) in inodes):raise FreshnessHold('invalidation_unsafe')
+        if stat.S_ISREG(info.st_mode):
+            if (info.st_dev,info.st_ino) in inodes or info.st_uid in owners:
+                raise FreshnessHold('invalidation_unsafe')
+        elif not (stat.S_ISFIFO(info.st_mode)
+                or stat.S_ISCHR(info.st_mode) and info.st_rdev==os.makedev(1,3)):
+            raise FreshnessHold('input_census_unknown')
 
 
 def validate_stdio(descriptors):

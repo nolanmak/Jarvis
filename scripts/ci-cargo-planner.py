@@ -2348,7 +2348,7 @@ class UnitPeerRelay(RootRelay):
                 raise FreshnessHold('invalidation_unsafe')
             capture=unit_views.capture_roots(descriptor,self.captures/str(ordinal),roots,
                 owners=(0,self.peer_uid),check=check)
-            unit_views.validate_capture_stdio(capture,outputs);check()
+            unit_views.validate_capture_stdio(capture,outputs,parent_uid=self.peer_uid);check()
             state.update(state='captured',filesystem=capture)
             encoded=json.dumps(state,sort_keys=True,separators=(',',':')).encode()
             if len(encoded)>16*1024**2:raise FreshnessHold('input_census_unknown')
