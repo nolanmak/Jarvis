@@ -2637,3 +2637,17 @@ establish worker quiescence, a destination epoch, artifact export slots,
 complete alias absence or permission to project/apply results. Those O3b
 requirements remain unfinished, and alias/input/full-CI/shipping flags stay
 false. Seven real descriptor regressions cover the new behavior.
+
+Native replay `088c2c30` validates the new bound output-stream observation
+before 20 private-view launches and inside all 16 frozen captures, preserving
+the exact original scope/binding and capture-record digests. This Rust-only
+fixture declares zero generated-output roots, so it proves production-path
+wiring, not the nonempty-map alias-rejection cases; those are covered by the
+seven host real-FD regressions. Four nested roots progress; one deepest child
+returns zero with one independently verified sealed ELF. The other three
+deepest exit results are not retained before sibling cancellation, so their
+success is not claimed. The full unchanged test remains red with
+InputCensusUnknown after 108.68 seconds. Original VM resource cleanup is
+positively verified. All 633 Python tests and 34 focused managed Rust tests
+pass. Worker-pause/epoch handling, artifact projection and complete alias
+closure remain required before result application or parent resume.
