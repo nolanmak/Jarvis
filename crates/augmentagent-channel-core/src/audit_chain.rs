@@ -37,6 +37,17 @@ struct Anchor {
     #[serde(default)]
     sealed: Option<serde_json::Value>,
 }
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandoffSeal {
+    version:u32,
+    kind:String,
+    request_sha256:String,
+    committed_sha256:String,
+    committed_bytes:usize,
+    sequence:u64,
+    validation:serde_json::Value,
+}
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -144,6 +155,8 @@ impl AnchoredAudit {
         ensure!(file.metadata()?.len() <= LIMIT, "anchor exceeds budget");
         let mut anchor: Anchor = serde_json::from_reader(file)?;
         ensure!(anchor.version == 1, "unsupported anchor");
+        ensure!(anchor.sealed.as_ref().is_none_or(|proof|proof.get("kind").is_none()),
+            "handoff seal cannot authorize interrupted recovery");
         let mut file = private_open(&self.log, false)?;
         ensure!(file.metadata()?.len() <= LIMIT, "audit exceeds budget");
         let mut bytes = Vec::new();
@@ -163,6 +176,46 @@ impl AnchoredAudit {
             "interrupted_append":anchor.pending,"validation":validation});
         anchor.sealed = Some(proof.clone());
         self.save(&anchor)?;
+        Ok(proof)
+    }
+    /// Seal healthy committed evidence for one immutable transfer request.
+    /// The caller validates outstanding writer tickets and kernel quiescence
+    /// under this gate. Replay verifies bytes and request identity without
+    /// re-entering validation or changing a previously published proof.
+    pub(crate) fn seal_for_handoff<F>(&self,request_sha256:&str,validate:F)->Result<serde_json::Value>
+    where F:FnOnce(&[serde_json::Value])->Result<serde_json::Value> {
+        ensure!(request_sha256.len()==64 && request_sha256.bytes().all(|c|c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
+            "handoff request digest must be canonical SHA-256");
+        let lock_path=self.anchor.with_extension("lock");
+        ensure!(lock_path!=self.anchor && lock_path!=self.log,"audit lock path collision");
+        let lock=private_open(&lock_path,false)?;
+        #[cfg(unix)]
+        ensure!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX)}==0,"audit lock failed");
+        ensure!(self.anchor.exists() && self.log.exists(),"handoff requires existing audit evidence");
+        let file=private_open(&self.anchor,false)?;
+        ensure!(file.metadata()?.len()<=LIMIT,"anchor exceeds budget");
+        let mut anchor:Anchor=serde_json::from_reader(file)?;
+        ensure!(anchor.version==1 && anchor.pending.is_none(),"handoff requires a complete healthy anchor");
+        let mut file=private_open(&self.log,false)?;
+        ensure!(file.metadata()?.len()<=LIMIT,"audit exceeds budget");
+        let mut bytes=Vec::new();file.read_to_end(&mut bytes)?;
+        ensure!(bytes.len()==anchor.bytes,"handoff audit is truncated or has an unanchored tail");
+        let actual=if bytes.is_empty(){String::new()}else{digest(&bytes)};
+        ensure!(actual==anchor.hash,"committed audit modified");
+        let rows=bytes.split(|b|*b==b'\n').filter(|r|!r.is_empty())
+            .map(serde_json::from_slice).collect::<std::result::Result<Vec<serde_json::Value>,_>>()?;
+        ensure!(rows.len() as u64==anchor.sequence,"handoff audit sequence mismatch");
+        if let Some(proof)=&anchor.sealed {
+            let sealed:HandoffSeal=serde_json::from_value(proof.clone())?;
+            ensure!(sealed.version==1 && sealed.kind=="healthy_handoff" && sealed.request_sha256==request_sha256
+                && sealed.committed_sha256==anchor.hash && sealed.committed_bytes==anchor.bytes && sealed.sequence==anchor.sequence,
+                "handoff seal belongs to different evidence or request");
+            return Ok(proof.clone());
+        }
+        let validation=validate(&rows)?;
+        let proof=serde_json::to_value(HandoffSeal {version:1,kind:"healthy_handoff".into(),request_sha256:request_sha256.into(),
+            committed_sha256:anchor.hash.clone(),committed_bytes:anchor.bytes,sequence:anchor.sequence,validation})?;
+        anchor.sealed=Some(proof.clone());self.save(&anchor)?;
         Ok(proof)
     }
     fn append_locked(&self, mut record: serde_json::Value) -> Result<()> {
@@ -264,6 +317,67 @@ mod tests {
         )
         .unwrap();
         (dir, sink)
+    }
+    #[test]
+    fn healthy_handoff_replay_is_request_bound_and_does_not_revalidate() {
+        let (_dir,sink)=setup();sink.append(serde_json::json!({"kind":"admitted"})).unwrap();
+        let request="a".repeat(64);
+        let proof=sink.seal_for_handoff(&request,|_|Ok(serde_json::json!({"quiescent":true}))).unwrap();
+        let anchored=fs::read(&sink.anchor).unwrap();let bytes=fs::read(&sink.log).unwrap();
+        assert!(sink.append(serde_json::json!({"late":true})).is_err());
+        let replay=sink.seal_for_handoff(&request,|_|anyhow::bail!("sealed replay must not re-enter validation")).unwrap();
+        assert_eq!(replay,proof);assert_eq!(proof["request_sha256"],request);
+        assert_eq!(fs::read(&sink.anchor).unwrap(),anchored);assert_eq!(fs::read(&sink.log).unwrap(),bytes);
+        assert!(sink.seal_for_handoff(&"b".repeat(64),|_|Ok(serde_json::json!({}))).is_err());
+        assert!(sink.seal_for_recovery(|_|Ok(serde_json::json!({}))).is_err(),"healthy transfer proof cannot authorize interrupted recovery");
+    }
+    #[test]
+    fn healthy_handoff_refuses_pending_append_without_recovery_or_mutation() {
+        let (_dir,sink)=setup();sink.append(serde_json::json!({"kind":"admitted"})).unwrap();
+        let mut anchor:Anchor=serde_json::from_slice(&fs::read(&sink.anchor).unwrap()).unwrap();
+        anchor.pending=Some("{\"uncertain\":true}\n".into());sink.save(&anchor).unwrap();
+        let anchored=fs::read(&sink.anchor).unwrap();let bytes=fs::read(&sink.log).unwrap();
+        assert!(sink.seal_for_handoff(&"a".repeat(64),|_|Ok(serde_json::json!({"quiescent":true}))).is_err());
+        assert_eq!(fs::read(&sink.anchor).unwrap(),anchored);assert_eq!(fs::read(&sink.log).unwrap(),bytes);
+    }
+    #[test]
+    fn healthy_handoff_refuses_noncanonical_request_digest() {
+        for request in ["".to_string(),"a".repeat(63),"A".repeat(64),"x".repeat(64)] {
+            let (_dir,sink)=setup();sink.append(serde_json::json!({"kind":"admitted"})).unwrap();
+            let before=fs::read(&sink.anchor).unwrap();
+            assert!(sink.seal_for_handoff(&request,|_|Ok(serde_json::json!({}))).is_err());
+            assert_eq!(fs::read(&sink.anchor).unwrap(),before);
+        }
+    }
+    #[test]
+    fn healthy_handoff_validates_before_sealing_and_keeps_recovery_evidence_separate() {
+        let (_dir,sink)=setup();sink.append(serde_json::json!({"kind":"admitted"})).unwrap();
+        let before=fs::read(&sink.anchor).unwrap();
+        assert!(sink.seal_for_handoff(&"a".repeat(64),|_|anyhow::bail!("writer or resource still active")).is_err());
+        assert_eq!(fs::read(&sink.anchor).unwrap(),before);
+        sink.seal_for_recovery(|_|Ok(serde_json::json!({"interrupted":true}))).unwrap();
+        let recovered=fs::read(&sink.anchor).unwrap();
+        assert!(sink.seal_for_handoff(&"a".repeat(64),|_|Ok(serde_json::json!({}))).is_err());
+        assert_eq!(fs::read(&sink.anchor).unwrap(),recovered);
+    }
+    #[test]
+    fn healthy_handoff_replay_refuses_modified_committed_bytes() {
+        let (_dir,sink)=setup();sink.append(serde_json::json!({"kind":"admitted"})).unwrap();
+        sink.seal_for_handoff(&"a".repeat(64),|_|Ok(serde_json::json!({}))).unwrap();
+        let mut bytes=fs::read(&sink.log).unwrap();bytes[2]^=1;fs::write(&sink.log,&bytes).unwrap();
+        assert!(sink.seal_for_handoff(&"a".repeat(64),|_|panic!("corrupted replay called validation")).is_err());
+        assert_eq!(fs::read(&sink.log).unwrap(),bytes);
+    }
+    #[test]
+    fn healthy_handoff_concurrent_requests_cannot_both_seal_one_generation() {
+        let (_dir,sink)=setup();sink.append(serde_json::json!({"kind":"admitted"})).unwrap();
+        let barrier=std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads:Vec<_>=["a","b"].into_iter().map(|id| {
+            let sink=sink.clone();let barrier=barrier.clone();let request=id.repeat(64);
+            std::thread::spawn(move||{barrier.wait();sink.seal_for_handoff(&request,|_|Ok(serde_json::json!({})))})
+        }).collect();
+        let results:Vec<_>=threads.into_iter().map(|thread|thread.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|result|result.is_ok()).count(),1);
     }
     #[test]
     fn recovery_seal_preserves_interrupted_tail_and_blocks_late_writers() {

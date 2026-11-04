@@ -1399,6 +1399,13 @@ mod tests {
 
     #[test]
     fn audit_seal_serializes_cross_process_writer_registration() {
+        check_audit_seal_serialization(false);
+    }
+    #[test]
+    fn healthy_handoff_seal_serializes_cross_process_writer_registration() {
+        check_audit_seal_serialization(true);
+    }
+    fn check_audit_seal_serialization(healthy:bool) {
         const CHILD:&str="AUDIT_INGRESS_CHILD_ROOT";
         if let Some(root)=std::env::var_os(CHILD) {
             let root=PathBuf::from(root);
@@ -1412,14 +1419,17 @@ mod tests {
         let sink=logger.anchored.as_ref().unwrap().clone();
         let (entered,ready)=std::sync::mpsc::channel();
         let (release,proceed)=std::sync::mpsc::channel();
-        let sealer=std::thread::spawn(move ||sink.seal_for_recovery(|_| {
-            entered.send(()).unwrap();
-            proceed.recv_timeout(std::time::Duration::from_secs(10))?;
-            Ok(serde_json::json!({"fixture":"sealed"}))
-        }));
+        let sealer=std::thread::spawn(move || {
+            let validation=|_:&[serde_json::Value]| {
+                entered.send(()).unwrap();
+                proceed.recv_timeout(std::time::Duration::from_secs(10))?;
+                Ok(serde_json::json!({"fixture":"sealed"}))
+            };
+            if healthy {sink.seal_for_handoff(&"a".repeat(64),validation)}else{sink.seal_for_recovery(validation)}
+        });
         ready.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
         let mut child=std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact","tool_audit::tests::audit_seal_serializes_cross_process_writer_registration","--nocapture"])
+            .args(["--exact",if healthy {"tool_audit::tests::healthy_handoff_seal_serializes_cross_process_writer_registration"}else{"tool_audit::tests::audit_seal_serializes_cross_process_writer_registration"},"--nocapture"])
             .env(CHILD,dir.path()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
         let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
         while !dir.path().join("writer-ready").exists() && std::time::Instant::now()<deadline {
