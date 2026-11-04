@@ -37,21 +37,21 @@ impl WorkflowStore {
     }
     pub fn uncertain_progress(&self,bot:u64,owner:u64)->Result<Vec<(super::discord_ingress::DiscordOrigin,String,i64,String,String)>> {
         ensure!(bot>0 && owner>0,"progress recovery identity missing");
-        let mut stmt=self.conn.prepare("SELECT d.channel,d.workflow,d.sequence,d.nonce,d.content FROM workflow_progress_delivery d JOIN discord_workflow_binding b ON b.workflow=d.workflow AND b.bot=d.bot AND b.owner=d.owner AND b.channel=d.channel WHERE d.bot=?1 AND d.owner=?2 AND d.state='uncertain' ORDER BY d.dispatched_at,d.workflow LIMIT 128")?;
+        let mut stmt=self.conn.prepare("SELECT d.channel,d.workflow,d.sequence,d.nonce,d.content FROM workflow_progress_delivery d JOIN workflow_delivery_binding b ON b.workflow=d.workflow AND b.bot=d.bot AND b.owner=d.owner AND b.channel=d.channel WHERE d.bot=?1 AND d.owner=?2 AND d.state='uncertain' ORDER BY d.dispatched_at,d.workflow LIMIT 128")?;
         let rows=stmt.query_map(params![bot.to_string(),owner.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))?;
         rows.map(|row| {let (channel,workflow,sequence,nonce,content)=row?;Ok((super::discord_ingress::DiscordOrigin {bot,owner,channel:channel.parse()?,message:1},workflow,sequence,nonce,content))}).collect()
     }
     pub fn pending_progress(&self,bot:u64,owner:u64)->Result<Vec<(super::discord_ingress::DiscordOrigin,String,i64)>> {
         ensure!(bot>0 && owner>0,"progress recovery identity missing");
         if !exists(&self.conn)? {return Ok(Vec::new());}
-        let mut stmt=self.conn.prepare("SELECT b.channel,b.workflow,s.sequence FROM discord_workflow_binding b JOIN workflow_progress_state s ON s.workflow=b.workflow WHERE b.bot=?1 AND b.owner=?2 AND NOT EXISTS(SELECT 1 FROM workflow_progress_delivery d WHERE d.workflow=b.workflow AND d.bot=b.bot AND d.owner=b.owner AND d.channel=b.channel AND (d.state='uncertain' OR d.sequence>=s.sequence)) ORDER BY s.workflow,b.channel LIMIT 128")?;
+        let mut stmt=self.conn.prepare("SELECT b.channel,b.workflow,s.sequence FROM workflow_delivery_binding b JOIN workflow_progress_state s ON s.workflow=b.workflow WHERE b.bot=?1 AND b.owner=?2 AND NOT EXISTS(SELECT 1 FROM workflow_progress_delivery d WHERE d.workflow=b.workflow AND d.bot=b.bot AND d.owner=b.owner AND d.channel=b.channel AND (d.state='uncertain' OR d.sequence>=s.sequence)) ORDER BY s.workflow,b.channel LIMIT 128")?;
         let rows=stmt.query_map(params![bot.to_string(),owner.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?;
         rows.map(|row| {let (channel,workflow,sequence)=row?;Ok((super::discord_ingress::DiscordOrigin {bot,owner,channel:channel.parse()?,message:1},workflow,sequence))}).collect()
     }
     pub fn claim_progress(&mut self,origin:&super::discord_ingress::DiscordOrigin,workflow:&str,sequence:i64,now:i64)->Result<Option<(String,String)>> {
         origin.validate()?;
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::discord_ingress::bound_workflow(&tx,origin,Some(workflow))?;
+        super::delivery::require_destination(&tx,origin,workflow)?;
         let raw:Option<(i64,String)>=tx.query_row("SELECT sequence,payload FROM workflow_progress_state WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         let Some((current,raw))=raw else {return Ok(None);};
         if current!=sequence {return Ok(None);}
@@ -68,7 +68,7 @@ impl WorkflowStore {
     pub fn confirm_progress(&mut self,origin:&super::discord_ingress::DiscordOrigin,workflow:&str,sequence:i64,message:u64,now:i64)->Result<()> {
         origin.validate()?;ensure!(message>0,"progress remote message missing");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::discord_ingress::bound_workflow(&tx,origin,Some(workflow))?;
+        super::delivery::require_destination(&tx,origin,workflow)?;
         let (state,prior):(String,Option<String>)=tx.query_row("SELECT state,message FROM workflow_progress_delivery WHERE workflow=?1 AND bot=?2 AND owner=?3 AND channel=?4 AND sequence=?5",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence],|r|Ok((r.get(0)?,r.get(1)?)))?;
         if state=="confirmed" {ensure!(prior.as_deref()==Some(message.to_string().as_str()),"progress receipt conflict");return Ok(());}
         ensure!(state=="uncertain","progress was never dispatched");
@@ -78,10 +78,13 @@ impl WorkflowStore {
     pub fn progress_delivery(&self,workflow:&str)->Result<DeliveryStatus> {
         if !exists(&self.conn)? {return Ok(DeliveryStatus {state:"not-observed".into(),pending_events:0,oldest_pending_at_ms:None,latest_sequence:None});}
         let delivery_table:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_progress_delivery')",[],|r|r.get(0))?;
-        let query=if delivery_table {"SELECT count(*),min(e.created_at),max(e.sequence) FROM workflow_progress_event e WHERE e.workflow=?1 AND (NOT EXISTS(SELECT 1 FROM discord_workflow_binding b WHERE b.workflow=e.workflow) OR EXISTS(SELECT 1 FROM discord_workflow_binding b WHERE b.workflow=e.workflow AND NOT EXISTS(SELECT 1 FROM workflow_progress_delivery d WHERE d.workflow=b.workflow AND d.bot=b.bot AND d.owner=b.owner AND d.channel=b.channel AND d.state='confirmed' AND d.sequence>=e.sequence)))"}
+        let new_routes:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_delivery_binding')",[],|r|r.get(0))?;
+        let routes=if new_routes {"workflow_delivery_binding"} else {"discord_workflow_binding"};
+        let query=if delivery_table {"SELECT count(*),min(e.created_at),max(e.sequence) FROM workflow_progress_event e WHERE e.workflow=?1 AND (NOT EXISTS(SELECT 1 FROM workflow_delivery_binding b WHERE b.workflow=e.workflow) OR EXISTS(SELECT 1 FROM workflow_delivery_binding b WHERE b.workflow=e.workflow AND NOT EXISTS(SELECT 1 FROM workflow_progress_delivery d WHERE d.workflow=b.workflow AND d.bot=b.bot AND d.owner=b.owner AND d.channel=b.channel AND d.state='confirmed' AND d.sequence>=e.sequence)))"}
             else {"SELECT count(*),min(created_at),max(sequence) FROM workflow_progress_event WHERE workflow=?1"};
-        let (pending,oldest,latest):(i64,Option<i64>,Option<i64>)=self.conn.query_row(query,[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-        let bound:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM discord_workflow_binding WHERE workflow=?1)",[workflow],|r|r.get(0))?;
+        let query=query.replace("workflow_delivery_binding",routes);
+        let (pending,oldest,latest):(i64,Option<i64>,Option<i64>)=self.conn.query_row(&query,[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        let bound:bool=self.conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {routes} WHERE workflow=?1)"),[workflow],|r|r.get(0))?;
         let uncertain=delivery_table && self.conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_progress_delivery WHERE workflow=?1 AND state='uncertain')",[workflow],|r|r.get::<_,bool>(0))?;
         Ok(DeliveryStatus {state:if uncertain {"delivery-uncertain"} else if pending==0 {"delivery-confirmed"} else if bound {"delivery-pending"} else {"delivery-unconfigured"}.into(),
             pending_events:pending,oldest_pending_at_ms:oldest,latest_sequence:latest})
@@ -110,6 +113,7 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     if !matches!(source,"registered"|"checkpoint"|"autonomous_merge_confirmed"|"command_queued"|"command_attempt_finished"|"owner_control_changed") {return Ok(());}
     let previous:Option<(i64,String,bool)>=tx.query_row("SELECT sequence,fingerprint,terminal FROM workflow_progress_state WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     if previous.as_ref().is_some_and(|p|p.2) {return Ok(());}
+    super::delivery::apply_default(tx,workflow,now)?;
     let snapshot:Option<(String,Option<u64>)>=tx.query_row("SELECT checkpoint,pr FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let checkpoint=snapshot.as_ref().map(|(raw,_)|serde_json::from_str::<Checkpoint>(raw)).transpose()?;
     let requested:Option<String>=tx.query_row("SELECT provider FROM command_job WHERE workflow=?1",[workflow],|r|r.get(0)).optional()?;

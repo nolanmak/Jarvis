@@ -315,8 +315,24 @@ impl WorkflowStore {
                 bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
                 workflow TEXT NOT NULL REFERENCES command_job(workflow), created_at INTEGER NOT NULL,
                 PRIMARY KEY(bot,owner,channel,workflow));
+            CREATE TABLE IF NOT EXISTS workflow_delivery_binding (
+                bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
+                workflow TEXT NOT NULL, source TEXT NOT NULL, created_at INTEGER NOT NULL,
+                PRIMARY KEY(bot,owner,channel,workflow));
+            CREATE TABLE IF NOT EXISTS repository_delivery_default (
+                repository TEXT PRIMARY KEY, bot TEXT NOT NULL, owner TEXT NOT NULL,
+                channel TEXT NOT NULL, principal TEXT NOT NULL, updated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS repository_delivery_route_event (
+                id TEXT PRIMARY KEY, repository TEXT NOT NULL, principal TEXT NOT NULL,
+                previous_routes TEXT NOT NULL, destination TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS discord_binding_delivery AFTER INSERT ON discord_workflow_binding BEGIN
+                SELECT CASE WHEN EXISTS(SELECT 1 FROM workflow_progress_delivery d JOIN workflow_delivery_binding b ON b.workflow=d.workflow AND b.bot=d.bot AND b.owner=d.owner AND b.channel=d.channel WHERE d.workflow=NEW.workflow AND b.source='default' AND d.state='uncertain') THEN RAISE(ABORT,'delivery-uncertain-reconcile-before-rebind') END;
+                DELETE FROM workflow_delivery_binding WHERE workflow=NEW.workflow AND source='default';
+                INSERT OR IGNORE INTO workflow_delivery_binding VALUES(NEW.bot,NEW.owner,NEW.channel,NEW.workflow,'discord',NEW.created_at);
+            END;
+            INSERT OR IGNORE INTO workflow_delivery_binding SELECT bot,owner,channel,workflow,'discord',created_at FROM discord_workflow_binding;
             CREATE TABLE IF NOT EXISTS discord_delivery_route_event (
-                id TEXT PRIMARY KEY, workflow TEXT NOT NULL REFERENCES command_job(workflow),
+                id TEXT PRIMARY KEY, workflow TEXT NOT NULL,
                 principal TEXT NOT NULL, previous_routes TEXT NOT NULL, destination TEXT NOT NULL,
                 created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS discord_command_ingress (

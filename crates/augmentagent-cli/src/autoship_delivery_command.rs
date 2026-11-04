@@ -9,6 +9,13 @@ pub(crate) struct Args {
 }
 #[derive(clap::Subcommand)]
 pub(crate) enum Operation {
+    /// Set the private operational destination for CLI and poller work.
+    Configure {
+        #[arg(long)] repo:String,
+        #[arg(long,required_unless_present="owner_dm",conflicts_with="owner_dm")] channel:Option<u64>,
+        #[arg(long)] owner_dm:bool,
+        #[arg(long)] json:bool,
+    },
     /// Route updates to the configured owner's verified private Discord DM.
     Rebind {
         #[arg(long)] workflow:String,
@@ -28,7 +35,8 @@ fn verified_destination(bot:&Value,channel:&Value,owner:u64)->Result<Destination
     ensure!(bot["bot"]==true && owner>0 && bot_id!=owner,"Discord bot/owner identity mismatch");
     ensure!(channel["type"]==1 && channel.get("guild_id").is_none_or(Value::is_null),"delivery-private-owner-dm-required");
     let recipients=channel["recipients"].as_array().context("Discord DM recipients missing")?;
-    ensure!(recipients.len()==1 && snowflake(&recipients[0]["id"])?==owner,"delivery-private-owner-dm-required");
+    ensure!(recipients.len()==1 && snowflake(&recipients[0]["id"])?==owner
+        && recipients[0]["bot"]!=true,"delivery-private-owner-dm-required");
     Ok(Destination {bot:bot_id,owner,channel:snowflake(&channel["id"])?})
 }
 
@@ -54,31 +62,47 @@ async fn discord_destination(channel:Option<u64>)->Result<Destination> {
     Ok(verified)
 }
 
-async fn apply(workflow:&str,channel:Option<u64>)->Result<Value> {
+async fn apply_rebind(workflow:&str,channel:Option<u64>)->Result<Value> {
     let repo=std::env::current_dir()?;let path=crate::autoship_workflow::default_path();
+    let (repository,target)=super::target(workflow)?;
     let store=WorkflowStore::open_read_only(&path)?.context("no durable workflow state")?;
-    let request=store.command_request(workflow)?.context("delivery requires an admitted workflow")?;
+    let workflow=if target["kind"]=="pr" {
+        store.resolve_pr(&repository,target["number"].as_u64().unwrap())?.unwrap_or(workflow.to_ascii_lowercase())
+    }else {workflow.to_ascii_lowercase()};
+    ensure!(store.command_request(&workflow)?.is_some() || store.snapshot(&workflow)?.is_some(),"unknown workflow");
     drop(store);
-    let principal=crate::self_improve::targeted::authorize_command(&repo,&request).await?;
+    let principal=crate::self_improve::targeted::authorize_repository(&repo,&repository).await?;
     let destination=discord_destination(channel).await?;
-    // Recheck repository authorization after remote validation and before the
-    // transaction. A binding never grants execution or merge authority.
-    ensure!(crate::self_improve::targeted::authorize_command(&repo,&request).await?==principal,"delivery operator changed");
+    ensure!(crate::self_improve::targeted::authorize_repository(&repo,&repository).await?==principal,"delivery operator changed");
     let mut store=WorkflowStore::open(&path)?;
-    ensure!(store.command_request(workflow)?.is_some_and(|current|current.repository==request.repository && current.target==request.target),"workflow target changed");
-    let changed=store.bind_delivery(workflow,&principal,destination,chrono::Utc::now().timestamp_millis())?;
+    let changed=store.bind_delivery(&workflow,&principal,destination,chrono::Utc::now().timestamp_millis())?;
     Ok(json!({"schema_version":1,"accepted":true,"complete":false,"workflow":workflow,
         "reason":if changed {"delivery-bound"} else {"delivery-already-bound"},
-        "destination":destination,"delivery":store.progress_delivery(workflow)?,"execution":"not-started-by-delivery-command"}))
+        "destination":destination,"delivery":store.progress_delivery(&workflow)?,"execution":"not-started-by-delivery-command"}))
+}
+
+async fn apply_configure(repository:&str,channel:Option<u64>)->Result<Value> {
+    let repository=crate::autoship_workflow::submission::normalized_repository(repository)?;
+    let repo=std::env::current_dir()?;
+    let principal=crate::self_improve::targeted::authorize_repository(&repo,&repository).await?;
+    let destination=discord_destination(channel).await?;
+    ensure!(crate::self_improve::targeted::authorize_repository(&repo,&repository).await?==principal,"delivery operator changed");
+    let changed=WorkflowStore::open(&crate::autoship_workflow::default_path())?.configure_delivery(&repository,&principal,destination,chrono::Utc::now().timestamp_millis())?;
+    Ok(json!({"schema_version":1,"accepted":true,"complete":false,"repository":repository,
+        "reason":if changed {"delivery-default-configured"} else {"delivery-default-unchanged"},
+        "destination":destination,"execution":"not-started-by-delivery-command"}))
 }
 
 pub(crate) async fn run(args:&Args)->i32 {
-    let Operation::Rebind {workflow,channel,json:json_output,..}=&args.operation;
-    let (code,value)=match apply(workflow,*channel).await {
-        Ok(value)=>(0,value),Err(error)=>(3,json!({"schema_version":1,"accepted":false,"complete":false,
-            "workflow":workflow,"reason":"delivery-rebind-refused","error":format!("{error:#}")})),
+    let (result,json_output)=match &args.operation {
+        Operation::Rebind {workflow,channel,json,..}=>(apply_rebind(workflow,*channel).await,*json),
+        Operation::Configure {repo,channel,json,..}=>(apply_configure(repo,*channel).await,*json),
     };
-    if *json_output {println!("{value}");}else {println!("{}",serde_json::to_string_pretty(&value).unwrap());}
+    let (code,value)=match result {
+        Ok(value)=>(0,value),Err(error)=>(3,json!({"schema_version":1,"accepted":false,"complete":false,
+            "reason":"delivery-change-refused","error":format!("{error:#}")})),
+    };
+    if json_output {println!("{value}");}else {println!("{}",serde_json::to_string_pretty(&value).unwrap());}
     code
 }
 
@@ -86,14 +110,30 @@ pub(crate) async fn run(args:&Args)->i32 {
 mod tests {
     use super::*;
     #[test]
+    fn delivery_commands_require_one_explicit_private_destination() {
+        use clap::Parser;
+        for args in [vec!["augmentagent","autopr","delivery","configure","--repo","owner/repo","--owner-dm","--json"],
+            vec!["augmentagent","autopr","delivery","rebind","--workflow","owner/repo#7","--channel","33","--json"]] {
+            assert!(crate::Cli::try_parse_from(args).is_ok());
+        }
+        for args in [vec!["augmentagent","autopr","delivery","configure","--repo","owner/repo"],
+            vec!["augmentagent","autopr","delivery","configure","--repo","owner/repo","--channel","33","--owner-dm"],
+            vec!["augmentagent","autopr","delivery","rebind","--owner-dm"]] {
+            assert!(crate::Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
     fn only_the_actual_bots_private_dm_with_the_configured_owner_can_bind() {
         let bot=json!({"id":"11","bot":true});let dm=json!({"id":"33","type":1,"recipients":[{"id":"22"}]});
         assert_eq!(verified_destination(&bot,&dm,22).unwrap(),Destination {bot:11,owner:22,channel:33});
         for invalid in [json!({"id":"33","type":0,"guild_id":"99","recipients":[{"id":"22"}]}),
             json!({"id":"33","type":3,"recipients":[{"id":"22"},{"id":"44"}]}),
+            json!({"id":"33","type":1,"recipients":[{"id":"22","bot":true}]}),
+            json!({"id":"33","type":1,"recipients":[{"id":"22"},{"id":"44"}]}),
             json!({"id":"33","type":1,"recipients":[{"id":"44"}]}),
             json!({"id":"0","type":1,"recipients":[{"id":"22"}]})] {
-            assert!(verified_destination(&bot,&invalid,22).is_err());
+            assert!(verified_destination(&bot,&invalid,22).is_err(),"invalid private destination accepted: {invalid}");
         }
         assert!(verified_destination(&json!({"id":"11","bot":false}),&dm,22).is_err());
         assert!(verified_destination(&bot,&dm,11).is_err());
