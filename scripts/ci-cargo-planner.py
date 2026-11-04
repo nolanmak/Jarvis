@@ -1653,6 +1653,15 @@ class RootRelay:
 
     def request_context(self,ordinal,request):return {},None
     def execution_cancelled(self):return self._stop.is_set() or self.ordinals.fenced()
+    def runnable_observation(self):
+        # Observe the original semaphore; do not allocate a second pool or
+        # acquire/release a permit just to determine its availability.
+        with self._slots._cond:available=self._slots._value
+        with self._lock:children=len(self._children)
+        if not 0<=available<=4 or not 0<=children<=4:raise FreshnessHold('input_census_unknown')
+        return {'version':1,'kind':'ci-original-dispatch-observation','capacity':4,'available':available,
+            'original_supervisors':children,'shipping_authority':False}
+
     def unit_signal_grant(self,value,transport,grant):grant()
 
     def unit_credit_drained(self,value,transport,started):
@@ -1691,7 +1700,8 @@ class RootRelay:
                     admission=admit(self.admission.target,self.admission.binding,self.admission.command,transport_root)
                     transport=UnitPeerRelay(admission,library=self.library,ordinal=ordinal,scope=directory,
                         ordinals=self.ordinals,deadline=deadline,view=view,
-                        credit_parent=self.parent_ordinal if isinstance(self,UnitPeerRelay) else None)
+                        credit_parent=self.parent_ordinal if isinstance(self,UnitPeerRelay) else None,
+                        original_dispatcher=self.original_dispatcher if isinstance(self,UnitPeerRelay) else self)
                     transport.__enter__()
                     if relay_fd is not None:raise FreshnessHold('invalidation_unsafe')
                     descriptor=transport.config_fd()
@@ -2127,7 +2137,7 @@ class UnitFreezer:
 
 class UnitPeerRelay(RootRelay):
     """Private contained execution; effect transfer and CI authority stay fenced."""
-    def __init__(self,admission,*,library,ordinal,scope,ordinals,deadline,view,credit_parent=None):
+    def __init__(self,admission,*,library,ordinal,scope,ordinals,deadline,view,credit_parent=None,original_dispatcher=None):
         if type(ordinal) is not int or not 0<=ordinal<4096 or not cache._uuid(Path(scope).name):
             raise FreshnessHold('invalidation_unsafe')
         if (type(view) is not dict or set(view) not in ({'root','artifacts','source','mounts','ordinal'},
@@ -2138,6 +2148,9 @@ class UnitPeerRelay(RootRelay):
         self.peer_uid=2000+ordinal;self.config_uid=self.peer_uid;self.config_magic=b'JARVUNT3'
         if credit_parent is not None:NestedJobserverCredits._ordinal(credit_parent)
         self.credit_parent=credit_parent
+        if not isinstance(original_dispatcher,RootRelay) or original_dispatcher.ordinals is not ordinals:
+            raise FreshnessHold('generation_mismatch')
+        self.original_dispatcher=original_dispatcher
         self.require_message_credentials=True;self.parent_ordinal=ordinal;self.scope=Path(scope)
         self.scope_pidfd=None;self.scope_namespaces=None;self.scope_root=None;self.received_requests=0;self.closed=False
         self.staged_signals=None
@@ -2279,7 +2292,14 @@ class UnitPeerRelay(RootRelay):
                     replacement=os.dup(captured.fileno());os.close(descriptors[1]);descriptors[1]=replacement
                     child_attempted=True
                     loan=self.ordinals.credits.lend(self.parent_ordinal,ordinal,record['pause'])
-                    record['jobserver_loan']['state']=loan['state'];cache._write_record(self.root/'admission.json',record)
+                    pipe=staging.observe_jobserver(environment,dict(zip(numbers[3:],descriptors[4:])))
+                    ledger=self.ordinals.credits.observation()
+                    lent_roots=sorted(row['ordinal'] for row in ledger['units'].values()
+                        if row['parent'] is None and row['state']=='lent' and row['jobserver'] is not None
+                        and row['jobserver']['kernel_pipe_sha256']==pipe['kernel_pipe_sha256'])
+                    record['jobserver_loan'].update(state=loan['state'],pipe=pipe,lent_root_units=lent_roots,
+                        dispatcher=self.original_dispatcher.runnable_observation(),observed_monotonic_ns=time.monotonic_ns())
+                    cache._write_record(self.root/'admission.json',record)
                     result=super()._run(connection,ordinal,descriptors,numbers,phase,staged=True,defer_terminal=True)
                     record['child_result']={'returncode':result['returncode'],'original_cleanup':result['original_cleanup'],
                         'exec_observed':result['exec_observed'],'scope':result['directory'].name,

@@ -7,6 +7,7 @@ its cancellation channel live, and gate tool_started after capture returns.
 Requested tool environments never configure this controller interpreter.
 """
 import errno
+import array
 import fcntl
 import hashlib
 import importlib.util
@@ -16,6 +17,7 @@ from pathlib import Path
 import re
 import select
 import stat
+import termios
 import time
 
 
@@ -172,6 +174,28 @@ def normalize_jobserver(environment,inherited):
     pipe=hashlib.sha256(f'{read_info.st_dev}:{read_info.st_ino}'.encode('ascii')).hexdigest()
     return normalized,((3,reader),(4,writer)),{'version':3,'kind':'ci-unit-jobserver',
         'kernel_pipe_sha256':pipe,'worker_numbers':[3,4],
+        'input_closure_complete':False,'shipping_authority':False}
+
+
+def observe_jobserver(environment,inherited):
+    """Sample pending bytes without reading tokens or changing pipe flags.
+
+    This is an instant observation, not exclusive-writer or credit ownership
+    proof. The original caller must bind it to its paused unit and grant.
+    """
+    _,mapping,job=normalize_jobserver(environment,inherited)
+    if job is None or len(mapping)!=2:raise StagingUnavailable('jobserver_binding')
+    reader,writer=(row[1] for row in mapping)
+    before=[os.fstat(fd) for fd in (reader,writer)]
+    flags=[fcntl.fcntl(fd,fcntl.F_GETFL) for fd in (reader,writer)]
+    count=array.array('i',[0]);fcntl.ioctl(reader,termios.FIONREAD,count,True)
+    if not 0<=count[0]<=MAX_BYTES:raise StagingUnavailable('jobserver_binding')
+    after=[os.fstat(fd) for fd in (reader,writer)]
+    if (any((a.st_dev,a.st_ino,a.st_mode)!=(b.st_dev,b.st_ino,b.st_mode) for a,b in zip(before,after))
+            or [fcntl.fcntl(fd,fcntl.F_GETFL) for fd in (reader,writer)]!=flags):
+        raise StagingUnavailable('jobserver_binding')
+    return {'version':1,'kind':'ci-jobserver-observation','kernel_pipe_sha256':job['kernel_pipe_sha256'],
+        'available_bytes':count[0],'reader_flags':flags[0],'writer_flags':flags[1],
         'input_closure_complete':False,'shipping_authority':False}
 
 

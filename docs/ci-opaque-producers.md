@@ -727,6 +727,32 @@ remains red. Observation:
 These results close neither the real four-parent Cargo exhaustion gate nor
 full-chain return/resume; no parent mutation or CI/merge authority is enabled.
 
+The controller now takes read-only, instant jobserver/dispatcher observations
+at the original post-freeze loan boundary. `FIONREAD` samples pending bytes;
+normalization, inode and flag checks surround it without reading/writing a token
+or changing flags. The original dispatcher's existing semaphore and supervisor
+set are sampled without acquiring/releasing a permit. Each loan record binds
+these observations, the same-pipe lent root ordinals and controller monotonic
+time to its existing command/parent/child/pause identity. These are observations,
+not exclusive-writer, complete credit or passing-CI proof. Five host regressions
+cover empty/filled real pipes, unchanged bytes/flags, invalid bindings, ioctl
+failure and observation of four exhausted original test slots.
+
+A separate opt-in `live_shared_ci_four_parent_jobserver_progress` now runs four
+real binary targets through the unchanged protected repository adapter using
+actual pinned Cargo `--jobs 4`. It uses 2000 real functions per target and the
+existing resource ceilings; no wrapper, filename exception, extra permit pool,
+new execution mode or hand-constructed jobserver pipe substitutes for Cargo.
+The initial build and repeated compatible build require original compiler counts
+`[4,0]` and original Cargo cleanup. Its postmortem companion must verify the
+root-owned pipe/slot/cohort records. The test does not initiate cancellation and
+always leaves cancellation/reacquisition and full exhaustion acceptance false;
+it is the initial execution stage of the still-open four-parent gate. A separate
+controlled cancellation/reacquisition scenario remains mandatory; a successful
+initial build alone cannot satisfy O4. The original V3 fixture, arguments,
+counters, streams and acceptance assertions remain unchanged. The new actual
+Cargo test and expanded 106-case component guest check remain pending.
+
 Routing and cancellation must not wait for an execution permit held by the
 request's paused ancestor. Containment is acyclic and recorded before dispatch.
 Iterative traversal closes arbitrarily deep admitted chains within the existing

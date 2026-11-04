@@ -554,6 +554,7 @@ async fn live_shared_ci_namespace_steps()->Result<()> {
         ("ci-cargo-observer.py",include_bytes!("../../../scripts/ci-cargo-observer.py").as_slice()),
         ("ci-lookup-inputs.py",include_bytes!("../../../scripts/ci-lookup-inputs.py").as_slice()),
         ("tests/ci_cargo_parent_signals_test.py",include_bytes!("../../../scripts/tests/ci_cargo_parent_signals_test.py").as_slice()),
+        ("tests/ci_cargo_jobserver_observation_test.py",include_bytes!("../../../scripts/tests/ci_cargo_jobserver_observation_test.py").as_slice()),
         ("tests/ci_cargo_credits_test.py",include_bytes!("../../../scripts/tests/ci_cargo_credits_test.py").as_slice()),
         ("tests/ci_cargo_active_signals_test.py",include_bytes!("../../../scripts/tests/ci_cargo_active_signals_test.py").as_slice()),
         ("ci-cargo-views.py",include_bytes!("../../../scripts/ci-cargo-views.py").as_slice()),
@@ -579,8 +580,8 @@ assert os.getuid()==1000
 assert pathlib.Path(tempfile.gettempdir())==pathlib.Path('/workspace/target')
 sys.path.insert(0,'/workspace/tests')
 suite=unittest.TestSuite([unittest.TestLoader().discover('/workspace/tests',pattern=pattern)
- for pattern in ('ci_cargo_namespace_apply_test.py','ci_cargo_namespace_sequence_test.py','ci_cargo_transfer_objects_test.py','ci_cargo_transfer_test.py','ci_cargo_parent_signals_test.py','ci_cargo_active_signals_test.py','ci_cargo_credits_test.py')])
-assert suite.countTestCases()==101
+ for pattern in ('ci_cargo_namespace_apply_test.py','ci_cargo_namespace_sequence_test.py','ci_cargo_transfer_objects_test.py','ci_cargo_transfer_test.py','ci_cargo_parent_signals_test.py','ci_cargo_active_signals_test.py','ci_cargo_credits_test.py','ci_cargo_jobserver_observation_test.py')])
+assert suite.countTestCases()==106
 stream=io.StringIO();result=unittest.TextTestRunner(stream=stream,verbosity=2).run(suite)
 print(json.dumps({'uid':os.getuid(),'cache_device':os.stat('/workspace/target').st_dev,
  'tests_run':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),
@@ -595,7 +596,7 @@ PY"#;
         "version":1,"kind":"real_shared_ci_namespace_steps","head":head,"generation":source.generation(),
         "status":result.status,"cases":cases,"actual_vm_commands":1,"input_closure_complete":false,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
-    ensure!(result.status=="passed" && cases["uid"]==1000 && cases["tests_run"]==101
+    ensure!(result.status=="passed" && cases["uid"]==1000 && cases["tests_run"]==106
         && cases["failures"]==0 && cases["errors"]==0 && cases["successful"]==true,
         "namespace step guest cases unavailable: {} {}",result.stdout,result.stderr);
     Ok(())
@@ -1656,6 +1657,80 @@ async fn live_shared_ci_structured_cargo_execution()->Result<()> {
         "version":1,"kind":"structured-cargo-adapter-replay","outcomes":outcomes,
         "original_commands_preserved":true,"failing_test_exit_preserved":true,
         "input_closure_complete":false,"full_ci":false,"shipping_authority":false}))?)?;
+    Ok(())
+}
+
+/// Actual four-target Cargo scheduling through the normal protected adapter.
+/// Component semaphores and a caller-created pipe cannot satisfy this gate.
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_four_parent_jobserver_progress()->Result<()> {
+    let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private fixture evidence required");
+    std::fs::create_dir(&evidence)?;std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"shared-ci-four-parent-jobserver",None)?;
+    audit.require_run_resources()?;
+    let target=crate::build_storage::effective_target(&owner);
+    let storage=crate::build_storage::admit_ci(&owner,&target).await?;
+    let fixture=tempfile::Builder::new().prefix("four-parent-cargo-").tempdir_in(&target)?;
+    let root=fixture.path();std::fs::create_dir_all(root.join("src/bin"))?;
+    std::fs::write(root.join("Cargo.toml"),"[package]\nname=\"four-parent-probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[profile.dev]\ndebug=0\nincremental=false\ncodegen-units=1\n")?;
+    std::fs::write(root.join("Cargo.lock"),"version=4\n\n[[package]]\nname=\"four-parent-probe\"\nversion=\"0.1.0\"\n")?;
+    // Enough real code generation for the four original compiler processes to
+    // overlap. This changes neither the original V3 fixture nor its budgets.
+    for index in 0..4 {
+        let mut source=format!("#![allow(dead_code)]\n#[inline(never)] fn f0(x:u64)->u64{{x.wrapping_add({index})}}\n");
+        for function in 1..2000 {source.push_str(&format!("#[inline(never)] fn f{function}(x:u64)->u64{{f{}(x).wrapping_add({function})}}\n",function-1));}
+        source.push_str("fn main(){std::hint::black_box(f1999(17));}\n");
+        std::fs::write(root.join(format!("src/bin/parent_{index}.rs")),source)?;
+    }
+    std::fs::write(root.join("driver.py"),r#"import json,os,subprocess
+assert os.getresuid()==(1000,1000,1000) and os.getgroups()==[]
+environment=dict(os.environ,CARGO_BUILD_JOBS='4',CARGO_INCREMENTAL='0')
+command=['cargo','build','--offline','--locked','--jobs','4','--bins']
+for iteration in range(2):
+ result=subprocess.run(command,env=environment)
+ assert result.returncode==0,(iteration,result.returncode)
+print(json.dumps({'original_cargo_builds':2,'requested_jobs':4,'targets':4}),flush=True)
+"#)?;
+    git(root,&["-c","init.templateDir=","init","-q"]).await?;git(root,&["add","."]).await?;
+    git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","core.hooksPath=/dev/null",
+        "-c","commit.gpgsign=false","commit","-qm","four-parent Cargo fixture"]).await?;
+    let head=git(root,&["rev-parse","HEAD"]).await?.trim().to_owned();
+    git(root,&["update-ref","refs/remotes/origin/main",&head]).await?;
+    let bound=binding(root).await?;let source=snapshot(root,&bound,&target).await?;
+    let session=vm::Session::prepare(&owner,&target)?;session.enable_protected_repository()?;
+    let outcome=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some("python3 -I driver.py"),
+        &storage,&target,&audit,std::time::Duration::from_secs(180)).await;
+    let result=match outcome {
+        Ok(result)=>result,
+        Err(error)=>{
+            std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({
+                "version":1,"kind":"real_four_parent_jobserver","head":head,"generation":source.generation(),
+                "status":"held","diagnostic":error.to_string(),"requested_jobs":4,"targets":4,
+                "four_parent_exhaustion_verified":false,"cancellation_reacquisition_verified":false,
+                "input_closure_complete":false,"full_ci":false,"shipping_authority":false}))?)?;
+            return Err(error)
+        }
+    };
+    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({
+        "version":1,"kind":"real_four_parent_jobserver","head":head,"generation":source.generation(),
+        "status":result.status,"execution":result.repository_execution,"stdout":result.stdout,"stderr":result.stderr,
+        "four_parent_exhaustion_verified":false,"cancellation_reacquisition_verified":false,
+        "input_closure_complete":false,"full_ci":false,"shipping_authority":false}))?)?;
+    ensure!(result.status=="passed","four-parent original Cargo execution did not complete");
+    let execution=result.repository_execution.as_ref().context("original protected repository receipt absent")?;
+    let commands=execution["cargo_commands"].as_array().context("original Cargo commands absent")?;
+    ensure!(commands.len()==2 && commands.iter().all(|command|command["cargo_exit"]==0 && command["original_cargo_cleanup"]==true),
+        "original four-parent Cargo cleanup/exit absent");
+    ensure!(commands.iter().map(|command|command["compiler_calls"].as_u64().unwrap_or(u64::MAX)).collect::<Vec<_>>()==vec![4,0],
+        "four original compilers or mandatory compatible within-job reuse absent");
+    // This execution test is only the first stage. Its postmortem companion
+    // must verify the root-owned pipe/slot/cohort observations. It does not
+    // initiate cancellation, so it cannot claim that acceptance requirement.
+    ensure!(execution["input_closure_complete"]==false && execution["full_ci"]==false && execution["shipping_authority"]==false,
+        "jobserver experiment acquired CI authority");
     Ok(())
 }
 
