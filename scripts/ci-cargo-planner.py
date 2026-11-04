@@ -2323,6 +2323,7 @@ class RepositoryWorkerFreezer(UnitFreezer):
     def __init__(self,admission,scope,lock,namespaces):
         if type(lock) is not WorkerProjectionLock:raise FreshnessHold('invalidation_unsafe')
         self.progress_path=admission.target/('.jobserver-credit-'+admission.command)/'worker-scope-progress.json'
+        self.progress_lock=threading.Lock();self.progress_events=[]
         super().__init__(admission,scope,1000,_worker_token=_WORKER_GROUP_TOKEN)
         self.lock=lock;self.namespaces=dict(namespaces);self.members={}
         self.membership='0::/ci-workers/'+self.path.name+'\n'
@@ -2331,12 +2332,16 @@ class RepositoryWorkerFreezer(UnitFreezer):
             raise FreshnessHold('invalidation_unsafe')
 
     def _note(self,phase,**values):
-        super()._note(phase,**values)
-        cache._write_record(self.progress_path,{'version':1,'kind':'ci-worker-scope-progress',
-            'binding':self.setup_record['binding'],'command':self.setup_record['command'],
-            'phase':phase,'scope_id':self.setup_path.parent.name,
-            'members':[{'pid':pid,'birth':member['birth']} for pid,member in sorted(getattr(self,'members',{}).items())],
-            'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
+        with self.progress_lock:
+            super()._note(phase,**values)
+            self.progress_events.append({'phase':phase,'monotonic_ns':time.monotonic_ns(),
+                **{key:values[key] for key in ('ordinal','enrolled_pid','enrolled_birth','diagnostic') if key in values}})
+            self.progress_events=self.progress_events[-16:]
+            cache._write_record(self.progress_path,{'version':1,'kind':'ci-worker-scope-progress',
+                'binding':self.setup_record['binding'],'command':self.setup_record['command'],
+                'phase':phase,'scope_id':self.setup_path.parent.name,'events':self.progress_events,
+                'members':[{'pid':pid,'birth':member['birth']} for pid,member in sorted(getattr(self,'members',{}).items())],
+                'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
 
     def _lease(self,kind):
         lease=self.lock.active
@@ -2837,6 +2842,11 @@ class WorkerRelay(RootRelay):
                 if not locked:raise FreshnessHold('input_census_unknown')
                 self.cargo_owner=ordinal
             super()._run(connection,ordinal,descriptors,numbers,phase)
+        except BaseException as error:
+            if self.worker_freezer is not None:
+                self.worker_freezer._note('worker_request_failed',ordinal=ordinal,
+                    diagnostic=diagnostic({'stage':phase[0],'category':type(error).__name__,'errno':getattr(error,'errno',None)}))
+            raise
         finally:
             if locked and self.cargo_owner==ordinal:
                 self.cargo_owner=None;self.cargo_lock.release()
@@ -2847,13 +2857,16 @@ class WorkerRelay(RootRelay):
 
     def unit_launch(self,value):
         if value.get('execution_role')!='worker':return None
+        if self.worker_freezer is not None:self.worker_freezer._note('worker_launch_wait',ordinal=value['ordinal'])
         lease=self.projection_lock.launch(value['deadline'],self.check_worker_scope)
         if self.worker_freezer is None:
             lease.close();raise FreshnessHold('cleanup_uncertain')
+        self.worker_freezer._note('worker_launch',ordinal=value['ordinal'])
         return lease
 
     def unit_before_grant(self,value,pid,pidfd,supervisor,directory):
         if value.get('execution_role')!='worker':return
+        self.worker_freezer._note('worker_entry_check',ordinal=value['ordinal'])
         entry=cache._read_record(directory/'exec-entry.json')
         if (entry.get('binding')!=self.admission.binding or entry.get('command')!=self.admission.command
                 or entry.get('ordinal')!=value['ordinal']):raise FreshnessHold('generation_mismatch')
@@ -2867,6 +2880,10 @@ class WorkerRelay(RootRelay):
         member=self.worker_freezer.enroll(pid,pidfd,observed,supervisor=supervisor)
         self.worker_members[value['ordinal']]=member
         cache._write_record(directory/'worker-scope.json',member)
+
+    def unit_started(self,value,directory):
+        if value.get('execution_role')=='worker':
+            self.worker_freezer._note('worker_granted',ordinal=value['ordinal'])
 
     def unit_credit_drained(self,value,transport,started):
         super().unit_credit_drained(value,transport,started)
@@ -2913,6 +2930,7 @@ class WorkerRelay(RootRelay):
         invocation=validate_invocation(['/toolchain/bin/cargo',*[os.fsdecode(arg) for arg in argv[1:]]],
             {os.fsdecode(key):os.fsdecode(value) for key,value in environment.items()},os.fsdecode(cwd))
         if self.executor is None:
+            if self.worker_freezer is not None:self.worker_freezer._note('worker_pause_wait',ordinal=ordinal)
             with self.projection_lock.pause(self.value['deadline'],self.check_worker_scope):
                 if self.worker_freezer is None or self.original_worker_entry is None:
                     raise FreshnessHold('cleanup_uncertain')
@@ -5113,6 +5131,7 @@ def _execute_repository(arguments):
             cache._write_record(root/'original-worker-admission.json',worker.original_worker_entry)
             _control(controller,3,worker.original_worker_entry['entry']['pid'])
             original_launch.close();original_launch=None
+            worker.worker_freezer._note('original_worker_granted')
             output,error=capture_command(child,value['deadline']);original_cargo_cleanup(supervisor_receipt)
             worker.drain();planner.drain()
             if worker.errors or planner.errors:raise FreshnessHold('input_census_unknown')
