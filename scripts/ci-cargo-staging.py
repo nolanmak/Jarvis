@@ -161,6 +161,173 @@ def observe_uid_cohort(uid,expected,*,check):
         raise StagingUnavailable('uid_cohort_unobservable') from None
 
 
+def observe_task_inode_aliases(task,inodes,*,check):
+    """Observe one actual task's references to caller-held inode identities.
+
+    Includes readonly/directory capabilities and mappings after FD close. This
+    never proves a stopped population, global alias absence or writer closure.
+    The caller must bind task identity, visibility, allocation and quiescence.
+    No target FD or mapped byte is read, and no shared offset is changed.
+    """
+    if (type(task) is not dict or set(task)!={'pid','tid','birth'}
+            or any(type(task[key]) is not int or task[key]<(0 if key=='birth' else 1) for key in task)
+            or type(inodes) not in (set,frozenset) or len(inodes)>100000 or not callable(check)
+            or any(type(key) is not tuple or len(key)!=2 or any(type(n) is not int or n<0 for n in key)
+                or key[1]==0 for key in inodes)):
+        raise StagingUnavailable('inode_alias_identity')
+    root=Path('/proc')/str(task['pid'])/'task'/str(task['tid'])
+    def read(path):
+        check()
+        with path.open('rb') as stream:body=stream.read(MAX_BYTES+1)
+        if len(body)>MAX_BYTES:raise StagingUnavailable('inode_alias_bound')
+        return body
+    def identity():
+        fields=read(root/'stat').rsplit(b')',1)[1].split()
+        status=dict(line.split(b':',1) for line in read(root/'status').splitlines())
+        actual={'pid':int(status[b'Tgid']),'tid':int(status[b'Pid']),'birth':int(fields[19])}
+        ids={key:[int(n) for n in status[key.encode()].split()] for key in ('Uid','Gid')}
+        if actual!=task or any(len(values)!=4 for values in ids.values()):
+            raise StagingUnavailable('inode_alias_identity')
+        return ids
+    def scan():
+        aliases=[]
+        with os.scandir(root/'fd') as entries:names=sorted(int(entry.name) for entry in entries)
+        if len(names)>65536 or any(not 0<=n<=65535 for n in names):raise StagingUnavailable('inode_alias_bound')
+        for number in names:
+            check();path=root/'fd'/str(number)
+            try:info=path.stat()
+            except FileNotFoundError:continue
+            key=(info.st_dev,info.st_ino)
+            if key not in inodes:continue
+            if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+                raise StagingUnavailable('inode_alias_identity')
+            details=dict(line.split(b':',1) for line in read(root/'fdinfo'/str(number)).splitlines())
+            after=path.stat()
+            if (after.st_dev,after.st_ino,after.st_mode)!=(info.st_dev,info.st_ino,info.st_mode):
+                raise StagingUnavailable('inode_alias_changed')
+            aliases.append({'kind':'fd','number':number,'device':key[0],'inode':key[1],
+                'flags':int(details[b'flags'],8),'position':int(details[b'pos']),
+                'type':stat.S_IFMT(info.st_mode)})
+        for line in read(root/'maps').splitlines():
+            fields=line.split(None,5)
+            if len(fields)<5:raise StagingUnavailable('inode_alias_unobservable')
+            major,minor=fields[3].split(b':');key=(os.makedev(int(major,16),int(minor,16)),int(fields[4]))
+            if key not in inodes:continue
+            bounds=fields[0].split(b'-');access=fields[1]
+            if (len(bounds)!=2 or len(access)!=4 or access[0:1] not in (b'r',b'-')
+                    or access[1:2] not in (b'w',b'-') or access[2:3] not in (b'x',b'-')
+                    or access[3:4] not in (b's',b'p')):raise StagingUnavailable('inode_alias_unobservable')
+            start,end=(int(value,16) for value in bounds)
+            if not 0<=start<end:raise StagingUnavailable('inode_alias_identity')
+            aliases.append({'kind':'mapping','start':start,'end':end,'device':key[0],'inode':key[1],
+                'writable':access[1:2]==b'w','shared':access[3:4]==b's'})
+        for name in ('cwd','root','exe'):
+            check()
+            try:info=root.joinpath(name).stat()
+            except FileNotFoundError:continue
+            key=(info.st_dev,info.st_ino)
+            if key in inodes:aliases.append({'kind':name,'device':key[0],'inode':key[1]})
+        if len(aliases)>100000:raise StagingUnavailable('inode_alias_bound')
+        return aliases
+    try:
+        before=identity();aliases=scan()
+        if identity()!=before or scan()!=aliases or identity()!=before:
+            raise StagingUnavailable('inode_alias_changed')
+        check()
+        return {'version':1,'kind':'ci-task-inode-aliases','task':dict(task),
+            'uids':before['Uid'],'gids':before['Gid'],'aliases':aliases,
+            'alias_closure_complete':False,'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+    except (OSError,ValueError,KeyError,IndexError,OverflowError):
+        raise StagingUnavailable('inode_alias_unobservable') from None
+
+
+def observe_private_inode_aliases(inodes,cohort,controller_fds,*,check):
+    """Root's bounded negative check over the guest's actual task population.
+
+    Original private allocation, initial FD closure, namespaces, policy, pause
+    and controller serialization remain caller-owned prerequisites. A procfs
+    observation does not establish complete kernel-resource/writer authority.
+    """
+    if (os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0) or not callable(check)
+            or type(inodes) not in (set,frozenset) or len(inodes)>100000
+            or any(type(key) is not tuple or len(key)!=2 or any(type(n) is not int or n<0 for n in key)
+                or key[1]==0 for key in inodes)
+            or type(cohort) is not dict or cohort.get('kind')!='ci-unit-uid-cohort'
+            or type(cohort.get('version')) is not int or cohort['version']!=1 or type(cohort.get('uid')) is not int
+            or type(cohort.get('tasks')) is not list or len(cohort['tasks'])>512
+            or any(type(row) is not dict or set(row)!={'pid','tid','birth'}
+                or any(type(row[key]) is not int or row[key]<(0 if key=='birth' else 1) for key in row)
+                for row in cohort['tasks'])
+            or any(cohort.get(key) is not False for key in ('input_closure_complete','full_ci','shipping_authority'))
+            or type(controller_fds) is not list or len(controller_fds)>100000
+            or any(type(fd) is not int or not 0<=fd<=65535 for fd in controller_fds)
+            or len(set(controller_fds))!=len(controller_fds)):
+        raise StagingUnavailable('inode_alias_identity')
+    namespace=os.readlink('/proc/self/ns/pid')
+    if os.readlink('/proc/1/ns/pid')!=namespace or cohort.get('pid_namespace')!=namespace:
+        raise StagingUnavailable('inode_alias_visibility')
+    expected={(row['pid'],row['tid'],row['birth']) for row in cohort['tasks']}
+    if len(expected)!=len(cohort['tasks']):raise StagingUnavailable('inode_alias_identity')
+    controlled={}
+    for fd in controller_fds:
+        check();info=os.fstat(fd);key=(info.st_dev,info.st_ino)
+        if key not in inodes:raise StagingUnavailable('inode_alias_identity')
+        controlled[fd]=key
+    # This also reobserves the original UID allocation, not merely a supplied
+    # list of task IDs. It never turns the census into a freeze capability.
+    if observe_uid_cohort(cohort['uid'],cohort['tasks'],check=check)!=cohort:
+        raise StagingUnavailable('inode_alias_identity')
+    observations=[];seen=set();visited=0;encoded_bytes=0
+    try:
+        with os.scandir('/proc') as processes:
+            for process in processes:
+                if not process.name.isdecimal():continue
+                check();visited+=1
+                if visited>100000:raise StagingUnavailable('inode_alias_bound')
+                try:
+                    with os.scandir(Path(process.path)/'task') as tasks:
+                        for task in tasks:
+                            if not task.name.isdecimal():continue
+                            check();visited+=1
+                            if visited>100000:raise StagingUnavailable('inode_alias_bound')
+                            try:
+                                with (Path(task.path)/'stat').open('rb') as stream:body=stream.read(65537)
+                                if len(body)>65536:raise StagingUnavailable('inode_alias_bound')
+                                birth=int(body.rsplit(b')',1)[1].split()[19])
+                                identity={'pid':int(process.name),'tid':int(task.name),'birth':birth}
+                                observation=observe_task_inode_aliases(identity,inodes,check=check)
+                            except FileNotFoundError:continue
+                            token=(identity['pid'],identity['tid'],identity['birth'])
+                            parent=token in expected
+                            if parent:
+                                seen.add(token)
+                                if observation['uids']!=[cohort['uid']]*4:
+                                    raise StagingUnavailable('inode_alias_identity')
+                            for alias in observation['aliases']:
+                                if parent:continue
+                                if (identity['pid']==os.getpid() and alias['kind']=='fd'
+                                        and controlled.get(alias['number'])==(alias['device'],alias['inode'])):continue
+                                raise StagingUnavailable('inode_alias_outside')
+                            if observation['aliases']:
+                                encoded_bytes+=len(json.dumps(observation,separators=(',',':')).encode())
+                                if encoded_bytes>16*1024**2:raise StagingUnavailable('inode_alias_bound')
+                                observations.append(observation)
+                except FileNotFoundError:continue
+        if seen!=expected or observe_uid_cohort(cohort['uid'],cohort['tasks'],check=check)!=cohort:
+            raise StagingUnavailable('inode_alias_identity')
+        for fd,key in controlled.items():
+            check();info=os.fstat(fd)
+            if (info.st_dev,info.st_ino)!=key:raise StagingUnavailable('inode_alias_identity')
+        if namespace!=os.readlink('/proc/self/ns/pid'):raise StagingUnavailable('inode_alias_visibility')
+        return {'version':1,'kind':'ci-private-inode-alias-census','pid_namespace':namespace,
+            'cohort_sha256':hashlib.sha256(json.dumps(cohort,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
+            'inodes_checked':len(inodes),'controller_descriptions':len(controlled),
+            'observations':observations,'alias_closure_complete':False,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+    except (OSError,ValueError,KeyError,TypeError,IndexError):
+        raise StagingUnavailable('inode_alias_unobservable') from None
+
+
 def observe_sealed_descriptor(pid,number):
     """Hash an actual sealed regular descriptor without touching its OFD.
 

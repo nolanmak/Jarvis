@@ -372,6 +372,17 @@ PY"#;
 }
 
 #[cfg(target_os="linux")]
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[test]
+fn private_inode_alias_observations_cover_real_fds_mappings_and_threads() {
+    let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests/ci_cargo_inode_alias_test.py");
+    let output=std::process::Command::new("python3").arg("-I").arg(tests).output().unwrap();
+    let diagnostics=String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(),"task inode alias observations failed: {diagnostics}");
+    assert!(diagnostics.contains("Ran 9 tests") && !diagnostics.contains("skipped"),
+        "task inode alias observations did not execute: {diagnostics}");
+}
+
 #[test]
 fn supervised_descriptor_handoff_requires_original_descendant_cleanup() {
     let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests/provider_supervisor_test.py");

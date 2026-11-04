@@ -2701,7 +2701,9 @@ class UnitPeerRelay(RootRelay):
             unit_views.validate_capture_stdio(capture,outputs,parent_uid=self.peer_uid);check()
             projection_stdio=unit_views.reject_projection_stdio(outputs,GeneratedForests.WORKSPACE,
                 mounts['declared_outputs'],owner=GeneratedForests._WORKER_UID,check=check)
-            state.update(state='captured',filesystem=capture,worker_output_stdio=projection_stdio)
+            aliases=self.observe_private_aliases(capture,[],check=check)
+            state.update(state='captured',filesystem=capture,worker_output_stdio=projection_stdio,
+                private_inode_aliases=aliases)
             encoded=json.dumps(state,sort_keys=True,separators=(',',':')).encode()
             if len(encoded)>16*1024**2:raise FreshnessHold('input_census_unknown')
             cache._write_record(path,state);check()
@@ -2710,6 +2712,11 @@ class UnitPeerRelay(RootRelay):
                 'alias_closure_complete':False,'original_metadata_emulated':False,
                 'input_closure_complete':False,'shipping_authority':False}
         finally:os.close(descriptor)
+
+    def observe_private_aliases(self,capture,controller_fds,*,check):
+        if self.freezer.paused_cohort is None:raise FreshnessHold('cleanup_uncertain')
+        keys={tuple(row[2][:2]) for row in capture['entries'] if row[2][3]==self.peer_uid}
+        return staging.observe_private_inode_aliases(keys,self.freezer.paused_cohort,controller_fds,check=check)
 
     def check(self):
         self.__exit__(None,None,None)
@@ -2753,6 +2760,12 @@ class _ContainedViews:
             self.retained[ordinal]=unit_views.RetainedInodes(descriptor,self.capture['filesystem'],working,copied,
                 parent_uid=relay.peer_uid,unit_uid=2000+ordinal,check=self.check)
         finally:os.close(descriptor)
+        held=self.retained[ordinal]
+        aliases=relay.observe_private_aliases(self.capture['filesystem'],
+            [entry['original_fd'] for entry in held.entries if entry['original_key'][3]==relay.peer_uid],check=self.check)
+        cache._write_record(slot/'entry-aliases.json',{'version':1,'binding':relay.admission.binding,
+            'command':relay.admission.command,'parent_scope':relay.scope.name,'request_ordinal':ordinal,
+            'observation':aliases,'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
         mounts=cache._read_record(Path(relay.view['mounts']),max_bytes=16*1024**2)
         if (mounts.get('binding')!=relay.admission.binding or mounts.get('command')!=relay.admission.command
                 or mounts.get('ordinal')!=relay.parent_ordinal):raise FreshnessHold('generation_mismatch')
