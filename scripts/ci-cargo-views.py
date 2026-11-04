@@ -1052,8 +1052,10 @@ def apply_namespace_sequence(directory,*,plan_sha256,steps,inodes,parents,check)
             changed=updates.get(tuple(node['key'][:2]))
             if changed is not None:
                 node['key']=changed['key'];node['links']=changed['links']
-                if stat.S_ISDIR(node['key'][5]):
-                    physical=str(node['key'][0])+':'+str(node['key'][1]);node['children']=copy_module.deepcopy(expected['parents'][physical]['entries'])
+            # A changed child's metadata also changes its row in every held
+            # ancestor view, even when that ancestor's own inode is unchanged.
+            if stat.S_ISDIR(node['key'][5]):
+                physical=str(node['key'][0])+':'+str(node['key'][1]);node['children']=copy_module.deepcopy(expected['parents'][physical]['entries'])
         return expected
     if path.exists():
         record=cache._read_record(path,max_bytes=16*1024**2)
@@ -1292,6 +1294,332 @@ class PreparedTransferObjects:
                 except OSError:failed=True
             collection.clear()
         if failed:raise FreshnessHold('cleanup_uncertain')
+
+    def __enter__(self):self._owned();return self
+    def __exit__(self,*args):self.close()
+
+
+class RetainedTransfer:
+    """Apply a complete private filesystem plan in its original controller.
+
+    The caller must hold the original mutation lock and prove W, exclusive
+    writers, child cleanup and parent pause before every check. This class
+    does not supply those proofs, resume a process, or authorize reuse. A lost
+    controller cannot adopt these capabilities from the journal.
+    """
+    def __init__(self,retained,directory,plan,*,check):
+        retained._owned();self.held=retained;self.directory=literal(directory)
+        self.plan=copy_module.deepcopy(plan);self.check=check;self.owner=os.getpid();self.closed=False
+        self.digest=hashlib.sha256(self._encode(plan)).hexdigest();self.record=None;self.committed=None
+        self.dirty=False;self.objects=None;self.extra_fds=[];self.stage=None;self.steps=None
+        self.nodes={};self.parents={};self.prefix_fds={};self.stage_anchor=None;self.object_snapshot=None
+        self.by_key={self._node(obj['working_inode']):obj for obj in plan['objects']}
+        self.by_initial={obj['initial_path']:obj for obj in plan['objects'] if obj['initial_path'] is not None}
+        self.path=self.directory/'transfer-progress.json'
+        self.binding={'plan_sha256':self.digest,'owner_pid':self.owner,
+            'owner_birth':Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()[19],
+            'holder_nonce':os.urandom(32).hex()}
+        try:
+            if (cache._read_record(self.directory/'plan.json',max_bytes=16*1024**2)!=plan
+                    or plan.get('before')!=retained.capture or plan.get('namespace_edges')!=namespace_edges(plan)
+                    or self.path.exists()):raise FreshnessHold('invalidation_unsafe')
+            initial={entry['path']:entry for entry in retained.entries}
+            for obj in plan['objects']:
+                key=self._node(obj['working_inode'])
+                if obj['initial_path'] is not None:
+                    entry=initial.get(obj['initial_path'])
+                    if (entry is None or entry['kind']!=obj['kind']
+                            or entry['working_key'][:2]!=obj['working_inode']
+                            or entry['original_key']!=obj['original_key']):raise FreshnessHold('input_census_unknown')
+                    self.nodes[key]=entry['original_fd']
+                    if obj['kind']=='directory':self.parents[key]=entry['original_fd']
+            if len(self.nodes)!=len(initial):raise FreshnessHold('input_census_unknown')
+            for root in retained.roots:
+                prefix=root.parent
+                if prefix in self.prefix_fds:continue
+                fd=os.dup(retained.root_fd) if prefix==Path('.') else _open_beneath(retained.root_fd,prefix,os.O_RDONLY|os.O_DIRECTORY)
+                self.extra_fds.append(fd);self.prefix_fds[prefix]=fd
+                self.parents['prefix:'+os.fsencode(prefix).hex()]=fd
+            # A temporary namespace lives only inside an unchanged mutable W
+            # directory. No outside allocation or unregistered target is used.
+            stable=[]
+            by_initial={relative(bytes.fromhex(obj['initial_path'])):obj for obj in plan['objects'] if obj['initial_path'] is not None}
+            for path,obj in by_initial.items():
+                if (obj['kind']!='directory' or obj['initial_path']!=obj['final_path']
+                        or obj['original_key'][3:5]!=[retained.parent_uid,retained.parent_uid]):continue
+                if any(parent in by_initial and by_initial[parent]['initial_path']!=by_initial[parent]['final_path'] for parent in path.parents):continue
+                stable.append((len(path.parts),os.fsencode(path),self._node(obj['working_inode'])))
+            if stable:self.stage_anchor=sorted(stable)[0][2]
+            moved={self._node(row['working_inode']) for row in plan['namespace_edges']['detach'] if row['final_path'] is not None}
+            if (moved or any(obj['initial_path'] is None and obj['kind']=='directory' for obj in plan['objects'])) and self.stage_anchor is None:
+                raise FreshnessHold('invalidation_unsafe')
+            self.needs_stage=bool(moved or any(obj['initial_path'] is None and obj['kind']=='directory' for obj in plan['objects']))
+            if len(plan['objects'])+int(self.needs_stage)>MAX_ENTRIES:raise FreshnessHold('input_census_unknown')
+            total=sum(obj['old_effect']['size'] if obj['initial_path'] is not None else obj['final_key'][2]
+                for obj in plan['objects'] if obj['kind']=='file')
+            if total>MAX_BYTES:raise FreshnessHold('input_census_unknown')
+            # All allocation and changed edges must fit the pinned original
+            # mount topology before old bytes can be changed. Cloning does not
+            # turn a cross-mount rename into a legal original operation.
+            self.allocations={}
+            def original_parent(endpoint):
+                if 'prefix' in endpoint:return self.prefix_fds[Path(os.fsdecode(bytes.fromhex(endpoint['prefix'])))]
+                key=self._node(endpoint['working_inode'])
+                if key in self.parents:return self.parents[key]
+                return original_parent(final_edges[key]['new_parent'])
+            final_edges={self._node(row['working_inode']):row for row in plan['namespace_edges']['attach']}
+            for obj in plan['objects']:
+                if obj['initial_path'] is None:
+                    endpoint=original_parent(final_edges[self._node(obj['working_inode'])]['new_parent'])
+                    mount=_descriptor_mount_id(endpoint)
+                    candidates=[key for _,_,key in sorted(stable) if _descriptor_mount_id(self.parents[key])==mount]
+                    if not candidates:raise FreshnessHold('invalidation_unsafe')
+                    self.allocations[self._node(obj['working_inode'])]=self.parents[candidates[0]]
+                    if obj['kind']=='directory' and _descriptor_mount_id(self.parents[self.stage_anchor])!=mount:
+                        raise FreshnessHold('invalidation_unsafe')
+            for row in plan['namespace_edges']['detach']:
+                fd=self.nodes[self._node(row['working_inode'])];mount=_descriptor_mount_id(fd)
+                if _descriptor_mount_id(original_parent(row['old_parent']))!=mount:raise FreshnessHold('invalidation_unsafe')
+                if row['final_path'] is not None and (_descriptor_mount_id(original_parent(row['new_parent']))!=mount
+                        or _descriptor_mount_id(self.parents[self.stage_anchor])!=mount):raise FreshnessHold('invalidation_unsafe')
+            self.stage_name=os.fsencode('.ci-transfer-'+self.binding['holder_nonce'])
+            final_paths={obj['final_path'] for obj in plan['objects'] if obj['final_path'] is not None}
+            if self.needs_stage:
+                anchor=next(obj for obj in plan['objects'] if self._node(obj['working_inode'])==self.stage_anchor)
+                if os.fsencode(relative(bytes.fromhex(anchor['final_path']))/os.fsdecode(self.stage_name)).hex() in final_paths:
+                    raise FreshnessHold('invalidation_unsafe')
+        except BaseException:
+            self.close();raise
+
+    @staticmethod
+    def _encode(value):return json.dumps(value,sort_keys=True,separators=(',',':')).encode()
+
+    @staticmethod
+    def _node(inode):return 'inode:'+str(inode[0])+':'+str(inode[1])
+
+    def _owned(self):
+        if self.owner!=os.getpid() or self.closed:raise FreshnessHold('invalidation_unsafe')
+        self.held._owned();self.check()
+        if cache._read_record(self.directory/'plan.json',max_bytes=16*1024**2)!=self.plan:
+            raise FreshnessHold('input_census_unknown')
+
+    def _images(self):
+        for root,sha in ((literal(self.plan['before_root']),self.plan['before']['payload_sha256']),
+                (self.directory/'after',self.plan['after']['payload_sha256'])):
+            self.check();rows=inventory(root,owner=os.geteuid(),sealed=True)
+            if hashlib.sha256(self._encode(rows)).hexdigest()!=sha:raise FreshnessHold('input_census_unknown')
+        for entry in self.held.entries:
+            obj=self.by_initial[entry['path']]
+            if list(_key(os.fstat(entry['working_fd'])))!=obj['old_effect']['working_key']:
+                raise FreshnessHold('input_census_unknown')
+        self.held._allocation(self.check)
+        after={row[0]:row for row in self.plan['after']['entries']}
+        children={raw:set() for raw,row in after.items() if row[1]=='directory'}
+        for raw in after:
+            parent=os.fsencode(relative(bytes.fromhex(raw)).parent).hex()
+            if parent in children:children[parent].add(os.fsencode(relative(bytes.fromhex(raw)).name))
+        for raw,row in after.items():
+            fd=_open_beneath(self.held.working_fd,relative(bytes.fromhex(raw)),os.O_RDONLY|(os.O_DIRECTORY if row[1]=='directory' else 0))
+            try:
+                if list(_key(os.fstat(fd)))!=row[2]:raise FreshnessHold('input_census_unknown')
+                if row[1]=='directory':
+                    if set(map(os.fsencode,os.listdir(fd)))!=children[raw]:raise FreshnessHold('input_census_unknown')
+                elif self.held._read(fd,self.check)!=(row[2][2],row[3]):raise FreshnessHold('input_census_unknown')
+            finally:os.close(fd)
+        for raw in self.plan['after'].get('missing_roots',[]):
+            try:fd=_open_beneath(self.held.working_fd,relative(bytes.fromhex(raw)),os.O_RDONLY)
+            except FileNotFoundError:continue
+            else:os.close(fd);raise FreshnessHold('input_census_unknown')
+
+    def _snapshot(self):
+        self.check();nodes={};parents={};total=0
+        for key,fd in self.nodes.items():
+            self.check();info=os.fstat(fd);row={'key':list(_key(info)),'links':info.st_nlink}
+            if stat.S_ISREG(info.st_mode):
+                row['size'],row['sha256']=self.held._read(fd,self.check);total+=row['size']
+                if total>MAX_BYTES:raise FreshnessHold('input_census_unknown')
+            if os.listxattr(fd) or info.st_mode&0o7000:raise FreshnessHold('invalidation_unsafe')
+            nodes[key]=row
+        for key,fd in self.parents.items():
+            info=os.fstat(fd)
+            parents[key]=({'key':list(_key(info)),'links':0,'entries':[]} if info.st_nlink==0 else _namespace_directory(fd,self.check))
+        result={'nodes':nodes,'parents':parents}
+        if len(self._encode(result))>16*1024**2:raise FreshnessHold('input_census_unknown')
+        return result
+
+    def _persist(self):
+        self.check()
+        if len(self._encode(self.record))>16*1024**2:raise FreshnessHold('input_census_unknown')
+        cache._write_record(self.path,self.record)
+        self.committed=copy_module.deepcopy(self.record);self.dirty=False
+
+    def _advance(self,state,**values):
+        self.record.update(state=state,snapshot=self._snapshot(),**values);self.dirty=True;self._persist()
+
+    def _verify_snapshot(self):
+        if self._snapshot()!=self.record['snapshot']:raise FreshnessHold('input_census_unknown')
+
+    def _prepare_objects(self):
+        if self.object_snapshot is not None and self._snapshot()!=self.object_snapshot:
+            raise FreshnessHold('input_census_unknown')
+        if self.objects is None:
+            path=self.directory/'object-receipts';path.mkdir(mode=0o700)
+            self.objects=PreparedTransferObjects(path,plan_sha256=self.digest,check=self.check)
+            self.object_snapshot=copy_module.deepcopy(self.record['snapshot'])
+        if self.needs_stage:
+            self.stage=self.objects.prepare_directory('stage',self.parents[self.stage_anchor],self.stage_name)
+            self.nodes['stage']=self.stage;self.parents['stage']=self.stage
+            self.object_snapshot=self._snapshot()
+        for obj in self.plan['objects']:
+            if obj['initial_path'] is not None:continue
+            key=self._node(obj['working_inode'])
+            if obj['kind']=='directory':
+                fd=self.objects.prepare_directory(key,self.stage,key.encode())
+                self.parents[key]=fd
+            else:
+                metadata=obj['final_key'];expected={'size':metadata[2],'sha256':obj['sha256'],
+                    'uid':self.held.parent_uid,'gid':self.held.parent_uid,'mode':stat.S_IMODE(metadata[5]),'mtime_ns':metadata[6]}
+                fd=self.objects.prepare_file(key,self.allocations[key],self.directory/'after'/relative(bytes.fromhex(obj['final_path'])),expected)
+            self.nodes[key]=fd;self.object_snapshot=self._snapshot()
+        edges=self.plan['namespace_edges'];steps=[]
+        def parent(endpoint):
+            return self._node(endpoint['working_inode']) if 'working_inode' in endpoint else 'prefix:'+endpoint['prefix']
+        for row in edges['detach']:
+            key=self._node(row['working_inode'])
+            step={'action':'remove' if row['final_path'] is None else 'move','inode':key,
+                'source_parent':parent(row['old_parent']),'source_name':row['old_name']}
+            if step['action']=='move':step.update(destination_parent='stage',destination_name=key.encode().hex())
+            steps.append(step)
+        for row in edges['attach']:
+            key=self._node(row['working_inode']);obj=self.by_key[key]
+            step={'action':'attach' if obj['initial_path'] is None and obj['kind']=='file' else 'move',
+                'inode':key,'destination_parent':parent(row['new_parent']),'destination_name':row['new_name']}
+            if step['action']=='move':step.update(source_parent='stage',source_name=key.encode().hex())
+            steps.append(step)
+        if self.needs_stage:
+            steps.append({'action':'remove','inode':'stage','source_parent':self.stage_anchor,'source_name':self.stage_name.hex()})
+        if len(steps)>2*MAX_ENTRIES:raise FreshnessHold('input_census_unknown')
+        self.steps=steps
+
+    def _directory_metadata(self):
+        directories=[obj for obj in self.plan['objects'] if obj['kind']=='directory']
+        for index,obj in enumerate(directories):
+            if index<self.record['next_directory']:continue
+            key=self._node(obj['working_inode']);fd=self.nodes[key]
+            metadata=obj['old_effect']['working_key'] if obj['initial_path'] is not None else obj['final_key']
+            owner=self.held.parent_uid if metadata[3]==self.held.unit_uid else metadata[3]
+            group=self.held.parent_uid if metadata[4]==self.held.unit_uid else metadata[4]
+            info=os.fstat(fd);wanted=(owner,group,stat.S_IMODE(metadata[5]),metadata[6])
+            actual=(info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode),info.st_mtime_ns)
+            current=self._snapshot();recovered=False
+            if current!=self.record['snapshot']:
+                if self.record.get('active_directory')!=index or actual!=wanted:
+                    raise FreshnessHold('input_census_unknown')
+                before=self.record['snapshot']['nodes'][key]['key'];after=list(_key(info))
+                if any(a!=b for i,(a,b) in enumerate(zip(before,after)) if i not in (3,4,5,6,7)):
+                    raise FreshnessHold('input_census_unknown')
+                projected=copy_module.deepcopy(self.record['snapshot'])
+                projected['nodes'][key]['key']=after
+                for parent in projected['parents'].values():
+                    if parent['key'][:2]==after[:2]:parent['key']=after
+                    for row in parent['entries']:
+                        if row[1][:2]==after[:2]:row[1]=after
+                if projected!=current:raise FreshnessHold('input_census_unknown')
+                recovered=True
+            if not recovered:
+                self.record['active_directory']=index;self.dirty=True;self._persist()
+                # Avoid changing ctime for unchanged original directories.
+                if actual!=wanted:
+                    self.check()
+                    if (info.st_uid,info.st_gid)!=(owner,group):os.fchown(fd,owner,group)
+                    if stat.S_IMODE(os.fstat(fd).st_mode)!=wanted[2]:os.fchmod(fd,wanted[2])
+                    if os.fstat(fd).st_mtime_ns!=wanted[3]:os.utime(fd,ns=(info.st_atime_ns,wanted[3]))
+            self.check();os.fsync(fd)
+            self._advance('directories',next_directory=index+1,active_directory=None)
+
+    def _final(self):
+        expected={obj['final_path']:obj for obj in self.plan['objects'] if obj['final_path'] is not None}
+        after={row[0]:row for row in self.plan['after']['entries']}
+        if set(expected)!=set(after):raise FreshnessHold('input_census_unknown')
+        for obj in self.plan['objects']:
+            self.check();fd=self.nodes[self._node(obj['working_inode'])];info=os.fstat(fd)
+            metadata=obj['old_effect']['working_key'] if obj['initial_path'] is not None else obj['final_key']
+            wanted=(self.held.parent_uid if metadata[3]==self.held.unit_uid else metadata[3],
+                self.held.parent_uid if metadata[4]==self.held.unit_uid else metadata[4],stat.S_IMODE(metadata[5]),metadata[6])
+            if (info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode),info.st_mtime_ns)!=wanted:
+                raise FreshnessHold('input_census_unknown')
+            raw=obj['final_path']
+            if raw is None:
+                if info.st_nlink!=0:raise FreshnessHold('invalidation_unsafe')
+            else:
+                named=_open_beneath(self.held.root_fd,relative(bytes.fromhex(raw)),os.O_RDONLY|(os.O_DIRECTORY if obj['kind']=='directory' else 0))
+                try:
+                    if _key(os.fstat(named))!=_key(info):raise FreshnessHold('input_census_unknown')
+                finally:os.close(named)
+                if obj['kind']=='directory':
+                    path=relative(bytes.fromhex(raw))
+                    names={os.fsencode(relative(bytes.fromhex(name)).name).hex():self.nodes[self._node(child['working_inode'])] for name,child in expected.items() if relative(bytes.fromhex(name)).parent==path}
+                    rows=_namespace_directory(fd,self.check)['entries']
+                    if {row[0] for row in rows}!=set(names):raise FreshnessHold('input_census_unknown')
+                    for name,key,links in rows:
+                        if key!=list(_key(os.fstat(names[name]))):raise FreshnessHold('input_census_unknown')
+                elif info.st_nlink!=1:raise FreshnessHold('invalidation_unsafe')
+            if obj['kind']=='file':
+                effect=obj.get('old_effect',{})
+                if self.held._read(fd,self.check)!=(effect.get('size',metadata[2]),effect.get('sha256',obj.get('sha256'))):
+                    raise FreshnessHold('input_census_unknown')
+        for raw in self.plan['after'].get('missing_roots',[]):
+            try:fd=_open_beneath(self.held.root_fd,relative(bytes.fromhex(raw)),os.O_RDONLY)
+            except FileNotFoundError:continue
+            else:os.close(fd);raise FreshnessHold('input_census_unknown')
+        if self.stage is not None and (os.fstat(self.stage).st_nlink!=0 or os.listdir(self.stage)):
+            raise FreshnessHold('invalidation_unsafe')
+
+    def apply(self):
+        self._owned();self._images()
+        if self.path.exists():
+            actual=cache._read_record(self.path,max_bytes=16*1024**2)
+            if actual!=self.committed and not (self.dirty and actual==self.record):raise FreshnessHold('invalidation_unsafe')
+        elif self.committed is not None:raise FreshnessHold('invalidation_unsafe')
+        if self.dirty:self._verify_snapshot();self._persist()
+        if self.record is None:
+            self.record={'version':1,'kind':'ci-retained-transfer','binding':self.binding,'state':'inodes',
+                'effects_materialized':False,'input_closure_complete':False,'full_ci':False,'shipping_authority':False,
+                'snapshot':self._snapshot()}
+            self.dirty=True;self._persist()
+        if self.record['state']=='inodes':
+            self.held.apply_inode_effects(self.directory,self.plan,check=self.check)
+            self._advance('objects')
+        if self.record['state']=='objects':
+            # No namespace operation has started yet. Allocation capabilities
+            # remain pinned in this holder; a lost holder is never reconstructed.
+            if self.objects is None:self._verify_snapshot()
+            self._prepare_objects();self._advance('namespace')
+        if self.record['state']=='namespace':
+            path=self.directory/'namespace-receipts'
+            if not path.exists():self._verify_snapshot();path.mkdir(mode=0o700)
+            elif not (path/'sequence.json').exists():self._verify_snapshot()
+            apply_namespace_sequence(path,plan_sha256=self.digest,steps=self.steps,
+                inodes=self.nodes,parents=self.parents,check=self.check)
+            self._advance('directories',next_directory=0)
+        if self.record['state']=='directories':
+            self._directory_metadata();self._final();self._advance('transfer_applied')
+        if self.record['state']!='transfer_applied':raise FreshnessHold('invalidation_unsafe')
+        self._verify_snapshot();self._final();return copy_module.deepcopy(self.record)
+
+    def close(self):
+        if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
+        if self.closed:return
+        self.closed=True
+        try:
+            if self.objects is not None:self.objects.close()
+        finally:
+            failed=False
+            for fd in self.extra_fds:
+                try:os.close(fd)
+                except OSError:failed=True
+            self.extra_fds.clear()
+            if failed:raise FreshnessHold('cleanup_uncertain')
 
     def __enter__(self):self._owned();return self
     def __exit__(self,*args):self.close()

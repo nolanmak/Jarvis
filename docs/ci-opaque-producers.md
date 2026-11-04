@@ -483,6 +483,39 @@ creation/recovery primitives; whole-transfer integration, allocation/image
 proof, final materialization and parent resume remain unproved. All
 materialization/input/CI/shipping flags stay false.
 
+
+`RetainedTransfer` now composes the filesystem primitives in one original
+controller lifetime: validate sealed/current child images and allocation,
+apply old inode effects, allocate held new objects, run the namespace sequence,
+remove its private stage, apply final directory metadata, and validate the whole
+final graph and all retained old objects. The phase journal skips completed
+components after later legitimate namespace/metadata changes. Lost phase commits
+are checked against the same holder's exact current graph before persistence;
+a new holder cannot adopt an anonymous capability or partial transfer. Directory
+metadata recovery projects only the active inode's exact intended transition
+across all parent aliases and rejects unrelated changes.
+
+The combined tests exposed stale child metadata in the namespace sequencer's
+ancestor views; projection now refreshes every held directory's child list,
+including ancestors whose own inode metadata did not change. Another injected
+failure reproduced refusal after a completed directory metadata update lost its
+sync acknowledgement; exact whole-graph recovery now recognizes it without
+rewriting the metadata. Seventeen host cases cover combined write/replace/unlink/
+move/create operations, swaps, ancestor-carried descendants, root tombstones,
+retained FD/mapping semantics, corruption before mutation, lost phase commits,
+foreign writes and lost-holder refusal. The expanded guest test retains all 46
+previous cases and adds these 17 cases; its execution remains pending here.
+
+This is still a filesystem-mechanics component. The root executor does not call
+it or resume its paused parent. Original alias/exclusive-writer/W/pause/cleanup
+proof, active-leaf signal routing and jobserver loan remain required before that
+integration. Staging uses an unchanged mutable directory inside W; unsupported
+staging/mount topologies hold before old inode writes. All final/old file bytes
+share the existing 4-GiB ceiling; all original/new/stage nodes share the existing
+100000-entry ceiling. No external temporary tree or new grant is introduced.
+Input closure, CI, materialization and shipping flags remain false. This draft
+and the final C proof still require the full independent handoff audit.
+
 A rename is an identity-preserving namespace move in this graph, including
 rename-over-existing and directory descendants. Persist its original/final path
 sets, source/destination identities and staged-move progress in the transfer
