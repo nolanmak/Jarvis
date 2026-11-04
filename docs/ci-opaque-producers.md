@@ -504,7 +504,11 @@ rewriting the metadata. Seventeen host cases cover combined write/replace/unlink
 move/create operations, swaps, ancestor-carried descendants, root tombstones,
 retained FD/mapping semantics, corruption before mutation, lost phase commits,
 foreign writes and lost-holder refusal. The expanded guest test retains all 46
-previous cases and adds these 17 cases; its execution remains pending here.
+previous cases and adds these 17 cases. At `7b0e6723`, all 63 cases passed
+in 92.35 seconds as UID1000 on the admitted cache filesystem. The original
+resource subtree was positively removed after cleanup. All 530 Python tests
+and 34 focused managed Rust tests pass; 23 opt-in guest tests remain ignored
+in routine Rust runs. Receipt: `/tmp/augmentagent-ci-whole-transfer-20261104064537/receipt.json`.
 
 This is still a filesystem-mechanics component. The root executor does not call
 it or resume its paused parent. Original alias/exclusive-writer/W/pause/cleanup
