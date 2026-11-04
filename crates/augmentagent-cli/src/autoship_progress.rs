@@ -13,6 +13,8 @@ pub struct Progress {
     pub pr:Option<u64>,
     pub requested_provider:Option<submission::Provider>,
     pub actual_provider:Option<String>,
+    #[serde(default)]
+    pub actual_provider_role:Option<String>,
     pub merge_state:String,
     pub deployment_state:String,
     pub evidence_digest:String,
@@ -59,8 +61,8 @@ impl WorkflowStore {
         if blocked {return Ok(None);}
         let progress:Progress=serde_json::from_str(&raw)?;
         let nonce=format!("{:x}",Sha256::digest(serde_json::to_vec(&(workflow,origin.bot,origin.owner,origin.channel,sequence))?))[..24].to_string();
-        let content=format!("Autoship {workflow} · update {sequence}: {}. Stage: {:?}. Reason: {}. Next: {} (eligible at: {:?}). PR: {:?}. Requested provider: {:?}; actual provider: {}. Merge: {}. Deployment: {}. Evidence digest: {}. [autoship:{nonce}]",
-            progress.kind,progress.stage,progress.reason,progress.next_action,progress.eligible_at_ms,progress.pr,progress.requested_provider,progress.actual_provider.as_deref().unwrap_or("unknown"),progress.merge_state,progress.deployment_state,progress.evidence_digest);
+        let content=format!("Autoship {workflow} · update {sequence}: {}. Stage: {:?}. Reason: {}. Next: {} (eligible at: {:?}). PR: {:?}. Requested provider: {:?}; actual provider: {} ({}). Merge: {}. Deployment: {}. Evidence digest: {}. [autoship:{nonce}]",
+            progress.kind,progress.stage,progress.reason,progress.next_action,progress.eligible_at_ms,progress.pr,progress.requested_provider,progress.actual_provider.as_deref().unwrap_or("unknown"),progress.actual_provider_role.as_deref().unwrap_or("unknown"),progress.merge_state,progress.deployment_state,progress.evidence_digest);
         ensure!(content.chars().count()<=1900,"progress message exceeds Discord bound");
         tx.execute("INSERT INTO workflow_progress_delivery(workflow,bot,owner,channel,sequence,nonce,content,state,dispatched_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'uncertain',?8)",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence,nonce,content,now])?;
         tx.commit()?;Ok(Some((nonce,content)))
@@ -110,7 +112,7 @@ fn code(value:&str,fallback:&str)->String {
 }
 
 pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Result<()> {
-    if !matches!(source,"registered"|"checkpoint"|"autonomous_merge_confirmed"|"command_queued"|"command_attempt_finished"|"owner_control_changed") {return Ok(());}
+    if !matches!(source,"registered"|"checkpoint"|"autonomous_merge_confirmed"|"command_queued"|"command_attempt_finished"|"owner_control_changed"|"native_model_admitted") {return Ok(());}
     let previous:Option<(i64,String,bool)>=tx.query_row("SELECT sequence,fingerprint,terminal FROM workflow_progress_state WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     if previous.as_ref().is_some_and(|p|p.2) {return Ok(());}
     super::delivery::apply_default(tx,workflow,now)?;
@@ -140,11 +142,22 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     if confirmed {stage=Some(Stage::Merged);kind="merged".into();reason="autonomous-merge-confirmed".into();action="inspect_deployment".into();eligible=None;}
     let evidence=checkpoint.as_ref().map(|c|(&c.binding,&c.evidence,&c.next.reason,&c.next.action));
     let evidence_digest=format!("{:x}",Sha256::digest(serde_json::to_vec(&evidence)?));
-    let fingerprint=format!("{:x}",Sha256::digest(serde_json::to_vec(&(&kind,stage,&reason,&action,&evidence_digest))?));
+    let actual:Option<String>=tx.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' ORDER BY seq DESC LIMIT 1",[workflow],|r|r.get(0)).optional()?;
+    let (actual_provider,actual_provider_role)=if let Some(raw)=actual {
+        let value:serde_json::Value=serde_json::from_str(&raw)?;
+        let provider=match &value["provider"] {
+            serde_json::Value::Null=>None,
+            serde_json::Value::String(name) if matches!(name.as_str(),"codex"|"claude")=>Some(name.clone()),
+            _=>bail!("invalid admitted native provider"),
+        };
+        let reviewer=value["reviewer"].as_bool().context("native provider role missing")?;
+        (provider,Some(if reviewer {"reviewer"}else{"workflow"}.into()))
+    }else{(None,None)};
+    let fingerprint=format!("{:x}",Sha256::digest(serde_json::to_vec(&(&kind,stage,&reason,&action,&evidence_digest,&actual_provider,&actual_provider_role))?));
     let changed=previous.as_ref().is_none_or(|p|p.1!=fingerprint);
     let sequence=previous.as_ref().map_or(1,|p|p.0+i64::from(changed));
     let progress=Progress {workflow:workflow.into(),sequence,kind,stage,reason,next_action:action,eligible_at_ms:eligible,
-        pr:snapshot.and_then(|s|s.1),requested_provider,actual_provider:None,
+        pr:snapshot.and_then(|s|s.1),requested_provider,actual_provider,actual_provider_role,
         merge_state:if confirmed {"observed-autonomous-merge"} else if external_merge {"observed-external-merge"} else {"not-confirmed"}.into(),deployment_state:"unknown".into(),evidence_digest,observed_at_ms:now};
     let payload=serde_json::to_string(&progress)?;
     if changed {tx.execute("INSERT INTO workflow_progress_event(workflow,sequence,payload,created_at) VALUES(?1,?2,?3,?4)",params![workflow,sequence,payload,now])?;}
