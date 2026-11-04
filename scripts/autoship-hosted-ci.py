@@ -197,9 +197,15 @@ def evaluate(request, github):
             pending |= path in expected
             continue
         run = max(runs, key=lambda r: r['id'])
-        # filter=latest includes the current attempt, not previous green reruns.
+        if run.get('status') not in ('in_progress', 'completed'):
+            # A just-queued rerun can still expose only prior green jobs.
+            pending = True
+            continue
+        # filter=latest includes the newest incarnation of each job.
         jobs = github.pages(f"{prefix}/actions/runs/{run['id']}/jobs?filter=latest", 'jobs')
-        if any(j.get('run_id') != run['id'] for j in jobs):
+        if any(j.get('run_id') != run['id'] or j.get('head_sha') != head
+               or not isinstance(j.get('run_attempt'), int)
+               or not 1 <= j['run_attempt'] <= run['run_attempt'] for j in jobs):
             raise ValueError('job/run identity mismatch')
         state, failed = job_verdict(names, jobs)
         failures.extend(failed)

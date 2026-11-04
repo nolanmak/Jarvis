@@ -55,8 +55,8 @@ class EvidenceTests(unittest.TestCase):
   self.contract['workflows'][self.path]['sha256']=hashlib.sha256(b'policy').hexdigest()
   self.request={'repository':'o/r','pr':7,'contract':self.contract,'policy_files':{}}
   self.pull={'head':{'sha':self.head},'base':{'sha':self.base,'ref':'main','repo':{'full_name':'o/r'}},'state':'open','changed_files':1}
-  self.runs=[{'id':10,'run_attempt':1,'head_sha':self.head,'head_branch':'branch','event':'pull_request','path':self.path,'repository':{'full_name':'o/r'},'pull_requests':[{'number':7}]}]
-  self.jobs=[{'id':i,'run_id':10,'name':name,'status':'completed','conclusion':'success'} for i,name in enumerate(['tests (ubuntu-latest)','privacy','node-release'],1)]
+  self.runs=[{'id':10,'run_attempt':1,'status':'in_progress','head_sha':self.head,'head_branch':'branch','event':'pull_request','path':self.path,'repository':{'full_name':'o/r'},'pull_requests':[{'number':7}]}]
+  self.jobs=[{'id':i,'run_id':10,'run_attempt':1,'head_sha':self.head,'name':name,'status':'completed','conclusion':'success'} for i,name in enumerate(['tests (ubuntu-latest)','privacy','node-release'],1)]
   self.required=[{'name':'privacy','state':'SUCCESS'},{'name':'node-release','state':'SUCCESS'}]
   self.after=None;self.policy=b'policy';self.files=[{'filename':'src/a.rs'}]
   self.calls=[]
@@ -134,6 +134,13 @@ class EvidenceTests(unittest.TestCase):
   self.contract['workflows']['.github/workflows/release.yml']['events']['push']={}
   self.jobs[0]['conclusion']='failure'
   self.assertEqual(self.evaluate()['state'],'failed')
+ def test_queued_rerun_cannot_reuse_previous_green_jobs(self):
+  self.runs[0].update(run_attempt=2,status='queued')
+  self.assertEqual(self.evaluate()['state'],'pending')
+ def test_job_head_and_attempt_are_bound(self):
+  for key,value in [('head_sha','c'*40),('run_attempt',2)]:
+   self.setUp();self.jobs[0][key]=value
+   with self.assertRaisesRegex(ValueError,'identity'):self.evaluate()
  def test_mismatched_job_run_holds(self):
   self.jobs[0]['run_id']=99
   with self.assertRaisesRegex(ValueError,'identity'):self.evaluate()

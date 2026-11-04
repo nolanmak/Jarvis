@@ -186,7 +186,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        assert!(String::from_utf8_lossy(&result.stderr).contains("Ran 26 tests"));
+        assert!(String::from_utf8_lossy(&result.stderr).contains("Ran 28 tests"));
     }
     #[tokio::test]
     async fn prepublication_requires_a_checkout_without_claiming_a_passing_gate() {
