@@ -709,8 +709,23 @@ original resource removal verified. The read-only model/pipe check now also
 runs at authenticated receive, before stdin staging, so missing/substituted
 models cannot drain a stream before refusal. A fifteenth host case verifies
 that ordering without changing pipe bytes or the credit journal. The revised
-101-case guest check and unchanged Cargo replay remain pending. These results
-close neither the real four-parent Cargo exhaustion gate nor full-chain return/resume.
+101-case guest check at `4d99b193` passed as UID1000 in 295.73 seconds,
+including managed admission/reconciliation, and verified original resource
+removal. All 559 Python and 34 focused managed Rust tests pass. The first
+101-case attempt at `3de923f4` failed before the suite because the count edit
+also accidentally changed the expected UID; both original UID1000 assertions
+were restored before this successful run. No role/resource criterion was waived.
+
+The unchanged Cargo replay at `4d99b193` remains red at its deliberate transfer
+hold in 104.26 seconds. Independent managed image inspection reverified original
+exec/cleanup, every ancestor hold, the unchanged sealed before/after graph and
+the managed credit journal's command, scope and pause bindings. Units 8–12 use
+one original credit and pipe; the successful leaf's loan returned, interrupted
+ancestor loans 9–11 remain fenced, and strict full-chain return/root closure
+remains red. Observation:
+`/tmp/autoship-1703-credit-lineage-integration-observation-2.json`.
+These results close neither the real four-parent Cargo exhaustion gate nor
+full-chain return/resume; no parent mutation or CI/merge authority is enabled.
 
 Routing and cancellation must not wait for an execution permit held by the
 request's paused ancestor. Containment is acyclic and recorded before dispatch.
