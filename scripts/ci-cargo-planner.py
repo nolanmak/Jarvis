@@ -2065,9 +2065,12 @@ class UnitFreezer:
             raise FreshnessHold('invalidation_unsafe')
         _source(admission.target,admission.binding,admission.command)
         self.owner=os.getpid();self.uid=uid;self.original=None;self.pidfd=None;self.entry=None;self.mount_layout=None
+        self.paused_cohort=None
+        self.pid_namespace=os.readlink('/proc/self/ns/pid')
+        if os.readlink('/proc/1/ns/pid')!=self.pid_namespace:raise FreshnessHold('invalidation_unsafe')
         self.setup_path=Path(scope)/'freeze-setup.json'
         self.setup_record={'version':1,'kind':'ci-unit-freezer-setup','binding':admission.binding,
-            'command':admission.command,'uid':uid,'shipping_authority':False}
+            'command':admission.command,'uid':uid,'pid_namespace':self.pid_namespace,'shipping_authority':False}
         with self._setup:
             mount=Path('/sys/fs/cgroup')
             # This controller runs in the isolated guest's initial cgroup.
@@ -2125,6 +2128,7 @@ class UnitFreezer:
         if status[0]!='t' or {p.name for p in process.joinpath('task').iterdir()}!={str(pid)}:
             raise FreshnessHold('invalidation_unsafe')
         if entry['pid']!=pid or entry['birth']!=int(status[19]):raise FreshnessHold('invalidation_unsafe')
+        if os.readlink(f'/proc/{pid}/ns/pid')!=self.pid_namespace:raise FreshnessHold('invalidation_unsafe')
         if self._read('cgroup.procs'):raise FreshnessHold('invalidation_unsafe')
         signal.pidfd_send_signal(pidfd,0)
         self._write('cgroup.procs',str(pid).encode()+b'\n')
@@ -2135,7 +2139,11 @@ class UnitFreezer:
         self.original=pid;self.pidfd=os.dup(pidfd);self.entry=copy.deepcopy(entry)
         self.mount_layout=copy.deepcopy(mount_layout)
         self.private_base=copy.deepcopy(private_base);self.mutable_roots=list(mutable_roots)
-        self._note('original_enrolled')
+        self.entry_uid_cohort=staging.observe_uid_cohort(self.uid,
+            [{'pid':pid,'tid':pid,'birth':entry['birth']}],
+            check=lambda:signal.pidfd_send_signal(self.pidfd,0))
+        if self.entry_uid_cohort['pid_namespace']!=self.pid_namespace:raise FreshnessHold('invalidation_unsafe')
+        self._note('original_enrolled',uid_cohort=self.entry_uid_cohort)
 
     def _wait(self,frozen,deadline):
         while True:
@@ -2188,16 +2196,33 @@ class UnitFreezer:
                 unit_uid=self.uid,check=check_private)
             if private_base!=self.private_base:raise FreshnessHold('invalidation_unsafe')
         finally:os.close(descriptor)
+        expected=[{'pid':row['pid'],'tid':task['tid'],'birth':int(task['birth'])}
+            for row in rows for task in row['tasks']]
+        self.paused_cohort=staging.observe_uid_cohort(self.uid,expected,check=check_private)
+        if self.paused_cohort['pid_namespace']!=self.pid_namespace:raise FreshnessHold('invalidation_unsafe')
+        self.check_frozen_cohort()
         return {'version':1,'kind':'ci-unit-freeze-observation','scope':self.path.name,
             'cgroup_device':self.identity.st_dev,'cgroup_inode':self.identity.st_ino,'original_pid':self.original,
             'entry_sha256':hashlib.sha256(json.dumps(self.entry,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
             'kernel_policy_sha256':self.entry['policy_activation']['policy']['sha256'],
             'mount_layout_sha256':self.mount_layout['sha256'],
             'private_base_sha256':self.private_base['base_sha256'],
+            'uid_cohort':self.paused_cohort,
             'frozen':True,'processes':rows,'input_closure_complete':False,'shipping_authority':False}
+
+    def check_frozen_cohort(self):
+        # Only this controller can change the private cgroup, and the unit
+        # policy prevents migration/credential namespace changes. Retain the
+        # original census barrier while the same kernel scope stays frozen.
+        if self.paused_cohort is None:raise FreshnessHold('cleanup_uncertain')
+        fields=dict(line.split() for line in self._read('cgroup.events').splitlines())
+        expected={row['pid'] for row in self.paused_cohort['tasks']}
+        if fields.get(b'frozen')!=b'1' or set(map(int,self._read('cgroup.procs').split()))!=expected:
+            raise FreshnessHold('cleanup_uncertain')
 
     def thaw(self,deadline):
         self._write('cgroup.freeze',b'0\n');self._wait(0,deadline)
+        self.paused_cohort=None
 
     def close(self):
         if self.closed:return
@@ -2272,20 +2297,20 @@ class UnitPeerRelay(RootRelay):
             'entry_sha256':layout['entry_sha256'],'mount_bindings':verified,'private_base':private_base,
             'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
         cache._write_record(self.scope/'mount-bindings.json',binding_record)
-        # Root compiler scope receipts otherwise live only in the VM's
-        # ephemeral controller tree. Retain the same original observations
-        # beside the private view, before its first instruction is granted.
-        cache._write_record(Path(self.view['root']).parent/'entry-boundary.json',{
-            'version':1,'kind':'ci-unit-entry-boundary','binding':self.admission.binding,
-            'command':self.admission.command,'ordinal':self.parent_ordinal,'scope':self.scope.name,
-            'entry':entered,'mount_layout':layout,'mount_bindings':binding_record,
-            'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
         namespaces={name:os.readlink(f'/proc/{pid}/ns/'+name) for name in ('mnt','ipc','net','user','pid')}
         if any(record['namespaces'][name]['unit']!=namespaces[name] for name in ('mnt','ipc','net')):
             raise FreshnessHold('invalidation_unsafe')
         self.scope_root=record['root_identity'];self.scope_namespaces=namespaces;self.scope_pidfd=os.pidfd_open(pid)
         self.freezer.attach(pid,self.scope_pidfd,entry=entry,mount_layout=layout['layout'],
             private_base=private_base,mutable_roots=mutable_roots)
+        # Original root compiler scopes otherwise disappear with the guest
+        # controller tree. Preserve the same entry and global UID census.
+        cache._write_record(Path(self.view['root']).parent/'entry-boundary.json',{
+            'version':1,'kind':'ci-unit-entry-boundary','binding':self.admission.binding,
+            'command':self.admission.command,'ordinal':self.parent_ordinal,'scope':self.scope.name,
+            'entry':entered,'mount_layout':layout,'mount_bindings':binding_record,
+            'uid_cohort':self.freezer.entry_uid_cohort,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
         self.staged_signals=StagedParentSignals(self.scope_pidfd,lock=self.ordinals.signal_lock)
         staged=cache._read_record(self.scope/'stdin.json')
         if (staged.get('binding')!=self.admission.binding or staged.get('command')!=self.admission.command
@@ -2451,8 +2476,7 @@ class UnitPeerRelay(RootRelay):
         def check():
             if (self._stop.is_set() or self.staged_signals.cancelled.is_set() or time.monotonic()>=self.deadline
                     or select.select([self.scope_pidfd],[],[],0)[0]):raise FreshnessHold('cleanup_uncertain')
-            fields=dict(line.split() for line in self.freezer._read('cgroup.events').splitlines())
-            if fields.get(b'frozen')!=b'1':raise FreshnessHold('cleanup_uncertain')
+            self.freezer.check_frozen_cohort()
         check()
         descriptor=os.open(f'/proc/{self.freezer.original}/root',os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
         try:
@@ -2530,8 +2554,7 @@ class _ContainedViews:
         relay=self.relay
         if relay.execution_cancelled() or time.monotonic()>=relay.deadline:
             raise FreshnessHold('cleanup_uncertain')
-        if dict(line.split() for line in relay.freezer._read('cgroup.events').splitlines()).get(b'frozen')!=b'1':
-            raise FreshnessHold('cleanup_uncertain')
+        relay.freezer.check_frozen_cohort()
 
     def close(self):
         for retained in self.retained.values():retained.close()

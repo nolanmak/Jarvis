@@ -2581,3 +2581,19 @@ verified. The full original test remains red with InputCensusUnknown after
 private-base prerequisite evidence, not complete writer/alias/resource closure,
 result application/resume or passing-CI authority. The host suites pass 617
 Python tests and 34 focused managed Rust tests.
+
+Original enrollment and frozen capture now census all visible procfs tasks for
+the unit's assigned UID, not only cgroup members or process leaders. Two bounded
+passes compare exact PID/TID/start-time identities, including each thread's
+credential fields; a matching task outside the expected cohort holds. Expected
+cohorts retain the existing 512-task bound, and global enumeration has a
+100000-entry ceiling. The guest controller must share the PID namespace of
+procfs PID 1, and the original unit must share that namespace before enrollment.
+Entry observations are retained before grant; pause observations bind the full
+cohort to the original freeze. Subsequent capture checks require the same
+private cgroup to remain frozen with the same process membership; thaw clears
+that original barrier. Seven actual-process tests cover escaped same-UID tasks,
+wrong births, foreign ownership, vanished tasks, cancellation and bounds. A
+standalone census never supplies freeze, cleanup, alias/input or CI authority.
+Remaining structural allocation/alias/kernel-resource gates and result
+application/resume still stay fenced.

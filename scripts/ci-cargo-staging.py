@@ -92,6 +92,74 @@ def require_exec_entry(entry,*,uid,gid,groups,descriptors):
         raise StagingUnavailable('exec_entry')
 
 
+def observe_uid_cohort(uid,expected,*,check):
+    """Census actual task identities, not a freeze or exclusive-writer grant.
+
+    The caller owns the original stopped cohort, non-reused UID allocation,
+    namespace visibility and mutation lock. Both procfs passes must find
+    exactly those task births, including threads with a different leader UID.
+    """
+    if (type(uid) is not int or not 0<=uid<2**32-1 or type(expected) is not list
+            or len(expected)>512 or not callable(check)):
+        raise StagingUnavailable('uid_cohort_identity')
+    tasks={}
+    for row in expected:
+        if (type(row) is not dict or set(row)!={'pid','tid','birth'}
+                or any(type(row[key]) is not int or row[key]<(0 if key=='birth' else 1) for key in row)
+                or row['tid'] in tasks):raise StagingUnavailable('uid_cohort_identity')
+        tasks[row['tid']]=dict(row)
+    def read(path):
+        with path.open('rb') as stream:body=stream.read(65537)
+        if len(body)>65536:raise StagingUnavailable('uid_cohort_unobservable')
+        return body
+    def identity(pid,tid):
+        root=Path('/proc')/str(pid)/'task'/str(tid)
+        def observe():
+            fields=read(root/'stat').rsplit(b')',1)[1].split()
+            status=dict(line.split(b':',1) for line in read(root/'status').splitlines())
+            ids=[int(n) for n in status[b'Uid'].split()]
+            if len(ids)!=4 or int(status[b'Pid'])!=tid or int(status[b'Tgid'])!=pid:
+                raise StagingUnavailable('uid_cohort_identity')
+            return {'pid':pid,'tid':tid,'birth':int(fields[19])},ids
+        before=observe()
+        if observe()!=before:raise StagingUnavailable('uid_cohort_identity')
+        return before
+    try:
+        namespace=os.readlink('/proc/self/ns/pid')
+        for row in tasks.values():
+            check();observed,ids=identity(row['pid'],row['tid'])
+            if observed!=row or ids!=[uid]*4:raise StagingUnavailable('uid_cohort_identity')
+        def scan():
+            seen={};count=0
+            with os.scandir('/proc') as processes:
+                for process in processes:
+                    if not process.name.isdecimal():continue
+                    check();count+=1
+                    if count>100000:raise StagingUnavailable('uid_cohort_bound')
+                    try:
+                        with os.scandir(Path(process.path)/'task') as members:
+                            for task in members:
+                                check();count+=1
+                                if count>100000:raise StagingUnavailable('uid_cohort_bound')
+                                try:row,ids=identity(int(process.name),int(task.name))
+                                except FileNotFoundError:continue
+                                if uid not in ids:continue
+                                if ids!=[uid]*4 or tasks.get(row['tid'])!=row:
+                                    raise StagingUnavailable('uid_cohort_outside')
+                                seen[row['tid']]=row
+                    except FileNotFoundError:continue
+            if seen!=tasks:raise StagingUnavailable('uid_cohort_identity')
+            return sorted(seen.values(),key=lambda row:(row['pid'],row['tid']))
+        observed=scan()
+        if scan()!=observed or namespace!=os.readlink('/proc/self/ns/pid'):
+            raise StagingUnavailable('uid_cohort_identity')
+        return {'version':1,'kind':'ci-unit-uid-cohort','uid':uid,'tasks':observed,
+            'pid_namespace':namespace,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+    except (OSError,ValueError,KeyError,IndexError):
+        raise StagingUnavailable('uid_cohort_unobservable') from None
+
+
 def observe_sealed_descriptor(pid,number):
     """Hash an actual sealed regular descriptor without touching its OFD.
 
