@@ -2418,3 +2418,18 @@ capabilities, no-new-privileges and seccomp state, including original PID birth.
 The pause record binds the entry digest and policy digest. This records the
 trusted installation path; it does not dump the installed kernel BPF program or
 establish complete private-W writer/alias isolation, input closure or CI authority.
+
+The native replay at `615887c5` verifies 16 policy-bound exec entries and 16
+pause records against the compiled policy digest
+`d1836f15fcaa81c98e86de7ac2987b87c30639b5f329704851b5f220b3e3b795`.
+Twelve pause digests independently join retained parent entry records; the four
+initial parent entry files are outside this retained executor traversal. All
+four nested root children progress with the original pipe/slots exhausted, and
+all four deepest children return zero with original cleanup verified. The full
+test remains red at held transfer/resume after 101.24 seconds. Observation:
+`/tmp/autoship-1703-four-parent-observation-5.json`. Host validation passes 582
+Python tests and 34 focused managed Rust tests (24 routine guest opt-ins ignored).
+The original ten-case unit-policy module and its native count assertion remain
+unchanged; the three additional loader identity tests live in a separate module.
+No parent-state transfer, input-closure/CI authority or production rollout is
+enabled by these observations.
