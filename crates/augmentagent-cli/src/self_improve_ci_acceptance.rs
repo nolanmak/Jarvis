@@ -531,6 +531,63 @@ PY"#;
     Ok(())
 }
 
+/// Actual namespace syscall/replay cases on the pinned guest cache filesystem.
+/// No original Cargo fixture, execution assertion or proof authority changes.
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_namespace_steps()->Result<()> {
+    let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private evidence required");
+    std::fs::create_dir(&evidence)?;std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"shared-ci-namespace-steps",None)?;
+    audit.require_run_resources()?;
+    let target=crate::build_storage::effective_target(&owner);
+    let storage=crate::build_storage::admit_ci(&owner,&target).await?;
+    let fixture=tempfile::Builder::new().prefix("namespace-step-fixture-").tempdir_in(&target)?;
+    let root=fixture.path();std::fs::create_dir(root.join("tests"))?;
+    for (name,bytes) in [
+        ("ci-cargo-views.py",include_bytes!("../../../scripts/ci-cargo-views.py").as_slice()),
+        ("ci-cache-generation.py",include_bytes!("../../../scripts/ci-cache-generation.py").as_slice()),
+        ("tests/ci_cargo_capture_test.py",include_bytes!("../../../scripts/tests/ci_cargo_capture_test.py").as_slice()),
+        ("tests/ci_cargo_namespace_apply_test.py",include_bytes!("../../../scripts/tests/ci_cargo_namespace_apply_test.py").as_slice())] {
+        std::fs::write(root.join(name),bytes)?;
+    }
+    git(root,&["-c","init.templateDir=","init","-q"]).await?;git(root,&["add","."]).await?;
+    git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","core.hooksPath=/dev/null",
+        "-c","commit.gpgsign=false","commit","-qm","namespace syscall fixture"]).await?;
+    let head=git(root,&["rev-parse","HEAD"]).await?.trim().to_owned();
+    git(root,&["update-ref","refs/remotes/origin/main",&head]).await?;
+    let binding=binding(root).await?;let session=vm::Session::prepare(&owner,&target)?;
+    let source=snapshot(root,&binding,&target).await?;
+    let command=r#"TMPDIR=/workspace/target python3 -I - <<'PY'
+import io,json,os,pathlib,sys,tempfile,unittest
+assert os.getuid()==1000
+assert pathlib.Path(tempfile.gettempdir())==pathlib.Path('/workspace/target')
+sys.path.insert(0,'/workspace/tests')
+suite=unittest.TestLoader().discover('/workspace/tests',pattern='ci_cargo_namespace_apply_test.py')
+assert suite.countTestCases()==14
+stream=io.StringIO();result=unittest.TextTestRunner(stream=stream,verbosity=2).run(suite)
+print(json.dumps({'uid':os.getuid(),'cache_device':os.stat('/workspace/target').st_dev,
+ 'tests_run':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),
+ 'successful':result.wasSuccessful(),'details':stream.getvalue(),
+ 'input_closure_complete':False,'full_ci':False,'shipping_authority':False}))
+sys.exit(0 if result.wasSuccessful() else 1)
+PY"#;
+    let result=session.run("repository",&source,root,&binding,None,&[],&[],&[],Some(command),
+        &storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
+    let cases:serde_json::Value=serde_json::from_str(&result.stdout).unwrap_or(serde_json::Value::Null);
+    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({
+        "version":1,"kind":"real_shared_ci_namespace_steps","head":head,"generation":source.generation(),
+        "status":result.status,"cases":cases,"actual_vm_commands":1,"input_closure_complete":false,
+        "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
+    ensure!(result.status=="passed" && cases["uid"]==1000 && cases["tests_run"]==14
+        && cases["failures"]==0 && cases["errors"]==0 && cases["successful"]==true,
+        "namespace step guest cases unavailable: {} {}",result.stdout,result.stderr);
+    Ok(())
+}
+
 /// Exercise the controller-built primitive as an unprivileged guest process.
 /// This does not run Cargo under a new identity or establish metadata isolation.
 #[cfg(all(target_os="linux",target_arch="x86_64"))]

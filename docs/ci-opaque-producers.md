@@ -402,6 +402,26 @@ This is planning only: detach/attach execution, filesystem-local staging,
 interrupted-move replay and checked resume remain unfinished. Guest namespace
 execution and application remain unproved.
 
+Individual namespace steps now execute and replay no-overwrite moves, unlink/
+rmdir and attachment of a prepared anonymous file. A root-private journal binds
+one step to the plan digest, controller PID/birth, original held inode and both
+parent inodes/names. It captures complete bounded parent listings and the held
+inode's bytes/metadata before dispatch. Recovery accepts the exact before state
+or the expected kernel transition with the original inode; a filename alone is
+insufficient. `renameat2(RENAME_NOREPLACE)` and the new-file link refuse occupied
+destinations without clobbering them. Parent/file sync precedes the step's
+applied record, whose materialization/input/CI/shipping flags remain false.
+Fourteen real host cases cover preserved FDs/mappings and descendant inode/
+ctime, parent overlap, directory removal, anonymous-file attachment, lost syscall
+acknowledgements or progress commits, a destination race, foreign changes,
+prepared-intent storage failure, wrong plans and forked controllers. A separate
+opt-in guest check runs these same cases on the admitted cache filesystem;
+guest evidence is pending. All 481 Python tests and 34 focused Rust tests pass
+(with 23 opt-in guest checks excluded). Whole-transfer sequencing, filesystem-local staging
+allocation/new-directory creation, final metadata/materialization validation,
+alias closure and checked parent resume remain unfinished. The executor still
+does not invoke inode or namespace application.
+
 A rename is an identity-preserving namespace move in this graph, including
 rename-over-existing and directory descendants. Persist its original/final path
 sets, source/destination identities and staged-move progress in the transfer

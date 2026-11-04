@@ -727,6 +727,165 @@ class RetainedInodes:
 
 
 
+
+def _rename_noreplace(source_parent,source_name,destination_parent,destination_name):
+    library=ctypes.CDLL(None,use_errno=True)
+    try:rename=library.renameat2
+    except AttributeError:raise FreshnessHold('invalidation_unsafe') from None
+    rename.argtypes=[ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint]
+    rename.restype=ctypes.c_int
+    if rename(source_parent,source_name,destination_parent,destination_name,1)!=0:
+        raise OSError(ctypes.get_errno(),'namespace move unavailable')
+
+
+def _link_prepared_inode(inode_fd,parent,name):
+    library=ctypes.CDLL(None,use_errno=True);link=library.linkat
+    link.argtypes=[ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_int];link.restype=ctypes.c_int
+    if link(-100,os.fsencode('/proc/self/fd/'+str(inode_fd)),parent,name,0x400)!=0:
+        raise OSError(ctypes.get_errno(),'prepared inode attachment unavailable')
+
+
+def _namespace_directory(descriptor,check):
+    check();before=os.fstat(descriptor)
+    if not stat.S_ISDIR(before.st_mode):raise FreshnessHold('invalidation_unsafe')
+    rows=[];record_bytes=0
+    for name in sorted(os.listdir(descriptor),key=os.fsencode):
+        check();info=os.stat(name,dir_fd=descriptor,follow_symlinks=False)
+        row=[os.fsencode(name).hex(),list(_key(info)),info.st_nlink]
+        record_bytes+=len(json.dumps(row,separators=(',',':')).encode());rows.append(row)
+        if len(rows)>MAX_ENTRIES or record_bytes>16*1024**2:raise FreshnessHold('input_census_unknown')
+    if _key(os.fstat(descriptor))!=_key(before):raise FreshnessHold('input_census_unknown')
+    return {'key':list(_key(before)),'links':before.st_nlink,'entries':rows}
+
+
+def apply_namespace_step(intent,*,plan_sha256,action,inode_fd,source_parent=None,source_name=None,
+        destination_parent=None,destination_name=None,check):
+    """Apply/replay one bound kernel namespace operation using a held inode.
+
+    Caller-owned prerequisites include a paused parent, exclusive writers, the
+    original child cleanup and a validated whole-transfer sequence. This step
+    alone never completes copyback, resumes a parent or certifies CI. Replay
+    accepts an exact before state or the expected inode/whole-parent transition;
+    it cannot adopt an object based on its filename.
+    """
+    intent=literal(intent);check()
+    if (type(plan_sha256) is not str or len(plan_sha256)!=64 or any(c not in '0123456789abcdef' for c in plan_sha256)
+            or action not in ('move','remove','attach') or type(inode_fd) is not int):
+        raise FreshnessHold('invalidation_unsafe')
+    if ((source_parent is not None)!=(action in ('move','remove'))
+            or (destination_parent is not None)!=(action in ('move','attach'))):
+        raise FreshnessHold('invalidation_unsafe')
+    def basename(value):
+        name=relative(value)
+        if len(name.parts)!=1:raise FreshnessHold('invalidation_unsafe')
+        return os.fsencode(name)
+    source_name=basename(source_name) if source_parent is not None else None
+    destination_name=basename(destination_name) if destination_parent is not None else None
+    info=os.fstat(inode_fd);is_directory=stat.S_ISDIR(info.st_mode)
+    if (not (is_directory or stat.S_ISREG(info.st_mode)) or info.st_mode&0o7000
+            or os.listxattr(inode_fd) or action=='attach' and is_directory):
+        raise FreshnessHold('invalidation_unsafe')
+    inode_identity=[info.st_dev,info.st_ino];parents={};endpoints={}
+    for label,descriptor in (('source',source_parent),('destination',destination_parent)):
+        if descriptor is None:continue
+        parent=os.fstat(descriptor);identity=str(parent.st_dev)+':'+str(parent.st_ino)
+        if not stat.S_ISDIR(parent.st_mode) or parent.st_dev!=info.st_dev:raise FreshnessHold('invalidation_unsafe')
+        parents[identity]=descriptor;endpoints[label]=identity
+    if action=='move' and endpoints['source']==endpoints['destination'] and source_name==destination_name:
+        raise FreshnessHold('invalidation_unsafe')
+    controller=intent.parent.stat()
+    if (controller.st_uid!=os.geteuid() or stat.S_IMODE(controller.st_mode)!=0o700
+            or (controller.st_dev,controller.st_ino) in {(os.fstat(fd).st_dev,os.fstat(fd).st_ino) for fd in parents.values()}
+            or [controller.st_dev,controller.st_ino]==inode_identity):
+        raise FreshnessHold('invalidation_unsafe')
+    encode=lambda value:json.dumps(value,sort_keys=True,separators=(',',':')).encode()
+    birth=Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()[19]
+    binding={'plan_sha256':plan_sha256,'action':action,'inode':inode_identity,'owner_pid':os.getpid(),
+        'owner_birth':birth,'endpoints':endpoints,'source_name':None if source_name is None else source_name.hex(),
+        'destination_name':None if destination_name is None else destination_name.hex()}
+    def snapshot():
+        check();info=os.fstat(inode_fd)
+        node={'key':list(_key(info)),'links':info.st_nlink}
+        if is_directory:
+            node['children']=[] if info.st_nlink==0 else _namespace_directory(inode_fd,check)['entries']
+        else:node['size'],node['sha256']=RetainedInodes._read(inode_fd,check)
+        result={'inode':node,'parents':{key:_namespace_directory(fd,check) for key,fd in parents.items()}}
+        if sum(len(row['entries']) for row in result['parents'].values())>MAX_ENTRIES:
+            raise FreshnessHold('input_census_unknown')
+        if len(encode(result))>16*1024**2:raise FreshnessHold('input_census_unknown')
+        return result
+    def persist(value):
+        check()
+        if len(encode(value))>16*1024**2:raise FreshnessHold('input_census_unknown')
+        cache._write_record(intent,value)
+    def synced():
+        check();os.fsync(inode_fd)
+        for fd in parents.values():check();os.fsync(fd)
+    if intent.exists():
+        record=cache._read_record(intent,max_bytes=16*1024**2)
+        if (record.get('kind')!='ci-namespace-step' or record.get('version')!=1 or record.get('binding')!=binding
+                or record.get('state') not in ('prepared','applied') or record.get('effects_materialized') is not False
+                or record.get('input_closure_complete') is not False or record.get('full_ci') is not False
+                or record.get('shipping_authority') is not False):raise FreshnessHold('invalidation_unsafe')
+    else:
+        synced();before=snapshot();node=before['inode']
+        if node['links']!=(0 if action=='attach' else (node['links'] if is_directory else 1)):
+            raise FreshnessHold('invalidation_unsafe')
+        if source_parent is not None:
+            source=dict((r[0],r[1:]) for r in before['parents'][endpoints['source']]['entries']).get(source_name.hex())
+            if source!=[node['key'],node['links']]:raise FreshnessHold('input_census_unknown')
+        if destination_parent is not None and destination_name.hex() in {r[0] for r in before['parents'][endpoints['destination']]['entries']}:
+            raise FreshnessHold('invalidation_unsafe')
+        record={'version':1,'kind':'ci-namespace-step','binding':binding,'state':'prepared','before':before,
+            'effects_materialized':False,'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+        persist(record)
+    before=record['before'];current=snapshot()
+    def postcondition(actual):
+        old=before['inode'];node=actual['inode']
+        expected_links=0 if action=='remove' else (1 if action=='attach' else old['links'])
+        ignored={7}|({2,6} if is_directory and action=='remove' else set())
+        if (node['links']!=expected_links or any(a!=b for i,(a,b) in enumerate(zip(old['key'],node['key'])) if i not in ignored)
+                or (not is_directory and (node['size'],node['sha256'])!=(old['size'],old['sha256']))
+                or (is_directory and node['children']!=old['children'])):return False
+        expected={key:{r[0]:r[1:] for r in row['entries']} for key,row in before['parents'].items()}
+        if source_parent is not None:
+            if expected[endpoints['source']].pop(source_name.hex(),None)!=[old['key'],old['links']]:return False
+        if destination_parent is not None:expected[endpoints['destination']][destination_name.hex()]=[old['key'],expected_links]
+        deltas={key:0 for key in parents}
+        if is_directory:
+            if source_parent is not None:deltas[endpoints['source']]-=1
+            if destination_parent is not None:deltas[endpoints['destination']]+=1
+        parent_identities={tuple(row['key'][:2]):key for key,row in before['parents'].items()}
+        for key,parent in before['parents'].items():
+            now=actual['parents'][key]
+            if (now['links']!=parent['links']+deltas[key]
+                    or any(a!=b for i,(a,b) in enumerate(zip(parent['key'],now['key'])) if i not in (2,6,7))):return False
+            rows={r[0]:r[1:] for r in now['entries']}
+            if set(rows)!=set(expected[key]):return False
+            for name,(metadata,links) in expected[key].items():
+                observed,observed_links=rows[name];identity=tuple(metadata[:2]);ignore=set()
+                if list(identity)==inode_identity:ignore={7}
+                if identity in parent_identities:
+                    ignore={2,6,7};links+=deltas[parent_identities[identity]]
+                if observed_links!=links or any(a!=b for i,(a,b) in enumerate(zip(metadata,observed)) if i not in ignore):return False
+        return True
+    if record['state']=='applied':
+        if current!=record['after'] or not postcondition(current):raise FreshnessHold('input_census_unknown')
+        return record
+    if current==before:
+        check()
+        if action=='move':_rename_noreplace(source_parent,source_name,destination_parent,destination_name)
+        elif action=='remove':
+            if is_directory:os.rmdir(source_name,dir_fd=source_parent)
+            else:os.unlink(source_name,dir_fd=source_parent)
+        else:_link_prepared_inode(inode_fd,destination_parent,destination_name)
+        current=snapshot()
+    if not postcondition(current):raise FreshnessHold('input_census_unknown')
+    synced();record['state']='applied';record['after']=snapshot()
+    if not postcondition(record['after']):raise FreshnessHold('input_census_unknown')
+    persist(record);return record
+
+
 def namespace_edges(plan):
     """Plan changed parent/name edges, keeping moved descendants attached.
 
