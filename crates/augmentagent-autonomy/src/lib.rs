@@ -18,6 +18,7 @@
 //! - [`control`] — Undo / Pause / Pause all / Confirm (C8, D10).
 //! - [`watch`] — config hash check and reload before every decision (D3).
 //! - [`explain`] — the side-effect-free `autonomy explain` dry run.
+//! - [`outreach`] — C10 heartbeat proactive outreach through the gate (D16).
 
 pub mod broker;
 pub mod calendar;
@@ -28,6 +29,7 @@ pub mod exempt;
 pub mod explain;
 pub mod gate;
 pub mod handle;
+pub mod outreach;
 pub mod planner;
 pub mod records;
 pub mod registry;

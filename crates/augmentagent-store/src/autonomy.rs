@@ -22,13 +22,45 @@ use crate::{Store, StoreError, StoreResult};
 pub const DAILY_CAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 
 pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(SCHEMA)
+    conn.execute_batch(SCHEMA)?;
+    conn.execute_batch(OUTREACH_SCHEMA)
+}
+
+/// D16 — one row per heartbeat outreach message that was composed (sent or
+/// carded), so the same text to the same person is proposed at most once
+/// per 24 h. Its own statement so a read-only store can get a TEMP copy
+/// independently of the other autonomy tables.
+const OUTREACH_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS autonomy_outreach_log (
+            id            INTEGER PRIMARY KEY,
+            contact_slug  TEXT NOT NULL,
+            text_hash     TEXT NOT NULL,
+            action_id     TEXT,
+            outcome       TEXT NOT NULL,
+            created_at    INTEGER NOT NULL);
+         CREATE INDEX IF NOT EXISTS idx_autonomy_outreach_log_contact
+            ON autonomy_outreach_log(contact_slug, created_at);";
+
+fn migrate_outreach_temp(conn: &Connection) -> rusqlite::Result<()> {
+    let present: i64 = conn.query_row(
+        "SELECT count(*) FROM main.sqlite_master WHERE type = 'table' AND name = 'autonomy_outreach_log'",
+        [],
+        |r| r.get(0),
+    )?;
+    if present > 0 {
+        return Ok(());
+    }
+    conn.execute_batch(
+        &OUTREACH_SCHEMA
+            .replace("CREATE TABLE IF NOT EXISTS ", "CREATE TEMP TABLE IF NOT EXISTS ")
+            .replace("CREATE INDEX IF NOT EXISTS ", "CREATE INDEX IF NOT EXISTS temp."),
+    )
 }
 
 /// #1833 — a read-only store (`augmentagent autonomy explain`) still needs
 /// the autonomy tables to read from. When the main database predates them,
 /// create empty TEMP copies (in memory, never written to the file).
 pub(crate) fn migrate_temp(conn: &Connection) -> rusqlite::Result<()> {
+    migrate_outreach_temp(conn)?;
     let present: i64 = conn.query_row(
         "SELECT count(*) FROM main.sqlite_master WHERE type = 'table' AND name = 'autonomous_plans'",
         [],
@@ -808,6 +840,82 @@ impl Store {
         })
     }
 
+    // ----- D16 heartbeat outreach ----------------------------------------
+
+    /// D16 email outreach: the Gmail account (entity id) that most recently
+    /// received a message from `address` (bare, lowercased), so a new email
+    /// to them goes out from the mailbox they already write to.
+    pub fn latest_gmail_account_from(&self, address: &str) -> StoreResult<Option<String>> {
+        let address = address.trim().to_ascii_lowercase();
+        self.with_conn(|c| {
+            Ok(c.query_row(
+                "SELECT accountEntityId FROM emails
+                  WHERE platform = 'gmail' AND accountEntityId IS NOT NULL AND accountEntityId != ''
+                    AND (lower(fromEmail) = ?1 OR instr(lower(fromEmail), '<' || ?1 || '>') > 0)
+                  ORDER BY firstSeenAt DESC LIMIT 1",
+                [&address],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+        })
+    }
+
+    /// Record a composed outreach message (`outcome`: `auto` or `card`).
+    pub fn record_outreach(
+        &self,
+        contact_slug: &str,
+        text_hash: &str,
+        action_id: Option<&str>,
+        outcome: &str,
+        now_ms: i64,
+    ) -> StoreResult<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO autonomy_outreach_log(contact_slug, text_hash, action_id, outcome, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![contact_slug, text_hash, action_id, outcome, now_ms],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Whether the same normalised text went to `contact_slug` (sent or
+    /// carded) after `since_ms`.
+    pub fn outreach_text_seen_since(&self, contact_slug: &str, text_hash: &str, since_ms: i64) -> StoreResult<bool> {
+        self.with_conn(|c| {
+            Ok(c.query_row(
+                "SELECT 1 FROM autonomy_outreach_log
+                  WHERE contact_slug = ?1 AND text_hash = ?2 AND created_at > ?3 LIMIT 1",
+                params![contact_slug, text_hash, since_ms],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+        })
+    }
+
+    /// Outreach log retention, pruned with the plans (D11).
+    pub fn prune_outreach_log(&self, created_before_ms: i64) -> StoreResult<usize> {
+        self.with_conn(|c| c.execute("DELETE FROM autonomy_outreach_log WHERE created_at < ?1", [created_before_ms]))
+    }
+
+    /// D16 owner-took-over for email outreach: the Gmail thread of the
+    /// newest message received from `address` (bare, lowercased), if any.
+    pub fn latest_gmail_thread_from(&self, address: &str) -> StoreResult<Option<String>> {
+        let address = address.trim().to_ascii_lowercase();
+        self.with_conn(|c| {
+            Ok(c.query_row(
+                "SELECT threadId FROM emails
+                  WHERE platform = 'gmail' AND threadId IS NOT NULL AND threadId != ''
+                    AND (lower(fromEmail) = ?1 OR instr(lower(fromEmail), '<' || ?1 || '>') > 0)
+                  ORDER BY firstSeenAt DESC LIMIT 1",
+                [&address],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+        })
+    }
+
     /// D10 — terminal plans whose notice is still undelivered and that were
     /// created before `created_before_ms`. Any such plan means the owner is
     /// blind, so the gate stops acting until the notice goes through.
@@ -849,9 +957,25 @@ mod tests {
         assert_eq!(ro.autonomous_plans_in_cap_window("jane-doe", 0).unwrap(), 0);
         assert_eq!(ro.email_triage_result("m1").unwrap().as_deref(), Some("reply"));
         assert_eq!(ro.owner_message_times_in_thread("t1", 10).unwrap().len(), 1);
+        assert!(!ro.outreach_text_seen_since("jane-doe", "h", 0).unwrap());
         assert!(ro.set_autonomy_global_pause(true, 1).is_err(), "query_only refuses writes");
         drop(ro);
         assert_eq!(std::fs::read(&path).unwrap(), before, "the file is untouched");
         assert!(!dir.path().join("data.db-wal").exists());
+    }
+
+    #[test]
+    fn outreach_log_dedups_by_contact_text_and_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data.db")).unwrap();
+        store.record_outreach("jane-doe", "h1", Some("a1"), "auto", 1_000).unwrap();
+        assert!(store.outreach_text_seen_since("jane-doe", "h1", 999).unwrap());
+        assert!(!store.outreach_text_seen_since("jane-doe", "h1", 1_000).unwrap());
+        assert!(!store.outreach_text_seen_since("jane-doe", "h2", 0).unwrap());
+        assert!(!store.outreach_text_seen_since("sam-roe", "h1", 0).unwrap());
+        assert_eq!(store.prune_outreach_log(2_000).unwrap(), 1);
+        assert_eq!(store.latest_gmail_account_from("jane@example.test").unwrap(), None);
+        assert_eq!(store.latest_gmail_thread_from("jane@example.test").unwrap(), None);
+        assert!(!store.outreach_text_seen_since("jane-doe", "h1", 0).unwrap());
     }
 }

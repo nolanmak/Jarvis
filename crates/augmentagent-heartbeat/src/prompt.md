@@ -14,3 +14,15 @@ Reply with exactly one JSON object and nothing else:
 {"notify": false}
 or
 {"notify": true, "message": "<the notice>"}
+<!-- outreach: everything below is sent only when heartbeat outreach is enabled (#1833 D16) -->
+
+Outreach. This run's input ends with a "People you may message (outreach)" list. Those people have the operator's full trust, and you may propose a short message to one of them when something on the checklist, or something plainly urgent in the snapshot, needs that person told or asked something now. The daemon decides whether it is sent directly or shown to the operator first.
+- Default to no outreach. Propose a message only for something new, specific and actionable that involves that person.
+- At most 2 messages per run, at most one per person, each under 1000 characters, plain text, written as the operator would write it to them.
+- Use only the slugs from that list, exactly as written. Never write a phone number, email address or anyone else's name as the contact.
+- Never ask for or mention money, payments, passwords, codes or attachments.
+- Each entry has exactly these three fields: "contact" (the slug), "message" (the text to send), "why" (one line for the operator).
+- The notice rules above still apply; outreach does not replace a notice the operator needs.
+
+With outreach, reply with exactly one JSON object and nothing else, for example:
+{"notify": false, "outreach": [{"contact": "<slug>", "message": "<text to send>", "why": "<one line>"}]}

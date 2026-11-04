@@ -91,8 +91,15 @@ pub async fn run(cli: &crate::Cli, store: Arc<Store>, op: &HeartbeatOp) -> Resul
                 .clone()
                 .context("heartbeat run-once needs --wiki-dir")?;
             let (broker, _) = crate::build_broker(cli, Arc::clone(&store), dry_run).await?;
-            let runner =
+            // #1833 D16 — outreach only with both switches on; a dry run
+            // shows the proposals and the gate's decision for each, with no
+            // side effects.
+            let outreach = crate::autonomy_cmd::heartbeat_outreach(cli, &store, dry_run);
+            let mut runner =
                 HeartbeatRunner::new(store, broker, crate::build_reasoner(), wiki_root, config);
+            if let Some(outreach) = outreach {
+                runner = runner.with_outreach(outreach);
+            }
             let report = runner.run_once(RunOptions { force, dry_run }).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -176,6 +183,15 @@ fn describe_report(report: &RunReport) -> String {
     }
     if let Some(message) = &report.message {
         line.push_str(&format!("\n{message}"));
+    }
+    for o in &report.outreach {
+        line.push_str(&format!("\noutreach: {} → {}", o.contact, o.status));
+        if let Some(reason) = &o.reason {
+            line.push_str(&format!(" ({reason})"));
+        }
+        if let Some(detail) = &o.detail {
+            line.push_str(&format!(" · {detail}"));
+        }
     }
     line
 }
