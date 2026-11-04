@@ -2478,3 +2478,15 @@ preserves ENOSPC/EDQUOT through the existing infrastructure path. Root-reserved
 blocks do not count as worker capacity. This check does not prove the required
 plan fits, reclaim unknown state, increase any cap or replace lifecycle-aware
 retirement and required-plan capacity acceptance.
+
+The unchanged full-image replay at `c3166100` now returns the admitted VM's
+environment/resource recovery result with guest `OSError` errno 28 at
+`prepare_generation`, before worker execution (78.63 seconds). Original VM
+resource teardown remains verified. This validates the infrastructure boundary,
+not a passing Cargo build or recovered capacity. Host validation passes 589
+Python tests and 34 focused managed Rust tests; the VM adapter suite runs 20
+cases with six opt-ins skipped. Observation:
+`/tmp/autoship-1703-capacity-guard-native-observation-1.json`. Lifecycle-aware
+retirement of validated closed executions and original-R recovery of active or
+incomplete states remain required; no image wipe, cap increase, new producer
+authority or production rollout occurred.
