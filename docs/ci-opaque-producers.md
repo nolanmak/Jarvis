@@ -354,8 +354,15 @@ materialization/input/CI/shipping flags. The root controller binds the canonical
 plan digest to the original command, parent/child scopes, ordinal and child exit
 status; failed origins remain non-reusable. This is preparation only. Durable
 application/replay, alias closure and checked parent resume remain required.
-All 453 Python tests and 34 focused Rust tests pass. Guest preparation evidence
-is pending.
+All 453 Python tests and 34 focused Rust tests pass. At `7ff16743`, the
+unchanged guest replay completed in 101.12 seconds at the unmaterialized-effect
+hold. Independent read-only image inspection under the managed lease verified
+the canonical intent digest, exact original scopes and inode graph against the
+original working-copy mapping and final inventory. It verified all before image
+payloads (seven files / 24 entries / 64,832 bytes) and all after image payloads
+(eight files / 25 entries / 537,776 bytes), including one new 472,944-byte output.
+Old inode payloads and original cleanup/resource teardown also verified. The
+parent remained held: application, replay and checked resume are unproved.
 
 A rename is an identity-preserving namespace move in this graph, including
 rename-over-existing and directory descendants. Persist its original/final path
