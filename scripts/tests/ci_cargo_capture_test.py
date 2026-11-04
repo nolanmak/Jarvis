@@ -119,5 +119,29 @@ class CaptureRootsTests(unittest.TestCase):
             finally:
                 for descriptor in (writer,null,read,pipe):os.close(descriptor)
 
+    def test_child_working_tree_preserves_bytes_modes_and_mtime_without_sharing_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data=self.tree(root);sealed=root/'capture'
+            capture=self.capture(source,sealed);working=root/'working'
+            result=views.materialize_capture(sealed,capture,working,parent_uid=os.getuid(),unit_uid=os.getuid(),check=lambda:None)
+            copied=working/data.relative_to(source)
+            self.assertEqual(copied.read_bytes(),data.read_bytes())
+            self.assertEqual(stat.S_IMODE(copied.stat().st_mode),0o750)
+            self.assertEqual(copied.stat().st_mtime_ns,data.stat().st_mtime_ns)
+            self.assertNotEqual(copied.stat().st_ino,data.stat().st_ino)
+            self.assertNotEqual(copied.stat().st_ino,(sealed/data.relative_to(source)).stat().st_ino)
+            copied.write_bytes(b'child effects')
+            self.assertEqual(data.read_bytes(),b'binary\x00\xffpayload')
+            self.assertEqual((sealed/data.relative_to(source)).read_bytes(),b'binary\x00\xffpayload')
+            self.assertTrue((working/'out/empty').is_dir())
+            self.assertFalse(result['input_closure_complete']);self.assertFalse(result['shipping_authority'])
+
+    def test_working_tree_refuses_a_changed_sealed_payload_before_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data=self.tree(root);sealed=root/'capture';capture=self.capture(source,sealed)
+            original=sealed/data.relative_to(source);original.chmod(0o600);original.write_bytes(b'corrupt');original.chmod(0o555)
+            with self.assertRaises(views.FreshnessHold):
+                views.materialize_capture(sealed,capture,root/'working',parent_uid=os.getuid(),unit_uid=os.getuid(),check=lambda:None)
+
 
 if __name__=='__main__':unittest.main()

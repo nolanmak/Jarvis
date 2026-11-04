@@ -300,6 +300,52 @@ def capture_roots(root_fd,destination,roots,*,owners,check):
         'original_metadata_emulated':False,'input_closure_complete':False,'shipping_authority':False}
 
 
+def materialize_capture(source,capture,destination,*,parent_uid,unit_uid,check):
+    """Create detached private working bytes, never publish reusable output."""
+    source,destination=map(literal,(source,destination))
+    if (type(capture) is not dict or capture.get('version')!=1 or capture.get('kind')!='ci-paused-root-capture'
+            or capture.get('input_closure_complete') is not False or capture.get('shipping_authority') is not False
+            or any(type(uid) is not int or uid<0 for uid in (parent_uid,unit_uid))):
+        raise FreshnessHold('input_census_unknown')
+    def source_digest():
+        check();value=inventory(source,owner=os.geteuid(),sealed=True)
+        return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    if source_digest()!=capture['payload_sha256']:raise FreshnessHold('input_census_unknown')
+    destination.mkdir(mode=0o700);mapping=[];directories=[]
+    for raw,kind,original,*digest in capture['entries']:
+        check();name=relative(bytes.fromhex(raw));output=destination/name
+        if original[3] not in (0,parent_uid):raise FreshnessHold('artifact_provenance_unknown')
+        owner=unit_uid if original[3]==parent_uid else 0
+        group=unit_uid if original[4]==parent_uid else original[4]
+        mode=stat.S_IMODE(original[5])
+        if mode&0o7000:raise FreshnessHold('artifact_provenance_unknown')
+        if kind=='directory':
+            output.mkdir(mode=0o700,parents=True,exist_ok=True);directories.append((output,owner,group,mode,original[6]))
+        elif kind=='file':
+            output.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+            descriptor=os.open(output,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
+            try:
+                _mode,size,sha=_read(source/name,os.geteuid(),True,descriptor)
+                if size!=original[2] or sha!=digest[0]:raise FreshnessHold('input_census_unknown')
+                current=os.fstat(descriptor)
+                if (current.st_uid,current.st_gid)!=(owner,group):os.fchown(descriptor,owner,group)
+                os.fchmod(descriptor,mode);os.utime(descriptor,ns=(original[6],original[6]));os.fsync(descriptor)
+            finally:os.close(descriptor)
+            if _read(output,owner,False)[1:]!=(original[2],digest[0]):raise FreshnessHold('input_census_unknown')
+        else:raise FreshnessHold('input_census_unknown')
+        info=output.stat();mapping.append([raw,kind,[original[0],original[1]],[info.st_dev,info.st_ino]])
+    for path,owner,group,mode,mtime in reversed(directories):
+        check();current=path.stat()
+        if (current.st_uid,current.st_gid)!=(owner,group):os.chown(path,owner,group)
+        path.chmod(mode);os.utime(path,ns=(mtime,mtime))
+        descriptor=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+        try:os.fsync(descriptor)
+        finally:os.close(descriptor)
+    if source_digest()!=capture['payload_sha256']:raise FreshnessHold('input_census_unknown')
+    return {'version':1,'kind':'ci-contained-working-copy','mapping':mapping,
+        'original_metadata_emulated':False,'input_closure_complete':False,'shipping_authority':False}
+
+
 def validate_capture_stdio(capture,descriptors):
     """Refuse direct writable stdio aliases to captured original inodes."""
     if type(descriptors) is not list or len(descriptors)!=2:raise FreshnessHold('input_census_unknown')
@@ -379,14 +425,14 @@ def toolchain_view(source,destination):
     destination.chmod(0o555)
 
 
-def enter(root,unit,source,artifacts,bindings=(),source_bindings=None,declared_outputs=None,*,transport=None):
+def enter(root,unit,source,artifacts,bindings=(),source_bindings=None,declared_outputs=None,*,transport=None,working=None):
     phase=['planner_view_enter']
-    try:return _enter(root,unit,source,artifacts,bindings,phase,source_bindings,declared_outputs,transport)
+    try:return _enter(root,unit,source,artifacts,bindings,phase,source_bindings,declared_outputs,transport,working)
     except BaseException as error:
         error.unit_view_stage=phase[0];raise
 
 
-def _enter(root,unit,source,artifacts,bindings,phase,source_bindings=None,declared_outputs=None,transport=None):
+def _enter(root,unit,source,artifacts,bindings,phase,source_bindings=None,declared_outputs=None,transport=None,working=None):
     """Root-only entry from a sealed admitted unit bootstrap, before UID drop.
 
     The caller supplies controller-owned paths, not candidate mount arguments.
@@ -437,6 +483,15 @@ def _enter(root,unit,source,artifacts,bindings,phase,source_bindings=None,declar
         destination=root/'workspace/target'/name
         input_mount(original,destination,raw,expected)
     source_mounts(root/'workspace',[] if source_bindings is None else source_bindings,{} if declared_outputs is None else declared_outputs)
+    if working is not None:
+        working=literal(working);info=working.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or stat.S_IMODE(info.st_mode)!=0o700:
+            raise FreshnessHold('invalidation_unsafe')
+        for name in ('tmp','home/worker','cargo','var/tmp','dev/shm'):
+            original=literal(working/name);info=original.stat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid!=unit or info.st_gid!=unit:
+                raise FreshnessHold('invalidation_unsafe')
+            _mount('--bind',original,root/name);_mount('-o','remount,bind,rw,nosuid,nodev,noatime',root/name)
     phase[0]='planner_view_proc'
     _mount('-t','proc','-o','ro,nosuid,nodev,noexec,hidepid=2','proc',root/'proc')
     phase[0]='planner_view_devices'

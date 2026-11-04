@@ -252,6 +252,20 @@ tests pass. The full native protocol remains red at the held child grant. These
 are byte-staging observations; metadata emulation, complete alias closure,
 contained execution and final CI authority remain unproved.
 
+The next implementation increment creates a detached working copy from the
+verified capture and routes contained tools through the original supervisor,
+exec observation and grant. Working bytes preserve mode and mtime with mapped
+actor ownership; inode/ctime emulation and complete alias closure remain open.
+Terminal child results are withheld and attempted parents remain frozen until
+original teardown: effect transfer is not implemented, so this increment must
+end in an infrastructure hold. Parent death cancels further child admission.
+Any controller exception fences the shared command, cancels its controllers and
+retains the original allowance slot through teardown; uncertain cleanup cannot
+admit replacement work. The 437 Python tests and 34 focused Rust tests pass.
+Guest execution evidence for this increment is still pending. This does not
+establish copyback, active-child signal routing, jobserver loan correctness,
+complete input closure, full CI or shipping authority.
+
 An opaque parent stays stopped during its contained call. Child stdout/stderr
 use their original admitted descriptions; fd 0 uses staged bytes as above. The
 controller and external Cargo caller remain runnable. Worker-origin capture uses
@@ -666,7 +680,7 @@ The following load-bearing choices remain parked with C; they are not waived:
   permanent cancellation and pre-auth busy-socket revocation. This is not an
   active-child router. Actual contained-child routing, stopped nested-proxy
   guest signal cases, terminal races and checked child drain before parent
-  resume remain this thread's gates. No child execution grant is enabled.
+  resume remain this thread's gates. That staging barrier alone enables no child execution grant.
   At `b1bcede6`, the unchanged pinned-guest replay completed in 98.00 seconds
   and reached the held child grant. Its original capture/pause/request bindings,
   verified thaw and all four files / 21 entries / 64,832 bytes passed the same

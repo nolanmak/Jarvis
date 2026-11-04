@@ -123,6 +123,16 @@ class StagedParentSignalTests(unittest.TestCase):
         self.assertTrue(gate.observation()['revoked'])
         with self.assertRaises(planner.FreshnessHold):gate.pause(8)
 
+    def test_parent_exit_cancels_contained_admission_before_another_child_grant(self):
+        gate=self.new_gate();relay=object.__new__(planner.UnitPeerRelay)
+        relay._stop=threading.Event();relay.scope_pidfd=self.pidfd;relay.staged_signals=gate
+        binding={'generation':str(uuid.uuid4()),'head':'a'*40,'tree':'b'*40,
+            **{key:'c'*64 for key in ('contract_sha256','authority_sha256','cache_identity_sha256','source_inputs_sha256')}}
+        relay.ordinals=planner.DispatchOrdinals(binding,str(uuid.uuid4()))
+        self.assertFalse(relay.execution_cancelled())
+        self.child.terminate();self.child.wait(timeout=2)
+        self.assertTrue(relay.execution_cancelled())
+
     def test_busy_unit_socket_revokes_staging_without_starting_another_handler(self):
         gate=self.new_gate();gate.pause(7);self.stop()
         with tempfile.TemporaryDirectory() as directory,\

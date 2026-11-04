@@ -66,6 +66,20 @@ class DispatchOrdinalsTests(unittest.TestCase):
         finally:os.close(read);self.assertEqual(os.waitpid(child,0)[1],0)
         self.assertEqual(budget.allocate(),0)
 
+    def test_fenced_command_cancels_registered_controllers_and_cannot_allocate_again(self):
+        import threading
+        budget=planner.DispatchOrdinals(self.binding(),str(uuid.uuid4()))
+        first=threading.Event();second=threading.Event();budget.register_stop(first);budget.register_stop(second)
+        self.assertEqual(budget.allocate(),0);budget.fence()
+        self.assertTrue(first.is_set());self.assertTrue(second.is_set());self.assertTrue(budget.fenced())
+        with self.assertRaises(planner.FreshnessHold):budget.allocate()
+        late=threading.Event();budget.register_stop(late);self.assertTrue(late.is_set())
+
+    def test_fencing_does_not_reset_or_replace_the_original_command(self):
+        budget=planner.DispatchOrdinals(self.binding(),str(uuid.uuid4()));budget.fence();budget.fence()
+        self.assertTrue(budget.fenced())
+        with self.assertRaises(planner.FreshnessHold):budget.allocate()
+
 
 class PathnameSocketTests(unittest.TestCase):
     def test_long_private_path_binds_via_directory_fd_and_connects_after_fd_close(self):
@@ -91,6 +105,27 @@ class PathnameSocketTests(unittest.TestCase):
                 with socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET) as server:
                     with self.assertRaises(planner.FreshnessHold):planner.bind_controller_socket(server,path)
                 self.assertFalse((root/'relay.sock').exists())
+
+
+class AdmissionFenceTests(unittest.TestCase):
+    def test_controller_refusal_fences_the_command_and_does_not_release_its_slot(self):
+        for failure in (planner.FreshnessHold('metadata_torn'),MemoryError()):
+            with self.subTest(failure=type(failure).__name__):
+                # Rejection only: no admission or execution can occur in this
+                # fixture. A held slot represents the original request.
+                server,client=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET)
+                relay=object.__new__(planner.RootRelay);relay.errors=[];relay._stop=threading.Event();relay.timeout=.5
+                relay.ordinals=planner.DispatchOrdinals(DispatchOrdinalsTests().binding(),str(uuid.uuid4()))
+                relay.ordinals.register_stop(relay._stop)
+                relay._slots=threading.BoundedSemaphore(1);relay._slots.acquire()
+                def refused(*_args):raise failure
+                relay._receive=refused
+                try:
+                    relay._handle(server,0)
+                    self.assertEqual(planner.decode_event(client.recv(16)),('error',22))
+                    self.assertTrue(relay.ordinals.fenced());self.assertTrue(relay._stop.is_set())
+                    self.assertFalse(relay._slots.acquire(blocking=False))
+                finally:server.close();client.close()
 
 
 class RequestStdinTests(unittest.TestCase):

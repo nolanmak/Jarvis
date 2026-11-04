@@ -1313,7 +1313,7 @@ class DispatchOrdinals:
         cache.validate_binding(binding)
         if not cache._uuid(command):raise FreshnessHold('generation_mismatch')
         self.owner=os.getpid();self._binding=copy.deepcopy(binding);self.command=command
-        self._next=0;self._lock=threading.Lock()
+        self._next=0;self._lock=threading.Lock();self._fenced=False;self._stops=[]
 
     def require(self,binding,command):
         if self.owner!=os.getpid() or self._binding!=binding or self.command!=command:
@@ -1323,8 +1323,24 @@ class DispatchOrdinals:
         # Check before acquiring a possibly inherited locked mutex after fork.
         if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
         with self._lock:
+            if self._fenced:raise FreshnessHold('cleanup_uncertain')
             if self._next>=4096:raise FreshnessHold('input_census_unknown')
             ordinal=self._next;self._next+=1;return ordinal
+
+    def register_stop(self,stop):
+        if self.owner!=os.getpid() or not isinstance(stop,threading.Event):raise FreshnessHold('invalidation_unsafe')
+        with self._lock:
+            if self._fenced:stop.set()
+            else:self._stops.append(stop)
+
+    def fenced(self):
+        if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
+        with self._lock:return self._fenced
+
+    def fence(self):
+        if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
+        with self._lock:self._fenced=True;stops=tuple(self._stops)
+        for stop in stops:stop.set()
 
 
 def bind_controller_socket(listener,path):
@@ -1367,6 +1383,7 @@ class RootRelay:
         if not self.client_path.is_absolute() or len(os.fsencode(self.client_path))>=108:raise FreshnessHold('invalidation_unsafe')
         self.views=None;self.completed=[];self.errors=[];self._stop=threading.Event();self._slots=threading.BoundedSemaphore(4)
         self._threads=[];self._children=set();self._lock=threading.Lock()
+        self.ordinals.register_stop(self._stop)
 
     def __enter__(self):
         os.chown(self.root,0,self.peer_uid);self.root.chmod(0o710)
@@ -1448,23 +1465,31 @@ class RootRelay:
         return numbers[:count]
 
     def _handle(self,connection,ordinal):
-        descriptors=[];phase=['planner_request_receive']
+        descriptors=[];phase=['planner_request_receive'];release_slot=True
         try:
             connection.settimeout(self.timeout)
             numbers=self._receive(connection,descriptors);phase[0]='planner_unit'
             self._run(connection,ordinal,descriptors,numbers,phase)
-        except (OSError,ValueError,RuntimeError,struct.error,subprocess.SubprocessError,FreshnessHold,staging.StagingUnavailable) as error:
+        except BaseException as error:
+            # An incomplete contained subtree must never release its ancestor's
+            # original runnable allowance. Fence this command, cancel every
+            # registered controller and retain this slot through original R
+            # teardown instead of admitting another unit beside unknown work.
+            release_slot=False;self.ordinals.fence()
             self.errors.append(diagnostic({'stage':getattr(error,'unit_view_stage',phase[0]),
                 'category':type(error).__name__,'errno':getattr(error,'errno',None)}))
             try:connection.sendall(event('error',errno.EINVAL))
             except OSError:pass
         finally:
-            legacy._close(descriptors);connection.close();self._slots.release()
+            legacy._close(descriptors);connection.close()
+            if release_slot:self._slots.release()
 
     def request_context(self,ordinal,request):return {},None
+    def execution_cancelled(self):return self._stop.is_set() or self.ordinals.fenced()
+    def unit_started(self,value,directory):pass
     def unit_finished(self,value,record):pass
 
-    def _run(self,connection,ordinal,descriptors,numbers,phase):
+    def _run(self,connection,ordinal,descriptors,numbers,phase,*,staged=False,defer_terminal=False):
         directory=self.root/'units'/str(uuid.uuid4());directory.mkdir(mode=0o700)
         control,child_control=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
         cancel,stop=os.pipe2(os.O_CLOEXEC);release,grant=os.pipe2(os.O_CLOEXEC);exec_release,exec_grant=os.pipe2(os.O_CLOEXEC)
@@ -1510,7 +1535,8 @@ class RootRelay:
             os.close(bootstrap);bootstrap=None;child_control.close();legacy._close(descriptors);descriptors.clear()
             phase[0]='planner_capture'
             while True:
-                if self._stop.is_set() or time.monotonic()>=deadline:cancelled=True
+                if (self.execution_cancelled() or time.monotonic()>=deadline
+                        or transport is not None and transport._stop.is_set()):cancelled=True
                 readers=select.select([connection]+([] if control_eof else [control]),[],[],.02)[0]
                 if connection in readers:
                     frame,extra,flags,_=connection.recvmsg(16,0)
@@ -1539,7 +1565,7 @@ class RootRelay:
                         if int(Path(f'/proc/{child_pid}/stat').read_text().split()[3])!=child.pid:
                             raise FreshnessHold('cleanup_uncertain')
                         original_pid=child_pid
-                        if not cancelled:connection.sendall(event('staging_ready',0))
+                        if not cancelled and not staged:connection.sendall(event('staging_ready',0))
                         ready=True
                     elif stage==2 and not sealed and not received:
                         observed=cache._read_record(directory/'stdin.json')
@@ -1551,6 +1577,7 @@ class RootRelay:
                         if not cancelled:
                             if transport is not None:transport.register_parent(original_pid,directory/'view-namespace.json')
                             connection.sendall(event('tool_started',0));os.write(exec_grant,b'go\n');started=True;phase[0]='planner_unit_exec'
+                            self.unit_started(value,directory)
                     else:legacy._close(received);raise ValueError('out-of-order original control frame')
                     legacy._close(received)
                 if ready and sealed and not authorized and not cancelled:
@@ -1583,9 +1610,11 @@ class RootRelay:
                 'cancelled':cancelled,'returncode':raw,'original_cleanup':True,
                 'input_closure_complete':False,'shipping_authority':False})
             self.unit_finished(value,self.completed[-1])
-            if not cancelled:
+            if not cancelled and not defer_terminal:
                 if not started or record.get('exec_observed') is not True:connection.sendall(event('error',errno.EIO))
                 else:connection.sendall(event('signaled' if raw<0 else 'finished',abs(raw)))
+            return {'ordinal':ordinal,'directory':directory,'view':view,'returncode':raw,
+                'original_cleanup':True,'exec_observed':record.get('exec_observed') is True,'cancelled':cancelled}
         finally:
             if child is not None:
                 if child.poll() is None:child.terminate();child.wait(timeout=6)
@@ -1841,11 +1870,12 @@ class UnitFreezer:
 
 
 class UnitPeerRelay(RootRelay):
-    """Authenticated unit endpoint; capture/dispatch remains a closed gate."""
+    """Private contained execution; effect transfer and CI authority stay fenced."""
     def __init__(self,admission,*,library,ordinal,scope,ordinals,deadline,view):
         if type(ordinal) is not int or not 0<=ordinal<4096 or not cache._uuid(Path(scope).name):
             raise FreshnessHold('invalidation_unsafe')
-        if (type(view) is not dict or set(view)!={'root','artifacts','source','mounts','ordinal'}
+        if (type(view) is not dict or set(view) not in ({'root','artifacts','source','mounts','ordinal'},
+                {'root','artifacts','source','mounts','ordinal','working'})
                 or view['ordinal']!=ordinal):raise FreshnessHold('invalidation_unsafe')
         super().__init__(admission,library=library,timeout=min(900,max(1,deadline-time.monotonic())),
             deadline=deadline,ordinals=ordinals,client_path='/run/ci-unit.sock')
@@ -1853,6 +1883,7 @@ class UnitPeerRelay(RootRelay):
         self.require_message_credentials=True;self.parent_ordinal=ordinal;self.scope=Path(scope)
         self.scope_pidfd=None;self.scope_namespaces=None;self.scope_root=None;self.received_requests=0;self.closed=False
         self.staged_signals=None
+        self.active_record=None
         self._slots=threading.BoundedSemaphore(1)
         self.view=dict(view);self.mutation_lock=threading.RLock()
         self.captures=self.root/'captures';self.captures.mkdir(mode=0o700)
@@ -1873,7 +1904,22 @@ class UnitPeerRelay(RootRelay):
 
     def forward_signal(self,number):
         if self.staged_signals is None:raise FreshnessHold('invalidation_unsafe')
-        return self.staged_signals.forward(number)
+        disposition=self.staged_signals.forward(number)
+        if disposition=='queued':self.request_cancel()
+        return disposition
+
+    def execution_cancelled(self):
+        return (super().execution_cancelled() or self.scope_pidfd is None
+            or bool(select.select([self.scope_pidfd],[],[],0)[0])
+            or self.staged_signals is not None and self.staged_signals.cancelled.is_set())
+
+    def unit_started(self,value,directory):
+        record=self.active_record
+        if record is None or record['last_request_ordinal']!=value['ordinal']:raise FreshnessHold('generation_mismatch')
+        record['dispatch_tested']=True
+        record['child_dispatch']={'ordinal':value['ordinal'],'uid':execution_identity(value),'scope':directory.name,
+            'exec_observed':True,'exec_grant_sent':True,'shipping_authority':False}
+        cache._write_record(self.root/'admission.json',record)
 
     def request_cancel(self):
         self._stop.set()
@@ -1902,9 +1948,9 @@ class UnitPeerRelay(RootRelay):
         return numbers
 
     def _run(self,connection,ordinal,descriptors,numbers,phase):
-        # No child grant exists until the staged request has a proven paused
-        # input capture and admitted mutation set. Preserve the real request's
-        # structural evidence; never execute it as an untracked fallback.
+        # A child runs only in detached private working state under the original
+        # supervision/grant. Its result cannot reach the paused parent before
+        # verified effect transfer, and it grants no CI/reuse authority.
         body=payload(descriptors[0]);info=os.fstat(descriptors[0])
         with self._lock:
             self.received_requests+=1
@@ -1923,16 +1969,32 @@ class UnitPeerRelay(RootRelay):
             phase[0]='planner_capture'
             with self.mutation_lock:
                 self.staged_signals.pause(ordinal)
+                child_attempted=False
                 try:
                     record['pause']=self.freezer.freeze(self.deadline)
                     cache._write_record(self.root/'admission.json',record)
                     record['capture']=self._capture(ordinal,record,descriptors[2:4])
+                    cache._write_record(self.root/'admission.json',record)
+                    if self._stop.is_set() or self.staged_signals.cancelled.is_set():raise FreshnessHold('cleanup_uncertain')
+                    self.views=_ContainedViews(self,ordinal);self.active_record=record
+                    replacement=os.dup(captured.fileno());os.close(descriptors[1]);descriptors[1]=replacement
+                    child_attempted=True
+                    result=super()._run(connection,ordinal,descriptors,numbers,phase,staged=True,defer_terminal=True)
+                    record['child_result']={'returncode':result['returncode'],'original_cleanup':result['original_cleanup'],
+                        'exec_observed':result['exec_observed'],'scope':result['directory'].name,
+                        'effects_materialized':False,'shipping_authority':False}
+                    # Terminal results and parent resume remain fenced until
+                    # identity-preserving effect transfer is implemented.
+                    raise FreshnessHold('input_census_unknown')
                 finally:
-                    self.staged_signals.resume(ordinal,lambda:self.freezer.thaw(self.deadline))
-                    if 'pause' in record:
-                        record['thaw_verified']=True
-                        record['staged_signals']=self.staged_signals.observation()
-                        cache._write_record(self.root/'admission.json',record)
+                    self.active_record=None
+                    if child_attempted:
+                        record['parent_resume_held']=True;self.request_cancel()
+                    else:
+                        self.staged_signals.resume(ordinal,lambda:self.freezer.thaw(self.deadline))
+                        if 'pause' in record:record['thaw_verified']=True
+                    record['staged_signals']=self.staged_signals.observation()
+                    cache._write_record(self.root/'admission.json',record)
         raise FreshnessHold('input_census_unknown')
 
     def _capture(self,ordinal,admission,outputs):
@@ -1983,6 +2045,60 @@ class UnitPeerRelay(RootRelay):
         finally:
             if self.staged_signals is not None:self.staged_signals.close()
             if self.scope_pidfd is not None:os.close(self.scope_pidfd);self.scope_pidfd=None
+
+
+class _ContainedViews:
+    """Private working bytes for a contained call; no publication capability."""
+    def __init__(self,relay,request):
+        self.relay=relay;self.request=request;self.units={}
+        self.capture=cache._read_record(relay.captures/(str(request)+'.json'),max_bytes=16*1024**2)
+        if (self.capture.get('binding')!=relay.admission.binding or self.capture.get('command')!=relay.admission.command
+                or self.capture.get('state')!='captured' or self.capture.get('parent_scope')!=relay.scope.name
+                or self.capture.get('request_ordinal')!=request or self.capture.get('shipping_authority') is not False):
+            raise FreshnessHold('generation_mismatch')
+        self.root=relay.root/'contained';self.root.mkdir(mode=0o700,exist_ok=True)
+
+    def prepare(self,ordinal,request):
+        # A nested Cargo request requires the separate protected Cargo planner;
+        # it never receives an ordinary writable-target execution fallback.
+        if worker_cargo_request(request):raise FreshnessHold('input_census_unknown')
+        relay=self.relay
+        if ordinal!=self.request or relay._stop.is_set() or relay.staged_signals.cancelled.is_set():
+            raise FreshnessHold('invalidation_unsafe')
+        slot=self.root/str(ordinal);slot.mkdir(mode=0o700);working=slot/'working'
+        def check():
+            if relay.execution_cancelled() or time.monotonic()>=relay.deadline:
+                raise FreshnessHold('cleanup_uncertain')
+            if dict(line.split() for line in relay.freezer._read('cgroup.events').splitlines()).get(b'frozen')!=b'1':
+                raise FreshnessHold('cleanup_uncertain')
+        copied=unit_views.materialize_capture(relay.captures/str(ordinal),self.capture['filesystem'],working,
+            parent_uid=relay.peer_uid,unit_uid=2000+ordinal,check=check)
+        mounts=cache._read_record(Path(relay.view['mounts']),max_bytes=16*1024**2)
+        if (mounts.get('binding')!=relay.admission.binding or mounts.get('command')!=relay.admission.command
+                or mounts.get('ordinal')!=relay.parent_ordinal):raise FreshnessHold('generation_mismatch')
+        mounts=dict(mounts,ordinal=ordinal);path=slot/'mounts.json';cache._write_record(path,mounts)
+        cache._write_record(slot/'working-copy.json',{'version':1,'binding':relay.admission.binding,
+            'command':relay.admission.command,'parent_scope':relay.scope.name,'request_ordinal':ordinal,
+            'working_copy':copied,'input_closure_complete':False,'shipping_authority':False})
+        root=slot/'root';root.mkdir(mode=0o700)
+        view={'root':str(root),'artifacts':str(working/'workspace/target'),'source':relay.view['source'],
+            'mounts':str(path),'ordinal':ordinal,'working':str(working)}
+        self.units[ordinal]=view;return view
+
+    def running(self,view):pass
+
+    def finish(self,view,directory,raw):
+        relay=self.relay
+        record=cache._read_record(directory/'exit-status.json')
+        if (record.get('binding')!=relay.admission.binding or record.get('command')!=relay.admission.command
+                or record.get('ordinal')!=view['ordinal'] or record.get('returncode')!=raw
+                or record.get('exec_observed') is not True):raise FreshnessHold('cleanup_uncertain')
+        cache._write_record(Path(view['root']).parent/'contained-result.json',{
+            'version':1,'kind':'ci-contained-result-observation','binding':relay.admission.binding,
+            'command':relay.admission.command,'parent_scope':relay.scope.name,'child_scope':directory.name,
+            'ordinal':view['ordinal'],'uid':2000+view['ordinal'],'returncode':raw,
+            'original_exec_observed':True,'original_child_cleanup':True,'effects_materialized':False,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
 
 
 class WorkerRelay(RootRelay):
@@ -2320,7 +2436,7 @@ def _stage(arguments):
         if (mounts.get('binding')!=value['binding'] or mounts.get('command')!=value['command']
                 or mounts.get('ordinal')!=value['ordinal']):raise FreshnessHold('generation_mismatch')
         unit_views.enter(view['root'],2000+value['ordinal'],view['source'],view['artifacts'],mounts['entries'],
-            mounts.get('source_entries'),mounts.get('declared_outputs'),transport=view.get('transport'))
+            mounts.get('source_entries'),mounts.get('declared_outputs'),transport=view.get('transport'),working=view.get('working'))
         if 'transport' in view:
             descriptor=value.get('relay_fd')
             if type(descriptor) is not int or not 3<=descriptor<=65535:raise FreshnessHold('invalidation_unsafe')
