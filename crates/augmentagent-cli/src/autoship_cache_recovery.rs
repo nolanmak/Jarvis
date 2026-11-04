@@ -466,10 +466,6 @@ mod tests {
     use rusqlite::Connection;
 
     fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
-        // Hermetic: recovery and forensic capture enforce the real free-space
-        // floor, which a hosted CI runner (about 7.5 GB free) never meets.
-        // libtest runs each test on its own thread, so this stays local.
-        crate::disk::TEST_GATE_MIN_FREE_GB.with(|v| v.set(Some(0.0)));
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("workflow.db");
         drop(crate::autoship_workflow::WorkflowStore::open(&path).unwrap());
