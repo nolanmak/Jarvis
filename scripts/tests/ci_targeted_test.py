@@ -136,13 +136,16 @@ class Wait(unittest.TestCase):
 
     def test_verdict_uses_latest_attempt_and_fails_closed(self):
         expected = {'w.yml': {'a', 'b'}}
-        run = lambda i, n, attempt, **extra: {'id': i, 'path': 'w.yml', 'event': 'pull_request', 'run_number': n, 'run_attempt': attempt, 'pull_requests': [{'number': 7}], **extra}
+        run = lambda i, n, attempt, **extra: {'id': i, 'path': 'w.yml', 'event': 'pull_request', 'run_number': n, 'run_attempt': attempt, 'status': 'completed', 'pull_requests': [{'number': 7}], **extra}
         job = lambda name, status='completed', conclusion='success': {'name': name, 'status': status, 'conclusion': conclusion}
         check = lambda runs, jobs, pr=7: targeted.verdict(expected, targeted.latest_runs(expected, runs, pr), jobs)
         self.assertEqual(check([], {})[0], 'pending')
         self.assertEqual(check([run(1, 1, 1)], {})[0], 'pending')  # run not finished yet
         self.assertEqual(check([run(1, 1, 1)], {1: [job('a'), job('b')]}), ('pass', []))
         self.assertEqual(check([run(1, 1, 1)], {1: [job('a')]})[0], 'fail')  # finished without a required job
+        self.assertEqual(check([run(1, 1, 1, status='in_progress')], {1: [job('a')]})[0], 'pending')  # job not created yet
+        # Required Linux jobs done while the run's macOS jobs still run: green now.
+        self.assertEqual(check([run(1, 1, 1, status='in_progress')], {1: [job('a'), job('b'), job('b (macos-latest)', 'queued', None)]}), ('pass', []))
         for conclusion in ['failure', 'cancelled', 'skipped', 'timed_out', None]:
             self.assertEqual(check([run(1, 1, 1)], {1: [job('a'), job('b', conclusion=conclusion)]})[0], 'fail', conclusion)
         # A newer attempt supersedes the earlier failure; push runs and runs for another PR never count.

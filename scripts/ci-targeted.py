@@ -214,7 +214,9 @@ def verdict(expected, latest, jobs_by_run):
         jobs = {job['name']: job for job in jobs_by_run[run['id']]}
         for name in sorted(names):
             job = jobs.get(name)
-            if job is None:
+            if job is None and run.get('status') != 'completed':
+                pending.append(path + ': ' + name + ' (not created yet)')
+            elif job is None:
                 failed.append(path + ': ' + name + ' -> missing from a finished run')
             elif job['status'] != 'completed':
                 pending.append(path + ': ' + name)
@@ -253,9 +255,14 @@ def wait(args, plan):
         try:
             runs = github(api + '/actions/runs?event=pull_request&per_page=100&head_sha=' + args.head, token)['workflow_runs']
             latest = latest_runs(expected, runs, pr_number)
-            for run in latest.values():
+            for path, run in latest.items():
+                # Read jobs while the run is still going too: a workflow's
+                # Linux jobs often finish long before its macOS jobs (which
+                # are not required). Stop re-reading once every required job
+                # in that run attempt has finished.
                 key = (run['id'], run['run_attempt'])
-                if run['status'] == 'completed' and key not in finished:
+                done = {job['name'] for job in finished.get(key, []) if job['status'] == 'completed'}
+                if not expected[path] <= done:
                     finished[key] = github(api + '/actions/runs/' + str(run['id']) + '/jobs?filter=latest&per_page=100', token)['jobs']
             state, details = verdict(expected, latest, {run['id']: finished[(run['id'], run['run_attempt'])]
                                                          for run in latest.values() if (run['id'], run['run_attempt']) in finished})
