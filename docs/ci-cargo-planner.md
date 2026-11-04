@@ -2447,7 +2447,7 @@ Transfer/resume, input closure, full CI and shipping authority remain disabled.
 Replay `5d19f372` verifies 16 retained mount layouts and four nested root children
 making progress; original cleanup remains verified and the full test is red after
 101.96 seconds at the held transfer path. The pinned guest's chroot table omits
-the base mount. Each contained view exposes 21 explicit runtime/source/target,
+the base mount. Each contained view exposes 20 explicit runtime/source/target,
 private temp/home/Cargo/shm, proc/device and transport binds in this fixture.
 Observation: `/tmp/autoship-1703-four-parent-observation-6.json`.
 
@@ -2460,3 +2460,21 @@ view and its bound mount manifest. No tool argument or environment can add one.
 This enforces the explicit binds; private base-tree permissions, whole-UID writer
 closure and complete kernel-resource disposition still need evidence before any
 parent transfer/resume or passing-CI authority.
+
+Replay `13ed3156` encountered guest ENOSPC before compiler work: Cargo could not
+create its target directory (153.23 seconds, zero compiler calls). Its three
+initial metadata units executed and cleaned up, but nested binding enforcement
+was not exercised. Managed read-only inspection found 36 sealed generations;
+all contain newer execution-lease lifecycle metadata that the existing generation
+reclaimer does not understand. Fifteen leases report closed (three lack current
+completion evidence), and 21 remain active. This is not deletion authority:
+closed-state grammar, completion/cleanup correlation, owned namespaces, live
+source protection and original-R disposition must be validated before reclaim.
+Inspection: `/tmp/autoship-1703-own-cache-capacity-inspection-2.json`.
+
+After normal source/cache seeding and before each original Cargo invocation, the
+controller now rejects zero worker-available blocks/inodes using statvfs and
+preserves ENOSPC/EDQUOT through the existing infrastructure path. Root-reserved
+blocks do not count as worker capacity. This check does not prove the required
+plan fits, reclaim unknown state, increase any cap or replace lifecycle-aware
+retirement and required-plan capacity acceptance.

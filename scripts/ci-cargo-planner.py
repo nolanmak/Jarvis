@@ -2025,8 +2025,10 @@ def unit_mount_rules(view,mounts,*,library,endpoint):
         add(os.fsencode('/dev/'+name),'/dev/'+name,'device','rw')
     add(b'/run/ci-unit.sock',endpoint,'socket')
     add(b'/run/ci-cargo-relay.so',library,'file')
+    source_entries=mounts.get('source_entries')
+    if source_entries is None:source_entries=[]
     for prefix,entries in ((b'/workspace/target/',mounts['entries']),
-            (b'/workspace/',mounts.get('source_entries',[]))):
+            (b'/workspace/',source_entries)):
         for raw,source,expected in entries:
             name=os.fsencode(unit_views.relative(bytes.fromhex(raw)))
             if expected[1] not in ('file','tree'):raise FreshnessHold('invalidation_unsafe')
@@ -3791,6 +3793,7 @@ class _CargoExecutor:
         elif mapping['kind']=='application':self._application_outputs(view,ordinal)
 
     def _command(self,value,relay,*,operation='run'):
+        cache.require_cache_capacity(self.target)
         global _PHASE,_CHILD_DIAGNOSTIC
         _PHASE='planner_cargo_supervisor'
         if self.owner!=os.getpid() or len(self.commands)>=4 or operation not in ('run','metadata','original'):raise FreshnessHold('invalidation_unsafe')

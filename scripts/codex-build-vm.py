@@ -453,6 +453,7 @@ try:
             for relative,source in output_mounts.items():
                 subprocess.run(['/usr/bin/mount','--bind',str(source),str(Path('/workspace')/relative)],check=True)
             seed_build_cache(ci_target)
+            ci_cache['require_cache_capacity'](ci_target)
             if action and action['kind']=='install':
                 ci_cache['begin_seed_install'](ci_target,generation['binding'],action['seed'])
                 dependency_result=ci_dependency.install(action,seed_binding,ci_target,ci_target.parent/'cargo-home')

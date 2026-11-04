@@ -51,6 +51,21 @@ class FreshnessHold(Exception):
                 "evidence_sha256": self.evidence_sha256}
 
 
+def require_cache_capacity(directory):
+    """Refuse an already-full cache before worker dispatch, without cleanup.
+
+    Reserved root blocks are unavailable to the unprivileged worker. This is
+    only a zero-capacity check; it never proves the admitted plan fits or changes
+    any reservation, cache limit, retention decision or reusable-artifact proof.
+    """
+    info=os.statvfs(directory)
+    fields=(info.f_frsize,info.f_blocks,info.f_bavail,info.f_files,info.f_favail)
+    if (any(type(value) is not int or value<0 for value in fields)
+            or info.f_frsize==0 or info.f_blocks==0):raise FreshnessHold('invalidation_unsafe')
+    if info.f_bavail==0 or info.f_files>0 and info.f_favail==0:
+        raise OSError(errno.ENOSPC,'CI cache has no worker-available blocks or inodes')
+
+
 def validate_hold(value):
     if (isinstance(value, dict) and set(value) == {"version", "reason", "recovery", "evidence_sha256"}
             and type(value["version"]) is int and value["version"] == 1
