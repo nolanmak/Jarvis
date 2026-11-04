@@ -340,6 +340,23 @@ parent remained held. All 446 Python tests and 34 focused Rust tests pass.
 This proves retained-byte integration, not final-path transfer, parent resume,
 complete alias closure, full CI or shipping authority.
 
+Prepared transfer plans now seal the final allocation inventory alongside the
+retained old inode payloads and original sealed before image. Final inventory
+uses explicit tombstones for missing allocated roots; the admission capture
+continues to require every initial root. The entire private container is checked
+against W and its fixed ancestors, so a new sibling cannot expand the allocation.
+The object graph matches final inodes across all initial paths, distinguishing
+moves from replacement at the same pathname and preserving old unlinked writes.
+Protected objects, hardlink/symlink aliases, parent drift, changed before images,
+missing graph objects and interrupted preparation refuse completion. Plans use
+the existing entry/byte/metadata bounds and remain `state:prepared` with false
+materialization/input/CI/shipping flags. The root controller binds the canonical
+plan digest to the original command, parent/child scopes, ordinal and child exit
+status; failed origins remain non-reusable. This is preparation only. Durable
+application/replay, alias closure and checked parent resume remain required.
+All 453 Python tests and 34 focused Rust tests pass. Guest preparation evidence
+is pending.
+
 A rename is an identity-preserving namespace move in this graph, including
 rename-over-existing and directory descendants. Persist its original/final path
 sets, source/destination identities and staged-move progress in the transfer

@@ -2111,11 +2111,19 @@ class _ContainedViews:
                 or record.get('exec_observed') is not True):raise FreshnessHold('cleanup_uncertain')
         self.check();slot=Path(view['root']).parent
         retained=self.retained[view['ordinal']]
-        old_effects=retained.snapshot_old(slot/'old-inode-payload',check=self.check)
+        plan=retained.prepare_transfer(slot/'transfer',relay.captures/str(view['ordinal']),check=self.check)
+        if cache._read_record(slot/'transfer/plan.json',max_bytes=16*1024**2)!=plan:
+            raise FreshnessHold('input_census_unknown')
+        digest=hashlib.sha256(json.dumps(plan,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        cache._write_record(slot/'transfer-intent.json',{'version':1,'kind':'ci-contained-transfer-intent',
+            'binding':relay.admission.binding,'command':relay.admission.command,'parent_scope':relay.scope.name,
+            'child_scope':directory.name,'ordinal':view['ordinal'],'state':'prepared','plan_sha256':digest,
+            'origin':{'returncode':raw,'failed':raw!=0,'reusable':False},'effects_materialized':False,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
         cache._write_record(slot/'old-inode-effects.json',{'version':1,'binding':relay.admission.binding,
             'command':relay.admission.command,'parent_scope':relay.scope.name,'child_scope':directory.name,
-            'ordinal':view['ordinal'],'old_effects':old_effects,'effects_materialized':False,
-            'input_closure_complete':False,'shipping_authority':False})
+            'ordinal':view['ordinal'],'old_effects':plan['old_effects'],'payload_root':'transfer/old',
+            'effects_materialized':False,'input_closure_complete':False,'shipping_authority':False})
         cache._write_record(slot/'contained-result.json',{
             'version':1,'kind':'ci-contained-result-observation','binding':relay.admission.binding,
             'command':relay.admission.command,'parent_scope':relay.scope.name,'child_scope':directory.name,

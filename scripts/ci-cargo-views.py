@@ -6,6 +6,7 @@ filesystem helpers are also exercised without privilege; their results alone
 never establish trusted producer identity, input closure, or reuse authority.
 """
 import ctypes
+import copy as copy_module
 import errno
 import fcntl
 import hashlib
@@ -185,7 +186,7 @@ def copy_output_roots(source,destination,roots,*,owner,controller):
     return result
 
 
-def capture_roots(root_fd,destination,roots,*,owners,check):
+def capture_roots(root_fd,destination,roots,*,owners,check,allow_missing=False):
     """Copy selected visible roots through held descriptors, without authority.
 
     The controller must prove pause, scope and alias closure separately. Original
@@ -195,7 +196,8 @@ def capture_roots(root_fd,destination,roots,*,owners,check):
     if (type(root_fd) is not int or root_fd<0 or not stat.S_ISDIR(os.fstat(root_fd).st_mode)
             or type(roots) is not list or not 1<=len(roots)<=64
             or type(owners) not in (tuple,list) or not owners
-            or any(type(owner) is not int or owner<0 for owner in owners) or not callable(check)):
+            or any(type(owner) is not int or owner<0 for owner in owners) or not callable(check)
+            or type(allow_missing) is not bool):
         raise FreshnessHold('input_census_unknown')
     roots=sorted((relative(name) for name in roots),key=lambda name:name.parts)
     if any(a==b or a in b.parents for a,b in zip(roots,roots[1:])):raise FreshnessHold('input_census_unknown')
@@ -210,7 +212,7 @@ def capture_roots(root_fd,destination,roots,*,owners,check):
             raise FreshnessHold('artifact_provenance_unknown')
         return list(_key(info))
     def scan(copying):
-        rows=[];total=0;record_bytes=0
+        rows=[];total=0;record_bytes=0;missing=[]
         def append(row):
             nonlocal record_bytes
             rows.append(row);record_bytes+=len(json.dumps(row,separators=(',',':')).encode())
@@ -269,12 +271,16 @@ def capture_roots(root_fd,destination,roots,*,owners,check):
                     try:metadata(os.fstat(child),child)
                     except BaseException:os.close(child);raise
                     os.close(descriptor);descriptor=child
+                try:os.stat(root.name,dir_fd=descriptor,follow_symlinks=False)
+                except FileNotFoundError:
+                    if not allow_missing:raise
+                    missing.append(os.fsencode(root).hex());continue
                 visit(descriptor,root.name,root)
             finally:os.close(descriptor)
-        return rows,total
+        return rows,total,missing
     try:
-        entries,total=scan(True)
-        if scan(False)!=(entries,total):raise FreshnessHold('input_census_unknown')
+        entries,total,missing=scan(True)
+        if scan(False)!=(entries,total,missing):raise FreshnessHold('input_census_unknown')
     except OSError as error:
         if error.errno in (errno.ELOOP,errno.ENOTDIR):raise FreshnessHold('invalidation_unsafe') from None
         raise
@@ -297,7 +303,8 @@ def capture_roots(root_fd,destination,roots,*,owners,check):
     return {'version':1,'kind':'ci-paused-root-capture','roots':[os.fsencode(root).hex() for root in roots],
         'entries':entries,'copied_entries':len(sealed),'copied_bytes':total,
         'payload_sha256':hashlib.sha256(json.dumps(sealed,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
-        'original_metadata_emulated':False,'input_closure_complete':False,'shipping_authority':False}
+        'original_metadata_emulated':False,'input_closure_complete':False,'shipping_authority':False,
+        **({'missing_roots':missing} if allow_missing else {})}
 
 
 def materialize_capture(source,capture,destination,*,parent_uid,unit_uid,check):
@@ -367,7 +374,7 @@ class RetainedInodes:
     """
     def __init__(self,root_fd,capture,working,copy,*,parent_uid,unit_uid,check):
         self.owner=os.getpid();self.closed=False;self.entries=[];self.parent_uid=parent_uid;self.unit_uid=unit_uid
-        self.root_fd=None;self.working_fd=None
+        self.root_fd=None;self.working_fd=None;self.capture=copy_module.deepcopy(capture);self.prefixes={}
         try:
             if (type(root_fd) is not int or not stat.S_ISDIR(os.fstat(root_fd).st_mode)
                     or type(capture) is not dict or capture.get('kind')!='ci-paused-root-capture'
@@ -410,6 +417,14 @@ class RetainedInodes:
                         raise FreshnessHold('input_census_unknown')
                     if label=='working':entry['working_key']=list(_key(info))
                 check()
+            self.roots=[relative(bytes.fromhex(raw)) for raw in capture['roots']]
+            for root in self.roots:
+                for prefix in root.parents:
+                    if prefix==Path('.') or prefix in self.prefixes:continue
+                    fd=_open_beneath(self.working_fd,prefix,os.O_RDONLY|os.O_DIRECTORY)
+                    try:self.prefixes[prefix]=list(_key(os.fstat(fd)))
+                    finally:os.close(fd)
+            self._allocation(check)
         except BaseException as error:
             self.close()
             if isinstance(error,OSError) and error.errno in (errno.EMFILE,errno.ENFILE,errno.ELOOP,errno.ENOTDIR):
@@ -476,6 +491,86 @@ class RetainedInodes:
         finally:os.close(descriptor)
         return {'version':1,'kind':'ci-retained-inode-effects','entries':rows,'copied_bytes':total,
             'effects_materialized':False,'input_closure_complete':False,'shipping_authority':False}
+
+    def _allocation(self,check):
+        """The private container may contain only W and its fixed ancestors."""
+        allowed=set(self.roots)|set(self.prefixes)
+        for prefix in [Path('.'),*self.prefixes]:
+            check()
+            fd=os.dup(self.working_fd) if prefix==Path('.') else _open_beneath(self.working_fd,prefix,os.O_RDONLY|os.O_DIRECTORY)
+            try:
+                if prefix!=Path('.'):
+                    info=list(_key(os.fstat(fd)));initial=self.prefixes[prefix]
+                    if info[:2]!=initial[:2] or info[3:6]!=initial[3:6]:raise FreshnessHold('invalidation_unsafe')
+                if any(prefix/name not in allowed for name in os.listdir(fd)):
+                    raise FreshnessHold('invalidation_unsafe')
+            finally:os.close(fd)
+
+    def prepare_transfer(self,destination,before,*,check):
+        """Prepare sealed images and an inode graph; do not mutate the parent.
+
+        Original cleanup and a paused parent are caller-owned preconditions.
+        Durable graph preparation is not completion or a reusable publication.
+        """
+        self._owned();destination,before=map(literal,(destination,before));check()
+        def before_digest():
+            check();rows=inventory(before,owner=os.geteuid(),sealed=True)
+            return hashlib.sha256(json.dumps(rows,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        if before_digest()!=self.capture['payload_sha256']:raise FreshnessHold('input_census_unknown')
+        self._allocation(check);destination.mkdir(mode=0o700)
+        old=self.snapshot_old(destination/'old',check=check)
+        after=capture_roots(self.working_fd,destination/'after',[os.fsdecode(root) for root in self.roots],
+            owners=tuple(sorted({0,self.unit_uid})),check=check,allow_missing=True)
+        final={};old_map={tuple(entry['working_key'][:2]):entry for entry in self.entries}
+        if len(old_map)!=len(self.entries):raise FreshnessHold('invalidation_unsafe')
+        for row in after['entries']:
+            identity=tuple(row[2][:2])
+            if identity in final:raise FreshnessHold('invalidation_unsafe')
+            final[identity]=row
+        effects={row['path']:row for row in old['entries']};objects=[]
+        for entry in self.entries:
+            check();initial=entry['working_key'];identity=tuple(initial[:2]);ending=final.get(identity)
+            effect=effects[entry['path']];kind=entry['kind'];final_path=ending[0] if ending else None
+            if ending is not None and (ending[1]!=kind or ending[2]!=effect['working_key']
+                    or kind=='file' and ending[3]!=effect['sha256']):
+                raise FreshnessHold('input_census_unknown')
+            if (kind=='file' and effect['working_links']!=int(ending is not None)
+                    or kind=='directory' and ending is None and effect['working_links']!=0):
+                raise FreshnessHold('invalidation_unsafe')
+            changed=kind=='file' and effect['sha256']!=entry['initial_digest'][0]
+            metadata=effect['working_key'][3:]!=initial[3:]
+            moved=final_path!=entry['path']
+            if entry['original_key'][3]!=self.parent_uid and (changed or metadata or moved):
+                raise FreshnessHold('invalidation_unsafe')
+            objects.append({'initial_path':entry['path'],'final_path':final_path,'kind':kind,
+                'original_inode':entry['original_key'][:2],'original_key':entry['original_key'],
+                'initial_working_key':initial,'working_inode':list(identity),
+                'content_changed':changed,'metadata_changed':metadata,'namespace_changed':moved,
+                'old_effect':effect})
+        for identity,row in final.items():
+            if identity in old_map:continue
+            check();raw,kind,info,*digest=row
+            if (info[3],info[4])!=(self.unit_uid,self.unit_uid):raise FreshnessHold('invalidation_unsafe')
+            objects.append({'initial_path':None,'final_path':raw,'kind':kind,'original_inode':None,
+                'working_inode':list(identity),'content_changed':kind=='file','metadata_changed':True,
+                'namespace_changed':True,'final_key':info,'sha256':digest[0] if digest else None})
+        if len(objects)>MAX_ENTRIES:raise FreshnessHold('input_census_unknown')
+        self._allocation(check)
+        for entry in self.entries:
+            check()
+            if list(_key(os.fstat(entry['original_fd'])))!=entry['original_key']:
+                raise FreshnessHold('input_census_unknown')
+            if list(_key(os.fstat(entry['working_fd'])))!=effects[entry['path']]['working_key']:
+                raise FreshnessHold('input_census_unknown')
+        if before_digest()!=self.capture['payload_sha256']:raise FreshnessHold('input_census_unknown')
+        plan={'version':1,'kind':'ci-contained-transfer-plan','state':'prepared',
+            'roots':self.capture['roots'],'before_root':str(before),'before':self.capture,
+            'after':after,'old_effects':old,'objects':objects,'effects_materialized':False,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+        encoded=json.dumps(plan,sort_keys=True,separators=(',',':')).encode()
+        if len(encoded)>16*1024**2:raise FreshnessHold('input_census_unknown')
+        check();cache._write_record(destination/'plan.json',plan);check()
+        return plan
 
     def close(self):
         if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')

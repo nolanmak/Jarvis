@@ -275,6 +275,121 @@ print(json.dumps(rows))
                 self.assertEqual(data.read_bytes(),b'binary\x00\xffpayload')
             finally:os.close(descriptor)
 
+    def test_transfer_plan_tracks_moves_replacements_new_files_and_deleted_old_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data,working,held=self.retained(root)
+            before=data.read_bytes();old_inode=[data.stat().st_dev,data.stat().st_ino]
+            with held:
+                child=working/data.relative_to(source);child.write_bytes(b'moved bytes');child.rename(working/'out/moved')
+                (working/data.relative_to(source)).write_bytes(b'replacement')
+                (working/'out/new').write_bytes(b'new bytes');(working/'out/empty').rmdir()
+                plan=held.prepare_transfer(root/'transfer',root/'capture',check=lambda:None)
+                self.assertEqual(json.loads((root/'transfer/plan.json').read_text()),plan)
+                old=next(r for r in plan['objects'] if r['initial_path']==os.fsencode(data.relative_to(source)).hex())
+                self.assertEqual(old['final_path'],b'out/moved'.hex());self.assertEqual(old['original_inode'],old_inode)
+                self.assertTrue(old['content_changed']);self.assertTrue(old['namespace_changed'])
+                new={r['final_path'] for r in plan['objects'] if r['initial_path'] is None}
+                self.assertEqual(new,{os.fsencode(data.relative_to(source)).hex(),b'out/new'.hex()})
+                deleted=next(r for r in plan['objects'] if r['initial_path']==b'out/empty'.hex())
+                self.assertIsNone(deleted['final_path']);self.assertTrue(deleted['namespace_changed'])
+                self.assertFalse(plan['effects_materialized']);self.assertFalse(plan['shipping_authority'])
+                self.assertEqual(data.read_bytes(),before);self.assertTrue((source/'out/empty').is_dir())
+                self.assertFalse((source/'out/moved').exists())
+
+    def test_transfer_plan_maps_directory_rename_and_descendants_by_inode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data,working,held=self.retained(root)
+            with held:
+                (working/'out').rename(working/'renamed')
+                # Renaming the whole allocated root removes it from W. The
+                # sibling destination is outside the controller allocation.
+                with self.assertRaises(views.FreshnessHold):held.prepare_transfer(root/'transfer',root/'capture',check=lambda:None)
+            self.assertTrue(data.is_file())
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data=self.tree(root);(source/'out/sub').mkdir();(source/'out/sub/file').write_bytes(b'directory child')
+            sealed=root/'capture';capture=self.capture(source,sealed);working=root/'working'
+            copied=views.materialize_capture(sealed,capture,working,parent_uid=os.getuid(),unit_uid=os.getuid(),check=lambda:None)
+            fd=os.open(source,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+            try:held=views.RetainedInodes(fd,capture,working,copied,parent_uid=os.getuid(),unit_uid=os.getuid(),check=lambda:None)
+            finally:os.close(fd)
+            with held:
+                (working/'out/sub').rename(working/'out/renamed')
+                plan=held.prepare_transfer(root/'transfer',sealed,check=lambda:None)
+                rows={r['initial_path']:r for r in plan['objects']}
+                for old,new in ((b'out/sub',b'out/renamed'),(b'out/sub/file',b'out/renamed/file')):
+                    self.assertEqual(rows[old.hex()]['final_path'],new.hex())
+                    self.assertTrue(rows[old.hex()]['namespace_changed'])
+                self.assertEqual((source/'out/sub/file').read_bytes(),b'directory child')
+
+    def test_transfer_plan_preserves_old_writes_when_a_new_inode_replaces_the_same_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data,working,held=self.retained(root)
+            with held:
+                child=working/data.relative_to(source);child.write_bytes(b'old inode effects')
+                replacement=working/'out/replacement';replacement.write_bytes(b'new inode effects');replacement.replace(child)
+                plan=held.prepare_transfer(root/'transfer',root/'capture',check=lambda:None)
+                raw=os.fsencode(data.relative_to(source)).hex()
+                old=next(r for r in plan['objects'] if r['initial_path']==raw)
+                new=next(r for r in plan['objects'] if r['initial_path'] is None and r['final_path']==raw)
+                self.assertIsNone(old['final_path']);self.assertTrue(old['content_changed'])
+                self.assertNotEqual(old['working_inode'],new['working_inode'])
+                self.assertEqual((root/'transfer/old'/old['old_effect']['payload']).read_bytes(),b'old inode effects')
+                self.assertEqual((root/'transfer/after'/data.relative_to(source)).read_bytes(),b'new inode effects')
+                self.assertEqual(data.read_bytes(),b'binary\x00\xffpayload')
+
+    def test_transfer_plan_does_not_complete_when_prepared_record_cannot_be_synced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data,working,held=self.retained(root)
+            with held:
+                (working/data.relative_to(source)).write_bytes(b'child effects')
+                with patch.object(views.cache,'_write_record',side_effect=OSError(errno.ENOSPC,'intent storage full')):
+                    with self.assertRaises(OSError):held.prepare_transfer(root/'transfer',root/'capture',check=lambda:None)
+                self.assertFalse((root/'transfer/plan.json').exists())
+                self.assertEqual(data.read_bytes(),b'binary\x00\xffpayload')
+
+    def test_transfer_plan_records_deleted_file_roots_as_tombstones(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source,data=self.tree(root);sealed=root/'capture'
+            capture=self.capture(source,sealed,roots=(data.relative_to(source),));working=root/'working'
+            copied=views.materialize_capture(sealed,capture,working,parent_uid=os.getuid(),unit_uid=os.getuid(),check=lambda:None)
+            fd=os.open(source,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+            try:held=views.RetainedInodes(fd,capture,working,copied,parent_uid=os.getuid(),unit_uid=os.getuid(),check=lambda:None)
+            finally:os.close(fd)
+            with held:
+                child=working/data.relative_to(source);child.write_bytes(b'deleted effects');child.unlink()
+                plan=held.prepare_transfer(root/'transfer',sealed,check=lambda:None)
+                self.assertEqual(plan['after']['missing_roots'],[os.fsencode(data.relative_to(source)).hex()])
+                self.assertIsNone(plan['objects'][0]['final_path']);self.assertTrue(plan['objects'][0]['content_changed'])
+                self.assertEqual(data.read_bytes(),b'binary\x00\xffpayload')
+
+    def test_transfer_plan_refuses_renamed_protected_objects_and_new_aliases(self):
+        # Host-only ownership substitution exercises the immutable branch;
+        # this filesystem primitive grants no execution or CI capability.
+        for fault in ('protected','hardlink','symlink','outside'):
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);source,data,working,held=self.retained(root)
+                with held:
+                    child=working/data.relative_to(source)
+                    if fault=='protected':
+                        held.parent_uid=os.getuid()+1
+                        child.rename(working/'out/moved')
+                    elif fault=='hardlink':os.link(child,working/'out/extra')
+                    elif fault=='symlink':(working/'out/link').symlink_to('/etc/passwd')
+                    else:(working/'outside').write_bytes(b'outside allocated roots')
+                    with self.assertRaises(views.FreshnessHold):held.prepare_transfer(root/'transfer',root/'capture',check=lambda:None)
+                    self.assertEqual(data.read_bytes(),b'binary\x00\xffpayload')
+
+    def test_transfer_plan_refuses_corrupt_before_images_and_parent_drift(self):
+        for fault in ('before','parent'):
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);source,data,working,held=self.retained(root)
+                with held:
+                    if fault=='before':
+                        p=root/'capture'/data.relative_to(source);p.chmod(0o600);p.write_bytes(b'corrupt');p.chmod(0o555)
+                    else:(source/'out/new-parent-entry').write_bytes(b'foreign parent write')
+                    with self.assertRaises(views.FreshnessHold):held.prepare_transfer(root/'transfer',root/'capture',check=lambda:None)
+                    self.assertEqual(data.read_bytes(),b'binary\x00\xffpayload')
+
     def test_working_tree_refuses_a_changed_sealed_payload_before_execution(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);source,data=self.tree(root);sealed=root/'capture';capture=self.capture(source,sealed)
