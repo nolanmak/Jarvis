@@ -2223,8 +2223,18 @@ The actual supervised kernel tests first failed against the old native helper
 with seven missing-symbol failures; all ten kernel/loader tests then passed.
 They exercise namespace/mount calls, both asynchronous-I/O interfaces, clone
 flags, pre-existing threads and ordinary fork/exec/thread behavior. The complete
-Python CI suite passes **391 tests without skips**. Pinned-guest policy and
-original adapter validation remain pending at this checkpoint. This establishes
-neither first-instruction exec mediation nor a complete input/pause proof. The
+Python CI suite passes **391 tests without skips**, and the focused managed Rust
+suite passes **33 tests** with 21 opt-in guest tests ignored. The separate
+pinned-guest policy test at `7371d137` passed all seven kernel cases in **87.25
+seconds**. Receipt:
+`/tmp/augmentagent-ci-unit-policy-20261104005747/receipt.json`, SHA-256
+`0ff3269fc6a2037f0f5a504afb85a671ed92e889c557acd5afe1819c65409d1b`.
+The unchanged five-command generated-input adapter replay passed in **163.84
+seconds**, preserving cross-VM zero compiler calls for unchanged inputs,
+generated-change holds and original supervision/cleanup. Receipt:
+`/tmp/augmentagent-ci-unit-policy-adapter-20261104010000/receipt.json`, SHA-256
+`47944a4c88f04b349c383ffd2e4a2f1c87aace821cadd5553b510484824d8230`.
+Both runs used existing managed admission and unchanged resource/deadline policy.
+This establishes neither first-instruction exec mediation nor a complete input/pause proof. The
 original generated-publication regression and all final proof, reuse and rollout
 gates remain required; experimental authority flags remain false.
