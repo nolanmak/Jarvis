@@ -29,6 +29,11 @@ async fn read(repo: &Path, args: &[&str]) -> Result<String> {
 
 async fn authorized_repository(repo: &Path, request: &Request) -> Result<String> {
     let request = request.normalized()?;
+    authorized_repository_name(repo,&request.repository).await
+}
+
+async fn authorized_repository_name(repo:&Path,requested:&str)->Result<String> {
+    let requested=crate::autoship_workflow::submission::normalized_repository(requested)?;
     let repository = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         workflow::canonical_repository(repo),
@@ -36,7 +41,7 @@ async fn authorized_repository(repo: &Path, request: &Request) -> Result<String>
     .await
     .context("repository identity lookup timed out")??;
     anyhow::ensure!(
-        repository.eq_ignore_ascii_case(&request.repository),
+        repository.eq_ignore_ascii_case(&requested),
         "requested repository differs from checkout"
     );
     let permission = read(
@@ -61,7 +66,12 @@ async fn authorized_repository(repo: &Path, request: &Request) -> Result<String>
 /// Authenticate before looking up a replay; closed targets may replay their
 /// original admission, but a revoked repository grant may not.
 pub(crate) async fn authorize_command(repo: &Path, request: &Request) -> Result<String> {
-    authorized_repository(repo, request).await?;
+    let request=request.normalized()?;
+    authorize_repository(repo,&request.repository).await
+}
+
+pub(crate) async fn authorize_repository(repo:&Path,repository:&str)->Result<String> {
+    authorized_repository_name(repo,repository).await?;
     let actor = read(repo, &["api", "user", "--jq", ".login"]).await?;
     let actor = actor.trim();
     anyhow::ensure!(!actor.is_empty() && actor.len() <= 100 && actor.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'), "invalid authenticated GitHub actor");
