@@ -29,6 +29,11 @@ async fn read(repo: &Path, args: &[&str]) -> Result<String> {
 
 async fn authorized_repository(repo: &Path, request: &Request) -> Result<String> {
     let request = request.normalized()?;
+    authorized_repository_name(repo,&request.repository).await
+}
+
+async fn authorized_repository_name(repo:&Path,requested:&str)->Result<String> {
+    let requested=crate::autoship_workflow::submission::normalized_repository(requested)?;
     let repository = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         workflow::canonical_repository(repo),
@@ -36,7 +41,7 @@ async fn authorized_repository(repo: &Path, request: &Request) -> Result<String>
     .await
     .context("repository identity lookup timed out")??;
     anyhow::ensure!(
-        repository.eq_ignore_ascii_case(&request.repository),
+        repository.eq_ignore_ascii_case(&requested),
         "requested repository differs from checkout"
     );
     let permission = read(
@@ -61,7 +66,12 @@ async fn authorized_repository(repo: &Path, request: &Request) -> Result<String>
 /// Authenticate before looking up a replay; closed targets may replay their
 /// original admission, but a revoked repository grant may not.
 pub(crate) async fn authorize_command(repo: &Path, request: &Request) -> Result<String> {
-    authorized_repository(repo, request).await?;
+    let request=request.normalized()?;
+    authorize_repository(repo,&request.repository).await
+}
+
+pub(crate) async fn authorize_repository(repo:&Path,repository:&str)->Result<String> {
+    authorized_repository_name(repo,repository).await?;
     let actor = read(repo, &["api", "user", "--jq", ".login"]).await?;
     let actor = actor.trim();
     anyhow::ensure!(!actor.is_empty() && actor.len() <= 100 && actor.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'), "invalid authenticated GitHub actor");
@@ -72,19 +82,12 @@ pub(crate) async fn validate_command(repo: &Path, request: &Request) -> Result<(
     resolve(repo, request).await.map(|_| ())
 }
 
-/// Shared read-only execution admission, also used before clearing owner pause.
-/// Background dispatch still verifies deployed-service equality independently.
+/// Resume is a control request for the deployed worker, not native execution
+/// by the operator's terminal. Every productive dispatch still passes the full
+/// execution preflight inside that worker, including provider/resource gates.
 pub(crate) async fn command_readiness(repo:&Path,request:&Request)->Result<()> {
-    execution_preflight(repo,Some(request.target),ExecutionMode::Local,None).await
-}
-
-pub(crate) fn prepare_internal_execution_retry(path:&Path,id:&str,principal:&str,revision:i64)->Result<()> {
-    let mut store=crate::autoship_workflow::WorkflowStore::open(path)?;
-    let now=chrono::Utc::now().timestamp_millis();
-    if store.request_execution_retry_retirement(id,principal,revision,now)? {
-        workflow::reconcile_runtime_retirements_in(&mut store,now)?;
-    }
-    Ok(())
+    request.normalized()?;
+    crate::autoship_deployment::inspect(repo).await.preflight()
 }
 
 pub(super) async fn execution_preflight(repo:&Path,target:Option<Target>,mode:ExecutionMode,
@@ -804,6 +807,11 @@ else:raise Exception('unexpected request '+repr(a))
             assert_eq!(status["milestones"]["merged"], true);
             let allowance = store.merge_allowance(now, 5).unwrap();
             assert_eq!((allowance.confirmed, allowance.available), (0, 5), "manual merge debited the autonomous allowance");
+            let progress=store.progress_events(&ids[0]).unwrap();
+            let merged=progress.last().unwrap();
+            assert_eq!(merged.kind,"merged","manual completion must not look like unresolved merge reconciliation");
+            assert_eq!(merged.merge_state,"observed-external-merge");
+            assert_eq!(merged.deployment_state,"unknown","merge observation is not deployment proof");
             // Closed unmerged PR and closed issue: terminal, never retried.
             for id in [&ids[1], &ids[2]] {
                 assert_eq!(stage(id).stage, Stage::Retired, "{id}");
@@ -861,6 +869,19 @@ else: raise Exception('unexpected request '+repr(a))
             "local execution requires an authorized target"
         );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "read-only admission probe requiring the normally deployed worker"]
+    async fn live_resume_uses_worker_readiness_from_a_nondelegated_operator() {
+        let repo=PathBuf::from(std::env::var_os("AUGMENTAGENT_LIVE_REPO").expect("production repository required"));
+        crate::autoship_deployment::inspect(&repo).await.preflight().expect("live worker must match its deployment configuration");
+        assert!(!augmentagent_channel_core::run_resources::readiness().await.permits_attempt,
+            "this regression must run from a nondelegated operator context");
+        let request=Request {repository:"nolanmak/jarvis".into(),target:Target::Pr(1669),provider:None,
+            until:crate::autoship_workflow::submission::Milestone::Merged};
+        let result=command_readiness(&repo,&request).await;
+        assert!(result.is_ok(),"a control request for the deployed worker must not require the operator's native execution delegation: {result:?}");
     }
 
     #[tokio::test]
