@@ -2608,3 +2608,14 @@ an unrelated bootstrap UID transition causing a false hold: identity changes
 now hold only if they concern an expected task or enter/leave the target UID.
 Both directions remain tested; this does not ignore any target-UID identity
 change. The additional two policy tests do not claim actual host UID changes.
+
+Final replay `4aadc3e0` independently validates 23 entry UID censuses and all
+16 frozen-parent censuses after the foreign-transition fix and entry deadline
+check. Paused cohorts contain 1, 2 or 5 tasks, matched exactly to the original
+PID/TID/start-time observations and unit UID. All four deepest children return
+zero; one sealed ELF output is independently verified before sibling
+cancellation. The full unchanged test remains red with InputCensusUnknown after
+108.35 seconds, and original VM subtree cleanup is positively verified. All
+626 host Python tests and 34 focused managed Rust tests pass. These are census
+and pause-barrier observations, not complete allocation/alias/resource closure,
+parent transfer/resume, passing CI or production autoship.
