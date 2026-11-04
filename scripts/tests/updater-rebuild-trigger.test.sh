@@ -22,6 +22,17 @@ bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     %s\n' "$1" "${2:-}"; }
 # not change a production binary, so they must not cost a release rebuild.
 # A new include outside crates/ must be classified here or trigger a rebuild.
 TEST_ONLY_EMBEDS=(
+  # self_improve_ci::acceptance is compiled only under #[cfg(test)].
+  scripts/tests/ci_cargo_active_signals_test.py
+  scripts/tests/ci_cargo_capture_test.py
+  scripts/tests/ci_cargo_credits_test.py
+  scripts/tests/ci_cargo_jobserver_observation_test.py
+  scripts/tests/ci_cargo_namespace_apply_test.py
+  scripts/tests/ci_cargo_namespace_sequence_test.py
+  scripts/tests/ci_cargo_namespace_test.py
+  scripts/tests/ci_cargo_parent_signals_test.py
+  scripts/tests/ci_cargo_transfer_objects_test.py
+  scripts/tests/ci_cargo_transfer_test.py
   docs/fixtures/whatsapp/wire-v1.ndjson
   docs/reasoner-capabilities.json
   eval/autopr-cases.json
