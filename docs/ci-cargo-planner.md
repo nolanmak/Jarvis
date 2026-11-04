@@ -2321,3 +2321,37 @@ Observations: `/tmp/autoship-1703-exec-controller-inspection-4.json` and
 `/tmp/autoship-1703-exec-controller-inspection-5.json`. Both failing replays
 retained verified VM teardown and false shipping authority; no production
 workflow, original regression or grant was changed.
+
+### Scoped unit credential admission
+
+The V3 relay now recognizes the distinct sealed `JARVUNT3` unit role. Its existing
+uid field names the assigned client in 2000–6095; all real/effective/saved UID/GID
+values must match, supplementary groups remain empty and the grant must be a
+root-owned sealed descriptor. Worker/planner roles keep their existing uid=0
+layout. The expected V3 server UID remains root independently of the unit's
+client UID; V2's same-UID server behavior remains intact.
+
+The actual pinned guest first reproduced rejection of a valid UID2000 unit grant
+at `fd854de0`: constructor exit 125 before main, **82.57 seconds** for the replay.
+After the role change at `03335b00`, retained root observations verify all ten
+constructor cases: both boundary UIDs accepted, and eight wrong/out-of-range or
+cross-role grants refused before main. These credential-only cases run outside
+the original unit observer's UID/process-attribution window. **402 Python tests
+and 34 focused Rust tests pass**, with 22 guest opt-ins ignored routinely.
+Red observation SHA-256:
+`c25b7f8777eaa006a647d5774ca02f0c2474dce7e0ced72363a74283bb2145dd`;
+accepted/refused observation SHA-256:
+`3ee1327caf2437f267e0c8cbb8d2dfbb6b4d7f5f17e41fc76b08d44af66c44db`.
+
+This proves constructor admission, not unit-peer connection, contained dispatch
+or output provenance. The unchanged full native replay remains **red** after
+**94.27 seconds** at the known compiler subsequent-exec refusal. The first attempt
+was blocked by deployment admission for 300.26 seconds and supplied no guest-test
+evidence; it is not counted as the reproduced constructor failure. No production
+configuration or shipping authority changed.
+
+The [nested-producer mechanism draft](ci-opaque-producers.md) now records the
+provisional-result/reuse distinction, worker liveness, artifact export slots,
+inode/rename semantics and C/R recovery obligations from the 84-seam review.
+Signal ingress, sibling-effect closure and complete kernel-policy disposition
+remain explicit C-owned handoff blockers; the draft is not a final C proof/API.
