@@ -55,6 +55,34 @@ they never execute a candidate-controlled host wrapper. Deterministic host gates
 and explicit host/legacy builders retain verified target leases and parent-proof
 checks. No model output can opt into the narrower admission path.
 
+Shared CI admission (`admit_ci`) boots the build VM, so it waits up to 300 s for
+the deployment exclusion and the build lease instead of failing on the first
+busy attempt (#1816). Each attempt takes both or neither, so a waiting CI run
+never holds the deployment lock while the build lease is busy. On timeout it
+defers with the busy lock's existing `retry CI admission` text.
+
+Isolated shared CI also records a private cleanup hold before its supervisor
+starts. The hold binds the exact source, controller and target directories to
+the resource identity observed at admission, before the command is released.
+An immutable admission receipt is separate from the mutable completion result.
+A damaged completion keeps CI unverified, while intact original admission and
+a matching live kernel proof can still establish safe storage cleanup.
+A completed process or cleanup log alone does not release that ownership:
+normal completion verifies the same kernel scope is quiescent first. A
+resource refusal before admission can release unused storage only when the
+supervisor has reaped its descendants and never received the launch token.
+
+If teardown cannot be proven, CI preserves its source checkout, controller and
+supervisor receipts. The hold survives controller descriptor loss. Every new
+managed storage admission reconciles abandoned holds under the existing
+allocation lock, using the original resource identity and kernel evidence.
+Missing, corrupt, replaced or foreign ownership/admission evidence defers builds and pruning; it
+does not trigger code repair, spend a model call, or change shipping allowance.
+Do not delete hold files, inherited locks or retained checkouts to make an
+admission succeed. Recovery must establish the original correlation and
+positive teardown evidence. The normal updater and worker must use the
+compatible storage implementation before these holds are written.
+
 For ad hoc session names, opt a dedicated build parent into discovery once:
 
 ```sh
@@ -189,12 +217,26 @@ The helper creates a consistent compressed SQLite copy, optional release binary,
 and ownership manifest. It runs retention around creation. Snapshot allocation
 shares the build lease and reserves space for simultaneous plain/compressed
 copies, the binary, and the final free-space floor. The storage budget
-`AUGMENTAGENT_DEPLOY_MAX_GB` defaults to 8 GiB; admission conservatively reserves
-the uncompressed input plus binary. The newest `AUGMENTAGENT_DEPLOY_KEEP`
-snapshots (default two) and snapshots younger than 48 hours are retained. If
-protected data exhausts the budget, creation refuses rather than growing it.
-Retention orders snapshots by the manifest creation date; pinning or unpinning
-does not change which rollback points count as newest.
+`AUGMENTAGENT_DEPLOY_MAX_GB` (default 8 GiB) is checked against the new
+snapshot's exact size once it is written, not an estimate (#1815).
+
+Retention keeps the newest `AUGMENTAGENT_DEPLOY_KEEP` (default two) snapshots
+*per source database*; each manifest records `source_db`. Manifests written
+before that form one legacy group, which stops holding keep slots once that
+many tagged snapshots are newer than all of it; a group whose database file is
+gone stops too. While under budget, snapshots younger than 48 hours are also
+retained. Over budget, the budget wins: unpinned, unreferenced snapshots
+outside the keep slots are evicted oldest first until the total fits, and
+nothing is evicted if even that would not fit. Creation evicts only after the
+new copy is complete, so a failed copy never costs a rollback point. Forensic
+evidence counts toward the budget and is never evicted for it. When protected
+material alone fills the budget, `deploy snapshot` refuses, names each blocker
+(`pinned`, `referenced`, `reference probe unavailable`, `forensic evidence`,
+`newest for its database`, `newest legacy snapshot`), and tells agents to
+report it rather than unpin or raise the cap; `autopr-health` raises
+`snapshot-budget` for the owner. Retention orders snapshots by the manifest
+creation date; pinning or unpinning does not change which rollback points
+count as newest.
 
 ```sh
 augmentagent deploy pin SNAPSHOT --reason 'current rollback point'
@@ -209,7 +251,7 @@ agents (`sshd`, `ssh-agent`, `(sd-pam)`), whose `exe`/`cwd`/`fd` are denied even
 to their own user while their status and command line stay readable (#1753).
 Each kept snapshot says why: `kept: pinned`, `kept: referenced`, or
 `kept: reference probe unavailable (<first blocker>; +N more)`. A pin is
-reported ahead of the others. A budget refusal names the same blocker. Unknown folders
+reported ahead of the others. Over budget with nothing evictable, prune prints one `kept:` line per blocker and `over budget: … nothing evictable`. Unknown folders
 under the snapshot root are preserved. Stray backup deletion still requires
 `--strays --yes`.
 

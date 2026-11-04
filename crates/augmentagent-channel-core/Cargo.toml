@@ -52,6 +52,10 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
+augmentagent-phone = { path = "../augmentagent-phone", features = ["test-support"] }
+tokio-tungstenite = "0.29"
+hmac = "0.12"
+sha1 = "0.10"
 # #1548 — paused-clock timing tests for the phone queue notices.
 tokio = { workspace = true, features = ["test-util"] }
 syn = { version = "2", features = ["full", "visit"] }

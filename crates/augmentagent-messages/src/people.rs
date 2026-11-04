@@ -102,10 +102,13 @@ fn identity_handles(ids: &Identities) -> Vec<String> {
     for v in &ids.whatsapp {
         push("whatsapp", v);
     }
+    // #1796: a page may list several Instagram handles.
+    for v in &ids.instagram {
+        push("instagram", v);
+    }
     for (platform, v) in [
         ("discord", &ids.discord),
         ("linkedin", &ids.linkedin),
-        ("instagram", &ids.instagram),
         ("twitter", &ids.twitter),
         ("slack", &ids.slack),
     ] {

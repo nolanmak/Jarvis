@@ -11,6 +11,8 @@ use std::{path::Path, time::Duration};
 mod merge_allowance;
 #[path = "autoship_progress.rs"]
 pub(crate) mod progress;
+#[path = "autoship_delivery.rs"]
+pub(crate) mod delivery;
 #[path = "autoship_milestone.rs"]
 mod milestone;
 #[path = "autoship_discord_ingress.rs"]
@@ -29,6 +31,9 @@ pub(crate) mod owner_inbox;
 pub(crate) mod discord_controls;
 #[path = "autoship_owner_control.rs"]
 pub(crate) mod owner_control;
+#[path = "autoship_verification_retry.rs"]
+mod verification_retry;
+pub use verification_retry::VerificationDomain;
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
@@ -310,6 +315,26 @@ impl WorkflowStore {
                 bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
                 workflow TEXT NOT NULL REFERENCES command_job(workflow), created_at INTEGER NOT NULL,
                 PRIMARY KEY(bot,owner,channel,workflow));
+            CREATE TABLE IF NOT EXISTS workflow_delivery_binding (
+                bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
+                workflow TEXT NOT NULL, source TEXT NOT NULL, created_at INTEGER NOT NULL,
+                PRIMARY KEY(bot,owner,channel,workflow));
+            CREATE TABLE IF NOT EXISTS repository_delivery_default (
+                repository TEXT PRIMARY KEY, bot TEXT NOT NULL, owner TEXT NOT NULL,
+                channel TEXT NOT NULL, principal TEXT NOT NULL, updated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS repository_delivery_route_event (
+                id TEXT PRIMARY KEY, repository TEXT NOT NULL, principal TEXT NOT NULL,
+                previous_routes TEXT NOT NULL, destination TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS discord_binding_delivery AFTER INSERT ON discord_workflow_binding BEGIN
+                SELECT CASE WHEN EXISTS(SELECT 1 FROM workflow_progress_delivery d JOIN workflow_delivery_binding b ON b.workflow=d.workflow AND b.bot=d.bot AND b.owner=d.owner AND b.channel=d.channel WHERE d.workflow=NEW.workflow AND b.source='default' AND d.state='uncertain') THEN RAISE(ABORT,'delivery-uncertain-reconcile-before-rebind') END;
+                DELETE FROM workflow_delivery_binding WHERE workflow=NEW.workflow AND source='default';
+                INSERT OR IGNORE INTO workflow_delivery_binding VALUES(NEW.bot,NEW.owner,NEW.channel,NEW.workflow,'discord',NEW.created_at);
+            END;
+            INSERT OR IGNORE INTO workflow_delivery_binding SELECT bot,owner,channel,workflow,'discord',created_at FROM discord_workflow_binding;
+            CREATE TABLE IF NOT EXISTS discord_delivery_route_event (
+                id TEXT PRIMARY KEY, workflow TEXT NOT NULL,
+                principal TEXT NOT NULL, previous_routes TEXT NOT NULL, destination TEXT NOT NULL,
+                created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS discord_command_ingress (
                 request_id TEXT PRIMARY KEY REFERENCES command_request(request_id), origin TEXT NOT NULL,
                 message_sha256 TEXT NOT NULL, response TEXT NOT NULL, state TEXT NOT NULL,
@@ -381,6 +406,10 @@ impl WorkflowStore {
                 workflow TEXT NOT NULL REFERENCES workflow(id), lease_generation INTEGER NOT NULL,
                 audit_path TEXT NOT NULL, retirement_reason TEXT, retired_at INTEGER,
                 attempted_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(workflow,lease_generation));
+            CREATE TABLE IF NOT EXISTS owner_execution_retry (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id), owner_revision INTEGER NOT NULL,
+                generation INTEGER NOT NULL, binding TEXT NOT NULL, state TEXT NOT NULL,
+                requested_at INTEGER NOT NULL, attempted_at INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS workflow_audit_generation (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), generation INTEGER NOT NULL,
                 lease_generation INTEGER NOT NULL, recovery TEXT NOT NULL);
@@ -705,6 +734,11 @@ impl WorkflowStore {
             bail!("unknown workflow");
         };
         let cp: Checkpoint = serde_json::from_str(&raw)?;
+        // Pending owner cleanup owns this generation until checked retirement
+        // settles the retry. Even free recovery must not fence that intent.
+        if cp.stage == Stage::Held && cp.next.reason == "owner_execution_retry_pending" {
+            return Ok(None);
+        }
         if purpose != ClaimPurpose::General {
             if owner_control::read(&tx,workflow)?.is_some_and(|c|c.paused) {return Ok(None);}
             let policy: Option<String> = tx.query_row("SELECT until_milestone FROM command_job WHERE workflow=?1", [workflow], |r| r.get(0)).optional()?;
@@ -1761,6 +1795,36 @@ impl WorkflowStore {
         .collect()
     }
 
+    /// Read-only recovery authority for a recorded, unpublished candidate.
+    /// This grants execution for fresh verification, never publication or merge.
+    pub fn retained_candidate_head(
+        &self, repository: &str, pr: u64, branch: &str, published: &str, local: &str, now: i64,
+    ) -> Result<Option<String>> {
+        let Some(id) = self.resolve_pr(repository, pr)? else { return Ok(None); };
+        let Some(snapshot) = self.snapshot(&id)? else { return Ok(None); };
+        if snapshot.pr != Some(pr) || snapshot.branch != branch
+            || snapshot.checkpoint.binding.head != local || local == published
+            || snapshot.lease_until_ms > now || snapshot.checkpoint.next.eligible_at_ms > now
+            || !matches!(snapshot.checkpoint.stage,
+                Stage::Scope | Stage::Build | Stage::Verify | Stage::Review | Stage::Reconcile | Stage::AwaitChecks)
+            || self.owner_control(&id)?.is_some_and(|control| control.paused)
+            || self.merge_reconciliation_needed(&id)? || !self.pending_operations(&id)?.is_empty() {
+            return Ok(None);
+        }
+        let latest: Option<(String, Option<String>)> = self.conn.query_row(
+            "SELECT binding,receipt FROM operation WHERE workflow=?1 AND kind=?2 ORDER BY rowid DESC LIMIT 1",
+            params![id, serde_json::to_string(&OperationKind::Push)?],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let Some((binding, receipt)) = latest else { return Ok(None); };
+        let binding: Binding = serde_json::from_str(&binding)?;
+        binding.validate()?;
+        if binding.head != published || receipt.as_deref() != Some(&format!("git-head:{published}")) {
+            return Ok(None);
+        }
+        Ok(Some(snapshot.checkpoint.binding.head))
+    }
+
     pub fn snapshot(&self, workflow: &str) -> Result<Option<Snapshot>> {
         let row = self.conn.query_row("SELECT branch,pr,checkpoint,attempts,wall_ms,model_calls,tokens,heartbeat_at,progress_at,lease_until,generation FROM workflow WHERE id=?1",[workflow],|r| {
             Ok((r.get::<_,String>(0)?,r.get::<_,Option<u64>>(1)?,r.get::<_,String>(2)?,r.get::<_,u64>(3)?,r.get::<_,u64>(4)?,r.get::<_,u64>(5)?,r.get::<_,u64>(6)?,r.get::<_,i64>(7)?,r.get::<_,i64>(8)?,r.get::<_,i64>(9)?,r.get::<_,i64>(10)?))
@@ -1841,6 +1905,59 @@ fn event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_candidate_recovery_requires_idle_authority_and_latest_confirmed_publication() {
+        for fault in [
+            "active", "future", "intake", "publish", "held", "merge", "retired", "merged", "pause",
+            "unknown-push", "unknown-merge", "newer-publication", "wrong-head", "wrong-branch",
+            "wrong-repository", "wrong-pr", "missing-publication",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+            let original = Binding { head: "published".into(), contract: "contract".into(), evidence_hash: "evidence".into() };
+            let mut retained = original.clone(); retained.head = "retained".into();
+            store.register("owner/repo#77", "fixture", original.clone(), 10).unwrap();
+            let lease = store.claim("owner/repo#77", "first", 20, 60_000).unwrap().unwrap();
+            store.attach_pr_in_repo(&lease, "owner/repo", 42, 21).unwrap();
+            if fault != "missing-publication" {
+                let operation = store.begin_operation(&lease, OperationKind::Push, &original, 22).unwrap();
+                store.complete_operation(&lease, &operation.id, "git-head:published", 23).unwrap();
+            }
+            let mut cp = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+            cp.binding = retained.clone(); cp.stage = Stage::Verify;
+            cp.next = NextAction {reason:"verification_infrastructure_retry".into(),action:"retry_verification".into(),eligible_at_ms:30};
+            store.checkpoint(&lease, &cp, 24).unwrap(); store.release(&lease, 25).unwrap();
+            if fault != "missing-publication" {
+                assert_eq!(store.retained_candidate_head("owner/repo",42,"fixture","published","retained",40).unwrap().as_deref(),Some("retained"));
+            }
+            let lease = store.claim("owner/repo#77", "fault", 40, 60_000).unwrap().unwrap();
+            match fault {
+                "future" => {cp.next.eligible_at_ms=100_000;store.checkpoint(&lease,&cp,41).unwrap();}
+                "intake" | "publish" | "held" | "merge" | "retired" | "merged" => {
+                    cp.stage=match fault {"intake"=>Stage::Intake,"publish"=>Stage::Publish,"held"=>Stage::Held,"merge"=>Stage::Merge,"retired"=>Stage::Retired,_=>Stage::Merged};
+                    store.checkpoint(&lease,&cp,41).unwrap();
+                }
+                "pause" => {store.set_owner_pause(&lease.workflow,"owner",0,true,41).unwrap();}
+                "unknown-push" | "unknown-merge" | "newer-publication" => {
+                    let kind=if fault=="unknown-merge" {OperationKind::MergePr}else{OperationKind::Push};
+                    let operation=store.begin_operation(&lease,kind,&retained,41).unwrap();
+                    if fault=="newer-publication" {store.complete_operation(&lease,&operation.id,"git-head:retained",42).unwrap();}
+                }
+                _=>{}
+            }
+            if fault!="active" {store.release(&lease,43).unwrap();}
+            let before=store.snapshot(&lease.workflow).unwrap().unwrap();
+            let events=store.events(&lease.workflow).unwrap();
+            assert!(store.retained_candidate_head(
+                if fault=="wrong-repository" {"other/repo"}else{"owner/repo"},
+                if fault=="wrong-pr" {43}else{42},
+                if fault=="wrong-branch" {"other"}else{"fixture"},"published",
+                if fault=="wrong-head" {"unrecorded"}else{"retained"},50).unwrap().is_none(),"accepted {fault}");
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);
+            assert_eq!(store.events(&lease.workflow).unwrap(),events);
+        }
+    }
     fn check_constructor_retains_other_connection_locks(test_name: &str, writable: bool) {
         if let Some(path)=std::env::var_os("AUGMENTAGENT_WORKFLOW_LOCK_PROBE_DB") {
             let db=Connection::open(path).unwrap();

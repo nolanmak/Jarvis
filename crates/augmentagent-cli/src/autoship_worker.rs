@@ -1,6 +1,7 @@
 //! Auto-ship's process lifetime is independent of the serving daemon. The
 //! worker finishes its current tick before loading a replacement executable.
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -21,13 +22,25 @@ pub struct UpgradeWatch {
     identity: (u64, u64),
     configuration:Vec<(PathBuf,Option<ConfigurationStamp>)>,
 }
-type ConfigurationStamp=(u64,u64,u64,i64,i64,i64,i64);
+type ConfigurationStamp=(u64,u64,u64,String);
 fn configuration_stamp(path:&Path)->Result<Option<ConfigurationStamp>> {
-    match std::fs::metadata(path) {
-        Ok(m)=>Ok(Some((m.dev(),m.ino(),m.len(),m.mtime(),m.mtime_nsec(),m.ctime(),m.ctime_nsec()))),
-        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>Ok(None),
-        Err(error)=>Err(error.into()),
-    }
+    let m=match std::fs::metadata(path) {
+        Ok(m)=>m,
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+        Err(error)=>return Err(error.into()),
+    };
+    // Inode timestamps come from a coarse clock, so an editor rewriting a
+    // policy in place with the same length can leave every one of them
+    // identical: only the contents witness a different configuration. Stamping
+    // the digest instead also keeps a `touch` from forcing a needless restart.
+    let content=if m.is_file() {
+        match std::fs::read(path) {
+            Ok(bytes)=>format!("{:x}",Sha256::digest(bytes)),
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+            Err(error)=>return Err(error.into()),
+        }
+    } else {String::new()};
+    Ok(Some((m.dev(),m.ino(),m.len(),content)))
 }
 impl UpgradeWatch {
     pub fn current() -> Result<Self> {
@@ -165,6 +178,31 @@ mod tests {
             let mut watch=UpgradeWatch::at(&binary);watch.configuration.push((path.clone(),configuration_stamp(&path).unwrap()));
             assert!(!watch.changed().unwrap());std::fs::write(&path,"new").unwrap();assert!(watch.changed().unwrap());
         }
+    }
+    /// The kernel stamps inodes from a coarse clock, so two same-length writes
+    /// inside one tick leave the metadata identical and only the contents
+    /// witness the new policy; restoring the modification time reproduces that
+    /// metadata exactly. A bare `touch` is the same invariant from the other
+    /// side: it is not a policy the worker has to reload for.
+    #[test]
+    fn a_policy_reload_follows_the_contents_not_the_inode_timestamps() {
+        let root=tempfile::tempdir().unwrap();let binary=root.path().join("binary");
+        std::fs::write(&binary,"same executable").unwrap();
+        let path=root.path().join("autoship-native.env");std::fs::write(&path,"old").unwrap();
+        let before=std::fs::metadata(&path).unwrap();
+        let watch=||{let mut w=UpgradeWatch::at(&binary);
+            w.configuration.push((path.clone(),configuration_stamp(&path).unwrap()));w};
+        let set_modified=|at|std::fs::File::options().write(true).open(&path).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(at)).unwrap();
+        let rewritten=watch();
+        std::fs::write(&path,"new").unwrap();set_modified(before.modified().unwrap());
+        let after=std::fs::metadata(&path).unwrap();
+        assert_eq!((after.len(),after.ino(),after.modified().unwrap()),
+            (before.len(),before.ino(),before.modified().unwrap()),"fixture must replay the coarse clock");
+        assert!(rewritten.changed().unwrap(),"a same-length in-place rewrite is a new policy");
+        let touched=watch();
+        set_modified(before.modified().unwrap()+std::time::Duration::from_secs(60));
+        assert!(!touched.changed().unwrap(),"a touch alone is not a new policy");
     }
     #[test]
     fn replacing_binary_is_detected_without_treating_missing_file_as_an_upgrade() {

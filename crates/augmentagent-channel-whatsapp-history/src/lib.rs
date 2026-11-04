@@ -136,6 +136,23 @@ fn read_entries(root: &Path, conv: &Conversation) -> Result<Vec<MessageEntry>> {
     Ok(parse_entries(&std::fs::read_to_string(path)?))
 }
 
+/// The latest `tail` entries of one chat, for a card the owner asked for.
+pub fn conversation_delta(root: &Path, jid: &str, tail: usize) -> Result<Delta> {
+    let index: BTreeMap<String, Conversation> = serde_json::from_str(&std::fs::read_to_string(
+        root.join("conversations/index.json"),
+    )?)
+    .context("invalid WhatsApp conversation index")?;
+    let conversation = index
+        .get(jid)
+        .filter(|c| c.identifier == jid && c.service == "WhatsApp")
+        .cloned()
+        .with_context(|| format!("no WhatsApp chat {jid:?} in the archive"))?;
+    let entries = read_entries(root, &conversation)?;
+    let start = entries.len().saturating_sub(tail);
+    let entries = entries.into_iter().enumerate().skip(start).collect();
+    Ok(Delta { conversation, entries, first_run: false })
+}
+
 pub fn email(conv: &Conversation, idx: usize, entry: &MessageEntry) -> Email {
     let mut email = augmentagent_channel_imessage::synthetic_imessage_email(conv, idx, entry);
     email.message_id = format!("{THREAD_PREFIX}{}:{idx}", conv.identifier);
@@ -224,7 +241,12 @@ pub fn poll_once(root: &Path, store: &Store) -> Result<Report> {
                 Err(_) => continue,
             };
             let item = email(&delta.conversation, idx, entry);
-            if store.upsert_email_backfill(&item, ts)? {
+            let inserted = store.upsert_email_backfill(&item, ts)?;
+            // A reposted group card reloads this row; keep its members (#1764).
+            if !item.to.is_empty() {
+                store.record_reply_recipients(&item)?;
+            }
+            if inserted {
                 report.inserted += 1;
                 delta.entries.push((idx, entry.clone()));
             }

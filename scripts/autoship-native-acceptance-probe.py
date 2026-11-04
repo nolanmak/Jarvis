@@ -8,6 +8,7 @@ remote-main identity lookup. An explicit private VM policy supplies declared
 provider credentials; no required-workflow host transport fallback is allowed.
 """
 import argparse
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -15,9 +16,11 @@ import os
 import re
 import uuid
 import stat
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 
 
 _spec=importlib.util.spec_from_file_location('probe_routing',Path(__file__).with_name('native-probe-routing.py'))
@@ -77,6 +80,165 @@ def resource_budget(native_mb, build_mb, available, controller_mb=256, defer_run
             'observed_available_bytes':available,'final_admission':'RunScope',
             'deferred_run_admission':defer_run_admission,'startup_floor_bytes':startup_floor,
             'run_admitted_by_preflight':False}
+
+
+# Host build lease: the same flock pair managed builds (disk-build.lock) and
+# deployment builds (disk-update.lock) hold. A VM run waits in line on it so
+# no build can start beside the VM, instead of racing a MemAvailable reading.
+LEASE_LOCKS=('disk-update.lock','disk-build.lock')
+
+
+class LeaseUnavailable(RuntimeError):
+    """The host build lease stayed busy for the whole bounded wait."""
+
+
+class LeaseInvalid(LeaseUnavailable):
+    """A lock file failed validation; never retried."""
+
+
+def host_state_dir(environ):
+    """channel-core state_dir::resolve, from the wrapper's own environment."""
+    state_home=environ.get('XDG_STATE_HOME','')
+    if state_home and os.path.isabs(state_home):
+        return Path(state_home)/'augmentagent'
+    home=environ.get('HOME','')
+    if not home:
+        raise LeaseInvalid('no state directory for the host build lease (HOME unset)')
+    return Path(home)/'.local/state/augmentagent'
+
+
+def holder_pid(path, locks_text=None):
+    """First FLOCK WRITE holder of path in /proc/locks (major:minor hex, inode decimal)."""
+    try:
+        info=os.stat(path,follow_symlinks=False)
+        if locks_text is None:
+            locks_text=Path('/proc/locks').read_text()
+    except OSError:
+        return None
+    device=f'{os.major(info.st_dev):02x}:{os.minor(info.st_dev):02x}:{info.st_ino}'
+    for line in locks_text.splitlines():
+        fields=line.split()
+        if len(fields)<6 or '->' in line or fields[1]!='FLOCK' or fields[3]!='WRITE':
+            continue
+        if fields[5]==device and fields[4].isdigit():
+            return int(fields[4])
+    return None
+
+
+def describe_holder(path):
+    pid=holder_pid(path)
+    if pid is None:
+        return 'unknown holder'
+    try:
+        comm=Path(f'/proc/{pid}/comm').read_text().strip()
+    except OSError:
+        comm='(exited)'
+    return f'pid {pid} {comm}'
+
+
+class HostBuildLease:
+    def __init__(self, fds, waited_seconds):
+        self.fds=fds
+        self.waited_seconds=waited_seconds
+        self.locks=list(LEASE_LOCKS)
+
+    def release(self):
+        while self.fds:
+            os.close(self.fds.pop())
+
+
+def _try_lock(state, name):
+    """Open/validate like Rust Lease::try_kind_at; return fd, or None when busy."""
+    fd=os.open(state/name,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,0o600)
+    try:
+        info=os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_uid!=os.geteuid():
+            raise LeaseInvalid(f'{name} must be an owned regular single-link file')
+        try:
+            fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return None
+        # Migrate historical umask-derived modes through the held inode only.
+        os.fchmod(fd,0o600)
+        return fd
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def acquire_host_build_lease(state, wait_seconds, status, poll=0.1, progress_every=60,
+                             clock=time.monotonic, sleep=time.sleep):
+    """Wait in line for both host locks; each attempt is all-or-nothing.
+
+    Never sits on disk-update.lock while waiting for disk-build.lock, so a
+    waiting VM run does not block deploys. Validation errors are not retried.
+    """
+    state=Path(state)
+    os.makedirs(state,mode=0o700,exist_ok=True)
+    started=clock();announced=None;next_progress=started+progress_every
+    while True:
+        held=[];busy=None
+        try:
+            for name in LEASE_LOCKS:
+                fd=_try_lock(state,name)
+                if fd is None:
+                    busy=name;break
+                held.append(fd)
+        except OSError as error:
+            for fd in held:os.close(fd)
+            raise LeaseInvalid(f'host build lease unavailable: {error.strerror or error}') from None
+        except BaseException:
+            for fd in held:os.close(fd)
+            raise
+        now=clock()
+        if busy is None:
+            waited=now-started if announced else 0.0
+            if announced:
+                status(f'host build lease acquired after {waited:.1f}s')
+            return HostBuildLease(held,waited)
+        for fd in held:os.close(fd)
+        waited=now-started
+        if waited>=wait_seconds:
+            raise LeaseUnavailable(f'host build lease still busy: {busy} held by {describe_holder(state/busy)} '
+                                   f'after {waited:.1f}s (limit {wait_seconds:g}s); managed builds did not drain, retry later')
+        if announced is None:
+            announced=busy
+            status(f'waiting in line for host build lease ({busy} held by {describe_holder(state/busy)}); up to {wait_seconds:g}s')
+        elif now>=next_progress:
+            next_progress=now+progress_every
+            status(f'still waiting for host build lease: {waited:.0f}s of {wait_seconds:g}s ({busy})')
+        sleep(poll)
+
+
+def admit_host(state, native_mb, build_mb, controller_mb, defer, wait_seconds, settle_seconds,
+               read_available, status, sleep=time.sleep, clock=time.monotonic, settle_poll=2):
+    """Lease first, then memory: a reading taken while builds can still start is meaningless."""
+    # Validate static inputs before queueing so a bad declaration never holds the lease.
+    resource_budget(native_mb,build_mb,2**62,controller_mb,defer)
+    lease=acquire_host_build_lease(state,wait_seconds,status)
+    try:
+        started=clock()
+        while True:
+            available=read_available()
+            try:
+                budget=resource_budget(native_mb,build_mb,available,controller_mb,defer)
+            except ValueError:
+                waited=clock()-started
+                if waited>=settle_seconds:
+                    required=resource_budget(native_mb,build_mb,2**62,controller_mb,defer)['startup_floor_bytes']
+                    raise ValueError(f'insufficient host headroom for composed isolated probe with the host build lease held: '
+                                     f'required {required} bytes, last reading {available} bytes after {waited:.1f}s settle') from None
+                sleep(settle_poll)
+                continue
+            budget['settle_seconds']=round(clock()-started,3)
+            return lease,budget
+    except BaseException:
+        lease.release()
+        raise
 
 
 def binary_digest(binary):
@@ -139,7 +301,18 @@ def main():
                         help="preflight controller allowance, minimum256MiB; final RunScope admission remains authoritative")
     parser.add_argument("--defer-run-admission", action="store_true",
                         help="start only the bounded controller; RunScope must admit the unchanged full run before VM/model dispatch")
+    parser.add_argument("--lease-wait-secs", type=float, default=1800,
+                        help="wait this long for the host build lease (disk-update.lock + disk-build.lock) so no "
+                             "managed or deployment build runs beside the VMs; polled, no ordering guarantee; 0 tries once")
+    parser.add_argument("--capacity-settle-secs", type=float, default=120,
+                        help="with the lease held, re-read MemAvailable this long for memory freed by a finished build; 0 reads once")
+    parser.add_argument("--max-run-secs", type=int, default=14400,
+                        help="unit RuntimeMaxSec, which bounds how long the host build lease is held (minimum 60)")
     args = parser.parse_args()
+    if args.max_run_secs<60:
+        parser.error("--max-run-secs must be at least 60")
+    if not (args.lease_wait_secs>=0 and args.capacity_settle_secs>=0):
+        parser.error("--lease-wait-secs and --capacity-settle-secs must be non-negative")
     route_evidence,route_environment=routing.snapshot(args.operator_router_config,args.operator_selection_config)
     binary = args.binary.resolve(strict=True)
     if not binary.is_file() or not os.access(binary, os.X_OK):
@@ -163,11 +336,32 @@ def main():
         build_mb=reachable_build_memory(args.probe,json.loads(build_config.read_text())['memory_mb'])
     except ValueError as error:
         parser.error(str(error))
-    available=next((int(line.split()[1])*1024 for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:')),0)
+    # Host build lease first, memory second: a reading taken while managed
+    # builds can still start loses every race. The unit's own builds use the
+    # isolated XDG_STATE_HOME below, so holding the host lease cannot deadlock it.
     try:
-        budget=resource_budget(native_mb,build_mb,available,args.controller_headroom_mb,args.defer_run_admission)
+        lease,budget=admit_host(host_state_dir(os.environ),native_mb,build_mb,args.controller_headroom_mb,
+                                args.defer_run_admission,args.lease_wait_secs,args.capacity_settle_secs,
+                                read_mem_available,lambda line:print(line,flush=True))
+    except LeaseUnavailable as error:
+        # Same clean-deferral exit as a busy managed build (storage busy).
+        print(f"{parser.prog}: {error}",file=sys.stderr,flush=True)
+        return 75
     except ValueError as error:
         parser.error(str(error))
+    try:
+        return launch(args,binary,inventory_binary_digest,inventory_digest,policy,build_config,
+                      budget,route_evidence,route_environment,lease,parser)
+    finally:
+        lease.release()
+
+
+def read_mem_available():
+    return next((int(line.split()[1])*1024 for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:')),0)
+
+
+def launch(args,binary,inventory_binary_digest,inventory_digest,policy,build_config,budget,
+           route_evidence,route_environment,lease,parser):
     run_memory=budget['run_memory_bytes']
     aggregate_memory=budget['aggregate_ceiling_bytes']
     policy_digest = hashlib.sha256(policy.read_bytes()).hexdigest()
@@ -204,7 +398,7 @@ subprocess.run(['/usr/bin/git', 'rev-parse', 'refs/remotes/origin/main'], check=
         env["GH_BIN"] = str(gh)
     unit = "augmentagent-native-" + root.name.removeprefix("autoship-native-acceptance-")
     command = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", f"--unit={unit}"]
-    for value in ("Delegate=cpu memory pids", "DelegateSubgroup=daemon", f"MemoryMax={aggregate_memory}", "TasksMax=256", "CPUQuota=200%"):
+    for value in ("Delegate=cpu memory pids", "DelegateSubgroup=daemon", f"MemoryMax={aggregate_memory}", "TasksMax=256", "CPUQuota=200%", f"RuntimeMaxSec={args.max_run_secs}"):
         command += ["-p", value]
     command += [f"--setenv={key}={value}" for key, value in env.items()]
     command += ["/usr/bin/env"]
@@ -213,7 +407,8 @@ subprocess.run(['/usr/bin/git', 'rev-parse', 'refs/remotes/origin/main'], check=
                 "AUGMENTAGENT_AUTOPR_OPENED_FILE", "AUGMENTAGENT_AUTOPR_BASELINE_FILE",
                 "AUGMENTAGENT_AUTOPR_UNREVIEWABLE_FILE", "AUGMENTAGENT_AUTOPR_FAIR_FILE",
                 "AUGMENTAGENT_AUTOPR_ATTEMPTED_FILE", "AUGMENTAGENT_AUTOPR_HISTORY_FILE",
-                "AUGMENTAGENT_PRUNE_TARGET_DIRS", "AUGMENTAGENT_BUILD_STORAGE_PARENT_LEASE"):
+                "AUGMENTAGENT_PRUNE_TARGET_DIRS", "AUGMENTAGENT_BUILD_STORAGE_PARENT_LEASE",
+                "AUGMENTAGENT_BUILD_PARENT_LEASE"):
         command += ["-u", key]
     completion_nonce = uuid.uuid4().hex
     completion_path = root / "test-completion.json"
@@ -233,7 +428,7 @@ subprocess.run(['/usr/bin/git', 'rev-parse', 'refs/remotes/origin/main'], check=
     (root / "operator-route-final.json").write_text(json.dumps({"unchanged":route_unchanged,"initial_sha256":hashlib.sha256((root/"operator-route.json").read_bytes()).hexdigest()}))
     if not route_unchanged:
         raise RuntimeError("operator routing changed during probe; result cannot establish one route")
-    (root / "result.json").write_text(json.dumps({"probe": args.probe, "test": TESTS[args.probe], "binary": str(binary), "binary_sha256": tested_binary_digest, "test_inventory_sha256": inventory_digest, "vm_policy": str(policy), "vm_policy_sha256": policy_digest, "unit": unit, "exit_code": exit_code, "service_exit_code": result.returncode, "test_completed": completion is not None, "no_production_mutation": True, "resource_preflight": budget}, indent=2) + "\n")
+    (root / "result.json").write_text(json.dumps({"probe": args.probe, "test": TESTS[args.probe], "binary": str(binary), "binary_sha256": tested_binary_digest, "test_inventory_sha256": inventory_digest, "vm_policy": str(policy), "vm_policy_sha256": policy_digest, "unit": unit, "exit_code": exit_code, "service_exit_code": result.returncode, "test_completed": completion is not None, "no_production_mutation": True, "resource_preflight": budget, "host_build_lease": {"waited_seconds": round(lease.waited_seconds, 3), "locks": lease.locks}}, indent=2) + "\n")
     print(f"Exit: {exit_code}; transcript: {root / 'transcript.log'}", flush=True)
     return exit_code
 

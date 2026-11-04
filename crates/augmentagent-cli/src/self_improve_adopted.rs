@@ -202,7 +202,7 @@ pub(super) async fn resume(
     let Some(_lock) = RunLock::try_acquire(&lock_path)? else {
         return Ok(RunReport::held("adopted PR worktree busy".into()));
     };
-    let worktree = workflow::prepare_resume_worktree_at_head(repo, pr.pr, &pr.branch,Some(&pr.head)).await?;
+    let worktree = workflow::prepare_resume_candidate(repo, &pr.repository, pr.pr, &pr.branch, Some(&pr.head)).await?;
     let request = format!("Pull request #{}: {}\n{}", pr.pr, pr.title, pr.body);
     let environment = recovery::environment_identity(&worktree).await?;
     let Some(mut guard) = workflow::WorkflowGuard::acquire(workflow::Start {
@@ -238,6 +238,11 @@ pub(super) async fn resume(
     )
     .await;
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+    if result.as_ref().is_err_and(|error| error.is::<CiInfrastructureDeferred>()) {
+        let report = capacity_accounting.settle_ci(result)?;
+        guard.finish()?;
+        return Ok(report);
+    }
     match result {
         Ok(report) => {
             guard.finish()?;
@@ -350,7 +355,7 @@ async fn execute(
             .iter()
             .map(|criterion| criterion.requirement.clone())
             .collect();
-        verification_gate(worktree, &guard.audit_logger()).await?;
+        verification_gate(worktree, &guard.audit_logger()).await.for_workflow(guard).await??;
         guard
             .transition(Stage::Review, "adopted_review", "collect_reviews", 0)
             .await?;
@@ -364,7 +369,7 @@ async fn execute(
             &criteria,
             aligned_review::ReviewContext {
                 qa_ok: true,
-                qa_notes: "Independent executable acceptance and full verification gate passed.",
+                qa_notes: "Independent executable acceptance passed; exact-head GitHub Actions required before merge.",
                 repair_round: round,
                 previous: previous.as_ref(),
                 environment_id: environment,

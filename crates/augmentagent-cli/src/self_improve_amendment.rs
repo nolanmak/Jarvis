@@ -31,6 +31,27 @@ struct Pending {
 pub(super) fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+
+/// Attribute only the candidate contribution, while keeping the registered
+/// original baseline unchanged for independent behavioral red reproduction.
+async fn contribution_diff(
+    root: &Path, original_base: &str, canonical_main: &str, head: &str,
+) -> Result<(String, String)> {
+    for oid in [original_base, canonical_main, head] {
+        ensure!(matches!(oid.len(), 40 | 64)
+            && oid.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
+            "amendment scope requires literal commit identities");
+        trusted_git(root, &["--no-replace-objects", "cat-file", "-e", &format!("{oid}^{{commit}}")])
+            .await.context("amendment scope commit unavailable")?;
+    }
+    for descendant in [canonical_main, head] {
+        trusted_git(root, &["--no-replace-objects", "merge-base", "--is-ancestor", original_base, descendant])
+            .await.context("amendment scope no longer descends from the registered original baseline")?;
+    }
+    let basis = trusted_git(root, &["--no-replace-objects", "merge-base", canonical_main, head]).await?;
+    let diff = trusted_git(root, &["--no-replace-objects", "diff", "--no-ext-diff", "--no-textconv", &basis, head, "--"]).await?;
+    Ok((basis, diff))
+}
 fn pending_path(control: &Path, source: AcceptanceSource) -> PathBuf {
     control.join(format!("{}-pending-amendment.json", source.key()))
 }
@@ -160,7 +181,7 @@ impl EnvironmentEvidence {
         Ok(())
     }
     fn prompt(&self) -> Result<String> {
-        Ok(format!("Controller-measured environment evidence: {}\nThe registered environment is a composite fingerprint, including the controller verifier engine, source-controlled compiler inputs and runner identity. An older engine may omit committed-source export and use in-process assertions; its old receipts authorize nothing. A changed original-base fingerprint under the current engine is not by itself evidence that the candidate changed dependencies. Compare current_original_baseline with current_candidate and the full source diff to distinguish current source-input changes. Historical component identities cannot be inferred from an opaque old digest. You may explicitly approve_environment_transition for a legitimate controller-engine migration/rebaseline as well as legitimate runner/compiler/dependency changes. Never silently carry old red/green claims forward: the exact recorded original base must produce intended assertion red under the current engine and the candidate must separately produce green. Preserve every owner requirement; reject unknown setup failures or requirement weakening.", serde_json::to_string(self)?))
+        Ok(format!("Controller-measured environment evidence: {}\nThe registered environment is a composite fingerprint, including the controller verifier engine, source-controlled compiler inputs and runner identity. An older engine may omit committed-source export and use in-process assertions; its old receipts authorize nothing. A changed original-base fingerprint under the current engine is not by itself evidence that the candidate changed dependencies. Compare current_original_baseline with current_candidate, the candidate contribution diff, and the separately identified integrated upstream paths to distinguish current source-input changes. Historical component identities cannot be inferred from an opaque old digest. You may explicitly approve_environment_transition for a legitimate controller-engine migration/rebaseline as well as legitimate runner/compiler/dependency changes. Never silently carry old red/green claims forward: the exact recorded original base must produce intended assertion red under the current engine and the candidate must separately produce green. Preserve every owner requirement; reject unknown setup failures or requirement weakening.", serde_json::to_string(self)?))
     }
 }
 async fn environment_evidence(root: &Path, control: &Path, old: &PreparedAcceptance) -> Result<EnvironmentEvidence> {
@@ -253,6 +274,9 @@ pub(super) async fn try_amend(
     repair_exhausted: bool,
     adjudication: Option<&str>,
 ) -> Result<Option<PreparedAcceptance>> {
+    // This is the paid amendment ingress, including repair-exhausted and
+    // resumed callers. Missing infrastructure cannot authorize a correction.
+    acceptance::defer_transient_verifier_infrastructure(failure,workflow).await?;
     if let Some(prepared) = resume_pending(root, control, source).await? {
         return Ok(Some(prepared));
     }
@@ -267,10 +291,33 @@ pub(super) async fn try_amend(
     }
     old.baseline.registration.verify_integrity(root)?;
     let head = actual_head(root).await?;
-    let tree = trusted_git(root, &["rev-parse", "HEAD^{tree}"]).await?;
+    let tree = trusted_git(root, &["--no-replace-objects", "rev-parse", &format!("{head}^{{tree}}")]).await?;
+    // GitHub supplies the canonical main identity; a candidate can mutate its
+    // local tracking refs, so they cannot establish this scope boundary.
+    let scope = async {
+        let main = workflow::remote_main_head(root, workflow.repository()).await
+            .context("amendment canonical main unavailable")?;
+        let (basis, diff) = contribution_diff(root, old.baseline.registration.baseline_head(), &main, &head).await?;
+        let upstream_paths = trusted_git(root, &["--no-replace-objects", "diff", "--name-only", "--no-ext-diff", "--no-textconv",
+            old.baseline.registration.baseline_head(), &basis, "--"]).await?;
+        Ok::<_, anyhow::Error>((main, basis, diff, upstream_paths))
+    }.await;
+    let (canonical_main, scope_base, diff, upstream_paths) = match scope {
+        Ok(scope) => scope,
+        Err(error) => {
+            let detail = format!("{error:#}");
+            if detail.contains("amendment canonical main unavailable") || detail.contains("amendment scope commit unavailable") {
+                CiGateResult(Err(error.context("acceptance infrastructure unavailable"))).for_workflow(workflow).await??;
+                unreachable!("missing scope authority became passing");
+            }
+            return Err(error);
+        }
+    };
     let input_hash = digest(&serde_json::to_vec(&(
         old.baseline.registration.contract_hash(),
         &tree,
+        &canonical_main,
+        &scope_base,
         environment_id(root)?,
         adjudication.map(|text| digest(text.as_bytes())),
     ))?);
@@ -300,19 +347,8 @@ pub(super) async fn try_amend(
         .await?;
     let environments = environment_evidence(root, control, old).await?;
     let candidate_environment = environments.current_candidate.clone();
-    let diff = trusted_git(
-        root,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            old.baseline.registration.baseline_head(),
-            "HEAD",
-            "--",
-        ],
-    )
-    .await?;
-    let prompt=format!("Determine whether this failure is an objectively bad/outdated verifier or an implementation defect. Reject amendment for implementation defects, weakened criteria, always-green/no-op tests, or missing setup dependencies. For legitimate compiler/dependency input changes you may explicitly approve the candidate environment transition; old-base red must still be reproduced independently. Preserve every previous criterion ID and exact requirement text; do not expand implementation paths. A correction must produce revision {} and the same real source {}. All new fixtures are public: synthetic examples only, no secrets/private literals. Return JSON {{\"approved\":bool,\"previous_contract_hash\":\"{}\",\"approve_environment_transition\":bool,\"reason\":\"objective cause\",\"proposal\":null or {{\"contract\":...,\"files\":...}}}}.\nIntent: {title}\nFailure: {failure}\nOriginal proposal: {}\nFull candidate diff:\n{diff}",old.proposal.contract.revision+1,source,old.baseline.registration.contract_hash(),serde_json::to_string(&old.proposal)?);
+    let original_base = old.baseline.registration.baseline_head();
+    let prompt=format!("Determine whether this failure is an objectively bad/outdated verifier or an implementation defect. Reject amendment for implementation defects, weakened criteria, always-green/no-op tests, or missing setup dependencies. For legitimate compiler/dependency input changes you may explicitly approve the candidate environment transition; old-base red must still be reproduced independently. Preserve every previous criterion ID and exact requirement text; do not expand implementation paths. A correction must produce revision {} and the same real source {}. All new fixtures are public: synthetic examples only, no secrets/private literals. Return JSON {{\"approved\":bool,\"previous_contract_hash\":\"{}\",\"approve_environment_transition\":bool,\"reason\":\"objective cause\",\"proposal\":null or {{\"contract\":...,\"files\":...}}}}.\nIntent: {title}\nFailure: {failure}\nOriginal proposal: {}\nOriginal behavioral baseline (unchanged): {original_base}\nCanonical main: {canonical_main}\nCandidate contribution base: {scope_base}\nExact candidate head: {head}\nCandidate contribution diff (every change here remains subject to allowed paths):\n{diff}\nIntegrated upstream paths (original baseline to contribution base; these are context, not candidate edits):\n{upstream_paths}\nApproval only permits constructing and independently testing a correction. A proposed replacement harness cannot have its new red receipt before it exists: the controller must subsequently reproduce intended assertion red at the unchanged original baseline under the current engine and separately obtain candidate green before activation. Never treat approval or historical receipts as those measurements.",old.proposal.contract.revision+1,source,old.baseline.registration.contract_hash(),serde_json::to_string(&old.proposal)?);
     ensure!(
         prompt.len() <= 512 * 1024,
         "verifier authority evidence needs smaller scoped revision"
@@ -324,6 +360,13 @@ pub(super) async fn try_amend(
     } else {
         prompt
     };
+    ensure!(actual_head(root).await? == head, "candidate changed during amendment scope preparation");
+    workflow.audit_logger().record_controller(serde_json::json!({
+        "kind": "amendment_scope_basis", "workflow": workflow.id(),
+        "original_base": original_base, "canonical_main": canonical_main,
+        "contribution_base": scope_base, "candidate_head": head,
+        "contribution_diff_sha256": digest(diff.as_bytes()), "shipping_authority": false,
+    }))?;
     let (decision, native_provider, native_session) =
         authority(builder, workflow, root, &prompt).await?;
     immutable(
@@ -788,6 +831,101 @@ pub(super) async fn resume_pending(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn amendment_scope_excludes_integrated_main_but_keeps_candidate_conflict_resolution() {
+        let root=tempfile::tempdir().unwrap();
+        async fn git(root:&Path,args:&[&str])->String {
+            let output=Command::new("/usr/bin/git").args(["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+                "-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null"]).args(args).current_dir(root)
+                .env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
+            assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+            String::from_utf8(output.stdout).unwrap().trim().into()
+        }
+        git(root.path(),&["init","-q"]).await;
+        std::fs::write(root.path().join("behavior.py"),"old\n").unwrap();
+        std::fs::write(root.path().join("upstream.txt"),"original\n").unwrap();
+        git(root.path(),&["add","."]).await;git(root.path(),&["commit","-qm","base"]).await;
+        let base=git(root.path(),&["rev-parse","HEAD"]).await;
+        std::fs::write(root.path().join("upstream.txt"),"main update\n").unwrap();
+        git(root.path(),&["commit","-qam","main update"]).await;
+        let main=git(root.path(),&["rev-parse","HEAD"]).await;
+        git(root.path(),&["checkout","-qb","candidate",&base]).await;
+        std::fs::write(root.path().join("behavior.py"),"fixed\n").unwrap();
+        git(root.path(),&["commit","-qam","candidate fix"]).await;
+        git(root.path(),&["merge","--no-edit",&main]).await;
+        let head=git(root.path(),&["rev-parse","HEAD"]).await;
+        let (basis,diff)=contribution_diff(root.path(),&base,&main,&head).await.unwrap();
+        assert_eq!(basis,main);assert!(diff.contains("behavior.py"));
+        assert!(!diff.contains("upstream.txt"),"upstream changes were attributed to the candidate");
+        // A later remote main commit must not be attributed to a candidate
+        // that has only integrated the earlier canonical commit.
+        git(root.path(), &["checkout", "-qb", "later-main", &main]).await;
+        std::fs::write(root.path().join("upstream.txt"), "later main update\n").unwrap();
+        git(root.path(), &["commit", "-qam", "later main update"]).await;
+        let later_main = git(root.path(), &["rev-parse", "HEAD"]).await;
+        let (basis, diff) = contribution_diff(root.path(), &base, &later_main, &head).await.unwrap();
+        assert_eq!(basis, main);
+        assert!(!diff.contains("upstream.txt"));
+        git(root.path(), &["checkout", "candidate"]).await;
+        // Local replacement refs cannot rewrite the trusted commit graph.
+        git(root.path(), &["replace", &main, &base]).await;
+        let (basis, diff) = contribution_diff(root.path(), &base, &main, &head).await.unwrap();
+        assert_eq!(basis, main);
+        assert!(!diff.contains("upstream.txt"));
+        git(root.path(), &["replace", "-d", &main]).await;
+        assert!(contribution_diff(root.path(), "HEAD", &main, &head).await.is_err());
+        assert!(contribution_diff(root.path(), &head, &main, &head).await.is_err());
+        // A candidate edit to an upstream-touched file is still its own edit.
+        std::fs::write(root.path().join("upstream.txt"),"candidate override\n").unwrap();
+        git(root.path(),&["commit","-qam","candidate override"]).await;
+        let changed=git(root.path(),&["rev-parse","HEAD"]).await;
+        git(root.path(),&["update-ref","refs/remotes/origin/main",&changed]).await;
+        let (_,diff)=contribution_diff(root.path(),&base,&main,&changed).await.unwrap();
+        assert!(diff.contains("candidate override"),"an unauthorized candidate edit was hidden by local ref mutation");
+        assert_ne!(base,main,"the original behavioral baseline must remain distinct");
+    }
+    #[test]
+    fn source_red_and_explicit_environment_migration_remain_amendable() {
+        for detail in ["assertion failed: expected ready", "unexpected_failure: candidate output mismatch",
+            "verifier environment changed", "legacy in-process assertion must be migrated"] {
+            assert!(!acceptance::transient_verifier_infrastructure(detail), "source or explicit migration was treated as transient: {detail}");
+        }
+    }
+    #[tokio::test]
+    async fn infrastructure_never_enters_amendment_even_after_repair_exhaustion() {
+        for failure in ["unexpected_failure: infrastructure_failure: verifier unavailable",
+            "alignment transport unavailable","constraint authority unavailable"] {
+            let (root,prepared)=fixture();let control=tempfile::tempdir_in("/tmp").unwrap();
+            let database=control.path().join("workflow.db");
+            for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+                "-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","fixture"]] {
+                let output=Command::new("/usr/bin/git").args(args).current_dir(root.path())
+                    .env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
+                assert!(output.status.success());
+            }
+            let head=actual_head(root.path()).await.unwrap();
+            trusted_git(root.path(),&["update-ref","refs/remotes/origin/main",&head]).await.unwrap();
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {
+                repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:Some(42),pr:None,
+                branch:"fixture",contract:prepared.baseline.registration.contract_hash(),environment:"environment-a"
+            }).await.unwrap().unwrap();
+            guard.checkpoint(crate::autoship_workflow::Stage::Review,"candidate_ready","run_verifier",0,&["receipt".into()]).await.unwrap();
+            let before=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            let reasoner=FallbackReasoner::for_tests(vec![],augmentagent_channel_core::CooldownLatch::at(control.path().join("cooldowns.json")));
+            let error=try_amend(&reasoner,AcceptanceSource::Issue(42),"fixture",root.path(),&prepared,control.path(),
+                &mut guard,failure,true,None).await.unwrap_err();
+            assert!(error.downcast_ref::<CiInfrastructureDeferred>().is_some(),"infrastructure entered amendment: {error:#}");
+            let after=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(after.model_calls,before.model_calls);
+            assert_eq!(after.checkpoint.stage,before.checkpoint.stage);
+            assert_eq!(after.checkpoint.binding,before.checkpoint.binding);
+            assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+            assert_eq!(after.progress_at_ms,before.progress_at_ms);
+            assert!(after.lease_until_ms<=chrono::Utc::now().timestamp_millis());
+            assert_eq!(after.checkpoint.next.reason,"verification_infrastructure_retry");
+            guard.finish().unwrap();
+        }
+    }
     use crate::autoship_contract::{Criterion, PathScope, Verifier, VerifierCommand};
     fn fixture() -> (tempfile::TempDir, PreparedAcceptance) {
         let root = tempfile::tempdir().unwrap();

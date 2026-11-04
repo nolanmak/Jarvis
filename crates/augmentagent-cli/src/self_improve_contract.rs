@@ -1750,6 +1750,23 @@ pub(super) fn worker_roots(worktree: &Path) -> Vec<PathBuf> {
     }
     roots
 }
+
+pub(super) fn transient_verifier_infrastructure(detail:&str)->bool {
+    let lower=detail.to_ascii_lowercase();
+    infra_failure_reason(detail).is_some() || ["infrastructure_failure",
+        "verifier dependency integrity infrastructure failure","verifier infrastructure:",
+        "alignment reviewer unavailable","alignment transport","alignment invalid structured response",
+        "constraint authority unavailable","constraint authority invalid structured response"]
+        .iter().any(|sign|lower.contains(sign))
+}
+
+pub(super) async fn defer_transient_verifier_infrastructure(detail:&str,workflow:&mut workflow::WorkflowGuard)->Result<()> {
+    if transient_verifier_infrastructure(detail) {
+        CiGateResult(Err(anyhow::anyhow!(detail.to_owned()).context("acceptance infrastructure unavailable")))
+            .for_workflow(workflow).await??;
+    }
+    Ok(())
+}
 /// Return explicit retry/re-scope state, never an implicit human hold. Repair
 /// admission is durable and shared across restarts of this workflow.
 pub(super) async fn verify_with_repair(
@@ -1908,10 +1925,18 @@ pub(super) async fn verify_with_repair_for(
                         &[serde_json::to_string(&reference)?],
                     )
                     .await?;
+                workflow.verification_gate_passed(crate::autoship_workflow::VerificationDomain::Acceptance).await?;
                 return Ok(reference);
             }
             Err(error) => {
                 if workflow.audit_logger().resource_capacity_seen() { return Err(error); }
+                let error=if transient_verifier_infrastructure(&format!("{error:#}")) {
+                    error.context("acceptance infrastructure unavailable")
+                } else {error};
+                let error=match CiGateResult(Err(error)).for_workflow(workflow).await? {
+                    Err(error)=>error,
+                    Ok(())=>unreachable!("failed acceptance check became passing"),
+                };
                 let detail = format!("{error:#}");
                 if round < 2 {
                     if let Some(amended) = amendment::try_amend(
@@ -1935,15 +1960,9 @@ pub(super) async fn verify_with_repair_for(
                     || detail.contains("constraint authority invalid structured response")
                     || detail.contains("alignment invalid structured response");
                 if infrastructure {
-                    workflow
-                        .transition(
-                            crate::autoship_workflow::Stage::Verify,
-                            "acceptance_infrastructure_retry",
-                            "retry_verifier",
-                            chrono::Utc::now().timestamp_millis() + 300_000,
-                        )
-                        .await?;
-                    return Err(error).context("acceptance infrastructure deferred for retry");
+                    CiGateResult(Err(error.context("acceptance infrastructure unavailable")))
+                        .for_workflow(workflow).await??;
+                    unreachable!("infrastructure deferral became passing");
                 }
                 let repair_epoch = amendment::digest(&serde_json::to_vec(&(
                     prepared.baseline.registration.contract_hash(),
@@ -2005,7 +2024,7 @@ pub(super) async fn verify_with_repair_for(
                 recovery::commit_candidate_named(worktree, &format!("fix: {title} ({source})")).await?;
                 // A repair can affect code outside the selected regression test.
                 // It must re-earn the normal gate before any review sees it.
-                verification_gate(worktree, &workflow.audit_logger()).await?;
+                verification_gate(worktree, &workflow.audit_logger()).await.for_workflow(workflow).await??;
             }
         }
     }

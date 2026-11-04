@@ -7,11 +7,11 @@ ROOT=Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('shared_ci',ROOT/'scripts/ci-contract.py');ci=importlib.util.module_from_spec(spec);spec.loader.exec_module(ci)
 class ContractTests(unittest.TestCase):
  def test_autoship_cli_suites_execute_as_separate_cargo_commands(self):
-  body=json.loads((ROOT/'scripts/ci-contract.json').read_text())['commands']['rust/agents/12']['body']
+  body=json.loads((ROOT/'scripts/ci-contract.json').read_text())['commands']['rust/cli/6']['body']
   with tempfile.TemporaryDirectory() as directory:
    root=Path(directory);cargo=root/'cargo';calls=root/'calls'
    cargo.write_text('#!'+sys.executable+'\nimport json,os,sys\nwith open(os.environ["CALLS"],"a") as f:f.write(json.dumps(sys.argv[1:])+"\\n")\n');cargo.chmod(0o700)
-   done=subprocess.run(['bash','--noprofile','--norc','-ec',body],env={'PATH':str(root)+':/usr/bin:/bin','CALLS':str(calls)},capture_output=True,text=True)
+   done=subprocess.run(['bash','--noprofile','--norc','-ec',body],cwd=ROOT,env={'PATH':str(root)+':/usr/bin:/bin','CALLS':str(calls)},capture_output=True,text=True)
    self.assertEqual(done.returncode,0,done.stderr)
    rows=[json.loads(line) for line in calls.read_text().splitlines()]
    self.assertEqual(len(rows),2,rows)
@@ -149,4 +149,104 @@ class ContractTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d);c=self.fixture(root);job=c['workflows']['.github/workflows/test.yml']['jobs']['check'];job['env']={'X':'${{ secrets.UNDECLARED }}'}
    self.assertEqual(ci.plan(c,self.args(root))['checks'][0]['status'],'remote_required')
+ def test_macos_jobs_mirror_their_linux_jobs(self):
+  c=json.loads((ROOT/'scripts/ci-contract.json').read_text())
+  self.assertEqual(mirror_drift(c),[])
+  for job in [j for w in c['workflows'].values() if w['role']=='validation' for j in w['jobs'].values()]:
+   for step in job['steps']:
+    self.assertIn(step.get('if'),ALLOWED_STEP_IF,step)
+ def test_mirror_check_detects_each_kind_of_drift(self):
+  c=json.loads((ROOT/'scripts/ci-contract.json').read_text())
+  mac=lambda d:d['workflows']['.github/workflows/macos.yml']['jobs']['channels-macos']
+  linux=lambda d:d['workflows']['.github/workflows/rust.yml']['jobs']['phone']
+  def command_steps(job):return [s for s in job['steps'] if 'command_id' in s]
+  cases=[]
+  d=copy.deepcopy(c);mac(d)['steps'].remove(command_steps(mac(d))[-1]);cases.append(('dropped macOS step',d))
+  d=copy.deepcopy(c);s=command_steps(mac(d));s[0],s[1]=s[1],s[0];i=[mac(d)['steps'].index(x) for x in s[:2]];mac(d)['steps'][min(i)],mac(d)['steps'][max(i)]=mac(d)['steps'][max(i)],mac(d)['steps'][min(i)];cases.append(('reordered macOS steps',d))
+  d=copy.deepcopy(c);d['commands'][command_steps(linux(d))[0]['command_id']]['body']+='\necho changed\n';cases.append(('changed Linux body',d))
+  d=copy.deepcopy(c);command_steps(linux(d))[0].setdefault('env',{})['NEW']='1';cases.append(('changed Linux step env',d))
+  d=copy.deepcopy(c);linux(d)['env']['CARGO_PROFILE_TEST_DEBUG']=2;cases.append(('changed Linux job env',d))
+  d=copy.deepcopy(c);linux(d)['steps'].insert(1,{'uses':'actions/setup-node@x','with':{'node-version':'22'}});cases.append(('Linux-only setup action',d))
+  d=copy.deepcopy(c);mac(d)['name']='channels (macos-14)';cases.append(('name not derived from runner',d))
+  d=copy.deepcopy(c);[x for x in linux(d)['steps'] if x.get('uses','').startswith('actions/setup-python@')][0]['with']['python-version']='3.13';cases.append(('changed setup input',d))
+  d=copy.deepcopy(c);linux(d)['timeout-minutes']=10;cases.append(('changed timeout',d))
+  for label,case in cases:self.assertNotEqual(mirror_drift(case),[],label)
+  # A Linux-only step needs no macOS twin.
+  d=copy.deepcopy(c);row=dict(command_steps(linux(d))[0]);row['if']="runner.os == 'Linux'";linux(d)['steps'].insert(3,row)
+  self.assertEqual(mirror_drift(d),[])
+  # So does a macOS-only step.
+  d=copy.deepcopy(c);row=dict(command_steps(mac(d))[0]);row['if']="runner.os == 'macOS'";mac(d)['steps'].insert(3,row)
+  self.assertEqual(mirror_drift(d),[])
+ def test_validation_rust_jobs_restore_the_warm_cache_without_writing(self):
+  # rust-cache.yml is the only writer; a job only hits its cache when the key
+  # inputs (runner label, toolchain, CARGO* env) match the warm job's.
+  c=json.loads((ROOT/'scripts/ci-contract.json').read_text())
+  warm=yaml_load(ROOT/'.github/workflows/rust-cache.yml')['jobs']['warm']
+  labels=set(warm['strategy']['matrix']['os']);toolchain=[s for s in warm['steps'] if s.get('uses','').startswith('dtolnay/rust-toolchain@')][0]['with']['toolchain']
+  checked=0
+  for path,w in c['workflows'].items():
+   if w['role']!='validation':continue
+   for name,job in w['jobs'].items():
+    caches=[s for s in job['steps'] if s.get('uses','').startswith('Swatinem/rust-cache@')]
+    if not caches:continue
+    checked+=1;where=path+':'+name
+    self.assertEqual(caches[0]['with'],{'shared-key':'ci','env-vars':'ImageOS','save-if':False},where)
+    self.assertEqual(job.get('env'),warm['env'],where)
+    rows=ci.matrices(job)
+    self.assertTrue({ci.resolve(job['runs-on'],{'matrix.'+k:v for k,v in r.items()}) for r in rows}<=labels,where)
+    for s in job['steps']:
+     if s.get('uses','').startswith('dtolnay/rust-toolchain@'):self.assertEqual(s['with']['toolchain'],toolchain,where)
+  self.assertGreaterEqual(checked,9)
+ def test_platform_no_longer_cancels_main_runs(self):
+  syncspec=importlib.util.spec_from_file_location('sync_platform',ROOT/'scripts/ci-contract-sync.py');sync=importlib.util.module_from_spec(syncspec);syncspec.loader.exec_module(sync)
+  with self.assertRaisesRegex(ValueError,'PR concurrency policy'):
+   sync.validate_concurrency('platform.yml',{'concurrency':{'group':'platform-${{ github.ref }}','cancel-in-progress':True}})
+  sync.validate_concurrency('macos.yml',{'concurrency':sync.PR_CONCURRENCY})
+
+def yaml_load(path):
+ import yaml
+ return yaml.safe_load(path.read_text())
+# macOS job -> the Linux jobs whose steps it runs, in this order. The macOS
+# job runs every step of its twins except those marked Linux-only; shared
+# checkout/toolchain/cache setup appears once. It may add `runner.os ==
+# 'macOS'` steps of its own.
+MIRRORS={('.github/workflows/macos.yml','channels-macos'):[('.github/workflows/rust.yml','channels'),('.github/workflows/rust.yml','phone')],
+         ('.github/workflows/macos.yml','platform-macos'):[('.github/workflows/platform.yml','platform')]}
+LINUX_ONLY="runner.os == 'Linux'";MACOS_ONLY="runner.os == 'macOS'"
+ALLOWED_STEP_IF={None,'always()','success()',LINUX_ONLY,MACOS_ONLY}
+def mirror_drift(contract):
+ """Differences between each macOS job and its Linux twin(s); [] when they agree."""
+ workflows=contract['workflows'];drift=[]
+ def row(step):
+  if 'command_id' in step:
+   body=contract['commands'][step['command_id']]
+   key=('run',body['body'],body['shell'])
+  else:key=('uses',step['uses'],json.dumps(step.get('with',{}),sort_keys=True).replace('ubuntu-latest','macos-latest'))
+  return key+(json.dumps(step.get('env',{}),sort_keys=True),step.get('working-directory','.'),step.get('if'))
+ for (mac_path,mac_name),twins in MIRRORS.items():
+  mac=workflows[mac_path]['jobs'][mac_name];linux=[workflows[p]['jobs'][n] for p,n in twins]
+  def runner(job):
+   # A Linux twin may keep a one-entry matrix so its check ids keep their suffix.
+   rows=ci.matrices(job)
+   return ci.resolve(job['runs-on'],{'matrix.'+k:v for k,v in rows[0].items()}) if len(rows)==1 else None
+  def display(job):return ci.resolve(job.get('name',''),{'matrix.'+k:v for k,v in ci.matrices(job)[0].items()})
+  for job,os_name in [(mac,'macos-latest')]+[(j,'ubuntu-latest') for j in linux]:
+   if job.get('if') or runner(job)!=os_name:drift.append('job must run only on '+os_name+': '+str(job.get('name')))
+  expected=[]
+  for j in linux:
+   for s in j['steps']:
+    if s.get('if')==LINUX_ONLY:continue
+    r=row(s)
+    if r[0]=='uses' and r[1].split('@')[0] in ('actions/checkout','dtolnay/rust-toolchain','Swatinem/rust-cache') and r in expected:continue
+    expected.append(r)
+  actual=[row(s) for s in mac['steps'] if s.get('if')!=MACOS_ONLY]
+  if actual!=expected:
+   first=next((i for i,(a,b) in enumerate(zip(actual,expected)) if a!=b),min(len(actual),len(expected)))
+   drift.append(mac_name+': steps differ from '+', '.join(n for _,n in twins)+' at step '+str(first))
+  for j in linux:
+   for key in ('env','timeout-minutes'):
+    if j.get(key)!=mac.get(key):drift.append(mac_name+': job '+key+' differs')
+  prefix=mac['name'].split(' (')[0]
+  if display(mac)!=prefix+' (macos-latest)' or display(linux[0])!=prefix+' (ubuntu-latest)':drift.append(mac_name+': check names must be <job> (<runner>)')
+ return drift
 if __name__=='__main__':unittest.main()

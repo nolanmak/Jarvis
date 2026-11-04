@@ -22,6 +22,7 @@ use tracing::{info, warn};
 use crate::checklist;
 use crate::config::HeartbeatConfig;
 use crate::decision::{self, Decision};
+use crate::outreach::{Outreach, OutreachResult};
 use crate::store_ext::{status, HeartbeatStore, Outcome};
 
 /// How often the loop checks whether a run is due. The cadence itself comes
@@ -68,12 +69,44 @@ pub struct RunReport {
     pub decision: Option<String>,
     pub message: Option<String>,
     pub run_id: Option<i64>,
+    /// D16 — what became of each proposed outreach message. Empty (and
+    /// absent from the JSON) whenever outreach is off.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub outreach: Vec<OutreachResult>,
 }
 
 /// Read-only wiki access on the fast tier: the heartbeat checks facts, it
 /// never writes, and it runs often enough that cost matters.
 pub fn heartbeat_opts(wiki_root: &Path) -> ReasonerOpts {
-    let mut opts = ReasonerOpts::pinned(ModelTier::Fast, SYSTEM_PROMPT);
+    heartbeat_opts_for(wiki_root, false)
+}
+
+/// D16 — the marker in `prompt.md` after which the outreach contract
+/// starts. Everything before it is the system prompt with outreach off,
+/// byte for byte what it was before outreach existed.
+const OUTREACH_MARKER: &str = "<!-- outreach:";
+
+/// The system prompt, with the outreach contract only when `outreach`.
+pub fn system_prompt(outreach: bool) -> &'static str {
+    let at = SYSTEM_PROMPT
+        .find(OUTREACH_MARKER)
+        .unwrap_or(SYSTEM_PROMPT.len());
+    let (base, rest) = SYSTEM_PROMPT.split_at(at);
+    if !outreach {
+        return base;
+    }
+    // Static so the opts can borrow it; built once.
+    static WITH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    WITH.get_or_init(|| {
+        let contract = rest.split_once("-->").map_or("", |(_, c)| c);
+        format!("{base}\n{}", contract.trim_start_matches('\n'))
+    })
+}
+
+/// [`heartbeat_opts`], with the outreach contract in the system prompt
+/// when `outreach` (D16). Same tools, model and scope either way.
+pub fn heartbeat_opts_for(wiki_root: &Path, outreach: bool) -> ReasonerOpts {
+    let mut opts = ReasonerOpts::pinned(ModelTier::Fast, system_prompt(outreach));
     opts.allowed_tools = vec!["Read".into(), "Grep".into(), "Glob".into()];
     opts.add_dirs = vec![wiki_root.to_path_buf()];
     opts
@@ -87,6 +120,7 @@ impl RunReport {
             decision: None,
             message: None,
             run_id: None,
+            outreach: Vec::new(),
         }
     }
 
@@ -147,6 +181,8 @@ pub struct HeartbeatRunner<R: Reasoner + ?Sized> {
     config: HeartbeatConfig,
     clock: Arc<dyn Clock>,
     holder: String,
+    /// D16 — set only when outreach is enabled (both switches on).
+    outreach: Option<Arc<dyn Outreach>>,
 }
 
 impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
@@ -165,6 +201,7 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
             config,
             clock: Arc::new(SystemClock),
             holder: format!("pid:{}", std::process::id()),
+            outreach: None,
         }
     }
 
@@ -175,6 +212,14 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
 
     pub fn with_holder(mut self, holder: impl Into<String>) -> Self {
         self.holder = holder.into();
+        self
+    }
+
+    /// D16 — enable proactive outreach through `outreach`. The CLI calls
+    /// this only when `AUGMENTAGENT_HEARTBEAT_OUTREACH=on` and the autonomy
+    /// master switch is on; without it the heartbeat is unchanged.
+    pub fn with_outreach(mut self, outreach: Arc<dyn Outreach>) -> Self {
+        self.outreach = Some(outreach);
         self
     }
 
@@ -281,8 +326,19 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
         } else {
             Some(self.store.start_run(now_ms)?)
         };
-        let prompt = self.build_prompt(now, last_attempt, &checklist)?;
-        let decision = self.call(now_ms, &prompt).await;
+        // D16: the roster is the only list of people outreach may name.
+        let roster = match &self.outreach {
+            Some(outreach) => outreach.roster(now_ms),
+            None => Vec::new(),
+        };
+        let mut prompt = self.build_prompt(now, last_attempt, &checklist)?;
+        prompt.push_str(&crate::outreach::prompt_section(&roster));
+        let call = self.call(now_ms, &prompt, !roster.is_empty()).await;
+        let raw = match &call {
+            Ok((_, raw)) => Some(raw.clone()),
+            Err(_) => None,
+        };
+        let decision = call.map(|(decision, _)| decision);
 
         let mut report = match decision {
             Err(CallError::Timeout) => self.fail(run_id, "timeout", "model call timed out").await?,
@@ -312,6 +368,28 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
                 self.deliver(run_id, now_ms, message, opts.dry_run).await?
             }
         };
+        // D16: only a run that produced a valid decision may reach out.
+        if let (Some(outreach), Some(raw)) = (&self.outreach, raw.as_deref()) {
+            if !roster.is_empty() && matches!(report.decision.as_deref(), Some("silent" | "notify"))
+            {
+                let slugs: Vec<String> = roster.iter().map(|r| r.slug.clone()).collect();
+                let parsed = decision::parse_outreach(raw, &slugs);
+                for entry in &parsed.entries {
+                    let result = outreach.propose(entry, opts.dry_run, now_ms).await;
+                    info!(
+                        contact = %result.contact,
+                        status = %result.status,
+                        reason = ?result.reason,
+                        "heartbeat outreach"
+                    );
+                    report.outreach.push(result);
+                }
+                for dropped in parsed.dropped {
+                    warn!(contact = %dropped.contact, detail = ?dropped.detail, "heartbeat outreach entry dropped");
+                    report.outreach.push(dropped);
+                }
+            }
+        }
         if opts.dry_run {
             report.status = "dry-run".into();
         }
@@ -319,13 +397,18 @@ impl<R: Reasoner + ?Sized + 'static> HeartbeatRunner<R> {
         Ok(report)
     }
 
-    async fn call(&self, now_ms: i64, prompt: &str) -> std::result::Result<Decision, CallError> {
-        let mut opts = heartbeat_opts(&self.wiki_root);
+    async fn call(
+        &self,
+        now_ms: i64,
+        prompt: &str,
+        outreach: bool,
+    ) -> std::result::Result<(Decision, String), CallError> {
+        let mut opts = heartbeat_opts_for(&self.wiki_root, outreach);
         opts.session_id = Some(format!("heartbeat:{now_ms}"));
         match tokio::time::timeout(self.config.timeout, self.reasoner.call(&opts, prompt)).await {
             Err(_) => Err(CallError::Timeout),
             Ok(Err(e)) => Err(CallError::Reasoner(format!("{e:#}"))),
-            Ok(Ok(reply)) => Ok(decision::parse(&reply)),
+            Ok(Ok(reply)) => Ok((decision::parse(&reply), reply)),
         }
     }
 
@@ -996,6 +1079,173 @@ mod tests {
         );
         assert!(opts.settings_json.is_none() && !opts.restrict_env);
         assert!(opts.system_prompt.contains(r#"{"notify": false}"#));
+    }
+
+    /// sha256 of `prompt.md` before outreach existed (#1833 D16).
+    const PRE_OUTREACH_PROMPT_SHA256: &str =
+        "95cd269bce968abfde0f558d403b2c57843611c01b7b0e32cc55f1057208b505";
+
+    #[test]
+    fn outreach_off_system_prompt_is_byte_identical() {
+        let off = system_prompt(false);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(off.as_bytes())),
+            PRE_OUTREACH_PROMPT_SHA256
+        );
+        assert_eq!(heartbeat_opts(Path::new("/w")).system_prompt, off);
+        let on = system_prompt(true);
+        assert!(on.starts_with(off));
+        assert!(on.contains(r#""outreach""#) && on.contains("At most 2 messages"));
+        assert!(!on.contains("<!--"), "the marker never reaches the model");
+        let (a, b) = (
+            heartbeat_opts_for(Path::new("/w"), true),
+            heartbeat_opts(Path::new("/w")),
+        );
+        assert_eq!(
+            (a.allowed_tools, a.add_dirs, a.model),
+            (b.allowed_tools, b.add_dirs, b.model)
+        );
+    }
+
+    struct Sink {
+        roster: Vec<crate::outreach::RosterEntry>,
+        proposed: Mutex<Vec<(crate::outreach::OutreachEntry, bool)>>,
+    }
+
+    #[async_trait]
+    impl crate::outreach::Outreach for Sink {
+        fn roster(&self, _: i64) -> Vec<crate::outreach::RosterEntry> {
+            self.roster.clone()
+        }
+        async fn propose(
+            &self,
+            entry: &crate::outreach::OutreachEntry,
+            dry_run: bool,
+            _: i64,
+        ) -> OutreachResult {
+            self.proposed.lock().unwrap().push((entry.clone(), dry_run));
+            OutreachResult {
+                contact: entry.contact.clone(),
+                status: "auto-sent".into(),
+                reason: None,
+                detail: None,
+            }
+        }
+    }
+
+    fn sink(slugs: &[&str]) -> Arc<Sink> {
+        Arc::new(Sink {
+            roster: slugs
+                .iter()
+                .map(|s| crate::outreach::RosterEntry {
+                    slug: s.to_string(),
+                    display_name: format!("Name of {s}"),
+                })
+                .collect(),
+            proposed: Mutex::new(Vec::new()),
+        })
+    }
+
+    const WITH_OUTREACH: Reply = Reply::Text(
+        r#"{"notify": true, "message": "Flight UA12 moved to 6pm", "outreach": [{"contact": "jane-doe", "message": "Running late", "why": "flight moved"}]}"#,
+    );
+
+    #[tokio::test]
+    async fn without_outreach_the_run_is_unchanged() {
+        // No sink (switches off): the outreach key is ignored, the prompt
+        // and the notice are exactly as before.
+        let h = harness(vec![WITH_OUTREACH]);
+        let report = h.runner.run_once(RUN).await.unwrap();
+        assert_eq!(report.status, status::SENT);
+        assert!(report.outreach.is_empty());
+        assert!(!serde_json::to_string(&report).unwrap().contains("outreach"));
+        assert_eq!(h.broker.reasons(), vec!["Flight UA12 moved to 6pm"]);
+        let prompt = h.reasoner.prompts.lock().unwrap()[0].clone();
+        assert!(!prompt.contains("outreach"));
+        assert_eq!(
+            h.reasoner.opts.lock().unwrap()[0].system_prompt,
+            system_prompt(false)
+        );
+
+        // A sink with an empty roster is the same as none.
+        let h = harness(vec![WITH_OUTREACH]);
+        let empty = sink(&[]);
+        let runner = HeartbeatRunner::new(
+            Arc::clone(&h.store),
+            Arc::clone(&h.broker) as Arc<dyn ApprovalBroker>,
+            Arc::clone(&h.reasoner),
+            h.runner.wiki_root.clone(),
+            config(),
+        )
+        .with_clock(Arc::clone(&h.clock) as Arc<dyn Clock>)
+        .with_holder("test")
+        .with_outreach(empty.clone());
+        let report = runner.run_once(RUN).await.unwrap();
+        assert!(report.outreach.is_empty());
+        assert!(empty.proposed.lock().unwrap().is_empty());
+        assert_eq!(
+            h.reasoner.opts.lock().unwrap()[0].system_prompt,
+            system_prompt(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_entries_reach_the_sink_and_the_notice_still_posts() {
+        let h = harness(vec![WITH_OUTREACH, WITH_OUTREACH]);
+        let s = sink(&["jane-doe"]);
+        let runner = HeartbeatRunner::new(
+            Arc::clone(&h.store),
+            Arc::clone(&h.broker) as Arc<dyn ApprovalBroker>,
+            Arc::clone(&h.reasoner),
+            h.runner.wiki_root.clone(),
+            config(),
+        )
+        .with_clock(Arc::clone(&h.clock) as Arc<dyn Clock>)
+        .with_holder("test")
+        .with_outreach(s.clone());
+        let report = runner.run_once(RUN).await.unwrap();
+        assert_eq!(report.status, status::SENT);
+        assert_eq!(h.broker.reasons(), vec!["Flight UA12 moved to 6pm"]);
+        assert_eq!(report.outreach.len(), 1);
+        let proposed = s.proposed.lock().unwrap().clone();
+        assert_eq!(proposed.len(), 1);
+        assert_eq!(proposed[0].0.message, "Running late");
+        assert!(!proposed[0].1);
+        let prompt = h.reasoner.prompts.lock().unwrap()[0].clone();
+        assert!(prompt.contains("- jane-doe — Name of jane-doe"));
+        assert_eq!(
+            h.reasoner.opts.lock().unwrap()[0].system_prompt,
+            system_prompt(true)
+        );
+
+        // A dry run hands the sink dry_run = true.
+        h.clock.advance(interval(&h));
+        runner
+            .run_once(RunOptions {
+                force: true,
+                dry_run: true,
+            })
+            .await
+            .unwrap();
+        assert!(s.proposed.lock().unwrap()[1].1);
+    }
+
+    #[tokio::test]
+    async fn failed_runs_never_outreach() {
+        let h = harness(vec![Reply::Fail]);
+        let s = sink(&["jane-doe"]);
+        let runner = HeartbeatRunner::new(
+            Arc::clone(&h.store),
+            Arc::clone(&h.broker) as Arc<dyn ApprovalBroker>,
+            Arc::clone(&h.reasoner),
+            h.runner.wiki_root.clone(),
+            config(),
+        )
+        .with_holder("test")
+        .with_outreach(s.clone());
+        let report = runner.run_once(FORCE).await.unwrap();
+        assert_eq!(report.status, status::ERROR);
+        assert!(s.proposed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
