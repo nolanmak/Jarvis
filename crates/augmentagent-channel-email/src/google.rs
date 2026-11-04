@@ -243,6 +243,9 @@ pub struct GoogleGmail {
     app: OAuthApp,
     creds: Arc<dyn CredentialStore>,
     cache: Mutex<HashMap<String, CachedToken>>,
+    /// #1833 D12 — where fetched messages' sender authentication is
+    /// recorded (`email_sender_auth`). `None` records nothing.
+    sender_auth_store: Option<Arc<augmentagent_store::Store>>,
 }
 
 impl std::fmt::Debug for GoogleGmail {
@@ -266,6 +269,7 @@ impl GoogleGmail {
             app,
             creds: default_store(),
             cache: Mutex::new(HashMap::new()),
+            sender_auth_store: None,
         }
     }
 
@@ -285,6 +289,32 @@ impl GoogleGmail {
     pub fn with_credential_store(mut self, creds: Arc<dyn CredentialStore>) -> Self {
         self.creds = creds;
         self
+    }
+
+    /// #1833 D12 — record each fetched message's [`SenderAuth`] (from
+    /// Google's own `Authentication-Results` header) in `store`, keyed by
+    /// message id, for the autonomy gate. The `Email` struct is unchanged.
+    ///
+    /// [`SenderAuth`]: crate::sender_auth::SenderAuth
+    pub fn with_sender_auth_store(mut self, store: Arc<augmentagent_store::Store>) -> Self {
+        self.sender_auth_store = Some(store);
+        self
+    }
+
+    /// #1833 D12 — persist Google's verdict on `msg`'s sender, when a
+    /// store is attached and the message carries Google's own
+    /// `Authentication-Results` header. A store failure is logged, never
+    /// fatal to the fetch: a missing record reads as unauthenticated.
+    fn record_sender_auth(&self, msg: &GmailMessage) {
+        let Some(store) = &self.sender_auth_store else { return };
+        let Some(auth) = msg.sender_auth() else { return };
+        if msg.id.is_empty() {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Err(e) = store.record_email_sender_auth(&msg.id, auth, now) {
+            tracing::warn!(message_id = %msg.id, error = %e, "could not record sender authentication");
+        }
     }
 
     pub fn app(&self) -> &OAuthApp {
@@ -718,6 +748,7 @@ impl GoogleGmail {
                     Some(v) => {
                         let msg: GmailMessage = serde_json::from_value(v)
                             .map_err(|e| GmailError::Decode(format!("messages.get {id}: {e}")))?;
+                        self.record_sender_auth(&msg);
                         Ok(Some(msg.into_email(&entity_id_for(email))))
                     }
                 }
@@ -752,7 +783,10 @@ impl GoogleGmail {
         let mut msgs: Vec<Email> = thread
             .messages
             .into_iter()
-            .map(|m| m.into_email(&entity))
+            .map(|m| {
+                self.record_sender_auth(&m);
+                m.into_email(&entity)
+            })
             .collect();
         msgs.sort_by_key(|m| crate::outbound::parse_rfc2822_or_ms(&m.date));
         if max > 0 && msgs.len() > max as usize {
@@ -1263,6 +1297,16 @@ impl GmailMessage {
             .unwrap_or_default()
     }
 
+    /// #1833 D12 — Google's verdict from the top-most `mx.google.com`
+    /// `Authentication-Results` header (headers are in message order).
+    pub(crate) fn sender_auth(&self) -> Option<crate::sender_auth::SenderAuth> {
+        let part = self.payload.as_ref()?;
+        crate::sender_auth::sender_auth_from_headers(
+            part.headers.iter().map(|h| (h.name.as_str(), h.value.as_str())),
+            &self.header("From"),
+        )
+    }
+
     pub(crate) fn into_email(self, account_entity_id: &str) -> Email {
         let from = self.header("From");
         let to = self.header("To");
@@ -1706,6 +1750,40 @@ mod tests {
         assert_eq!(decode_base64url("aGk=").unwrap(), b"hi");
         assert_eq!(decode_base64url("-_8").unwrap(), decode_base64url("+/8=").unwrap());
         assert!(decode_base64url("not*base64").is_none());
+    }
+
+    /// #1833 D12 — a Gmail-direct fetch records Google's verdict per
+    /// message; a message without Google's header records nothing.
+    #[tokio::test]
+    async fn gmail_direct_fetch_records_sender_auth() {
+        let pass = "mx.google.com; dkim=pass header.i=@work.example.test; dmarc=pass header.from=work.example.test";
+        let forged_only = "relay.example.test; dmarc=pass header.from=work.example.test";
+        let fake = FakeGoogle::start(vec![
+            token_route("at-1"),
+            ("GET", "/users/me/messages?", 200,
+             r#"{"messages":[{"id":"m1"},{"id":"m2"}],"resultSizeEstimate":2}"#.into()),
+            ("GET", "/users/me/messages/m1", 200,
+             serde_json::json!({"id":"m1","threadId":"t1","internalDate":"1792850400000","payload":{
+                 "mimeType":"text/plain","headers":[
+                     {"name":"Authentication-Results","value":pass},
+                     {"name":"From","value":"Jane <jane@work.example.test>"},{"name":"Subject","value":"One"}],
+                 "body":{"data": b64url("first")}}}).to_string()),
+            ("GET", "/users/me/messages/m2", 200,
+             serde_json::json!({"id":"m2","threadId":"t2","internalDate":"1792850300000","payload":{
+                 "mimeType":"text/plain","headers":[
+                     {"name":"Authentication-Results","value":forged_only},
+                     {"name":"From","value":"b@example.test"},{"name":"Subject","value":"Two"}],
+                 "body":{"data": b64url("second")}}}).to_string()),
+        ])
+        .await;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(augmentagent_store::Store::open(db.path()).unwrap());
+        let g = client_with_token(&fake, Some(stored(MAILBOX))).with_sender_auth_store(Arc::clone(&store));
+        let emails = g.search(MAILBOX, "is:unread", 50).await.unwrap();
+        assert_eq!(emails.len(), 2);
+        let a = store.email_sender_auth("m1").unwrap().expect("m1 carries Google's header");
+        assert!(a.dmarc_pass && a.trusted());
+        assert_eq!(store.email_sender_auth("m2").unwrap(), None, "no Google header => None");
     }
 
     #[tokio::test]

@@ -106,6 +106,10 @@ pub enum CalendarError {
     /// A create might have reached Google. Never retry it automatically.
     #[error("calendar creation is unconfirmed: {0}; check the calendar before retrying")]
     Unconfirmed(String),
+    /// #1833 C4 — a conditional write (`If-Match: <etag>`) lost a race: the
+    /// event changed since it was read (HTTP 412). Nothing was written.
+    #[error("calendar event changed since it was read: {message}")]
+    PreconditionFailed { message: String },
 }
 
 #[async_trait]

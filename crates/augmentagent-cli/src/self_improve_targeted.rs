@@ -75,10 +75,11 @@ pub(crate) async fn validate_command(repo: &Path, request: &Request) -> Result<(
 /// Shared read-only execution admission, also used before clearing owner pause.
 /// Background dispatch still verifies deployed-service equality independently.
 pub(crate) async fn command_readiness(repo:&Path,request:&Request)->Result<()> {
-    execution_preflight(repo,Some(request.target),ExecutionMode::Local).await
+    execution_preflight(repo,Some(request.target),ExecutionMode::Local,None).await
 }
 
-pub(super) async fn execution_preflight(repo:&Path,target:Option<Target>,mode:ExecutionMode)->Result<()> {
+pub(super) async fn execution_preflight(repo:&Path,target:Option<Target>,mode:ExecutionMode,
+    selected_pr:Option<&adoption::AdoptedPr>)->Result<()> {
     let readiness:Result<()>=async {
         tokio::task::spawn_blocking(augmentagent_channel_core::native_vm::readiness::runtime::preflight)
             .await.context("native runtime preflight task failed")??;
@@ -86,12 +87,46 @@ pub(super) async fn execution_preflight(repo:&Path,target:Option<Target>,mode:Ex
             let builder=workflow_builder(repo,target).await?;
             provider_readiness::inspect_builder(builder.as_ref()).preflight()?;
         } else {provider_readiness::inspect().preflight()?;}
-        augmentagent_channel_core::run_resources::readiness().await.preflight()?;
+        let resources=augmentagent_channel_core::run_resources::readiness().await;
+        preflight_selected_resources(&workflow::path(),selected_pr,&resources,chrono::Utc::now().timestamp_millis())?;
         if mode==ExecutionMode::Background {crate::autoship_deployment::inspect(repo).await.preflight()?;}
         Ok(())
     }.await;
     readiness.context(CommandFailure {code:3,reason:"execution-readiness-blocked"})
 }
+
+/// An observation is not an execution reservation. Launch-time R admission
+/// remains mandatory independently of this initial workflow preflight.
+fn preflight_selected_resources(state:&Path,pr:Option<&adoption::AdoptedPr>,
+    resources:&augmentagent_channel_core::run_resources::Readiness,now:i64)->Result<()> {
+    use crate::autoship_workflow::{Stage,WorkflowStore};
+    if let Some(pr)=pr.filter(|pr|pr.ready_for_review()) {
+        if let Some(store)=WorkflowStore::open_read_only(state)? {
+            if let Some(id)=store.resolve_pr(&pr.repository,pr.pr)? {
+                if let Some(snapshot)=store.snapshot(&id)? {
+                    if snapshot.pr==Some(pr.pr) && snapshot.checkpoint.binding.head==pr.head
+                        && snapshot.checkpoint.stage==Stage::Verify
+                        && matches!(snapshot.checkpoint.next.action.as_str(),"run_verifier"|"retry_verification")
+                        && snapshot.checkpoint.next.eligible_at_ms<=now && snapshot.lease_until_ms<=now
+                        && !store.owner_control(&id)?.is_some_and(|control|control.paused)
+                        && store.pending_owner_messages(&id)?==0
+                        && store.pending_operations(&id)?.is_empty()
+                        && !store.merge_reconciliation_needed(&id)? {
+                        // Shared CI acquires its build-only R reservation at
+                        // launch. A subsequent native repair independently
+                        // acquires the full native+build reservation before spend.
+                        return resources.declaration_preflight();
+                    }
+                }
+            }
+        }
+    }
+    resources.preflight()
+}
+
+#[cfg(test)]
+#[path="self_improve_targeted_resource_tests.rs"]
+mod resource_tests;
 
 /// Final read-only observation for PR milestone waiters. Closed PRs remain
 /// observable on replay, but the repository grant and exact PR identity must hold.
