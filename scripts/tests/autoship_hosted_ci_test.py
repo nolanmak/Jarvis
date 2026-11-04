@@ -74,6 +74,7 @@ class EvidenceTests(unittest.TestCase):
    def pages(self,endpoint,key=None):
     fixture.calls.append(endpoint)
     if endpoint.endswith('/files'):return fixture.files
+    if '/commits/' in endpoint:return fixture.files
     if '/workflows/' in endpoint:return fixture.runs
     if '/jobs?' in endpoint:return fixture.jobs
     raise AssertionError(endpoint)
@@ -117,6 +118,22 @@ class EvidenceTests(unittest.TestCase):
   self.request.update(pr=None,head=self.head)
   self.runs[0].update(event='push',head_branch='main')
   self.assertEqual(self.evaluate()['state'],'passed')
+ def test_main_path_filtered_workflow_can_be_absent(self):
+  self.request.update(pr=None,head=self.head)
+  self.runs[0].update(event='push',head_branch='main')
+  c=self.contract['workflows'];c['.github/workflows/conditional.yml']={'sha256':hashlib.sha256(b'policy').hexdigest(),'role':'validation','events':{'push':{'paths':['other/**']}},'jobs':{'extra':{'runs-on':'ubuntu-latest'}}}
+  original=self.api.pages
+  self.api.pages=lambda endpoint,key=None: [] if '/conditional.yml/' in endpoint else original(endpoint,key)
+  self.assertEqual(self.evaluate()['state'],'passed')
+ def test_main_ignores_no_failure_from_an_actual_conditional_run(self):
+  self.request.update(pr=None,head=self.head)
+  self.runs[0].update(event='push',head_branch='main')
+  self.contract['workflows'][self.path]['events']['push']['paths']=['other/**']
+  # Mandatory checks remain in a separate unconditional workflow.
+  self.contract['workflows']['.github/workflows/release.yml']=copy.deepcopy(self.contract['workflows'][self.path])
+  self.contract['workflows']['.github/workflows/release.yml']['events']['push']={}
+  self.jobs[0]['conclusion']='failure'
+  self.assertEqual(self.evaluate()['state'],'failed')
  def test_mismatched_job_run_holds(self):
   self.jobs[0]['run_id']=99
   with self.assertRaisesRegex(ValueError,'identity'):self.evaluate()

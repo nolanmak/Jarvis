@@ -453,7 +453,7 @@
       "shell": "bash"
     },
     "rust/agents/9": {
-      "body": "sudo apt-get update && sudo apt-get install -y fonts-liberation poppler-utils",
+      "body": "# Keep the real 15 GiB snapshot/maintenance floor in hosted tests.\n# Android/.NET/Haskell SDKs are unused by these Rust/Python/Node suites.\ndf -h .\nsudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc\ndf -h .\nsudo apt-get update && sudo apt-get install -y fonts-liberation poppler-utils",
       "shell": "bash"
     },
     "rust/channels/10": {
@@ -1755,7 +1755,7 @@
             },
             {
               "command_id": "rust/agents/9",
-              "name": "Install PDF fonts and poppler"
+              "name": "Reclaim unused SDKs and install PDF fonts and poppler"
             },
             {
               "command_id": "rust/agents/10",
@@ -2235,7 +2235,7 @@
         }
       },
       "role": "validation",
-      "sha256": "759cf3c2ffefdb36dceccfb13793b536cd7b6863e1b4df6573a417d2b35a81d4"
+      "sha256": "eaaa0f74791f80e589a902333ce849f1a7e4a5b5b5eafe966bc914435c46a551"
     }
   }
 }

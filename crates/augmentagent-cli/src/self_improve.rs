@@ -1917,8 +1917,7 @@ async fn failed_ci_findings(repo_root: &Path, pr: u64) -> Option<String> {
     for (name, job) in failed {
         findings.push_str(&format!("\nFailed check: {name}\n"));
         if let Some(job) = job {
-            if let Ok((true, log, _)) = run(&gh_bin(), &["run", "view", "--job",
-                &job.to_string(), "--log-failed"], repo_root).await {
+            if let Ok((true, log, _)) = run(&gh_bin(), &["api", &format!("repos/{{owner}}/{{repo}}/actions/jobs/{job}/logs")], repo_root).await {
                 findings.push_str(&truncate_tail(&log, 2000));
             }
         }
@@ -5106,8 +5105,8 @@ fn red_main_title(red: &RedMain) -> String {
 
 fn red_main_body(red: &RedMain, recent_commits: &str) -> String {
     let mut b = format!(
-        "{RED_MAIN_MARKER}\nAuto-filed by the auto-PR loop: `origin/main` at `{}` fails its \
-         own verification gate, so every issue's gate is red until this is fixed. \
+        "{RED_MAIN_MARKER}\nAuto-filed by the auto-PR loop: `origin/main` at `{}` fails its GitHub Actions \
+         checks, so autonomous merges wait until this is fixed. \
          This issue outranks all other work.\n\n",
         red.sha
     );

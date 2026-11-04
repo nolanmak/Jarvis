@@ -234,7 +234,7 @@ jobs:
 
       # Discord voice. augmentagent-cli's document_signing tests render a real
       # PDF, which needs the pinned runtime and its fonts.
-      - name: Install PDF fonts and poppler
+      - name: Reclaim unused SDKs and install PDF fonts and poppler
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/agents/9"
       - name: Provision the pinned PDF runtime
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/agents/10"

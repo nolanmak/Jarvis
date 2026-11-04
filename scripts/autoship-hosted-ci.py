@@ -149,6 +149,14 @@ def evaluate(request, github):
     else:
         if github.api(f'{prefix}/branches/main')['commit']['sha'] != head:
             raise ValueError('main source moved')
+    if not pull:
+        # The commit API exposes the diff to the first parent, including the
+        # complete PR diff for the protected merge commits used by autoship.
+        files = github.pages(f'{prefix}/commits/{head}', 'files')
+        if len(files) >= 3000:
+            raise ValueError('main changed paths incomplete')
+        changed = [f['filename'] for f in files]
+        changed.extend(f['previous_filename'] for f in files if 'previous_filename' in f)
     contract = request['contract']
     # Bind the actual executed workflow and helper bytes to controller policy.
     # Changes to CI policy wait for a reviewed controller rollout, rather than
@@ -175,14 +183,18 @@ def evaluate(request, github):
     failures = []
     pending = False
     receipts = []
-    for path, names in sorted(expected.items()):
+    inventory = expected if pull else expected_jobs(contract, [], event)
+    for path, names in sorted(inventory.items()):
         workflow = urllib.parse.quote(path.rsplit('/', 1)[1], safe='')
         runs = github.pages(f'{prefix}/actions/workflows/{workflow}/runs?head_sha={head}&event={event}', 'workflow_runs')
         runs = [r for r in runs if run_matches(r, repository, head, event, path)
                 and (not pull or any(p.get('number') == pr for p in r.get('pull_requests', [])))
                 and (pull or r.get('head_branch') == 'main')]
         if not runs:
-            pending = True
+            # Path-filtered push workflows may legitimately have no run. Every
+            # actual run is still checked, including multi-commit pushes whose
+            # earlier changes are outside the last commit's diff.
+            pending |= path in expected
             continue
         run = max(runs, key=lambda r: r['id'])
         # filter=latest includes the current attempt, not previous green reruns.
