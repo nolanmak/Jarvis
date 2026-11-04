@@ -7613,6 +7613,15 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 }};
                 crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
                     .finish_command_attempt(&id,selected_at,outcome,reason,chrono::Utc::now().timestamp_millis())?;
+                // One job's rejected target is that job's outcome (recorded
+                // above with its retry backoff), not a failed tick: the next
+                // turn still serves other work.
+                if let Err(error)=&result {
+                    if let Some(failure)=error.downcast_ref::<targeted::CommandFailure>().filter(|failure|failure.code==2) {
+                        warn!(workflow=%id,reason=failure.reason,"auto-PR command job rejected; other work continues: {error:#}");
+                        return Ok(RunReport::triage(format!("Command job {id} rejected: {}",failure.reason)));
+                    }
+                }
                 return result;
             }
         }
