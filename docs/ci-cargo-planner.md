@@ -2677,3 +2677,30 @@ worker launches, serialize worker projection/capture epochs, or enable
 RetainedTransfer/resume. All input/full-CI/shipping flags remain false. A
 separate ordinary repository-adapter diagnostic exercises a builtin printf
 without substituting for the unchanged four-parent or full-CI acceptance.
+
+Protected worker-admission replay `c76fab0a` passes in 90.09 seconds through
+the ordinary repository adapter, with a version-2 receipt. The independently
+inspected original worker has UID/GID1000, no supplementary groups, exactly
+[0,1,2,11] inherited FDs, measured policy identity and relay seals15. Original
+worker cleanup and host VM subtree removal are verified. The first diagnostic
+selected the legacy route and is not admission evidence; subsequent validation
+located an overstrict stdin receipt rule. Python's original DEVNULL descriptor
+is O_RDWR. The corrected grammar accepts readable null descriptors without
+normalizing their flags and still refuses write-only stdin. Two metadata-only
+regressions cover that rule; six actual exec-stop/grant cases remain unchanged.
+
+The unchanged four-parent replay at the same runtime reaches all four nested
+root children and validates20 entry/16 pause/capture records. Its retained
+original worker admission joins to the same execution claim's scope, which is
+explicitly abandoned/nonreusable only after original R. One deepest success
+and sealed ELF are independently observed; three deepest exit results remain
+unrecorded before sibling cancellation. The full test remains red with
+InputCensusUnknown after107.12 seconds because effect transfer/resume remains
+fenced. All644 Python tests and35 focused managed Rust tests pass.
+
+Receipt validation now preserves the original bounded hold fingerprint across
+the adapter boundary instead of replacing it with an empty-evidence hash.
+Fixed worker-entry/descriptor stage labels survive sanitization without raw
+exception text, paths or output. Malformed diagnostic envelopes still hold.
+These changes grant no worker pause/projection epoch, full-input/CI or shipping
+authority, and no production rollout or autonomous merge is claimed.
