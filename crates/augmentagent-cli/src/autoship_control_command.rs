@@ -40,6 +40,9 @@ pub(crate) async fn apply(repo:&Path,path:&Path,id:&str,paused:bool)->(i32,Value
         if let Err(e)=crate::self_improve::targeted::command_readiness(repo,&request).await {
             return failure(&id,3,"execution-readiness-blocked",format!("{e:#}"));
         }
+        if let Err(e)=crate::self_improve::targeted::prepare_internal_execution_retry(path,&id,&principal,revision) {
+            return failure(&id,3,"execution-retry-teardown-blocked",format!("{e:#}"));
+        }
     }
     let changed=(||->anyhow::Result<_> {
         WorkflowStore::open(path)?.set_owner_pause(&id,&principal,revision,paused,chrono::Utc::now().timestamp_millis())
@@ -48,7 +51,7 @@ pub(crate) async fn apply(repo:&Path,path:&Path,id:&str,paused:bool)->(i32,Value
         Ok(control)=>(0,json!({"schema_version":1,"workflow":id,"accepted":true,"complete":false,
             "reason":if paused {"owner-pause-requested"} else {"owner-resume-accepted"},
             "owner_control":control,"worker_enforcement":"unverified","quiescence":"unverified","execution":"not-confirmed"})),
-        Err(e) if matches!(e.to_string().as_str(),"owner-followup-pending"|"owner-control-revision-conflict"|"terminal workflow cannot change owner control"|"unknown workflow")=>failure(&id,3,"owner-control-rejected",e),
+        Err(e) if matches!(e.to_string().as_str(),"owner-followup-pending"|"owner-control-revision-conflict"|"terminal workflow cannot change owner control"|"unknown workflow"|"execution-retry-not-quiescent")=>failure(&id,3,"owner-control-rejected",e),
         Err(e)=>failure(&id,4,"workflow-state-unavailable",e),
     }
 }

@@ -78,6 +78,15 @@ pub(crate) async fn command_readiness(repo:&Path,request:&Request)->Result<()> {
     execution_preflight(repo,Some(request.target),ExecutionMode::Local,None).await
 }
 
+pub(crate) fn prepare_internal_execution_retry(path:&Path,id:&str,principal:&str,revision:i64)->Result<()> {
+    let mut store=crate::autoship_workflow::WorkflowStore::open(path)?;
+    let now=chrono::Utc::now().timestamp_millis();
+    if store.request_execution_retry_retirement(id,principal,revision,now)? {
+        workflow::reconcile_runtime_retirements_in(&mut store,now)?;
+    }
+    Ok(())
+}
+
 pub(super) async fn execution_preflight(repo:&Path,target:Option<Target>,mode:ExecutionMode,
     selected_pr:Option<&adoption::AdoptedPr>)->Result<()> {
     let readiness:Result<()>=async {
