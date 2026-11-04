@@ -35,6 +35,60 @@ class StagingUnavailable(_cache.FreshnessHold):
         super().__init__('input_census_unknown',reason.encode('ascii'))
 
 
+def observe_exec_entry(pid):
+    """Inspect the original supervisor's still-stopped, single-threaded exec.
+
+    No descriptor is opened in the tracee and no pipe bytes, file contents or
+    shared offsets are read. These facts do not identify the installed filter
+    program, establish input closure, or authorize a transfer or resume.
+    """
+    if type(pid) is not int or pid<=0:raise StagingUnavailable('exec_entry')
+    root=Path('/proc')/str(pid)
+    def read(path):
+        with path.open('rb') as stream:data=stream.read(65537)
+        if len(data)>65536:raise StagingUnavailable('exec_entry')
+        return data.decode('ascii')
+    def status():
+        rows=dict(line.split(':',1) for line in read(root/'status').splitlines())
+        fields=read(root/'stat').rsplit(')',1)[1].split()
+        tasks=sorted(path.name for path in (root/'task').iterdir())
+        if (fields[0]!='t' or int(rows['TracerPid'])!=os.getpid()
+                or tasks!=[str(pid)]):raise StagingUnavailable('exec_entry')
+        return {'pid':pid,'birth':int(fields[19]),'tracer':int(rows['TracerPid']),
+            'uids':[int(n) for n in rows['Uid'].split()],
+            'gids':[int(n) for n in rows['Gid'].split()],
+            'groups':sorted(int(n) for n in rows['Groups'].split()),
+            'no_new_privs':int(rows['NoNewPrivs']),'seccomp':int(rows['Seccomp']),
+            'seccomp_filters':int(rows['Seccomp_filters']),
+            'capabilities':{key:int(rows[key],16) for key in ('CapEff','CapPrm','CapAmb')}}
+    try:
+        before=status();names=sorted(int(path.name) for path in (root/'fd').iterdir())
+        if len(names)>64 or any(not 0<=number<=65535 for number in names):
+            raise StagingUnavailable('exec_entry')
+        rows=[]
+        for number in names:
+            info=os.stat(root/'fd'/str(number))
+            detail=dict(line.split(':',1) for line in read(root/'fdinfo'/str(number)).splitlines())
+            rows.append({'number':number,'device':info.st_dev,'inode':info.st_ino,
+                'type':stat.S_IFMT(info.st_mode),'uid':info.st_uid,'gid':info.st_gid,
+                'flags':int(detail['flags'].strip(),8),'position':int(detail['pos'])})
+        if before!=status() or names!=sorted(int(path.name) for path in (root/'fd').iterdir()):
+            raise StagingUnavailable('exec_entry')
+        return {'version':1,'kind':'ci-unit-exec-entry',**before,'descriptors':names,'fd_table':rows,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+    except (OSError,ValueError,KeyError,IndexError,UnicodeError):
+        raise StagingUnavailable('exec_entry') from None
+
+
+def require_exec_entry(entry,*,uid,gid,groups,descriptors):
+    """Check observed entry against trusted caller expectations, never grant it."""
+    if (entry['uids']!=[uid]*4 or entry['gids']!=[gid]*4 or entry['groups']!=groups
+            or entry['descriptors']!=sorted(descriptors) or len(set(descriptors))!=len(descriptors)
+            or entry['no_new_privs']!=1 or entry['seccomp']!=2 or entry['seccomp_filters']<1
+            or any(entry['capabilities'].values())):
+        raise StagingUnavailable('exec_entry')
+
+
 def _seal(descriptor):
     fcntl.fcntl(descriptor,fcntl.F_ADD_SEALS,SEALS)
 

@@ -2355,3 +2355,23 @@ provisional-result/reuse distinction, worker liveness, artifact export slots,
 inode/rename semantics and C/R recovery obligations from the 84-seam review.
 Signal ingress, sibling-effect closure and complete kernel-policy disposition
 remain explicit C-owned handoff blockers; the draft is not a final C proof/API.
+
+### Original exec-entry observation
+
+Before releasing the original kernel exec stop, the unit supervisor now samples
+the actual PID/birth, tracer, single-thread census, four UID/GID slots,
+supplementary groups, capabilities, no-new-privileges, seccomp status and bounded
+descriptor table. It requires the assigned unit identity, empty groups, zero
+effective/permitted/ambient capabilities and exactly the intended standard
+streams, normalized jobserver ends and relay descriptor. Standard output/error
+identity and access mode must match the original supervisor; both jobserver ends
+must match the staged pipe identity. The observation is bound to the original
+command and unit ordinal and cannot authorize transfer, reuse or shipping.
+
+Three real host-process tests use the original supervisor and actual native unit
+policy: inspection precedes the body's first instruction, an inherited extra FD
+prevents body execution, and a running controller cannot substitute for the
+original stopped tracee. Host tests observe the host's actual supplementary
+groups; production requires empty groups. These tests do not establish private
+guest namespaces, exact installed filter identity, sealed stdin/config contents,
+complete writer isolation or end-to-end autoship.

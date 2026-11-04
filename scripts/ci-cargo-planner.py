@@ -2560,11 +2560,34 @@ def _unit(arguments):
         mediation.spawned(child)
     def executed(child):
         nonlocal observed
-        status=Path(f'/proc/{child.pid}/status').read_text()
         expected=execution_identity(value)
-        for label in ('Uid:','Gid:'):
-            row=next(line for line in status.splitlines() if line.startswith(label))
-            if [int(number) for number in row.split()[1:]]!=[expected]*4:raise FreshnessHold('invalidation_unsafe')
+        stdin=cache._read_record(Path(value['directory'])/'stdin.json')
+        if (stdin.get('binding')!=value['binding'] or stdin.get('command')!=value['command']
+                or stdin.get('ordinal')!=value['ordinal']):raise FreshnessHold('generation_mismatch')
+        allowed=[0,1,2]
+        if stdin['jobserver'] is not None:allowed.extend([3,4])
+        if (value.get('execution_role') in ('worker','cargo')
+                or 'transport' in value.get('view',{})):allowed.append(value['relay_fd'])
+        entry=staging.observe_exec_entry(child.pid)
+        staging.require_exec_entry(entry,uid=expected,gid=expected,groups=[],descriptors=allowed)
+        table={row['number']:row for row in entry['fd_table']}
+        for number in (1,2):
+            info=os.fstat(number);actual=table[number]
+            if ((actual['device'],actual['inode'],actual['type'],actual['flags']&os.O_ACCMODE)
+                    !=(info.st_dev,info.st_ino,stat.S_IFMT(info.st_mode),
+                        fcntl.fcntl(number,fcntl.F_GETFL)&os.O_ACCMODE)):
+                raise FreshnessHold('invalidation_unsafe')
+        if stdin['jobserver'] is not None:
+            reader,writer=table[3],table[4]
+            if (reader['type']!=stat.S_IFIFO or writer['type']!=stat.S_IFIFO
+                    or (reader['device'],reader['inode'])!=(writer['device'],writer['inode'])
+                    or reader['flags']&os.O_ACCMODE!=os.O_RDONLY
+                    or writer['flags']&os.O_ACCMODE!=os.O_WRONLY
+                    or hashlib.sha256(f"{reader['device']}:{reader['inode']}".encode('ascii')).hexdigest()
+                        !=stdin['jobserver']['kernel_pipe_sha256']):raise FreshnessHold('invalidation_unsafe')
+        cache._write_record(Path(value['directory'])/'exec-entry.json',{'version':1,
+            'binding':value['binding'],'command':value['command'],'ordinal':value['ordinal'],'entry':entry,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
         if 'view' in value:
             namespaces={name:{'controller':os.readlink('/proc/self/ns/'+name),
                 'unit':os.readlink(f'/proc/{child.pid}/ns/'+name)} for name in ('mnt','ipc','net')}
