@@ -1830,7 +1830,7 @@ class UnitPeerRelay(RootRelay):
                 finally:
                     self.freezer.thaw(self.deadline)
                     if 'pause' in record:
-                        record['pause']['thaw_verified']=True
+                        record['thaw_verified']=True
                         cache._write_record(self.root/'admission.json',record)
         raise FreshnessHold('input_census_unknown')
 
