@@ -2322,12 +2322,20 @@ class RepositoryWorkerFreezer(UnitFreezer):
     """
     def __init__(self,admission,scope,lock,namespaces):
         if type(lock) is not WorkerProjectionLock:raise FreshnessHold('invalidation_unsafe')
+        self.progress_path=admission.target.parent/'repository-held-request.json'
         super().__init__(admission,scope,1000,_worker_token=_WORKER_GROUP_TOKEN)
         self.lock=lock;self.namespaces=dict(namespaces);self.members={}
         self.membership='0::/ci-workers/'+self.path.name+'\n'
         if (set(self.namespaces)!={'mnt','ipc','net','user','pid'} or any(
                 value!=os.readlink('/proc/self/ns/'+name) for name,value in self.namespaces.items())):
             raise FreshnessHold('invalidation_unsafe')
+
+    def _note(self,phase,**values):
+        super()._note(phase,**values)
+        cache._write_record(self.progress_path,{'version':1,'kind':'ci-worker-scope-progress',
+            'binding':self.setup_record['binding'],'command':self.setup_record['command'],
+            'phase':phase,'scope_id':self.setup_path.parent.name,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
 
     def _lease(self,kind):
         lease=self.lock.active
@@ -2384,7 +2392,9 @@ class RepositoryWorkerFreezer(UnitFreezer):
         self._lease('pause')
         if self.original is None or self.entry is None:raise FreshnessHold('cleanup_uncertain')
         signal.pidfd_send_signal(self.pidfd,0)
+        self._note('freezing_workers')
         self._write('cgroup.freeze',b'1\n');self._wait(1,deadline)
+        self._note('frozen_workers')
         rows=[];expected=[];pids=set(map(int,self._read('cgroup.procs').split()))
         if self.original not in pids or not 1<=len(pids)<=512:raise FreshnessHold('input_census_unknown')
         for pid in sorted(pids):
@@ -2410,15 +2420,18 @@ class RepositoryWorkerFreezer(UnitFreezer):
         def check():
             if time.monotonic()>=deadline:raise FreshnessHold('cleanup_uncertain')
             signal.pidfd_send_signal(self.pidfd,0);self._wait(1,deadline)
+        self._note('worker_uid_census')
         self.paused_cohort=staging.observe_uid_cohort(1000,expected,check=check)
         if self.paused_cohort['pid_namespace']!=self.pid_namespace:raise FreshnessHold('invalidation_unsafe')
         self.check_frozen_cohort()
+        self._note('worker_pause_verified')
         return {'version':1,'kind':'ci-worker-freeze-observation','scope':self.descriptor(),
             'uid_cohort':self.paused_cohort,'processes':rows,'frozen':True,
             'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
 
     def thaw(self,deadline):
         self._lease('pause');super().thaw(deadline)
+        self._note('workers_thawed')
 
     def close(self):
         if self.members:raise FreshnessHold('cleanup_uncertain')
@@ -2883,7 +2896,9 @@ class WorkerRelay(RootRelay):
                 'version':1,'binding':self.admission.binding,'command':self.admission.command,
                 'file_hex':file[:4096].hex(),'argv_hex':[arg[:2048].hex() for arg in argv[:32]],
                 'cwd_hex':cwd[:4096].hex(),'search_hex':None if search is None else search[:4096].hex(),
-                'stage':getattr(error,'unit_view_stage','planner_cargo_request'),'shipping_authority':False})
+                'stage':getattr(error,'unit_view_stage','planner_cargo_request'),
+                'worker_scope_phase':None if self.worker_freezer is None else self.worker_freezer.setup_record['phase'],
+                'shipping_authority':False})
             raise
 
     def _request_context(self,ordinal,request):
