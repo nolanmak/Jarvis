@@ -18,7 +18,7 @@ them from the checkout, where the daemon also runs and reads `.env`.
 
 | Host | State |
 | --- | --- |
-| macOS, Apple Silicon | Pending real-host acceptance (#1300). CI runs every Slack test on `macos-latest`. |
+| macOS, Apple Silicon | Pending real-host acceptance (#1300). CI runs every Slack test on `macos-latest` (`platform (macos-latest)` in `.github/workflows/macos.yml`: every push to `main`, nightly, and PRs touching macOS-sensitive paths). |
 | macOS, Intel | Pending, qualified separately from Apple Silicon (#1300). Not supported until recorded. |
 | Linux (systemd) | Pending real-host acceptance (#1300). Credentials persist since [#1325](https://github.com/nolanmak/Jarvis/issues/1325) in an owner-only file store (`credential_backend: private-file`); CI proves a second process reads what the first stored. After upgrading from an earlier build, re-run `slack app install` (see Linux specifics). |
 

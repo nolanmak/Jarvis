@@ -18,9 +18,10 @@ PR_CONCURRENCY = {
  'cancel-in-progress': "${{ github.event_name == 'pull_request' }}",
 }
 def validate_concurrency(filename,data):
-    # Platform's existing explicit policy predates this rollout and is retained.
-    expected={'group':'platform-${{ github.ref }}','cancel-in-progress':True} if filename=='platform.yml' else PR_CONCURRENCY
-    if data.get('concurrency')!=expected:
+    # No per-workflow exceptions: a main push must never cancel an earlier
+    # main run, or a merge burst leaves commits with no verdict (most PRs get
+    # the full macOS suites only after merge).
+    if data.get('concurrency')!=PR_CONCURRENCY:
         raise ValueError('validation workflow requires reviewed PR concurrency policy: '+filename)
 
 def generate(root=ROOT):
