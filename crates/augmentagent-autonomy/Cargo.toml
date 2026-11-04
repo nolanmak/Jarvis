@@ -11,6 +11,17 @@ description = "Trusted-contact autonomy (#1833): trust config, canonical handles
 augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-messages = { path = "../augmentagent-messages" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
+# C5–C9: the gate, planner, broker decorator and sweeps live here. Only the
+# CLI depends on this crate, so depending on the channel crates is no cycle.
+augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
+augmentagent-channel-core = { path = "../augmentagent-channel-core" }
+augmentagent-channel-calendar = { path = "../augmentagent-channel-calendar" }
+augmentagent-channel-email = { path = "../augmentagent-channel-email" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+tokio = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -23,3 +34,4 @@ toml = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
+mockito = "1"

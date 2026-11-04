@@ -248,6 +248,7 @@ async fn phone_tool_configuration_requires_authenticated_context_and_preserves_o
         ("social_adapter_opts", social_adapter_opts("Synthetic instructions".into())),
         ("loop_parse_opts", loop_parse_opts()),
         ("archetype_pick_opts", archetype_pick_opts()),
+        ("autonomy_plan_opts", autonomy_plan_opts()),
     ];
     let manifest: serde_json::Value = serde_json::from_str(include_str!("../../../docs/reasoner-capabilities.json")).unwrap();
     let expected: std::collections::BTreeSet<_> = manifest["presets"].as_array().unwrap().iter()
