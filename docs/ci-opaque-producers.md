@@ -475,8 +475,13 @@ primitives require the original serialized controller mutation lock and its
 allocation/writer/pause proof; they introduce no new runnable grant or resource
 pool. Whole-transfer allocation/preflight integration, final metadata/graph
 validation, alias closure and parent resume remain unfinished. Guest preparation
-evidence is pending. All 513 Python tests and 34 focused managed Rust tests
-pass; all materialization/input/CI/shipping flags stay false.
+at `e43c654d` passed all 46 cases in 90.50 seconds as UID1000 on the admitted
+cache filesystem: the unchanged 14 syscall and 18 sequence cases plus these
+14 creation/reservation cases. Original resource teardown positively verified.
+All 513 Python tests and 34 focused managed Rust tests pass. This proves the
+creation/recovery primitives; whole-transfer integration, allocation/image
+proof, final materialization and parent resume remain unproved. All
+materialization/input/CI/shipping flags stay false.
 
 A rename is an identity-preserving namespace move in this graph, including
 rename-over-existing and directory descendants. Persist its original/final path
