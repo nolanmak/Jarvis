@@ -2433,3 +2433,13 @@ The original ten-case unit-policy module and its native count assertion remain
 unchanged; the three additional loader identity tests live in a separate module.
 No parent-state transfer, input-closure/CI authority or production rollout is
 enabled by these observations.
+
+Actual mountinfo is now observed before the original unit's first instruction,
+bound to the exec-entry digest, rechecked by Root before enrollment and compared
+again while the original cohort is frozen. Parsing preserves escaped and
+non-UTF8 pathname bytes and rejects malformed/duplicate mount identities under
+the existing 16 MiB/100000-entry bounds. Namespace filesystem labels remain
+distinct from ordinary path roots. The observation records exact per-mount
+read/write, propagation, filesystem and backing-root fields; it does not yet
+classify the complete writable layout or certify private-W writer isolation.
+Transfer/resume, input closure, full CI and shipping authority remain disabled.

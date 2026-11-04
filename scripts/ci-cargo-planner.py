@@ -2020,7 +2020,7 @@ class UnitFreezer:
                 or not cache._uuid(Path(scope).name) or type(uid) is not int or not 2000<=uid<6096):
             raise FreshnessHold('invalidation_unsafe')
         _source(admission.target,admission.binding,admission.command)
-        self.owner=os.getpid();self.uid=uid;self.original=None;self.pidfd=None;self.entry=None
+        self.owner=os.getpid();self.uid=uid;self.original=None;self.pidfd=None;self.entry=None;self.mount_layout=None
         self.setup_path=Path(scope)/'freeze-setup.json'
         self.setup_record={'version':1,'kind':'ci-unit-freezer-setup','binding':admission.binding,
             'command':admission.command,'uid':uid,'shipping_authority':False}
@@ -2075,7 +2075,7 @@ class UnitFreezer:
             if os.write(descriptor,body)!=len(body):raise FreshnessHold('cleanup_uncertain')
         finally:os.close(descriptor)
 
-    def attach(self,pid,pidfd,*,entry):
+    def attach(self,pid,pidfd,*,entry,mount_layout):
         if self.original is not None:raise FreshnessHold('invalidation_unsafe')
         process=Path('/proc')/str(pid);status=process.joinpath('stat').read_text().rsplit(')',1)[1].split()
         if status[0]!='t' or {p.name for p in process.joinpath('task').iterdir()}!={str(pid)}:
@@ -2089,6 +2089,7 @@ class UnitFreezer:
                 or set(self._read('cgroup.procs').split())!={str(pid).encode()}):
             raise FreshnessHold('invalidation_unsafe')
         self.original=pid;self.pidfd=os.dup(pidfd);self.entry=copy.deepcopy(entry)
+        self.mount_layout=copy.deepcopy(mount_layout)
         self._note('original_enrolled')
 
     def _wait(self,frozen,deadline):
@@ -2102,6 +2103,8 @@ class UnitFreezer:
         if self.original is None or self.entry is None:raise FreshnessHold('invalidation_unsafe')
         signal.pidfd_send_signal(self.pidfd,0)
         self._write('cgroup.freeze',b'1\n');self._wait(1,deadline)
+        if unit_views.observe_mount_layout(self.original)!=self.mount_layout:
+            raise FreshnessHold('invalidation_unsafe')
         rows=[]
         pids=set(map(int,self._read('cgroup.procs').split()))
         if self.original not in pids or not 1<=len(pids)<=512:raise FreshnessHold('input_census_unknown')
@@ -2135,6 +2138,7 @@ class UnitFreezer:
             'cgroup_device':self.identity.st_dev,'cgroup_inode':self.identity.st_ino,'original_pid':self.original,
             'entry_sha256':hashlib.sha256(json.dumps(self.entry,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
             'kernel_policy_sha256':self.entry['policy_activation']['policy']['sha256'],
+            'mount_layout_sha256':self.mount_layout['sha256'],
             'frozen':True,'processes':rows,'input_closure_complete':False,'shipping_authority':False}
 
     def thaw(self,deadline):
@@ -2190,11 +2194,18 @@ class UnitPeerRelay(RootRelay):
                 'size_bytes':measured.size_bytes,'activation_returncode':0,
                 'input_closure_complete':False,'full_ci':False,'shipping_authority':False}}
         if entry['policy_activation']!=expected:raise FreshnessHold('authority_changed')
+        layout=cache._read_record(self.scope/'mount-layout.json',max_bytes=16*1024**2)
+        if (layout.get('binding')!=self.admission.binding or layout.get('command')!=self.admission.command
+                or layout.get('ordinal')!=self.parent_ordinal
+                or layout.get('entry_sha256')!=hashlib.sha256(json.dumps(entry,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+                or layout.get('layout')!=unit_views.observe_mount_layout(pid)
+                or layout['layout']['sha256']!=entry['mount_layout_sha256']):
+            raise FreshnessHold('invalidation_unsafe')
         namespaces={name:os.readlink(f'/proc/{pid}/ns/'+name) for name in ('mnt','ipc','net','user','pid')}
         if any(record['namespaces'][name]['unit']!=namespaces[name] for name in ('mnt','ipc','net')):
             raise FreshnessHold('invalidation_unsafe')
         self.scope_root=record['root_identity'];self.scope_namespaces=namespaces;self.scope_pidfd=os.pidfd_open(pid)
-        self.freezer.attach(pid,self.scope_pidfd,entry=entry)
+        self.freezer.attach(pid,self.scope_pidfd,entry=entry,mount_layout=layout['layout'])
         self.staged_signals=StagedParentSignals(self.scope_pidfd,lock=self.ordinals.signal_lock)
         staged=cache._read_record(self.scope/'stdin.json')
         if (staged.get('binding')!=self.admission.binding or staged.get('command')!=self.admission.command
@@ -2632,10 +2643,17 @@ def _unit(arguments):
                     or writer['flags']&os.O_ACCMODE!=os.O_WRONLY
                     or hashlib.sha256(f"{reader['device']}:{reader['inode']}".encode('ascii')).hexdigest()
                         !=stdin['jobserver']['kernel_pipe_sha256']):raise FreshnessHold('invalidation_unsafe')
+        layout=None
+        if 'view' in value:
+            layout=unit_views.observe_mount_layout(child.pid);entry['mount_layout_sha256']=layout['sha256']
         cache._write_record(Path(value['directory'])/'exec-entry.json',{'version':1,
             'binding':value['binding'],'command':value['command'],'ordinal':value['ordinal'],'entry':entry,
             'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
         if 'view' in value:
+            cache._write_record(Path(value['directory'])/'mount-layout.json',{'version':1,
+                'binding':value['binding'],'command':value['command'],'ordinal':value['ordinal'],
+                'entry_sha256':hashlib.sha256(json.dumps(entry,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
+                'layout':layout,'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
             namespaces={name:{'controller':os.readlink('/proc/self/ns/'+name),
                 'unit':os.readlink(f'/proc/{child.pid}/ns/'+name)} for name in ('mnt','ipc','net')}
             if any(row['controller']==row['unit'] for row in namespaces.values()):raise FreshnessHold('invalidation_unsafe')

@@ -24,6 +24,75 @@ MAX_ENTRIES=100000
 MAX_BYTES=4*1024**3
 
 
+def parse_mount_layout(body):
+    """Decode a bounded kernel mountinfo table without losing pathname bytes."""
+    if type(body) is not bytes or not 0<len(body)<=16*1024**2 or b'\0' in body:
+        raise FreshnessHold('input_census_unknown')
+    def path(raw):
+        result=bytearray();offset=0;escapes={b'040':32,b'011':9,b'012':10,b'134':92}
+        while offset<len(raw):
+            if raw[offset]==92:
+                code=raw[offset+1:offset+4]
+                if code not in escapes:raise FreshnessHold('input_census_unknown')
+                result.append(escapes[code]);offset+=4
+            else:result.append(raw[offset]);offset+=1
+        decoded=bytes(result)
+        if (not decoded.startswith(b'/') or len(decoded)>4096
+                or decoded!=b'/' and any(part in (b'',b'.',b'..') for part in decoded[1:].split(b'/'))):
+            raise FreshnessHold('input_census_unknown')
+        return decoded.hex()
+    rows=[];ids=set()
+    try:
+        lines=body.split(b'\n')
+        if lines[-1]==b'':lines.pop()
+        for line in lines:
+            fields=line.split(b' ');separator=fields.index(b'-')
+            if separator<6 or len(fields)!=separator+4 or any(not field for field in fields):
+                raise FreshnessHold('input_census_unknown')
+            if not all(field.isdigit() for field in fields[:2]):raise FreshnessHold('input_census_unknown')
+            number,parent=map(int,fields[:2]);device=fields[2].split(b':')
+            if number<=0 or number in ids or len(device)!=2 or any(not field.isdigit() for field in device):
+                raise FreshnessHold('input_census_unknown')
+            options=fields[5].decode('ascii').split(',');super_options=fields[-1].decode('ascii').split(',')
+            if (len(set(options)&{'rw','ro'})!=1 or len(options)!=len(set(options))
+                    or len(set(super_options)&{'rw','ro'})!=1):raise FreshnessHold('input_census_unknown')
+            filesystem=fields[separator+1].decode('ascii');root=fields[3]
+            if filesystem=='nsfs' and not root.startswith(b'/'):
+                label,colon,identity=root.partition(b':[')
+                if (label not in (b'mnt',b'net',b'uts',b'ipc',b'pid',b'user',b'cgroup',b'time')
+                        or not colon or not identity.endswith(b']') or not identity[:-1].isdigit()):
+                    raise FreshnessHold('input_census_unknown')
+                root=root.hex()
+            else:root=path(root)
+            ids.add(number);rows.append({'id':number,'parent':parent,'device':list(map(int,device)),
+                'root':root,'mountpoint':path(fields[4]),'options':sorted(options),
+                'optional':[field.decode('ascii') for field in fields[6:separator]],
+                'filesystem':filesystem,'source':fields[separator+2].hex(),
+                'super_options':sorted(super_options)})
+            if len(rows)>MAX_ENTRIES:raise FreshnessHold('input_census_unknown')
+        if not rows:raise FreshnessHold('input_census_unknown')
+        return sorted(rows,key=lambda row:row['id'])
+    except (ValueError,UnicodeError,IndexError):raise FreshnessHold('input_census_unknown') from None
+
+
+def observe_mount_layout(pid):
+    """Observe the current namespace and root; never certify writable isolation."""
+    if type(pid) is not int or pid<=0:raise FreshnessHold('input_census_unknown')
+    process=Path('/proc')/str(pid)
+    def read():
+        with (process/'mountinfo').open('rb') as stream:return stream.read(16*1024**2+1)
+    try:
+        namespace=os.readlink(process/'ns/mnt');root=os.stat(process/'root');body=read()
+        rows=parse_mount_layout(body);after=os.stat(process/'root')
+        if (body!=read() or namespace!=os.readlink(process/'ns/mnt')
+                or (root.st_dev,root.st_ino)!=(after.st_dev,after.st_ino)):
+            raise FreshnessHold('invalidation_unsafe')
+        return {'version':1,'kind':'ci-unit-mount-layout','pid':pid,'mount_namespace':namespace,
+            'root_identity':[root.st_dev,root.st_ino],'mounts':rows,'sha256':hashlib.sha256(body).hexdigest(),
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+    except OSError:raise FreshnessHold('input_census_unknown') from None
+
+
 def relative(value):
     raw=os.fsencode(value)
     if (not raw or len(raw)>4096 or raw.startswith(b'/') or b'\0' in raw
