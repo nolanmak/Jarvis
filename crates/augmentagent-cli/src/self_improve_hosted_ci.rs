@@ -135,6 +135,51 @@ fn job_diagnostics(log: &str) -> String {
         .collect()
 }
 
+/// How auto-ship reads `main` from GitHub's evidence, newest commit first.
+#[derive(Debug, PartialEq)]
+enum MainVerdict {
+    /// `main`'s newest completed CI run passed (the head's, or, while the
+    /// head's run is still pending, the newest ancestor's that completed).
+    Green { observed: String },
+    /// The head's own CI failed.
+    Red,
+    /// Nothing usable yet: the head is pending and no recent ancestor
+    /// completed green (a red ancestor may already be fixed at the head).
+    Pending(String),
+}
+
+/// `observations` are `(sha, state)` newest first, starting at the head and
+/// stopping at the first completed run. `main` moves every 10–40 minutes and
+/// its Linux CI takes ~20, so demanding the exact head's verdict left the
+/// loop yielding on almost every tick (2026-11-04). A pending head inherits
+/// its newest green ancestor: the PR's own exact-head CI still catches
+/// anything the newer commits broke.
+fn decide_main(observations: &[(String, String)]) -> MainVerdict {
+    let Some((head, head_state)) = observations.first() else {
+        return MainVerdict::Pending("main head unavailable".into());
+    };
+    match head_state.as_str() {
+        "passed" => return MainVerdict::Green { observed: head.clone() },
+        "failed" => return MainVerdict::Red,
+        _ => {}
+    }
+    for (sha, state) in &observations[1..] {
+        match state.as_str() {
+            "passed" => return MainVerdict::Green { observed: sha.clone() },
+            "failed" => {
+                return MainVerdict::Pending(format!(
+                    "head {head} pending and newest completed main commit {sha} failed; waiting for the head"
+                ))
+            }
+            _ => {}
+        }
+    }
+    MainVerdict::Pending(format!("head {head} {head_state}; no recently completed main commit"))
+}
+
+/// How many first-parent main commits to look back while the head is pending.
+const MAIN_LOOKBACK: usize = 8;
+
 pub(super) async fn main_status(root: &Path) -> Result<Option<RedMain>> {
     let repository = workflow::canonical_repository(root).await?;
     let (ok, raw, _) = run(
@@ -149,8 +194,39 @@ pub(super) async fn main_status(root: &Path) -> Result<Option<RedMain>> {
         .as_str()
         .context("main head unavailable")?;
     let evidence = observe_with(root, &gh_bin(), &repository, None, Some(head)).await?;
+    let mut observations = vec![(head.to_owned(), if evidence.head == head { evidence.state.clone() } else { "unknown".into() })];
+    if !matches!(observations[0].1.as_str(), "passed" | "failed") {
+        let (ok, raw, _) = run(
+            &gh_bin(),
+            &["api", &format!("repos/{repository}/commits?sha={head}&per_page={}", MAIN_LOOKBACK + 1)],
+            root,
+        )
+        .await?;
+        if ok {
+            let commits: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+            for sha in commits.as_array().into_iter().flatten().filter_map(|c| c["sha"].as_str()).skip(1) {
+                let older = observe_with(root, &gh_bin(), &repository, None, Some(sha)).await;
+                let state = match older {
+                    Ok(e) if e.head == sha => e.state,
+                    _ => "unknown".into(),
+                };
+                let done = matches!(state.as_str(), "passed" | "failed");
+                observations.push((sha.to_owned(), state));
+                if done { break; }
+            }
+        }
+    }
+    match decide_main(&observations) {
+        MainVerdict::Green { observed } => {
+            if observed != head {
+                info!(head, observed, "main head CI pending; newest completed main commit passed");
+            }
+            return Ok(None);
+        }
+        MainVerdict::Pending(why) => bail!("GitHub main CI pending or unavailable: {why}"),
+        MainVerdict::Red => {}
+    }
     match evidence.state.as_str() {
-        "passed" if evidence.head == head => Ok(None),
         "failed" if evidence.head == head => {
             let mut diagnostics = String::from("GitHub Actions on main failed:\n");
             for failure in &evidence.failures {
@@ -178,7 +254,7 @@ pub(super) async fn main_status(root: &Path) -> Result<Option<RedMain>> {
                 sha: head.to_owned(),
             }))
         }
-        _ => bail!("GitHub main CI pending or unavailable: {}", evidence.reason),
+        _ => bail!("GitHub main CI pending or unavailable: {} {}", evidence.state, evidence.reason),
     }
 }
 
@@ -215,6 +291,28 @@ mod tests {
         ]);
         assert_eq!(failing_packages(&diagnostics), vec!["augmentagent-cli"]);
         assert_eq!(job_diagnostics("plain diagnostic\n"), "plain diagnostic\n");
+    }
+
+    fn obs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    #[test]
+    fn a_pending_main_head_inherits_its_newest_green_ancestor() {
+        assert_eq!(decide_main(&obs(&[("h", "passed")])), MainVerdict::Green { observed: "h".into() });
+        assert_eq!(decide_main(&obs(&[("h", "failed")])), MainVerdict::Red);
+        assert_eq!(
+            decide_main(&obs(&[("h", "pending"), ("p1", "unknown"), ("p2", "passed")])),
+            MainVerdict::Green { observed: "p2".into() }
+        );
+    }
+
+    #[test]
+    fn a_pending_head_over_a_red_ancestor_or_no_evidence_keeps_waiting() {
+        assert!(matches!(decide_main(&obs(&[("h", "pending"), ("p1", "failed"), ("p2", "passed")])),
+            MainVerdict::Pending(why) if why.contains("p1") && why.contains("failed")));
+        assert!(matches!(decide_main(&obs(&[("h", "pending"), ("p1", "pending")])), MainVerdict::Pending(_)));
+        assert!(matches!(decide_main(&[]), MainVerdict::Pending(_)));
     }
 
     #[tokio::test]
