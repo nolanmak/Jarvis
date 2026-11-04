@@ -381,7 +381,14 @@ Real host cases cover retained FDs/offsets, shared and private mappings,
 write→unlink/replacement, all-images preflight, partial writes, lost progress
 commits, metadata-only changes, foreign writes, late child writes, corrupt final
 images and forked-controller refusal. All 462 Python tests and 34 focused Rust
-tests pass. Guest application is unproved.
+tests pass. At `217959d7`, the unchanged guest replay completed in 102.59
+seconds at the deliberate result hold. After a managed inspection admission
+deferred behind a live production VM, the admitted read-only inspection verified
+the original exec/cleanup and prepared plan graph, all seven before/old payloads
+(64,832 bytes) and all eight after payloads (537,776 bytes). The original resource
+subtree was positively removed, and no inode-application journal exists. This
+checks pre-execution writable-handle acquisition; guest application is unproved
+and remains uninvoked.
 
 Prepared plans now derive namespace operations from each object's parent
 inode and basename, rather than from a changed full pathname alone. Descendants
@@ -390,10 +397,10 @@ or reinserted. Changed old edges are ordered deepest first; final attachments
 put directory parents before their children. Host filesystem cases cover a
 renamed populated directory, rename over an empty directory, two-file swaps,
 new directory/child ordering and moving a child before removing its old parent.
-All 467 Python tests pass. This is planning only: detach/attach execution,
-filesystem-local staging, interrupted-move replay and checked resume remain
-unfinished. The managed Rust rebuild is queued behind the production worker's
-live VM lease; the last completed focused Rust run passed 34 tests at `217959d7`.
+All 467 Python tests and 34 focused managed Rust tests pass at `08d06630`.
+This is planning only: detach/attach execution, filesystem-local staging,
+interrupted-move replay and checked resume remain unfinished. Guest namespace
+execution and application remain unproved.
 
 A rename is an identity-preserving namespace move in this graph, including
 rename-over-existing and directory descendants. Persist its original/final path
