@@ -38,7 +38,19 @@ pub const DEFAULT_GATE_MIN_FREE_GB: f64 = 15.0;
 pub const LOW_DISK_REFUSAL: &str = "gate refused: low disk";
 
 pub fn gate_min_free_gb() -> f64 {
+    #[cfg(test)]
+    if let Some(gb) = TEST_GATE_MIN_FREE_GB.with(|v| v.get()) {
+        return gb;
+    }
     env_f64("AUGMENTAGENT_GATE_MIN_FREE_GB", DEFAULT_GATE_MIN_FREE_GB)
+}
+
+// Tests that exercise real snapshot/maintenance paths must not depend on how
+// much space the CI runner happens to have (7.5 GB free failed the 15 GB
+// floor on every hosted run). Per-thread, so parallel tests are unaffected.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_GATE_MIN_FREE_GB: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {

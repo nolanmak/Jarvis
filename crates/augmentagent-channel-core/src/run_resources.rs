@@ -554,6 +554,25 @@ impl Readiness {
         anyhow::ensure!(self.permits_attempt,"workflow-resource:{}",self.status);
         Ok(())
     }
+
+    /// Configuration-only preflight for work whose executor obtains its own
+    /// reservation. This does not establish headroom or authorize a launch.
+    /// A larger workflow's physical-capacity refusal may be deferred to that
+    /// executor; invalid declarations, delegation and unknown inspection fail.
+    pub fn declaration_preflight(&self)->Result<()> {
+        if self.permits_attempt {return self.preflight();}
+        let observation=self.observation.as_ref();
+        let capacity=observation.is_some_and(|value|
+            value["status"]=="capacity-exhausted" && value["permits_attempt"]==false
+                && value["live_verified"]==false
+                && value["refusal"]["phase"]=="admission_failed"
+                && value["refusal"]["exhausted"]==true
+                && matches!(value["refusal"]["refusal_code"].as_str(),
+                    Some("host_headroom"|"aggregate_reservations"|"ancestor_headroom")));
+        anyhow::ensure!(self.status=="capacity-exhausted" && !self.live_verified
+            && self.policy.is_some() && capacity,"workflow-resource:{}",self.status);
+        Ok(())
+    }
 }
 
 pub async fn readiness()->Readiness {
