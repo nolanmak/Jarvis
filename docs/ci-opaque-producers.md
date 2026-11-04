@@ -426,6 +426,30 @@ allocation/new-directory creation, final metadata/materialization validation,
 alias closure and checked parent resume remain unfinished. The executor still
 does not invoke inode or namespace application.
 
+Namespace sequencing now binds the complete step list and held inode/parent
+capabilities, including mount identities, to one plan and controller PID/birth.
+Before the first step it simulates all source/destination edges and refuses
+later collisions, nonempty removals and directory cycles. A durable master
+stores the next step, active operation, immutable step-receipt digests and the
+whole current participating inode/parent graph. Recovery validates that graph,
+then replays only the active operation; an obsolete completed step is never
+re-executed against parents changed by later operations. Active recovery projects
+the verified before/after transition across all parent aliases and refuses
+unrelated changes before further dispatch. Completion rechecks the entire graph
+even if only the final master commit was lost. That last boundary initially
+failed its injected foreign-write regression and is now checked explicitly.
+Eighteen host cases cover each lost syscall/master commit, swaps, directory
+rename-over-existing with unchanged descendants, anonymous replacement, child
+moves/removal, invalid later operations, unrelated writes and final-commit loss. A second
+regression caught late inode-mode refusal after an earlier move; all inode
+mode/attribute admission now precedes the first step.
+This sequences already-held namespace capabilities only: whole-transfer image/
+allocation preflight, owned staging/new-directory creation, old-inode-write
+integration, final metadata/materialization validation and alias/pause proof
+remain caller-owned and unfinished. The namespace master still records false
+materialization/input/CI/shipping flags. All 499 Python tests and 34 focused
+managed Rust tests pass. Expanded guest evidence is pending.
+
 A rename is an identity-preserving namespace move in this graph, including
 rename-over-existing and directory descendants. Persist its original/final path
 sets, source/destination identities and staged-move progress in the transfer

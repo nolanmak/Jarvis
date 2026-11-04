@@ -840,35 +840,7 @@ def apply_namespace_step(intent,*,plan_sha256,action,inode_fd,source_parent=None
             'effects_materialized':False,'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
         persist(record)
     before=record['before'];current=snapshot()
-    def postcondition(actual):
-        old=before['inode'];node=actual['inode']
-        expected_links=0 if action=='remove' else (1 if action=='attach' else old['links'])
-        ignored={7}|({2,6} if is_directory and action=='remove' else set())
-        if (node['links']!=expected_links or any(a!=b for i,(a,b) in enumerate(zip(old['key'],node['key'])) if i not in ignored)
-                or (not is_directory and (node['size'],node['sha256'])!=(old['size'],old['sha256']))
-                or (is_directory and node['children']!=old['children'])):return False
-        expected={key:{r[0]:r[1:] for r in row['entries']} for key,row in before['parents'].items()}
-        if source_parent is not None:
-            if expected[endpoints['source']].pop(source_name.hex(),None)!=[old['key'],old['links']]:return False
-        if destination_parent is not None:expected[endpoints['destination']][destination_name.hex()]=[old['key'],expected_links]
-        deltas={key:0 for key in parents}
-        if is_directory:
-            if source_parent is not None:deltas[endpoints['source']]-=1
-            if destination_parent is not None:deltas[endpoints['destination']]+=1
-        parent_identities={tuple(row['key'][:2]):key for key,row in before['parents'].items()}
-        for key,parent in before['parents'].items():
-            now=actual['parents'][key]
-            if (now['links']!=parent['links']+deltas[key]
-                    or any(a!=b for i,(a,b) in enumerate(zip(parent['key'],now['key'])) if i not in (2,6,7))):return False
-            rows={r[0]:r[1:] for r in now['entries']}
-            if set(rows)!=set(expected[key]):return False
-            for name,(metadata,links) in expected[key].items():
-                observed,observed_links=rows[name];identity=tuple(metadata[:2]);ignore=set()
-                if list(identity)==inode_identity:ignore={7}
-                if identity in parent_identities:
-                    ignore={2,6,7};links+=deltas[parent_identities[identity]]
-                if observed_links!=links or any(a!=b for i,(a,b) in enumerate(zip(metadata,observed)) if i not in ignore):return False
-        return True
+    def postcondition(actual):return _namespace_step_after(record,actual)
     if record['state']=='applied':
         if current!=record['after'] or not postcondition(current):raise FreshnessHold('input_census_unknown')
         return record
@@ -884,6 +856,255 @@ def apply_namespace_step(intent,*,plan_sha256,action,inode_fd,source_parent=None
     synced();record['state']='applied';record['after']=snapshot()
     if not postcondition(record['after']):raise FreshnessHold('input_census_unknown')
     persist(record);return record
+
+
+def _namespace_step_after(record,actual):
+    before=record['before'];binding=record['binding'];action=binding['action'];endpoints=binding['endpoints']
+    inode_identity=binding['inode'];is_directory=stat.S_ISDIR(before['inode']['key'][5])
+    source_name=None if binding['source_name'] is None else bytes.fromhex(binding['source_name'])
+    destination_name=None if binding['destination_name'] is None else bytes.fromhex(binding['destination_name'])
+    old=before['inode'];node=actual['inode']
+    expected_links=0 if action=='remove' else (1 if action=='attach' else old['links'])
+    ignored={7}|({2,6} if is_directory and action=='remove' else set())
+    if (node['links']!=expected_links or any(a!=b for i,(a,b) in enumerate(zip(old['key'],node['key'])) if i not in ignored)
+            or (not is_directory and (node['size'],node['sha256'])!=(old['size'],old['sha256']))
+            or (is_directory and node['children']!=old['children'])):return False
+    expected={key:{r[0]:r[1:] for r in row['entries']} for key,row in before['parents'].items()}
+    if 'source' in endpoints:
+        if expected[endpoints['source']].pop(source_name.hex(),None)!=[old['key'],old['links']]:return False
+    if 'destination' in endpoints:expected[endpoints['destination']][destination_name.hex()]=[old['key'],expected_links]
+    deltas={key:0 for key in before['parents']}
+    if is_directory:
+        if 'source' in endpoints:deltas[endpoints['source']]-=1
+        if 'destination' in endpoints:deltas[endpoints['destination']]+=1
+    parent_identities={tuple(row['key'][:2]):key for key,row in before['parents'].items()}
+    for key,parent in before['parents'].items():
+        now=actual['parents'][key]
+        if (now['links']!=parent['links']+deltas[key]
+                or any(a!=b for i,(a,b) in enumerate(zip(parent['key'],now['key'])) if i not in (2,6,7))):return False
+        rows={r[0]:r[1:] for r in now['entries']}
+        if set(rows)!=set(expected[key]):return False
+        for name,(metadata,links) in expected[key].items():
+            observed,observed_links=rows[name];identity=tuple(metadata[:2]);ignore=set()
+            if list(identity)==inode_identity:ignore={7}
+            if identity in parent_identities:
+                ignore={2,6,7};links+=deltas[parent_identities[identity]]
+            if observed_links!=links or any(a!=b for i,(a,b) in enumerate(zip(metadata,observed)) if i not in ignore):return False
+    return True
+
+
+
+def _descriptor_mount_id(descriptor):
+    rows=Path('/proc/self/fdinfo/'+str(descriptor)).read_text().splitlines()
+    values=[line.split()[1] for line in rows if line.startswith('mnt_id:')]
+    if len(values)!=1 or not values[0].isdigit():raise FreshnessHold('invalidation_unsafe')
+    return int(values[0])
+
+
+def apply_namespace_sequence(directory,*,plan_sha256,steps,inodes,parents,check):
+    """Sequence held-capability operations with a verified completion prefix.
+
+    The caller owns whole-transfer allocation/image/writer/pause proof and all
+    staging/creation capabilities. No parent resume or materialization authority
+    is returned here. Only the current active operation can be replayed; finished
+    operations are checked against immutable receipts and the whole current
+    graph rather than against their obsolete per-step parent snapshots.
+    """
+    directory=literal(directory);check();control=directory.stat()
+    if (control.st_uid!=os.geteuid() or stat.S_IMODE(control.st_mode)!=0o700
+            or type(plan_sha256) is not str or len(plan_sha256)!=64
+            or any(c not in '0123456789abcdef' for c in plan_sha256)
+            or type(steps) is not list or len(steps)>2*MAX_ENTRIES
+            or type(inodes) is not dict or type(parents) is not dict or len(inodes)>MAX_ENTRIES):
+        raise FreshnessHold('invalidation_unsafe')
+    steps=copy_module.deepcopy(steps);inodes=dict(inodes);parents=dict(parents)
+    encode=lambda value:json.dumps(value,sort_keys=True,separators=(',',':')).encode()
+    def name(value):
+        if type(value) is not str:raise FreshnessHold('invalidation_unsafe')
+        result=relative(bytes.fromhex(value))
+        if len(result.parts)!=1:raise FreshnessHold('invalidation_unsafe')
+        return os.fsencode(result)
+    def identity(fd):
+        info=os.fstat(fd);return str(info.st_dev)+':'+str(info.st_ino)
+    def role(key):
+        if type(key) is not str or not 0<len(key)<=4096 or '\0' in key:raise FreshnessHold('invalidation_unsafe')
+    contexts={};parent_roles={};node_roles={};mounts={};fingerprints={'inodes':{},'parents':{}}
+    for key,fd in inodes.items():
+        role(key);info=os.fstat(fd);physical=identity(fd)
+        if (physical in node_roles.values() or not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode))
+                or info.st_mode&0o7000 or os.listxattr(fd)):
+            raise FreshnessHold('invalidation_unsafe')
+        node_roles[key]=physical;fingerprints['inodes'][key]=[info.st_dev,info.st_ino,_descriptor_mount_id(fd),stat.S_IFMT(info.st_mode)]
+        if stat.S_ISDIR(info.st_mode):contexts[physical]=fd
+    for key,fd in parents.items():
+        role(key);info=os.fstat(fd);physical=identity(fd)
+        if not stat.S_ISDIR(info.st_mode):raise FreshnessHold('invalidation_unsafe')
+        parent_roles[key]=physical;fingerprints['parents'][key]=[info.st_dev,info.st_ino,_descriptor_mount_id(fd)]
+        if physical in contexts and _descriptor_mount_id(contexts[physical])!=_descriptor_mount_id(fd):
+            raise FreshnessHold('invalidation_unsafe')
+        contexts[physical]=fd
+    for physical,fd in contexts.items():
+        if [control.st_dev,control.st_ino]==list(_key(os.fstat(fd)))[:2]:raise FreshnessHold('invalidation_unsafe')
+        mounts[physical]=_descriptor_mount_id(fd)
+    for step in steps:
+        if (type(step) is not dict or step.get('action') not in ('move','remove','attach')
+                or step.get('inode') not in inodes):raise FreshnessHold('invalidation_unsafe')
+        expected={'action','inode'}
+        if step['action'] in ('move','remove'):expected|={'source_parent','source_name'}
+        if step['action'] in ('move','attach'):expected|={'destination_parent','destination_name'}
+        if set(step)!=expected:raise FreshnessHold('invalidation_unsafe')
+        for side in ('source','destination'):
+            if side+'_parent' in step:
+                if step[side+'_parent'] not in parent_roles:raise FreshnessHold('invalidation_unsafe')
+                name(step[side+'_name'])
+    def snapshot():
+        check();nodes={};total=0
+        for key,fd in inodes.items():
+            info=os.fstat(fd);node={'key':list(_key(info)),'links':info.st_nlink}
+            if stat.S_ISDIR(info.st_mode):node['children']=[] if info.st_nlink==0 else _namespace_directory(fd,check)['entries']
+            else:
+                node['size'],node['sha256']=RetainedInodes._read(fd,check);total+=node['size']
+                if total>MAX_BYTES:raise FreshnessHold('input_census_unknown')
+            if _key(os.fstat(fd))!=tuple(node['key']):raise FreshnessHold('input_census_unknown')
+            nodes[key]=node
+        forest={}
+        for key,fd in contexts.items():
+            info=os.fstat(fd)
+            forest[key]=({'key':list(_key(info)),'links':0,'entries':[]} if info.st_nlink==0 else _namespace_directory(fd,check))
+        members={tuple(row[1][:2]) for parent in forest.values() for row in parent['entries']}
+        members|={tuple(node['key'][:2]) for node in nodes.values()}
+        if len(members)>MAX_ENTRIES:raise FreshnessHold('input_census_unknown')
+        result={'inodes':nodes,'parents':forest}
+        if len(encode(result))>16*1024**2:raise FreshnessHold('input_census_unknown')
+        return result
+    def preflight(frame):
+        members={key:{r[0]:r[1][:2] for r in row['entries']} for key,row in frame['parents'].items()}
+        links={key:row['links'] for key,row in frame['parents'].items()}
+        links.update({node_roles[key]:row['links'] for key,row in frame['inodes'].items()})
+        for step in steps:
+            obj=frame['inodes'][step['inode']];physical=node_roles[step['inode']];inode=obj['key'][:2]
+            is_dir=stat.S_ISDIR(obj['key'][5]);action=step['action']
+            source=parent_roles.get(step.get('source_parent'));destination=parent_roles.get(step.get('destination_parent'))
+            if action=='attach' and (is_dir or links[physical]!=0):raise FreshnessHold('invalidation_unsafe')
+            if source is not None:
+                if links[source]==0 or members[source].get(step['source_name'])!=inode:raise FreshnessHold('input_census_unknown')
+                if fingerprints['inodes'][step['inode']][2]!=mounts[source]:raise FreshnessHold('invalidation_unsafe')
+                if not is_dir and links[physical]!=1:raise FreshnessHold('invalidation_unsafe')
+            if destination is not None:
+                if (links[destination]==0 or step['destination_name'] in members[destination]
+                        or os.fstat(inodes[step['inode']]).st_dev!=os.fstat(contexts[destination]).st_dev):
+                    raise FreshnessHold('invalidation_unsafe')
+            if action=='move' and mounts[source]!=mounts[destination]:raise FreshnessHold('invalidation_unsafe')
+            if action=='attach' and fingerprints['inodes'][step['inode']][2]!=mounts[destination]:raise FreshnessHold('invalidation_unsafe')
+            if action=='remove' and is_dir and members[physical]:raise FreshnessHold('invalidation_unsafe')
+            if is_dir and destination is not None:
+                ancestors={}
+                for parent,rows in members.items():
+                    for child in rows.values():
+                        child_id=str(child[0])+':'+str(child[1])
+                        if child_id in contexts:ancestors[child_id]=parent
+                cursor=destination;seen=set()
+                while cursor not in seen:
+                    if cursor==physical:raise FreshnessHold('invalidation_unsafe')
+                    seen.add(cursor)
+                    if cursor not in ancestors:break
+                    cursor=ancestors[cursor]
+            if source is not None:
+                members[source].pop(step['source_name'])
+                if is_dir:links[source]-=1
+            if destination is not None:
+                members[destination][step['destination_name']]=inode
+                if is_dir:links[destination]+=1
+            if action=='remove':links[physical]=0
+            elif action=='attach':links[physical]=1
+    binding={'plan_sha256':plan_sha256,'steps':steps,'capabilities':fingerprints,'owner_pid':os.getpid(),
+        'owner_birth':Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()[19]}
+    path=directory/'sequence.json'
+    def persist(record):
+        check()
+        if len(encode(record))>16*1024**2:raise FreshnessHold('input_census_unknown')
+        cache._write_record(path,record)
+    def step_binding(index):
+        step=steps[index];inode=os.fstat(inodes[step['inode']]);endpoints={}
+        for side in ('source','destination'):
+            if side+'_parent' in step:endpoints[side]=parent_roles[step[side+'_parent']]
+        return {'plan_sha256':plan_sha256,'action':step['action'],'inode':[inode.st_dev,inode.st_ino],
+            'owner_pid':binding['owner_pid'],'owner_birth':binding['owner_birth'],'endpoints':endpoints,
+            'source_name':step.get('source_name'),'destination_name':step.get('destination_name')}
+    def footprint(frame,index):
+        return {'inode':frame['inodes'][steps[index]['inode']],
+            'parents':{key:frame['parents'][key] for key in set(step_binding(index)['endpoints'].values())}}
+    def projected(frame,index,after):
+        expected=copy_module.deepcopy(frame);expected['inodes'][steps[index]['inode']]=copy_module.deepcopy(after['inode'])
+        updates={tuple(row['key'][:2]):row for row in after['parents'].values()}
+        updates[tuple(after['inode']['key'][:2])]=after['inode']
+        expected['parents'].update(copy_module.deepcopy(after['parents']))
+        for parent in expected['parents'].values():
+            changed=updates.get(tuple(parent['key'][:2]))
+            if changed is not None:
+                parent['key']=changed['key'];parent['links']=changed['links']
+                if 'entries' in changed:parent['entries']=copy_module.deepcopy(changed['entries'])
+                elif 'children' in changed:parent['entries']=copy_module.deepcopy(changed['children'])
+            for row in parent['entries']:
+                changed=updates.get(tuple(row[1][:2]))
+                if changed is not None:row[1]=changed['key'];row[2]=changed['links']
+        for node in expected['inodes'].values():
+            changed=updates.get(tuple(node['key'][:2]))
+            if changed is not None:
+                node['key']=changed['key'];node['links']=changed['links']
+                if stat.S_ISDIR(node['key'][5]):
+                    physical=str(node['key'][0])+':'+str(node['key'][1]);node['children']=copy_module.deepcopy(expected['parents'][physical]['entries'])
+        return expected
+    if path.exists():
+        record=cache._read_record(path,max_bytes=16*1024**2)
+        if (record.get('kind')!='ci-namespace-sequence' or record.get('version')!=1 or record.get('binding')!=binding
+                or record.get('state') not in ('applying','namespace_sequence_applied')
+                or type(record.get('next_step')) is not int or not 0<=record['next_step']<=len(steps)
+                or record.get('active_step') not in (None,record['next_step'])
+                or record.get('effects_materialized') is not False or record.get('shipping_authority') is not False
+                or record.get('full_ci') is not False or record.get('input_closure_complete') is not False
+                or type(record.get('step_receipts')) is not list or len(record['step_receipts'])!=record['next_step']):
+            raise FreshnessHold('invalidation_unsafe')
+        for index,digest in enumerate(record['step_receipts']):
+            receipt=cache._read_record(directory/('step-'+str(index)+'.json'),max_bytes=16*1024**2)
+            if (receipt.get('state')!='applied' or receipt.get('binding')!=step_binding(index)
+                    or hashlib.sha256(encode(receipt)).hexdigest()!=digest):raise FreshnessHold('input_census_unknown')
+    else:
+        frame=snapshot();preflight(frame)
+        record={'version':1,'kind':'ci-namespace-sequence','binding':binding,'state':'applying','next_step':0,
+            'active_step':None,'snapshot':frame,'initial_sha256':hashlib.sha256(encode(frame)).hexdigest(),
+            'step_receipts':[],'effects_materialized':False,'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+        persist(record)
+    if record['state']=='namespace_sequence_applied':
+        if record['next_step']!=len(steps) or record['active_step'] is not None or snapshot()!=record['snapshot']:
+            raise FreshnessHold('input_census_unknown')
+        return record
+    while record['next_step']<len(steps):
+        index=record['next_step'];step=steps[index];step_path=directory/('step-'+str(index)+'.json');current=snapshot()
+        if current!=record['snapshot']:
+            if record['active_step']!=index or not step_path.exists():raise FreshnessHold('input_census_unknown')
+            active=cache._read_record(step_path,max_bytes=16*1024**2)
+            if (active.get('binding')!=step_binding(index) or active.get('before')!=footprint(record['snapshot'],index)
+                    or not _namespace_step_after(active,footprint(current,index))
+                    or projected(record['snapshot'],index,footprint(current,index))!=current):
+                raise FreshnessHold('input_census_unknown')
+        elif step_path.exists():
+            active=cache._read_record(step_path,max_bytes=16*1024**2)
+            if active.get('binding')!=step_binding(index) or active.get('before')!=footprint(record['snapshot'],index):
+                raise FreshnessHold('input_census_unknown')
+        record['active_step']=index;persist(record)
+        kwargs={'plan_sha256':plan_sha256,'action':step['action'],'inode_fd':inodes[step['inode']],'check':check}
+        for side in ('source','destination'):
+            if side+'_parent' in step:kwargs[side+'_parent']=parents[step[side+'_parent']];kwargs[side+'_name']=name(step[side+'_name'])
+        applied=apply_namespace_step(step_path,**kwargs)
+        if applied['before']!=footprint(record['snapshot'],index):raise FreshnessHold('input_census_unknown')
+        expected=projected(record['snapshot'],index,applied['after'])
+        if snapshot()!=expected:raise FreshnessHold('input_census_unknown')
+        record['snapshot']=expected;record['step_receipts'].append(hashlib.sha256(encode(applied)).hexdigest())
+        record['next_step']+=1;record['active_step']=None;persist(record)
+    if record['active_step'] is not None or snapshot()!=record['snapshot']:
+        raise FreshnessHold('input_census_unknown')
+    check();record['state']='namespace_sequence_applied';persist(record);return record
 
 
 def namespace_edges(plan):
