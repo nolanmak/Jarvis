@@ -71,6 +71,7 @@ _Static_assert(sizeof(struct configuration) == 160, "configuration ABI");
 _Static_assert(sizeof(struct request) == 300, "request ABI");
 _Static_assert(sizeof(struct response) == 16, "response ABI");
 static struct configuration config;
+static uid_t server_uid;
 static int initialized;
 static volatile sig_atomic_t proxy_connection = -1;
 static volatile sig_atomic_t proxy_signal_failure;
@@ -163,19 +164,22 @@ __attribute__((constructor)) static void initialize_relay(void) {
         || pread(fd, &config, sizeof(config), 0) != sizeof(config)) _exit(125);
     close(fd);
 #ifdef JARVIS_CARGO_PROTOCOL_V3
-    /* Root grants distinct worker/planner roles. A worker descriptor never
-     * admits planner credentials, and vice versa. The server peer stays root. */
+    /* The unit role uses the existing uid field for the assigned client UID.
+     * Worker/planner layouts retain uid=0; every V3 server peer stays root. */
     int worker = memcmp(config.magic, "JARVWRK3", 8) == 0;
-    uid_t expected = worker ? 1000 : 1001;
+    int unit = memcmp(config.magic, "JARVUNT3", 8) == 0;
+    uid_t expected = unit ? config.uid : worker ? 1000 : 1001;
     uid_t real_uid,effective_uid,saved_uid;
     gid_t real_gid,effective_gid,saved_gid;
-    if ((!worker && memcmp(config.magic, CONFIG_MAGIC, 8))
-        || config.uid!=0 || info.st_uid!=0
+    if ((!worker && !unit && memcmp(config.magic, CONFIG_MAGIC, 8))
+        || (unit ? config.uid<2000 || config.uid>=6096 : config.uid!=0) || info.st_uid!=0
         || getresuid(&real_uid,&effective_uid,&saved_uid) || getresgid(&real_gid,&effective_gid,&saved_gid)
         || real_uid!=expected || effective_uid!=expected || saved_uid!=expected
         || real_gid!=expected || effective_gid!=expected || saved_gid!=expected || getgroups(0,NULL)!=0) _exit(125);
+    server_uid = 0;
 #else
     if (memcmp(config.magic, CONFIG_MAGIC, 8) || config.uid != geteuid()) _exit(125);
+    server_uid = config.uid;
 #endif
     if (config.pid == 0 || config.pid > INT_MAX || config.timeout_ms < 1000
         || config.timeout_ms > MAX_TIMEOUT_MS || config.path[0] != '/'
@@ -347,7 +351,7 @@ static int delegate_exec(const char *file, char *const argv[], char *const envp[
     struct ucred peer;
     socklen_t size = sizeof(peer);
     if (getsockopt(connection, SOL_SOCKET, SO_PEERCRED, &peer, &size) < 0) goto failed;
-    if (size != sizeof(peer) || peer.uid != config.uid || peer.pid != (pid_t)config.pid) {
+    if (size != sizeof(peer) || peer.uid != server_uid || peer.pid != (pid_t)config.pid) {
         errno = EPERM; goto failed;
     }
     struct request request = {.magic = {'J','A','R','V','R','E','Q',PROTOCOL_DIGIT}, .count = 3, .numbers = {0,1,2}};

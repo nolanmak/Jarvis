@@ -3455,9 +3455,12 @@ def _probe(arguments):
     root=Path(value['root']);admission=admit(value['target'],value['binding'],value['command'],root)
     results=[];view_probe=None;cargo_probe=None
     _PHASE='planner_kernel_observer'
-    with kernel_observer.Observer(admission,deadline=value['deadline']) as observer, RootRelay(admission,library=value['library'],timeout=30) as relay:
+    relay=RootRelay(admission,library=value['library'],timeout=30)
+    # Credential-only constructor cases are not planned compiler units. Keep
+    # them outside the original unit observer's process/UID attribution window.
+    unit_credential_role_probe(value,relay)
+    with kernel_observer.Observer(admission,deadline=value['deadline']) as observer, relay:
         credential_roles=credential_role_probe(value,relay)
-        unit_credential_role_probe(value,relay)
         metadata=root/'planner-metadata';metadata.write_text('');os.chown(metadata,1001,1001);metadata.chmod(0o600)
         for ordinal,mode in enumerate(('stdin','jobserver','cancel','signal','view')):
             _PHASE='planner_probe_'+mode
