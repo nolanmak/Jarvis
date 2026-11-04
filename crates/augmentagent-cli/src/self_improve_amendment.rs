@@ -207,11 +207,46 @@ async fn environment_evidence(root: &Path, control: &Path, old: &PreparedAccepta
     })
 }
 
+fn decode_authority_response(raw:&str,expected_contract:&str)->Result<Decision> {
+    ensure!(raw.len()<=2*1024*1024,"authority_response_oversized");
+    let text=raw.trim().strip_prefix("```json\n").and_then(|s|s.strip_suffix("```")).unwrap_or(raw.trim());
+    let decision:Decision=serde_json::from_str(text).map_err(|_|anyhow::anyhow!("authority_invalid_json_or_schema"))?;
+    if decision.approved {
+        ensure!(decision.proposal.is_some(),"approved_without_proposal");
+        ensure!(decision.previous_contract_hash==expected_contract,"approved_wrong_previous_contract");
+        ensure!(decision.reason.trim().len()>=20,"approved_without_grounded_reason");
+    }
+    Ok(decision)
+}
+
+async fn authority_response<F,T,G>(root:&Path,head:&str,expected_contract:&str,prompt:&str,mut call:F,mut admit_correction:G)->Result<(Decision,String)>
+where F:FnMut(String)->T,T:std::future::Future<Output=Result<(String,String)>>,G:FnMut()->Result<bool> {
+    let original=format!("{prompt}\nDecision consistency: approved=true requires a complete non-null proposal with contract and files. If no justified complete correction can be supplied, return approved=false. Preserve every original owner requirement; approval alone is never executable proof.");
+    let mut request=original.clone();
+    for attempt in 0..2 {
+        ensure!(actual_head(root).await?==head,"amendment candidate changed before authority call");
+        let (raw,session)=call(request).await?;
+        ensure!(actual_head(root).await?==head,"amendment candidate changed during authority call");
+        match decode_authority_response(&raw,expected_contract) {
+            Ok(decision)=>return Ok((decision,session)),
+            Err(error)=> {
+                ensure!(attempt==0,"authority response invalid after bounded correction: {error}");
+                ensure!(admit_correction()?,"amendment authority correction budget exhausted");
+                // Only controller-defined error codes enter the correction;
+                // provider prose never supplies new instructions or authority.
+                request=format!("{original}\nYour previous completed response failed controller validation: {error}. Return the complete requested JSON. This is a consistency repair, not permission to approve; a justified denial remains valid.");
+            }
+        }
+    }
+    unreachable!("bounded authority correction must return or fail")
+}
+
 async fn authority(
     builder: &FallbackReasoner,
     workflow: &workflow::WorkflowGuard,
     root: &Path,
     prompt: &str,
+    expected_contract:&str,input_hash:&str,epoch:&str,
 ) -> Result<(Decision, String, String)> {
     let head = actual_head(root).await?;
     let origin = adoption::origin_for_candidate(root, Some(workflow)).await?;
@@ -236,29 +271,15 @@ async fn authority(
     if provider == augmentagent_channel_core::ProviderKind::Claude {
         opts.model = Some(build_model());
     }
-    let (raw, session) = augmentagent_channel_core::native_session::fresh_review_scope(
-        provider,
-        augmentagent_channel_core::model_router::native_reviewer_scope(
-            provider,
-            reasoner.call(&opts, prompt),
-        ),
-    )
-    .await?;
-    origin.validate(&head)?;
-    ensure!(
-        actual_head(root).await? == head,
-        "amendment candidate changed during authority call"
-    );
-    ensure!(
-        raw.len() <= 2 * 1024 * 1024,
-        "amendment authority response oversized"
-    );
-    let text = raw
-        .trim()
-        .strip_prefix("```json\n")
-        .and_then(|s| s.strip_suffix("```"))
-        .unwrap_or(raw.trim());
-    let decision: Decision = serde_json::from_str(text)?;
+    let reasoner=&reasoner;let opts=&opts;let origin=&origin;
+    let (decision,session)=authority_response(root,&head,expected_contract,prompt,|request|async move {
+        origin.validate(&actual_head(root).await?)?;
+        let answer=augmentagent_channel_core::native_session::fresh_review_scope(provider,
+            augmentagent_channel_core::model_router::native_reviewer_scope(provider,reasoner.call(opts,&request))).await?;
+        origin.validate(&actual_head(root).await?)?;
+        Ok(answer)
+    },||Ok(workflow.admit_epoch_attempt("verifier-amend-input",input_hash,2)?
+        && workflow.admit_epoch_attempt("verifier-amend-total",epoch,4)?)).await?;
     Ok((decision, provider.name().into(), session))
 }
 
@@ -368,7 +389,7 @@ pub(super) async fn try_amend(
         "contribution_diff_sha256": digest(diff.as_bytes()), "shipping_authority": false,
     }))?;
     let (decision, native_provider, native_session) =
-        authority(builder, workflow, root, &prompt).await?;
+        authority(builder, workflow, root, &prompt,old.baseline.registration.contract_hash(),&input_hash,&epoch).await?;
     immutable(
         control,
         &format!(
@@ -831,6 +852,71 @@ pub(super) async fn resume_pending(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn authority_correction_is_bounded_and_cannot_bypass_its_call_budget() {
+        for allow in [false,true] {
+            let (root,old,head)=authority_fixture().await;
+            let raw=authority_json(&old,true,None);let calls=std::sync::atomic::AtomicUsize::new(0);
+            let result=authority_response(root.path(),&head,old.baseline.registration.contract_hash(),"Preserve criteria",|_| {
+                calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);let raw=raw.clone();async move {Ok((raw,"scripted-native-session".into()))}
+            },||Ok(allow)).await;
+            assert!(result.is_err());assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),if allow {2}else{1});
+        }
+    }
+    #[tokio::test]
+    async fn complete_authority_approval_needs_no_correction() {
+        let (root,old,head)=authority_fixture().await;let mut proposal=old.proposal.clone();proposal.contract.revision+=1;
+        let raw=authority_json(&old,true,Some(proposal));
+        let (decision,session)=authority_response(root.path(),&head,old.baseline.registration.contract_hash(),"Preserve criteria",|_| {
+            let raw=raw.clone();async move {Ok((raw,"scripted-native-session".into()))}
+        },||panic!("valid response must not reserve a correction")).await.unwrap();
+        assert!(decision.approved);assert!(decision.proposal.is_some());assert_eq!(session,"scripted-native-session");
+    }
+    #[tokio::test]
+    async fn candidate_change_during_invalid_authority_response_prevents_a_second_dispatch() {
+        let (root,old,head)=authority_fixture().await;let raw=authority_json(&old,true,None);
+        let calls=std::sync::atomic::AtomicUsize::new(0);let path=root.path();
+        let result=authority_response(path,&head,old.baseline.registration.contract_hash(),"Preserve criteria",|_| {
+            calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);let raw=raw.clone();async move {
+                let out=Command::new("/usr/bin/git").args(["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","--allow-empty","-qm","changed source"])
+                    .current_dir(path).env_clear().env("PATH","/usr/bin:/bin").output().await?;ensure!(out.status.success(),"fixture commit failed");
+                Ok((raw,"scripted-native-session".into()))
+            }
+        },||panic!("changed source must not authorize another model call")).await;
+        assert!(result.unwrap_err().to_string().contains("candidate changed"));assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),1);
+    }
+    #[tokio::test]
+    async fn native_authority_failure_is_not_retried_as_response_correction() {
+        let (root,old,head)=authority_fixture().await;
+        let result=authority_response(root.path(),&head,old.baseline.registration.contract_hash(),"Preserve criteria",|_|async {
+            Err(anyhow::anyhow!("scripted native resource refusal"))
+        },||panic!("native refusal is not malformed model output")).await;
+        assert!(result.unwrap_err().to_string().contains("native resource refusal"));
+    }
+    async fn authority_fixture()->(tempfile::TempDir,PreparedAcceptance,String) {
+        let (root,old)=fixture();
+        for args in [&["init","-q"][..],&["add","."],&["commit","-qm","fixture"]] {
+            let out=Command::new("/usr/bin/git").args(["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null"])
+                .args(args).current_dir(root.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();assert!(out.status.success());
+        }
+        let head=actual_head(root.path()).await.unwrap();(root,old,head)
+    }
+    fn authority_json(old:&PreparedAcceptance,approved:bool,proposal:Option<ContractProposal>)->String {
+        serde_json::to_string(&Decision {approved,previous_contract_hash:old.baseline.registration.contract_hash().into(),approve_environment_transition:false,approve_additional_files:vec![],reason:"Independent authority preserves every owner requirement".into(),proposal}).unwrap()
+    }
+    #[tokio::test]
+    async fn incomplete_authority_approval_gets_one_bounded_correction_without_forcing_approval() {
+        let (root,old,head)=authority_fixture().await;
+        let mut replies=std::collections::VecDeque::from([authority_json(&old,true,None),authority_json(&old,false,None)]);
+        let prompts=std::sync::Mutex::new(Vec::new());let reservations=std::sync::atomic::AtomicUsize::new(0);
+        let (decision,_)=authority_response(root.path(),&head,old.baseline.registration.contract_hash(),"Preserve the original criteria",|request| {
+            prompts.lock().unwrap().push(request);let raw=replies.pop_front().unwrap();async move {Ok((raw,"scripted-native-session".into()))}
+        },|| {reservations.fetch_add(1,std::sync::atomic::Ordering::SeqCst);Ok(true)}).await.unwrap();
+        assert!(!decision.approved,"a schema correction must permit a legitimate denial, not accept approval without a proposal");
+        let prompts=prompts.lock().unwrap();assert_eq!(prompts.len(),2);assert!(prompts[1].contains("approved_without_proposal"));
+        assert_eq!(reservations.load(std::sync::atomic::Ordering::SeqCst),1);
+    }
+
     #[tokio::test]
     async fn amendment_scope_excludes_integrated_main_but_keeps_candidate_conflict_resolution() {
         let root=tempfile::tempdir().unwrap();
