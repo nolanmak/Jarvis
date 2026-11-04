@@ -336,6 +336,20 @@ pub fn approval_message(
     CreateMessage::new().embed(embed).components(rows)
 }
 
+/// #1833 D6 — [`approval_message`] for an active trusted contact the
+/// autonomy gate held back: the same embed and buttons, plus a
+/// `Not auto-sent: <reason>` line as message content.
+pub fn approval_message_noted(
+    action_id: &str,
+    email: &Email,
+    draft: &str,
+    redraft_count: i64,
+    note: &str,
+) -> CreateMessage {
+    approval_message(action_id, email, draft, redraft_count)
+        .content(truncate(&format!("Not auto-sent: {note}"), 1900))
+}
+
 /// #1188 — the in-place edit form of [`approval_message`]. When
 /// `gmail update-draft` repoints a pending card at a replacement draft, the
 /// visible Discord message is edited to this so "what the card shows equals

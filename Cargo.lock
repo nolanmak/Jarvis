@@ -324,16 +324,26 @@ dependencies = [
 name = "augmentagent-autonomy"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
+ "augmentagent-channel-calendar",
+ "augmentagent-channel-core",
+ "augmentagent-channel-email",
  "augmentagent-messages",
  "augmentagent-store",
  "augmentagent-wiki",
+ "chrono",
+ "chrono-tz",
  "hex",
+ "mockito",
  "regex",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "toml",
  "tracing",
 ]

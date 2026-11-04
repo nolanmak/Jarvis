@@ -148,6 +148,18 @@
       "provider_conformance": "verified"
     },
     {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::autonomy_plan_opts",
+      "permission_profile": "text",
+      "output_contract": "Closed-schema autonomy plan JSON (#1833 D8): none, or one calendar candidate id plus registry actions",
+      "model_tier": "quality",
+      "tier_rationale": "Pins the quality tier: runs only for active trusted contacts (low volume) and its plan can act without a click, so precision matters more than cost.",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts",
+        "reasoner::model_pin_tests::preset_is_pinned"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
       "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::ask_opts",
       "permission_profile": "wiki-agentic",
       "output_contract": "Complete assistant transcript with original ATTACH markers and image context",
