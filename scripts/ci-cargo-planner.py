@@ -1661,6 +1661,29 @@ def _unit(arguments):
         endpoint.close()
 
 
+class UnitPolicy:
+    """Constructor-free measured helper, loaded before a unit changes root."""
+    def __init__(self):
+        path=Path('/ci-tools/ci-cargo-unit-policy.so');descriptor=None
+        try:
+            if path.resolve()!=path:raise FreshnessHold('authority_changed')
+            descriptor=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+            info=os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022
+                    or info.st_nlink!=1 or not 1<=info.st_size<=2*1024**2):raise FreshnessHold('authority_changed')
+            # Load the checked inode, rather than looking its name up again.
+            # This DSO has no relay constructor and is never LD_PRELOAD input.
+            self.library=ctypes.CDLL(f'/proc/self/fd/{descriptor}',use_errno=True)
+            self.restrict=self.library.jarvis_ci_restrict_unit
+            self.restrict.argtypes=[];self.restrict.restype=ctypes.c_int
+        except (OSError,AttributeError):raise FreshnessHold('authority_changed') from None
+        finally:
+            if descriptor is not None:os.close(descriptor)
+
+    def activate(self):
+        if self.restrict()!=0:raise FreshnessHold('invalidation_unsafe')
+
+
 def _stage(arguments):
     global _PHASE
     bootstrap,data,cancel,release,control=map(int,arguments)
@@ -1681,6 +1704,7 @@ def _stage(arguments):
     for target,source in saved:os.dup2(source,target,inheritable=True);os.close(source)
     environment=strip_transport(environment,value['library'])
     role=value.get('execution_role','unit');uid=execution_identity(value)
+    policy=UnitPolicy()
     if role in ('worker','cargo'):
         descriptor=value.get('relay_fd')
         if type(descriptor) is not int or not 3<=descriptor<=65535:raise FreshnessHold('invalidation_unsafe')
@@ -1695,6 +1719,7 @@ def _stage(arguments):
                 or mounts.get('ordinal')!=value['ordinal']):raise FreshnessHold('generation_mismatch')
         unit_views.enter(view['root'],2000+value['ordinal'],view['source'],view['artifacts'],mounts['entries'],
             mounts.get('source_entries'),mounts.get('declared_outputs'))
+    policy.activate()
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     _PHASE='planner_drop'
@@ -2936,6 +2961,7 @@ def _cargo(arguments):
             or cache._read_record(root/'control.json')!={'version':1,'kind':'cargo-execution',
                 'binding':value['binding'],'command':value['command'],'shipping_authority':False,'state':'active'}):
         raise FreshnessHold('invalidation_unsafe')
+    policy=UnitPolicy()
     _PHASE='planner_cargo_runtime';cargo_namespace(root,source,value.get('source_mounts'));libc=ctypes.CDLL(None,use_errno=True)
     invocation=value.get('original_invocation')
     if invocation is None:
@@ -2946,6 +2972,7 @@ def _cargo(arguments):
     else:
         validate_invocation(**invocation)
         environment=dict(invocation['environment'],LD_PRELOAD=value['library'],JARVIS_CARGO_RELAY_FD=str(configuration))
+    policy.activate()
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     os.setgroups([]);os.setgid(1001);os.setuid(1001);os.umask(0o077);_parent_guard(value['parent'])
     os.set_inheritable(configuration,True);os.chdir('/workspace');_PHASE='planner_cargo_execute'
@@ -3347,6 +3374,7 @@ def _repository_worker(arguments):
     worker_runtime_request((os.fsencode(value['argv'][0]),list(map(os.fsencode,value['argv'])),
         {os.fsencode(key):os.fsencode(item) for key,item in environment.items()},b'/workspace',None,0,0),value['library'])
     environment.update(LD_PRELOAD=value['library'],JARVIS_CARGO_RELAY_FD=str(configuration))
+    policy=UnitPolicy();policy.activate()
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     os.setgroups([]);os.setgid(1000);os.setuid(1000);os.umask(0o022);_parent_guard(value['parent'])

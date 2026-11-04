@@ -359,7 +359,7 @@ def execute(request,run=vm.run,progress=None):
     if type(probe) is not bool or probe and request['operation']!='repository':raise cache_generation.FreshnessHold('invalidation_unsafe')
     if probe or protected or repository:
         context.update(planner_programs={name:private_bytes(BASE/name) for name in (
-            'ci-cargo-planner.py','ci-cargo-relay.py','ci-cargo-staging.py','ci-cargo-views.py','ci-cargo-observer.py','ci-lookup-inputs.py','ci-cargo-planner.so')})
+            'ci-cargo-planner.py','ci-cargo-relay.py','ci-cargo-staging.py','ci-cargo-views.py','ci-cargo-observer.py','ci-lookup-inputs.py','ci-cargo-planner.so','ci-cargo-unit-policy.so')})
     if probe:context['planner_protocol_probe']=True
     if protected:context['cargo_execution']=cargo_commands(cargo)
     if repository:context['repository_execution']=True

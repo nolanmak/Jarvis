@@ -2199,6 +2199,32 @@ The hosted bridge failure is recorded in job 126287631330 of run 41742617176.
 
 The updater's embed-drift regression also reproduced a missing rebuild trigger
 for `ci-legacy-recovery-preview.py`: **99 passed / one failed**. The release
-rebuild pattern now includes that embedded helper. The same updater regression is now green: **100 passed / zero failed**. New
-managed Rust/native and hosted validation of the ownership-fixture change remain
-pending; these repairs change no live configuration or production cache.
+rebuild pattern now includes that embedded helper. The same updater regression is
+now green: **100 passed / zero failed**. Managed Rust validation passed 32 tests
+with 20 opt-in native tests ignored. The unchanged five-command guest replay at
+`51d6071a` passed in **165.02 seconds**; receipt:
+`/tmp/augmentagent-ci-forest-owner-20261104003652/receipt.json`, SHA-256
+`61023961e87f0e946929a996dd660ec07d8d8bd419e258641e761cba938a00c9`.
+Hosted bridge and PDF checks also passed at that head. These repairs change no
+live configuration or production cache.
+
+### Namespace and asynchronous-I/O policy prerequisite
+
+The constructor-free native helper now exports `jarvis_ci_restrict_unit`.
+Controller bootstraps load its measured root-owned, single-link inode before
+changing root, and activate it after trusted namespace setup but before dropping
+credentials and entering worker, Cargo or unit code. It refuses namespace and
+mount changes, namespace clone flags, io_uring and Linux native AIO. `clone3`
+returns ENOSYS so ordinary libc thread/fork creation can fall back to inspected
+`clone` flags. The policy synchronizes existing threads, survives fork/exec and
+rejects foreign/x32 syscall routes. Existing exec denial remains separate.
+
+The actual supervised kernel tests first failed against the old native helper
+with seven missing-symbol failures; all ten kernel/loader tests then passed.
+They exercise namespace/mount calls, both asynchronous-I/O interfaces, clone
+flags, pre-existing threads and ordinary fork/exec/thread behavior. The complete
+Python CI suite passes **391 tests without skips**. Pinned-guest policy and
+original adapter validation remain pending at this checkpoint. This establishes
+neither first-instruction exec mediation nor a complete input/pause proof. The
+original generated-publication regression and all final proof, reuse and rollout
+gates remain required; experimental authority flags remain false.
