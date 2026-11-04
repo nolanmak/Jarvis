@@ -2267,9 +2267,18 @@ class UnitPeerRelay(RootRelay):
             private_base=unit_views.validate_private_base(root_descriptor,layout['layout'],mutable_roots,
                 unit_uid=self.peer_uid,check=lambda:None)
         finally:os.close(root_descriptor)
-        cache._write_record(self.scope/'mount-bindings.json',{'version':1,
+        binding_record={'version':1,
             'binding':self.admission.binding,'command':self.admission.command,'ordinal':self.parent_ordinal,
             'entry_sha256':layout['entry_sha256'],'mount_bindings':verified,'private_base':private_base,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+        cache._write_record(self.scope/'mount-bindings.json',binding_record)
+        # Root compiler scope receipts otherwise live only in the VM's
+        # ephemeral controller tree. Retain the same original observations
+        # beside the private view, before its first instruction is granted.
+        cache._write_record(Path(self.view['root']).parent/'entry-boundary.json',{
+            'version':1,'kind':'ci-unit-entry-boundary','binding':self.admission.binding,
+            'command':self.admission.command,'ordinal':self.parent_ordinal,'scope':self.scope.name,
+            'entry':entered,'mount_layout':layout,'mount_bindings':binding_record,
             'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
         namespaces={name:os.readlink(f'/proc/{pid}/ns/'+name) for name in ('mnt','ipc','net','user','pid')}
         if any(record['namespaces'][name]['unit']!=namespaces[name] for name in ('mnt','ipc','net')):
