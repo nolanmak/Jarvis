@@ -4891,6 +4891,7 @@ def _execute_repository(arguments):
                 'stderr':error.decode('utf-8','replace'),'repository_execution':receipt}))
         finally:
             try:
+                controller.close()
                 if child is not None and child.poll() is None:
                     child.terminate()
                     try:child.wait(timeout=6)

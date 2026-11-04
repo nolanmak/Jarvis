@@ -1620,6 +1620,7 @@ async fn live_shared_ci_original_worker_admission() -> Result<()> {
     git(root,&["update-ref","refs/remotes/origin/main",&head]).await?;
     let bound=binding(root).await?;let source=snapshot(root,&bound,&target).await?;
     let session=vm::Session::prepare(&owner,&target)?;
+    session.enable_protected_repository()?;
     let result=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some("printf ORIGINAL_WORKER_ENTRY"),
         &storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
     ensure!(result.status=="passed" && result.stdout=="ORIGINAL_WORKER_ENTRY","original worker body failed");
