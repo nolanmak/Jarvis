@@ -2308,3 +2308,16 @@ the adapter replay remain blocked on this failure; it is not a passing native
 result. A bounded root-owned per-view exec-mediation observation now records the
 original acknowledgement, raw return status and notification counts to locate
 the failure, without granting publication/reuse/shipping authority.
+
+The second unchanged replay at `eb62e119` reproduced the hold in **95.77
+seconds**. Managed read-only inspection found one initial authorization, no
+denials, no notification errors and exit zero in each of units 5–7. Unit 8 had
+one initial authorization, one denied subsequent exec, no notification errors
+and exit one. Its retained output contains two real build-script compiler
+`.rcgu.o` objects and dep-info, with no linked executable. This is consistent
+with a denied linker launch; the exact requested executable was not captured.
+The required repair is mediated nested execution, not raw helper authorization.
+Observations: `/tmp/autoship-1703-exec-controller-inspection-4.json` and
+`/tmp/autoship-1703-exec-controller-inspection-5.json`. Both failing replays
+retained verified VM teardown and false shipping authority; no production
+workflow, original regression or grant was changed.
