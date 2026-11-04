@@ -1314,6 +1314,7 @@ class DispatchOrdinals:
         if not cache._uuid(command):raise FreshnessHold('generation_mismatch')
         self.owner=os.getpid();self._binding=copy.deepcopy(binding);self.command=command
         self._next=0;self._lock=threading.Lock();self._fenced=False;self._stops=[]
+        self.signal_lock=threading.RLock()
 
     def require(self,binding,command):
         if self.owner!=os.getpid() or self._binding!=binding or self.command!=command:
@@ -1486,6 +1487,10 @@ class RootRelay:
 
     def request_context(self,ordinal,request):return {},None
     def execution_cancelled(self):return self._stop.is_set() or self.ordinals.fenced()
+    def unit_signal_grant(self,value,transport,grant):grant()
+
+    def unit_signal_drained(self,value,transport,started):pass
+
     def unit_started(self,value,directory):pass
     def unit_finished(self,value,record):pass
 
@@ -1576,8 +1581,10 @@ class RootRelay:
                     elif stage==3 and authorized and not started and not received and child_pid==original_pid:
                         if not cancelled:
                             if transport is not None:transport.register_parent(original_pid,directory/'view-namespace.json')
-                            connection.sendall(event('tool_started',0));os.write(exec_grant,b'go\n');started=True;phase[0]='planner_unit_exec'
-                            self.unit_started(value,directory)
+                            def grant_started():
+                                connection.sendall(event('tool_started',0));os.write(exec_grant,b'go\n')
+                            self.unit_signal_grant(value,transport,grant_started)
+                            started=True;phase[0]='planner_unit_exec';self.unit_started(value,directory)
                     else:legacy._close(received);raise ValueError('out-of-order original control frame')
                     legacy._close(received)
                 if ready and sealed and not authorized and not cancelled:
@@ -1603,6 +1610,9 @@ class RootRelay:
                     or not -64<=record['returncode']<=255):raise FreshnessHold('cleanup_uncertain')
             raw=record['returncode']
             if status!=(raw if raw>=0 else 128-raw):raise FreshnessHold('cleanup_uncertain')
+            # The original cleanup marker and raw status must be validated
+            # before removing a signal target or closing its owned pidfd.
+            self.unit_signal_drained(value,transport,started)
             if transport is not None:transport.check()
             if view is not None:
                 phase[0]='planner_view_publish';self.views.finish(view,directory,raw)
@@ -1668,17 +1678,18 @@ class StagedParentSignals:
     Frames are ordered at this barrier. Kernel standard-signal coalescing is
     unchanged; this does not promise one userspace handler call per frame.
     """
-    def __init__(self,pidfd):
+    def __init__(self,pidfd,*,lock=None):
         if type(pidfd) is not int or pidfd<0 or os.readlink(f'/proc/self/fd/{pidfd}')!='anon_inode:[pidfd]':
             raise FreshnessHold('invalidation_unsafe')
-        self.owner=os.getpid();self.pidfd=os.dup(pidfd);self.lock=threading.RLock()
+        self.owner=os.getpid();self.pidfd=os.dup(pidfd);self.lock=threading.RLock() if lock is None else lock
+        self.active_child=None;self.controller_parent=None;self.routed=0
         self.cancelled=threading.Event();self.paused=None;self.used=set();self.queue=[]
         self.received=0;self.delivered=0;self.late=0;self.revoked=False;self.closed=False;self.delivery_uncertain=False
 
     def _check(self):
         if self.owner!=os.getpid() or self.closed:raise FreshnessHold('invalidation_unsafe')
 
-    def _alive(self):return not select.select([self.pidfd],[],[],0)[0]
+    def _alive(self):return not self.closed and not select.select([self.pidfd],[],[],0)[0]
 
     def _deliver(self,number):
         if not self._alive():self.late+=1;return 'late'
@@ -1686,17 +1697,84 @@ class StagedParentSignals:
         except ProcessLookupError:self.late+=1;return 'late'
         self.delivered+=1;return 'forwarded'
 
+    def _route(self):
+        route=[];seen=set();node=self
+        while node is not None:
+            if (id(node) in seen or len(route)>=4096 or node.owner!=self.owner
+                    or node.closed or node.lock is not self.lock):raise FreshnessHold('cleanup_uncertain')
+            seen.add(id(node));route.append(node);node=node.active_child
+        return route
+
+    @staticmethod
+    def _revoke(route,*,uncertain=False):
+        for node in route:
+            node.revoked=True;node.cancelled.set()
+            if uncertain:node.delivery_uncertain=True
+
+    def activate_child(self,request,child,grant):
+        """Bind before the original exec grant; serialize signal ingress.
+
+        No new process, permit or jobserver token is allocated here. The caller
+        owns authenticated lineage and the original supervisor's exec stop.
+        """
+        self._check()
+        with self.lock:
+            if (type(request) is not int or request!=self.paused or not callable(grant)
+                    or type(child) is not StagedParentSignals or child is self or child.owner!=self.owner
+                    or child.closed or child.lock is not self.lock or child.controller_parent is not None
+                    or self.active_child is not None or self.revoked or self.cancelled.is_set()
+                    or not self._alive() or not child._alive()):raise FreshnessHold('cleanup_uncertain')
+            route=child._route()
+            if any(node.revoked or node.cancelled.is_set() or node.delivery_uncertain for node in route):
+                raise FreshnessHold('cleanup_uncertain')
+            ancestor=self;seen=set()
+            while ancestor is not None:
+                if id(ancestor) in seen or len(seen)>=4096 or ancestor in route:
+                    raise FreshnessHold('cleanup_uncertain')
+                if ancestor.revoked or ancestor.cancelled.is_set() or ancestor.delivery_uncertain or not ancestor._alive():
+                    raise FreshnessHold('cleanup_uncertain')
+                seen.add(id(ancestor));ancestor=ancestor.controller_parent
+            if len(seen)+len(route)>4096:raise FreshnessHold('input_census_unknown')
+            self.active_child=child;child.controller_parent=self
+            try:grant()
+            except BaseException:
+                self._revoke([self,*route],uncertain=True);raise
+
+    def child_drained(self,request,child):
+        """Release routing only after caller-verified original child cleanup.
+
+        A dead pidfd alone is not a descendant-cleanup receipt. The original
+        root supervisor must validate that receipt before calling this method.
+        """
+        self._check()
+        with self.lock:
+            if (type(request) is not int or request!=self.paused or child is not self.active_child
+                    or child.controller_parent is not self or child._alive() or child.active_child is not None):
+                raise FreshnessHold('cleanup_uncertain')
+            self.active_child=None;child.controller_parent=None
+
     def forward(self,number):
         self._check()
         if isinstance(number,bool) or not isinstance(number,int) or number not in legacy.FORWARDED_SIGNALS:
             raise FreshnessHold('invalidation_unsafe')
         with self.lock:
+            route=self._route()
+            if any(node.delivery_uncertain for node in route):raise FreshnessHold('cleanup_uncertain')
             if self.received>=4096:
-                self.revoked=True;self.cancelled.set();raise FreshnessHold('input_census_unknown')
-            self.received+=1
-            if self.paused is not None:
-                self.queue.append(number);self.cancelled.set();return 'queued'
-            return self._deliver(number)
+                self._revoke(route);raise FreshnessHold('input_census_unknown')
+            self.received+=1;leaf=route[-1]
+            if leaf.paused is not None:
+                leaf.queue.append(number)
+                for node in route:node.cancelled.set()
+                return 'queued'
+            try:disposition=leaf._deliver(number)
+            except BaseException:
+                self._revoke(route,uncertain=True);raise
+            if leaf is not self:
+                self.routed+=1
+                if disposition=='late':self.late+=1
+                else:self.delivered+=1
+            return disposition
 
     def pause(self,request):
         self._check()
@@ -1710,7 +1788,7 @@ class StagedParentSignals:
         self._check()
         with self.lock:
             if (type(request) is not int or request!=self.paused or not callable(thaw)
-                    or self.delivery_uncertain):raise FreshnessHold('cleanup_uncertain')
+                    or self.delivery_uncertain or self.active_child is not None):raise FreshnessHold('cleanup_uncertain')
             # Serialize ingress across checked thaw and every queued send. A
             # failed thaw leaves the queue intact; uncertain delivery is never
             # retried as though the previous signal had not happened.
@@ -1725,18 +1803,25 @@ class StagedParentSignals:
 
     def cancel(self):
         self._check()
-        with self.lock:self.revoked=True;self.cancelled.set()
+        with self.lock:
+            # Revoke the current route synchronously. Waiting for each relay's
+            # polling loop would leave a window for a descendant exec grant.
+            self._revoke([self]);self._revoke(self._route())
 
     def observation(self):
         self._check()
         with self.lock:return {'received':self.received,'delivered':self.delivered,'late':self.late,
-            'queued':len(self.queue),'paused_request':self.paused,'revoked':self.revoked,'shipping_authority':False}
+            'queued':len(self.queue),'paused_request':self.paused,'revoked':self.revoked,
+            'routed':self.routed,'active_child':self.active_child is not None,'shipping_authority':False}
 
     def close(self):
         if self.closed:return
         self._check()
         with self.lock:
             if self.paused is not None and self._alive():raise FreshnessHold('cleanup_uncertain')
+            if self.active_child is not None:
+                if self.active_child._alive():raise FreshnessHold('cleanup_uncertain')
+                self.active_child.controller_parent=None;self.active_child=None
             os.close(self.pidfd);self.closed=True
 
 
@@ -1900,7 +1985,7 @@ class UnitPeerRelay(RootRelay):
             raise FreshnessHold('invalidation_unsafe')
         self.scope_root=record['root_identity'];self.scope_namespaces=namespaces;self.scope_pidfd=os.pidfd_open(pid)
         self.freezer.attach(pid,self.scope_pidfd)
-        self.staged_signals=StagedParentSignals(self.scope_pidfd)
+        self.staged_signals=StagedParentSignals(self.scope_pidfd,lock=self.ordinals.signal_lock)
 
     def forward_signal(self,number):
         if self.staged_signals is None:raise FreshnessHold('invalidation_unsafe')
@@ -1912,6 +1997,19 @@ class UnitPeerRelay(RootRelay):
         return (super().execution_cancelled() or self.scope_pidfd is None
             or bool(select.select([self.scope_pidfd],[],[],0)[0])
             or self.staged_signals is not None and self.staged_signals.cancelled.is_set())
+
+    def unit_signal_grant(self,value,transport,grant):
+        record=self.active_record
+        if (record is None or record['last_request_ordinal']!=value['ordinal']
+                or type(transport) is not UnitPeerRelay or transport.staged_signals is None):
+            raise FreshnessHold('generation_mismatch')
+        self.staged_signals.activate_child(value['ordinal'],transport.staged_signals,grant)
+
+    def unit_signal_drained(self,value,transport,started):
+        if not started:return
+        if type(transport) is not UnitPeerRelay or transport.staged_signals is None:
+            raise FreshnessHold('cleanup_uncertain')
+        self.staged_signals.child_drained(value['ordinal'],transport.staged_signals)
 
     def unit_started(self,value,directory):
         record=self.active_record

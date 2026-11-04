@@ -886,7 +886,7 @@ The following load-bearing choices remain parked with C; they are not waived:
   per-frame userspace handler delivery/order is not promised. Host kernel tests
   exercise a stopped receiver, thaw races and failure, ordinary/late delivery,
   permanent cancellation and pre-auth busy-socket revocation. This is not an
-  active-child router. Actual contained-child routing, stopped nested-proxy
+  active-child router at that revision. Actual contained-child routing, stopped nested-proxy
   guest signal cases, terminal races and checked child drain before parent
   resume remain this thread's gates. That staging barrier alone enables no child execution grant.
   At `b1bcede6`, the unchanged pinned-guest replay completed in 98.00 seconds
@@ -898,6 +898,33 @@ The following load-bearing choices remain parked with C; they are not waived:
   actual stopped-recipient signal behavior is covered by the eight host kernel
   and socket cases, not by this zero-frame guest observation. All 431 Python
   tests and 34 focused Rust tests pass; full CI and shipping authority stay false.
+  The controller now links signal gates at the original supervisor's exec-stop
+  acknowledgement, before releasing the unchanged exec grant. One lock owned by
+  the original command serializes that transition and ingress; a signal arriving
+  during the grant waits for its outcome. Iterative routing follows the current
+  active child chain through stopped ancestors to its pidfd. No stopped proxy
+  has to forward a frame. Wrong epochs, duplicate/multiple-parent links, cycles,
+  another command's lock and the unchanged 4096 bound refuse admission. Unknown
+  grant/delivery outcomes revoke the route and are never retried as fresh sends.
+  Ancestor cancellation synchronously revokes descendants before another grant;
+  its missing propagation was first reproduced by a failing regression.
+
+  A signal after leaf exit remains late at that leaf until the original
+  supervisor validates its raw status and all-descendants-reaped marker. Only
+  then does the cleanup hook detach the signal target, before its transport
+  closes the owned pidfd. Dead-pidfd observation alone grants no cleanup proof.
+  Resume refuses any still-active child, and staging/transfer signals still
+  queue and revoke the current attempt. Thaw, transfer completion, jobserver
+  credit return and terminal-result delivery remain separate unfinished gates.
+  Thirteen host kernel cases cover actual stopped parents, two stopped ancestors,
+  ordered leaf signals, grant races/failure, late delivery, live-child drain/
+  resume refusal, original hook binding and ancestor cancellation. All 543 Python
+  and 34 focused managed Rust tests pass; routine Rust ignores 23 guest opt-ins.
+  The expanded guest suite retains the previous 63 filesystem cases and adds
+  the nine existing staging and 13 active-signal cases; execution is pending.
+  The unchanged Cargo protocol also needs replay to verify the actual root
+  hooks, followed by injected stopped-proxy/terminal signals at those hooks.
+  These host/component results establish no final signal, CI or merge proof.
 * Before producer/restart integration acceptance or mechanism handoff, settle the
   complete-initial-closure rule for successful sibling output effects. The
   unchanged fixture appends counter/log data in the same generated namespace as
