@@ -1891,6 +1891,49 @@ def validate_capture_stdio(capture,descriptors,*,parent_uid=None):
             raise FreshnessHold('input_census_unknown')
 
 
+def reject_projection_stdio(descriptors,workspace,outputs,*,owner,check):
+    """Refuse known aliases to the original worker's declared destinations.
+
+    This is a negative admission guard. The caller supplies the authenticated
+    declaration; it does not establish worker quiescence, a projection epoch,
+    complete alias absence or any artifact-export/reuse authority.
+    """
+    cache.validate_outputs(outputs);workspace=literal(workspace)
+    if (type(descriptors) is not list or len(descriptors)!=2 or type(owner) is not int
+            or any(type(fd) is not int or fd<0 for fd in descriptors) or not callable(check)):
+        raise FreshnessHold('input_census_unknown')
+    roots=[];regular=0
+    try:
+        for name,kind in sorted(outputs.items()):
+            check();path=literal(workspace/name);info=path.lstat()
+            if (info.st_uid!=owner or info.st_mode&0o7000
+                    or not (stat.S_ISDIR(info.st_mode) if kind=='directory' else stat.S_ISREG(info.st_mode))):
+                raise FreshnessHold('invalidation_unsafe')
+            roots.append((path,kind,info))
+        for fd in descriptors:
+            check();before=os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode):continue
+            regular+=1
+            if before.st_nlink!=1:raise FreshnessHold('invalidation_unsafe')
+            named=literal(Path(os.readlink(f'/proc/self/fd/{fd}')))
+            if _key(named.lstat())!=_key(before):raise FreshnessHold('invalidation_unsafe')
+            for path,kind,info in roots:
+                if ((before.st_dev,before.st_ino)==(info.st_dev,info.st_ino)
+                        or kind=='directory' and path in named.parents):
+                    raise FreshnessHold('invalidation_unsafe')
+            check();after=os.fstat(fd)
+            if (_key(after)!=_key(before) or after.st_nlink!=before.st_nlink
+                    or _key(named.lstat())!=_key(before)):
+                raise FreshnessHold('invalidation_unsafe')
+        for path,_kind,info in roots:
+            check()
+            if _key(path.lstat())!=_key(info):raise FreshnessHold('invalidation_unsafe')
+        return {'version':1,'kind':'ci-declared-output-stdio-observation','roots_checked':len(roots),
+            'regular_descriptors':regular,'alias_closure_complete':False,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+    except OSError:raise FreshnessHold('invalidation_unsafe') from None
+
+
 def validate_stdio(descriptors):
     if len(descriptors)!=3:raise FreshnessHold('input_census_unknown')
     for descriptor in descriptors:

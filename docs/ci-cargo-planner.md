@@ -2619,3 +2619,21 @@ cancellation. The full unchanged test remains red with InputCensusUnknown after
 626 host Python tests and 34 focused managed Rust tests pass. These are census
 and pause-barrier observations, not complete allocation/alias/resource closure,
 parent transfer/resume, passing CI or production autoship.
+
+Inherited output descriptors now have a separate negative admission check
+against the original worker's controller-declared generated destinations. The
+previous parent-W check can accept a descriptor owned by the distinct worker
+UID; a real-FD regression demonstrates that gap. Known destination identities
+and directory descendants are refused, as are ambiguous hard links, nameless
+regular files, changed descriptor/path identities and untrusted destination
+roots. External named regular outputs preserve their bytes, OFD offset, flags
+and timestamps; pipe/null outputs remain usable. No output bytes are read.
+
+The root runs this check before starting every private view and retains its
+bound observation, then repeats it during frozen parent capture. Declarations
+come from the existing root-owned mount record, with the original binding,
+command and ordinal. It is deliberately only a negative guard: it does not
+establish worker quiescence, a destination epoch, artifact export slots,
+complete alias absence or permission to project/apply results. Those O3b
+requirements remain unfinished, and alias/input/full-CI/shipping flags stay
+false. Seven real descriptor regressions cover the new behavior.

@@ -1704,6 +1704,18 @@ class RootRelay:
             if self.views is not None:
                 phase[0]='planner_view_prepare';view=self.views.prepare(ordinal,request)
                 if view is not None:
+                    def check_stdio():
+                        if self.execution_cancelled() or time.monotonic()>=deadline:
+                            raise FreshnessHold('cleanup_uncertain')
+                    mounts=cache._read_record(Path(view['mounts']),max_bytes=16*1024**2)
+                    if (mounts.get('binding')!=self.admission.binding or mounts.get('command')!=self.admission.command
+                            or mounts.get('ordinal')!=ordinal):raise FreshnessHold('generation_mismatch')
+                    observed_stdio=unit_views.reject_projection_stdio(descriptors[2:4],GeneratedForests.WORKSPACE,
+                        mounts['declared_outputs'],owner=GeneratedForests._WORKER_UID,check=check_stdio)
+                    cache._write_record(Path(view['root']).parent/'worker-output-stdio.json',{
+                        'version':1,'binding':self.admission.binding,'command':self.admission.command,
+                        'ordinal':ordinal,'scope':directory.name,'observation':observed_stdio,
+                        'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
                     transport_root=Path(view['root']).parent/'transport';transport_root.mkdir(mode=0o700)
                     admission=admit(self.admission.target,self.admission.binding,self.admission.command,transport_root)
                     transport=UnitPeerRelay(admission,library=self.library,ordinal=ordinal,scope=directory,
@@ -2489,7 +2501,9 @@ class UnitPeerRelay(RootRelay):
             capture=unit_views.capture_roots(descriptor,self.captures/str(ordinal),roots,
                 owners=(0,self.peer_uid),check=check)
             unit_views.validate_capture_stdio(capture,outputs,parent_uid=self.peer_uid);check()
-            state.update(state='captured',filesystem=capture)
+            projection_stdio=unit_views.reject_projection_stdio(outputs,GeneratedForests.WORKSPACE,
+                mounts['declared_outputs'],owner=GeneratedForests._WORKER_UID,check=check)
+            state.update(state='captured',filesystem=capture,worker_output_stdio=projection_stdio)
             encoded=json.dumps(state,sort_keys=True,separators=(',',':')).encode()
             if len(encoded)>16*1024**2:raise FreshnessHold('input_census_unknown')
             cache._write_record(path,state);check()
