@@ -2481,9 +2481,11 @@ retirement and required-plan capacity acceptance.
 
 The unchanged full-image replay at `c3166100` now returns the admitted VM's
 environment/resource recovery result with guest `OSError` errno 28 at
-`prepare_generation`, before worker execution (78.63 seconds). Original VM
+`prepare_generation`, before repository worker execution (78.63 seconds). Original VM
 resource teardown remains verified. This validates the infrastructure boundary,
-not a passing Cargo build or recovered capacity. Host validation passes 589
+not a passing Cargo build or recovered capacity. The fixed diagnostic does not
+identify which setup allocation/check raised ENOSPC; the capacity guard itself
+is directly covered by the host statvfs tests. Host validation passes 589
 Python tests and 34 focused managed Rust tests; the VM adapter suite runs 20
 cases with six opt-ins skipped. Observation:
 `/tmp/autoship-1703-capacity-guard-native-observation-1.json`. Lifecycle-aware
