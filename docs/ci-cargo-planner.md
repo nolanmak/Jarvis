@@ -2557,3 +2557,13 @@ and four sealed ELF outputs were verified. The full original four-parent test
 still fails with InputCensusUnknown after 104.02 seconds because parent result
 application/resume remains fenced; this is not a passing CI or autoship result.
 The host suites pass 611 Python tests and 34 focused managed Rust tests.
+
+The original unit exec-stop path now checks the private base tree outside the
+shared capture-root list and independently validated mount points. Remaining
+entries must be controller-owned, without writable group/other permissions,
+ACL/xattr metadata, special entries or unaccounted regular-file hard links.
+Descriptor-relative scans refuse symlink mutable roots, compare two bounded
+inventories and preserve original atime. The same base fingerprint is checked
+again under the original cgroup freeze before capture. This closes a private
+base DAC prerequisite only; whole-UID writer/alias/kernel-resource closure and
+checked transfer/resume still remain required. All CI authority flags stay false.

@@ -2014,6 +2014,12 @@ class StagedParentSignals:
             os.close(self.pidfd);self.closed=True
 
 
+def unit_mutable_roots(mounts):
+    declared=mounts.get('declared_outputs');cache.validate_outputs(declared)
+    return ['workspace/target','tmp','home/worker','cargo','var/tmp','dev/shm',
+        *['workspace/'+name for name in declared]]
+
+
 def unit_mount_rules(view,mounts,*,library,endpoint):
     """Original admitted view bindings; never accept requested tool mount rules."""
     rules={}
@@ -2113,7 +2119,7 @@ class UnitFreezer:
             if os.write(descriptor,body)!=len(body):raise FreshnessHold('cleanup_uncertain')
         finally:os.close(descriptor)
 
-    def attach(self,pid,pidfd,*,entry,mount_layout):
+    def attach(self,pid,pidfd,*,entry,mount_layout,private_base,mutable_roots):
         if self.original is not None:raise FreshnessHold('invalidation_unsafe')
         process=Path('/proc')/str(pid);status=process.joinpath('stat').read_text().rsplit(')',1)[1].split()
         if status[0]!='t' or {p.name for p in process.joinpath('task').iterdir()}!={str(pid)}:
@@ -2128,6 +2134,7 @@ class UnitFreezer:
             raise FreshnessHold('invalidation_unsafe')
         self.original=pid;self.pidfd=os.dup(pidfd);self.entry=copy.deepcopy(entry)
         self.mount_layout=copy.deepcopy(mount_layout)
+        self.private_base=copy.deepcopy(private_base);self.mutable_roots=list(mutable_roots)
         self._note('original_enrolled')
 
     def _wait(self,frozen,deadline):
@@ -2172,11 +2179,21 @@ class UnitFreezer:
             rows.append({'pid':pid,'tasks':sorted(tasks,key=lambda row:row['tid'])})
         self._wait(1,deadline)
         if set(map(int,self._read('cgroup.procs').split()))!=pids:raise FreshnessHold('input_census_unknown')
+        def check_private():
+            if time.monotonic()>=deadline:raise FreshnessHold('cleanup_uncertain')
+            signal.pidfd_send_signal(self.pidfd,0);self._wait(1,deadline)
+        descriptor=os.open(f'/proc/{self.original}/root',os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+        try:
+            private_base=unit_views.validate_private_base(descriptor,self.mount_layout,self.mutable_roots,
+                unit_uid=self.uid,check=check_private)
+            if private_base!=self.private_base:raise FreshnessHold('invalidation_unsafe')
+        finally:os.close(descriptor)
         return {'version':1,'kind':'ci-unit-freeze-observation','scope':self.path.name,
             'cgroup_device':self.identity.st_dev,'cgroup_inode':self.identity.st_ino,'original_pid':self.original,
             'entry_sha256':hashlib.sha256(json.dumps(self.entry,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
             'kernel_policy_sha256':self.entry['policy_activation']['policy']['sha256'],
             'mount_layout_sha256':self.mount_layout['sha256'],
+            'private_base_sha256':self.private_base['base_sha256'],
             'frozen':True,'processes':rows,'input_closure_complete':False,'shipping_authority':False}
 
     def thaw(self,deadline):
@@ -2243,18 +2260,23 @@ class UnitPeerRelay(RootRelay):
         if (mounts.get('binding')!=self.admission.binding or mounts.get('command')!=self.admission.command
                 or mounts.get('ordinal')!=self.parent_ordinal):raise FreshnessHold('generation_mismatch')
         root_descriptor=os.open(f'/proc/{pid}/root',os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
-        try:verified=unit_views.validate_mount_bindings(root_descriptor,layout['layout'],
-            unit_mount_rules(self.view,mounts,library=self.library,endpoint=self.path))
+        try:
+            verified=unit_views.validate_mount_bindings(root_descriptor,layout['layout'],
+                unit_mount_rules(self.view,mounts,library=self.library,endpoint=self.path))
+            mutable_roots=unit_mutable_roots(mounts)
+            private_base=unit_views.validate_private_base(root_descriptor,layout['layout'],mutable_roots,
+                unit_uid=self.peer_uid,check=lambda:None)
         finally:os.close(root_descriptor)
         cache._write_record(self.scope/'mount-bindings.json',{'version':1,
             'binding':self.admission.binding,'command':self.admission.command,'ordinal':self.parent_ordinal,
-            'entry_sha256':layout['entry_sha256'],'mount_bindings':verified,
+            'entry_sha256':layout['entry_sha256'],'mount_bindings':verified,'private_base':private_base,
             'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
         namespaces={name:os.readlink(f'/proc/{pid}/ns/'+name) for name in ('mnt','ipc','net','user','pid')}
         if any(record['namespaces'][name]['unit']!=namespaces[name] for name in ('mnt','ipc','net')):
             raise FreshnessHold('invalidation_unsafe')
         self.scope_root=record['root_identity'];self.scope_namespaces=namespaces;self.scope_pidfd=os.pidfd_open(pid)
-        self.freezer.attach(pid,self.scope_pidfd,entry=entry,mount_layout=layout['layout'])
+        self.freezer.attach(pid,self.scope_pidfd,entry=entry,mount_layout=layout['layout'],
+            private_base=private_base,mutable_roots=mutable_roots)
         self.staged_signals=StagedParentSignals(self.scope_pidfd,lock=self.ordinals.signal_lock)
         staged=cache._read_record(self.scope/'stdin.json')
         if (staged.get('binding')!=self.admission.binding or staged.get('command')!=self.admission.command
@@ -2409,9 +2431,7 @@ class UnitPeerRelay(RootRelay):
         mounts=cache._read_record(Path(self.view['mounts']),max_bytes=16*1024**2)
         if (mounts.get('binding')!=self.admission.binding or mounts.get('command')!=self.admission.command
                 or mounts.get('ordinal')!=self.parent_ordinal):raise FreshnessHold('generation_mismatch')
-        declared=mounts.get('declared_outputs');cache.validate_outputs(declared)
-        roots=['workspace/target','tmp','home/worker','cargo','var/tmp','dev/shm',
-            *['workspace/'+name for name in declared]]
+        roots=unit_mutable_roots(mounts)
         state={'version':1,'kind':'ci-unit-input-capture','binding':self.admission.binding,
             'command':self.admission.command,'parent_ordinal':self.parent_ordinal,'parent_scope':self.scope.name,
             'request_ordinal':ordinal,'request_sha256':admission['request_sha256'],

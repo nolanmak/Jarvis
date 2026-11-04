@@ -134,6 +134,75 @@ def validate_mount_bindings(root_fd,layout,rules):
         if opened is not None:os.close(opened)
 
 
+def validate_private_base(root_fd,layout,mutable_roots,*,unit_uid,check):
+    """Check DAC outside W and caller-verified mounts through original FDs.
+
+    The caller separately authenticates the mount table and stopped cohort.
+    This is one writer-boundary prerequisite, never complete alias/input or
+    resume authority. Readonly mounted trees are covered by mount validation.
+    """
+    try:
+        root=os.fstat(root_fd)
+        if ([root.st_dev,root.st_ino]!=layout['root_identity'] or not stat.S_ISDIR(root.st_mode)
+                or type(mutable_roots) is not list or not 1<=len(mutable_roots)<=64
+                or type(unit_uid) is not int or not 2000<=unit_uid<6096):
+            raise FreshnessHold('invalidation_unsafe')
+        roots=sorted((os.fsencode(relative(name)) for name in mutable_roots))
+        if any(a==b or b.startswith(a+b'/') for a,b in zip(roots,roots[1:])):
+            raise FreshnessHold('invalidation_unsafe')
+        mounts={bytes.fromhex(row['mountpoint'])[1:] for row in layout['mounts']}
+        if b'' in mounts:raise FreshnessHold('invalidation_unsafe')
+        for name in roots:
+            check();fd=_open_beneath(root_fd,name,os.O_RDONLY)
+            try:
+                info=os.fstat(fd)
+                if (not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode))
+                        or info.st_uid not in (os.geteuid(),unit_uid)
+                        or info.st_gid not in (os.getegid(),unit_uid) or info.st_mode&0o7000):
+                    raise FreshnessHold('invalidation_unsafe')
+            finally:os.close(fd)
+        excluded=set(roots)|mounts
+        def scan():
+            rows=[];encoded_bytes=0
+            def visit(parent,name,path):
+                nonlocal encoded_bytes
+                check();before=os.stat(name,dir_fd=parent,follow_symlinks=False)
+                if path in excluded:return
+                if (before.st_uid!=os.geteuid() or before.st_gid!=os.getegid()
+                        or before.st_mode&0o7000):raise FreshnessHold('invalidation_unsafe')
+                if stat.S_ISLNK(before.st_mode):
+                    target=os.fsencode(os.readlink(name,dir_fd=parent))
+                    row=[path.hex(),'symlink',list(_key(before)),target.hex()]
+                else:
+                    if (not (stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode))
+                            or before.st_mode&0o022 or stat.S_ISREG(before.st_mode) and before.st_nlink!=1):
+                        raise FreshnessHold('invalidation_unsafe')
+                    fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NONBLOCK
+                        |getattr(os,'O_NOATIME',0),dir_fd=parent)
+                    try:
+                        if (_key(os.fstat(fd))!=_key(before) or os.listxattr(fd)):
+                            raise FreshnessHold('invalidation_unsafe')
+                        row=[path.hex(),'directory' if stat.S_ISDIR(before.st_mode) else 'file',list(_key(before))]
+                        if stat.S_ISDIR(before.st_mode):
+                            names=sorted(os.listdir(fd),key=os.fsencode)
+                            for child in names:visit(fd,child,os.fsencode(child) if not path else path+b'/'+os.fsencode(child))
+                            if sorted(os.listdir(fd),key=os.fsencode)!=names:raise FreshnessHold('invalidation_unsafe')
+                        if _key(os.fstat(fd))!=_key(before):raise FreshnessHold('invalidation_unsafe')
+                    finally:os.close(fd)
+                if _key(os.stat(name,dir_fd=parent,follow_symlinks=False))!=_key(before):
+                    raise FreshnessHold('invalidation_unsafe')
+                check();rows.append(row);encoded_bytes+=len(json.dumps(row,separators=(',',':')).encode())
+                if len(rows)>MAX_ENTRIES or encoded_bytes>16*1024**2:raise FreshnessHold('input_census_unknown')
+            visit(root_fd,'.',b'');return rows
+        rows=scan()
+        if scan()!=rows:raise FreshnessHold('invalidation_unsafe')
+        return {'version':1,'kind':'ci-unit-private-base','root_identity':[root.st_dev,root.st_ino],
+            'mutable_roots':[name.hex() for name in roots],'base_entries':len(rows),
+            'base_sha256':hashlib.sha256(json.dumps(rows,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+    except (OSError,KeyError,ValueError,TypeError):raise FreshnessHold('invalidation_unsafe') from None
+
+
 def relative(value):
     raw=os.fsencode(value)
     if (not raw or len(raw)>4096 or raw.startswith(b'/') or b'\0' in raw
