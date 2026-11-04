@@ -2238,3 +2238,33 @@ Both runs used existing managed admission and unchanged resource/deadline policy
 This establishes neither first-instruction exec mediation nor a complete input/pause proof. The
 original generated-publication regression and all final proof, reuse and rollout
 gates remain required; experimental authority flags remain false.
+
+### First-exec mediation feasibility
+
+The native helper now has explicit notification-listener/receive/response
+primitives. The feasibility harness creates the listener in a trusted
+single-threaded bootstrap before activating the unit policy. That policy also
+refuses subsequent NEW_LISTENER creation, preventing a replacement notification
+listener from overriding the original filter. Existing stricter relay exec
+denial may still be installed.
+
+The unchanged original supervisor observes the kernel exec stop. Its callback
+closes initial-exec authorization before detaching, so no application instruction
+runs while the initial permission remains open. Before that acknowledgement,
+only the original live bootstrap PID can receive CONTINUE; this is not pointer
+inspection or authorization of untrusted requests. Failed initial PATH
+candidates may continue in that trusted bootstrap until a real exec succeeds.
+All later raw exec notifications receive EPERM; loss of the listener returns
+ENOSYS. Withdrawn notifications and terminal listener hangup are distinct from
+received requests and never supply authorization or fabricated cleanup, following
+the [kernel notification contract](https://docs.kernel.org/userspace-api/seccomp_filter.html).
+
+The first five real syscall tests failed against the earlier missing API.
+Six host cases now pass: early-constructor and body execve/execveat, an actual
+static ELF without PT_INTERP, failed initial lookup, cancellation without an
+exec acknowledgement, listener loss, and inherited mediation in a forked
+descendant. Every case retains the original supervisor's descendant cleanup.
+The complete Python suite passes **397 tests without skips**; the focused
+managed Rust suite passes **34 tests**, with 22 opt-in guest tests ignored.
+Pinned-guest validation and production bootstrap/transport integration remain
+pending. These primitives and experiments grant no passing-CI or merge authority.

@@ -9,6 +9,12 @@ const CARGO_EXEC_DENIAL_CASES:&[u8]=include_bytes!("ci_cargo_exec_cases.py");
 #[cfg(all(target_os="linux",target_arch="x86_64"))]
 const CARGO_UNIT_POLICY_CASES:&[u8]=include_bytes!("ci_cargo_unit_policy_cases.py");
 #[cfg(all(target_os="linux",target_arch="x86_64"))]
+const CARGO_EXEC_MEDIATION_CASES:&[u8]=include_bytes!("ci_cargo_exec_mediation_cases.py");
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+const CARGO_EXEC_EARLY:&[u8]=include_bytes!(concat!(env!("OUT_DIR"),"/libci_cargo_exec_early.so"));
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+const CARGO_EXEC_STATIC:&[u8]=include_bytes!(concat!(env!("OUT_DIR"),"/ci_cargo_exec_static"));
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
 const CARGO_RELAY_LIBRARY:&[u8]=include_bytes!(concat!(env!("OUT_DIR"),"/libci_cargo_relay.so"));
 
 /// Credential and V3 transport feasibility only. Generated input closure,
@@ -400,6 +406,81 @@ fn native_unit_policy_covers_real_namespace_async_io_and_thread_syscalls() {
     assert!(output.status.success(),"native unit policy failed: {diagnostics}");
     assert!(diagnostics.contains("Ran 10 tests") && !diagnostics.contains("skipped"),"unit policy cases did not execute: {diagnostics}");
     assert!(std::process::Command::new("/usr/bin/true").status().unwrap().success(),"child policy affected the Rust parent");
+}
+
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[test]
+fn native_exec_mediation_covers_early_static_and_original_exec_ack() {
+    let directory=tempfile::tempdir().unwrap();
+    for (name,bytes) in [("native.so",CARGO_EXEC_DENIAL_LIBRARY),("early.so",CARGO_EXEC_EARLY),("static",CARGO_EXEC_STATIC)] {
+        let path=directory.path().join(name);std::fs::write(&path,bytes).unwrap();
+        std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests/ci_cargo_exec_mediation_test.py");
+    let output=std::process::Command::new("python3").arg("-I").arg(tests)
+        .env("AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY",directory.path().join("native.so"))
+        .env("AUGMENTAGENT_CARGO_EXEC_EARLY_LIBRARY",directory.path().join("early.so"))
+        .env("AUGMENTAGENT_CARGO_EXEC_STATIC_BINARY",directory.path().join("static"))
+        .output().unwrap();
+    let diagnostics=String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(),"first-exec feasibility cases failed: {diagnostics}");
+    assert!(diagnostics.contains("Ran 6 tests") && !diagnostics.contains("skipped"),"first-exec cases did not execute: {diagnostics}");
+}
+
+/// Actual initial exec, early constructor, static entry and closed-listener behavior.
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_exec_mediation()->Result<()> {
+    let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private evidence required");
+    std::fs::create_dir(&evidence)?;std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"shared-ci-exec-mediation",None)?;
+    audit.require_run_resources()?;
+    let target=crate::build_storage::effective_target(&owner);
+    let storage=crate::build_storage::admit_ci(&owner,&target).await?;
+    let fixture=tempfile::Builder::new().prefix("exec-mediation-fixture-").tempdir_in(&target)?;
+    let root=fixture.path();
+    for (name,bytes) in [("native.so",CARGO_EXEC_DENIAL_LIBRARY),("early.so",CARGO_EXEC_EARLY),
+        ("static",CARGO_EXEC_STATIC),("cases.py",CARGO_EXEC_MEDIATION_CASES),
+        ("supervisor.py",include_bytes!("../../../scripts/provider-supervisor.py").as_slice())] {
+        let path=root.join(name);std::fs::write(&path,bytes)?;
+        std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700))?;
+    }
+    git(root,&["init","-q"]).await?;git(root,&["add","."]).await?;
+    git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","commit","-qm","exec mediation fixture"]).await?;
+    let head=git(root,&["rev-parse","HEAD"]).await?.trim().to_owned();
+    git(root,&["update-ref","refs/remotes/origin/main",&head]).await?;
+    let binding=binding(root).await?;let session=vm::Session::prepare(&owner,&target)?;
+    let source=snapshot(root,&binding,&target).await?;
+    let command=r#"python3 -I - <<'PY'
+import json,pathlib,shutil,subprocess,sys
+for name in ('native.so','early.so','static'):
+ shutil.copyfile('/workspace/'+name,'/workspace/target/'+name)
+ pathlib.Path('/workspace/target/'+name).chmod(0o700)
+results={}
+for mode in ('early','static','search','listener-loss','cancel','fork'):
+ receipt='/workspace/target/'+mode+'-cleanup'
+ result=subprocess.run([sys.executable,'-I','/workspace/cases.py','/workspace/supervisor.py','/workspace/target/native.so',
+  '/workspace/target/early.so','/workspace/target/static',mode,receipt],capture_output=True,text=True,timeout=15)
+ assert result.returncode==0,(mode,result.stdout,result.stderr)
+ expected=['STATIC_DENIED'] if mode=='static' else [] if mode=='cancel' else ['EARLY_DENIED','BODY_DENIED'] if mode=='early' else ['BODY_DENIED']
+ lines=result.stdout.splitlines();assert lines[:-1]==expected,(mode,lines)
+ assert pathlib.Path(receipt).read_text()=='all-descendants-reaped\n'
+ results[mode]=json.loads(lines[-1]);assert results[mode]['original_cleanup'] and results[mode]['shipping_authority'] is False
+print(json.dumps(results))
+PY"#;
+    let result=session.run("repository",&source,root,&binding,None,&[],&[],&[],Some(command),
+        &storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
+    let cases:serde_json::Value=serde_json::from_str(&result.stdout).unwrap_or(serde_json::Value::Null);
+    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({
+        "version":1,"kind":"real_shared_ci_exec_mediation","head":head,"generation":source.generation(),
+        "status":result.status,"cases":cases,"actual_vm_commands":1,"input_closure_complete":false,
+        "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
+    ensure!(result.status=="passed" && cases.as_object().is_some_and(|cases|cases.len()==6),
+        "exec mediation unavailable: {} {}",result.stdout,result.stderr);
+    Ok(())
 }
 
 /// Kernel-policy feasibility in the pinned guest; this grants no CI authority.

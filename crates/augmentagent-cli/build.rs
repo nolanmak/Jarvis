@@ -3,6 +3,8 @@ use std::{env, fs, path::PathBuf, process::Command};
 fn main() {
     println!("cargo:rerun-if-changed=src/ci_cargo_exec.c");
     println!("cargo:rerun-if-changed=src/ci_cargo_relay.c");
+    println!("cargo:rerun-if-changed=src/ci_cargo_exec_early.c");
+    println!("cargo:rerun-if-changed=src/ci_cargo_exec_static.c");
     println!("cargo:rerun-if-env-changed=CC");
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo output directory"))
         .join("libci_cargo_exec.so");
@@ -17,6 +19,10 @@ fn main() {
             .expect("write unsupported relay marker");
         fs::write(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("libci_cargo_planner.so"), [])
             .expect("write unsupported planner marker");
+        for name in ["libci_cargo_exec_early.so", "ci_cargo_exec_static"] {
+            fs::write(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join(name), [])
+                .expect("write unsupported exec feasibility marker");
+        }
         return;
     }
     let source = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"))
@@ -43,4 +49,17 @@ fn main() {
         .arg("-o").arg(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("libci_cargo_planner.so"))
         .status().expect("start protected planner relay compiler");
     assert!(status.success(),"native protected planner relay compilation failed");
+    for (source, output, flags) in [
+        ("ci_cargo_exec_early.c", "libci_cargo_exec_early.so", vec!["-shared", "-fPIC"]),
+        ("ci_cargo_exec_static.c", "ci_cargo_exec_static", vec!["-nostdlib", "-static", "-fno-stack-protector",
+            "-fno-pie", "-no-pie", "-mno-sse", "-mno-mmx", "-fno-builtin"]),
+    ] {
+        let status = Command::new(env::var_os("CC").unwrap_or_else(|| "cc".into()))
+            .args(["-std=c11", "-O2", "-g0", "-Wall", "-Wextra", "-Werror"])
+            .args(flags)
+            .arg(PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("src").join(source))
+            .arg("-o").arg(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join(output))
+            .status().expect("start exec feasibility fixture compiler");
+        assert!(status.success(), "native exec feasibility fixture compilation failed");
+    }
 }

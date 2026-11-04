@@ -1,11 +1,13 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <linux/sched.h>
 #include <sys/prctl.h>
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -84,6 +86,16 @@ __attribute__((visibility("default"))) int jarvis_ci_restrict_unit(void) {
         DENY_CALL(SYS_io_getevents),
         DENY_CALL(SYS_io_pgetevents),
         DENY_CALL(SYS_io_destroy),
+        /* A later notification filter with its own listener could supersede
+         * the original notifier. Trusted setup creates that listener first.
+         * Ordinary stricter filters (including the relay's exec denial) may
+         * still be installed; they cannot relax these ERRNO restrictions.
+         */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_seccomp, 0, 4),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[1])),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, SECCOMP_FILTER_FLAG_NEW_LISTENER, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         /* clone3's flags live behind a mutable pointer. Refuse it with the
          * libc fallback errno, then inspect ordinary clone's value argument.
          */
@@ -115,5 +127,76 @@ __attribute__((visibility("default"))) int jarvis_ci_restrict_unit(void) {
 #else
     errno = ENOSYS;
     return -1;
+#endif
+}
+
+/* Feasibility primitives only. The caller owns the original single-threaded
+ * bootstrap, authenticated listener transfer, initial-exec authorization,
+ * PTRACE_EXEC acknowledgement, cancellation and original descendant cleanup.
+ * CONTINUE is never an authorization decision for untrusted pointer arguments.
+ */
+__attribute__((visibility("default"))) int jarvis_ci_exec_listener(void) {
+#if defined(__linux__) && defined(__x86_64__)
+    struct seccomp_notif_sizes sizes = {0};
+    if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0, &sizes) != 0) return -1;
+    if (sizes.seccomp_notif != sizeof(struct seccomp_notif) ||
+        sizes.seccomp_notif_resp != sizeof(struct seccomp_notif_resp) ||
+        sizes.seccomp_data != sizeof(struct seccomp_data)) { errno = ENOTSUP; return -1; }
+    const struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x40000000U, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_execve, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_execveat, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
+    };
+    struct sock_fprog program = {
+        .len = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
+        .filter = (struct sock_filter *)filter
+    };
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1UL, 0UL, 0UL, 0UL) != 0) return -1;
+    return (int)syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
+                        SECCOMP_FILTER_FLAG_NEW_LISTENER, &program);
+#else
+    errno = ENOSYS; return -1;
+#endif
+}
+
+__attribute__((visibility("default"))) int jarvis_ci_exec_receive(
+        int listener, uint64_t *identity, uint32_t *pid, int32_t *number) {
+#if defined(__linux__) && defined(__x86_64__)
+    if (!identity || !pid || !number) { errno = EINVAL; return -1; }
+    struct seccomp_notif request = {0};
+    if (ioctl(listener, SECCOMP_IOCTL_NOTIF_RECV, &request) != 0) return -1;
+    if (request.flags || request.data.arch != AUDIT_ARCH_X86_64 ||
+        (request.data.nr != SYS_execve && request.data.nr != SYS_execveat)) {
+        errno = EPROTO; return -1;
+    }
+    *identity = request.id; *pid = request.pid; *number = request.data.nr;
+    return 0;
+#else
+    (void)listener; (void)identity; (void)pid; (void)number;
+    errno = ENOSYS; return -1;
+#endif
+}
+
+__attribute__((visibility("default"))) int jarvis_ci_exec_respond(
+        int listener, uint64_t identity, int allow_initial) {
+#if defined(__linux__) && defined(__x86_64__)
+    if (allow_initial != 0 && allow_initial != 1) { errno = EINVAL; return -1; }
+    if (ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &identity) != 0) return -1;
+    struct seccomp_notif_resp response = {
+        .id = identity, .val = 0, .error = allow_initial ? 0 : -EPERM,
+        .flags = allow_initial ? SECCOMP_USER_NOTIF_FLAG_CONTINUE : 0
+    };
+    return ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND, &response);
+#else
+    (void)listener; (void)identity; (void)allow_initial;
+    errno = ENOSYS; return -1;
 #endif
 }
