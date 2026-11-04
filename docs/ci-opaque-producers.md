@@ -750,8 +750,31 @@ always leaves cancellation/reacquisition and full exhaustion acceptance false;
 it is the initial execution stage of the still-open four-parent gate. A separate
 controlled cancellation/reacquisition scenario remains mandatory; a successful
 initial build alone cannot satisfy O4. The original V3 fixture, arguments,
-counters, streams and acceptance assertions remain unchanged. The new actual
-Cargo test and expanded 106-case component guest check remain pending.
+counters, streams and acceptance assertions remain unchanged.
+
+At `e4a3a55e`, the first actual four-target attempt deferred before guest/Cargo
+execution after 300.26 seconds because a live production deployment/verification
+held the managed lease; that attempt supplies no model evidence. The next
+attempt ran the actual protected adapter in 108.34 seconds and remained red with
+`InputCensusUnknown`. Managed read-only image inspection verified a shared empty
+Cargo pipe, zero available original slots, four original supervisors and the
+four lent root compiler units 5–8. All four nested root children progressed into
+further admitted execs; four deepest children returned zero with original
+cleanup. Two complete sealed ELF outputs (651616 bytes each) passed independent
+header/size/hash checks; the other two parents were interrupted before sealing
+completed. Every original parent still withheld its result, with no root
+filesystem application/resume. The initial exhaustion/progress experiment is
+positive; the actual build and full four-parent gate are red. Cancellation and
+reacquisition were not exercised and remain unproved. Observation:
+`/tmp/autoship-1703-four-parent-observation-2.json`.
+
+The expanded component guest check at that revision passed all 106 cases as
+UID1000 in 95.76 seconds, retaining the previous 101 cases and the new five.
+Original resource subtree removal verified in both actual VM experiments.
+All 564 Python and 34 focused managed Rust tests pass; routine Rust ignores 24
+guest opt-ins, including the new actual Cargo test. All input/CI/shipping flags
+remain false. These results do not replace the required writer/alias/W proof,
+root transfer/resume or controlled cancellation/reacquisition acceptance.
 
 Routing and cancellation must not wait for an execution permit held by the
 request's paused ancestor. Containment is acyclic and recorded before dispatch.
