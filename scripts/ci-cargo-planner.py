@@ -3402,6 +3402,53 @@ def credential_role_probe(value,relay):
     return results
 
 
+def _unit_credential_client(arguments):
+    bootstrap=int(arguments[0]);value=_bootstrap(bootstrap,'unit-credential-client');_parent_guard(value['parent']);os.close(bootstrap)
+    uid=value['uid'];configuration=int(arguments[1])
+    if type(uid) is not int or uid not in (1000,1001,2000,6095):raise FreshnessHold('invalidation_unsafe')
+    libc=ctypes.CDLL(None,use_errno=True)
+    if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
+    os.setgroups([]);os.setgid(uid);os.setuid(uid);_parent_guard(value['parent'])
+    os.set_inheritable(configuration,True)
+    os.execve('/usr/bin/python3',['python3','-I','-c','print("UNIT_ROLE_MAIN_REACHED",flush=True)'],
+        {'PATH':os.defpath,'LD_PRELOAD':value['library'],'JARVIS_CARGO_RELAY_FD':str(configuration)})
+
+
+def unit_credential_role_probe(value,relay):
+    """Constructor credential feasibility only; does not dispatch a child unit."""
+    results={}
+    cases=(('unit_first',2000,b'JARVUNT3',2000,True),('unit_last',6095,b'JARVUNT3',6095,True),
+        ('unit_wrong_client',2000,b'JARVUNT3',6095,False),('unit_zero',2000,b'JARVUNT3',0,False),
+        ('unit_below_range',2000,b'JARVUNT3',1999,False),('unit_above_range',2000,b'JARVUNT3',6096,False),
+        ('worker_rejects_unit',1000,b'JARVUNT3',2000,False),('planner_rejects_unit',1001,b'JARVUNT3',2000,False),
+        ('unit_rejects_worker',2000,b'JARVWRK3',0,False),('unit_rejects_planner',2000,b'JARVCFG3',0,False))
+    for name,uid,magic,client_uid,accepted in cases:
+        configuration=os.memfd_create('unit-credential-role',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
+        bootstrap=None;child=None
+        try:
+            body=legacy.CONFIG.pack(magic,client_uid,os.getpid(),30000,relay.nonce,os.fsencode(relay.path))
+            if os.write(configuration,body)!=len(body):raise FreshnessHold('metadata_torn')
+            fcntl.fcntl(configuration,fcntl.F_ADD_SEALS,legacy.SEALS)
+            bootstrap=_sealed(dict(value,kind='unit-credential-client',parent=os.getpid(),uid=uid))
+            child=subprocess.Popen([sys.executable,'-I',str(Path(__file__).resolve()),'--unit-credential-client',str(bootstrap),str(configuration)],
+                pass_fds=(bootstrap,configuration),env={'PATH':os.defpath},stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            output,error=child.communicate(timeout=5)
+            result={'uid':uid,'config_uid':client_uid,'exit_code':child.returncode,'main_reached':output==b'UNIT_ROLE_MAIN_REACHED\n','expected_acceptance':accepted}
+            results[name]=result
+            if child.returncode!=(0 if accepted else 125) or error or output!=(b'UNIT_ROLE_MAIN_REACHED\n' if accepted else b''):
+                break
+        finally:
+            if child is not None and child.poll() is None:child.kill();child.wait(timeout=2)
+            os.close(configuration)
+            if bootstrap is not None:os.close(bootstrap)
+    record={'version':1,'kind':'ci-unit-role-constructor-probe','binding':value['binding'],'command':value['command'],
+        'cases':results,'dispatch_tested':False,'input_closure_complete':False,'shipping_authority':False}
+    cache._write_record(Path(value['target'])/'unit-role-constructor-probe.json',record)
+    if len(results)!=len(cases) or any(row['main_reached']!=row['expected_acceptance']
+            or row['exit_code']!=(0 if row['expected_acceptance'] else 125) for row in results.values()):
+        raise FreshnessHold('invalidation_unsafe')
+
+
 def _probe(arguments):
     global _PHASE,_CHILD_DIAGNOSTIC
     value=_bootstrap(int(arguments[0]),'probe');_parent_guard(value['parent'])
@@ -3410,6 +3457,7 @@ def _probe(arguments):
     _PHASE='planner_kernel_observer'
     with kernel_observer.Observer(admission,deadline=value['deadline']) as observer, RootRelay(admission,library=value['library'],timeout=30) as relay:
         credential_roles=credential_role_probe(value,relay)
+        unit_credential_role_probe(value,relay)
         metadata=root/'planner-metadata';metadata.write_text('');os.chown(metadata,1001,1001);metadata.chmod(0o600)
         for ordinal,mode in enumerate(('stdin','jobserver','cancel','signal','view')):
             _PHASE='planner_probe_'+mode
@@ -3896,6 +3944,7 @@ if __name__=='__main__':
         elif sys.argv[1:2]==['--execute-repository']:result=_execute_repository(sys.argv[2:])
         elif sys.argv[1:2]==['--repository-execution-supervisor']:result=_repository_execution_supervisor(sys.argv[2:])
         elif sys.argv[1:2]==['--credential-client']:result=_credential_client(sys.argv[2:])
+        elif sys.argv[1:2]==['--unit-credential-client']:result=_unit_credential_client(sys.argv[2:])
         elif sys.argv[1:2]==['--probe']:result=_probe(sys.argv[2:])
         elif sys.argv[1:2]==['--probe-supervisor']:result=_probe_supervisor(sys.argv[2:])
         else:raise FreshnessHold('invalidation_unsafe')
