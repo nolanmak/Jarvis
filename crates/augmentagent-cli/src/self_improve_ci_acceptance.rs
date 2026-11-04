@@ -575,7 +575,7 @@ async fn live_shared_ci_namespace_steps()->Result<()> {
     let source=snapshot(root,&binding,&target).await?;
     let command=r#"TMPDIR=/workspace/target python3 -I - <<'PY'
 import io,json,os,pathlib,sys,tempfile,unittest
-assert os.getuid()==1010
+assert os.getuid()==1000
 assert pathlib.Path(tempfile.gettempdir())==pathlib.Path('/workspace/target')
 sys.path.insert(0,'/workspace/tests')
 suite=unittest.TestSuite([unittest.TestLoader().discover('/workspace/tests',pattern=pattern)
@@ -595,7 +595,7 @@ PY"#;
         "version":1,"kind":"real_shared_ci_namespace_steps","head":head,"generation":source.generation(),
         "status":result.status,"cases":cases,"actual_vm_commands":1,"input_closure_complete":false,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
-    ensure!(result.status=="passed" && cases["uid"]==1010 && cases["tests_run"]==101
+    ensure!(result.status=="passed" && cases["uid"]==1000 && cases["tests_run"]==101
         && cases["failures"]==0 && cases["errors"]==0 && cases["successful"]==true,
         "namespace step guest cases unavailable: {} {}",result.stdout,result.stderr);
     Ok(())
