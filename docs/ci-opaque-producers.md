@@ -938,7 +938,20 @@ The following load-bearing choices remain parked with C; they are not waived:
   outer ancestor hold records. Revocation now traverses those known closed gate
   objects without using their closed pidfds; it keeps the active hold and blocks
   signal dispatch/resume. Only original verified cleanup can release it. The
-  revised 86-case guest check and unchanged Cargo replay remain pending here.
+  revised 86-case guest check at `698d987d` passed in 96.25 seconds as UID1000,
+  including all 14 active-signal cases, and verified original resource removal.
+  All 544 Python and 34 focused managed Rust tests pass. Receipt:
+  `/tmp/augmentagent-ci-active-signals-20261104070215/receipt.json`.
+
+  The unchanged Cargo replay at that revision remained red at its deliberate
+  transfer hold in 102.12 seconds. Managed read-only image validation now verifies
+  all four ancestor hold/revocation records (requests 9–12), each original exec
+  observation and all-descendants-reaped marker, the successful leaf's detached
+  signal target, the unchanged sealed before/old/after graph and VM quiescence.
+  The three aborted ancestors retain raw -9 dispositions; the leaf retains raw
+  zero. No active signal was injected into these actual Cargo hooks. The proof
+  `/tmp/autoship-1703-active-signals-integration-payload-proof-2.json` records these
+  observations without claiming parent resume, materialization or CI authority.
 * Before producer/restart integration acceptance or mechanism handoff, settle the
   complete-initial-closure rule for successful sibling output effects. The
   unchanged fixture appends counter/log data in the same generated namespace as
