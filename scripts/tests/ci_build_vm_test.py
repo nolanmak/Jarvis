@@ -66,7 +66,7 @@ class AdapterTests(unittest.TestCase):
    def format_image(argv,**kwargs):
     fd=int(argv[-1].split('/')[-1]);header=bytearray(1024)
     import struct
-    struct.pack_into('<I',header,4,capacity//4096);struct.pack_into('<I',header,24,2);header[56:58]=b'\x53\xef'
+    struct.pack_into('<I',header,4,capacity//4096);struct.pack_into('<I',header,12,capacity//4096);struct.pack_into('<I',header,24,2);header[56:58]=b'\x53\xef'
     os.pwrite(fd,header,1024)
    with patch.object(adapter.subprocess,'run',side_effect=format_image) as formatter:
     adapter.ensure_cache(image,capacity,lease);inode=image.stat().st_ino
@@ -75,6 +75,69 @@ class AdapterTests(unittest.TestCase):
     with self.assertRaisesRegex(vm.Unavailable,'capacity changed'):adapter.ensure_cache(image,capacity*2,lease)
     image.chmod(0o644)
     with self.assertRaisesRegex(vm.Unavailable,'identity'):adapter.ensure_cache(image,capacity,lease)
+ def test_a_nearly_full_cache_is_reformatted_before_the_vm_boots(self):
+  # The persistent cache only ever grew: once full, every build failed with
+  # ENOSPC and the gate retried hourly forever ("disk full", main never green).
+  with tempfile.TemporaryDirectory() as d:
+   root=Path(d);image=root/'cache.img';capacity=64*1024*1024
+   class Lease:
+    fds=[4,5];floor=0
+    def check(self):pass
+   lease=Lease();free_blocks=[capacity//4096]
+   def format_image(argv,**kwargs):
+    fd=int(argv[-1].split('/')[-1]);header=bytearray(1024)
+    import struct
+    struct.pack_into('<I',header,4,capacity//4096);struct.pack_into('<I',header,12,free_blocks[0]);struct.pack_into('<I',header,24,2);header[56:58]=b'\x53\xef'
+    os.pwrite(fd,header,1024)
+   with patch.object(adapter.subprocess,'run',side_effect=format_image) as formatter:
+    free_blocks[0]=(capacity//4096)//20   # 5% free, like the host's 630 MB of 12 GiB
+    adapter.ensure_cache(image,capacity,lease);first=image.stat().st_ino
+    free_blocks[0]=capacity//4096
+    adapter.ensure_cache(image,capacity,lease)
+    self.assertEqual(formatter.call_count,2,'a nearly full cache is recreated, not reused')
+    with open(image,'rb') as f:f.seek(1024);fresh=f.read(1024)
+    self.assertEqual(adapter.cache_free_bytes(fresh),capacity,'the recreated cache starts empty')
+    adapter.ensure_cache(image,capacity,lease)
+    self.assertEqual(formatter.call_count,2,'a roomy cache is reused')
+ def test_a_cache_full_build_resets_the_cache_and_retries_once(self):
+  for failure in [{'exit_code':101,'stdout':'','stderr':'error: failed to write: No space left on device (os error 28)'},
+                  vm.Unavailable('VM build cache is full')]:
+   with tempfile.TemporaryDirectory() as d:
+    request=self.fixture(Path(d));image=Path(d)/'cache.img';image.write_bytes(b'x');image.chmod(0o600)
+    request.update(operation='step',id='platform/platform/3',build_cache=str(image),cache_bytes=67108864)
+    calls=[];ensured=[]
+    def run(*a,**k):
+     calls.append(1)
+     if len(calls)==1:
+      self.assertTrue(image.exists())
+      if isinstance(failure,Exception):raise failure
+      return failure
+     self.assertFalse(image.exists(),'the full cache was discarded before the retry')
+     return {'exit_code':0,'stdout':'','stderr':''}
+    with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',side_effect=lambda *a:ensured.append(1)):
+     result=adapter.execute(request,run=run)
+    self.assertEqual(result['status'],'passed',result);self.assertEqual(len(calls),2);self.assertEqual(len(ensured),2)
+    self.assertEqual(result.get('cache_reset'),'full')
+ def test_a_second_cache_full_failure_is_reported_not_looped(self):
+  with tempfile.TemporaryDirectory() as d:
+   request=self.fixture(Path(d));image=Path(d)/'cache.img'
+   request.update(operation='step',id='platform/platform/3',build_cache=str(image),cache_bytes=67108864)
+   calls=[]
+   def run(*a,**k):
+    calls.append(1);return {'exit_code':101,'stdout':'','stderr':'No space left on device'}
+   with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache'):
+    result=adapter.execute(request,run=run)
+   self.assertEqual(len(calls),2);self.assertEqual(result['status'],'failed')
+ def test_an_ordinary_failure_keeps_the_cache(self):
+  with tempfile.TemporaryDirectory() as d:
+   request=self.fixture(Path(d));image=Path(d)/'cache.img';image.write_bytes(b'x')
+   request.update(operation='step',id='x/y/1',build_cache=str(image),cache_bytes=67108864)
+   calls=[]
+   def run(*a,**k):
+    calls.append(1);return {'exit_code':101,'stdout':'','stderr':'test result: FAILED. 1 failed'}
+   with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache'):
+    result=adapter.execute(request,run=run)
+   self.assertEqual(len(calls),1);self.assertTrue(image.exists());self.assertEqual(result['status'],'failed')
  def test_cache_refuses_symlink_and_missing_target_admission(self):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d);image=root/'cache.img'
