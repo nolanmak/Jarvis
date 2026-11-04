@@ -1303,6 +1303,154 @@ def strip_transport(environment,library):
     return result
 
 
+class NestedJobserverCredits:
+    """Record the original unit's implicit job slot; never operate on its pipe.
+
+    This is lineage bookkeeping under original supervisor ownership, not a
+    second permit allocator. Callers prove the exec stop, actual pause and
+    original descendant cleanup. No record authorizes reuse or parent resume.
+    """
+    def __init__(self,path,*,binding,command,lock):
+        cache.validate_binding(binding)
+        if not cache._uuid(command):raise FreshnessHold('generation_mismatch')
+        self.path=Path(path);self.owner=os.getpid();self.lock=lock;self.committed=None;self.dirty=False
+        parent=unit_views.literal(self.path.parent);info=parent.stat()
+        if (self.path.name!='credits.json' or info.st_uid!=os.geteuid() or info.st_mode&0o022
+                or self.path.exists() or self.path.is_symlink()):raise FreshnessHold('invalidation_unsafe')
+        self.control=[info.st_dev,info.st_ino]
+        self.state={'version':1,'kind':'ci-nested-jobserver-lineage','binding':copy.deepcopy(binding),'command':command,
+            'owner_pid':self.owner,'owner_birth':Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()[19],
+            'holder_nonce':os.urandom(32).hex(),'units':{},'loans':{},
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+
+    @staticmethod
+    def _ordinal(value):
+        if type(value) is not int or not 0<=value<4096:raise FreshnessHold('input_census_unknown')
+        return str(value)
+
+    @staticmethod
+    def _job(value,*,required=True):
+        if value is None and not required:return None
+        if (type(value) is not dict or set(value)!={'version','kind','kernel_pipe_sha256','worker_numbers','input_closure_complete','shipping_authority'}
+                or value['version']!=3 or value['kind']!='ci-unit-jobserver' or value['worker_numbers']!=[3,4]
+                or type(value['kernel_pipe_sha256']) is not str or re.fullmatch('[0-9a-f]{64}',value['kernel_pipe_sha256']) is None
+                or value['input_closure_complete'] is not False or value['shipping_authority'] is not False):
+            raise FreshnessHold('input_census_unknown')
+        return copy.deepcopy(value)
+
+    def _persist(self):
+        self.dirty=True
+        if len(json.dumps(self.state,separators=(',',':')).encode())>16*1024**2:raise FreshnessHold('input_census_unknown')
+        cache._write_record(self.path,self.state);self.committed=copy.deepcopy(self.state);self.dirty=False
+
+    def _check(self):
+        if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
+        info=self.path.parent.lstat()
+        if (list(unit_views._key(info))[:2]!=self.control or info.st_uid!=os.geteuid() or info.st_mode&0o022):
+            raise FreshnessHold('invalidation_unsafe')
+        if self.path.exists():
+            actual=cache._read_record(self.path,max_bytes=16*1024**2)
+            if actual!=self.committed and not (self.dirty and actual==self.state):raise FreshnessHold('invalidation_unsafe')
+        elif self.committed is not None:raise FreshnessHold('invalidation_unsafe')
+        if self.dirty:self._persist()
+
+    def enter(self,ordinal,scope,jobserver,*,parent=None):
+        self._ordinal(ordinal)
+        if not cache._uuid(scope):raise FreshnessHold('generation_mismatch')
+        job=self._job(jobserver,required=False)
+        if parent is not None:self._ordinal(parent)
+        if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
+        with self.lock:
+            self._check();key=str(ordinal)
+            if key in self.state['units'] or len(self.state['units'])>=4096:raise FreshnessHold('invalidation_unsafe')
+            if parent is None:
+                if key in self.state['loans']:raise FreshnessHold('invalidation_unsafe')
+                credit=hashlib.sha256((self.state['command']+':'+scope+':'+key).encode()).hexdigest()
+            else:
+                loan=self.state['loans'].get(key);source=self.state['units'].get(str(parent))
+                if (loan is None or source is None or loan['parent']!=parent or loan['state']!='lent'
+                        or source['state']!='lent' or source['child']!=ordinal or loan['jobserver']!=job):
+                    raise FreshnessHold('cleanup_uncertain')
+                credit=loan['credit_id']
+            row={'ordinal':ordinal,'scope':scope,'parent':parent,'state':'owned','child':None,
+                'credit_id':credit,'jobserver':job}
+            self.state['units'][key]=row;self._persist();return copy.deepcopy(row)
+
+    def prepare(self,parent,child,jobserver):
+        self._ordinal(parent);self._ordinal(child);job=self._job(jobserver)
+        if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
+        with self.lock:
+            self._check();source=self.state['units'].get(str(parent));existing=self.state['loans'].get(str(child))
+            if (source is None or parent==child or source['state']!='owned' or source['jobserver']!=job
+                    or str(child) in self.state['units']):raise FreshnessHold('cleanup_uncertain')
+            if existing is not None:
+                if existing['parent']==parent and existing['state']=='prepared' and source['child']==child and existing['jobserver']==job:
+                    return copy.deepcopy(existing)
+                raise FreshnessHold('invalidation_unsafe')
+            if source['child'] is not None or len(self.state['loans'])>=4096:raise FreshnessHold('input_census_unknown')
+            source['child']=child
+            row={'parent':parent,'child':child,'credit_id':source['credit_id'],'jobserver':job,'state':'prepared'}
+            self.state['loans'][str(child)]=row;self._persist();return copy.deepcopy(row)
+
+    def lend(self,parent,child,pause):
+        self._ordinal(parent);self._ordinal(child)
+        if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
+        with self.lock:
+            self._check();source=self.state['units'].get(str(parent));loan=self.state['loans'].get(str(child))
+            if (source is None or loan is None or loan['parent']!=parent or source['child']!=child
+                    or type(pause) is not dict or pause.get('kind')!='ci-unit-freeze-observation'
+                    or pause.get('version')!=1 or pause.get('scope')!=source['scope'] or pause.get('frozen') is not True
+                    or pause.get('input_closure_complete') is not False or pause.get('shipping_authority') is not False):
+                raise FreshnessHold('cleanup_uncertain')
+            digest=hashlib.sha256(json.dumps(pause,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+            if loan['state']=='lent' and source['state']=='lent' and loan.get('pause_sha256')==digest:return copy.deepcopy(loan)
+            if loan['state']!='prepared' or source['state']!='owned':raise FreshnessHold('cleanup_uncertain')
+            source['state']='lent';loan.update(state='lent',pause_sha256=digest);self._persist();return copy.deepcopy(loan)
+
+    def return_child(self,parent,child):
+        self._ordinal(parent);self._ordinal(child)
+        if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
+        with self.lock:
+            self._check();source=self.state['units'].get(str(parent));target=self.state['units'].get(str(child));loan=self.state['loans'].get(str(child))
+            if (source is None or target is None or loan is None or source['child']!=child or source['state']!='lent'
+                    or target['parent']!=parent or target['state']!='owned' or target['child'] is not None
+                    or loan['parent']!=parent or loan['state']!='lent' or target['credit_id']!=source['credit_id']):
+                raise FreshnessHold('cleanup_uncertain')
+            source.update(state='owned',child=None);target['state']='returned';loan['state']='returned'
+            self._persist();return copy.deepcopy(loan)
+
+    def abort_prepared(self,parent,child):
+        self._ordinal(parent);self._ordinal(child)
+        if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
+        with self.lock:
+            self._check();source=self.state['units'].get(str(parent));loan=self.state['loans'].get(str(child))
+            if (source is None or loan is None or loan['parent']!=parent or source['child']!=child
+                    or source['state']!='owned' or loan['state']!='prepared' or str(child) in self.state['units']):
+                raise FreshnessHold('cleanup_uncertain')
+            source['child']=None;loan['state']='aborted';self._persist()
+
+    def require_owned(self,ordinal):
+        self._ordinal(ordinal)
+        if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
+        with self.lock:
+            self._check();row=self.state['units'].get(str(ordinal))
+            if row is None or row['state']!='owned' or row['child'] is not None:raise FreshnessHold('cleanup_uncertain')
+            return copy.deepcopy(row)
+
+    def finish_root(self,ordinal):
+        self._ordinal(ordinal)
+        if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
+        with self.lock:
+            self._check();row=self.state['units'].get(str(ordinal))
+            if row is None or row['parent'] is not None or row['state']!='owned' or row['child'] is not None:
+                raise FreshnessHold('cleanup_uncertain')
+            row['state']='closed';self._persist()
+
+    def observation(self):
+        if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
+        with self.lock:self._check();return copy.deepcopy(self.state)
+
+
 class DispatchOrdinals:
     """One original command's process-owned request/UID namespace.
 
@@ -1314,7 +1462,7 @@ class DispatchOrdinals:
         if not cache._uuid(command):raise FreshnessHold('generation_mismatch')
         self.owner=os.getpid();self._binding=copy.deepcopy(binding);self.command=command
         self._next=0;self._lock=threading.Lock();self._fenced=False;self._stops=[]
-        self.signal_lock=threading.RLock()
+        self.signal_lock=threading.RLock();self.credits=None
 
     def require(self,binding,command):
         if self.owner!=os.getpid() or self._binding!=binding or self.command!=command:
@@ -1378,6 +1526,10 @@ class RootRelay:
         self.ordinals=DispatchOrdinals(admission.binding,admission.command) if ordinals is None else ordinals
         if type(self.ordinals) is not DispatchOrdinals:raise FreshnessHold('invalidation_unsafe')
         self.ordinals.require(admission.binding,admission.command)
+        with self.ordinals._lock:
+            if self.ordinals.credits is None:
+                self.ordinals.credits=NestedJobserverCredits(admission.root/'credits.json',
+                    binding=admission.binding,command=admission.command,lock=self.ordinals.signal_lock)
         self.timeout=timeout;self.peer_uid=1001;self.config_magic=b'JARVCFG3';self.require_message_credentials=False
         self.path=self.root/'relay.sock';self.nonce=os.urandom(32);self.config_uid=0
         self.client_path=self.path if client_path is None else Path(client_path)
@@ -1489,6 +1641,9 @@ class RootRelay:
     def execution_cancelled(self):return self._stop.is_set() or self.ordinals.fenced()
     def unit_signal_grant(self,value,transport,grant):grant()
 
+    def unit_credit_drained(self,value,transport,started):
+        if started and transport is not None:self.ordinals.credits.finish_root(value['ordinal'])
+
     def unit_signal_drained(self,value,transport,started):pass
 
     def unit_started(self,value,directory):pass
@@ -1521,7 +1676,8 @@ class RootRelay:
                     transport_root=Path(view['root']).parent/'transport';transport_root.mkdir(mode=0o700)
                     admission=admit(self.admission.target,self.admission.binding,self.admission.command,transport_root)
                     transport=UnitPeerRelay(admission,library=self.library,ordinal=ordinal,scope=directory,
-                        ordinals=self.ordinals,deadline=deadline,view=view)
+                        ordinals=self.ordinals,deadline=deadline,view=view,
+                        credit_parent=self.parent_ordinal if isinstance(self,UnitPeerRelay) else None)
                     transport.__enter__()
                     if relay_fd is not None:raise FreshnessHold('invalidation_unsafe')
                     descriptor=transport.config_fd()
@@ -1612,6 +1768,7 @@ class RootRelay:
             if status!=(raw if raw>=0 else 128-raw):raise FreshnessHold('cleanup_uncertain')
             # The original cleanup marker and raw status must be validated
             # before removing a signal target or closing its owned pidfd.
+            self.unit_credit_drained(value,transport,started)
             self.unit_signal_drained(value,transport,started)
             if transport is not None:transport.check()
             if view is not None:
@@ -1956,7 +2113,7 @@ class UnitFreezer:
 
 class UnitPeerRelay(RootRelay):
     """Private contained execution; effect transfer and CI authority stay fenced."""
-    def __init__(self,admission,*,library,ordinal,scope,ordinals,deadline,view):
+    def __init__(self,admission,*,library,ordinal,scope,ordinals,deadline,view,credit_parent=None):
         if type(ordinal) is not int or not 0<=ordinal<4096 or not cache._uuid(Path(scope).name):
             raise FreshnessHold('invalidation_unsafe')
         if (type(view) is not dict or set(view) not in ({'root','artifacts','source','mounts','ordinal'},
@@ -1965,6 +2122,8 @@ class UnitPeerRelay(RootRelay):
         super().__init__(admission,library=library,timeout=min(900,max(1,deadline-time.monotonic())),
             deadline=deadline,ordinals=ordinals,client_path='/run/ci-unit.sock')
         self.peer_uid=2000+ordinal;self.config_uid=self.peer_uid;self.config_magic=b'JARVUNT3'
+        if credit_parent is not None:NestedJobserverCredits._ordinal(credit_parent)
+        self.credit_parent=credit_parent
         self.require_message_credentials=True;self.parent_ordinal=ordinal;self.scope=Path(scope)
         self.scope_pidfd=None;self.scope_namespaces=None;self.scope_root=None;self.received_requests=0;self.closed=False
         self.staged_signals=None
@@ -1986,6 +2145,11 @@ class UnitPeerRelay(RootRelay):
         self.scope_root=record['root_identity'];self.scope_namespaces=namespaces;self.scope_pidfd=os.pidfd_open(pid)
         self.freezer.attach(pid,self.scope_pidfd)
         self.staged_signals=StagedParentSignals(self.scope_pidfd,lock=self.ordinals.signal_lock)
+        staged=cache._read_record(self.scope/'stdin.json')
+        if (staged.get('binding')!=self.admission.binding or staged.get('command')!=self.admission.command
+                or staged.get('ordinal')!=self.parent_ordinal or staged.get('shipping_authority') is not False):
+            raise FreshnessHold('generation_mismatch')
+        self.ordinals.credits.enter(self.parent_ordinal,self.scope.name,staged.get('jobserver'),parent=self.credit_parent)
 
     def forward_signal(self,number):
         if self.staged_signals is None:raise FreshnessHold('invalidation_unsafe')
@@ -2004,6 +2168,14 @@ class UnitPeerRelay(RootRelay):
                 or type(transport) is not UnitPeerRelay or transport.staged_signals is None):
             raise FreshnessHold('generation_mismatch')
         self.staged_signals.activate_child(value['ordinal'],transport.staged_signals,grant)
+
+    def unit_credit_drained(self,value,transport,started):
+        if not started:return
+        loan=self.ordinals.credits.return_child(self.parent_ordinal,value['ordinal'])
+        record=self.active_record
+        if record is None or record['last_request_ordinal']!=value['ordinal']:
+            raise FreshnessHold('generation_mismatch')
+        record['jobserver_loan']['state']=loan['state'];cache._write_record(self.root/'admission.json',record)
 
     def unit_signal_drained(self,value,transport,started):
         if not started:return
@@ -2066,6 +2238,12 @@ class UnitPeerRelay(RootRelay):
             cache._write_record(self.root/'admission.json',record)
             phase[0]='planner_capture'
             with self.mutation_lock:
+                environment=body[2]
+                _,_,jobserver=staging.normalize_jobserver(environment,dict(zip(numbers[3:],descriptors[4:])))
+                loan=self.ordinals.credits.prepare(self.parent_ordinal,ordinal,jobserver)
+                record['jobserver_loan']={'credit_id':loan['credit_id'],'parent':self.parent_ordinal,
+                    'child':ordinal,'state':'prepared','shipping_authority':False}
+                cache._write_record(self.root/'admission.json',record)
                 self.staged_signals.pause(ordinal)
                 child_attempted=False;contained_views=None
                 try:
@@ -2077,6 +2255,8 @@ class UnitPeerRelay(RootRelay):
                     contained_views=_ContainedViews(self,ordinal);self.views=contained_views;self.active_record=record
                     replacement=os.dup(captured.fileno());os.close(descriptors[1]);descriptors[1]=replacement
                     child_attempted=True
+                    loan=self.ordinals.credits.lend(self.parent_ordinal,ordinal,record['pause'])
+                    record['jobserver_loan']['state']=loan['state'];cache._write_record(self.root/'admission.json',record)
                     result=super()._run(connection,ordinal,descriptors,numbers,phase,staged=True,defer_terminal=True)
                     record['child_result']={'returncode':result['returncode'],'original_cleanup':result['original_cleanup'],
                         'exec_observed':result['exec_observed'],'scope':result['directory'].name,
@@ -2090,6 +2270,8 @@ class UnitPeerRelay(RootRelay):
                     if child_attempted:
                         record['parent_resume_held']=True;self.request_cancel()
                     else:
+                        self.ordinals.credits.abort_prepared(self.parent_ordinal,ordinal)
+                        self.ordinals.credits.require_owned(self.parent_ordinal)
                         self.staged_signals.resume(ordinal,lambda:self.freezer.thaw(self.deadline))
                         if 'pause' in record:record['thaw_verified']=True
                     record['staged_signals']=self.staged_signals.observation()

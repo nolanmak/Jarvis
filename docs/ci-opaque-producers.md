@@ -653,6 +653,36 @@ four-parent test must exhaust both controller permits and pipe tokens, run neste
 work with the borrowed implicit slots, and verify cancellation/reacquisition
 without token injection. Failure blocks handoff and requires a revised model.
 
+The current controller now records `credits.json` once under the original
+command's admitted root. This is bookkeeping for the existing unit permit and
+implicit slot; it creates no semaphore, runnable queue, pipe token or renewed
+ordinal budget. Each root unit binds its original ordinal/scope and supervised
+stdin record's normalized jobserver pipe identity. A nested request must match
+that inherited identity before parent pause. Unknown/missing models or changed
+pipe capabilities hold before lending. Root and nested metadata queries may
+have no jobserver; that fact cannot authorize a nested implicit-slot loan.
+
+The parent prepares one child loan, lends only after the original kernel freeze
+observation, and the child enters that same credit at its existing exec stop.
+Each command/parent/child loan keeps its original identity; ordinal reuse, a
+second child, an unrelated scope and foreign journal contents refuse admission.
+Original child cleanup returns the credit only when that child has no unresolved
+loan. A pre-dispatch prepared loan can be aborted, while a lent/unknown subtree
+stays fenced. Parent resume requires its owned, child-free state as well as the
+separate signal, filesystem-transfer and cleanup gates. Original root cleanup
+closes the credit; it does not expose another implicit pipe byte. Failed journal
+acknowledgements replay only the same holder's known exact state. Lost/forked
+holders cannot adopt it. All records keep false input/CI/shipping flags.
+
+Thirteen real-file/pipe host cases cover four exhausted test semaphores and an
+empty real pipe, nested same-credit chains, unchanged pipe flags/bytes, wrong
+pipe/scope/model, duplicate/unknown loans, lost prepare/lend acknowledgements,
+root closure and the original cleanup hook. That four-slot component experiment
+is not the required four-parent pinned-Cargo test above. The expanded guest suite
+and unchanged original Cargo protocol replay remain pending; actual four-parent
+exhaustion/cancellation/reacquisition and checked parent resume remain mandatory
+before this selected model can pass its integration gate.
+
 Routing and cancellation must not wait for an execution permit held by the
 request's paused ancestor. Containment is acyclic and recorded before dispatch.
 Iterative traversal closes arbitrarily deep admitted chains within the existing
