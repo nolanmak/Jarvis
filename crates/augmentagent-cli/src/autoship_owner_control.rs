@@ -24,17 +24,48 @@ impl WorkflowStore {
 
     pub fn require_owner_dispatch(&self,workflow:&str)->Result<()> {require_dispatch(&self.conn,workflow)}
 
-    /// An authenticated resume may request checked cleanup for this one internal
-    /// failure. This is retirement intent, never evidence of native quiescence.
-    pub(crate) fn request_execution_retry_retirement(&mut self,workflow:&str,principal:&str,expected_revision:i64,now:i64)->Result<bool> {
+    /// The worker calls this after its normal checked native retirement pass.
+    /// A queued owner intent cannot make work runnable until every guard passes.
+    pub(crate) fn settle_owner_execution_retries(&mut self,now:i64,limit:usize)->Result<usize> {
+        ensure!(limit<=64,"owner retry reconciliation batch too large");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some((_,generation))=retry_checkpoint(&tx,workflow,now,false)? else {return Ok(false);};
-        ensure!(!principal.is_empty() && principal.len()<=256 && principal.bytes().all(|b|b.is_ascii_graphic()),"invalid owner principal");
-        ensure!(read(&tx,workflow)?.map_or(0,|c|c.revision)==expected_revision,"owner-control-revision-conflict");
-        ensure!(super::owner_inbox::pending(&tx,workflow)?==0,"owner-followup-pending");
-        let changed=tx.execute("UPDATE workflow_native_owner SET retirement_reason='owner_execution_retry' WHERE workflow=?1 AND retired_at IS NULL AND retirement_reason IS NULL",[workflow])?;
-        if changed>0 {event(&tx,workflow,generation,"owner_retry_retirement_requested",&serde_json::json!({"principal":principal,"owner_revision":expected_revision}).to_string(),now)?;}
-        tx.commit()?;Ok(true)
+        let rows={
+            let mut query=tx.prepare("SELECT workflow,owner_revision,generation,binding FROM owner_execution_retry WHERE state='pending' ORDER BY attempted_at,requested_at,workflow LIMIT ?1")?;
+            let rows=query.query_map([limit as i64],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut completed=0;
+        for (workflow,revision,generation,binding) in rows {
+            tx.execute("UPDATE owner_execution_retry SET attempted_at=?2 WHERE workflow=?1",params![workflow,now])?;
+            if !read(&tx,&workflow)?.is_some_and(|c|!c.paused && c.revision==revision) {
+                tx.execute("UPDATE owner_execution_retry SET state='superseded' WHERE workflow=?1",[&workflow])?;
+                continue;
+            }
+            if super::owner_inbox::pending(&tx,&workflow)?>0 {continue;}
+            let candidate=match retry_checkpoint(&tx,&workflow,now,true) {
+                Ok(candidate)=>candidate,
+                Err(error) if error.to_string()=="execution-retry-not-quiescent"=>continue,
+                Err(error)=>return Err(error),
+            };
+            let Some((mut checkpoint,current_generation))=candidate else {
+                tx.execute("UPDATE owner_execution_retry SET state='superseded' WHERE workflow=?1",[&workflow])?;
+                continue;
+            };
+            if current_generation!=generation || serde_json::to_string(&checkpoint.binding)?!=binding
+                || checkpoint.next.reason!="owner_execution_retry_pending" {
+                tx.execute("UPDATE owner_execution_retry SET state='superseded' WHERE workflow=?1",[&workflow])?;
+                continue;
+            }
+            checkpoint.stage=Stage::Reconcile;
+            checkpoint.next.reason="owner_execution_retry_requested".into();
+            checkpoint.next.action="resume_preserved_pr".into();
+            tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",params![workflow,serde_json::to_string(&checkpoint)?,now])?;
+            tx.execute("UPDATE owner_execution_retry SET state='completed' WHERE workflow=?1",[&workflow])?;
+            event(&tx,&workflow,generation,"owner_execution_retry_reconciled",&revision.to_string(),now)?;
+            super::progress::project(&tx,&workflow,"checkpoint",now)?;
+            completed+=1;
+        }
+        tx.commit()?;Ok(completed)
     }
 }
 
@@ -42,7 +73,10 @@ fn retry_checkpoint(tx:&Transaction<'_>,workflow:&str,now:i64,require_retired:bo
     let row:Option<(String,i64,i64)>=tx.query_row("SELECT checkpoint,lease_until,generation FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let Some((raw,until,generation))=row else {return Ok(None);};
     let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
-    if checkpoint.stage!=Stage::Held || checkpoint.next.reason!="adopted_execution_retry" || checkpoint.next.action!="resume_preserved_pr" {return Ok(None);}
+    let original=checkpoint.next.reason=="adopted_execution_retry" && checkpoint.next.action=="resume_preserved_pr";
+    let pending=checkpoint.next.reason=="owner_execution_retry_pending" && checkpoint.next.action=="reconcile_runtime_retirement"
+        && tx.query_row("SELECT EXISTS(SELECT 1 FROM owner_execution_retry WHERE workflow=?1 AND generation=?2 AND binding=?3 AND state IN ('pending','superseded'))",params![workflow,generation,serde_json::to_string(&checkpoint.binding)?],|r|r.get::<_,bool>(0))?;
+    if checkpoint.stage!=Stage::Held || (!original && !pending) {return Ok(None);}
     ensure!(until<=now,"execution-retry-not-quiescent");
     let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed'))",[workflow],|r|r.get(0))?;
     ensure!(!blocked,"execution-retry-not-quiescent");
@@ -65,18 +99,23 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
         let revision=prior.as_ref().map_or(0,|c|c.revision);
         ensure!(revision==expected_revision,"owner-control-revision-conflict");
         let revision=revision.checked_add(1).context("owner control revision overflow")?;
-        let retry=if paused {None}else{retry_checkpoint(tx,workflow,now,true)?};
+        let retry=if paused {None}else{retry_checkpoint(tx,workflow,now,false)?};
         let control=OwnerControl {revision,paused,principal:principal.into(),updated_at_ms:now};
         tx.execute("INSERT INTO workflow_owner_control VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workflow) DO UPDATE SET revision=excluded.revision,paused=excluded.paused,principal=excluded.principal,updated_at=excluded.updated_at",
             params![workflow,revision,paused,principal,now])?;
         tx.execute("INSERT INTO workflow_owner_control_event VALUES(?1,?2,?3,?4,?5)",params![workflow,revision,paused,principal,now])?;
         if let Some((mut checkpoint,generation))=retry {
-            checkpoint.stage=Stage::Reconcile;
-            checkpoint.next.reason="owner_execution_retry_requested".into();
+            let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND retired_at IS NULL)",[workflow],|r|r.get(0))?;
+            tx.execute("UPDATE workflow_native_owner SET retirement_reason='owner_execution_retry' WHERE workflow=?1 AND retired_at IS NULL AND retirement_reason IS NULL",[workflow])?;
+            tx.execute("INSERT INTO owner_execution_retry(workflow,owner_revision,generation,binding,state,requested_at,attempted_at) VALUES(?1,?2,?3,?4,?5,?6,0) ON CONFLICT(workflow) DO UPDATE SET owner_revision=excluded.owner_revision,generation=excluded.generation,binding=excluded.binding,state=excluded.state,requested_at=excluded.requested_at,attempted_at=0",
+                params![workflow,revision,generation,serde_json::to_string(&checkpoint.binding)?,if pending {"pending"}else{"completed"},now])?;
+            checkpoint.stage=if pending {Stage::Held}else{Stage::Reconcile};
+            checkpoint.next.reason=if pending {"owner_execution_retry_pending"}else{"owner_execution_retry_requested"}.into();
+            checkpoint.next.action=if pending {"reconcile_runtime_retirement"}else{"resume_preserved_pr"}.into();
             // Preserve the current binding, evidence, compute accounting and
             // retry eligibility. Normal execution revalidates the source/head.
             tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",params![workflow,serde_json::to_string(&checkpoint)?,now])?;
-            event(tx,workflow,generation,"owner_execution_retry_requested",principal,now)?;
+            event(tx,workflow,generation,"owner_execution_retry_requested",&serde_json::json!({"principal":principal,"owner_revision":revision,"cleanup_pending":pending}).to_string(),now)?;
         }
         super::progress::project(tx,workflow,"owner_control_changed",now)?;
         Ok(control)
@@ -121,13 +160,19 @@ mod tests {
             }
             if blocker!="lease" {store.release(&lease,6).unwrap();}
             let resumed=store.set_owner_pause(&id,"github:owner",0,false,7);
-            if blocker!="none" {
+            if blocker!="none" && blocker!="native" {
                 assert!(resumed.is_err(),"{blocker} must prevent an internal retry");
                 assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint,checkpoint);
                 assert!(store.owner_control(&id).unwrap().is_none(),"a refused retry must roll back owner control");
                 continue;
             }
             resumed.unwrap();
+            if blocker=="native" {
+                assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.stage,Stage::Held);
+                assert_eq!(store.settle_owner_execution_retries(8,16).unwrap(),0,"intent cannot certify native teardown");
+                store.complete_native_retirement(&id,lease.generation,dir.path().join("native-audit").to_str().unwrap(),9).unwrap();
+                assert_eq!(store.settle_owner_execution_retries(10,16).unwrap(),1);
+            }
             let after=store.snapshot(&id).unwrap().unwrap();
             assert_eq!(after.checkpoint.stage,Stage::Reconcile,"owner resume must make the failed internal attempt runnable");
             assert_eq!(after.checkpoint.binding,checkpoint.binding);
@@ -141,6 +186,53 @@ mod tests {
     }
 
     #[test]
+    fn owner_resume_can_queue_native_cleanup_without_claiming_quiescence() {
+        let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        let id=store.submit_authorized("request","github:owner",&request(1),1).unwrap().workflow;
+        store.register(&id,"candidate",binding(),2).unwrap();let lease=store.claim(&id,"worker",3,100).unwrap().unwrap();
+        let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+        checkpoint.stage=Stage::Held;checkpoint.next=NextAction {reason:"adopted_execution_retry".into(),action:"resume_preserved_pr".into(),eligible_at_ms:1000};
+        store.checkpoint(&lease,&checkpoint,4).unwrap();store.register_native_owner(&lease,dir.path().join("audit").to_str().unwrap(),5).unwrap();store.release(&lease,6).unwrap();
+        let control=store.set_owner_pause(&id,"github:owner",0,false,7).expect("the operator must be able to queue cleanup for the worker");
+        assert!(!control.paused);
+        let after=store.snapshot(&id).unwrap().unwrap().checkpoint;
+        assert_eq!(after.stage,Stage::Held,"queued cleanup is not teardown proof");
+        assert_eq!(after.next.reason,"owner_execution_retry_pending");
+        assert_eq!(after.next.eligible_at_ms,1000);
+        assert!(store.claim_productive(&id,"next",1001,100).unwrap().is_none());
+        drop(store);
+        let mut recovered=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        assert_eq!(recovered.settle_owner_execution_retries(1002,16).unwrap(),0);
+        recovered.complete_native_retirement(&id,lease.generation,dir.path().join("audit").to_str().unwrap(),1003).unwrap();
+        assert_eq!(recovered.settle_owner_execution_retries(1004,16).unwrap(),1,"queued retry must survive reopening the store");
+        assert_eq!(recovered.snapshot(&id).unwrap().unwrap().checkpoint.stage,Stage::Reconcile);
+    }
+
+    #[test]
+    fn blocked_cleanup_requests_do_not_starve_a_ready_retry() {
+        let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        let mut ready=String::new();
+        for n in 1..=18 {
+            let id=store.submit_authorized(&format!("request-{n}"),"github:owner",&request(n),1).unwrap().workflow;
+            store.register(&id,"candidate",binding(),2).unwrap();
+            let lease=store.claim(&id,"worker",3,100).unwrap().unwrap();
+            let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+            checkpoint.stage=Stage::Held;
+            checkpoint.next=NextAction {reason:"adopted_execution_retry".into(),action:"resume_preserved_pr".into(),eligible_at_ms:1000};
+            store.checkpoint(&lease,&checkpoint,4).unwrap();
+            let audit=dir.path().join(format!("audit-{n}"));
+            store.register_native_owner(&lease,audit.to_str().unwrap(),5).unwrap();store.release(&lease,6).unwrap();
+            store.set_owner_pause(&id,"github:owner",0,false,10+n as i64).unwrap();
+            if n==18 {
+                store.complete_native_retirement(&id,lease.generation,audit.to_str().unwrap(),40).unwrap();ready=id;
+            }
+        }
+        assert_eq!(store.settle_owner_execution_retries(50,16).unwrap(),0);
+        assert_eq!(store.settle_owner_execution_retries(51,16).unwrap(),1,"blocked cleanup must rotate behind unobserved requests");
+        assert_eq!(store.snapshot(&ready).unwrap().unwrap().checkpoint.stage,Stage::Reconcile);
+    }
+
+    #[test]
     fn pending_owner_input_cannot_request_native_retirement_for_a_retry() {
         let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
         let origin=super::super::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
@@ -151,7 +243,7 @@ mod tests {
         store.checkpoint(&lease,&checkpoint,4).unwrap();
         store.register_native_owner(&lease,dir.path().join("audit").to_str().unwrap(),5).unwrap();store.release(&lease,6).unwrap();
         store.enqueue_owner_message(&super::super::discord_ingress::DiscordOrigin {message:45,..origin},&id,"Owner requirement",None,7).unwrap();
-        assert_eq!(store.request_execution_retry_retirement(&id,"github:owner",1,8).unwrap_err().to_string(),"owner-followup-pending");
+        assert_eq!(store.set_owner_pause(&id,"github:owner",1,false,8).unwrap_err().to_string(),"owner-followup-pending");
         let retirement:Option<String>=store.conn.query_row("SELECT retirement_reason FROM workflow_native_owner",[],|r|r.get(0)).unwrap();
         assert_eq!(retirement,None,"refused resume must not start teardown behind pending owner input");
         assert!(store.owner_control(&id).unwrap().unwrap().paused);
@@ -166,12 +258,18 @@ mod tests {
         checkpoint.stage=Stage::Held;checkpoint.next=NextAction {reason:"adopted_execution_retry".into(),action:"resume_preserved_pr".into(),eligible_at_ms:0};
         store.checkpoint(&lease,&checkpoint,4).unwrap();store.register_native_owner(&lease,dir.path().join("audit").to_str().unwrap(),5).unwrap();store.release(&lease,6).unwrap();
         store.set_owner_pause(&id,"github:owner",0,true,7).unwrap();store.set_owner_pause(&id,"github:owner",1,true,8).unwrap();
-        assert!(store.request_execution_retry_retirement(&id,"github:owner",1,9).is_err());
+        assert!(store.set_owner_pause(&id,"github:owner",1,false,9).is_err());
         assert_eq!(store.conn.query_row("SELECT retirement_reason FROM workflow_native_owner",[],|r|r.get::<_,Option<String>>(0)).unwrap(),None);
-        assert!(store.request_execution_retry_retirement(&id,"github:owner",2,10).unwrap());
-        assert!(store.set_owner_pause(&id,"github:owner",2,false,11).is_err(),"retirement intent cannot certify teardown");
-        assert_eq!(store.owner_control(&id).unwrap().unwrap().revision,2);
-        assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint,checkpoint);
+        store.set_owner_pause(&id,"github:owner",2,false,10).unwrap();
+        assert_eq!(store.settle_owner_execution_retries(11,16).unwrap(),0,"retirement intent cannot certify teardown");
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.stage,Stage::Held);
+        store.set_owner_pause(&id,"github:owner",3,true,12).unwrap();
+        store.complete_native_retirement(&id,lease.generation,dir.path().join("audit").to_str().unwrap(),13).unwrap();
+        assert_eq!(store.settle_owner_execution_retries(14,16).unwrap(),0,"a newer pause must fence the pending resume after cleanup");
+        assert_eq!(store.owner_control(&id).unwrap().unwrap().revision,4);
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.binding,checkpoint.binding);
+        store.set_owner_pause(&id,"github:owner",4,false,15).unwrap();
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.stage,Stage::Reconcile);
     }
 
     #[test]

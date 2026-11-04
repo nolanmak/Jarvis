@@ -72,19 +72,12 @@ pub(crate) async fn validate_command(repo: &Path, request: &Request) -> Result<(
     resolve(repo, request).await.map(|_| ())
 }
 
-/// Shared read-only execution admission, also used before clearing owner pause.
-/// Background dispatch still verifies deployed-service equality independently.
+/// Resume is a control request for the deployed worker, not native execution
+/// by the operator's terminal. Every productive dispatch still passes the full
+/// execution preflight inside that worker, including provider/resource gates.
 pub(crate) async fn command_readiness(repo:&Path,request:&Request)->Result<()> {
-    execution_preflight(repo,Some(request.target),ExecutionMode::Local,None).await
-}
-
-pub(crate) fn prepare_internal_execution_retry(path:&Path,id:&str,principal:&str,revision:i64)->Result<()> {
-    let mut store=crate::autoship_workflow::WorkflowStore::open(path)?;
-    let now=chrono::Utc::now().timestamp_millis();
-    if store.request_execution_retry_retirement(id,principal,revision,now)? {
-        workflow::reconcile_runtime_retirements_in(&mut store,now)?;
-    }
-    Ok(())
+    request.normalized()?;
+    crate::autoship_deployment::inspect(repo).await.preflight()
 }
 
 pub(super) async fn execution_preflight(repo:&Path,target:Option<Target>,mode:ExecutionMode,
@@ -861,6 +854,19 @@ else: raise Exception('unexpected request '+repr(a))
             "local execution requires an authorized target"
         );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "read-only admission probe requiring the normally deployed worker"]
+    async fn live_resume_uses_worker_readiness_from_a_nondelegated_operator() {
+        let repo=PathBuf::from(std::env::var_os("AUGMENTAGENT_LIVE_REPO").expect("production repository required"));
+        crate::autoship_deployment::inspect(&repo).await.preflight().expect("live worker must match its deployment configuration");
+        assert!(!augmentagent_channel_core::run_resources::readiness().await.permits_attempt,
+            "this regression must run from a nondelegated operator context");
+        let request=Request {repository:"nolanmak/jarvis".into(),target:Target::Pr(1669),provider:None,
+            until:crate::autoship_workflow::submission::Milestone::Merged};
+        let result=command_readiness(&repo,&request).await;
+        assert!(result.is_ok(),"a control request for the deployed worker must not require the operator's native execution delegation: {result:?}");
     }
 
     #[tokio::test]

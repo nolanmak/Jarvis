@@ -384,6 +384,10 @@ impl WorkflowStore {
                 workflow TEXT NOT NULL REFERENCES workflow(id), lease_generation INTEGER NOT NULL,
                 audit_path TEXT NOT NULL, retirement_reason TEXT, retired_at INTEGER,
                 attempted_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(workflow,lease_generation));
+            CREATE TABLE IF NOT EXISTS owner_execution_retry (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id), owner_revision INTEGER NOT NULL,
+                generation INTEGER NOT NULL, binding TEXT NOT NULL, state TEXT NOT NULL,
+                requested_at INTEGER NOT NULL, attempted_at INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS workflow_audit_generation (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), generation INTEGER NOT NULL,
                 lease_generation INTEGER NOT NULL, recovery TEXT NOT NULL);

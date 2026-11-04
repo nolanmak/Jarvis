@@ -1,5 +1,5 @@
-//! Authenticated adapters for owner dispatch controls. No checkpoint or hold is
-//! rewritten, and an accepted pause is never presented as completed teardown.
+//! Authenticated adapters for owner dispatch controls. Resume queues an internal
+//! retry for the worker; accepted controls never certify native teardown.
 use crate::autoship_workflow::WorkflowStore;
 use serde_json::{json,Value};
 use std::path::Path;
@@ -39,9 +39,6 @@ pub(crate) async fn apply(repo:&Path,path:&Path,id:&str,paused:bool)->(i32,Value
     if !paused {
         if let Err(e)=crate::self_improve::targeted::command_readiness(repo,&request).await {
             return failure(&id,3,"execution-readiness-blocked",format!("{e:#}"));
-        }
-        if let Err(e)=crate::self_improve::targeted::prepare_internal_execution_retry(path,&id,&principal,revision) {
-            return failure(&id,3,"execution-retry-teardown-blocked",format!("{e:#}"));
         }
     }
     let changed=(||->anyhow::Result<_> {
