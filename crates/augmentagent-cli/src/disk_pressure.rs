@@ -92,13 +92,28 @@ pub fn reclaim(
     Ok(reports)
 }
 
+/// An admission path usually names an output nobody has written yet, so the
+/// filesystem owing it headroom is the one holding its nearest existing
+/// ancestor. Naming that ancestor keeps a refusal diagnosable.
+fn admission_device(path: &Path) -> Result<u64> {
+    let mut candidate = Some(path);
+    while let Some(ancestor) = candidate {
+        if ancestor.exists() {
+            return crate::disk::device_id(ancestor).with_context(|| {
+                format!("cannot determine admission pressure filesystem for {}", ancestor.display())
+            });
+        }
+        candidate = ancestor.parent();
+    }
+    anyhow::bail!("admission path {} names no existing filesystem", path.display())
+}
+
 pub(crate) fn reclaim_roots_for_paths(
     roots: &[Root], paths: &[std::path::PathBuf], required: u64,
     held: Option<&TargetLeases>, dry_run: bool, procs: Option<&[BuildProc]>,
     refs: &References, headroom: &dyn Fn(&Path) -> Result<u64>,
 ) -> Result<Vec<RootReport>> {
-    let devices=paths.iter().map(|path|crate::disk::device_id(path)
-        .context("cannot determine admission pressure filesystem"))
+    let devices=paths.iter().map(|path|admission_device(path.as_path()))
         .collect::<Result<std::collections::BTreeSet<_>>>()?;
     anyhow::ensure!(!devices.is_empty(),"admission pressure requires a filesystem");
     reclaim_scoped_roots(roots,required,held,dry_run,procs,refs,headroom,Some(&devices))
@@ -325,21 +340,32 @@ mod tests {
         }
     }
 
+    /// A filesystem every Linux host mounts and no fixture can live on, so a
+    /// cross-filesystem scope is observable without a second writable mount
+    /// like `/dev/shm`, which a sandboxed runner need not offer. Scoping only
+    /// ever reads a path's device, so a read-only mount is evidence enough.
+    #[cfg(target_os="linux")]
+    const OTHER_FILESYSTEM: &str = "/proc/self";
+
     #[cfg(target_os="linux")]
     #[test]
     fn admission_pressure_preserves_an_unrelated_filesystem_even_when_both_are_low() {
         for dry_run in [true,false] {
-            let requested=Fixture::new();
-            let unrelated=Fixture::in_directory(tempfile::tempdir_in("/dev/shm").unwrap());
-            assert_ne!(std::fs::metadata(&requested.root.path).unwrap().dev(),
-                std::fs::metadata(&unrelated.root.path).unwrap().dev(),"fixture needs two real filesystems");
-            let reports=reclaim_roots_for_paths(&[unrelated.root.clone(),requested.root.clone()],
-                &[requested.root.path.join("future/output")],65536,None,dry_run,Some(&[]),&requested.refs,
-                &|path|Ok(if path.starts_with(&unrelated.root.path) && !unrelated.deps.exists() {65536} else {0})).unwrap();
+            let unrelated=Fixture::new();
+            let elsewhere=Path::new(OTHER_FILESYSTEM).join("future/output");
+            assert_ne!(admission_device(&elsewhere).unwrap(),
+                std::fs::metadata(&unrelated.root.path).unwrap().dev(),"fixture needs two filesystems");
+            let reports=reclaim_roots_for_paths(std::slice::from_ref(&unrelated.root),&[elsewhere],
+                65536,None,dry_run,Some(&[]),&unrelated.refs,&|_|Ok(0)).unwrap();
             assert!(unrelated.deps.exists(),"reclaimed warm cache on a filesystem unused by this admission");
-            assert!(!reports.iter().any(|r|r.path.starts_with(&unrelated.root.path.to_string_lossy().into_owned()) && r.removed>0),
-                "cleanup reported unrelated filesystem reclamation");
-            assert!(reports.iter().any(|r|r.path.starts_with(&requested.root.path.to_string_lossy().into_owned()) && r.removed>0));
+            assert!(reports.is_empty(),"cleanup reported unrelated filesystem reclamation");
+            // The same deficit on the admission's own filesystem is reclaimed,
+            // so the preservation above is scoping rather than inaction.
+            let requested=Fixture::new();
+            let reports=reclaim_roots_for_paths(std::slice::from_ref(&requested.root),
+                &[requested.root.path.join("future/output")],65536,None,dry_run,Some(&[]),
+                &requested.refs,&|_|Ok(0)).unwrap();
+            assert!(reports.iter().any(|r|r.removed>0));
             assert_eq!(requested.deps.exists(),dry_run);
         }
     }
@@ -354,12 +380,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn admission_scope_follows_a_future_output_to_its_containing_filesystem() {
+        let fixture = Fixture::new();
+        assert_eq!(
+            admission_device(&fixture.root.path.join("release/deps/not/yet/written.rlib")).unwrap(),
+            std::fs::metadata(&fixture.root.path).unwrap().dev()
+        );
+        assert!(admission_device(Path::new("")).is_err());
+    }
+
+    /// A scope naming more than one filesystem must reclaim on every root it
+    /// covers, not stop at the first device it resolves.
     #[cfg(target_os="linux")]
     #[test]
     fn admission_pressure_reclaims_each_explicitly_used_filesystem() {
         let first=Fixture::new();
-        let second=Fixture::in_directory(tempfile::tempdir_in("/dev/shm").unwrap());
-        let paths=vec![first.root.path.clone(),second.root.path.clone(),first.root.path.join("future/output")];
+        let second=Fixture::new();
+        let elsewhere=Path::new(OTHER_FILESYSTEM).to_path_buf();
+        assert_ne!(admission_device(&elsewhere).unwrap(),
+            admission_device(&first.root.path).unwrap(),"scope needs two filesystems");
+        let paths=vec![elsewhere,first.root.path.join("future/output"),second.root.path.clone()];
         reclaim_roots_for_paths(&[first.root.clone(),second.root.clone()],&paths,
             65536,None,false,Some(&[]),&first.refs,&|p|Ok(if p.starts_with(&first.root.path) {
                 if first.deps.exists(){0}else{65536}
