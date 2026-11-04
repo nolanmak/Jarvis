@@ -2298,3 +2298,13 @@ passes **402 tests without skips**; the focused managed Rust suite passes **34
 tests**, including the six feasibility cases and five controller cases, with 22
 opt-in guest tests ignored. This does not yet establish the final C proof or
 all-caller hold projection, and it does not enable production autoship.
+
+The unchanged original V3 protocol replay at `29a895ca` is **red**: it reached
+Cargo after the five original protocol scenarios and returned a prerequisite at
+`planner_request_cleanup` after **95.14 seconds**. Retained image inspection was
+read-only under the managed storage lease. No protocol fixture, counter,
+acceptance condition or resource grant was changed. Integration acceptance and
+the adapter replay remain blocked on this failure; it is not a passing native
+result. A bounded root-owned per-view exec-mediation observation now records the
+original acknowledgement, raw return status and notification counts to locate
+the failure, without granting publication/reuse/shipping authority.

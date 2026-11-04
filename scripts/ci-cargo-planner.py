@@ -1651,6 +1651,14 @@ def _unit(arguments):
         raw=supervisor.supervise(Path(value['directory'])/'cleanup',argv,forward_fds=forwarded,
             close_after_spawn=(stage_bootstrap,),return_raw_status=True,on_spawn=spawned,on_exec=executed)
         stage_bootstrap=None
+        if 'view' in value:
+            mediation.settle()
+            cache._write_record(Path(value['view']['root']).parent/'exec-mediation.json',{
+                'version':1,'kind':'ci-exec-mediation-observation','binding':value['binding'],
+                'command':value['command'],'ordinal':value['ordinal'],'returncode':raw,
+                'exec_observed':observed,'initial_attempts':sum(row['allowed'] for row in mediation.records),
+                'denied_execs':sum(not row['allowed'] for row in mediation.records),
+                'notification_errors':len(mediation.errors),'shipping_authority':False})
         mediation.check()
         cache._write_record(Path(value['directory'])/'exit-status.json',{'version':3,'binding':value['binding'],
             'command':value['command'],'ordinal':value['ordinal'],'returncode':raw,'exec_observed':observed})
@@ -1776,11 +1784,14 @@ class ExecMediation:
                 if list(map(int,row.split()[1:]))!=[self.uid]*4:raise FreshnessHold('invalidation_unsafe')
             self.initial=False;self.ack=True
 
-    def check(self):
+    def settle(self):
         self._stop.set()
         if self.thread is not None:
             self.thread.join(timeout=2)
             if self.thread.is_alive():raise FreshnessHold('cleanup_uncertain')
+
+    def check(self):
+        self.settle()
         if self.errors:raise FreshnessHold('cleanup_uncertain')
         if any(not record['allowed'] for record in self.records):raise FreshnessHold('input_census_unknown')
 
