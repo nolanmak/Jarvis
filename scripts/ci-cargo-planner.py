@@ -683,6 +683,7 @@ class GeneratedForests:
     artifact compatibility. Active producer changes remain refused at consume.
     """
     WORKSPACE=Path('/workspace')
+    _WORKER_UID=1000
 
     def __init__(self,lease,outputs):
         cache.validate_outputs(outputs);self.lease=lease;self.outputs=dict(outputs)
@@ -703,9 +704,9 @@ class GeneratedForests:
         result={}
         for name,kind in sorted(self.outputs.items()):
             path=unit_views.literal(self.WORKSPACE/name)
-            if kind=='directory':result[name]=planner_snapshot(path,owner=1000)
+            if kind=='directory':result[name]=planner_snapshot(path,owner=self._WORKER_UID)
             else:
-                mode,size,digest=unit_views._read(path,1000,False)
+                mode,size,digest=unit_views._read(path,self._WORKER_UID,False)
                 result[name]={'sha256':hashlib.sha256(json.dumps([list(unit_views._key(path.stat())),digest],separators=(',',':')).encode()).hexdigest(),
                     'entries':1,'bytes':size}
         return result
@@ -761,12 +762,12 @@ class GeneratedForests:
         for name,kind in sorted(self.outputs.items()):
             original=self.WORKSPACE/name
             if kind=='directory':
-                for row in unit_views.inventory(original,owner=1000,sealed=False):
+                for row in unit_views.inventory(original,owner=self._WORKER_UID,sealed=False):
                     path=Path(name)/os.fsdecode(bytes.fromhex(row[0]));key=os.fsdecode(path)
                     (directories if row[1]=='directory' else files).append(key);times[key]=(self.WORKSPACE/path).stat()
             else:files.append(name);times[name]=original.stat()
         prefixes=sorted({str(parent) for name in self.outputs for parent in Path(name).parents})
-        manifest=unit_views.copy_outputs(self.WORKSPACE,data,files,owner=1000,controller=os.geteuid(),
+        manifest=unit_views.copy_outputs(self.WORKSPACE,data,files,owner=self._WORKER_UID,controller=os.geteuid(),
             directories=directories,controller_prefixes=prefixes)
         for name,info in sorted(times.items(),key=lambda item:len(Path(item[0]).parts),reverse=True):
             os.utime(data/name,ns=(info.st_atime_ns,info.st_mtime_ns),follow_symlinks=False)

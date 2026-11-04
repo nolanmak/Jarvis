@@ -358,7 +358,8 @@ class PlannerProtocolTests(unittest.TestCase):
             (workspace/'dist/partial').write_bytes(b'failed producer output')
             command=str(uuid.uuid4());binding=self.publication_binding()
             workspace.chmod(0o555)
-            with patch.object(planner,'_source',return_value=target),patch.object(planner.GeneratedForests,'WORKSPACE',workspace):
+            with patch.object(planner,'_source',return_value=target),patch.object(planner.GeneratedForests,'WORKSPACE',workspace),\
+                    patch.object(planner.GeneratedForests,'_WORKER_UID',os.getuid()):
                 lease=planner.ExecutionLease(target,binding,command,None)
                 scope=workers.WorkerScope(control,os.getuid(),os.getgid(),['/usr/bin/false']);lease.bind_scope(scope)
                 process=subprocess.Popen(scope.argv);scope.attach(process);self.assertEqual(process.wait(timeout=5),1)
@@ -367,6 +368,24 @@ class PlannerProtocolTests(unittest.TestCase):
                     lease.finish(scope,stopped,outputs={'dist':'directory'},producer_succeeded=False)
                 self.assertFalse((generation/'completed-ci-commands'/(command+'.json')).exists())
                 self.assertEqual(planner.cache._read_record(lease.path)['phase'],'active')
+
+    def test_generated_public_inputs_require_the_declared_worker_owner_on_any_host_uid(self):
+        self.assertEqual(planner.GeneratedForests._WORKER_UID,1000)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);target=root/'target';target.mkdir()
+            workspace=root/'workspace';workspace.mkdir();(workspace/'dist').mkdir()
+            (workspace/'dist/output').write_bytes(b'worker output')
+            (workspace/'single').write_bytes(b'single output')
+            lease=SimpleNamespace(target=target)
+            with patch.object(planner.GeneratedForests,'WORKSPACE',workspace):
+                forest=planner.GeneratedForests(lease,{'dist':'directory','single':'file'})
+                with patch.object(planner.GeneratedForests,'_WORKER_UID',os.getuid()):
+                    snapshot=forest.public()
+                self.assertEqual(set(snapshot),{'dist','single'})
+                with patch.object(planner.GeneratedForests,'_WORKER_UID',os.getuid()+1),self.assertRaises(planner.FreshnessHold):
+                    forest.public()
+                with patch.object(planner.GeneratedForests,'_WORKER_UID',os.getuid()+1),self.assertRaises(planner.FreshnessHold):
+                    planner.GeneratedForests(lease,{'single':'file'}).public()
 
     def test_generated_forests_require_completed_original_scope_and_keep_sealed_inputs(self):
         workers=planner._load('forest_test_workers','ci-worker-scope.py')
@@ -379,7 +398,8 @@ class PlannerProtocolTests(unittest.TestCase):
             binding=self.publication_binding();first=str(uuid.uuid4());second=str(uuid.uuid4())
             outputs={'node_modules':'directory'}
             workspace.chmod(0o555)
-            with patch.object(planner,'_source',return_value=target),patch.object(planner.GeneratedForests,'WORKSPACE',workspace):
+            with patch.object(planner,'_source',return_value=target),patch.object(planner.GeneratedForests,'WORKSPACE',workspace),\
+                    patch.object(planner.GeneratedForests,'_WORKER_UID',os.getuid()):
                 lease=planner.ExecutionLease(target,binding,first,None)
                 scope=workers.WorkerScope(control,os.getuid(),os.getgid(),['/usr/bin/true']);lease.bind_scope(scope)
                 with self.assertRaises(planner.FreshnessHold):lease.generated_inputs(outputs)
@@ -419,7 +439,8 @@ class PlannerProtocolTests(unittest.TestCase):
             artifact=workspace/'dist/output';artifact.write_bytes(b'first')
             outputs={'dist':'directory'};binding=self.publication_binding();previous=None;checkpoints=[]
             workspace.chmod(0o555)
-            with patch.object(planner,'_source',return_value=target),patch.object(planner.GeneratedForests,'WORKSPACE',workspace):
+            with patch.object(planner,'_source',return_value=target),patch.object(planner.GeneratedForests,'WORKSPACE',workspace),\
+                    patch.object(planner.GeneratedForests,'_WORKER_UID',os.getuid()):
                 for index in range(3):
                     command=str(uuid.uuid4());lease=planner.ExecutionLease(target,binding,command,previous)
                     scope=workers.WorkerScope(control,os.getuid(),os.getgid(),['/usr/bin/true']);lease.bind_scope(scope)

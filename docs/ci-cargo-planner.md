@@ -2161,8 +2161,44 @@ and changed replacement metadata. Its original executable body, argv, streams,
 counters, cleanup and resource limits are unchanged.
 
 **380 Python CI tests pass without skips and 32 focused managed Rust tests
-pass** (20 native opt-ins excluded). Actual native validation of this revision
-is pending. Full runtime/toolchain/output and
+pass** (20 native opt-ins excluded). The actual native results for this executable revision are recorded below. Full runtime/toolchain/output and
 metadata input coverage, opaque producers and bounded publication restart,
 trusted dependency reuse, final C proof/API/audit and consumer/merge enforcement
 remain open. Complete-input/full-CI/shipping flags remain false.
+
+
+At executable `bf22a3a9`, the unchanged native protocol fixture passed in
+**116.64 seconds**. Six actual descriptor calls matched all delivered metadata
+fields and their original namespaces; 114 failed/unknown calls remained unbound.
+Selection restoration and replacement-metadata relevance passed. Original
+compiler counts `[3, 0]`, invalidated retry exit 101, six directory selections,
+29 unbound directory calls, signals, jobserver, metadata isolation and cleanup
+assertions all remained intact. Receipt:
+`/tmp/augmentagent-ci-descriptor-selection-20261103235935/receipt.json`, SHA-256
+`cf8d797120fd24c60165e2a89e0b22d3767e5b511112ee7dd521d33e6fccf248`.
+
+The original five-command adapter replay passed in **192.82 seconds** under the
+unchanged per-command deadlines and resource policy. Managed read-only inspection
+verified the original capture SHA, new descriptor namespace fields, selection/
+unbound-call accounting and durable descriptor relevance fields. Its compiler
+scopes had 20 and 22 actual fstat calls, all unbound. This establishes adapter
+capture/recovery compatibility; the preceding native protocol gate establishes
+positive descriptor selection. Unchanged cross-VM compiler counts remained zero
+and the generated change held. Receipt:
+`/tmp/augmentagent-ci-descriptor-adapter-20261104000151/receipt.json`; inspection:
+`/tmp/autoship-1703-descriptor-adapter-inspection-1.json`. Both native runs retain
+false complete-input/full-CI/shipping flags and zero autonomous merges claimed.
+
+Hosted CI exposed two additional integration defects. The generated-forest host
+fixtures assumed guest worker UID 1000 rather than the host fixture's own UID.
+`GeneratedForests` keeps the fixed production worker role at UID 1000 through a
+private class constant; host fixtures explicitly map that role to their temporary
+filesystem owner. Real foreign-owned directory and single-file outputs still
+refuse publication. The local Python suite now passes **381 tests without skips**.
+The hosted bridge failure is recorded in job 126287631330 of run 41742617176.
+
+The updater's embed-drift regression also reproduced a missing rebuild trigger
+for `ci-legacy-recovery-preview.py`: **99 passed / one failed**. The release
+rebuild pattern now includes that embedded helper. The same updater regression is now green: **100 passed / zero failed**. New
+managed Rust/native and hosted validation of the ownership-fixture change remain
+pending; these repairs change no live configuration or production cache.
