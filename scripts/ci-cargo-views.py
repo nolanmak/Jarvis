@@ -254,12 +254,12 @@ def toolchain_view(source,destination):
 
 def enter(root,unit,source,artifacts,bindings=(),source_bindings=None,declared_outputs=None,*,transport=None):
     phase=['planner_view_enter']
-    try:return _enter(root,unit,source,artifacts,bindings,phase,source_bindings,declared_outputs)
+    try:return _enter(root,unit,source,artifacts,bindings,phase,source_bindings,declared_outputs,transport)
     except BaseException as error:
         error.unit_view_stage=phase[0];raise
 
 
-def _enter(root,unit,source,artifacts,bindings,phase,source_bindings=None,declared_outputs=None):
+def _enter(root,unit,source,artifacts,bindings,phase,source_bindings=None,declared_outputs=None,transport=None):
     """Root-only entry from a sealed admitted unit bootstrap, before UID drop.
 
     The caller supplies controller-owned paths, not candidate mount arguments.
