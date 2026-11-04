@@ -148,7 +148,7 @@ impl Plan {
         Ok(())
     }
 }
-async fn git(root: &Path, args: &[&str]) -> Result<String> {
+pub(super) async fn git(root: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("/usr/bin/git")
         .args([
             "--no-replace-objects",

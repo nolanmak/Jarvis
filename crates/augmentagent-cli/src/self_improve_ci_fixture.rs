@@ -62,7 +62,7 @@ pub(in crate::self_improve) async fn scope<F: std::future::Future>(
     Ok(AUTHORITY_ROOT.scope(root, future).await)
 }
 
-pub(super) fn selected(root: &Path) -> Result<Option<String>> {
+pub(in crate::self_improve) fn selected(root: &Path) -> Result<Option<String>> {
     let scoped = AUTHORITY_ROOT.try_with(Clone::clone).ok();
     let Some(scoped) = scoped else {
         return Ok(None);

@@ -29,6 +29,8 @@ jobs:
       REQUIRE_ENFORCEABLE_SANDBOX: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install renderer, syscall-filter library and ripgrep
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id bridge-suites/bridge-suites/1"
       - name: Report sandbox capabilities

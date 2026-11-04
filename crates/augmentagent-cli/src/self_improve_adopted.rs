@@ -369,7 +369,7 @@ async fn execute(
             &criteria,
             aligned_review::ReviewContext {
                 qa_ok: true,
-                qa_notes: "Independent executable acceptance and full verification gate passed.",
+                qa_notes: "Independent executable acceptance passed; exact-head GitHub Actions required before merge.",
                 repair_round: round,
                 previous: previous.as_ref(),
                 environment_id: environment,

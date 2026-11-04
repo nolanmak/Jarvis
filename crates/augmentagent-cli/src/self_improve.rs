@@ -42,6 +42,8 @@ use augmentagent_channel_core::{build_workflow_reasoner as build_reasoner, Fallb
 
 #[path = "self_improve_ci.rs"]
 mod shared_ci;
+#[path = "self_improve_hosted_ci.rs"]
+mod hosted_ci;
 #[path = "self_improve_baseline_priority.rs"]
 mod baseline_priority;
 
@@ -1866,11 +1868,12 @@ async fn ready_for_merge(repo_root: &Path, pr: u64, draft: Option<bool>) -> Opti
 mod optional_checks;
 
 async fn checks_green(repo_root: &Path, pr: u64) -> Option<bool> {
-    // gh can return nonzero with valid JSON when an optional check is pending
-    // or failing. Decide from individual checks, not its aggregate exit code.
-    let (_, out, _) = run(&gh_bin(),
-        &["pr", "checks", &pr.to_string(), "--json", "name,state,link"], repo_root).await.ok()?;
-    ci_checks_green(&optional_checks::classify(repo_root,pr,&out).await)
+    let evidence = hosted_ci::observe(repo_root, Some(pr), None).await.ok()?;
+    match evidence.state.as_str() {
+        "passed" => Some(true),
+        "pending" | "failed" => Some(false),
+        _ => None,
+    }
 }
 
 fn is_optional_review_check(row: &serde_json::Value) -> bool {
@@ -1901,10 +1904,10 @@ fn failed_ci_checks(raw: &str) -> Vec<(String, Option<u64>)> {
 }
 
 async fn failed_ci_findings(repo_root: &Path, pr: u64) -> Option<String> {
-    // gh returns nonzero for red/pending checks, with valid JSON on stdout.
-    let (_, out, _) = run(&gh_bin(), &["pr", "checks", &pr.to_string(),
-        "--json", "name,bucket,link"], repo_root).await.ok()?;
-    let failed = failed_ci_checks(&optional_checks::classify(repo_root,pr,&out).await);
+    let evidence = hosted_ci::observe(repo_root, Some(pr), None).await.ok()?;
+    if evidence.state != "failed" { return None; }
+    let failed: Vec<_> = evidence.failures.iter().take(5).map(|row|
+        (row["name"].as_str().unwrap_or("unnamed check").to_owned(), row["job"].as_u64())).collect();
     if failed.is_empty() { return None; }
     let mut findings = String::from(
         "GitHub CI failed on the previously pushed PR head. Reproduce these failures \
@@ -1914,8 +1917,7 @@ async fn failed_ci_findings(repo_root: &Path, pr: u64) -> Option<String> {
     for (name, job) in failed {
         findings.push_str(&format!("\nFailed check: {name}\n"));
         if let Some(job) = job {
-            if let Ok((true, log, _)) = run(&gh_bin(), &["run", "view", "--job",
-                &job.to_string(), "--log-failed"], repo_root).await {
+            if let Ok((true, log, _)) = run(&gh_bin(), &["api", &format!("repos/{{owner}}/{{repo}}/actions/jobs/{job}/logs")], repo_root).await {
                 findings.push_str(&truncate_tail(&log, 2000));
             }
         }
@@ -4572,12 +4574,17 @@ fn changed_crates(paths: &str) -> Option<Vec<String>> {
 /// Build + test ONLY the given crates (#870). Used between revision rounds,
 /// where the full single-threaded workspace suite (~5 min) was re-verifying
 /// 30+ untouched crates after every round — ~20 of the 49 minutes of a
-/// three-round run. The FULL gate still runs exactly once before anything is
-/// pushed or merged; this trims the redundancy, not the bar.
+/// three-round run. Hosted CI now runs after publication; intermediate rounds
+/// record a pending publication preflight instead of starting local CI.
 async fn verification_gate_targeted(worktree: &Path, crates: &[String], audit: &Arc<augmentagent_channel_core::AuditLogger>) -> CiGateResult {
     CiGateResult(async {
-        gate_disk_guard()?;
-        shared_ci::targeted(worktree, crates, audit).await
+        #[cfg(test)]
+        if shared_ci::fixture::selected(worktree)?.is_some() {
+            gate_disk_guard()?;
+            return shared_ci::targeted(worktree, crates, audit).await;
+        }
+        let _ = crates;
+        hosted_ci::preflight(worktree, audit).await
     }.await)
 }
 
@@ -4593,8 +4600,12 @@ async fn gate_for_round(worktree: &Path, changed_paths: &str, audit: &Arc<augmen
 async fn verification_gate(worktree: &Path, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> CiGateResult {
     CiGateResult(async {
         audit.dispatch_allowed()?;
-        gate_disk_guard()?;
-        shared_ci::verify(worktree, audit).await
+        #[cfg(test)]
+        if shared_ci::fixture::selected(worktree)?.is_some() {
+            gate_disk_guard()?;
+            return shared_ci::verify(worktree, audit).await;
+        }
+        hosted_ci::preflight(worktree, audit).await
     }.await)
 }
 
@@ -4627,6 +4638,11 @@ impl CiGateResult {
             }
             Err(error)=>error,
         };
+        if error.downcast_ref::<hosted_ci::AwaitingHostedCi>().is_some() {
+            // Publication can proceed. Do not clear infrastructure history or
+            // record verification_gate_passed before GitHub has tested the head.
+            return Ok(Ok(()));
+        }
         // Capacity has its own durable recovery and accounting boundary.
         if workflow.audit_logger().resource_capacity_seen() {
             return Err(error);
@@ -5005,70 +5021,15 @@ struct RedMain {
     gate_err: Option<String>,
 }
 
-/// #932 — is `origin/main` red? The full verification gate runs once per
-/// main SHA on a clean detached worktree (sandboxed env, shared target dir)
-/// and the answer is cached against that exact source identity.
-/// Optional diagnosis has a typed deferred outcome when readiness or source
-/// cannot be proven; the loop yields without caching a verdict or model spend.
+/// Main health comes from exact-commit GitHub Actions. Incomplete or unknown
+/// hosted evidence yields without a local build or a cached red/green verdict.
 async fn main_is_red(repo_root: &Path) -> std::result::Result<Option<RedMain>, baseline_priority::Deferred> {
-    let sha = baseline_priority::fresh_source(repo_root).await?;
-    let path = baseline_cache_path();
-    let mut cache = BaselineCache::load(&path);
-    if cache.needs_full_check(&sha) {
-        let short = sha.get(..7).unwrap_or(&sha);
-        info!(
-            sha = short,
-            "self-improve: full gate on origin/main (once per main commit)"
-        );
-        baseline_priority::check(repo_root, &sha).await?;
-        let now = chrono::Utc::now();
-        let verdict = full_gate_on_main(repo_root, &sha).await;
-        baseline_priority::unchanged(repo_root, &sha).await?;
-        match verdict {
-            Ok(Ok(())) => cache.record_full(&sha, &[], None, now),
-            Ok(Err(gate_err)) => {
-                let text = format!("{gate_err:#}");
-                // #1407 (#960 item 1) — a gate that died on the box (full
-                // disk, OOM, network) says nothing about `main`. Recording
-                // it would hold the loop on a red verdict nothing re-checks.
-                if let Some(why) = baseline_infra_reason(&text) {
-                    warn!(
-                        sha = short,
-                        "full gate on origin/main failed on infra ({why}); verdict not recorded, \
-                         next tick re-runs it"
-                    );
-                    return Err(baseline_priority::Deferred::DiagnosticUnavailable);
-                }
-                let failing = failing_tests(&text);
-                warn!(
-                    sha = short,
-                    failing = %failing.join(", "),
-                    "origin/main is RED: {}",
-                    truncate(&text, 600)
-                );
-                cache.record_full(&sha, &failing, Some(truncate(&text, 4000)), now);
-            }
-            Err(e) => {
-                warn!("optional main diagnostic unavailable; yielding this tick: {e:#}");
-                return Err(baseline_priority::Deferred::DiagnosticUnavailable);
-            }
-        }
-        cache.save(&path);
-    }
-    if !cache.is_red(&sha) {
-        return Ok(None);
-    }
-    let gate_err = cache.gate_err_for(&sha).cloned();
-    let packages = gate_err
-        .as_deref()
-        .map(failing_packages)
-        .unwrap_or_default();
-    Ok(Some(RedMain {
-        failing: cache.failing_for(&sha).to_vec(),
-        packages,
-        gate_err,
-        sha,
-    }))
+    // Re-read hosted evidence on every observation: reruns can change the
+    // verdict without a new commit. Never reuse the legacy local-gate cache.
+    hosted_ci::main_status(repo_root).await.map_err(|error| {
+        warn!("GitHub main CI unavailable; yielding without local build: {error:#}");
+        baseline_priority::Deferred::DiagnosticUnavailable
+    })
 }
 
 /// `Some(reason)` when a red full-gate result is the harness's fault and must
@@ -5144,8 +5105,8 @@ fn red_main_title(red: &RedMain) -> String {
 
 fn red_main_body(red: &RedMain, recent_commits: &str) -> String {
     let mut b = format!(
-        "{RED_MAIN_MARKER}\nAuto-filed by the auto-PR loop: `origin/main` at `{}` fails its \
-         own verification gate, so every issue's gate is red until this is fixed. \
+        "{RED_MAIN_MARKER}\nAuto-filed by the auto-PR loop: `origin/main` at `{}` fails its GitHub Actions \
+         checks, so autonomous merges wait until this is fixed. \
          This issue outranks all other work.\n\n",
         red.sha
     );
@@ -13031,9 +12992,13 @@ for tool, arguments in [
             let body = &src[at..at + 900];
             assert!(body.contains("gate_disk_guard()?"), "{sig} skips the disk guard");
         }
-        // And the baseline must not cache an infra failure as red.
+        // Hosted main observations never enter local storage admission or
+        // reuse a cached local verdict; missing evidence yields the tick.
         let at = src.find("async fn main_is_red(").expect("main_is_red");
-        assert!(src[at..at + 2000].contains("baseline_infra_reason(&text)"));
+        let body = &src[at..src[at..].find("\n///").unwrap() + at];
+        assert!(body.contains("hosted_ci::main_status"));
+        assert!(!body.contains("gate_disk_guard"));
+        assert!(!body.contains("full_gate_on_main("));
     }
 
     #[test]
