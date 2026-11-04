@@ -122,6 +122,19 @@ async fn observe_with(
     serde_json::from_slice(&output.stdout).context("invalid hosted CI evidence")
 }
 
+fn job_diagnostics(log: &str) -> String {
+    log.split_inclusive('\n')
+        .map(|line| match line.split_once(' ') {
+            Some((timestamp, diagnostic))
+                if chrono::DateTime::parse_from_rfc3339(timestamp).is_ok() =>
+            {
+                diagnostic
+            }
+            _ => line,
+        })
+        .collect()
+}
+
 pub(super) async fn main_status(root: &Path) -> Result<Option<RedMain>> {
     let repository = workflow::canonical_repository(root).await?;
     let (ok, raw, _) = run(
@@ -153,7 +166,7 @@ pub(super) async fn main_status(root: &Path) -> Result<Option<RedMain>> {
                     )
                     .await
                     {
-                        diagnostics.push_str(&truncate_tail(&logs, 8000));
+                        diagnostics.push_str(&truncate_tail(&job_diagnostics(&logs), 8000));
                     }
                 }
             }
@@ -188,9 +201,28 @@ mod tests {
         );
         assert!(String::from_utf8_lossy(&result.stderr).contains("Ran 30 tests"));
     }
+    #[test]
+    fn timestamped_job_logs_retain_failed_test_and_package_identity() {
+        let logs = "2026-11-04T17:51:05.3266114Z failures:\n\
+2026-11-04T17:51:05.3266217Z     self_improve::progress_tests::approved_ready_pr_preserves_review_but_never_replays_uncertain_merge\n\
+2026-11-04T17:51:05.3266548Z     self_improve::progress_tests::background_queue_consumes_approved_command_without_rebuilding\n\
+2026-11-04T17:51:05.3267112Z \n\
+2026-11-04T17:51:05.3267686Z error: test failed, to rerun pass `-p augmentagent-cli --bin augmentagent`\n";
+        let diagnostics = job_diagnostics(logs);
+        assert_eq!(failing_tests(&diagnostics), vec![
+            "self_improve::progress_tests::approved_ready_pr_preserves_review_but_never_replays_uncertain_merge",
+            "self_improve::progress_tests::background_queue_consumes_approved_command_without_rebuilding"
+        ]);
+        assert_eq!(failing_packages(&diagnostics), vec!["augmentagent-cli"]);
+        assert_eq!(job_diagnostics("plain diagnostic\n"), "plain diagnostic\n");
+    }
+
     #[tokio::test]
     async fn prepublication_requires_a_checkout_without_claiming_a_passing_gate() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("hosted-ci-preflight-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let audit = test_resource_audit(directory.path());
         let error = preflight(directory.path(), &audit).await.unwrap_err();
         assert!(error.downcast_ref::<AwaitingHostedCi>().is_none());

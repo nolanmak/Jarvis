@@ -238,7 +238,7 @@ async fn approved_ready_pr_preserves_review_but_never_replays_uncertain_merge() 
         let root = dir.path();
         let gh = root.join("gh.py");
         std::fs::write(&gh, r#"#!/usr/bin/env python3
-import json, os, pathlib, sys, time
+import base64, importlib.util, json, os, pathlib, sys, time, urllib.parse
 root=pathlib.Path(os.environ['AUTOSHIP_PROGRESS_FIXTURE'])
 a=sys.argv[1:]
 with (root/'calls').open('a') as f: f.write(json.dumps(a)+'\n')
@@ -254,7 +254,10 @@ elif a[:2]==['pr','view']:
 elif a[:2]==['issue','view']: print(json.dumps(dict(body='Fix synthetic addition',author=dict(login='fixture-owner'))))
 elif a[:2]==['pr','diff']: print('src/synthetic.rs')
 elif a[:2]==['pr','checks']:
-    print(json.dumps([dict(name='rust',state=s['checks']),dict(name='CodeRabbit',state='FAILURE')])); sys.exit(1)
+    rows=[dict(name='rust',state=s['checks'])]
+    if '--required' not in a: rows.append(dict(name='CodeRabbit',state='FAILURE'))
+    print(json.dumps(rows)); sys.exit(0 if s['checks']=='SUCCESS' else 8)
+
 elif a[:2]==['api','graphql']:
     fields=dict(value.split('=',1) for i,value in enumerate(a) if i>0 and a[i-1]=='-f')
     if fields['query'].startswith('query AutoshipDirectMergePolicy'):
@@ -269,6 +272,37 @@ elif a[0]=='api' and '/rules/branches/main' in a[1]: print(json.dumps([dict(type
 elif a[0]=='api' and '/rulesets/1' in a[1]: print(json.dumps(dict(enforcement='active',bypass_actors=[])))
 elif a[0]=='api' and '/git/ref/heads/main' in a[1]: print(s['base'])
 elif a[0]=='api' and '/issues/' in a[1]: print(json.dumps(dict(state='open')))
+elif a[0]=='api' and any(part in a[1] for part in ['/contents/','/actions/','/pulls/20']):
+    policy=json.loads((root/'hosted-policy.json').read_text())
+    spec=importlib.util.spec_from_file_location('fixture_hosted_policy',root/'hosted-reader.py')
+    reader=importlib.util.module_from_spec(spec);spec.loader.exec_module(reader)
+    path=urllib.parse.urlsplit(a[1]).path
+    repository='fixture-owner/project'
+    workflow_paths=sorted(p for p,w in policy['contract']['workflows'].items() if w['role']=='validation')
+    if path.endswith('/pulls/20/files'):
+        print(json.dumps([dict(filename='src/synthetic.rs')]))
+    elif path.endswith('/pulls/20'):
+        print(json.dumps(dict(number=20,state='open',draft=s['draft'],changed_files=1,
+            head=dict(sha=s['head'],ref='agent-fix/issue-10'),
+            base=dict(sha=s['base'],ref='main',repo=dict(full_name=repository)))))
+    elif '/contents/' in path:
+        name=path.split('/contents/',1)[1]
+        print(json.dumps(dict(type='file',encoding='base64',content=base64.b64encode(policy['files'][name].encode()).decode())))
+    elif '/actions/workflows/' in path:
+        workflow='.github/workflows/'+urllib.parse.unquote(path.split('/actions/workflows/',1)[1].split('/runs')[0])
+        run=1000+workflow_paths.index(workflow)
+        # Real GitHub can report queued while Linux passed and macOS waits.
+        print(json.dumps(dict(workflow_runs=[dict(id=run,run_attempt=1,status='queued',head_sha=s['head'],
+            event='pull_request',path=workflow,repository=dict(full_name=repository),pull_requests=[dict(number=20)])])))
+    elif '/actions/runs/' in path and path.endswith('/jobs'):
+        run=int(path.split('/actions/runs/',1)[1].split('/')[0]);workflow=workflow_paths[run-1000]
+        names=reader.expected_jobs(policy['contract'],['src/synthetic.rs'],'pull_request').get(workflow,set())
+        jobs=[dict(id=run*100+i,run_id=run,run_attempt=1,head_sha=s['head'],name=name,
+            status='completed' if s['checks'] in ('SUCCESS','FAILURE') else 'queued',
+            conclusion={'SUCCESS':'success','FAILURE':'failure'}.get(s['checks'])) for i,name in enumerate(sorted(names),1)]
+        jobs.append(dict(id=run*100+99,run_id=run,run_attempt=1,head_sha=s['head'],name='Informational macOS',status='queued',conclusion=None))
+        print(json.dumps(dict(jobs=jobs)))
+    else: raise Exception('unexpected hosted evidence request '+repr(a))
 elif a[0]=='api': print('[]')
 elif a[:2]==['pr','edit']: time.sleep(30)
 elif a[:2]==['pr','ready']:
@@ -280,6 +314,21 @@ elif a[:2]==['pr','merge']:
 else: raise Exception('unexpected call '+repr(a))
 "#).unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Serve the real pinned inventory through the same GitHub API reader
+        // used in production. No synthetic "CI passed" override is installed.
+        let policy_raw = include_str!("../../../scripts/ci-contract.json");
+        let policy: serde_json::Value = serde_json::from_str(policy_raw).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = serde_json::Map::new();
+        for path in policy["workflows"].as_object().unwrap().keys() {
+            files.insert(path.clone(), std::fs::read_to_string(source.join(path)).unwrap().into());
+        }
+        files.insert("scripts/ci-contract.json".into(), policy_raw.into());
+        files.insert("scripts/ci-contract.py".into(), include_str!("../../../scripts/ci-contract.py").into());
+        std::fs::write(root.join("hosted-policy.json"), serde_json::to_vec(&serde_json::json!({
+            "contract":policy,"files":files
+        })).unwrap()).unwrap();
+        std::fs::write(root.join("hosted-reader.py"), include_str!("../../../scripts/autoship-hosted-ci.py")).unwrap();
         std::fs::create_dir(root.join("home")).unwrap();
         std::fs::create_dir(root.join("cache")).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
