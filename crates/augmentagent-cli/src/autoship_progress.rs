@@ -134,7 +134,9 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     let control:Option<bool>=tx.query_row("SELECT paused FROM workflow_owner_control WHERE workflow=?1",[workflow],|r|r.get(0)).optional()?;
     if control==Some(true) {kind="blocked".into();reason="owner-pause-requested".into();action="await_owner_resume".into();}
     else if source=="owner_control_changed" {kind="resume-requested".into();reason="owner-resume-accepted".into();action="await_worker".into();}
-    let terminal=confirmed || stage==Some(Stage::Retired);
+    let external_merge=checkpoint.as_ref().is_some_and(|c|c.stage==Stage::Merged && c.next.reason=="external_merge_reconciled");
+    let terminal=confirmed || external_merge || stage==Some(Stage::Retired);
+    if external_merge {kind="merged".into();reason="external-merge-observed".into();action="complete".into();eligible=None;}
     if confirmed {stage=Some(Stage::Merged);kind="merged".into();reason="autonomous-merge-confirmed".into();action="inspect_deployment".into();eligible=None;}
     let evidence=checkpoint.as_ref().map(|c|(&c.binding,&c.evidence,&c.next.reason,&c.next.action));
     let evidence_digest=format!("{:x}",Sha256::digest(serde_json::to_vec(&evidence)?));
@@ -143,7 +145,7 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     let sequence=previous.as_ref().map_or(1,|p|p.0+i64::from(changed));
     let progress=Progress {workflow:workflow.into(),sequence,kind,stage,reason,next_action:action,eligible_at_ms:eligible,
         pr:snapshot.and_then(|s|s.1),requested_provider,actual_provider:None,
-        merge_state:if confirmed {"observed-autonomous-merge"} else {"not-confirmed"}.into(),deployment_state:"unknown".into(),evidence_digest,observed_at_ms:now};
+        merge_state:if confirmed {"observed-autonomous-merge"} else if external_merge {"observed-external-merge"} else {"not-confirmed"}.into(),deployment_state:"unknown".into(),evidence_digest,observed_at_ms:now};
     let payload=serde_json::to_string(&progress)?;
     if changed {tx.execute("INSERT INTO workflow_progress_event(workflow,sequence,payload,created_at) VALUES(?1,?2,?3,?4)",params![workflow,sequence,payload,now])?;}
     tx.execute("INSERT INTO workflow_progress_state VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workflow) DO UPDATE SET sequence=excluded.sequence,fingerprint=excluded.fingerprint,terminal=excluded.terminal,payload=excluded.payload",params![workflow,sequence,fingerprint,terminal,payload])?;

@@ -807,6 +807,11 @@ else:raise Exception('unexpected request '+repr(a))
             assert_eq!(status["milestones"]["merged"], true);
             let allowance = store.merge_allowance(now, 5).unwrap();
             assert_eq!((allowance.confirmed, allowance.available), (0, 5), "manual merge debited the autonomous allowance");
+            let progress=store.progress_events(&ids[0]).unwrap();
+            let merged=progress.last().unwrap();
+            assert_eq!(merged.kind,"merged","manual completion must not look like unresolved merge reconciliation");
+            assert_eq!(merged.merge_state,"observed-external-merge");
+            assert_eq!(merged.deployment_state,"unknown","merge observation is not deployment proof");
             // Closed unmerged PR and closed issue: terminal, never retried.
             for id in [&ids[1], &ids[2]] {
                 assert_eq!(stage(id).stage, Stage::Retired, "{id}");

@@ -20,7 +20,7 @@ impl WorkflowStore {
         let next=(destination.bot.to_string(),destination.owner.to_string(),destination.channel.to_string());
         if prior.as_ref()==Some(&next) {return Ok(false);}
         let workflows={
-            let mut query=tx.prepare("SELECT workflow FROM workflow_progress_state WHERE terminal=0 ORDER BY workflow")?;
+            let mut query=tx.prepare("SELECT p.workflow FROM workflow_progress_state p LEFT JOIN workflow w ON w.id=p.workflow WHERE p.terminal=0 AND (w.id IS NULL OR json_extract(w.checkpoint,'$.stage') NOT IN ('merged','retired')) ORDER BY p.workflow")?;
             let rows=query.query_map([],|r|r.get::<_,String>(0))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
@@ -253,6 +253,22 @@ mod tests {
         store.configure_delivery("owner/repo","github:owner",destination(33),6).unwrap();
         assert!(store.pending_progress(11,22).unwrap().is_empty(),"configuring updates must not replay old terminal milestones");
         assert!(!store.progress_events(&id).unwrap().is_empty(),"archived terminal receipts must remain readable");
+    }
+
+    #[test]
+    fn legacy_manual_merge_projection_is_not_replayed_when_configuring_updates() {
+        let (_dir,mut store,id)=setup();
+        store.register(&id,"candidate",Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()},2).unwrap();
+        let lease=store.claim(&id,"worker",3,100).unwrap().unwrap();
+        let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+        checkpoint.stage=Stage::Merged;checkpoint.next.reason="external_merge_reconciled".into();
+        store.checkpoint(&lease,&checkpoint,4).unwrap();store.release(&lease,5).unwrap();
+        // Existing installations stored external merges as nonterminal progress.
+        store.conn.execute("UPDATE workflow_progress_state SET terminal=0 WHERE workflow=?1",[&id]).unwrap();
+        store.configure_delivery("owner/repo","github:owner",destination(33),6).unwrap();
+        assert!(store.pending_progress(11,22).unwrap().is_empty(),"old manually merged PRs must not flood a newly configured destination");
+        assert!(!store.progress_events(&id).unwrap().is_empty());
+        assert_eq!(store.merge_allowance(7,5).unwrap().confirmed,0);
     }
 
     #[test]
