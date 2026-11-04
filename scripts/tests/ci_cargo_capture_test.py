@@ -16,7 +16,7 @@ class CaptureRootsTests(unittest.TestCase):
     def capture(self,source,destination,roots=('out',),*,check=lambda:None,owners=None):
         descriptor=os.open(source,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
         try:return views.capture_roots(descriptor,destination,list(roots),
-            owners=(os.getuid(),) if owners is None else owners,check=check)
+            owners=tuple(sorted({os.getuid(),os.getgid()})) if owners is None else owners,check=check)
         finally:os.close(descriptor)
 
     def tree(self,root):

@@ -239,6 +239,19 @@ record; the detached copies do not yet emulate it. Complete writable-alias
 closure, metadata/runtime behavior, signal-at-pause cases and the child grant
 therefore remain closed gates, with false complete-input/CI/shipping flags.
 
+At `f8316da4`, the unchanged native replay staged 64,832 bytes across 21 entries
+from the actual frozen compiler view. Its 288.25-second elapsed time includes
+shared storage admission waiting. A subsequent read-only image inspection under
+the managed lease independently verified all four payload files, their digests,
+root ownership, sealed modes, complete staged membership and the payload digest.
+The original request/scope, capture-record hash, immutable pause hash and separate
+verified-thaw observation agree. The preceding 96.54-second run at `5139e30b`
+exposed mutation of the pause hash preimage when thaw was added; the fix keeps
+thaw outside the frozen observation. All 423 Python tests and 34 focused Rust
+tests pass. The full native protocol remains red at the held child grant. These
+are byte-staging observations; metadata emulation, complete alias closure,
+contained execution and final CI authority remain unproved.
+
 An opaque parent stays stopped during its contained call. Child stdout/stderr
 use their original admitted descriptions; fd 0 uses staged bytes as above. The
 controller and external Cargo caller remain runnable. Worker-origin capture uses
