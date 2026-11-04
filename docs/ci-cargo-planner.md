@@ -2567,3 +2567,17 @@ inventories and preserve original atime. The same base fingerprint is checked
 again under the original cgroup freeze before capture. This closes a private
 base DAC prerequisite only; whole-UID writer/alias/kernel-resource closure and
 checked transfer/resume still remain required. All CI authority flags stay false.
+
+Native replay `ae25e429` now retains the original entry/layout/binding records
+beside each controller-owned view before the first instruction grant. Managed
+read-only inspection validates all 23 unit boundaries, including the original
+compiler/probe units whose scope receipts otherwise disappear with the guest
+controller tree. Each private base has 23 checked entries; all 16 frozen-parent
+base hashes join to the same original boundary and scope. The admitted mount
+counts are 15 for initial views and 20 for detached working views. All four
+deepest children returned zero; two sealed ELF outputs were independently
+verified. The full original test remains red with InputCensusUnknown after
+104.57 seconds; original VM subtree cleanup is positively verified. This is
+private-base prerequisite evidence, not complete writer/alias/resource closure,
+result application/resume or passing-CI authority. The host suites pass 617
+Python tests and 34 focused managed Rust tests.
