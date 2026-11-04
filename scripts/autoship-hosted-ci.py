@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Controller-owned GitHub Actions evidence reader. Never executes repository code.
+The controller supplies its embedded CI inventory; candidates cannot choose jobs.
+Unknown, incomplete, changed-policy, or stale evidence holds instead of passing.
+"""
+import base64
+import hashlib
+import itertools
+import json
+import re
+import subprocess
+import sys
+import urllib.parse
+
+
+def match_path(path, pattern):
+    expression = re.escape(pattern).replace(r'\*\*/', '(?:.*/)?').replace(r'\*\*', '.*').replace(r'\*', '[^/]*').replace(r'\?', '[^/]')
+    return re.fullmatch(expression, path) is not None
+
+
+def applicable(trigger, changed):
+    trigger = trigger or {}
+    if not changed:
+        return True
+    if 'paths' in trigger:
+        for path in changed:
+            matched = False
+            for pattern in trigger['paths']:
+                if match_path(path, pattern.lstrip('!')):
+                    matched = not pattern.startswith('!')
+            if matched:
+                return True
+        return False
+    return any(not any(match_path(path, p) for p in trigger.get('paths-ignore', [])) for path in changed)
+
+
+def resolve(value, matrix):
+    def replace(match):
+        key = match.group(1).strip()
+        if not key.startswith('matrix.') or key[7:] not in matrix:
+            raise ValueError('unsupported hosted CI expression')
+        return str(matrix[key[7:]])
+    return re.sub(r'\$\{\{(.*?)\}\}', replace, value)
+
+
+def expected_jobs(contract, changed, event):
+    result = {}
+    for path, workflow in contract['workflows'].items():
+        if workflow['role'] != 'validation' or event not in workflow['events']:
+            continue
+        if not applicable(workflow['events'][event], changed):
+            continue
+        names = set()
+        for key, job in workflow['jobs'].items():
+            if job.get('if'):
+                raise ValueError('unsupported hosted CI job condition')
+            matrix = job.get('strategy', {}).get('matrix', {})
+            if matrix.get('include'):
+                raise ValueError('unsupported hosted CI matrix include')
+            keys = [k for k in matrix if k != 'exclude']
+            rows = [dict(zip(keys, v)) for v in itertools.product(*(matrix[k] for k in keys))] if keys else [{}]
+            for row in rows:
+                if any(all(row.get(k) == v for k, v in exc.items()) for exc in matrix.get('exclude', [])):
+                    continue
+                runner = resolve(job['runs-on'], row)
+                if runner.startswith('macos-'):
+                    continue
+                if not re.fullmatch(r'ubuntu-(latest|[0-9]+\.[0-9]+)(-arm)?', runner):
+                    raise ValueError('unsupported hosted CI runner')
+                name = resolve(job.get('name', key), row)
+                if row and 'name' not in job:
+                    name += ' (' + ', '.join(str(row[k]) for k in keys) + ')'
+                if name in names:
+                    raise ValueError('ambiguous hosted CI job name')
+                names.add(name)
+        if names:
+            result[path] = names
+    return result
+
+
+def job_verdict(expected, jobs):
+    latest = {}
+    for job in jobs:
+        name = job['name']
+        if name not in latest or job['id'] > latest[name]['id']:
+            latest[name] = job
+    failures = []
+    pending = False
+    for name in sorted(expected):
+        job = latest.get(name)
+        if job is None or job['status'] != 'completed':
+            pending = True
+        elif job['conclusion'] in ('failure', 'timed_out', 'startup_failure'):
+            failures.append({'name': name, 'job': job['id'], 'url': job.get('html_url', '')})
+        elif job['conclusion'] != 'success':
+            pending = True
+    return ('failed' if failures else 'pending' if pending else 'passed'), failures
+
+
+def run_matches(run, repository, head, event, path):
+    return (isinstance(run.get('id'), int) and run.get('head_sha') == head
+            and run.get('event') == event and run.get('path') == path
+            and str(run.get('repository', {}).get('full_name', '')).casefold() == repository.casefold())
+
+
+class GitHub:
+    def __init__(self, binary):
+        self.binary = binary
+
+    def api(self, endpoint):
+        done = subprocess.run([self.binary, 'api', endpoint], capture_output=True, text=True, timeout=30)
+        if done.returncode:
+            raise ValueError('GitHub evidence unavailable')
+        return json.loads(done.stdout)
+
+    def pages(self, endpoint, key=None):
+        rows = []
+        for page in range(1, 101):
+            data = self.api(endpoint + ('&' if '?' in endpoint else '?') + f'per_page=100&page={page}')
+            batch = data[key] if key else data
+            if not isinstance(batch, list):
+                raise ValueError('invalid GitHub page')
+            rows.extend(batch)
+            if len(batch) < 100:
+                return rows
+        raise ValueError('GitHub evidence pagination incomplete')
+
+
+def evaluate(request, github):
+    repository = request['repository']
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
+        raise ValueError('invalid repository')
+    prefix = f'repos/{repository}'
+    pr = request.get('pr')
+    pull = github.api(f'{prefix}/pulls/{pr}') if pr else None
+    event = 'pull_request' if pull else 'push'
+    head = pull['head']['sha'] if pull else request['head']
+    if not re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}', head):
+        raise ValueError('invalid source head')
+    if pull and (pull['base']['ref'] != 'main' or pull['state'] != 'open' or pull['base']['repo']['full_name'].casefold() != repository.casefold()):
+        raise ValueError('PR source identity unavailable')
+    changed = []
+    if pull:
+        files = github.pages(f'{prefix}/pulls/{pr}/files')
+        if len(files) != pull['changed_files'] or len(files) >= 3000:
+            raise ValueError('PR changed paths incomplete')
+        changed = [f['filename'] for f in files]
+        changed.extend(f['previous_filename'] for f in files if 'previous_filename' in f)
+    else:
+        if github.api(f'{prefix}/branches/main')['commit']['sha'] != head:
+            raise ValueError('main source moved')
+    contract = request['contract']
+    # Bind the actual executed workflow and helper bytes to controller policy.
+    # Changes to CI policy wait for a reviewed controller rollout, rather than
+    # allowing model-written checks to certify themselves.
+    policy = dict(request['policy_files'])
+    for path, workflow in contract['workflows'].items():
+        if workflow['role'] == 'validation':
+            policy[path] = workflow['sha256']
+    # The merge tree runs on PRs, so check both parents for policy changes.
+    refs = {head}
+    if pull:
+        refs.add(pull['base']['sha'])
+    for ref in refs:
+        for path, expected in policy.items():
+            content = github.api(f'{prefix}/contents/{path}?ref={ref}')
+            if content.get('encoding') != 'base64' or content.get('type') != 'file':
+                raise ValueError('CI policy source unavailable')
+            if hashlib.sha256(base64.b64decode(content['content'])).hexdigest() != expected:
+                raise ValueError('CI policy changed; reviewed controller rollout required')
+    expected = expected_jobs(contract, changed, event)
+    # These two always run and cannot disappear with path filters.
+    if not {'privacy', 'node-release'}.issubset(set().union(*expected.values()) if expected else set()):
+        raise ValueError('mandatory release checks missing from controller policy')
+    failures = []
+    pending = False
+    receipts = []
+    for path, names in sorted(expected.items()):
+        workflow = urllib.parse.quote(path.rsplit('/', 1)[1], safe='')
+        runs = github.pages(f'{prefix}/actions/workflows/{workflow}/runs?head_sha={head}&event={event}', 'workflow_runs')
+        runs = [r for r in runs if run_matches(r, repository, head, event, path)
+                and (not pull or any(p.get('number') == pr for p in r.get('pull_requests', [])))
+                and (pull or r.get('head_branch') == 'main')]
+        if not runs:
+            pending = True
+            continue
+        run = max(runs, key=lambda r: r['id'])
+        # filter=latest includes the current attempt, not previous green reruns.
+        jobs = github.pages(f"{prefix}/actions/runs/{run['id']}/jobs?filter=latest", 'jobs')
+        if any(j.get('run_id') != run['id'] for j in jobs):
+            raise ValueError('job/run identity mismatch')
+        state, failed = job_verdict(names, jobs)
+        failures.extend(failed)
+        pending |= state == 'pending'
+        receipts.append({'workflow': path, 'run': run['id'], 'attempt': run['run_attempt'], 'jobs': sorted(names), 'state': state})
+    # Additional branch-protection contexts (including explicitly required macOS)
+    # remain mandatory. gh resolves both rulesets and legacy branch protection.
+    if pull:
+        done = subprocess.run([github.binary, 'pr', 'checks', str(pr), '--repo', repository,
+                               '--required', '--json', 'name,state'], capture_output=True, text=True, timeout=30)
+        if done.returncode not in (0, 1, 8):
+            raise ValueError('required branch checks unavailable')
+        checks = json.loads(done.stdout)
+        if not checks:
+            raise ValueError('required branch checks unavailable')
+        pending |= any(c['state'] != 'SUCCESS' for c in checks)
+        current = github.api(f'{prefix}/pulls/{pr}')
+        if current['head']['sha'] != head or current['base']['sha'] != pull['base']['sha'] or current['state'] != 'open':
+            raise ValueError('PR moved during CI observation')
+    elif github.api(f'{prefix}/branches/main')['commit']['sha'] != head:
+        raise ValueError('main moved during CI observation')
+    return {'state': 'failed' if failures else 'pending' if pending else 'passed',
+            'head': head, 'failures': failures, 'receipts': receipts}
+
+
+def main():
+    try:
+        request = json.load(sys.stdin)
+        result = evaluate(request, GitHub(request['gh']))
+    except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as error:
+        result = {'state': 'unknown', 'reason': str(error)}
+    print(json.dumps(result, separators=(',', ':')))
+
+
+if __name__ == '__main__':
+    main()
