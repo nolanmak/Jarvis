@@ -329,7 +329,16 @@ The result is an observation with `effects_materialized:false`; it does not
 mutate the parent, resume it or complete the transfer intent below. Real host
 filesystem cases cover write→unlink, rename-over-existing, directory rename,
 parent drift, extra hardlinks, descriptor exhaustion, exec inheritance,
-cancellation and payload corruption. Guest retention evidence is pending.
+cancellation and payload corruption. At `3d5097d2`, the unchanged guest replay
+completed in 100.39 seconds, again ending at the deliberate unmaterialized-effect
+hold. Read-only inspection under the managed lease independently verified all
+seven old inode payload files (64,832 bytes), their hashes, root ownership and
+sealed modes. Their exact binding, command, ordinal and child/parent scopes
+agree with the original exec observation/grant, leaf exit zero and cleanup.
+The original execution resource subtree was positively removed; the waiting
+parent remained held. All 446 Python tests and 34 focused Rust tests pass.
+This proves retained-byte integration, not final-path transfer, parent resume,
+complete alias closure, full CI or shipping authority.
 
 A rename is an identity-preserving namespace move in this graph, including
 rename-over-existing and directory descendants. Persist its original/final path
