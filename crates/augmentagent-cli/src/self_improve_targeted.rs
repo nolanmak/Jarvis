@@ -625,6 +625,113 @@ else:raise Exception('unexpected request '+repr(a))
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    /// A command job's bound target can change state outside the loop (a human
+    /// merges or closes the PR, or closes the issue). Those settle the workflow
+    /// terminally; a genuine identity mismatch still refuses, but only that job.
+    #[tokio::test]
+    async fn bound_target_lifecycle_settles_without_failing_the_tick() {
+        const CHILD: &str = "AUTOSHIP_TARGET_LIFECYCLE_FIXTURE";
+        if let Some(root) = std::env::var_os(CHILD) {
+            use crate::autoship_workflow::{Binding, NextAction, Stage, WorkflowStore};
+            let root = PathBuf::from(root);
+            let issue = |n: u64, state: &str| serde_json::json!({"number":n,"state":state,
+                "html_url":format!("https://github.com/owner/repo/issues/{n}"),"title":"Fix","body":"Fix it",
+                "user":{"login":"owner"},"author_association":"OWNER"});
+            let pr = |n: u64, state: &str, repository: &str| serde_json::json!({"number":n,"state":state,
+                "url":format!("https://github.com/{repository}/pull/{n}"),"headRefName":format!("agent/{n}"),
+                "headRefOid":"a".repeat(40),"baseRefName":"main","isCrossRepository":false,"author":{"login":"owner"},
+                "title":"Fix","body":"Fix it","closingIssuesReferences":[],
+                "mergeCommit":if state=="MERGED" {serde_json::json!({"oid":"c".repeat(40)})} else {serde_json::Value::Null}});
+            std::fs::write(root.join("scenario.json"), serde_json::json!({"permission":"WRITE",
+                "issues":{"7":issue(7,"open"),"8":issue(8,"open"),"9":issue(9,"closed"),"10":issue(10,"open"),"11":issue(11,"open")},
+                "prs":{"42":pr(42,"MERGED","owner/repo"),"43":pr(43,"CLOSED","owner/repo"),"44":pr(44,"OPEN","foreign/repo")}}).to_string()).unwrap();
+            let path = workflow::path();
+            let mut store = WorkflowStore::open(&path).unwrap();
+            let mut ids = Vec::new();
+            // (issue, bound PR): merged by hand, closed unmerged, closed issue,
+            // foreign PR identity, and an ordinary healthy job queued last.
+            for (at, (number, bound)) in [(7, Some(42)), (8, Some(43)), (9, None), (10, Some(44)), (11, None)].into_iter().enumerate() {
+                let request = Request {repository:"owner/repo".into(),target:Target::Issue(number),provider:None,until:Milestone::Merged};
+                let id = store.submit_authorized(&format!("job-{number}"), "github:owner", &request, at as i64 + 1).unwrap().workflow;
+                if number != 11 {
+                    store.register(&id, &format!("agent/{number}"), Binding {head:"b".repeat(40),contract:"c1".into(),evidence_hash:"e1".into()}, 10).unwrap();
+                    let lease = store.claim(&id, "setup", 20, 1000).unwrap().unwrap();
+                    if let Some(pr) = bound { store.attach_pr(&lease, pr, 21).unwrap(); }
+                    let mut checkpoint = store.snapshot(&id).unwrap().unwrap().checkpoint;
+                    checkpoint.stage = Stage::Verify;
+                    checkpoint.next = NextAction {reason:"verification_infrastructure_retry".into(),action:"retry_verification".into(),eligible_at_ms:0};
+                    store.checkpoint(&lease, &checkpoint, 22).unwrap();
+                    store.release(&lease, 23).unwrap();
+                }
+                ids.push(id);
+            }
+            drop(store);
+            let mut reports = Vec::new();
+            for _ in &ids {
+                // One command turn, then the alternating automatic-lane turn
+                // (which defers on the fixture's missing runtime).
+                reports.push(run_once(&root, false).await.map(|r| r.to_string()).map_err(|e| format!("{e:#}")));
+                let _ = run_once(&root, false).await;
+            }
+            let store = WorkflowStore::open(&path).unwrap();
+            let stage = |id: &str| store.snapshot(id).unwrap().unwrap().checkpoint;
+            let now = chrono::Utc::now().timestamp_millis();
+            // Merged outside the loop: complete, recorded as a manual merge,
+            // never debiting the autonomous allowance.
+            assert!(reports[0].is_ok(), "manual merge must not fail the tick: {:?}", reports[0]);
+            assert_eq!(stage(&ids[0]).stage, Stage::Merged);
+            assert_eq!(stage(&ids[0]).next.reason, "external_merge_reconciled");
+            assert!(stage(&ids[0]).evidence.iter().any(|e| e == &format!("github:pr:42:merged-externally:{}", "c".repeat(40))));
+            let (_, status) = crate::autoship_commands::status(&path, &ids[0], now, 5);
+            assert_eq!(status["complete"], true, "{status}");
+            assert_eq!(status["milestones"]["merged"], true);
+            let allowance = store.merge_allowance(now, 5).unwrap();
+            assert_eq!((allowance.confirmed, allowance.available), (0, 5), "manual merge debited the autonomous allowance");
+            // Closed unmerged PR and closed issue: terminal, never retried.
+            for id in [&ids[1], &ids[2]] {
+                assert_eq!(stage(id).stage, Stage::Retired, "{id}");
+                assert_eq!(stage(id).next.reason, "target_closed", "{id}");
+            }
+            assert!(reports[1].is_ok() && reports[2].is_ok(), "{reports:?}");
+            // A genuinely foreign identity still refuses, but only that job.
+            assert!(reports[3].is_ok(), "one invalid job failed the whole tick: {:?}", reports[3]);
+            assert_eq!(stage(&ids[3]).stage, Stage::Verify);
+            let rejected = store.command_attempt(&ids[3]).unwrap().unwrap();
+            assert_eq!(rejected.reason, "invalid-target");
+            assert_eq!(rejected.outcome, crate::autoship_workflow::submission::AttemptOutcome::Rejected);
+            assert!(rejected.eligible_at_ms > rejected.selected_at_ms, "rejection must back off");
+            // The healthy job behind it was still selected and passed target
+            // resolution (it only defers on the fixture's missing runtime).
+            assert_eq!(store.command_attempt(&ids[4]).unwrap().unwrap().reason, "execution-readiness-blocked", "{reports:?}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for args in [&["init", "-q"][..], &["remote", "add", "origin", "https://github.com/owner/repo.git"]] {
+            assert!(std::process::Command::new("git").args(args).current_dir(root).output().unwrap().status.success());
+        }
+        let gh = root.join("gh.py");
+        std::fs::write(&gh, r#"#!/usr/bin/env python3
+import json,os,pathlib,sys
+root=pathlib.Path(os.environ['AUTOSHIP_TARGET_LIFECYCLE_FIXTURE'])
+a=sys.argv[1:];s=json.loads((root/'scenario.json').read_text())
+if a[:2]==['repo','view']: print(s['permission'] if 'viewerPermission' in a else 'owner/repo')
+elif a[:2]==['api','user']: print('owner')
+elif a[:2]==['pr','list']: print('[]')
+elif a[:1]==['api'] and a[1].startswith('repos/owner/repo/issues/'): print(json.dumps(s['issues'][a[1].rsplit('/',1)[1]]))
+elif a[:2]==['pr','view']: print(json.dumps(s['prs'][a[2]]))
+else: raise Exception('unexpected request '+repr(a))
+"#).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "self_improve::targeted::tests::bound_target_lifecycle_settles_without_failing_the_tick", "--nocapture"])
+            .env_remove("AUGMENTAGENT_NATIVE_VM_POLICY")
+            .env(CHILD, root).env("GH_BIN", gh).env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS", "owner")
+            .env("XDG_STATE_HOME", root.join("state")).env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB", root.join("state/workflow.db"))
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
     #[tokio::test]
     async fn local_execution_cannot_skip_deployment_without_an_explicit_target() {
         let dir = tempfile::tempdir().unwrap();
