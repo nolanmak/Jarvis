@@ -203,6 +203,19 @@ but the pinned guest replay must establish support. Signal routing across a
 stopped parent and capture/child execution remain explicit gates below; a
 successful freeze experiment cannot authorize either.
 
+The unchanged pinned-guest replay at `62749ab8` reached this kernel-completed
+freeze in 98.69 seconds. Its retained original scope contains two processes and
+five threads, including the compiler's forked descendant; every recorded member
+has its original birth identity. The nested request and empty stdin remain
+bound to that same parent scope. The previous admission record at `1dfe92e3`
+has no pause evidence. An initial freezer replay at `c793be20` stopped earlier:
+root membership was checked before the first unified-hierarchy mount. The
+kernel omits that hierarchy from `/proc` until it becomes visible; the corrected
+entry mounts first and then verifies root membership. Host validation passes
+414 Python tests and 34 focused Rust tests. The full native test remains red
+at the intentional capture/dispatch hold. No immutable filesystem capture,
+signal-at-pause acceptance, child execution or passing-CI proof is claimed.
+
 While paused and locked, flush and copy only the admitted parent's visible
 private input/output state needed by the contained call. Verify held inode
 identity, full inventories, modes, ownership, link closure and unchanged bytes;
