@@ -59,6 +59,50 @@ class WorkerEntryDiagnosticTests(unittest.TestCase):
         self.assertEqual(progress['stage'],'worker_entry_header')
         self.assertEqual(caught.exception.evidence_sha256,hashlib.sha256(b'worker_entry_header').hexdigest())
 
+    def scoped_admission(self):
+        value,binding,command,scope=self.admission(os.O_RDWR)
+        group={'version':1,'kind':'ci-repository-worker-scope','scope_id':scope['scope_id'],'uid':1000,
+            'cgroup_device':19,'cgroup_inode':42,'original_pid':401,'original_birth':9,
+            'pid_namespace':value['namespaces']['pid'],'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+        value.update(version=2,worker_scope=group,worker_pauses=[])
+        return value,binding,command,scope
+
+    def test_scope_receipt_grammar_preserves_original_admission_without_ci_authority(self):
+        args=self.scoped_admission()
+        self.assertIs(planner.validate_worker_entry(*args),args[0])
+
+    def test_scope_receipt_refuses_a_foreign_original_process_or_namespace(self):
+        for key,new in (('original_pid',402),('original_birth',10),('scope_id',str(uuid.uuid4())),
+                        ('uid',1001),('pid_namespace','pid:[2]'),('shipping_authority',True)):
+            args=self.scoped_admission();args[0]['worker_scope'][key]=new
+            with self.subTest(key=key),self.assertRaises(planner.FreshnessHold):planner.validate_worker_entry(*args)
+
+    def test_scope_receipt_refuses_unbound_pause_or_extra_scope_fields(self):
+        args=self.scoped_admission();args[0]['worker_pauses']=[{}]
+        with self.assertRaises(planner.FreshnessHold):planner.validate_worker_entry(*args)
+        args=self.scoped_admission();args[0]['worker_scope']['claimed_cleanup']=True
+        with self.assertRaises(planner.FreshnessHold):planner.validate_worker_entry(*args)
+
+    def test_scope_pause_grammar_requires_exact_original_birth_and_task_census(self):
+        import copy
+        args=self.scoped_admission();value=args[0];group=value['worker_scope']
+        flags={'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+        pause={'version':1,'kind':'ci-worker-freeze-observation','scope':dict(group),'frozen':True,
+            'processes':[{'pid':401,'tasks':[{'tid':401,'birth':9},{'tid':402,'birth':10}]}],
+            'uid_cohort':{'version':1,'kind':'ci-unit-uid-cohort','uid':1000,'pid_namespace':group['pid_namespace'],
+                'tasks':[{'pid':401,'tid':401,'birth':9},{'pid':401,'tid':402,'birth':10}],**flags},**flags}
+        value['worker_pauses']=[pause]
+        self.assertIs(planner.validate_worker_entry(*args),value)
+        for mutation in ('missing-task','foreign-birth','foreign-scope','authority'):
+            damaged=copy.deepcopy(value);record=damaged['worker_pauses'][0]
+            if mutation=='missing-task':record['uid_cohort']['tasks'].pop()
+            elif mutation=='foreign-birth':
+                record['processes'][0]['tasks'][0]['birth']=11;record['uid_cohort']['tasks'][0]['birth']=11
+            elif mutation=='foreign-scope':record['scope']['cgroup_inode']+=1
+            else:record['uid_cohort']['shipping_authority']=True
+            with self.subTest(mutation=mutation),self.assertRaises(planner.FreshnessHold):
+                planner.validate_worker_entry(damaged,*args[1:])
+
 
 @unittest.skipUnless(os.environ.get('AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY'),'requires managed native policy helper')
 class WorkerEntryTests(unittest.TestCase):

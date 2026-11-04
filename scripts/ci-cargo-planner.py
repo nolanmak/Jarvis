@@ -47,6 +47,7 @@ import shutil
 FreshnessHold=cache.FreshnessHold
 STAGES={'staging_ready':1,'tool_started':2,'finished':3,'error':4,'signaled':5}
 _TOKEN=object()
+_WORKER_GROUP_TOKEN=object()
 _PHASE='planner_startup'
 _CHILD_DIAGNOSTIC=None
 
@@ -1686,6 +1687,8 @@ class RootRelay:
             'original_supervisors':children,'shipping_authority':False}
 
     def unit_signal_grant(self,value,transport,grant):grant()
+    def unit_launch(self,value):return None
+    def unit_before_grant(self,value,pid,pidfd,supervisor,directory):pass
 
     def unit_credit_drained(self,value,transport,started):
         if started and transport is not None:self.ordinals.credits.finish_root(value['ordinal'])
@@ -1704,7 +1707,7 @@ class RootRelay:
             'binding':self.admission.binding,'command':self.admission.command,'directory':str(directory),
             'ordinal':ordinal,'deadline':deadline,'library':str(self.library),'numbers':numbers,
             'extras':descriptors[4:]}
-        view=None;bootstrap=None;child=None;pidfd=None;relay_fd=None;transport=None;cancelled=False;ready=False;sealed=False;authorized=False;started=False
+        view=None;bootstrap=None;child=None;pidfd=None;relay_fd=None;transport=None;launch=None;cancelled=False;ready=False;sealed=False;authorized=False;started=False
         signal_count=0;cancelled_at=None;control_eof=False;original_pid=None
         try:
             request=payload(descriptors[0]);context,relay_fd=self.request_context(ordinal,request)
@@ -1716,6 +1719,7 @@ class RootRelay:
                 if relay_fd>65535:raise FreshnessHold('input_census_unknown')
                 context=dict(context,relay_fd=relay_fd)
             value.update(context)
+            launch=self.unit_launch(value)
             if self.views is not None:
                 phase[0]='planner_view_prepare';view=self.views.prepare(ordinal,request)
                 if view is not None:
@@ -1795,11 +1799,13 @@ class RootRelay:
                         sealed=True;phase[0]='planner_authorize'
                     elif stage==3 and authorized and not started and not received and child_pid==original_pid:
                         if not cancelled:
+                            self.unit_before_grant(value,original_pid,pidfd,child.pid,directory)
                             if transport is not None:transport.register_parent(original_pid,directory/'view-namespace.json',supervisor_pid=child.pid)
                             def grant_started():
                                 connection.sendall(event('tool_started',0));os.write(exec_grant,b'go\n')
                             self.unit_signal_grant(value,transport,grant_started)
                             started=True;phase[0]='planner_unit_exec';self.unit_started(value,directory)
+                            if launch is not None:launch.close();launch=None
                     else:legacy._close(received);raise ValueError('out-of-order original control frame')
                     legacy._close(received)
                 if ready and sealed and not authorized and not cancelled:
@@ -1842,6 +1848,7 @@ class RootRelay:
             return {'ordinal':ordinal,'directory':directory,'view':view,'returncode':raw,
                 'original_cleanup':True,'exec_observed':record.get('exec_observed') is True,'cancelled':cancelled}
         finally:
+            if launch is not None:self._stop.set()
             if child is not None:
                 if child.poll() is None:child.terminate();child.wait(timeout=6)
                 with self._lock:self._children.discard(child)
@@ -1849,6 +1856,7 @@ class RootRelay:
             control.close();child_control.close()
             if pidfd is not None:os.close(pidfd)
             if transport is not None:transport.__exit__(None,None,None)
+            if launch is not None:launch.close()
 
 
 def stage_request_stdin(connection,source,*,deadline,stop,owner_pidfd=None):
@@ -2127,10 +2135,13 @@ class UnitFreezer:
     """
     _setup=threading.Lock()
 
-    def __init__(self,admission,scope,uid):
+    def __init__(self,admission,scope,uid,*,_worker_token=None):
+        worker=_worker_token is _WORKER_GROUP_TOKEN
         if (os.getresuid()!=(0,0,0) or type(admission) is not _Admission
                 or admission.token is not _TOKEN or admission.owner!=os.getpid()
-                or not cache._uuid(Path(scope).name) or type(uid) is not int or not 2000<=uid<6096):
+                or not cache._uuid(Path(scope).name) or type(uid) is not int
+                or not (uid==1000 if worker else 2000<=uid<6096)
+                or _worker_token is not None and not worker):
             raise FreshnessHold('invalidation_unsafe')
         _source(admission.target,admission.binding,admission.command)
         self.owner=os.getpid();self.uid=uid;self.original=None;self.pidfd=None;self.entry=None;self.mount_layout=None
@@ -2138,7 +2149,7 @@ class UnitFreezer:
         self.pid_namespace=os.readlink('/proc/self/ns/pid')
         if os.readlink('/proc/1/ns/pid')!=self.pid_namespace:raise FreshnessHold('invalidation_unsafe')
         self.setup_path=Path(scope)/'freeze-setup.json'
-        self.setup_record={'version':1,'kind':'ci-unit-freezer-setup','binding':admission.binding,
+        self.setup_record={'version':1,'kind':'ci-worker-freezer-setup' if worker else 'ci-unit-freezer-setup','binding':admission.binding,
             'command':admission.command,'uid':uid,'pid_namespace':self.pid_namespace,'shipping_authority':False}
         with self._setup:
             mount=Path('/sys/fs/cgroup')
@@ -2157,7 +2168,7 @@ class UnitFreezer:
             rows=Path('/proc/self/mountinfo').read_text().splitlines()
             if not any(line.split()[4]=='/sys/fs/cgroup' and ' - cgroup2 ' in line for line in rows):
                 raise FreshnessHold('invalidation_unsafe')
-            root=mount/'ci-units'
+            root=mount/('ci-workers' if worker else 'ci-units')
             if not root.exists():root.mkdir(mode=0o700)
             info=root.lstat()
             if (root.resolve()!=root or not stat.S_ISDIR(info.st_mode) or info.st_uid!=0
@@ -2301,6 +2312,117 @@ class UnitFreezer:
         if self._read('cgroup.procs'):raise FreshnessHold('cleanup_uncertain')
         self.path.rmdir();self.closed=True
         if self.pidfd is not None:os.close(self.pidfd);self.pidfd=None
+
+
+class RepositoryWorkerFreezer(UnitFreezer):
+    """Original UID1000 population; launch admission precedes every exec grant.
+
+    This uses the guest's shared worker mount namespace, not a unit's private
+    base. Freezing establishes a bounded writer census, never input authority.
+    """
+    def __init__(self,admission,scope,lock,namespaces):
+        if type(lock) is not WorkerProjectionLock:raise FreshnessHold('invalidation_unsafe')
+        super().__init__(admission,scope,1000,_worker_token=_WORKER_GROUP_TOKEN)
+        self.lock=lock;self.namespaces=dict(namespaces);self.members={}
+        self.membership='0::/ci-workers/'+self.path.name+'\n'
+        if (set(self.namespaces)!={'mnt','ipc','net','user','pid'} or any(
+                value!=os.readlink('/proc/self/ns/'+name) for name,value in self.namespaces.items())):
+            raise FreshnessHold('invalidation_unsafe')
+
+    def _lease(self,kind):
+        lease=self.lock.active
+        if (self.owner!=os.getpid() or lease is None or lease.closed or lease.kind!=kind
+                or lease.owner!=(os.getpid(),threading.get_ident())):raise FreshnessHold('cleanup_uncertain')
+
+    def enroll(self,pid,pidfd,entry,*,supervisor,original=False):
+        self._lease('launch');self._check()
+        if pid in self.members or original!=(self.original is None):raise FreshnessHold('invalidation_unsafe')
+        signal.pidfd_send_signal(pidfd,0)
+        info=Path(f'/proc/self/fdinfo/{pidfd}').read_text().splitlines()
+        if next((line.split()[1] for line in info if line.startswith('Pid:')),None)!=str(pid):
+            raise FreshnessHold('cleanup_uncertain')
+        actual=staging.observe_exec_entry(pid,tracer=supervisor)
+        staging.require_exec_entry(actual,uid=1000,gid=1000,groups=[],descriptors=entry['descriptors'])
+        if {key:entry[key] for key in actual}!=actual:raise FreshnessHold('invalidation_unsafe')
+        process=Path('/proc')/str(pid)
+        status=process.joinpath('stat').read_text().rsplit(')',1)[1].split()
+        if (status[0]!='t' or int(status[1])!=supervisor
+                or {task.name for task in process.joinpath('task').iterdir()}!={str(pid)}
+                or any(os.readlink(f'/proc/{pid}/ns/'+name)!=namespace for name,namespace in self.namespaces.items())
+                or process.joinpath('cgroup').read_text()!='0::/\n'):
+            raise FreshnessHold('invalidation_unsafe')
+        self._write('cgroup.procs',str(pid).encode()+b'\n')
+        if (process.joinpath('cgroup').read_text()!=self.membership
+                or process.joinpath('stat').read_text().rsplit(')',1)[1].split()[19]!=str(entry['birth'])
+                or str(pid).encode() not in self._read('cgroup.procs').split()):
+            raise FreshnessHold('invalidation_unsafe')
+        self.members[pid]={'pidfd':os.dup(pidfd),'birth':entry['birth']}
+        if original:
+            self.original=pid;self.entry=copy.deepcopy(entry);self.pidfd=os.dup(pidfd)
+        self._note('worker_enrolled',original_pid=self.original,enrolled_pid=pid,enrolled_birth=entry['birth'])
+        return {'pid':pid,'birth':entry['birth'],'scope_id':self.path.name,
+            'cgroup_device':self.identity.st_dev,'cgroup_inode':self.identity.st_ino,'shipping_authority':False}
+
+    def descriptor(self):
+        self._check()
+        if self.original is None:raise FreshnessHold('cleanup_uncertain')
+        return {'version':1,'kind':'ci-repository-worker-scope','scope_id':self.path.name,'uid':1000,
+            'cgroup_device':self.identity.st_dev,'cgroup_inode':self.identity.st_ino,
+            'original_pid':self.original,'original_birth':self.entry['birth'],'pid_namespace':self.pid_namespace,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+
+    def drained(self,pid):
+        self._check()
+        member=self.members.get(pid)
+        if member is None or not select.select([member['pidfd']],[],[],0)[0]:
+            raise FreshnessHold('cleanup_uncertain')
+        # Called only after the original supervisor's full descendant cleanup
+        # and exit record. pidfd readiness by itself never authorizes this.
+        os.close(member['pidfd']);del self.members[pid]
+
+    def freeze(self,deadline):
+        self._lease('pause')
+        if self.original is None or self.entry is None:raise FreshnessHold('cleanup_uncertain')
+        signal.pidfd_send_signal(self.pidfd,0)
+        self._write('cgroup.freeze',b'1\n');self._wait(1,deadline)
+        rows=[];expected=[];pids=set(map(int,self._read('cgroup.procs').split()))
+        if self.original not in pids or not 1<=len(pids)<=512:raise FreshnessHold('input_census_unknown')
+        for pid in sorted(pids):
+            process=Path('/proc')/str(pid)
+            if (process.joinpath('cgroup').read_text()!=self.membership or any(
+                    os.readlink(f'/proc/{pid}/ns/'+name)!=namespace for name,namespace in self.namespaces.items())):
+                raise FreshnessHold('invalidation_unsafe')
+            tasks=[]
+            for task in process.joinpath('task').iterdir():
+                fields=task.joinpath('stat').read_text().rsplit(')',1)[1].split()
+                status=dict(line.split(':',1) for line in task.joinpath('status').read_text().splitlines())
+                if (any(list(map(int,status[label].split()))!=[1000]*4 for label in ('Uid','Gid'))
+                        or status['Groups'].split() or int(status['NoNewPrivs'])!=1
+                        or int(status['Seccomp'])!=2 or int(status['Seccomp_filters'])<self.entry['seccomp_filters']
+                        or any(int(status[label],16) for label in ('CapEff','CapPrm','CapAmb'))):
+                    raise FreshnessHold('invalidation_unsafe')
+                if int(task.name)==self.original and int(fields[19])!=self.entry['birth']:
+                    raise FreshnessHold('invalidation_unsafe')
+                expected.append({'pid':pid,'tid':int(task.name),'birth':int(fields[19])})
+                if len(expected)>512:raise FreshnessHold('input_census_unknown')
+                tasks.append({'tid':int(task.name),'birth':int(fields[19])})
+            rows.append({'pid':pid,'tasks':sorted(tasks,key=lambda row:row['tid'])})
+        def check():
+            if time.monotonic()>=deadline:raise FreshnessHold('cleanup_uncertain')
+            signal.pidfd_send_signal(self.pidfd,0);self._wait(1,deadline)
+        self.paused_cohort=staging.observe_uid_cohort(1000,expected,check=check)
+        if self.paused_cohort['pid_namespace']!=self.pid_namespace:raise FreshnessHold('invalidation_unsafe')
+        self.check_frozen_cohort()
+        return {'version':1,'kind':'ci-worker-freeze-observation','scope':self.descriptor(),
+            'uid_cohort':self.paused_cohort,'processes':rows,'frozen':True,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+
+    def thaw(self,deadline):
+        self._lease('pause');super().thaw(deadline)
+
+    def close(self):
+        if self.members:raise FreshnessHold('cleanup_uncertain')
+        super().close()
 
 
 class UnitPeerRelay(RootRelay):
@@ -2677,6 +2799,7 @@ class WorkerRelay(RootRelay):
         self.peer_uid=1000;self.config_magic=b'JARVWRK3';self.require_message_credentials=True;self.planner_relay=planner_relay
         self.value=value;self.executor=None;self.cargo_lock=threading.Lock();self.cargo_owner=None;self.cargo_commands=[];self.metadata_units=[]
         self.original_worker_entry=None
+        self.projection_lock=WorkerProjectionLock();self.worker_freezer=None;self.worker_members={}
 
     def __enter__(self):
         super().__enter__()
@@ -2704,7 +2827,43 @@ class WorkerRelay(RootRelay):
             if locked and self.cargo_owner==ordinal:
                 self.cargo_owner=None;self.cargo_lock.release()
 
+    def check_worker_scope(self):
+        if self.execution_cancelled() or time.monotonic()>=self.value['deadline']:
+            raise FreshnessHold('cleanup_uncertain')
+
+    def unit_launch(self,value):
+        if value.get('execution_role')!='worker':return None
+        lease=self.projection_lock.launch(value['deadline'],self.check_worker_scope)
+        if self.worker_freezer is None:
+            lease.close();raise FreshnessHold('cleanup_uncertain')
+        return lease
+
+    def unit_before_grant(self,value,pid,pidfd,supervisor,directory):
+        if value.get('execution_role')!='worker':return
+        entry=cache._read_record(directory/'exec-entry.json')
+        if (entry.get('binding')!=self.admission.binding or entry.get('command')!=self.admission.command
+                or entry.get('ordinal')!=value['ordinal']):raise FreshnessHold('generation_mismatch')
+        observed=entry['entry'];policy=UnitPolicy()
+        expected={'version':1,'kind':'ci-unit-policy-receipt','binding':self.admission.binding,
+            'command':self.admission.command,'ordinal':value['ordinal'],'pid':pid,
+            'policy':{'version':1,'kind':'ci-unit-policy-activation','sha256':policy.sha256,
+                'size_bytes':policy.size_bytes,'activation_returncode':0,
+                'input_closure_complete':False,'full_ci':False,'shipping_authority':False}}
+        if observed['policy_activation']!=expected:raise FreshnessHold('authority_changed')
+        member=self.worker_freezer.enroll(pid,pidfd,observed,supervisor=supervisor)
+        self.worker_members[value['ordinal']]=member
+        cache._write_record(directory/'worker-scope.json',member)
+
+    def unit_credit_drained(self,value,transport,started):
+        super().unit_credit_drained(value,transport,started)
+        if value.get('execution_role')=='worker' and started:
+            member=self.worker_members[value['ordinal']]
+            self.worker_freezer.drained(member['pid'])
+
     def unit_finished(self,value,record):
+        if value.get('execution_role')=='worker':
+            if record['started']:record['worker_scope']=self.worker_members.pop(record['ordinal'])
+            return
         if value.get('execution_role')!='cargo':return
         self.planner_relay.drain()
         if record['uid']!=1001 or self.cargo_owner!=record['ordinal']:raise FreshnessHold('cleanup_uncertain')
@@ -2738,9 +2897,16 @@ class WorkerRelay(RootRelay):
         invocation=validate_invocation(['/toolchain/bin/cargo',*[os.fsdecode(arg) for arg in argv[1:]]],
             {os.fsdecode(key):os.fsdecode(value) for key,value in environment.items()},os.fsdecode(cwd))
         if self.executor is None:
-            self.executor=_CargoExecutor(self.planner_relay.admission,execution_lease=self.value.get('execution_lease'),generated_outputs=self.value.get('generated_outputs'));self.planner_relay.views=self.executor
-            if self.original_worker_entry is None:raise FreshnessHold('cleanup_uncertain')
-            cache._write_record(self.executor.root/'original-worker-entry.json',self.original_worker_entry)
+            with self.projection_lock.pause(self.value['deadline'],self.check_worker_scope):
+                if self.worker_freezer is None or self.original_worker_entry is None:
+                    raise FreshnessHold('cleanup_uncertain')
+                paused=self.worker_freezer.freeze(self.value['deadline'])
+                try:
+                    self.executor=_CargoExecutor(self.planner_relay.admission,execution_lease=self.value.get('execution_lease'),generated_outputs=self.value.get('generated_outputs'));self.planner_relay.views=self.executor
+                    self.worker_freezer.check_frozen_cohort()
+                    self.original_worker_entry['worker_pauses'].append(paused)
+                    cache._write_record(self.executor.root/'original-worker-entry.json',self.original_worker_entry)
+                finally:self.worker_freezer.thaw(self.value['deadline'])
             self.executor.preparing_graph=True
             metadata_start=len(self.planner_relay.completed)
             try:status,metadata,error=self.executor._command(dict(self.value,original_invocation=invocation),
@@ -4907,7 +5073,7 @@ def _execute_repository(arguments):
     root=Path(value['root']);worker_admission=admit(value['target'],value['binding'],value['command'],root)
     planner_root=root/'planner';planner_root.mkdir(mode=0o700)
     planner_admission=admit(value['target'],value['binding'],value['command'],planner_root)
-    supervisor_receipt=root/'original-worker-cleanup';child=None;bootstrap=None;configuration=None;worker_pidfd=None
+    supervisor_receipt=root/'original-worker-cleanup';child=None;bootstrap=None;configuration=None;worker_pidfd=None;original_launch=None
     controller,worker_control=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
     policy_receipt=os.memfd_create('ci-repository-worker-policy',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
     with CommandObservation(planner_admission,value['deadline']) as observation, RootRelay(planner_admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic())),deadline=value['deadline']) as planner:
@@ -4915,15 +5081,26 @@ def _execute_repository(arguments):
         try:
             configuration=worker.config_fd()
             bootstrap=_sealed(dict(value,kind='repository-worker-supervisor',parent=os.getpid(),worker_receipt=str(supervisor_receipt),policy_receipt_fd=policy_receipt))
+            original_launch=worker.projection_lock.launch(value['deadline'],worker.check_worker_scope)
             child=subprocess.Popen([sys.executable,'-I',str(Path(__file__).resolve()),'--repository-worker-supervisor',str(bootstrap),str(configuration),str(worker_control.fileno())],
                 pass_fds=(bootstrap,configuration,worker_control.fileno(),policy_receipt),env={'PATH':os.defpath},stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             worker_control.close()
             worker_pidfd,worker.original_worker_entry=admit_original_repository_worker(child,controller,configuration,policy_receipt,value)
+            scopes=root/'worker-scopes';scopes.mkdir(mode=0o700)
+            scope=scopes/worker.original_worker_entry['scope_id'];scope.mkdir(mode=0o700)
+            worker.worker_freezer=RepositoryWorkerFreezer(worker_admission,scope,worker.projection_lock,
+                worker.original_worker_entry['namespaces'])
+            worker.worker_freezer.enroll(worker.original_worker_entry['entry']['pid'],worker_pidfd,
+                worker.original_worker_entry['entry'],supervisor=child.pid,original=True)
+            worker.original_worker_entry.update(version=2,worker_scope=worker.worker_freezer.descriptor(),worker_pauses=[])
+            cache._write_record(root/'original-worker-admission.json',worker.original_worker_entry)
             _control(controller,3,worker.original_worker_entry['entry']['pid'])
+            original_launch.close();original_launch=None
             output,error=capture_command(child,value['deadline']);original_cargo_cleanup(supervisor_receipt)
             worker.drain();planner.drain()
             if worker.errors or planner.errors:raise FreshnessHold('input_census_unknown')
+            worker.worker_freezer.drained(worker.original_worker_entry['entry']['pid']);worker.worker_freezer.close()
             captured=observation.finish(worker.executor)
             receipt={'version':2,'kind':'ci-repository-execution','binding':value['binding'],'command':value['command'],
                 'worker_entry':worker.original_worker_entry,
@@ -4933,6 +5110,7 @@ def _execute_repository(arguments):
                 'stderr':error.decode('utf-8','replace'),'repository_execution':receipt}))
         finally:
             try:
+                if original_launch is not None:worker._stop.set()
                 controller.close()
                 if child is not None and child.poll() is None:
                     child.terminate()
@@ -4941,6 +5119,7 @@ def _execute_repository(arguments):
             finally:
                 legacy._close([] if bootstrap is None else [bootstrap]);legacy._close([] if configuration is None else [configuration])
                 legacy._close([policy_receipt]+([] if worker_pidfd is None else [worker_pidfd]));controller.close();worker_control.close()
+                if original_launch is not None:original_launch.close()
     return 0
 
 
@@ -4971,6 +5150,51 @@ def validate_checkpoint(value,binding,command,predecessor,scope):
     return value
 
 
+def validate_worker_scope(value,entry,scope_id,pid_namespace):
+    keys={'version','kind','scope_id','uid','cgroup_device','cgroup_inode','original_pid','original_birth',
+        'pid_namespace','input_closure_complete','full_ci','shipping_authority'}
+    if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
+            or value['kind']!='ci-repository-worker-scope' or value['scope_id']!=scope_id or value['uid']!=1000
+            or any(type(value[key]) is not int or value[key]<minimum for key,minimum in (
+                ('uid',1000),('cgroup_device',0),('cgroup_inode',1),('original_pid',1),('original_birth',0)))
+            or value['original_pid']!=entry['pid'] or value['original_birth']!=entry['birth']
+            or value['pid_namespace']!=pid_namespace
+            or any(value[key] is not False for key in ('input_closure_complete','full_ci','shipping_authority'))):
+        raise ValueError()
+
+
+def validate_worker_pauses(pauses,scope):
+    if type(pauses) is not list or len(pauses)>4096:raise ValueError()
+    for pause in pauses:
+        if (type(pause) is not dict or set(pause)!={'version','kind','scope','uid_cohort','processes','frozen',
+                'input_closure_complete','full_ci','shipping_authority'} or type(pause['version']) is not int
+                or pause['version']!=1 or pause['kind']!='ci-worker-freeze-observation'
+                or pause['scope']!=scope or pause['frozen'] is not True
+                or any(pause[key] is not False for key in ('input_closure_complete','full_ci','shipping_authority'))):
+            raise ValueError()
+        census=pause['uid_cohort'];processes=pause['processes']
+        if (type(census) is not dict or set(census)!={'version','kind','uid','tasks','pid_namespace',
+                'input_closure_complete','full_ci','shipping_authority'} or type(census['version']) is not int
+                or census['version']!=1 or census['kind']!='ci-unit-uid-cohort' or census['uid']!=1000
+                or type(census['uid']) is not int or census['pid_namespace']!=scope['pid_namespace']
+                or any(census[key] is not False for key in ('input_closure_complete','full_ci','shipping_authority'))
+                or type(processes) is not list or not 1<=len(processes)<=512):raise ValueError()
+        tasks=[];seen=set()
+        for process in processes:
+            if (type(process) is not dict or set(process)!={'pid','tasks'} or type(process['pid']) is not int
+                    or process['pid']<=0 or process['pid'] in seen or type(process['tasks']) is not list
+                    or not 1<=len(process['tasks'])<=512):raise ValueError()
+            seen.add(process['pid'])
+            for task in process['tasks']:
+                if (type(task) is not dict or set(task)!={'tid','birth'} or type(task['tid']) is not int
+                        or task['tid']<=0 or type(task['birth']) is not int or task['birth']<0):raise ValueError()
+                tasks.append({'pid':process['pid'],**task})
+        if (len(tasks)>512 or len({task['tid'] for task in tasks})!=len(tasks)
+                or census['tasks']!=sorted(tasks,key=lambda row:(row['pid'],row['tid']))
+                or {'pid':scope['original_pid'],'tid':scope['original_pid'],'birth':scope['original_birth']} not in tasks):
+            raise ValueError()
+
+
 def validate_worker_entry(value,binding,command,scope,progress=None):
     """Receipt grammar only; original live admission remains controller-owned."""
     stage='worker_entry_header'
@@ -4980,9 +5204,10 @@ def validate_worker_entry(value,binding,command,scope,progress=None):
         if progress is not None:progress['stage']=name
     try:
         at('worker_entry_header')
-        if (type(value) is not dict or set(value)!={'version','kind','binding','command','scope_id','supervisor_pid',
-                'entry','namespaces','input_closure_complete','full_ci','shipping_authority'}
-                or type(value['version']) is not int or value['version']!=1
+        keys={'version','kind','binding','command','scope_id','supervisor_pid',
+            'entry','namespaces','input_closure_complete','full_ci','shipping_authority'}
+        if (type(value) is not dict or type(value.get('version')) is not int or value['version'] not in (1,2)
+                or set(value)!=(keys|{'worker_scope','worker_pauses'} if value['version']==2 else keys)
                 or value['kind']!='ci-repository-worker-admission' or value['binding']!=binding or value['command']!=command
                 or value['scope_id']!=scope['scope_id'] or not cache._uuid(value['scope_id'])
                 or type(value['supervisor_pid']) is not int or value['supervisor_pid']<=0
@@ -5027,6 +5252,9 @@ def validate_worker_entry(value,binding,command,scope,progress=None):
         at('worker_entry_namespaces')
         if (set(value['namespaces'])!={'mnt','ipc','net','user','pid'} or any(
                 re.fullmatch(name+r':\[[0-9]+\]',namespace) is None for name,namespace in value['namespaces'].items())):raise ValueError()
+        if value['version']==2:
+            validate_worker_scope(value['worker_scope'],entry,value['scope_id'],value['namespaces']['pid'])
+            validate_worker_pauses(value['worker_pauses'],value['worker_scope'])
         return value
     except (ValueError,TypeError,KeyError,IndexError):raise FreshnessHold('input_census_unknown',stage.encode()) from None
 
@@ -5057,6 +5285,13 @@ def validate_repository_execution(value,binding,command,workers,scope,predecesso
                     or unit['shipping_authority'] is not False or unit['input_closure_complete'] is not False
                     or type(unit['returncode']) is not int or not -64<=unit['returncode']<=255):raise ValueError()
             units[ordinal]=unit
+            if value['version']==2 and value['worker_entry']['version']==2 and unit['uid']==1000:
+                member=unit['worker_scope'];group=value['worker_entry']['worker_scope']
+                if (type(member) is not dict or set(member)!={'pid','birth','scope_id','cgroup_device','cgroup_inode','shipping_authority'}
+                        or any(member[key]!=group[key] for key in ('scope_id','cgroup_device','cgroup_inode'))
+                        or type(member['pid']) is not int or member['pid']<=0 or member['pid']==group['original_pid']
+                        or type(member['birth']) is not int or member['birth']<0 or member['shipping_authority'] is not False):
+                    raise ValueError()
         for cargo_command in value['cargo_commands']:
             ordinal=cargo_command['ordinal'];unit=units[ordinal]
             if (ordinal in cargo or unit['uid']!=1001 or cargo_command['cargo_exit']!=unit['returncode']

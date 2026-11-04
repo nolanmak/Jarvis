@@ -1636,6 +1636,79 @@ async fn live_shared_ci_original_worker_admission() -> Result<()> {
     Ok(())
 }
 
+/// Real ordinary workers and a fork descendant must share the original scope;
+/// Cargo's initial snapshot pauses that full population, then runs after thaw.
+/// This diagnostic grants no complete-input, projection or passing-CI authority.
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_repository_worker_pause() -> Result<()> {
+    let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private evidence required");
+    std::fs::create_dir(&evidence)?;
+    std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"shared-ci-worker-pause",None)?;
+    audit.require_run_resources()?;
+    let target=crate::build_storage::effective_target(&owner);
+    let storage=crate::build_storage::admit_ci(&owner,&target).await?;
+    let fixture=tempfile::Builder::new().prefix("worker-pause-").tempdir_in(&target)?;
+    let root=fixture.path();std::fs::create_dir(root.join("src"))?;
+    std::fs::write(root.join("Cargo.toml"),"[package]\nname=\"worker-pause-probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[workspace]\n[profile.dev]\ndebug=0\nincremental=false\n")?;
+    std::fs::write(root.join("Cargo.lock"),"version=4\n\n[[package]]\nname=\"worker-pause-probe\"\nversion=\"0.1.0\"\n")?;
+    std::fs::write(root.join("src/main.rs"),"fn main() {}\n")?;
+    std::fs::write(root.join("driver.py"),r#"import os,subprocess
+from pathlib import Path
+scope=Path('/proc/self/cgroup').read_text()
+assert scope.startswith('0::/ci-workers/'),scope
+stop=Path('/tmp/worker-scope-stop')
+child_program='''import os,time
+from pathlib import Path
+child=os.fork()
+if child==0:
+ while not Path('/tmp/worker-scope-stop').exists():time.sleep(.01)
+ os._exit(0)
+print(Path('/proc/self/cgroup').read_text().strip(),flush=True)
+assert os.waitpid(child,0)[1]==0
+'''
+child=subprocess.Popen(['/usr/bin/python3','-I','-c',child_program],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,text=True)
+try:
+ assert child.stdout.readline().strip()==scope.strip()
+ result=subprocess.run(['/toolchain/bin/cargo','build','--offline','--locked'])
+ assert result.returncode==0,result.returncode
+finally:
+ stop.write_text('stop')
+ output,_=child.communicate(timeout=10)
+assert child.returncode==0,(child.returncode,output)
+print('WORKER_SCOPE_PAUSE_OK',flush=True)
+"#)?;
+    git(root,&["-c","init.templateDir=","init","-q"]).await?;git(root,&["add","."]).await?;
+    git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+        "-c","core.hooksPath=/dev/null","-c","commit.gpgsign=false","commit","-qm","worker pause fixture"]).await?;
+    let head=git(root,&["rev-parse","HEAD"]).await?.trim().to_owned();
+    git(root,&["update-ref","refs/remotes/origin/main",&head]).await?;
+    let bound=binding(root).await?;let source=snapshot(root,&bound,&target).await?;
+    let session=vm::Session::prepare(&owner,&target)?;session.enable_protected_repository()?;
+    let result=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some("python3 -I driver.py"),
+        &storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
+    ensure!(result.status=="passed" && result.stdout.contains("WORKER_SCOPE_PAUSE_OK"),"worker pause/Cargo failed");
+    let execution=result.repository_execution.context("worker scope receipt absent")?;
+    let entry=&execution["worker_entry"];let group=&entry["worker_scope"];
+    ensure!(entry["version"]==2 && group["scope_id"]==entry["scope_id"],"original worker scope absent");
+    let pauses=entry["worker_pauses"].as_array().context("worker pauses absent")?;
+    ensure!(pauses.len()==1 && pauses[0]["scope"]==*group && pauses[0]["frozen"]==true,"original worker pause absent");
+    ensure!(pauses[0]["uid_cohort"]["tasks"].as_array().is_some_and(|tasks|tasks.len()>=4),"fork descendant census absent");
+    let workers=execution["worker_units"].as_array().context("worker units absent")?;
+    ensure!(workers.iter().filter(|unit|unit["uid"]==1000 && unit["worker_scope"]["scope_id"]==entry["scope_id"]).count()>=2,
+        "additional worker enrollment absent");
+    ensure!(execution["original_worker_cleanup"]==true && execution["input_closure_complete"]==false
+        && execution["full_ci"]==false && execution["shipping_authority"]==false,"diagnostic acquired CI authority");
+    let receipt=serde_json::json!({"version":1,"kind":"real_repository_worker_pause","execution":execution,
+        "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
+    audit.record_controller(receipt.clone())?;audit.protected_health()?;
+    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&receipt)?)?;
+    Ok(())
+}
+
 /// Exercise the actual targeted adapter, including its original build/test argv
 /// and a failing test's real Cargo exit. This is execution evidence, not a
 /// complete-input or passing-CI capability. The original publication regression
