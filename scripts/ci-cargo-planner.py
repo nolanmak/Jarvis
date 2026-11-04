@@ -2077,6 +2077,48 @@ def unit_mount_rules(view,mounts,*,library,endpoint):
     return rules
 
 
+class WorkerProjectionLock:
+    """Serialize worker launch admission with a bounded projection pause.
+
+    A lease coordinates Root threads only; it never proves a kernel freeze,
+    input closure, or original cleanup.
+    """
+    class Lease:
+        def __init__(self,lock,kind):
+            self.lock=lock;self.kind=kind;self.owner=(os.getpid(),threading.get_ident());self.closed=False
+
+        def close(self):
+            if self.owner!=(os.getpid(),threading.get_ident()):raise FreshnessHold('cleanup_uncertain')
+            if self.closed:return
+            if self.lock.active is not self:raise FreshnessHold('cleanup_uncertain')
+            self.lock.active=None;self.closed=True;self.lock.mutex.release()
+
+        def __enter__(self):return self
+        def __exit__(self,*unused):self.close()
+
+    def __init__(self):
+        self.owner=os.getpid();self.mutex=threading.Lock();self.active=None
+
+    def _acquire(self,kind,deadline,check):
+        if (self.owner!=os.getpid() or type(deadline) not in (int,float)
+                or not math.isfinite(deadline) or not callable(check)):
+            raise FreshnessHold('cleanup_uncertain')
+        owner=(os.getpid(),threading.get_ident())
+        if self.active is not None and self.active.owner==owner:raise FreshnessHold('cleanup_uncertain')
+        while True:
+            check();remaining=deadline-time.monotonic()
+            if remaining<=0:raise FreshnessHold('cleanup_uncertain')
+            if self.mutex.acquire(timeout=min(.05,remaining)):break
+        try:
+            check()
+            if time.monotonic()>=deadline:raise FreshnessHold('cleanup_uncertain')
+            lease=self.Lease(self,kind);self.active=lease;return lease
+        except BaseException:self.mutex.release();raise
+
+    def launch(self,deadline,check):return self._acquire('launch',deadline,check)
+    def pause(self,deadline,check):return self._acquire('pause',deadline,check)
+
+
 class UnitFreezer:
     """Original unit's guest-only cgroup; a pause is never original cleanup.
 
