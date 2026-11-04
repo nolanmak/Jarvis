@@ -2566,11 +2566,24 @@ def _unit(arguments):
                 or stdin.get('ordinal')!=value['ordinal']):raise FreshnessHold('generation_mismatch')
         allowed=[0,1,2]
         if stdin['jobserver'] is not None:allowed.extend([3,4])
-        if (value.get('execution_role') in ('worker','cargo')
-                or 'transport' in value.get('view',{})):allowed.append(value['relay_fd'])
+        relay_enabled=(value.get('execution_role') in ('worker','cargo')
+            or 'transport' in value.get('view',{}))
+        if relay_enabled:allowed.append(value['relay_fd'])
         entry=staging.observe_exec_entry(child.pid)
         staging.require_exec_entry(entry,uid=expected,gid=expected,groups=[],descriptors=allowed)
         table={row['number']:row for row in entry['fd_table']}
+        sealed=staging.observe_sealed_descriptor(child.pid,0)
+        if (sealed['uid']!=0 or sealed['gid']!=0
+                or sealed['sha256']!=stdin['stdin']['sha256']
+                or sealed['size_bytes']!=stdin['stdin']['size_bytes']):raise FreshnessHold('invalidation_unsafe')
+        entry['sealed_stdin']=sealed
+        if relay_enabled:
+            descriptor=value['relay_fd']
+            original=staging.observe_sealed_descriptor(os.getpid(),descriptor)
+            actual=staging.observe_sealed_descriptor(child.pid,descriptor)
+            if original!=actual or actual['uid']!=0 or actual['gid']!=0:
+                raise FreshnessHold('invalidation_unsafe')
+            entry['sealed_relay']=actual
         for number in (1,2):
             info=os.fstat(number);actual=table[number]
             if ((actual['device'],actual['inode'],actual['type'],actual['flags']&os.O_ACCMODE)

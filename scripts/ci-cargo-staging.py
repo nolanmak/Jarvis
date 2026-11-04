@@ -89,6 +89,42 @@ def require_exec_entry(entry,*,uid,gid,groups,descriptors):
         raise StagingUnavailable('exec_entry')
 
 
+def observe_sealed_descriptor(pid,number):
+    """Hash an actual sealed regular descriptor without touching its OFD.
+
+    The caller must already own the original exec stop. O_NOATIME and positioned
+    reads preserve the inherited stream's offset, flags and access timestamp.
+    This is content/identity evidence, not provenance or policy authorization.
+    """
+    if (type(pid) is not int or pid<=0 or type(number) is not int or not 0<=number<=65535):
+        raise StagingUnavailable('exec_entry_descriptor')
+    descriptor=None
+    def key(info):
+        return (info.st_dev,info.st_ino,info.st_size,info.st_mode,info.st_uid,info.st_gid,
+                info.st_nlink,info.st_mtime_ns,info.st_ctime_ns)
+    try:
+        path=Path('/proc')/str(pid)/'fd'/str(number);before=os.stat(path)
+        if not stat.S_ISREG(before.st_mode) or not 0<=before.st_size<=MAX_BYTES:
+            raise StagingUnavailable('exec_entry_descriptor')
+        descriptor=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOATIME|os.O_NONBLOCK)
+        if key(os.fstat(descriptor))!=key(before):raise StagingUnavailable('exec_entry_descriptor')
+        seals=fcntl.fcntl(descriptor,fcntl.F_GET_SEALS)
+        if seals&SEALS!=SEALS:raise StagingUnavailable('exec_entry_descriptor')
+        digest=hashlib.sha256();offset=0
+        while offset<before.st_size:
+            block=os.pread(descriptor,min(65536,before.st_size-offset),offset)
+            if not block:raise StagingUnavailable('exec_entry_descriptor')
+            digest.update(block);offset+=len(block)
+        if (key(os.fstat(descriptor))!=key(before) or key(os.stat(path))!=key(before)
+                or fcntl.fcntl(descriptor,fcntl.F_GET_SEALS)!=seals):
+            raise StagingUnavailable('exec_entry_descriptor')
+        return {'device':before.st_dev,'inode':before.st_ino,'uid':before.st_uid,'gid':before.st_gid,
+                'size_bytes':before.st_size,'sha256':digest.hexdigest(),'seals':seals}
+    except OSError:raise StagingUnavailable('exec_entry_descriptor') from None
+    finally:
+        if descriptor is not None:os.close(descriptor)
+
+
 def _seal(descriptor):
     fcntl.fcntl(descriptor,fcntl.F_ADD_SEALS,SEALS)
 

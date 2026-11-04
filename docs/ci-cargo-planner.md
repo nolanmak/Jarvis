@@ -2373,5 +2373,20 @@ policy: inspection precedes the body's first instruction, an inherited extra FD
 prevents body execution, and a running controller cannot substitute for the
 original stopped tracee. Host tests observe the host's actual supplementary
 groups; production requires empty groups. These tests do not establish private
-guest namespaces, exact installed filter identity, sealed stdin/config contents,
-complete writer isolation or end-to-end autoship.
+guest namespaces, exact installed filter identity, complete writer isolation or
+end-to-end autoship.
+
+The unchanged four-parent native replay at `0c6543ae` remains red after 105.55
+seconds. Managed read-only inspection verifies 16 contained exec-entry records,
+four nested root children making progress with the original slots and jobserver
+pipe exhausted, four successful deepest-child returns, and original resource
+cleanup. Parent transfer/resume remains held and all CI/shipping authority flags
+remain false. Observation: `/tmp/autoship-1703-four-parent-observation-3.json`.
+
+The entry check additionally hashes the actual sealed stdin descriptor and
+compares it to the original staging observation. An inherited relay config must
+match the original supervisor's sealed inode, size, seals and content hash.
+Unsealed and oversized descriptors hold before any content read; positioned
+reads through an O_NOATIME handle preserve offsets, flags and timestamps. These
+content observations still do not establish exact installed filter identity or
+complete writer isolation.
