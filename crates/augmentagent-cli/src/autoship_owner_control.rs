@@ -203,6 +203,11 @@ mod tests {
         drop(store);
         let mut recovered=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
         assert_eq!(recovered.settle_owner_execution_retries(1002,16).unwrap(),0);
+        let before=recovered.snapshot(&id).unwrap().unwrap();
+        assert!(recovered.claim(&id,"publication-recovery",1002,100).unwrap().is_none(),"general recovery must not fence a pending owner retry");
+        assert!(recovered.claim_productive(&id,"productive",1002,100).unwrap().is_none());
+        assert!(recovered.claim_reconciliation(&id,"merge-recovery",1002,100).unwrap().is_none());
+        assert_eq!(recovered.snapshot(&id).unwrap().unwrap().generation,before.generation);
         recovered.complete_native_retirement(&id,lease.generation,dir.path().join("audit").to_str().unwrap(),1003).unwrap();
         assert_eq!(recovered.settle_owner_execution_retries(1004,16).unwrap(),1,"queued retry must survive reopening the store");
         assert_eq!(recovered.snapshot(&id).unwrap().unwrap().checkpoint.stage,Stage::Reconcile);
@@ -295,6 +300,7 @@ mod tests {
         store.set_owner_pause(&first.workflow,"github:owner",later.revision,false,11).unwrap();
         assert_eq!(store.snapshot(&first.workflow).unwrap().unwrap().checkpoint,checkpoint);
         assert!(store.claim_productive(&first.workflow,"next",12,1000).unwrap().is_none());
+        assert!(store.claim(&first.workflow,"dependency-recovery",13,1000).unwrap().is_some(),"unrelated holds must retain their free recovery path");
     }
     #[test]
     fn owner_pause_fences_new_calls_and_intents_but_preserves_inflight_receipts() {

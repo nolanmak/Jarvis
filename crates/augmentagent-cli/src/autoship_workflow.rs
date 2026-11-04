@@ -712,6 +712,11 @@ impl WorkflowStore {
             bail!("unknown workflow");
         };
         let cp: Checkpoint = serde_json::from_str(&raw)?;
+        // Pending owner cleanup owns this generation until checked retirement
+        // settles the retry. Even free recovery must not fence that intent.
+        if cp.stage == Stage::Held && cp.next.reason == "owner_execution_retry_pending" {
+            return Ok(None);
+        }
         if purpose != ClaimPurpose::General {
             if owner_control::read(&tx,workflow)?.is_some_and(|c|c.paused) {return Ok(None);}
             let policy: Option<String> = tx.query_row("SELECT until_milestone FROM command_job WHERE workflow=?1", [workflow], |r| r.get(0)).optional()?;
