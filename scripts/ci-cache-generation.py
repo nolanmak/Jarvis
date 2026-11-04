@@ -723,10 +723,207 @@ def prepare_source_projection(target,workspace,objects,binding,command,outputs):
     return projection
 
 
+def execution_cleanup_digest():return hashlib.sha256(b'all-descendants-reaped\n').hexdigest()
+
+
+def validate_execution_state(value,binding):
+    """The execution owner's versioned lease grammar, not cleanup authority."""
+    if (type(value) is not dict or set(value)!={'version','binding','command','predecessor','claim','phase','scope','root','checkpoint','forests','completion_sha256','input_closure_complete','shipping_authority'}
+            or type(value['version']) is not int or value['version']!=2 or value['binding']!=binding
+            or not _uuid(value['command']) or not _uuid(value['claim'])
+            or value['predecessor'] is not None and not _uuid(value['predecessor'])
+            or type(value['forests']) is not list or len(value['forests'])>1
+            or value['completion_sha256'] is not None and not _digest(value['completion_sha256'])
+            or value['phase'] not in ('active','closed') or value['input_closure_complete'] is not False
+            or value['shipping_authority'] is not False or (value['root'] is None)!=(value['checkpoint'] is None)):
+        raise FreshnessHold('metadata_torn')
+    scope=value['scope']
+    if scope is not None and (type(scope) is not dict or set(scope)!={'id','receipt','cleanup_sha256'}
+            or not _uuid(scope['id']) or type(scope['receipt']) is not str or not Path(scope['receipt']).is_absolute()
+            or scope['cleanup_sha256'] not in (None,execution_cleanup_digest())):raise FreshnessHold('metadata_torn')
+    return value
+
+
+def validate_completed_execution(record,binding,command):
+    if (type(record) is not dict or set(record)!={'version','binding','command','claim','predecessor','scope','forests','input_closure_complete','shipping_authority'}
+            or type(record['version']) is not int or record['version']!=1 or record['binding']!=binding
+            or record['command']!=command or not _uuid(command) or not _uuid(record['claim']) or type(record['scope']) is not dict
+            or set(record['scope'])!={'id','receipt','cleanup_sha256'}
+            or not _uuid(record['scope']['id']) or type(record['scope']['receipt']) is not str
+            or not Path(record['scope']['receipt']).is_absolute()
+            or record['scope']['cleanup_sha256']!=execution_cleanup_digest() or type(record['forests']) is not list
+            or len(record['forests'])>1
+            or record['predecessor'] is not None and not _uuid(record['predecessor'])
+            or record['input_closure_complete'] is not False or record['shipping_authority'] is not False):
+        raise FreshnessHold('artifact_provenance_unknown')
+    return record
+
+
+def _record_digest(value):return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+
+
+def validate_execution_completion(state,record):
+    validate_completed_execution(record,state['binding'],state['command'])
+    if (_record_digest(record)!=state['completion_sha256'] or record['claim']!=state['claim']
+            or record['scope']!=state['scope'] or record['forests']!=state['forests']
+            or record['predecessor']!=state['predecessor']):raise FreshnessHold('artifact_provenance_unknown')
+    return record
+
+
+def _execution_directory(path,device):
+    info=path.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or info.st_gid!=os.getegid()
+            or stat.S_IMODE(info.st_mode)!=0o700 or info.st_dev!=device):raise FreshnessHold('cleanup_uncertain')
+    return [info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid]
+
+
+def _closed_execution_snapshot(generation,original):
+    """Validate original closed-scope evidence; never promote artifact authority."""
+    binding=original['binding'];device=generation.stat().st_dev
+    state=validate_execution_state(_read_record(generation/'cargo-execution-state.json',max_bytes=_PROJECTION_DOCUMENT_BYTES),binding)
+    if (state['phase']!='closed' or state['command']!=original['active_command'] or state['scope'] is None
+            or state['scope']['cleanup_sha256']!=execution_cleanup_digest()):raise FreshnessHold('cleanup_uncertain')
+    directories={'completed-ci-commands':_execution_directory(generation/'completed-ci-commands',device)}
+    history={};records={}
+    import itertools
+    paths=list(itertools.islice((generation/'completed-ci-commands').iterdir(),1025))
+    if not 1<=len(paths)<=1024:raise FreshnessHold('cleanup_uncertain')
+    for path in paths:
+        if path.suffix!='.json' or not _uuid(path.stem):raise FreshnessHold('cleanup_uncertain')
+        record=validate_completed_execution(_read_record(path,max_bytes=_PROJECTION_DOCUMENT_BYTES),binding,path.stem)
+        records[path.stem]=record;history[path.name]=_record_digest(record)
+    validate_execution_completion(state,records[state['command']])
+    visited=set();command=state['command']
+    while command is not None:
+        if command in visited or command not in records:raise FreshnessHold('cleanup_uncertain')
+        visited.add(command);command=records[command]['predecessor']
+    if visited!=set(records):raise FreshnessHold('cleanup_uncertain')
+    forests=generation/'generated-forests'
+    if forests.exists() or forests.is_symlink():directories['generated-forests']=_execution_directory(forests,device)
+    elif state['forests']:raise FreshnessHold('cleanup_uncertain')
+    executor=None
+    if state['root'] is not None:
+        root=state['root'];checkpoint=state['checkpoint']
+        if (type(root) is not dict or set(root)!={'name','identity'} or type(root['name']) is not str
+                or not root['name'].startswith('.cargo-execution-') or not _uuid(root['name'][17:])
+                or type(checkpoint) is not dict or checkpoint.get('command') not in records
+                or 'creating' in checkpoint):raise FreshnessHold('cleanup_uncertain')
+        path=generation/'target'/root['name'];info=path.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or info.st_gid!=1001
+                or stat.S_IMODE(info.st_mode)!=0o710
+                or [info.st_dev,info.st_ino,info.st_uid,info.st_gid,info.st_mode]!=root['identity']):
+            raise FreshnessHold('cleanup_uncertain')
+        control=_read_record(path/'control.json')
+        if control!={'version':1,'kind':'cargo-execution','binding':binding,'command':checkpoint['command'],
+                'shipping_authority':False,'state':'closed'}:raise FreshnessHold('cleanup_uncertain')
+        executor={**root,'control_sha256':_record_digest(control)}
+    return {'version':1,'kind':'closed-ci-execution-retirement','command':state['command'],'claim':state['claim'],
+        'scope':state['scope'],'state_sha256':_record_digest(state),'completion_sha256':state['completion_sha256'],
+        'completed':history,'directories':directories,'executor':executor,
+        'input_closure_complete':False,'shipping_authority':False}
+
+
+def _validate_execution_snapshot(value,original):
+    if (type(value) is not dict or set(value)!={'version','kind','command','claim','scope','state_sha256','completion_sha256',
+            'completed','directories','executor','input_closure_complete','shipping_authority'}
+            or type(value['version']) is not int or value['version']!=1 or value['kind']!='closed-ci-execution-retirement'
+            or value['command']!=original['active_command'] or not _uuid(value['claim'])
+            or not _digest(value['state_sha256']) or not _digest(value['completion_sha256'])
+            or type(value['completed']) is not dict or not 1<=len(value['completed'])<=1024
+            or value['completed'].get(value['command']+'.json')!=value['completion_sha256']
+            or type(value['directories']) is not dict or 'completed-ci-commands' not in value['directories']
+            or set(value['directories'])-{'completed-ci-commands','generated-forests'}
+            or value['input_closure_complete'] is not False or value['shipping_authority'] is not False):
+        raise FreshnessHold('cleanup_uncertain')
+    scope=value['scope']
+    if (type(scope) is not dict or set(scope)!={'id','receipt','cleanup_sha256'} or not _uuid(scope['id'])
+            or type(scope['receipt']) is not str or not Path(scope['receipt']).is_absolute()
+            or scope['cleanup_sha256']!=execution_cleanup_digest()):raise FreshnessHold('cleanup_uncertain')
+    for name,digest in value['completed'].items():
+        if not name.endswith('.json') or not _uuid(name[:-5]) or not _digest(digest):raise FreshnessHold('cleanup_uncertain')
+    for identity in value['directories'].values():
+        if type(identity) is not list or len(identity)!=5 or any(type(n) is not int or n<0 for n in identity):
+            raise FreshnessHold('cleanup_uncertain')
+    executor=value['executor']
+    if executor is not None and (type(executor) is not dict or set(executor)!={'name','identity','control_sha256'}
+            or type(executor['name']) is not str or not executor['name'].startswith('.cargo-execution-')
+            or not _uuid(executor['name'][17:]) or not _digest(executor['control_sha256'])
+            or type(executor['identity']) is not list or len(executor['identity'])!=5
+            or any(type(n) is not int or n<0 for n in executor['identity'])):raise FreshnessHold('cleanup_uncertain')
+    return value
+
+
+def _execution_retirement_replay(generation,original,evidence):
+    _validate_execution_snapshot(evidence,original)
+    path=generation/'cargo-execution-state.json'
+    if path.exists() or path.is_symlink():
+        state=validate_execution_state(_read_record(path,max_bytes=_PROJECTION_DOCUMENT_BYTES),original['binding'])
+        if _record_digest(state)!=evidence['state_sha256']:raise FreshnessHold('cleanup_uncertain')
+    for name in ('completed-ci-commands','generated-forests'):
+        path=generation/name
+        if not path.exists() and not path.is_symlink():continue
+        if name not in evidence['directories'] or _execution_directory(path,generation.stat().st_dev)!=evidence['directories'][name]:
+            raise FreshnessHold('cleanup_uncertain')
+        if name=='completed-ci-commands':
+            import itertools
+            paths=list(itertools.islice(path.iterdir(),1025))
+            if len(paths)>1024:raise FreshnessHold('cleanup_uncertain')
+            for record_path in paths:
+                if record_path.name not in evidence['completed']:raise FreshnessHold('cleanup_uncertain')
+                record=_read_record(record_path,max_bytes=_PROJECTION_DOCUMENT_BYTES)
+                if _record_digest(record)!=evidence['completed'][record_path.name]:raise FreshnessHold('cleanup_uncertain')
+    executor=evidence['executor']
+    if executor is not None:
+        path=generation/'target'/executor['name']
+        if path.exists() or path.is_symlink():
+            info=path.lstat()
+            if [info.st_dev,info.st_ino,info.st_uid,info.st_gid,info.st_mode]!=executor['identity']:
+                raise FreshnessHold('cleanup_uncertain')
+            control=path/'control.json'
+            if (control.exists() or control.is_symlink()) and _record_digest(_read_record(control))!=executor['control_sha256']:
+                raise FreshnessHold('cleanup_uncertain')
+
+
+def _generation_evidence(cache,original,*,projection=None,execution=None,references=None):
+    """Immutable digest-bound GC evidence; no cap expansion or artifact proof."""
+    directory=cache/'ci-generation-retirement-evidence'
+    _directory(directory,0o700,create=references is None)
+    if directory.stat().st_dev!=cache.stat().st_dev:raise FreshnessHold('cleanup_uncertain')
+    result={};refs={}
+    for name,value in (('projection',projection),('execution',execution)):
+        if references is None:
+            if value is None:refs[name]=None;result[name]=None;continue
+            record={'version':1,'kind':'ci-generation-retirement-'+name,'original':original,'value':value}
+            if len(json.dumps(record,sort_keys=True,separators=(',',':')).encode())>_PROJECTION_DOCUMENT_BYTES:
+                raise FreshnessHold('cleanup_uncertain')
+            digest=_record_digest(record);path=directory/(digest+'.json')
+            if path.exists() or path.is_symlink():
+                if _read_record(path,max_bytes=_PROJECTION_DOCUMENT_BYTES)!=record:raise FreshnessHold('cleanup_uncertain')
+            else:_write_record(path,record)
+            refs[name]=digest;result[name]=value
+        else:
+            digest=references[name]
+            if digest is None:result[name]=None;continue
+            record=_read_record(directory/(digest+'.json'),max_bytes=_PROJECTION_DOCUMENT_BYTES)
+            if (set(record)!={'version','kind','original','value'} or type(record['version']) is not int or record['version']!=1
+                    or record['kind']!='ci-generation-retirement-'+name or record['original']!=original
+                    or _record_digest(record)!=digest):raise FreshnessHold('cleanup_uncertain')
+            result[name]=record['value']
+    if result['projection'] is not None:_projection_manifest(result['projection'],original['binding'])
+    _validate_execution_snapshot(result['execution'],original)
+    if references is None:
+        descriptor=os.open(cache,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW)
+        try:os.fsync(descriptor)
+        finally:os.close(descriptor)
+        return refs
+    return result
+
+
 def _generation_retirement(value):
     fields={'version','state','original'}
-    if (not isinstance(value,dict) or set(value) not in (fields,fields|{'source_projection'})
-            or type(value['version']) is not int or value['version']!=1
+    if (not isinstance(value,dict) or type(value.get('version')) is not int
+            or (value['version']==1 and set(value) not in (fields,fields|{'source_projection'}))
+            or (value['version']==2 and set(value)!=fields|{'evidence'}) or value['version'] not in (1,2)
             or value['state'] not in ('reclaiming','reclaimed')):raise FreshnessHold('cleanup_uncertain')
     original=value['original']
     if (not isinstance(original,dict) or set(original)!={'version','binding','active_command'}
@@ -734,6 +931,10 @@ def _generation_retirement(value):
             or not _uuid(original['active_command'])):raise FreshnessHold('metadata_torn')
     validate_binding(original['binding'])
     if 'source_projection' in value:_projection_manifest(value['source_projection'],original['binding'])
+    if value['version']==2:
+        refs=value['evidence']
+        if (type(refs) is not dict or set(refs)!={'projection','execution'} or not _digest(refs['execution'])
+                or refs['projection'] is not None and not _digest(refs['projection'])):raise FreshnessHold('cleanup_uncertain')
     return original
 
 
@@ -860,6 +1061,7 @@ def reclaim(cache, protected_generations, worker_uid, worker_gid, *, limit=2):
             original = _generation_retirement(receipt)
             if original["binding"]["generation"] != name:
                 continue
+            if receipt['version']==2:_generation_evidence(cache,original,references=receipt['evidence'])
         except (FreshnessHold, OSError, KeyError, TypeError, ValueError):
             continue
         _write_record(receipt_path, {**receipt,"state":"reclaimed"})
@@ -892,17 +1094,26 @@ def reclaim(cache, protected_generations, worker_uid, worker_gid, *, limit=2):
                 raise FreshnessHold("generation_mismatch")
             children = {child.name for child in generation.iterdir()}
             layout = seed_layout(generation, original["binding"])
+            execution=None;prior_projection=receipt.get('source_projection') if receipt is not None else None
+            lifecycle={'cargo-execution-state.json','completed-ci-commands','generated-forests'}
+            if receipt is not None and receipt['version']==2:
+                evidence=_generation_evidence(cache,original,references=receipt['evidence'])
+                execution=evidence['execution'];prior_projection=evidence['projection']
+                _execution_retirement_replay(generation,original,execution)
+            elif children&lifecycle:
+                if receipt is not None:raise FreshnessHold('cleanup_uncertain')
+                execution=_closed_execution_snapshot(generation,original)
             if children - {"control.json", "target", "cargo-home", "outputs", "dependency-layout.json", "cargo-home-seeded.json",
-                    "source-projection","source-projection.json"}:
+                    "source-projection","source-projection.json"} - (lifecycle if execution is not None else set()):
                 raise FreshnessHold("invalidation_unsafe")
             if "cargo-home-seeded.json" in children and _read_record(generation / "cargo-home-seeded.json") != {"version":1,"kind":"ci-downloads-seeded"}:
                 raise FreshnessHold("metadata_torn")
             projection=_projection_for_retirement(generation,original['binding'],
-                receipt.get('source_projection') if receipt is not None else None)
-            if receipt is not None and projection is not None and 'source_projection' not in receipt:
+                prior_projection)
+            if (receipt is not None and receipt['version']==1 and projection is not None and 'source_projection' not in receipt):
                 raise FreshnessHold('cleanup_uncertain')
             for name in children - {"control.json", "dependency-layout.json", "cargo-home-seeded.json",
-                    "source-projection","source-projection.json"}:
+                    "source-projection","source-projection.json"} - (lifecycle if execution is not None else set()):
                 info = (generation / name).lstat()
                 if layout and name in ("target", "cargo-home") and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o1777:
                     if info.st_dev != generation.stat().st_dev or info.st_gid != os.getegid():
@@ -916,8 +1127,12 @@ def reclaim(cache, protected_generations, worker_uid, worker_gid, *, limit=2):
         except (FreshnessHold, OSError, KeyError, TypeError, ValueError):
             continue
         if receipt is None:
-            receipt={"version":1,"state":"reclaiming","original":original}
-            if projection is not None:receipt['source_projection']=projection
+            if execution is None:
+                receipt={"version":1,"state":"reclaiming","original":original}
+                if projection is not None:receipt['source_projection']=projection
+            else:
+                receipt={'version':2,'state':'reclaiming','original':original,
+                    'evidence':_generation_evidence(cache,original,projection=projection,execution=execution)}
             _write_record(receipt_path,receipt)
         try:
             if projection is not None:_unseal_projection_for_retirement(generation/'source-projection')

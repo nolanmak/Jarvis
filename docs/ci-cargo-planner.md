@@ -2492,3 +2492,21 @@ cases with six opt-ins skipped. Observation:
 retirement of validated closed executions and original-R recovery of active or
 incomplete states remain required; no image wipe, cap increase, new producer
 authority or production rollout occurred.
+
+Generation retirement now shares the execution owner's versioned lease and
+completion validators. It accepts newer lifecycle namespaces only after a closed
+scope, matching command/claim/completion digest, complete predecessor history,
+and owned directory/executor identities are verified. Active, legacy/incomplete,
+protected and foreign allocations remain retained. This grants deletion of owned
+derived state after cleanup; it grants no artifact reuse or passing-CI authority.
+
+Version-2 retirement intents bind immutable evidence records by digest. Projection
+and lifecycle evidence each retain the existing 16 MiB record limit, while the
+master stays small. The intent is persisted before deleting any generation data.
+Replay checks remaining metadata against that original evidence, including after
+the state file or individual completion records were removed. Changed evidence
+holds; an absent generation can only complete its original validated intent.
+Nine filesystem regressions cover protected/active/foreign state, interrupted
+deletion, lost final acknowledgement, damaged evidence, unpublished master,
+incomplete/cyclic history and large projection metadata. Privileged reclamation
+and real four-parent progress still require native VM evidence.

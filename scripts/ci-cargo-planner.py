@@ -817,25 +817,11 @@ class ExecutionLease:
         cache._write_record(self.path,self._state)
 
     @staticmethod
-    def cleanup_digest():return hashlib.sha256(b'all-descendants-reaped\n').hexdigest()
+    def cleanup_digest():return cache.execution_cleanup_digest()
 
     @classmethod
     def _read(cls,path,binding):
-        value=cache._read_record(path,max_bytes=cls.LIMIT)
-        if (set(value)!={'version','binding','command','predecessor','claim','phase','scope','root','checkpoint','forests','completion_sha256','input_closure_complete','shipping_authority'}
-                or type(value['version']) is not int or value['version']!=2 or value['binding']!=binding
-                or not cache._uuid(value['command']) or not cache._uuid(value['claim'])
-                or value['predecessor'] is not None and not cache._uuid(value['predecessor'])
-                or type(value['forests']) is not list or len(value['forests'])>1
-                or value['completion_sha256'] is not None and not cache._digest(value['completion_sha256'])
-                or value['phase'] not in ('active','closed') or value['input_closure_complete'] is not False
-                or value['shipping_authority'] is not False or (value['root'] is None)!=(value['checkpoint'] is None)):
-            raise FreshnessHold('metadata_torn')
-        scope=value['scope']
-        if scope is not None and (type(scope) is not dict or set(scope)!={'id','receipt','cleanup_sha256'}
-                or not cache._uuid(scope['id']) or type(scope['receipt']) is not str or not Path(scope['receipt']).is_absolute()
-                or scope['cleanup_sha256'] not in (None,cls.cleanup_digest())):raise FreshnessHold('metadata_torn')
-        return value
+        return cache.validate_execution_state(cache._read_record(path,max_bytes=cls.LIMIT),binding)
 
     def handle(self):
         return {'version':2,'target':str(self.target),'binding':self.binding,'command':self.command,'claim':self.claim}
@@ -853,24 +839,10 @@ class ExecutionLease:
     def completed(self,command):
         if not cache._uuid(command):raise FreshnessHold('metadata_torn')
         record=cache._read_record(self.target.parent/'completed-ci-commands'/(command+'.json'),max_bytes=self.LIMIT)
-        if (set(record)!={'version','binding','command','claim','predecessor','scope','forests','input_closure_complete','shipping_authority'}
-                or type(record['version']) is not int or record['version']!=1 or record['binding']!=self.binding
-                or record['command']!=command or not cache._uuid(record['claim']) or type(record['scope']) is not dict
-                or set(record['scope'])!={'id','receipt','cleanup_sha256'}
-                or not cache._uuid(record['scope']['id']) or type(record['scope']['receipt']) is not str
-                or not Path(record['scope']['receipt']).is_absolute()
-                or record['scope']['cleanup_sha256']!=self.cleanup_digest() or type(record['forests']) is not list
-                or len(record['forests'])>1
-                or record['predecessor'] is not None and not cache._uuid(record['predecessor'])
-                or record['input_closure_complete'] is not False or record['shipping_authority'] is not False):
-            raise FreshnessHold('artifact_provenance_unknown')
-        return record
+        return cache.validate_completed_execution(record,self.binding,command)
 
     def _completed_check(self,state):
-        record=self.completed(state['command'])
-        digest=hashlib.sha256(json.dumps(record,sort_keys=True,separators=(',',':')).encode()).hexdigest()
-        if (digest!=state['completion_sha256'] or record['claim']!=state['claim'] or record['scope']!=state['scope']
-                or record['forests']!=state['forests']):raise FreshnessHold('artifact_provenance_unknown')
+        cache.validate_execution_completion(state,self.completed(state['command']))
 
     def generated_inputs(self,outputs):
         value=self._active(require_scope=True);bindings,_record=GeneratedForests(self,outputs).load(value['forests'])
