@@ -60,6 +60,37 @@ class NativeRelayTests(unittest.TestCase):
         self.assertIn(b'RAW_EXEC_DENIED', result.stdout)
         self.assertNotIn(b'RELAY_STD_COMPLETE', result.stdout)
 
+    def test_python_async_popen_returns_before_the_delegated_child_exits(self):
+        # Keep CPython's default process-launch settings. The child requires a
+        # parent acknowledgement, so retaining a vfork parent until tool exit
+        # is a real protocol deadlock, not merely slower synchronous work.
+        policy=Path(os.environ['AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY']).resolve(strict=True)
+        program='''import ctypes,subprocess,sys,time
+from pathlib import Path
+assert ctypes.CDLL(sys.argv[1],use_errno=True).jarvis_ci_restrict_unit()==0
+marker=Path(sys.argv[2]);started=time.monotonic()
+body="import sys,time;from pathlib import Path;print('READY',flush=True);p=Path(sys.argv[1]);"+"\\nwhile not p.exists():time.sleep(.01)\\nsys.exit(23)"
+child=subprocess.Popen(['/usr/bin/python3','-I','-c',body,str(marker)],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,text=True)
+assert child.poll() is None,'Popen waited for delegated child termination'
+assert child.stdout.readline()=='READY\\n'
+marker.write_text('parent resumed')
+output,_=child.communicate(timeout=2)
+assert child.returncode==23,(child.returncode,output)
+print('PYTHON_ASYNC_RELAY_COMPLETE',flush=True)
+'''
+        with relay.Relay(self.root,library=self.library,timeout=3) as server:
+            fd=server.config_fd()
+            try:
+                result=subprocess.run(['/usr/bin/python3','-I','-c',program,str(policy),str(self.root/'ack')],
+                    cwd=self.root,env={'PATH':os.defpath,'LD_PRELOAD':str(self.library),'JARVIS_CARGO_RELAY_FD':str(fd)},
+                    pass_fds=(fd,),capture_output=True,text=True,timeout=10)
+            finally:os.close(fd)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(result.stdout,'PYTHON_ASYNC_RELAY_COMPLETE\n')
+        self.assertTrue((self.root/'ack').is_file())
+        self.assertEqual(len(server.completed),1)
+        self.assertEqual(server.completed[0]['cleanup'],'all-descendants-reaped')
+
     def test_unsealed_configuration_refuses_before_rust_main(self):
         fd = os.memfd_create('unsealed-config', os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         try:

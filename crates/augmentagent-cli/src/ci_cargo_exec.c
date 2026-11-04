@@ -101,7 +101,16 @@ __attribute__((visibility("default"))) int jarvis_ci_restrict_unit(void) {
          */
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone3, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone, 0, 7),
+        /* The exec relay retains the original child as a status/signal
+         * proxy. It cannot release a vfork parent's shared address space at
+         * the delegated tool's exec boundary. Refuse that primitive before
+         * creation; runtimes such as CPython use their ordinary fork fallback.
+         * Separate processes sharing an mm are likewise unsupported. Ordinary
+         * fork and CLONE_THREAD threads remain available under the same caps.
+         */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_vfork, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone, 0, 12),
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]) + 4),
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
@@ -110,6 +119,11 @@ __attribute__((visibility("default"))) int jarvis_ci_restrict_unit(void) {
                  CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC |
                  CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWTIME, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, CLONE_VFORK, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, CLONE_VM, 0, 2),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, CLONE_THREAD, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
     };

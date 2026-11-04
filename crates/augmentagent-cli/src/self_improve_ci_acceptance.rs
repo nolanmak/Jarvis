@@ -244,10 +244,12 @@ fn cargo_relay_spawn_interface_fixture() {
 fn same_uid_cargo_relay_exercises_real_rust_spawns_and_refuses_unsupported_requests() {
     let directory=tempfile::tempdir().unwrap();let library=directory.path().join("relay.so");
     std::fs::write(&library,CARGO_RELAY_LIBRARY).unwrap();
-    for (name,count) in [("ci_cargo_relay_test.py",5),("ci_cargo_relay_native_test.py",8)] {
+    let policy=directory.path().join("native.so");std::fs::write(&policy,CARGO_EXEC_DENIAL_LIBRARY).unwrap();
+    for (name,count) in [("ci_cargo_relay_test.py",5),("ci_cargo_relay_native_test.py",9)] {
         let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests").join(name);
         let output=std::process::Command::new("python3").arg("-I").arg(tests)
             .env("AUGMENTAGENT_CARGO_RELAY_LIBRARY",&library)
+            .env("AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY",&policy)
             .env("AUGMENTAGENT_RELAY_FIXTURE_BINARY",std::env::current_exe().unwrap()).output().unwrap();
         let diagnostics=String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(),"relay cases failed: {diagnostics}");
