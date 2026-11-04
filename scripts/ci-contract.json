@@ -25,7 +25,7 @@
       "shell": "bash"
     },
     "bridge-suites/bridge-suites/6": {
-      "body": "bash scripts/tests/agent-pr-verify-gate.test.sh\nbash scripts/tests/cargo-target-guard.test.sh\npython3 scripts/ci-contract.py verify\npython3 scripts/tests/ci_contract_test.py\n\npython3 scripts/tests/ci_build_vm_test.py\n",
+      "body": "bash scripts/tests/agent-pr-verify-gate.test.sh\nbash scripts/tests/cargo-target-guard.test.sh\npython3 scripts/ci-contract.py verify\npython3 scripts/tests/ci_contract_test.py\npython3 scripts/tests/ci_targeted_test.py\n\npython3 scripts/tests/ci_build_vm_test.py\n",
       "shell": "bash"
     },
     "browser-sidecar/synthetic-page/2": {
@@ -895,6 +895,33 @@
     },
     "rust/phone/9": {
       "body": "python3 scripts/phone-offline-tests.py",
+      "shell": "bash"
+    },
+    "targeted/targeted/10": {
+      "body": "python3 scripts/ci-targeted.py wait --plan \"$RUNNER_TEMP/targeted-plan.json\" --base \"${CI_CONTRACT_BASE}\" --head \"${CI_CONTRACT_HEAD}\"\n",
+      "shell": "bash"
+    },
+    "targeted/targeted/3": {
+      "body": "python3 scripts/ci-targeted.py plan --base \"${CI_CONTRACT_BASE}\" --head \"${CI_CONTRACT_HEAD}\" --out \"$RUNNER_TEMP/targeted-plan.json\"\n",
+      "shell": "bash"
+    },
+    "targeted/targeted/5": {
+      "body": "sudo apt-get update && sudo apt-get install -y fonts-liberation poppler-utils python3-yaml",
+      "shell": "bash"
+    },
+    "targeted/targeted/6": {
+      "body": "python3 scripts/pdf-runtime.py",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pdf-python-runtime"
+      ]
+    },
+    "targeted/targeted/8": {
+      "body": "go build -mod=readonly -trimpath -o \"$RUNNER_TEMP/wa-sidecar\" .\necho \"AUGMENTAGENT_WA_SIDECAR_TEST_BIN=$RUNNER_TEMP/wa-sidecar\" >> \"$GITHUB_ENV\"\n",
+      "shell": "bash"
+    },
+    "targeted/targeted/9": {
+      "body": "bash scripts/ci-hosted-space.sh\npython3 scripts/ci-targeted.py test --plan \"$RUNNER_TEMP/targeted-plan.json\"\n",
       "shell": "bash"
     }
   },
@@ -2009,7 +2036,20 @@
       "defaults": {},
       "env": {},
       "events": {
-        "pull_request": null,
+        "pull_request": {
+          "paths": [
+            "**",
+            "!crates/**",
+            "crates/*/Cargo.toml",
+            "crates/**/build.rs",
+            "crates/**/*.py",
+            "crates/**/*.sh",
+            "scripts/ci-contract.py",
+            "scripts/ci-contract.json",
+            "scripts/ci-contract-sync.py",
+            "scripts/tests/ci_contract_test.py"
+          ]
+        },
         "push": {
           "branches": [
             "main"
@@ -2209,7 +2249,7 @@
         }
       },
       "role": "validation",
-      "sha256": "6698711ccb2afda08725c5c7ff682fdc1c18980e5c895a2897214ac54bafddd0"
+      "sha256": "7248f86279e003dfdf68ee204157b85764b675e36faede980e845ceca9556c38"
     },
     ".github/workflows/privacy.yml": {
       "defaults": {},
@@ -2295,7 +2335,20 @@
       "defaults": {},
       "env": {},
       "events": {
-        "pull_request": null,
+        "pull_request": {
+          "paths": [
+            "**",
+            "!crates/**",
+            "crates/*/Cargo.toml",
+            "crates/**/build.rs",
+            "crates/**/*.py",
+            "crates/**/*.sh",
+            "scripts/ci-contract.py",
+            "scripts/ci-contract.json",
+            "scripts/ci-contract-sync.py",
+            "scripts/tests/ci_contract_test.py"
+          ]
+        },
         "push": {
           "branches": [
             "main"
@@ -2970,7 +3023,97 @@
         }
       },
       "role": "validation",
-      "sha256": "dad3b0be18a08e222c574d37a81e72d6905402e14904617a7b4ad3f3e31ca18f"
+      "sha256": "b00d51b98305ea47a34aad48cf01bb0f3fdb62e9ba09c8672fc3245b9947563e"
+    },
+    ".github/workflows/targeted.yml": {
+      "defaults": {},
+      "env": {},
+      "events": {
+        "pull_request": null
+      },
+      "jobs": {
+        "targeted": {
+          "env": {
+            "CARGO_PROFILE_DEV_DEBUG": 0,
+            "CARGO_PROFILE_TEST_DEBUG": 0
+          },
+          "runs-on": "ubuntu-latest",
+          "steps": [
+            {
+              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+              "with": {
+                "fetch-depth": 0,
+                "persist-credentials": false
+              }
+            },
+            {
+              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
+              "with": {
+                "toolchain": "1.94.1"
+              }
+            },
+            {
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
+              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+              "with": {
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
+              }
+            },
+            {
+              "command_id": "targeted/targeted/3",
+              "name": "Plan which crates this change can affect"
+            },
+            {
+              "uses": "denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed",
+              "with": {
+                "deno-version": "2.7.14"
+              }
+            },
+            {
+              "command_id": "targeted/targeted/5",
+              "name": "Install PDF fonts and poppler"
+            },
+            {
+              "command_id": "targeted/targeted/6",
+              "name": "Provision the pinned PDF runtime"
+            },
+            {
+              "uses": "actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff",
+              "with": {
+                "cache-dependency-path": "sidecars/wa-sidecar/go.sum",
+                "go-version": "1.27.1"
+              }
+            },
+            {
+              "command_id": "targeted/targeted/8",
+              "env": {
+                "GOMAXPROCS": 2
+              },
+              "name": "Build exact sidecar used by Rust contract tests",
+              "working-directory": "sidecars/wa-sidecar"
+            },
+            {
+              "command_id": "targeted/targeted/9",
+              "name": "Targeted crate tests"
+            },
+            {
+              "command_id": "targeted/targeted/10",
+              "env": {
+                "GH_TOKEN": "${{ github.token }}",
+                "PR_NUMBER": "${{ github.event.pull_request.number }}"
+              },
+              "name": "Every other applicable Linux check for this head"
+            }
+          ],
+          "timeout-minutes": 180
+        }
+      },
+      "role": "validation",
+      "sha256": "128251cc59f3505804322522dcd7d4632f3a639ef3d3c008de3e4c3e6839b416"
     }
   }
 }

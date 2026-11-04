@@ -60,6 +60,35 @@ A failing test fails the job. `main` has no branch protection today, so the job
 blocks a merge only after the owner marks the **`bridge-suites`** check as
 required in the repository's branch protection or ruleset settings.
 
+## CI: targeted PR check
+
+`.github/workflows/targeted.yml` (check name `targeted`) is the PR check meant
+to be required alongside `privacy` and `node-release`.
+`scripts/ci-targeted.py plan` diffs the PR against its merge base:
+
+- **targeted**: every changed path is inside a workspace crate, but not its
+  `Cargo.toml` or a `build.rs`. The job runs `cargo test` for the owning
+  crates plus every crate that depends on them. That includes Cargo
+  dependencies of any kind, and crates that embed or name another crate's
+  files. `augmentagent-cli` tests run single-threaded, as in the full suites.
+- **full**: anything else, such as workflows, lockfile, manifests, build
+  scripts, toolchain, `scripts/`, `docs/` and `schema/`. Crates embed files
+  from all of these. `rust.yml` and `platform.yml` trigger on exactly these
+  paths (`FULL_SUITE_PATHS`), and the job requires them.
+
+In both modes the job then waits for every other Linux validation job that
+applies to the change, and fails if any of them fails or is cancelled,
+skipped or missing. Requiring `targeted` therefore requires all of them.
+macOS is not waited on: it runs post-merge (`macos.yml`).
+`scripts/tests/ci_targeted_test.py` checks the following:
+
+- the planner and the path filters agree for every tracked file;
+- every directory under `crates/` is a workspace member;
+- cross-crate file references are covered;
+- the wait verdict behaves as described.
+
+The full suites, Platform and macOS still run on every push to `main`.
+
 ## CI: Code Mode
 
 The `cli` job in `.github/workflows/rust.yml` runs on every PR and push to `main`. It pins

@@ -1,0 +1,77 @@
+name: Targeted checks
+
+# The one PR check meant to be required (with privacy and node-release).
+# A change confined to workspace crates tests only those crates and every
+# crate that depends on them; anything else (workflows, manifests, lockfile,
+# build scripts, toolchain, scripts/, docs/, schema/, ...) is a full-mode
+# change, for which rust.yml and platform.yml trigger themselves. Either way
+# this job then waits for every other Linux validation job that applies to
+# the change and fails if any of them fails, so requiring it requires them.
+# See scripts/ci-targeted.py.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  actions: read
+
+# Superseded PR heads cancel; non-PR runs retain distinct queue slots.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
+
+jobs:
+  targeted:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          # The planner diffs against the merge base, as GitHub path filters do.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.94.1
+      # Restore-only: rust-cache.yml writes this cache from main. Build
+      # parallelism doesn't change artifacts, so it stays out of the cache key.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci
+          env-vars: ImageOS
+          save-if: false
+        env:
+          CARGO_BUILD_JOBS: ''
+      - name: Plan which crates this change can affect
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id targeted/targeted/3 --input-base \"${{ github.event.pull_request.base.sha }}\" --input-head \"${{ github.event.pull_request.head.sha }}\""
+      # Same prerequisites the full suites give these crates' tests: Deno for
+      # Code Mode, the pinned PDF runtime and fonts for document rendering,
+      # and disk headroom for the snapshot tests.
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
+        with:
+          deno-version: 2.7.14
+      - name: Install PDF fonts and poppler
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id targeted/targeted/5"
+      - name: Provision the pinned PDF runtime
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id targeted/targeted/6"
+      # The WhatsApp channel's real-sidecar contract test skips without it.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: sidecars/wa-sidecar/go.sum
+      - name: Build exact sidecar used by Rust contract tests
+        working-directory: sidecars/wa-sidecar
+        env:
+          GOMAXPROCS: 2
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id targeted/targeted/8"
+      - name: Targeted crate tests
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id targeted/targeted/9"
+      - name: Every other applicable Linux check for this head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id targeted/targeted/10 --input-base \"${{ github.event.pull_request.base.sha }}\" --input-head \"${{ github.event.pull_request.head.sha }}\""

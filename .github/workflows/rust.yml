@@ -14,7 +14,21 @@ name: Rust suites
 # step the prerequisites of every step before it in the job.
 
 on:
+  # Crate-only PRs are covered by targeted.yml (owning crates + dependents);
+  # every other change runs these full suites. Must equal FULL_SUITE_PATHS in
+  # scripts/ci-targeted.py (ci_targeted_test.py checks it).
   pull_request:
+    paths:
+      - '**'
+      - '!crates/**'
+      - 'crates/*/Cargo.toml'
+      - 'crates/**/build.rs'
+      - 'crates/**/*.py'
+      - 'crates/**/*.sh'
+      - "scripts/ci-contract.py"
+      - "scripts/ci-contract.json"
+      - "scripts/ci-contract-sync.py"
+      - "scripts/tests/ci_contract_test.py"
   push:
     branches: [main]
   workflow_dispatch:
