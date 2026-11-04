@@ -224,6 +224,21 @@ and commit its root-owned input-capture record before granting child execution.
 No writer-owned inode becomes a child input. This is staging, not decision 9's
 completed-output publication. That distinction is an explicit amendment.
 
+The initial byte-capture implementation opens the original `/proc/<pid>/root`
+while its held pidfd and kernel freeze remain valid, then traverses with held
+directory descriptors and no-follow child opens. It stages `workspace/target`,
+`tmp`, `home/worker`, `cargo`, `var/tmp`, `dev/shm` and controller-declared generated
+roots within the existing 64-root, entry, byte and record bounds. It rejects
+unknown owners, symlinks, special entries, hard links and writable stdio aliases.
+The original before/after inventory must agree, and a readback of the sealed
+detached destination must match its source bytes. A preparation record precedes
+copying; only verified/synced bytes receive a captured-state record under the
+original request/scope. This is neither successful producer publication nor
+child writable-set admission. Original metadata is retained in the capture
+record; the detached copies do not yet emulate it. Complete writable-alias
+closure, metadata/runtime behavior, signal-at-pause cases and the child grant
+therefore remain closed gates, with false complete-input/CI/shipping flags.
+
 An opaque parent stays stopped during its contained call. Child stdout/stderr
 use their original admitted descriptions; fd 0 uses staged bytes as above. The
 controller and external Cargo caller remain runnable. Worker-origin capture uses

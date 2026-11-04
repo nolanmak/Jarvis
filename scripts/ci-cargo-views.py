@@ -7,8 +7,10 @@ never establish trusted producer identity, input closure, or reuse authority.
 """
 import ctypes
 import errno
+import fcntl
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import stat
@@ -181,6 +183,131 @@ def copy_output_roots(source,destination,roots,*,owner,controller):
     if any(inventory(source/root,owner=owner,sealed=False)!=snapshot for root,snapshot in snapshots.items()):
         raise FreshnessHold('input_census_unknown')
     return result
+
+
+def capture_roots(root_fd,destination,roots,*,owners,check):
+    """Copy selected visible roots through held descriptors, without authority.
+
+    The controller must prove pause, scope and alias closure separately. Original
+    metadata is recorded, not emulated by these detached root-owned byte copies.
+    Partial destinations remain uncommitted if any validation or copy fails.
+    """
+    if (type(root_fd) is not int or root_fd<0 or not stat.S_ISDIR(os.fstat(root_fd).st_mode)
+            or type(roots) is not list or not 1<=len(roots)<=64
+            or type(owners) not in (tuple,list) or not owners
+            or any(type(owner) is not int or owner<0 for owner in owners) or not callable(check)):
+        raise FreshnessHold('input_census_unknown')
+    roots=sorted((relative(name) for name in roots),key=lambda name:name.parts)
+    if any(a==b or a in b.parents for a,b in zip(roots,roots[1:])):raise FreshnessHold('input_census_unknown')
+    destination=literal(destination);parent=destination.parent.stat()
+    if parent.st_uid!=os.geteuid() or parent.st_mode&0o022:raise FreshnessHold('invalidation_unsafe')
+    check();destination.mkdir(mode=0o700);output_identity=destination.stat()
+    flags=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK|getattr(os,'O_NOATIME',0)
+    def metadata(info,descriptor):
+        if (info.st_uid not in owners or info.st_gid not in owners or info.st_mode&0o7000
+                or (hasattr(os,'listxattr') and os.listxattr(descriptor))
+                or (info.st_dev,info.st_ino)==(output_identity.st_dev,output_identity.st_ino)):
+            raise FreshnessHold('artifact_provenance_unknown')
+        return list(_key(info))
+    def scan(copying):
+        rows=[];total=0;record_bytes=0
+        def append(row):
+            nonlocal record_bytes
+            rows.append(row);record_bytes+=len(json.dumps(row,separators=(',',':')).encode())
+            if len(rows)>MAX_ENTRIES or record_bytes>16*1024**2:raise FreshnessHold('input_census_unknown')
+        def visit(parent_fd,name,prefix):
+            nonlocal total
+            check();relative(prefix)
+            named=os.stat(name,dir_fd=parent_fd,follow_symlinks=False)
+            if not (stat.S_ISREG(named.st_mode) or stat.S_ISDIR(named.st_mode)):
+                raise FreshnessHold('artifact_provenance_unknown')
+            descriptor=os.open(name,flags|(os.O_DIRECTORY if stat.S_ISDIR(named.st_mode) else 0),dir_fd=parent_fd)
+            try:
+                before=os.fstat(descriptor);original=metadata(before,descriptor)
+                if _key(named)!=_key(before):raise FreshnessHold('input_census_unknown')
+                if stat.S_ISDIR(before.st_mode):
+                    append([os.fsencode(prefix).hex(),'directory',original])
+                    names=sorted(os.listdir(descriptor),key=os.fsencode)
+                    if copying:(destination/prefix).mkdir(parents=True,mode=0o700,exist_ok=False)
+                    for child in names:visit(descriptor,child,prefix/child)
+                    if sorted(os.listdir(descriptor),key=os.fsencode)!=names:raise FreshnessHold('input_census_unknown')
+                else:
+                    if before.st_nlink!=1 or before.st_size>MAX_BYTES-total:raise FreshnessHold('artifact_provenance_unknown')
+                    os.fsync(descriptor);check();count=0;digest=hashlib.sha256();writer=None
+                    try:
+                        if copying:
+                            output=destination/prefix;output.parent.mkdir(parents=True,mode=0o700,exist_ok=True)
+                            writer=os.open(output,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o600)
+                        while True:
+                            check();block=os.read(descriptor,1024**2)
+                            if not block:break
+                            count+=len(block)
+                            if count>before.st_size:raise FreshnessHold('input_census_unknown')
+                            digest.update(block)
+                            if writer is not None:
+                                remaining=memoryview(block)
+                                while remaining:
+                                    check();written=os.write(writer,remaining)
+                                    if written<=0:raise OSError(errno.EIO,'input capture copy failed')
+                                    remaining=remaining[written:]
+                        if count!=before.st_size:raise FreshnessHold('input_census_unknown')
+                        if writer is not None:
+                            os.fchmod(writer,0o555 if before.st_mode&0o111 else 0o444);os.fsync(writer)
+                    finally:
+                        if writer is not None:os.close(writer)
+                    total+=count;append([os.fsencode(prefix).hex(),'file',original,digest.hexdigest()])
+                check()
+                if (_key(os.fstat(descriptor))!=_key(before)
+                        or _key(os.stat(name,dir_fd=parent_fd,follow_symlinks=False))!=_key(before)):
+                    raise FreshnessHold('input_census_unknown')
+            finally:os.close(descriptor)
+        for root in roots:
+            descriptor=os.dup(root_fd)
+            try:
+                for component in root.parts[:-1]:
+                    child=os.open(component,flags|os.O_DIRECTORY,dir_fd=descriptor)
+                    try:metadata(os.fstat(child),child)
+                    except BaseException:os.close(child);raise
+                    os.close(descriptor);descriptor=child
+                visit(descriptor,root.name,root)
+            finally:os.close(descriptor)
+        return rows,total
+    try:
+        entries,total=scan(True)
+        if scan(False)!=(entries,total):raise FreshnessHold('input_census_unknown')
+    except OSError as error:
+        if error.errno in (errno.ELOOP,errno.ENOTDIR):raise FreshnessHold('invalidation_unsafe') from None
+        raise
+    for base,_dirs,_files in os.walk(destination,topdown=False):
+        check();path=Path(base);path.chmod(0o555)
+        descriptor=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+        try:os.fsync(descriptor)
+        finally:os.close(descriptor)
+    check()
+    expected={b'.'.hex():[b'.'.hex(),'directory',0o555]}
+    for name,kind,original,*digest in entries:
+        path=relative(bytes.fromhex(name))
+        for parent in path.parents:
+            raw=os.fsencode(parent).hex();expected[raw]=[raw,'directory',0o555]
+        expected[name]=([name,'directory',0o555] if kind=='directory' else
+            [name,'file',0o555 if original[5]&0o111 else 0o444,original[2],digest[0]])
+    sealed=inventory(destination,owner=os.geteuid(),sealed=True)
+    if {row[0]:row for row in sealed}!=expected:raise FreshnessHold('input_census_unknown')
+    check()
+    return {'version':1,'kind':'ci-paused-root-capture','roots':[os.fsencode(root).hex() for root in roots],
+        'entries':entries,'copied_entries':len(sealed),'copied_bytes':total,
+        'payload_sha256':hashlib.sha256(json.dumps(sealed,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
+        'original_metadata_emulated':False,'input_closure_complete':False,'shipping_authority':False}
+
+
+def validate_capture_stdio(capture,descriptors):
+    """Refuse direct writable stdio aliases to captured original inodes."""
+    if type(descriptors) is not list or len(descriptors)!=2:raise FreshnessHold('input_census_unknown')
+    inodes={(row[2][0],row[2][1]) for row in capture['entries'] if row[1]=='file'}
+    for descriptor in descriptors:
+        info=os.fstat(descriptor)
+        if (stat.S_ISREG(info.st_mode) and fcntl.fcntl(descriptor,fcntl.F_GETFL)&os.O_ACCMODE!=os.O_RDONLY
+                and (info.st_dev,info.st_ino) in inodes):raise FreshnessHold('invalidation_unsafe')
 
 
 def validate_stdio(descriptors):

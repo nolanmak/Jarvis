@@ -1487,7 +1487,7 @@ class RootRelay:
                     transport_root=Path(view['root']).parent/'transport';transport_root.mkdir(mode=0o700)
                     admission=admit(self.admission.target,self.admission.binding,self.admission.command,transport_root)
                     transport=UnitPeerRelay(admission,library=self.library,ordinal=ordinal,scope=directory,
-                        ordinals=self.ordinals,deadline=deadline)
+                        ordinals=self.ordinals,deadline=deadline,view=view)
                     transport.__enter__()
                     if relay_fd is not None:raise FreshnessHold('invalidation_unsafe')
                     descriptor=transport.config_fd()
@@ -1757,15 +1757,19 @@ class UnitFreezer:
 
 class UnitPeerRelay(RootRelay):
     """Authenticated unit endpoint; capture/dispatch remains a closed gate."""
-    def __init__(self,admission,*,library,ordinal,scope,ordinals,deadline):
+    def __init__(self,admission,*,library,ordinal,scope,ordinals,deadline,view):
         if type(ordinal) is not int or not 0<=ordinal<4096 or not cache._uuid(Path(scope).name):
             raise FreshnessHold('invalidation_unsafe')
+        if (type(view) is not dict or set(view)!={'root','artifacts','source','mounts','ordinal'}
+                or view['ordinal']!=ordinal):raise FreshnessHold('invalidation_unsafe')
         super().__init__(admission,library=library,timeout=min(900,max(1,deadline-time.monotonic())),
             deadline=deadline,ordinals=ordinals,client_path='/run/ci-unit.sock')
         self.peer_uid=2000+ordinal;self.config_uid=self.peer_uid;self.config_magic=b'JARVUNT3'
         self.require_message_credentials=True;self.parent_ordinal=ordinal;self.scope=Path(scope)
         self.scope_pidfd=None;self.scope_namespaces=None;self.scope_root=None;self.received_requests=0;self.closed=False
         self._slots=threading.BoundedSemaphore(1)
+        self.view=dict(view);self.mutation_lock=threading.RLock()
+        self.captures=self.root/'captures';self.captures.mkdir(mode=0o700)
         self.freezer=UnitFreezer(admission,scope,self.peer_uid)
 
     def register_parent(self,pid,path):
@@ -1817,11 +1821,56 @@ class UnitPeerRelay(RootRelay):
                 stop=self._stop,owner_pidfd=self.scope_pidfd) as captured:
             record['stdin']=captured.observation()
             cache._write_record(self.root/'admission.json',record)
-            try:
-                record['pause']=self.freezer.freeze(self.deadline)
-                cache._write_record(self.root/'admission.json',record)
-            finally:self.freezer.thaw(self.deadline)
+            phase[0]='planner_capture'
+            with self.mutation_lock:
+                try:
+                    record['pause']=self.freezer.freeze(self.deadline)
+                    cache._write_record(self.root/'admission.json',record)
+                    record['capture']=self._capture(ordinal,record,descriptors[2:4])
+                finally:
+                    self.freezer.thaw(self.deadline)
+                    if 'pause' in record:
+                        record['pause']['thaw_verified']=True
+                        cache._write_record(self.root/'admission.json',record)
         raise FreshnessHold('input_census_unknown')
+
+    def _capture(self,ordinal,admission,outputs):
+        mounts=cache._read_record(Path(self.view['mounts']),max_bytes=16*1024**2)
+        if (mounts.get('binding')!=self.admission.binding or mounts.get('command')!=self.admission.command
+                or mounts.get('ordinal')!=self.parent_ordinal):raise FreshnessHold('generation_mismatch')
+        declared=mounts.get('declared_outputs');cache.validate_outputs(declared)
+        roots=['workspace/target','tmp','home/worker','cargo','var/tmp','dev/shm',
+            *['workspace/'+name for name in declared]]
+        state={'version':1,'kind':'ci-unit-input-capture','binding':self.admission.binding,
+            'command':self.admission.command,'parent_ordinal':self.parent_ordinal,'parent_scope':self.scope.name,
+            'request_ordinal':ordinal,'request_sha256':admission['request_sha256'],
+            'pause_sha256':hashlib.sha256(json.dumps(admission['pause'],sort_keys=True,separators=(',',':')).encode()).hexdigest(),
+            'state':'preparing','alias_closure_complete':False,'input_closure_complete':False,
+            'full_ci':False,'shipping_authority':False}
+        path=self.captures/(str(ordinal)+'.json');cache._write_record(path,state)
+        def check():
+            if (self._stop.is_set() or time.monotonic()>=self.deadline
+                    or select.select([self.scope_pidfd],[],[],0)[0]):raise FreshnessHold('cleanup_uncertain')
+            fields=dict(line.split() for line in self.freezer._read('cgroup.events').splitlines())
+            if fields.get(b'frozen')!=b'1':raise FreshnessHold('cleanup_uncertain')
+        check()
+        descriptor=os.open(f'/proc/{self.freezer.original}/root',os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+        try:
+            root=os.fstat(descriptor)
+            if self.scope_root!={'device':(os.major(root.st_dev)<<20)|os.minor(root.st_dev),'inode':root.st_ino,'mode':root.st_mode}:
+                raise FreshnessHold('invalidation_unsafe')
+            capture=unit_views.capture_roots(descriptor,self.captures/str(ordinal),roots,
+                owners=(0,self.peer_uid),check=check)
+            unit_views.validate_capture_stdio(capture,outputs);check()
+            state.update(state='captured',filesystem=capture)
+            encoded=json.dumps(state,sort_keys=True,separators=(',',':')).encode()
+            if len(encoded)>16*1024**2:raise FreshnessHold('input_census_unknown')
+            cache._write_record(path,state);check()
+            return {'record_sha256':hashlib.sha256(encoded).hexdigest(),'payload_sha256':capture['payload_sha256'],
+                'copied_entries':capture['copied_entries'],'copied_bytes':capture['copied_bytes'],
+                'alias_closure_complete':False,'original_metadata_emulated':False,
+                'input_closure_complete':False,'shipping_authority':False}
+        finally:os.close(descriptor)
 
     def check(self):
         self.__exit__(None,None,None)
