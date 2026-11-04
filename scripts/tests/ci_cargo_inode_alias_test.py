@@ -27,6 +27,13 @@ def run():
  else:
   os.lseek(fd,3,os.SEEK_SET)
   if mode=='flock':fcntl.flock(fd,fcntl.LOCK_EX)
+  if mode=='posix':
+   fcntl.lockf(fd,fcntl.LOCK_EX|fcntl.LOCK_NB,2,0,os.SEEK_SET)
+   fcntl.lockf(fd,fcntl.LOCK_EX|fcntl.LOCK_NB,2,6,os.SEEK_SET)
+  if mode=='ofd':
+   class Lock(ctypes.Structure):
+    _fields_=[('kind',ctypes.c_short),('whence',ctypes.c_short),('start',ctypes.c_longlong),('length',ctypes.c_longlong),('pid',ctypes.c_int)]
+   fcntl.fcntl(fd,fcntl.F_OFD_SETLK,bytes(Lock(fcntl.F_WRLCK,os.SEEK_SET,2,4,0)))
  tid=threading.get_native_id();pid=os.getpid()
  birth=int(Path('/proc/self/task/'+str(tid)+'/stat').read_text().rsplit(')',1)[1].split()[19])
  print(json.dumps({'pid':pid,'tid':tid,'birth':birth}),flush=True)
@@ -87,6 +94,17 @@ class TaskInodeAliasTests(unittest.TestCase):
         task,keys,_=self.child('shared');rows=self.observe(task,keys)['aliases']
         self.assertEqual(len(rows),1);self.assertEqual(rows[0]['kind'],'mapping')
         self.assertTrue(rows[0]['shared']);self.assertTrue(rows[0]['writable'])
+
+    def test_multiple_posix_ranges_are_not_collapsed_into_one_fdinfo_field(self):
+        task,keys,_=self.child('posix');locks=self.observe(task,keys)['aliases'][0]['locks']
+        self.assertEqual(len(locks),2)
+        self.assertEqual({(r['start'],r['end']) for r in locks},{(0,1),(6,7)})
+        self.assertTrue(all(r['kind']=='POSIX' and r['owner']==task['pid'] for r in locks))
+
+    def test_open_file_description_lock_has_no_process_owner(self):
+        task,keys,_=self.child('ofd');locks=self.observe(task,keys)['aliases'][0]['locks']
+        self.assertEqual(len(locks),1);self.assertEqual(locks[0]['kind'],'OFDLCK')
+        self.assertEqual((locks[0]['owner'],locks[0]['start'],locks[0]['end']),(-1,2,5))
 
     def test_private_mapping_is_distinguished_after_descriptor_close(self):
         task,keys,_=self.child('private');rows=self.observe(task,keys)['aliases']
