@@ -568,6 +568,7 @@ class RetainedInodes:
             'roots':self.capture['roots'],'before_root':str(before),'before':self.capture,
             'after':after,'old_effects':old,'objects':objects,'effects_materialized':False,
             'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+        plan['namespace_edges']=namespace_edges(plan)
         encoded=json.dumps(plan,sort_keys=True,separators=(',',':')).encode()
         if len(encoded)>16*1024**2:raise FreshnessHold('input_census_unknown')
         check();cache._write_record(destination/'plan.json',plan);check()
@@ -723,6 +724,61 @@ class RetainedInodes:
 
     def __enter__(self):self._owned();return self
     def __exit__(self,*_args):self.close()
+
+
+
+def namespace_edges(plan):
+    """Plan changed parent/name edges, keeping moved descendants attached.
+
+    This is a graph calculation, not permission to mutate a paused parent.
+    Detach deepest old edges before changing their ancestors; attach final
+    directory parents before their children. Execution/replay remains separate.
+    """
+    if (type(plan) is not dict or plan.get('kind')!='ci-contained-transfer-plan'
+            or plan.get('effects_materialized') is not False or plan.get('shipping_authority') is not False
+            or type(plan.get('objects')) is not list or len(plan['objects'])>MAX_ENTRIES):
+        raise FreshnessHold('input_census_unknown')
+    roots=[relative(bytes.fromhex(raw)) for raw in plan['roots']]
+    prefixes={prefix for root in roots for prefix in root.parents}
+    indexes={'initial_path':{},'final_path':{}};nodes=[];identities=set()
+    for obj in plan['objects']:
+        identity=obj['working_inode']
+        if (type(identity) is not list or len(identity)!=2 or any(type(i) is not int or i<0 for i in identity)
+                or tuple(identity) in identities or obj['kind'] not in ('file','directory')):
+            raise FreshnessHold('invalidation_unsafe')
+        identities.add(tuple(identity));paths={}
+        for field,index in indexes.items():
+            raw=obj[field]
+            if raw is None:paths[field]=None;continue
+            path=relative(bytes.fromhex(raw))
+            if path in index or not any(path==root or root in path.parents for root in roots):
+                raise FreshnessHold('invalidation_unsafe')
+            index[path]=obj;paths[field]=path
+        if all(path is None for path in paths.values()):raise FreshnessHold('invalidation_unsafe')
+        nodes.append((obj,paths))
+    def edge(path,index):
+        if path is None:return None,None
+        parent=index.get(path.parent)
+        if parent is not None:
+            if parent['kind']!='directory':raise FreshnessHold('invalidation_unsafe')
+            endpoint={'working_inode':parent['working_inode']}
+        elif path.parent in prefixes:endpoint={'prefix':os.fsencode(path.parent).hex()}
+        else:raise FreshnessHold('input_census_unknown')
+        return endpoint,os.fsencode(path.name).hex()
+    detach=[];attach=[]
+    for obj,paths in nodes:
+        old_parent,old_name=edge(paths['initial_path'],indexes['initial_path'])
+        new_parent,new_name=edge(paths['final_path'],indexes['final_path'])
+        if (old_parent,old_name)==(new_parent,new_name):continue
+        row={'working_inode':obj['working_inode'],'kind':obj['kind'],
+            'initial_path':obj['initial_path'],'final_path':obj['final_path'],
+            'old_parent':old_parent,'old_name':old_name,'new_parent':new_parent,'new_name':new_name}
+        if old_parent is not None:detach.append(row)
+        if new_parent is not None:attach.append(row)
+    detach.sort(key=lambda row:(-len(relative(bytes.fromhex(row['initial_path'])).parts),bytes.fromhex(row['initial_path'])))
+    attach.sort(key=lambda row:(len(relative(bytes.fromhex(row['final_path'])).parts),bytes.fromhex(row['final_path'])))
+    return {'version':1,'kind':'ci-namespace-edges','detach':detach,'attach':attach,
+        'effects_materialized':False,'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
 
 
 def validate_capture_stdio(capture,descriptors):
