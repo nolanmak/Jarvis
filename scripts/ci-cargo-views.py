@@ -93,6 +93,47 @@ def observe_mount_layout(pid):
     except OSError:raise FreshnessHold('input_census_unknown') from None
 
 
+def validate_mount_bindings(root_fd,layout,rules):
+    """Compare observed mounts to original caller-owned bindings, without writes.
+
+    The caller owns the original exec stop/freeze and authenticated root/rules.
+    This checks mount coverage and inode identity, not the complete private tree,
+    exclusive writers, producer provenance, input closure or resume authority.
+    """
+    opened=None
+    try:
+        root=os.fstat(root_fd)
+        if ([root.st_dev,root.st_ino]!=layout['root_identity'] or not stat.S_ISDIR(root.st_mode)
+                or type(rules) is not dict or len(rules)>MAX_ENTRIES):raise FreshnessHold('invalidation_unsafe')
+        seen=set()
+        kinds={'directory':stat.S_ISDIR,'file':stat.S_ISREG,'socket':stat.S_ISSOCK,
+               'device':stat.S_ISCHR,'proc':stat.S_ISDIR}
+        for row in layout['mounts']:
+            name=bytes.fromhex(row['mountpoint']);rule=rules.get(name)
+            if (rule is None or name in seen or row['optional'] or not name.startswith(b'/')
+                    or rule['kind'] not in kinds or rule['access'] not in ('ro','rw')
+                    or set(row['options'])&{'ro','rw'}!={rule['access']}):raise FreshnessHold('invalidation_unsafe')
+            if rule['kind']!='device' and not {'nosuid','nodev'}<=set(row['options']):
+                raise FreshnessHold('invalidation_unsafe')
+            opened=_open_beneath(root_fd,name[1:],os.O_PATH);actual=os.fstat(opened)
+            os.close(opened);opened=None
+            if not kinds[rule['kind']](actual.st_mode):raise FreshnessHold('invalidation_unsafe')
+            if rule['kind']=='proc':
+                if row['filesystem']!='proc' or rule['access']!='ro':raise FreshnessHold('invalidation_unsafe')
+            else:
+                source=literal(rule['source']).stat()
+                if (actual.st_dev,actual.st_ino,stat.S_IFMT(actual.st_mode),actual.st_rdev)!=(
+                        source.st_dev,source.st_ino,stat.S_IFMT(source.st_mode),source.st_rdev):
+                    raise FreshnessHold('invalidation_unsafe')
+            seen.add(name)
+        if seen!=set(rules):raise FreshnessHold('invalidation_unsafe')
+        return {'version':1,'kind':'ci-unit-mount-bindings','mount_layout_sha256':layout['sha256'],
+            'verified_bindings':len(seen),'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+    except (OSError,ValueError,KeyError,TypeError):raise FreshnessHold('invalidation_unsafe') from None
+    finally:
+        if opened is not None:os.close(opened)
+
+
 def relative(value):
     raw=os.fsencode(value)
     if (not raw or len(raw)>4096 or raw.startswith(b'/') or b'\0' in raw

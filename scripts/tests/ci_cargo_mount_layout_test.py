@@ -1,10 +1,37 @@
 """Bounded kernel mount-layout parsing and actual proc observations."""
 import os
+from pathlib import Path
+import tempfile
 import unittest
 from ci_cargo_capture_test import views
 
 
 class MountLayoutTests(unittest.TestCase):
+    def test_binding_checks_require_exact_paths_modes_and_actual_source_inodes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/'source';source.write_bytes(b'immutable')
+            tree=root/'tree';tree.mkdir();os.link(source,tree/'input')
+            descriptor=os.open(tree,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+            layout={'root_identity':[tree.stat().st_dev,tree.stat().st_ino],
+                'sha256':'a'*64,'mounts':views.parse_mount_layout(
+                    b'1 9 8:1 /source /input ro,nosuid,nodev - ext4 /dev/vda rw\n')}
+            rules={b'/input':{'source':str(source),'kind':'file','access':'ro'}}
+            try:
+                result=views.validate_mount_bindings(descriptor,layout,rules)
+                self.assertEqual(result['verified_bindings'],1);self.assertFalse(result['shipping_authority'])
+                original=layout['mounts'][0]
+                for fault in ('writable','unknown','duplicate','propagation','missing'):
+                    row=dict(original)
+                    if fault=='writable':row['options']=['rw','nosuid','nodev']
+                    elif fault=='unknown':row['mountpoint']=b'/outside'.hex()
+                    elif fault=='propagation':row['optional']=['shared:7']
+                    layout['mounts']=[] if fault=='missing' else [row,row] if fault=='duplicate' else [row]
+                    with self.subTest(fault=fault),self.assertRaises(views.FreshnessHold):
+                        views.validate_mount_bindings(descriptor,layout,rules)
+                layout['mounts']=[original];source.unlink();source.write_bytes(b'foreign replacement')
+                with self.assertRaises(views.FreshnessHold):views.validate_mount_bindings(descriptor,layout,rules)
+            finally:os.close(descriptor)
+
     def test_mount_paths_preserve_kernel_escaped_and_non_utf8_bytes(self):
         body=(b'1 9 8:1 /private/root / rw,relatime - ext4 /dev/vda rw\n'
               b'2 1 8:1 /input\\040space/\\134raw\xff /workspace/with\\011tab ro,nosuid,nodev - ext4 /dev/vda rw\n')

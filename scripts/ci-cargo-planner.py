@@ -2006,6 +2006,34 @@ class StagedParentSignals:
             os.close(self.pidfd);self.closed=True
 
 
+def unit_mount_rules(view,mounts,*,library,endpoint):
+    """Original admitted view bindings; never accept requested tool mount rules."""
+    rules={}
+    def add(name,source,kind,access='ro'):
+        if name in rules:raise FreshnessHold('invalidation_unsafe')
+        rules[name]={'source':str(source) if source is not None else None,'kind':kind,'access':access}
+    add(b'/usr','/usr','directory')
+    if Path('/toolchain').is_dir():
+        for name in ('bin','etc','lib','libexec','share'):
+            add(os.fsencode('/toolchain/'+name),'/toolchain/'+name,'directory')
+    add(b'/workspace',view['source'],'directory')
+    add(b'/workspace/target',view['artifacts'],'directory','rw')
+    for name in ('tmp','home/worker','cargo','var/tmp','dev/shm'):
+        if 'working' in view:add(os.fsencode('/'+name),Path(view['working'])/name,'directory','rw')
+    add(b'/proc',None,'proc')
+    for name in ('null','zero','random','urandom'):
+        add(os.fsencode('/dev/'+name),'/dev/'+name,'device','rw')
+    add(b'/run/ci-unit.sock',endpoint,'socket')
+    add(b'/run/ci-cargo-relay.so',library,'file')
+    for prefix,entries in ((b'/workspace/target/',mounts['entries']),
+            (b'/workspace/',mounts.get('source_entries',[]))):
+        for raw,source,expected in entries:
+            name=os.fsencode(unit_views.relative(bytes.fromhex(raw)))
+            if expected[1] not in ('file','tree'):raise FreshnessHold('invalidation_unsafe')
+            add(prefix+name,source,'directory' if expected[1]=='tree' else 'file')
+    return rules
+
+
 class UnitFreezer:
     """Original unit's guest-only cgroup; a pause is never original cleanup.
 
@@ -2201,6 +2229,17 @@ class UnitPeerRelay(RootRelay):
                 or layout.get('layout')!=unit_views.observe_mount_layout(pid)
                 or layout['layout']['sha256']!=entry['mount_layout_sha256']):
             raise FreshnessHold('invalidation_unsafe')
+        mounts=cache._read_record(Path(self.view['mounts']),max_bytes=16*1024**2)
+        if (mounts.get('binding')!=self.admission.binding or mounts.get('command')!=self.admission.command
+                or mounts.get('ordinal')!=self.parent_ordinal):raise FreshnessHold('generation_mismatch')
+        root_descriptor=os.open(f'/proc/{pid}/root',os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+        try:verified=unit_views.validate_mount_bindings(root_descriptor,layout['layout'],
+            unit_mount_rules(self.view,mounts,library=self.library,endpoint=self.path))
+        finally:os.close(root_descriptor)
+        cache._write_record(self.scope/'mount-bindings.json',{'version':1,
+            'binding':self.admission.binding,'command':self.admission.command,'ordinal':self.parent_ordinal,
+            'entry_sha256':layout['entry_sha256'],'mount_bindings':verified,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
         namespaces={name:os.readlink(f'/proc/{pid}/ns/'+name) for name in ('mnt','ipc','net','user','pid')}
         if any(record['namespaces'][name]['unit']!=namespaces[name] for name in ('mnt','ipc','net')):
             raise FreshnessHold('invalidation_unsafe')

@@ -2443,3 +2443,20 @@ distinct from ordinary path roots. The observation records exact per-mount
 read/write, propagation, filesystem and backing-root fields; it does not yet
 classify the complete writable layout or certify private-W writer isolation.
 Transfer/resume, input closure, full CI and shipping authority remain disabled.
+
+Replay `5d19f372` verifies 16 retained mount layouts and four nested root children
+making progress; original cleanup remains verified and the full test is red after
+101.96 seconds at the held transfer path. The pinned guest's chroot table omits
+the base mount. Each contained view exposes 21 explicit runtime/source/target,
+private temp/home/Cargo/shm, proc/device and transport binds in this fixture.
+Observation: `/tmp/autoship-1703-four-parent-observation-6.json`.
+
+Root enrollment now requires exactly the original view's planned mount paths and
+access modes, rejects stacked/unknown/shared mounts, and compares actual bound
+inodes to the original runtime, source, artifact, working-copy and transport
+sources. Proc must be the readonly proc filesystem; writable device binds must
+match the original devices. The source/working rules come from the admitted
+view and its bound mount manifest. No tool argument or environment can add one.
+This enforces the explicit binds; private base-tree permissions, whole-UID writer
+closure and complete kernel-resource disposition still need evidence before any
+parent transfer/resume or passing-CI authority.
