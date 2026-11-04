@@ -4,6 +4,8 @@ name: Platform (Linux + macOS)
 # builds and tests the host-dependent surface on both so neither side can
 # silently regress: service/status/logs/installers/doctor probes, the
 # process walker, sidecar socket paths, and the updater's restart library.
+# The macOS leg runs in macos.yml (`platform (macos-latest)`): every push to
+# main, nightly, on demand, and PRs touching macOS-sensitive paths.
 
 on:
   pull_request:
@@ -13,17 +15,23 @@ on:
 permissions:
   contents: read
 
+# Superseded PR heads cancel; non-PR runs retain distinct queue slots.
 concurrency:
-  group: platform-${{ github.ref }}
-  cancel-in-progress: true
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
 
 jobs:
   platform:
+    # The macOS leg of this job lives in macos.yml (platform-macos), which
+    # mirrors this job's non-Linux-only steps. It runs on main, nightly, on
+    # demand and on PRs touching macOS-sensitive paths.
     name: platform (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # A single entry on purpose: the check ids stay
+        # `<step> @{"os":"ubuntu-latest"}`, which controller code references.
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
