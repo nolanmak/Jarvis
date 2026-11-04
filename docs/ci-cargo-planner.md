@@ -2266,5 +2266,14 @@ exec acknowledgement, listener loss, and inherited mediation in a forked
 descendant. Every case retains the original supervisor's descendant cleanup.
 The complete Python suite passes **397 tests without skips**; the focused
 managed Rust suite passes **34 tests**, with 22 opt-in guest tests ignored.
-Pinned-guest validation and production bootstrap/transport integration remain
-pending. These primitives and experiments grant no passing-CI or merge authority.
+The separate pinned-guest gate at `627ca7f0` passed all six cases in **89.96
+seconds** under the existing managed admission and unchanged command deadline
+and resources. The receipt retains actual initial/denied notification records:
+early constructor and fork each had four denied calls after acknowledgement;
+static entry had two; failed lookup had two initial attempts followed by two
+denials; cancellation had no acknowledgement; closed-listener behavior remained
+fail-closed. All six retained original descendant cleanup. Receipt:
+`/tmp/augmentagent-ci-exec-mediation-20261104011422/receipt.json`, SHA-256
+`16b4ca3e30a4c7b7475216a19abd528bf6b12f7f5efa24039b91e5b2a70b04fc`.
+Production bootstrap/transport integration remains pending. These primitives and
+experiments grant no passing-CI or merge authority.
