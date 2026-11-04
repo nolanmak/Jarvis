@@ -704,8 +704,13 @@ aliases on each stdio stream. Such a stdin stager could consume token bytes;
 stdout/stderr could fabricate them. Admission now rejects those kernel-inode
 aliases before reading stdin, pausing a parent or preparing a credit loan.
 The same test accepts distinct stdio and checks unchanged original pipe bytes.
-The expanded 100-case guest run remains pending. This closes neither the real
-four-parent Cargo exhaustion gate nor the full-chain return/resume gate.
+At `092fa2da`, all 100 guest cases passed in 96.92 seconds as UID1000, with
+original resource removal verified. The read-only model/pipe check now also
+runs at authenticated receive, before stdin staging, so missing/substituted
+models cannot drain a stream before refusal. A fifteenth host case verifies
+that ordering without changing pipe bytes or the credit journal. The revised
+101-case guest check and unchanged Cargo replay remain pending. These results
+close neither the real four-parent Cargo exhaustion gate nor full-chain return/resume.
 
 Routing and cancellation must not wait for an execution permit held by the
 request's paused ancestor. Containment is acyclic and recorded before dispatch.

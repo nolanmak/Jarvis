@@ -2229,7 +2229,16 @@ class UnitPeerRelay(RootRelay):
         root=os.stat(f'/proc/{pid}/root')
         if self.scope_root!={'device':(os.major(root.st_dev)<<20)|os.minor(root.st_dev),'inode':root.st_ino,'mode':root.st_mode}:
             raise FreshnessHold('invalidation_unsafe')
+        self.validate_jobserver_request(descriptors,numbers)
         return numbers
+
+    def validate_jobserver_request(self,descriptors,numbers):
+        # This runs after authenticated receive and before stage_request_stdin.
+        # A missing model must not get as far as draining an aliased stdin.
+        _,_,environment,*_=payload(descriptors[0])
+        _,_,jobserver=staging.normalize_jobserver(environment,dict(zip(numbers[3:],descriptors[4:])))
+        if jobserver is None or self.ordinals.credits.require_owned(self.parent_ordinal)['jobserver']!=jobserver:
+            raise FreshnessHold('input_census_unknown')
 
     def _run(self,connection,ordinal,descriptors,numbers,phase):
         # A child runs only in detached private working state under the original

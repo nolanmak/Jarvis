@@ -187,6 +187,30 @@ class JobserverCreditTests(unittest.TestCase):
                     self.assertEqual(os.read(self.reader,1),b'+')
 
 
+    def test_missing_or_substituted_credit_model_is_rejected_before_stdin_staging(self):
+        self.enter(8);relay=object.__new__(planner.UnitPeerRelay);relay.parent_ordinal=8
+        relay.ordinals=type('CreditOwner',(),{'credits':self.credits})()
+        other_r,other_w=os.pipe2(os.O_CLOEXEC)
+        try:
+            for environment,extras,accepted in ((self.environment,[self.reader,self.writer],True),
+                    ({},[],False),(self.environment,[other_r,other_w],False)):
+                with self.subTest(accepted=accepted,missing=not environment):
+                    body=bytearray(planner.legacy.encode_request(b'/usr/bin/python3',[b'python3'],
+                        [k+b'='+v for k,v in environment.items()],b'/workspace'))
+                    body[:8]=b'JARVARG3';payload=os.memfd_create('credit-preflight',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
+                    os.write(payload,body);fcntl.fcntl(payload,fcntl.F_ADD_SEALS,planner.legacy.SEALS)
+                    numbers=[0,1,2]+([71,72] if extras else []);descriptors=[payload,self.reader,self.writer,self.writer,*extras]
+                    before=(self.root/'credits.json').read_bytes();os.write(self.writer,b'+')
+                    try:
+                        if accepted:relay.validate_jobserver_request(descriptors,numbers)
+                        else:
+                            with self.assertRaises(planner.FreshnessHold):relay.validate_jobserver_request(descriptors,numbers)
+                        self.assertEqual(os.read(self.reader,1),b'+')
+                        self.assertEqual((self.root/'credits.json').read_bytes(),before)
+                    finally:os.close(payload)
+        finally:os.close(other_r);os.close(other_w)
+
+
 def select_readable(fd):
     import select
     return bool(select.select([fd],[],[],0)[0])
