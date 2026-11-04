@@ -121,9 +121,10 @@ def observe_uid_cohort(uid,expected,*,check):
             if len(ids)!=4 or int(status[b'Pid'])!=tid or int(status[b'Tgid'])!=pid:
                 raise StagingUnavailable('uid_cohort_identity')
             return {'pid':pid,'tid':tid,'birth':int(fields[19])},ids
-        before=observe()
-        if observe()!=before:raise StagingUnavailable('uid_cohort_identity')
-        return before
+        before=observe();after=observe()
+        if before!=after and (tid in tasks or uid in before[1] or uid in after[1]):
+            raise StagingUnavailable('uid_cohort_identity')
+        return after
     try:
         namespace=os.readlink('/proc/self/ns/pid')
         for row in tasks.values():

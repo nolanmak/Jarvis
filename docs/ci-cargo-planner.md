@@ -2597,3 +2597,14 @@ wrong births, foreign ownership, vanished tasks, cancellation and bounds. A
 standalone census never supplies freeze, cleanup, alias/input or CI authority.
 Remaining structural allocation/alias/kernel-resource gates and result
 application/resume still stay fenced.
+
+Native replay `003a22c8` independently validates 20 original/nested entry UID
+censuses and all 16 frozen-parent censuses against their original task births,
+unit UIDs and controller PID namespace. Original VM cleanup is positively
+verified; all four nested root children progress. The full test still fails
+with InputCensusUnknown after 105.70 seconds because effect application/resume
+remains fenced. A further controlled credential-resampling regression exposes
+an unrelated bootstrap UID transition causing a false hold: identity changes
+now hold only if they concern an expected task or enter/leave the target UID.
+Both directions remain tested; this does not ignore any target-UID identity
+change. The additional two policy tests do not claim actual host UID changes.

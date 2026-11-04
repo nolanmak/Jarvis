@@ -2122,7 +2122,7 @@ class UnitFreezer:
             if os.write(descriptor,body)!=len(body):raise FreshnessHold('cleanup_uncertain')
         finally:os.close(descriptor)
 
-    def attach(self,pid,pidfd,*,entry,mount_layout,private_base,mutable_roots):
+    def attach(self,pid,pidfd,*,entry,mount_layout,private_base,mutable_roots,deadline):
         if self.original is not None:raise FreshnessHold('invalidation_unsafe')
         process=Path('/proc')/str(pid);status=process.joinpath('stat').read_text().rsplit(')',1)[1].split()
         if status[0]!='t' or {p.name for p in process.joinpath('task').iterdir()}!={str(pid)}:
@@ -2139,9 +2139,12 @@ class UnitFreezer:
         self.original=pid;self.pidfd=os.dup(pidfd);self.entry=copy.deepcopy(entry)
         self.mount_layout=copy.deepcopy(mount_layout)
         self.private_base=copy.deepcopy(private_base);self.mutable_roots=list(mutable_roots)
+        def check_entry():
+            if time.monotonic()>=deadline:raise FreshnessHold('cleanup_uncertain')
+            signal.pidfd_send_signal(self.pidfd,0)
         self.entry_uid_cohort=staging.observe_uid_cohort(self.uid,
             [{'pid':pid,'tid':pid,'birth':entry['birth']}],
-            check=lambda:signal.pidfd_send_signal(self.pidfd,0))
+            check=check_entry)
         if self.entry_uid_cohort['pid_namespace']!=self.pid_namespace:raise FreshnessHold('invalidation_unsafe')
         self._note('original_enrolled',uid_cohort=self.entry_uid_cohort)
 
@@ -2302,7 +2305,7 @@ class UnitPeerRelay(RootRelay):
             raise FreshnessHold('invalidation_unsafe')
         self.scope_root=record['root_identity'];self.scope_namespaces=namespaces;self.scope_pidfd=os.pidfd_open(pid)
         self.freezer.attach(pid,self.scope_pidfd,entry=entry,mount_layout=layout['layout'],
-            private_base=private_base,mutable_roots=mutable_roots)
+            private_base=private_base,mutable_roots=mutable_roots,deadline=self.deadline)
         # Original root compiler scopes otherwise disappear with the guest
         # controller tree. Preserve the same entry and global UID census.
         cache._write_record(Path(self.view['root']).parent/'entry-boundary.json',{

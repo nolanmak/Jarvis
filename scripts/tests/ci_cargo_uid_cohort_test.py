@@ -1,11 +1,14 @@
 """Actual procfs identities; these observations never prove a freeze or reuse."""
 import os
+import io
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
 import time
 import unittest
+from unittest.mock import patch
 from ci_cargo_entry_test import staging
 
 
@@ -69,6 +72,30 @@ class UidCohortTests(unittest.TestCase):
         for tasks in ([self.original,self.original],[self.original]*513):
             with self.subTest(count=len(tasks)),self.assertRaises(staging.StagingUnavailable):
                 staging.observe_uid_cohort(os.getuid(),tasks,check=lambda:None)
+
+    def credential_transition(self,other):
+        # Controlled resampling of one real task's UID fields exercises a
+        # concurrent bootstrap changing credentials. This is a parser/policy
+        # regression, not evidence that this host task changed its real UID.
+        target=Path(f'/proc/{os.getpid()}/task/{os.getpid()}/status')
+        open_file=Path.open;reads=[]
+        def observe(path,*args,**kwargs):
+            stream=open_file(path,*args,**kwargs)
+            if path!=target:return stream
+            with stream:body=stream.read()
+            reads.append(True);uid=os.getuid() if len(reads)%2 else other
+            return io.BytesIO(re.sub(rb'(?m)^Uid:.*$',('Uid:\t'+'\t'.join([str(uid)]*4)).encode(),body))
+        return reads,patch.object(Path,'open',observe)
+
+    def test_unrelated_credential_transition_does_not_invalidate_target_uid_census(self):
+        reads,sampling=self.credential_transition(os.getuid()+1)
+        with sampling:result=staging.observe_uid_cohort(2**32-2,[],check=lambda:None)
+        self.assertEqual(result['tasks'],[]);self.assertGreaterEqual(len(reads),4)
+
+    def test_transition_into_target_uid_still_holds(self):
+        _,sampling=self.credential_transition(2**32-2)
+        with sampling,self.assertRaises(staging.StagingUnavailable):
+            staging.observe_uid_cohort(2**32-2,[],check=lambda:None)
 
 
 if __name__=='__main__':unittest.main()
