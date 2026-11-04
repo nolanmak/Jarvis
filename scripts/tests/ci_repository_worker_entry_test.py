@@ -10,6 +10,8 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
+import stat
 
 ROOT=Path(__file__).resolve().parents[2]
 def load(name,file):
@@ -19,6 +21,36 @@ planner=load('worker_entry_planner_tests','ci-cargo-planner.py')
 
 
 class WorkerEntryDiagnosticTests(unittest.TestCase):
+    def admission(self,stdin_flags):
+        scope={'scope_id':str(uuid.uuid4())};binding={};command=str(uuid.uuid4())
+        flags={'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+        native={'version':1,'kind':'ci-unit-policy-activation','sha256':'a'*64,'size_bytes':100,
+            'activation_returncode':0,**flags}
+        policy={'version':1,'kind':'ci-repository-worker-policy-receipt','binding':binding,'command':command,
+            'scope_id':scope['scope_id'],'pid':401,'policy':native}
+        rows=[{'number':n,'device':1,'inode':n+1,'type':kind,'uid':0,'gid':0,'flags':access,'position':0}
+            for n,kind,access in ((0,stat.S_IFCHR,stdin_flags),(1,stat.S_IFIFO,os.O_WRONLY),
+                                 (2,stat.S_IFIFO,os.O_WRONLY),(4,stat.S_IFREG,os.O_RDWR))]
+        entry={'version':1,'kind':'ci-unit-exec-entry','pid':401,'birth':9,'tracer':400,
+            'uids':[1000]*4,'gids':[1000]*4,'groups':[],'no_new_privs':1,'seccomp':2,'seccomp_filters':2,
+            'capabilities':{'CapEff':0,'CapPrm':0,'CapAmb':0},'descriptors':[0,1,2,4],'fd_table':rows,
+            'policy_activation':policy,'sealed_relay':{'device':1,'inode':5,'uid':0,'gid':0,'seals':15,
+                'sha256':'b'*64,'size_bytes':160},**flags}
+        value={'version':1,'kind':'ci-repository-worker-admission','binding':binding,'command':command,
+            'scope_id':scope['scope_id'],'supervisor_pid':400,'entry':entry,
+            'namespaces':{name:name+':[1]' for name in ('mnt','ipc','net','user','pid')},**flags}
+        return value,binding,command,scope
+
+    def test_receipt_grammar_accepts_original_readwrite_devnull_without_normalizing(self):
+        # Metadata-only fixture: this is not a live root admission token.
+        value,binding,command,scope=self.admission(os.O_RDWR)
+        self.assertIs(planner.validate_worker_entry(value,binding,command,scope),value)
+        self.assertEqual(value['entry']['fd_table'][0]['flags'],os.O_RDWR)
+
+    def test_receipt_grammar_refuses_writeonly_stdin(self):
+        with self.assertRaises(planner.FreshnessHold):
+            planner.validate_worker_entry(*self.admission(os.O_WRONLY))
+
     def test_worker_entry_failure_has_bounded_stage_and_stable_evidence(self):
         import hashlib
         progress={}

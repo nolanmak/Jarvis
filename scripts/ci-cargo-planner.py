@@ -4977,7 +4977,7 @@ def validate_worker_entry(value,binding,command,scope,progress=None):
             at('worker_entry_fd_'+key)
             if any(type(row[key]) is not int or row[key]<0 for row in rows):raise ValueError()
         at('worker_entry_fd_stdin')
-        if rows[0]['type']!=stat.S_IFCHR or rows[0]['flags']&os.O_ACCMODE!=os.O_RDONLY:raise ValueError()
+        if rows[0]['type']!=stat.S_IFCHR or rows[0]['flags']&os.O_ACCMODE not in (os.O_RDONLY,os.O_RDWR):raise ValueError()
         at('worker_entry_fd_stdout')
         if any(row['type']!=stat.S_IFIFO or row['flags']&os.O_ACCMODE!=os.O_WRONLY for row in rows[1:3]):raise ValueError()
         at('worker_entry_fd_configuration')
