@@ -1346,6 +1346,15 @@ exec(compile(module.guarded_probe(module._PLANNER_PROBE),'fixed-planner-probe','
         self.assertEqual(planner.failed_probe_diagnostic(json.dumps({'planner_diagnostic':proxy}).encode(),request),request[0])
         self.assertNotIn('PRIVATE',json.dumps(planner.failed_probe_diagnostic(stderr,request)))
 
+    def test_controller_refusal_is_not_masked_by_a_later_broken_stdin_pipe(self):
+        stream={'stage':'planner_probe_stream','category':'OSError','errno':32}
+        request=[{'stage':'planner_view_prepare','category':'FreshnessHold','errno':None,
+            'private':'PRIVATE_CONTROLLER_PATH'}]
+        self.assertEqual(planner.failed_probe_diagnostic(json.dumps({'planner_diagnostic':stream}).encode(),request),
+            {'stage':'planner_view_prepare','category':'FreshnessHold','errno':None})
+        direct={'stage':'planner_drop','category':'OSError','errno':13}
+        self.assertEqual(planner.failed_probe_diagnostic(json.dumps({'planner_diagnostic':direct}).encode(),request),direct)
+
     def test_fixed_tool_refusal_reports_only_credentials_phase(self):
         if os.getresuid()==(2000,2000,2000) and os.getresgid()==(2000,2000,2000):
             self.skipTest('host happens to have the exact admitted unit credentials')

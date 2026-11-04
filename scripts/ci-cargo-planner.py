@@ -71,7 +71,8 @@ def failed_probe_diagnostic(error,request_errors):
         if type(value) is dict and type(value.get('planner_diagnostic')) is dict:
             candidate=diagnostic(value['planner_diagnostic'])
             if selected is None or candidate['stage']!='planner_probe_status':selected=candidate
-    if request_errors and (selected is None or selected['stage']=='planner_probe_status'):
+    if request_errors and (selected is None or selected['stage']=='planner_probe_status'
+            or selected=={'stage':'planner_probe_stream','category':'OSError','errno':errno.EPIPE}):
         selected=diagnostic(request_errors[0])
     return selected
 
@@ -1640,13 +1641,23 @@ class UnitFreezer:
             raise FreshnessHold('invalidation_unsafe')
         _source(admission.target,admission.binding,admission.command)
         self.owner=os.getpid();self.uid=uid;self.original=None;self.pidfd=None
+        self.setup_path=Path(scope)/'freeze-setup.json'
+        self.setup_record={'version':1,'kind':'ci-unit-freezer-setup','binding':admission.binding,
+            'command':admission.command,'uid':uid,'shipping_authority':False}
         with self._setup:
             mount=Path('/sys/fs/cgroup')
             # This controller runs in the isolated guest's initial cgroup.
             # Refuse a host service/delegation rather than modifying its tree.
-            if Path('/proc/self/cgroup').read_bytes()!=b'0::/\n':raise FreshnessHold('invalidation_unsafe')
+            membership=Path('/proc/self/cgroup').read_bytes()
+            self._note('before_mount',membership_root=membership==b'0::/\n',membership_empty=membership==b'',
+                mountpoint_exists=mount.is_dir(),v2_controls_present=(mount/'cgroup.controllers').exists())
+            # The unified hierarchy is omitted from proc until its first
+            # mount. Verify actual root membership after making it visible.
+            if membership not in (b'',b'0::/\n'):raise FreshnessHold('invalidation_unsafe')
             if not (mount/'cgroup.controllers').exists():
                 unit_views._mount('-t','cgroup2','-o','nosuid,nodev,noexec','none',mount)
+            self._note('verify_mount')
+            if Path('/proc/self/cgroup').read_bytes()!=b'0::/\n':raise FreshnessHold('invalidation_unsafe')
             rows=Path('/proc/self/mountinfo').read_text().splitlines()
             if not any(line.split()[4]=='/sys/fs/cgroup' and ' - cgroup2 ' in line for line in rows):
                 raise FreshnessHold('invalidation_unsafe')
@@ -1657,9 +1668,14 @@ class UnitFreezer:
                     or stat.S_IMODE(info.st_mode)!=0o700):raise FreshnessHold('invalidation_unsafe')
             self.path=root/Path(scope).name;self.path.mkdir(mode=0o700)
         self.identity=self.path.stat();self.closed=False
+        self._note('configure_scope')
         self._write('cgroup.max.depth',b'0\n');self._write('cgroup.max.descendants',b'0\n')
         if self._read('cgroup.type')!=b'domain\n' or self._read('cgroup.procs'):
             raise FreshnessHold('invalidation_unsafe')
+        self._note('scope_ready')
+
+    def _note(self,phase,**values):
+        self.setup_record.update(phase=phase,**values);cache._write_record(self.setup_path,self.setup_record)
 
     def _check(self):
         current=self.path.lstat()
@@ -1692,6 +1708,7 @@ class UnitFreezer:
                 or set(self._read('cgroup.procs').split())!={str(pid).encode()}):
             raise FreshnessHold('invalidation_unsafe')
         self.original=pid;self.pidfd=os.dup(pidfd)
+        self._note('original_enrolled')
 
     def _wait(self,frozen,deadline):
         while True:
