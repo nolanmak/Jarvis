@@ -1758,7 +1758,10 @@ pub(crate) fn is_auth_refusal(text: &str) -> bool {
         "failed to authenticate",
         "invalid api key",
         "not logged in",
+        // Not a bare "oauth": an answer about OAuth itself starts that way.
         "oauth token",
+        "oauth session",
+        "please run /login",
         "authentication error",
         "authentication_error",
     ]
@@ -4589,6 +4592,8 @@ mod rate_limit_tests {
             "Invalid API key · Please run /login",
             "OAuth token has expired. Please obtain a new token or refresh your existing token.",
             "Not logged in · Please run /login",
+            "OAuth session expired and could not be refreshed",
+            "Please run /login · API Error: 401",
         ] {
             assert!(is_auth_refusal(refusal), "missed auth refusal: {refusal}");
         }
@@ -4609,6 +4614,10 @@ mod rate_limit_tests {
             &padded,
             "",
             "You've hit your session limit · resets 9:30am",
+            // Anchored on "oauth" but not a refusal: answers about OAuth
+            // itself must not latch claude.
+            "OAuth 2.0 uses short-lived access tokens; the app stores them in the keychain.",
+            r#"{"summary":"Please run /login was mentioned in the ticket"}"#,
         ] {
             assert!(!is_auth_refusal(ok), "false positive on: {ok}");
         }
