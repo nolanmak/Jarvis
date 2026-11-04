@@ -1619,7 +1619,16 @@ class RootRelay:
             raise FreshnessHold('metadata_torn')
         unit_views.validate_stdio(descriptors[1:4])
         _,_,environment,*_=payload(descriptors[0])
-        staging.normalize_jobserver(environment,dict(zip(numbers[3:count],descriptors[4:])))
+        _,mapping,_=staging.normalize_jobserver(environment,dict(zip(numbers[3:count],descriptors[4:])))
+        if mapping:
+            pipe=os.fstat(mapping[0][1]);identity=(pipe.st_dev,pipe.st_ino)
+            # Staging stdin or writing output must never consume/fabricate
+            # jobserver bytes through an unmodeled stdio alias. Refuse before
+            # the first read, parent pause or credit-loan preparation.
+            for descriptor in descriptors[1:4]:
+                info=os.fstat(descriptor)
+                if stat.S_ISFIFO(info.st_mode) and (info.st_dev,info.st_ino)==identity:
+                    raise FreshnessHold('input_census_unknown')
         return numbers[:count]
 
     def _handle(self,connection,ordinal):

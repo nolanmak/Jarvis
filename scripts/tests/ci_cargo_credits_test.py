@@ -163,6 +163,30 @@ class JobserverCreditTests(unittest.TestCase):
         self.assertFalse(select_readable(self.reader))
 
 
+    def test_jobserver_stdio_aliases_are_refused_before_any_token_can_be_consumed(self):
+        import array,socket
+        for side in (None,0,1,2):
+            with self.subTest(side=side):
+                server,client=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET)
+                relay=object.__new__(planner.RootRelay);relay.peer_uid=os.getuid()
+                relay.require_message_credentials=False;relay.nonce=b'n'*32;received=[]
+                body=bytearray(planner.legacy.encode_request(b'/usr/bin/python3',[b'python3'],[k+b'='+v for k,v in self.environment.items()],b'/workspace'))
+                body[:8]=b'JARVARG3';payload=os.memfd_create('credit-alias-request',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
+                os.write(payload,body);fcntl.fcntl(payload,fcntl.F_ADD_SEALS,planner.legacy.SEALS)
+                null=os.open('/dev/null',os.O_RDWR|os.O_CLOEXEC);stdio=[null,null,null]
+                if side is not None:stdio[side]=self.reader if side==0 else self.writer
+                frame=planner.legacy.REQUEST.pack(b'JARVREQ3',relay.nonce,5,0,1,2,71,72,*([0]*59))
+                os.write(self.writer,b'+')
+                try:
+                    client.sendmsg([frame],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',[payload,*stdio,self.reader,self.writer]))])
+                    if side is None:self.assertEqual(relay._receive(server,received),[0,1,2,71,72])
+                    else:
+                        with self.assertRaises(planner.FreshnessHold):relay._receive(server,received)
+                finally:
+                    planner.legacy._close(received);os.close(payload);os.close(null);server.close();client.close()
+                    self.assertEqual(os.read(self.reader,1),b'+')
+
+
 def select_readable(fd):
     import select
     return bool(select.select([fd],[],[],0)[0])

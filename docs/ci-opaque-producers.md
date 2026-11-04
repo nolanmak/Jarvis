@@ -689,6 +689,24 @@ credit tests and 34 Rust tests. The unchanged original Cargo replay remains
 pending. Actual four-parent exhaustion/cancellation/reacquisition and checked
 parent resume remain mandatory before this model can pass its integration gate.
 
+At `8a8b307c`, the unchanged Cargo replay stayed red at the deliberate
+unmaterialized-transfer hold in 103.27 seconds. Managed read-only inspection
+verified the retained journal's binding, owner/mode, shared original credit and
+kernel pipe across units 8–12. Independent comparison against the original
+admission/cleanup records verified every scope and pause hash. The successful
+leaf loan returned; interrupted ancestor loans 9–11 remain lent and their parents
+stay fenced. The strict full-chain-return/root-closure verifier is red; those
+states must not be reset or relabeled as returned to manufacture acceptance.
+Observation: `/tmp/autoship-1703-credit-lineage-fenced-observation-1.json`.
+
+A fourteenth real socket/FD regression reproduced acceptance of jobserver-pipe
+aliases on each stdio stream. Such a stdin stager could consume token bytes;
+stdout/stderr could fabricate them. Admission now rejects those kernel-inode
+aliases before reading stdin, pausing a parent or preparing a credit loan.
+The same test accepts distinct stdio and checks unchanged original pipe bytes.
+The expanded 100-case guest run remains pending. This closes neither the real
+four-parent Cargo exhaustion gate nor the full-chain return/resume gate.
+
 Routing and cancellation must not wait for an execution permit held by the
 request's paused ancestor. Containment is acyclic and recorded before dispatch.
 Iterative traversal closes arbitrarily deep admitted chains within the existing
