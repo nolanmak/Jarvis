@@ -1593,6 +1593,48 @@ async fn live_shared_ci_vm_smoke() -> Result<()> {
 }
 
 
+/// Observe original worker admission through the ordinary repository adapter.
+/// This does not exercise projection, parent resume or grant passing-CI authority.
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_original_worker_admission() -> Result<()> {
+    let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private evidence required");
+    std::fs::create_dir(&evidence)?;
+    std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"shared-ci-original-worker-entry",None)?;
+    audit.require_run_resources()?;
+    let target=crate::build_storage::effective_target(&owner);
+    let storage=crate::build_storage::admit_ci(&owner,&target).await?;
+    let fixture=tempfile::Builder::new().prefix("original-worker-entry-").tempdir_in(&target)?;
+    let root=fixture.path();std::fs::create_dir(root.join("src"))?;
+    std::fs::write(root.join("Cargo.toml"),"[package]\nname=\"worker-entry-probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[workspace]\n")?;
+    std::fs::write(root.join("Cargo.lock"),"version=4\n\n[[package]]\nname=\"worker-entry-probe\"\nversion=\"0.1.0\"\n")?;
+    std::fs::write(root.join("src/main.rs"),"fn main() {}\n")?;
+    git(root,&["-c","init.templateDir=","init","-q"]).await?;
+    git(root,&["add","."]).await?;
+    git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+        "-c","core.hooksPath=/dev/null","-c","commit.gpgsign=false","commit","-qm","worker admission fixture"]).await?;
+    let head=git(root,&["rev-parse","HEAD"]).await?.trim().to_owned();
+    git(root,&["update-ref","refs/remotes/origin/main",&head]).await?;
+    let bound=binding(root).await?;let source=snapshot(root,&bound,&target).await?;
+    let session=vm::Session::prepare(&owner,&target)?;
+    let result=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some("printf ORIGINAL_WORKER_ENTRY"),
+        &storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
+    ensure!(result.status=="passed" && result.stdout=="ORIGINAL_WORKER_ENTRY","original worker body failed");
+    let execution=result.repository_execution.context("worker entry receipt absent")?;
+    ensure!(execution["version"]==2 && execution["original_worker_cleanup"]==true,"worker receipt version/cleanup absent");
+    let entry=&execution["worker_entry"];
+    ensure!(entry["kind"]=="ci-repository-worker-admission" && entry["entry"]["uids"]==serde_json::json!([1000,1000,1000,1000]),"worker identity absent");
+    ensure!(execution["input_closure_complete"]==false && execution["full_ci"]==false && execution["shipping_authority"]==false,"diagnostic acquired CI authority");
+    let receipt=serde_json::json!({"version":1,"kind":"real_original_worker_admission","execution":execution,
+        "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
+    audit.record_controller(receipt.clone())?;audit.protected_health()?;
+    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&receipt)?)?;
+    Ok(())
+}
+
 /// Exercise the actual targeted adapter, including its original build/test argv
 /// and a failing test's real Cargo exit. This is execution evidence, not a
 /// complete-input or passing-CI capability. The original publication regression

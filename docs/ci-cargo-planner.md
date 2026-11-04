@@ -2651,3 +2651,29 @@ InputCensusUnknown after 108.68 seconds. Original VM resource cleanup is
 positively verified. All 633 Python tests and 34 focused managed Rust tests
 pass. Worker-pause/epoch handling, artifact projection and complete alias
 closure remain required before result application or parent resume.
+
+The original repository worker now remains at its original supervisor's kernel
+exec stop until the command controller admits it. Trusted bootstrap policy
+activation is sealed in a controller-owned memfd before UID drop; that FD is
+CLOEXEC and absent from the worker entry. The original supervisor observes
+UID/GID/groups, capability/filter state, the exact four inherited descriptors,
+sealed relay identity and original null/pipe streams, closes initial exec
+permission, then sends the actual pidfd over its private control pair. Wrong
+PID grants, controller EOF or deadline expiry cannot release the stop.
+
+The controller independently checks the pidfd's actual PID, still-stopped
+original exec/tracer/parent identity, shared namespaces, measured policy
+receipt, relay seals and actual output pipe inodes before persisting admission
+and granting execution. It holds that original pidfd through original worker
+cleanup. Repository receipts evolve to version 2 with this bound worker-entry
+observation; version-1 prototype receipts remain readable without acquiring
+CI authority. The entry is also retained in any created Cargo executor for
+post-VM inspection. Six actual exec-stop tests cover grant gating, wrong PID,
+controller loss, deadline, extra FD and foreign policy receipts.
+
+This establishes original worker entry admission only. It does not yet enroll
+the UID1000 population into a worker pause scope, enroll additional ordinary
+worker launches, serialize worker projection/capture epochs, or enable
+RetainedTransfer/resume. All input/full-CI/shipping flags remain false. A
+separate ordinary repository-adapter diagnostic exercises a builtin printf
+without substituting for the unchanged four-parent or full-CI acceptance.

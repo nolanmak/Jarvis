@@ -216,6 +216,28 @@ def publish_policy_receipt(descriptor,value):
     except OSError:raise StagingUnavailable('policy_receipt') from None
 
 
+def observe_worker_entry(pid,configuration,receipt,expected_policy,*,uid,gid,groups,tracer=None):
+    """Original supervisor observation, without a runnable or cleanup grant."""
+    entry=observe_exec_entry(pid,tracer=tracer)
+    require_exec_entry(entry,uid=uid,gid=gid,groups=groups,descriptors=[0,1,2,configuration])
+    entry['policy_activation']=read_policy_receipt(receipt,expected_policy)
+    original=observe_sealed_descriptor(os.getpid(),configuration)
+    actual=observe_sealed_descriptor(pid,configuration)
+    if actual!=original or actual['uid']!=os.geteuid() or actual['gid']!=os.getegid():
+        raise StagingUnavailable('worker_entry_configuration')
+    entry['sealed_relay']=actual
+    table={row['number']:row for row in entry['fd_table']}
+    for number in (0,1,2):
+        info=os.fstat(number);row=table[number]
+        if (row['device'],row['inode'],row['type'],row['flags']&os.O_ACCMODE)!=(
+                info.st_dev,info.st_ino,stat.S_IFMT(info.st_mode),fcntl.fcntl(number,fcntl.F_GETFL)&os.O_ACCMODE):
+            raise StagingUnavailable('worker_entry_stream')
+        if (number==0 and (not stat.S_ISCHR(info.st_mode) or info.st_rdev!=os.makedev(1,3))
+                or number in (1,2) and not stat.S_ISFIFO(info.st_mode)):
+            raise StagingUnavailable('worker_entry_stream')
+    return entry
+
+
 def read_policy_receipt(descriptor,expected):
     """Read only a sealed receipt matching the original caller's full context."""
     try:

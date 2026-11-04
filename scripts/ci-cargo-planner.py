@@ -193,6 +193,21 @@ def receive_control(endpoint):
     except BaseException:legacy._close(received);raise
 
 
+def wait_original_worker_grant(endpoint,pid,deadline):
+    while True:
+        remaining=deadline-time.monotonic()
+        if remaining<=0:raise FreshnessHold('cleanup_uncertain')
+        if not select.select([endpoint],[],[],min(.05,remaining))[0]:continue
+        received=[]
+        try:
+            frame=receive_control(endpoint)
+            if frame is None:raise FreshnessHold('cleanup_uncertain')
+            stage,original,received=frame
+            if stage!=3 or original!=pid or received:raise FreshnessHold('generation_mismatch')
+            return
+        finally:legacy._close(received)
+
+
 def fixture_out_dir(environment):
     value=environment.get(b'OUT_DIR')
     if value is None:return None
@@ -2619,6 +2634,7 @@ class WorkerRelay(RootRelay):
         super().__init__(admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic())),deadline=value['deadline'],ordinals=planner_relay.ordinals)
         self.peer_uid=1000;self.config_magic=b'JARVWRK3';self.require_message_credentials=True;self.planner_relay=planner_relay
         self.value=value;self.executor=None;self.cargo_lock=threading.Lock();self.cargo_owner=None;self.cargo_commands=[];self.metadata_units=[]
+        self.original_worker_entry=None
 
     def __enter__(self):
         super().__enter__()
@@ -2681,6 +2697,8 @@ class WorkerRelay(RootRelay):
             {os.fsdecode(key):os.fsdecode(value) for key,value in environment.items()},os.fsdecode(cwd))
         if self.executor is None:
             self.executor=_CargoExecutor(self.planner_relay.admission,execution_lease=self.value.get('execution_lease'),generated_outputs=self.value.get('generated_outputs'));self.planner_relay.views=self.executor
+            if self.original_worker_entry is None:raise FreshnessHold('cleanup_uncertain')
+            cache._write_record(self.executor.root/'original-worker-entry.json',self.original_worker_entry)
             self.executor.preparing_graph=True
             metadata_start=len(self.planner_relay.completed)
             try:status,metadata,error=self.executor._command(dict(self.value,original_invocation=invocation),
@@ -4734,9 +4752,72 @@ def _execute(arguments):
     return 0
 
 
+def repository_worker_policy_context(value,policy,pid):
+    scope=Path(value['receipt']).parent.name.removeprefix('worker-')
+    if not cache._uuid(scope):raise FreshnessHold('generation_mismatch')
+    return {'version':1,'kind':'ci-repository-worker-policy-receipt','binding':value['binding'],
+        'command':value['command'],'scope_id':scope,'pid':pid,
+        'policy':{'version':1,'kind':'ci-unit-policy-activation','sha256':policy.sha256,
+            'size_bytes':policy.size_bytes,'activation_returncode':0,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}}
+
+
+def admit_original_repository_worker(child,endpoint,configuration,receipt,value):
+    global _PHASE
+    _PHASE='planner_original_worker_entry'
+    pidfd=None
+    try:
+        while True:
+            remaining=value['deadline']-time.monotonic()
+            if remaining<=0 or child.poll() is not None:raise FreshnessHold('cleanup_uncertain')
+            if select.select([endpoint],[],[],min(.05,remaining))[0]:break
+        frame=receive_control(endpoint)
+        if frame is None:raise FreshnessHold('cleanup_uncertain')
+        stage,pid,received=frame
+        if len(received)!=1:
+            legacy._close(received);raise FreshnessHold('cleanup_uncertain')
+        pidfd=received[0]
+        if stage!=3 or pid<=0:raise FreshnessHold('generation_mismatch')
+        signal.pidfd_send_signal(pidfd,0)
+        info=Path(f'/proc/self/fdinfo/{pidfd}').read_text().splitlines()
+        if next((line.split()[1] for line in info if line.startswith('Pid:')),None)!=str(pid):
+            raise FreshnessHold('cleanup_uncertain')
+        observed=staging.observe_exec_entry(pid,tracer=child.pid)
+        staging.require_exec_entry(observed,uid=1000,gid=1000,groups=[],descriptors=[0,1,2,configuration])
+        entry=cache._read_record(Path(value['root'])/'original-worker-entry.json')
+        if entry.get('binding')!=value['binding'] or entry.get('command')!=value['command']:
+            raise FreshnessHold('generation_mismatch')
+        stored=entry['entry']
+        if {key:stored[key] for key in observed}!=observed:raise FreshnessHold('invalidation_unsafe')
+        expected=repository_worker_policy_context(value,UnitPolicy(),pid)
+        if stored['policy_activation']!=staging.read_policy_receipt(receipt,expected):
+            raise FreshnessHold('authority_changed')
+        configuration_identity=staging.observe_sealed_descriptor(os.getpid(),configuration)
+        if (stored['sealed_relay']!=configuration_identity
+                or staging.observe_sealed_descriptor(pid,configuration)!=configuration_identity):
+            raise FreshnessHold('invalidation_unsafe')
+        table={row['number']:row for row in observed['fd_table']}
+        for number,stream in ((1,child.stdout),(2,child.stderr)):
+            actual=os.fstat(stream.fileno());target=table[number]
+            if ((target['device'],target['inode'],target['type'])!=(actual.st_dev,actual.st_ino,stat.S_IFMT(actual.st_mode))
+                    or target['flags']&os.O_ACCMODE!=os.O_WRONLY):raise FreshnessHold('invalidation_unsafe')
+        namespaces={name:os.readlink(f'/proc/{pid}/ns/'+name) for name in ('mnt','ipc','net','user','pid')}
+        if any(namespace!=os.readlink('/proc/self/ns/'+name) for name,namespace in namespaces.items()):
+            raise FreshnessHold('invalidation_unsafe')
+        admission={'version':1,'kind':'ci-repository-worker-admission','binding':value['binding'],
+            'command':value['command'],'scope_id':expected['scope_id'],'supervisor_pid':child.pid,
+            'entry':stored,'namespaces':namespaces,'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+        cache._write_record(Path(value['root'])/'original-worker-admission.json',admission)
+        return pidfd,admission
+    except BaseException:
+        if pidfd is not None:os.close(pidfd)
+        raise
+
+
 def _repository_worker(arguments):
     bootstrap=int(arguments[0]);value=_bootstrap(bootstrap,'repository-worker');_parent_guard(value['parent']);os.close(bootstrap)
     configuration=int(arguments[1]);environment=dict(value['environment'])
+    receipt=value['policy_receipt_fd'];os.set_inheritable(receipt,False)
     if (value['cwd']!='/workspace' or type(value['argv']) is not list or not value['argv']
             or value['argv'][0]!='/bin/bash' or any(key in environment for key in ('LD_PRELOAD','JARVIS_CARGO_RELAY_FD'))):
         raise FreshnessHold('invalidation_unsafe')
@@ -4744,6 +4825,7 @@ def _repository_worker(arguments):
         {os.fsencode(key):os.fsencode(item) for key,item in environment.items()},b'/workspace',None,0,0),value['library'])
     environment.update(LD_PRELOAD=value['library'],JARVIS_CARGO_RELAY_FD=str(configuration))
     policy=UnitPolicy();stage_exec_mediation(value,policy);policy.activate()
+    staging.publish_policy_receipt(receipt,repository_worker_policy_context(value,policy,os.getpid()))
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     os.setgroups([]);os.setgid(1000);os.setuid(1000);os.umask(0o022);_parent_guard(value['parent'])
@@ -4752,16 +4834,30 @@ def _repository_worker(arguments):
 
 
 def _repository_worker_supervisor(arguments):
+    global _PHASE
+    _PHASE='planner_original_worker_supervisor'
     value=_bootstrap(int(arguments[0]),'repository-worker-supervisor');_parent_guard(value['parent'])
     mediation=ExecMediation(value['deadline'],1000)
     bootstrap=_sealed(dict(value,kind='repository-worker',parent=os.getpid(),exec_mediation_fd=mediation.child_fd))
     supervisor=_load('original_repository_worker_supervisor','provider-supervisor.py')
+    endpoint=socket.socket(fileno=int(arguments[2]));os.set_inheritable(endpoint.fileno(),False)
+    def executed(child):
+        observed=staging.observe_worker_entry(child.pid,int(arguments[1]),value['policy_receipt_fd'],
+            repository_worker_policy_context(value,mediation.policy,child.pid),uid=1000,gid=1000,groups=[])
+        cache._write_record(Path(value['root'])/'original-worker-entry.json',{
+            'version':1,'binding':value['binding'],'command':value['command'],'entry':observed,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
+        mediation.executed(child)
+        descriptor=os.pidfd_open(child.pid)
+        try:_control(endpoint,3,child.pid,descriptor)
+        finally:os.close(descriptor)
+        wait_original_worker_grant(endpoint,child.pid,value['deadline'])
     try:
         raw=supervisor.supervise(value['worker_receipt'],[sys.executable,'-I',str(Path(__file__).resolve()),
-            '--repository-worker',str(bootstrap),arguments[1]],forward_fds=(bootstrap,int(arguments[1]),mediation.child_fd),
-            close_after_spawn=(bootstrap,),on_spawn=mediation.spawned,on_exec=mediation.executed)
+            '--repository-worker',str(bootstrap),arguments[1]],forward_fds=(bootstrap,int(arguments[1]),mediation.child_fd,value['policy_receipt_fd']),
+            close_after_spawn=(bootstrap,),on_spawn=mediation.spawned,on_exec=executed)
         mediation.check();return raw
-    finally:mediation.close()
+    finally:endpoint.close();mediation.close()
 
 
 def _execute_repository(arguments):
@@ -4769,20 +4865,26 @@ def _execute_repository(arguments):
     root=Path(value['root']);worker_admission=admit(value['target'],value['binding'],value['command'],root)
     planner_root=root/'planner';planner_root.mkdir(mode=0o700)
     planner_admission=admit(value['target'],value['binding'],value['command'],planner_root)
-    supervisor_receipt=root/'original-worker-cleanup';child=None;bootstrap=None;configuration=None
+    supervisor_receipt=root/'original-worker-cleanup';child=None;bootstrap=None;configuration=None;worker_pidfd=None
+    controller,worker_control=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
+    policy_receipt=os.memfd_create('ci-repository-worker-policy',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
     with CommandObservation(planner_admission,value['deadline']) as observation, RootRelay(planner_admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic())),deadline=value['deadline']) as planner:
       with WorkerRelay(worker_admission,planner_relay=planner,value=value) as worker:
         try:
             configuration=worker.config_fd()
-            bootstrap=_sealed(dict(value,kind='repository-worker-supervisor',parent=os.getpid(),worker_receipt=str(supervisor_receipt)))
-            child=subprocess.Popen([sys.executable,'-I',str(Path(__file__).resolve()),'--repository-worker-supervisor',str(bootstrap),str(configuration)],
-                pass_fds=(bootstrap,configuration),env={'PATH':os.defpath},stdin=subprocess.DEVNULL,
+            bootstrap=_sealed(dict(value,kind='repository-worker-supervisor',parent=os.getpid(),worker_receipt=str(supervisor_receipt),policy_receipt_fd=policy_receipt))
+            child=subprocess.Popen([sys.executable,'-I',str(Path(__file__).resolve()),'--repository-worker-supervisor',str(bootstrap),str(configuration),str(worker_control.fileno())],
+                pass_fds=(bootstrap,configuration,worker_control.fileno(),policy_receipt),env={'PATH':os.defpath},stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            worker_control.close()
+            worker_pidfd,worker.original_worker_entry=admit_original_repository_worker(child,controller,configuration,policy_receipt,value)
+            _control(controller,3,worker.original_worker_entry['entry']['pid'])
             output,error=capture_command(child,value['deadline']);original_cargo_cleanup(supervisor_receipt)
             worker.drain();planner.drain()
             if worker.errors or planner.errors:raise FreshnessHold('input_census_unknown')
             captured=observation.finish(worker.executor)
-            receipt={'version':1,'kind':'ci-repository-execution','binding':value['binding'],'command':value['command'],
+            receipt={'version':2,'kind':'ci-repository-execution','binding':value['binding'],'command':value['command'],
+                'worker_entry':worker.original_worker_entry,
                 'worker_units':worker.completed,'metadata_units':worker.metadata_units,'cargo_commands':worker.cargo_commands,'original_worker_cleanup':True,'kernel_observation':captured,
                 'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
             print(json.dumps({'exit_code':child.returncode,'stdout':output.decode('utf-8','replace'),
@@ -4795,6 +4897,7 @@ def _execute_repository(arguments):
                     except subprocess.TimeoutExpired:child.kill();child.wait(timeout=2);raise FreshnessHold('cleanup_uncertain') from None
             finally:
                 legacy._close([] if bootstrap is None else [bootstrap]);legacy._close([] if configuration is None else [configuration])
+                legacy._close([policy_receipt]+([] if worker_pidfd is None else [worker_pidfd]));controller.close();worker_control.close()
     return 0
 
 
@@ -4825,17 +4928,67 @@ def validate_checkpoint(value,binding,command,predecessor,scope):
     return value
 
 
+def validate_worker_entry(value,binding,command,scope):
+    """Receipt grammar only; original live admission remains controller-owned."""
+    try:
+        if (type(value) is not dict or set(value)!={'version','kind','binding','command','scope_id','supervisor_pid',
+                'entry','namespaces','input_closure_complete','full_ci','shipping_authority'}
+                or type(value['version']) is not int or value['version']!=1
+                or value['kind']!='ci-repository-worker-admission' or value['binding']!=binding or value['command']!=command
+                or value['scope_id']!=scope['scope_id'] or not cache._uuid(value['scope_id'])
+                or type(value['supervisor_pid']) is not int or value['supervisor_pid']<=0
+                or any(value[key] is not False for key in ('input_closure_complete','full_ci','shipping_authority'))):raise ValueError()
+        entry=value['entry'];numbers=entry['descriptors']
+        if (type(entry['version']) is not int or entry['version']!=1 or entry['kind']!='ci-unit-exec-entry' or type(entry['pid']) is not int or entry['pid']<=0
+                or type(entry['birth']) is not int or entry['birth']<0 or entry['tracer']!=value['supervisor_pid']
+                or entry['uids']!=[1000]*4 or entry['gids']!=[1000]*4 or entry['groups']!=[]
+                or any(type(entry[key]) is not int for key in ('no_new_privs','seccomp','seccomp_filters'))
+                or entry['no_new_privs']!=1 or entry['seccomp']!=2 or entry['seccomp_filters']<1
+                or set(entry['capabilities'])!={'CapEff','CapPrm','CapAmb'}
+                or any(type(number) is not int or number!=0 for number in entry['capabilities'].values())
+                or type(numbers) is not list or len(numbers)!=4 or numbers[:3]!=[0,1,2]
+                or type(numbers[3]) is not int or not 3<=numbers[3]<=65535
+                or any(entry[key] is not False for key in ('input_closure_complete','full_ci','shipping_authority'))):raise ValueError()
+        policy=entry['policy_activation'];native=policy['policy']
+        if (set(policy)!={'version','kind','binding','command','scope_id','pid','policy'} or type(policy['version']) is not int or policy['version']!=1
+                or policy['kind']!='ci-repository-worker-policy-receipt' or policy['binding']!=binding or policy['command']!=command
+                or policy['scope_id']!=value['scope_id'] or policy['pid']!=entry['pid']
+                or set(native)!={'version','kind','sha256','size_bytes','activation_returncode','input_closure_complete','full_ci','shipping_authority'}
+                or type(native['version']) is not int or native['version']!=1 or native['kind']!='ci-unit-policy-activation' or not cache._digest(native['sha256'])
+                or type(native['size_bytes']) is not int or not 1<=native['size_bytes']<=2*1024**2
+                or type(native['activation_returncode']) is not int or native['activation_returncode']!=0
+                or any(native[key] is not False for key in ('input_closure_complete','full_ci','shipping_authority'))):raise ValueError()
+        configuration=entry['sealed_relay']
+        if (configuration['uid']!=0 or configuration['gid']!=0 or configuration['seals']&15!=15
+                or not cache._digest(configuration['sha256']) or not 1<=configuration['size_bytes']<=staging.MAX_BYTES):raise ValueError()
+        rows=entry['fd_table']
+        if type(rows) is not list or len(rows)!=4 or [row['number'] for row in rows]!=numbers:raise ValueError()
+        for row in rows:
+            if (set(row)!={'number','device','inode','type','uid','gid','flags','position'}
+                    or any(type(number) is not int or number<0 for number in row.values())):raise ValueError()
+        if (rows[0]['type']!=stat.S_IFCHR or rows[0]['flags']&os.O_ACCMODE!=os.O_RDONLY
+                or any(row['type']!=stat.S_IFIFO or row['flags']&os.O_ACCMODE!=os.O_WRONLY for row in rows[1:3])
+                or rows[3]['type']!=stat.S_IFREG or (rows[3]['device'],rows[3]['inode'])!=(configuration['device'],configuration['inode'])):
+            raise ValueError()
+        if (set(value['namespaces'])!={'mnt','ipc','net','user','pid'} or any(
+                re.fullmatch(name+r':\[[0-9]+\]',namespace) is None for name,namespace in value['namespaces'].items())):raise ValueError()
+        return value
+    except (ValueError,TypeError,KeyError,IndexError):raise FreshnessHold('input_census_unknown') from None
+
+
 def validate_repository_execution(value,binding,command,workers,scope,predecessor=None):
     try:
         keys={'version','kind','binding','command','checkpoint','worker_units','cargo_commands','original_worker_cleanup',
             'input_closure_complete','full_ci','shipping_authority','guest_worker_quiescence','kernel_observation','metadata_units'}
-        if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
+        if (type(value) is not dict or type(value.get('version')) is not int or value['version'] not in (1,2)
+                or set(value)!=(keys|{'worker_entry'} if value['version']==2 else keys)
                 or value['kind']!='ci-repository-execution' or value['binding']!=binding or value['command']!=command
                 or value['original_worker_cleanup'] is not True
                 or any(value[key] is not False for key in ('input_closure_complete','full_ci','shipping_authority'))
                 or value['guest_worker_quiescence']!=scope or scope not in workers['scopes']
                 or type(value['worker_units']) is not list or len(value['worker_units'])>4096
                 or type(value['cargo_commands']) is not list or len(value['cargo_commands'])>4096):raise ValueError()
+        if value['version']==2:validate_worker_entry(value['worker_entry'],binding,command,scope)
         validate_checkpoint(value['checkpoint'],binding,command,predecessor,scope)
         units={};cargo=set()
         for unit in value['worker_units']:
