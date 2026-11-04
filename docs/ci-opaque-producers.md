@@ -188,6 +188,21 @@ entire population is stopped or zombie and no unaccounted member remains. A
 bounded census that cannot establish this state holds; a sampled `/proc` tree,
 one stopped main thread or a stopped process group alone is insufficient.
 
+The current feasibility implementation tests a controller-owned cgroup v2 scope
+as the structural pause boundary instead of repeatedly stopping sampled PIDs.
+Enroll the original single-threaded process at its existing PTRACE_EXEC stop,
+before its first untrusted instruction. Descendants inherit that scope; its
+root-only controls are absent from the private view. No controller/supervisor
+enters it, no resource grant is increased, and nested cgroups are disabled.
+Wait for the kernel's `frozen 1` event before reading its bounded process/thread
+birth census. A cgroup name or a successful freeze write is insufficient.
+Retain the original UID, namespace/root and supervisor bindings. Thaw and
+positive original cleanup are separate observations. This follows the
+[kernel cgroup v2 contract](https://docs.kernel.org/admin-guide/cgroup-v2.html),
+but the pinned guest replay must establish support. Signal routing across a
+stopped parent and capture/child execution remain explicit gates below; a
+successful freeze experiment cannot authorize either.
+
 While paused and locked, flush and copy only the admitted parent's visible
 private input/output state needed by the contained call. Verify held inode
 identity, full inventories, modes, ownership, link closure and unchanged bytes;

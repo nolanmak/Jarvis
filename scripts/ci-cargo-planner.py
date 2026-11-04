@@ -1625,6 +1625,119 @@ def stage_request_stdin(connection,source,*,deadline,stop,owner_pidfd=None):
         os.close(cancelled);os.close(notify)
 
 
+class UnitFreezer:
+    """Original unit's guest-only cgroup; a pause is never original cleanup.
+
+    Enrollment happens at the original single-threaded exec stop, before any
+    untrusted instruction. No controller or supervisor enters this cgroup.
+    """
+    _setup=threading.Lock()
+
+    def __init__(self,admission,scope,uid):
+        if (os.getresuid()!=(0,0,0) or type(admission) is not _Admission
+                or admission.token is not _TOKEN or admission.owner!=os.getpid()
+                or not cache._uuid(Path(scope).name) or type(uid) is not int or not 2000<=uid<6096):
+            raise FreshnessHold('invalidation_unsafe')
+        _source(admission.target,admission.binding,admission.command)
+        self.owner=os.getpid();self.uid=uid;self.original=None;self.pidfd=None
+        with self._setup:
+            mount=Path('/sys/fs/cgroup')
+            # This controller runs in the isolated guest's initial cgroup.
+            # Refuse a host service/delegation rather than modifying its tree.
+            if Path('/proc/self/cgroup').read_bytes()!=b'0::/\n':raise FreshnessHold('invalidation_unsafe')
+            if not (mount/'cgroup.controllers').exists():
+                unit_views._mount('-t','cgroup2','-o','nosuid,nodev,noexec','none',mount)
+            rows=Path('/proc/self/mountinfo').read_text().splitlines()
+            if not any(line.split()[4]=='/sys/fs/cgroup' and ' - cgroup2 ' in line for line in rows):
+                raise FreshnessHold('invalidation_unsafe')
+            root=mount/'ci-units'
+            if not root.exists():root.mkdir(mode=0o700)
+            info=root.lstat()
+            if (root.resolve()!=root or not stat.S_ISDIR(info.st_mode) or info.st_uid!=0
+                    or stat.S_IMODE(info.st_mode)!=0o700):raise FreshnessHold('invalidation_unsafe')
+            self.path=root/Path(scope).name;self.path.mkdir(mode=0o700)
+        self.identity=self.path.stat();self.closed=False
+        self._write('cgroup.max.depth',b'0\n');self._write('cgroup.max.descendants',b'0\n')
+        if self._read('cgroup.type')!=b'domain\n' or self._read('cgroup.procs'):
+            raise FreshnessHold('invalidation_unsafe')
+
+    def _check(self):
+        current=self.path.lstat()
+        if (self.owner!=os.getpid() or self.closed or current.st_uid!=0 or current.st_mode!=self.identity.st_mode
+                or (current.st_dev,current.st_ino)!=(self.identity.st_dev,self.identity.st_ino)):
+            raise FreshnessHold('cleanup_uncertain')
+
+    def _read(self,name):
+        self._check()
+        with (self.path/name).open('rb') as stream:body=stream.read(16385)
+        if len(body)>16384:raise FreshnessHold('input_census_unknown')
+        return body
+
+    def _write(self,name,body):
+        self._check();descriptor=os.open(self.path/name,os.O_WRONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+        try:
+            if os.write(descriptor,body)!=len(body):raise FreshnessHold('cleanup_uncertain')
+        finally:os.close(descriptor)
+
+    def attach(self,pid,pidfd):
+        if self.original is not None:raise FreshnessHold('invalidation_unsafe')
+        process=Path('/proc')/str(pid);status=process.joinpath('stat').read_text().rsplit(')',1)[1].split()
+        if status[0]!='t' or {p.name for p in process.joinpath('task').iterdir()}!={str(pid)}:
+            raise FreshnessHold('invalidation_unsafe')
+        if self._read('cgroup.procs'):raise FreshnessHold('invalidation_unsafe')
+        signal.pidfd_send_signal(pidfd,0)
+        self._write('cgroup.procs',str(pid).encode()+b'\n')
+        if (process.joinpath('stat').read_text().rsplit(')',1)[1].split()[19]!=status[19]
+                or process.joinpath('cgroup').read_text()!='0::/ci-units/'+self.path.name+'\n'
+                or set(self._read('cgroup.procs').split())!={str(pid).encode()}):
+            raise FreshnessHold('invalidation_unsafe')
+        self.original=pid;self.pidfd=os.dup(pidfd)
+
+    def _wait(self,frozen,deadline):
+        while True:
+            fields=dict(line.split() for line in self._read('cgroup.events').splitlines())
+            if fields.get(b'frozen')==str(frozen).encode():return
+            if time.monotonic()>=deadline:raise FreshnessHold('cleanup_uncertain')
+            time.sleep(.005)
+
+    def freeze(self,deadline):
+        if self.original is None:raise FreshnessHold('invalidation_unsafe')
+        signal.pidfd_send_signal(self.pidfd,0)
+        self._write('cgroup.freeze',b'1\n');self._wait(1,deadline)
+        rows=[]
+        pids=set(map(int,self._read('cgroup.procs').split()))
+        if self.original not in pids or not 1<=len(pids)<=512:raise FreshnessHold('input_census_unknown')
+        for pid in sorted(pids):
+            process=Path('/proc')/str(pid)
+            status=process.joinpath('status').read_text().splitlines()
+            for label in ('Uid:','Gid:'):
+                if list(map(int,next(line for line in status if line.startswith(label)).split()[1:]))!=[self.uid]*4:
+                    raise FreshnessHold('invalidation_unsafe')
+            if next(line for line in status if line.startswith('Groups:')).split()[1:]:raise FreshnessHold('invalidation_unsafe')
+            if process.joinpath('cgroup').read_text()!='0::/ci-units/'+self.path.name+'\n':
+                raise FreshnessHold('invalidation_unsafe')
+            tasks=[]
+            for task in process.joinpath('task').iterdir():
+                fields=task.joinpath('stat').read_text().rsplit(')',1)[1].split()
+                tasks.append({'tid':int(task.name),'birth':fields[19]})
+                if len(tasks)+sum(len(row['tasks']) for row in rows)>512:raise FreshnessHold('input_census_unknown')
+            rows.append({'pid':pid,'tasks':sorted(tasks,key=lambda row:row['tid'])})
+        self._wait(1,deadline)
+        if set(map(int,self._read('cgroup.procs').split()))!=pids:raise FreshnessHold('input_census_unknown')
+        return {'version':1,'kind':'ci-unit-freeze-observation','scope':self.path.name,
+            'cgroup_device':self.identity.st_dev,'cgroup_inode':self.identity.st_ino,'original_pid':self.original,
+            'frozen':True,'processes':rows,'input_closure_complete':False,'shipping_authority':False}
+
+    def thaw(self,deadline):
+        self._write('cgroup.freeze',b'0\n');self._wait(0,deadline)
+
+    def close(self):
+        if self.closed:return
+        if self._read('cgroup.procs'):raise FreshnessHold('cleanup_uncertain')
+        self.path.rmdir();self.closed=True
+        if self.pidfd is not None:os.close(self.pidfd);self.pidfd=None
+
+
 class UnitPeerRelay(RootRelay):
     """Authenticated unit endpoint; capture/dispatch remains a closed gate."""
     def __init__(self,admission,*,library,ordinal,scope,ordinals,deadline):
@@ -1636,6 +1749,7 @@ class UnitPeerRelay(RootRelay):
         self.require_message_credentials=True;self.parent_ordinal=ordinal;self.scope=Path(scope)
         self.scope_pidfd=None;self.scope_namespaces=None;self.scope_root=None;self.received_requests=0;self.closed=False
         self._slots=threading.BoundedSemaphore(1)
+        self.freezer=UnitFreezer(admission,scope,self.peer_uid)
 
     def register_parent(self,pid,path):
         if self.scope_pidfd is not None:raise FreshnessHold('invalidation_unsafe')
@@ -1647,6 +1761,7 @@ class UnitPeerRelay(RootRelay):
         if any(record['namespaces'][name]['unit']!=namespaces[name] for name in ('mnt','ipc','net')):
             raise FreshnessHold('invalidation_unsafe')
         self.scope_root=record['root_identity'];self.scope_namespaces=namespaces;self.scope_pidfd=os.pidfd_open(pid)
+        self.freezer.attach(pid,self.scope_pidfd)
 
     def _receive(self,connection,descriptors):
         numbers=super()._receive(connection,descriptors)
@@ -1685,6 +1800,10 @@ class UnitPeerRelay(RootRelay):
                 stop=self._stop,owner_pidfd=self.scope_pidfd) as captured:
             record['stdin']=captured.observation()
             cache._write_record(self.root/'admission.json',record)
+            try:
+                record['pause']=self.freezer.freeze(self.deadline)
+                cache._write_record(self.root/'admission.json',record)
+            finally:self.freezer.thaw(self.deadline)
         raise FreshnessHold('input_census_unknown')
 
     def check(self):
@@ -1693,7 +1812,7 @@ class UnitPeerRelay(RootRelay):
 
     def __exit__(self,*arguments):
         if self.closed:return
-        try:super().__exit__(*arguments);self.closed=True
+        try:super().__exit__(*arguments);self.freezer.close();self.closed=True
         finally:
             if self.scope_pidfd is not None:os.close(self.scope_pidfd);self.scope_pidfd=None
 
