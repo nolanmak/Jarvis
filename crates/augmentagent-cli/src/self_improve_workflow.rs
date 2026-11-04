@@ -228,7 +228,7 @@ pub(super) fn reconcile_runtime_retirements()->Result<usize> {
     if !state.exists(){return Ok(0);}
     reconcile_runtime_retirements_in(&mut WorkflowStore::open(&state)?,millis())
 }
-fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<usize> {
+pub(super) fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<usize> {
     if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_none(){return Ok(0);}
     let rows=store.pending_native_retirements(now,16)?;
     let mut completed=0;

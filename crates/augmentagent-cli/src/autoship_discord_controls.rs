@@ -60,6 +60,7 @@ impl WorkflowStore {
                         "owner-followup-pending"=>"owner-followup-pending".into(),
                         "owner-control-revision-conflict"=>"owner-control-revision-conflict".into(),
                         "terminal workflow cannot change owner control"=>"workflow-terminal".into(),
+                        "execution-retry-not-quiescent"=>"execution-retry-teardown-blocked".into(),
                         _=>return Err(error),
                     });
                 }
