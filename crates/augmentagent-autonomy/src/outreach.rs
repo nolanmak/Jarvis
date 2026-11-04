@@ -29,16 +29,19 @@
 //! `NeedsApproval` the compose stays a normal approval card, noted with the
 //! reason, so the owner can still send it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use augmentagent_approval_discord::ApprovalActionOutcome;
 use augmentagent_heartbeat::outreach::{Outreach, OutreachEntry, OutreachResult, RosterEntry};
+use augmentagent_store::autonomy::{NewPlan, NewStep, PlanStatus, StepStatus};
 use augmentagent_store::Email;
 
 use crate::broker::AutonomyBroker;
-use crate::gate::{AutonomyGate, Reason};
-use crate::handle::Handle;
+use crate::config::{Tier, TrustedContact};
+use crate::gate::{admit, Admission, AutonomyGate, ReadyKind, ReadyPlan, Reason};
+use crate::handle::{Handle, Platform};
 
 /// `thread_key` prefix of an outreach plan (D11: one per contact per 30 min).
 pub const PROACTIVE_THREAD_PREFIX: &str = "proactive:";
@@ -144,17 +147,230 @@ pub struct OutreachEngine {
     pub notices_deliverable: bool,
 }
 
-/// Case- and whitespace-insensitive fingerprint (the heartbeat's own).
+/// Case- and whitespace-insensitive fingerprint (the heartbeat's own), so
+/// a reworded-by-spacing repeat still counts as the same message.
 pub fn text_hash(text: &str) -> String {
-    let _ = text;
-    String::new()
+    use sha2::{Digest, Sha256};
+    let normalised = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    hex::encode(Sha256::digest(normalised.as_bytes()))
+}
+
+/// The person page's `# Title`, else the slug. Display only.
+pub fn display_name(wiki_root: Option<&Path>, slug: &str) -> String {
+    wiki_root
+        .and_then(|w| std::fs::read_to_string(w.join("people").join(format!("{slug}.md"))).ok())
+        .and_then(|raw| {
+            raw.lines()
+                .find_map(|l| l.strip_prefix("# "))
+                .map(|t| t.trim().to_string())
+        })
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| slug.to_string())
+}
+
+/// What the pre-compose checks found.
+struct Checked {
+    contact: TrustedContact,
+    handle: Handle,
+    hash: String,
+    idem_key: String,
+    /// Composed but carded, for this reason.
+    hold: Option<(Reason, Option<String>)>,
+}
+
+type Refusal = (Reason, Option<String>);
+
+impl AutonomyGate {
+    /// D16 — the gate for a [`Trigger::Proactive`] decision, before
+    /// anything is composed. `Err` refuses (nothing composed or carded);
+    /// `Ok` with a hold composes and cards; `Ok` without one may run.
+    fn check_proactive(
+        &self,
+        slug: &str,
+        text: &str,
+        now_ms: i64,
+        notices_deliverable: bool,
+    ) -> Result<Checked, Refusal> {
+        let store = &self.deps.store;
+        let refuse = |r: Reason, d: &str| Err((r, Some(d.to_string())));
+        // 1. Master switch, a blind owner, pause-all (D1, D10).
+        if !self.deps.master_on {
+            return refuse(Reason::AutonomyOff, "AUGMENTAGENT_AUTONOMY is not `on`");
+        }
+        if !notices_deliverable {
+            return refuse(
+                Reason::AutonomyOff,
+                "no approval surface can post the autonomy notice",
+            );
+        }
+        match store.autonomy_global_pause() {
+            Ok(false) => {}
+            Ok(true) => return refuse(Reason::AutonomyOff, "paused (pause-all)"),
+            Err(e) => return refuse(Reason::AutonomyOff, &format!("store: {e}")),
+        }
+        match store.undelivered_autonomy_notices_before(now_ms - crate::broker::NOTICE_DEADLINE_MS)
+        {
+            Ok(0) => {}
+            Ok(n) => {
+                return refuse(
+                    Reason::AutonomyOff,
+                    &format!("{n} autonomy notice(s) undelivered for over an hour"),
+                )
+            }
+            Err(e) => return refuse(Reason::AutonomyOff, &format!("store: {e}")),
+        }
+        // 3. Active trusted contact, by slug (the roster's only key).
+        let snapshot = self.deps.trust.snapshot(now_ms);
+        let Some(contact) = snapshot.active_contact(slug).cloned() else {
+            return refuse(Reason::NotTrusted, "not an active trusted contact");
+        };
+        // 10. Proactive messages are free text: `full` tier only (D16).
+        if !contact.allows(crate::registry::REPLY) {
+            return refuse(Reason::ActionNotAllowed, "outreach needs the full tier");
+        }
+        // 2. The channel: the contact's own preferred handle (D13).
+        let handle = contact.preferred_handle.clone();
+        if !matches!(handle.platform(), Platform::Imessage | Platform::Email)
+            || !contact.has_handle(&handle)
+        {
+            return refuse(Reason::ChannelNotEnabled, "no iMessage or email handle");
+        }
+        if text.trim().is_empty() {
+            return refuse(Reason::EvidenceIncomplete, "empty message");
+        }
+        // 13. Duplicates: the same text within 24 h, or any outreach plan
+        // in this 30-minute window (`thread_key = proactive:<slug>`).
+        let hash = text_hash(text);
+        match store.outreach_text_seen_since(&contact.slug, &hash, now_ms - TEXT_DEDUP_MS) {
+            Ok(false) => {}
+            Ok(true) => {
+                return refuse(
+                    Reason::Duplicate,
+                    "the same message was proposed to them in the last 24 h",
+                )
+            }
+            Err(e) => return refuse(Reason::AutonomyOff, &format!("store: {e}")),
+        }
+        let thread_key = format!("{PROACTIVE_THREAD_PREFIX}{}", contact.slug);
+        let idem_key =
+            crate::records::idem_key(&contact.slug, &thread_key, PLAN_KIND, None, now_ms);
+        match store.autonomous_plan_by_idem_key(&idem_key) {
+            Ok(None) => {}
+            Ok(Some(plan)) => {
+                return refuse(
+                    Reason::Duplicate,
+                    &format!(
+                        "already reached out in this 30-minute window (plan {})",
+                        plan.id
+                    ),
+                )
+            }
+            Err(e) => return refuse(Reason::AutonomyOff, &format!("store: {e}")),
+        }
+        // Held for the owner from here on: composed, then carded.
+        let hold = |r: Reason, d: Option<String>| Some((r, d));
+        let held = (|| {
+            // 5. Paused for this person (D10).
+            match store.contact_paused(&contact.slug) {
+                Ok(false) => {}
+                Ok(true) => return hold(Reason::ContactPaused, None),
+                Err(e) => return hold(Reason::ContactPaused, Some(format!("store: {e}"))),
+            }
+            // 7. The owner is already talking to them (last 2 h).
+            match owner_messaged_recently(store, &handle, now_ms - OWNER_RECENT_MS) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return hold(
+                        Reason::OwnerTookOver,
+                        Some("you messaged them in the last 2 hours".into()),
+                    )
+                }
+                Err(e) => return hold(Reason::OwnerTookOver, Some(e)),
+            }
+            // 11. Content floor (D9) on the free text.
+            if let Some(rule) = crate::registry::content_floor_hit(text) {
+                return hold(Reason::ContentFloor, Some(format!("rule: {rule}")));
+            }
+            // 12. Daily cap (D9); the insert re-checks it atomically.
+            match store.autonomous_plans_in_cap_window(&contact.slug, now_ms) {
+                Ok(n) if n >= i64::from(contact.daily_cap) => hold(Reason::DailyCap, None),
+                Ok(_) => None,
+                Err(e) => hold(Reason::DailyCap, Some(format!("store: {e}"))),
+            }
+        })();
+        Ok(Checked {
+            contact,
+            handle,
+            hash,
+            idem_key,
+            hold: held,
+        })
+    }
+}
+
+/// D16 owner-took-over: the owner messaged the contact's thread after
+/// `since_ms`. iMessage: an owner row (`fromEmail = 'me'`) in the 1:1
+/// thread. Email: an owner reply in the Gmail thread of the newest message
+/// from that address (no thread ⇒ nothing to take over). `Err` when it
+/// cannot be established (callers fail closed).
+pub fn owner_messaged_recently(
+    store: &augmentagent_store::Store,
+    handle: &Handle,
+    since_ms: i64,
+) -> Result<bool, String> {
+    match handle.platform() {
+        Platform::Imessage => {
+            let thread = format!("imessage:{}", handle.value());
+            let rows = store
+                .owner_message_times_in_thread(&thread, 500)
+                .map_err(|e| format!("store: {e}"))?;
+            Ok(rows.iter().any(|ts| {
+                chrono::DateTime::parse_from_rfc3339(ts.trim())
+                    .is_ok_and(|t| t.timestamp_millis() > since_ms)
+            }))
+        }
+        Platform::Email => {
+            match store
+                .latest_gmail_thread_from(handle.value())
+                .map_err(|e| format!("store: {e}"))?
+            {
+                Some(thread) => store
+                    .thread_has_user_reply_after(&thread, since_ms)
+                    .map_err(|e| format!("store: {e}")),
+                None => Ok(false),
+            }
+        }
+    }
 }
 
 impl OutreachEngine {
     /// Active `full`-tier contacts, slug + display name. Never a handle.
+    /// Empty when the master switch is off.
     pub fn roster(&self, now_ms: i64) -> Vec<RosterEntry> {
-        let _ = now_ms;
-        Vec::new()
+        if !self.gate.deps.master_on {
+            return Vec::new();
+        }
+        let snapshot = self.gate.deps.trust.snapshot(now_ms);
+        snapshot
+            .active
+            .iter()
+            .filter(|c| c.tier == Tier::Full)
+            .map(|c| RosterEntry {
+                slug: c.slug.clone(),
+                display_name: display_name(self.wiki_root.as_deref(), &c.slug),
+            })
+            .collect()
+    }
+
+    fn notices_deliverable(&self) -> bool {
+        match &self.broker {
+            Some(b) => b.inner().can_post_autonomy_notice(),
+            None => self.notices_deliverable,
+        }
     }
 
     /// Run one proposal through the proactive gate and, unless `dry_run`,
@@ -167,17 +383,286 @@ impl OutreachEngine {
         dry_run: bool,
         now_ms: i64,
     ) -> OutreachReport {
-        let _ = (why, dry_run, now_ms);
-        OutreachReport {
-            contact: contact.into(),
+        let text = message.trim();
+        let mut report = OutreachReport {
+            contact: contact.to_string(),
             decision: OutreachDecision::Refused,
             reason: None,
-            detail: Some("not implemented".into()),
+            detail: None,
             handle: None,
             action_id: None,
             plan_id: None,
-            text: message.into(),
+            text: text.to_string(),
             idem_key: None,
+        };
+        let checked =
+            match self
+                .gate
+                .check_proactive(contact, text, now_ms, self.notices_deliverable())
+            {
+                Ok(c) => c,
+                Err((reason, detail)) => {
+                    report.reason = Some(reason);
+                    report.detail = detail;
+                    return report;
+                }
+            };
+        report.handle = Some(checked.handle.canonical());
+        report.idem_key = Some(checked.idem_key.clone());
+        if let Some((reason, detail)) = &checked.hold {
+            report.reason = Some(*reason);
+            report.detail = detail.clone();
+        }
+
+        if dry_run {
+            match self.composer.check(&checked.handle, text).await {
+                Ok(desc) => {
+                    report.decision = if checked.hold.is_some() {
+                        OutreachDecision::WouldNeedApproval
+                    } else {
+                        OutreachDecision::WouldAutoSend
+                    };
+                    report.detail = Some(match report.detail.take() {
+                        Some(d) => format!("{d}; {desc}"),
+                        None => desc,
+                    });
+                }
+                Err(e) => report.detail = Some(format!("compose refused: {e}")),
+            }
+            return report;
+        }
+
+        let Some(broker) = self.broker.clone() else {
+            report.detail = Some("no approval surface (dry runs only)".into());
+            return report;
+        };
+        let composed = match self.composer.compose(&checked.handle, text).await {
+            Ok(c) => c,
+            Err(e) => {
+                report.reason = None;
+                report.detail = Some(format!("compose refused: {e}"));
+                return report;
+            }
+        };
+        report.action_id = Some(composed.action_id.clone());
+        let store = Arc::clone(&self.gate.deps.store);
+        let outcome = if checked.hold.is_some() {
+            "card"
+        } else {
+            "auto"
+        };
+        if let Err(e) = store.record_outreach(
+            &checked.contact.slug,
+            &checked.hash,
+            Some(&composed.action_id),
+            outcome,
+            now_ms,
+        ) {
+            tracing::warn!(action_id = %composed.action_id, "outreach: recording the dedup row failed: {e}");
+        }
+
+        if let Some((reason, _)) = checked.hold {
+            card(&broker, &store, &composed, text, &reason.to_string()).await;
+            report.decision = OutreachDecision::NeedsApproval;
+            return report;
+        }
+
+        let ready = ReadyPlan {
+            contact: checked.contact.clone(),
+            kind: ReadyKind::Reply,
+            text: text.to_string(),
+            new_plan: new_plan(&checked, &composed.action_id, text, why),
+        };
+        match admit(&store, &ready, now_ms, false) {
+            Admission::Inserted { plan_id, .. } => {
+                report.plan_id = Some(plan_id);
+                tracing::info!(plan_id, contact = %checked.contact.slug, "outreach: executing plan");
+                self.execute(
+                    &broker,
+                    plan_id,
+                    &checked,
+                    &composed,
+                    text,
+                    now_ms,
+                    &mut report,
+                )
+                .await;
+            }
+            Admission::Hold(Reason::Duplicate) => {
+                // Lost a race with another proposal in this window: retire
+                // the compose instead of leaving a stray card.
+                let _ = store.try_resolve_action(
+                    &composed.action_id,
+                    augmentagent_store::ActionStatus::Superseded,
+                    "autonomy",
+                    Some("outreach: already reached out in this window"),
+                );
+                report.reason = Some(Reason::Duplicate);
+                report.decision = OutreachDecision::Refused;
+            }
+            Admission::Hold(reason) => {
+                card(&broker, &store, &composed, text, &reason.to_string()).await;
+                report.reason = Some(reason);
+                report.decision = OutreachDecision::NeedsApproval;
+            }
+            Admission::WouldInsert => unreachable!("live admission never answers WouldInsert"),
+        }
+        report
+    }
+
+    /// Run the plan's one send step through the Approve path, then post
+    /// the D10 notice.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute(
+        &self,
+        broker: &Arc<AutonomyBroker>,
+        plan_id: i64,
+        checked: &Checked,
+        composed: &Composed,
+        text: &str,
+        now_ms: i64,
+        report: &mut OutreachReport,
+    ) {
+        let store = &self.gate.deps.store;
+        let now = || chrono::Utc::now().timestamp_millis();
+        let _ = store.transition_autonomous_plan(
+            plan_id,
+            PlanStatus::Planned,
+            PlanStatus::Executing,
+            now(),
+        );
+        let steps = store.autonomous_steps(plan_id).unwrap_or_default();
+        let mut note: Option<String> = None;
+        for step in &steps {
+            // D9: re-checked right before the side effect.
+            let took_over =
+                owner_messaged_recently(store, &checked.handle, now_ms - OWNER_RECENT_MS)
+                    .unwrap_or(true);
+            if took_over {
+                let _ = store.set_autonomous_step_status(step.id, StepStatus::Failed, None, now());
+                card(
+                    broker,
+                    store,
+                    composed,
+                    text,
+                    &Reason::OwnerTookOver.to_string(),
+                )
+                .await;
+                report.reason = Some(Reason::OwnerTookOver);
+                report.decision = OutreachDecision::NeedsApproval;
+                continue;
+            }
+            let outcome = augmentagent_approval_discord::deciding(
+                "autonomy",
+                broker.executor().approve(&composed.action_id),
+            )
+            .await;
+            let status = match &outcome {
+                ApprovalActionOutcome::Approved => {
+                    report.decision = OutreachDecision::AutoSent;
+                    StepStatus::Executed
+                }
+                ApprovalActionOutcome::Failed { message } => {
+                    let problem = format!("auto-send failed: {message}");
+                    card(broker, store, composed, text, &problem).await;
+                    report.detail = Some(problem.clone());
+                    report.decision = OutreachDecision::Failed;
+                    note = Some(problem);
+                    StepStatus::Failed
+                }
+                ApprovalActionOutcome::AlreadyResolved { status, .. } => {
+                    let problem = format!("the compose was already resolved ({status})");
+                    report.detail = Some(problem.clone());
+                    report.decision = OutreachDecision::Failed;
+                    note = Some(problem);
+                    StepStatus::Failed
+                }
+                other => {
+                    let problem = format!("send outcome unclear: {other:?}");
+                    report.detail = Some(problem.clone());
+                    report.decision = OutreachDecision::Failed;
+                    note = Some(problem);
+                    StepStatus::Unknown
+                }
+            };
+            let _ = store.set_autonomous_step_status(step.id, status, None, now());
+        }
+        let steps = store.autonomous_steps(plan_id).unwrap_or_default();
+        let status = crate::broker::plan_status(&steps);
+        let _ = store.set_autonomous_plan_status(plan_id, status, now());
+        tracing::info!(plan_id, status = %status, "outreach: plan finished");
+        broker.deliver_notice(plan_id, note).await;
+    }
+}
+
+fn new_plan(checked: &Checked, action_id: &str, text: &str, why: &str) -> NewPlan {
+    use augmentagent_approval_discord::autonomy::STEP_SEND;
+    let contact = &checked.contact;
+    NewPlan {
+        idem_key: checked.idem_key.clone(),
+        contact_slug: contact.slug.clone(),
+        tier: contact.tier.as_str().to_string(),
+        inbound_message_id: None,
+        thread_key: format!("{PROACTIVE_THREAD_PREFIX}{}", contact.slug),
+        action_id: action_id.to_string(),
+        plan_json: serde_json::json!({
+            "plan": PLAN_KIND,
+            "trigger": "proactive",
+            "action": crate::registry::REPLY,
+            "why": why,
+            "text_hash": checked.hash,
+            "channel": checked.handle.platform().as_str(),
+        })
+        .to_string(),
+        steps: vec![NewStep {
+            seq: 1,
+            kind: STEP_SEND.into(),
+            target_handle: checked.handle.canonical(),
+            account: None,
+            event_ref: None,
+            payload_json: serde_json::json!({ "text": text }).to_string(),
+        }],
+    }
+}
+
+/// Leave the compose as a normal approval card, noted with `note`, and
+/// mark it the active card so the queue does not post a second one. When
+/// the card cannot be posted, hand it to the approval queue instead.
+async fn card(
+    broker: &AutonomyBroker,
+    store: &augmentagent_store::Store,
+    composed: &Composed,
+    text: &str,
+    note: &str,
+) {
+    let pending = store
+        .get_action_with_email(&composed.action_id)
+        .ok()
+        .flatten()
+        .is_some_and(|a| a.action.status == "pending");
+    if !pending {
+        return;
+    }
+    match broker
+        .inner()
+        .post_approval_noted(&composed.action_id, &composed.email, text, note)
+        .await
+    {
+        Ok(()) => {
+            let next =
+                chrono::Utc::now().timestamp_millis() + augmentagent_store::NUDGE_INTERVAL_MS;
+            if let Err(e) = store.record_nudge(&composed.action_id, next) {
+                tracing::warn!(action_id = %composed.action_id, "outreach: record_nudge failed: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(action_id = %composed.action_id, "outreach: card not posted ({e}); leaving it to the approval queue");
+            let _ = store.with_conn(|c| {
+                c.execute(
+                    "UPDATE actions SET nudgeCount = 0 WHERE id = ?1 AND status = 'pending'",
+                    [&composed.action_id],
+                )
+            });
         }
     }
 }
@@ -198,6 +683,5 @@ impl Outreach for OutreachEngine {
 /// The heartbeat's outreach sink, or `None` unless
 /// `AUGMENTAGENT_HEARTBEAT_OUTREACH=on` and the D1 master switch is on.
 pub fn heartbeat_outreach(engine: Arc<OutreachEngine>) -> Option<Arc<dyn Outreach>> {
-    let _ = engine;
-    None
+    crate::switch::heartbeat_outreach_from_env().then_some(engine as Arc<dyn Outreach>)
 }

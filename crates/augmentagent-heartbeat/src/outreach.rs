@@ -75,6 +75,22 @@ pub trait Outreach: Send + Sync {
 
 /// The prompt section listing the roster. Empty when the roster is.
 pub fn prompt_section(roster: &[RosterEntry]) -> String {
-    let _ = roster;
-    String::new()
+    if roster.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n## People you may message (outreach)\n");
+    for person in roster {
+        // Names come from wiki page titles: keep them on one line.
+        let name: String = person
+            .display_name
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if name.is_empty() || name == person.slug {
+            out.push_str(&format!("- {}\n", person.slug));
+        } else {
+            out.push_str(&format!("- {} — {name}\n", person.slug));
+        }
+    }
+    out
 }

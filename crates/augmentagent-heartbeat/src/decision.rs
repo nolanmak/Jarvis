@@ -15,7 +15,9 @@ pub const OK_TOKEN: &str = "HEARTBEAT_OK";
 /// model said something substantive while also claiming "nothing to report".
 pub const ACK_MAX_CHARS: usize = 300;
 
-use crate::outreach::{OutreachEntry, OutreachResult, MAX_OUTREACH, MAX_OUTREACH_CHARS, MAX_WHY_CHARS};
+use crate::outreach::{
+    OutreachEntry, OutreachResult, MAX_OUTREACH, MAX_OUTREACH_CHARS, MAX_WHY_CHARS,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -71,9 +73,88 @@ pub struct OutreachParse {
 
 /// D16 — read the optional `"outreach"` list of the decision object.
 /// `roster` is the slugs the prompt offered (active `full`-tier contacts).
+///
+/// Fail closed per entry: an entry that is not an object, has any key
+/// besides `contact`/`message`/`why`, misses one, names a slug that is not
+/// on the roster (unknown, `actions` tier, pending, or a handle), repeats a
+/// contact, or is over length is dropped; the rest stands. Valid entries
+/// past the first [`MAX_OUTREACH`] are dropped. An [`Decision::Invalid`] reply yields
+/// nothing at all.
 pub fn parse_outreach(reply: &str, roster: &[String]) -> OutreachParse {
-    let _ = (reply, roster);
-    OutreachParse::default()
+    let mut out = OutreachParse::default();
+    if matches!(parse(reply), Decision::Invalid(_)) {
+        return out;
+    }
+    let Some(object) = last_decision_object(reply) else {
+        return out;
+    };
+    let items = match object.get("outreach") {
+        None | Some(serde_json::Value::Null) => return out,
+        Some(serde_json::Value::Array(items)) => items,
+        Some(_) => {
+            out.dropped
+                .push(OutreachResult::dropped(None, "`outreach` is not a list"));
+            return out;
+        }
+    };
+    for item in items {
+        let contact = item
+            .get("contact")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim);
+        match outreach_entry(item, roster) {
+            Ok(entry) if out.entries.iter().any(|e| e.contact == entry.contact) => {
+                out.dropped.push(OutreachResult::dropped(
+                    Some(&entry.contact),
+                    "a second message to the same person in one run",
+                ));
+            }
+            Ok(entry) if out.entries.len() >= MAX_OUTREACH => {
+                out.dropped.push(OutreachResult::dropped(
+                    Some(&entry.contact),
+                    format!("over the cap of {MAX_OUTREACH} per run"),
+                ));
+            }
+            Ok(entry) => out.entries.push(entry),
+            Err(why) => out.dropped.push(OutreachResult::dropped(contact, why)),
+        }
+    }
+    out
+}
+
+fn outreach_entry(item: &serde_json::Value, roster: &[String]) -> Result<OutreachEntry, String> {
+    let serde_json::Value::Object(map) = item else {
+        return Err("entry is not an object".into());
+    };
+    if let Some(extra) = map
+        .keys()
+        .find(|k| !matches!(k.as_str(), "contact" | "message" | "why"))
+    {
+        return Err(format!("unexpected field `{extra}`"));
+    }
+    let field = |name: &str| -> Result<String, String> {
+        map.get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("`{name}` missing or empty"))
+    };
+    let (contact, message, why) = (field("contact")?, field("message")?, field("why")?);
+    if !roster.contains(&contact) {
+        return Err("not a full-tier trusted contact".into());
+    }
+    if message.chars().count() > MAX_OUTREACH_CHARS {
+        return Err(format!("message over {MAX_OUTREACH_CHARS} characters"));
+    }
+    if why.chars().count() > MAX_WHY_CHARS {
+        return Err(format!("why over {MAX_WHY_CHARS} characters"));
+    }
+    Ok(OutreachEntry {
+        contact,
+        message,
+        why,
+    })
 }
 
 /// The last top-level JSON object in `text` that has a `notify` key. Prose,
@@ -260,10 +341,17 @@ mod tests {
         let reply = r#"{"notify": true, "message": "Deck due at 3", "outreach": [
             {"contact": "jane-doe", "message": "Deck by 3?", "why": "due"}]}"#;
         assert_eq!(parse(reply), Decision::Notify("Deck due at 3".into()));
-        assert_eq!(contacts(&parse_outreach(reply, &roster(&["jane-doe"]))), vec!["jane-doe"]);
+        assert_eq!(
+            contacts(&parse_outreach(reply, &roster(&["jane-doe"]))),
+            vec!["jane-doe"]
+        );
 
         // No outreach key, an empty list, or the bare token: nothing.
-        for reply in [r#"{"notify": false}"#, r#"{"notify": false, "outreach": []}"#, "HEARTBEAT_OK"] {
+        for reply in [
+            r#"{"notify": false}"#,
+            r#"{"notify": false, "outreach": []}"#,
+            "HEARTBEAT_OK",
+        ] {
             let p = parse_outreach(reply, &roster(&["jane-doe"]));
             assert!(p.entries.is_empty() && p.dropped.is_empty(), "{reply}");
         }
@@ -285,7 +373,9 @@ mod tests {
         // A handle is never accepted in place of a slug.
         let reply = r#"{"notify": false, "outreach": [
             {"contact": "imessage:+12025550100", "message": "hi", "why": "handle"}]}"#;
-        assert!(parse_outreach(reply, &roster(&["jane-doe"])).entries.is_empty());
+        assert!(parse_outreach(reply, &roster(&["jane-doe"]))
+            .entries
+            .is_empty());
         // With no roster (outreach off) nothing is ever valid.
         let reply = r#"{"notify": false, "outreach": [
             {"contact": "jane-doe", "message": "hi", "why": "x"}]}"#;
@@ -320,12 +410,16 @@ mod tests {
             r#"{{"notify": false, "outreach": [{{"contact": "jane-doe", "message": "{}", "why": "x"}}]}}"#,
             "a".repeat(MAX_OUTREACH_CHARS + 1)
         );
-        assert!(parse_outreach(&long, &roster(&["jane-doe"])).entries.is_empty());
+        assert!(parse_outreach(&long, &roster(&["jane-doe"]))
+            .entries
+            .is_empty());
         let long_why = format!(
             r#"{{"notify": false, "outreach": [{{"contact": "jane-doe", "message": "hi", "why": "{}"}}]}}"#,
             "w".repeat(MAX_WHY_CHARS + 1)
         );
-        assert!(parse_outreach(&long_why, &roster(&["jane-doe"])).entries.is_empty());
+        assert!(parse_outreach(&long_why, &roster(&["jane-doe"]))
+            .entries
+            .is_empty());
         let p = parse_outreach(
             r#"{"notify": false, "outreach": {"contact": "jane-doe"}}"#,
             &roster(&["jane-doe"]),

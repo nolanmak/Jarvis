@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use augmentagent_autonomy::gate::{AutonomyGate, GateDeps};
-use augmentagent_autonomy::outreach::{heartbeat_outreach, Composed, OutreachComposer, OutreachEngine};
+use augmentagent_autonomy::outreach::{
+    heartbeat_outreach, Composed, OutreachComposer, OutreachEngine,
+};
 use augmentagent_autonomy::{Handle, Tier};
 use common::*;
 

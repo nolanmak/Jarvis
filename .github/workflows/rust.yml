@@ -96,22 +96,25 @@ jobs:
       - name: Autonomy gate C5-C9 preset, receipts and Discord notice
         if: runner.os == 'Linux'
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/14"
+      - name: Autonomy C10 heartbeat outreach
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/15"
       # Heartbeat (Linux).
       - name: Format heartbeat crate
         if: runner.os == 'Linux'
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/15"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/16"
       - name: Heartbeat lint
         if: runner.os == 'Linux'
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/16"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/17"
       - name: Heartbeat behavior
         if: runner.os == 'Linux'
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/17"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/18"
       - name: Heartbeat store schema and capability manifest
         if: runner.os == 'Linux'
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/18"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/19"
       - name: Heartbeat CLI unit and process tests
         if: runner.os == 'Linux'
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/19"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/20"
 
       # LinkedIn archive/read/approval suite plus the directly affected
       # store/auth contracts. No live credentials.
@@ -119,7 +122,7 @@ jobs:
         shell: bash
         env:
           AUGMENTAGENT_GH_DISABLE: '1'
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/20"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/21"
 
       # Phone offline acceptance.
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -129,37 +132,37 @@ jobs:
         env: &phone_env
           AUGMENTAGENT_GH_DISABLE: '1'
           AUGMENTAGENT_PHONE_ENABLED: '0'
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/22"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/23"
       - name: Live receipt validator (synthetic fixtures only)
         env: *phone_env
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/23"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/24"
       - name: Portable bridge search and parent lifetime
         env: *phone_env
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/24"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/25"
       - name: Journal write guard including portable path resolution
         env: *phone_env
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/25"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/26"
       - name: Compile opt-in native phone probes (no model calls)
         env: *phone_env
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/26"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/27"
       - name: Required offline phone suites
         env: *phone_env
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/27"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/28"
       - name: Service installation preserves private phone configuration
         env: *phone_env
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/28"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/29"
       - name: Pre-phone database upgrade and rollback compatibility
         env: *phone_env
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/29"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/30"
       - name: ConversationRelay rollback preserves GPT-Live tasks and receipts
         env: *phone_env
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/30"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/31"
       - name: CLI integration compiles
         env: *phone_env
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/31"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/32"
       - name: Phone lint
         env: *phone_env
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/32"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/33"
       - name: Upload offline phone evidence (not live qualification)
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -181,16 +184,16 @@ jobs:
         working-directory: sidecars/wa-sidecar
         env:
           GOMAXPROCS: 2
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/35"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/36"
       - name: Build exact sidecar used by Rust contract tests
         working-directory: sidecars/wa-sidecar
         env:
           GOMAXPROCS: 2
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/36"
-      - name: WhatsApp Rust channel and real Go-process contract tests
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/37"
-      - name: WhatsApp Rust channel lint
+      - name: WhatsApp Rust channel and real Go-process contract tests
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/38"
+      - name: WhatsApp Rust channel lint
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/39"
 
   agents:
     runs-on: ubuntu-latest

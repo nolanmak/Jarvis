@@ -4047,13 +4047,18 @@ async fn main() -> Result<()> {
             let heartbeat = augmentagent_heartbeat::HeartbeatConfig::from_env();
             match heartbeat_cmd::serve_decision(&heartbeat, cli.wiki_dir.as_deref(), dry_run) {
                 Ok(wiki_root) => {
-                    let runner = augmentagent_heartbeat::HeartbeatRunner::new(
+                    let mut runner = augmentagent_heartbeat::HeartbeatRunner::new(
                         Arc::clone(&store),
                         Arc::clone(&broker),
                         build_reasoner(),
                         wiki_root,
                         heartbeat,
                     );
+                    // #1833 D16 — proactive outreach to full-tier trusted
+                    // contacts, only with both switches on.
+                    if let Some(outreach) = autonomy_cmd::heartbeat_outreach(&cli, &store, false) {
+                        runner = runner.with_outreach(outreach);
+                    }
                     let sd = shutdown.clone();
                     tasks.push(tokio::spawn(async move { runner.run(sd).await }));
                 }

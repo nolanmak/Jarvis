@@ -230,7 +230,11 @@ async fn outreach_runs_through_gate_with_proactive_trigger() {
     assert!(fx.inner.cards().is_empty(), "auto-sent: no card");
 
     // D11 record: proactive thread key, no inbound, one executed send step.
-    let plan = fx.store.autonomous_plan(r.plan_id.unwrap()).unwrap().unwrap();
+    let plan = fx
+        .store
+        .autonomous_plan(r.plan_id.unwrap())
+        .unwrap()
+        .unwrap();
     assert_eq!(plan.thread_key, format!("{PROACTIVE_THREAD_PREFIX}{SLUG}"));
     assert_eq!(plan.inbound_message_id, None);
     assert_eq!(plan.action_id, action_id);
@@ -278,7 +282,10 @@ async fn outreach_runs_through_gate_with_proactive_trigger() {
     capped.daily_cap = 1;
     let fx = fx_with(snapshot(capped), true);
     let t0 = window_start();
-    assert_eq!(send(&fx, "first", t0).await.decision, OutreachDecision::AutoSent);
+    assert_eq!(
+        send(&fx, "first", t0).await.decision,
+        OutreachDecision::AutoSent
+    );
     let r = send(&fx, "second", t0 + 31 * MIN).await;
     assert_eq!(r.reason, Some(Reason::DailyCap), "{r:?}");
     assert_eq!(r.decision, OutreachDecision::NeedsApproval);
@@ -322,7 +329,9 @@ async fn same_text_within_24h_deduped() {
 
     // Different text, a fresh window: goes.
     assert_eq!(
-        send(&fx, "Also: dinner at 7?", t0 + 60 * MIN).await.decision,
+        send(&fx, "Also: dinner at 7?", t0 + 60 * MIN)
+            .await
+            .decision,
         OutreachDecision::AutoSent
     );
     // Different text in the SAME 30-min window: the per-thread idempotency
@@ -344,7 +353,9 @@ async fn same_text_within_24h_deduped() {
 
     // After 24 h the same text may go again.
     assert_eq!(
-        send(&fx, "Can you send the deck?", t0 + 25 * HOUR).await.decision,
+        send(&fx, "Can you send the deck?", t0 + 25 * HOUR)
+            .await
+            .decision,
         OutreachDecision::AutoSent
     );
     assert_eq!(fx.exec.approvals().len(), 3);
@@ -404,13 +415,21 @@ async fn dry_run_shows_the_decision_without_side_effects() {
         .run(SLUG, "Can you send the deck?", "due", true, now_ms())
         .await;
     assert_eq!(r.decision, OutreachDecision::WouldAutoSend, "{r:?}");
-    assert_eq!(r.handle.as_deref(), Some(format!("imessage:{PHONE}").as_str()));
+    assert_eq!(
+        r.handle.as_deref(),
+        Some(format!("imessage:{PHONE}").as_str())
+    );
     assert!(r.idem_key.is_some());
     assert_eq!(fx.composer.checks().len(), 1);
     assert!(fx.composer.composes().is_empty());
     assert!(fx.exec.approvals().is_empty());
     assert!(fx.inner.calls().iter().all(|c| matches!(c, Call::Other(_))));
-    assert_eq!(fx.store.autonomous_plans_in_cap_window(SLUG, now_ms()).unwrap(), 0);
+    assert_eq!(
+        fx.store
+            .autonomous_plans_in_cap_window(SLUG, now_ms())
+            .unwrap(),
+        0
+    );
     // Nothing logged: the same text is not a duplicate afterwards.
     let r = fx
         .engine
@@ -424,7 +443,10 @@ async fn dry_run_shows_the_decision_without_side_effects() {
         .await;
     assert_eq!(
         (r.decision, r.reason),
-        (OutreachDecision::WouldNeedApproval, Some(Reason::ContentFloor))
+        (
+            OutreachDecision::WouldNeedApproval,
+            Some(Reason::ContentFloor)
+        )
     );
 }
 
@@ -447,7 +469,11 @@ impl Reasoner for Scripted {
 }
 
 fn heartbeat_for(fx: &Fx, reply: &str) -> (HeartbeatRunner<Scripted>, Arc<Scripted>) {
-    std::fs::write(fx.wiki.join("HEARTBEAT.md"), "- nudge people about the deck\n").unwrap();
+    std::fs::write(
+        fx.wiki.join("HEARTBEAT.md"),
+        "- nudge people about the deck\n",
+    )
+    .unwrap();
     let reasoner = Arc::new(Scripted {
         reply: reply.into(),
         prompts: Mutex::new(Vec::new()),
@@ -489,7 +515,14 @@ async fn prompt_lists_only_full_tier_slugs() {
     let (system, user) = &prompts[0];
     assert!(system.contains("outreach"), "the contract is explained");
     assert!(user.contains(SLUG) && user.contains("Jane Doe"), "{user}");
-    for absent in [ACTIONS_SLUG, PENDING_SLUG, PHONE, ACTIONS_PHONE, PENDING_PHONE, WORK_EMAIL] {
+    for absent in [
+        ACTIONS_SLUG,
+        PENDING_SLUG,
+        PHONE,
+        ACTIONS_PHONE,
+        PENDING_PHONE,
+        WORK_EMAIL,
+    ] {
         assert!(!user.contains(absent), "{absent} leaked into the prompt");
         assert!(!system.contains(absent), "{absent} leaked into the prompt");
     }
@@ -497,9 +530,8 @@ async fn prompt_lists_only_full_tier_slugs() {
 
 #[tokio::test]
 async fn invalid_decision_never_outreaches() {
-    let entry = format!(
-        r#"[{{"contact": "{SLUG}", "message": "Can you send the deck?", "why": "due"}}]"#
-    );
+    let entry =
+        format!(r#"[{{"contact": "{SLUG}", "message": "Can you send the deck?", "why": "due"}}]"#);
     // Invalid decision: nothing composed, nothing sent.
     let fx = fixture();
     let (runner, _) = heartbeat_for(&fx, &format!(r#"{{"notify": true, "outreach": {entry}}}"#));
