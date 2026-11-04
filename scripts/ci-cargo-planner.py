@@ -2322,7 +2322,7 @@ class RepositoryWorkerFreezer(UnitFreezer):
     """
     def __init__(self,admission,scope,lock,namespaces):
         if type(lock) is not WorkerProjectionLock:raise FreshnessHold('invalidation_unsafe')
-        self.progress_path=admission.target.parent/'repository-held-request.json'
+        self.progress_path=admission.target/('.jobserver-credit-'+admission.command)/'worker-scope-progress.json'
         super().__init__(admission,scope,1000,_worker_token=_WORKER_GROUP_TOKEN)
         self.lock=lock;self.namespaces=dict(namespaces);self.members={}
         self.membership='0::/ci-workers/'+self.path.name+'\n'
@@ -2335,6 +2335,7 @@ class RepositoryWorkerFreezer(UnitFreezer):
         cache._write_record(self.progress_path,{'version':1,'kind':'ci-worker-scope-progress',
             'binding':self.setup_record['binding'],'command':self.setup_record['command'],
             'phase':phase,'scope_id':self.setup_path.parent.name,
+            'members':[{'pid':pid,'birth':member['birth']} for pid,member in sorted(getattr(self,'members',{}).items())],
             'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
 
     def _lease(self,kind):
@@ -2892,7 +2893,7 @@ class WorkerRelay(RootRelay):
         try:return self._request_context(ordinal,request)
         except (FreshnessHold,OSError) as error:
             file,argv,environment,cwd,search,*_=request
-            cache._write_record(self.admission.target.parent/'repository-held-request.json',{
+            cache._write_record(self.admission.target/('.jobserver-credit-'+self.admission.command)/'worker-held-request.json',{
                 'version':1,'binding':self.admission.binding,'command':self.admission.command,
                 'file_hex':file[:4096].hex(),'argv_hex':[arg[:2048].hex() for arg in argv[:32]],
                 'cwd_hex':cwd[:4096].hex(),'search_hex':None if search is None else search[:4096].hex(),
