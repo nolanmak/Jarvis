@@ -1408,16 +1408,20 @@ class RootRelay:
             except socket.timeout:continue
             try:ordinal=self.ordinals.allocate()
             except FreshnessHold:
+                self.rejected_request()
                 self.errors.append(diagnostic({'stage':'planner_request_receive','category':'FreshnessHold','errno':errno.EBUSY}))
                 try:connection.sendall(event('error',errno.EBUSY))
                 finally:connection.close()
                 continue
             if not self._slots.acquire(blocking=False):
+                self.rejected_request()
                 try:connection.sendall(event('error',errno.EBUSY))
                 finally:connection.close()
                 continue
             thread=threading.Thread(target=self._handle,args=(connection,ordinal),daemon=True)
             self._threads.append(thread);thread.start()
+
+    def rejected_request(self):pass
 
     def _receive(self,connection,descriptors):
         pid,uid,gid=struct.unpack('3i',connection.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
@@ -1517,7 +1521,9 @@ class RootRelay:
                         if magic!=b'JARVSIG3' or reserved or number not in legacy.FORWARDED_SIGNALS or signal_count>4096:raise ValueError('invalid client signal')
                         if not started:cancelled=True
                         elif pidfd is not None:
-                            try:signal.pidfd_send_signal(pidfd,number)
+                            try:
+                                if transport is None:signal.pidfd_send_signal(pidfd,number)
+                                else:transport.forward_signal(number)
                             except ProcessLookupError:pass
                 if control in readers:
                     message=receive_control(control)
@@ -1552,6 +1558,7 @@ class RootRelay:
                     # cancellation is waiting to be read at this boundary.
                     if not select.select([connection],[],[],0)[0]:os.write(grant,b'go\n');authorized=True
                 if cancelled and child.poll() is None and cancelled_at is None:
+                    if transport is not None:transport.request_cancel()
                     os.write(stop,b'cancel');child.terminate();cancelled_at=time.monotonic()
                 if view is not None and started:self.views.running(view)
                 status=child.poll()
@@ -1624,6 +1631,84 @@ def stage_request_stdin(connection,source,*,deadline,stop,owner_pidfd=None):
         if captured is not None:captured.close()
         if watcher.is_alive():raise FreshnessHold('cleanup_uncertain')
         os.close(cancelled);os.close(notify)
+
+
+class StagedParentSignals:
+    """Unfrozen ingress during input staging, never a child-execution grant.
+
+    Frames are ordered at this barrier. Kernel standard-signal coalescing is
+    unchanged; this does not promise one userspace handler call per frame.
+    """
+    def __init__(self,pidfd):
+        if type(pidfd) is not int or pidfd<0 or os.readlink(f'/proc/self/fd/{pidfd}')!='anon_inode:[pidfd]':
+            raise FreshnessHold('invalidation_unsafe')
+        self.owner=os.getpid();self.pidfd=os.dup(pidfd);self.lock=threading.RLock()
+        self.cancelled=threading.Event();self.paused=None;self.used=set();self.queue=[]
+        self.received=0;self.delivered=0;self.late=0;self.revoked=False;self.closed=False;self.delivery_uncertain=False
+
+    def _check(self):
+        if self.owner!=os.getpid() or self.closed:raise FreshnessHold('invalidation_unsafe')
+
+    def _alive(self):return not select.select([self.pidfd],[],[],0)[0]
+
+    def _deliver(self,number):
+        if not self._alive():self.late+=1;return 'late'
+        try:signal.pidfd_send_signal(self.pidfd,number)
+        except ProcessLookupError:self.late+=1;return 'late'
+        self.delivered+=1;return 'forwarded'
+
+    def forward(self,number):
+        self._check()
+        if isinstance(number,bool) or not isinstance(number,int) or number not in legacy.FORWARDED_SIGNALS:
+            raise FreshnessHold('invalidation_unsafe')
+        with self.lock:
+            if self.received>=4096:
+                self.revoked=True;self.cancelled.set();raise FreshnessHold('input_census_unknown')
+            self.received+=1
+            if self.paused is not None:
+                self.queue.append(number);self.cancelled.set();return 'queued'
+            return self._deliver(number)
+
+    def pause(self,request):
+        self._check()
+        with self.lock:
+            if (type(request) is not int or not 0<=request<4096 or request in self.used
+                    or self.paused is not None or self.revoked or not self._alive()):
+                self.cancelled.set();raise FreshnessHold('invalidation_unsafe')
+            self.used.add(request);self.paused=request;self.cancelled.clear()
+
+    def resume(self,request,thaw):
+        self._check()
+        with self.lock:
+            if (type(request) is not int or request!=self.paused or not callable(thaw)
+                    or self.delivery_uncertain):raise FreshnessHold('cleanup_uncertain')
+            # Serialize ingress across checked thaw and every queued send. A
+            # failed thaw leaves the queue intact; uncertain delivery is never
+            # retried as though the previous signal had not happened.
+            try:thaw()
+            except BaseException:self.cancelled.set();raise
+            while self.queue:
+                try:self._deliver(self.queue[0])
+                except BaseException:
+                    self.delivery_uncertain=True;self.revoked=True;self.cancelled.set();raise
+                self.queue.pop(0)
+            self.paused=None
+
+    def cancel(self):
+        self._check()
+        with self.lock:self.revoked=True;self.cancelled.set()
+
+    def observation(self):
+        self._check()
+        with self.lock:return {'received':self.received,'delivered':self.delivered,'late':self.late,
+            'queued':len(self.queue),'paused_request':self.paused,'revoked':self.revoked,'shipping_authority':False}
+
+    def close(self):
+        if self.closed:return
+        self._check()
+        with self.lock:
+            if self.paused is not None and self._alive():raise FreshnessHold('cleanup_uncertain')
+            os.close(self.pidfd);self.closed=True
 
 
 class UnitFreezer:
@@ -1767,6 +1852,7 @@ class UnitPeerRelay(RootRelay):
         self.peer_uid=2000+ordinal;self.config_uid=self.peer_uid;self.config_magic=b'JARVUNT3'
         self.require_message_credentials=True;self.parent_ordinal=ordinal;self.scope=Path(scope)
         self.scope_pidfd=None;self.scope_namespaces=None;self.scope_root=None;self.received_requests=0;self.closed=False
+        self.staged_signals=None
         self._slots=threading.BoundedSemaphore(1)
         self.view=dict(view);self.mutation_lock=threading.RLock()
         self.captures=self.root/'captures';self.captures.mkdir(mode=0o700)
@@ -1783,6 +1869,19 @@ class UnitPeerRelay(RootRelay):
             raise FreshnessHold('invalidation_unsafe')
         self.scope_root=record['root_identity'];self.scope_namespaces=namespaces;self.scope_pidfd=os.pidfd_open(pid)
         self.freezer.attach(pid,self.scope_pidfd)
+        self.staged_signals=StagedParentSignals(self.scope_pidfd)
+
+    def forward_signal(self,number):
+        if self.staged_signals is None:raise FreshnessHold('invalidation_unsafe')
+        return self.staged_signals.forward(number)
+
+    def request_cancel(self):
+        self._stop.set()
+        if self.staged_signals is not None:self.staged_signals.cancel()
+
+    def rejected_request(self):
+        self.request_cancel()
+        self.errors.append(diagnostic({'stage':'planner_request_receive','category':'FreshnessHold','errno':errno.EBUSY}))
 
     def _receive(self,connection,descriptors):
         numbers=super()._receive(connection,descriptors)
@@ -1823,14 +1922,16 @@ class UnitPeerRelay(RootRelay):
             cache._write_record(self.root/'admission.json',record)
             phase[0]='planner_capture'
             with self.mutation_lock:
+                self.staged_signals.pause(ordinal)
                 try:
                     record['pause']=self.freezer.freeze(self.deadline)
                     cache._write_record(self.root/'admission.json',record)
                     record['capture']=self._capture(ordinal,record,descriptors[2:4])
                 finally:
-                    self.freezer.thaw(self.deadline)
+                    self.staged_signals.resume(ordinal,lambda:self.freezer.thaw(self.deadline))
                     if 'pause' in record:
                         record['thaw_verified']=True
+                        record['staged_signals']=self.staged_signals.observation()
                         cache._write_record(self.root/'admission.json',record)
         raise FreshnessHold('input_census_unknown')
 
@@ -1849,7 +1950,7 @@ class UnitPeerRelay(RootRelay):
             'full_ci':False,'shipping_authority':False}
         path=self.captures/(str(ordinal)+'.json');cache._write_record(path,state)
         def check():
-            if (self._stop.is_set() or time.monotonic()>=self.deadline
+            if (self._stop.is_set() or self.staged_signals.cancelled.is_set() or time.monotonic()>=self.deadline
                     or select.select([self.scope_pidfd],[],[],0)[0]):raise FreshnessHold('cleanup_uncertain')
             fields=dict(line.split() for line in self.freezer._read('cgroup.events').splitlines())
             if fields.get(b'frozen')!=b'1':raise FreshnessHold('cleanup_uncertain')
@@ -1880,6 +1981,7 @@ class UnitPeerRelay(RootRelay):
         if self.closed:return
         try:super().__exit__(*arguments);self.freezer.close();self.closed=True
         finally:
+            if self.staged_signals is not None:self.staged_signals.close()
             if self.scope_pidfd is not None:os.close(self.scope_pidfd);self.scope_pidfd=None
 
 

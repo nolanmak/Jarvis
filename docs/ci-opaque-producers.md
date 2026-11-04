@@ -655,6 +655,18 @@ The following load-bearing choices remain parked with C; they are not waived:
   epoch/acknowledgement and late/duplicate/signal-at-terminal behavior; prove the
   unchanged signal cases plus a genuinely stopped nested proxy. Unknown ingress
   cannot be described as preserved signal behavior.
+  The root controller now supplies `StagedParentSignals` for the input-staging
+  window. It marks the original request before freezing, queues root-ingress
+  frames and cancels that staging attempt, then serializes verified thaw and
+  queued sends. Wrong/repeated request identities cannot resume another call;
+  failed thaw keeps the queue, late sends are explicit and the original
+  4096-frame limit remains. Standard kernel signal coalescing is unchanged;
+  per-frame userspace handler delivery/order is not promised. Host kernel tests
+  exercise a stopped receiver, thaw races and failure, ordinary/late delivery,
+  permanent cancellation and pre-auth busy-socket revocation. This is not an
+  active-child router. Actual contained-child routing, stopped nested-proxy
+  guest signal cases, terminal races and checked child drain before parent
+  resume remain this thread's gates. No child execution grant is enabled.
 * Before producer/restart integration acceptance or mechanism handoff, settle the
   complete-initial-closure rule for successful sibling output effects. The
   unchanged fixture appends counter/log data in the same generated namespace as
