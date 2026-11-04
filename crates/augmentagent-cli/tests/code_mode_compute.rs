@@ -967,7 +967,14 @@ fn real_cli_unrelated_fds_are_absent_from_children_and_guest() {
         }
     }
     let root = tempfile::tempdir().unwrap();
-    let scratch = root.path().join("scratch");
+    // #1823 — the build scratch needs the bridge's free-space headroom; use the
+    // operator's scratch root when one is given rather than the system tempdir.
+    let scratch_parent = std::env::var_os("JARVIS_TEST_COMPUTE_SCRATCH").map(std::path::PathBuf::from);
+    let scratch_dir = match &scratch_parent {
+        Some(parent) => tempfile::Builder::new().prefix("fd-isolation-").tempdir_in(parent).unwrap(),
+        None => tempfile::tempdir().unwrap(),
+    };
+    let scratch = scratch_dir.path().join("scratch");
     std::fs::create_dir(&scratch).unwrap();
     std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
     let canary = root.path().join("private-fd-canary");
@@ -1002,14 +1009,28 @@ fn real_cli_unrelated_fds_are_absent_from_children_and_guest() {
                 let Ok(executable) = std::fs::read_link(format!("/proc/{pid}/exe")) else { continue; };
                 let name = executable.file_name().unwrap().to_string_lossy();
                 let kind = if name == "deno" { "deno" } else if name.starts_with("python3") { "helper" } else { continue; };
+                // #1823 — `execve` switches /proc/<pid>/exe to the new image
+                // shortly before it closes the close-on-exec descriptors, so
+                // a child caught in that window still lists the canary, already
+                // flagged O_CLOEXEC by `isolate_descriptors`. That is a pending
+                // close, not an inheritance: look again. A canary without
+                // O_CLOEXEC (dup2 clears it) is a real leak and fails.
                 let descriptors = std::fs::read_dir(format!("/proc/{pid}/fd")).unwrap();
+                let mut exec_in_progress = false;
                 for entry in descriptors.flatten() {
                     if let Ok(metadata) = std::fs::metadata(entry.path()) {
-                        assert!(!(metadata.dev() == identity.dev() && metadata.ino() == identity.ino()),
-                                "{kind} inherited the unrelated canary descriptor");
+                        if metadata.dev() == identity.dev() && metadata.ino() == identity.ino() {
+                            let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{}",
+                                entry.file_name().to_string_lossy())).unwrap_or_default();
+                            let Some(flags) = info.lines().find_map(|l| l.strip_prefix("flags:"))
+                                .and_then(|f| u32::from_str_radix(f.trim(), 8).ok()) else { continue; };
+                            assert!(flags & libc::O_CLOEXEC as u32 != 0,
+                                    "{kind} inherited the unrelated canary descriptor (flags {flags:o})");
+                            exec_in_progress = true;
+                        }
                     }
                 }
-                seen.insert(kind);
+                if !exec_in_progress { seen.insert(kind); }
             }
         }
         assert!(Instant::now() < deadline, "did not inspect both Deno and compute helper");
@@ -1020,7 +1041,10 @@ fn real_cli_unrelated_fds_are_absent_from_children_and_guest() {
         assert!(Instant::now() < deadline, "CLI did not finish its descriptor probe");
         std::thread::sleep(Duration::from_millis(10));
     };
-    assert!(status.success(), "guest descriptor isolation failed");
+    assert!(status.success(), "guest descriptor isolation failed: {}",
+            std::fs::read(root.path().join("report.json")).ok()
+                .and_then(|r| serde_json::from_slice::<Value>(&r).ok())
+                .map(|r| r["final"]["error"].to_string()).unwrap_or_else(|| "no report".into()));
     let result = report(root.path());
     assert_eq!(result["final"]["runner"], "vm");
     assert_eq!(result["final"]["stdout"].as_str().unwrap().trim(), "60");

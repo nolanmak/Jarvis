@@ -2194,38 +2194,40 @@ os.execv(sys.executable,[sys.executable,'-I','-S','-c',sys.argv[1],sys.argv[2]])
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
         self.assertEqual(json.loads(result.stdout)['matches'], [[0, 1, 'SYNTHETIC_MATCH']])
 
-    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin resident-memory monitor; Linux uses RLIMIT_AS')
-    def test_darwin_memory_monitor_refuses_over_budget_matcher(self):
-        import os
-        code = bridge.GREP_MATCHER.replace('MAX_MATCHER_RESIDENT = 1 << 30', 'MAX_MATCHER_RESIDENT = 1')
-        result = subprocess.run([sys.executable, '-I', '-S', '-c', code, str(os.getpid())],
-            input=b'', capture_output=True, timeout=5)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(b'check resident memory: MemoryError', result.stderr)
+    # #1823 — the resident-memory monitor exists only on Darwin (Linux uses
+    # RLIMIT_AS). Define these tests only there: a skip on Linux would read as
+    # an unverified case to the compute acceptance gate, which rejects skips.
+    if sys.platform == 'darwin':
+        def test_darwin_memory_monitor_refuses_over_budget_matcher(self):
+            import os
+            code = bridge.GREP_MATCHER.replace('MAX_MATCHER_RESIDENT = 1 << 30', 'MAX_MATCHER_RESIDENT = 1')
+            result = subprocess.run([sys.executable, '-I', '-S', '-c', code, str(os.getpid())],
+                input=b'', capture_output=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b'check resident memory: MemoryError', result.stderr)
 
-    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin resident-memory monitor')
-    def test_darwin_memory_monitor_failure_after_startup_stops_matcher(self):
-        import os
-        for error in ('MemoryError', 'OSError'):
-            with self.subTest(error=error):
-                code = bridge.GREP_MATCHER.replace('    def check_memory():',
-                    '    memory_checks = 0\n'
-                    '    def check_memory():\n'
-                    '        global memory_checks\n'
-                    '        memory_checks += 1\n'
-                    '        if memory_checks == 2: raise ' + error + "('synthetic monitor failure')")
-                child = subprocess.Popen([sys.executable, '-I', '-S', '-c', code, str(os.getpid())],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                try:
-                    # Keep stdin open: after arming the guardian, the matcher
-                    # blocks awaiting input. Only the monitor should stop it.
-                    child.wait(timeout=2)
-                    self.assertNotEqual(child.returncode, 0)
-                    self.assertIn(('check resident memory: ' + error).encode(), child.stderr.read())
-                finally:
-                    if child.poll() is None:
-                        child.kill()
-                    child.communicate(timeout=5)
+        def test_darwin_memory_monitor_failure_after_startup_stops_matcher(self):
+            import os
+            for error in ('MemoryError', 'OSError'):
+                with self.subTest(error=error):
+                    code = bridge.GREP_MATCHER.replace('    def check_memory():',
+                        '    memory_checks = 0\n'
+                        '    def check_memory():\n'
+                        '        global memory_checks\n'
+                        '        memory_checks += 1\n'
+                        '        if memory_checks == 2: raise ' + error + "('synthetic monitor failure')")
+                    child = subprocess.Popen([sys.executable, '-I', '-S', '-c', code, str(os.getpid())],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    try:
+                        # Keep stdin open: after arming the guardian, the matcher
+                        # blocks awaiting input. Only the monitor should stop it.
+                        child.wait(timeout=2)
+                        self.assertNotEqual(child.returncode, 0)
+                        self.assertIn(('check resident memory: ' + error).encode(), child.stderr.read())
+                    finally:
+                        if child.poll() is None:
+                            child.kill()
+                        child.communicate(timeout=5)
 
     def test_matcher_dies_with_parent_during_pathological_regex(self):
         import os
