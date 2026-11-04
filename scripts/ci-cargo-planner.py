@@ -1302,8 +1302,50 @@ def strip_transport(environment,library):
     return result
 
 
+class DispatchOrdinals:
+    """One original command's process-owned request/UID namespace.
+
+    Shared by relays in the controller, never copied to bootstrap processes.
+    Allocation does not grant a runnable permit, output or CI authority.
+    """
+    def __init__(self,binding,command):
+        cache.validate_binding(binding)
+        if not cache._uuid(command):raise FreshnessHold('generation_mismatch')
+        self.owner=os.getpid();self._binding=copy.deepcopy(binding);self.command=command
+        self._next=0;self._lock=threading.Lock()
+
+    def require(self,binding,command):
+        if self.owner!=os.getpid() or self._binding!=binding or self.command!=command:
+            raise FreshnessHold('generation_mismatch')
+
+    def allocate(self):
+        # Check before acquiring a possibly inherited locked mutex after fork.
+        if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
+        with self._lock:
+            if self._next>=4096:raise FreshnessHold('input_census_unknown')
+            ordinal=self._next;self._next+=1;return ordinal
+
+
+def bind_controller_socket(listener,path):
+    """Bind an owned pathname inode without the AF_UNIX address-length limit.
+
+    Filesystem mechanics only; RootRelay authenticates the root admission.
+    Clients resolve the real pathname or its private bind mount, not this fd name.
+    """
+    path=Path(path)
+    if (not path.is_absolute() or path.parent.resolve()!=path.parent or path.name in ('.','..')
+            or re.fullmatch(r'[A-Za-z0-9._-]{1,64}',path.name) is None):raise FreshnessHold('invalidation_unsafe')
+    descriptor=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW)
+    try:
+        info=os.fstat(descriptor);named=path.parent.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or info.st_mode&0o022
+                or (info.st_dev,info.st_ino)!=(named.st_dev,named.st_ino)):raise FreshnessHold('invalidation_unsafe')
+        listener.bind(f'/proc/self/fd/{descriptor}/{path.name}')
+    finally:os.close(descriptor)
+
+
 class RootRelay:
-    def __init__(self,admission,*,library,timeout=30,deadline=None):
+    def __init__(self,admission,*,library,timeout=30,deadline=None,ordinals=None,client_path=None):
         if (os.geteuid()!=0 or type(admission) is not _Admission or admission.token is not _TOKEN
                 or admission.owner!=os.getpid() or type(timeout) not in (int,float) or not 1<=timeout<=900):
             raise FreshnessHold('invalidation_unsafe')
@@ -1315,18 +1357,22 @@ class RootRelay:
         info=self.library.lstat()
         if (self.library.resolve()!=self.library or not stat.S_ISREG(info.st_mode) or info.st_uid!=0
                 or info.st_mode&0o022 or info.st_nlink!=1 or not 1<=info.st_size<=2*1024**2):raise FreshnessHold('authority_changed')
+        self.ordinals=DispatchOrdinals(admission.binding,admission.command) if ordinals is None else ordinals
+        if type(self.ordinals) is not DispatchOrdinals:raise FreshnessHold('invalidation_unsafe')
+        self.ordinals.require(admission.binding,admission.command)
         self.timeout=timeout;self.peer_uid=1001;self.config_magic=b'JARVCFG3';self.require_message_credentials=False
-        self.path=self.root/'relay.sock';self.nonce=os.urandom(32)
-        if len(os.fsencode(self.path))>=108:raise FreshnessHold('invalidation_unsafe')
+        self.path=self.root/'relay.sock';self.nonce=os.urandom(32);self.config_uid=0
+        self.client_path=self.path if client_path is None else Path(client_path)
+        if not self.client_path.is_absolute() or len(os.fsencode(self.client_path))>=108:raise FreshnessHold('invalidation_unsafe')
         self.views=None;self.completed=[];self.errors=[];self._stop=threading.Event();self._slots=threading.BoundedSemaphore(4)
-        self._threads=[];self._requests=0;self._children=set();self._lock=threading.Lock()
+        self._threads=[];self._children=set();self._lock=threading.Lock()
 
     def __enter__(self):
         os.chown(self.root,0,self.peer_uid);self.root.chmod(0o710)
         (self.root/'units').mkdir(mode=0o700)
         self.listener=socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
         if self.require_message_credentials:self.listener.setsockopt(socket.SOL_SOCKET,socket.SO_PASSCRED,1)
-        self.listener.bind(str(self.path));os.chown(self.path,0,self.peer_uid);self.path.chmod(0o660)
+        bind_controller_socket(self.listener,self.path);os.chown(self.path,0,self.peer_uid);self.path.chmod(0o660)
         self.listener.listen(8);self.listener.settimeout(.05)
         self.thread=threading.Thread(target=self._accept,daemon=True);self.thread.start();return self
 
@@ -1350,7 +1396,7 @@ class RootRelay:
     def config_fd(self):
         fd=os.memfd_create('ci-planner-client',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
         try:
-            body=legacy.CONFIG.pack(self.config_magic,0,os.getpid(),int(self.timeout*1000),self.nonce,os.fsencode(self.path))
+            body=legacy.CONFIG.pack(self.config_magic,self.config_uid,os.getpid(),int(self.timeout*1000),self.nonce,os.fsencode(self.client_path))
             if os.write(fd,body)!=len(body):raise OSError(errno.EIO,'client configuration write failed')
             fcntl.fcntl(fd,fcntl.F_ADD_SEALS,legacy.SEALS);return fd
         except BaseException:os.close(fd);raise
@@ -1359,8 +1405,13 @@ class RootRelay:
         while not self._stop.is_set():
             try:connection,_=self.listener.accept()
             except socket.timeout:continue
-            ordinal=self._requests;self._requests+=1
-            if ordinal>=4096 or not self._slots.acquire(blocking=False):
+            try:ordinal=self.ordinals.allocate()
+            except FreshnessHold:
+                self.errors.append(diagnostic({'stage':'planner_request_receive','category':'FreshnessHold','errno':errno.EBUSY}))
+                try:connection.sendall(event('error',errno.EBUSY))
+                finally:connection.close()
+                continue
+            if not self._slots.acquire(blocking=False):
                 try:connection.sendall(event('error',errno.EBUSY))
                 finally:connection.close()
                 continue
@@ -1417,7 +1468,7 @@ class RootRelay:
             'binding':self.admission.binding,'command':self.admission.command,'directory':str(directory),
             'ordinal':ordinal,'deadline':deadline,'library':str(self.library),'numbers':numbers,
             'extras':descriptors[4:]}
-        view=None;bootstrap=None;child=None;pidfd=None;relay_fd=None;cancelled=False;ready=False;sealed=False;authorized=False;started=False
+        view=None;bootstrap=None;child=None;pidfd=None;relay_fd=None;transport=None;cancelled=False;ready=False;sealed=False;authorized=False;started=False
         signal_count=0;cancelled_at=None;control_eof=False;original_pid=None
         try:
             request=payload(descriptors[0]);context,relay_fd=self.request_context(ordinal,request)
@@ -1431,7 +1482,19 @@ class RootRelay:
             value.update(context)
             if self.views is not None:
                 phase[0]='planner_view_prepare';view=self.views.prepare(ordinal,request)
-                if view is not None:value['view']=view
+                if view is not None:
+                    transport_root=Path(view['root']).parent/'transport';transport_root.mkdir(mode=0o700)
+                    admission=admit(self.admission.target,self.admission.binding,self.admission.command,transport_root)
+                    transport=UnitPeerRelay(admission,library=self.library,ordinal=ordinal,scope=directory,
+                        ordinals=self.ordinals,deadline=deadline)
+                    transport.__enter__()
+                    if relay_fd is not None:raise FreshnessHold('invalidation_unsafe')
+                    descriptor=transport.config_fd()
+                    try:relay_fd=fcntl.fcntl(descriptor,fcntl.F_DUPFD_CLOEXEC,max(256,max(numbers)+1))
+                    finally:os.close(descriptor)
+                    if relay_fd>65535:raise FreshnessHold('input_census_unknown')
+                    value['relay_fd']=relay_fd
+                    value['view']=dict(view,transport={'socket':str(transport.path),'library':str(self.library)})
             bootstrap=_sealed(value)
             argv=[sys.executable,'-I',str(Path(__file__).resolve()),'--unit',
                 *map(str,(bootstrap,descriptors[0],cancel,release,exec_release,child_control.fileno()))]
@@ -1479,6 +1542,7 @@ class RootRelay:
                         sealed=True;phase[0]='planner_authorize'
                     elif stage==3 and authorized and not started and not received and child_pid==original_pid:
                         if not cancelled:
+                            if transport is not None:transport.register_parent(original_pid,directory/'view-namespace.json')
                             connection.sendall(event('tool_started',0));os.write(exec_grant,b'go\n');started=True;phase[0]='planner_unit_exec'
                     else:legacy._close(received);raise ValueError('out-of-order original control frame')
                     legacy._close(received)
@@ -1504,6 +1568,7 @@ class RootRelay:
                     or not -64<=record['returncode']<=255):raise FreshnessHold('cleanup_uncertain')
             raw=record['returncode']
             if status!=(raw if raw>=0 else 128-raw):raise FreshnessHold('cleanup_uncertain')
+            if transport is not None:transport.check()
             if view is not None:
                 phase[0]='planner_view_publish';self.views.finish(view,directory,raw)
             self.completed.append({'ordinal':ordinal,'uid':execution_identity(value),'started':started,
@@ -1520,6 +1585,75 @@ class RootRelay:
             legacy._close([cancel,stop,release,grant,exec_release,exec_grant]+([] if bootstrap is None else [bootstrap])+([] if relay_fd is None else [relay_fd]))
             control.close();child_control.close()
             if pidfd is not None:os.close(pidfd)
+            if transport is not None:transport.__exit__(None,None,None)
+
+
+class UnitPeerRelay(RootRelay):
+    """Authenticated unit endpoint; capture/dispatch remains a closed gate."""
+    def __init__(self,admission,*,library,ordinal,scope,ordinals,deadline):
+        if type(ordinal) is not int or not 0<=ordinal<4096 or not cache._uuid(Path(scope).name):
+            raise FreshnessHold('invalidation_unsafe')
+        super().__init__(admission,library=library,timeout=min(900,max(1,deadline-time.monotonic())),
+            deadline=deadline,ordinals=ordinals,client_path='/run/ci-unit.sock')
+        self.peer_uid=2000+ordinal;self.config_uid=self.peer_uid;self.config_magic=b'JARVUNT3'
+        self.require_message_credentials=True;self.parent_ordinal=ordinal;self.scope=Path(scope)
+        self.scope_pidfd=None;self.scope_namespaces=None;self.scope_root=None;self.received_requests=0;self.closed=False
+        self._slots=threading.BoundedSemaphore(1)
+
+    def register_parent(self,pid,path):
+        if self.scope_pidfd is not None:raise FreshnessHold('invalidation_unsafe')
+        record=cache._read_record(path)
+        if (record.get('binding')!=self.admission.binding or record.get('command')!=self.admission.command
+                or record.get('ordinal')!=self.parent_ordinal or record.get('pid')!=pid):
+            raise FreshnessHold('generation_mismatch')
+        namespaces={name:os.readlink(f'/proc/{pid}/ns/'+name) for name in ('mnt','ipc','net','user','pid')}
+        if any(record['namespaces'][name]['unit']!=namespaces[name] for name in ('mnt','ipc','net')):
+            raise FreshnessHold('invalidation_unsafe')
+        self.scope_root=record['root_identity'];self.scope_namespaces=namespaces;self.scope_pidfd=os.pidfd_open(pid)
+
+    def _receive(self,connection,descriptors):
+        numbers=super()._receive(connection,descriptors)
+        if self.scope_pidfd is None:raise FreshnessHold('invalidation_unsafe')
+        signal.pidfd_send_signal(self.scope_pidfd,0)
+        pid,uid,gid=struct.unpack('3i',connection.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+        status=Path(f'/proc/{pid}/status').read_text()
+        for label in ('Uid:','Gid:'):
+            row=next(line for line in status.splitlines() if line.startswith(label))
+            if list(map(int,row.split()[1:]))!=[self.peer_uid]*4:raise FreshnessHold('invalidation_unsafe')
+        if next(line for line in status.splitlines() if line.startswith('Groups:')).split()[1:]:
+            raise FreshnessHold('invalidation_unsafe')
+        if any(os.readlink(f'/proc/{pid}/ns/'+name)!=value for name,value in self.scope_namespaces.items()):
+            raise FreshnessHold('invalidation_unsafe')
+        root=os.stat(f'/proc/{pid}/root')
+        if self.scope_root!={'device':(os.major(root.st_dev)<<20)|os.minor(root.st_dev),'inode':root.st_ino,'mode':root.st_mode}:
+            raise FreshnessHold('invalidation_unsafe')
+        return numbers
+
+    def _run(self,connection,ordinal,descriptors,numbers,phase):
+        # No child grant exists until the staged request has a proven paused
+        # input capture and admitted mutation set. Preserve the real request's
+        # structural evidence; never execute it as an untracked fallback.
+        body=payload(descriptors[0]);info=os.fstat(descriptors[0])
+        with self._lock:
+            self.received_requests+=1
+            cache._write_record(self.root/'admission.json',{'version':1,'kind':'ci-unit-peer-admission',
+                'binding':self.admission.binding,'command':self.admission.command,
+                'parent_ordinal':self.parent_ordinal,'parent_scope':self.scope.name,'client_uid':self.peer_uid,
+                'last_request_ordinal':ordinal,'received_requests':self.received_requests,
+                'request_sha256':hashlib.sha256(os.pread(descriptors[0],info.st_size,0)).hexdigest(),
+                'peer_and_message_credentials_bound':True,'original_namespaces_and_root_bound':True,
+                'payload_validated':body is not None,'dispatch_tested':False,'shipping_authority':False})
+        raise FreshnessHold('input_census_unknown')
+
+    def check(self):
+        self.__exit__(None,None,None)
+        if self.received_requests or self.errors:raise FreshnessHold('input_census_unknown')
+
+    def __exit__(self,*arguments):
+        if self.closed:return
+        try:super().__exit__(*arguments);self.closed=True
+        finally:
+            if self.scope_pidfd is not None:os.close(self.scope_pidfd);self.scope_pidfd=None
 
 
 class WorkerRelay(RootRelay):
@@ -1530,7 +1664,7 @@ class WorkerRelay(RootRelay):
     This routing does not establish generated-input closure or CI authority.
     """
     def __init__(self,admission,*,planner_relay,value):
-        super().__init__(admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic())),deadline=value['deadline'])
+        super().__init__(admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic())),deadline=value['deadline'],ordinals=planner_relay.ordinals)
         self.peer_uid=1000;self.config_magic=b'JARVWRK3';self.require_message_credentials=True;self.planner_relay=planner_relay
         self.value=value;self.executor=None;self.cargo_lock=threading.Lock();self.cargo_owner=None;self.cargo_commands=[];self.metadata_units=[]
 
@@ -1857,7 +1991,13 @@ def _stage(arguments):
         if (mounts.get('binding')!=value['binding'] or mounts.get('command')!=value['command']
                 or mounts.get('ordinal')!=value['ordinal']):raise FreshnessHold('generation_mismatch')
         unit_views.enter(view['root'],2000+value['ordinal'],view['source'],view['artifacts'],mounts['entries'],
-            mounts.get('source_entries'),mounts.get('declared_outputs'))
+            mounts.get('source_entries'),mounts.get('declared_outputs'),transport=view.get('transport'))
+        if 'transport' in view:
+            descriptor=value.get('relay_fd')
+            if type(descriptor) is not int or not 3<=descriptor<=65535:raise FreshnessHold('invalidation_unsafe')
+            os.set_inheritable(descriptor,True)
+            environment[b'JARVIS_CARGO_RELAY_FD']=str(descriptor).encode()
+            environment[b'LD_PRELOAD']=b'/run/ci-cargo-relay.so'+(b' '+environment[b'LD_PRELOAD'] if b'LD_PRELOAD' in environment else b'')
     stage_exec_mediation(value,policy);policy.activate()
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')

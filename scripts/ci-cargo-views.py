@@ -252,7 +252,7 @@ def toolchain_view(source,destination):
     destination.chmod(0o555)
 
 
-def enter(root,unit,source,artifacts,bindings=(),source_bindings=None,declared_outputs=None):
+def enter(root,unit,source,artifacts,bindings=(),source_bindings=None,declared_outputs=None,*,transport=None):
     phase=['planner_view_enter']
     try:return _enter(root,unit,source,artifacts,bindings,phase,source_bindings,declared_outputs)
     except BaseException as error:
@@ -317,5 +317,20 @@ def _enter(root,unit,source,artifacts,bindings,phase,source_bindings=None,declar
         (root/'dev'/name).touch(mode=0o600);_mount('--bind','/dev/'+name,root/'dev'/name)
     (root/'dev/fd').symlink_to('/proc/self/fd')
     for name,descriptor in (('stdin',0),('stdout',1),('stderr',2)):(root/'dev'/name).symlink_to('/proc/self/fd/'+str(descriptor))
+    if transport is not None:
+        if type(transport) is not dict or set(transport)!={'socket','library'}:raise FreshnessHold('invalidation_unsafe')
+        for key,name in (('socket','ci-unit.sock'),('library','ci-cargo-relay.so')):
+            original=literal(transport[key]);before=original.lstat()
+            if before.st_uid!=0 or before.st_nlink!=1:raise FreshnessHold('authority_changed')
+            if key=='socket':
+                if not stat.S_ISSOCK(before.st_mode) or before.st_gid!=unit or stat.S_IMODE(before.st_mode)!=0o660:
+                    raise FreshnessHold('invalidation_unsafe')
+            elif not stat.S_ISREG(before.st_mode) or before.st_mode&0o022 or not 1<=before.st_size<=2*1024**2:
+                raise FreshnessHold('authority_changed')
+            destination=root/'run'/name;destination.touch(mode=0o600)
+            _mount('--bind',original,destination)
+            _mount('-o','remount,bind,ro,nosuid,nodev,noatime',destination)
+            if _key(original.lstat())!=_key(before) or _key(destination.stat())!=_key(before):
+                raise FreshnessHold('authority_changed')
     phase[0]='planner_view_root'
     root.chmod(0o755);os.chroot(root);os.chdir('/')

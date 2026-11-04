@@ -147,6 +147,35 @@ static const char *environment_value(const char *name) {
     return NULL;
 }
 
+#ifdef JARVIS_CARGO_PROTOCOL_V3
+static int strip_unit_transport_environment(void) {
+    const char *preload=environment_value("LD_PRELOAD");
+    if (preload) {
+        size_t length=strnlen(preload,MAX_STRING+1);
+        if (length>MAX_STRING) {errno=E2BIG;return -1;}
+        char *filtered=malloc(length+1);
+        if (!filtered) return -1;
+        size_t used=0;
+        const char *cursor=preload;
+        const char own[]="/run/ci-cargo-relay.so";
+        while (*cursor) {
+            while (*cursor==' ' || *cursor==':') ++cursor;
+            const char *start=cursor;
+            while (*cursor && *cursor!=' ' && *cursor!=':') ++cursor;
+            size_t count=(size_t)(cursor-start);
+            if (!count || (count==sizeof(own)-1 && !memcmp(start,own,count))) continue;
+            if (used) filtered[used++]=' ';
+            memcpy(filtered+used,start,count);used+=count;
+        }
+        filtered[used]=0;
+        int result=used?setenv("LD_PRELOAD",filtered,1):unsetenv("LD_PRELOAD");
+        free(filtered);
+        if (result<0) return -1;
+    }
+    return unsetenv("JARVIS_CARGO_RELAY_FD");
+}
+#endif
+
 __attribute__((constructor)) static void initialize_relay(void) {
     const char *value = environment_value("JARVIS_CARGO_RELAY_FD");
     if (geteuid() == 0 || getuid() != geteuid() || !value || !*value) _exit(125);
@@ -185,6 +214,9 @@ __attribute__((constructor)) static void initialize_relay(void) {
         || config.timeout_ms > MAX_TIMEOUT_MS || config.path[0] != '/'
         || !memchr(config.path, 0, sizeof(config.path))) _exit(125);
     if (jarvis_ci_deny_exec() != 0) _exit(125);
+#ifdef JARVIS_CARGO_PROTOCOL_V3
+    if (unit && strip_unit_transport_environment()!=0) _exit(125);
+#endif
     initialized = 1;
 }
 
