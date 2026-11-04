@@ -51,7 +51,10 @@ impl Admission {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        Ok(Self(file))
+        let admission=Self(file);
+        crate::build_storage::ci_holds::reconcile_before_admission()
+            .map_err(|error|Busy(format!("unverified CI cleanup prevents storage admission: {error:#}")))?;
+        Ok(admission)
     }
 
     pub fn claims(&self, exclude: Option<&str>) -> Result<Claims> {

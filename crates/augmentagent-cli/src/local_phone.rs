@@ -180,7 +180,7 @@ pub fn spawn(
         io.clone(),
         wiki.clone(),
         Arc::new(|_| Ok(None)),
-    ));
+    ).with_attention_provider(Arc::new(crate::phone_attention::PhoneAttention::new(store.clone()))));
     let registration = endpoint.router.register("cli", bridge)?;
     let handler = Arc::new(LocalHandler {
         endpoint,

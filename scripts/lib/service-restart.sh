@@ -319,10 +319,84 @@ external_autopr_isolated() {
     --lock "$SELF_IMPROVE_LOCK" --lock "${SELF_IMPROVE_LOCK%.lock}-resume.lock" 2>/dev/null
 }
 
-# Should this restart be deferred? 0 = defer (a run owns the lock);
-# 1 = proceed. Clears its own state on
+# --- #1779: don't kill an owner's in-flight surface turn ---------------------
+#
+# The updater restarts the daemon about once per merged PR. Each restart that
+# lands while the owner is waiting on a Discord/Slack answer kills that turn
+# (#1774 made it honest — "Jarvis restarted, resend" — but the request is still
+# lost). `surface_native_turns` holds every surface's turns (Discord rows reach
+# it through the mirror trigger) and a turn is `pending` exactly while a live
+# daemon works on it: the #1396 startup pass closes any a dead process left
+# behind, so no age heuristic is needed.
+#
+# Bounded: after RESTART_TURN_DEFER_MAX_SECS of continuous deferral the deploy
+# proceeds anyway and says so. Fails open: no sqlite3, no DB, an unreadable DB
+# or a missing table never blocks a deploy. AUGMENTAGENT_RESTART_FORCE=1
+# bypasses it, like the #903 checks.
+RESTART_TURN_DEFER_MAX_SECS="${AUGMENTAGENT_RESTART_TURN_DEFER_MAX_SECS:-600}"
+RESTART_TURN_DEFER_STAMP="${AUGMENTAGENT_RESTART_TURN_DEFER_STAMP:-${LOG_DIR:-$AUGMENTAGENT_STATE_DIR}/restart-turn-deferred-since}"
+
+# The daemon's store, by the CLI's rule: AUGMENTAGENT_DB, else ./data.db —
+# resolved against the checkout, which is the unit's WorkingDirectory.
+restart_turn_db() {
+  local db="${AUGMENTAGENT_RESTART_TURN_DB:-${AUGMENTAGENT_DB:-data.db}}"
+  case "$db" in
+    /*) printf '%s\n' "$db" ;;
+    *)  printf '%s/%s\n' "${REPO_ROOT:-.}" "$db" ;;
+  esac
+}
+
+# Pending owner turns in the daemon's store; empty when it cannot be read.
+pending_owner_turns() {
+  local db
+  db=$(restart_turn_db)
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+  [ -r "$db" ] || return 0
+  { sqlite3 -readonly -cmd '.timeout 2000' "$db" \
+      "SELECT COUNT(*) FROM surface_native_turns WHERE status = 'pending';" 2>/dev/null \
+      || true; } | head -n1 | tr -dc '0-9'
+}
+
+# 0 = defer (an owner turn is in flight, within the cap); 1 = proceed.
+owner_turn_defer() {
+  if [ "${AUGMENTAGENT_RESTART_FORCE:-0}" = 1 ]; then
+    rm -f "$RESTART_TURN_DEFER_STAMP"
+    return 1
+  fi
+  local n now since
+  n=$(pending_owner_turns)
+  if [ -z "$n" ] || [ "$n" -eq 0 ]; then
+    rm -f "$RESTART_TURN_DEFER_STAMP"
+    return 1
+  fi
+  now=$(date +%s)
+  since=$(cat "$RESTART_TURN_DEFER_STAMP" 2>/dev/null || true)
+  case "$since" in
+    ''|*[!0-9]*)
+      mkdir -p "$(dirname "$RESTART_TURN_DEFER_STAMP")" 2>/dev/null || true
+      printf '%s\n' "$now" > "$RESTART_TURN_DEFER_STAMP"
+      _sr_log "restart deferred: owner turn in flight ($n pending; retry next tick; AUGMENTAGENT_RESTART_FORCE=1 overrides)"
+      return 0
+      ;;
+  esac
+  if [ $((now - since)) -ge "$RESTART_TURN_DEFER_MAX_SECS" ]; then
+    # Keep the stamp: if another guard holds this tick, the next one must not
+    # start a fresh 600 s window for the same long turn. It clears once
+    # nothing is pending.
+    _sr_log "owner turn still in flight after $((now - since))s (cap ${RESTART_TURN_DEFER_MAX_SECS}s); restarting anyway — the turn will be reported interrupted"
+    return 1
+  fi
+  _sr_log "restart deferred: owner turn in flight ($n pending, $((now - since))s; retry next tick)"
+  return 0
+}
+
+# Should this restart be deferred? 0 = defer (an owner turn is in flight, or
+# a run owns the lock); 1 = proceed. Clears its own state on
 # every proceed so one long-past deferral cannot poison a later deploy.
 maybe_defer_restart() {
+  if owner_turn_defer; then
+    return 0
+  fi
   if ! self_improve_run_in_flight; then
     rm -f "$RESTART_DEFER_STAMP"
     return 1

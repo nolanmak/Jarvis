@@ -1273,6 +1273,8 @@ impl Store {
         // #1699 — after retryGuardContext: the backfill reads it.
         crate::recipients::migrate(conn)?;
         crate::team_coverage::migrate(conn)?;
+        // #1833 — trusted-contact autonomy state and D12 sender auth.
+        crate::autonomy::migrate(conn)?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS email_guard_observations (
             id INTEGER PRIMARY KEY, message_id TEXT NOT NULL, action_id TEXT NOT NULL,
             attempt_n INTEGER NOT NULL, guard TEXT NOT NULL, disposition TEXT NOT NULL,
@@ -2659,6 +2661,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_emails_triage ON emails(triageResult);\
              CREATE INDEX IF NOT EXISTS idx_emails_seen ON emails(firstSeenAt);\
              CREATE INDEX IF NOT EXISTS idx_emails_platform ON emails(platform);\
+             CREATE INDEX IF NOT EXISTS idx_emails_pending_by_account ON emails(accountEntityId) WHERE platform='gmail' AND triageResult IS NULL;\
              CREATE INDEX IF NOT EXISTS idx_channel_subs_active_mode ON channel_subscriptions(active, mode);\
              CREATE INDEX IF NOT EXISTS idx_slack_workspaces_active ON slack_workspaces(active);\
              CREATE INDEX IF NOT EXISTS idx_drive_accounts_active ON drive_accounts(active);",
@@ -2869,6 +2872,16 @@ impl Store {
     /// now, so downstream freshness rendering ("facts as of …") reflects
     /// when the message was actually sent. Existing rows update like
     /// [`upsert_email`] and keep their original `firstSeenAt`.
+    /// Persist `email`'s recipients as the reply context a later reload
+    /// restores, for importers that store rows via [`Store::upsert_email_backfill`].
+    pub fn record_reply_recipients(&self, email: &Email) -> StoreResult<()> {
+        let context = serde_json::to_string(&(email.to.clone(), email.cc.clone(), email.attachments.clone()))
+            .map_err(|e| StoreError::InvalidInput(e.to_string()))?;
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute("UPDATE emails SET retryGuardContext = ?2 WHERE messageId = ?1", params![email.message_id, context])?;
+        Ok(())
+    }
+
     pub fn upsert_email_backfill(&self, email: &Email, first_seen_ms: i64) -> StoreResult<bool> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let existed: Option<i64> = guard

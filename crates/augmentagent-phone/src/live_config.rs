@@ -26,7 +26,7 @@ impl VoiceBackend {
 pub struct LiveConfig {
     api_key: String,
     voice: crate::live_voice::LiveVoice,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     endpoint: Option<String>,
 }
 impl LiveConfig {
@@ -42,12 +42,13 @@ impl LiveConfig {
         Ok(Self {
             api_key,
             voice: crate::live_voice::LiveVoice::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             endpoint: None,
         })
     }
-    #[cfg(test)]
-    pub(crate) fn for_test(endpoint: String) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(endpoint: String) -> Self {
+        assert!(endpoint.starts_with("ws://127.0.0.1:"), "test endpoint must be loopback");
         let mut config = Self::new("synthetic-key".into()).unwrap();
         config.endpoint = Some(endpoint);
         config
@@ -71,7 +72,7 @@ impl LiveConfig {
         greet: bool,
     ) -> Result<LiveConnection, LiveError> {
         let endpoint = crate::live_session::ENDPOINT;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let endpoint = self.endpoint.as_deref().unwrap_or(endpoint);
         LiveConnection::connect_to_mode(
             endpoint,

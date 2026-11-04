@@ -13,6 +13,7 @@ mod composio_auth_tool;
 mod calendar_rsvp;
 mod voice_tool;
 mod phone_runtime;
+mod phone_attention;
 mod phone_metrics;
 mod local_phone_transport;
 mod local_phone;
@@ -159,6 +160,7 @@ mod slack_serve;
 mod slack_subscriptions;
 mod slack_voice;
 mod status;
+mod trust_cmd;
 
 #[derive(Parser)]
 #[command(name = "augmentagent", version, about = "AugmentAgent Rust daemon")]
@@ -414,6 +416,12 @@ enum Cmd {
     TeamCoverage {
         #[command(subcommand)]
         op: TeamCoverageOp,
+    },
+    /// Trusted-contact autonomy (#1833): the owner-only trust config and
+    /// its confirm/pause controls.
+    Trust {
+        #[command(subcommand)]
+        op: trust_cmd::Op,
     },
     /// Structured cross-channel message index (#1095): backfill and health.
     Messages {
@@ -3253,6 +3261,7 @@ async fn main() -> Result<()> {
                     strays: *strays,
                     yes: *yes,
                     keep: deploy_snapshot::keep_from_env(),
+                    budget_bytes: None,
                 },
                 *json,
                 &mut out,
@@ -4691,6 +4700,7 @@ async fn main() -> Result<()> {
         Cmd::RepoDocs { .. } => unreachable!("handled before database initialization"),
         Cmd::Team { .. } => unreachable!("handled before database initialization"),
         Cmd::TeamCoverage { op } => team_coverage_cmd(&store, op),
+        Cmd::Trust { op } => trust_cmd::run(&store, op, cli.wiki_dir.as_deref()),
         Cmd::HandoffPrune { .. } => unreachable!("handled before database initialization"),
         Cmd::Disk { .. } => unreachable!("handled before database initialization"),
         Cmd::Deploy { .. } => unreachable!("handled before database initialization"),
@@ -5172,6 +5182,9 @@ async fn main() -> Result<()> {
         },
         Cmd::WhatsappHistory { op: whatsapp_history::Op::PollOnce } => {
             whatsapp_history::poll_command(store).await
+        }
+        Cmd::WhatsappHistory { op: whatsapp_history::Op::Card { jid } } => {
+            whatsapp_history::card_command(store, &jid, cli.wiki_dir.clone()).await
         }
         Cmd::WhatsappHistory { op } => whatsapp_history::policy_command(&store, &op),
         Cmd::Messages { op } => messages_cmd::run(store, op, cli.wiki_dir.clone()).await,

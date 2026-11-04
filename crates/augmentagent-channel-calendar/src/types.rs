@@ -69,6 +69,10 @@ pub struct CalendarEvent {
     pub location: Option<String>,
     #[serde(rename = "conferenceData")]
     pub conference_data: Option<ConferenceData>,
+    /// Google Meet join URL (#1833 C3 candidate join link). Same
+    /// sensitivity as `EntryPoint::uri`: never persisted by this channel.
+    #[serde(rename = "hangoutLink")]
+    pub hangout_link: Option<String>,
     #[serde(rename = "recurrence")]
     pub recurrence: Option<Vec<String>>,
 }

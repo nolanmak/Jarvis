@@ -104,6 +104,7 @@ const DUE_COMMAND_SQL: &str = "SELECT j.workflow FROM command_job j
                 w.lease_until<=?2
                 AND json_extract(w.checkpoint,'$.next.eligible_at_ms')<=?2
                 AND json_extract(w.checkpoint,'$.stage') NOT IN ('held','retired','merged','merge')
+                AND json_extract(w.checkpoint,'$.next.action') IS NOT 'await_child_completion'
                 AND NOT (j.until_milestone='\"pr\"' AND json_extract(w.checkpoint,'$.stage')='await_checks')
              ))
              ORDER BY COALESCE(s.attempted_at,0),j.created_at,j.workflow LIMIT 1";
@@ -527,6 +528,51 @@ mod tests {
         }
         assert_eq!(store.next_command_job("owner/repo", 100).unwrap().as_deref(), Some("owner/repo/pr/48"));
         assert_eq!(store.snapshot("owner/repo/pr/42").unwrap().unwrap().checkpoint.stage, Stage::Held);
+    }
+
+    #[test]
+    fn delegated_parent_is_not_due_and_cannot_take_a_childs_command_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.db");
+        let mut store = WorkflowStore::open(&path).unwrap();
+        let parent = Request { repository: "owner/repo".into(), target: Target::Issue(1725),
+            provider: Some(Provider::Codex), until: Milestone::Merged };
+        let parent_id = store.submit_authorized("parent", "owner", &parent, 1).unwrap().workflow;
+        store.register(&parent_id, "parent-branch", Binding { head:"head".into(),
+            contract:"contract".into(), evidence_hash:"evidence".into() }, 1).unwrap();
+        let lease = store.claim(&parent_id, "worker", 2, 100).unwrap().unwrap();
+        store.charge(&lease, "original-scope", ResourceCharge {
+            model_calls: 12, wall_ms: 562_468, tokens: 0 }, 3).unwrap();
+        store.release(&lease, 4).unwrap();
+        let original = store.snapshot(&parent_id).unwrap().unwrap();
+        let mut checkpoint = original.checkpoint.clone();
+        checkpoint.stage = Stage::Scope;
+        checkpoint.next.action = "await_child_completion".into();
+        checkpoint.next.eligible_at_ms = 0;
+        store.conn.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",
+            params![parent_id, serde_json::to_string(&checkpoint).unwrap()]).unwrap();
+        assert!(!store.command_queue_due("owner/repo", 100).unwrap(),
+            "a delegated parent is not runnable work");
+        let child = Request { target: Target::Issue(1796), ..parent.clone() };
+        let child_id = store.submit_authorized("child", "owner", &child, 2).unwrap().workflow;
+        assert!(store.command_queue_due("owner/repo", 100).unwrap());
+        assert_eq!(store.next_command_job("owner/repo", 100).unwrap(), Some(child_id.clone()));
+        assert!(store.command_attempt(&parent_id).unwrap().is_none());
+        drop(store);
+        let mut store = WorkflowStore::open(&path).unwrap();
+        assert_eq!(store.snapshot(&parent_id).unwrap().unwrap().checkpoint, checkpoint);
+        // Keep normal-lane fairness and durable child backoff. Neither is reset
+        // merely because the old parent was suspended.
+        assert_eq!(store.next_command_job("owner/repo", 101).unwrap(), None);
+        assert!(!store.command_queue_due("owner/repo", 102).unwrap());
+        assert_eq!(store.next_command_job("owner/repo", 300_100).unwrap(), Some(child_id));
+        assert_eq!(store.command_request(&parent_id).unwrap().unwrap(), parent);
+        let retained = store.snapshot(&parent_id).unwrap().unwrap();
+        assert_eq!(retained.model_calls, 12);
+        assert_eq!(retained.wall_ms, 562_468);
+        assert_eq!(retained.generation, original.generation);
+        assert_eq!(retained.progress_at_ms, original.progress_at_ms);
+        assert_eq!(store.merge_allowance(300_101, 5).unwrap().available, 5);
     }
 
     #[test]

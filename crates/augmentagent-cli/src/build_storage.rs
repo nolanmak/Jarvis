@@ -10,6 +10,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[path = "build_storage_ci_holds.rs"]
+pub(crate) mod ci_holds;
+
 const MARKER: &str = ".augmentagent-target.json";
 const CACHE_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n";
 pub const PARENT_LEASE_ENV: &str = "AUGMENTAGENT_BUILD_PARENT_LEASE";
@@ -134,9 +137,12 @@ impl Drop for Lease {
     }
 }
 
+/// How long a writer waits in line for the build lease before deferring.
+pub const LEASE_WAIT: Duration = Duration::from_secs(300);
+
 pub async fn acquire() -> Result<Lease> {
     let state = state_dir()?;
-    let until = tokio::time::Instant::now() + Duration::from_secs(300);
+    let until = tokio::time::Instant::now() + LEASE_WAIT;
     loop {
         if let Some(lock) = Lease::try_at(&state)? {
             return Ok(lock);
@@ -788,12 +794,53 @@ pub async fn admit(repo: &Path, target: &Path) -> Result<Lease> {
 // Serialize it with updater writes until that growth has a dedicated reservation.
 // Exclusion is acquired before normal admission, never while holding Admission.
 pub async fn admit_ci(repo: &Path, target: &Path) -> Result<Lease> {
-    let state = state_dir()?;
-    let exclusion = ci_update_exclusion(&state)?;
-    let mut lease = Lease::try_at(&state)?
-        .ok_or_else(|| crate::storage_reservations::Busy("build lease is held; retry CI admission".into()))?;
-    lease.ci_update_exclusion = Some(exclusion);
+    let lease = wait_ci_leases(&state_dir()?, LEASE_WAIT).await?;
     admit_with_lease(repo, target, None, lease).await
+}
+
+struct PrivateCiExclusion(Option<std::fs::File>);
+impl Drop for PrivateCiExclusion {
+    fn drop(&mut self) {
+        // No worker has received this description yet. An unrelated fork must
+        // not retain an unsuccessful admission's updater exclusion.
+        if let Some(file)=&self.0 {unsafe {libc::flock(file.as_raw_fd(),libc::LOCK_UN);}}
+    }
+}
+
+/// Shared CI boots the build VM, so it waits in line behind managed and
+/// deployment builds instead of failing on the first busy attempt. Each
+/// attempt is all-or-nothing: a busy build lease drops the update exclusion
+/// before sleeping, so a waiting CI run never blocks deploys. Only contention
+/// is retried; validation errors return at once. On timeout the error names
+/// whichever lock was busy on the last attempt.
+async fn wait_ci_leases(state: &Path, wait: Duration) -> Result<Lease> {
+    let until = tokio::time::Instant::now() + wait;
+    let mut announced = false;
+    loop {
+        let busy = match ci_update_exclusion(state) {
+            Ok(exclusion) => {
+                let mut private=PrivateCiExclusion(Some(exclusion));
+                match Lease::try_at(state)? {
+                    Some(mut lease) => {
+                        lease.ci_update_exclusion = private.0.take();
+                        return Ok(lease);
+                    }
+                    None => "build lease is held; retry CI admission",
+                }
+            },
+            Err(error) if error.downcast_ref::<crate::storage_reservations::Busy>().is_some() =>
+                "deployment build is active; retry CI admission",
+            Err(error) => return Err(error),
+        };
+        if tokio::time::Instant::now() >= until {
+            return Err(crate::storage_reservations::Busy(busy.into()).into());
+        }
+        if !announced {
+            announced = true;
+            tracing::info!(reason = busy, wait_secs = wait.as_secs(), "shared CI waiting in line for host build lease");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 fn ci_update_exclusion(state: &Path) -> Result<std::fs::File> {
@@ -812,10 +859,12 @@ fn ci_update_exclusion(state: &Path) -> Result<std::fs::File> {
         }
         return Err(error.into());
     }
+    let mut private=PrivateCiExclusion(Some(file));
+    let file=private.0.as_ref().unwrap();
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     file.sync_all()?;
     // File close only: the exported open description can outlive this controller.
-    Ok(file)
+    Ok(private.0.take().unwrap())
 }
 
 pub async fn admit_session(repo: &Path, target: &Path) -> Result<Lease> {
@@ -1750,6 +1799,88 @@ mod inherited_ci_storage_tests {
             assert!(std::time::Instant::now() < deadline, "exported updater exclusion did not release");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Shared CI boots the build VM; it waits in line behind a managed build
+    /// instead of failing on the first busy attempt.
+    #[tokio::test]
+    async fn ci_leases_wait_in_line_until_build_lease_is_released() {
+        let state = tempfile::tempdir().unwrap();
+        let build = Lease::try_at(state.path()).unwrap().unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            drop(build);
+        });
+        let started = std::time::Instant::now();
+        let ci = wait_ci_leases(state.path(), Duration::from_secs(10)).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(400), "acquired while a build held the lease");
+        assert!(ci.ci_update_exclusion.is_some(), "CI must also exclude deployment builds");
+        assert!(Lease::try_at(state.path()).unwrap().is_none());
+        release.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ci_leases_wait_for_deployment_build_without_holding_build_lease() {
+        let state = tempfile::tempdir().unwrap();
+        let updater = Lease::try_kind_at(state.path(), true).unwrap().unwrap();
+        let path = state.path().to_path_buf();
+        let waiter = tokio::spawn(async move { wait_ci_leases(&path, Duration::from_secs(10)).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // While waiting on the deploy, CI must not sit on the build lease.
+        assert!(Lease::try_at(state.path()).unwrap().is_some(), "waiting CI held the build lease");
+        drop(updater);
+        let ci = waiter.await.unwrap().unwrap();
+        assert!(ci.ci_update_exclusion.is_some());
+    }
+
+    #[tokio::test]
+    async fn ci_leases_time_out_busy_and_hold_nothing() {
+        let state = tempfile::tempdir().unwrap();
+        let _build = Lease::try_at(state.path()).unwrap().unwrap();
+        let error = wait_ci_leases(state.path(), Duration::from_millis(600)).await
+            .err().expect("CI must not acquire while a build holds the lease");
+        assert!(error.downcast_ref::<crate::storage_reservations::Busy>().is_some(), "{error:#}");
+        assert!(error.to_string().contains("build lease is held; retry CI admission"), "{error:#}");
+        assert!(ci_update_exclusion(state.path()).is_ok(), "timed-out CI kept the update exclusion");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refused_ci_admission_releases_incidentally_inherited_update_exclusion() {
+        use std::os::fd::FromRawFd;
+        let state=tempfile::tempdir().unwrap();
+        let _build=Lease::try_at(state.path()).unwrap().unwrap();
+        // Stall actual CI admission after it acquires updater exclusion, so a
+        // duplicate of that exact open description can reproduce fork inheritance.
+        let admission=crate::storage_reservations::Admission::lock().unwrap();
+        let path=state.path().to_owned();
+        let waiter=std::thread::spawn(move || {
+            let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(wait_ci_leases(&path,Duration::ZERO))
+        });
+        let deadline=std::time::Instant::now()+Duration::from_secs(5);
+        let inherited=loop {
+            let mut found=None;
+            if let Ok(lock)=std::fs::metadata(state.path().join("disk-update.lock")) {
+                for entry in std::fs::read_dir("/proc/self/fd").unwrap().flatten() {
+                    let Ok(info)=std::fs::metadata(entry.path()) else {continue};
+                    if (info.dev(),info.ino())!=(lock.dev(),lock.ino()) {continue;}
+                    let fd=entry.file_name().to_string_lossy().parse::<i32>().unwrap();
+                    let duplicate=unsafe {libc::fcntl(fd,libc::F_DUPFD_CLOEXEC,3)};
+                    assert!(duplicate>=0,"duplicate held exclusion");
+                    found=Some(unsafe {std::fs::File::from_raw_fd(duplicate)});break;
+                }
+            }
+            if let Some(file)=found {break file;}
+            assert!(std::time::Instant::now()<deadline,"CI did not open updater exclusion");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        drop(admission);
+        let error=waiter.join().unwrap().err().expect("busy build unexpectedly admitted CI");
+        assert!(error.downcast_ref::<crate::storage_reservations::Busy>().is_some());
+        assert!(ci_update_exclusion(state.path()).is_ok(),
+            "refused CI left updater exclusion held by an incidental child descriptor");
+        drop(inherited);
     }
 
     #[test]

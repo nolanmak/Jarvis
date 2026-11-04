@@ -1928,6 +1928,16 @@ fn approval_followup(
     fu
 }
 
+/// Discord makes the first followup to an ephemeral defer ephemeral too,
+/// whatever it asks for. Paste-ready text must survive the click (#1765), so
+/// a short ephemeral ack takes that first slot and the text follows it.
+fn manual_send_ack() -> CreateInteractionResponseFollowup {
+    CreateInteractionResponseFollowup::new()
+        .content("Approved. The reply to paste is posted below and stays in this channel.")
+        .ephemeral(true)
+        .allowed_mentions(serenity::all::CreateAllowedMentions::new())
+}
+
 /// Shared with the local Serenity interaction repro. Authorization and metadata
 /// capture occur before the approver, independently of receipt delivery.
 async fn dispatch_component_approval(
@@ -1989,6 +1999,9 @@ async fn deliver_approval_outcome(
             .unwrap_or("signed-document.pdf")
             .to_string();
         followup = followup.add_file(serenity::all::CreateAttachment::bytes(bytes, name));
+    }
+    if manual_text.is_some() {
+        comp.create_followup(http, manual_send_ack()).await?;
     }
     let posted=comp.create_followup(http, followup).await?;
     if should_delete_source(outcome) {
@@ -3252,6 +3265,18 @@ mod tests {
         }
         assert!(!is_query_thread(ChannelType::Text, Some(query), query));
         assert!(!is_query_thread(ChannelType::Voice, Some(query), query));
+    }
+
+    #[test]
+    fn manual_send_text_follows_an_ephemeral_ack_so_it_outlives_the_click() {
+        // Live 2026-11-02: the paste text arrived as "Only you can see this"
+        // because it was the first followup to an ephemeral defer.
+        let ack = serde_json::to_value(manual_send_ack()).unwrap();
+        assert_eq!(ack["flags"].as_u64().unwrap_or(0) & 64, 64, "the ack absorbs the ephemeral slot");
+        let ready = ApprovalActionOutcome::ManualSendReady { text: "lemme check it out".into(), link: None };
+        let text = serde_json::to_value(approval_followup(&ready, "a")).unwrap();
+        assert_eq!(text["flags"].as_u64().unwrap_or(0) & 64, 0, "the paste text is a normal message");
+        assert!(text["content"].as_str().unwrap().contains("lemme check it out"));
     }
 
     #[tokio::test]

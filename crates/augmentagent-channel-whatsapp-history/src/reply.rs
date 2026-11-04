@@ -247,6 +247,26 @@ impl WhatsappReplier {
     }
 }
 
+impl WhatsappReplier {
+    /// A card the owner asked for (`whatsapp-history card <jid>`): skips
+    /// triage and the first-run/age gates, but never a chat the owner already
+    /// answered or denied.
+    pub async fn card_requested(&self, delta: &Delta, now_ms: i64) -> anyhow::Result<Handled> {
+        let jid = &delta.conversation.identifier;
+        anyhow::ensure!(self.store.is_whatsapp_inbound_allowed(jid)?, "reply cards are denied for this chat");
+        let open = Delta { conversation: delta.conversation.clone(), entries: delta.entries.clone(), first_run: false };
+        let card = card_email(&open, now_ms, Duration::from_secs(10 * 365 * 86_400))
+            .ok_or_else(|| anyhow::anyhow!("the newest message is yours or has no text; nothing to reply to"))?;
+        let drafter = CardDrafter {
+            store: &self.store,
+            reasoner: self.reasoner.as_ref(),
+            approvals: self.approvals.as_ref(),
+            config: &self.config,
+        };
+        drafter.card(card, is_group(&delta.conversation), "superseded by an owner-requested card").await
+    }
+}
+
 /// `https://wa.me/<digits>` for a phone-addressed chat; groups and `@lid`
 /// chats have no addressable link (#1765).
 pub fn chat_link(thread_id: &str) -> Option<String> {
@@ -386,7 +406,9 @@ mod tests {
     /// What `poll_once` stores before replies run.
     fn ingest(store: &Store, d: &Delta) {
         for (i, e) in &d.entries {
-            store.upsert_email(&email(&d.conversation, *i, e)).unwrap();
+            let row = email(&d.conversation, *i, e);
+            store.upsert_email_backfill(&row, 1).unwrap();
+            store.record_reply_recipients(&row).unwrap();
         }
     }
 
@@ -439,6 +461,32 @@ mod tests {
         assert_eq!(card.to, "Jo <+14155550999>, Ana <+14155550777>"); // pii-ok synthetic
         assert_eq!(card.from, "Ana <+14155550777>"); // pii-ok synthetic
         assert!(card.body.contains("] Ana <+14155550777>\nSam, can you drive"), "{}", card.body); // pii-ok synthetic
+    }
+
+    #[tokio::test]
+    async fn owner_requested_card_drafts_without_triage_even_for_an_old_message() {
+        let f = fx();
+        f.store.allow_whatsapp_inbound(DM).unwrap();
+        let r = Scripted::new(&["sure, Thursday works"]);
+        let d = delta(dm(), vec![entry(DM, "free Thursday?", 60 * 48)], true);
+        ingest(&f.store, &d);
+        let handled = replier(&f, r.clone()).card_requested(&d, now_ms()).await.unwrap();
+        assert!(matches!(handled, Handled::Card { .. }));
+        assert_eq!(r.prompts().len(), 1, "the owner asked: draft only, no triage");
+        let cards = f.broker.cards.lock().unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].2, "sure, Thursday works");
+    }
+
+    #[tokio::test]
+    async fn owner_requested_card_refuses_an_answered_or_denied_chat() {
+        let f = fx();
+        let answered = delta(dm(), vec![entry(DM, "free?", 30), entry("me", "yes", 20)], false);
+        assert!(replier(&f, Scripted::new(&[])).card_requested(&answered, now_ms()).await.is_err());
+        f.store.deny_whatsapp_inbound(DM).unwrap();
+        let open = delta(dm(), vec![entry(DM, "free?", 30)], false);
+        assert!(replier(&f, Scripted::new(&[])).card_requested(&open, now_ms()).await.is_err());
+        assert!(f.broker.cards.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
