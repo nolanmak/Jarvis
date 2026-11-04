@@ -6302,13 +6302,15 @@ const RABBIT_NOT_WAITED_FOR: &str =
     "CodeRabbit is advisory and was not waited for; it reviews the merged \
      commit and anything it finds becomes a follow-up issue.";
 
-/// Optional notes must not hold up a merge, even when GitHub hangs.
+/// Optional notes must not hold up a merge or replace its canonical source.
+/// PR bodies carry owner requirements and closing-issue references; recovery
+/// observations belong in comments so later adoption cannot scope the note.
 async fn write_optional_pr_note(repo_root: &Path, selector: &str, body: &str) -> bool {
     if augmentagent_channel_core::public_report::validate("", body).is_err() {
         return false;
     }
     let mut command = Command::new(gh_bin());
-    command.args(["pr", "edit", selector, "--body", body])
+    command.args(["pr", "comment", selector, "--body", body])
         .current_dir(repo_root).stdin(Stdio::null()).kill_on_drop(true);
     matches!(tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await,
         Ok(Ok(out)) if out.status.success())
@@ -12025,6 +12027,9 @@ impl AutoPrLoop {
 #[cfg(test)]
 #[path = "self_improve_lifecycle_tests.rs"]
 mod lifecycle_tests;
+#[cfg(test)]
+#[path = "self_improve_pr_notes_tests.rs"]
+mod pr_notes_tests;
 
 #[cfg(test)]
 #[path = "self_improve_progress_tests.rs"]
