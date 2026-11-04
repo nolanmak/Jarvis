@@ -416,8 +416,12 @@ ctime, parent overlap, directory removal, anonymous-file attachment, lost syscal
 acknowledgements or progress commits, a destination race, foreign changes,
 prepared-intent storage failure, wrong plans and forked controllers. A separate
 opt-in guest check runs these same cases on the admitted cache filesystem;
-guest evidence is pending. All 481 Python tests and 34 focused Rust tests pass
-(with 23 opt-in guest checks excluded). Whole-transfer sequencing, filesystem-local staging
+at `9e96d376`, all 14 cases passed in 87.71 seconds as UID1000 on that cache
+filesystem, including the injected acknowledgement/storage/race failures. The
+original resource subtree was positively removed. This is guest syscall/replay
+evidence, not whole-transfer or parent-resume acceptance. All 481 Python tests
+and 34 focused Rust tests pass (with 23 opt-in guest checks excluded).
+Whole-transfer sequencing, filesystem-local staging
 allocation/new-directory creation, final metadata/materialization validation,
 alias closure and checked parent resume remain unfinished. The executor still
 does not invoke inode or namespace application.
