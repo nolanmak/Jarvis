@@ -702,6 +702,27 @@ impl Store {
         })
     }
 
+    /// #1833 — open `path` strictly read-only: no WAL switch, no
+    /// migrations, no guards, nothing written to the file. Tables a newer
+    /// build adds but the file lacks (the autonomy tables) exist as empty
+    /// TEMP tables. For dry-run diagnostics against the live store
+    /// (`augmentagent autonomy explain`).
+    pub fn open_read_only(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let path = path.as_ref();
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        crate::autonomy::migrate_temp(&conn)?;
+        // After the TEMP tables exist: from here nothing can be written.
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            path: path.to_path_buf(),
+        })
+    }
+
     /// On-disk path this store was opened from. Lets extension crates
     /// (e.g. `augmentagent-proactive`) run their own additive queries
     /// against the same db file without threading the path through every

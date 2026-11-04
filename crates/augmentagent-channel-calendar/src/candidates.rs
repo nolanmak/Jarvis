@@ -93,6 +93,18 @@ pub struct CandidateSet {
 }
 
 impl CandidateSet {
+    /// A set from already-ranked `(candidate, event)` pairs, keeping each
+    /// candidate's id (fakes and replays; a live lookup builds its own).
+    pub fn from_parts(window: CandidateWindow, entries: Vec<(Candidate, EventRef)>) -> Self {
+        let mut candidates = Vec::with_capacity(entries.len());
+        let mut refs = BTreeMap::new();
+        for (c, r) in entries {
+            refs.insert(c.id.clone(), r);
+            candidates.push(c);
+        }
+        Self { candidates, window, refs }
+    }
+
     /// The event a candidate id stands for; `None` for any id this lookup
     /// did not hand out.
     pub fn resolve(&self, id: &str) -> Option<&EventRef> {

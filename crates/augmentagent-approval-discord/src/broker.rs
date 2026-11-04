@@ -13,7 +13,8 @@ use augmentagent_store::{Email, Store};
 
 use crate::event_handler::Handler;
 use crate::layout::{
-    approval_edit_message, approval_message, flag_notice_message, scheduled_notice_message,
+    approval_edit_message, approval_message, approval_message_noted, flag_notice_message,
+    scheduled_notice_message,
 };
 use crate::loops::LoopCommandParser;
 use crate::voice_bridge::VoiceBridge;
@@ -287,6 +288,50 @@ impl ApprovalBroker for DiscordApprovalBroker {
             let key: String = action_id.chars().filter(|c| *c != '-').take(20).collect();
             message.nonce(serenity::all::Nonce::String(format!("imsg-{key}"))).enforce_nonce(true)
         } else { message };
+        self.channel_id
+            .send_message(&*self.http, message)
+            .await
+            .map_err(|e| ApprovalError::Discord(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn post_approval_noted(
+        &self,
+        action_id: &str,
+        email: &Email,
+        draft: &str,
+        note: &str,
+    ) -> Result<(), ApprovalError> {
+        let message = approval_message_noted(action_id, email, draft, 0, note);
+        self.channel_id
+            .send_message(&*self.http, message)
+            .await
+            .map_err(|e| ApprovalError::Discord(e.to_string()))?;
+        Ok(())
+    }
+
+    fn can_post_autonomy_notice(&self) -> bool {
+        true
+    }
+
+    async fn post_autonomy_notice(
+        &self,
+        notice: &crate::autonomy::AutonomyNotice,
+    ) -> Result<String, ApprovalError> {
+        let message = crate::autonomy::autonomy_notice_message(notice);
+        let sent = self
+            .channel_id
+            .send_message(&*self.http, message)
+            .await
+            .map_err(|e| ApprovalError::Discord(e.to_string()))?;
+        Ok(sent.id.get().to_string())
+    }
+
+    async fn post_trust_notice(
+        &self,
+        notice: &crate::autonomy::TrustNotice,
+    ) -> Result<(), ApprovalError> {
+        let message = crate::autonomy::trust_notice_message(notice);
         self.channel_id
             .send_message(&*self.http, message)
             .await

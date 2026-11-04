@@ -2424,13 +2424,15 @@ mod tests {
 
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in\n  add-generic-password) printf '%s' \"$7\" > '{item}' ;;
-              \n  find-generic-password) sleep 1 ;;
+              \n  find-generic-password) sleep 5 ;;
               \n  delete-generic-password) rm '{item}' ;;
               \n esac\n",
             item = item.display(),
         );
         write_stub(&security, script);
-        let timed_out = check_keychain_probe_with(&security, Duration::from_millis(50)).await;
+        // Only `find` should exceed the limit: add/delete get a full second so a
+        // slow runner can't time them out too and change the reported message.
+        let timed_out = check_keychain_probe_with(&security, Duration::from_secs(1)).await;
         assert_eq!(timed_out.severity, Severity::Error);
         assert!(timed_out.message.contains("timed out"));
         assert!(!item.exists());

@@ -161,6 +161,7 @@ mod slack_subscriptions;
 mod slack_voice;
 mod status;
 mod trust_cmd;
+mod autonomy_cmd;
 
 #[derive(Parser)]
 #[command(name = "augmentagent", version, about = "AugmentAgent Rust daemon")]
@@ -422,6 +423,12 @@ enum Cmd {
     Trust {
         #[command(subcommand)]
         op: trust_cmd::Op,
+    },
+    /// Trusted-contact autonomy (#1833): `explain` dry-runs the gate for a
+    /// stored message with no side effects.
+    Autonomy {
+        #[command(subcommand)]
+        op: autonomy_cmd::Op,
     },
     /// Structured cross-channel message index (#1095): backfill and health.
     Messages {
@@ -3203,6 +3210,11 @@ async fn main() -> Result<()> {
         let archive_on = ops_archive::remote_from_env().is_some();
         return log_rotate::run_cli(&dir, dry_run, json, archive_on, &mut std::io::stdout().lock());
     }
+    // #1833 — `autonomy explain` opens the store read-only itself: it must
+    // never migrate or write the live database.
+    if let Cmd::Autonomy { ref op } = cli.cmd {
+        return autonomy_cmd::run(&cli, op).await;
+    }
     if let Cmd::OpsArchive { op: OpsArchiveOp::Sync { dry_run, json } } = cli.cmd {
         return ops_archive::run_cli(dry_run, json, &mut std::io::stdout().lock());
     }
@@ -4035,13 +4047,18 @@ async fn main() -> Result<()> {
             let heartbeat = augmentagent_heartbeat::HeartbeatConfig::from_env();
             match heartbeat_cmd::serve_decision(&heartbeat, cli.wiki_dir.as_deref(), dry_run) {
                 Ok(wiki_root) => {
-                    let runner = augmentagent_heartbeat::HeartbeatRunner::new(
+                    let mut runner = augmentagent_heartbeat::HeartbeatRunner::new(
                         Arc::clone(&store),
                         Arc::clone(&broker),
                         build_reasoner(),
                         wiki_root,
                         heartbeat,
                     );
+                    // #1833 D16 — proactive outreach to full-tier trusted
+                    // contacts, only with both switches on.
+                    if let Some(outreach) = autonomy_cmd::heartbeat_outreach(&cli, &store, false) {
+                        runner = runner.with_outreach(outreach);
+                    }
                     let sd = shutdown.clone();
                     tasks.push(tokio::spawn(async move { runner.run(sd).await }));
                 }
@@ -4701,6 +4718,7 @@ async fn main() -> Result<()> {
         Cmd::Team { .. } => unreachable!("handled before database initialization"),
         Cmd::TeamCoverage { op } => team_coverage_cmd(&store, op),
         Cmd::Trust { op } => trust_cmd::run(&store, op, cli.wiki_dir.as_deref()),
+        Cmd::Autonomy { .. } => unreachable!("handled before database initialization"),
         Cmd::HandoffPrune { .. } => unreachable!("handled before database initialization"),
         Cmd::Disk { .. } => unreachable!("handled before database initialization"),
         Cmd::Deploy { .. } => unreachable!("handled before database initialization"),
@@ -16433,11 +16451,16 @@ async fn build_approval_surfaces(
     }
     let names: Vec<&str> = brokers.iter().map(|(n, _)| *n).collect();
     info!(surfaces = %names.join(","), "approval cards go to these surfaces");
-    let broker: Arc<dyn ApprovalBroker> = if brokers.len() == 1 {
+    let surfaces_broker: Arc<dyn ApprovalBroker> = if brokers.len() == 1 {
         brokers.pop().expect("one broker").1
     } else {
         Arc::new(augmentagent_approval_discord::MultiSurfaceBroker::new(brokers))
     };
+    // #1833 D6 — every channel's post_approval passes through here: wrap the
+    // final broker in the autonomy gate (a pass-through unless
+    // AUGMENTAGENT_AUTONOMY=on; see autonomy_cmd).
+    let broker: Arc<dyn ApprovalBroker> =
+        autonomy_cmd::wrap(cli, surfaces_broker, &approver, &reasoner, start_owner_worker);
     // #501 — hand the approver a Weak broker handle so the schedule verbs
     // can post/delete the scheduled notice and repost cards. Weak for the
     // same cycle-break reason as `nudge` (the broker's event handler holds
