@@ -2510,3 +2510,21 @@ Nine filesystem regressions cover protected/active/foreign state, interrupted
 deletion, lost final acknowledgement, damaged evidence, unpublished master,
 incomplete/cyclic history and large projection metadata. Privileged reclamation
 and real four-parent progress still require native VM evidence.
+
+Native replay `d06fdbad` verifies two version-2 closed-generation retirements
+through normal reclamation, retaining all 21 previously active generations and
+all three incomplete legacy records. The actual mount-binding checks pass for
+16 contained entries (20 binds each), with all four nested root children making
+progress and original VM teardown verified. The four deepest children return
+SIGBUS; none completes successfully, and no ELF result is sealed. The full test
+remains red after 106.84 seconds. Post-run free blocks are below the filesystem's
+root reserve, but the signal's cause is not independently established.
+Observation: `/tmp/autoship-1703-execution-retirement-native-observation-1.json`.
+
+A bounded read-only census of that generation finds 186627618 logical bytes in
+the seeded Cargo registry and 28664677 in the contained executor, across 5332
+entries with none skipped. Closed-generation retirement is now functional, but
+capacity admission and retirement of interrupted executions using original R
+evidence remain unfinished. No active/incomplete allocation, cache image or cap
+was cleared or enlarged. Host suites pass 598 Python tests and 34 focused managed
+Rust tests; transfer/resume, full CI and production autoship remain disabled.
