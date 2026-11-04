@@ -275,7 +275,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        assert!(String::from_utf8_lossy(&result.stderr).contains("Ran 30 tests"));
+        assert!(String::from_utf8_lossy(&result.stderr).contains("Ran 31 tests"));
     }
     #[test]
     fn timestamped_job_logs_retain_failed_test_and_package_identity() {
