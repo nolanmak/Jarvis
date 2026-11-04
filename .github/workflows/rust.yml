@@ -103,22 +103,26 @@ jobs:
         if: runner.os == 'Linux'
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/14"
 
+      - name: Autonomy C10 heartbeat outreach
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/15"
+
       # Heartbeat (Linux).
       - name: Format heartbeat crate
         if: runner.os == 'Linux'
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/15"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/16"
       - name: Heartbeat lint
         if: runner.os == 'Linux'
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/16"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/17"
       - name: Heartbeat behavior
         if: runner.os == 'Linux'
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/17"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/18"
       - name: Heartbeat store schema and capability manifest
         if: runner.os == 'Linux'
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/18"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/19"
       - name: Heartbeat CLI unit and process tests
         if: runner.os == 'Linux'
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/19"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/20"
 
       # LinkedIn archive/read/approval suite plus the directly affected
       # store/auth contracts. No live credentials.
@@ -126,7 +130,7 @@ jobs:
         shell: bash
         env:
           AUGMENTAGENT_GH_DISABLE: '1'
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/20"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/21"
 
       # WhatsApp sidecar wire contract: Go sidecar plus the Rust channel
       # against the real Go process.
@@ -138,16 +142,16 @@ jobs:
         working-directory: sidecars/wa-sidecar
         env:
           GOMAXPROCS: 2
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/22"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/23"
       - name: Build exact sidecar used by Rust contract tests
         working-directory: sidecars/wa-sidecar
         env:
           GOMAXPROCS: 2
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/23"
-      - name: WhatsApp Rust channel and real Go-process contract tests
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/24"
-      - name: WhatsApp Rust channel lint
+      - name: WhatsApp Rust channel and real Go-process contract tests
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/25"
+      - name: WhatsApp Rust channel lint
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/26"
 
   phone:
     # Split from channels for wall clock; macos.yml runs these steps on macOS.

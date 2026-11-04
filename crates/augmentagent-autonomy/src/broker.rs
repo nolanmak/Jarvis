@@ -93,6 +93,11 @@ impl AutonomyBroker {
         &self.gate
     }
 
+    /// The Approve button's send path (C10 outreach runs through it too).
+    pub fn executor(&self) -> &Arc<dyn AutonomyExecutor> {
+        &self.executor
+    }
+
     fn now() -> i64 {
         chrono::Utc::now().timestamp_millis()
     }
@@ -422,7 +427,7 @@ impl AutonomyBroker {
     }
 
     /// Post (or retry) the D10 notice for a finished plan.
-    async fn deliver_notice(&self, plan_id: i64, note: Option<String>) -> bool {
+    pub async fn deliver_notice(&self, plan_id: i64, note: Option<String>) -> bool {
         let store = &self.gate.deps.store;
         let Ok(Some(plan)) = store.autonomous_plan(plan_id) else {
             return false;
@@ -533,6 +538,9 @@ impl AutonomyBroker {
         // D11 retention.
         if let Err(e) = store.prune_autonomous_records(now_ms - RETENTION_MS) {
             tracing::warn!("autonomy sweep: prune: {e}");
+        }
+        if let Err(e) = store.prune_outreach_log(now_ms - RETENTION_MS) {
+            tracing::warn!("autonomy sweep: prune outreach log: {e}");
         }
         // D3: notice config edits even when no message arrives.
         if let Some(watch) = &self.watch {

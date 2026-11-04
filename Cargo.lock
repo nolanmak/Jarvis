@@ -330,6 +330,7 @@ dependencies = [
  "augmentagent-channel-calendar",
  "augmentagent-channel-core",
  "augmentagent-channel-email",
+ "augmentagent-heartbeat",
  "augmentagent-messages",
  "augmentagent-store",
  "augmentagent-wiki",

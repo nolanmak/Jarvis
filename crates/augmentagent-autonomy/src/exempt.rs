@@ -44,6 +44,9 @@ pub const EXEMPT_CARD_PATHS: &[(&str, &str, usize, Coverage)] = &[
     ("crates/augmentagent-autonomy/src/broker.rs", PA, 2, Coverage::Exempt("the AutonomyBroker's own delegation to the inner broker")),
     ("crates/augmentagent-autonomy/src/broker.rs", PAC, 1, REPOST),
     ("crates/augmentagent-autonomy/src/broker.rs", PAN, 4, Coverage::Exempt("the AutonomyBroker's own noted cards")),
+    // C10 (D16): an outreach compose the proactive gate held is carded on
+    // the AutonomyBroker's inner broker with the gate's reason.
+    ("crates/augmentagent-autonomy/src/outreach.rs", PAN, 1, Coverage::Exempt("the proactive gate's own noted card for a held outreach compose")),
     // Channels: every one is handed serve's (wrapped) broker.
     ("crates/augmentagent-channel-discord-dm/src/channel.rs", PA, 2, W),
     ("crates/augmentagent-channel-email/src/channel.rs", PA, 1, W),
