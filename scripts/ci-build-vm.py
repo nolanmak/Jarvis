@@ -51,6 +51,39 @@ class InheritedStorage:
         if space.f_bavail*space.f_frsize<self.floor:raise vm.Unavailable('managed storage floor unavailable')
 
 
+# A cargo cache that outlives every run only ever grows. Below this fraction
+# of free space the next build fails with ENOSPC inside the guest — which the
+# gate classifies as infra and retries hourly, forever (main never green).
+# Start such a run on a fresh cache instead; it is only a cache.
+CACHE_MIN_FREE_FRACTION = 0.25
+
+
+def cache_free_bytes(header):
+    """Free bytes recorded in an ext4 superblock (1024 bytes at offset 1024)."""
+    block = 1024 << struct.unpack_from('<I', header, 24)[0]
+    free = struct.unpack_from('<I', header, 12)[0]
+    if struct.unpack_from('<I', header, 96)[0] & 0x80:
+        free |= struct.unpack_from('<I', header, 0x158)[0] << 32
+    return free * block
+
+
+def cache_full(outcome):
+    """The guest ran out of space in the build cache (not a real failure)."""
+    if outcome.get('exit_code') == 0:
+        return False
+    text = (outcome.get('stdout') or '') + (outcome.get('stderr') or '')
+    return 'No space left on device' in text or 'VM build cache is full' in text
+
+
+def discard_cache(path, lease):
+    """Drop a full cache image; ensure_cache recreates it empty."""
+    lease.check()
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        pass
+
+
 def ensure_cache(path, capacity, lease):
     """Provision only inside the controller's registered, already leased target."""
     path=Path(path)
@@ -80,8 +113,12 @@ def ensure_cache(path, capacity, lease):
             if blocks*(1024<<struct.unpack_from('<I',header,24)[0])!=capacity:
                 raise vm.Unavailable('managed CI filesystem capacity changed')
             growth=max(0,capacity-info.st_blocks*512)
-        if free<lease.floor+growth:raise vm.Unavailable('managed CI cache growth reserve unavailable')
-        return
+            exhausted=cache_free_bytes(header)<capacity*CACHE_MIN_FREE_FRACTION
+        if not exhausted:
+            if free<lease.floor+growth:raise vm.Unavailable('managed CI cache growth reserve unavailable')
+            return
+        discard_cache(path,lease)
+        available=os.statvfs(parent);free=available.f_bavail*available.f_frsize
     if free<lease.floor+capacity:raise vm.Unavailable('managed CI cache growth reserve unavailable')
     fd,name=tempfile.mkstemp(prefix='.ci-cache-',dir=parent)
     try:
@@ -177,11 +214,25 @@ def execute(request,run=vm.run,progress=None):
         else:
             command=['/usr/bin/python3','-I','-c',CARGO_OPERATIONS,json.dumps(cargo,separators=(',',':'))]
     progress['stage']='vm_launch'
-    outcome=run(runtime,workspace,command,{},timeout=None,scratch_dir=str(scratch),build_cache=request['build_cache'],storage_lease=lease,
-                ci_context={'state':state,'git_objects':Path(request['git_objects']),'runner':runner,'contract':contract})
+    def launch():
+        try:
+            return run(runtime,workspace,command,{},timeout=None,scratch_dir=str(scratch),build_cache=request['build_cache'],storage_lease=lease,
+                       ci_context={'state':state,'git_objects':Path(request['git_objects']),'runner':runner,'contract':contract})
+        except vm.Unavailable as error:
+            if 'VM build cache is full' not in str(error):raise
+            return {'exit_code':1,'stdout':'','stderr':str(error)}
+    outcome=launch();cache_reset=None
+    if request['operation']!='plan' and cache_full(outcome):
+        # Retry once on a fresh cache: a second ENOSPC is a real report, not a loop.
+        progress['stage']='cache_reset'
+        discard_cache(request['build_cache'],lease)
+        ensure_cache(request['build_cache'],request.get('cache_bytes'),lease)
+        cache_reset='full';progress['stage']='vm_launch'
+        outcome=launch()
     progress['stage']='receipt_validate'
     result={'version':1,'head':request['head'],'base':request['base'],'contract_sha256':hashlib.sha256(contract).hexdigest(),
             'boundary':'existing-build-vm','exit_code':outcome['exit_code'],'stdout':outcome['stdout'],'stderr':outcome['stderr']}
+    if cache_reset:result['cache_reset']=cache_reset
     if outcome['exit_code']==0:
         if request['operation']=='plan':
             plan=json.loads(outcome['stdout'])

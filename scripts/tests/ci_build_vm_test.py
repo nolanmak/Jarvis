@@ -95,7 +95,8 @@ class AdapterTests(unittest.TestCase):
     free_blocks[0]=capacity//4096
     adapter.ensure_cache(image,capacity,lease)
     self.assertEqual(formatter.call_count,2,'a nearly full cache is recreated, not reused')
-    self.assertNotEqual(image.stat().st_ino,first)
+    with open(image,'rb') as f:f.seek(1024);fresh=f.read(1024)
+    self.assertEqual(adapter.cache_free_bytes(fresh),capacity,'the recreated cache starts empty')
     adapter.ensure_cache(image,capacity,lease)
     self.assertEqual(formatter.call_count,2,'a roomy cache is reused')
  def test_a_cache_full_build_resets_the_cache_and_retries_once(self):
