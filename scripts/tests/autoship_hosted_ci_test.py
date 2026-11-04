@@ -134,6 +134,13 @@ class EvidenceTests(unittest.TestCase):
   self.contract['workflows']['.github/workflows/release.yml']['events']['push']={}
   self.jobs[0]['conclusion']='failure'
   self.assertEqual(self.evaluate()['state'],'failed')
+ def test_workflow_queued_for_macos_does_not_block_current_linux_success(self):
+  self.runs[0]['status']='queued'
+  self.assertEqual(self.evaluate()['state'],'passed')
+ def test_queued_macos_only_rerun_keeps_linux_informational_independence(self):
+  self.runs[0].update(run_attempt=2,status='queued')
+  self.jobs.append({'id':99,'run_id':10,'run_attempt':2,'head_sha':self.head,'name':'tests (macos-latest)','status':'queued','conclusion':None})
+  self.assertEqual(self.evaluate()['state'],'passed')
  def test_queued_rerun_cannot_reuse_previous_green_jobs(self):
   self.runs[0].update(run_attempt=2,status='queued')
   self.assertEqual(self.evaluate()['state'],'pending')
