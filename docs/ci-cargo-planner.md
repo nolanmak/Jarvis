@@ -2547,3 +2547,13 @@ and owned directories. Creating/partial executor state remains nonreusable and
 can be deleted only under that cleanup authority. Old active/incomplete records
 without such evidence remain retained. Zero-capacity admission now also runs
 after normal reclamation and before allocating/seeding a fresh generation.
+
+Native replay `32e59bdf` verifies the prospective failure disposition in the
+real retained image: version-3 abandoned state and its matching Root-owned
+disposition validate; completion remains null and all authority flags remain
+false. Normal reclamation retired two more previously closed generations; all
+22 historical active generations remained. All four deepest tasks returned zero
+and four sealed ELF outputs were verified. The full original four-parent test
+still fails with InputCensusUnknown after 104.02 seconds because parent result
+application/resume remains fenced; this is not a passing CI or autoship result.
+The host suites pass 611 Python tests and 34 focused managed Rust tests.
