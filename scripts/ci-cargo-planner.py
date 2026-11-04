@@ -1528,7 +1528,12 @@ class RootRelay:
         self.ordinals.require(admission.binding,admission.command)
         with self.ordinals._lock:
             if self.ordinals.credits is None:
-                self.ordinals.credits=NestedJobserverCredits(admission.root/'credits.json',
+                # The probe/controller transport can live on guest tmpfs. Keep
+                # unresolved credit lineage inside the original admitted
+                # generation, under its existing managed storage/R ownership.
+                credit_root=admission.target/('.jobserver-credit-'+admission.command)
+                credit_root.mkdir(mode=0o700)
+                self.ordinals.credits=NestedJobserverCredits(credit_root/'credits.json',
                     binding=admission.binding,command=admission.command,lock=self.ordinals.signal_lock)
         self.timeout=timeout;self.peer_uid=1001;self.config_magic=b'JARVCFG3';self.require_message_credentials=False
         self.path=self.root/'relay.sock';self.nonce=os.urandom(32);self.config_uid=0

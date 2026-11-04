@@ -653,8 +653,10 @@ four-parent test must exhaust both controller permits and pipe tokens, run neste
 work with the borrowed implicit slots, and verify cancellation/reacquisition
 without token injection. Failure blocks handoff and requires a revised model.
 
-The current controller now records `credits.json` once under the original
-command's admitted root. This is bookkeeping for the existing unit permit and
+The current controller now records `credits.json` once inside the original
+admitted generation's managed target, in its command-owned `.jobserver-credit-<command>`
+directory. A controller transport's temporary directory does not retain this journal.
+Unknown pre-existing credit directories are held, never deleted/adopted. This is bookkeeping for the existing unit permit and
 implicit slot; it creates no semaphore, runnable queue, pipe token or renewed
 ordinal budget. Each root unit binds its original ordinal/scope and supervised
 stdin record's normalized jobserver pipe identity. A nested request must match
@@ -678,10 +680,14 @@ Thirteen real-file/pipe host cases cover four exhausted test semaphores and an
 empty real pipe, nested same-credit chains, unchanged pipe flags/bytes, wrong
 pipe/scope/model, duplicate/unknown loans, lost prepare/lend acknowledgements,
 root closure and the original cleanup hook. That four-slot component experiment
-is not the required four-parent pinned-Cargo test above. The expanded guest suite
-and unchanged original Cargo protocol replay remain pending; actual four-parent
-exhaustion/cancellation/reacquisition and checked parent resume remain mandatory
-before this selected model can pass its integration gate.
+is not the required four-parent pinned-Cargo test above. At `f1b30ea5`, all 99
+guest cases passed in 94.25 seconds as UID1000: the previous 86 filesystem/signal
+cases plus these 13 lineage cases. Original resource removal was verified.
+All 557 Python tests and 34 focused managed Rust tests pass at that revision;
+the subsequent managed-target journal placement also passes the 13 focused
+credit tests and 34 Rust tests. The unchanged original Cargo replay remains
+pending. Actual four-parent exhaustion/cancellation/reacquisition and checked
+parent resume remain mandatory before this model can pass its integration gate.
 
 Routing and cancellation must not wait for an execution permit held by the
 request's paused ancestor. Containment is acyclic and recorded before dispatch.
