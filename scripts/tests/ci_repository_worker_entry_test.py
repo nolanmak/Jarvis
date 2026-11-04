@@ -18,6 +18,16 @@ def load(name,file):
 planner=load('worker_entry_planner_tests','ci-cargo-planner.py')
 
 
+class WorkerEntryDiagnosticTests(unittest.TestCase):
+    def test_worker_entry_failure_has_bounded_stage_and_stable_evidence(self):
+        import hashlib
+        progress={}
+        with self.assertRaises(planner.FreshnessHold) as caught:
+            planner.validate_worker_entry({},None,None,{},progress)
+        self.assertEqual(progress['stage'],'worker_entry_header')
+        self.assertEqual(caught.exception.evidence_sha256,hashlib.sha256(b'worker_entry_header').hexdigest())
+
+
 @unittest.skipUnless(os.environ.get('AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY'),'requires managed native policy helper')
 class WorkerEntryTests(unittest.TestCase):
     def run_case(self,mode):

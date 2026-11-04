@@ -50,6 +50,15 @@ class FreshnessHold(Exception):
         return {"version": 1, "reason": self.reason, "recovery": self.recovery,
                 "evidence_sha256": self.evidence_sha256}
 
+    @classmethod
+    def from_diagnostic(cls,value):
+        if (type(value) is not dict or set(value)!={'version','reason','recovery','evidence_sha256'}
+                or type(value['version']) is not int or value['version']!=1
+                or type(value['reason']) is not str or value['reason'] not in RECOVERY or value['recovery']!=RECOVERY[value['reason']]
+                or not _digest(value['evidence_sha256'])):
+            raise cls('metadata_torn')
+        hold=cls(value['reason']);hold.evidence_sha256=value['evidence_sha256'];return hold
+
 
 def require_cache_capacity(directory):
     """Refuse an already-full cache before worker dispatch, without cleanup.

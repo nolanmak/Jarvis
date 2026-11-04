@@ -16,6 +16,19 @@ spec.loader.exec_module(cache)
 
 
 class GenerationTests(unittest.TestCase):
+    def test_foreign_hold_diagnostic_retains_original_evidence_without_rehashing(self):
+        original=cache.FreshnessHold('input_census_unknown',b'worker_entry_policy')
+        rebound=cache.FreshnessHold.from_diagnostic(original.diagnostic())
+        self.assertEqual(rebound.diagnostic(),original.diagnostic())
+        self.assertNotEqual(cache.FreshnessHold(original.reason).diagnostic(),original.diagnostic())
+
+    def test_foreign_hold_diagnostic_rejects_malformed_or_inconsistent_fields(self):
+        original=cache.FreshnessHold('input_census_unknown',b'worker_entry_policy').diagnostic()
+        for change in ({'version':True},{'reason':'not-a-reason'},{'reason':[]},
+                {'recovery':'await_verified_cleanup'},{'evidence_sha256':'not-a-digest'},{'extra':True}):
+            with self.subTest(change=change),self.assertRaises(cache.FreshnessHold):
+                cache.FreshnessHold.from_diagnostic(original|change)
+
     def test_root_preparation_requires_original_command_and_ready_dependency_layout(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

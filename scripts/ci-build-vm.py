@@ -428,8 +428,8 @@ def execute(request,run=vm.run,progress=None):
         spec=importlib.util.spec_from_file_location('observed_repository_execution',BASE/'ci-cargo-planner.py')
         planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
         try:result['repository_execution']=planner.validate_repository_execution(outcome.get('repository_execution'),
-            generation['binding'],generation['command'],guest_workers,observed_inputs['guest_worker_quiescence'],generation['predecessor'])
-        except planner.FreshnessHold as error:raise cache_generation.FreshnessHold(error.reason) from None
+            generation['binding'],generation['command'],guest_workers,observed_inputs['guest_worker_quiescence'],generation['predecessor'],progress)
+        except planner.FreshnessHold as error:raise cache_generation.FreshnessHold.from_diagnostic(error.diagnostic()) from None
     if dependency is not None:
         observed=outcome.get('dependency_result')
         if (not isinstance(observed,dict) or observed.get('version')!=1 or observed.get('shipping_authority') is not False

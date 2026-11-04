@@ -4929,9 +4929,15 @@ def validate_checkpoint(value,binding,command,predecessor,scope):
     return value
 
 
-def validate_worker_entry(value,binding,command,scope):
+def validate_worker_entry(value,binding,command,scope,progress=None):
     """Receipt grammar only; original live admission remains controller-owned."""
+    stage='worker_entry_header'
+    def at(name):
+        nonlocal stage
+        stage=name
+        if progress is not None:progress['stage']=name
     try:
+        at('worker_entry_header')
         if (type(value) is not dict or set(value)!={'version','kind','binding','command','scope_id','supervisor_pid',
                 'entry','namespaces','input_closure_complete','full_ci','shipping_authority'}
                 or type(value['version']) is not int or value['version']!=1
@@ -4939,7 +4945,7 @@ def validate_worker_entry(value,binding,command,scope):
                 or value['scope_id']!=scope['scope_id'] or not cache._uuid(value['scope_id'])
                 or type(value['supervisor_pid']) is not int or value['supervisor_pid']<=0
                 or any(value[key] is not False for key in ('input_closure_complete','full_ci','shipping_authority'))):raise ValueError()
-        entry=value['entry'];numbers=entry['descriptors']
+        at('worker_entry_credentials');entry=value['entry'];numbers=entry['descriptors']
         if (type(entry['version']) is not int or entry['version']!=1 or entry['kind']!='ci-unit-exec-entry' or type(entry['pid']) is not int or entry['pid']<=0
                 or type(entry['birth']) is not int or entry['birth']<0 or entry['tracer']!=value['supervisor_pid']
                 or entry['uids']!=[1000]*4 or entry['gids']!=[1000]*4 or entry['groups']!=[]
@@ -4950,7 +4956,7 @@ def validate_worker_entry(value,binding,command,scope):
                 or type(numbers) is not list or len(numbers)!=4 or numbers[:3]!=[0,1,2]
                 or type(numbers[3]) is not int or not 3<=numbers[3]<=65535
                 or any(entry[key] is not False for key in ('input_closure_complete','full_ci','shipping_authority'))):raise ValueError()
-        policy=entry['policy_activation'];native=policy['policy']
+        at('worker_entry_policy');policy=entry['policy_activation'];native=policy['policy']
         if (set(policy)!={'version','kind','binding','command','scope_id','pid','policy'} or type(policy['version']) is not int or policy['version']!=1
                 or policy['kind']!='ci-repository-worker-policy-receipt' or policy['binding']!=binding or policy['command']!=command
                 or policy['scope_id']!=value['scope_id'] or policy['pid']!=entry['pid']
@@ -4959,10 +4965,10 @@ def validate_worker_entry(value,binding,command,scope):
                 or type(native['size_bytes']) is not int or not 1<=native['size_bytes']<=2*1024**2
                 or type(native['activation_returncode']) is not int or native['activation_returncode']!=0
                 or any(native[key] is not False for key in ('input_closure_complete','full_ci','shipping_authority'))):raise ValueError()
-        configuration=entry['sealed_relay']
+        at('worker_entry_configuration');configuration=entry['sealed_relay']
         if (configuration['uid']!=0 or configuration['gid']!=0 or configuration['seals']&15!=15
                 or not cache._digest(configuration['sha256']) or not 1<=configuration['size_bytes']<=staging.MAX_BYTES):raise ValueError()
-        rows=entry['fd_table']
+        at('worker_entry_descriptors');rows=entry['fd_table']
         if type(rows) is not list or len(rows)!=4 or [row['number'] for row in rows]!=numbers:raise ValueError()
         for row in rows:
             if (set(row)!={'number','device','inode','type','uid','gid','flags','position'}
@@ -4971,14 +4977,16 @@ def validate_worker_entry(value,binding,command,scope):
                 or any(row['type']!=stat.S_IFIFO or row['flags']&os.O_ACCMODE!=os.O_WRONLY for row in rows[1:3])
                 or rows[3]['type']!=stat.S_IFREG or (rows[3]['device'],rows[3]['inode'])!=(configuration['device'],configuration['inode'])):
             raise ValueError()
+        at('worker_entry_namespaces')
         if (set(value['namespaces'])!={'mnt','ipc','net','user','pid'} or any(
                 re.fullmatch(name+r':\[[0-9]+\]',namespace) is None for name,namespace in value['namespaces'].items())):raise ValueError()
         return value
-    except (ValueError,TypeError,KeyError,IndexError):raise FreshnessHold('input_census_unknown') from None
+    except (ValueError,TypeError,KeyError,IndexError):raise FreshnessHold('input_census_unknown',stage.encode()) from None
 
 
-def validate_repository_execution(value,binding,command,workers,scope,predecessor=None):
+def validate_repository_execution(value,binding,command,workers,scope,predecessor=None,progress=None):
     try:
+        if progress is not None:progress['stage']='repository_receipt_header'
         keys={'version','kind','binding','command','checkpoint','worker_units','cargo_commands','original_worker_cleanup',
             'input_closure_complete','full_ci','shipping_authority','guest_worker_quiescence','kernel_observation','metadata_units'}
         if (type(value) is not dict or type(value.get('version')) is not int or value['version'] not in (1,2)
@@ -4989,8 +4997,10 @@ def validate_repository_execution(value,binding,command,workers,scope,predecesso
                 or value['guest_worker_quiescence']!=scope or scope not in workers['scopes']
                 or type(value['worker_units']) is not list or len(value['worker_units'])>4096
                 or type(value['cargo_commands']) is not list or len(value['cargo_commands'])>4096):raise ValueError()
-        if value['version']==2:validate_worker_entry(value['worker_entry'],binding,command,scope)
+        if value['version']==2:validate_worker_entry(value['worker_entry'],binding,command,scope,progress)
+        if progress is not None:progress['stage']='repository_checkpoint'
         validate_checkpoint(value['checkpoint'],binding,command,predecessor,scope)
+        if progress is not None:progress['stage']='repository_units'
         units={};cargo=set()
         for unit in value['worker_units']:
             ordinal=unit['ordinal']
@@ -5011,6 +5021,7 @@ def validate_repository_execution(value,binding,command,workers,scope,predecesso
                         or compiler['original_cleanup'] is not True or compiler['shipping_authority'] is not False
                         or compiler['input_closure_complete'] is not False):raise ValueError()
         if cargo!={ordinal for ordinal,unit in units.items() if unit['uid']==1001}:raise ValueError()
+        if progress is not None:progress['stage']='repository_kernel_observation'
         validate_command_observation(value['kernel_observation'],binding,command,
             original_unit_ordinals([*value['metadata_units'],*[unit for item in value['cargo_commands'] for unit in item['units']]]))
         return value
