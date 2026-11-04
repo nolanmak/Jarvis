@@ -667,6 +667,15 @@ The following load-bearing choices remain parked with C; they are not waived:
   active-child router. Actual contained-child routing, stopped nested-proxy
   guest signal cases, terminal races and checked child drain before parent
   resume remain this thread's gates. No child execution grant is enabled.
+  At `b1bcede6`, the unchanged pinned-guest replay completed in 98.00 seconds
+  and reached the held child grant. Its original capture/pause/request bindings,
+  verified thaw and all four files / 21 entries / 64,832 bytes passed the same
+  independent read-only image validation. The staging barrier settled with zero
+  received, queued, delivered or late frames and no revocation. This checks
+  integration without injecting a signal into the guest's frozen compiler;
+  actual stopped-recipient signal behavior is covered by the eight host kernel
+  and socket cases, not by this zero-frame guest observation. All 431 Python
+  tests and 34 focused Rust tests pass; full CI and shipping authority stay false.
 * Before producer/restart integration acceptance or mechanism handoff, settle the
   complete-initial-closure rule for successful sibling output effects. The
   unchanged fixture appends counter/log data in the same generated namespace as
