@@ -1760,7 +1760,7 @@ class RootRelay:
                         sealed=True;phase[0]='planner_authorize'
                     elif stage==3 and authorized and not started and not received and child_pid==original_pid:
                         if not cancelled:
-                            if transport is not None:transport.register_parent(original_pid,directory/'view-namespace.json')
+                            if transport is not None:transport.register_parent(original_pid,directory/'view-namespace.json',supervisor_pid=child.pid)
                             def grant_started():
                                 connection.sendall(event('tool_started',0));os.write(exec_grant,b'go\n')
                             self.unit_signal_grant(value,transport,grant_started)
@@ -2020,7 +2020,7 @@ class UnitFreezer:
                 or not cache._uuid(Path(scope).name) or type(uid) is not int or not 2000<=uid<6096):
             raise FreshnessHold('invalidation_unsafe')
         _source(admission.target,admission.binding,admission.command)
-        self.owner=os.getpid();self.uid=uid;self.original=None;self.pidfd=None
+        self.owner=os.getpid();self.uid=uid;self.original=None;self.pidfd=None;self.entry=None
         self.setup_path=Path(scope)/'freeze-setup.json'
         self.setup_record={'version':1,'kind':'ci-unit-freezer-setup','binding':admission.binding,
             'command':admission.command,'uid':uid,'shipping_authority':False}
@@ -2075,11 +2075,12 @@ class UnitFreezer:
             if os.write(descriptor,body)!=len(body):raise FreshnessHold('cleanup_uncertain')
         finally:os.close(descriptor)
 
-    def attach(self,pid,pidfd):
+    def attach(self,pid,pidfd,*,entry):
         if self.original is not None:raise FreshnessHold('invalidation_unsafe')
         process=Path('/proc')/str(pid);status=process.joinpath('stat').read_text().rsplit(')',1)[1].split()
         if status[0]!='t' or {p.name for p in process.joinpath('task').iterdir()}!={str(pid)}:
             raise FreshnessHold('invalidation_unsafe')
+        if entry['pid']!=pid or entry['birth']!=int(status[19]):raise FreshnessHold('invalidation_unsafe')
         if self._read('cgroup.procs'):raise FreshnessHold('invalidation_unsafe')
         signal.pidfd_send_signal(pidfd,0)
         self._write('cgroup.procs',str(pid).encode()+b'\n')
@@ -2087,7 +2088,7 @@ class UnitFreezer:
                 or process.joinpath('cgroup').read_text()!='0::/ci-units/'+self.path.name+'\n'
                 or set(self._read('cgroup.procs').split())!={str(pid).encode()}):
             raise FreshnessHold('invalidation_unsafe')
-        self.original=pid;self.pidfd=os.dup(pidfd)
+        self.original=pid;self.pidfd=os.dup(pidfd);self.entry=copy.deepcopy(entry)
         self._note('original_enrolled')
 
     def _wait(self,frozen,deadline):
@@ -2098,7 +2099,7 @@ class UnitFreezer:
             time.sleep(.005)
 
     def freeze(self,deadline):
-        if self.original is None:raise FreshnessHold('invalidation_unsafe')
+        if self.original is None or self.entry is None:raise FreshnessHold('invalidation_unsafe')
         signal.pidfd_send_signal(self.pidfd,0)
         self._write('cgroup.freeze',b'1\n');self._wait(1,deadline)
         rows=[]
@@ -2116,13 +2117,24 @@ class UnitFreezer:
             tasks=[]
             for task in process.joinpath('task').iterdir():
                 fields=task.joinpath('stat').read_text().rsplit(')',1)[1].split()
-                tasks.append({'tid':int(task.name),'birth':fields[19]})
+                observed=dict(line.split(':',1) for line in task.joinpath('status').read_text().splitlines())
+                if (any(list(map(int,observed[label].split()))!=[self.uid]*4 for label in ('Uid','Gid'))
+                        or observed['Groups'].split() or int(observed['NoNewPrivs'])!=1
+                        or int(observed['Seccomp'])!=2 or int(observed['Seccomp_filters'])<self.entry['seccomp_filters']
+                        or any(int(observed[label],16) for label in ('CapEff','CapPrm','CapAmb'))):
+                    raise FreshnessHold('invalidation_unsafe')
+                if int(task.name)==self.original and int(fields[19])!=self.entry['birth']:
+                    raise FreshnessHold('invalidation_unsafe')
+                tasks.append({'tid':int(task.name),'birth':fields[19],
+                    'no_new_privs':1,'seccomp':2,'seccomp_filters':int(observed['Seccomp_filters'])})
                 if len(tasks)+sum(len(row['tasks']) for row in rows)>512:raise FreshnessHold('input_census_unknown')
             rows.append({'pid':pid,'tasks':sorted(tasks,key=lambda row:row['tid'])})
         self._wait(1,deadline)
         if set(map(int,self._read('cgroup.procs').split()))!=pids:raise FreshnessHold('input_census_unknown')
         return {'version':1,'kind':'ci-unit-freeze-observation','scope':self.path.name,
             'cgroup_device':self.identity.st_dev,'cgroup_inode':self.identity.st_ino,'original_pid':self.original,
+            'entry_sha256':hashlib.sha256(json.dumps(self.entry,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
+            'kernel_policy_sha256':self.entry['policy_activation']['policy']['sha256'],
             'frozen':True,'processes':rows,'input_closure_complete':False,'shipping_authority':False}
 
     def thaw(self,deadline):
@@ -2160,17 +2172,29 @@ class UnitPeerRelay(RootRelay):
         self.captures=self.root/'captures';self.captures.mkdir(mode=0o700)
         self.freezer=UnitFreezer(admission,scope,self.peer_uid)
 
-    def register_parent(self,pid,path):
+    def register_parent(self,pid,path,*,supervisor_pid):
         if self.scope_pidfd is not None:raise FreshnessHold('invalidation_unsafe')
         record=cache._read_record(path)
         if (record.get('binding')!=self.admission.binding or record.get('command')!=self.admission.command
                 or record.get('ordinal')!=self.parent_ordinal or record.get('pid')!=pid):
             raise FreshnessHold('generation_mismatch')
+        entered=cache._read_record(self.scope/'exec-entry.json')
+        if (entered.get('binding')!=self.admission.binding or entered.get('command')!=self.admission.command
+                or entered.get('ordinal')!=self.parent_ordinal):raise FreshnessHold('generation_mismatch')
+        entry=entered['entry'];actual=staging.observe_exec_entry(pid,tracer=supervisor_pid)
+        if {key:entry[key] for key in actual}!=actual:raise FreshnessHold('invalidation_unsafe')
+        measured=UnitPolicy()
+        expected={'version':1,'kind':'ci-unit-policy-receipt','binding':self.admission.binding,
+            'command':self.admission.command,'ordinal':self.parent_ordinal,'pid':pid,
+            'policy':{'version':1,'kind':'ci-unit-policy-activation','sha256':measured.sha256,
+                'size_bytes':measured.size_bytes,'activation_returncode':0,
+                'input_closure_complete':False,'full_ci':False,'shipping_authority':False}}
+        if entry['policy_activation']!=expected:raise FreshnessHold('authority_changed')
         namespaces={name:os.readlink(f'/proc/{pid}/ns/'+name) for name in ('mnt','ipc','net','user','pid')}
         if any(record['namespaces'][name]['unit']!=namespaces[name] for name in ('mnt','ipc','net')):
             raise FreshnessHold('invalidation_unsafe')
         self.scope_root=record['root_identity'];self.scope_namespaces=namespaces;self.scope_pidfd=os.pidfd_open(pid)
-        self.freezer.attach(pid,self.scope_pidfd)
+        self.freezer.attach(pid,self.scope_pidfd,entry=entry)
         self.staged_signals=StagedParentSignals(self.scope_pidfd,lock=self.ordinals.signal_lock)
         staged=cache._read_record(self.scope/'stdin.json')
         if (staged.get('binding')!=self.admission.binding or staged.get('command')!=self.admission.command
@@ -2549,7 +2573,11 @@ def _unit(arguments):
     descriptors=[bootstrap,data,cancel,release,exec_release,control,*value['extras'],*(() if value.get('relay_fd') is None else (value['relay_fd'],))]
     for fd in descriptors:os.set_inheritable(fd,False)
     mediation=ExecMediation(value['deadline'],execution_identity(value),cancel=cancel,minimum=max(256,max(value['numbers'])+1))
-    stage=dict(value,kind='stage',parent=os.getpid(),exec_mediation_fd=mediation.child_fd);stage_bootstrap=_sealed(stage)
+    raw_receipt=os.memfd_create('ci-unit-policy-receipt',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
+    try:policy_receipt=fcntl.fcntl(raw_receipt,fcntl.F_DUPFD_CLOEXEC,max(256,max(value['numbers'])+1))
+    finally:os.close(raw_receipt)
+    stage=dict(value,kind='stage',parent=os.getpid(),exec_mediation_fd=mediation.child_fd,
+        policy_receipt_fd=policy_receipt);stage_bootstrap=_sealed(stage)
     stage_identity=os.fstat(stage_bootstrap)
     endpoint=socket.socket(fileno=control);observed=False
     supervisor=_load('planner_original_supervisor','provider-supervisor.py')
@@ -2571,6 +2599,12 @@ def _unit(arguments):
         if relay_enabled:allowed.append(value['relay_fd'])
         entry=staging.observe_exec_entry(child.pid)
         staging.require_exec_entry(entry,uid=expected,gid=expected,groups=[],descriptors=allowed)
+        entry['policy_activation']=staging.read_policy_receipt(policy_receipt,{
+            'version':1,'kind':'ci-unit-policy-receipt','binding':value['binding'],
+            'command':value['command'],'ordinal':value['ordinal'],'pid':child.pid,
+            'policy':{'version':1,'kind':'ci-unit-policy-activation','sha256':mediation.policy.sha256,
+                'size_bytes':mediation.policy.size_bytes,'activation_returncode':0,
+                'input_closure_complete':False,'full_ci':False,'shipping_authority':False}})
         table={row['number']:row for row in entry['fd_table']}
         sealed=staging.observe_sealed_descriptor(child.pid,0)
         if (sealed['uid']!=0 or sealed['gid']!=0
@@ -2615,7 +2649,7 @@ def _unit(arguments):
         mediation.executed(child)
         _control(endpoint,3,child.pid);_release(exec_release,cancel,value['deadline']);observed=True
     try:
-        forwarded=tuple([stage_bootstrap,data,cancel,release,control,mediation.child_fd,*value['extras'],*(() if value.get('relay_fd') is None else (value['relay_fd'],))])
+        forwarded=tuple([stage_bootstrap,data,cancel,release,control,mediation.child_fd,policy_receipt,*value['extras'],*(() if value.get('relay_fd') is None else (value['relay_fd'],))])
         argv=[sys.executable,'-I',str(Path(__file__).resolve()),'--stage',*map(str,(stage_bootstrap,data,cancel,release,control))]
         raw=supervisor.supervise(Path(value['directory'])/'cleanup',argv,forward_fds=forwarded,
             close_after_spawn=(stage_bootstrap,),return_raw_status=True,on_spawn=spawned,on_exec=executed)
@@ -2639,22 +2673,37 @@ def _unit(arguments):
                 if (current.st_dev,current.st_ino)==(stage_identity.st_dev,stage_identity.st_ino):os.close(stage_bootstrap)
             except OSError as error:
                 if error.errno!=errno.EBADF:raise
-        endpoint.close();mediation.close()
+        os.close(policy_receipt);endpoint.close();mediation.close()
 
 
 class UnitPolicy:
     """Constructor-free measured helper, loaded before a unit changes root."""
     def __init__(self):
         path=Path('/ci-tools/ci-cargo-unit-policy.so');descriptor=None
+        self._activated=False
         try:
             if path.resolve()!=path:raise FreshnessHold('authority_changed')
             descriptor=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
             info=os.fstat(descriptor)
             if (not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022
                     or info.st_nlink!=1 or not 1<=info.st_size<=2*1024**2):raise FreshnessHold('authority_changed')
+            def measured():
+                digest=hashlib.sha256();offset=0
+                while offset<info.st_size:
+                    block=os.pread(descriptor,min(65536,info.st_size-offset),offset)
+                    if not block:raise FreshnessHold('authority_changed')
+                    digest.update(block);offset+=len(block)
+                current=os.fstat(descriptor)
+                if (os.pread(descriptor,1,info.st_size)
+                        or (current.st_mode,current.st_uid,current.st_nlink,current.st_size)
+                            !=(info.st_mode,info.st_uid,info.st_nlink,info.st_size)):
+                    raise FreshnessHold('authority_changed')
+                return digest.hexdigest()
+            self.sha256=measured();self.size_bytes=info.st_size
             # Load the checked inode, rather than looking its name up again.
             # This DSO has no relay constructor and is never LD_PRELOAD input.
             self.library=ctypes.CDLL(f'/proc/self/fd/{descriptor}',use_errno=True)
+            if measured()!=self.sha256:raise FreshnessHold('authority_changed')
             self.restrict=self.library.jarvis_ci_restrict_unit
             self.restrict.argtypes=[];self.restrict.restype=ctypes.c_int
         except (OSError,AttributeError):raise FreshnessHold('authority_changed') from None
@@ -2662,7 +2711,15 @@ class UnitPolicy:
             if descriptor is not None:os.close(descriptor)
 
     def activate(self):
+        self._activated=False
         if self.restrict()!=0:raise FreshnessHold('invalidation_unsafe')
+        self._activated=True
+
+    def activation_observation(self):
+        if not self._activated:raise FreshnessHold('invalidation_unsafe')
+        return {'version':1,'kind':'ci-unit-policy-activation','sha256':self.sha256,
+            'size_bytes':self.size_bytes,'activation_returncode':0,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
 
 
 class ExecMediation:
@@ -2678,7 +2735,7 @@ class ExecMediation:
                 or type(uid) is not int or uid not in (1000,1001) and not 2000<=uid<6096
                 or type(minimum) is not int or not 3<=minimum<=65535):raise FreshnessHold('invalidation_unsafe')
         self.deadline=deadline;self.uid=uid;self.cancel=cancel;self.setup_uid=os.geteuid()
-        self.native=UnitPolicy().library
+        self.policy=UnitPolicy();self.native=self.policy.library
         self.native.jarvis_ci_exec_receive.argtypes=[ctypes.c_int,ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.c_uint32),ctypes.POINTER(ctypes.c_int32)]
         self.native.jarvis_ci_exec_respond.argtypes=[ctypes.c_int,ctypes.c_uint64,ctypes.c_int]
@@ -2797,7 +2854,9 @@ def _stage(arguments):
     bootstrap,data,cancel,release,control=map(int,arguments)
     value=_bootstrap(bootstrap,'stage');_parent_guard(value['parent'])
     if type(value['ordinal']) is not int or not 0<=value['ordinal']<4096:raise FreshnessHold('invalidation_unsafe')
-    for fd in (bootstrap,data,cancel,release,control,value['exec_mediation_fd'],*value['extras'],*(() if value.get('relay_fd') is None else (value['relay_fd'],))):os.set_inheritable(fd,False)
+    receipt=value['policy_receipt_fd']
+    if type(receipt) is not int or not 3<=receipt<=65535:raise FreshnessHold('invalidation_unsafe')
+    for fd in (bootstrap,data,cancel,release,control,value['exec_mediation_fd'],receipt,*value['extras'],*(() if value.get('relay_fd') is None else (value['relay_fd'],))):os.set_inheritable(fd,False)
     file,argv,environment,cwd,search,ignored,blocked=payload(data)
     environment,mapping,jobserver=staging.normalize_jobserver(environment,dict(zip(value['numbers'][3:],value['extras'])))
     _PHASE='planner_capture';captured=staging.capture(0,cancel,command_deadline=value['deadline'])
@@ -2836,6 +2895,9 @@ def _stage(arguments):
     stage_exec_mediation(value,policy);policy.activate()
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
+    staging.publish_policy_receipt(receipt,{'version':1,'kind':'ci-unit-policy-receipt',
+        'binding':value['binding'],'command':value['command'],'ordinal':value['ordinal'],
+        'pid':os.getpid(),'policy':policy.activation_observation()})
     _PHASE='planner_drop'
     os.setgroups([]);os.setgid(uid);os.setuid(uid);os.umask(0o077)
     _parent_guard(value['parent'])  # setuid/setgid clear the previous guard.

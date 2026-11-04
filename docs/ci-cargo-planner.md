@@ -2401,3 +2401,20 @@ Python suite passes 575 tests; the managed focused Rust suite passes 34 tests
 with 24 opt-in guest tests ignored in that routine run. Guest observation:
 `/tmp/autoship-1703-four-parent-observation-4.json`. This does not enable transfer,
 resume, passing-CI proof or production autoship.
+
+The trusted unit bootstrap now measures the held native policy inode before and
+after loading it. Changing its contents during loading holds; replacing its
+pathname cannot substitute a different inode into that measurement. Only a
+successful native activation can produce the bootstrap's activation observation.
+An empty supervisor-created memfd carries the bounded receipt, seals before the
+credential drop, and closes at exec. The original exec observer checks its full
+command/ordinal/PID binding and the independently loaded policy digest.
+
+Before enrollment, Root re-observes the same stopped process against the original
+supervisor PID from its own launch handle, compares the complete recorded entry,
+and verifies the policy receipt against its own measured runtime library. The
+freezer retains that entry and checks each frozen thread's UID/GID, empty groups,
+capabilities, no-new-privileges and seccomp state, including original PID birth.
+The pause record binds the entry digest and policy digest. This records the
+trusted installation path; it does not dump the installed kernel BPF program or
+establish complete private-W writer/alias isolation, input closure or CI authority.

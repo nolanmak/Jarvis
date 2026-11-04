@@ -11,6 +11,7 @@ import array
 import fcntl
 import hashlib
 import importlib.util
+import json
 import math
 import os
 from pathlib import Path
@@ -35,14 +36,16 @@ class StagingUnavailable(_cache.FreshnessHold):
         super().__init__('input_census_unknown',reason.encode('ascii'))
 
 
-def observe_exec_entry(pid):
+def observe_exec_entry(pid,*,tracer=None):
     """Inspect the original supervisor's still-stopped, single-threaded exec.
 
     No descriptor is opened in the tracee and no pipe bytes, file contents or
     shared offsets are read. These facts do not identify the installed filter
     program, establish input closure, or authorize a transfer or resume.
     """
-    if type(pid) is not int or pid<=0:raise StagingUnavailable('exec_entry')
+    if tracer is None:tracer=os.getpid()
+    if type(pid) is not int or pid<=0 or type(tracer) is not int or tracer<=0:
+        raise StagingUnavailable('exec_entry')
     root=Path('/proc')/str(pid)
     def read(path):
         with path.open('rb') as stream:data=stream.read(65537)
@@ -52,7 +55,7 @@ def observe_exec_entry(pid):
         rows=dict(line.split(':',1) for line in read(root/'status').splitlines())
         fields=read(root/'stat').rsplit(')',1)[1].split()
         tasks=sorted(path.name for path in (root/'task').iterdir())
-        if (fields[0]!='t' or int(rows['TracerPid'])!=os.getpid()
+        if (fields[0]!='t' or int(rows['TracerPid'])!=tracer or int(rows['PPid'])!=tracer
                 or tasks!=[str(pid)]):raise StagingUnavailable('exec_entry')
         return {'pid':pid,'birth':int(fields[19]),'tracer':int(rows['TracerPid']),
             'uids':[int(n) for n in rows['Uid'].split()],
@@ -123,6 +126,39 @@ def observe_sealed_descriptor(pid,number):
     except OSError:raise StagingUnavailable('exec_entry_descriptor') from None
     finally:
         if descriptor is not None:os.close(descriptor)
+
+
+def publish_policy_receipt(descriptor,value):
+    """Seal a bootstrap observation in the original supervisor's empty memfd.
+
+    Only the trusted bootstrap calls this, after successful native activation.
+    The descriptor remains CLOEXEC and never reaches the untrusted tool.
+    """
+    try:
+        info=os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid()
+                or info.st_nlink!=0 or info.st_size!=0
+                or fcntl.fcntl(descriptor,fcntl.F_GET_SEALS)!=0):
+            raise StagingUnavailable('policy_receipt')
+        encoded=json.dumps(value,sort_keys=True,separators=(',',':')).encode()
+        if not 1<=len(encoded)<=8192:raise StagingUnavailable('policy_receipt')
+        if os.pwrite(descriptor,encoded,0)!=len(encoded):raise StagingUnavailable('policy_receipt')
+        _seal(descriptor)
+    except OSError:raise StagingUnavailable('policy_receipt') from None
+
+
+def read_policy_receipt(descriptor,expected):
+    """Read only a sealed receipt matching the original caller's full context."""
+    try:
+        info=os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid() or info.st_nlink!=0
+                or not 1<=info.st_size<=8192
+                or fcntl.fcntl(descriptor,fcntl.F_GET_SEALS)&SEALS!=SEALS):
+            raise StagingUnavailable('policy_receipt')
+        value=json.loads(os.pread(descriptor,info.st_size+1,0),object_pairs_hook=_cache._unique_object)
+        if type(value) is not dict or value!=expected:raise StagingUnavailable('policy_receipt')
+        return value
+    except (OSError,ValueError,UnicodeError):raise StagingUnavailable('policy_receipt') from None
 
 
 def _seal(descriptor):

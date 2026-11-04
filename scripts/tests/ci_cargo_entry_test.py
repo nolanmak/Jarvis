@@ -16,6 +16,30 @@ staging=importlib.util.module_from_spec(spec);spec.loader.exec_module(staging)
 
 
 class SealedEntryDescriptorTests(unittest.TestCase):
+    def test_policy_receipt_is_sealed_and_bound_to_original_process_and_command(self):
+        fd=os.memfd_create('policy-receipt',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
+        context={'binding':{'generation':'original'},'command':'original-command','ordinal':12,
+                 'pid':os.getpid(),'policy':{'sha256':'a'*64,'size_bytes':123}}
+        try:
+            with self.assertRaises(staging.StagingUnavailable):staging.read_policy_receipt(fd,context)
+            staging.publish_policy_receipt(fd,context)
+            self.assertEqual(staging.read_policy_receipt(fd,context),context)
+            for key,value in (('pid',os.getpid()+1),('ordinal',13),('command','foreign'),
+                              ('binding',{'generation':'foreign'}),('policy',{'sha256':'b'*64,'size_bytes':123})):
+                with self.subTest(key=key),self.assertRaises(staging.StagingUnavailable):
+                    staging.read_policy_receipt(fd,{**context,key:value})
+            with self.assertRaises(OSError):os.pwrite(fd,b'changed',0)
+            with self.assertRaises(staging.StagingUnavailable):staging.publish_policy_receipt(fd,context)
+        finally:os.close(fd)
+
+    def test_policy_receipt_never_overwrites_a_nonempty_descriptor(self):
+        fd=os.memfd_create('nonempty-policy-receipt',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
+        try:
+            os.write(fd,b'original')
+            with self.assertRaises(staging.StagingUnavailable):staging.publish_policy_receipt(fd,{'record':True})
+            self.assertEqual(os.pread(fd,99,0),b'original')
+        finally:os.close(fd)
+
     def test_actual_sealed_inode_bytes_without_offset_flags_or_timestamp_changes(self):
         fd=os.memfd_create('entry-content',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
         try:
@@ -63,9 +87,10 @@ class EntryTests(unittest.TestCase):
             record=json.loads(result.stdout)
             self.assertIsNone(record['callback_error'])
             self.assertTrue(record['cleanup'])
-            self.assertEqual(record['body_started'],mode=='normal')
-            self.assertEqual(record['held'],mode!='normal')
-            if mode=='normal':
+            succeeds=mode in ('normal','bound-tracer')
+            self.assertEqual(record['body_started'],succeeds)
+            self.assertEqual(record['held'],not succeeds)
+            if succeeds:
                 entry=record['entry']
                 self.assertEqual(entry['descriptors'],[0,1,2])
                 self.assertEqual(entry['uids'],[os.getuid()]*4)
@@ -79,6 +104,8 @@ class EntryTests(unittest.TestCase):
     def test_actual_exec_stop_observed_before_first_body_instruction(self):self.run_case('normal')
     def test_extra_inherited_descriptor_prevents_body_execution(self):self.run_case('extra')
     def test_running_controller_cannot_be_claimed_as_original_exec_stop(self):self.run_case('running')
+    def test_explicit_original_tracer_binding_observes_the_same_stop(self):self.run_case('bound-tracer')
+    def test_foreign_tracer_binding_prevents_body_execution(self):self.run_case('wrong-tracer')
 
 
 def probe(mode,directory,library):
@@ -102,7 +129,9 @@ os.execve(sys.executable,[sys.executable,'-I','-c',"from pathlib import Path;Pat
         nonlocal entry,held,callback_error
         try:
             assert not marker.exists()
-            entry=staging.observe_exec_entry(os.getpid() if mode=='running' else child.pid)
+            options={} if mode not in ('bound-tracer','wrong-tracer') else {
+                'tracer':os.getpid()+(mode=='wrong-tracer')}
+            entry=staging.observe_exec_entry(os.getpid() if mode=='running' else child.pid,**options)
             staging.require_exec_entry(entry,uid=os.getuid(),gid=os.getgid(),groups=sorted(os.getgroups()),
                                        descriptors=[0,1,2])
         except staging.StagingUnavailable:
