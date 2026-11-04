@@ -145,6 +145,15 @@ endpoint deliberately holds before child execution: `dispatch_tested:false`
 and `shipping_authority:false`. This proves a real connection, not input
 closure, child dispatch, completed CI or production recovery.
 
+At `1dfe92e3`, a further unchanged replay completed in 98.31 seconds and its
+retained admission record includes the actual nested request's staged stdin:
+zero bytes and SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+The host tests separately exercise nonempty binary streams, sealed bytes and
+cancellation from transport loss, original-owner exit, command stop and an
+original signal before tool start. All 413 Python tests and 34 focused Rust
+tests pass. The guest still holds before parent pause and contained execution;
+an stdin record is not an immutable filesystem capture or a child grant.
+
 After namespace setup and before untrusted code, install a kernel policy that
 prevents changes to the namespaces/credentials used for attribution: deny
 `unshare`, `setns`, namespace-creating clone flags and mount/chroot/pivot APIs.
