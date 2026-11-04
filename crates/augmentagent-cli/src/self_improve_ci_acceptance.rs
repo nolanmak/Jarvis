@@ -416,15 +416,17 @@ fn native_exec_mediation_covers_early_static_and_original_exec_ack() {
         let path=directory.path().join(name);std::fs::write(&path,bytes).unwrap();
         std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests/ci_cargo_exec_mediation_test.py");
-    let output=std::process::Command::new("python3").arg("-I").arg(tests)
-        .env("AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY",directory.path().join("native.so"))
-        .env("AUGMENTAGENT_CARGO_EXEC_EARLY_LIBRARY",directory.path().join("early.so"))
-        .env("AUGMENTAGENT_CARGO_EXEC_STATIC_BINARY",directory.path().join("static"))
-        .output().unwrap();
-    let diagnostics=String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(),"first-exec feasibility cases failed: {diagnostics}");
-    assert!(diagnostics.contains("Ran 6 tests") && !diagnostics.contains("skipped"),"first-exec cases did not execute: {diagnostics}");
+    for (file,count) in [("ci_cargo_exec_mediation_test.py",6),("ci_cargo_exec_controller_test.py",5)] {
+        let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests").join(file);
+        let output=std::process::Command::new("python3").arg("-I").arg(tests)
+            .env("AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY",directory.path().join("native.so"))
+            .env("AUGMENTAGENT_CARGO_EXEC_EARLY_LIBRARY",directory.path().join("early.so"))
+            .env("AUGMENTAGENT_CARGO_EXEC_STATIC_BINARY",directory.path().join("static"))
+            .output().unwrap();
+        let diagnostics=String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(),"first-exec {file} failed: {diagnostics}");
+        assert!(diagnostics.contains(&format!("Ran {count} tests")) && !diagnostics.contains("skipped"),"first-exec cases did not execute: {diagnostics}");
+    }
 }
 
 /// Actual initial exec, early constructor, static entry and closed-listener behavior.

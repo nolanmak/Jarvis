@@ -11,6 +11,8 @@ import signal
 import socket
 import sys
 import threading
+import time
+from types import SimpleNamespace
 
 
 def native(path):
@@ -174,7 +176,56 @@ def main(arguments):
         'original_cleanup': True, 'shipping_authority': False}))
 
 
+def integrated(arguments):
+    controller_path, supervisor_path, library_path, early, executable, mode, receipt = arguments
+    spec = importlib.util.spec_from_file_location('actual_exec_controller', controller_path)
+    planner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(planner)
+    # The host fixture supplies the real constructor-free DSO. Production
+    # bootstraps use UnitPolicy's checked root-owned literal /ci-tools inode.
+    library = native(library_path)
+    planner.UnitPolicy = lambda: SimpleNamespace(library=library)
+    spec = importlib.util.spec_from_file_location('integrated_original_supervisor', supervisor_path)
+    supervisor = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(supervisor)
+    cancellation = os.pipe() if mode == 'cancel' else None
+    if cancellation is not None:os.write(cancellation[1],b'cancel')
+    gate = planner.ExecMediation(time.monotonic()+10, os.getuid(),cancel=None if cancellation is None else cancellation[0])
+    try:
+        argv=[sys.executable, '-I', str(Path(__file__).resolve()), '--launcher',library_path, early, executable, mode, str(gate.child_fd)]
+        if mode == 'cancel':argv=[sys.executable,'-I','-c','raise SystemExit(125)']
+        result = supervisor.supervise(receipt, argv, forward_fds=(gate.child_fd,),
+            on_spawn=gate.spawned, on_exec=gate.executed, return_raw_status=True)
+        if mode == 'cancel':
+            assert result == 125 and not gate.ack and not gate.records
+            gate.check()
+            assert Path(receipt).read_text() == 'all-descendants-reaped\n'
+            print(json.dumps({'controller_hold':None,'cancelled_before_exec':True,'original_cleanup':True,'shipping_authority':False}))
+            return
+        assert result == 0 and gate.ack
+        try:
+            gate.check()
+        except planner.FreshnessHold as hold:
+            assert hold.reason == 'input_census_unknown'
+        else:
+            raise AssertionError('unsupported raw exec was accepted as a source verdict')
+        assert not gate.errors
+        assert len([r for r in gate.records if r['allowed']]) == (2 if mode == 'search' else 1)
+        denied = [r for r in gate.records if not r['allowed']]
+        assert len(denied) == (4 if mode in ('early','fork') else 2)
+        assert all(r['after_ack'] for r in denied)
+        assert Path(receipt).read_text() == 'all-descendants-reaped\n'
+        print(json.dumps({'controller_hold':'input_census_unknown','original_cleanup':True,'shipping_authority':False}))
+    finally:
+        gate.close()
+        if cancellation is not None:
+            for descriptor in cancellation:os.close(descriptor)
+
+
 if __name__ == '__main__':
     if sys.argv[1] == '--launcher':
         sys.exit(launcher(sys.argv[2:]))
+    if sys.argv[1] == '--controller':
+        integrated(sys.argv[2:])
+        sys.exit(0)
     main(sys.argv[1:])

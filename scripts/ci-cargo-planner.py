@@ -1615,7 +1615,8 @@ def _unit(arguments):
     value=_bootstrap(bootstrap,'unit');_parent_guard(value['parent'])
     descriptors=[bootstrap,data,cancel,release,exec_release,control,*value['extras'],*(() if value.get('relay_fd') is None else (value['relay_fd'],))]
     for fd in descriptors:os.set_inheritable(fd,False)
-    stage=dict(value,kind='stage',parent=os.getpid());stage_bootstrap=_sealed(stage)
+    mediation=ExecMediation(value['deadline'],execution_identity(value),cancel=cancel,minimum=max(256,max(value['numbers'])+1))
+    stage=dict(value,kind='stage',parent=os.getpid(),exec_mediation_fd=mediation.child_fd);stage_bootstrap=_sealed(stage)
     stage_identity=os.fstat(stage_bootstrap)
     endpoint=socket.socket(fileno=control);observed=False
     supervisor=_load('planner_original_supervisor','provider-supervisor.py')
@@ -1623,6 +1624,7 @@ def _unit(arguments):
         pidfd=os.pidfd_open(child.pid)
         try:_control(endpoint,1,child.pid,pidfd)
         finally:os.close(pidfd)
+        mediation.spawned(child)
     def executed(child):
         nonlocal observed
         status=Path(f'/proc/{child.pid}/status').read_text()
@@ -1641,13 +1643,15 @@ def _unit(arguments):
                 'pid':child.pid,'namespaces':namespaces,
                 'root_identity':{'device':(os.major(root.st_dev)<<20)|os.minor(root.st_dev),
                     'inode':root.st_ino,'mode':root.st_mode}})
+        mediation.executed(child)
         _control(endpoint,3,child.pid);_release(exec_release,cancel,value['deadline']);observed=True
     try:
-        forwarded=tuple([stage_bootstrap,data,cancel,release,control,*value['extras'],*(() if value.get('relay_fd') is None else (value['relay_fd'],))])
+        forwarded=tuple([stage_bootstrap,data,cancel,release,control,mediation.child_fd,*value['extras'],*(() if value.get('relay_fd') is None else (value['relay_fd'],))])
         argv=[sys.executable,'-I',str(Path(__file__).resolve()),'--stage',*map(str,(stage_bootstrap,data,cancel,release,control))]
         raw=supervisor.supervise(Path(value['directory'])/'cleanup',argv,forward_fds=forwarded,
             close_after_spawn=(stage_bootstrap,),return_raw_status=True,on_spawn=spawned,on_exec=executed)
         stage_bootstrap=None
+        mediation.check()
         cache._write_record(Path(value['directory'])/'exit-status.json',{'version':3,'binding':value['binding'],
             'command':value['command'],'ordinal':value['ordinal'],'returncode':raw,'exec_observed':observed})
         return raw if raw>=0 else 128-raw
@@ -1658,7 +1662,7 @@ def _unit(arguments):
                 if (current.st_dev,current.st_ino)==(stage_identity.st_dev,stage_identity.st_ino):os.close(stage_bootstrap)
             except OSError as error:
                 if error.errno!=errno.EBADF:raise
-        endpoint.close()
+        endpoint.close();mediation.close()
 
 
 class UnitPolicy:
@@ -1684,12 +1688,136 @@ class UnitPolicy:
         if self.restrict()!=0:raise FreshnessHold('invalidation_unsafe')
 
 
+class ExecMediation:
+    """Root-local listener ownership under the original exec supervisor.
+
+    The only CONTINUE recipient is its still-trusted, original bootstrap.
+    Original on_exec must close that permission before acknowledging/releasing
+    the kernel exec stop. No untrusted pathname/pointer is authorized here.
+    """
+    def __init__(self,deadline,uid,*,cancel=None,minimum=256):
+        if (type(deadline) not in (int,float) or not math.isfinite(deadline)
+                or not time.monotonic()<deadline<=time.monotonic()+901
+                or type(uid) is not int or uid not in (1000,1001) and not 2000<=uid<6096
+                or type(minimum) is not int or not 3<=minimum<=65535):raise FreshnessHold('invalidation_unsafe')
+        self.deadline=deadline;self.uid=uid;self.cancel=cancel;self.setup_uid=os.geteuid()
+        self.native=UnitPolicy().library
+        self.native.jarvis_ci_exec_receive.argtypes=[ctypes.c_int,ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint32),ctypes.POINTER(ctypes.c_int32)]
+        self.native.jarvis_ci_exec_respond.argtypes=[ctypes.c_int,ctypes.c_uint64,ctypes.c_int]
+        self.endpoint,child=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
+        try:self.child_fd=fcntl.fcntl(child.fileno(),fcntl.F_DUPFD_CLOEXEC,minimum)
+        finally:child.close()
+        self.endpoint.setsockopt(socket.SOL_SOCKET,socket.SO_PASSCRED,1)
+        self.listener=None;self.pid=None;self.pidfd=None;self.ack=False;self.initial=True
+        self.errors=[];self.records=[];self._lock=threading.Lock();self._stop=threading.Event();self.thread=None
+
+    def spawned(self,child):
+        os.close(self.child_fd);self.child_fd=None
+        self.pid=child.pid;self.pidfd=os.pidfd_open(child.pid)
+        while True:
+            remaining=self.deadline-time.monotonic()
+            if remaining<=0:raise FreshnessHold('cleanup_uncertain')
+            readers=select.select([self.endpoint]+([] if self.cancel is None else [self.cancel]),[],[],min(.05,remaining))[0]
+            if self.cancel is not None and self.cancel in readers:return
+            if self.endpoint in readers:break
+        data,control,flags,_=self.endpoint.recvmsg(16,socket.CMSG_SPACE(4)+socket.CMSG_SPACE(12),socket.MSG_CMSG_CLOEXEC)
+        received=[];credentials=[]
+        try:
+            for level,kind,body in control:
+                if level==socket.SOL_SOCKET and kind==socket.SCM_RIGHTS and len(body)%4==0:
+                    values=array.array('i');values.frombytes(body);received.extend(values)
+                elif level==socket.SOL_SOCKET and kind==socket.SCM_CREDENTIALS and len(body)==12:
+                    credentials.append(struct.unpack('3i',body))
+                else:raise FreshnessHold('invalidation_unsafe')
+            if (data!=b'listener' or flags&~socket.MSG_CMSG_CLOEXEC or len(received)!=1
+                    or credentials!=[(self.pid,self.setup_uid,os.getegid())]):raise FreshnessHold('invalidation_unsafe')
+            descriptor=received[0]
+            if os.readlink(f'/proc/self/fd/{descriptor}')!='anon_inode:seccomp notify':raise FreshnessHold('invalidation_unsafe')
+            self.listener=received.pop();os.set_inheritable(self.listener,False)
+        finally:legacy._close(received)
+        self.thread=threading.Thread(target=self._notifications);self.thread.start()
+
+    def _notifications(self):
+        try:
+            poller=select.poll();poller.register(self.listener,select.POLLIN)
+            while not self._stop.is_set():
+                if time.monotonic()>=self.deadline:raise FreshnessHold('cleanup_uncertain')
+                events=poller.poll(20)
+                if not events:continue
+                flags=events[0][1]
+                if flags&(select.POLLERR|select.POLLNVAL):raise FreshnessHold('cleanup_uncertain')
+                if flags&select.POLLHUP and not flags&select.POLLIN:return
+                identity,pid,number=ctypes.c_uint64(),ctypes.c_uint32(),ctypes.c_int32()
+                if self.native.jarvis_ci_exec_receive(self.listener,ctypes.byref(identity),ctypes.byref(pid),ctypes.byref(number))!=0:
+                    if ctypes.get_errno() in (errno.ENOENT,errno.EINTR):continue
+                    raise FreshnessHold('cleanup_uncertain')
+                with self._lock:
+                    if len(self.records)>=4096:raise FreshnessHold('input_census_unknown')
+                    cancelled=self.cancel is not None and bool(select.select([self.cancel],[],[],0)[0])
+                    allow=self.initial and pid.value==self.pid and not cancelled
+                    if number.value not in (59,322):raise FreshnessHold('invalidation_unsafe')
+                    if self.native.jarvis_ci_exec_respond(self.listener,identity.value,int(allow))!=0:
+                        if ctypes.get_errno()==errno.ENOENT:continue  # Withdrawn; no decision committed.
+                        raise FreshnessHold('cleanup_uncertain')
+                    self.records.append({'pid':pid.value,'nr':number.value,'allowed':allow,'after_ack':self.ack})
+        except BaseException:
+            self.errors.append('exec_mediation_unavailable')
+            try:signal.pidfd_send_signal(self.pidfd,signal.SIGKILL)
+            except (OSError,TypeError):pass
+
+    def executed(self,child):
+        with self._lock:
+            if self.ack or self.listener is None or child.pid!=self.pid or self.errors:raise FreshnessHold('invalidation_unsafe')
+            signal.pidfd_send_signal(self.pidfd,0)
+            status=Path(f'/proc/{child.pid}/status').read_text()
+            for label in ('Uid:','Gid:'):
+                row=next(line for line in status.splitlines() if line.startswith(label))
+                if list(map(int,row.split()[1:]))!=[self.uid]*4:raise FreshnessHold('invalidation_unsafe')
+            self.initial=False;self.ack=True
+
+    def check(self):
+        self._stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+            if self.thread.is_alive():raise FreshnessHold('cleanup_uncertain')
+        if self.errors:raise FreshnessHold('cleanup_uncertain')
+        if any(not record['allowed'] for record in self.records):raise FreshnessHold('input_census_unknown')
+
+    def close(self):
+        self._stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+            if self.thread.is_alive():raise FreshnessHold('cleanup_uncertain')
+        legacy._close(([] if self.child_fd is None else [self.child_fd])+([] if self.listener is None else [self.listener])+([] if self.pidfd is None else [self.pidfd]))
+        self.endpoint.close()
+
+
+def stage_exec_mediation(value,policy):
+    descriptor=value.get('exec_mediation_fd')
+    if type(descriptor) is not int or not 3<=descriptor<=65535:raise FreshnessHold('invalidation_unsafe')
+    function=policy.library.jarvis_ci_exec_listener;function.argtypes=[];function.restype=ctypes.c_int
+    listener=function()
+    if listener<0:raise FreshnessHold('invalidation_unsafe')
+    try:
+        with socket.socket(fileno=descriptor) as channel:
+            peer=struct.unpack('3i',channel.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+            if peer!=(value['parent'],os.geteuid(),os.getegid()):raise FreshnessHold('invalidation_unsafe')
+            channel.sendmsg([b'listener'],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',[listener]))])
+    finally:os.close(listener)
+
+
+def arm_original_exec():
+    if ctypes.CDLL(None,use_errno=True).ptrace(0,0,None,None)!=0:raise FreshnessHold('invalidation_unsafe')
+    os.kill(os.getpid(),signal.SIGSTOP)
+
+
 def _stage(arguments):
     global _PHASE
     bootstrap,data,cancel,release,control=map(int,arguments)
     value=_bootstrap(bootstrap,'stage');_parent_guard(value['parent'])
     if type(value['ordinal']) is not int or not 0<=value['ordinal']<4096:raise FreshnessHold('invalidation_unsafe')
-    for fd in (bootstrap,data,cancel,release,control,*value['extras'],*(() if value.get('relay_fd') is None else (value['relay_fd'],))):os.set_inheritable(fd,False)
+    for fd in (bootstrap,data,cancel,release,control,value['exec_mediation_fd'],*value['extras'],*(() if value.get('relay_fd') is None else (value['relay_fd'],))):os.set_inheritable(fd,False)
     file,argv,environment,cwd,search,ignored,blocked=payload(data)
     environment,mapping,jobserver=staging.normalize_jobserver(environment,dict(zip(value['numbers'][3:],value['extras'])))
     _PHASE='planner_capture';captured=staging.capture(0,cancel,command_deadline=value['deadline'])
@@ -1719,7 +1847,7 @@ def _stage(arguments):
                 or mounts.get('ordinal')!=value['ordinal']):raise FreshnessHold('generation_mismatch')
         unit_views.enter(view['root'],2000+value['ordinal'],view['source'],view['artifacts'],mounts['entries'],
             mounts.get('source_entries'),mounts.get('declared_outputs'))
-    policy.activate()
+    stage_exec_mediation(value,policy);policy.activate()
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     _PHASE='planner_drop'
@@ -2920,11 +3048,16 @@ def _cargo_supervisor(arguments):
             or cache._read_record(directory/'control.json')!={'version':1,'binding':value['binding'],
                 'command':value['command'],'invocation':value['invocation'],'operation':value['cargo_operation']}):
         raise FreshnessHold('cleanup_uncertain')
-    child_bootstrap=_sealed(dict(value,kind='cargo',parent=os.getpid()))
+    mediation=ExecMediation(value['deadline'],1001)
+    child_bootstrap=_sealed(dict(value,kind='cargo',parent=os.getpid(),exec_mediation_fd=mediation.child_fd))
     supervisor=_load('original_cargo_supervisor','provider-supervisor.py')
-    return supervisor.supervise(directory/'cleanup',
-        [sys.executable,'-I',str(Path(__file__).resolve()),'--cargo',str(child_bootstrap),str(configuration)],
-        forward_fds=(child_bootstrap,configuration),close_after_spawn=(child_bootstrap,))
+    try:
+        raw=supervisor.supervise(directory/'cleanup',
+            [sys.executable,'-I',str(Path(__file__).resolve()),'--cargo',str(child_bootstrap),str(configuration)],
+            forward_fds=(child_bootstrap,configuration,mediation.child_fd),close_after_spawn=(child_bootstrap,),
+            on_spawn=mediation.spawned,on_exec=mediation.executed)
+        mediation.check();return raw
+    finally:mediation.close()
 
 
 def cargo_namespace(root,source,source_mounts=None):
@@ -2972,7 +3105,7 @@ def _cargo(arguments):
     else:
         validate_invocation(**invocation)
         environment=dict(invocation['environment'],LD_PRELOAD=value['library'],JARVIS_CARGO_RELAY_FD=str(configuration))
-    policy.activate()
+    stage_exec_mediation(value,policy);policy.activate()
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     os.setgroups([]);os.setgid(1001);os.setuid(1001);os.umask(0o077);_parent_guard(value['parent'])
     os.set_inheritable(configuration,True);os.chdir('/workspace');_PHASE='planner_cargo_execute'
@@ -2981,7 +3114,7 @@ def _cargo(arguments):
     elif operation=='run' and invocation is None:argv=['/toolchain/bin/cargo','run','--offline','--locked','--quiet']
     elif operation=='original' and invocation is not None:argv=invocation['argv']
     else:raise FreshnessHold('invalidation_unsafe')
-    os.execve('/toolchain/bin/cargo',argv,environment)
+    arm_original_exec();os.execve('/toolchain/bin/cargo',argv,environment)
 
 
 
@@ -3374,20 +3507,25 @@ def _repository_worker(arguments):
     worker_runtime_request((os.fsencode(value['argv'][0]),list(map(os.fsencode,value['argv'])),
         {os.fsencode(key):os.fsencode(item) for key,item in environment.items()},b'/workspace',None,0,0),value['library'])
     environment.update(LD_PRELOAD=value['library'],JARVIS_CARGO_RELAY_FD=str(configuration))
-    policy=UnitPolicy();policy.activate()
+    policy=UnitPolicy();stage_exec_mediation(value,policy);policy.activate()
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     os.setgroups([]);os.setgid(1000);os.setuid(1000);os.umask(0o022);_parent_guard(value['parent'])
     os.set_inheritable(configuration,True);os.chdir(value['cwd'])
-    os.execve(value['argv'][0],value['argv'],environment)
+    arm_original_exec();os.execve(value['argv'][0],value['argv'],environment)
 
 
 def _repository_worker_supervisor(arguments):
     value=_bootstrap(int(arguments[0]),'repository-worker-supervisor');_parent_guard(value['parent'])
-    bootstrap=_sealed(dict(value,kind='repository-worker',parent=os.getpid()))
+    mediation=ExecMediation(value['deadline'],1000)
+    bootstrap=_sealed(dict(value,kind='repository-worker',parent=os.getpid(),exec_mediation_fd=mediation.child_fd))
     supervisor=_load('original_repository_worker_supervisor','provider-supervisor.py')
-    return supervisor.supervise(value['worker_receipt'],[sys.executable,'-I',str(Path(__file__).resolve()),
-        '--repository-worker',str(bootstrap),arguments[1]],forward_fds=(bootstrap,int(arguments[1])),close_after_spawn=(bootstrap,))
+    try:
+        raw=supervisor.supervise(value['worker_receipt'],[sys.executable,'-I',str(Path(__file__).resolve()),
+            '--repository-worker',str(bootstrap),arguments[1]],forward_fds=(bootstrap,int(arguments[1]),mediation.child_fd),
+            close_after_spawn=(bootstrap,),on_spawn=mediation.spawned,on_exec=mediation.executed)
+        mediation.check();return raw
+    finally:mediation.close()
 
 
 def _execute_repository(arguments):

@@ -2275,5 +2275,26 @@ denials; cancellation had no acknowledgement; closed-listener behavior remained
 fail-closed. All six retained original descendant cleanup. Receipt:
 `/tmp/augmentagent-ci-exec-mediation-20261104011422/receipt.json`, SHA-256
 `16b4ca3e30a4c7b7475216a19abd528bf6b12f7f5efa24039b91e5b2a70b04fc`.
-Production bootstrap/transport integration remains pending. These primitives and
-experiments grant no passing-CI or merge authority.
+Protected worker/Cargo/unit bootstrap integration is now implemented as described
+below; its original protocol/adapter guest validation remains pending. These
+primitives and experiments grant no passing-CI or merge authority.
+
+The shared `ExecMediation` controller owns a separate root-local socket and the
+listener FD under each original supervisor. Sealed bootstrap data binds the
+transport FD; kernel message credentials and the original pidfd bind the sender.
+The extra descriptor stays within the original FD/resource limits and is closed
+before untrusted entry. Namespace setup precedes listener installation; the unit
+restriction follows it. The original supervisor closes initial authorization at
+its kernel exec callback before the existing acknowledgement and detach. The V3
+control frames and original jobserver/stdio requests are unchanged.
+
+Actual controller tests reproduce four failures against the preceding controller
+source and now pass five cases using real notifications and the original
+supervisor. Unsupported constructor, static-program and descendant exec attempts
+cause a typed `input_census_unknown` controller hold, including a failed initial
+PATH candidate followed by the original launch. Cancelled staging produces no
+exec acknowledgement and retains original cleanup. The complete Python suite
+passes **402 tests without skips**; the focused managed Rust suite passes **34
+tests**, including the six feasibility cases and five controller cases, with 22
+opt-in guest tests ignored. This does not yet establish the final C proof or
+all-caller hold projection, and it does not enable production autoship.
