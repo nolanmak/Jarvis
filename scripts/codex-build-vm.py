@@ -289,6 +289,39 @@ def execution_lease():
         generation['binding'],generation['command'],generation['predecessor'])
 
 
+def _run_execution(scope,lease,journal,field):
+    stopped=None;verification_attempted=False
+    try:
+        observed=_run_worker(scope.argv,scope)
+        verification_attempted=True;stopped=scope.verify()
+        writes=journal.finish(stopped)
+        guest_worker_receipts.append(stopped.observation())
+        if observed.get('exit_code')!=0:
+            raise ci_cache['FreshnessHold']('input_census_unknown',observed.get('stderr','').encode()[:8192])
+        try:
+            result=json.loads(observed['stdout'])
+            if (type(result) is not dict or set(result)!={'exit_code','stdout','stderr',field}
+                    or type(result['exit_code']) is not int or not 0<=result['exit_code']<=255
+                    or any(type(result[key]) is not str for key in ('stdout','stderr'))
+                    or type(result[field]) is not dict):raise ValueError()
+            result[field]['guest_worker_quiescence']=stopped.observation()
+        except (ValueError,KeyError,TypeError):raise ci_cache['FreshnessHold']('input_census_unknown') from None
+        invoked=field=='cargo_execution' or bool(result[field]['cargo_commands'])
+        result[field]['checkpoint']=lease.finish(scope,stopped,outputs=generation['outputs'],
+            invoked_cargo=invoked,producer_succeeded=result['exit_code']==0)
+        result['input_write_observation']=writes
+        return result
+    except BaseException:
+        if stopped is None and not verification_attempted:
+            # A failed transport/read still needs this same original scope's
+            # positive cleanup. Missing proof leaves the active claim held.
+            try:stopped=scope.verify()
+            except Exception:pass
+        if stopped is not None:lease.abandon_nonreusable(scope,stopped)
+        raise
+    finally:journal.close()
+
+
 def run_cargo_commands(commands,input_roots):
     # This replaces the normal structured Cargo driver, not an extra replay.
     # All candidate code still starts after planner/unit credential drops.
@@ -301,22 +334,7 @@ def run_cargo_commands(commands,input_roots):
         'commands':commands,'environment':dict(environment),'cwd':'/workspace','execution_lease':lease.handle(),'generated_outputs':generation['outputs']})
     lease.bind_scope(scope)
     journal=ci_inputs.ChangeJournal(input_roots,scope=scope)
-    try:
-        observed=_run_worker(scope.argv,scope);stopped=scope.verify()
-        writes=journal.finish(stopped)
-    finally:journal.close()
-    guest_worker_receipts.append(stopped.observation())
-    if observed.get('exit_code')!=0:raise ci_cache['FreshnessHold']('input_census_unknown',observed.get('stderr','').encode()[:8192])
-    try:
-        result=json.loads(observed['stdout'])
-        if (type(result) is not dict or set(result)!={'exit_code','stdout','stderr','cargo_execution'}
-                or type(result['exit_code']) is not int or not 0<=result['exit_code']<=255
-                or any(type(result[key]) is not str for key in ('stdout','stderr'))):raise ValueError()
-        result['cargo_execution']['guest_worker_quiescence']=stopped.observation()
-    except (ValueError,KeyError,TypeError):raise ci_cache['FreshnessHold']('input_census_unknown') from None
-    result['cargo_execution']['checkpoint']=lease.finish(scope,stopped,outputs=generation['outputs'],invoked_cargo=True)
-    result['input_write_observation']=writes
-    return result
+    return _run_execution(scope,lease,journal,'cargo_execution')
 
 
 def run_repository_command(argv,input_roots):
@@ -329,22 +347,7 @@ def run_repository_command(argv,input_roots):
         'argv':argv,'environment':dict(environment),'cwd':'/workspace','execution_lease':lease.handle(),'generated_outputs':generation['outputs']})
     lease.bind_scope(scope)
     journal=ci_inputs.ChangeJournal(input_roots,scope=scope)
-    try:
-        observed=_run_worker(scope.argv,scope);stopped=scope.verify();writes=journal.finish(stopped)
-    finally:journal.close()
-    guest_worker_receipts.append(stopped.observation())
-    if observed.get('exit_code')!=0:raise ci_cache['FreshnessHold']('input_census_unknown',observed.get('stderr','').encode()[:8192])
-    try:
-        result=json.loads(observed['stdout'])
-        if (type(result) is not dict or set(result)!={'exit_code','stdout','stderr','repository_execution'}
-                or type(result['exit_code']) is not int or not 0<=result['exit_code']<=255
-                or any(type(result[key]) is not str for key in ('stdout','stderr'))):raise ValueError()
-        result['repository_execution']['guest_worker_quiescence']=stopped.observation()
-    except (ValueError,KeyError,TypeError):raise ci_cache['FreshnessHold']('input_census_unknown') from None
-    result['repository_execution']['checkpoint']=lease.finish(scope,stopped,outputs=generation['outputs'],
-        invoked_cargo=bool(result['repository_execution']['cargo_commands']),producer_succeeded=result['exit_code']==0)
-    result['input_write_observation']=writes
-    return result
+    return _run_execution(scope,lease,journal,'repository_execution')
 
 
 SOURCE_ACCESS_PROBE=r"""
@@ -439,6 +442,7 @@ try:
             if os.geteuid()!=0:raise OSError('CI cache preparation requires the guest controller')
             generation=job['ci_generation']
             cache_reclaimed=ci_cache['reclaim']('/build-cache',generation['retained_generations'],uid,gid)
+            ci_cache['require_cache_capacity']('/build-cache')
             ci_target=ci_cache['prepare']('/build-cache',generation['binding'],generation['command'],uid,gid,
                 predecessor=generation['predecessor'])
             source_view=ci_cache['prepare_source_projection'](ci_target,Path('/workspace'),Path('/ci-git-objects'),

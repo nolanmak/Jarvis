@@ -728,19 +728,23 @@ def execution_cleanup_digest():return hashlib.sha256(b'all-descendants-reaped\n'
 
 def validate_execution_state(value,binding):
     """The execution owner's versioned lease grammar, not cleanup authority."""
-    if (type(value) is not dict or set(value)!={'version','binding','command','predecessor','claim','phase','scope','root','checkpoint','forests','completion_sha256','input_closure_complete','shipping_authority'}
-            or type(value['version']) is not int or value['version']!=2 or value['binding']!=binding
+    fields={'version','binding','command','predecessor','claim','phase','scope','root','checkpoint','forests','completion_sha256','input_closure_complete','shipping_authority'}
+    if (type(value) is not dict or type(value.get('version')) is not int or value['version'] not in (2,3)
+            or set(value)!=(fields|{'abandonment_sha256'} if value['version']==3 else fields) or value['binding']!=binding
             or not _uuid(value['command']) or not _uuid(value['claim'])
             or value['predecessor'] is not None and not _uuid(value['predecessor'])
             or type(value['forests']) is not list or len(value['forests'])>1
             or value['completion_sha256'] is not None and not _digest(value['completion_sha256'])
-            or value['phase'] not in ('active','closed') or value['input_closure_complete'] is not False
+            or value['phase'] not in (('abandoned',) if value['version']==3 else ('active','closed')) or value['input_closure_complete'] is not False
             or value['shipping_authority'] is not False or (value['root'] is None)!=(value['checkpoint'] is None)):
         raise FreshnessHold('metadata_torn')
     scope=value['scope']
     if scope is not None and (type(scope) is not dict or set(scope)!={'id','receipt','cleanup_sha256'}
             or not _uuid(scope['id']) or type(scope['receipt']) is not str or not Path(scope['receipt']).is_absolute()
             or scope['cleanup_sha256'] not in (None,execution_cleanup_digest())):raise FreshnessHold('metadata_torn')
+    if value['version']==3 and (scope is None or scope['cleanup_sha256']!=execution_cleanup_digest()
+            or value['completion_sha256'] is not None or not _digest(value['abandonment_sha256'])):
+        raise FreshnessHold('metadata_torn')
     return value
 
 
@@ -770,6 +774,23 @@ def validate_execution_completion(state,record):
     return record
 
 
+def validate_abandoned_execution(record,state):
+    if (type(record) is not dict or set(record)!={'version','kind','binding','command','claim','predecessor',
+            'scope','state_sha256','input_closure_complete','shipping_authority'}
+            or type(record['version']) is not int or record['version']!=1 or record['kind']!='ci-execution-abandoned'
+            or any(record[key]!=state[key] for key in ('binding','command','claim','predecessor'))
+            or record['scope']!={**state['scope'],'cleanup_sha256':execution_cleanup_digest()}
+            or not _digest(record['state_sha256']) or record['input_closure_complete'] is not False
+            or record['shipping_authority'] is not False):raise FreshnessHold('cleanup_uncertain')
+    prior={**state,'version':2,'phase':'active','scope':{**state['scope'],'cleanup_sha256':None}}
+    prior.pop('abandonment_sha256',None)
+    if state['phase'] not in ('active','abandoned') or _record_digest(prior)!=record['state_sha256']:
+        raise FreshnessHold('cleanup_uncertain')
+    if state['phase']=='abandoned' and _record_digest(record)!=state['abandonment_sha256']:
+        raise FreshnessHold('cleanup_uncertain')
+    return record
+
+
 def _execution_directory(path,device):
     info=path.lstat()
     if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or info.st_gid!=os.getegid()
@@ -781,19 +802,37 @@ def _closed_execution_snapshot(generation,original):
     """Validate original closed-scope evidence; never promote artifact authority."""
     binding=original['binding'];device=generation.stat().st_dev
     state=validate_execution_state(_read_record(generation/'cargo-execution-state.json',max_bytes=_PROJECTION_DOCUMENT_BYTES),binding)
-    if (state['phase']!='closed' or state['command']!=original['active_command'] or state['scope'] is None
+    abandoned=state['phase']=='abandoned'
+    if (state['phase'] not in ('closed','abandoned') or state['command']!=original['active_command'] or state['scope'] is None
             or state['scope']['cleanup_sha256']!=execution_cleanup_digest()):raise FreshnessHold('cleanup_uncertain')
-    directories={'completed-ci-commands':_execution_directory(generation/'completed-ci-commands',device)}
+    directories={};dispositions={}
+    if abandoned:
+        directory=generation/'execution-dispositions';directories['execution-dispositions']=_execution_directory(directory,device)
+        import itertools
+        paths=list(itertools.islice(directory.iterdir(),2))
+        if len(paths)!=1 or paths[0].name!=state['command']+'.json':raise FreshnessHold('cleanup_uncertain')
+        disposition=validate_abandoned_execution(_read_record(paths[0]),state)
+        dispositions[paths[0].name]=_record_digest(disposition)
+    elif (generation/'execution-dispositions').exists() or (generation/'execution-dispositions').is_symlink():
+        raise FreshnessHold('cleanup_uncertain')
     history={};records={}
     import itertools
-    paths=list(itertools.islice((generation/'completed-ci-commands').iterdir(),1025))
-    if not 1<=len(paths)<=1024:raise FreshnessHold('cleanup_uncertain')
+    directory=generation/'completed-ci-commands'
+    if directory.exists() or directory.is_symlink():
+        directories['completed-ci-commands']=_execution_directory(directory,device)
+        paths=list(itertools.islice(directory.iterdir(),1025))
+    else:paths=[]
+    if len(paths)>1024 or not abandoned and not paths:raise FreshnessHold('cleanup_uncertain')
     for path in paths:
         if path.suffix!='.json' or not _uuid(path.stem):raise FreshnessHold('cleanup_uncertain')
         record=validate_completed_execution(_read_record(path,max_bytes=_PROJECTION_DOCUMENT_BYTES),binding,path.stem)
         records[path.stem]=record;history[path.name]=_record_digest(record)
-    validate_execution_completion(state,records[state['command']])
-    visited=set();command=state['command']
+    if not abandoned:validate_execution_completion(state,records[state['command']])
+    elif state['command'] in records:
+        record=records[state['command']]
+        if (record['claim']!=state['claim'] or record['scope']!=state['scope']
+                or record['predecessor']!=state['predecessor']):raise FreshnessHold('cleanup_uncertain')
+    visited=set();command=state['command'] if state['command'] in records else state['predecessor']
     while command is not None:
         if command in visited or command not in records:raise FreshnessHold('cleanup_uncertain')
         visited.add(command);command=records[command]['predecessor']
@@ -806,35 +845,52 @@ def _closed_execution_snapshot(generation,original):
         root=state['root'];checkpoint=state['checkpoint']
         if (type(root) is not dict or set(root)!={'name','identity'} or type(root['name']) is not str
                 or not root['name'].startswith('.cargo-execution-') or not _uuid(root['name'][17:])
-                or type(checkpoint) is not dict or checkpoint.get('command') not in records
-                or 'creating' in checkpoint):raise FreshnessHold('cleanup_uncertain')
+                or type(checkpoint) is not dict or checkpoint.get('command') not in (set(records)|{state['command']})
+                or not abandoned and ('creating' in checkpoint or checkpoint.get('command') not in records)):
+            raise FreshnessHold('cleanup_uncertain')
         path=generation/'target'/root['name'];info=path.lstat()
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or info.st_gid!=1001
                 or stat.S_IMODE(info.st_mode)!=0o710
                 or [info.st_dev,info.st_ino,info.st_uid,info.st_gid,info.st_mode]!=root['identity']):
             raise FreshnessHold('cleanup_uncertain')
         control=_read_record(path/'control.json')
-        if control!={'version':1,'kind':'cargo-execution','binding':binding,'command':checkpoint['command'],
+        if abandoned:
+            if (set(control)!={'version','kind','binding','command','shipping_authority','state'}
+                    or type(control['version']) is not int or control['version']!=1 or control['kind']!='cargo-execution'
+                    or control['binding']!=binding or control['command'] not in (set(records)|{state['command']})
+                    or control['state'] not in ('active','closed') or control['shipping_authority'] is not False):
+                raise FreshnessHold('cleanup_uncertain')
+        elif control!={'version':1,'kind':'cargo-execution','binding':binding,'command':checkpoint['command'],
                 'shipping_authority':False,'state':'closed'}:raise FreshnessHold('cleanup_uncertain')
         executor={**root,'control_sha256':_record_digest(control)}
-    return {'version':1,'kind':'closed-ci-execution-retirement','command':state['command'],'claim':state['claim'],
+    result={'version':1,'kind':'closed-ci-execution-retirement','command':state['command'],'claim':state['claim'],
         'scope':state['scope'],'state_sha256':_record_digest(state),'completion_sha256':state['completion_sha256'],
         'completed':history,'directories':directories,'executor':executor,
         'input_closure_complete':False,'shipping_authority':False}
+    if abandoned:result.update(version=2,kind='abandoned-ci-execution-retirement',abandoned=dispositions)
+    return result
 
 
 def _validate_execution_snapshot(value,original):
-    if (type(value) is not dict or set(value)!={'version','kind','command','claim','scope','state_sha256','completion_sha256',
+    fields={'version','kind','command','claim','scope','state_sha256','completion_sha256',
             'completed','directories','executor','input_closure_complete','shipping_authority'}
-            or type(value['version']) is not int or value['version']!=1 or value['kind']!='closed-ci-execution-retirement'
+    abandoned=type(value) is dict and value.get('version')==2
+    if (type(value) is not dict or set(value)!=(fields|{'abandoned'} if abandoned else fields)
+            or type(value['version']) is not int or value['version'] not in (1,2)
+            or value['kind']!=('abandoned-ci-execution-retirement' if abandoned else 'closed-ci-execution-retirement')
             or value['command']!=original['active_command'] or not _uuid(value['claim'])
-            or not _digest(value['state_sha256']) or not _digest(value['completion_sha256'])
-            or type(value['completed']) is not dict or not 1<=len(value['completed'])<=1024
-            or value['completed'].get(value['command']+'.json')!=value['completion_sha256']
-            or type(value['directories']) is not dict or 'completed-ci-commands' not in value['directories']
-            or set(value['directories'])-{'completed-ci-commands','generated-forests'}
+            or not _digest(value['state_sha256']) or not abandoned and not _digest(value['completion_sha256'])
+            or abandoned and value['completion_sha256'] is not None
+            or type(value['completed']) is not dict or not (0 if abandoned else 1)<=len(value['completed'])<=1024
+            or not abandoned and value['completed'].get(value['command']+'.json')!=value['completion_sha256']
+            or type(value['directories']) is not dict
+            or ('execution-dispositions' if abandoned else 'completed-ci-commands') not in value['directories']
+            or set(value['directories'])-({'completed-ci-commands','generated-forests','execution-dispositions'} if abandoned
+                else {'completed-ci-commands','generated-forests'})
             or value['input_closure_complete'] is not False or value['shipping_authority'] is not False):
         raise FreshnessHold('cleanup_uncertain')
+    if abandoned and (type(value['abandoned']) is not dict or set(value['abandoned'])!={value['command']+'.json'}
+            or not _digest(value['abandoned'][value['command']+'.json'])):raise FreshnessHold('cleanup_uncertain')
     scope=value['scope']
     if (type(scope) is not dict or set(scope)!={'id','receipt','cleanup_sha256'} or not _uuid(scope['id'])
             or type(scope['receipt']) is not str or not Path(scope['receipt']).is_absolute()
@@ -859,19 +915,20 @@ def _execution_retirement_replay(generation,original,evidence):
     if path.exists() or path.is_symlink():
         state=validate_execution_state(_read_record(path,max_bytes=_PROJECTION_DOCUMENT_BYTES),original['binding'])
         if _record_digest(state)!=evidence['state_sha256']:raise FreshnessHold('cleanup_uncertain')
-    for name in ('completed-ci-commands','generated-forests'):
+    for name in ('completed-ci-commands','generated-forests','execution-dispositions'):
         path=generation/name
         if not path.exists() and not path.is_symlink():continue
         if name not in evidence['directories'] or _execution_directory(path,generation.stat().st_dev)!=evidence['directories'][name]:
             raise FreshnessHold('cleanup_uncertain')
-        if name=='completed-ci-commands':
+        if name in ('completed-ci-commands','execution-dispositions'):
+            expected=evidence['completed'] if name=='completed-ci-commands' else evidence.get('abandoned',{})
             import itertools
             paths=list(itertools.islice(path.iterdir(),1025))
             if len(paths)>1024:raise FreshnessHold('cleanup_uncertain')
             for record_path in paths:
-                if record_path.name not in evidence['completed']:raise FreshnessHold('cleanup_uncertain')
+                if record_path.name not in expected:raise FreshnessHold('cleanup_uncertain')
                 record=_read_record(record_path,max_bytes=_PROJECTION_DOCUMENT_BYTES)
-                if _record_digest(record)!=evidence['completed'][record_path.name]:raise FreshnessHold('cleanup_uncertain')
+                if _record_digest(record)!=expected[record_path.name]:raise FreshnessHold('cleanup_uncertain')
     executor=evidence['executor']
     if executor is not None:
         path=generation/'target'/executor['name']
@@ -1095,7 +1152,7 @@ def reclaim(cache, protected_generations, worker_uid, worker_gid, *, limit=2):
             children = {child.name for child in generation.iterdir()}
             layout = seed_layout(generation, original["binding"])
             execution=None;prior_projection=receipt.get('source_projection') if receipt is not None else None
-            lifecycle={'cargo-execution-state.json','completed-ci-commands','generated-forests'}
+            lifecycle={'cargo-execution-state.json','completed-ci-commands','generated-forests','execution-dispositions'}
             if receipt is not None and receipt['version']==2:
                 evidence=_generation_evidence(cache,original,references=receipt['evidence'])
                 execution=evidence['execution'];prior_projection=evidence['projection']

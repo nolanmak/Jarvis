@@ -2528,3 +2528,22 @@ capacity admission and retirement of interrupted executions using original R
 evidence remain unfinished. No active/incomplete allocation, cache image or cap
 was cleared or enlarged. Host suites pass 598 Python tests and 34 focused managed
 Rust tests; transfer/resume, full CI and production autoship remain disabled.
+
+An interrupted execution can now become explicitly nonreusable only after its
+original stopped-scope token matches the bound scope and its original cleanup
+receipt is revalidated. The controller writes a dedicated abandonment disposition
+before committing version-3 `abandoned` state. It never fabricates a completed
+command, producer success or reusable checkpoint. Pending/lost state acknowledgement
+blocks reuse and can replay only the same original disposition; an already closed
+claim is revalidated without being rewritten as abandoned.
+
+Both protected Cargo and repository callers use the same failure path. Nonzero
+supervisor results, malformed payloads, input-journal failures and checkpoint
+failures after verified R trigger abandonment. An earlier transport failure can
+use only that same original scope's verified cleanup; missing/failed verification
+leaves the claim active. Retirement accepts the abandonment only after matching
+the state preimage, disposition digest, scope/claim/command, predecessor history
+and owned directories. Creating/partial executor state remains nonreusable and
+can be deleted only under that cleanup authority. Old active/incomplete records
+without such evidence remain retained. Zero-capacity admission now also runs
+after normal reclamation and before allocating/seeding a fresh generation.

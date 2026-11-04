@@ -39,6 +39,41 @@ class ExecutionRetirementTests(unittest.TestCase):
 
     def reclaim(self,protected=()):return cache.reclaim(self.image,list(protected),os.getuid(),os.getgid())
 
+    def abandoned(self):
+        self.closed();(self.completed/(self.command+'.json')).unlink();self.completed.rmdir()
+        prior={**self.state,'phase':'active','scope':{**self.state['scope'],'cleanup_sha256':None},'completion_sha256':None}
+        self.disposition={'version':1,'kind':'ci-execution-abandoned',
+            **{key:prior[key] for key in ('binding','command','claim','predecessor')},
+            'scope':self.state['scope'],'state_sha256':self.digest(prior),
+            'input_closure_complete':False,'shipping_authority':False}
+        self.dispositions=self.generation/'execution-dispositions';self.dispositions.mkdir(mode=0o700)
+        cache._write_record(self.dispositions/(self.command+'.json'),self.disposition)
+        self.state={**prior,'version':3,'phase':'abandoned','scope':self.disposition['scope'],
+            'abandonment_sha256':self.digest(self.disposition)}
+        cache._write_record(self.generation/'cargo-execution-state.json',self.state)
+
+    def test_verified_abandonment_retires_without_any_successful_completion(self):
+        self.abandoned();self.assertEqual(self.reclaim([self.binding['generation']]),[])
+        self.assertEqual(self.reclaim(),[self.binding['generation']]);self.assertFalse(self.generation.exists())
+
+    def test_abandonment_replay_preserves_original_disposition_after_partial_removal(self):
+        self.abandoned()
+        def interrupted(path):
+            (self.generation/'cargo-execution-state.json').unlink()
+            (self.dispositions/(self.command+'.json')).unlink()
+            raise OSError(errno.EIO,'disposition already removed')
+        with patch.object(cache.shutil,'rmtree',side_effect=interrupted),self.assertRaises(cache.FreshnessHold):self.reclaim()
+        self.assertEqual(self.reclaim(),[self.binding['generation']])
+
+    def test_foreign_or_modified_abandonment_is_never_retired(self):
+        self.abandoned()
+        for field in ('claim','state_sha256'):
+            changed={**self.disposition,field:str(uuid.uuid4()) if field=='claim' else 'f'*64}
+            cache._write_record(self.dispositions/(self.command+'.json'),changed)
+            cache._write_record(self.generation/'cargo-execution-state.json',
+                {**self.state,'abandonment_sha256':self.digest(changed)})
+            self.assertEqual(self.reclaim(),[]);self.assertTrue(self.generation.exists())
+
     def test_closed_execution_retires_only_after_matching_cleanup_and_completion(self):
         self.closed();self.assertEqual(self.reclaim([self.binding['generation']]),[])
         self.assertEqual(self.reclaim(),[self.binding['generation']]);self.assertFalse(self.generation.exists())

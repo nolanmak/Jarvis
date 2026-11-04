@@ -852,7 +852,9 @@ class ExecutionLease:
         _source(self.target,self.binding,self.command)
         value=self._read(self.path,self.binding)
         if (os.getpid()!=self.owner or value['phase']!='active' or value['command']!=self.command or value['claim']!=self.claim
-                or require_scope and value['scope'] is None):raise FreshnessHold('cleanup_uncertain')
+                or require_scope and value['scope'] is None
+                or (self.target.parent/'execution-dispositions').exists()
+                or (self.target.parent/'execution-dispositions').is_symlink()):raise FreshnessHold('cleanup_uncertain')
         return value
 
     def bind_scope(self,scope):
@@ -917,12 +919,46 @@ class ExecutionLease:
         value['checkpoint']={'command':self.command,'creating':True}
         cache._write_record(self.path,value)
 
-    def finish(self,scope,stopped,*,outputs=None,invoked_cargo=False,producer_succeeded=True):
-        value=self._active(require_scope=True)
-        if (self.scope is not scope or not stopped.matches(scope) or not scope.closed
-                or value['scope']!={'id':scope.directory.name.removeprefix('worker-'),'receipt':str(scope.receipt),'cleanup_sha256':None}):
+    def _original_stopped_scope(self,scope,stopped,*,allow_recorded=False):
+        _source(self.target,self.binding,self.command)
+        value=self._read(self.path,self.binding)
+        expected={'id':scope.directory.name.removeprefix('worker-'),'receipt':str(scope.receipt),
+            'cleanup_sha256':self.cleanup_digest() if value['phase'] in ('closed','abandoned') else None}
+        if (self.owner!=os.getpid() or value['command']!=self.command or value['claim']!=self.claim
+                or self.scope is not scope or stopped is None or not stopped.matches(scope) or not scope.closed
+                or value['scope']!=expected or not allow_recorded and value['phase']!='active'):
             raise FreshnessHold('cleanup_uncertain')
+        if not allow_recorded and ((self.target.parent/'execution-dispositions').exists()
+                or (self.target.parent/'execution-dispositions').is_symlink()):raise FreshnessHold('cleanup_uncertain')
         original_cargo_cleanup(scope.receipt,owner=os.geteuid())
+        return value
+
+    def abandon_nonreusable(self,scope,stopped):
+        """Persist only original verified cleanup, without producer completion."""
+        value=self._original_stopped_scope(scope,stopped,allow_recorded=True)
+        if value['phase']=='closed':
+            self._completed_check(value);return self.completed(self.command)
+        directory=self.target.parent/'execution-dispositions'
+        if not directory.exists():directory.mkdir(mode=0o700)
+        cache._execution_directory(directory,self.target.parent.stat().st_dev)
+        path=directory/(self.command+'.json')
+        if value['phase']=='abandoned':
+            return cache.validate_abandoned_execution(cache._read_record(path),value)
+        record={'version':1,'kind':'ci-execution-abandoned','binding':self.binding,'command':self.command,
+            'claim':self.claim,'predecessor':value['predecessor'],
+            'scope':{**value['scope'],'cleanup_sha256':self.cleanup_digest()},'state_sha256':cache._record_digest(value),
+            'input_closure_complete':False,'shipping_authority':False}
+        cache.validate_abandoned_execution(record,value)
+        if path.exists() or path.is_symlink():
+            if cache._read_record(path)!=record:raise FreshnessHold('cleanup_uncertain')
+        else:cache._write_record(path,record)
+        following={**value,'version':3,'phase':'abandoned','scope':record['scope'],
+            'abandonment_sha256':cache._record_digest(record)}
+        cache.validate_execution_state(following,self.binding);cache._write_record(self.path,following)
+        return record
+
+    def finish(self,scope,stopped,*,outputs=None,invoked_cargo=False,producer_succeeded=True):
+        value=self._original_stopped_scope(scope,stopped)
         forests=GeneratedForests(self,{} if outputs is None else outputs)
         if type(producer_succeeded) is not bool:raise FreshnessHold('artifact_provenance_unknown')
         if invoked_cargo or not producer_succeeded:forests.load(value['forests']);following_forests=value['forests']
