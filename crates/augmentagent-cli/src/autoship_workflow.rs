@@ -11,6 +11,8 @@ use std::{path::Path, time::Duration};
 mod merge_allowance;
 #[path = "autoship_progress.rs"]
 pub(crate) mod progress;
+#[path = "autoship_delivery.rs"]
+pub(crate) mod delivery;
 #[path = "autoship_milestone.rs"]
 mod milestone;
 #[path = "autoship_discord_ingress.rs"]
@@ -313,6 +315,10 @@ impl WorkflowStore {
                 bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
                 workflow TEXT NOT NULL REFERENCES command_job(workflow), created_at INTEGER NOT NULL,
                 PRIMARY KEY(bot,owner,channel,workflow));
+            CREATE TABLE IF NOT EXISTS discord_delivery_route_event (
+                id TEXT PRIMARY KEY, workflow TEXT NOT NULL REFERENCES command_job(workflow),
+                principal TEXT NOT NULL, previous_routes TEXT NOT NULL, destination TEXT NOT NULL,
+                created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS discord_command_ingress (
                 request_id TEXT PRIMARY KEY REFERENCES command_request(request_id), origin TEXT NOT NULL,
                 message_sha256 TEXT NOT NULL, response TEXT NOT NULL, state TEXT NOT NULL,
