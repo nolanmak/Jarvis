@@ -228,8 +228,8 @@ pub(super) fn reconcile_runtime_retirements()->Result<usize> {
     if !state.exists(){return Ok(0);}
     reconcile_runtime_retirements_in(&mut WorkflowStore::open(&state)?,millis())
 }
-pub(super) fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<usize> {
-    if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_none(){return Ok(0);}
+fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<usize> {
+    if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_none(){store.settle_owner_execution_retries(now,16)?;return Ok(0);}
     let rows=store.pending_native_retirements(now,16)?;
     let mut completed=0;
     for (workflow,generation,audit_path) in rows {
@@ -239,6 +239,7 @@ pub(super) fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)
             Err(error)=>warn!("native runtime retirement retained for retry: {error:#}"),
         }
     }
+    store.settle_owner_execution_retries(now,16)?;
     Ok(completed)
 }
 
