@@ -23,6 +23,33 @@ impl WorkflowStore {
     }
 
     pub fn require_owner_dispatch(&self,workflow:&str)->Result<()> {require_dispatch(&self.conn,workflow)}
+
+    /// An authenticated resume may request checked cleanup for this one internal
+    /// failure. This is retirement intent, never evidence of native quiescence.
+    pub(crate) fn request_execution_retry_retirement(&mut self,workflow:&str,principal:&str,expected_revision:i64,now:i64)->Result<bool> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some((_,generation))=retry_checkpoint(&tx,workflow,now,false)? else {return Ok(false);};
+        ensure!(!principal.is_empty() && principal.len()<=256 && principal.bytes().all(|b|b.is_ascii_graphic()),"invalid owner principal");
+        ensure!(read(&tx,workflow)?.map_or(0,|c|c.revision)==expected_revision,"owner-control-revision-conflict");
+        ensure!(super::owner_inbox::pending(&tx,workflow)?==0,"owner-followup-pending");
+        let changed=tx.execute("UPDATE workflow_native_owner SET retirement_reason='owner_execution_retry' WHERE workflow=?1 AND retired_at IS NULL AND retirement_reason IS NULL",[workflow])?;
+        if changed>0 {event(&tx,workflow,generation,"owner_retry_retirement_requested",&serde_json::json!({"principal":principal,"owner_revision":expected_revision}).to_string(),now)?;}
+        tx.commit()?;Ok(true)
+    }
+}
+
+fn retry_checkpoint(tx:&Transaction<'_>,workflow:&str,now:i64,require_retired:bool)->Result<Option<(Checkpoint,i64)>> {
+    let row:Option<(String,i64,i64)>=tx.query_row("SELECT checkpoint,lease_until,generation FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let Some((raw,until,generation))=row else {return Ok(None);};
+    let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
+    if checkpoint.stage!=Stage::Held || checkpoint.next.reason!="adopted_execution_retry" || checkpoint.next.action!="resume_preserved_pr" {return Ok(None);}
+    ensure!(until<=now,"execution-retry-not-quiescent");
+    let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed'))",[workflow],|r|r.get(0))?;
+    ensure!(!blocked,"execution-retry-not-quiescent");
+    if require_retired {
+        ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND retired_at IS NULL)",[workflow],|r|r.get::<_,bool>(0))?,"execution-retry-not-quiescent");
+    }
+    Ok(Some((checkpoint,generation)))
 }
 
 pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&str,expected_revision:i64,paused:bool,now:i64)->Result<OwnerControl> {
@@ -38,10 +65,19 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
         let revision=prior.as_ref().map_or(0,|c|c.revision);
         ensure!(revision==expected_revision,"owner-control-revision-conflict");
         let revision=revision.checked_add(1).context("owner control revision overflow")?;
+        let retry=if paused {None}else{retry_checkpoint(tx,workflow,now,true)?};
         let control=OwnerControl {revision,paused,principal:principal.into(),updated_at_ms:now};
         tx.execute("INSERT INTO workflow_owner_control VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workflow) DO UPDATE SET revision=excluded.revision,paused=excluded.paused,principal=excluded.principal,updated_at=excluded.updated_at",
             params![workflow,revision,paused,principal,now])?;
         tx.execute("INSERT INTO workflow_owner_control_event VALUES(?1,?2,?3,?4,?5)",params![workflow,revision,paused,principal,now])?;
+        if let Some((mut checkpoint,generation))=retry {
+            checkpoint.stage=Stage::Reconcile;
+            checkpoint.next.reason="owner_execution_retry_requested".into();
+            // Preserve the current binding, evidence, compute accounting and
+            // retry eligibility. Normal execution revalidates the source/head.
+            tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",params![workflow,serde_json::to_string(&checkpoint)?,now])?;
+            event(tx,workflow,generation,"owner_execution_retry_requested",principal,now)?;
+        }
         super::progress::project(tx,workflow,"owner_control_changed",now)?;
         Ok(control)
 }
@@ -65,6 +101,78 @@ mod tests {
     use super::*;
     fn binding()->Binding {Binding {head:"head".into(),contract:"owner-contract".into(),evidence_hash:"proof".into()}}
     fn request(n:u64)->submission::Request {submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(n),provider:None,until:submission::Milestone::Merged}}
+
+    #[test]
+    fn owner_resume_retries_only_quiescent_internal_execution_failures() {
+        for blocker in ["none","lease","native","operation"] {
+            let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+            let id=store.submit_authorized("request","github:owner",&request(1),1).unwrap().workflow;
+            store.register(&id,"candidate",binding(),2).unwrap();
+            let lease=store.claim(&id,"worker",3,100).unwrap().unwrap();
+            store.charge(&lease,"previous-attempt",ResourceCharge {model_calls:7,tokens:42,wall_ms:10},3).unwrap();
+            let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+            checkpoint.stage=Stage::Held;
+            checkpoint.evidence=vec!["retained-verification-evidence".into()];
+            checkpoint.next=NextAction {reason:"adopted_execution_retry".into(),action:"resume_preserved_pr".into(),eligible_at_ms:1000};
+            store.checkpoint(&lease,&checkpoint,4).unwrap();
+            if blocker=="native" {store.register_native_owner(&lease,dir.path().join("native-audit").to_str().unwrap(),5).unwrap();}
+            if blocker=="operation" {
+                store.conn.execute("INSERT INTO operation VALUES('uncertain-push',?1,?2,?3,NULL,5)",params![id,serde_json::to_string(&OperationKind::Push).unwrap(),serde_json::to_string(&checkpoint.binding).unwrap()]).unwrap();
+            }
+            if blocker!="lease" {store.release(&lease,6).unwrap();}
+            let resumed=store.set_owner_pause(&id,"github:owner",0,false,7);
+            if blocker!="none" {
+                assert!(resumed.is_err(),"{blocker} must prevent an internal retry");
+                assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint,checkpoint);
+                assert!(store.owner_control(&id).unwrap().is_none(),"a refused retry must roll back owner control");
+                continue;
+            }
+            resumed.unwrap();
+            let after=store.snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.checkpoint.stage,Stage::Reconcile,"owner resume must make the failed internal attempt runnable");
+            assert_eq!(after.checkpoint.binding,checkpoint.binding);
+            assert_eq!(after.checkpoint.evidence,checkpoint.evidence);
+            assert_eq!(after.checkpoint.next.eligible_at_ms,1000,"resume must preserve retry admission time");
+            assert!(store.claim_productive(&id,"next",999,100).unwrap().is_none());
+            assert!(store.claim_productive(&id,"next",1000,100).unwrap().is_some());
+            assert_eq!((after.model_calls,after.tokens,after.wall_ms),(7,42,10),"resume must retain previous compute charges");
+            assert_eq!(store.merge_allowance(1000,5).unwrap().confirmed,0);
+        }
+    }
+
+    #[test]
+    fn pending_owner_input_cannot_request_native_retirement_for_a_retry() {
+        let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        let origin=super::super::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
+        let id=store.submit_discord_authorized(&origin,&request(1),&"a".repeat(64),1).unwrap().admission.workflow;
+        store.register(&id,"candidate",binding(),2).unwrap();let lease=store.claim(&id,"worker",3,100).unwrap().unwrap();
+        let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+        checkpoint.stage=Stage::Held;checkpoint.next=NextAction {reason:"adopted_execution_retry".into(),action:"resume_preserved_pr".into(),eligible_at_ms:0};
+        store.checkpoint(&lease,&checkpoint,4).unwrap();
+        store.register_native_owner(&lease,dir.path().join("audit").to_str().unwrap(),5).unwrap();store.release(&lease,6).unwrap();
+        store.enqueue_owner_message(&super::super::discord_ingress::DiscordOrigin {message:45,..origin},&id,"Owner requirement",None,7).unwrap();
+        assert_eq!(store.request_execution_retry_retirement(&id,"github:owner",1,8).unwrap_err().to_string(),"owner-followup-pending");
+        let retirement:Option<String>=store.conn.query_row("SELECT retirement_reason FROM workflow_native_owner",[],|r|r.get(0)).unwrap();
+        assert_eq!(retirement,None,"refused resume must not start teardown behind pending owner input");
+        assert!(store.owner_control(&id).unwrap().unwrap().paused);
+    }
+
+    #[test]
+    fn stale_resume_cannot_start_retirement_and_intent_is_not_quiescence() {
+        let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        let id=store.submit_authorized("request","github:owner",&request(1),1).unwrap().workflow;
+        store.register(&id,"candidate",binding(),2).unwrap();let lease=store.claim(&id,"worker",3,100).unwrap().unwrap();
+        let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+        checkpoint.stage=Stage::Held;checkpoint.next=NextAction {reason:"adopted_execution_retry".into(),action:"resume_preserved_pr".into(),eligible_at_ms:0};
+        store.checkpoint(&lease,&checkpoint,4).unwrap();store.register_native_owner(&lease,dir.path().join("audit").to_str().unwrap(),5).unwrap();store.release(&lease,6).unwrap();
+        store.set_owner_pause(&id,"github:owner",0,true,7).unwrap();store.set_owner_pause(&id,"github:owner",1,true,8).unwrap();
+        assert!(store.request_execution_retry_retirement(&id,"github:owner",1,9).is_err());
+        assert_eq!(store.conn.query_row("SELECT retirement_reason FROM workflow_native_owner",[],|r|r.get::<_,Option<String>>(0)).unwrap(),None);
+        assert!(store.request_execution_retry_retirement(&id,"github:owner",2,10).unwrap());
+        assert!(store.set_owner_pause(&id,"github:owner",2,false,11).is_err(),"retirement intent cannot certify teardown");
+        assert_eq!(store.owner_control(&id).unwrap().unwrap().revision,2);
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint,checkpoint);
+    }
 
     #[test]
     fn paused_queue_does_not_starve_other_work_and_resume_preserves_unrelated_holds() {
