@@ -2866,7 +2866,7 @@ mod tests {
 
     #[tokio::test]
     async fn ci_gate_reports_meaningful_success_only_after_a_passing_result() {
-        for disposition in ["passed","source-failed","infrastructure-failed"] {
+        for disposition in ["passed","hosted-pending","source-failed","infrastructure-failed"] {
             let directory=repo();let state=control_dir();let path=state.path().join("workflow.db");
             let mut guard=WorkflowGuard::acquire_at(&path,Start {
                 repo_root:directory.path(),worktree:directory.path(),repository:"owner/repo",
@@ -2876,12 +2876,13 @@ mod tests {
             let before=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
             let result=match disposition {
                 "passed"=>Ok(()),
+                "hosted-pending"=>Err(hosted_ci::AwaitingHostedCi.into()),
                 "source-failed"=>Err(anyhow::anyhow!("error[E0308]: mismatched types")),
                 _=>Err(anyhow::anyhow!("shared CI prerequisite unavailable: network offline")),
             };
             let outcome=CiGateResult(result).for_workflow(&mut guard).await;
             match disposition {
-                "passed"=>assert!(matches!(outcome,Ok(Ok(())))),
+                "passed" | "hosted-pending"=>assert!(matches!(outcome,Ok(Ok(())))),
                 "source-failed"=>assert!(matches!(outcome,Ok(Err(_)))),
                 _=>assert!(outcome.unwrap_err().downcast_ref::<CiInfrastructureDeferred>().is_some()),
             }

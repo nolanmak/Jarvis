@@ -116,9 +116,11 @@ jobs:
       - name: Autonomy gate C5-C9 preset, receipts and Discord notice
         if: runner.os == 'Linux'
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/14"
+
       - name: Autonomy C10 heartbeat outreach
         if: runner.os == 'Linux'
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/15"
+
       # Heartbeat (Linux).
       - name: Format heartbeat crate
         if: runner.os == 'Linux'
