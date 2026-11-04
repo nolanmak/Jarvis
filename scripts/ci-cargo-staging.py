@@ -201,13 +201,28 @@ def observe_task_inode_aliases(task,inodes,*,check):
             if key not in inodes:continue
             if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
                 raise StagingUnavailable('inode_alias_identity')
-            details=dict(line.split(b':',1) for line in read(root/'fdinfo'/str(number)).splitlines())
+            lines=read(root/'fdinfo'/str(number)).splitlines()
+            details=dict(line.split(b':',1) for line in lines);locks=[]
+            for line in lines:
+                if not line.startswith(b'lock:'):continue
+                fields=line.split(b':',1)[1].split();blocked=len(fields)>1 and fields[1]==b'->'
+                if blocked:fields.pop(1)
+                if (len(fields)!=8 or fields[1] not in (b'FLOCK',b'POSIX',b'OFDLCK',b'LEASE')
+                        or fields[2] not in (b'ADVISORY',b'MANDATORY',b'ACTIVE',b'BREAKING')
+                        or fields[3] not in (b'READ',b'WRITE')):
+                    raise StagingUnavailable('inode_alias_kernel_lock')
+                major,minor,inode=fields[5].split(b':')
+                if (os.makedev(int(major,16),int(minor,16)),int(inode))!=key:
+                    raise StagingUnavailable('inode_alias_kernel_lock')
+                locks.append({'kind':fields[1].decode('ascii'),'scope':fields[2].decode('ascii'),
+                    'access':fields[3].decode('ascii'),'owner':int(fields[4]),'start':int(fields[6]),
+                    'end':None if fields[7]==b'EOF' else int(fields[7]),'blocked':blocked})
             after=path.stat()
             if (after.st_dev,after.st_ino,after.st_mode)!=(info.st_dev,info.st_ino,info.st_mode):
                 raise StagingUnavailable('inode_alias_changed')
             aliases.append({'kind':'fd','number':number,'device':key[0],'inode':key[1],
                 'flags':int(details[b'flags'],8),'position':int(details[b'pos']),
-                'type':stat.S_IFMT(info.st_mode)})
+                'type':stat.S_IFMT(info.st_mode),'locks':locks})
         for line in read(root/'maps').splitlines():
             fields=line.split(None,5)
             if len(fields)<5:raise StagingUnavailable('inode_alias_unobservable')
@@ -304,6 +319,10 @@ def observe_private_inode_aliases(inodes,cohort,controller_fds,*,check):
                                 if observation['uids']!=[cohort['uid']]*4:
                                     raise StagingUnavailable('inode_alias_identity')
                             for alias in observation['aliases']:
+                                if alias['kind']=='fd' and alias['locks']:
+                                    error=StagingUnavailable('inode_alias_kernel_lock')
+                                    error.alias_reference={'task':identity,'uids':observation['uids'],'alias':alias}
+                                    raise error
                                 if parent:continue
                                 if (identity['pid']==os.getpid() and alias['kind']=='fd'
                                         and controlled.get(alias['number'])==(alias['device'],alias['inode'])):continue

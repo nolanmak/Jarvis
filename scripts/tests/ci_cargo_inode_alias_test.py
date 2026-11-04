@@ -11,7 +11,7 @@ spec=importlib.util.spec_from_file_location('task_alias_staging',Path(__file__).
 staging=importlib.util.module_from_spec(spec);spec.loader.exec_module(staging)
 
 
-PROGRAM='''import ctypes,json,mmap,os,sys,threading
+PROGRAM='''import ctypes,fcntl,json,mmap,os,sys,threading
 fd=int(sys.argv[1]);mode=sys.argv[2]
 def run():
  global mapped
@@ -24,7 +24,9 @@ def run():
   assert mapped not in (None,ctypes.c_void_p(-1).value),ctypes.get_errno()
   os.close(fd)
  elif mode=='cwd':os.fchdir(fd);os.close(fd)
- else:os.lseek(fd,3,os.SEEK_SET)
+ else:
+  os.lseek(fd,3,os.SEEK_SET)
+  if mode=='flock':fcntl.flock(fd,fcntl.LOCK_EX)
  tid=threading.get_native_id();pid=os.getpid()
  birth=int(Path('/proc/self/task/'+str(tid)+'/stat').read_text().rsplit(')',1)[1].split()[19])
  print(json.dumps({'pid':pid,'tid':tid,'birth':birth}),flush=True)
@@ -70,6 +72,16 @@ class TaskInodeAliasTests(unittest.TestCase):
         task,keys,_=self.child('readonly')
         rows=self.observe(task,keys)['aliases'];self.assertEqual(len(rows),1)
         self.assertEqual(rows[0]['flags']&os.O_ACCMODE,os.O_RDONLY)
+
+    def test_held_kernel_lock_is_reported_without_releasing_or_reacquiring_it(self):
+        import fcntl
+        task,keys,path=self.child('flock');rows=self.observe(task,keys)['aliases']
+        self.assertEqual(len(rows),1);self.assertTrue(rows[0]['locks'])
+        self.assertEqual(rows[0]['locks'][0]['kind'],'FLOCK')
+        fd=os.open(path,os.O_RDWR|os.O_CLOEXEC)
+        try:
+            with self.assertRaises(BlockingIOError):fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        finally:os.close(fd)
 
     def test_shared_writable_mapping_survives_descriptor_close(self):
         task,keys,_=self.child('shared');rows=self.observe(task,keys)['aliases']

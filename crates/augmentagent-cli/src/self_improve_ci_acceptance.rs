@@ -378,7 +378,7 @@ fn private_inode_alias_observations_cover_real_fds_mappings_and_threads() {
     let output=std::process::Command::new("python3").arg("-I").arg(tests).output().unwrap();
     let diagnostics=String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(),"task inode alias observations failed: {diagnostics}");
-    assert!(diagnostics.contains("Ran 9 tests") && !diagnostics.contains("skipped"),
+    assert!(diagnostics.contains("Ran 10 tests") && !diagnostics.contains("skipped"),
         "task inode alias observations did not execute: {diagnostics}");
 }
 

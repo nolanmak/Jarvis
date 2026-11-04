@@ -2719,7 +2719,7 @@ class UnitPeerRelay(RootRelay):
         try:return staging.observe_private_inode_aliases(keys,self.freezer.paused_cohort,controller_fds,check=check)
         except staging.StagingUnavailable as error:
             reasons={'inode_alias_identity','inode_alias_bound','inode_alias_changed','inode_alias_unobservable',
-                'inode_alias_visibility','inode_alias_outside','uid_cohort_identity','uid_cohort_unobservable',
+                'inode_alias_visibility','inode_alias_outside','inode_alias_kernel_lock','uid_cohort_identity','uid_cohort_unobservable',
                 'uid_cohort_outside','uid_cohort_bound'}
             cache._write_record(self.root/'alias-hold.json',{'version':1,'kind':'ci-private-inode-alias-hold',
                 'binding':self.admission.binding,'command':self.admission.command,'parent_scope':self.scope.name,
