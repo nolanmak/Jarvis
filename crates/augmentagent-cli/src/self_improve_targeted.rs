@@ -224,6 +224,84 @@ pub(super) async fn resolve(repo: &Path, request: &Request) -> Result<Resolved> 
     }
 }
 
+/// Remote lifecycle of a command's current target. Identity stays strict: a
+/// foreign or renumbered target is an error, never a lifecycle state.
+#[derive(Debug, PartialEq, Eq)]
+enum Lifecycle {
+    Open,
+    Merged(String),
+    Closed,
+}
+
+async fn target_lifecycle(repo: &Path, repository: &str, target: Target) -> Result<Lifecycle> {
+    match target {
+        Target::Issue(number) => {
+            let raw = read(repo, &["api", &format!("repos/{repository}/issues/{number}")]).await?;
+            let value: serde_json::Value = serde_json::from_str(&raw)?;
+            anyhow::ensure!(
+                value["number"].as_u64() == Some(number)
+                    && value.get("pull_request").is_none_or(|v| v.is_null())
+                    && value["html_url"].as_str().is_some_and(|url| url
+                        .eq_ignore_ascii_case(&format!("https://github.com/{repository}/issues/{number}"))),
+                "issue repository/target identity differs"
+            );
+            match value["state"].as_str() {
+                Some("open") => Ok(Lifecycle::Open),
+                Some("closed") => Ok(Lifecycle::Closed),
+                _ => anyhow::bail!("issue state unknown"),
+            }
+        }
+        Target::Pr(number) => {
+            let raw = read(repo, &["pr", "view", &number.to_string(), "--repo", repository,
+                "--json", "number,state,url,mergeCommit"]).await?;
+            let value: serde_json::Value = serde_json::from_str(&raw)?;
+            anyhow::ensure!(
+                value["number"].as_u64() == Some(number)
+                    && value["url"].as_str().is_some_and(|url| url
+                        .eq_ignore_ascii_case(&format!("https://github.com/{repository}/pull/{number}"))),
+                "PR repository/target identity differs"
+            );
+            match value["state"].as_str() {
+                Some("OPEN") => Ok(Lifecycle::Open),
+                Some("CLOSED") => Ok(Lifecycle::Closed),
+                Some("MERGED") => {
+                    let commit = value["mergeCommit"]["oid"].as_str()
+                        .filter(|sha| matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+                        .context("merged PR has no merge commit identity")?;
+                    Ok(Lifecycle::Merged(commit.to_ascii_lowercase()))
+                }
+                _ => anyhow::bail!("PR state unknown"),
+            }
+        }
+    }
+}
+
+/// Settle a workflow whose target finished outside the loop through the
+/// ordinary lease/checkpoint path. No merge operation or allowance dispatch is
+/// created, so an observed manual merge never debits the autonomous allowance.
+/// Returns false when another owner holds the workflow lease.
+fn settle_outside_target(path: &Path, id: &str, stage: crate::autoship_workflow::Stage,
+    reason: &str, evidence: String) -> Result<bool> {
+    use crate::autoship_workflow::{Binding, NextAction, WorkflowStore};
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut store = WorkflowStore::open(path)?;
+    if store.snapshot(id)?.is_none() {
+        // Admitted but never started: give the command a terminal record.
+        store.register(id, "unbound", Binding {head:"unbound".into(),
+            contract:"target-settled-outside-autoship".into(), evidence_hash:"none".into()}, now)?;
+    }
+    let Some(lease) = store.claim(id, "autoship-target-lifecycle", now, 60_000)? else { return Ok(false); };
+    let mut checkpoint = store.snapshot(id)?.context("workflow disappeared")?.checkpoint;
+    checkpoint.stage = stage;
+    checkpoint.next = NextAction {reason: reason.into(), action: "complete".into(), eligible_at_ms: 0};
+    if checkpoint.evidence.len() < 128 { checkpoint.evidence.push(evidence); }
+    let settled = store.checkpoint(&lease, &checkpoint, now);
+    store.release(&lease, now)?;
+    settled?;
+    info!(workflow = id, ?stage, reason, "autoship command target settled outside the loop");
+    Ok(true)
+}
+
 #[derive(Debug)]
 pub(crate) struct CommandFailure {
     pub code: i32,
@@ -297,6 +375,36 @@ pub(super) async fn work_once_mode(repo: &Path, id: &str, mode: ExecutionMode) -
     };
     if let Some(pr) = store.snapshot(id)?.and_then(|state| state.pr) {
         request.target = Target::Pr(pr);
+    }
+    // Humans may merge or close the target outside the loop. Settle those
+    // terminally instead of rejecting (and retrying) forever; a foreign or
+    // renumbered identity is still an invalid target.
+    match target_lifecycle(repo, &request.repository, request.target).await
+        .context(CommandFailure {code:2, reason:"invalid-target"})? {
+        Lifecycle::Open => {}
+        Lifecycle::Merged(commit) => {
+            drop(store);
+            let Target::Pr(pr) = request.target else { anyhow::bail!("merged target is not a PR") };
+            return Ok(if settle_outside_target(&workflow::path(), id, crate::autoship_workflow::Stage::Merged,
+                "external_merge_reconciled", format!("github:pr:{pr}:merged-externally:{commit}"))? {
+                RunReport::triage(format!("PR #{pr} was merged outside autoship; recorded as a manual merge"))
+            } else {
+                RunReport::held("Workflow lease unavailable; external merge reconciliation deferred".into())
+            });
+        }
+        Lifecycle::Closed => {
+            drop(store);
+            let evidence = match request.target {
+                Target::Pr(n) => format!("github:pr:{n}:closed-unmerged"),
+                Target::Issue(n) => format!("github:issue:{n}:closed"),
+            };
+            return Ok(if settle_outside_target(&workflow::path(), id, crate::autoship_workflow::Stage::Retired,
+                "target_closed", evidence)? {
+                RunReport::triage("Command target was closed outside autoship; workflow retired".into())
+            } else {
+                RunReport::held("Workflow lease unavailable; closed-target retirement deferred".into())
+            });
+        }
     }
     let mut selected = resolve(repo, &request).await.context(CommandFailure {code:2, reason:"invalid-target"})?;
     if let (Some(issue), Resolved::Pr(pr)) = (source_issue, &mut selected) {
