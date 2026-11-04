@@ -311,7 +311,28 @@ pub async fn handle_code_mode_failure(
     // exact #448 amplification shape). Skip straight to the classic signal;
     // the classic attempt fails fast against the cooldown latch.
     if let CodeModeError::ReasonerFailed(inner) = original_err {
-        if crate::reasoner::ReasonerError::find_in(inner).is_some_and(|re| re.is_provider_side()) {
+        use crate::reasoner::ReasonerError;
+        // #1779 D3 — a host-signal stop (deploy restart) or an unverified
+        // cleanup skips repair too: the repair call would spawn inside the
+        // dying daemon, or on top of a tree nobody proved reaped.
+        if let Some(re @ (ReasonerError::Interrupted { .. } | ReasonerError::CleanupUncertain { .. })) =
+            ReasonerError::find_in(inner)
+        {
+            warn!(
+                message_id = %ctx.email.message_id,
+                channel = %ctx.channel,
+                "code-mode call stopped ({re}); skipping self-repair (#1779)"
+            );
+            return DraftOutcome::ClassicNeeded(FailureRecord {
+                original_source: original_source.to_string(),
+                original_error,
+                original_stage,
+                repair_source: None,
+                repair_error: Some(format!("skipped: {re} — not a program defect, see #1779")),
+                repair_stage: Some(FailureStage::RepairCallCodeMode),
+            });
+        }
+        if ReasonerError::find_in(inner).is_some_and(|re| re.is_provider_side()) {
             warn!(
                 message_id = %ctx.email.message_id,
                 channel = %ctx.channel,
@@ -953,6 +974,33 @@ mod tests {
     /// timeout) must skip the self-repair spawn entirely. Pre-#655 one
     /// rate-limited email burned three back-to-back CLI spawns (code-mode →
     /// repair → classic); the repair leg is the one this module owns.
+    /// #1779 D3 — a host-signal stop (deploy restart) or an unverified
+    /// cleanup is not "the model wrote a bad program": a repair call would
+    /// spawn inside the dying daemon (or on top of an unreaped tree).
+    #[tokio::test]
+    async fn interrupted_or_cleanup_uncertain_skips_self_repair() {
+        for err in [
+            crate::reasoner::interrupted_error("claude", 15),
+            anyhow::Error::new(crate::reasoner::ReasonerError::CleanupUncertain { provider: "claude".into() }),
+        ] {
+            let store = tmp_store();
+            let broker: Arc<dyn ApprovalBroker> = Arc::new(NoopBroker);
+            let gh: Arc<dyn GhIssueRunner> = Arc::new(RecordingGh::new(1));
+            let r = ScriptedReasoner::new(["```ts\nawait main();\n```"]);
+            let ctx = build_ctx(&r, store, broker, gh, sample_email());
+            let label = format!("{err}");
+            let failed = CodeModeError::ReasonerFailed(err);
+            match handle_code_mode_failure(&ctx, "", &failed, FailureStage::CallCodeMode).await {
+                DraftOutcome::ClassicNeeded(rec) => {
+                    assert!(rec.repair_source.is_none(), "{label}");
+                    assert!(rec.repair_error.as_deref().unwrap_or("").contains("skipped"), "{label}: {:?}", rec.repair_error);
+                }
+                other => panic!("{label}: expected ClassicNeeded, got {other:?}"),
+            }
+            assert_eq!(r.responses.lock().unwrap().len(), 1, "{label}: repair must not fire");
+        }
+    }
+
     #[tokio::test]
     async fn provider_side_failure_skips_self_repair() {
         let store = tmp_store();
