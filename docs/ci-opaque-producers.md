@@ -364,6 +364,25 @@ payloads (seven files / 24 entries / 64,832 bytes) and all after image payloads
 Old inode payloads and original cleanup/resource teardown also verified. The
 parent remained held: application, replay and checked resume are unproved.
 
+The host-tested inode-write phase applies changed old file bytes, mode and
+mtime through original writable handles acquired before child execution; root-
+owned immutable inputs retain read-only handles. Positioned writes preserve
+parent descriptor offsets, inode identity and normal shared/private mapping
+behavior. Every before/after image, old payload, original namespace identity and
+held child inode is validated before the first parent write. Root-private
+progress binds the prepared plan digest, controller PID/birth and each original
+inode. A completed write whose progress commit was lost is recognized only by
+its exact after image; unknown partial bytes or later foreign writes stay fenced.
+Only `state:inodes_applied` is recorded, with false materialization/input/CI/
+shipping flags. Namespace edges, directory metadata finalization and parent
+resume are separate unfinished phases. This primitive is not yet called by
+contained execution: exclusive-writer/alias proof must precede parent mutation.
+Real host cases cover retained FDs/offsets, shared and private mappings,
+write→unlink/replacement, all-images preflight, partial writes, lost progress
+commits, metadata-only changes, foreign writes, late child writes, corrupt final
+images and forked-controller refusal. All 462 Python tests and 34 focused Rust
+tests pass. Guest application is unproved.
+
 A rename is an identity-preserving namespace move in this graph, including
 rename-over-existing and directory descendants. Persist its original/final path
 sets, source/destination identities and staged-move progress in the transfer

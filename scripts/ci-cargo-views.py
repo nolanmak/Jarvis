@@ -398,7 +398,8 @@ class RetainedInodes:
                 seen.add(raw);entry={'path':raw,'kind':kind,'original_key':original,'initial_digest':digest,
                     'original_fd':None,'working_fd':None};self.entries.append(entry)
                 for label,base in (('original',self.root_fd),('working',self.working_fd)):
-                    flags=os.O_RDONLY|os.O_DIRECTORY if kind=='directory' else os.O_RDONLY
+                    flags=os.O_RDONLY|os.O_DIRECTORY if kind=='directory' else (
+                        os.O_RDWR if label=='original' and original[3]==parent_uid else os.O_RDONLY)
                     descriptor=_open_beneath(base,name,flags);entry[label+'_fd']=descriptor
                     info=os.fstat(descriptor)
                     if (stat.S_ISDIR(info.st_mode)!=(kind=='directory') or info.st_mode&0o7000
@@ -571,6 +572,143 @@ class RetainedInodes:
         if len(encoded)>16*1024**2:raise FreshnessHold('input_census_unknown')
         check();cache._write_record(destination/'plan.json',plan);check()
         return plan
+
+    def apply_inode_effects(self,destination,plan,*,check):
+        """Apply old-file bytes/mode/mtime through retained original inodes.
+
+        Pure filesystem mechanics. The caller must separately prove exclusive
+        writers, original child cleanup and a paused parent. This phase never
+        changes namespace edges, resumes a parent or authorizes publication.
+        Unknown partial writes remain fenced; only exact before/after images
+        and committed original-inode progress can be replayed.
+        """
+        self._owned();destination=literal(destination);check()
+        if (cache._read_record(destination/'plan.json',max_bytes=16*1024**2)!=plan
+                or plan.get('kind')!='ci-contained-transfer-plan' or plan.get('state')!='prepared'
+                or plan.get('before')!=self.capture or plan.get('effects_materialized') is not False
+                or plan.get('shipping_authority') is not False):
+            raise FreshnessHold('invalidation_unsafe')
+        encode=lambda value:json.dumps(value,sort_keys=True,separators=(',',':')).encode()
+        digest=hashlib.sha256(encode(plan)).hexdigest()
+        for root,expected in ((literal(plan['before_root']),self.capture['payload_sha256']),
+                (destination/'after',plan['after']['payload_sha256'])):
+            check();rows=inventory(root,owner=os.geteuid(),sealed=True)
+            if hashlib.sha256(encode(rows)).hexdigest()!=expected:raise FreshnessHold('input_census_unknown')
+        objects={obj['initial_path']:obj for obj in plan['objects'] if obj['initial_path'] is not None}
+        if len(objects)!=len(self.entries) or set(objects)!={e['path'] for e in self.entries}:
+            raise FreshnessHold('input_census_unknown')
+        targets={};entries={entry['path']:entry for entry in self.entries}
+        for raw,entry in entries.items():
+            check();obj=objects[raw];effect=obj['old_effect']
+            if (obj['kind']!=entry['kind'] or obj['original_key']!=entry['original_key']
+                    or obj['original_inode']!=entry['original_key'][:2]
+                    or obj['initial_working_key']!=entry['working_key']
+                    or obj['working_inode']!=entry['working_key'][:2]
+                    or effect['path']!=raw or list(_key(os.fstat(entry['working_fd'])))!=effect['working_key']):
+                raise FreshnessHold('input_census_unknown')
+            if entry['kind']!='file':continue
+            name=effect['payload']
+            if type(name) is not str or not name.isascii() or not name.isdigit() or len(name)>6:
+                raise FreshnessHold('invalidation_unsafe')
+            if _read(destination/'old'/name,os.geteuid(),True)[1:]!=(effect['size'],effect['sha256']):
+                raise FreshnessHold('input_census_unknown')
+            content=effect['sha256']!=entry['initial_digest'][0]
+            metadata=effect['working_key'][3:]!=entry['working_key'][3:]
+            if obj['content_changed']!=content or obj['metadata_changed']!=metadata:
+                raise FreshnessHold('input_census_unknown')
+            if content or metadata:
+                if entry['original_key'][3]!=self.parent_uid or fcntl.fcntl(entry['original_fd'],fcntl.F_GETFL)&os.O_ACCMODE!=os.O_RDWR:
+                    raise FreshnessHold('invalidation_unsafe')
+                targets[raw]=effect
+        progress_path=destination/'inode-progress.json'
+        birth=Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()[19]
+        if progress_path.exists():
+            progress=cache._read_record(progress_path,max_bytes=16*1024**2)
+            if (progress.get('kind')!='ci-inode-application-progress' or progress.get('version')!=1
+                    or progress.get('plan_sha256')!=digest or progress.get('owner_pid')!=self.owner
+                    or progress.get('owner_birth')!=birth or progress.get('state') not in ('applying','inodes_applied')
+                    or progress.get('effects_materialized') is not False or progress.get('shipping_authority') is not False
+                    or progress.get('input_closure_complete') is not False or progress.get('full_ci') is not False
+                    or type(progress.get('completed')) is not list or len(progress['completed'])>len(targets)):
+                raise FreshnessHold('invalidation_unsafe')
+        else:
+            progress={'version':1,'kind':'ci-inode-application-progress','plan_sha256':digest,
+                'owner_pid':self.owner,'owner_birth':birth,'state':'applying','active':None,'completed':[],
+                'effects_materialized':False,'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+        def parent_state():
+            done={row['path']:row for row in progress['completed']}
+            if (len(done)!=len(progress['completed']) or not set(done)<=set(targets)
+                    or progress['active'] is not None and (progress['active'] not in targets or progress['active'] in done)
+                    or progress['state']=='inodes_applied' and (set(done)!=set(targets) or progress['active'] is not None)):
+                raise FreshnessHold('invalidation_unsafe')
+            recovered=set()
+            for raw,entry in entries.items():
+                check();descriptor=entry['original_fd'];info=os.fstat(descriptor);key=list(_key(info))
+                named=_open_beneath(self.root_fd,relative(bytes.fromhex(raw)),os.O_RDONLY|(os.O_DIRECTORY if entry['kind']=='directory' else 0))
+                try:
+                    if _key(os.fstat(named))!=_key(info):raise FreshnessHold('input_census_unknown')
+                finally:os.close(named)
+                if (key[:2]!=entry['original_key'][:2] or key[3:5]!=entry['original_key'][3:5]
+                        or os.listxattr(descriptor) or entry['kind']=='file' and info.st_nlink!=1):
+                    raise FreshnessHold('invalidation_unsafe')
+                if entry['kind']=='directory':
+                    if key!=entry['original_key']:raise FreshnessHold('input_census_unknown')
+                    continue
+                size,sha=self._read(descriptor,check)
+                if raw in done:
+                    row=done[raw]
+                    if (row['original_inode']!=entry['original_key'][:2] or key!=row['after_key']
+                            or (size,sha)!=(targets[raw]['size'],targets[raw]['sha256'])):
+                        raise FreshnessHold('input_census_unknown')
+                elif key==entry['original_key'] and sha==entry['initial_digest'][0]:continue
+                elif progress['active']==raw:
+                    effect=targets[raw]
+                    if ((size,sha)!=(effect['size'],effect['sha256'])
+                            or stat.S_IMODE(info.st_mode)!=stat.S_IMODE(effect['working_key'][5])
+                            or info.st_mtime_ns!=effect['working_key'][6]):
+                        raise FreshnessHold('input_census_unknown')
+                    recovered.add(raw)
+                else:raise FreshnessHold('input_census_unknown')
+            return done,recovered
+        def persist():
+            check()
+            if len(encode(progress))>16*1024**2:raise FreshnessHold('input_census_unknown')
+            cache._write_record(progress_path,progress)
+        done,recovered=parent_state()
+        if progress['state']=='inodes_applied':return progress
+        persist()
+        for raw,effect in targets.items():
+            if raw in done:continue
+            check();entry=entries[raw];descriptor=entry['original_fd']
+            progress['active']=raw;persist();check()
+            if raw not in recovered:
+                if list(_key(os.fstat(descriptor)))!=entry['original_key']:
+                    raise FreshnessHold('input_census_unknown')
+                if objects[raw]['content_changed']:
+                    source=os.open(destination/'old'/effect['payload'],os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+                    try:
+                        offset=0
+                        while offset<effect['size']:
+                            check();body=os.pread(source,min(1024**2,effect['size']-offset),offset)
+                            if not body:raise FreshnessHold('input_census_unknown')
+                            remaining=memoryview(body)
+                            while remaining:
+                                check();written=os.pwrite(descriptor,remaining,offset)
+                                if written<=0:raise OSError(errno.EIO,'original inode effect write failed')
+                                offset+=written;remaining=remaining[written:]
+                        os.ftruncate(descriptor,effect['size'])
+                    finally:os.close(source)
+                if self._read(descriptor,check)!=(effect['size'],effect['sha256']):
+                    raise FreshnessHold('input_census_unknown')
+                atime=os.fstat(descriptor).st_atime_ns
+                os.fchmod(descriptor,stat.S_IMODE(effect['working_key'][5]))
+                os.utime(descriptor,ns=(atime,effect['working_key'][6]))
+            check();os.fsync(descriptor)
+            row={'path':raw,'original_inode':entry['original_key'][:2],'after_key':list(_key(os.fstat(descriptor)))}
+            progress['completed'].append(row);progress['active']=None
+            persist()
+        parent_state();check();progress['state']='inodes_applied';persist();check()
+        return progress
 
     def close(self):
         if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
