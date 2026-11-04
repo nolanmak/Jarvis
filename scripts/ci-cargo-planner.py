@@ -2716,7 +2716,17 @@ class UnitPeerRelay(RootRelay):
     def observe_private_aliases(self,capture,controller_fds,*,check):
         if self.freezer.paused_cohort is None:raise FreshnessHold('cleanup_uncertain')
         keys={tuple(row[2][:2]) for row in capture['entries'] if row[2][3]==self.peer_uid}
-        return staging.observe_private_inode_aliases(keys,self.freezer.paused_cohort,controller_fds,check=check)
+        try:return staging.observe_private_inode_aliases(keys,self.freezer.paused_cohort,controller_fds,check=check)
+        except staging.StagingUnavailable as error:
+            reasons={'inode_alias_identity','inode_alias_bound','inode_alias_changed','inode_alias_unobservable',
+                'inode_alias_visibility','inode_alias_outside','uid_cohort_identity','uid_cohort_unobservable',
+                'uid_cohort_outside','uid_cohort_bound'}
+            cache._write_record(self.root/'alias-hold.json',{'version':1,'kind':'ci-private-inode-alias-hold',
+                'binding':self.admission.binding,'command':self.admission.command,'parent_scope':self.scope.name,
+                'reason':error.stage_reason if error.stage_reason in reasons else 'unknown',
+                'reference':getattr(error,'alias_reference',None),
+                'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
+            raise
 
     def check(self):
         self.__exit__(None,None,None)

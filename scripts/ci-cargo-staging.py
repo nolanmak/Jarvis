@@ -307,7 +307,9 @@ def observe_private_inode_aliases(inodes,cohort,controller_fds,*,check):
                                 if parent:continue
                                 if (identity['pid']==os.getpid() and alias['kind']=='fd'
                                         and controlled.get(alias['number'])==(alias['device'],alias['inode'])):continue
-                                raise StagingUnavailable('inode_alias_outside')
+                                error=StagingUnavailable('inode_alias_outside')
+                                error.alias_reference={'task':identity,'uids':observation['uids'],'alias':alias}
+                                raise error
                             if observation['aliases']:
                                 encoded_bytes+=len(json.dumps(observation,separators=(',',':')).encode())
                                 if encoded_bytes>16*1024**2:raise StagingUnavailable('inode_alias_bound')

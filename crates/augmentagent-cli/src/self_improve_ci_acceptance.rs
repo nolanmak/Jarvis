@@ -371,7 +371,6 @@ PY"#;
     drop(source);drop(session);drop(storage);Ok(())
 }
 
-#[cfg(target_os="linux")]
 #[cfg(all(target_os="linux",target_arch="x86_64"))]
 #[test]
 fn private_inode_alias_observations_cover_real_fds_mappings_and_threads() {
@@ -383,6 +382,7 @@ fn private_inode_alias_observations_cover_real_fds_mappings_and_threads() {
         "task inode alias observations did not execute: {diagnostics}");
 }
 
+#[cfg(target_os="linux")]
 #[test]
 fn supervised_descriptor_handoff_requires_original_descendant_cleanup() {
     let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests/provider_supervisor_test.py");
