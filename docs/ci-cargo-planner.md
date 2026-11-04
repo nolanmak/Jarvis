@@ -2390,3 +2390,14 @@ Unsealed and oversized descriptors hold before any content read; positioned
 reads through an O_NOATIME handle preserve offsets, flags and timestamps. These
 content observations still do not establish exact installed filter identity or
 complete writer isolation.
+
+The replay at `b12995aa` verifies sealed stdin/config observations in all 16
+contained exec entries, with four successful deepest-child returns, four nested
+root children progressing and original cleanup verified. The guest stdin was
+empty; each relay config was 160 bytes. Nonempty content preservation is covered
+by the host descriptor tests, not this guest fixture. The full native test stays
+red at the held transfer/resume path after 104.66 seconds. The complete host
+Python suite passes 575 tests; the managed focused Rust suite passes 34 tests
+with 24 opt-in guest tests ignored in that routine run. Guest observation:
+`/tmp/autoship-1703-four-parent-observation-4.json`. This does not enable transfer,
+resume, passing-CI proof or production autoship.
