@@ -4968,15 +4968,20 @@ def validate_worker_entry(value,binding,command,scope,progress=None):
         at('worker_entry_configuration');configuration=entry['sealed_relay']
         if (configuration['uid']!=0 or configuration['gid']!=0 or configuration['seals']&15!=15
                 or not cache._digest(configuration['sha256']) or not 1<=configuration['size_bytes']<=staging.MAX_BYTES):raise ValueError()
-        at('worker_entry_descriptors');rows=entry['fd_table']
+        at('worker_entry_fd_shape');rows=entry['fd_table']
         if type(rows) is not list or len(rows)!=4 or [row['number'] for row in rows]!=numbers:raise ValueError()
+        at('worker_entry_fd_keys')
         for row in rows:
-            if (set(row)!={'number','device','inode','type','uid','gid','flags','position'}
-                    or any(type(number) is not int or number<0 for number in row.values())):raise ValueError()
-        if (rows[0]['type']!=stat.S_IFCHR or rows[0]['flags']&os.O_ACCMODE!=os.O_RDONLY
-                or any(row['type']!=stat.S_IFIFO or row['flags']&os.O_ACCMODE!=os.O_WRONLY for row in rows[1:3])
-                or rows[3]['type']!=stat.S_IFREG or (rows[3]['device'],rows[3]['inode'])!=(configuration['device'],configuration['inode'])):
-            raise ValueError()
+            if set(row)!={'number','device','inode','type','uid','gid','flags','position'}:raise ValueError()
+        for key in ('number','device','inode','type','uid','gid','flags','position'):
+            at('worker_entry_fd_'+key)
+            if any(type(row[key]) is not int or row[key]<0 for row in rows):raise ValueError()
+        at('worker_entry_fd_stdin')
+        if rows[0]['type']!=stat.S_IFCHR or rows[0]['flags']&os.O_ACCMODE!=os.O_RDONLY:raise ValueError()
+        at('worker_entry_fd_stdout')
+        if any(row['type']!=stat.S_IFIFO or row['flags']&os.O_ACCMODE!=os.O_WRONLY for row in rows[1:3]):raise ValueError()
+        at('worker_entry_fd_configuration')
+        if rows[3]['type']!=stat.S_IFREG or (rows[3]['device'],rows[3]['inode'])!=(configuration['device'],configuration['inode']):raise ValueError()
         at('worker_entry_namespaces')
         if (set(value['namespaces'])!={'mnt','ipc','net','user','pid'} or any(
                 re.fullmatch(name+r':\[[0-9]+\]',namespace) is None for name,namespace in value['namespaces'].items())):raise ValueError()

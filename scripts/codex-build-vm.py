@@ -39,7 +39,7 @@ class FreshnessUnavailable(Unavailable):
 
 def guest_diagnostic(value):
     value=value if isinstance(value,dict) else {}
-    stages={'load_dependency_controller','reclaim_legacy_incremental','reclaim_producers','reclaim_seeds','prepare_producer','bind_producer_cache','hide_producer_cache',
+    stages={'planner_original_worker_entry','planner_original_worker_supervisor','load_dependency_controller','reclaim_legacy_incremental','reclaim_producers','reclaim_seeds','prepare_producer','bind_producer_cache','hide_producer_cache',
             'resolve_dependencies','freeze_resolution','compile_dependencies','record_producer',
             'publish_dependencies','prepare_generation','execute_command','planner_protocol_probe',
             'planner_startup','planner_unit','planner_capture','planner_authorize','planner_drop',

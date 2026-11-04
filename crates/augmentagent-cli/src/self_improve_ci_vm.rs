@@ -351,6 +351,12 @@ impl Outcome {
                         | "command_prepare"
                         | "vm_launch"
                         | "receipt_validate"
+                        | "repository_receipt_header" | "repository_checkpoint" | "repository_units" | "repository_kernel_observation"
+                        | "worker_entry_header" | "worker_entry_credentials" | "worker_entry_policy" | "worker_entry_configuration"
+                        | "worker_entry_fd_shape" | "worker_entry_fd_keys" | "worker_entry_fd_number" | "worker_entry_fd_device"
+                        | "worker_entry_fd_inode" | "worker_entry_fd_type" | "worker_entry_fd_uid" | "worker_entry_fd_gid"
+                        | "worker_entry_fd_flags" | "worker_entry_fd_position" | "worker_entry_fd_stdin" | "worker_entry_fd_stdout"
+                        | "worker_entry_fd_configuration" | "worker_entry_namespaces"
                 )
             })
             .unwrap_or("unknown");
@@ -385,7 +391,7 @@ impl Outcome {
                 .expect("bounded freshness protocol serializes");
         }
         if let Some(value)=&self.guest_diagnostic {
-            let stage=value["stage"].as_str().filter(|value|matches!(*value,"load_dependency_controller"|"reclaim_legacy_incremental"|"reclaim_producers"|"prepare_producer"|"bind_producer_cache"|"hide_producer_cache"|"resolve_dependencies"|"freeze_resolution"|"compile_dependencies"|"record_producer"|"publish_dependencies"|"prepare_generation"|"execute_command"|"reclaim_seeds"|"planner_protocol_probe"|"planner_startup"|"planner_unit"|"planner_capture"|"planner_authorize"|"planner_drop"|"planner_arm_exec"|"planner_unit_exec"|"planner_client_start"|"planner_client_exec"|"planner_probe_stdin"|"planner_probe_jobserver"|"planner_probe_cancel"|"planner_probe_signal"|"planner_probe_supervisor"|"planner_probe_credentials"|"planner_probe_filter"|"planner_probe_exec_start"|"planner_probe_stream"|"planner_probe_wait"|"planner_probe_status"|"planner_request_receive"|"planner_request_cleanup"|"planner_tool_credentials"|"planner_tool_metadata"|"planner_tool_socket"|"planner_tool_jobserver"|"planner_tool_fds"|"planner_tool_environment"|"planner_tool_stdin"|"planner_probe_view"|"planner_tool_view"|"planner_view_prepare"|"planner_view_enter"|"planner_view_namespace"|"planner_view_runtime"|"planner_view_source"|"planner_view_inputs"|"planner_view_proc"|"planner_view_devices"|"planner_view_root"|"planner_view_publish"|"planner_cargo_request"|"planner_cargo_artifact"|"planner_cargo_runtime"|"planner_cargo_execute"|"planner_cargo_compile"|"planner_cargo_build_script"|"planner_cargo_application"|"planner_cargo_supervisor"|"planner_cargo_retire"|"planner_cargo_retry"|"planner_kernel_observer")).unwrap_or("unknown");
+            let stage=value["stage"].as_str().filter(|value|matches!(*value,"load_dependency_controller"|"reclaim_legacy_incremental"|"reclaim_producers"|"prepare_producer"|"bind_producer_cache"|"hide_producer_cache"|"resolve_dependencies"|"freeze_resolution"|"compile_dependencies"|"record_producer"|"publish_dependencies"|"prepare_generation"|"execute_command"|"reclaim_seeds"|"planner_protocol_probe"|"planner_startup"|"planner_unit"|"planner_capture"|"planner_authorize"|"planner_drop"|"planner_arm_exec"|"planner_unit_exec"|"planner_client_start"|"planner_client_exec"|"planner_probe_stdin"|"planner_probe_jobserver"|"planner_probe_cancel"|"planner_probe_signal"|"planner_probe_supervisor"|"planner_probe_credentials"|"planner_probe_filter"|"planner_probe_exec_start"|"planner_probe_stream"|"planner_probe_wait"|"planner_probe_status"|"planner_request_receive"|"planner_request_cleanup"|"planner_tool_credentials"|"planner_tool_metadata"|"planner_tool_socket"|"planner_tool_jobserver"|"planner_tool_fds"|"planner_tool_environment"|"planner_tool_stdin"|"planner_probe_view"|"planner_tool_view"|"planner_view_prepare"|"planner_view_enter"|"planner_view_namespace"|"planner_view_runtime"|"planner_view_source"|"planner_view_inputs"|"planner_view_proc"|"planner_view_devices"|"planner_view_root"|"planner_view_publish"|"planner_cargo_request"|"planner_cargo_artifact"|"planner_cargo_runtime"|"planner_cargo_execute"|"planner_cargo_compile"|"planner_cargo_build_script"|"planner_cargo_application"|"planner_cargo_supervisor"|"planner_cargo_retire"|"planner_cargo_retry"|"planner_kernel_observer"|"planner_original_worker_entry"|"planner_original_worker_supervisor")).unwrap_or("unknown");
             let category=value["category"].as_str().filter(|value|matches!(*value,"OSError"|"PermissionError"|"FileNotFoundError"|"FileExistsError"|"NotADirectoryError"|"IsADirectoryError"|"CalledProcessError"|"RuntimeError"|"TimeoutExpired"|"FreshnessHold"|"Unavailable"|"ValueError"|"KeyError"|"ModuleNotFoundError"|"ImportError")).unwrap_or("unknown");
             diagnostic["guest"]=serde_json::json!({"stage":stage,"category":category,
                 "errno":value["errno"].as_i64().filter(|value|(0..=4096).contains(value))});
@@ -1302,6 +1308,14 @@ mod tests {
             assert_eq!(hold.reason, crate::autoship_freshness::Reason::InputCensusUnknown);
             assert_eq!(receipt.setup_diagnostic()["freshness_hold"]["reason"], "input_census_unknown");
         }
+    }
+
+    #[test]
+    fn worker_receipt_stage_survives_without_untrusted_exception_content() {
+        let receipt:Outcome=serde_json::from_value(serde_json::json!({"version":1,"boundary":"existing-build-vm",
+            "status":"prerequisite_hold","stage":"worker_entry_fd_keys","category":"FreshnessHold",
+            "reason":"private exception contents","stderr":"private output"})).unwrap();
+        assert_eq!(receipt.setup_diagnostic(),serde_json::json!({"stage":"worker_entry_fd_keys","category":"FreshnessHold","errno":null}));
     }
 
     #[test]
