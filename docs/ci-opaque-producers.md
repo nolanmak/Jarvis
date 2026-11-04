@@ -456,6 +456,28 @@ and preservation of directory descendants. Original resource teardown positively
 verified. This establishes namespace sequencing, not whole-transfer allocation/
 image validation, staging creation, alias closure or checked parent resume.
 
+Per-transfer object preparation now owns verified anonymous replacement files
+and named directory capabilities under the existing parent mutation lock. File
+bytes are copied from sealed controller payloads, checked by readback, mapped to
+the admitted owner/group/mode/mtime and synced while link count stays zero.
+Directory creation records its intent before `mkdir`; preparation records the
+actual held inode after sync. A known prepared identity can be reopened only
+when the named inode matches. Lost creation acknowledgement without a recorded
+or still-held capability stays unknown; it cannot be adopted by filename.
+Object/byte reservations include preparing receipts across all keys and retries
+under the original 100000-entry/4-GiB ceilings. A holder nonce prevents a fresh
+holder replacing another holder's unknown anonymous capability. Four injected
+regressions first reproduced duplicate reservation use and anonymous capability
+replacement; shared reservations and capability ownership now refuse them.
+Fourteen real host cases also cover corruption/FD cleanup, metadata admission,
+prepared-commit loss, existing foreign names and forked-holder refusal. These
+primitives require the original serialized controller mutation lock and its
+allocation/writer/pause proof; they introduce no new runnable grant or resource
+pool. Whole-transfer allocation/preflight integration, final metadata/graph
+validation, alias closure and parent resume remain unfinished. Guest preparation
+evidence is pending. All 513 Python tests and 34 focused managed Rust tests
+pass; all materialization/input/CI/shipping flags stay false.
+
 A rename is an identity-preserving namespace move in this graph, including
 rename-over-existing and directory descendants. Persist its original/final path
 sets, source/destination identities and staged-move progress in the transfer

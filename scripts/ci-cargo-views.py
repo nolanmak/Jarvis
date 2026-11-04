@@ -1107,6 +1107,196 @@ def apply_namespace_sequence(directory,*,plan_sha256,steps,inodes,parents,check)
     check();record['state']='namespace_sequence_applied';persist(record);return record
 
 
+
+class PreparedTransferObjects:
+    """Own new-object capabilities inside one controller lifetime.
+
+    Caller owns allocation/image/alias/pause proof and stage retention under R.
+    Named creation without a recorded or still-held inode stays unknown. An
+    anonymous file never becomes a prepared replacement based on a pathname.
+    These receipts are not materialization, publication or cleanup authority.
+    """
+    def __init__(self,directory,*,plan_sha256,check):
+        self.directory=literal(directory);self.owner=os.getpid();self.uid=os.geteuid();self.gid=os.getegid()
+        self.birth=Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()[19]
+        self.check=check;self.closed=False;self.files={};self.directories={};self.file_holder_nonce=os.urandom(32).hex()
+        if (type(plan_sha256) is not str or len(plan_sha256)!=64
+                or any(c not in '0123456789abcdef' for c in plan_sha256)):
+            raise FreshnessHold('invalidation_unsafe')
+        self.plan=plan_sha256;info=self.directory.stat();self.control=[info.st_dev,info.st_ino]
+        self._owned()
+
+    def _owned(self):
+        if self.owner!=os.getpid() or self.closed or self.uid!=os.geteuid() or self.gid!=os.getegid():
+            raise FreshnessHold('invalidation_unsafe')
+        self.check();info=self.directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or [info.st_dev,info.st_ino]!=self.control
+                or (info.st_uid,info.st_gid)!=(self.uid,self.gid) or stat.S_IMODE(info.st_mode)!=0o700):
+            raise FreshnessHold('invalidation_unsafe')
+
+    def _slot(self,kind,key,parent,extra):
+        self._owned()
+        if type(key) is not str or not 0<len(key)<=4096 or '\0' in key:raise FreshnessHold('invalidation_unsafe')
+        info=os.fstat(parent)
+        if not stat.S_ISDIR(info.st_mode):raise FreshnessHold('invalidation_unsafe')
+        token=hashlib.sha256((kind+':'+key).encode()).hexdigest();path=self.directory/(token+'.json')
+        binding={'plan_sha256':self.plan,'object':key,'role':kind,'owner_pid':self.owner,'owner_birth':self.birth,
+            'control':self.control,'parent':[info.st_dev,info.st_ino,_descriptor_mount_id(parent)],**extra}
+        record=None
+        if path.exists():
+            record=cache._read_record(path,max_bytes=16*1024**2)
+            if (record.get('version')!=1 or record.get('binding')!=binding or record.get('kind')!='ci-prepared-'+kind
+                    or record.get('state') not in ('preparing','prepared') or record.get('effects_materialized') is not False
+                    or record.get('input_closure_complete') is not False or record.get('full_ci') is not False
+                    or record.get('shipping_authority') is not False):raise FreshnessHold('invalidation_unsafe')
+        self._budget(token,kind,extra)
+        return token,path,binding,record
+
+    def _budget(self,token,kind,extra):
+        # All keys share the existing per-transfer object/byte ceilings. A
+        # preparing receipt keeps its reservation, and retrying that same key
+        # neither charges again nor creates a second anonymous capability.
+        entries=list(self.directory.iterdir());used_bytes=0;known=set()
+        if len(entries)>MAX_ENTRIES:raise FreshnessHold('input_census_unknown')
+        for path in entries:
+            record=cache._read_record(path,max_bytes=16*1024**2);binding=record.get('binding',{})
+            role=binding.get('role');key=binding.get('object')
+            if (role not in ('file','directory') or type(key) is not str or not 0<len(key)<=4096
+                    or record.get('kind')!='ci-prepared-'+role or record.get('version')!=1
+                    or record.get('state') not in ('preparing','prepared') or binding.get('plan_sha256')!=self.plan
+                    or binding.get('owner_pid')!=self.owner or binding.get('owner_birth')!=self.birth
+                    or binding.get('control')!=self.control or record.get('effects_materialized') is not False
+                    or record.get('input_closure_complete') is not False or record.get('full_ci') is not False
+                    or record.get('shipping_authority') is not False):raise FreshnessHold('invalidation_unsafe')
+            identity=hashlib.sha256((role+':'+key).encode()).hexdigest()
+            if path.name!=identity+'.json' or identity in known:raise FreshnessHold('invalidation_unsafe')
+            known.add(identity)
+            if role=='file':
+                size=binding.get('expected',{}).get('size')
+                if type(size) is not int or not 0<=size<=MAX_BYTES:raise FreshnessHold('input_census_unknown')
+                used_bytes+=size
+        if token not in known:
+            if len(known)>=MAX_ENTRIES:raise FreshnessHold('input_census_unknown')
+            if kind=='file':used_bytes+=extra['expected']['size']
+        if used_bytes>MAX_BYTES:raise FreshnessHold('input_census_unknown')
+
+    def _record(self,path,binding,state,**fields):
+        self._owned();record={'version':1,'kind':'ci-prepared-'+binding['role'],'binding':binding,'state':state,
+            'effects_materialized':False,'input_closure_complete':False,'full_ci':False,'shipping_authority':False,**fields}
+        if len(json.dumps(record,sort_keys=True,separators=(',',':')).encode())>16*1024**2:
+            raise FreshnessHold('input_census_unknown')
+        cache._write_record(path,record);return record
+
+    def prepare_file(self,key,parent,payload,expected):
+        self._owned();payload=literal(payload);expected=copy_module.deepcopy(expected)
+        if (type(expected) is not dict or set(expected)!={'size','sha256','mode','mtime_ns','uid','gid'}
+                or any(type(expected[k]) is not int for k in ('size','mode','mtime_ns','uid','gid'))
+                or not 0<=expected['size']<=MAX_BYTES or not 0<=expected['mode']<=0o777
+                or not -(2**63)<=expected['mtime_ns']<2**63
+                or any(not 0<=expected[k]<2**32-1 for k in ('uid','gid'))
+                or type(expected['sha256']) is not str or len(expected['sha256'])!=64
+                or any(c not in '0123456789abcdef' for c in expected['sha256'])):
+            raise FreshnessHold('invalidation_unsafe')
+        token,path,binding,record=self._slot('file',key,parent,{'payload':str(payload),'expected':expected,'holder_nonce':self.file_holder_nonce})
+        def verify(entry):
+            fd=entry['fd'];info=os.fstat(fd)
+            if ([info.st_dev,info.st_ino]!=entry['inode'] or info.st_nlink!=0 or not stat.S_ISREG(info.st_mode)
+                    or (info.st_uid,info.st_gid)!=(expected['uid'],expected['gid'])
+                    or stat.S_IMODE(info.st_mode)!=expected['mode'] or info.st_mtime_ns!=expected['mtime_ns']
+                    or os.listxattr(fd) or RetainedInodes._read(fd,self.check)!=(expected['size'],expected['sha256'])):
+                raise FreshnessHold('input_census_unknown')
+            return list(_key(info))
+        if token in self.files:
+            entry=self.files[token];metadata=verify(entry)
+            if record is None or record['state']=='prepared' and record.get('inode')!=entry['inode']:
+                raise FreshnessHold('invalidation_unsafe')
+            self._record(path,binding,'prepared',inode=entry['inode'],metadata=metadata)
+            return entry['fd']
+        if record is not None and record['state']=='prepared':raise FreshnessHold('cleanup_uncertain')
+        self._record(path,binding,'preparing')
+        source=None;descriptor=None;ready=False
+        try:
+            source=os.open(payload,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK|getattr(os,'O_NOATIME',0))
+            info=os.fstat(source)
+            if (not stat.S_ISREG(info.st_mode) or (info.st_uid,info.st_gid)!=(self.uid,self.gid)
+                    or info.st_nlink!=1 or stat.S_IMODE(info.st_mode) not in (0o444,0o555)
+                    or info.st_size!=expected['size'] or os.listxattr(source)):
+                raise FreshnessHold('input_census_unknown')
+            self.check();descriptor=os.open('.',os.O_TMPFILE|os.O_RDWR|os.O_CLOEXEC,0o600,dir_fd=parent)
+            if RetainedInodes._read(source,self.check,descriptor)!=(expected['size'],expected['sha256']):
+                raise FreshnessHold('input_census_unknown')
+            current=os.fstat(descriptor)
+            if (current.st_uid,current.st_gid)!=(expected['uid'],expected['gid']):
+                os.fchown(descriptor,expected['uid'],expected['gid'])
+            os.fchmod(descriptor,expected['mode']);os.utime(descriptor,ns=(expected['mtime_ns'],expected['mtime_ns']))
+            self.check();os.fsync(descriptor)
+            entry={'fd':descriptor,'inode':list(_key(os.fstat(descriptor)))[:2]};metadata=verify(entry)
+            self.files[token]=entry;ready=True
+            self._record(path,binding,'prepared',inode=entry['inode'],metadata=metadata)
+            return descriptor
+        finally:
+            if source is not None:os.close(source)
+            if descriptor is not None and not ready:os.close(descriptor)
+
+    def prepare_directory(self,key,parent,name):
+        self._owned();name=os.fsencode(relative(name))
+        if len(relative(name).parts)!=1:raise FreshnessHold('invalidation_unsafe')
+        token,path,binding,record=self._slot('directory',key,parent,{'name':name.hex()})
+        def named():
+            try:return os.stat(name,dir_fd=parent,follow_symlinks=False)
+            except FileNotFoundError:return None
+        def verify(entry,empty=False):
+            fd=entry['fd'];info=os.fstat(fd);found=named()
+            if (found is None or [info.st_dev,info.st_ino]!=entry['inode'] or _key(found)!=_key(info)
+                    or not stat.S_ISDIR(info.st_mode) or info.st_nlink<2
+                    or (info.st_uid,info.st_gid)!=(self.uid,self.gid) or stat.S_IMODE(info.st_mode)!=0o700
+                    or os.listxattr(fd) or empty and os.listdir(fd)):
+                raise FreshnessHold('input_census_unknown')
+            return list(_key(info))
+        if record is not None and record['state']=='prepared':
+            if token not in self.directories:
+                found=named()
+                if found is None or [found.st_dev,found.st_ino]!=record.get('inode'):
+                    raise FreshnessHold('input_census_unknown')
+                descriptor=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=parent)
+                self.directories[token]={'fd':descriptor,'inode':record['inode']}
+            entry=self.directories[token]
+            if entry['inode']!=record['inode']:raise FreshnessHold('input_census_unknown')
+            verify(entry);return entry['fd']
+        if record is None:
+            if named() is not None:raise FreshnessHold('invalidation_unsafe')
+            record=self._record(path,binding,'preparing',before_parent=_namespace_directory(parent,self.check))
+        if token not in self.directories:
+            if named() is not None or _namespace_directory(parent,self.check)!=record['before_parent']:
+                raise FreshnessHold('cleanup_uncertain')
+            self.check();os.mkdir(name,mode=0o700,dir_fd=parent)
+            descriptor=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=parent)
+            self.directories[token]={'fd':descriptor,'inode':list(_key(os.fstat(descriptor)))[:2]}
+        entry=self.directories[token];metadata=verify(entry,empty=True)
+        before=record['before_parent'];after=_namespace_directory(parent,self.check)
+        rows={row[0]:row[1:] for row in before['entries']};rows[name.hex()]=[metadata,os.fstat(entry['fd']).st_nlink]
+        if (dict((row[0],row[1:]) for row in after['entries'])!=rows or after['links']!=before['links']+1
+                or any(a!=b for i,(a,b) in enumerate(zip(before['key'],after['key'])) if i not in (2,6,7))):
+            raise FreshnessHold('input_census_unknown')
+        self.check();os.fsync(entry['fd']);os.fsync(parent)
+        self._record(path,binding,'prepared',inode=entry['inode'],metadata=metadata)
+        return entry['fd']
+
+    def close(self):
+        if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
+        if self.closed:return
+        self.closed=True;failed=False
+        for collection in (self.files,self.directories):
+            for entry in collection.values():
+                try:os.close(entry['fd'])
+                except OSError:failed=True
+            collection.clear()
+        if failed:raise FreshnessHold('cleanup_uncertain')
+
+    def __enter__(self):self._owned();return self
+    def __exit__(self,*args):self.close()
+
+
 def namespace_edges(plan):
     """Plan changed parent/name edges, keeping moved descendants attached.
 
