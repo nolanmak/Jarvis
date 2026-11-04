@@ -4,7 +4,13 @@ import copy
 import importlib.util
 import os
 import socket
+import select
+import signal
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 import unittest
 import uuid
@@ -85,6 +91,84 @@ class PathnameSocketTests(unittest.TestCase):
                 with socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET) as server:
                     with self.assertRaises(planner.FreshnessHold):planner.bind_controller_socket(server,path)
                 self.assertFalse((root/'relay.sock').exists())
+
+
+class RequestStdinTests(unittest.TestCase):
+    def stage(self,source,client,server,*,owner=None,stop=None):
+        return planner.stage_request_stdin(server,source,deadline=time.monotonic()+3,
+            stop=threading.Event() if stop is None else stop,owner_pidfd=owner)
+
+    def test_original_stream_is_read_after_ready_and_sealed_without_tool_start(self):
+        reader,writer=os.pipe2(os.O_CLOEXEC)
+        client,server=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET)
+        client.settimeout(2)
+        body=b'original\x00stdin\xff'*4096
+        outcome=[]
+        def controller():
+            try:outcome.append(self.stage(reader,client,server))
+            except BaseException as error:outcome.append(error)
+        thread=threading.Thread(target=controller);thread.start()
+        try:
+            self.assertEqual(planner.decode_event(client.recv(16)),('staging_ready',0))
+            remaining=memoryview(body)
+            while remaining:
+                count=os.write(writer,remaining[:4096]);remaining=remaining[count:]
+            os.close(writer);writer=None;thread.join(timeout=4)
+            self.assertFalse(thread.is_alive());self.assertEqual(len(outcome),1)
+            captured=outcome[0]
+            if isinstance(captured,BaseException):raise captured
+            with captured:
+                self.assertEqual(os.read(captured.fileno(),len(body)+1),body)
+                self.assertEqual(captured.observation()['size_bytes'],len(body))
+                self.assertFalse(captured.observation()['shipping_authority'])
+                with self.assertRaises(OSError):os.write(captured.fileno(),b'change')
+            self.assertEqual(select.select([client],[],[],0)[0],[])
+        finally:
+            client.close();server.close();os.close(reader)
+            if writer is not None:os.close(writer)
+            thread.join(timeout=4)
+
+    def test_transport_loss_cancels_an_open_stdin_instead_of_waiting_for_eof(self):
+        self.cancel_case('transport')
+
+    def test_original_owner_death_cancels_an_open_stdin(self):
+        self.cancel_case('owner')
+
+    def test_command_stop_cancels_an_open_stdin(self):
+        self.cancel_case('stop')
+
+    def test_original_signal_before_tool_start_cancels_staging(self):
+        self.cancel_case('signal')
+
+    def cancel_case(self,mode):
+        reader,writer=os.pipe2(os.O_CLOEXEC)
+        client,server=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET)
+        client.settimeout(2)
+        owner=subprocess.Popen([sys.executable,'-I','-c','import time;time.sleep(10)']) if mode=='owner' else None
+        pidfd=os.pidfd_open(owner.pid) if owner is not None else None
+        stop=threading.Event();outcome=[]
+        def controller():
+            try:
+                with self.stage(reader,client,server,owner=pidfd,stop=stop):outcome.append('captured')
+            except BaseException as error:outcome.append(error)
+        thread=threading.Thread(target=controller);thread.start()
+        try:
+            self.assertEqual(planner.decode_event(client.recv(16)),('staging_ready',0))
+            started=time.monotonic()
+            if mode=='transport':client.close()
+            elif mode=='owner':owner.terminate();owner.wait(timeout=2)
+            elif mode=='signal':client.sendall(planner.legacy.RESPONSE.pack(b'JARVSIG3',signal.SIGTERM,0))
+            else:stop.set()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive());self.assertLess(time.monotonic()-started,2)
+            self.assertEqual(len(outcome),1)
+            self.assertIsInstance(outcome[0],planner.staging.StagingUnavailable)
+        finally:
+            client.close();server.close();os.close(reader);os.close(writer)
+            if owner is not None:
+                if owner.poll() is None:owner.terminate();owner.wait(timeout=2)
+                os.close(pidfd)
+            thread.join(timeout=4)
 
 
 if __name__=='__main__':unittest.main()

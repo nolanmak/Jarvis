@@ -134,6 +134,17 @@ keeps the gate closed and requires original cleanup. Host and pinned-guest
 constructor/static tests exist; actual nested helper dispatch and the full
 runtime-policy disposition gate below remain unfinished prerequisites.
 
+At `9f6b9a65`, the unchanged native V3 replay reached the private unit relay
+in 98.36 seconds. The original build-script compiler (ordinal 8, UID 2008)
+submitted request ordinal 9. Its retained root record validates peer/message
+credentials, original namespaces/root and the sealed payload. Its exec record
+has one acknowledged initial exec and no later raw-exec denial. The earlier
+91.39-second replay exposed a missing transport argument at private-view entry;
+the second run includes that correction. Both runs remain red overall. The
+endpoint deliberately holds before child execution: `dispatch_tested:false`
+and `shipping_authority:false`. This proves a real connection, not input
+closure, child dispatch, completed CI or production recovery.
+
 After namespace setup and before untrusted code, install a kernel policy that
 prevents changes to the namespaces/credentials used for attribution: deny
 `unshare`, `setns`, namespace-creating clone flags and mount/chroot/pivot APIs.

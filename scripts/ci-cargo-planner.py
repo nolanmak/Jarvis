@@ -1588,6 +1588,43 @@ class RootRelay:
             if transport is not None:transport.__exit__(None,None,None)
 
 
+def stage_request_stdin(connection,source,*,deadline,stop,owner_pidfd=None):
+    """Stage original bytes before a parent pause, without a child exec grant.
+
+    Before tool_started, a queued signal or transport loss cancels staging,
+    matching the original supervisor protocol. The watcher never consumes a
+    signal that a running child would need: this function cannot start one.
+    """
+    cancelled,notify=os.pipe2(os.O_CLOEXEC)
+    finished=threading.Event();errors=[];captured=None
+    readers=[connection]+([] if owner_pidfd is None else [owner_pidfd])
+    def unavailable():
+        return stop.is_set() or bool(select.select(readers,[],[],0)[0])
+    def watch():
+        try:
+            while not finished.is_set():
+                if unavailable() or time.monotonic()>=deadline:
+                    os.write(notify,b'cancel');return
+                finished.wait(.02)
+        except BaseException:
+            errors.append('stdin_watch_unavailable')
+            try:os.write(notify,b'cancel')
+            except OSError:pass
+    watcher=threading.Thread(target=watch,daemon=True);watcher.start()
+    try:
+        connection.sendall(event('staging_ready',0))
+        captured=staging.capture(source,cancelled,command_deadline=deadline)
+        finished.set();watcher.join(timeout=2)
+        if watcher.is_alive():raise FreshnessHold('cleanup_uncertain')
+        if errors or unavailable():raise staging.StagingUnavailable('stdin_cancelled')
+        result=captured;captured=None;return result
+    finally:
+        finished.set();watcher.join(timeout=2)
+        if captured is not None:captured.close()
+        if watcher.is_alive():raise FreshnessHold('cleanup_uncertain')
+        os.close(cancelled);os.close(notify)
+
+
 class UnitPeerRelay(RootRelay):
     """Authenticated unit endpoint; capture/dispatch remains a closed gate."""
     def __init__(self,admission,*,library,ordinal,scope,ordinals,deadline):
@@ -1636,13 +1673,18 @@ class UnitPeerRelay(RootRelay):
         body=payload(descriptors[0]);info=os.fstat(descriptors[0])
         with self._lock:
             self.received_requests+=1
-            cache._write_record(self.root/'admission.json',{'version':1,'kind':'ci-unit-peer-admission',
+            record={'version':1,'kind':'ci-unit-peer-admission',
                 'binding':self.admission.binding,'command':self.admission.command,
                 'parent_ordinal':self.parent_ordinal,'parent_scope':self.scope.name,'client_uid':self.peer_uid,
                 'last_request_ordinal':ordinal,'received_requests':self.received_requests,
                 'request_sha256':hashlib.sha256(os.pread(descriptors[0],info.st_size,0)).hexdigest(),
                 'peer_and_message_credentials_bound':True,'original_namespaces_and_root_bound':True,
-                'payload_validated':body is not None,'dispatch_tested':False,'shipping_authority':False})
+                'payload_validated':body is not None,'dispatch_tested':False,'shipping_authority':False}
+            cache._write_record(self.root/'admission.json',record)
+        with stage_request_stdin(connection,descriptors[1],deadline=self.deadline,
+                stop=self._stop,owner_pidfd=self.scope_pidfd) as captured:
+            record['stdin']=captured.observation()
+            cache._write_record(self.root/'admission.json',record)
         raise FreshnessHold('input_census_unknown')
 
     def check(self):
