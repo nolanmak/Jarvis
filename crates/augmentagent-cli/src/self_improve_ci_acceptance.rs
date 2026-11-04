@@ -579,7 +579,7 @@ assert pathlib.Path(tempfile.gettempdir())==pathlib.Path('/workspace/target')
 sys.path.insert(0,'/workspace/tests')
 suite=unittest.TestSuite([unittest.TestLoader().discover('/workspace/tests',pattern=pattern)
  for pattern in ('ci_cargo_namespace_apply_test.py','ci_cargo_namespace_sequence_test.py','ci_cargo_transfer_objects_test.py','ci_cargo_transfer_test.py','ci_cargo_parent_signals_test.py','ci_cargo_active_signals_test.py')])
-assert suite.countTestCases()==85
+assert suite.countTestCases()==86
 stream=io.StringIO();result=unittest.TextTestRunner(stream=stream,verbosity=2).run(suite)
 print(json.dumps({'uid':os.getuid(),'cache_device':os.stat('/workspace/target').st_dev,
  'tests_run':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),
@@ -594,7 +594,7 @@ PY"#;
         "version":1,"kind":"real_shared_ci_namespace_steps","head":head,"generation":source.generation(),
         "status":result.status,"cases":cases,"actual_vm_commands":1,"input_closure_complete":false,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
-    ensure!(result.status=="passed" && cases["uid"]==1000 && cases["tests_run"]==85
+    ensure!(result.status=="passed" && cases["uid"]==1000 && cases["tests_run"]==86
         && cases["failures"]==0 && cases["errors"]==0 && cases["successful"]==true,
         "namespace step guest cases unavailable: {} {}",result.stdout,result.stderr);
     Ok(())

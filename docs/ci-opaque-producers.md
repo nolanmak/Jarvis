@@ -925,6 +925,20 @@ The following load-bearing choices remain parked with C; they are not waived:
   The unchanged Cargo protocol also needs replay to verify the actual root
   hooks, followed by injected stopped-proxy/terminal signals at those hooks.
   These host/component results establish no final signal, CI or merge proof.
+  At `ee14bc76`, the 85-case guest suite passed in 94.86 seconds as UID1000
+  and positively removed its original resource subtree. The unchanged full Cargo
+  replay remained red at the deliberate transfer hold in 104.27 seconds, but
+  reached all four contained grants and the successful leaf. Independent managed
+  image inspection reverified seven before/old files (64832 bytes), eight after
+  files (537776 bytes), graph/intents and original leaf cleanup. The leaf's signal
+  target was detached; no signals were injected in that Cargo replay.
+
+  A fourteenth real-process regression reproduced cancellation raising after an
+  exited child's gate had already closed. In the Cargo replay that interrupted
+  outer ancestor hold records. Revocation now traverses those known closed gate
+  objects without using their closed pidfds; it keeps the active hold and blocks
+  signal dispatch/resume. Only original verified cleanup can release it. The
+  revised 86-case guest check and unchanged Cargo replay remain pending here.
 * Before producer/restart integration acceptance or mechanism handoff, settle the
   complete-initial-closure rule for successful sibling output effects. The
   unchanged fixture appends counter/log data in the same generated namespace as

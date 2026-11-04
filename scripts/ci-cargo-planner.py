@@ -1697,11 +1697,11 @@ class StagedParentSignals:
         except ProcessLookupError:self.late+=1;return 'late'
         self.delivered+=1;return 'forwarded'
 
-    def _route(self):
+    def _route(self,*,allow_closed=False):
         route=[];seen=set();node=self
         while node is not None:
             if (id(node) in seen or len(route)>=4096 or node.owner!=self.owner
-                    or node.closed or node.lock is not self.lock):raise FreshnessHold('cleanup_uncertain')
+                    or node.closed and not allow_closed or node.lock is not self.lock):raise FreshnessHold('cleanup_uncertain')
             seen.add(id(node));route.append(node);node=node.active_child
         return route
 
@@ -1806,7 +1806,7 @@ class StagedParentSignals:
         with self.lock:
             # Revoke the current route synchronously. Waiting for each relay's
             # polling loop would leave a window for a descendant exec grant.
-            self._revoke([self]);self._revoke(self._route())
+            self._revoke([self]);self._revoke(self._route(allow_closed=True))
 
     def observation(self):
         self._check()

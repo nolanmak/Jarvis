@@ -170,4 +170,13 @@ class ActiveSignalsTests(unittest.TestCase):
             c.activate_child(8,n,lambda:self.fail('must not grant after ancestor cancellation'))
 
 
+    def test_cancellation_after_target_close_still_revokes_and_preserves_the_hold(self):
+        parent,p=self.process();child,c=self.process(p.lock);self.stop(parent,p,7);self.activate(p,7,c)
+        child.kill();child.wait(timeout=2);c.close()
+        p.cancel();p.cancel()
+        self.assertTrue(p.observation()['revoked']);self.assertTrue(p.observation()['active_child'])
+        with self.assertRaises(planner.FreshnessHold):p.forward(signal.SIGUSR1)
+        with self.assertRaises(planner.FreshnessHold):p.resume(7,lambda:self.fail('must not thaw'))
+
+
 if __name__=='__main__':unittest.main()
