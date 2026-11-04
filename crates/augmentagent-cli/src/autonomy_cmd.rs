@@ -325,6 +325,29 @@ pub(crate) struct CliComposer {
     pub imessage: crate::imessage_compose::ComposeConfig,
 }
 
+/// Optional sending mailbox for email outreach when the contact has never
+/// written to any connected account (address or entity id).
+pub(crate) const OUTREACH_ACCOUNT_ENV: &str = "AUGMENTAGENT_OUTREACH_GMAIL_ACCOUNT";
+
+/// Which connected Gmail account an outreach email to `address` goes out
+/// from: the one that last received mail from them, else
+/// `AUGMENTAGENT_OUTREACH_GMAIL_ACCOUNT`, else the only active account.
+/// More than one account and no signal refuses (no guessing a sender).
+fn outreach_account(store: &Store, address: &str) -> Result<(String, String), String> {
+    let selector = store
+        .latest_gmail_account_from(address)
+        .map_err(|e| format!("store: {e}"))?
+        .filter(|entity| {
+            store
+                .get_active_gmail_accounts()
+                .is_ok_and(|accounts| accounts.iter().any(|a| &a.entity_id == entity))
+        })
+        .or_else(|| std::env::var(OUTREACH_ACCOUNT_ENV).ok().filter(|v| !v.trim().is_empty()));
+    crate::resolve_gmail_entity_id(store, selector).map_err(|e| {
+        format!("{e:#} (no mailbox has mail from them; set {OUTREACH_ACCOUNT_ENV} to choose one)")
+    })
+}
+
 /// The new email's subject: the message's first line, cut at a word near
 /// 60 characters.
 fn outreach_subject(text: &str) -> String {
@@ -351,7 +374,7 @@ impl OutreachComposer for CliComposer {
                 ComposeOutcome::Card { .. } => Err("a dry-run compose stored a card".into()),
             },
             Platform::Email => {
-                let (_, account) = crate::resolve_gmail_entity_id(&self.store, None).map_err(|e| format!("{e:#}"))?;
+                let (_, account) = outreach_account(&self.store, target.value())?;
                 Ok(format!("new email to {} from {account}, subject \"{}\"", target.value(), outreach_subject(text)))
             }
         }
@@ -368,7 +391,7 @@ impl OutreachComposer for CliComposer {
             },
             Platform::Email => {
                 let approver = self.approver.as_ref().ok_or("no Gmail client in this process")?;
-                let (entity, account) = crate::resolve_gmail_entity_id(&self.store, None).map_err(|e| format!("{e:#}"))?;
+                let (entity, account) = outreach_account(&self.store, target.value())?;
                 let to = target.value().to_string();
                 let subject = outreach_subject(text);
                 let draft_id = approver

@@ -842,6 +842,24 @@ impl Store {
 
     // ----- D16 heartbeat outreach ----------------------------------------
 
+    /// D16 email outreach: the Gmail account (entity id) that most recently
+    /// received a message from `address` (bare, lowercased), so a new email
+    /// to them goes out from the mailbox they already write to.
+    pub fn latest_gmail_account_from(&self, address: &str) -> StoreResult<Option<String>> {
+        let address = address.trim().to_ascii_lowercase();
+        self.with_conn(|c| {
+            Ok(c.query_row(
+                "SELECT accountEntityId FROM emails
+                  WHERE platform = 'gmail' AND accountEntityId IS NOT NULL AND accountEntityId != ''
+                    AND (lower(fromEmail) = ?1 OR instr(lower(fromEmail), '<' || ?1 || '>') > 0)
+                  ORDER BY firstSeenAt DESC LIMIT 1",
+                [&address],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+        })
+    }
+
     /// Record a composed outreach message (`outcome`: `auto` or `card`).
     pub fn record_outreach(
         &self,
@@ -956,6 +974,8 @@ mod tests {
         assert!(!store.outreach_text_seen_since("jane-doe", "h2", 0).unwrap());
         assert!(!store.outreach_text_seen_since("sam-roe", "h1", 0).unwrap());
         assert_eq!(store.prune_outreach_log(2_000).unwrap(), 1);
+        assert_eq!(store.latest_gmail_account_from("jane@example.test").unwrap(), None);
+        assert_eq!(store.latest_gmail_thread_from("jane@example.test").unwrap(), None);
         assert!(!store.outreach_text_seen_since("jane-doe", "h1", 0).unwrap());
     }
 }
