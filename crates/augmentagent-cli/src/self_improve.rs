@@ -5815,8 +5815,11 @@ fn unreviewable_plan(
              for another review attempt; a provider outage does not reject the code."
         )),
         stand_down: None,
+        // Local log/report only: carry the detail (which reviewer check
+        // failed). The public PR comment above keeps the headline.
         message: format!(
-            "PR #{pr}: independent review unavailable, {headline}; still draft, day {days} waiting for recovery{cost}"
+            "PR #{pr}: independent review unavailable, {}; still draft, day {days} waiting for recovery{cost}",
+            why.log_line()
         ),
     }
 }
