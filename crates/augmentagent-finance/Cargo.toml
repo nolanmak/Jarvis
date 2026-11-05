@@ -17,7 +17,7 @@ reqwest.workspace = true
 tokio.workspace = true
 chrono.workspace = true
 uuid.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
