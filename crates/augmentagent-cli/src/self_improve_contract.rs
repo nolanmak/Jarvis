@@ -22,6 +22,8 @@ pub(super) use scope_authority::run as scope_original;
 pub(super) mod readiness;
 #[path = "self_improve_adjudicated_contract.rs"]
 mod adjudicated;
+#[path = "self_improve_legacy_verifier.rs"]
+mod legacy_verifier;
 pub(super) use adjudicated::apply as apply_adjudicated_amendment;
 
 const SANDBOX: &str = include_str!("../../../scripts/codex-command-sandbox.py");
