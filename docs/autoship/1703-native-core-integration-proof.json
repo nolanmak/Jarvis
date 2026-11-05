@@ -1,0 +1,222 @@
+{
+  "kind": "local-native-owner-core-validation",
+  "tested_source_commit": "6c1f3a8aeed78d715704cb9e7b74d9e4e129b53a",
+  "tested_source_tree": "1a0595db7a524332ec7a5ac68c0ee4298636728b",
+  "sources": [
+    {
+      "path": "Cargo.lock",
+      "sha256": "20f9e0734e86ed443d1810b613d465639ff325f812beb4442e4598e8e91a9810"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/audit_chain.rs",
+      "sha256": "320c48ff820326bfe12b0028fb4e9f16147a8609f0b2fdea11c4d578ffafa8ae"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/codex.rs",
+      "sha256": "890f7cb0c3e0383c51ca333047f785314cca749f81ab6a7d3bad6c7390a41591"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/lib.rs",
+      "sha256": "85ecf9ba4e2db5237dc34e1009af1cb93bc8b2cf85b0b3dc4fc4cda2da7ddf4e"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_completion.rs",
+      "sha256": "a2069827f3c0c26d8e594006a08438c0d44ac78364a53dfd2db09bce11342acd"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_handoff.rs",
+      "sha256": "78927238ed257471362f3e9e80364bb51114c9024f7f0b30588d016596addf8a"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_initial.rs",
+      "sha256": "cf5d612a1b292d1afa0c320a1fc32a4b8b87ce32b67fbf510d2bfe5f64e0ea14"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_inventory.rs",
+      "sha256": "2920a66e1e01e1224c8a652e8d68748f51b51275a6b6093c15774cf5daa094ff"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
+      "sha256": "1ce8a10ee84c3bb78a9242883a5512a5bcf441b5d8935d561d2b90efefb28950"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_outcome.rs",
+      "sha256": "2b5fb912ffa0259f93ad8ddf7a2a671ccd2b18b7c27597588fbb4987935e24ec"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_store.rs",
+      "sha256": "22ae062dc5cf9438dda775671141c3583c0799987495781cb8a61e909338211c"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_transfer.rs",
+      "sha256": "17b351586556089630d710aa8fef2e3cfa956d1d5bf14dd8eac002e10844a235"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_transfer_wire.rs",
+      "sha256": "23f4920eab8cc0d049f6df3fec9068b2537a0ab94ae87deb3745c1c3e46bfaca"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_session.rs",
+      "sha256": "4137049620d75f1c086077fa8bcddf161ba5c4fe20f7b092526347a14640c216"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "ae6e47057a1a9f22b03abf5e73d3064dbd36a7771c747ac0d62a7312561479db"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/process_tree.rs",
+      "sha256": "12e36035898350585397e58d1a88016e9e1904979c7b0f5c5a3869a339102cff"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/reasoner.rs",
+      "sha256": "649388708350cfd467f049bd0e226782a13913427ec4987aed044bb9231b3553"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/run_resources.rs",
+      "sha256": "626325f021caf8072387940e45ea76934abd650317f6b1fbc983e892b21f84e6"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "d73e827a5084cc736de4064e97b57b97fe4a7128c6ba6d41d3524cb7a293f1c3"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/tests/phone_agent.rs",
+      "sha256": "94957cfdc79264e414d889b283298cfaa4eac1b739e054c9ecce564f6e0897bf"
+    },
+    {
+      "path": "crates/augmentagent-cli/Cargo.toml",
+      "sha256": "2ed793ccf559958a5206608a9275eb4f98324277f03409629845e08a610f64f7"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_launch.rs",
+      "sha256": "d82d0bc0744197bf6025af56f87ab5e6c8eeb1a48c8e6fb5202681d16ec63d1d"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+      "sha256": "ab54d9feccaebdf1352878eaf89310f58532f04e2c2f5ad17e8432ce3b2feacd"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
+      "sha256": "0e70aa247f2f810e2cd41417877c32d09296f2108ffc2b19bb4fee4ff54a26bd"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_control.rs",
+      "sha256": "ebb75f3af86256446c078fa90223b9a57e3d5933e358ec9c04ff49041dc266ef"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_review.rs",
+      "sha256": "d4f08b217c52f45156d516a51a50f5720d5044de56e6af5e4b4e779e11cde695"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "be81042bd23482c939dfafb9f25c73a49142bd7a26e2c8def07020b9d81d39bb"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/discord_voice_session_tests.rs",
+      "sha256": "8e48c65fa263e9c511e2bfcc886f3a18ed08befc84d59eba884f2a8350e9cd76"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/local_phone.rs",
+      "sha256": "688b588282caaef9064aa505378dc6d6742c9d3706c5efbb13a74c99e2431ead"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/local_phone_transport.rs",
+      "sha256": "3d647045ca91ad19bf5eae7feb54525d394a89cc650f8ddf67b0559d1d75ef01"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve.rs",
+      "sha256": "5aa7e6a8b200fce6bbc7050e1980be30db43b0d52d5763cd8bd177a8f485cc7c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_adopted.rs",
+      "sha256": "6b93b1103e403fb3c9a3efb33f771eac25c3198c4697e06527b1296612e9c559"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_contract.rs",
+      "sha256": "f47510a1eff01f6a4e5466fd5192ffa1527d74bdc74c43485f8214ffd18b852e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_native_acceptance.rs",
+      "sha256": "83da24d9a849df73c1a19ae0b612d04bc0b384270206b73f51e8385a9f520207"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_review.rs",
+      "sha256": "549e734261f33b3db71a73aa24b97baeaa50bfe2f0c20066c70f5f1b6a7a7b55"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_review_callers.rs",
+      "sha256": "a430867050b137d6653486de1fec54b27fe2972a7f3f8c4a84608187fc12603e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_review_plan.rs",
+      "sha256": "bb481d689680785cf637bfcc9cff519832ab3e2432df818b0ee9b4fb2bf5ccd3"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_review_symbols.rs",
+      "sha256": "ffd52df841656d3141b33e0fb1ec8a9b210c9c9583d4c4eb0ac8f3129d43ac54"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "ba6d802f86fe2965a6c2959cc5330623a47ca543b0125a0ada31325e5ce5c2cf"
+    },
+    {
+      "path": "docs/autoship/1703-native-handoff-orchestration-probe.json",
+      "sha256": "8b08aa276a808f8307255805dc07d7c23f44a9819908cd2b2ed61e0f05c82c5e"
+    },
+    {
+      "path": "docs/autoship/1703-native-ledger-probe.json",
+      "sha256": "7b7ab26037f79b7bdf9d03938916a2e3920bb8eeaaa528ce7c6e79c873ddaafe"
+    },
+    {
+      "path": "docs/autoship/1703-native-store-identity-probe.json",
+      "sha256": "7829d4ad7dbe4ce707f0ad40bb7e201ca3e6235d996f409eba8d4440fa6e3c24"
+    },
+    {
+      "path": "docs/autoship/1703-native-transfer-request-probe.json",
+      "sha256": "bd13b01ba895e280bf9a66c054429d0c04d35e5dfec48208b945c20cb5a1fb93"
+    },
+    {
+      "path": "docs/autoship/1703-native-typed-outcomes-probe.json",
+      "sha256": "7c1683f1f89a75b1f6b4ea0ee3291d7d40879c7823c8e03293f39c9bdb31102f"
+    },
+    {
+      "path": "docs/autoship/1713-native-owner-transfer-design.json",
+      "sha256": "d35d4a9b37a1ee27fb75511fc57f4538d90121c5da2e59d46ed210c910ded999"
+    },
+    {
+      "path": "scripts/native-provider-runtime-union-probe.py",
+      "sha256": "c2a66a220de5b897f899121f2d04dd7af113bd1adde0ab2f6201be8f38af5751"
+    },
+    {
+      "path": "scripts/native-provider-vm.py",
+      "sha256": "6ce2135a1bae0584cc80974367ddfd4460438d46c98131306573b3272f0c0ee4"
+    },
+    {
+      "path": "scripts/provision-native-vm-probe.py",
+      "sha256": "3d1cda0b97080291584fc92cae54aff570bde83764aa0709e567582df294a6f5"
+    },
+    {
+      "path": "scripts/test-native-provider-vm.py",
+      "sha256": "9e8cd83ef184b7eb2e7be89a436bf5072e31604253286cff4af85e57258c51c3"
+    },
+    {
+      "path": "scripts/test-provision-native-vm.py",
+      "sha256": "f18b63144d01c50667deec2542d774a78157d16f85a3c536acd617cd08c6ac14"
+    }
+  ],
+  "results": {
+    "core": "854 passed;0 failed;15 ignored",
+    "cli": "1751 passed;0 failed;33 ignored",
+    "kernel_cleanup": "1 passed;0 failed;isolated delegated transient service;live descendant refused,cleanup accepted,forged host refused"
+  },
+  "build_provenance": "Fresh manager-owned target dedicated to this worktree; shared-target compile failure was discarded.",
+  "hosted_ci": "pending",
+  "production_acceptance": "incomplete",
+  "shipping_authority": false,
+  "draft_blockers": [
+    "Receipt-backed caller preparation,promotion and reconciliation",
+    "Verified legacy original-store-binding recovery",
+    "Authenticated corrupt-prepared-state recovery",
+    "Public Discord ingress and real Codex/Claude coding consumer"
+  ]
+}
