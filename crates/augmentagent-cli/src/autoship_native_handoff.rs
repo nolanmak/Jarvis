@@ -122,7 +122,9 @@ pub(super) fn capture(
 fn provider_key(provider:submission::Provider)->&'static str {
     match provider {submission::Provider::Codex=>"codex",submission::Provider::Claude=>"claude"}
 }
-pub(super) fn read_facts(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64)->Result<NativeHandoffFacts> {
+pub(super) fn read_facts(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64)->Result<NativeHandoffFacts> {read_facts_mode(tx,lease,binding,now,false)}
+pub(super) fn read_closed_facts(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64)->Result<NativeHandoffFacts> {read_facts_mode(tx,lease,binding,now,true)}
+fn read_facts_mode(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64,closed:bool)->Result<NativeHandoffFacts> {
     require_binding(&tx, lease, binding, now)?;
     let raw: String = tx.query_row(
         "SELECT checkpoint FROM workflow WHERE id=?1",
@@ -141,7 +143,8 @@ pub(super) fn read_facts(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i
     native_pending::require_clear_abort_barriers(tx,&lease.workflow)?;
     let transfers = native_pending::settlement::History::load(tx, &lease.workflow, u64::MAX)?;
     let owners = {
-        let mut query=tx.prepare("SELECT lease_generation,audit_path FROM workflow_native_owner WHERE workflow=?1 AND lease_generation<?2 AND retirement_reason IS NULL AND retired_at IS NULL AND NOT EXISTS(SELECT 1 FROM workflow_native_transferred_source d WHERE d.workflow=workflow_native_owner.workflow AND d.lease_generation=workflow_native_owner.lease_generation AND d.audit_path=workflow_native_owner.audit_path) ORDER BY lease_generation,audit_path LIMIT 65")?;
+        let predicate=if closed {"retirement_reason IS NOT NULL AND retired_at IS NOT NULL"}else{"retirement_reason IS NULL AND retired_at IS NULL"};
+        let mut query=tx.prepare(&format!("SELECT lease_generation,audit_path FROM workflow_native_owner WHERE workflow=?1 AND lease_generation<?2 AND {predicate} AND NOT EXISTS(SELECT 1 FROM workflow_native_transferred_source d WHERE d.workflow=workflow_native_owner.workflow AND d.lease_generation=workflow_native_owner.lease_generation AND d.audit_path=workflow_native_owner.audit_path) ORDER BY lease_generation,audit_path LIMIT 129"))?;
         let rows = query
             .query_map(params![lease.workflow, lease.generation], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
@@ -150,7 +153,7 @@ pub(super) fn read_facts(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i
         rows
     };
     ensure!(!owners.is_empty(), TransferReason::InventoryMissing);
-    ensure!(owners.len() <= 64, TransferReason::HistoryCapacity);
+    ensure!(owners.len() <= if closed {128}else{64}, TransferReason::HistoryCapacity);
     let mut source_owners = Vec::new();
     let mut source_projection = Vec::new();
     let mut original_binding = None;

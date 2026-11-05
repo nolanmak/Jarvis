@@ -933,6 +933,17 @@ impl WorkflowGuard {
                         ReconciliationRun::Retained {reason,..}=>anyhow::bail!(reason),
                     }
                 }
+                let recovery=self.store.lock().map_err(|_|anyhow::anyhow!("native recovery census store poisoned"))?
+                    .closed_native_recovery_facts(&self.lease,&self.binding,self.audit.path().to_str().context("native audit is not UTF-8")?,millis())?;
+                if let Some(basis)=recovery {
+                    self.audit.set_native_store_binding(basis.original.clone())?;
+                    let audits=existing_native_sources(&state,&basis.plan.namespaces,worktree,&basis.original)?;
+                    ownership::with_closed_workflow(&basis.original,&basis.plan,&audits,&self.audit,&current,&mut |proof| {
+                        self.store.lock().map_err(|_|anyhow::anyhow!("native recovery registration store poisoned"))?
+                            .register_closed_native_owner(&self.lease,&self.binding,&basis,proof,millis())
+                    }).map_err(anyhow::Error::new)?;
+                    completed=true;break;
+                }
                 let sources=self.store.lock().map_err(|_|anyhow::anyhow!("native facts store poisoned"))?.native_handoff_sources(&self.lease,&self.binding,millis());
                 let sources=match sources {
                     Ok((authorities,original))=>{self.audit.set_native_store_binding(original.clone())?;existing_native_sources(&state,&authorities,worktree,&original)?}
@@ -1306,7 +1317,7 @@ impl WorkflowGuard {
         self.store
             .lock()
             .map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?
-            .validate_lease(&self.lease, &self.binding, millis())
+            .validate_dispatch(&self.lease, &self.binding, millis())
     }
 
     pub(super) fn intent(&self, kind: OperationKind) -> Result<Operation> {
@@ -3062,7 +3073,7 @@ mod tests {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss"] {
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
                     .env(CHILD,control.path()).env(MODE,mode);
@@ -3163,7 +3174,7 @@ mod tests {
             assert_eq!(rows[0].protected_observation_reference.as_ref(),Some(fact.receipt()));
             assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
         }
-        if mode=="resolved-abort-acquisition" {
+        if matches!(mode.as_str(),"resolved-abort-acquisition"|"closed-recovery-rollback"|"closed-recovery-history-loss") {
             use augmentagent_channel_core::native_vm::ownership;
             let source=guard.audit_logger();let original=saved.clone().unwrap();guard.finish().unwrap();
             let mut store=WorkflowStore::open(&state).unwrap();let lease=store.claim(&id,"fixture-interrupted-transfer",millis(),LEASE_MS).unwrap().unwrap();let binding=store.snapshot(&id).unwrap().unwrap().checkpoint.binding;
@@ -3174,8 +3185,15 @@ mod tests {
             for authority in pending.request().source_owners.iter().chain(std::iter::once(&pending.request().destination)) {augmentagent_channel_core::native_vm::retire_owned_runtimes(&original,Path::new(&authority.audit_path),&authority.owner,&||Ok(())).unwrap();}
             store.release(&lease,millis()).unwrap();let recovery=store.claim(&id,"fixture-abort-ack",millis(),LEASE_MS).unwrap().unwrap();
             ownership::with_transfer_inspection(&original,pending.request(),&pending.observation(),&||Ok(()),&mut |proof|store.acknowledge_native_aborted(&recovery,&binding,&pending,proof,millis())).unwrap();store.release(&recovery,millis()).unwrap();assert_eq!(store.unresolved_native_abort_namespaces(&id).unwrap().len(),2);let calls=store.snapshot(&id).unwrap().unwrap().model_calls;drop(store);
-            // All-closed reuse is still held, but verified abort barriers must be resolved.
-            assert!(WorkflowGuard::acquire_at(&state,start(),millis()).await.is_err());let mut store=WorkflowStore::open(&state).unwrap();assert!(store.unresolved_native_abort_namespaces(&id).unwrap().is_empty());let snapshot=store.snapshot(&id).unwrap().unwrap();assert_eq!(snapshot.lease_until_ms,0);assert_eq!(snapshot.model_calls,calls);assert!(store.native_owner_binding(&id,snapshot.generation).unwrap().is_none());assert!(!store.initial_native_owner_available(&id).unwrap());assert_eq!(store.native_aborted_handoff(&id,&pending.request().transfer_id).unwrap(),Some(pending));return;
+            let epoch=std::fs::read(native.join("authority-epoch.json")).unwrap();
+            if mode=="closed-recovery-rollback" {
+                rusqlite::Connection::open(&state).unwrap().execute_batch("CREATE TRIGGER deny_closed_recovery BEFORE INSERT ON workflow_native_recovery BEGIN SELECT RAISE(ABORT,'injected closed recovery failure'); END;").unwrap();
+                assert!(WorkflowGuard::acquire_at(&state,start(),millis()).await.is_err());let store=WorkflowStore::open(&state).unwrap();let snapshot=store.snapshot(&id).unwrap().unwrap();assert_eq!(snapshot.lease_until_ms,0);assert_eq!(snapshot.model_calls,calls);assert!(store.native_owner_binding(&id,snapshot.generation).unwrap().is_none());assert_eq!(store.audit_generation(&id).unwrap(),0);drop(store);
+                rusqlite::Connection::open(&state).unwrap().execute_batch("DROP TRIGGER deny_closed_recovery").unwrap();
+            }
+            let recovered=WorkflowGuard::acquire_at(&state,start(),millis()).await.unwrap().unwrap();recovered.validate_before_side_effect().unwrap();assert!(recovered.fresh_native_builder_sessions().is_ok());let mut store=recovered.store.lock().unwrap();assert!(store.unresolved_native_abort_namespaces(&id).unwrap().is_empty());let snapshot=store.snapshot(&id).unwrap().unwrap();assert_eq!(snapshot.model_calls,calls);assert_eq!(snapshot.checkpoint.binding,binding);assert_eq!(store.native_owner_binding(&id,snapshot.generation).unwrap(),Some(original));assert!(!store.initial_native_owner_available(&id).unwrap());assert_eq!(store.audit_generation(&id).unwrap(),snapshot.generation);assert_eq!(store.native_aborted_handoff(&id,&pending.request().transfer_id).unwrap(),Some(pending));assert_eq!(std::fs::read(native.join("authority-epoch.json")).unwrap(),epoch);
+            if mode=="closed-recovery-history-loss" {store.validate_dispatch(&recovered.lease,&binding,millis()).unwrap();rusqlite::Connection::open(&state).unwrap().execute("DELETE FROM workflow_native_recovery WHERE workflow=?1",[&id]).unwrap();assert!(store.validate_dispatch(&recovered.lease,&binding,millis()).is_err());assert!(store.initial_native_owner_available(&id).is_err());let events=store.events(&id).unwrap();assert!(store.begin_operation(&recovered.lease,OperationKind::CreatePr,&binding,millis()).is_err());assert_eq!(store.events(&id).unwrap(),events);drop(store);assert!(recovered.validate_before_side_effect().is_err());return;}
+            drop(store);recovered.finish().unwrap();let mut store=WorkflowStore::open(&state).unwrap();assert!(!store.initial_native_owner_available(&id).unwrap());assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,calls);return;
         }
         if matches!(mode.as_str(),"native-sweep"|"native-sweep-lost-authority") {
             guard.record_review("fixture-independent-review",true,"native sweep fixture approval").unwrap();

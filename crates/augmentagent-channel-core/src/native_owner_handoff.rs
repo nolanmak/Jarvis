@@ -217,7 +217,14 @@ fn scan_inventory(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Authorit
     scan_inventory_bounded(root,ledger,workflow,sources,observations,4096,64*1024*1024)
 }
 fn scan_inventory_bounded(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Authority],observations:&[PhysicalObservation],max_entries:usize,max_metadata:u64)->Result<PhysicalInventory> {
-    ensure!(!workflow.is_empty() && !sources.is_empty() && sources.len()<=64 && observations.len()<=4096,R::StateCapacity);
+    scan_inventory_impl(root,ledger,workflow,sources,observations,max_entries,max_metadata,false)
+}
+pub(super) fn with_retired_workflow_inventory(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Authority],observations:&[PhysicalObservation],visit:&mut dyn FnMut(&[String])->Result<()>)->Result<()> {
+    let scan=scan_inventory_impl(root,ledger,workflow,sources,observations,4096,64*1024*1024,true)?;
+    ensure!(scan.inventory.is_empty(),R::AuthorityConflict);visit(&scan.retired)
+}
+fn scan_inventory_impl(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Authority],observations:&[PhysicalObservation],max_entries:usize,max_metadata:u64,closed:bool)->Result<PhysicalInventory> {
+    ensure!(!workflow.is_empty() && !sources.is_empty() && sources.len()<=if closed {128}else{64} && observations.len()<=4096,R::StateCapacity);
     let store=ledger.store_identity()?;
     super::owner_store::validate_bound_metadata(root,&store)?;
     private_directory(root)?;
@@ -263,6 +270,7 @@ fn scan_inventory_bounded(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[
             result._sessions.push(session_lock(&path)?);
             let relative=super::relative_runtime(root,&path)?;
             let observed=declared.remove(relative);
+            if closed {ensure!(sources.contains(&authority) && ledger.retired_authority(&authority)?,R::AuthorityConflict);}
             if let Some(observed)=observed {
                 ensure!(observed.creation_receipt_sha256==sha(&owned) && observed.authority==authority,R::MetadataInvalid);
             }
@@ -941,6 +949,41 @@ mod tests {
         for logger in f.sources.iter().chain(std::iter::once(&f.destination)) {logger.set_native_store_binding(binding.clone()).unwrap();}
         let lock=super::super::StateLock::existing(&f.root).unwrap();let mut ledger=Ledger::open(&f.root,&lock).unwrap();let plan=audit_plan(&f.request,&f.sources,&f.destination).unwrap();ledger.prepare(&f.request,&plan.endpoints,u64::MAX).unwrap();drop(ledger);drop(lock);
         let source=&f.request.source_owners[0];super::super::retire_owned_runtimes(&binding,Path::new(&source.audit_path),&source.owner,&||Ok(())).unwrap();binding
+    }
+    fn closed_recovery_fixture(f:&Fixture)->(super::super::ownership::TransferBinding,super::super::ownership::ClosedWorkflowPlan,Vec<Arc<AuditLogger>>,Arc<AuditLogger>,std::path::PathBuf) {
+        let binding=aborted_retirement_fixture(f);let path=policy(f);
+        for authority in f.request.source_owners.iter().chain(std::iter::once(&f.request.destination)) {super::super::retire_owned_runtimes(&binding,Path::new(&authority.audit_path),&authority.owner,&||Ok(())).unwrap();}
+        let destination=logger(f.destination.path().parent().unwrap().parent().unwrap(),"recovered",4);destination.set_native_store_binding(binding.clone()).unwrap();
+        let mut namespaces=f.request.source_owners.clone();namespaces.push(f.request.destination.clone());namespaces.sort_by(|a,b|(a.owner.lease_generation,&a.audit_path).cmp(&(b.owner.lease_generation,&b.audit_path)));
+        let plan=super::super::ownership::ClosedWorkflowPlan {workflow:f.request.workflow_id.clone(),namespaces,runtimes:physical_observations(f),destination:Authority {owner:destination.native_runtime_owner().unwrap().unwrap(),audit_path:destination.path().to_str().unwrap().into()}};
+        let mut audits=f.sources.clone();audits.push(f.destination.clone());(binding,plan,audits,destination,path)
+    }
+    #[test]
+    fn native_closed_workflow_proof_holds_original_state_session_and_audit_locks_without_mutation() {
+        use super::super::ownership::*;
+        let f=fixture(true);let (binding,plan,audits,destination,path)=closed_recovery_fixture(&f);let before=audit_bytes(&f);let ledger=std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();let called=std::cell::Cell::new(false);
+        super::super::owner_recovery::with_policy(Some(&path),&binding,&plan,&audits,&destination,&||Ok(()),&mut |proof| {
+            called.set(true);assert_eq!(proof.binding(),&binding);assert_eq!(proof.plan(),&plan);assert_eq!(proof.evidence()["kind"],"closed_native_workflow_recovery");assert!(super::super::StateLock::existing(&f.root).is_err());assert!(session_lock(&f.root.join("codex/session-codex")).is_err());
+            for audit in &audits {let gate=std::fs::OpenOptions::new().read(true).write(true).open(audit.protected_anchor_path().unwrap().with_extension("lock")).unwrap();assert_ne!(unsafe{libc::flock(gate.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);}
+            Ok(())
+        }).unwrap();assert!(called.get());assert_eq!(audit_bytes(&f),before);assert_eq!(std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(),ledger);
+    }
+    #[test]
+    fn native_closed_workflow_proof_refuses_missing_or_omitted_authority_and_replays_callback_failure() {
+        use super::super::ownership::*;
+        for fault in ["missing-runtime","missing-epoch","missing-audit-lock","omitted-namespace","creation","stale","callback","busy","kernel","unretired-namespace","policy"] {
+            let f=fixture(false);let (binding,mut plan,audits,destination,path)=closed_recovery_fixture(&f);
+            let held=if fault=="busy" {Some(session_lock(&f.root.join("codex/session-codex")).unwrap())}else{None};
+            match fault {"missing-runtime"=>std::fs::remove_dir_all(f.root.join("codex/session-codex")).unwrap(),"missing-epoch"=>std::fs::remove_file(f.root.join("authority-epoch.json")).unwrap(),"missing-audit-lock"=>std::fs::remove_file(f.sources[0].protected_anchor_path().unwrap().with_extension("lock")).unwrap(),"omitted-namespace"=>{plan.namespaces.pop();},"creation"=>std::fs::write(f.root.join("codex/session-codex/owned.json"),b"{}").unwrap(),_=>{}}
+            if fault=="kernel" {f.sources[0].record_controller(json!({"actor":"controller","kind":"run_resource_admitted","provider":"codex","observation":{"identity":{"host_sha256":"invalid-host","boot_id":"invalid","path":"/sys/fs/cgroup/run-00000000000000000000000000000000","inode":1}}})).unwrap();}
+            if fault=="unretired-namespace" {augmentagent_store::rusqlite::Connection::open(f.root.join("runtime-retirement.sqlite")).unwrap().execute("DELETE FROM retired_owner WHERE generation=3",[]).unwrap();}
+            if fault=="policy" {std::fs::write(&path,b"{}").unwrap();}
+            let before=audit_bytes(&f);
+            let called=std::cell::Cell::new(false);let mut callback=|_:&ClosedWorkflowProof<'_>|->anyhow::Result<()> {called.set(true);anyhow::bail!("injected metadata write failure")};
+            assert!(super::super::owner_recovery::with_policy(Some(&path),&binding,&plan,&audits,&destination,&||if fault=="stale" {Err(TransferFenceError::NotCurrent)}else{Ok(())},&mut callback).is_err(),"{fault}");assert_eq!(called.get(),fault=="callback","{fault}");assert_eq!(audit_bytes(&f),before);
+            if fault=="missing-epoch" {assert!(!f.root.join("authority-epoch.json").exists());}if fault=="missing-audit-lock" {assert!(!f.sources[0].protected_anchor_path().unwrap().with_extension("lock").exists());}
+            if fault=="callback" {super::super::owner_recovery::with_policy(Some(&path),&binding,&plan,&audits,&destination,&||Ok(()),&mut |_|Ok(())).unwrap();}drop(held);
+        }
     }
     #[test]
     fn native_retired_namespace_proof_holds_exact_locks_and_preserves_peers() {

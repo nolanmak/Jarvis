@@ -89,6 +89,8 @@ mod owner_ledger;
 mod owner_inventory;
 #[path = "native_owner_handoff.rs"]
 mod owner_handoff;
+#[path = "native_owner_recovery.rs"]
+mod owner_recovery;
 #[path = "native_owner_reconciliation.rs"]
 mod owner_reconciliation;
 #[path = "native_owner_preparation.rs"]

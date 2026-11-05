@@ -558,6 +558,33 @@ impl<'a> Ledger<'a> {
         Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM retired_owner WHERE workflow=?1 AND generation=?2 AND audit_path=?3)",
             params![authority.owner.workflow_id,authority.owner.lease_generation,authority.audit_path],|r|r.get(0))?)
     }
+    /// Complete original-ledger frontier, excluding only verified transfer
+    /// closures. A caller-supplied subset cannot hide an unretired destination.
+    pub fn retired_workflow_frontier(&self,workflow:&str,expected:&[Authority])->Result<()> {
+        ensure!(history_bytes(self.root)?<=HISTORY_LIMIT,R::HistoryCapacity);validate_all_history(&self.db)?;
+        let key=|a:&Authority|(a.owner.lease_generation,a.audit_path.clone());
+        let wanted=expected.iter().map(|a|(key(a),a.clone())).collect::<BTreeMap<_,_>>();
+        ensure!(!wanted.is_empty() && wanted.len()==expected.len() && wanted.len()<=128,R::StateCapacity);
+        let mut known=wanted.clone();
+        let mut query=self.db.prepare("SELECT id FROM native_transfer ORDER BY id")?;
+        for id in query.query_map([],|r|r.get::<_,String>(0))? {
+            let record=load(&self.db,&id?)?.context(R::PreparedCorrupt)?;
+            if record.request.workflow_id!=workflow {continue;}
+            ensure!(!matches!(record.state,State::Prepared),R::PendingUnknown);
+            for authority in record.request.source_owners.into_iter().chain(std::iter::once(record.request.destination)) {known.insert(key(&authority),authority);}
+        }
+        let mut query=self.db.prepare("SELECT generation,audit_path FROM retired_owner WHERE workflow=?1")?;
+        for row in query.query_map([workflow],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))? {let (generation,audit_path)=row?;let authority=Authority {owner:RuntimeOwner {workflow_id:workflow.into(),lease_generation:generation},audit_path};known.insert(key(&authority),authority);}
+        ensure!(known.len()<=4096,R::HistoryCapacity);
+        let mut actual=BTreeMap::new();
+        for (key,authority) in known {
+            let transferred:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM native_transfer_close WHERE workflow=?1 AND generation=?2 AND audit_path=?3)",params![workflow,authority.owner.lease_generation,authority.audit_path],|r|r.get(0))?;
+            if transferred {continue;}
+            ensure!(self.retired_authority(&authority)? && !self.claimed(&authority.owner,"")? && !self.claimed_audit(&authority.audit_path)?,R::AuthorityConflict);
+            actual.insert(key,authority);
+        }
+        ensure!(actual==wanted,R::InventoryMissing);Ok(())
+    }
     pub fn held_by_abort(&self, owner: &RuntimeOwner) -> Result<bool> {
         conflict(&self.db, owner)
     }

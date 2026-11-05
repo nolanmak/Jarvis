@@ -29,6 +29,8 @@ pub(crate) mod owner_turn;
 mod native_owner_binding;
 #[path = "autoship_native_handoff.rs"]
 mod native_handoff;
+#[path = "autoship_native_recovery.rs"]
+pub(crate) mod native_recovery;
 #[path = "autoship_native_reconcile.rs"]
 pub(crate) mod native_reconcile;
 #[path = "autoship_native_prepare.rs"]
@@ -436,6 +438,10 @@ impl WorkflowStore {
                 binding TEXT NOT NULL, registered_at INTEGER NOT NULL,
                 PRIMARY KEY(workflow,lease_generation),
                 FOREIGN KEY(workflow,lease_generation) REFERENCES workflow_native_owner(workflow,lease_generation));
+            CREATE TABLE IF NOT EXISTS workflow_native_recovery (
+                workflow TEXT NOT NULL REFERENCES workflow(id),generation INTEGER NOT NULL,
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record TEXT NOT NULL,
+                PRIMARY KEY(workflow,generation));
             CREATE TABLE IF NOT EXISTS workflow_native_handoff_completed (
                 transfer_id TEXT PRIMARY KEY, workflow TEXT NOT NULL REFERENCES workflow(id),
                 pending_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
@@ -976,6 +982,7 @@ impl WorkflowStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx, lease, binding, now_ms)?;
         owner_control::require_dispatch(&tx,&lease.workflow)?;
+        native_pending::require_clear_abort_barriers(&tx,&lease.workflow)?;
         tx.execute("INSERT INTO operation(id,workflow,kind,binding,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING",
             params![id,lease.workflow,kind_json,binding_json,now_ms])?;
         let (receipt, recorded_binding): (Option<String>, String) = tx.query_row(

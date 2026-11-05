@@ -130,3 +130,7 @@ pub(super) fn acknowledged(conn:&Connection,pending:&PendingNativeHandoff)->Resu
     }
     Ok(false)
 }
+
+pub(super) fn closed_namespaces(conn:&Connection,workflow:&str)->Result<Vec<(Authority,augmentagent_channel_core::native_vm::ownership::TransferBinding)>> {
+    let mut result=Vec::new();for record in history(conn,workflow)? {for namespace in namespaces(&record.pending) {result.push((namespace,record.pending.original_binding.clone()));}}Ok(result)
+}

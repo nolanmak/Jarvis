@@ -1,4 +1,5 @@
 //! Controller-owned runtime handoff; creation receipts remain immutable.
+pub use super::owner_recovery::{ClosedWorkflowPlan,ClosedWorkflowProof,with_closed_workflow};
 pub use super::owner_outcome::{
     capture_owner_binding, capture_transfer_binding, transfer, transfer_receipt,
     validate_owner_binding, with_initial_owner_binding, TransferBinding, TransferFenceError,
