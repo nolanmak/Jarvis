@@ -186,10 +186,19 @@ impl WorkflowStore {
 
     /// A protected history read, never a complete inventory or dispatch grant.
     pub fn native_launch_intents(&self, workflow: &str) -> Result<Vec<NativeLaunchRecord>> {
-        let mut query=self.conn.prepare(&format!("SELECT {COLUMNS} FROM workflow_native_launch WHERE workflow=?1 ORDER BY sequence"))?;
-        let rows=query.query_map([workflow],indexed)?.collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.into_iter().map(|row|decode_record(&self.conn,row)).collect()
+        history(&self.conn, workflow)
     }
+}
+
+pub(super) fn history(conn: &Connection, workflow: &str) -> Result<Vec<NativeLaunchRecord>> {
+    let mut query=conn.prepare(&format!("SELECT {COLUMNS} FROM workflow_native_launch WHERE workflow=?1 ORDER BY sequence LIMIT 8193"))?;
+    let mut result=Vec::new(); let mut bytes=0usize;
+    for row in query.query_map([workflow], indexed)? {
+        let row=row?;bytes=bytes.checked_add(row.0.len()).context("native launch history overflow")?;
+        ensure!(result.len()<8192 && bytes<=128*1024*1024,"native launch history capacity reached");
+        result.push(decode_record(conn,row)?);
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

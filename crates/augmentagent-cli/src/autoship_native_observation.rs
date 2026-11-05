@@ -413,7 +413,12 @@ impl WorkflowStore {
         Ok(row)
     }
     pub fn native_observation_history(&self, workflow: &str) -> Result<Vec<NativeObservation>> {
-        let mut query=self.conn.prepare(&format!("SELECT {COLUMNS} FROM workflow_native_observation WHERE workflow=?1 ORDER BY sequence LIMIT 8193"))?;
+        history(&self.conn, workflow)
+    }
+}
+
+pub(super) fn history(conn: &Connection, workflow: &str) -> Result<Vec<NativeObservation>> {
+        let mut query=conn.prepare(&format!("SELECT {COLUMNS} FROM workflow_native_observation WHERE workflow=?1 ORDER BY sequence LIMIT 8193"))?;
         let rows = query.query_map([workflow], indexed)?;
         let mut result = Vec::new();
         let mut bytes = 0usize;
@@ -426,10 +431,9 @@ impl WorkflowStore {
                 result.len() < 8192 && bytes <= 128 * 1024 * 1024,
                 "native observation history capacity reached"
             );
-            result.push(decode(&self.conn, row)?);
+            result.push(decode(conn, row)?);
         }
         Ok(result)
-    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -744,4 +748,344 @@ mod tests {
                 .is_empty());
         }
     }
+    fn next_handoff_lease(f: &mut Fixture) -> Lease {
+        f.store.release(&f.lease, now()).unwrap();
+        f.store
+            .claim(&f.lease.workflow, "next-controller", now(), 60_000)
+            .unwrap()
+            .unwrap()
+    }
+    #[test]
+    fn native_handoff_snapshot_binds_complete_history_and_survives_reopen() {
+        if child("native_handoff_snapshot_binds_complete_history_and_survives_reopen") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let fact = f.complete();
+        let observed = f.record(&fact).unwrap();
+        let lease = next_handoff_lease(&mut f);
+        let events_before = f.store.events(&lease.workflow).unwrap();
+        let snapshot = f
+            .store
+            .native_handoff_snapshot(&lease, &f.binding, now())
+            .unwrap();
+        assert_eq!(snapshot.source_owners.len(), 1);
+        assert_eq!(
+            snapshot.source_owners[0].owner.lease_generation,
+            f.lease.generation
+        );
+        assert!(snapshot
+            .source_owners
+            .iter()
+            .all(|source| source.owner.lease_generation < lease.generation));
+        assert_eq!(snapshot.inventory.len(), 1);
+        assert_eq!(snapshot.inventory[0].native_session_id, "actual-session");
+        assert_eq!(
+            snapshot.inventory[0].completion_sha256,
+            observed.completion_sha256.unwrap()
+        );
+        assert!(snapshot.observation.certain);
+        assert!(snapshot.observation.revision > 0);
+        assert_eq!(snapshot.observation.sha256.len(), 64);
+        assert_eq!(
+            snapshot.original_binding,
+            f.store
+                .native_owner_binding(&lease.workflow, f.lease.generation)
+                .unwrap()
+                .unwrap()
+        );
+        let events = f.store.events(&lease.workflow).unwrap();
+        assert_eq!(events.len(), events_before.len() + 1);
+        let mut reopened = WorkflowStore::open(&f.path).unwrap();
+        assert_eq!(
+            reopened
+                .native_handoff_snapshot(&lease, &f.binding, now())
+                .unwrap(),
+            snapshot
+        );
+        assert_eq!(
+            reopened.events(&lease.workflow).unwrap(),
+            events,
+            "inventory read mutated workflow history"
+        );
+    }
+    #[test]
+    fn native_handoff_snapshot_never_uses_older_success_after_uncertainty() {
+        if child("native_handoff_snapshot_never_uses_older_success_after_uncertainty") {
+            return;
+        }
+        for known in [true, false] {
+            let mut f = Fixture::new();
+            let complete = f.complete();
+            f.record(&complete).unwrap();
+            let uncertain = f.uncertain(known);
+            f.record(&uncertain).unwrap();
+            let lease = next_handoff_lease(&mut f);
+            let snapshot = f
+                .store
+                .native_handoff_snapshot(&lease, &f.binding, now())
+                .unwrap();
+            assert!(!snapshot.observation.certain);
+            assert!(
+                snapshot.inventory.is_empty(),
+                "old certain inventory survived newer uncertainty"
+            );
+        }
+    }
+    #[test]
+    fn native_handoff_snapshot_detects_deleted_latest_observation() {
+        if child("native_handoff_snapshot_detects_deleted_latest_observation") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let complete = f.complete();
+        f.record(&complete).unwrap();
+        let uncertain = f.uncertain(false);
+        let row = f.record(&uncertain).unwrap();
+        f.store
+            .conn
+            .execute(
+                "DELETE FROM workflow_native_observation WHERE sequence=?1",
+                [row.observation_sequence],
+            )
+            .unwrap();
+        let lease = next_handoff_lease(&mut f);
+        let error = f
+            .store
+            .native_handoff_snapshot(&lease, &f.binding, now())
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ownership::TransferReason>(),
+            Some(&ownership::TransferReason::InventoryMissing)
+        );
+    }
+    #[test]
+    fn native_handoff_snapshot_does_not_collapse_multiple_launches_per_provider() {
+        if child("native_handoff_snapshot_does_not_collapse_multiple_launches_per_provider") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let complete = f.complete();
+        f.record(&complete).unwrap();
+        let intent = native_launch::NativeLaunchIntent {
+            intent_id: uuid::Uuid::new_v4().to_string(),
+            provider: submission::Provider::Codex,
+            runtime_relative_path: "codex/session-second".into(),
+            native_session_id: Some("second-session".into()),
+            launch_sha256: "c".repeat(64),
+            creation_receipt_sha256: "d".repeat(64),
+            controller_receipt: None,
+        };
+        f.store
+            .record_native_launch_intent(&f.lease, &f.binding, &intent, now())
+            .unwrap();
+        let lease = next_handoff_lease(&mut f);
+        let error = f
+            .store
+            .native_handoff_snapshot(&lease, &f.binding, now())
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ownership::TransferReason>(),
+            Some(&ownership::TransferReason::ConversationUncertain)
+        );
+    }
+    #[test]
+    fn native_handoff_snapshot_refuses_changed_candidate_and_stale_lease() {
+        if child("native_handoff_snapshot_refuses_changed_candidate_and_stale_lease") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let complete = f.complete();
+        f.record(&complete).unwrap();
+        let lease = next_handoff_lease(&mut f);
+        assert!(f
+            .store
+            .native_handoff_snapshot(&f.lease, &f.binding, now())
+            .is_err());
+        let mut changed = f.binding.clone();
+        changed.head = "different-head".into();
+        assert!(f
+            .store
+            .native_handoff_snapshot(&lease, &changed, now())
+            .is_err());
+    }
+
+    #[test]
+    fn native_handoff_snapshot_reuses_sequence_across_new_reconciliation_leases() {
+        if child("native_handoff_snapshot_reuses_sequence_across_new_reconciliation_leases") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let fact = f.complete();
+        f.record(&fact).unwrap();
+        let first = next_handoff_lease(&mut f);
+        let snapshot = f
+            .store
+            .native_handoff_snapshot(&first, &f.binding, now())
+            .unwrap();
+        f.store.release(&first, now()).unwrap();
+        let next = f
+            .store
+            .claim(&first.workflow, "restarted-reconciler", now(), 60_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            f.store
+                .native_handoff_snapshot(&next, &f.binding, now())
+                .unwrap(),
+            snapshot
+        );
+    }
+    #[test]
+    fn native_handoff_snapshot_refuses_lost_or_changed_snapshot_projection() {
+        if child("native_handoff_snapshot_refuses_lost_or_changed_snapshot_projection") {
+            return;
+        }
+        for deleted in [true, false] {
+            let mut f = Fixture::new();
+            let fact = f.complete();
+            f.record(&fact).unwrap();
+            let lease = next_handoff_lease(&mut f);
+            let snapshot = f
+                .store
+                .native_handoff_snapshot(&lease, &f.binding, now())
+                .unwrap();
+            if deleted {
+                f.store
+                    .conn
+                    .execute(
+                        "DELETE FROM workflow_native_handoff_snapshot WHERE workflow=?1",
+                        [&lease.workflow],
+                    )
+                    .unwrap();
+            } else {
+                f.store.conn.execute("UPDATE workflow_native_handoff_snapshot SET record=json_set(record,'$.revision',?2) WHERE workflow=?1",params![lease.workflow,snapshot.observation.revision+1]).unwrap();
+            }
+            let events = f.store.events(&lease.workflow).unwrap();
+            assert!(f
+                .store
+                .native_handoff_snapshot(&lease, &f.binding, now())
+                .is_err());
+            assert_eq!(
+                f.store.events(&lease.workflow).unwrap(),
+                events,
+                "recovery invented a new snapshot sequence"
+            );
+        }
+    }
+    #[test]
+    fn native_handoff_snapshot_event_and_projection_commit_atomically() {
+        if child("native_handoff_snapshot_event_and_projection_commit_atomically") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let fact = f.complete();
+        f.record(&fact).unwrap();
+        let lease = next_handoff_lease(&mut f);
+        let events = f.store.events(&lease.workflow).unwrap();
+        f.store.conn.execute_batch("CREATE TRIGGER deny_handoff_snapshot BEFORE INSERT ON workflow_native_handoff_snapshot BEGIN SELECT RAISE(ABORT,'synthetic snapshot insert failure'); END;").unwrap();
+        assert!(f
+            .store
+            .native_handoff_snapshot(&lease, &f.binding, now())
+            .is_err());
+        assert_eq!(f.store.events(&lease.workflow).unwrap(), events);
+        f.store
+            .conn
+            .execute_batch("DROP TRIGGER deny_handoff_snapshot")
+            .unwrap();
+        assert!(f
+            .store
+            .native_handoff_snapshot(&lease, &f.binding, now())
+            .is_ok());
+    }
+    #[test]
+    fn native_handoff_snapshot_keeps_original_binding_after_policy_selection_changes() {
+        if child("native_handoff_snapshot_keeps_original_binding_after_policy_selection_changes") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let fact = f.complete();
+        f.record(&fact).unwrap();
+        let original = f
+            .store
+            .native_owner_binding(&f.lease.workflow, f.lease.generation)
+            .unwrap()
+            .unwrap();
+        let lease = next_handoff_lease(&mut f);
+        std::env::set_var(
+            "AUGMENTAGENT_NATIVE_VM_POLICY",
+            "/missing/changed-policy.json",
+        );
+        assert_eq!(
+            f.store
+                .native_handoff_snapshot(&lease, &f.binding, now())
+                .unwrap()
+                .original_binding,
+            original
+        );
+    }
+    #[test]
+    fn native_handoff_snapshot_keeps_both_completed_sessions_for_one_provider() {
+        if child("native_handoff_snapshot_keeps_both_completed_sessions_for_one_provider") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let fact = f.complete();
+        f.record(&fact).unwrap();
+        let state = f._root.path().canonicalize().unwrap().join("native");
+        let runtime = state.join("codex/session-second");
+        directory(&runtime);
+        let owned=serde_json::to_vec(&serde_json::json!({"version":1,"owner":f.prepared.intent.source_owner,"audit_path":f.audit.path()})).unwrap();
+        file(&runtime.join("owned.json"), &owned);
+        let intent = PreparedLaunchIntent {
+            intent_id: uuid::Uuid::new_v4().to_string(),
+            runtime_relative_path: "codex/session-second".into(),
+            native_session_id: None,
+            launch_sha256: "b".repeat(64),
+            creation_receipt_sha256: sha(&owned),
+            ..f.prepared.intent.clone()
+        };
+        let prepared = f.audit.native_launch_prepared(&intent).unwrap();
+        f.store
+            .record_verified_native_launch(&f.lease, &f.binding, &f.audit, &prepared, now())
+            .unwrap();
+        let resource=f.audit.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
+            "kind":"native_launch_resource_binding","launch_intent":intent,"launch_receipt":prepared.controller_receipt,
+            "resource_identity":{"host_sha256":sha(&std::fs::read("/etc/machine-id").unwrap()),
+                "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),
+                "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1}})).unwrap();
+        let session=f.audit.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
+            "kind":"native_session_observed","launch_intent":intent,"launch_receipt":prepared.controller_receipt,
+            "native_session_id":"second-actual-session","observed_at_ms":now()})).unwrap();
+        file(
+            &state
+                .join("codex/aliases")
+                .join(sha(b"second-actual-session")),
+            b"\"session-second\"",
+        );
+        directory(&runtime.join("generation-second"));
+        file(&runtime.join("generation-second/context"), b"saved-second");
+        file(&runtime.join("complete.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"exit_code":0,
+            "generation":"generation-second","launch_sha256":intent.launch_sha256,"worker_quiescence":{"remaining_workers":0,"quiet_scans":2}})).unwrap());
+        let second =
+            ownership::observe_native_completion(&f.audit, &prepared, &session, &resource).unwrap();
+        f.record(&second).unwrap();
+        let lease = next_handoff_lease(&mut f);
+        let snapshot = f
+            .store
+            .native_handoff_snapshot(&lease, &f.binding, now())
+            .unwrap();
+        assert_eq!(snapshot.inventory.len(), 2);
+        assert!(snapshot.observation.certain);
+        let ids: std::collections::BTreeSet<_> = snapshot
+            .inventory
+            .iter()
+            .map(|row| row.native_session_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from(["actual-session", "second-actual-session"])
+        );
+    }
+
 }
