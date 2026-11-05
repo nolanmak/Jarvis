@@ -14,8 +14,14 @@ impl std::fmt::Display for EvidenceBudget {
     }
 }
 impl std::error::Error for EvidenceBudget {}
+/// A budget refusal keeps its meaning however many `context` layers the review
+/// path wrapped it in, so classify on the whole chain and not the outer error
+/// (#1885: PR #1669 was held as missing reviewer capacity because of one).
+fn is_evidence_budget(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<EvidenceBudget>() || cause.is::<aligned::RequestBudgetExceeded>())
+}
 fn unavailable_from_error(provider: augmentagent_channel_core::ProviderKind, error: anyhow::Error) -> IndependentReview {
-    IndependentReview::unavailable(if error.is::<EvidenceBudget>() || error.is::<aligned::RequestBudgetExceeded>() {
+    IndependentReview::unavailable(if is_evidence_budget(&error) {
         ReviewUnavailable::EvidenceBudget { detail: format!("{error:#}") }
     } else {
         ReviewUnavailable::NoCapacity { reviewers: vec![provider], detail: format!("aligned review needs recovery: {error:#}") }
@@ -1115,6 +1121,27 @@ mod tests {
         let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
         assert!(matches!(review.why_unavailable,Some(ReviewUnavailable::EvidenceBudget {..})),
             "a deterministic request-size refusal cannot be reported as a missing provider");
+    }
+
+    #[test]
+    fn context_wrapped_budget_errors_stay_evidence_budget() {
+        let budgets:[fn()->anyhow::Error;2]=[
+            ||anyhow::Error::new(aligned::RequestBudgetExceeded),
+            ||anyhow::Error::new(EvidenceBudget("caller evidence".into()))];
+        for budget in budgets {
+            for depth in 0..3 {
+                let mut error=budget();
+                for layer in 0..depth {error=error.context(format!("review layer {layer}"));}
+                let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
+                let why=review.why_unavailable.as_ref().unwrap();
+                assert_eq!(why.code(),"review-evidence-budget",
+                    "a budget refusal wrapped in {depth} context layers is not missing reviewer capacity");
+                let ReviewUnavailable::EvidenceBudget {detail}=why else {unreachable!()};
+                for layer in 0..depth {assert!(detail.contains(&format!("review layer {layer}")),"the reported detail keeps every context layer");}
+            }
+        }
+        let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,anyhow::anyhow!("provider down"));
+        assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity");
     }
 
     #[tokio::test]
