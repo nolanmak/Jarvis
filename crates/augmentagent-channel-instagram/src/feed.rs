@@ -72,7 +72,7 @@ struct IdentitiesBlock {
 }
 
 /// #1796: `instagram: handle` and `instagram: [a, b]` are both valid; the
-/// feed follows the first usable handle of a list (#1887).
+/// feed follows the first handle, as before.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum Handles {
