@@ -4,6 +4,7 @@ pub use super::owner_outcome::{
     validate_owner_binding, with_initial_owner_binding, TransferBinding, TransferFenceError,
     TransferObservation, TransferOutcome, TransferReason,
 };
+pub use super::owner_preparation::{NoPendingPreparationFailure,PreparationFingerprintInput,PreparationCapacity};
 use anyhow::{ensure, Result};
 #[cfg(test)]
 use serde_json::Value;

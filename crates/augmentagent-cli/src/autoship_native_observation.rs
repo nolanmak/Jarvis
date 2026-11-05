@@ -1196,6 +1196,17 @@ mod tests {
         }
     }
     #[test]
+    fn native_preparation_retry_refuses_active_or_orphaned_persisted_intent() {
+        if child("native_preparation_retry_refuses_active_or_orphaned_persisted_intent") {return;}
+        for orphan in [false,true] {
+            let mut f=Fixture::new();let fact=f.complete();f.record(&fact).unwrap();let lease=next_handoff_lease(&mut f);let facts=f.store.native_handoff_facts(&lease,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);
+            let _pending=pending_record(f.store.prepare_native_handoff_filtered(&lease,&f.binding,"/private/filtered-audit",&facts,&rows,&[],now()).unwrap());
+            if orphan {f.store.conn.execute("DELETE FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow]).unwrap();}
+            let failure=ownership::NoPendingPreparationFailure::new(ownership::PreparationFingerprintInput {workflow_id:lease.workflow.clone(),workflow_binding:serde_json::to_value(&f.binding).unwrap(),original_binding_sha256:None,source_registration_sha256:Some(facts.source_registration_sha256),latest_input_sha256:Some(facts.latest_input_sha256),selected_policy_sha256:None,capacity_class:ownership::PreparationCapacity::default()},ownership::TransferReason::LockBusy).unwrap();
+            let events=f.store.events(&lease.workflow).unwrap();assert!(f.store.defer_native_handoff_preparation(&lease,&f.binding,&failure,now()).is_err());assert_eq!(f.store.events(&lease.workflow).unwrap(),events);
+        }
+    }
+    #[test]
     fn native_handoff_pending_request_survives_restart_without_new_identity() {
         if child("native_handoff_pending_request_survives_restart_without_new_identity") {
             return;

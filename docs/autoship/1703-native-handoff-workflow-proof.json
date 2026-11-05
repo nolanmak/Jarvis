@@ -1,12 +1,12 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "0132dcbc072f15eaa8bb0b95bb2e61fd4e7903ee",
+  "source_parent_commit": "fcb9eed7177c2c8968506d1524cd7630fde3d8cc",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
     {
       "path": "crates/augmentagent-channel-core/src/native_vm.rs",
-      "sha256": "3c3d41e9253600be0bcae6ae65308db4891b034fa89a257077fc1acf6d900e40"
+      "sha256": "6d2c714afc848ef9981dae4d013e3613bea180733093d89d24d16b79bd591cfa"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_handoff.rs",
@@ -26,7 +26,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
-      "sha256": "67e15e030edd454c33722591ef958f4d1dbc407c8aed7db41d911817b45f9c55"
+      "sha256": "903a6bf7e2630fa5c5096c9d40dd0c497c9684fb9cc39b74cfdf796b375f6b02"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
@@ -51,28 +51,42 @@
     {
       "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
       "sha256": "9fbad8fc1a529014f83105589f6ba4729eef4032a013228a2ca859aa60274011"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_preparation.rs",
+      "sha256": "1d5e04cee7bb2a210e6f42742ebb66f067da02794346c727700716dd4133b9ec"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_transfer.rs",
+      "sha256": "b889011c882af75fb58e30888faeafef5954fa413bcf3e406c9c54edccb97303"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_verification_retry.rs",
+      "sha256": "421187103ed2fc56f681f3f4da8500250e886a1622541fcb4a13173fbf115e42"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1789,
+    "passed": 1794,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
     "pending_handoff_cases": 8,
     "retained_logs": [
-      "autoship-native-workflow-filtered-red.log",
-      "autoship-native-workflow-filtered-green.log",
-      "autoship-native-workflow-pending-fence-red.log",
-      "autoship-native-workflow-filtered-focused.log",
-      "autoship-native-workflow-filtered-full-cli.log",
-      "autoship-native-locked-preparation-full-core.log"
+      "autoship-native-preparation-failure-red.log",
+      "autoship-native-preparation-failure-green.log",
+      "autoship-native-preparation-retry-red.log",
+      "autoship-native-preparation-retry-initial-fixture-failure.log",
+      "autoship-native-preparation-retry-domain-red.log",
+      "autoship-native-preparation-retry-focused.log",
+      "autoship-native-preparation-failure-full-core.log",
+      "autoship-native-preparation-failure-full-cli.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
     "owner_eligibility_cases": 6,
     "focused_native_observation_cases": 33,
-    "core_passed": 877,
+    "core_passed": 881,
     "core_failed": 0,
     "core_ignored": 15,
     "owner_retirement_marker_cases": 3,
@@ -80,7 +94,8 @@
     "physical_inventory_scan_cases": 7,
     "locked_preparation_cases": 7,
     "workflow_filtered_preparation_cases": 7,
-    "core_source_unchanged_since": "0132dcbc072f15eaa8bb0b95bb2e61fd4e7903ee"
+    "preparation_fingerprint_cases": 4,
+    "preparation_retry_cases": 5
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -118,7 +133,12 @@
     "complete unfiltered latest-input array has canonical digest while every eligible original source registration remains in the separate source digest",
     "one immediate workflow transaction revalidates the complete census and atomically records a filtered snapshot and exact pending request; failed insert rolls back both and their events",
     "proposed retired uncertainty is omitted only from the selected metadata snapshot, preserving original uncertainty/history and zero-runtime source registrations; no native retirement authority is created",
-    "metadata-only active-pending fence requires exact decoded request, original observation, current lease/candidate/destination, dispatch/remote guards and unretired source namespaces; cleared intent, hold and newer lease refuse"
+    "metadata-only active-pending fence requires exact decoded request, original observation, current lease/candidate/destination, dispatch/remote guards and unretired source namespaces; cleared intent, hold and newer lease refuse",
+    "no-pending preparation diagnostic uses the exact canonical input/reason/class/capacity fingerprint with explicit null unknowns, no fabricated request ID or observation sequence",
+    "preparation status defers transient contention/capacity/persistence and holds provenance uncertainty; clock, lease generation and provisional audit are excluded from typed inputs",
+    "finite native_handoff_preparation domain uses the existing durable retry service with 5/10/20/40/60-minute capped backoff and independent CI/acceptance epochs",
+    "same-generation replay is idempotent, changed fingerprint resets its epoch, unrelated success cannot clear native debt, and unknown domains/cross-domain overwrites are refused",
+    "native no-pending retry write independently refuses active or orphaned native intent and unresolved remote/merge mutations without changing progress, binding, attempts, model charges or allowance"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -163,5 +183,10 @@
   "locked_preparation_red_evidence": "Initial four callback/locking tests failed behaviorally against the placeholder. Expanded red: one precondition test passed and five failed. Final full core suite includes seven cases, including real concurrent retirement.",
   "workflow_filtered_transaction_component_executed": true,
   "workflow_filtered_transaction_scope": "actual WorkflowStore SQLite transactions with synthetic proposed retained/retired selections; no core callback adapter, native transfer or model dispatch in these new cases",
-  "workflow_filtered_red_evidence": "Five census/filtered transaction tests failed against placeholders, then passed; two exact pending-fence tests separately failed before implementation. Final focused and full CLI runs include all seven."
+  "workflow_filtered_red_evidence": "Five census/filtered transaction tests failed against placeholders, then passed; two exact pending-fence tests separately failed before implementation. Final focused and full CLI runs include all seven.",
+  "preparation_diagnostic_retry_component_executed": true,
+  "preparation_diagnostic_retry_scope": "typed diagnostic plus actual WorkflowStore retry/event scheduling fixtures; no guarded core preparation adapter or productive caller enabled",
+  "early_input_wake_integrated": false,
+  "pending_commit_uncertainty_disposition_integrated": false,
+  "preparation_diagnostic_retry_red_evidence": "Four fingerprint tests failed against the placeholder, and native retry initially had three behavioral failures/one refusal passing. Separate domain-overwrite test reproduced its behavioral failure. Initial retry implementation had one fixture failure from claiming before scheduled eligibility; corrected test uses normal admission and proves changed-input epoch reset, not early wake."
 }

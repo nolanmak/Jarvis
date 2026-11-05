@@ -7,6 +7,8 @@ struct Retry {
     version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stage: Option<Stage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    domain:Option<VerificationDomain>,
     binding: Binding,
     failure_code: String,
     dependency_sha256: String,
@@ -19,12 +21,14 @@ impl Retry {
     fn stage(&self) -> Stage {
         self.stage.unwrap_or(Stage::Verify)
     }
+    fn domain(&self)->VerificationDomain {self.domain.unwrap_or_else(||VerificationDomain::for_failure(&self.failure_code))}
     fn validate(&self) -> Result<()> {
         self.binding.validate()?;
         ensure!(
-            ((self.version == 1 && self.stage.is_none())
-                || (self.version == 2 && self.stage.is_some()))
-                && retryable_stage(self.stage())
+            ((self.version == 1 && self.stage.is_none() && self.domain.is_none())
+                || (self.version == 2 && self.stage.is_some() && self.domain.is_none())
+                || (self.version == 3 && self.stage.is_some() && self.domain==Some(VerificationDomain::NativeHandoffPreparation)))
+                && retryable_domain_stage(self.domain(),self.stage())
                 && self.generation > 0
                 && self.failures > 0
                 && self.failed_at_ms >= 0
@@ -63,8 +67,9 @@ impl Retry {
 /// Starting a stage, editing a head, or passing CI cannot clear acceptance debt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum VerificationDomain { Ci, Acceptance }
+pub enum VerificationDomain { Ci, Acceptance, NativeHandoffPreparation }
 impl VerificationDomain {
+    fn key(self)->&'static str {match self {Self::Ci=>"ci",Self::Acceptance=>"acceptance",Self::NativeHandoffPreparation=>"native_handoff_preparation"}}
     fn for_failure(code: &str) -> Self {
         if code=="acceptance verifier infrastructure" {Self::Acceptance} else {Self::Ci}
     }
@@ -104,7 +109,16 @@ fn retryable_stage(stage: Stage) -> bool {
     )
 }
 
+fn retryable_domain_stage(domain:VerificationDomain,stage:Stage)->bool {
+    if domain==VerificationDomain::NativeHandoffPreparation { !matches!(stage,Stage::Held|Stage::Merged|Stage::Retired) }
+    else {retryable_stage(stage)}
+}
 impl WorkflowStore {
+    pub fn defer_native_handoff_preparation(&mut self,lease:&Lease,binding:&Binding,
+        failure:&augmentagent_channel_core::native_vm::ownership::NoPendingPreparationFailure,now:i64)->Result<i64> {
+        ensure!(failure.workflow_id()==lease.workflow && failure.workflow_binding()==&serde_json::to_value(binding)?,"native preparation retry scope differs from current workflow");
+        self.defer_retry(lease,binding,failure.reason().code(),failure.fingerprint(),VerificationDomain::NativeHandoffPreparation,now)
+    }
     /// Called after the controller's actual successful gate, never at stage
     /// entry. Completion remains recordable after an owner pause; it cannot
     /// clear that pause, schedule productive work, or change any accounting.
@@ -126,11 +140,21 @@ impl WorkflowStore {
         dependency_sha256: &str,
         now: i64,
     ) -> Result<i64> {
+        self.defer_retry(lease,binding,failure_code,dependency_sha256,VerificationDomain::for_failure(failure_code),now)
+    }
+    fn defer_retry(&mut self,lease:&Lease,binding:&Binding,failure_code:&str,dependency_sha256:&str,domain:VerificationDomain,now:i64)->Result<i64> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx, lease, binding, now)?;
         owner_control::require_dispatch(&tx, &lease.workflow)?;
+        if domain==VerificationDomain::NativeHandoffPreparation {
+            // No-pending diagnostics are descriptive, never proof that a
+            // possibly committed request vanished. Fence absence in this write.
+            let unresolved:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_handoff_pending WHERE workflow=?1) OR EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=?1 AND e.kind='native_handoff_prepared' AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_completed c WHERE c.workflow=e.workflow AND c.pending_sequence=e.seq)) OR EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed'))",[&lease.workflow],|r|r.get(0))?;
+            ensure!(!unresolved,"native preparation retry cannot replace unresolved durable intent");
+        }
+        let (retry_reason,retry_action)=if domain==VerificationDomain::NativeHandoffPreparation {("native_handoff_preparation_retry","retry_native_handoff_preparation")} else {("verification_infrastructure_retry","retry_verification")};
         let (raw, progress_at): (String, i64) = tx.query_row(
             "SELECT checkpoint,progress_at FROM workflow WHERE id=?1",
             [&lease.workflow],
@@ -138,7 +162,7 @@ impl WorkflowStore {
         )?;
         let mut checkpoint: Checkpoint = serde_json::from_str(&raw)?;
         ensure!(
-            retryable_stage(checkpoint.stage),
+            retryable_domain_stage(domain,checkpoint.stage),
             "only an active pre-merge CI stage can be deferred"
         );
         let decode = |raw: &str| -> Result<Retry> {
@@ -151,12 +175,19 @@ impl WorkflowStore {
                 "verification retry contains unknown binding fields");
             Ok(prior)
         };
+        // Domain isolation must not hide malformed history or let a second
+        // domain overwrite an unchanged schedule in the same owner generation.
+        let latest:Option<String>=tx.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='verification_infrastructure_retry' ORDER BY seq DESC LIMIT 1",[&lease.workflow],|row|row.get(0)).optional()?;
+        let latest=latest.map(|raw|decode(&raw)).transpose()?;
+        if let Some(prior)=latest.as_ref().filter(|p|p.generation==lease.generation && progress_at<=p.failed_at_ms) {
+            ensure!(prior.domain()==domain,"retry domains cannot overwrite unchanged debt in the same generation");
+        }
         let previous:Option<(i64,String)>=tx.query_row(
-            "SELECT seq,payload FROM workflow_event WHERE workflow=?1 AND kind='verification_infrastructure_retry' ORDER BY seq DESC LIMIT 1",
-            [&lease.workflow],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+            "SELECT seq,payload FROM workflow_event WHERE workflow=?1 AND kind='verification_infrastructure_retry' AND coalesce(json_extract(payload,'$.domain'),CASE WHEN json_extract(payload,'$.failure_code')='acceptance verifier infrastructure' THEN 'acceptance' ELSE 'ci' END)=?2 ORDER BY seq DESC LIMIT 1",
+            params![lease.workflow,domain.key()],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
         let previous=previous.map(|(seq,raw)|decode(&raw).map(|retry|(seq,retry))).transpose()?;
         let same = |prior: &Retry| {
-            prior.binding == *binding
+            prior.domain()==domain && prior.binding == *binding
                 && prior.stage() == checkpoint.stage
                 && prior.failure_code == failure_code
                 && prior.dependency_sha256 == dependency_sha256
@@ -168,8 +199,8 @@ impl WorkflowStore {
         {
             ensure!(
                 same(prior)
-                    && checkpoint.next.reason == "verification_infrastructure_retry"
-                    && checkpoint.next.action == "retry_verification"
+                    && checkpoint.next.reason == retry_reason
+                    && checkpoint.next.action == retry_action
                     && checkpoint.next.eligible_at_ms == prior.eligible_at_ms,
                 "verification retry replay changed within its owner generation"
             );
@@ -183,20 +214,21 @@ impl WorkflowStore {
             previous.clone()
         } else {
             let raw:Option<(i64,String)>=tx.query_row(
-                "SELECT seq,payload FROM workflow_event WHERE workflow=?1 AND kind='verification_infrastructure_retry' AND json_extract(payload,'$.failure_code')=?2 AND json_extract(payload,'$.dependency_sha256')=?3 ORDER BY seq DESC LIMIT 1",
-                params![lease.workflow,failure_code,dependency_sha256],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+                "SELECT seq,payload FROM workflow_event WHERE workflow=?1 AND kind='verification_infrastructure_retry' AND coalesce(json_extract(payload,'$.domain'),CASE WHEN json_extract(payload,'$.failure_code')='acceptance verifier infrastructure' THEN 'acceptance' ELSE 'ci' END)=?4 AND json_extract(payload,'$.failure_code')=?2 AND json_extract(payload,'$.dependency_sha256')=?3 ORDER BY seq DESC LIMIT 1",
+                params![lease.workflow,failure_code,dependency_sha256,domain.key()],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
             raw.map(|(seq,raw)|decode(&raw).map(|retry|(seq,retry))).transpose()?
         };
         let failures=if let Some((seq,prior))=matching {
-            if gate_passed_since(&tx,lease,seq,prior.failed_at_ms,VerificationDomain::for_failure(failure_code),now)? {1}
+            if gate_passed_since(&tx,lease,seq,prior.failed_at_ms,domain,now)? {1}
             else {prior.failures.saturating_add(1)}
         } else {1};
         let delay = 300_000_i64
             .saturating_mul(1 << (failures - 1).min(4))
             .min(3_600_000);
         let retry = Retry {
-            version: 2,
+            version:if domain==VerificationDomain::NativeHandoffPreparation {3}else{2},
             stage: Some(checkpoint.stage),
+            domain:if domain==VerificationDomain::NativeHandoffPreparation {Some(domain)}else{None},
             binding: binding.clone(),
             failure_code: failure_code.into(),
             dependency_sha256: dependency_sha256.into(),
@@ -207,8 +239,8 @@ impl WorkflowStore {
         };
         retry.validate()?;
         checkpoint.next = NextAction {
-            reason: "verification_infrastructure_retry".into(),
-            action: "retry_verification".into(),
+            reason:retry_reason.into(),
+            action:retry_action.into(),
             eligible_at_ms: retry.eligible_at_ms,
         };
         let checkpoint = serde_json::to_string(&checkpoint)?;
@@ -261,6 +293,50 @@ mod tests {
         checkpoint.evidence = vec!["protected-receipt".into()];
         store.checkpoint(&lease, &checkpoint, 21).unwrap();
         (store, lease, binding)
+    }
+    fn preparation_failure(lease:&Lease,binding:&Binding,source:char)->augmentagent_channel_core::native_vm::ownership::NoPendingPreparationFailure {
+        use augmentagent_channel_core::native_vm::ownership::*;
+        NoPendingPreparationFailure::new(PreparationFingerprintInput {workflow_id:lease.workflow.clone(),workflow_binding:serde_json::to_value(binding).unwrap(),original_binding_sha256:Some("a".repeat(64)),source_registration_sha256:Some(source.to_string().repeat(64)),latest_input_sha256:Some("c".repeat(64)),selected_policy_sha256:None,capacity_class:PreparationCapacity::default()},TransferReason::LockBusy).unwrap()
+    }
+    #[test]
+    fn native_preparation_retry_persists_capped_backoff_without_charges_or_fake_requests() {
+        let directory=tempfile::tempdir().unwrap();let path=directory.path().join("workflow.db");let (mut store,mut lease,binding)=setup(&path);let mut now=30;
+        let mut checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Intake;store.checkpoint(&lease,&checkpoint,22).unwrap();
+        for delay in [300_000,600_000,1_200_000,2_400_000,3_600_000,3_600_000] {
+            let failure=preparation_failure(&lease,&binding,'b');let before=store.snapshot(&lease.workflow).unwrap().unwrap();let allowance=store.merge_allowance(now,5).unwrap();
+            let due=store.defer_native_handoff_preparation(&lease,&binding,&failure,now).unwrap();assert_eq!(due,now+delay);
+            let events=store.events(&lease.workflow).unwrap();assert_eq!(store.defer_native_handoff_preparation(&lease,&binding,&failure,now+1).unwrap(),due);assert_eq!(store.events(&lease.workflow).unwrap(),events);
+            let after=store.snapshot(&lease.workflow).unwrap().unwrap();assert_eq!(after.attempts,before.attempts);assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.progress_at_ms,before.progress_at_ms);assert_eq!(after.checkpoint.binding,before.checkpoint.binding);assert_eq!(store.merge_allowance(now+1,5).unwrap(),allowance);
+            assert_eq!(after.checkpoint.next.action,"retry_native_handoff_preparation");
+            let raw:String=store.conn.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='verification_infrastructure_retry' ORDER BY seq DESC LIMIT 1",[&lease.workflow],|r|r.get(0)).unwrap();let payload:serde_json::Value=serde_json::from_str(&raw).unwrap();assert_eq!(payload["domain"],"native_handoff_preparation");assert!(payload.get("transfer_id").is_none() && payload.get("observation_revision").is_none());
+            store.release(&lease,now+2).unwrap();drop(store);store=WorkflowStore::open(&path).unwrap();assert!(store.claim_productive(&lease.workflow,"early",due-1,60_000).unwrap().is_none());lease=store.claim_productive(&lease.workflow,"next",due,60_000).unwrap().unwrap();now=due+1;
+        }
+    }
+    #[test]
+    fn native_preparation_retry_is_separate_from_ci_acceptance_epochs_and_gate_success() {
+        let directory=tempfile::tempdir().unwrap();let (mut store,lease,binding)=setup(&directory.path().join("workflow.db"));let failure=preparation_failure(&lease,&binding,'b');
+        let due=store.defer_native_handoff_preparation(&lease,&binding,&failure,30).unwrap();store.release(&lease,31).unwrap();let lease=store.claim_productive(&lease.workflow,"ci",due,60_000).unwrap().unwrap();
+        store.record_verification_gate_passed(&lease,&binding,VerificationDomain::Ci,due+1).unwrap();store.record_verification_gate_passed(&lease,&binding,VerificationDomain::Acceptance,due+2).unwrap();
+        let ci_due=store.defer_verification_infrastructure(&lease,&binding,failure.reason().code(),failure.fingerprint(),due+3).unwrap();assert_eq!(ci_due,due+3+300_000,"native epoch leaked into CI");
+        store.release(&lease,due+4).unwrap();let lease=store.claim_productive(&lease.workflow,"native",ci_due,60_000).unwrap().unwrap();
+        assert_eq!(store.defer_native_handoff_preparation(&lease,&binding,&failure,ci_due+1).unwrap(),ci_due+1+600_000,"CI or acceptance success cleared native preparation debt");
+    }
+    #[test]
+    fn native_preparation_retry_changed_inputs_reset_epoch_but_wrong_scope_cannot_schedule() {
+        let directory=tempfile::tempdir().unwrap();let (mut store,lease,binding)=setup(&directory.path().join("workflow.db"));let failure=preparation_failure(&lease,&binding,'b');let due=store.defer_native_handoff_preparation(&lease,&binding,&failure,30).unwrap();store.release(&lease,31).unwrap();
+        let lease=store.claim(&lease.workflow,"changed-input",due,60_000).unwrap().unwrap();let changed=preparation_failure(&lease,&binding,'d');assert_eq!(store.defer_native_handoff_preparation(&lease,&binding,&changed,due+1).unwrap(),due+1+300_000);
+        let mut foreign=lease.clone();foreign.workflow="another/repo#9".into();let wrong=preparation_failure(&foreign,&binding,'d');let events=store.events(&lease.workflow).unwrap();assert!(store.defer_native_handoff_preparation(&lease,&binding,&wrong,due+2).is_err());assert_eq!(store.events(&lease.workflow).unwrap(),events);
+    }
+    #[test]
+    fn native_preparation_retry_cannot_overwrite_same_generation_debt_or_hide_unknown_domain() {
+        for fault in ["same-generation","unknown-domain"] {
+            let directory=tempfile::tempdir().unwrap();let (mut store,lease,binding)=setup(&directory.path().join("workflow.db"));let failure=preparation_failure(&lease,&binding,'b');
+            store.defer_native_handoff_preparation(&lease,&binding,&failure,30).unwrap();
+            if fault=="unknown-domain" {store.conn.execute("UPDATE workflow_event SET payload=json_set(payload,'$.domain','unknown') WHERE workflow=?1 AND kind='verification_infrastructure_retry'",[&lease.workflow]).unwrap();}
+            let events=store.events(&lease.workflow).unwrap();let before=store.snapshot(&lease.workflow).unwrap().unwrap();
+            assert!(store.defer_verification_infrastructure(&lease,&binding,"network",&"e".repeat(64),31).is_err(),"{fault}");
+            assert_eq!(store.events(&lease.workflow).unwrap(),events);assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint.next,before.checkpoint.next);
+        }
     }
     #[test]
     fn unchanged_dependency_keeps_backoff_across_new_heads_stage_starts_and_restarts() {
@@ -445,6 +521,7 @@ mod tests {
             .defer_verification_infrastructure(&lease, &binding, "network", &"a".repeat(64), 30)
             .unwrap();
         let legacy = Retry {
+            domain:None,
             version: 1,
             stage: None,
             binding: binding.clone(),
@@ -623,6 +700,7 @@ mod tests {
                 "future-generation" | "future-clock" => {
                     let failed_at = if fault == "future-clock" { 50 } else { 22 };
                     let retry = Retry {
+                        domain:None,
                         version: 1,
                         stage: None,
                         binding: binding.clone(),

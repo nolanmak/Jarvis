@@ -89,6 +89,8 @@ mod owner_ledger;
 mod owner_inventory;
 #[path = "native_owner_handoff.rs"]
 mod owner_handoff;
+#[path = "native_owner_preparation.rs"]
+mod owner_preparation;
 #[path = "native_owner_outcome.rs"]
 mod owner_outcome;
 #[path = "native_owner_store.rs"]
