@@ -470,6 +470,21 @@ impl AnchoredAudit {
         self.save(&anchor)?;
         Ok(proof)
     }
+    /// Read committed healthy evidence while retaining the writer ingress gate.
+    /// Existing seals remain unchanged; no append or new generation is created.
+    pub(crate) fn with_retained_snapshot<T>(&self, validate:impl FnOnce(&[serde_json::Value],serde_json::Value)->Result<T>)->Result<T> {
+        let (_lock,anchor,rows,clean)=self.locked_snapshot_from(true)?;
+        ensure!(clean,"namespace cleanup requires complete committed audit evidence");
+        if let Some(proof)=&anchor.sealed {
+            if proof["kind"]=="healthy_handoff" {
+                let seal:HandoffSeal=serde_json::from_value(proof.clone())?;
+                ensure!(seal.version==1 && seal.committed_sha256==anchor.hash && seal.committed_bytes==anchor.bytes
+                    && seal.sequence==anchor.sequence && seal.request_sha256.len()==64
+                    && seal.request_sha256.bytes().all(|c|c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),"invalid retained handoff seal");
+            } else {verify_recovery_seal(&anchor,proof)?;}
+        }
+        validate(&rows,serde_json::json!({"committed_sha256":anchor.hash,"committed_bytes":anchor.bytes,"sequence":anchor.sequence,"sealed":anchor.sealed.is_some()}))
+    }
     pub(crate) fn inspect_open<F>(&self, validate: F) -> Result<()>
     where
         F: FnOnce(&[serde_json::Value]) -> Result<()>,
@@ -489,19 +504,25 @@ impl AnchoredAudit {
     }
 
     fn locked_snapshot(&self) -> Result<(AuditLock, Anchor, Vec<serde_json::Value>, bool)> {
+        self.locked_snapshot_from(false)
+    }
+    fn locked_snapshot_from(&self,existing_only:bool) -> Result<(AuditLock, Anchor, Vec<serde_json::Value>, bool)> {
+        let open=|path:&Path|if existing_only {private_existing(path)}else{private_open(path,false)};
+        let lock_path=self.anchor.with_extension("lock");
         let lock = AuditLock::acquire(
-            private_open(&self.anchor.with_extension("lock"), false)?,
-            false,
+            open(&lock_path)?,
+            existing_only,
         )?;
         ensure!(
             self.anchor.exists() && self.log.exists(),
             "recovery requires existing audit evidence"
         );
-        let file = private_open(&self.anchor, false)?;
+        let anchor_file = open(&self.anchor)?;
+        let file = &anchor_file;
         ensure!(file.metadata()?.len() <= LIMIT, "anchor exceeds budget");
         let anchor: Anchor = serde_json::from_reader(file)?;
         ensure!(anchor.version == 1, "unsupported anchor");
-        let mut file = private_open(&self.log, false)?;
+        let mut file = open(&self.log)?;
         ensure!(file.metadata()?.len() <= LIMIT, "audit exceeds budget");
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
@@ -535,6 +556,11 @@ impl AnchoredAudit {
             .map(serde_json::from_slice)
             .collect::<std::result::Result<Vec<serde_json::Value>, _>>()?;
         let clean = anchor.pending.is_none() && tail.is_empty();
+        if existing_only {
+            verify_existing_identity(&lock_path,&lock)?;
+            verify_existing_identity(&self.anchor,&anchor_file)?;
+            verify_existing_identity(&self.log,&file)?;
+        }
         Ok((lock, anchor, rows, clean))
     }
     fn append_locked(&self, mut record: serde_json::Value) -> Result<AppendReceipt> {

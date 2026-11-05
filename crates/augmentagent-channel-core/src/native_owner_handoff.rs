@@ -32,7 +32,7 @@ fn private_directory(path: &Path) -> Result<()> {
     );
     Ok(())
 }
-fn actual_audit(path: &Path) -> Result<PathBuf> {
+pub(super) fn actual_audit(path: &Path) -> Result<PathBuf> {
     let info = path.symlink_metadata()?;
     ensure!(
         info.is_file()
@@ -174,6 +174,29 @@ fn retired_with_reader(root:&Path,ledger:&Ledger<'_>,session:&Path,read:&mut dyn
         }
     }
     Ok(retired)
+}
+pub(super) struct NamespaceRetirementLocks { _sessions:Vec<SessionLock> }
+/// Verify the selected namespace only; a peer's retirement is never inferred.
+pub(super) fn retired_namespace(root:&Path,ledger:&Ledger<'_>,request:&TransferRequest,namespace:&Authority)->Result<NamespaceRetirementLocks> {
+    ensure!(ledger.retired_authority(namespace)?,R::AuthorityConflict);private_directory(root)?;
+    let mut remaining=64*1024*1024u64;let mut count=0usize;
+    let mut read=|path:&Path|->Result<Vec<u8>> {let bytes=super::private_with_limit(path,remaining)?;remaining=remaining.checked_sub(bytes.len() as u64).context(R::StateCapacity)?;Ok(bytes)};
+    let mut recorded=request.inventory.iter().filter(|row|row.effective_owner==namespace.owner && row.effective_audit_path==namespace.audit_path).map(|row|(row.runtime_relative_path.clone(),row)).collect::<BTreeMap<_,_>>();
+    let mut result=NamespaceRetirementLocks {_sessions:Vec::new()};
+    for entry in std::fs::read_dir(root)? {let _=entry?;count+=1;ensure!(count<=4096,R::StateCapacity);}
+    for provider in ["codex","claude","qwen","glm"] {
+        let directory=root.join(provider);match directory.symlink_metadata() {Err(e) if e.kind()==std::io::ErrorKind::NotFound=>continue,Err(e)=>return Err(e.into()),Ok(_)=>private_directory(&directory)?,}
+        for entry in std::fs::read_dir(&directory)? {
+            let path=entry?.path();count+=1;ensure!(count<=4096,R::StateCapacity);
+            if !path.file_name().is_some_and(|name|name.to_string_lossy().starts_with("session-")){continue;}
+            private_directory(&path)?;let owned=read(&path.join("owned.json"))?;
+            if super::runtime_authority_from(root,ledger,&path,&owned)?!=*namespace {continue;}
+            result._sessions.push(session_lock(&path)?);
+            if let Some(expected)=recorded.remove(super::relative_runtime(root,&path)?) {ensure!(sha(&owned)==expected.creation_receipt_sha256,R::MetadataInvalid);}
+            ensure!(retired_with_reader(root,ledger,&path,&mut read)?,R::AuthorityConflict);
+        }
+    }
+    ensure!(recorded.is_empty(),R::InventoryMissing);Ok(result)
 }
 // Latest metadata per physical runtime, already authenticated by the workflow
 // projection. None is retained uncertainty, never an older successful outcome.
@@ -912,6 +935,52 @@ mod tests {
             assert!(matches!(outcome,PreparedTransferResult::Pending {outcome:TransferOutcome::Held {reason:R::AuthorityConflict,..},..}),"{fault}: {outcome:?}");assert_eq!(audit_bytes(&f),before);
             let lock=super::super::StateLock::existing(&f.root).unwrap();assert!(Ledger::open(&f.root,&lock).unwrap().state_for(&f.request).unwrap().is_none());
         }
+    }
+    fn aborted_retirement_fixture(f:&Fixture)->super::super::ownership::TransferBinding {
+        let path=policy(f);let binding=binding_for(f,&path);
+        for logger in f.sources.iter().chain(std::iter::once(&f.destination)) {logger.set_native_store_binding(binding.clone()).unwrap();}
+        let lock=super::super::StateLock::existing(&f.root).unwrap();let mut ledger=Ledger::open(&f.root,&lock).unwrap();let plan=audit_plan(&f.request,&f.sources,&f.destination).unwrap();ledger.prepare(&f.request,&plan.endpoints,u64::MAX).unwrap();drop(ledger);drop(lock);
+        let source=&f.request.source_owners[0];super::super::retire_owned_runtimes(&binding,Path::new(&source.audit_path),&source.owner,&||Ok(())).unwrap();binding
+    }
+    #[test]
+    fn native_retired_namespace_proof_holds_exact_locks_and_preserves_peers() {
+        use super::super::ownership::*;
+        let f=fixture(true);let binding=aborted_retirement_fixture(&f);let source=&f.request.source_owners[0];let before=audit_bytes(&f);let native=std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();let called=std::cell::Cell::new(false);
+        with_retired_aborted_namespace(&binding,&f.request,&observation(),source,&f.sources[0],&||Ok(()),&mut |proof| {
+            called.set(true);assert_eq!(proof.binding(),&binding);assert_eq!(proof.request(),&f.request);assert_eq!(proof.observation(),&observation());assert_eq!(proof.namespace(),source);
+            assert_eq!(proof.evidence()["namespace"],serde_json::to_value(source).unwrap());assert!(super::super::StateLock::existing(&f.root).is_err());assert!(session_lock(&f.root.join("codex/session-codex")).is_err());assert!(session_lock(&f.root.join("claude/session-claude")).is_ok());
+            let gate=std::fs::OpenOptions::new().read(true).write(true).open(f.sources[0].protected_anchor_path().unwrap().with_extension("lock")).unwrap();assert_ne!(unsafe {libc::flock(gate.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);Ok(())
+        }).unwrap();assert!(called.get());assert_eq!(audit_bytes(&f),before);assert_eq!(std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(),native);
+        let lock=super::super::StateLock::existing(&f.root).unwrap();let ledger=Ledger::open(&f.root,&lock).unwrap();assert!(!ledger.retired_authority(&f.request.source_owners[1]).unwrap());assert!(!ledger.retired_authority(&f.request.destination).unwrap());
+    }
+    #[test]
+    fn native_retired_namespace_proof_refuses_unproved_markers_busy_sessions_and_bad_kernel_identity() {
+        use super::super::ownership::*;
+        for fault in ["marker","busy","creation","audit","kernel","audit-lock","missing-runtime"] {
+            let f=fixture(false);let binding=aborted_retirement_fixture(&f);let source=&f.request.source_owners[0];let session=f.root.join("codex/session-codex");
+            let held=if fault=="busy" {Some(session_lock(&session).unwrap())}else{None};
+            match fault {
+                "marker"=>{std::fs::remove_file(session.join("retired-owner.json")).unwrap();},
+                "audit-lock"=>{std::fs::remove_file(f.sources[0].protected_anchor_path().unwrap().with_extension("lock")).unwrap();},
+                "missing-runtime"=>{std::fs::remove_dir_all(&session).unwrap();},
+                "creation"=>{std::fs::write(session.join("owned.json"),&serde_json::to_vec(&json!({"version":1,"owner":source.owner,"audit_path":source.audit_path,"changed":true})).unwrap()).unwrap();},
+                "kernel"=>{f.sources[0].record_controller(json!({"actor":"controller","kind":"run_resource_admitted","provider":"codex","observation":{"identity":{"host_sha256":"invalid-host","boot_id":"invalid","path":"/sys/fs/cgroup/run-00000000000000000000000000000000","inode":1}}})).unwrap();},
+                _=>{},
+            }
+            let audit=if fault=="audit" {&f.destination}else{&f.sources[0]};let called=std::cell::Cell::new(false);
+            assert!(with_retired_aborted_namespace(&binding,&f.request,&observation(),source,audit,&||Ok(()),&mut |_| {called.set(true);Ok(())}).is_err(),"{fault}");assert!(!called.get(),"{fault}");if fault=="audit-lock" {assert!(!f.sources[0].protected_anchor_path().unwrap().with_extension("lock").exists());}drop(held);
+        }
+    }
+    #[test]
+    fn native_retired_namespace_proof_rechecks_kernel_on_sealed_audit_and_callback_replay() {
+        use super::super::ownership::*;
+        let f=fixture(false);let path=policy(&f);let binding=binding_for(&f,&path);for logger in f.sources.iter().chain(std::iter::once(&f.destination)) {logger.set_native_store_binding(binding.clone()).unwrap();}
+        let identity=json!({"host_sha256":sha(&std::fs::read("/etc/machine-id").unwrap()),"boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),"path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1,"limits":{}});
+        f.sources[0].record_controller(json!({"actor":"controller","kind":"run_resource_admitted","provider":"codex","observation":{"identity":identity}})).unwrap();f.sources[0].model_call_admitted_in_scope("codex",&identity).unwrap();
+        let lock=super::super::StateLock::existing(&f.root).unwrap();let mut ledger=Ledger::open(&f.root,&lock).unwrap();let plan=audit_plan(&f.request,&f.sources,&f.destination).unwrap();ledger.prepare(&f.request,&plan.endpoints,u64::MAX).unwrap();drop(ledger);drop(lock);
+        f.sources[0].handoff_evidence(&value_hash(&serde_json::to_value(&f.request).unwrap()).unwrap(),&f.request.destination.owner,&||Ok(())).unwrap();let source=&f.request.source_owners[0];super::super::retire_owned_runtimes(&binding,Path::new(&source.audit_path),&source.owner,&||Ok(())).unwrap();let before=audit_bytes(&f);
+        assert!(with_retired_aborted_namespace(&binding,&f.request,&observation(),source,&f.sources[0],&||Ok(()),&mut |_|anyhow::bail!("injected metadata acknowledgement failure")).is_err());
+        with_retired_aborted_namespace(&binding,&f.request,&observation(),source,&f.sources[0],&||Ok(()),&mut |proof| {assert_eq!(proof.evidence()["validation"]["quiescent_resources"][0]["identity"],identity);assert_eq!(proof.evidence()["validation"]["quiescent_resources"][0]["verified_state"],"removed_empty_subtree");Ok(())}).unwrap();assert_eq!(audit_bytes(&f),before);
     }
     #[test]
     fn native_transfer_inspection_absence_keeps_original_lock_and_never_reads_new_policy() {

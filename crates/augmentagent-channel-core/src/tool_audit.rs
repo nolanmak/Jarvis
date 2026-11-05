@@ -451,16 +451,19 @@ impl AuditLogger {
         assert_current()?;
         Ok(proof)
     }
-    fn handoff_validation(
-        rows: &[serde_json::Value],
-        destination: &crate::native_vm::RuntimeOwner,
-    ) -> anyhow::Result<serde_json::Value> {
+    fn handoff_validation(rows:&[serde_json::Value],destination:&crate::native_vm::RuntimeOwner)->anyhow::Result<serde_json::Value> {
+        let (previous,resources)=Self::namespace_resources(rows,&destination.workflow_id)?;
+        anyhow::ensure!(previous<destination.lease_generation,"handoff requires a newer fenced workflow generation");
+        Ok(serde_json::json!({"workflow_id":destination.workflow_id,"previous_lease_generation":previous,
+            "destination_lease_generation":destination.lease_generation,"quiescent_resources":resources}))
+    }
+    fn namespace_resources(rows:&[serde_json::Value],workflow:&str)->anyhow::Result<(i64,Vec<serde_json::Value>)> {
         let mut previous = 0i64;
         let mut required = false;
         let mut admissions: Vec<(String, serde_json::Value, bool)> = Vec::new();
         for row in rows {
             anyhow::ensure!(
-                row.get("workflow").is_none() || row["workflow"] == destination.workflow_id,
+                row.get("workflow").is_none() || row["workflow"] == workflow,
                 "foreign workflow in handoff audit"
             );
             let controller = row["actor"] == "controller";
@@ -469,7 +472,7 @@ impl AuditLogger {
                     .as_i64()
                     .ok_or_else(|| anyhow::anyhow!("handoff source generation missing"))?;
                 anyhow::ensure!(
-                    generation > 0 && row["workflow"] == destination.workflow_id,
+                    generation > 0 && row["workflow"] == workflow,
                     "handoff source workflow mismatch"
                 );
                 previous = previous.max(generation);
@@ -528,8 +531,8 @@ impl AuditLogger {
             }
         }
         anyhow::ensure!(
-            required && previous > 0 && previous < destination.lease_generation,
-            "handoff requires a newer fenced workflow generation"
+            required && previous > 0,
+            "namespace resource policy or generation missing"
         );
         // Validate the complete correlation before touching any kernel scope.
         // Unused admissions still need independent stop proof.
@@ -537,10 +540,17 @@ impl AuditLogger {
             .iter()
             .map(|(_, identity, _)| crate::run_resources::verify_quiescent(identity))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(
-            serde_json::json!({"workflow_id":destination.workflow_id,"previous_lease_generation":previous,
-            "destination_lease_generation":destination.lease_generation,"quiescent_resources":resources}),
-        )
+        Ok((previous,resources))
+    }
+    pub(crate) fn with_namespace_quiescence<T>(&self,namespace:&crate::native_vm::ownership::Authority,highest_generation:i64,visit:impl FnOnce(&serde_json::Value)->anyhow::Result<T>)->anyhow::Result<T> {
+        anyhow::ensure!(self.native_runtime_owner()?.as_ref()==Some(&crate::native_vm::RuntimeOwner {workflow_id:namespace.owner.workflow_id.clone(),lease_generation:highest_generation}),"namespace audit owner mismatch");
+        self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("namespace requires protected audit"))?.with_retained_snapshot(|rows,audit| {
+            self.check_protected_continuity()?;
+            let (previous,resources)=Self::namespace_resources(rows,&namespace.owner.workflow_id)?;
+            anyhow::ensure!(previous==highest_generation && previous>=namespace.owner.lease_generation,"namespace audit generation mismatch");
+            let evidence=serde_json::json!({"audit":audit,"validation":{"namespace":namespace,"highest_lease_generation":previous,"quiescent_resources":resources}});
+            self.check_protected_continuity()?;visit(&evidence)
+        })
     }
     pub(crate) fn protected_log_path(&self) -> Option<&Path> {
         self.anchored.as_ref().map(|sink| sink.log_path())

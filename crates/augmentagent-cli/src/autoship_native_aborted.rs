@@ -56,10 +56,10 @@ fn history(conn:&Connection,workflow:&str)->Result<Vec<Aborted>> {
     let gap:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=?1 AND e.kind='native_handoff_known_aborted' AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_aborted a WHERE a.workflow=e.workflow AND a.sequence=e.seq)) OR EXISTS(SELECT 1 FROM workflow_native_abort_namespace n WHERE n.workflow=?1 AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_aborted a WHERE a.workflow=n.workflow AND a.transfer_id=n.transfer_id))",[workflow],|r|r.get(0))?;
     ensure!(!gap,TransferReason::InventoryMissing);Ok(result)
 }
-pub(super) fn validate_history(conn:&Connection,workflow:&str)->Result<()> {history(conn,workflow)?;Ok(())}
+pub(super) fn validate_history(conn:&Connection,workflow:&str)->Result<()> {let records=history(conn,workflow)?;resolution::validate(conn,workflow,&records)}
 pub(super) fn require_clear(conn:&Connection,workflow:&str)->Result<()> {
     super::validate_dispositions(conn,workflow)?;
-    let blocked:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_handoff_aborted WHERE workflow=?1)",[workflow],|r|r.get(0))?;
+    let blocked:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_abort_namespace n WHERE n.workflow=?1 AND NOT EXISTS(SELECT 1 FROM workflow_native_abort_resolution r WHERE r.workflow=n.workflow AND r.transfer_id=n.transfer_id AND r.namespace_sha256=n.namespace_sha256))",[workflow],|r|r.get(0))?;
     ensure!(!blocked,"native_aborted_namespace_recovery_required");Ok(())
 }
 fn require_aborted(pending:&PendingNativeHandoff,proof:&NativeTransferInspection<'_>)->Result<()> {
@@ -104,9 +104,21 @@ impl WorkflowStore {
             && terminal.generation()>=pending.request.destination.owner.lease_generation,TransferReason::AuthorityConflict);
         acknowledge(&tx,terminal.workflow(),terminal.generation(),terminal.binding(),Some(terminal),pending,now)?;tx.commit()?;Ok(())
     }
+    /// Historical protected context only; native proof and cleanup authorization
+    /// must still be revalidated independently after a controller restart.
+    pub(crate) fn native_aborted_handoff(&self,workflow:&str,id:&str)->Result<Option<PendingNativeHandoff>> {
+        let tx=self.conn.unchecked_transaction()?;super::validate_dispositions(&tx,workflow)?;
+        let result=history(&tx,workflow)?.into_iter().find(|r|r.pending.request.transfer_id==id).map(|r|r.pending);
+        tx.commit()?;Ok(result)
+    }
     pub(crate) fn unresolved_native_abort_namespaces(&self,workflow:&str)->Result<Vec<(String,Authority)>> {
         let tx=self.conn.unchecked_transaction()?;super::validate_dispositions(&tx,workflow)?;
-        let result=history(&tx,workflow)?.into_iter().flat_map(|r|namespaces(&r.pending).into_iter().map(move |namespace|(r.pending.request.transfer_id.clone(),namespace))).collect();
+        let mut query=tx.prepare("SELECT n.transfer_id,n.namespace FROM workflow_native_abort_namespace n WHERE n.workflow=?1 AND NOT EXISTS(SELECT 1 FROM workflow_native_abort_resolution r WHERE r.workflow=n.workflow AND r.transfer_id=n.transfer_id AND r.namespace_sha256=n.namespace_sha256) ORDER BY n.transfer_id,n.namespace_sha256")?;
+        let indexed=query.query_map([workflow],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;drop(query);
+        let result=indexed.into_iter().map(|(id,raw)|Ok((id,serde_json::from_str(&raw)?))).collect::<Result<Vec<_>>>()?;
         tx.commit()?;Ok(result)
     }
 }
+
+#[path="autoship_native_abort_resolution.rs"]
+mod resolution;

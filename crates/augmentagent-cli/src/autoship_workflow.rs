@@ -451,6 +451,11 @@ impl WorkflowStore {
                 workflow TEXT NOT NULL REFERENCES workflow(id),transfer_id TEXT NOT NULL REFERENCES workflow_native_handoff_aborted(transfer_id),
                 namespace_sha256 TEXT NOT NULL,namespace TEXT NOT NULL,
                 PRIMARY KEY(transfer_id,namespace_sha256));
+            CREATE TABLE IF NOT EXISTS workflow_native_abort_resolution (
+                workflow TEXT NOT NULL REFERENCES workflow(id),transfer_id TEXT NOT NULL,
+                namespace_sha256 TEXT NOT NULL,sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record TEXT NOT NULL,
+                PRIMARY KEY(transfer_id,namespace_sha256),
+                FOREIGN KEY(transfer_id,namespace_sha256) REFERENCES workflow_native_abort_namespace(transfer_id,namespace_sha256));
             CREATE TABLE IF NOT EXISTS workflow_native_transferred_source (
                 workflow TEXT NOT NULL,lease_generation INTEGER NOT NULL,audit_path TEXT NOT NULL,
                 transfer_id TEXT NOT NULL REFERENCES workflow_native_handoff_completed(transfer_id) DEFERRABLE INITIALLY DEFERRED,

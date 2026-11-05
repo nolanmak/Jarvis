@@ -1532,6 +1532,42 @@ mod tests {
             let count:i64=store.lock().unwrap().conn.query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).unwrap();assert_eq!(count,if stale {1}else{0});if !stale {assert_eq!(store.lock().unwrap().unresolved_native_abort_namespaces(&lease.workflow).unwrap().len(),pending.request.source_owners.len()+1);}
         }
     }
+    fn acknowledged_abort_fixture(f:&mut Fixture)->(Lease,PendingNativeHandoff,std::sync::Arc<std::sync::Mutex<WorkflowStore>>) {
+        let (old,pending,store)=prepared_abort_fixture(f);store.lock().unwrap().release(&old,now()).unwrap();let lease=store.lock().unwrap().claim(&old.workflow,"resolve-abort-namespaces",now(),60_000).unwrap().unwrap();
+        ownership::with_transfer_inspection(&pending.original_binding,&pending.request,&pending.observation(),&||Ok(()),&mut |proof|store.lock().unwrap().acknowledge_native_aborted(&lease,&f.binding,&pending,proof,now())).unwrap();(lease,pending,store)
+    }
+    #[test]
+    fn native_abort_resolution_clears_only_verified_namespace_and_preserves_accounting() {
+        if child("native_abort_resolution_clears_only_verified_namespace_and_preserves_accounting") {return;}
+        let mut f=Fixture::new();let (lease,pending,store)=acknowledged_abort_fixture(&mut f);let source=&pending.request.source_owners[0];let before=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap();let allowance=store.lock().unwrap().merge_allowance(now(),5).unwrap();
+        let resolve=||ownership::with_retired_aborted_namespace(&pending.original_binding,&pending.request,&pending.observation(),source,&f.audit,&||store.lock().unwrap().validate_lease(&lease,&f.binding,now()).map_err(|_|ownership::TransferFenceError::NotCurrent),&mut |proof|store.lock().unwrap().settle_native_abort_namespace(&lease,&f.binding,proof,now()));resolve().unwrap();let events=store.lock().unwrap().events(&lease.workflow).unwrap();resolve().unwrap();assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);
+        let unresolved=store.lock().unwrap().unresolved_native_abort_namespaces(&lease.workflow).unwrap();assert_eq!(unresolved,vec![(pending.request.transfer_id.clone(),pending.request.destination.clone())]);assert!(store.lock().unwrap().validate_dispatch(&lease,&f.binding,now()).is_err());
+        let destination=&pending.request.destination;augmentagent_channel_core::native_vm::retire_owned_runtimes(&pending.original_binding,Path::new(&destination.audit_path),&destination.owner,&||Ok(())).unwrap();
+        let audit=AuditLogger::protected(PathBuf::from(&destination.audit_path),f._root.path().join("anchors/joined-destination.json"),&[]).unwrap();audit.set_native_runtime_owner(destination.owner.clone()).unwrap();audit.set_native_store_binding(pending.original_binding.clone()).unwrap();
+        ownership::with_retired_aborted_namespace(&pending.original_binding,&pending.request,&pending.observation(),destination,&audit,&||Ok(()),&mut |proof|store.lock().unwrap().settle_native_abort_namespace(&lease,&f.binding,proof,now())).unwrap();
+        let mut locked=store.lock().unwrap();assert!(locked.unresolved_native_abort_namespaces(&lease.workflow).unwrap().is_empty());locked.validate_dispatch(&lease,&f.binding,now()).unwrap();assert_eq!(locked.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(locked.merge_allowance(now(),5).unwrap(),allowance);assert!(locked.native_owner_binding(&lease.workflow,pending.request.destination.owner.lease_generation).unwrap().is_none());
+        let retired:Option<i64>=locked.conn.query_row("SELECT retired_at FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",params![lease.workflow,source.owner.lease_generation],|r|r.get(0)).unwrap();assert!(retired.is_some());
+        let reopened=WorkflowStore::open(&f.path).unwrap();assert!(reopened.unresolved_native_abort_namespaces(&lease.workflow).unwrap().is_empty());assert_eq!(reopened.native_aborted_handoff(&lease.workflow,&pending.request.transfer_id).unwrap(),Some(pending.clone()));
+    }
+    #[test]
+    fn native_abort_resolution_failure_retains_barrier_and_corruption_holds_after_reopen() {
+        if child("native_abort_resolution_failure_retains_barrier_and_corruption_holds_after_reopen") {return;}
+        let mut f=Fixture::new();let (lease,pending,store)=acknowledged_abort_fixture(&mut f);let source=&pending.request.source_owners[0];
+        store.lock().unwrap().conn.execute_batch("CREATE TRIGGER deny_abort_resolution BEFORE INSERT ON workflow_native_abort_resolution BEGIN SELECT RAISE(ABORT,'injected namespace resolution failure'); END;").unwrap();let events=store.lock().unwrap().events(&lease.workflow).unwrap();
+        let resolve=||ownership::with_retired_aborted_namespace(&pending.original_binding,&pending.request,&pending.observation(),source,&f.audit,&||Ok(()),&mut |proof|store.lock().unwrap().settle_native_abort_namespace(&lease,&f.binding,proof,now()));assert!(resolve().is_err());assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);assert_eq!(store.lock().unwrap().unresolved_native_abort_namespaces(&lease.workflow).unwrap().len(),2);
+        store.lock().unwrap().conn.execute_batch("DROP TRIGGER deny_abort_resolution").unwrap();resolve().unwrap();store.lock().unwrap().conn.execute("UPDATE workflow_native_abort_resolution SET record=json_set(record,'$.evidence.original_binding_sha256','corrupt') WHERE workflow=?1",[&lease.workflow]).unwrap();
+        let mut reopened=WorkflowStore::open(&f.path).unwrap();assert!(reopened.unresolved_native_abort_namespaces(&lease.workflow).is_err());assert!(reopened.validate_dispatch(&lease,&f.binding,now()).is_err());assert!(reopened.prepare_or_load_native_handoff(&lease,&f.binding,"/private/corrupt-resolution",now()).is_err());
+    }
+    #[test]
+    fn native_abort_resolution_terminal_fence_cannot_change_or_create_productive_owner() {
+        if child("native_abort_resolution_terminal_fence_cannot_change_or_create_productive_owner") {return;}
+        for stale in [false,true] {
+            let mut f=Fixture::new();let (lease,pending,store)=prepared_abort_fixture(&mut f);let mut checkpoint=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Retired;store.lock().unwrap().checkpoint(&lease,&checkpoint,now()).unwrap();let terminal=store.lock().unwrap().terminal_native_checkpoint(&lease.workflow).unwrap();
+            ownership::with_transfer_inspection(&pending.original_binding,&pending.request,&pending.observation(),&||Ok(()),&mut |proof|store.lock().unwrap().acknowledge_terminal_native_aborted(&terminal,&pending,proof,now())).unwrap();if stale {checkpoint.next.reason="changed-terminal-resolution".into();store.lock().unwrap().checkpoint(&lease,&checkpoint,now()).unwrap();}
+            let before=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap();let source=&pending.request.source_owners[0];let result=ownership::with_retired_aborted_namespace(&pending.original_binding,&pending.request,&pending.observation(),source,&f.audit,&||Ok(()),&mut |proof|store.lock().unwrap().settle_terminal_native_abort_namespace(&terminal,proof,now()));assert_eq!(result.is_ok(),!stale);assert_eq!(store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap(),before);
+            let barriers=store.lock().unwrap().unresolved_native_abort_namespaces(&lease.workflow).unwrap();assert_eq!(barriers.len(),if stale {2}else{1});assert!(store.lock().unwrap().native_owner_binding(&lease.workflow,lease.generation).unwrap().is_none());
+        }
+    }
     #[test]
     fn native_handoff_pending_request_survives_restart_without_new_identity() {
         if child("native_handoff_pending_request_survives_restart_without_new_identity") {

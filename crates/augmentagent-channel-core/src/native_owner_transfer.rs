@@ -5,7 +5,7 @@ pub use super::owner_outcome::{
     TransferObservation, TransferOutcome, TransferReason,
 };
 pub use super::owner_preparation::{NoPendingPreparationFailure,PreparationFingerprintInput,PreparationCapacity,PreparationRuntime,PreparationPlan,PreparedHandoffIntent,PreparationPersistence,PreparationScan,PreparedTransferResult,prepare_transfer};
-pub use super::owner_reconciliation::{with_transfer_inspection,NativeTransferInspection,NativeTransferState};
+pub use super::owner_reconciliation::{with_transfer_inspection,NativeTransferInspection,NativeTransferState,with_retired_aborted_namespace,RetiredNativeNamespace};
 use anyhow::{ensure, Result};
 #[cfg(test)]
 use serde_json::Value;
