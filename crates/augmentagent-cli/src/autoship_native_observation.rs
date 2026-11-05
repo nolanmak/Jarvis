@@ -2853,4 +2853,75 @@ pub(crate) mod tests {
         );
     }
 
+    fn completion_reference_fixture()->(Fixture,VerifiedNativeObservation) {
+        let f=Fixture::new();
+        f.audit.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":f.lease.workflow,"generation":f.lease.generation})).unwrap();
+        f.audit.require_run_resources().unwrap();
+        file(&f._root.path().join("native/codex/session-fixture/lock"),b"");
+        let fact=f.complete();(f,fact)
+    }
+    #[test]
+    fn current_native_completion_proof_holds_locks_and_refuses_changed_bytes() {
+        if child("current_native_completion_proof_holds_locks_and_refuses_changed_bytes") {return;}
+        use std::os::fd::AsRawFd;
+        let (f,fact)=completion_reference_fixture();let original=f.audit.native_store_binding().unwrap().unwrap();
+        ownership::with_current_native_completion(&f.audit,&f.prepared,fact.receipt(),&||Ok(()),&mut |proof| {
+            assert_eq!(proof.inventory(),fact.inventory().unwrap());assert_eq!(proof.prepared(),&f.prepared);assert_eq!(proof.receipt(),fact.receipt());assert_eq!(proof.binding(),&original);
+            assert!(ownership::validate_owner_binding(&original,&||Ok(())).is_err(),"completion visitor lost its native state lock");
+            let lock=std::fs::OpenOptions::new().read(true).write(true).open(f._root.path().join("native/codex/session-fixture/lock")).unwrap();
+            assert_ne!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0,"completion visitor lost its session lock");Ok(())
+        }).unwrap();
+        let context=f._root.path().join("native/codex/session-fixture/generation-fixture/context");file(&context,b"changed after observation");
+        let mut visited=false;
+        assert!(ownership::with_current_native_completion(&f.audit,&f.prepared,fact.receipt(),&||Ok(()),&mut |_| {visited=true;Ok(())}).is_err());assert!(!visited);
+        assert_eq!(f.store.snapshot(&f.lease.workflow).unwrap().unwrap().model_calls,0);
+    }
+    #[test]
+    fn current_native_completion_proof_refuses_uncertainty_other_receipts_and_stale_owner() {
+        if child("current_native_completion_proof_refuses_uncertainty_other_receipts_and_stale_owner") {return;}
+        let (f,fact)=completion_reference_fixture();let mut visited=false;
+        assert!(ownership::with_current_native_completion(&f.audit,&f.prepared,&f.session,&||Ok(()),&mut |_| {visited=true;Ok(())}).is_err());assert!(!visited);
+        assert!(ownership::with_current_native_completion(&f.audit,&f.prepared,fact.receipt(),&||anyhow::bail!("owner changed"),&mut |_| {visited=true;Ok(())}).is_err());assert!(!visited);
+        let uncertain=f.uncertain(true);
+        assert!(ownership::with_current_native_completion(&f.audit,&f.prepared,uncertain.receipt(),&||Ok(()),&mut |_| {visited=true;Ok(())}).is_err());assert!(!visited);
+        assert!(ownership::with_current_native_completion(&f.audit,&f.prepared,fact.receipt(),&||Ok(()),&mut |_| {visited=true;Ok(())}).is_err(),"old success cleared a later uncertain observation");assert!(!visited);
+        let refreshed=f.complete();assert!(ownership::with_current_native_completion(&f.audit,&f.prepared,refreshed.receipt(),&||Ok(()),&mut |_| {visited=true;Ok(())}).is_err(),"a normal observation erased historical uncertainty");assert!(!visited);
+    }
+    #[test]
+    fn current_native_completion_proof_allows_a_visitor_to_close_its_owner_fence() {
+        if child("current_native_completion_proof_allows_a_visitor_to_close_its_owner_fence") {return;}
+        let (f,fact)=completion_reference_fixture();let open=std::cell::Cell::new(true);let mut visited=false;
+        ownership::with_current_native_completion(&f.audit,&f.prepared,fact.receipt(),&|| {anyhow::ensure!(open.get(),"closed owner");Ok(())},&mut |_| {visited=true;open.set(false);Ok(())}).unwrap();
+        assert!(visited);assert!(!open.get());
+    }
+
+    #[test]
+    fn current_native_completion_proof_selects_latest_and_refuses_pending_launch_or_midway_fence() {
+        if child("current_native_completion_proof_selects_latest_and_refuses_pending_launch_or_midway_fence") {return;}
+        let (f,first)=completion_reference_fixture();let latest=f.complete();let mut visited=false;
+        assert!(ownership::with_current_native_completion(&f.audit,&f.prepared,first.receipt(),&||Ok(()),&mut |_| {visited=true;Ok(())}).is_err());assert!(!visited);
+        ownership::with_current_native_completion(&f.audit,&f.prepared,latest.receipt(),&||Ok(()),&mut |_| {visited=true;Ok(())}).unwrap();assert!(visited);visited=false;
+        let calls=std::cell::Cell::new(0);
+        assert!(ownership::with_current_native_completion(&f.audit,&f.prepared,latest.receipt(),&|| {let n=calls.get();calls.set(n+1);anyhow::ensure!(n==0,"owner changed before visitor");Ok(())},&mut |_| {visited=true;Ok(())}).is_err());assert!(!visited);
+        let mut pending=f.prepared.intent.clone();pending.intent_id=uuid::Uuid::new_v4().to_string();f.audit.native_launch_prepared(&pending).unwrap();
+        assert!(ownership::with_current_native_completion(&f.audit,&f.prepared,latest.receipt(),&||Ok(()),&mut |_| {visited=true;Ok(())}).is_err(),"unfinished later launch did not hold completion");assert!(!visited);
+    }
+
+    #[test]
+    fn current_native_completion_proof_retains_audit_lock_and_refuses_retired_owner() {
+        if child("current_native_completion_proof_retains_audit_lock_and_refuses_retired_owner") {return;}
+        let (f,fact)=completion_reference_fixture();let mut writer=None;
+        ownership::with_current_native_completion(&f.audit,&f.prepared,fact.receipt(),&||Ok(()),&mut |_| {
+            let audit=f.audit.clone();let (send,receive)=std::sync::mpsc::channel();
+            writer=Some(std::thread::spawn(move || {send.send(None).unwrap();let ok=audit.record_controller(serde_json::json!({"actor":"controller","kind":"fixture_competing_writer"})).is_ok();let _=send.send(Some(ok));}));
+            assert_eq!(receive.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),None);
+            assert!(!matches!(receive.recv_timeout(std::time::Duration::from_millis(50)),Ok(Some(true))),"completion visitor lost its protected audit lock");Ok(())
+        }).unwrap();writer.unwrap().join().unwrap();
+        f.audit.record_controller(serde_json::json!({"actor":"controller","kind":"fixture_writer_after_visitor"})).unwrap();
+        let binding=f.audit.native_store_binding().unwrap().unwrap();
+        augmentagent_channel_core::native_vm::retire_owned_runtimes(&binding,f.audit.path(),&f.prepared.intent.source_owner,&||Ok(())).unwrap();
+        let mut visited=false;
+        assert!(ownership::with_current_native_completion(&f.audit,&f.prepared,fact.receipt(),&||Ok(()),&mut |_| {visited=true;Ok(())}).is_err(),"caller fence substituted for native owner authority");assert!(!visited);
+    }
+
 }

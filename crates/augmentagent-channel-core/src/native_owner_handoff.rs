@@ -121,13 +121,13 @@ fn audit_plan<'a>(
         endpoints,
     })
 }
-struct SessionLock(std::fs::File);
+pub(super) struct SessionLock(std::fs::File);
 impl Drop for SessionLock {
     fn drop(&mut self) {
         unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
     }
 }
-fn session_lock(path: &Path) -> Result<SessionLock> {
+pub(super) fn session_lock(path: &Path) -> Result<SessionLock> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

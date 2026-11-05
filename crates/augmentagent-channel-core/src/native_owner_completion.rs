@@ -34,6 +34,113 @@ impl VerifiedNativeObservation {
     }
 }
 
+/// Fresh authority only within the locked visitor. A stored append reference
+/// or a previously verified observation cannot construct this capability.
+pub struct NativeCompletionProof<'a> {
+    prepared: &'a PreparedLaunchRecord,
+    receipt: &'a AppendReceipt,
+    binding: &'a super::ownership::TransferBinding,
+    inventory: &'a RuntimeInventoryRow,
+    evidence: &'a Value,
+    _state: &'a super::StateLock,
+}
+impl NativeCompletionProof<'_> {
+    pub fn prepared(&self) -> &PreparedLaunchRecord { self.prepared }
+    pub fn receipt(&self) -> &AppendReceipt { self.receipt }
+    pub fn binding(&self) -> &super::ownership::TransferBinding { self.binding }
+    pub fn inventory(&self) -> &RuntimeInventoryRow { self.inventory }
+    pub fn evidence(&self) -> &Value { self.evidence }
+}
+
+/// Revalidate an original protected completion, actual runtime/export bytes,
+/// and kernel closure while retaining native state, session and audit locks
+/// across the short metadata visitor. No native/audit IO belongs in `current`
+/// or `visit`. The visitor may atomically close its owner/dispatch fence; it
+/// therefore is intentionally not asked to remain dispatchable afterward.
+/// This performs no model dispatch, observation append, retirement or transfer.
+pub fn with_current_native_completion(
+    logger: &AuditLogger,
+    prepared: &PreparedLaunchRecord,
+    reference: &AppendReceipt,
+    current: &dyn Fn() -> Result<()>,
+    visit: &mut dyn FnMut(&NativeCompletionProof<'_>) -> Result<()>,
+) -> Result<()> {
+    current()?;
+    logger.verify_native_launch_reference(prepared)?;
+    ensure!(logger.native_runtime_owner()?.as_ref()==Some(&prepared.intent.source_owner),
+        "native completion owner changed");
+    let completed=referenced_event(logger,prepared,reference,"native_launch_completion_verified")?;
+    ensure!(completed["producer"]=="normal-completion","unsupported native completion producer");
+    let session:AppendReceipt=serde_json::from_value(completed["session_observation_receipt"].clone())?;
+    let resource:AppendReceipt=serde_json::from_value(completed["resource_binding_receipt"].clone())?;
+    ensure!(resource.sequence<session.sequence && session.sequence<reference.sequence,
+        "native completion reference ordering changed");
+    let observed=referenced_event(logger,prepared,&session,"native_session_observed")?;
+    let admitted=referenced_event(logger,prepared,&resource,"native_launch_resource_binding")?;
+    let id=observed["native_session_id"].as_str().context("native completion ID missing")?;
+    let expected:RuntimeInventoryRow=serde_json::from_value(completed["inventory"].clone())?;
+    let identity=&admitted["resource_identity"];
+    ensure!(identity.is_object(),"native completion resource identity missing");
+    let binding=logger.native_store_binding()?.context("original native binding missing")?;
+    selection(logger,&binding)?;
+    let (root,store)=binding.retirement_store()?;
+    let lock=super::StateLock::existing(root)?;
+    let ledger=super::owner_ledger::Ledger::open_bound(root,&lock,store,true)?;
+    super::ensure_native_admission(&ledger,&prepared.intent.source_owner,logger)?;
+    let actual_audit=super::owner_handoff::actual_audit(&prepared.intent.source_audit_path)?;
+    ensure!(logger.protected_log_path()==Some(actual_audit.as_path())
+        && super::owner_handoff::actual_audit(logger.path())?==actual_audit,
+        "native completion audit path changed");
+    let inventory=||->Result<RuntimeInventoryRow> {
+        let (row,launch)=super::owner_handoff::completed_inventory_row(root,&ledger,
+            &prepared.intent.provider,&prepared.intent.runtime_relative_path,id)?;
+        ensure!(row==expected && launch==prepared.intent.launch_sha256
+            && row.creation_receipt_sha256==prepared.intent.creation_receipt_sha256
+            && row.effective_owner==prepared.intent.source_owner
+            && Path::new(&row.effective_audit_path)==prepared.intent.source_audit_path,
+            "native completion runtime changed after observation");
+        Ok(row)
+    };
+    inventory()?;
+    let _session=super::owner_handoff::session_lock(&root.join(&prepared.intent.runtime_relative_path))?;
+    let namespace=super::ownership::Authority {owner:prepared.intent.source_owner.clone(),audit_path:prepared.intent.source_audit_path.to_string_lossy().into_owned()};
+    logger.with_namespace_quiescence_rows(&namespace,namespace.owner.lease_generation,|rows,audited| {
+        ensure!(rows.iter().any(|row|row==&completed),"native completion reference vanished from protected history");
+        let mut launches=std::collections::BTreeMap::<String,bool>::new();
+        let mut latest_selected=None;
+        for row in rows {
+            match row["kind"].as_str() {
+                Some("native_launch_intent")=>{
+                    let id=row["intent_id"].as_str().context("native launch identity missing")?;
+                    ensure!(launches.len()<4096,"native completion launch history exceeds bound");
+                    ensure!(row["version"]==2 && row["source_owner"]==serde_json::to_value(&prepared.intent.source_owner)?,"native completion launch authority changed");
+                    ensure!(launches.insert(id.into(),false).is_none(),"duplicate native launch intent");
+                }
+                Some("native_launch_uncertain")=>anyhow::bail!("uncertain native namespace cannot complete owner input"),
+                Some("native_launch_completion_verified")=>{
+                    let id=row["launch_intent"]["intent_id"].as_str().context("native completion identity missing")?;
+                    *launches.get_mut(id).context("native completion has no preceding launch")?=true;
+                    if id==prepared.intent.intent_id {latest_selected=row["audit_chain"]["sequence"].as_u64();}
+                }
+                Some("native_launch_resource_binding")=>{},
+                Some(kind) if kind.starts_with("native_launch_")=>anyhow::bail!("unknown native launch disposition"),
+                _=>{},
+            }
+        }
+        ensure!(latest_selected==Some(reference.sequence),"native completion reference was superseded");
+        ensure!(launches.get(&prepared.intent.intent_id)==Some(&true) && launches.values().all(|done|*done),
+            "native namespace has an incomplete launch");
+        let quiescent=crate::run_resources::verify_quiescent(identity)?;
+        let actual=inventory()?;
+        selection(logger,&binding)?;current()?;
+        let evidence=json!({"version":1,"kind":"current_native_completion","launch_intent_id":prepared.intent.intent_id,
+            "completion_reference":reference,"original_store_binding_sha256":prepared.intent.original_store_binding_sha256,
+            "inventory":actual,"audit":audited["audit"],"namespace_validation":audited["validation"],"quiescent_resource":quiescent});
+        let proof=NativeCompletionProof {prepared,receipt:reference,binding:&binding,inventory:&actual,evidence:&evidence,_state:&lock};
+        visit(&proof)
+    })
+}
+
 fn referenced_event(
     logger: &AuditLogger,
     prepared: &PreparedLaunchRecord,

@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "29b94a650da1883dfc293d6f6973c75fdb7c470d",
+  "source_parent_commit": "1eed3285fd6e77cf33ada44916b84a70769b4255",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -10,7 +10,7 @@
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_handoff.rs",
-      "sha256": "53abb7d8c765ba30e613ac371c2aeada7284a0f393b9df78c9f8571040957ac2"
+      "sha256": "a1dd47daee8ceea08db6ceff7caac460c0d1f7ad64b9bf1d622d481cafa35da0"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
@@ -26,7 +26,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
-      "sha256": "68323556db5b216745cf22528eddaf404147efcde6b41d956816a83d7ecf6448"
+      "sha256": "7419718a8f567337e2e606dff707972a5995a7550fd332b755178a0abbd15b18"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
@@ -58,7 +58,7 @@
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_transfer.rs",
-      "sha256": "7a94a648c3de4a3aeffb9d79a01e22e7927c770320cab2ada344892353045255"
+      "sha256": "fb483619ad37b2c35aad2d8d1b82b4cbffb6c44d87016e922cb514072cda9f0d"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_verification_retry.rs",
@@ -94,7 +94,7 @@
     },
     {
       "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
-      "sha256": "16bbd769db8c55c64a84bb1b458074487a8e7f34702a05fe9de8c561a1ff7d2f"
+      "sha256": "537cf1a288b57301439b34dc36e2ba5fcc1eeaa49ee3e59ca84d41af4096c909"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_abort_resolution.rs",
@@ -151,11 +151,15 @@
     {
       "path": "crates/augmentagent-cli/src/autoship_review_epoch.rs",
       "sha256": "f283cba8cfc19de7d343b3ff78e97ca78503c168ea555e5ffb9396c973aae922"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_completion.rs",
+      "sha256": "36166c7cc7c53410d6bfb419637e13eecd37e151aee8438473b229ef70e4885a"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1855,
+    "passed": 1860,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
@@ -280,7 +284,14 @@
       "autoship-owner-followup-serialization-red.log",
       "autoship-owner-followup-serialization-green.log",
       "autoship-owner-initial-acceptance-validated-full-cli.log",
-      "autoship-owner-initial-acceptance-validated-production-check.log"
+      "autoship-owner-initial-acceptance-validated-production-check.log",
+      "autoship-owner-current-completion-red.log",
+      "autoship-owner-current-completion-green-retry.log",
+      "autoship-owner-current-completion-locks-green.log",
+      "autoship-owner-current-completion-final-green.log",
+      "autoship-owner-current-completion-full-core.log",
+      "autoship-owner-current-completion-full-cli.log",
+      "autoship-owner-current-completion-production-check.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -971,5 +982,24 @@
         "sha256": "55549550568d0b87bd45be4c581e2d2a21277827ad38a9a536b2d3a47a6bf81b"
       }
     ]
+  },
+  "owner_current_completion": {
+    "scope": "Borrowed fresh original-store completion capability retained under state, runtime session and protected audit locks through a short metadata visitor. Not connected to owner dispatch or completion yet.",
+    "focused_passed": 5,
+    "core_passed": 895,
+    "cli_passed": 1860,
+    "production_check": "passed",
+    "refusals": [
+      "changed runtime bytes",
+      "uncertain namespace even after later observation",
+      "superseded completion reference",
+      "later unfinished launch",
+      "stale owner fence",
+      "retired original native owner"
+    ],
+    "fixtures": "Physical private runtime with synthetic protected controller/resource receipts. No live provider, VM or Discord execution.",
+    "red_evidence": "Initial API red is compilation failure, not behavioral parent regression. A fixture compile failure used the wrong retirement namespace; corrected separately.",
+    "worker_consumer_enabled": false,
+    "input_completion_enabled": false
   }
 }
