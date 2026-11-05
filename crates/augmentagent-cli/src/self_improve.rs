@@ -4180,6 +4180,21 @@ fn independent_reviewer_candidates(
 /// can serve it. A non-Codex approval still never unlocks the Codex-only
 /// opt-ins (receipt override, `hard` band) — see
 /// [`IndependentReview::codex_approved`].
+/// How long a freshly started worker waits before its first tick: the rest
+/// of the interval since the previous tick started, or the full interval when
+/// no tick has ever been recorded (a new install, or tests).
+fn first_tick_delay(last_start: Option<std::time::SystemTime>, now: std::time::SystemTime,
+    interval: std::time::Duration) -> std::time::Duration {
+    match last_start {
+        None => interval,
+        Some(started) => match now.duration_since(started) {
+            Ok(elapsed) => interval.saturating_sub(elapsed),
+            // A stamp in the future (clock change) is not trusted.
+            Err(_) => interval,
+        },
+    }
+}
+
 fn reviewer_pool() -> Vec<augmentagent_channel_core::ProviderKind> {
     reviewer_pool_from(std::env::var("AUGMENTAGENT_AUTOPR_REVIEWERS").ok().as_deref())
 }
@@ -4649,6 +4664,9 @@ impl CiGateResult {
             return Err(error);
         }
         if let Some(eligible_at_ms) = workflow.defer_verification_infrastructure(&error).await? {
+            // The classified code alone ("acceptance verifier infrastructure")
+            // never said what failed; keep the underlying error in the log.
+            warn!(workflow = workflow.id(), eligible_at_ms, "verification infrastructure deferred: {error:#}");
             // The gate future has returned. Record a checked release, not
             // a task drop, so the five-minute retry is not lease-blocked.
             workflow.finish_ci_deferral()?;
@@ -11917,10 +11935,23 @@ impl AutoPrLoop {
             "auto-PR loop started (#630/#653): polling open issues (self-triage, no label gate)"
         );
         let counter_path = self.counter_path.clone();
+        let tick_stamp = counter_path.with_file_name("autopr-last-tick-start");
         let mut queue_timer = tokio::time::interval(std::time::Duration::from_secs(30));
         queue_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut first = true;
         loop {
-            let next_tick = tokio::time::Instant::now() + self.interval;
+            // The worker restarts to load every deploy. Waiting a full
+            // interval after each start meant deploys arriving every 25-60
+            // minutes starved build ticks (2026-11-05). Keep the cadence
+            // across restarts instead: the first wait is measured from the
+            // previous tick's start, never shorter than nothing.
+            let wait = if std::mem::take(&mut first) {
+                first_tick_delay(std::fs::metadata(&tick_stamp).and_then(|m| m.modified()).ok(),
+                    std::time::SystemTime::now(), self.interval)
+            } else {
+                self.interval
+            };
+            let next_tick = tokio::time::Instant::now() + wait;
             loop {
                 self.upgrade_boundary()?;
                 tokio::select! {
@@ -11979,6 +12010,7 @@ impl AutoPrLoop {
                 }
                 let reservation = DailyCounter::update(&counter_path,
                     |counter| Ok(counter.begin_attempt(started_day)))?;
+                let _ = std::fs::write(&tick_stamp, b"");
                 let outcome = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => {
@@ -12020,6 +12052,12 @@ impl AutoPrLoop {
                     // Transient controller or network failures retry next tick.
                     Err(e) => {
                         warn!("auto-PR tick failed: {e:#}");
+                        // A bare OS error ("File exists (os error 17)") names no
+                        // operation. With RUST_LIB_BACKTRACE=1 the worker records
+                        // where it was raised, so the failing step is findable.
+                        if e.backtrace().status() == std::backtrace::BacktraceStatus::Captured {
+                            warn!(backtrace = %e.backtrace(), "auto-PR tick failure origin");
+                        }
                         break;
                     }
                 }
@@ -14254,6 +14292,19 @@ CODEX-REVIEW: lgtm").0);
             !production[loop_start + billed + 1..loop_start + record].contains("Ok(r)"),
             "the debt update sits inside the billed arm, not a later one"
         );
+    }
+
+    #[test]
+    fn a_restarted_worker_keeps_its_tick_cadence() {
+        use std::time::{Duration, SystemTime};
+        let now = SystemTime::now();
+        let interval = Duration::from_secs(1800);
+        assert_eq!(first_tick_delay(None, now, interval), interval, "no history: full interval");
+        assert_eq!(first_tick_delay(Some(now - Duration::from_secs(600)), now, interval), Duration::from_secs(1200));
+        assert_eq!(first_tick_delay(Some(now - Duration::from_secs(4000)), now, interval), Duration::ZERO,
+            "overdue after a restart: tick at once");
+        assert_eq!(first_tick_delay(Some(now + Duration::from_secs(60)), now, interval), interval,
+            "a future stamp is not trusted");
     }
 
     #[test]
