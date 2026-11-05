@@ -1130,12 +1130,35 @@ impl WorkflowGuard {
         }))
     }
 
-    pub(super) fn fresh_native_builder_sessions(&self) -> Result<Arc<augmentagent_channel_core::native_session::FreshBuilderSessions>> {
+    fn native_builder_owner(&self) -> Result<augmentagent_channel_core::native_vm::RuntimeOwner> {
         self.validate_before_side_effect()?;
         self.audit.validate_native_store_binding()?;
         let owner=self.audit.native_runtime_owner()?.context("workflow native owner missing")?;
         anyhow::ensure!(owner.workflow_id==self.lease.workflow && owner.lease_generation==self.lease.generation,"workflow native owner changed");
-        augmentagent_channel_core::native_session::FreshBuilderSessions::for_workflow(owner)
+        Ok(owner)
+    }
+
+    pub(super) fn fresh_native_builder_sessions(&self) -> Result<Arc<augmentagent_channel_core::native_session::FreshBuilderSessions>> {
+        augmentagent_channel_core::native_session::FreshBuilderSessions::for_workflow(self.native_builder_owner()?)
+    }
+
+    /// Owner follow-ups continue the actual observed builder conversation.
+    /// A new episode deliberately uses the separate fresh factory above.
+    /// Neither scope is native dispatch authority: transport preparation and
+    /// the installed admission callback still validate the original store,
+    /// current generation, owner intent and requested provider on every call.
+    pub(super) fn owner_turn_native_builder_sessions(
+        &self,
+        provider: augmentagent_channel_core::ProviderKind,
+    ) -> Result<Arc<augmentagent_channel_core::native_session::FreshBuilderSessions>> {
+        let owner=self.native_builder_owner()?;
+        let observed={
+            let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store poisoned"))?;
+            let now=millis();
+            let turn=store.owner_turn_for_lease(&self.lease,now)?;
+            store.owner_turn_conversations(&turn,provider,now)?
+        };
+        augmentagent_channel_core::native_session::FreshBuilderSessions::from_observed(owner,&observed)
     }
 
     pub(super) fn record_episode_sessions(
@@ -3112,7 +3135,8 @@ mod tests {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session"] {
+                if mode.ends_with("-session") && !cfg!(target_os="linux") {continue;}
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
                     .env(CHILD,control.path()).env(MODE,mode);
@@ -3140,7 +3164,7 @@ mod tests {
         let id=durable::workflow_id("owner/repo",77).unwrap();
         if mode.starts_with("owner-setup-") {
             let origin=durable::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
-            let request=durable::submission::Request {repository:"owner/repo".into(),target:durable::submission::Target::Issue(77),provider:Some(durable::submission::Provider::Codex),until:durable::submission::Milestone::Merged};
+            let request=durable::submission::Request {repository:"owner/repo".into(),target:durable::submission::Target::Issue(77),provider:Some(if mode=="owner-setup-claude-session" {durable::submission::Provider::Claude}else{durable::submission::Provider::Codex}),until:durable::submission::Milestone::Merged};
             WorkflowStore::open(&state).unwrap().submit_discord_authorized(&origin,&request,&"a".repeat(64),millis()).unwrap();
         }
         if mode=="legacy-workflow" {
@@ -3219,14 +3243,33 @@ mod tests {
             assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
         }
         if mode.starts_with("owner-setup-") {
+            let session_case=mode.ends_with("-session");
+            let healthy=mode=="owner-setup-healthy" || session_case;
+            let provider=if mode=="owner-setup-claude-session" {augmentagent_channel_core::ProviderKind::Claude}else{augmentagent_channel_core::ProviderKind::Codex};
+            #[cfg(target_os="linux")]
+            if session_case {
+                let (prepared,session,resource)=durable::native_observation::tests::retained_launch_fixture(
+                    &native,&guard.audit,provider.name(),|_|{});
+                let fact=augmentagent_channel_core::native_vm::ownership::observe_native_completion(
+                    &guard.audit,&prepared,&session,&resource).unwrap();
+                assert_eq!(fact.native_session_id(),Some("actual-session"));
+                let lock=native.join(format!("{}/session-fixture/lock",provider.name()));
+                std::fs::write(&lock,b"").unwrap();std::fs::set_permissions(&lock,std::fs::Permissions::from_mode(0o600)).unwrap();
+                // Saved provider-parser projection of the protected fixture
+                // completion above. No live provider or model admission.
+                guard.store.lock().unwrap().record_builder_conversations(
+                    &guard.lease,&guard.binding,&[augmentagent_channel_core::native_session::ObservedConversation {
+                        provider,id:fact.native_session_id().unwrap().into(),uncertain:false,
+                    }],millis()).unwrap();
+            }
             let original=saved.clone().unwrap();guard.finish().unwrap();let mut store=WorkflowStore::open(&state).unwrap();
             let origin=durable::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:45};let reply=store.enqueue_owner_message(&origin,&id,"Synthetic owner clarification",None,millis()).unwrap();assert!(reply.accepted);let control_before=store.owner_control(&id).unwrap().unwrap();let generation_before=store.snapshot(&id).unwrap().unwrap().generation;let policy_bytes=std::fs::read(&policy).unwrap();drop(store);
             if mode=="owner-setup-unconfigured" {unsafe{std::env::remove_var("AUGMENTAGENT_NATIVE_VM_POLICY");}}
-            else if mode!="owner-setup-healthy" {std::fs::remove_file(&policy).unwrap();}
+            else if !healthy {std::fs::remove_file(&policy).unwrap();}
             if mode=="owner-setup-write-failure" {rusqlite::Connection::open(&state).unwrap().execute_batch("CREATE TRIGGER deny_owner_setup_refusal BEFORE INSERT ON workflow_owner_turn_setup_refusal BEGIN SELECT RAISE(ABORT,'injected owner setup refusal failure'); END;").unwrap();}
             let result=WorkflowGuard::acquire_mode_at(&state,start(),millis(),true).await;
             if mode=="owner-setup-unconfigured" {assert!(result.is_err());let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&id).unwrap().unwrap().generation,generation_before);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.owner_control(&id).unwrap(),Some(control_before));return;}
-            let recovered=if mode=="owner-setup-healthy" {result.unwrap().expect("guarded native owner handoff must acquire the paused owner turn")}else{
+            let recovered=if healthy {result.unwrap().expect("guarded native owner handoff must acquire the paused owner turn")}else{
                 assert!(result.is_err());let mut store=WorkflowStore::open(&state).unwrap();let snapshot=store.snapshot(&id).unwrap().unwrap();assert_eq!(snapshot.model_calls,0);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.owner_control(&id).unwrap(),Some(control_before.clone()));assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
                 let row_state:String=rusqlite::Connection::open(&state).unwrap().query_row("SELECT state FROM workflow_owner_turn WHERE request_id=?1",[&reply.request_id],|r|r.get(0)).unwrap();
                 if mode=="owner-setup-write-failure" {assert_eq!(row_state,"claimed");assert!(snapshot.lease_until_ms>0);rusqlite::Connection::open(&state).unwrap().execute_batch("DROP TRIGGER deny_owner_setup_refusal").unwrap();assert!(store.claim_owner_turn(&id,"must-not-replay",millis()+LEASE_MS+1,LEASE_MS).unwrap().is_none());return;}
@@ -3239,6 +3282,21 @@ mod tests {
                 }
                 WorkflowGuard::acquire_mode_at(&state,start(),millis(),true).await.unwrap().expect("same unstarted owner request must retry after configuration recovery")
             };
+            if session_case {
+                // A new owner guard has reopened the workflow and transferred
+                // native authority. It must resume the actual observed ID.
+                let sessions=recovered.owner_turn_native_builder_sessions(provider).unwrap();
+                sessions.scope(async {
+                    let session=augmentagent_channel_core::native_session::current_for(provider).unwrap().unwrap();
+                    let turn=session.begin(provider).unwrap();
+                    assert_eq!(turn.launch(),augmentagent_channel_core::native_session::Launch::Resume {id:"actual-session".into()});
+                }).await;
+                let other=if provider==augmentagent_channel_core::ProviderKind::Codex {augmentagent_channel_core::ProviderKind::Claude}else{augmentagent_channel_core::ProviderKind::Codex};
+                assert!(recovered.owner_turn_native_builder_sessions(other).is_err(),"owner restoration changed the requested provider");
+                let uncertain=augmentagent_channel_core::native_session::ObservedConversation {provider,id:"actual-session".into(),uncertain:true};
+                recovered.store.lock().unwrap().record_builder_conversations(&recovered.lease,&recovered.binding,&[uncertain],millis()).unwrap();
+                assert!(recovered.owner_turn_native_builder_sessions(provider).is_err(),"uncertain conversation was resumed");
+            }
             recovered.validate_before_side_effect().unwrap();assert_eq!(recovered.audit.native_store_binding().unwrap(),Some(original));let mut store=recovered.store.lock().unwrap();let turn=store.owner_turn_for_lease(&recovered.lease,millis()).unwrap();assert_eq!(turn.request_id,reply.request_id);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.owner_control(&id).unwrap(),Some(control_before));assert!(store.begin_operation(&recovered.lease,OperationKind::Push,&recovered.binding,millis()).is_err());assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,0);drop(store);recovered.finish().unwrap();assert!(WorkflowStore::open(&state).unwrap().claim_owner_turn(&id,"published-turn-must-not-replay",millis()+LEASE_MS+1,LEASE_MS).unwrap().is_none());return;
         }
         if mode=="terminal-abort-cleanup" {

@@ -498,7 +498,7 @@
     "ordinary_and_observational_guard_acquisition": true,
     "merge_sweep": true,
     "runtime_deployed": false,
-    "guard_fixture_scope": "25 actual guard subprocess modes, 6 owner setup modes, plus joined paused-owner retained-runtime service fixture; no provider/model transport dispatch or production acceptance. Existing configured counter test makes one synthetic metadata model admission.",
+    "guard_fixture_scope": "27 actual guard subprocess modes: previous 25 modes plus Codex and Claude retained-runtime continuation factories. The two new modes use protected scripted receipts and physical runtime completion/inventory/transfer; no provider/model/VM dispatch or production acceptance.",
     "pre_guard_retired_aborted_namespace_resolution": true,
     "all_closed_original_binding_recovery": true,
     "all_closed_original_binding_recovery_scope": "complete intact original history, registered retired namespaces and resolved aborted destinations, original selected policy and existing audit authority; vanished/legacy/corrupt authority remains held",
@@ -507,7 +507,8 @@
     "owner_turn_guard_acquisition": true,
     "owner_turn_setup_refusal_recovery": true,
     "owner_coding_consumer": false,
-    "discord_coding_gateway_activation": false
+    "discord_coding_gateway_activation": false,
+    "owner_session_restoration_factory": true
   },
   "productive_caller_enabled_scope": "deployment activation remains unproven; supported guard source paths are connected as described in source_caller_integration",
   "closed_workflow_recovery_limits": {
@@ -524,5 +525,66 @@
     "phone": "SUCCESS",
     "targeted_linux_aggregate": "SUCCESS",
     "scope": "previous published head only; new-head checks pending"
+  },
+  "owner_session_restoration": {
+    "source_parent_commit": "95e541f3d00b5e02f6880c9f35ae51b944a82dc0",
+    "source_generation_authority": false,
+    "guard_factory_implemented": true,
+    "owner_worker_connected": false,
+    "discord_coding_gateway_enabled": false,
+    "deployed": false,
+    "provider_transport_dispatch": false,
+    "guard_subprocess_modes": 27,
+    "new_retained_runtime_provider_cases": [
+      "codex",
+      "claude"
+    ],
+    "checks": [
+      "exact observed ID resumes after real guard re-acquisition and native handoff",
+      "wrong requested provider refused",
+      "uncertain saved conversation refused",
+      "pending owner input, pause and model/merge accounting preserved; publication denied"
+    ],
+    "fixture_scope": "Scripted protected launch/resource/session receipts with real private runtime files, completion/kernel checks, workflow transactions and original-store ownership transfer. No VM/provider/model dispatch; no live Discord or process-restart acceptance.",
+    "initial_red": "Compilation failed because the owner-session factory did not exist; this is an API red, not a behavioral parent-revision failure.",
+    "fixture_corrections": [
+      "metadata-only conversation correctly failed inventory handoff",
+      "runtime lock must remain private",
+      "Claude requested creation IDs cannot be replaced by a scripted arbitrary ID; seed saved parser projection from protected fixture completion instead"
+    ],
+    "targeted_guard_result": {
+      "passed": 1,
+      "failed": 0,
+      "subprocess_modes": 27,
+      "log": "autoship-owner-session-restore-validated-guard.log"
+    },
+    "full_cli": "pending current managed run; top-level results still describe prior published validation",
+    "production_check": "pending after full CLI",
+    "optional_fresh_factory_mutation": "not executed: managed admission returned storage busy; source was restored byte-for-byte",
+    "retained_logs": [
+      "autoship-owner-session-restore-red.log",
+      "autoship-owner-session-restore-green.log",
+      "autoship-owner-session-restore-runtime-green.log",
+      "autoship-owner-session-restore-private-runtime-green.log",
+      "autoship-owner-session-restore-validated-guard.log",
+      "autoship-owner-session-restore-fresh-factory-mutation.log"
+    ],
+    "sources": [
+      {
+        "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+        "sha256": "887a303e0bd18b1dc68d526aa0948bc689b67d37fa0907a33b05b935d104a69e"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+        "sha256": "68323556db5b216745cf22528eddaf404147efcde6b41d956816a83d7ecf6448"
+      }
+    ],
+    "remaining": [
+      "actual owner worker execution and authorization/workspace recovery",
+      "contract revision through guarded generation/audit/native handoff",
+      "guarded completion and durable private reply",
+      "Discord gateway activation after the complete consumer works",
+      "normal rollout and full #1715 live acceptance"
+    ]
   }
 }

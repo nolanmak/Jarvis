@@ -419,7 +419,7 @@ pub(super) fn history(conn: &Connection, workflow: &str) -> Result<Vec<NativeObs
 }
 
 #[cfg(all(test, target_os = "linux"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use augmentagent_channel_core::{
         native_vm::{
@@ -445,6 +445,63 @@ mod tests {
     }
     fn now() -> i64 {
         chrono::Utc::now().timestamp_millis()
+    }
+    /// Physical retained runtime and protected scripted launch receipts. This
+    /// exercises real completion/kernel and handoff checks, with no VM/model.
+    pub(crate) fn retained_launch_fixture(
+        state:&Path,
+        audit:&AuditLogger,
+        provider:&str,
+        record:impl FnOnce(&PreparedLaunchRecord),
+    )->(PreparedLaunchRecord,AppendReceipt,AppendReceipt) {
+        directory(&state.join(provider));
+        let runtime = state.join(format!("{provider}/session-fixture"));
+        directory(&runtime);
+        directory(&state.join(format!("{provider}/aliases")));
+        let owned=serde_json::to_vec(&serde_json::json!({"version":1,"owner":audit.native_runtime_owner().unwrap().unwrap(),"audit_path":audit.path()})).unwrap();
+        file(&runtime.join("owned.json"), &owned);
+        let intent = PreparedLaunchIntent {
+            version: 2,
+            intent_id: uuid::Uuid::new_v4().to_string(),
+            source_owner: audit.native_runtime_owner().unwrap().unwrap(),
+            source_audit_path: audit.path().into(),
+            provider: provider.into(),
+            runtime_relative_path: format!("{provider}/session-fixture"),
+            native_session_id: Some("requested-not-observed".into()),
+            launch_sha256: "a".repeat(64),
+            creation_receipt_sha256: sha(&owned),
+            original_store_binding_sha256: sha(&ownership::canonical_bytes(
+                &serde_json::to_value(audit.native_store_binding().unwrap().unwrap()).unwrap(),
+            )
+            .unwrap()),
+        };
+        let prepared = audit.native_launch_prepared(&intent).unwrap();
+        record(&prepared);
+        // Synthetic protected controller resource/session receipts. The
+        // completion producer still reads private runtime/export bytes and
+        // performs actual same-host absent-cgroup kernel verification.
+        let resource=audit.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
+            "kind":"native_launch_resource_binding","launch_intent":intent,"launch_receipt":prepared.controller_receipt,
+            "resource_identity":{"host_sha256":sha(&std::fs::read("/etc/machine-id").unwrap()),
+                "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),
+                "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1}})).unwrap();
+        let session=audit.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
+            "kind":"native_session_observed","launch_intent":intent,"launch_receipt":prepared.controller_receipt,
+            "native_session_id":"actual-session","observed_at_ms":now()})).unwrap();
+        file(
+            &state.join(format!("{provider}/aliases")).join(sha(b"actual-session")),
+            b"\"session-fixture\"",
+        );
+        directory(&runtime.join("generation-fixture"));
+        file(&runtime.join("generation-fixture/context"), b"saved");
+        file(
+            &runtime.join("complete.json"),
+            &serde_json::to_vec(&serde_json::json!({"version":1,"exit_code":0,
+            "generation":"generation-fixture","launch_sha256":intent.launch_sha256,
+            "worker_quiescence":{"remaining_workers":0,"quiet_scans":2}}))
+            .unwrap(),
+        );
+        (prepared,session,resource)
     }
     struct Fixture {
         _root: tempfile::TempDir,
@@ -521,55 +578,9 @@ mod tests {
                 })
                 .unwrap();
             audit.set_native_store_binding(original.clone()).unwrap();
-            directory(&state.join("codex"));
-            let runtime = state.join("codex/session-fixture");
-            directory(&runtime);
-            directory(&state.join("codex/aliases"));
-            let owned=serde_json::to_vec(&serde_json::json!({"version":1,"owner":audit.native_runtime_owner().unwrap().unwrap(),"audit_path":audit.path()})).unwrap();
-            file(&runtime.join("owned.json"), &owned);
-            let intent = PreparedLaunchIntent {
-                version: 2,
-                intent_id: uuid::Uuid::new_v4().to_string(),
-                source_owner: audit.native_runtime_owner().unwrap().unwrap(),
-                source_audit_path: audit.path().into(),
-                provider: "codex".into(),
-                runtime_relative_path: "codex/session-fixture".into(),
-                native_session_id: Some("requested-not-observed".into()),
-                launch_sha256: "a".repeat(64),
-                creation_receipt_sha256: sha(&owned),
-                original_store_binding_sha256: sha(&ownership::canonical_bytes(
-                    &serde_json::to_value(original).unwrap(),
-                )
-                .unwrap()),
-            };
-            let prepared = audit.native_launch_prepared(&intent).unwrap();
-            store
-                .record_verified_native_launch(&lease, &binding, &audit, &prepared, now())
-                .unwrap();
-            // Synthetic protected controller resource/session receipts. The
-            // completion producer still reads private runtime/export bytes and
-            // performs actual same-host absent-cgroup kernel verification.
-            let resource=audit.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
-                "kind":"native_launch_resource_binding","launch_intent":intent,"launch_receipt":prepared.controller_receipt,
-                "resource_identity":{"host_sha256":sha(&std::fs::read("/etc/machine-id").unwrap()),
-                    "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),
-                    "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1}})).unwrap();
-            let session=audit.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
-                "kind":"native_session_observed","launch_intent":intent,"launch_receipt":prepared.controller_receipt,
-                "native_session_id":"actual-session","observed_at_ms":now()})).unwrap();
-            file(
-                &state.join("codex/aliases").join(sha(b"actual-session")),
-                b"\"session-fixture\"",
-            );
-            directory(&runtime.join("generation-fixture"));
-            file(&runtime.join("generation-fixture/context"), b"saved");
-            file(
-                &runtime.join("complete.json"),
-                &serde_json::to_vec(&serde_json::json!({"version":1,"exit_code":0,
-                "generation":"generation-fixture","launch_sha256":intent.launch_sha256,
-                "worker_quiescence":{"remaining_workers":0,"quiet_scans":2}}))
-                .unwrap(),
-            );
+            let (prepared,session,resource)=retained_launch_fixture(&state,&audit,"codex",|prepared| {
+                store.record_verified_native_launch(&lease,&binding,&audit,prepared,now()).unwrap();
+            });
             Self {
                 _root: root,
                 path,
