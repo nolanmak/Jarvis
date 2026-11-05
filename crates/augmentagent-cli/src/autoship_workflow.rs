@@ -38,6 +38,8 @@ mod native_pending;
 pub(crate) use native_pending::{HandoffPreparation, HandoffSettlement, PendingNativeHandoff, VerifiedHandoffReceipt};
 #[path = "autoship_native_observation.rs"]
 pub(crate) mod native_observation;
+#[path = "autoship_native_callbacks.rs"]
+pub(crate) mod native_callbacks;
 #[path = "autoship_native_launch.rs"]
 pub(crate) mod native_launch;
 #[path = "autoship_owner_inbox.rs"]
@@ -1625,13 +1627,7 @@ impl WorkflowStore {
 
     pub fn validate_dispatch(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_binding(&tx,lease,binding,now)?;
-        native_pending::require_clear_abort_barriers(&tx,&lease.workflow)?;
-        let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|row|row.get(0))?;
-        let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
-        ensure!(!matches!(checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired),"workflow checkpoint blocks native dispatch");
-        owner_turn::require_native_dispatch(&tx,lease,now)?;
-        tx.commit()?;Ok(())
+        require_native_dispatch_tx(&tx,lease,binding,now)?;tx.commit()?;Ok(())
     }
 
     pub fn validate_lease(&mut self, lease: &Lease, binding: &Binding, now_ms: i64) -> Result<()> {
@@ -3291,4 +3287,14 @@ mod observation_accounting_tests {
         assert!(store.observation_available(86_400_006,11,12).unwrap());
     }
 
+}
+
+fn require_native_dispatch_tx(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64)->Result<()> {
+        require_binding(tx,lease,binding,now)?;
+        native_pending::require_clear_abort_barriers(tx,&lease.workflow)?;
+        let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|row|row.get(0))?;
+        let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
+        ensure!(!matches!(checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired),"workflow checkpoint blocks native dispatch");
+        owner_turn::require_native_dispatch(tx,lease,now)?;
+    Ok(())
 }

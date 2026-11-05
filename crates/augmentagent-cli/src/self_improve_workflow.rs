@@ -856,28 +856,11 @@ impl WorkflowGuard {
             let original=self.store.lock().map_err(|_|anyhow::anyhow!("native original binding store poisoned"))?
                 .native_owner_binding(&self.lease.workflow,self.lease.generation)?;
             if let Some(original)=original {self.audit.set_native_store_binding(original)?;}
-            let journal_store=self.store.clone();let journal_lease=self.lease.clone();
-            // The logger owns its callback; a weak reference avoids retaining
-            // the logger/store after the guarded owner has gone away.
-            let journal_audit=Arc::downgrade(&self.audit);
-            self.audit.set_native_launch_observer(Arc::new(move |prepared| {
-                let audit=journal_audit.upgrade().context("native launch audit owner is gone")?;
-                let mut store=journal_store.lock().map_err(|_|anyhow::anyhow!("native launch journal lock poisoned"))?;
-                let binding=if let Ok(call)=BOUNDED_NATIVE_CALL.try_with(Clone::clone) {
-                    anyhow::ensure!(call.workflow==journal_lease.workflow,"native launch used another workflow scope");call.binding
-                } else {store.snapshot(&journal_lease.workflow)?.context("native launch workflow missing")?.checkpoint.binding};
-                store.record_verified_native_launch(&journal_lease,&binding,&audit,prepared,millis())?;
-                Ok(())
-            }))?;
-            let observation_store=self.store.clone();let observation_lease=self.lease.clone();
-            let observation_audit=Arc::downgrade(&self.audit);
-            self.audit.set_native_observation_observer(Arc::new(move |fact| {
-                let audit=observation_audit.upgrade().context("native observation controller is gone")?;
-                let mut store=observation_store.lock().map_err(|_|anyhow::anyhow!("native observation store poisoned"))?;
-                let binding=if let Ok(call)=BOUNDED_NATIVE_CALL.try_with(Clone::clone) {
-                    anyhow::ensure!(call.workflow==observation_lease.workflow,"native observation crossed workflow scope");call.binding
-                } else {store.snapshot(&observation_lease.workflow)?.context("native observation workflow missing")?.checkpoint.binding};
-                store.record_verified_native_observation(&observation_lease,&binding,&audit,fact,millis())?;Ok(())
+            let workflow=self.lease.workflow.clone();
+            durable::native_callbacks::install(&self.store,&self.lease,&self.audit,Arc::new(move || {
+                if let Ok(call)=BOUNDED_NATIVE_CALL.try_with(Clone::clone) {
+                    anyhow::ensure!(call.workflow==workflow,"native callback used another workflow scope");Ok(Some(call.binding))
+                } else {Ok(None)}
             }))?;
         }
         let capacity_store = self.store.clone();

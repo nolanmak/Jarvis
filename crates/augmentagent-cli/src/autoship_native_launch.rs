@@ -95,49 +95,52 @@ pub(super) fn recorded_launch(conn:&Connection,intent_id:&str)->Result<NativeLau
     decode_record(conn,row)
 }
 
+pub(super) fn binding_digest(binding:&augmentagent_channel_core::native_vm::ownership::TransferBinding)->Result<String> {
+    binding.validate()?;Ok(format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(binding)?)?)))
+}
+/// Private, nonserializable result of an actual protected append lookup.
+pub(crate) struct VerifiedLaunchAppend {
+    prepared:augmentagent_channel_core::native_vm::PreparedLaunchRecord,
+    original_binding:augmentagent_channel_core::native_vm::ownership::TransferBinding,
+    intent:NativeLaunchIntent,
+}
+pub(crate) fn verify_launch_append(audit:&augmentagent_channel_core::AuditLogger,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord)->Result<VerifiedLaunchAppend> {
+    ensure!(prepared.intent.version==2 && audit.native_runtime_owner()?.as_ref()==Some(&prepared.intent.source_owner)
+        && prepared.intent.source_audit_path==audit.path(),"native launch controller identity mismatch");
+    let original_binding=audit.native_store_binding()?.context("native launch original binding missing")?;original_binding.validate()?;
+    let digest=format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(&original_binding)?)?));
+    ensure!(digest==prepared.intent.original_store_binding_sha256,"native launch original binding digest mismatch");
+    let mut actual=audit.read_append_receipt(&prepared.controller_receipt)?;actual.as_object_mut().context("native launch audit record is not an object")?.remove("audit_chain");
+    let mut expected=serde_json::to_value(&prepared.intent)?;expected["actor"]="controller".into();expected["kind"]="native_launch_intent".into();ensure!(actual==expected,"native launch controller receipt describes another record");
+    let provider=match prepared.intent.provider.as_str() {"codex"=>submission::Provider::Codex,"claude"=>submission::Provider::Claude,_=>anyhow::bail!("unsupported workflow native launch provider")};
+    let intent=NativeLaunchIntent {intent_id:prepared.intent.intent_id.clone(),provider,runtime_relative_path:prepared.intent.runtime_relative_path.clone(),native_session_id:prepared.intent.native_session_id.clone(),launch_sha256:prepared.intent.launch_sha256.clone(),creation_receipt_sha256:prepared.intent.creation_receipt_sha256.clone(),controller_receipt:Some(prepared.controller_receipt.clone())};
+    intent.validate()?;Ok(VerifiedLaunchAppend {prepared:prepared.clone(),original_binding,intent})
+}
 impl WorkflowStore {
-    /// Verify the original protected controller record before journaling it.
-    pub fn record_verified_native_launch(&mut self, lease:&Lease, binding:&Binding,
-        audit:&augmentagent_channel_core::AuditLogger,
-        prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,
-        now:i64)->Result<NativeLaunchRecord> {
-        self.validate_dispatch(lease,binding,now)?;
-        let source=RuntimeOwner {workflow_id:lease.workflow.clone(),lease_generation:lease.generation};
-        ensure!(prepared.intent.version==2 && prepared.intent.source_owner==source
-            && audit.native_runtime_owner()?.as_ref()==Some(&source)
-            && prepared.intent.source_audit_path==audit.path(),"native launch controller identity mismatch");
-        let (original_audit,original_store_sha256)=original_context(&self.conn,&lease.workflow,lease.generation,true)?;
-        ensure!(Path::new(&original_audit)==audit.path(),"native launch original audit mismatch");
-        ensure!(prepared.intent.original_store_binding_sha256==original_store_sha256,"native launch original store digest mismatch");
-        ensure!(audit.native_store_binding()?==self.native_owner_binding(&lease.workflow,lease.generation)?,
-            "native launch original store binding mismatch");
-        let mut actual=audit.read_append_receipt(&prepared.controller_receipt)?;
-        actual.as_object_mut().context("native launch audit record is not an object")?.remove("audit_chain");
-        let mut expected=serde_json::to_value(&prepared.intent)?;
-        expected["actor"]="controller".into();expected["kind"]="native_launch_intent".into();
-        ensure!(actual==expected,"native launch controller receipt describes another record");
-        let provider=match prepared.intent.provider.as_str() {
-            "codex"=>submission::Provider::Codex,"claude"=>submission::Provider::Claude,
-            _=>anyhow::bail!("unsupported workflow native launch provider"),
-        };
-        let intent=NativeLaunchIntent {intent_id:prepared.intent.intent_id.clone(),provider,
-            runtime_relative_path:prepared.intent.runtime_relative_path.clone(),
-            native_session_id:prepared.intent.native_session_id.clone(),
-            launch_sha256:prepared.intent.launch_sha256.clone(),
-            creation_receipt_sha256:prepared.intent.creation_receipt_sha256.clone(),
-            controller_receipt:Some(prepared.controller_receipt.clone())};
-        // This transaction rechecks lease/candidate/original registration after
-        // the bounded read and publishes the identity, event and journal atomically.
-        self.record_native_launch_intent(lease,binding,&intent,now)
+    pub(crate) fn record_verified_launch_append(&mut self,lease:&Lease,binding:&Binding,append:&VerifiedLaunchAppend,now:i64)->Result<NativeLaunchRecord> {
+        ensure!(append.prepared.intent.source_owner==RuntimeOwner {workflow_id:lease.workflow.clone(),lease_generation:lease.generation},"native launch controller differs from current owner");
+        self.record_native_launch_intent_checked(lease,binding,&append.intent,Some((append.prepared.intent.source_audit_path.to_str().context("native audit is not UTF-8")?,&append.original_binding)),now)
+    }
+}
+impl WorkflowStore {
+    /// Compatibility wrapper for existing fixtures. Production callbacks capture
+    /// the private proof before acquiring the workflow mutex.
+    #[cfg(test)]
+    pub fn record_verified_native_launch(&mut self,lease:&Lease,binding:&Binding,audit:&augmentagent_channel_core::AuditLogger,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,now:i64)->Result<NativeLaunchRecord> {
+        self.validate_dispatch(lease,binding,now)?;let append=verify_launch_append(audit,prepared)?;self.record_verified_launch_append(lease,binding,&append,now)
     }
     /// Persist before releasing a native prompt. This records a launch intent,
     /// including a missing provider ID, without declaring runtime certainty.
-    pub fn record_native_launch_intent(&mut self, lease: &Lease, binding: &Binding,
-        intent: &NativeLaunchIntent, now: i64) -> Result<NativeLaunchRecord> {
+    #[cfg(test)]
+    pub fn record_native_launch_intent(&mut self,lease:&Lease,binding:&Binding,intent:&NativeLaunchIntent,now:i64)->Result<NativeLaunchRecord> {
+        self.record_native_launch_intent_checked(lease,binding,intent,None,now)
+    }
+    fn record_native_launch_intent_checked(&mut self,lease:&Lease,binding:&Binding,intent:&NativeLaunchIntent,expected:Option<(&str,&augmentagent_channel_core::native_vm::ownership::TransferBinding)>,now:i64)->Result<NativeLaunchRecord> {
         intent.validate()?;ensure!(now>=0,"invalid native launch time");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_binding(&tx,lease,binding,now)?;
+        require_native_dispatch_tx(&tx,lease,binding,now)?;
         let (audit,native_binding)=original_context(&tx,&lease.workflow,lease.generation,true)?;
+        if let Some((expected_audit,expected_binding))=expected {ensure!(audit==expected_audit && native_binding==binding_digest(expected_binding)?,"native launch original context changed after verification");}
         let prior: Option<IndexedRecord>=tx.query_row(&format!("SELECT {COLUMNS} FROM workflow_native_launch WHERE intent_id=?1"),
             [&intent.intent_id],indexed).optional()?;
         if let Some(prior)=prior {

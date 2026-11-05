@@ -231,50 +231,36 @@ fn decode(conn: &Connection, idx: Indexed) -> Result<NativeObservation> {
     );
     Ok(row)
 }
+/// Captured outside the workflow mutex; this is not deserializable authority.
+pub(crate) struct VerifiedObservationAppend {
+    fact:VerifiedNativeObservation,
+    original_binding:augmentagent_channel_core::native_vm::ownership::TransferBinding,
+    proof:serde_json::Value,
+}
+pub(crate) fn verify_observation_append(audit:&augmentagent_channel_core::AuditLogger,fact:&VerifiedNativeObservation)->Result<VerifiedObservationAppend> {
+    let prepared=fact.prepared();ensure!(prepared.intent.version==2,"unsupported native observation preparation");
+    ensure!(audit.path()==prepared.intent.source_audit_path && audit.native_runtime_owner()?.as_ref()==Some(&prepared.intent.source_owner),"native observation controller mismatch");
+    let original_binding=audit.native_store_binding()?.context("native observation original binding missing")?;original_binding.validate()?;
+    let digest=format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(&original_binding)?)?));
+    ensure!(digest==prepared.intent.original_store_binding_sha256,"native observation original binding digest mismatch");
+    let mut proof=audit.read_append_receipt(fact.receipt())?;proof.as_object_mut().context("native observation proof is not an object")?.remove("audit_chain");
+    ensure!(proof["launch_intent"]==serde_json::to_value(&prepared.intent)?,"native observation describes another preparation");
+    if let Some(inventory)=fact.inventory() {ensure!(proof["inventory"]==serde_json::to_value(inventory)?,"native observation inventory capability mismatch");}
+    Ok(VerifiedObservationAppend {fact:fact.clone(),original_binding,proof})
+}
 impl WorkflowStore {
-    /// Only real core producers supply this capability. Re-read the protected
-    /// append and recheck current lease/candidate inside the commit transaction.
-    pub fn record_verified_native_observation(
-        &mut self,
-        lease: &Lease,
-        binding: &Binding,
-        audit: &augmentagent_channel_core::AuditLogger,
-        fact: &VerifiedNativeObservation,
-        now: i64,
-    ) -> Result<NativeObservation> {
-        self.validate_dispatch(lease, binding, now)?;
-        let prepared = fact.prepared();
-        let launch = native_launch::recorded_launch(&self.conn, &prepared.intent.intent_id)?;
-        ensure!(
-            launch.workflow_id == lease.workflow
-                && launch.source_owner.lease_generation == lease.generation
-                && launch.workflow_binding == *binding
-                && audit.path() == prepared.intent.source_audit_path
-                && audit.native_runtime_owner()?.as_ref() == Some(&prepared.intent.source_owner)
-                && launch.intent.controller_receipt.as_ref() == Some(&prepared.controller_receipt),
-            "native observation controller differs from its journal"
-        );
-        ensure!(
-            audit.native_store_binding()?
-                == self.native_owner_binding(&lease.workflow, lease.generation)?,
-            "native observation original binding changed"
-        );
-        let mut proof = audit.read_append_receipt(fact.receipt())?;
-        proof
-            .as_object_mut()
-            .context("native observation proof is not an object")?
-            .remove("audit_chain");
-        ensure!(
-            proof["launch_intent"] == serde_json::to_value(&prepared.intent)?,
-            "native observation describes another preparation"
-        );
-        let inventory = fact.inventory();
-        if let Some(inventory) = inventory {
-            ensure!(
-                proof["inventory"] == serde_json::to_value(inventory)?,
-                "native observation inventory capability mismatch"
-            );
-        }
+    pub(crate) fn record_verified_observation_append(&mut self,lease:&Lease,binding:&Binding,append:&VerifiedObservationAppend,now:i64)->Result<NativeObservation> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_native_dispatch_tx(&tx,lease,binding,now)?;
+        let fact=&append.fact;let prepared=fact.prepared();let inventory=fact.inventory();let proof=append.proof.clone();
+        let launch=native_launch::recorded_launch(&tx,&prepared.intent.intent_id)?;
+        ensure!(launch.workflow_id==lease.workflow && launch.source_owner.lease_generation==lease.generation
+            && launch.workflow_binding==*binding && launch.source_owner==prepared.intent.source_owner
+            && Path::new(&launch.source_audit_path)==prepared.intent.source_audit_path
+            && launch.intent.controller_receipt.as_ref()==Some(&prepared.controller_receipt),"native observation controller differs from its journal");
+        let (original_audit,digest)=native_launch::original_context(&tx,&lease.workflow,lease.generation,true)?;
+        ensure!(original_audit==launch.source_audit_path && digest==prepared.intent.original_store_binding_sha256
+            && digest==native_launch::binding_digest(&append.original_binding)?,"native observation original owner changed after verification");
         let row = NativeObservation {
             version: 1,
             workflow_id: lease.workflow.clone(),
@@ -303,18 +289,6 @@ impl WorkflowStore {
             proof: Some(proof),
         };
         validate(&row, &launch)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_binding(&tx, lease, binding, now)?;
-        owner_control::require_dispatch(&tx, &lease.workflow)?;
-        let (original_audit, digest) =
-            native_launch::original_context(&tx, &lease.workflow, lease.generation, true)?;
-        ensure!(
-            original_audit == row.source_audit_path
-                && digest == prepared.intent.original_store_binding_sha256,
-            "native observation original owner changed"
-        );
         let receipt_sequence = i64::try_from(fact.receipt().sequence)?;
         let prior=tx.query_row(&format!("SELECT {COLUMNS} FROM workflow_native_observation WHERE source_audit_path=?1 AND receipt_sequence=?2"),
             params![row.source_audit_path,receipt_sequence],indexed).optional()?;
@@ -411,6 +385,14 @@ impl WorkflowStore {
         )?;
         tx.commit()?;
         Ok(row)
+
+    }
+}
+impl WorkflowStore {
+    /// Compatibility wrapper for fixtures; production uses the two-phase ingress.
+    #[cfg(test)]
+    pub fn record_verified_native_observation(&mut self,lease:&Lease,binding:&Binding,audit:&augmentagent_channel_core::AuditLogger,fact:&VerifiedNativeObservation,now:i64)->Result<NativeObservation> {
+        self.validate_dispatch(lease,binding,now)?;let append=verify_observation_append(audit,fact)?;self.record_verified_observation_append(lease,binding,&append,now)
     }
     pub fn native_observation_history(&self, workflow: &str) -> Result<Vec<NativeObservation>> {
         history(&self.conn, workflow)
@@ -1657,6 +1639,60 @@ mod tests {
         store.lock().unwrap().conn.execute_batch("CREATE TRIGGER deny_terminal_completed BEFORE INSERT ON workflow_native_handoff_completed BEGIN SELECT RAISE(ABORT,'injected terminal completion failure'); END;").unwrap();let events=store.lock().unwrap().events(&lease.workflow).unwrap();let result=native_reconcile::run(&store,Mode::Terminal(&terminal),&pending,None,&now).unwrap();assert!(matches!(result,ReconciliationRun::Retained {..}));assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);assert!(store.lock().unwrap().native_owner_binding(&lease.workflow,lease.generation).unwrap().is_none());let count:i64=store.lock().unwrap().conn.query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).unwrap();assert_eq!(count,1);
         store.lock().unwrap().conn.execute_batch("DROP TRIGGER deny_terminal_completed").unwrap();assert!(matches!(native_reconcile::run(&store,Mode::Terminal(&terminal),&pending,None,&now).unwrap(),ReconciliationRun::Settled(HandoffSettlement {current_context:false,..})));
         store.lock().unwrap().conn.execute("UPDATE workflow_native_handoff_completed SET record=json_set(record,'$.terminal.checkpoint_sha256','corrupt') WHERE workflow=?1",[&lease.workflow]).unwrap();let reopened=std::sync::Arc::new(std::sync::Mutex::new(WorkflowStore::open(&f.path).unwrap()));assert!(matches!(native_reconcile::run(&reopened,Mode::Terminal(&terminal),&pending,None,&now).unwrap(),ReconciliationRun::Retained {..}));
+    }
+    #[test]
+    fn native_callback_append_capabilities_recheck_context_at_commit() {
+        if child("native_callback_append_capabilities_recheck_context_at_commit") {return;}
+        for fault in ["lease","head","held","retired"] {
+            let mut f=Fixture::new();let fact=f.complete();let launch=native_launch::verify_launch_append(&f.audit,&f.prepared).unwrap();let observation=verify_observation_append(&f.audit,&fact).unwrap();
+            if fault=="lease" {f.store.release(&f.lease,now()).unwrap();f.store.claim(&f.lease.workflow,"new-callback-owner",now(),60_000).unwrap().unwrap();}
+            else {let mut checkpoint=f.store.snapshot(&f.lease.workflow).unwrap().unwrap().checkpoint;match fault {"head"=>checkpoint.binding.head="changed-callback-head".into(),"held"=>checkpoint.stage=Stage::Held,"retired"=>checkpoint.stage=Stage::Retired,_=>unreachable!()};f.store.checkpoint(&f.lease,&checkpoint,now()).unwrap();}
+            let events=f.store.events(&f.lease.workflow).unwrap();assert!(f.store.record_verified_launch_append(&f.lease,&f.binding,&launch,now()).is_err(),"{fault}");assert!(f.store.record_verified_observation_append(&f.lease,&f.binding,&observation,now()).is_err(),"{fault}");assert_eq!(f.store.events(&f.lease.workflow).unwrap(),events);
+        }
+    }
+    #[test]
+    fn native_callback_install_uses_actual_core_launch_and_uncertainty_ingress() {
+        if child("native_callback_install_uses_actual_core_launch_and_uncertainty_ingress") {return;}
+        use std::sync::{Arc,Mutex};
+        let mut f=Fixture::new();let reopened=WorkflowStore::open(&f.path).unwrap();let store=Arc::new(Mutex::new(std::mem::replace(&mut f.store,reopened)));let audit=Arc::new(f.audit.clone());
+        super::super::native_callbacks::install(&store,&f.lease,&audit,Arc::new(||Ok(None))).unwrap();
+        let mut intent=f.prepared.intent.clone();intent.intent_id=uuid::Uuid::new_v4().to_string();intent.launch_sha256="c".repeat(64);let prepared=audit.native_launch_prepared(&intent).unwrap();let fact=ownership::observe_native_uncertainty(&audit,&prepared,None).unwrap();
+        let locked=store.lock().unwrap();let launches=locked.native_launch_intents(&f.lease.workflow).unwrap();assert!(launches.iter().any(|r|r.intent.intent_id==prepared.intent.intent_id));let observations=locked.native_observation_history(&f.lease.workflow).unwrap();assert_eq!(observations.len(),1);assert_eq!(observations[0].certainty,Certainty::Uncertain);assert_eq!(observations[0].protected_observation_reference.as_ref(),Some(fact.receipt()));assert_eq!(locked.snapshot(&f.lease.workflow).unwrap().unwrap().model_calls,0);
+    }
+    #[test]
+    fn native_callback_capture_rejects_changed_receipt_without_poisoning_audit() {
+        if child("native_callback_capture_rejects_changed_receipt_without_poisoning_audit") {return;}
+        let f=Fixture::new();for fault in ["receipt","owner","binding","intent"] {
+            let mut prepared=f.prepared.clone();match fault {"receipt"=>prepared.controller_receipt.record_sha256="f".repeat(64),"owner"=>prepared.intent.source_owner.lease_generation+=1,"binding"=>prepared.intent.original_store_binding_sha256="f".repeat(64),"intent"=>prepared.intent.intent_id=uuid::Uuid::new_v4().to_string(),_=>unreachable!()};assert!(native_launch::verify_launch_append(&f.audit,&prepared).is_err(),"{fault}");f.audit.protected_health().unwrap();
+        }
+    }
+    #[test]
+    fn native_callback_real_receipts_and_handoff_do_not_reverse_workflow_audit_locks() {
+        if child("native_callback_real_receipts_and_handoff_do_not_reverse_workflow_audit_locks") {return;}
+        use std::sync::{Arc,Mutex,mpsc,atomic::{AtomicBool,Ordering}};use std::time::Duration;use std::os::fd::AsRawFd;
+        for kind in ["launch","observation"] {
+            let mut f=Fixture::new();let fact=f.complete();f.record(&fact).unwrap();file(&f._root.path().join("native/codex/session-fixture/lock"),b"");f.audit.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":f.lease.workflow,"generation":f.lease.generation})).unwrap();f.audit.require_run_resources().unwrap();
+            let reopened=WorkflowStore::open(&f.path).unwrap();let store=Arc::new(Mutex::new(std::mem::replace(&mut f.store,reopened)));let late_store=store.clone();let audit=f.audit.clone();let old=f.lease.clone();let old_binding=f.binding.clone();let prepared=f.prepared.clone();
+            let (entered_tx,entered_rx)=mpsc::channel();let (read_tx,read_rx)=mpsc::channel();let (verified_tx,verified_rx)=mpsc::channel();let (commit_tx,commit_rx)=mpsc::channel();let (done_tx,done_rx)=mpsc::channel();
+            let worker=std::thread::spawn(move || {
+                let result=if kind=="launch" {
+                    super::super::native_callbacks::journal(&late_store,&old,Some(&old_binding),|| {entered_tx.send(()).unwrap();read_rx.recv_timeout(Duration::from_secs(5)).unwrap();let proof=native_launch::verify_launch_append(&audit,&prepared)?;verified_tx.send(()).unwrap();commit_rx.recv_timeout(Duration::from_secs(5)).unwrap();Ok(proof)},WorkflowStore::record_verified_launch_append,&now).map(|_|())
+                }else{
+                    super::super::native_callbacks::journal(&late_store,&old,Some(&old_binding),|| {entered_tx.send(()).unwrap();read_rx.recv_timeout(Duration::from_secs(5)).unwrap();let proof=verify_observation_append(&audit,&fact)?;verified_tx.send(()).unwrap();commit_rx.recv_timeout(Duration::from_secs(5)).unwrap();Ok(proof)},WorkflowStore::record_verified_observation_append,&now).map(|_|())
+                };done_tx.send(result.is_err()).unwrap();result
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();let mut locked=store.try_lock().expect("callback retained workflow mutex while capturing a receipt");read_tx.send(()).unwrap();verified_rx.recv_timeout(Duration::from_secs(5)).expect("actual receipt capture needed the workflow mutex");locked.release(&f.lease,now()).unwrap();let lease=locked.claim(&f.lease.workflow,"concurrent-handoff",now(),60_000).unwrap().unwrap();drop(locked);
+            let base=f._root.path().canonicalize().unwrap();let destination=Arc::new(AuditLogger::protected(base.join("logs/callback-destination.jsonl"),base.join("anchors/callback-destination.json"),&[]).unwrap());destination.set_native_runtime_owner(RuntimeOwner {workflow_id:lease.workflow.clone(),lease_generation:lease.generation}).unwrap();destination.set_native_store_binding(f.audit.native_store_binding().unwrap().unwrap()).unwrap();destination.require_run_resources().unwrap();destination.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":lease.workflow,"generation":lease.generation})).unwrap();
+            let facts=store.lock().unwrap().native_handoff_facts(&lease,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);let pending=pending_record(store.lock().unwrap().prepare_native_handoff_filtered(&lease,&f.binding,destination.path().to_str().unwrap(),&facts,&rows,&[],now()).unwrap());let gate=f._root.path().join("anchors/native.lock");let fired=AtomicBool::new(false);
+            let current=|| {
+                store.lock().unwrap().native_handoff_pending_is_current(&lease,&f.binding,&pending,now()).map_err(|_|ownership::TransferFenceError::NotCurrent)?;
+                let file=std::fs::OpenOptions::new().read(true).open(&gate).unwrap();let held=unsafe {libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0;
+                if held && !fired.swap(true,Ordering::SeqCst) {commit_tx.send(()).unwrap();assert!(done_rx.recv_timeout(Duration::from_secs(5)).expect("late callback deadlocked under native/audit locks"));}
+                Ok(())
+            };
+            let outcome=ownership::transfer(&pending.original_binding,&pending.request,&pending.observation(),&[Arc::new(f.audit.clone())],&destination,&current);assert!(matches!(outcome,ownership::TransferOutcome::Completed(_)),"{kind}: {outcome:?}");assert!(fired.load(Ordering::SeqCst));assert!(worker.join().unwrap().is_err());
+            let verified=pending.verified_receipt(&||Ok(())).unwrap().unwrap();assert!(store.lock().unwrap().settle_native_handoff(&lease,&f.binding,&verified,now()).unwrap().current_context);let locked=store.lock().unwrap();assert_eq!(locked.native_launch_intents(&lease.workflow).unwrap().len(),1);assert_eq!(locked.native_observation_history(&lease.workflow).unwrap().len(),1);assert_eq!(locked.snapshot(&lease.workflow).unwrap().unwrap().model_calls,0);
+        }
     }
     #[test]
     fn native_handoff_pending_request_survives_restart_without_new_identity() {
