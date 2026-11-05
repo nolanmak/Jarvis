@@ -101,6 +101,19 @@ class ContractTests(unittest.TestCase):
    c['commands']['test/check/0']['body']='exit 23'
    failed=subprocess.run([sys.executable,'-I',str(ROOT/'scripts/ci-contract.py'),'--contract-json',json.dumps(c),'step','--id','test/check/0','--state-dir',state],cwd=root,capture_output=True,text=True)
    self.assertEqual(failed.returncode,23)
+ @unittest.skipUnless(sys.platform=='linux','Linux runner temporary filesystem placement')
+ def test_hosted_linux_temporary_files_use_runner_disk_instead_of_system_tmp(self):
+  with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as runtime, tempfile.TemporaryDirectory() as state:
+   root=Path(d);c=self.fixture(root,'test "$TMPDIR" = "$RUNNER_TEMP"; python3 -c \'import os,tempfile; assert tempfile.gettempdir() == os.environ["RUNNER_TEMP"]\'')
+   env={**os.environ,'RUNNER_TEMP':runtime,'TMPDIR':'/tmp'}
+   for mode in [['--hosted'],['--state-dir',state]]:
+    done=subprocess.run([sys.executable,'-I',str(ROOT/'scripts/ci-contract.py'),'--contract-json',json.dumps(c),'step',*mode,'--id','test/check/0'],cwd=root,env=env,capture_output=True,text=True)
+    self.assertEqual(done.returncode,0,done.stderr)
+   for invalid in ['', 'relative', str(root/'missing')]:
+    env['RUNNER_TEMP']=invalid
+    failed=subprocess.run([sys.executable,'-I',str(ROOT/'scripts/ci-contract.py'),'--contract-json',json.dumps(c),'step','--hosted','--id','test/check/0'],cwd=root,env=env,capture_output=True,text=True)
+    self.assertEqual(failed.returncode,2,failed.stderr)
+    self.assertIn('runner temporary directory',failed.stderr)
  def test_raw_contract_bytes_bind_plan(self):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d);c=self.fixture(root);raw=json.dumps(c,indent=2)

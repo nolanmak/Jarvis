@@ -10,7 +10,7 @@ if [[ "${GITHUB_ACTIONS:-}" != true || "${RUNNER_ENVIRONMENT:-}" != github-hoste
   exit 0
 fi
 
-df -h .
+df -h . /tmp "${RUNNER_TEMP:-.}"
 sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet \
   /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-df -h .
+df -h . /tmp "${RUNNER_TEMP:-.}"
