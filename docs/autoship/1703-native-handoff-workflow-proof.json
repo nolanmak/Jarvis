@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "22498a8bc820f86fd674611607d2f9bb7247137a",
+  "source_parent_commit": "8c5217cd",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -26,7 +26,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
-      "sha256": "ad96cbbc6df54ac5bfa2b99af682bebac35829ece92cb9de764274591b805dc7"
+      "sha256": "68323556db5b216745cf22528eddaf404147efcde6b41d956816a83d7ecf6448"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
@@ -110,7 +110,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "349a998a7d0e7bc836b00260ff70a51582c6c4df1839d13674bc8b88522598c6"
+      "sha256": "887a303e0bd18b1dc68d526aa0948bc689b67d37fa0907a33b05b935d104a69e"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_recovery.rs",
@@ -235,7 +235,10 @@
       "autoship-owner-guard-index-corruption-red.log",
       "autoship-owner-guard-index-corruption-green.log",
       "autoship-owner-guard-setup-validated-cli.log",
-      "autoship-owner-guard-setup-validated-production-check.log"
+      "autoship-owner-guard-setup-validated-production-check.log",
+      "autoship-owner-session-restore-validated-guard.log",
+      "autoship-owner-session-restore-full-cli.log",
+      "autoship-owner-session-restore-production-check.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -400,7 +403,8 @@
     "same owner request can be reclaimed only after validated setup_refused history; escaped/expired claimed turns remain blocked, refusal write failure stays conservative, and lost/corrupt authority history holds future claims",
     "owner-turn acquisition requires selected native configuration before claiming; configured counter-admission fixture preserves its pause/publication assertions and performs no provider transport dispatch",
     "actual joined preparation transfers a retained physical runtime under the guarded owner pause exception while preserving creation bytes, checkpoint, pending input and allowance",
-    "unrecognized binding fields in the current owner-turn authority index are refused rather than normalized and overwritten; the actual guard corruption regression failed before the fix"
+    "unrecognized binding fields in the current owner-turn authority index are refused rather than normalized and overwritten; the actual guard corruption regression failed before the fix",
+    "guarded owner continuation factory restores the exact saved Codex/Claude conversation after physical runtime completion and original-store handoff; mismatched provider and uncertain conversation refuse; no worker/gateway/provider-transport acceptance"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -558,8 +562,18 @@
       "subprocess_modes": 27,
       "log": "autoship-owner-session-restore-validated-guard.log"
     },
-    "full_cli": "pending current managed run; top-level results still describe prior published validation",
-    "production_check": "pending after full CLI",
+    "full_cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "passed": 1846,
+      "failed": 0,
+      "ignored": 33,
+      "log": "autoship-owner-session-restore-full-cli.log"
+    },
+    "production_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "exit_code": 0,
+      "log": "autoship-owner-session-restore-production-check.log"
+    },
     "optional_fresh_factory_mutation": "not executed: managed admission returned storage busy; source was restored byte-for-byte",
     "retained_logs": [
       "autoship-owner-session-restore-red.log",
