@@ -590,6 +590,22 @@ async fn attest_registry(root: &Path, registry: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A pathname check, not a substitute for C's complete inode/input closure.
+fn check_verifier_root_separation(roots:&[(&str,&Path)])->Result<()> {
+    let canonical=roots.iter().map(|(name,path)| {
+        let path=path.canonicalize().context("verifier infrastructure: cannot resolve isolation root")?;
+        ensure!(path.is_dir(),"verifier infrastructure: isolation root is not a directory: {name}");
+        Ok((*name,path))
+    }).collect::<Result<Vec<_>>>()?;
+    for (index,(left_name,left)) in canonical.iter().enumerate() {
+        for (right_name,right) in &canonical[index+1..] {
+            ensure!(!left.starts_with(right) && !right.starts_with(left),
+                "verifier infrastructure: isolation roots overlap: {left_name}/{right_name}");
+        }
+    }
+    Ok(())
+}
+
 async fn isolated_observation(
     root: &Path,
     target: &Path,
@@ -597,16 +613,17 @@ async fn isolated_observation(
     audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<Observation> {
     use std::os::unix::fs::{symlink, PermissionsExt};
-    let canonical_target = target.canonicalize()?;
-    ensure!(
-        !root.starts_with(&canonical_target),
-        "build cache cannot contain verifier source"
-    );
+    let canonical_root=root.canonicalize().context("verifier infrastructure: cannot resolve source root")?;
+    let canonical_target=target.canonicalize().context("verifier infrastructure: cannot resolve cache root")?;
+    let root=canonical_root.as_path();
+    let target=canonical_target.as_path();
+    check_verifier_root_separation(&[("source",root),("cache",target)])?;
     let private = tempfile::Builder::new()
         .prefix("autoship-verifier-")
         .tempdir()?;
     let runtime = private.path().join("runtime");
     std::fs::create_dir(&runtime)?;
+    check_verifier_root_separation(&[("source",root),("cache",target),("runtime",&runtime)])?;
     let home = runtime.join("home");
     std::fs::create_dir(&home)?;
     let cargo_home = runtime.join("cargo");
@@ -980,6 +997,47 @@ mod tests {
             assert!(harness_path(path));
         }
     }
+    #[test]
+    fn verifier_root_separation_checks_both_directions_runtime_and_symlink_aliases() {
+        let parent=tempfile::tempdir().unwrap();
+        let source=parent.path().join("source");let cache=parent.path().join("cache");let runtime=parent.path().join("runtime");
+        for root in [&source,&cache,&runtime] {std::fs::create_dir(root).unwrap();}
+        check_verifier_root_separation(&[("source",&source),("cache",&cache),("runtime",&runtime)]).unwrap();
+        for (left,right) in [(&source,&cache),(&source,&runtime),(&cache,&runtime)] {
+            check_verifier_root_separation(&[("left",left),("right",right)]).unwrap();
+            let nested=left.join("nested");std::fs::create_dir_all(&nested).unwrap();
+            for roots in [[("left",left.as_path()),("right",nested.as_path())],
+                [("left",nested.as_path()),("right",left.as_path())]] {
+                let error=check_verifier_root_separation(&roots).unwrap_err();
+                assert!(transient_verifier_infrastructure(&format!("{error:#}")));
+            }
+        }
+        let alias=parent.path().join("alias");std::os::unix::fs::symlink(&source,&alias).unwrap();
+        assert!(check_verifier_root_separation(&[("source",&alias),("cache",&source)]).is_err());
+        assert!(check_verifier_root_separation(&[("source",&source),("runtime",&alias)]).is_err());
+        let ancestor_alias=parent.path().join("ancestor-alias");std::os::unix::fs::symlink(parent.path(),&ancestor_alias).unwrap();
+        assert!(check_verifier_root_separation(&[("source",&source),("cache",&ancestor_alias)]).is_err());
+    }
+    #[cfg(target_os="linux")]
+    #[tokio::test]
+    async fn isolated_verifier_refuses_a_writable_cache_inside_its_source_before_launch() {
+        let source=tempfile::tempdir().unwrap();
+        let control=tempfile::tempdir_in("/tmp").unwrap();
+        let cache=source.path().join("cache");std::fs::create_dir(&cache).unwrap();
+        let adapter=cache.join("observer.py");
+        let body="from pathlib import Path\np=Path(__file__)\nsaved=p.read_bytes()\np.write_text('# changed during execution\\n')\np.write_bytes(saved)\n(p.parent/'ran').write_text('executed with writable adapter')\nprint('true')\n";
+        std::fs::write(&adapter,body).unwrap();
+        let result=isolated_observation(source.path(),&cache,
+            crate::autoship_contract::VerifierCommand::BlackBox {
+                invocation:crate::autoship_contract::BehaviorInvocation::PythonScript {file:"cache/observer.py".into(),args:vec![]},
+                oracle:crate::autoship_contract::OutputOracle::Json {value:serde_json::json!(true)}}.invocation().unwrap(),
+            &test_resource_audit(control.path())).await;
+        assert!(result.is_err(),"overlapping writable source was executed: {result:?}");
+        let error=format!("{:#}",result.unwrap_err());
+        assert!(transient_verifier_infrastructure(&error),"isolation refusal must not schedule product repair: {error}");
+        assert!(!cache.join("ran").exists(),"invalid source layout ran before rejection");
+        assert_eq!(std::fs::read_to_string(adapter).unwrap(),body);
+    }
     #[tokio::test]
     async fn real_isolated_python_assertion_and_protected_write() {
         // This tiny Python boundary fixture does not need the production Cargo
@@ -1010,7 +1068,8 @@ mod tests {
         assert!(observation.stderr.contains("intended regression witness"));
         let protected = root.path().join("protected");
         std::fs::write(&protected, "unchanged").unwrap();
-        std::fs::write(root.path().join("test_case.py"), "import unittest\nclass Case(unittest.TestCase):\n def test_behavior(self):\n  with self.assertRaises(PermissionError):\n   open('protected', 'w')\n  import socket\n  with self.assertRaises(PermissionError):\n   socket.socket()\n").unwrap();
+        let adapter="import unittest\nfrom pathlib import Path\nclass Case(unittest.TestCase):\n def test_behavior(self):\n  with self.assertRaises(PermissionError):\n   open('protected', 'w')\n  original=Path(__file__).read_bytes()\n  with self.assertRaises(PermissionError):\n   Path(__file__).write_text('# changed before restore')\n   Path(__file__).write_bytes(original)\n  import socket\n  with self.assertRaises(PermissionError):\n   socket.socket()\n";
+        std::fs::write(root.path().join("test_case.py"),adapter).unwrap();
         let invocation = crate::autoship_contract::VerifierCommand::PythonUnittest {
             test: "test_case.Case.test_behavior".into(),
         }
@@ -1021,6 +1080,8 @@ mod tests {
             .unwrap();
         assert_eq!(observation.exit_code, Some(0), "{}", observation.stderr);
         assert_eq!(std::fs::read_to_string(protected).unwrap(), "unchanged");
+        assert_eq!(std::fs::read_to_string(root.path().join("test_case.py")).unwrap(),adapter,
+            "read-only adapter changed during the child invocation");
     }
 }
 
