@@ -15,7 +15,7 @@ impl std::fmt::Display for EvidenceBudget {
 }
 impl std::error::Error for EvidenceBudget {}
 fn unavailable_from_error(provider: augmentagent_channel_core::ProviderKind, error: anyhow::Error) -> IndependentReview {
-    IndependentReview::unavailable(if error.downcast_ref::<EvidenceBudget>().is_some() {
+    IndependentReview::unavailable(if error.is::<EvidenceBudget>() || error.is::<aligned::RequestBudgetExceeded>() {
         ReviewUnavailable::EvidenceBudget { detail: format!("{error:#}") }
     } else {
         ReviewUnavailable::NoCapacity { reviewers: vec![provider], detail: format!("aligned review needs recovery: {error:#}") }
@@ -149,6 +149,8 @@ mod final_authority;
 mod adjudication_windows;
 #[path = "self_improve_requested_evidence.rs"]
 mod requested_evidence;
+#[path = "self_improve_review_symbols.rs"]
+mod source_items;
 
 const REGRESSION_REQUIREMENT: &str = "No newly demonstrated correctness, security or acceptance regression; report a reproducible example and concrete remedy.";
 
@@ -204,7 +206,10 @@ fn controller_acceptance_context(prepared:&acceptance::PreparedAcceptance, refer
     }))
 }
 fn add_controller_sources(shards:&mut BTreeMap<String,String>,prepared:&acceptance::PreparedAcceptance) {
-    for (path,body) in &prepared.proposal.files {
+    add_controller_source_files(shards,&prepared.proposal.files);
+}
+fn add_controller_source_files(shards:&mut BTreeMap<String,String>,files:&BTreeMap<String,String>) {
+    for (path,body) in files {
         for (index,chunk) in chunks(body,96*1024).into_iter().enumerate() {
             shards.insert(format!("controller_source:{}#part-{index}",serde_json::to_string(path).expect("source path")),chunk.into());
         }
@@ -302,7 +307,8 @@ fn immutable_write_findings_from_audit(root:&Path,prepared:&acceptance::Prepared
 
 pub(super) async fn diagnostic_call_bound(worktree:&Path, issue:&ReviewSubject<'_>, prepared:&acceptance::PreparedAcceptance)->Result<u64> {
     let snapshot=candidate_snapshot(worktree).await?;
-    let callers=complete_caller_evidence(worktree,&snapshot.head,&snapshot.diff).await?;
+    let caller_symbols=caller_discovery_symbols(worktree,&snapshot,Some(&prepared.proposal.files)).await?;
+    let callers=complete_caller_evidence_for_symbols(worktree,&snapshot.head,&caller_symbols).await?;
     let mut contract:BTreeMap<_,_>=prepared.proposal.contract.criteria.iter().map(|c|(c.id.clone(),c.requirement.clone())).collect();
     anyhow::ensure!(!contract.contains_key("REGRESSION"),"reserved criterion collision");
     contract.insert("REGRESSION".into(),REGRESSION_REQUIREMENT.into());
@@ -326,6 +332,35 @@ struct CandidateSnapshot {
     diff: String,
     required: BTreeSet<String>,
     files: BTreeMap<String, String>,
+}
+
+async fn caller_discovery_symbols(
+    root: &Path,
+    snapshot: &CandidateSnapshot,
+    controller_sources: Option<&BTreeMap<String, String>>,
+) -> Result<BTreeSet<String>> {
+    // A rename may hide the old path in --name-only output. Inspect both
+    // sides as additions/deletions so removed APIs retain their callers.
+    let paths=git(root,&["diff","--no-renames","--name-only","-z",&snapshot.base,&snapshot.head,"--"]).await?;
+    let changed:BTreeSet<String>=paths.split('\0').filter(|path|!path.is_empty()).map(str::to_owned).collect();
+    if let Some(sources) = controller_sources {
+        for (path, body) in sources {
+            if !changed.contains(path) { continue; }
+            anyhow::ensure!(acceptance::harness_path(path)
+                && snapshot.files.get(path) == Some(body),
+                "caller discovery can exclude only unchanged registered dedicated verifier source");
+        }
+    }
+    let implementation: Vec<_> = changed.iter()
+        .filter(|path| !controller_sources.is_some_and(|sources| sources.contains_key(*path)))
+        .collect();
+    if implementation.is_empty() { return Ok(BTreeSet::new()); }
+    // Dedicated pinned harnesses are still delivered in the complete diff,
+    // full files, and controller_source evidence. Their main/test entrypoints
+    // do not define product APIs whose callers should be scanned repo-wide.
+    // Syntax spans identify the enclosing edited item, without treating every
+    // unchanged function in a module or a quoted fixture string as an API edit.
+    source_items::collect(root,&snapshot.base,&snapshot.head,&implementation).await
 }
 
 async fn candidate_snapshot(worktree: &Path) -> Result<CandidateSnapshot> {
@@ -398,12 +433,23 @@ async fn caller_paths(worktree: &Path, head: &str, diff: &str) -> Result<(BTreeS
         .map(|line| format!("+{}", &line[1..]))
         .collect::<Vec<_>>()
         .join("\n");
+    let item_context = diff.lines().filter_map(|line| {
+        if let Some(context) = line.strip_prefix(' ') {
+            Some(format!("+{context}"))
+        } else if line.starts_with("@@") {
+            line.splitn(3, "@@").nth(2).map(|context| format!("+{context}"))
+        } else { None }
+    }).collect::<Vec<_>>().join("\n");
     let symbols: BTreeSet<_> = changed_symbols(diff)
         .into_iter()
         .chain(changed_symbols(&removed_as_added))
+        .chain(changed_symbols(&item_context))
         .collect();
+    caller_paths_for_symbols(worktree,head,&symbols).await.map(|paths|(symbols,paths))
+}
+async fn caller_paths_for_symbols(worktree:&Path,head:&str,symbols:&BTreeSet<String>)->Result<BTreeSet<String>> {
     let mut paths = BTreeSet::new();
-    for symbol in &symbols {
+    for symbol in symbols {
         let (ok, output, error) = git_output(
             worktree,
             &[
@@ -430,10 +476,17 @@ async fn caller_paths(worktree: &Path, head: &str, diff: &str) -> Result<(BTreeS
             paths.insert(path.to_owned());
         }
     }
-    Ok((symbols, paths))
+    Ok(paths)
 }
 async fn complete_caller_evidence(worktree: &Path, head: &str, diff: &str) -> Result<String> {
     let (symbols, paths)=caller_paths(worktree,head,diff).await?;
+    complete_caller_paths(worktree,head,&symbols,paths).await
+}
+async fn complete_caller_evidence_for_symbols(worktree:&Path,head:&str,symbols:&BTreeSet<String>)->Result<String> {
+    let paths=caller_paths_for_symbols(worktree,head,symbols).await?;
+    complete_caller_paths(worktree,head,symbols,paths).await
+}
+async fn complete_caller_paths(worktree:&Path,head:&str,symbols:&BTreeSet<String>,paths:BTreeSet<String>)->Result<String> {
     const MAX_CALLER_FILES: usize = 256;
     const MAX_CALLER_BYTES: usize = 8 * 1024 * 1024;
     if paths.len() > MAX_CALLER_FILES {
@@ -507,13 +560,16 @@ async fn run_impl(
         !criteria.is_empty(),
         "acceptance criteria missing; scope before review"
     );
+    let snapshot=candidate_snapshot(&worktree).await?;
+    let caller_symbols=caller_discovery_symbols(&worktree,&snapshot,
+        context.acceptance_evidence.map(|(prepared,_)|&prepared.proposal.files)).await?;
     let CandidateSnapshot {
         head,
         base,
         diff,
         required,
         files,
-    } = candidate_snapshot(&worktree).await?;
+    } = snapshot;
     let mut contract: BTreeMap<String, String> =
         if let Some((prepared, reference)) = context.acceptance_evidence {
             if diagnostic {
@@ -563,10 +619,10 @@ async fn run_impl(
         .acceptance_evidence
         .map(|(_, receipt)| receipt.binding.contract_hash.clone())
         .unwrap_or(aligned::digest(&serde_json::to_vec(&contract)?));
-    let (callers,caller_plan)=match complete_caller_evidence(&worktree,&head,&diff).await {
+    let (callers,caller_plan)=match complete_caller_evidence_for_symbols(&worktree,&head,&caller_symbols).await {
         Ok(inline)=>(inline,None),
         Err(error) if error.downcast_ref::<EvidenceBudget>().is_some()=>{
-            let plan=caller_stream::Plan::collect(&worktree,&head,&diff).await?;
+            let plan=caller_stream::Plan::collect_symbols(&worktree,&head,caller_symbols.clone()).await?;
             (plan.manifest.clone(),Some(plan))
         }
         Err(error)=>return Err(error),
@@ -1017,6 +1073,108 @@ mod tests {
         fixture_git(path, &["add", "-A"]);
         fixture_git(path, &["commit", "-qm", "candidate"]);
         dir
+    }
+
+    #[tokio::test]
+    async fn pinned_observer_entrypoint_does_not_expand_product_callers_but_edited_api_does() {
+        let dir=candidate_fixture();
+        let path=dir.path();
+        std::fs::write(path.join("api.rs"),"pub fn resolve_person() -> u32 {\n    1\n}\n").unwrap();
+        std::fs::write(path.join("caller.rs"),"fn caller() { resolve_person(); }\n").unwrap();
+        std::fs::write(path.join("unrelated.txt"),"main unrelated repo metadata\n").unwrap();
+        fixture_git(path,&["add","."]);fixture_git(path,&["commit","-qm","product and caller"]);
+        fixture_git(path,&["update-ref","refs/remotes/origin/main","HEAD"]);
+        std::fs::write(path.join("api.rs"),"pub fn resolve_person() -> u32 {\n    2\n}\n").unwrap();
+        let pin="src/bin/autoship_observer.rs";
+        std::fs::create_dir_all(path.join("src/bin")).unwrap();
+        std::fs::write(path.join(pin),"fn main() { resolve_person(); }\n").unwrap();
+        fixture_git(path,&["add","."]);fixture_git(path,&["commit","-qm","body edit and pinned observer"]);
+        let snapshot=candidate_snapshot(path).await.unwrap();
+        let pins=BTreeMap::from([(pin.into(),snapshot.files[pin].clone())]);
+        let symbols=caller_discovery_symbols(path,&snapshot,Some(&pins)).await.unwrap();
+        let paths=caller_paths_for_symbols(path,&snapshot.head,&symbols).await.unwrap();
+        assert!(!symbols.contains("main"),"a controller observer entrypoint is not a changed product API");
+        assert!(symbols.contains("resolve_person"),"body-only edits must collect the existing API's callers");
+        assert!(paths.contains("caller.rs"));
+        assert!(!paths.contains("unrelated.txt"));
+        assert!(snapshot.diff.contains("+fn main()"));
+        assert_eq!(snapshot.files[pin],pins[pin],"full review source still includes immutable observer bytes");
+        let mut changed_pin=pins.clone();changed_pin.insert(pin.into(),"changed source".into());
+        assert!(caller_discovery_symbols(path,&snapshot,Some(&changed_pin)).await.is_err());
+        let unregistered=BTreeMap::from([("api.rs".into(),snapshot.files["api.rs"].clone())]);
+        assert!(caller_discovery_symbols(path,&snapshot,Some(&unregistered)).await.is_err(),
+            "a product file cannot be excluded by claiming it is pinned verifier source");
+    }
+
+    #[test]
+    fn oversized_review_wire_is_evidence_budget_not_provider_capacity() {
+        let binding=aligned::ReviewBinding {head:"a".repeat(40),base:"b".repeat(40),
+            environment_id:"environment".into(),contract_hash:"c".repeat(64),evidence_hash:"d".repeat(64)};
+        let files=BTreeMap::from([("large.rs".into(),"x".repeat(aligned::MAX_PROMPT_BYTES))]);
+        let error=aligned::review_request(&binding,"fixture",&BTreeMap::from([("C1".into(),"correct".into())]),"diff",files.keys().cloned().collect(),&files,&[]).unwrap_err();
+        let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
+        assert!(matches!(review.why_unavailable,Some(ReviewUnavailable::EvidenceBudget {..})),
+            "a deterministic request-size refusal cannot be reported as a missing provider");
+    }
+
+    #[tokio::test]
+    async fn rename_does_not_hide_removed_rust_items_from_caller_lookup() {
+        let dir=candidate_fixture();let root=dir.path();
+        let common="// retained source context\n".repeat(50);
+        std::fs::write(root.join("original.rs"),format!("{common}pub fn kept() {{}}\npub fn removed_api() {{}}\n")).unwrap();
+        std::fs::write(root.join("consumer.rs"),"fn caller() { removed_api(); }\n").unwrap();
+        fixture_git(root,&["add","."]);fixture_git(root,&["commit","-qm","rename baseline"]);
+        fixture_git(root,&["update-ref","refs/remotes/origin/main","HEAD"]);
+        fixture_git(root,&["mv","original.rs","renamed.rs"]);
+        std::fs::write(root.join("renamed.rs"),format!("{common}pub fn kept() {{}}\n")).unwrap();
+        fixture_git(root,&["add","."]);fixture_git(root,&["commit","-qm","move and remove an API"]);
+        let snapshot=candidate_snapshot(root).await.unwrap();
+        assert_eq!(snapshot.required,BTreeSet::from(["renamed.rs".into()]),"fixture must exercise Git rename detection");
+        let symbols=caller_discovery_symbols(root,&snapshot,None).await.unwrap();
+        assert!(symbols.contains("removed_api"),"removed API must be discovered in the old path, not only the new path");
+        assert!(caller_paths_for_symbols(root,&snapshot.head,&symbols).await.unwrap().contains("consumer.rs"));
+    }
+
+    #[tokio::test]
+    #[ignore = "read-only packing replay requires an existing candidate and privately captured bound request; no native dispatch"]
+    async fn replay_readonly_caller_plan_from_bound_candidate() {
+        let root=PathBuf::from(std::env::var("AUTOSHIP_REPLAY_REPOSITORY").unwrap());
+        let input:serde_json::Value=serde_json::from_slice(&std::fs::read(std::env::var("AUTOSHIP_REPLAY_REQUEST").unwrap()).unwrap()).unwrap();
+        let binding:aligned::ReviewBinding=serde_json::from_value(input["binding"].clone()).unwrap();binding.validate().unwrap();
+        let paths=git(&root,&["diff","--name-only","-z",&binding.base,&binding.head,"--"]).await.unwrap();
+        let required:BTreeSet<String>=paths.split('\0').filter(|path|!path.is_empty()).map(str::to_owned).collect();
+        let mut files=BTreeMap::new();
+        for path in &required {
+            let (exists,body,_)=git_output(&root,&["show",&format!("{}:{path}",binding.head)]).await.unwrap();
+            assert!(exists,"this replay expects the published candidate's changed sources");files.insert(path.clone(),body);
+        }
+        let snapshot=CandidateSnapshot {head:binding.head.clone(),base:binding.base.clone(),
+            diff:git(&root,&["diff","--binary",&binding.base,&binding.head,"--"]).await.unwrap(),required,files};
+        let mut pins=BTreeMap::new();
+        for (path,sha) in input["controller_acceptance"]["pinned_source_hashes"].as_object().unwrap() {
+            let body=git(&root,&["show",&format!("{}:{path}",binding.head)]).await.unwrap();
+            assert_eq!(aligned::digest(body.as_bytes()),sha.as_str().unwrap());pins.insert(path.clone(),body);
+        }
+        let symbols=caller_discovery_symbols(&root,&snapshot,Some(&pins)).await.unwrap();
+        let callers=complete_caller_evidence_for_symbols(&root,&binding.head,&symbols).await.unwrap();
+        let caller_data:serde_json::Value=serde_json::from_str(&callers).unwrap();
+        let mut shards=supplied_shards(&snapshot.files,&snapshot.diff,&callers);add_controller_source_files(&mut shards,&pins);
+        let contract:BTreeMap<String,String>=serde_json::from_value(input["acceptance_criteria"].clone()).unwrap();
+        let prior:Vec<aligned::Finding>=serde_json::from_value(input["unresolved_findings"].clone()).unwrap();
+        // The original request was near 512 KiB including its actual system
+        // budget. A conservative 32 KiB system allowance tests extra headroom.
+        let inputs=evidence_plan::Inputs {binding:&binding,issue:input["issue"].as_str().unwrap(),contract:&contract,
+            prior:&prior,system_bytes:32*1024,controller_acceptance:Some(&input["controller_acceptance"])};
+        let requests=inputs.pack(&shards).unwrap();assert_eq!(requests.len(),1,"the published small change should have one coherent evidence group");
+        let result=serde_json::json!({"head":binding.head,"base":binding.base,"shipping_authority":false,
+            "symbols":symbols,"caller_files":caller_data["full_files"].as_object().unwrap().len(),
+            "caller_bytes":caller_data["full_files"].as_object().unwrap().values().map(|body|body.as_str().unwrap().len()).sum::<usize>(),
+            "request_bytes":requests[0].prompt.len(),"system_allowance_bytes":inputs.system_bytes,
+            "limit_bytes":aligned::MAX_PROMPT_BYTES,
+            "review_source_sha256":aligned::digest(include_bytes!("self_improve_review.rs")),
+            "item_parser_source_sha256":aligned::digest(include_bytes!("self_improve_review_symbols.rs"))});
+        let output=std::env::var("AUTOSHIP_REPLAY_PROOF").unwrap();std::fs::write(output,serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+        println!("{result}");
     }
 
     #[tokio::test]

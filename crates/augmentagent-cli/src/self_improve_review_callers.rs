@@ -23,6 +23,10 @@ impl Plan {
         let (symbols, paths)=caller_paths(root,head,diff).await?;
         Self::from_paths(root,head,paths,symbols,"All lexical matches for changed and removed Rust item names; not a semantic call graph").await
     }
+    pub async fn collect_symbols(root:&Path,head:&str,symbols:BTreeSet<String>)->Result<Self> {
+        let paths=caller_paths_for_symbols(root,head,&symbols).await?;
+        Self::from_paths(root,head,paths,symbols,"All lexical matches for edited and removed Rust declaration names; not a semantic call graph").await
+    }
     pub async fn named(root:&Path,head:&str,path:&str)->Result<Self> {
         Self::from_paths(root,head,BTreeSet::from([path.into()]),BTreeSet::new(),"Explicit immutable source requested by final authority").await
     }
