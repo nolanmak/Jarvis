@@ -53,6 +53,94 @@ impl NoPendingPreparationFailure {
         json!({"phase":"preparation","status":if self.deferred {"deferred"}else{"held"},"reason":self.reason.code(),"fingerprint":self.fingerprint})
     }
 }
+pub use super::owner_handoff::PhysicalObservation as PreparationRuntime;
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub struct PreparationPlan {
+    pub workflow_id:String,pub source_owners:Vec<super::ownership::Authority>,pub destination:super::ownership::Authority,
+    pub runtimes:Vec<PreparationRuntime>,pub fingerprint_input:PreparationFingerprintInput,
+}
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub struct PreparedHandoffIntent {
+    pub original_binding:super::ownership::TransferBinding,pub request:super::ownership::TransferRequest,
+    pub observation:super::ownership::TransferObservation,
+}
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub enum PreparationPersistence {
+    Durable(PreparedHandoffIntent),NotCommitted(TransferReason),
+    Unknown {reason:TransferReason,attempted:Option<PreparedHandoffIntent>},
+}
+/// Borrowed only during the original-lock callback. No public constructor,
+/// serialization or ownership/dispatch authority.
+pub struct PreparationScan<'a> {
+    inventory:&'a [super::ownership::RuntimeInventoryRow],retired:&'a [String],
+}
+impl PreparationScan<'_> {
+    pub fn inventory(&self)->&[super::ownership::RuntimeInventoryRow] {self.inventory}
+    pub fn retired(&self)->&[String] {self.retired}
+}
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub enum PreparedTransferResult {
+    NoPending(NoPendingPreparationFailure),
+    Pending {intent:PreparedHandoffIntent,outcome:super::ownership::TransferOutcome},
+    PersistenceUnknown {reason:TransferReason,attempted:Option<PreparedHandoffIntent>},
+}
+pub fn prepare_transfer(binding:&super::ownership::TransferBinding,plan:&PreparationPlan,sources:&[std::sync::Arc<crate::tool_audit::AuditLogger>],destination:&std::sync::Arc<crate::tool_audit::AuditLogger>,current:&dyn Fn()->Result<(),super::ownership::TransferFenceError>,persist:&mut dyn FnMut(&PreparationScan<'_>)->PreparationPersistence)->Result<PreparedTransferResult,TransferReason> {
+    let path=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY");
+    prepare_with_policy(path.as_deref().map(std::path::Path::new),binding,plan,sources,destination,current,persist)
+}
+pub(super) fn prepare_with_policy(policy:Option<&std::path::Path>,binding:&super::ownership::TransferBinding,plan:&PreparationPlan,sources:&[std::sync::Arc<crate::tool_audit::AuditLogger>],destination:&std::sync::Arc<crate::tool_audit::AuditLogger>,current:&dyn Fn()->Result<(),super::ownership::TransferFenceError>,persist:&mut dyn FnMut(&PreparationScan<'_>)->PreparationPersistence)->Result<PreparedTransferResult,TransferReason> {
+    use anyhow::Context;
+    use std::cell::{RefCell,Cell};
+    let mut input=plan.fingerprint_input.clone();
+    if input.workflow_id!=plan.workflow_id {return Err(TransferReason::InvalidRequest);}
+    input.original_binding_sha256=Some(format!("{:x}",Sha256::digest(canonical_bytes(&serde_json::to_value(binding).map_err(|_|TransferReason::InvalidRequest)?).map_err(|_|TransferReason::InvalidRequest)?)));
+    let selected=policy.and_then(|path|super::private(path).ok());
+    input.selected_policy_sha256=selected.as_ref().map(|bytes|format!("{:x}",Sha256::digest(bytes)));
+    // Validate fingerprint inputs without manufacturing a request identity.
+    NoPendingPreparationFailure::new(input.clone(),TransferReason::InvalidRequest).map_err(|_|TransferReason::InvalidRequest)?;
+    let no_pending=|reason|NoPendingPreparationFailure::new(input.clone(),reason).map(PreparedTransferResult::NoPending).map_err(|_|TransferReason::InvalidRequest);
+    let selection=(||->anyhow::Result<_> {
+        current().map_err(anyhow::Error::new)?;
+        let bytes=selected.as_ref().context(TransferReason::RuntimeUnavailable)?;
+        let selected:super::Policy=serde_json::from_slice(bytes).context(TransferReason::MetadataInvalid)?;
+        ensure!(super::owner_outcome::valid_policy(&selected),TransferReason::MetadataInvalid);
+        let (root,store)=binding.retirement_store()?;
+        binding.verify_launch_policy(bytes,&selected.state_root.canonicalize()?)?;
+        ensure!(plan.destination.owner.workflow_id==plan.workflow_id && plan.destination.owner.lease_generation>0
+            && std::path::Path::new(&plan.destination.audit_path).is_absolute()
+            && plan.source_owners.iter().all(|source|source.owner.lease_generation<plan.destination.owner.lease_generation && source.audit_path!=plan.destination.audit_path),TransferReason::InvalidRequest);
+        Ok((root,store,selected.max_state_bytes))
+    })();
+    let (root,store,max_state_bytes)=match selection {Ok(value)=>value,Err(error)=>return no_pending(super::owner_outcome::classify(&error).0)};
+    let selected_sha=input.selected_policy_sha256.as_deref().ok_or(TransferReason::InvalidRequest)?;
+    let fence=||super::owner_outcome::selected_fence(policy,selected_sha,root,current);
+    let phase=RefCell::new(None);let validated=Cell::new(false);
+    let result=super::owner_handoff::prepare_handoff_bound_at(root,max_state_bytes,store,&plan.workflow_id,&plan.source_owners,&plan.destination,&plan.runtimes,sources,destination,&fence,&mut |inventory,retired| {
+        let decision=persist(&PreparationScan {inventory,retired});
+        *phase.borrow_mut()=Some(decision.clone());
+        match decision {
+            PreparationPersistence::Durable(intent)=>{
+                intent.request.validate().context(TransferReason::InvalidRequest)?;
+                ensure!(intent.request.workflow_id==plan.workflow_id && intent.request.source_owners==plan.source_owners
+                    && intent.request.destination==plan.destination && intent.request.inventory==inventory,TransferReason::AuthorityConflict);
+                ensure!(intent.original_binding==*binding && intent.observation.certain && intent.observation.revision>0
+                    && intent.observation.sha256.len()==64 && intent.observation.sha256.bytes().all(|b|matches!(b,b'0'..=b'9'|b'a'..=b'f')),TransferReason::InventoryMissing);
+                validated.set(true);Ok(intent.request)
+            },
+            PreparationPersistence::NotCommitted(reason)=>anyhow::bail!(reason),
+            PreparationPersistence::Unknown {..}=>anyhow::bail!(TransferReason::PendingUnknown),
+        }
+    });
+    match phase.into_inner() {
+        Some(PreparationPersistence::Durable(intent))=>{
+            let outcome=match result {Ok(receipt)=>super::ownership::TransferOutcome::Completed(receipt),Err(error)=>super::owner_outcome::failure_after_intent(binding,&intent.request,&intent.observation,&error,validated.get())};
+            Ok(PreparedTransferResult::Pending {intent,outcome})
+        },
+        Some(PreparationPersistence::Unknown {reason,attempted})=>Ok(PreparedTransferResult::PersistenceUnknown {reason,attempted}),
+        Some(PreparationPersistence::NotCommitted(reason))=>no_pending(reason),
+        None=>match result {Err(error)=>no_pending(super::owner_outcome::classify(&error).0),Ok(_)=>Err(TransferReason::InvalidRequest)},
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

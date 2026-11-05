@@ -225,7 +225,7 @@ pub(super) fn validate_owner_with_policy(policy:Option<&Path>,binding:&TransferB
         _=>TransferReason::PendingUnknown,
     })
 }
-fn valid_policy(policy: &super::Policy) -> bool {
+pub(super) fn valid_policy(policy: &super::Policy) -> bool {
     policy.version == 1
         && (512..=4096).contains(&policy.memory_mb)
         && policy.max_state_bytes >= super::SESSION_BYTES
@@ -291,7 +291,7 @@ impl TransferBinding {
             .all(|hash| digest(hash))
     }
 }
-fn selected_fence(
+pub(super) fn selected_fence(
     policy: Option<&Path>,
     expected: &str,
     expected_root: &Path,
@@ -659,6 +659,20 @@ pub(super) fn transfer_bound_with_policy(
     }
 }
 
+/// Reconcile an error only after a durable workflow intent exists. Never
+/// downgrade missing native state or unreadable authority to preparation.
+pub(super) fn failure_after_intent(binding:&TransferBinding,request:&TransferRequest,observation:&TransferObservation,error:&anyhow::Error,inspect:bool)->TransferOutcome {
+    let mut context=FingerprintContext::new(request,observation);context.bind(binding);
+    if !inspect {return context.failure(TransferReason::AuthorityConflict,"none");}
+    match read_bound_state(binding,request,&mut context) {
+        Ok(Some(super::owner_ledger::State::Completed(receipt)))=>TransferOutcome::Completed(receipt),
+        Ok(Some(super::owner_ledger::State::Aborted))=>context.failure(TransferReason::AuthorityConflict,"none"),
+        Ok(_)=>{let (reason,category)=classify(error);context.failure(reason,category)},
+        Err(error) if error.downcast_ref::<TransferReason>()==Some(&TransferReason::AuthorityConflict)=>context.failure(TransferReason::AuthorityConflict,"none"),
+        Err(_)=>unknown(request),
+    }
+}
+
 #[cfg(test)]
 pub(super) fn reconcile_failure(
     root: &Path,
@@ -785,7 +799,7 @@ impl<'a> FingerprintContext<'a> {
         }
     }
 }
-fn classify(error: &anyhow::Error) -> (TransferReason, &'static str) {
+pub(super) fn classify(error: &anyhow::Error) -> (TransferReason, &'static str) {
     use TransferReason as R;
     for cause in error.chain() {
         if let Some(fence) = cause.downcast_ref::<TransferFenceError>() {

@@ -1295,6 +1295,65 @@ mod tests {
         let outcome=f.store.prepare_native_handoff_disposition(&lease,&f.binding,"/private/stale-audit",&facts,&[],&["codex/session-fixture".into()],now());
         assert_eq!(outcome,super::super::native_pending::NativePreparationPersistence::NotCommitted {reason:ownership::TransferReason::AuthorityConflict});assert_eq!(f.store.events(&lease.workflow).unwrap(),events);
     }
+    fn joined_fixture(f:&mut Fixture)->(Lease,Vec<std::sync::Arc<AuditLogger>>,std::sync::Arc<AuditLogger>,std::sync::Arc<std::sync::Mutex<WorkflowStore>>) {
+        use std::sync::{Arc,Mutex};
+        let fact=f.complete();f.record(&fact).unwrap();file(&f._root.path().join("native/codex/session-fixture/lock"),b"");
+        f.audit.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":f.lease.workflow,"generation":f.lease.generation})).unwrap();f.audit.require_run_resources().unwrap();
+        let lease=next_handoff_lease(f);let base=f._root.path().canonicalize().unwrap();
+        let destination=Arc::new(AuditLogger::protected(base.join("logs/joined-destination.jsonl"),base.join("anchors/joined-destination.json"),&[]).unwrap());
+        destination.set_native_runtime_owner(RuntimeOwner {workflow_id:lease.workflow.clone(),lease_generation:lease.generation}).unwrap();
+        destination.set_native_store_binding(f.store.native_owner_binding(&lease.workflow,f.lease.generation).unwrap().unwrap()).unwrap();destination.require_run_resources().unwrap();
+        destination.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":lease.workflow,"generation":lease.generation})).unwrap();
+        let reopened=WorkflowStore::open(&f.path).unwrap();let store=Arc::new(Mutex::new(std::mem::replace(&mut f.store,reopened)));
+        (lease,vec![Arc::new(f.audit.clone())],destination,store)
+    }
+    #[test]
+    fn native_joined_preparation_uses_real_workflow_callback_core_transfer_and_verified_settlement() {
+        if child("native_joined_preparation_uses_real_workflow_callback_core_transfer_and_verified_settlement") {return;}
+        let mut f=Fixture::new();let (lease,sources,destination,store)=joined_fixture(&mut f);let before=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap();let allowance=store.lock().unwrap().merge_allowance(now(),5).unwrap();
+        let outcome=super::super::native_prepare::run(&store,&lease,&f.binding,&sources,&destination,&now).unwrap();
+        let super::super::native_prepare::NativePreparationRun::Pending {pending,outcome,settlement:Some(settled),settlement_failed:false}=outcome else {panic!("joined handoff incomplete: {outcome:?}")};
+        assert!(matches!(outcome,ownership::TransferOutcome::Completed(_)));assert!(settled.current_context);assert_eq!(pending.request.inventory.len(),1);
+        let mut locked=store.lock().unwrap();assert_eq!(locked.native_owner_binding(&lease.workflow,lease.generation).unwrap(),Some(pending.original_binding.clone()));
+        let after=locked.snapshot(&lease.workflow).unwrap().unwrap();assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.attempts,before.attempts);assert_eq!(locked.merge_allowance(now(),5).unwrap(),allowance);
+        assert!(!locked.native_handoff_pending_is_current(&lease,&f.binding,&pending,now()).is_ok());let events=locked.events(&lease.workflow).unwrap();drop(locked);
+        assert!(matches!(super::super::native_prepare::run(&store,&lease,&f.binding,&sources,&destination,&now).unwrap(),super::super::native_prepare::NativePreparationRun::Registered {..}));assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);
+    }
+    #[test]
+    fn native_joined_preparation_rollback_schedules_free_retry_without_native_claims() {
+        if child("native_joined_preparation_rollback_schedules_free_retry_without_native_claims") {return;}
+        let mut f=Fixture::new();let (lease,sources,destination,store)=joined_fixture(&mut f);
+        store.lock().unwrap().conn.execute_batch("CREATE TRIGGER deny_joined_pending BEFORE INSERT ON workflow_native_handoff_pending BEGIN SELECT RAISE(ABORT,'joined precommit failure'); END;").unwrap();
+        let before=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap();
+        let result=super::super::native_prepare::run(&store,&lease,&f.binding,&sources,&destination,&now).unwrap();
+        assert!(matches!(result,super::super::native_prepare::NativePreparationRun::NoPending {next_eligible_ms:Some(_),..}),"{result:?}");
+        let native=rusqlite::Connection::open(f._root.path().join("native/runtime-retirement.sqlite")).unwrap();let count:i64=native.query_row("SELECT count(*) FROM native_transfer",[],|r|r.get(0)).unwrap();assert_eq!(count,0);
+        let mut locked=store.lock().unwrap();let after=locked.snapshot(&lease.workflow).unwrap().unwrap();assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.attempts,before.attempts);assert!(locked.native_owner_binding(&lease.workflow,lease.generation).unwrap().is_none());
+        let snapshots:i64=locked.conn.query_row("SELECT count(*) FROM workflow_native_handoff_snapshot",[],|r|r.get(0)).unwrap();assert_eq!(snapshots,0);
+    }
+    #[test]
+    fn native_joined_preparation_unknown_commit_never_creates_native_claims_or_no_pending_retry() {
+        if child("native_joined_preparation_unknown_commit_never_creates_native_claims_or_no_pending_retry") {return;}
+        let mut f=Fixture::new();let (lease,sources,destination,store)=joined_fixture(&mut f);
+        store.lock().unwrap().conn.execute_batch("CREATE TRIGGER lose_joined_response AFTER INSERT ON workflow_native_handoff_pending BEGIN DELETE FROM workflow_native_handoff_pending WHERE workflow=NEW.workflow; DELETE FROM workflow_event WHERE workflow=NEW.workflow AND kind='native_handoff_prepared'; END;").unwrap();
+        let outcome=super::super::native_prepare::run(&store,&lease,&f.binding,&sources,&destination,&now).unwrap();
+        assert!(matches!(outcome,super::super::native_prepare::NativePreparationRun::PersistenceUnknown {attempted:Some(_),..}),"{outcome:?}");
+        let native=rusqlite::Connection::open(f._root.path().join("native/runtime-retirement.sqlite")).unwrap();let count:i64=native.query_row("SELECT count(*) FROM native_transfer",[],|r|r.get(0)).unwrap();assert_eq!(count,0);
+        let locked=store.lock().unwrap();let retries:i64=locked.conn.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1 AND kind='verification_infrastructure_retry'",[&lease.workflow],|r|r.get(0)).unwrap();assert_eq!(retries,0);
+    }
+    #[test]
+    fn native_joined_preparation_settlement_failure_keeps_original_for_verified_reconciliation() {
+        if child("native_joined_preparation_settlement_failure_keeps_original_for_verified_reconciliation") {return;}
+        let mut f=Fixture::new();let (lease,sources,destination,store)=joined_fixture(&mut f);
+        store.lock().unwrap().conn.execute_batch("CREATE TRIGGER deny_joined_settlement BEFORE INSERT ON workflow_native_handoff_completed BEGIN SELECT RAISE(ABORT,'injected joined settlement failure'); END;").unwrap();
+        let result=super::super::native_prepare::run(&store,&lease,&f.binding,&sources,&destination,&now).unwrap();
+        let super::super::native_prepare::NativePreparationRun::Pending {pending,outcome:ownership::TransferOutcome::Completed(_),settlement:None,settlement_failed:true}=result else {panic!("lost native completion identity: {result:?}")};
+        let events=store.lock().unwrap().events(&lease.workflow).unwrap();let next=super::super::native_prepare::run(&store,&lease,&f.binding,&sources,&destination,&now).unwrap();
+        assert!(matches!(next,super::super::native_prepare::NativePreparationRun::ReconcileExisting(ref saved) if saved==&pending));assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);
+        let proof=pending.verified_receipt(&||Ok(())).unwrap().unwrap();
+        store.lock().unwrap().conn.execute_batch("DROP TRIGGER deny_joined_settlement").unwrap();
+        assert!(store.lock().unwrap().settle_native_handoff(&lease,&f.binding,&proof,now()).unwrap().current_context);
+    }
     #[test]
     fn native_handoff_pending_request_survives_restart_without_new_identity() {
         if child("native_handoff_pending_request_survives_restart_without_new_identity") {

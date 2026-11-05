@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "e90a9587178ef9915e7de039af04abc536706e1a",
+  "source_parent_commit": "c4ea3f0d009925503fcb7875bc6dde3d4746ae98",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -10,7 +10,7 @@
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_handoff.rs",
-      "sha256": "59189d4d242caac28a2b4fdedb1e7194ea89beab0f2091cfc597f49bda005959"
+      "sha256": "db48de837e40bd6340b9b38da442f41b64046bd6074d660baa7e59cbb89780df"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
@@ -26,7 +26,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
-      "sha256": "fbe034549628ccfa67e90d16c5d12f64e41388b8d6124659fda02775ce6f9921"
+      "sha256": "ead81af1ff0cb9f15efb1e1c548f9e97f7a531ce65d10161fe0ccdeae0ab1685"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
@@ -50,41 +50,49 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
-      "sha256": "9fbad8fc1a529014f83105589f6ba4729eef4032a013228a2ca859aa60274011"
+      "sha256": "26473a6eec6566d64aa71c138089112c9d36b0f04f61b121d5dd2b954ff8cb9f"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_preparation.rs",
-      "sha256": "1d5e04cee7bb2a210e6f42742ebb66f067da02794346c727700716dd4133b9ec"
+      "sha256": "465228dfef0a8946157918e913b528b73d8b62fab8eebd8bc6cf679fda2c5a19"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_transfer.rs",
-      "sha256": "b889011c882af75fb58e30888faeafef5954fa413bcf3e406c9c54edccb97303"
+      "sha256": "2056f093c4cc7183f671add182346185a61331138ff7b4c66bd4c9c5418dcac0"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_verification_retry.rs",
       "sha256": "421187103ed2fc56f681f3f4da8500250e886a1622541fcb4a13173fbf115e42"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_outcome.rs",
+      "sha256": "68d629ee7fa81497861bdbc8056cd7199d09187dd9d8c4928e0a43b46b7fe127"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_prepare.rs",
+      "sha256": "224bf105065015150d91113a173bcc8e98c298ff95763405cfdd06bd93fe0ed4"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1802,
+    "passed": 1806,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
     "pending_handoff_cases": 8,
     "retained_logs": [
-      "autoship-native-persistence-disposition-red.log",
-      "autoship-native-persistence-disposition-green.log",
-      "autoship-native-persistence-orphan-red.log",
-      "autoship-native-persistence-disposition-focused.log",
-      "autoship-native-persistence-disposition-full-cli.log",
-      "autoship-native-preparation-failure-full-core.log"
+      "autoship-native-guarded-adapter-red.log",
+      "autoship-native-guarded-adapter-green.log",
+      "autoship-native-joined-preparation-red.log",
+      "autoship-native-joined-preparation-green.log",
+      "autoship-native-guarded-adapter-full-core.log",
+      "autoship-native-joined-preparation-full-cli.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
     "owner_eligibility_cases": 6,
     "focused_native_observation_cases": 33,
-    "core_passed": 881,
+    "core_passed": 885,
     "core_failed": 0,
     "core_ignored": 15,
     "owner_retirement_marker_cases": 3,
@@ -95,7 +103,8 @@
     "preparation_fingerprint_cases": 4,
     "preparation_retry_cases": 5,
     "persistence_disposition_cases": 8,
-    "core_source_unchanged_since": "e90a9587178ef9915e7de039af04abc536706e1a"
+    "guarded_preparation_adapter_cases": 4,
+    "joined_preparation_cases": 4
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -143,7 +152,13 @@
     "lost commit response recovers original active intent after restart; rollback before commit attempt can be distinguished without inventing an identity",
     "missing/unreadable/erased evidence after a commit attempt stays Unknown with the saved request, even if the local result claimed success",
     "readback validates completed history and every orphan in the affected workflow before accepting an active row; unrelated workflows do not block it",
-    "settled intent is returned only for reconciliation and cannot pass the active-pending fence or construct a verified native receipt"
+    "settled intent is returned only for reconciliation and cannot pass the active-pending fence or construct a verified native receipt",
+    "public guarded preparation API validates original selected policy and immutable callback frame without inventing pre-intent UUIDs",
+    "fresh native owner/runtime/audit/log/anchor claims are checked before invoking workflow persistence; an older prepared native request cannot be bypassed by a fresh workflow UUID",
+    "durable and uncertain callback decisions preserve original intent phase; invalid callback frames cannot redirect native receipt readback to another binding",
+    "joined Arc<Mutex<WorkflowStore>> orchestrator runs actual filtered transaction, core transfer, independent original-ledger verified receipt lookup and atomic settlement with no model dispatch",
+    "joined callback rollback schedules existing-service free retry without native claims; uncertain commit cannot create native claims or a no-pending retry",
+    "native completion plus metadata settlement failure preserves the original pending request for verified reconciliation without replaying native work"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -155,11 +170,12 @@
   "hosted_ci": "pending current published head",
   "remaining": [
     "production preparation/promotion caller integration across all acquisition, owner-turn, recovery and merge-sweep leases",
-    "compose the workflow census/filtered transaction/exact pending fence with the guarded core adapter and typed no-pending preparation outcomes",
     "terminal and namespace cleanup-only settlement and authenticated legacy/uncertainty/corrupt-state recovery",
     "normal protected rollout and actual Codex/Claude Discord continuation acceptance",
     "C actual-backend freshness/storage/quiescence cutover, private verifier recovery/application and full epic soak",
-    "production workflow persistence callback integration, concurrent workflow/audit lock-order proof and locked absent/aborted reconciliation"
+    "production workflow persistence callback integration, concurrent workflow/audit lock-order proof and locked absent/aborted reconciliation",
+    "connect all real guard acquisition/promotion callers only after original-state Absent/Aborted/legacy recovery barriers are implemented",
+    "persist post-intent transient-I/O S backoff, actual input-change early wake and prove concurrent real callback/audit lock ordering before activation"
   ],
   "native_transfer_scope": "isolated synthetic-controller/native-filesystem fixtures only; zero production transfers or provider/model dispatch",
   "opaque_receipt_producer": "verified lookup through ownership::transfer_receipt in the originally bound native store; no serialized-receipt constructor",
@@ -170,7 +186,7 @@
     "metadata_failure_replays_same_original_receipt": true,
     "lost_original_store_refuses_new_verified_receipt": true
   },
-  "physical_runtime_inventory_closure_scope": "not established for production; retained/retired-runtime scan reconciliation remains required",
+  "physical_runtime_inventory_closure_scope": "established in isolated joined core/WorkflowStore fixtures only; production callers, recovery barriers and live acceptance remain unproven",
   "inventory_preparation_audit": {
     "spec": "docs/autoship/native-inventory-preparation.md",
     "canonical_seams_checked": 18,
@@ -192,9 +208,14 @@
   "preparation_diagnostic_retry_component_executed": true,
   "preparation_diagnostic_retry_scope": "typed diagnostic plus actual WorkflowStore retry/event scheduling fixtures; no guarded core preparation adapter or productive caller enabled",
   "early_input_wake_integrated": false,
-  "pending_commit_uncertainty_disposition_integrated": false,
+  "pending_commit_uncertainty_disposition_integrated": true,
   "preparation_diagnostic_retry_red_evidence": "Four fingerprint tests failed against the placeholder, and native retry initially had three behavioral failures/one refusal passing. Separate domain-overwrite test reproduced its behavioral failure. Initial retry implementation had one fixture failure from claiming before scheduled eligibility; corrected test uses normal admission and proves changed-input epoch reset, not early wake.",
   "workflow_commit_readback_component_executed": true,
   "workflow_commit_readback_scope": "actual WorkflowStore transaction/readback fixtures, including historical metadata from an actual isolated core transfer and settlement; no guarded core callback adapter or productive consumer enabled",
-  "persistence_disposition_red_evidence": "Initial five tests: four behavioral failures and one refusal passed against the placeholder. Separate same-workflow orphan test reproduced accepting an active row despite another orphan; fixed readback now checks all affected-workflow orphans. Final focused and full CLI runs contain eight cases."
+  "persistence_disposition_red_evidence": "Initial five tests: four behavioral failures and one refusal passed against the placeholder. Separate same-workflow orphan test reproduced accepting an active row despite another orphan; fixed readback now checks all affected-workflow orphans. Final focused and full CLI runs contain eight cases.",
+  "joined_preparation_component_executed": true,
+  "joined_preparation_scope": "isolated actual core/WorkflowStore orchestration fixtures; synthetic protected controller resource evidence, zero provider/model dispatch, zero production transfers",
+  "core_callback_connected": true,
+  "worker_guard_callers_enabled": false,
+  "guarded_joined_red_evidence": "Three public core adapter cases failed against the placeholder, then passed. Three actual WorkflowStore/core orchestration cases separately failed before composition. Final full suites include four cases in each group, including invalid callback frames and recovery from settlement failure."
 }

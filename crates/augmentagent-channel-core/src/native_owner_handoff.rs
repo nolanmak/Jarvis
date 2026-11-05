@@ -177,13 +177,13 @@ fn retired_with_reader(root:&Path,ledger:&Ledger<'_>,session:&Path,read:&mut dyn
 }
 // Latest metadata per physical runtime, already authenticated by the workflow
 // projection. None is retained uncertainty, never an older successful outcome.
-#[derive(Clone)]
-struct PhysicalObservation {
-    runtime_relative_path:String,
-    creation_receipt_sha256:String,
-    authority:Authority,
-    launch_sha256:String,
-    inventory:Option<RuntimeInventoryRow>,
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub struct PhysicalObservation {
+    pub runtime_relative_path:String,
+    pub creation_receipt_sha256:String,
+    pub authority:Authority,
+    pub launch_sha256:String,
+    pub inventory:Option<RuntimeInventoryRow>,
 }
 struct PhysicalInventory {
     inventory:Vec<RuntimeInventoryRow>,
@@ -264,7 +264,7 @@ fn scan_inventory_bounded(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[
     Ok(result)
 }
 
-fn prepare_handoff_bound_at(
+pub(super) fn prepare_handoff_bound_at(
     root:&Path,max_state_bytes:u64,expected:&super::owner_store::StoreIdentity,
     workflow:&str,source_owners:&[Authority],destination_owner:&Authority,observations:&[PhysicalObservation],
     sources:&[Arc<AuditLogger>],destination:&Arc<AuditLogger>,current:&dyn Fn()->Result<()>,
@@ -280,6 +280,21 @@ fn prepare_handoff_bound_at(
     let fence=|| {current()?;super::owner_store::validate_bound_metadata(root,expected)};
     fence()?;
     let scan=scan_inventory(root,&ledger,workflow,source_owners,observations)?;
+    // A fresh workflow request cannot supersede unresolved native claims,
+    // including claims whose workflow projection was lost or never readable.
+    for authority in source_owners.iter().chain(std::iter::once(destination_owner)) {
+        ensure!(!ledger.is_closed(&authority.owner)? && !ledger.held_by_abort(&authority.owner)?
+            && !ledger.claimed(&authority.owner,"")? && !ledger.claimed_audit(&authority.audit_path)?,R::PendingUnknown);
+    }
+    for relative in scan.inventory.iter().map(|row|row.runtime_relative_path.as_str()).chain(scan.retired.iter().map(String::as_str)) {
+        let authority=super::runtime_authority(root,&ledger,&root.join(relative))?;
+        ensure!(!ledger.claimed(&authority.owner,relative)? && !ledger.claimed_audit(&authority.audit_path)?,R::PendingUnknown);
+    }
+    for logger in sources.iter().chain(std::iter::once(destination)) {
+        let log=actual_audit(logger.protected_log_path().context(R::AuditCorrupt)?)?;
+        let anchor=actual_audit(logger.protected_anchor_path().context(R::AuditCorrupt)?)?;
+        ensure!(!ledger.claimed_log(&log)? && !ledger.claimed_anchor(&anchor)?,R::PendingUnknown);
+    }
     fence()?;
     let request=persist(&scan.inventory,&scan.retired).context(R::PersistRetry)?;
     request.validate().context(R::InvalidRequest)?;
@@ -846,6 +861,57 @@ mod tests {
         receipt.verify(&f.request).unwrap();
         super::super::retire(&retirement);
         assert!(!retirement.session.join("retired.json").exists(),"source Drop retired destination runtime");
+    }
+    fn guarded_plan(f:&Fixture)->super::super::owner_preparation::PreparationPlan {
+        use super::super::owner_preparation::*;
+        PreparationPlan {workflow_id:f.request.workflow_id.clone(),source_owners:f.request.source_owners.clone(),destination:f.request.destination.clone(),runtimes:physical_observations(f),fingerprint_input:PreparationFingerprintInput {workflow_id:f.request.workflow_id.clone(),workflow_binding:json!({"head":"head","contract":"contract","evidence_hash":"evidence"}),original_binding_sha256:None,source_registration_sha256:Some("a".repeat(64)),latest_input_sha256:Some("b".repeat(64)),selected_policy_sha256:None,capacity_class:PreparationCapacity::default()}}
+    }
+    #[test]
+    fn native_guarded_adapter_runs_held_scan_callback_and_actual_core_transfer() {
+        use super::super::owner_preparation::*;
+        let f=fixture(false);let path=policy(&f);let binding=binding_for(&f,&path);let plan=guarded_plan(&f);let called=std::cell::Cell::new(false);
+        let intent=PreparedHandoffIntent {original_binding:binding.clone(),request:f.request.clone(),observation:observation()};
+        let outcome=prepare_with_policy(Some(&path),&binding,&plan,&f.sources,&f.destination,&||Ok(()),&mut |scan| {
+            called.set(true);assert_eq!(scan.inventory(),f.request.inventory);assert!(scan.retired().is_empty());
+            assert!(super::super::StateLock::existing(&f.root).is_err());
+            PreparationPersistence::Durable(intent.clone())
+        }).unwrap();
+        assert!(called.get());assert!(matches!(outcome,PreparedTransferResult::Pending {outcome:TransferOutcome::Completed(ref receipt),..} if receipt.verify(&f.request).is_ok()));
+    }
+    #[test]
+    fn native_guarded_adapter_prior_native_claims_refuse_before_workflow_persistence() {
+        use super::super::owner_preparation::*;
+        let f=fixture(false);let path=policy(&f);let binding=binding_for(&f,&path);let plan=guarded_plan(&f);
+        {let lock=super::super::StateLock::existing(&f.root).unwrap();let mut ledger=Ledger::open(&f.root,&lock).unwrap();let audits=audit_plan(&f.request,&f.sources,&f.destination).unwrap();ledger.prepare(&f.request,&audits.endpoints,u64::MAX).unwrap();}
+        let before=audit_bytes(&f);let called=std::cell::Cell::new(false);
+        let outcome=prepare_with_policy(Some(&path),&binding,&plan,&f.sources,&f.destination,&||Ok(()),&mut |_| {called.set(true);PreparationPersistence::NotCommitted(R::PersistRetry)}).unwrap();
+        assert!(!called.get());assert!(matches!(outcome,PreparedTransferResult::NoPending(ref failure) if failure.reason()==R::PendingUnknown));assert_eq!(audit_bytes(&f),before);
+        let lock=super::super::StateLock::existing(&f.root).unwrap();assert!(matches!(Ledger::open(&f.root,&lock).unwrap().state_for(&f.request).unwrap(),Some(State::Prepared)));
+    }
+    #[test]
+    fn native_guarded_adapter_keeps_uncertain_and_durable_intent_out_of_no_pending_phase() {
+        use super::super::owner_preparation::*;
+        for decision in ["unknown","unknown-without-id","durable-stale","rollback"] {
+            let f=fixture(false);let path=policy(&f);let binding=binding_for(&f,&path);let plan=guarded_plan(&f);let before=audit_bytes(&f);let stale=std::cell::Cell::new(false);
+            let intent=PreparedHandoffIntent {original_binding:binding.clone(),request:f.request.clone(),observation:observation()};
+            let outcome=prepare_with_policy(Some(&path),&binding,&plan,&f.sources,&f.destination,&|| {if stale.get() {Err(TransferFenceError::NotCurrent)}else{Ok(())}},&mut |_| {
+                match decision {"unknown"=>PreparationPersistence::Unknown {reason:R::PendingUnknown,attempted:Some(intent.clone())},"unknown-without-id"=>PreparationPersistence::Unknown {reason:R::PendingUnknown,attempted:None},"durable-stale"=>{stale.set(true);PreparationPersistence::Durable(intent.clone())},_=>PreparationPersistence::NotCommitted(R::PersistRetry)}
+            }).unwrap();
+            match decision {"unknown"=>assert!(matches!(outcome,PreparedTransferResult::PersistenceUnknown {attempted:Some(ref saved),..} if saved==&intent)),"unknown-without-id"=>assert!(matches!(outcome,PreparedTransferResult::PersistenceUnknown {attempted:None,..})),"durable-stale"=>assert!(matches!(outcome,PreparedTransferResult::Pending {intent:ref saved,..} if saved==&intent)),_=>assert!(matches!(outcome,PreparedTransferResult::NoPending(ref failure) if failure.reason()==R::PersistRetry))}
+            assert_eq!(audit_bytes(&f),before);let lock=super::super::StateLock::existing(&f.root).unwrap();assert!(Ledger::open(&f.root,&lock).unwrap().state_for(&f.request).unwrap().is_none());
+        }
+    }
+    #[test]
+    fn native_guarded_adapter_invalid_durable_frame_cannot_reconcile_another_binding() {
+        use super::super::owner_preparation::*;
+        for fault in ["binding","workflow","observation"] {
+            let f=fixture(false);let path=policy(&f);let binding=binding_for(&f,&path);let plan=guarded_plan(&f);let before=audit_bytes(&f);
+            let mut intent=PreparedHandoffIntent {original_binding:binding.clone(),request:f.request.clone(),observation:observation()};
+            match fault {"binding"=>{let mut value=serde_json::to_value(&binding).unwrap();value["policy_sha256"]=json!("d".repeat(64));intent.original_binding=serde_json::from_value(value).unwrap();},"workflow"=>intent.request.workflow_id="foreign".into(),"observation"=>intent.observation.certain=false,_=>unreachable!()}
+            let outcome=prepare_with_policy(Some(&path),&binding,&plan,&f.sources,&f.destination,&||Ok(()),&mut |_|PreparationPersistence::Durable(intent.clone())).unwrap();
+            assert!(matches!(outcome,PreparedTransferResult::Pending {outcome:TransferOutcome::Held {reason:R::AuthorityConflict,..},..}),"{fault}: {outcome:?}");assert_eq!(audit_bytes(&f),before);
+            let lock=super::super::StateLock::existing(&f.root).unwrap();assert!(Ledger::open(&f.root,&lock).unwrap().state_for(&f.request).unwrap().is_none());
+        }
     }
     #[test]
     fn native_inventory_marker_owner_match_without_ledger_retirement_is_refused() {
