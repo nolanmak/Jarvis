@@ -23,7 +23,7 @@ impl WorkflowStore {
         ensure!(!owner.is_empty() && owner.len()<=256 && owner.bytes().all(|b|b.is_ascii_graphic()) && ttl>0,"invalid owner turn lease");
         let until=now.checked_add(ttl).context("owner turn lease overflow")?;
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        setup_refusal::validate(&tx,workflow)?;
+        validate_history(&tx,workflow)?;
         native_pending::require_clear_abort_barriers(&tx,workflow)?;
         let candidate:Option<(String,i64,i64)>=tx.query_row("SELECT checkpoint,lease_until,generation FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         let Some((raw,leased,generation))=candidate else {return Ok(None);};
@@ -70,7 +70,7 @@ impl WorkflowStore {
     }
 }
 pub(super) fn validate_turn(tx:&Transaction<'_>,turn:&OwnerTurn,now:i64)->Result<()> {
-        setup_refusal::validate(tx,&turn.lease.workflow)?;
+        validate_history(tx,&turn.lease.workflow)?;
         require_binding(tx,&turn.lease,&turn.binding,now)?;
         let matches:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1 AND request_id=?2 AND owner=?3 AND lease_generation=?4 AND pause_revision=?5 AND binding=?6 AND state='claimed' AND EXISTS(SELECT 1 FROM workflow_owner_message m WHERE m.request_id=?2 AND m.workflow=?1 AND m.body=?7 AND m.state='pending'))",params![turn.lease.workflow,turn.request_id,turn.lease.owner,turn.lease.generation,turn.pause_revision,serde_json::to_string(&turn.binding)?,turn.body],|r|r.get(0))?;
         ensure!(matches,"owner turn identity changed");
@@ -83,7 +83,7 @@ pub(super) fn validate_turn(tx:&Transaction<'_>,turn:&OwnerTurn,now:i64)->Result
 // Only model/verifier admission uses this exception. Publication and merge
 // retain the ordinary owner-pause checks even for an active owner turn.
 pub(super) fn require_native_dispatch(tx:&Transaction<'_>,lease:&Lease,now:i64)->Result<()> {
-    setup_refusal::validate(tx,&lease.workflow)?;
+    validate_history(tx,&lease.workflow)?;
     let turn:Option<(String,i64,String)>=tx.query_row("SELECT request_id,pause_revision,binding FROM workflow_owner_turn WHERE workflow=?1 AND owner=?2 AND lease_generation=?3 AND state='claimed'",params![lease.workflow,lease.owner,lease.generation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let Some((request,revision,raw))=turn else {return super::owner_control::require_dispatch(tx,&lease.workflow);};
     let binding:Binding=serde_json::from_str(&raw)?;require_binding(tx,lease,&binding,now)?;
@@ -187,4 +187,7 @@ mod tests {
 
 #[path="autoship_owner_setup_refusal.rs"]
 mod setup_refusal;
-pub(super) fn validate_setup_refusals(conn:&Connection,workflow:&str)->Result<()> {setup_refusal::validate(conn,workflow)}
+pub(super) fn validate_history(conn:&Connection,workflow:&str)->Result<()> {
+    setup_refusal::validate(conn,workflow)?;
+    super::owner_revision::validate_history(conn,workflow)
+}

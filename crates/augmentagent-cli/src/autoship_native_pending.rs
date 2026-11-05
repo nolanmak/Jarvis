@@ -86,7 +86,7 @@ pub(super) fn require_aborted_reference(conn:&Connection,pending:&PendingNativeH
 }
 pub(super) fn closed_abort_namespaces(conn:&Connection,workflow:&str)->Result<Vec<(Authority,TransferBinding)>> {aborted::closed_namespaces(conn,workflow)}
 pub(super) fn validate_dispositions(conn:&Connection,workflow:&str)->Result<()> {
-    unstarted::validate_history(conn,workflow)?;aborted::validate_history(conn,workflow)?;native_recovery::validate(conn,workflow)?;owner_turn::validate_setup_refusals(conn,workflow)?;
+    unstarted::validate_history(conn,workflow)?;aborted::validate_history(conn,workflow)?;native_recovery::validate(conn,workflow)?;owner_turn::validate_history(conn,workflow)?;
     let duplicate:bool=conn.query_row("SELECT EXISTS(SELECT sequence FROM (SELECT sequence FROM workflow_native_handoff_pending WHERE workflow=?1 UNION ALL SELECT pending_sequence FROM workflow_native_handoff_completed WHERE workflow=?1 UNION ALL SELECT pending_sequence FROM workflow_native_handoff_unstarted WHERE workflow=?1 UNION ALL SELECT pending_sequence FROM workflow_native_handoff_aborted WHERE workflow=?1) GROUP BY sequence HAVING count(*)>1)",[workflow],|r|r.get(0))?;
     ensure!(!duplicate,TransferReason::InventoryMissing);Ok(())
 }

@@ -1161,6 +1161,61 @@ impl WorkflowGuard {
         augmentagent_channel_core::native_session::FreshBuilderSessions::from_observed(owner,&observed)
     }
 
+    /// The independently prepared registration changes the owner turn's
+    /// generation. Consume this guard so its old audit/admission callbacks can
+    /// never be reused for the new contract. Native ownership must transfer
+    /// through the same original-store service before a new guard escapes.
+    /// This does not apply the input, unpause, approve acceptance or ship.
+    pub(super) async fn activate_owner_revision(
+        mut self,
+        previous: &crate::autoship_contract::RegisteredContract,
+        next: &crate::autoship_contract::RegisteredContract,
+    ) -> Result<Self> {
+        self.audit_health().await?;
+        self.validate_before_side_effect()?;
+        let contract=format!("registered:{}",next.contract_hash());
+        let environment=next.binding(&self.binding.head)?.environment_id;
+        let binding=git_binding(&self.worktree,&contract,&environment,&[]).await?;
+        let revised={
+            let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("owner revision store poisoned"))?;
+            let now=millis();
+            let turn=store.owner_turn_for_lease(&self.lease,now)?;
+            charge_elapsed(&mut store,&self.lease,self.started,&self.accounted_ms,now)?;
+            store.activate_owner_revision(&turn,previous,next,&binding,&self.worktree,now)?
+        };
+        self.heartbeat.cancel();
+        self.lease=revised.lease;
+        self.binding=revised.binding;
+        self.contract=contract;
+        self.environment=environment;
+        self.heartbeat=tokio_util::sync::CancellationToken::new();
+        self.lease_failure=Arc::new(Mutex::new(None));
+        self.started=std::time::Instant::now();
+        self.accounted_ms=Arc::new(AtomicU64::new(0));
+        self.capacity_exhausted=Arc::new(AtomicBool::new(false));
+        // Use a controller-local connection for native/audit I/O. No shared
+        // workflow mutex may span the state/session/audit lock acquisition.
+        let mut store=WorkflowStore::open(&self.state)?;
+        self.audit=acquire_audit_generation_inner(&self.state,&mut store,&self.lease,
+            Some(&self.worktree),&mut self.binding,millis())?;
+        self.audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
+            workflow_id:self.id().into(),lease_generation:self.lease.generation,
+        })?;
+        self.register_native_context()?;
+        self.install_model_accounting()?;
+        self.validate_before_side_effect()?;
+        self.audit_event("owner_revision_guard_ready",serde_json::json!({
+            "request_id":revised.request_id,"previous_contract":previous.contract_hash(),
+            "next_contract":next.contract_hash(),
+        }))?;
+        // Unlike initial constructor refusal, this turn has already escaped a
+        // guard and may have performed work. Failed setup stays claimed; it
+        // must never be relabelled as an unstarted, automatically replayable
+        // request. Drop charges elapsed usage and stops renewal without release.
+        self.spawn_renewal();
+        Ok(self)
+    }
+
     pub(super) fn record_episode_sessions(
         &self,
         sessions: &augmentagent_channel_core::native_session::FreshBuilderSessions,
@@ -3135,7 +3190,7 @@ mod tests {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session"] {
                 if mode.ends_with("-session") && !cfg!(target_os="linux") {continue;}
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
@@ -3164,7 +3219,7 @@ mod tests {
         let id=durable::workflow_id("owner/repo",77).unwrap();
         if mode.starts_with("owner-setup-") {
             let origin=durable::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
-            let request=durable::submission::Request {repository:"owner/repo".into(),target:durable::submission::Target::Issue(77),provider:Some(if mode=="owner-setup-claude-session" {durable::submission::Provider::Claude}else{durable::submission::Provider::Codex}),until:durable::submission::Milestone::Merged};
+            let request=durable::submission::Request {repository:"owner/repo".into(),target:durable::submission::Target::Issue(77),provider:Some(if mode.contains("-claude-") {durable::submission::Provider::Claude}else{durable::submission::Provider::Codex}),until:durable::submission::Milestone::Merged};
             WorkflowStore::open(&state).unwrap().submit_discord_authorized(&origin,&request,&"a".repeat(64),millis()).unwrap();
         }
         if mode=="legacy-workflow" {
@@ -3195,8 +3250,23 @@ mod tests {
                 "version":1,"audit_path":"/private/prior-audit","owner":{"workflow_id":id,"lease_generation":1}})).unwrap()).unwrap();
             std::fs::set_permissions(&owned,std::fs::Permissions::from_mode(0o600)).unwrap();
         }
+        let revision_contracts=if mode.contains("-revision-") {
+            use crate::autoship_contract::*;
+            let contract=AcceptanceContract {schema_version:SCHEMA_VERSION,revision:1,issue:Some(77),pull_request:None,
+                criteria:vec![Criterion {id:"C1".into(),requirement:"Original requirement".into(),verifier_ids:vec!["ready".into()]}],
+                allowed_paths:vec![PathScope::File("implementation.txt".into())],
+                verifiers:vec![Verifier {id:"ready".into(),command:VerifierCommand::BlackBox {
+                    invocation:BehaviorInvocation::CargoBinary {package:"fixture".into(),bin:"behavior".into(),args:vec![]},
+                    oracle:OutputOracle::Json {value:serde_json::json!(true)}},pinned_files:vec!["code.txt".into()],failure_witness:"expected ready".into()}]};
+            let base=git_evidence(dir.path(),&["rev-parse","HEAD"]).await.unwrap();
+            let previous=RegisteredContract::register(dir.path(),contract.clone(),base.clone(),"test".into()).unwrap();
+            let mut contract=contract;contract.revision=2;
+            contract.criteria.push(Criterion {id:"C2".into(),requirement:"Additional owner requirement".into(),verifier_ids:vec!["ready".into()]});
+            let next=RegisteredContract::register(dir.path(),contract,base,"test".into()).unwrap();Some((previous,next))
+        }else{None};
+        let contract_label=revision_contracts.as_ref().map(|(previous,_)|format!("registered:{}",previous.contract_hash())).unwrap_or_else(||"C1".into());
         let start=||Start{repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",
-            source_issue:Some(77),pr:None,branch:"fixture",contract:"C1",environment:"test"};
+            source_issue:Some(77),pr:None,branch:"fixture",contract:&contract_label,environment:"test"};
         let result=WorkflowGuard::acquire_at(&state,start(),millis()).await;
         if matches!(mode.as_str(),"missing-policy"|"legacy-owner"|"legacy-call"|"legacy-workflow"|"physical-prior-state") {
             assert!(result.is_err(),"registration should have refused: {mode}");
@@ -3245,7 +3315,7 @@ mod tests {
         if mode.starts_with("owner-setup-") {
             let session_case=mode.ends_with("-session");
             let healthy=mode=="owner-setup-healthy" || session_case;
-            let provider=if mode=="owner-setup-claude-session" {augmentagent_channel_core::ProviderKind::Claude}else{augmentagent_channel_core::ProviderKind::Codex};
+            let provider=if mode.contains("-claude-") {augmentagent_channel_core::ProviderKind::Claude}else{augmentagent_channel_core::ProviderKind::Codex};
             #[cfg(target_os="linux")]
             if session_case {
                 let (prepared,session,resource)=durable::native_observation::tests::retained_launch_fixture(
@@ -3269,7 +3339,7 @@ mod tests {
             if mode=="owner-setup-write-failure" {rusqlite::Connection::open(&state).unwrap().execute_batch("CREATE TRIGGER deny_owner_setup_refusal BEFORE INSERT ON workflow_owner_turn_setup_refusal BEGIN SELECT RAISE(ABORT,'injected owner setup refusal failure'); END;").unwrap();}
             let result=WorkflowGuard::acquire_mode_at(&state,start(),millis(),true).await;
             if mode=="owner-setup-unconfigured" {assert!(result.is_err());let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&id).unwrap().unwrap().generation,generation_before);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.owner_control(&id).unwrap(),Some(control_before));return;}
-            let recovered=if healthy {result.unwrap().expect("guarded native owner handoff must acquire the paused owner turn")}else{
+            let mut recovered=if healthy {result.unwrap().expect("guarded native owner handoff must acquire the paused owner turn")}else{
                 assert!(result.is_err());let mut store=WorkflowStore::open(&state).unwrap();let snapshot=store.snapshot(&id).unwrap().unwrap();assert_eq!(snapshot.model_calls,0);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.owner_control(&id).unwrap(),Some(control_before.clone()));assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
                 let row_state:String=rusqlite::Connection::open(&state).unwrap().query_row("SELECT state FROM workflow_owner_turn WHERE request_id=?1",[&reply.request_id],|r|r.get(0)).unwrap();
                 if mode=="owner-setup-write-failure" {assert_eq!(row_state,"claimed");assert!(snapshot.lease_until_ms>0);rusqlite::Connection::open(&state).unwrap().execute_batch("DROP TRIGGER deny_owner_setup_refusal").unwrap();assert!(store.claim_owner_turn(&id,"must-not-replay",millis()+LEASE_MS+1,LEASE_MS).unwrap().is_none());return;}
@@ -3282,6 +3352,36 @@ mod tests {
                 }
                 WorkflowGuard::acquire_mode_at(&state,start(),millis(),true).await.unwrap().expect("same unstarted owner request must retry after configuration recovery")
             };
+            if let Some((previous,next))=&revision_contracts {
+                let old_lease=recovered.lease.clone();let old_binding=recovered.binding.clone();
+                let old_native=recovered.audit.native_runtime_owner().unwrap().unwrap();
+                if mode.contains("-setup-failure-") {
+                    let before=recovered.store.lock().unwrap().snapshot(&id).unwrap().unwrap();
+                    let input_before=WorkflowStore::open(&state).unwrap().owner_control(&id).unwrap();
+                    rusqlite::Connection::open(&state).unwrap().execute_batch("CREATE TRIGGER deny_owner_revision_handoff BEFORE INSERT ON workflow_native_handoff_pending BEGIN SELECT RAISE(ABORT,'injected revision handoff failure'); END;").unwrap();
+                    assert!(recovered.activate_owner_revision(previous,next).await.is_err());
+                    let mut store=WorkflowStore::open(&state).unwrap();let after=store.snapshot(&id).unwrap().unwrap();
+                    assert_eq!(after.generation,old_lease.generation+1);assert_eq!(after.checkpoint.binding.contract,next.contract_hash());
+                    assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.attempts,before.attempts);
+                    assert_eq!(store.owner_control(&id).unwrap(),input_before);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);
+                    assert!(store.validate_dispatch(&old_lease,&old_binding,millis()).is_err());
+                    let (turn_state,turn_generation):(String,i64)=rusqlite::Connection::open(&state).unwrap().query_row("SELECT state,lease_generation FROM workflow_owner_turn WHERE request_id=?1",[&reply.request_id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                    assert_eq!(turn_state,"claimed");assert_eq!(turn_generation,after.generation);
+                    assert!(store.native_owner_binding(&id,after.generation).unwrap().is_none());
+                    assert!(store.claim_owner_turn(&id,"must-not-repeat-owner-work",millis()+LEASE_MS+1,LEASE_MS).unwrap().is_none());
+                    assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);return;
+                }
+                recovered=recovered.activate_owner_revision(previous,next).await.expect("owner revision must return a guard for the revised generation");
+                assert_eq!(recovered.lease.generation,old_lease.generation+1);
+                assert_eq!(recovered.binding.contract,next.contract_hash());assert_eq!(recovered.binding.head,old_binding.head);
+                recovered.validate_before_side_effect().unwrap();
+                assert_ne!(recovered.audit.native_runtime_owner().unwrap().unwrap(),old_native);
+                let mut store=recovered.store.lock().unwrap();
+                assert!(store.validate_dispatch(&old_lease,&old_binding,millis()).is_err(),"old callbacks survived owner contract activation");
+                assert_eq!(store.owner_turn_for_lease(&recovered.lease,millis()).unwrap().request_id,reply.request_id);
+                assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+                assert!(store.current_review_history(&id).unwrap().is_empty());
+            }
             if session_case {
                 // A new owner guard has reopened the workflow and transferred
                 // native authority. It must resume the actual observed ID.

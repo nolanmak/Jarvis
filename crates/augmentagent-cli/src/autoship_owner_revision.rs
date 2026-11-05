@@ -2,6 +2,9 @@
 use super::*;
 use super::owner_turn::OwnerTurn;
 use crate::autoship_contract::RegisteredContract;
+#[path="autoship_owner_revision_history.rs"]
+mod history;
+pub(super) fn validate_history(conn:&Connection,workflow:&str)->Result<()> {history::validate(conn,workflow)}
 impl WorkflowStore {
     /// Controller supplies an independently prepared registration. This records
     /// metadata activation only: baseline/candidate checks and review still gate shipping.
@@ -20,6 +23,7 @@ impl WorkflowStore {
         }
         let registration=serde_json::to_string(next)?;ensure!(registration.len()<=4*1024*1024,"owner revision registration exceeds bound");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_history(&tx,&turn.lease.workflow)?;
         let body_hash=format!("{:x}",Sha256::digest(turn.body.as_bytes()));
         let prior:Option<(String,String,String,String)>=tx.query_row("SELECT previous_contract,next_contract,binding,owner_message_sha256 FROM workflow_owner_revision WHERE request_id=?1",[&turn.request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
         if let Some((old,new,recorded,body))=prior {
@@ -42,7 +46,7 @@ impl WorkflowStore {
         super::review_epoch::invalidate(&tx,&turn.lease.workflow,&turn.request_id)?;
         event(&tx,&turn.lease.workflow,generation,"owner_contract_revised",&serde_json::json!({"request_id":turn.request_id,"previous_contract":previous.contract_hash(),"next_contract":next.contract_hash(),"revision":next.contract().revision,"owner_message_sha256":body_hash}).to_string(),now)?;
         event(&tx,&turn.lease.workflow,generation,"checkpoint",&serde_json::to_string(&checkpoint)?,now)?;
-        tx.commit()?;Ok(revised)
+        validate_history(&tx,&turn.lease.workflow)?;tx.commit()?;Ok(revised)
     }
 }
 #[cfg(test)]
@@ -118,6 +122,41 @@ mod tests {
         assert!(store.validate_dispatch(&turn.lease,&binding,6).is_err(),"old guard callback can dispatch against the new contract");
         assert!(store.charge(&turn.lease,"old-native-call",ResourceCharge {model_calls:1,..Default::default()},6).is_err());
         store.validate_dispatch(&revised.lease,&binding,6).unwrap();
+    }
+
+    #[test]
+    fn owner_revision_dispatch_requires_intact_activation_history() {
+        for corruption in ["projection","fence","event","registration","binding","fence-generation","orphan-event","claim","origin","all-history"] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+            let (mut store,turn,previous,next,binding)=setup(dir.path());
+            let revised=store.activate_owner_revision(&turn,&previous,&next,&binding,dir.path(),5).unwrap();
+            store.validate_dispatch(&revised.lease,&binding,6).unwrap();
+            // Simulate lost/corrupt protected state through a separate connection,
+            // not through a new production editing or recovery interface.
+            let db=rusqlite::Connection::open(&path).unwrap();db.pragma_update(None,"foreign_keys",false).unwrap();
+            match corruption {
+                "projection"=>{db.execute("DELETE FROM workflow_owner_revision WHERE request_id=?1",[&turn.request_id]).unwrap();},
+                "fence"=>{db.execute("DELETE FROM workflow_owner_revision_fence WHERE request_id=?1",[&turn.request_id]).unwrap();},
+                "event"=>{db.execute("DELETE FROM workflow_event WHERE workflow=?1 AND kind='owner_contract_revised'",[&turn.lease.workflow]).unwrap();},
+                "registration"=>{db.execute("UPDATE workflow_owner_revision SET registration=json_set(registration,'$.contract.criteria[0].requirement','changed') WHERE request_id=?1",[&turn.request_id]).unwrap();},
+                "binding"=>{db.execute("UPDATE workflow_owner_revision SET binding=json_set(binding,'$.unexpected_scope','unrecognized') WHERE request_id=?1",[&turn.request_id]).unwrap();},
+                "fence-generation"=>{db.execute("UPDATE workflow_owner_revision_fence SET next_generation=next_generation+1 WHERE request_id=?1",[&turn.request_id]).unwrap();},
+                "orphan-event"=>{db.execute("DELETE FROM workflow_owner_revision_fence WHERE request_id=?1",[&turn.request_id]).unwrap();db.execute("DELETE FROM workflow_owner_revision WHERE request_id=?1",[&turn.request_id]).unwrap();},
+                "claim"=>{db.execute("DELETE FROM workflow_event WHERE workflow=?1 AND kind='owner_turn_claimed'",[&turn.lease.workflow]).unwrap();},
+                "origin"=>{db.execute("DELETE FROM discord_control_request WHERE request_id=?1",[&turn.request_id]).unwrap();},
+                "all-history"=>{db.execute("DELETE FROM workflow_owner_revision_fence WHERE request_id=?1",[&turn.request_id]).unwrap();db.execute("DELETE FROM workflow_owner_revision WHERE request_id=?1",[&turn.request_id]).unwrap();db.execute("DELETE FROM workflow_event WHERE workflow=?1 AND kind='owner_contract_revised'",[&turn.lease.workflow]).unwrap();},
+                _=>unreachable!(),
+            }
+            drop(db);drop(store);
+            let mut store=WorkflowStore::open(&path).unwrap();
+            let before=store.snapshot(&turn.lease.workflow).unwrap().unwrap();let events=store.events(&turn.lease.workflow).unwrap();
+            assert!(store.validate_owner_turn(&revised,7).is_err(),"{corruption}: owner turn accepted damaged activation history");
+            assert!(store.validate_dispatch(&revised.lease,&binding,7).is_err(),"{corruption}: native dispatch accepted damaged activation history");
+            assert!(store.charge(&revised.lease,"must-not-admit",ResourceCharge {model_calls:1,..Default::default()},7).is_err(),"{corruption}: charged a model admission");
+            assert!(store.activate_owner_revision(&turn,&previous,&next,&binding,dir.path(),7).is_err(),"{corruption}: replay accepted damaged activation history");
+            assert_eq!(store.pending_owner_messages(&turn.lease.workflow).unwrap(),1);assert!(store.owner_control(&turn.lease.workflow).unwrap().unwrap().paused);
+            assert_eq!(store.snapshot(&turn.lease.workflow).unwrap().unwrap(),before);assert_eq!(store.events(&turn.lease.workflow).unwrap(),events);
+        }
     }
 
 }
