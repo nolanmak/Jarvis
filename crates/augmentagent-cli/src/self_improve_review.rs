@@ -1189,6 +1189,34 @@ mod tests {
             "an unrelated reviewer failure is not an evidence budget whatever reports it");
     }
 
+    /// Alternates the two kinds of wrapping the review path produces, so each
+    /// budget type is classified from every level it can occupy in the chain.
+    fn wrap_review_failure(error:anyhow::Error,level:usize)->anyhow::Error {
+        if level%2==0 {error.context(format!("review layer {level}"))}
+        else {anyhow::Error::new(SourcedFailure(error.into())).context(format!("review group {level}"))}
+    }
+
+    #[test]
+    fn every_budget_type_is_recognized_at_every_chain_level() {
+        let budgets:[fn()->anyhow::Error;2]=[
+            ||anyhow::Error::new(aligned::RequestBudgetExceeded),
+            ||anyhow::Error::new(EvidenceBudget("caller evidence".into()))];
+        for depth in 0..5 {
+            for budget in budgets {
+                let mut error=budget();
+                for level in 0..depth {error=wrap_review_failure(error,level);}
+                let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
+                assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"review-evidence-budget",
+                    "a budget refusal {depth} chain levels down is not missing reviewer capacity");
+            }
+            let mut error=anyhow::anyhow!("provider down");
+            for level in 0..depth {error=wrap_review_failure(error,level);}
+            let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
+            assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity",
+                "an unrelated reviewer failure {depth} chain levels down is not an evidence budget");
+        }
+    }
+
     #[test]
     fn source_chained_caller_budget_keeps_its_streamed_fallback() {
         let budget=anyhow::Error::new(EvidenceBudget("caller evidence".into()));
