@@ -314,7 +314,8 @@ pub(super) fn completed_inventory_row(
     );
     let manifest = super::owner_inventory::export_manifest(&session.join(generation))?;
     let actual = RuntimeInventoryRow {
-        provider: provider.to_string(),
+        provider: serde_json::from_value(serde_json::json!(provider))
+            .context(R::MetadataInvalid)?,
         native_session_id: native_session_id.to_string(),
         runtime_relative_path: runtime_relative_path.to_string(),
         creation_owner,
@@ -328,9 +329,18 @@ pub(super) fn completed_inventory_row(
     };
     Ok((actual, launch.to_string()))
 }
-fn exact_inventory_row(root: &Path, ledger: &Ledger<'_>, declared: &RuntimeInventoryRow) -> Result<()> {
-    let (actual, _) = completed_inventory_row(root, ledger, &declared.provider,
-        &declared.runtime_relative_path, &declared.native_session_id)?;
+fn exact_inventory_row(
+    root: &Path,
+    ledger: &Ledger<'_>,
+    declared: &RuntimeInventoryRow,
+) -> Result<()> {
+    let (actual, _) = completed_inventory_row(
+        root,
+        ledger,
+        declared.provider.as_str(),
+        &declared.runtime_relative_path,
+        &declared.native_session_id,
+    )?;
     ensure!(actual == *declared, R::MetadataInvalid);
     Ok(())
 }
@@ -1069,55 +1079,145 @@ mod tests {
     }
     #[test]
     fn native_owner_binding_validation_is_read_only_and_checks_current_fence() {
-        let f=empty_binding_fixture();let path=policy(&f);let binding=binding_for(&f,&path);
-        let database=f.root.join("runtime-retirement.sqlite");let before=std::fs::read(&database).unwrap();
-        assert_eq!(super::super::owner_outcome::validate_owner_with_policy(Some(&path),&binding,&||Ok(())),Ok(()));
-        for (error,reason) in [(TransferFenceError::NotCurrent,TransferReason::AuthorityConflict),
-            (TransferFenceError::Unavailable,TransferReason::PersistRetry)] {
-            assert_eq!(super::super::owner_outcome::validate_owner_with_policy(Some(&path),&binding,&||Err(error)),Err(reason));
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let binding = binding_for(&f, &path);
+        let database = f.root.join("runtime-retirement.sqlite");
+        let before = std::fs::read(&database).unwrap();
+        assert_eq!(
+            super::super::owner_outcome::validate_owner_with_policy(Some(&path), &binding, &|| Ok(
+                ()
+            )),
+            Ok(())
+        );
+        for (error, reason) in [
+            (
+                TransferFenceError::NotCurrent,
+                TransferReason::AuthorityConflict,
+            ),
+            (
+                TransferFenceError::Unavailable,
+                TransferReason::PersistRetry,
+            ),
+        ] {
+            assert_eq!(
+                super::super::owner_outcome::validate_owner_with_policy(
+                    Some(&path),
+                    &binding,
+                    &|| Err(error)
+                ),
+                Err(reason)
+            );
         }
-        assert_eq!(std::fs::read(database).unwrap(),before);
+        assert_eq!(std::fs::read(database).unwrap(), before);
     }
     #[test]
     fn native_owner_binding_validation_rejects_reselection_without_initializing_replacement() {
-        let f=empty_binding_fixture();let path=policy(&f);let binding=binding_for(&f,&path);
-        let replacement=f._temporary.path().join("replacement-state");std::fs::create_dir(&replacement).unwrap();
-        std::fs::set_permissions(&replacement,std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut value:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        value["state_root"]=replacement.to_str().unwrap().into();std::fs::write(&path,serde_json::to_vec(&value).unwrap()).unwrap();
-        assert_eq!(super::super::owner_outcome::validate_owner_with_policy(Some(&path),&binding,&||Ok(())),Err(TransferReason::AuthorityConflict));
-        assert_eq!(std::fs::read_dir(&replacement).unwrap().count(),0);
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let binding = binding_for(&f, &path);
+        let replacement = f._temporary.path().join("replacement-state");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["state_root"] = replacement.to_str().unwrap().into();
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            super::super::owner_outcome::validate_owner_with_policy(Some(&path), &binding, &|| Ok(
+                ()
+            )),
+            Err(TransferReason::AuthorityConflict)
+        );
+        assert_eq!(std::fs::read_dir(&replacement).unwrap().count(), 0);
     }
     #[test]
     fn native_owner_binding_validation_does_not_recreate_lost_authority() {
-        for lost in ["runtime-retirement.sqlite","state.lock","authority-epoch.json","schema"] {
-            let f=empty_binding_fixture();let path=policy(&f);let binding=binding_for(&f,&path);
-            if lost=="schema" {
-                let db=augmentagent_store::rusqlite::Connection::open(f.root.join("runtime-retirement.sqlite")).unwrap();
+        for lost in [
+            "runtime-retirement.sqlite",
+            "state.lock",
+            "authority-epoch.json",
+            "schema",
+        ] {
+            let f = empty_binding_fixture();
+            let path = policy(&f);
+            let binding = binding_for(&f, &path);
+            if lost == "schema" {
+                let db = augmentagent_store::rusqlite::Connection::open(
+                    f.root.join("runtime-retirement.sqlite"),
+                )
+                .unwrap();
                 db.execute_batch("DROP TABLE native_transfer").unwrap();
-            } else {std::fs::remove_file(f.root.join(lost)).unwrap();}
-            let snapshot=||std::fs::read_dir(&f.root).unwrap().map(|entry|{let entry=entry.unwrap();
-                (entry.file_name(),std::fs::read(entry.path()).unwrap())}).collect::<std::collections::BTreeMap<_,_>>();
-            let before=snapshot();
-            assert_eq!(super::super::owner_outcome::validate_owner_with_policy(Some(&path),&binding,&||Ok(())),Err(TransferReason::PendingUnknown),"accepted {lost}");
-            assert_eq!(snapshot(),before,"validation rewrote lost authority ({lost})");
+            } else {
+                std::fs::remove_file(f.root.join(lost)).unwrap();
+            }
+            let snapshot = || {
+                std::fs::read_dir(&f.root)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before = snapshot();
+            assert_eq!(
+                super::super::owner_outcome::validate_owner_with_policy(
+                    Some(&path),
+                    &binding,
+                    &|| Ok(())
+                ),
+                Err(TransferReason::PendingUnknown),
+                "accepted {lost}"
+            );
+            assert_eq!(
+                snapshot(),
+                before,
+                "validation rewrote lost authority ({lost})"
+            );
         }
     }
     #[test]
     fn native_owner_binding_validation_rechecks_selection_after_store_read() {
-        let f=empty_binding_fixture();let path=policy(&f);let binding=binding_for(&f,&path);
-        let original=std::fs::read(&path).unwrap();let database=f.root.join("runtime-retirement.sqlite");
-        let before=std::fs::read(&database).unwrap();let calls=std::cell::Cell::new(0);
-        let current=||{calls.set(calls.get()+1);if calls.get()==2 {
-            let mut changed=original.clone();changed.push(b' ');std::fs::write(&path,changed).unwrap();}Ok(())};
-        assert_eq!(super::super::owner_outcome::validate_owner_with_policy(Some(&path),&binding,&current),Err(TransferReason::AuthorityConflict));
-        assert_eq!(calls.get(),2);assert_eq!(std::fs::read(database).unwrap(),before);
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let binding = binding_for(&f, &path);
+        let original = std::fs::read(&path).unwrap();
+        let database = f.root.join("runtime-retirement.sqlite");
+        let before = std::fs::read(&database).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let current = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                let mut changed = original.clone();
+                changed.push(b' ');
+                std::fs::write(&path, changed).unwrap();
+            }
+            Ok(())
+        };
+        assert_eq!(
+            super::super::owner_outcome::validate_owner_with_policy(
+                Some(&path),
+                &binding,
+                &current
+            ),
+            Err(TransferReason::AuthorityConflict)
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(std::fs::read(database).unwrap(), before);
     }
     #[test]
     fn native_owner_binding_validation_refuses_busy_store_instead_of_waiting() {
-        let f=empty_binding_fixture();let path=policy(&f);let binding=binding_for(&f,&path);
-        let _writer=super::super::StateLock::acquire(&f.root).unwrap();
-        assert_eq!(super::super::owner_outcome::validate_owner_with_policy(Some(&path),&binding,&||Ok(())),Err(TransferReason::LockBusy));
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let binding = binding_for(&f, &path);
+        let _writer = super::super::StateLock::acquire(&f.root).unwrap();
+        assert_eq!(
+            super::super::owner_outcome::validate_owner_with_policy(Some(&path), &binding, &|| Ok(
+                ()
+            )),
+            Err(TransferReason::LockBusy)
+        );
     }
 
     #[test]
@@ -1125,83 +1225,227 @@ mod tests {
         let f = empty_binding_fixture();
         let path = policy(&f);
         let before = std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();
-        let binding = super::super::owner_outcome::capture_owner_with_policy(Some(&path), &|| Ok(())).unwrap();
+        let binding =
+            super::super::owner_outcome::capture_owner_with_policy(Some(&path), &|| Ok(()))
+                .unwrap();
         assert_eq!(binding, binding_for(&f, &path));
-        assert_eq!(super::super::owner_outcome::capture_owner_with_policy(Some(&path), &|| Ok(())), Ok(binding.clone()));
-        assert_eq!(std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(), before);
-        assert_eq!(super::super::ownership::transfer_receipt(&binding, &f.request, &observation(), &|| Ok(())), Ok(None));
+        assert_eq!(
+            super::super::owner_outcome::capture_owner_with_policy(Some(&path), &|| Ok(())),
+            Ok(binding.clone())
+        );
+        assert_eq!(
+            std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(),
+            before
+        );
+        assert_eq!(
+            super::super::ownership::transfer_receipt(
+                &binding,
+                &f.request,
+                &observation(),
+                &|| Ok(())
+            ),
+            Ok(None)
+        );
     }
     #[test]
     fn native_initial_owner_registration_holds_original_state_lock_through_callback() {
-        let f=empty_binding_fixture();let path=policy(&f);let expected=binding_for(&f,&path);let mut called=false;
-        let result=super::super::owner_outcome::initial_owner_with_policy(Some(&path),"fresh-workflow",&||Ok(()),&mut |binding| {
-            called=true;assert_eq!(*binding,expected);
-            assert!(super::super::StateLock::existing(&f.root).is_err(),"registration escaped the census lock");Ok(())
-        });
-        assert!(result.is_ok(),"{result:?}");assert!(called);
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let expected = binding_for(&f, &path);
+        let mut called = false;
+        let result = super::super::owner_outcome::initial_owner_with_policy(
+            Some(&path),
+            "fresh-workflow",
+            &|| Ok(()),
+            &mut |binding| {
+                called = true;
+                assert_eq!(*binding, expected);
+                assert!(
+                    super::super::StateLock::existing(&f.root).is_err(),
+                    "registration escaped the census lock"
+                );
+                Ok(())
+            },
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert!(called);
     }
     #[test]
     fn native_initial_owner_registration_refuses_prior_runtime_without_invoking_callback() {
-        let f=fixture(false);let path=policy(&f);let mut called=false;
-        let result=super::super::owner_outcome::initial_owner_with_policy(Some(&path),"workflow",&||Ok(()),&mut |_| {called=true;Ok(())});
-        assert_eq!(result,Err(TransferReason::AuthorityConflict));assert!(!called);
-    }
-    #[test]
-    fn native_initial_owner_registration_preserves_other_workflows_and_refuses_unknown_state() {
-        let f=fixture(false);let path=policy(&f);let mut called=0;
-        assert!(super::super::owner_outcome::initial_owner_with_policy(Some(&path),"new-workflow",&||Ok(()),&mut |_| {called+=1;Ok(())}).is_ok());
-        assert_eq!(called,1);
-        directory(&f.root.join("codex/session-unknown"));
-        let result=super::super::owner_outcome::initial_owner_with_policy(Some(&path),"new-workflow",&||Ok(()),&mut |_| {called+=1;Ok(())});
-        assert!(result.is_err(),"unowned legacy state was treated as absent");assert_eq!(called,1);
-    }
-    #[test]
-    fn native_initial_owner_registration_refuses_retired_history_with_zero_runtimes() {
-        let f=empty_binding_fixture();let path=policy(&f);
-        {
-            let lock=super::super::StateLock::existing(&f.root).unwrap();let mut ledger=Ledger::open(&f.root,&lock).unwrap();
-            ledger.abort_and_retire(&f.request.source_owners[0].audit_path,&f.request.source_owners[0].owner).unwrap();
-        }
-        let mut called=false;
-        assert_eq!(super::super::owner_outcome::initial_owner_with_policy(Some(&path),"workflow",&||Ok(()),&mut |_| {called=true;Ok(())}),Err(TransferReason::AuthorityConflict));
+        let f = fixture(false);
+        let path = policy(&f);
+        let mut called = false;
+        let result = super::super::owner_outcome::initial_owner_with_policy(
+            Some(&path),
+            "workflow",
+            &|| Ok(()),
+            &mut |_| {
+                called = true;
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(TransferReason::AuthorityConflict));
         assert!(!called);
     }
     #[test]
-    fn native_initial_owner_registration_rechecks_selection_after_callback_and_preserves_failures() {
-        for change_policy in [false,true] {
-            let f=empty_binding_fixture();let path=policy(&f);let before=std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();
-            let mut called=false;
-            let result=super::super::owner_outcome::initial_owner_with_policy(Some(&path),"fresh-workflow",&||Ok(()),&mut |_| {
-                called=true;
-                if change_policy {let mut bytes=std::fs::read(&path)?;bytes.push(b' ');std::fs::write(&path,bytes)?;Ok(())}
-                else {anyhow::bail!("synthetic registration transaction failure")}
-            });
-            assert_eq!(result,Err(if change_policy {TransferReason::AuthorityConflict} else {TransferReason::PersistRetry}));
-            assert!(called);assert_eq!(std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(),before);
+    fn native_initial_owner_registration_preserves_other_workflows_and_refuses_unknown_state() {
+        let f = fixture(false);
+        let path = policy(&f);
+        let mut called = 0;
+        assert!(super::super::owner_outcome::initial_owner_with_policy(
+            Some(&path),
+            "new-workflow",
+            &|| Ok(()),
+            &mut |_| {
+                called += 1;
+                Ok(())
+            }
+        )
+        .is_ok());
+        assert_eq!(called, 1);
+        directory(&f.root.join("codex/session-unknown"));
+        let result = super::super::owner_outcome::initial_owner_with_policy(
+            Some(&path),
+            "new-workflow",
+            &|| Ok(()),
+            &mut |_| {
+                called += 1;
+                Ok(())
+            },
+        );
+        assert!(
+            result.is_err(),
+            "unowned legacy state was treated as absent"
+        );
+        assert_eq!(called, 1);
+    }
+    #[test]
+    fn native_initial_owner_registration_refuses_retired_history_with_zero_runtimes() {
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        {
+            let lock = super::super::StateLock::existing(&f.root).unwrap();
+            let mut ledger = Ledger::open(&f.root, &lock).unwrap();
+            ledger
+                .abort_and_retire(
+                    &f.request.source_owners[0].audit_path,
+                    &f.request.source_owners[0].owner,
+                )
+                .unwrap();
+        }
+        let mut called = false;
+        assert_eq!(
+            super::super::owner_outcome::initial_owner_with_policy(
+                Some(&path),
+                "workflow",
+                &|| Ok(()),
+                &mut |_| {
+                    called = true;
+                    Ok(())
+                }
+            ),
+            Err(TransferReason::AuthorityConflict)
+        );
+        assert!(!called);
+    }
+    #[test]
+    fn native_initial_owner_registration_rechecks_selection_after_callback_and_preserves_failures()
+    {
+        for change_policy in [false, true] {
+            let f = empty_binding_fixture();
+            let path = policy(&f);
+            let before = std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();
+            let mut called = false;
+            let result = super::super::owner_outcome::initial_owner_with_policy(
+                Some(&path),
+                "fresh-workflow",
+                &|| Ok(()),
+                &mut |_| {
+                    called = true;
+                    if change_policy {
+                        let mut bytes = std::fs::read(&path)?;
+                        bytes.push(b' ');
+                        std::fs::write(&path, bytes)?;
+                        Ok(())
+                    } else {
+                        anyhow::bail!("synthetic registration transaction failure")
+                    }
+                },
+            );
+            assert_eq!(
+                result,
+                Err(if change_policy {
+                    TransferReason::AuthorityConflict
+                } else {
+                    TransferReason::PersistRetry
+                })
+            );
+            assert!(called);
+            assert_eq!(
+                std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(),
+                before
+            );
             assert!(super::super::StateLock::existing(&f.root).is_ok());
         }
     }
     #[test]
     fn native_initial_owner_registration_checks_alias_and_retained_launch_provenance() {
-        for scenario in ["orphan-alias","partial-launch","foreign-launch","escaped-launch","symlink-runtime"] {
-            let f=fixture(false);let policy=policy(&f);let provider=f.root.join("codex");
+        for scenario in [
+            "orphan-alias",
+            "partial-launch",
+            "foreign-launch",
+            "escaped-launch",
+            "symlink-runtime",
+        ] {
+            let f = fixture(false);
+            let policy = policy(&f);
+            let provider = f.root.join("codex");
             match scenario {
-                "orphan-alias"=>super::super::write(&provider.join("aliases/orphan"),br#""session-missing""#).unwrap(),
-                "symlink-runtime"=>std::os::unix::fs::symlink(provider.join("session-missing"),provider.join("session-alias")).unwrap(),
-                _=>{
-                    let launch=provider.join("launch-retained");directory(&launch);
-                    if scenario!="partial-launch" {
-                        let session=if scenario=="escaped-launch" {f.root.join("claude/session-escaped")} else {
-                            f.root.join(&f.request.inventory.iter().find(|runtime|runtime.provider=="codex").unwrap().runtime_relative_path)
+                "orphan-alias" => {
+                    super::super::write(&provider.join("aliases/orphan"), br#""session-missing""#)
+                        .unwrap()
+                }
+                "symlink-runtime" => std::os::unix::fs::symlink(
+                    provider.join("session-missing"),
+                    provider.join("session-alias"),
+                )
+                .unwrap(),
+                _ => {
+                    let launch = provider.join("launch-retained");
+                    directory(&launch);
+                    if scenario != "partial-launch" {
+                        let session = if scenario == "escaped-launch" {
+                            f.root.join("claude/session-escaped")
+                        } else {
+                            f.root.join(
+                                &f.request
+                                    .inventory
+                                    .iter()
+                                    .find(|runtime| runtime.provider.as_str() == "codex")
+                                    .unwrap()
+                                    .runtime_relative_path,
+                            )
                         };
                         super::super::write(&launch.join("launch.json"),&serde_json::to_vec(&json!({"version":1,"provider":"codex","session_directory":session})).unwrap()).unwrap();
                     }
-                },
+                }
             }
-            let mut called=false;
-            let result=super::super::owner_outcome::initial_owner_with_policy(Some(&policy),"fresh-workflow",&||Ok(()),&mut |_| {called=true;Ok(())});
-            assert_eq!(result.is_ok(),scenario=="foreign-launch","{scenario}: {result:?}");
-            assert_eq!(called,scenario=="foreign-launch","{scenario}");
+            let mut called = false;
+            let result = super::super::owner_outcome::initial_owner_with_policy(
+                Some(&policy),
+                "fresh-workflow",
+                &|| Ok(()),
+                &mut |_| {
+                    called = true;
+                    Ok(())
+                },
+            );
+            assert_eq!(
+                result.is_ok(),
+                scenario == "foreign-launch",
+                "{scenario}: {result:?}"
+            );
+            assert_eq!(called, scenario == "foreign-launch", "{scenario}");
         }
     }
     #[test]
@@ -1209,11 +1453,29 @@ mod tests {
         let f = empty_binding_fixture();
         let path = policy(&f);
         let before = std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();
-        for (fence, reason) in [(TransferFenceError::NotCurrent, TransferReason::AuthorityConflict), (TransferFenceError::Unavailable, TransferReason::PersistRetry)] {
-            assert_eq!(super::super::owner_outcome::capture_owner_with_policy(Some(&path), &|| Err(fence)), Err(reason));
+        for (fence, reason) in [
+            (
+                TransferFenceError::NotCurrent,
+                TransferReason::AuthorityConflict,
+            ),
+            (
+                TransferFenceError::Unavailable,
+                TransferReason::PersistRetry,
+            ),
+        ] {
+            assert_eq!(
+                super::super::owner_outcome::capture_owner_with_policy(Some(&path), &|| Err(fence)),
+                Err(reason)
+            );
         }
-        assert_eq!(std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(), before);
-        assert_eq!(super::super::owner_outcome::capture_owner_with_policy(None, &|| Ok(())), Err(TransferReason::RuntimeUnavailable));
+        assert_eq!(
+            std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(),
+            before
+        );
+        assert_eq!(
+            super::super::owner_outcome::capture_owner_with_policy(None, &|| Ok(())),
+            Err(TransferReason::RuntimeUnavailable)
+        );
     }
     #[test]
     fn native_owner_binding_capture_refuses_lost_authority_without_recreating_it() {
@@ -1223,10 +1485,15 @@ mod tests {
         {
             let _lock = super::super::StateLock::acquire(&f.root).unwrap();
             let connection = augmentagent_store::rusqlite::Connection::open(&database).unwrap();
-            connection.execute_batch("DROP TABLE native_transfer").unwrap();
+            connection
+                .execute_batch("DROP TABLE native_transfer")
+                .unwrap();
         }
         let before = std::fs::read(&database).unwrap();
-        assert_eq!(super::super::owner_outcome::capture_owner_with_policy(Some(&path), &|| Ok(())), Err(TransferReason::PendingUnknown));
+        assert_eq!(
+            super::super::owner_outcome::capture_owner_with_policy(Some(&path), &|| Ok(())),
+            Err(TransferReason::PendingUnknown)
+        );
         assert_eq!(std::fs::read(&database).unwrap(), before);
     }
     #[test]
@@ -1236,9 +1503,16 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let current = || {
             calls.set(calls.get() + 1);
-            if calls.get() == 3 {Err(TransferFenceError::NotCurrent)} else {Ok(())}
+            if calls.get() == 3 {
+                Err(TransferFenceError::NotCurrent)
+            } else {
+                Ok(())
+            }
         };
-        assert_eq!(super::super::owner_outcome::capture_owner_with_policy(Some(&path), &current), Err(TransferReason::AuthorityConflict));
+        assert_eq!(
+            super::super::owner_outcome::capture_owner_with_policy(Some(&path), &current),
+            Err(TransferReason::AuthorityConflict)
+        );
         assert_eq!(calls.get(), 3);
     }
     #[test]
@@ -1434,12 +1708,26 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
         assert!(matches!(
             run_bound(&f, &path, &binding),
-            TransferOutcome::Held { reason: TransferReason::AuthorityConflict, .. }
+            TransferOutcome::Held {
+                reason: TransferReason::AuthorityConflict,
+                ..
+            }
         ));
         assert!(!absent.exists());
-        assert_eq!(super::super::ownership::transfer_receipt(&binding, &f.request, &observation(), &|| Ok(())), Ok(None));
+        assert_eq!(
+            super::super::ownership::transfer_receipt(
+                &binding,
+                &f.request,
+                &observation(),
+                &|| Ok(())
+            ),
+            Ok(None)
+        );
         std::fs::write(&path, original).unwrap();
-        assert!(matches!(run_bound(&f, &path, &binding), TransferOutcome::Completed(_)));
+        assert!(matches!(
+            run_bound(&f, &path, &binding),
+            TransferOutcome::Completed(_)
+        ));
     }
     #[test]
     fn native_handoff_binding_capture_rejects_root_alias_changed_after_identity_read() {
@@ -1448,7 +1736,8 @@ mod tests {
         let path = policy(&f);
         let alias = f._temporary.path().join("selected-native-root");
         symlink(&f.root, &alias).unwrap();
-        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         value["state_root"] = json!(&alias);
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         let other = tempfile::tempdir().unwrap();
@@ -1463,8 +1752,22 @@ mod tests {
             }
             Ok(())
         };
-        let result = super::super::owner_outcome::capture_with_policy(Some(&path), &f.request, &observation(), &current);
-        assert!(matches!(result, Err(TransferOutcome::Held { reason: TransferReason::AuthorityConflict, .. })), "capture accepted a changed root alias: {result:?}");
+        let result = super::super::owner_outcome::capture_with_policy(
+            Some(&path),
+            &f.request,
+            &observation(),
+            &current,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(TransferOutcome::Held {
+                    reason: TransferReason::AuthorityConflict,
+                    ..
+                })
+            ),
+            "capture accepted a changed root alias: {result:?}"
+        );
         assert_eq!(calls.get(), 3);
     }
     #[test]
@@ -1615,7 +1918,7 @@ mod tests {
             )
             .unwrap();
             inventory.push(RuntimeInventoryRow {
-                provider: provider.into(),
+                provider: serde_json::from_value(json!(provider)).unwrap(),
                 native_session_id,
                 runtime_relative_path,
                 creation_owner: owner.owner.clone(),
@@ -1731,7 +2034,7 @@ mod tests {
                 "changed-alias" => {
                     std::fs::write(
                         f.root
-                            .join(&row.provider)
+                            .join(row.provider.as_str())
                             .join("aliases")
                             .join(sha(row.native_session_id.as_bytes())),
                         b"\"session-other\"",

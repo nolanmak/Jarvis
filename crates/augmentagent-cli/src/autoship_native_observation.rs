@@ -132,7 +132,7 @@ fn validate(row: &NativeObservation, launch: &native_launch::NativeLaunchRecord)
                 proof["kind"] == "native_launch_completion_verified"
                     && proof["producer"] == "normal-completion"
                     && row.native_session_id.as_deref() == Some(&inventory.native_session_id)
-                    && inventory.provider == provider_name(row.provider)
+                    && inventory.provider.as_str() == provider_name(row.provider)
                     && inventory.runtime_relative_path == row.runtime_relative_path
                     && inventory.effective_owner == row.source_owner
                     && inventory.effective_audit_path == row.source_audit_path

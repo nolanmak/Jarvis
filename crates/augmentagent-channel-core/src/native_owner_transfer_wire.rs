@@ -201,6 +201,17 @@ fn valid_runtime(path: &str, provider: Provider) -> bool {
 }
 
 impl TransferRequest {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let request: Self = serde_json::from_slice(bytes)?;
+        request.validate()?;
+        Ok(request)
+    }
+    pub fn request_digest(&self) -> Result<String> {
+        request_digest(self)
+    }
+    pub fn inventory_digest(&self) -> Result<String> {
+        inventory_digest(self)
+    }
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.version == 1,
@@ -333,6 +344,12 @@ pub fn receipt_digest(receipt: &TransferReceipt) -> Result<String> {
     let mut value = serde_json::to_value(receipt)?;
     value.as_object_mut().unwrap().remove("receipt_sha256");
     Ok(hash(&canonical_bytes(&value)?))
+}
+impl TransferReceipt {
+    /// Historical binding only; dispatch additionally needs current ledger authority.
+    pub fn verify(&self, request: &TransferRequest) -> Result<()> {
+        verify_receipt(request, self)
+    }
 }
 /// Verify the immutable wire binding, separately from current ledger authority.
 pub fn verify_receipt(request: &TransferRequest, receipt: &TransferReceipt) -> Result<()> {

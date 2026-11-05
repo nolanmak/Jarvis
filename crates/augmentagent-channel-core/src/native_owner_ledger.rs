@@ -403,6 +403,34 @@ fn validate_all_history(db: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 fn validate_schema(db: &rusqlite::Connection) -> Result<()> {
+    // A pre-release generation-only key cannot represent the complete ordered
+    // owner/audit pairs. Refuse that layout rather than silently dropping paths
+    // or modifying an existing ownership ledger during ordinary admission.
+    for (table, expected) in [
+        (
+            "native_transfer_source",
+            &["transfer_id", "workflow", "generation", "audit_path"][..],
+        ),
+        (
+            "native_transfer_close",
+            &["workflow", "generation", "audit_path"][..],
+        ),
+    ] {
+        let mut query = db.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut keys = query
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(5)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        keys.retain(|(position, _)| *position > 0);
+        keys.sort_by_key(|(position, _)| *position);
+        ensure!(
+            keys.iter()
+                .map(|(_, name)| name.as_str())
+                .eq(expected.iter().copied()),
+            R::PreparedCorrupt
+        );
+    }
     for name in [
         "retired_owner",
         "native_transfer_meta",
@@ -451,9 +479,9 @@ impl<'a> Ledger<'a> {
             INSERT OR IGNORE INTO native_transfer_meta VALUES(1,1);
             CREATE TABLE IF NOT EXISTS native_transfer(id TEXT PRIMARY KEY,request_json BLOB NOT NULL,request_sha256 TEXT NOT NULL,claims_json BLOB NOT NULL,claims_sha256 TEXT NOT NULL,reserved_bytes INTEGER NOT NULL CHECK(reserved_bytes>0),state TEXT NOT NULL CHECK(state IN ('prepared','completed','aborted')),receipt_json BLOB,seals_json BLOB);
             CREATE TABLE IF NOT EXISTS native_transfer_claim(kind TEXT NOT NULL,key TEXT NOT NULL,transfer_id TEXT NOT NULL REFERENCES native_transfer(id),PRIMARY KEY(kind,key));
-            CREATE TABLE IF NOT EXISTS native_transfer_source(transfer_id TEXT NOT NULL REFERENCES native_transfer(id),workflow TEXT NOT NULL,generation INTEGER NOT NULL,audit_path TEXT NOT NULL,PRIMARY KEY(transfer_id,workflow,generation));
+            CREATE TABLE IF NOT EXISTS native_transfer_source(transfer_id TEXT NOT NULL REFERENCES native_transfer(id),workflow TEXT NOT NULL,generation INTEGER NOT NULL,audit_path TEXT NOT NULL,PRIMARY KEY(transfer_id,workflow,generation,audit_path));
             CREATE INDEX IF NOT EXISTS native_transfer_source_owner ON native_transfer_source(workflow,generation);
-            CREATE TABLE IF NOT EXISTS native_transfer_close(workflow TEXT NOT NULL,generation INTEGER NOT NULL,audit_path TEXT NOT NULL,transfer_id TEXT NOT NULL REFERENCES native_transfer(id),PRIMARY KEY(workflow,generation));
+            CREATE TABLE IF NOT EXISTS native_transfer_close(workflow TEXT NOT NULL,generation INTEGER NOT NULL,audit_path TEXT NOT NULL,transfer_id TEXT NOT NULL REFERENCES native_transfer(id),PRIMARY KEY(workflow,generation,audit_path));
             CREATE TABLE IF NOT EXISTS native_transfer_link(seq INTEGER PRIMARY KEY AUTOINCREMENT,transfer_id TEXT NOT NULL REFERENCES native_transfer(id),ordinal INTEGER NOT NULL,runtime TEXT NOT NULL,UNIQUE(transfer_id,ordinal),UNIQUE(transfer_id,runtime));
             CREATE INDEX IF NOT EXISTS native_transfer_link_runtime ON native_transfer_link(runtime,seq);")?;
         }
@@ -1103,6 +1131,64 @@ mod tests {
             })
             .collect()
     }
+    #[test]
+    fn native_ledger_owner_audit_pairs_commit_and_replay_every_declared_closure() {
+        let root = fixture();
+        let lock = StateLock::acquire(root.path()).unwrap();
+        let mut request = request("workflow");
+        request.inventory.clear();
+        let mut second = request.source_owners[0].clone();
+        second.audit_path = "/audit/workflow/z-other".into();
+        request.source_owners.push(second);
+        request.validate().unwrap();
+        let receipt = {
+            let mut ledger = Ledger::open(root.path(), &lock).unwrap();
+            assert_eq!(
+                ledger
+                    .prepare(&request, &endpoints(&request), u64::MAX)
+                    .unwrap(),
+                State::Prepared
+            );
+            let receipt = ledger.commit(&request, seals(&request)).unwrap();
+            receipt.verify(&request).unwrap();
+            assert_eq!(receipt.source_closures.len(), 2);
+            assert_eq!(ledger.reserved_bytes().unwrap(), 0);
+            receipt
+        };
+        let ledger = Ledger::open(root.path(), &lock).unwrap();
+        assert_eq!(
+            ledger.state_for(&request).unwrap(),
+            Some(State::Completed(receipt))
+        );
+        assert!(ledger.is_closed(&request.source_owners[0].owner).unwrap());
+    }
+
+    #[test]
+    fn native_ledger_owner_audit_schema_refuses_incomplete_pre_release_keys() {
+        for table in ["native_transfer_source", "native_transfer_close"] {
+            let root = fixture();
+            let lock = StateLock::acquire(root.path()).unwrap();
+            {
+                let ledger = Ledger::open(root.path(), &lock).unwrap();
+                let ddl = if table == "native_transfer_source" {
+                    "DROP TABLE native_transfer_source; CREATE TABLE native_transfer_source(transfer_id TEXT NOT NULL REFERENCES native_transfer(id),workflow TEXT NOT NULL,generation INTEGER NOT NULL,audit_path TEXT NOT NULL,PRIMARY KEY(transfer_id,workflow,generation));"
+                } else {
+                    "DROP TABLE native_transfer_close; CREATE TABLE native_transfer_close(workflow TEXT NOT NULL,generation INTEGER NOT NULL,audit_path TEXT NOT NULL,transfer_id TEXT NOT NULL REFERENCES native_transfer(id),PRIMARY KEY(workflow,generation));"
+                };
+                ledger.db.execute_batch(ddl).unwrap();
+            }
+            let result = Ledger::open(root.path(), &lock);
+            assert!(
+                result.is_err(),
+                "{table} silently accepted a schema that cannot represent the wire contract"
+            );
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                "native-transfer-prepared-corrupt"
+            );
+        }
+    }
+
     #[test]
     fn native_ledger_preparation_survives_reopen_and_rejects_rebinding() {
         let root = fixture();
