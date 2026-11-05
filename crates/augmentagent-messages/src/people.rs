@@ -414,40 +414,33 @@ pub fn resolve_person(
     // A multi-word reference that matches exactly is settled. A single word
     // is only settled when nobody else's name contains that word: otherwise
     // the bare-key page wins by accident of slug, not by evidence (#1668).
-    if !exact.is_empty() && n.contains(' ') {
-        return Ok(exact_matches(exact));
-    }
     let mut partial: BTreeMap<String, String> = BTreeMap::new();
-    let mut stmt = c.prepare(
-        "SELECT person_key, name FROM message_person_names \
-         WHERE name LIKE ?1 || ' %' OR name LIKE '% ' || ?1 OR name LIKE '% ' || ?1 || ' %'",
-    )?;
-    for row in stmt.query_map([&n], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    })? {
-        let (k, name) = row?;
-        if !exact.contains_key(&k) {
-            partial.entry(k).or_insert(name);
+    if exact.is_empty() || !n.contains(' ') {
+        let mut stmt = c.prepare(
+            "SELECT person_key, name FROM message_person_names \
+             WHERE name LIKE ?1 || ' %' OR name LIKE '% ' || ?1 OR name LIKE '% ' || ?1 || ' %'",
+        )?;
+        for row in stmt.query_map([&n], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (k, name) = row?;
+            if !exact.contains_key(&k) {
+                partial.entry(k).or_insert(name);
+            }
         }
     }
-    let mut out = exact_matches(exact);
-    out.extend(partial.into_iter().map(|(key, name)| PersonMatch {
-        key,
-        name: Some(name),
-        kind: MatchKind::Partial,
-        resolved: true,
-        last_seen: None,
-    }));
+    let mut out = person_matches(exact, MatchKind::Exact);
+    out.extend(person_matches(partial, MatchKind::Partial));
     Ok(out)
 }
 
-fn exact_matches(exact: BTreeMap<String, String>) -> Vec<PersonMatch> {
-    exact
+fn person_matches(names: BTreeMap<String, String>, kind: MatchKind) -> Vec<PersonMatch> {
+    names
         .into_iter()
         .map(|(key, name)| PersonMatch {
             key,
             name: Some(name),
-            kind: MatchKind::Exact,
+            kind,
             resolved: true,
             last_seen: None,
         })
