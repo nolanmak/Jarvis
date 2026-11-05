@@ -327,6 +327,15 @@ async fn authority(
     Ok((decision, provider.name().into(), session))
 }
 
+fn append_verifier_schema(prompt:&str,revision:u64)->Result<String> {
+    ensure!(revision>0,"amendment revision must be positive");
+    // Initial scoping uses revision 1. An amendment's normative instructions
+    // and every complete schema example must agree on its next revision.
+    let schema=CONTRACT_PROMPT.replace("revision=1,",&format!("revision={revision},"))
+        .replace("\"revision\":1,",&format!("\"revision\":{revision},"));
+    Ok(format!("{prompt}\nCurrent controller verifier schema (mandatory for all proposed commands): {schema}\nLegacy in-process assertions are unsupported proof. If migration is requested, independently translate preserved owner requirements into behavioral adapters and controller oracles; legacy stored red/green receipts are not evidence. Original-base behavior must be measured again."))
+}
+
 pub(super) async fn try_amend(
     builder: &FallbackReasoner,
     source: AcceptanceSource,
@@ -413,13 +422,14 @@ pub(super) async fn try_amend(
     let environments = environment_evidence_against_main(root, control, old,&canonical_main).await?;
     let candidate_environment = environments.current_candidate.clone();
     let original_base = old.baseline.registration.baseline_head();
-    let prompt=format!("Determine whether this failure is an objectively bad/outdated verifier or an implementation defect. Reject amendment for implementation defects, weakened criteria, always-green/no-op tests, or missing setup dependencies. For legitimate compiler/dependency input changes you may explicitly approve the candidate environment transition; old-base red must still be reproduced independently. Preserve every previous criterion ID and exact requirement text; do not expand implementation paths. A correction must produce revision {} and the same real source {}. All new fixtures are public: synthetic examples only, no secrets/private literals. Return JSON {{\"approved\":bool,\"previous_contract_hash\":\"{}\",\"approve_environment_transition\":bool,\"reason\":\"objective cause\",\"proposal\":null or {{\"contract\":...,\"files\":...}}}}.\nIntent: {title}\nFailure: {failure}\nOriginal proposal: {}\nOriginal behavioral baseline (unchanged): {original_base}\nCanonical main: {canonical_main}\nCandidate contribution base: {scope_base}\nExact candidate head: {head}\nCandidate contribution diff (every change here remains subject to allowed paths):\n{diff}\nIntegrated upstream paths (original baseline to contribution base; these are context, not candidate edits):\n{upstream_paths}\nApproval only permits constructing and independently testing a correction. A proposed replacement harness cannot have its new red receipt before it exists: the controller must subsequently reproduce intended assertion red at the unchanged original baseline under the current engine and separately obtain candidate green before activation. Never treat approval or historical receipts as those measurements.",old.proposal.contract.revision+1,source,old.baseline.registration.contract_hash(),serde_json::to_string(&old.proposal)?);
+    let next_revision=old.proposal.contract.revision.checked_add(1).context("verifier contract revision overflow")?;
+    let prompt=format!("Determine whether this failure is an objectively bad/outdated verifier or an implementation defect. Reject amendment for implementation defects, weakened criteria, always-green/no-op tests, or missing setup dependencies. For legitimate compiler/dependency input changes you may explicitly approve the candidate environment transition; old-base red must still be reproduced independently. Preserve every previous criterion ID and exact requirement text; do not expand implementation paths. A correction must produce revision {} and the same real source {}. All new fixtures are public: synthetic examples only, no secrets/private literals. Return JSON {{\"approved\":bool,\"previous_contract_hash\":\"{}\",\"approve_environment_transition\":bool,\"reason\":\"objective cause\",\"proposal\":null or {{\"contract\":...,\"files\":...}}}}.\nIntent: {title}\nFailure: {failure}\nOriginal proposal: {}\nOriginal behavioral baseline (unchanged): {original_base}\nCanonical main: {canonical_main}\nCandidate contribution base: {scope_base}\nExact candidate head: {head}\nCandidate contribution diff (every change here remains subject to allowed paths):\n{diff}\nIntegrated upstream paths (original baseline to contribution base; these are context, not candidate edits):\n{upstream_paths}\nApproval only permits constructing and independently testing a correction. A proposed replacement harness cannot have its new red receipt before it exists: the controller must subsequently reproduce intended assertion red at the unchanged original baseline under the current engine and separately obtain candidate green before activation. Never treat approval or historical receipts as those measurements.",next_revision,source,old.baseline.registration.contract_hash(),serde_json::to_string(&old.proposal)?);
     ensure!(
         prompt.len() <= 512 * 1024,
         "verifier authority evidence needs smaller scoped revision"
     );
     let prompt = format!("{prompt}\n{}", environments.prompt()?);
-    let prompt = format!("{prompt}\nCurrent controller verifier schema (mandatory for all proposed commands): {CONTRACT_PROMPT}\nLegacy in-process assertions are unsupported proof. If migration is requested, independently translate preserved owner requirements into behavioral adapters and controller oracles; legacy stored red/green receipts are not evidence. Original-base behavior must be measured again.");
+    let prompt = append_verifier_schema(&prompt,next_revision)?;
     let prompt = if let Some(directive) = adjudication {
         format!("{prompt}\nA final native Codex adjudicator already decided this derived-criterion interpretation. Translate it into executable verifier/scope changes, preserving EVERY original owner requirement verbatim. Do not reconsider its technical ruling; reject only if it cannot be implemented without changing owner intent or protected controls. You may add literal implementation files by returning approve_additional_files:[exact paths], never broaden directories. For a contract_scope directive, additional files must be a subset of its explicit bound paths and necessary for that unchanged owner requirement. Never authorize Git/provider configuration, credentials, CI or daemon control state; if a requested path is protected, derive a compliant implementation alternative or report the immutable authorization conflict. All deterministic checks rerun. Bound final ruling: {directive}")
     } else {
@@ -906,6 +916,24 @@ pub(super) async fn resume_pending(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn amendment_schema_uses_the_requested_version_in_every_example() {
+        for revision in [2,3,12] {
+            let prompt=super::append_verifier_schema("Preserve every original owner requirement.",revision).unwrap();
+            let example=prompt.split_once("Complete schema example:\n").unwrap().1.split_once("\nEnd schema example.").unwrap().0;
+            let actual:serde_json::Value=serde_json::from_str(example).unwrap();
+            assert_eq!(actual["contract"]["revision"],revision,"authority schema contradicts the requested amendment revision");
+            assert!(prompt.contains(&format!("schema_version=1, revision={revision},")));
+            assert!(prompt.contains(&format!("\"revision\":{revision},\"pull_request\":841")));
+            assert!(prompt.contains(&format!("\"revision\":{revision},\"issue\":840")));
+            let initial=super::CONTRACT_PROMPT.split_once("Complete schema example:\n").unwrap().1.split_once("\nEnd schema example.").unwrap().0;
+            let mut expected:serde_json::Value=serde_json::from_str(initial).unwrap();
+            expected["contract"]["revision"]=revision.into();
+            assert_eq!(actual,expected,"schema rendering changed requirements,source,commands or oracle");
+        }
+        assert!(super::append_verifier_schema("untrusted revision",0).is_err());
+        assert!(super::CONTRACT_PROMPT.contains("schema_version=1, revision=1,"));
+    }
     use super::*;
     #[tokio::test]
     async fn authority_correction_is_bounded_and_cannot_bypass_its_call_budget() {

@@ -31,7 +31,9 @@ impl Reasoner for McpCaptureFixture {
 #[tokio::test]
 async fn active_voice_binding_injects_tool_only_into_its_owner_conversation_turn() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let root = tempfile::tempdir().unwrap();
+    // Unix socket names must fit even when managed build TMPDIR is long.
+    let root = tempfile::Builder::new().prefix("voice-")
+        .tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let socket = root.path().join("sidecar.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let sidecar = tokio::spawn(async move {
