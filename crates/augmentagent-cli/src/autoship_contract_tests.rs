@@ -559,3 +559,55 @@ fn cached_legacy_red_and_green_receipts_never_restore_authority() {
         .candidate_passes(&[baseline], &[candidate], &reg.binding(HEAD).unwrap())
         .is_err());
 }
+
+#[test]
+fn registration_metadata_requires_the_complete_exact_pinned_file_set() {
+    let (_, registered) = registered();
+    for replacement in [BTreeMap::<String, String>::new(), BTreeMap::from([
+        ("verifier.rs".into(), digest(b"assertion")),
+        ("unregistered.rs".into(), digest(b"extra")),
+    ])] {
+        // Simulate a structurally self-consistent record, not just a stale
+        // digest: every pinned path still must have an independently bound hash.
+        let mut altered = registered.clone();
+        altered.file_hashes = replacement;
+        altered.contract_hash = altered.computed_hash().unwrap();
+        assert!(altered.verify_metadata().is_err(),
+            "registration metadata accepted an incomplete or expanded pinned closure");
+    }
+}
+
+#[test]
+fn private_byte_registration_preserves_the_existing_format_and_exact_closure() {
+    let (dir, filesystem_registration) = registered();
+    let files = BTreeMap::from([("verifier.rs".into(),
+        std::fs::read_to_string(dir.path().join("verifier.rs")).unwrap())]);
+    let registration = RegisteredContract::register_from_files(
+        contract(), BASE.into(), "rust-1-fixture-env-v1".into(), &files,
+    ).unwrap();
+    assert_eq!(registration, filesystem_registration);
+    assert_eq!(serde_json::to_vec(&registration).unwrap(),
+        serde_json::to_vec(&filesystem_registration).unwrap());
+    registration.verify_files(&files).unwrap();
+    // No source file remains available: validation must use protected bytes.
+    std::fs::remove_file(dir.path().join("verifier.rs")).unwrap();
+    registration.verify_files(&files).unwrap();
+    assert!(registration.verify_integrity(dir.path()).is_err());
+    let changed = BTreeMap::from([("verifier.rs".into(), "weakened assertion".into())]);
+    assert!(registration.verify_files(&changed).is_err());
+    let extra = BTreeMap::from([("verifier.rs".into(), files["verifier.rs"].clone()),
+        ("extra.rs".into(), "extra".into())]);
+    let substituted = BTreeMap::from([("different.rs".into(), files["verifier.rs"].clone())]);
+    for invalid in [&BTreeMap::new(), &extra, &substituted] {
+        assert!(registration.verify_files(invalid).is_err());
+        assert!(RegisteredContract::register_from_files(
+            contract(), BASE.into(), "rust-1-fixture-env-v1".into(), invalid).is_err());
+    }
+    let oversized = BTreeMap::from([("verifier.rs".into(), "x".repeat(MAX_FILE_BYTES as usize + 1))]);
+    assert!(registration.verify_files(&oversized).is_err());
+    assert!(RegisteredContract::register_from_files(
+        contract(), BASE.into(), "rust-1-fixture-env-v1".into(), &oversized).is_err());
+    for (base, environment) in [("invalid", "environment"), (BASE, "")] {
+        assert!(RegisteredContract::register_from_files(contract(),base.into(),environment.into(),&files).is_err());
+    }
+}

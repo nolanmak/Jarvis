@@ -519,6 +519,38 @@ impl RegisteredContract {
             contract_hash,
         })
     }
+    /// Register controller-owned proposal bytes without installing them in the
+    /// product checkout. The caller must supply the independent protected map.
+    pub fn register_from_files(
+        contract: AcceptanceContract,
+        baseline_head: String,
+        environment_id: String,
+        files: &BTreeMap<String, String>,
+    ) -> Result<Self> {
+        contract.validate()?;
+        let file_hashes = files.iter().map(|(path, contents)| {
+            ensure!(contents.len() as u64 <= MAX_FILE_BYTES, "verifier file exceeds byte bound");
+            Ok((path.clone(), digest(contents.as_bytes())))
+        }).collect::<Result<BTreeMap<_, _>>>()?;
+        let mut registration = Self {
+            contract, baseline_head, environment_id,
+            candidate_environment_id: None, file_hashes, contract_hash: String::new(),
+        };
+        registration.contract_hash = registration.computed_hash()?;
+        registration.verify_files(files)?;
+        Ok(registration)
+    }
+    /// Verify exact registered names and bytes, never a worker directory walk.
+    pub fn verify_files(&self, files: &BTreeMap<String, String>) -> Result<()> {
+        self.verify_metadata()?;
+        ensure!(files.keys().eq(self.file_hashes.keys()), "registered verifier file set changed");
+        for (path, contents) in files {
+            ensure!(contents.len() as u64 <= MAX_FILE_BYTES, "verifier file exceeds byte bound");
+            ensure!(self.file_hashes[path] == digest(contents.as_bytes()),
+                "registered verifier changed: {path}");
+        }
+        Ok(())
+    }
     /// Controller-only: bind an independently authorized environment transition
     /// before either baseline or candidate receipts are generated.
     pub fn register_transition(
@@ -581,6 +613,13 @@ impl RegisteredContract {
     /// must deny builder writes while verification executes (lease/sandbox).
     pub fn verify_metadata(&self)->Result<()> {
         self.contract.validate()?;
+        let pinned = self.contract.verifiers.iter()
+            .flat_map(|verifier| verifier.pinned_files.iter()).collect::<BTreeSet<_>>();
+        ensure!(pinned.into_iter().eq(self.file_hashes.keys()),
+            "registration does not bind the exact pinned file set");
+        ensure!(self.file_hashes.values().all(|hash| hash.len() == 64
+            && hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))),
+            "invalid registered verifier digest");
         ensure!(self.computed_hash()?==self.contract_hash,"contract registration was modified");
         ensure!(valid_commit(&self.baseline_head) && !self.environment_id.is_empty(),"invalid registered baseline identity");
         Ok(())
