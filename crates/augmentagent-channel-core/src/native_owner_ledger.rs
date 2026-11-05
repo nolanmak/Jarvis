@@ -546,6 +546,11 @@ impl<'a> Ledger<'a> {
     pub fn is_closed(&self, owner: &RuntimeOwner) -> Result<bool> {
         closed(&self.db, owner)
     }
+    /// Transfer closure alone is not retirement of the current namespace.
+    pub fn retired_authority(&self, authority:&Authority)->Result<bool> {
+        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM retired_owner WHERE workflow=?1 AND generation=?2 AND audit_path=?3)",
+            params![authority.owner.workflow_id,authority.owner.lease_generation,authority.audit_path],|r|r.get(0))?)
+    }
     pub fn held_by_abort(&self, owner: &RuntimeOwner) -> Result<bool> {
         conflict(&self.db, owner)
     }

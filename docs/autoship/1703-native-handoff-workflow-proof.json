@@ -1,9 +1,17 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "73728c80195ea653f43baa10b405aa3d2ba0dccd",
+  "source_parent_commit": "6a3eacd030806601cae670716b65c1516900ac58",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_handoff.rs",
+      "sha256": "b73ee91655031d5915998d7b8bc11f9193110ad2d581dc51f76b83afc217932a"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
+      "sha256": "6579161cc381543300358b844d511e6a59aad21bff46f87de3ef0d0b085b4f07"
+    },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_handoff.rs",
       "sha256": "7e6930d9b817bf7097693c30547796f94386564c2dd906c85f70d18b45b021bc"
@@ -49,16 +57,19 @@
     "handoff_snapshot_cases": 10,
     "pending_handoff_cases": 8,
     "retained_logs": [
-      "autoship-native-owner-eligibility-red.log",
-      "autoship-native-owner-eligibility-green.log",
-      "autoship-native-owner-eligibility-json-failure.log",
-      "autoship-native-owner-eligibility-focused.log",
-      "autoship-native-owner-eligibility-full.log"
+      "autoship-native-inventory-marker-red.log",
+      "autoship-native-inventory-marker-green.log",
+      "autoship-native-inventory-marker-full-core.log",
+      "autoship-native-inventory-marker-full-cli.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
     "owner_eligibility_cases": 6,
-    "focused_native_observation_cases": 33
+    "focused_native_observation_cases": 33,
+    "core_passed": 857,
+    "core_failed": 0,
+    "core_ignored": 15,
+    "owner_retirement_marker_cases": 3
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -77,7 +88,9 @@
     "transferred registrations remain history without blocking active-owner or retirement selection",
     "bound retry cleanup requires matching durable owner resume event and original native binding",
     "plain-text/malformed event payloads cannot create cleanup authority or break JSON parsing",
-    "unavailable transfer history retains cleanup/retry intents while eligible peers advance"
+    "unavailable transfer history retains cleanup/retry intents while eligible peers advance",
+    "unrelated owner-retirement markers cannot omit a live runtime before source sealing",
+    "a matching owner marker also requires an exact retired_owner entry; transfer closure is insufficient"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -92,7 +105,9 @@
     "actual retained/retired-runtime inventory scan join before productive handoff preparation",
     "terminal and namespace cleanup-only settlement and authenticated legacy/uncertainty/corrupt-state recovery",
     "normal protected rollout and actual Codex/Claude Discord continuation acceptance",
-    "C actual-backend freshness/storage/quiescence cutover, private verifier recovery/application and full epic soak"
+    "C actual-backend freshness/storage/quiescence cutover, private verifier recovery/application and full epic soak",
+    "scope-marker v2 and shared provenance validation across classification and root-wide pruning",
+    "synchronized physical scan/workflow persistence/native prepare and locked absent/aborted reconciliation"
   ],
   "native_transfer_scope": "isolated synthetic-controller/native-filesystem fixtures only; zero production transfers or provider/model dispatch",
   "opaque_receipt_producer": "verified lookup through ownership::transfer_receipt in the originally bound native store; no serialized-receipt constructor",
@@ -103,5 +118,13 @@
     "metadata_failure_replays_same_original_receipt": true,
     "lost_original_store_refuses_new_verified_receipt": true
   },
-  "physical_runtime_inventory_closure_scope": "not established for production; retained/retired-runtime scan reconciliation remains required"
+  "physical_runtime_inventory_closure_scope": "not established for production; retained/retired-runtime scan reconciliation remains required",
+  "inventory_preparation_audit": {
+    "spec": "docs/autoship/native-inventory-preparation.md",
+    "canonical_seams_checked": 18,
+    "mapped_occurrences": 160,
+    "fresh_reader_checked": true,
+    "implementation_complete": false,
+    "production_ready": false
+  }
 }

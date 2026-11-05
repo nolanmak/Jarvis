@@ -146,7 +146,7 @@ fn session_lock(path: &Path) -> Result<SessionLock> {
     }
     Ok(SessionLock(file))
 }
-fn retired(session: &Path) -> Result<bool> {
+fn retired(root:&Path,ledger:&Ledger<'_>,session: &Path) -> Result<bool> {
     let mut retired = false;
     for name in ["retired.json", "retired-owner.json"] {
         match session.join(name).symlink_metadata() {
@@ -154,6 +154,13 @@ fn retired(session: &Path) -> Result<bool> {
                 let marker: serde_json::Value =
                     serde_json::from_slice(&super::private(&session.join(name))?)?;
                 ensure!(marker["version"] == 1, R::MetadataInvalid);
+                if name=="retired-owner.json" {
+                    ensure!(marker.as_object().is_some_and(|m|m.len()==4)
+                        && marker["reason"]=="fenced_workflow_owner_reconciled",R::MetadataInvalid);
+                    let declared:Authority=serde_json::from_value(serde_json::json!({"owner":marker["owner"],"audit_path":marker["audit_path"]}))?;
+                    let actual=super::runtime_authority(root,ledger,session)?;
+                    ensure!(declared==actual && ledger.retired_authority(&actual)?,R::MetadataInvalid);
+                }
                 retired = true;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -197,7 +204,7 @@ fn inventory_paths(
             if creation.workflow_id != request.workflow_id {
                 continue;
             }
-            if retired(&path)? {
+            if retired(root, ledger, &path)? {
                 continue;
             }
             ensure!(
@@ -248,7 +255,7 @@ pub(super) fn completed_inventory_row(
     private_directory(&root.join(provider))?;
     let session = root.join(runtime_relative_path);
     private_directory(&session)?;
-    ensure!(!retired(&session)?, R::AuthorityConflict);
+    ensure!(!retired(root, ledger, &session)?, R::AuthorityConflict);
     let owned = super::private(&session.join("owned.json"))?;
     let creation: serde_json::Value = serde_json::from_slice(&owned)?;
     ensure!(creation["version"] == 1, R::MetadataInvalid);
@@ -492,6 +499,40 @@ mod tests {
             &f.destination,
             current,
         )
+    }
+
+
+    #[test]
+    fn native_inventory_marker_owner_match_without_ledger_retirement_is_refused() {
+        let mut f=fixture(false);let row=f.request.inventory.remove(0);
+        super::super::write(&f.root.join(&row.runtime_relative_path).join("retired-owner.json"),
+            &serde_json::to_vec(&json!({"version":1,"reason":"fenced_workflow_owner_reconciled",
+                "owner":row.effective_owner,"audit_path":row.effective_audit_path})).unwrap()).unwrap();
+        assert!(handoff_at(&f.root,u64::MAX,&f.request,&f.sources,&f.destination,&||Ok(())).is_err());
+    }
+    #[test]
+    fn native_inventory_recognizes_exact_fenced_owner_retirement() {
+        let f=fixture(false);let row=&f.request.inventory[0];
+        let lock=super::super::StateLock::acquire(&f.root).unwrap();
+        let mut ledger=Ledger::open(&f.root,&lock).unwrap();
+        let authority=Authority {owner:row.effective_owner.clone(),audit_path:row.effective_audit_path.clone()};
+        ledger.abort_and_retire(&authority.audit_path,&authority.owner).unwrap();
+        let session=f.root.join(&row.runtime_relative_path);
+        super::super::write(&session.join("retired-owner.json"),&serde_json::to_vec(&json!({"version":1,"reason":"fenced_workflow_owner_reconciled",
+            "owner":authority.owner,"audit_path":authority.audit_path})).unwrap()).unwrap();
+        assert!(retired(&f.root,&ledger,&session).unwrap());
+    }
+    #[test]
+    fn native_inventory_rejects_unrelated_retirement_marker_before_source_seal() {
+        let mut f=fixture(false);
+        let row=f.request.inventory.remove(0);
+        super::super::write(&f.root.join(&row.runtime_relative_path).join("retired-owner.json"),
+            &serde_json::to_vec(&json!({"version":1,"reason":"fenced_workflow_owner_reconciled",
+                "owner":{"workflow_id":"different-workflow","lease_generation":999},"audit_path":"/different/audit"})).unwrap()).unwrap();
+        let source_before=std::fs::read(f.sources[0].path()).unwrap();
+        let result=handoff_at(&f.root,u64::MAX,&f.request,&f.sources,&f.destination,&||Ok(()));
+        assert!(result.is_err(),"a version-only retirement marker omitted a live runtime and allowed its source to close");
+        assert_eq!(std::fs::read(f.sources[0].path()).unwrap(),source_before);
     }
     #[test]
     fn native_handoff_outcome_public_entrypoint_uses_selected_policy_and_replays_private_receipt() {
