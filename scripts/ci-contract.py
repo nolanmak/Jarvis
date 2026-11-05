@@ -241,6 +241,13 @@ def main():
         target=(root/working).resolve()
         if not target.is_relative_to(root):raise ValueError('shared CI prerequisite unavailable: work directory outside checkout')
     else:target=root
+    if sys.platform=='linux':
+        # Ubuntu 26.04 mounts /tmp as a small tmpfs. Keep real snapshot and
+        # maintenance reserve checks on the runner's disk, and mirror that
+        # placement in the controller's already-private per-job runtime.
+        runtime=Path(environment.get('RUNNER_TEMP',''))
+        if not runtime.is_absolute() or not runtime.is_dir():raise ValueError('shared CI prerequisite unavailable: runner temporary directory')
+        environment['TMPDIR']=str(runtime)
     if args.input_base:environment['CI_CONTRACT_BASE']=args.input_base
     if args.input_head:environment['CI_CONTRACT_HEAD']=args.input_head
     for key in ['CI_CONTRACT_BASE','CI_CONTRACT_HEAD']:
