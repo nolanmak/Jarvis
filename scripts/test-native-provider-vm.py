@@ -50,12 +50,19 @@ class NativeVmTests(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, 'handshake did not complete')
             time.sleep(0.01)
 
-    def launch(self, root):
+    def launch(self, root, segmented_ready=False, ready_value='ready\n'):
         worker = root / 'worker.py'
         worker.write_text('''import os,time
 from pathlib import Path
 ready=Path(os.environ['JARVIS_NATIVE_VM_READY'])
-ready.write_text('ready\\n')
+if os.environ.get('FIXTURE_SEGMENTED_READY') == '1':
+    ready.write_text('')
+    ready.with_name('empty-ready-published').touch()
+    while not ready.with_name('publish-prefix').exists(): time.sleep(.005)
+    ready.write_text('rea')
+    ready.with_name('prefix-ready-published').touch()
+    while not ready.with_name('publish-ready').exists(): time.sleep(.005)
+ready.write_text(os.environ['FIXTURE_READY_VALUE'])
 ready.chmod(0o600)
 proceed=Path(os.environ['JARVIS_NATIVE_VM_CONTINUE'])
 while not proceed.exists(): time.sleep(.005)
@@ -63,9 +70,68 @@ if proceed.read_text() != 'admitted\\n': raise SystemExit(126)
 ready.with_name('actual-model-dispatch').write_text('called')
 ''')
         env = {'PATH': os.defpath, 'JARVIS_SUPERVISOR_VM_PREFLIGHT': '1',
-               'JARVIS_SUPERVISOR_ADMISSION': '1'}
+               'JARVIS_SUPERVISOR_ADMISSION': '1', 'FIXTURE_READY_VALUE': ready_value}
+        if segmented_ready:
+            env['FIXTURE_SEGMENTED_READY'] = '1'
         return subprocess.Popen([sys.executable, '-I', str(HERE / 'provider-supervisor.py'),
                                  str(root / 'cleanup-complete'), sys.executable, str(worker)], env=env)
+
+    def test_preflight_waits_for_complete_readiness_publication(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            process = self.launch(root, segmented_ready=True)
+            try:
+                for published, advance in [('empty-ready-published', 'publish-prefix'),
+                                           ('prefix-ready-published', 'publish-ready')]:
+                    self.wait_file(root / published, process)
+                    # Keep the writer paused while the supervisor observes a
+                    # visible empty/prefix file; neither grants admission.
+                    time.sleep(.1)
+                    self.assertIsNone(process.poll(), 'partial readiness must wait for publication')
+                    self.assertFalse((root / 'launch-ready').exists())
+                    self.assertFalse((root / 'actual-model-dispatch').exists())
+                    (root / advance).touch()
+                self.wait_file(root / 'launch-ready', process)
+                self.assertFalse((root / 'actual-model-dispatch').exists())
+                vm.atomic(root / 'launch-continue', b'admitted\n')
+                self.assertEqual(process.wait(timeout=5), 0)
+                self.assertTrue((root / 'actual-model-dispatch').exists())
+                self.assertEqual((root / 'cleanup-complete').read_text(), 'all-descendants-reaped\n')
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+
+    def test_preflight_rejects_malformed_readiness_without_admission(self):
+        for value in ('ready\nextra', 'wrong\n'):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                process = self.launch(root, ready_value=value)
+                try:
+                    self.assertNotEqual(process.wait(timeout=5), 0)
+                    self.assertFalse((root / 'launch-ready').exists())
+                    self.assertFalse((root / 'actual-model-dispatch').exists())
+                    self.assertEqual((root / 'cleanup-complete').read_text(), 'all-descendants-reaped\n')
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+                        process.wait(timeout=5)
+
+    def test_cancel_partial_readiness_reaps_worker_without_admission(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            process = self.launch(root, segmented_ready=True)
+            try:
+                self.wait_file(root / 'empty-ready-published', process)
+                process.terminate()
+                self.assertNotEqual(process.wait(timeout=5), 0)
+                self.assertFalse((root / 'launch-ready').exists())
+                self.assertFalse((root / 'actual-model-dispatch').exists())
+                self.assertEqual((root / 'cleanup-complete').read_text(), 'all-descendants-reaped\n')
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
 
     def test_long_state_root_uses_private_short_socket_without_moving_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
