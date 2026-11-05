@@ -147,20 +147,24 @@ fn session_lock(path: &Path) -> Result<SessionLock> {
     Ok(SessionLock(file))
 }
 pub(super) fn retired(root:&Path,ledger:&Ledger<'_>,session: &Path) -> Result<bool> {
+    retired_with_reader(root,ledger,session,&mut super::private)
+}
+fn retired_with_reader(root:&Path,ledger:&Ledger<'_>,session:&Path,read:&mut dyn FnMut(&Path)->Result<Vec<u8>>)->Result<bool> {
     let mut retired = false;
     for name in ["retired.json", "retired-owner.json"] {
         match session.join(name).symlink_metadata() {
             Ok(_) => {
-                let marker: serde_json::Value =
-                    serde_json::from_slice(&super::private(&session.join(name))?)?;
+                let bytes=read(&session.join(name))?;
+                let owned=read(&session.join("owned.json"))?;
                 if name=="retired.json" {
-                    super::validate_scope_marker(root,ledger,session,&super::private(&session.join(name))?)?;
+                    super::validate_scope_marker(root,ledger,session,&bytes,&owned)?;
                 } else {
+                    let marker:serde_json::Value=serde_json::from_slice(&bytes)?;
                     ensure!(marker["version"] == 1, R::MetadataInvalid);
                     ensure!(marker.as_object().is_some_and(|m|m.len()==4)
                         && marker["reason"]=="fenced_workflow_owner_reconciled",R::MetadataInvalid);
                     let declared:Authority=serde_json::from_value(serde_json::json!({"owner":marker["owner"],"audit_path":marker["audit_path"]}))?;
-                    let actual=super::runtime_authority(root,ledger,session)?;
+                    let actual=super::runtime_authority_from(root,ledger,session,&owned)?;
                     ensure!(declared==actual && ledger.retired_authority(&actual)?,R::MetadataInvalid);
                 }
                 retired = true;
@@ -171,6 +175,95 @@ pub(super) fn retired(root:&Path,ledger:&Ledger<'_>,session: &Path) -> Result<bo
     }
     Ok(retired)
 }
+// Latest metadata per physical runtime, already authenticated by the workflow
+// projection. None is retained uncertainty, never an older successful outcome.
+#[derive(Clone)]
+struct PhysicalObservation {
+    runtime_relative_path:String,
+    creation_receipt_sha256:String,
+    authority:Authority,
+    launch_sha256:String,
+    inventory:Option<RuntimeInventoryRow>,
+}
+struct PhysicalInventory {
+    inventory:Vec<RuntimeInventoryRow>,
+    retired:Vec<String>,
+    _sessions:Vec<SessionLock>,
+}
+fn scan_inventory(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Authority],observations:&[PhysicalObservation])->Result<PhysicalInventory> {
+    scan_inventory_bounded(root,ledger,workflow,sources,observations,4096,64*1024*1024)
+}
+fn scan_inventory_bounded(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Authority],observations:&[PhysicalObservation],max_entries:usize,max_metadata:u64)->Result<PhysicalInventory> {
+    ensure!(!workflow.is_empty() && !sources.is_empty() && sources.len()<=64 && observations.len()<=4096,R::StateCapacity);
+    let store=ledger.store_identity()?;
+    super::owner_store::validate_bound_metadata(root,&store)?;
+    private_directory(root)?;
+    let mut declared=BTreeMap::new();
+    for source in sources {
+        ensure!(source.owner.workflow_id==workflow && source.owner.lease_generation>0 && Path::new(&source.audit_path).is_absolute(),R::InvalidRequest);
+    }
+    ensure!(sources.windows(2).all(|pair|(pair[0].owner.lease_generation,pair[0].audit_path.as_bytes())<(pair[1].owner.lease_generation,pair[1].audit_path.as_bytes())),R::InvalidRequest);
+    for observed in observations {
+        let path=Path::new(&observed.runtime_relative_path);
+        let parts=path.components().collect::<Vec<_>>();
+        ensure!(parts.len()==2 && parts.iter().all(|part|matches!(part,std::path::Component::Normal(_)))
+            && matches!(parts[0].as_os_str().to_str(),Some("codex"|"claude"|"qwen"|"glm"))
+            && parts[1].as_os_str().to_str().is_some_and(|s|s.starts_with("session-"))
+            && observed.authority.owner.workflow_id==workflow,R::MetadataInvalid);
+        ensure!(declared.insert(observed.runtime_relative_path.clone(),observed).is_none(),R::MetadataInvalid);
+    }
+    let mut entries=0usize;
+    let mut charge_entry=||->Result<()> {entries=entries.checked_add(1).context(R::StateCapacity)?;ensure!(entries<=max_entries,R::StateCapacity);Ok(())};
+    for entry in std::fs::read_dir(root)? {let _=entry?;charge_entry()?;}
+    let mut remaining=max_metadata;
+    let mut read=|path:&Path|->Result<Vec<u8>> {
+        let length=path.symlink_metadata()?.len();
+        ensure!(length<=remaining,R::StateCapacity);
+        let bytes=super::private_with_limit(path,remaining)?;
+        remaining=remaining.checked_sub(bytes.len() as u64).context(R::StateCapacity)?;
+        Ok(bytes)
+    };
+    let mut result=PhysicalInventory {inventory:Vec::new(),retired:Vec::new(),_sessions:Vec::new()};
+    for provider in ["codex","claude","qwen","glm"] {
+        let directory=root.join(provider);
+        match directory.symlink_metadata() {
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>continue,
+            Err(error)=>return Err(error.into()),Ok(_)=>private_directory(&directory)?,
+        }
+        for entry in std::fs::read_dir(&directory)? {
+            let path=entry?.path();charge_entry()?;
+            if !path.file_name().is_some_and(|name|name.to_string_lossy().starts_with("session-")){continue;}
+            private_directory(&path)?;
+            let owned=read(&path.join("owned.json"))?;
+            let authority=super::runtime_authority_from(root,ledger,&path,&owned)?;
+            if authority.owner.workflow_id!=workflow {continue;}
+            result._sessions.push(session_lock(&path)?);
+            let relative=super::relative_runtime(root,&path)?;
+            let observed=declared.remove(relative);
+            if let Some(observed)=observed {
+                ensure!(observed.creation_receipt_sha256==sha(&owned) && observed.authority==authority,R::MetadataInvalid);
+            }
+            if retired_with_reader(root,ledger,&path,&mut read)? {
+                result.retired.push(relative.into());continue;
+            }
+            ensure!(matches!(provider,"codex"|"claude"),R::RuntimeUnavailable);
+            ensure!(sources.contains(&authority) && !ledger.is_closed(&authority.owner)? && !ledger.held_by_abort(&authority.owner)?,R::AuthorityConflict);
+            let observed=observed.context(R::InventoryMissing)?;
+            let row=observed.inventory.as_ref().context(R::ConversationUncertain)?;
+            ensure!(row.runtime_relative_path==relative && row.provider.as_str()==provider,R::MetadataInvalid);
+            let (actual,launch)=completed_inventory_row_with_reader(root,ledger,provider,relative,&row.native_session_id,&mut read)?;
+            ensure!(actual==*row && launch==observed.launch_sha256,R::MetadataInvalid);
+            result.inventory.push(actual);
+            ensure!(result.inventory.len()<=64,R::StateCapacity);
+        }
+    }
+    ensure!(declared.is_empty(),R::InventoryMissing);
+    result.inventory.sort_by(|a,b|(a.provider,a.runtime_relative_path.as_bytes()).cmp(&(b.provider,b.runtime_relative_path.as_bytes())));
+    result.retired.sort();
+    super::owner_store::validate_bound_metadata(root,&store)?;
+    Ok(result)
+}
+
 fn inventory_paths(
     root: &Path,
     ledger: &Ledger<'_>,
@@ -254,11 +347,14 @@ pub(super) fn completed_inventory_row(
     runtime_relative_path: &str,
     native_session_id: &str,
 ) -> Result<(RuntimeInventoryRow, String)> {
+    completed_inventory_row_with_reader(root,ledger,provider,runtime_relative_path,native_session_id,&mut super::private)
+}
+fn completed_inventory_row_with_reader(root:&Path,ledger:&Ledger<'_>,provider:&str,runtime_relative_path:&str,native_session_id:&str,read:&mut dyn FnMut(&Path)->Result<Vec<u8>>)->Result<(RuntimeInventoryRow,String)> {
     private_directory(&root.join(provider))?;
     let session = root.join(runtime_relative_path);
     private_directory(&session)?;
-    ensure!(!retired(root, ledger, &session)?, R::AuthorityConflict);
-    let owned = super::private(&session.join("owned.json"))?;
+    ensure!(!retired_with_reader(root, ledger, &session,read)?, R::AuthorityConflict);
+    let owned = read(&session.join("owned.json"))?;
     let creation: serde_json::Value = serde_json::from_slice(&owned)?;
     ensure!(creation["version"] == 1, R::MetadataInvalid);
     let creation_owner: super::RuntimeOwner = serde_json::from_value(creation["owner"].clone())?;
@@ -274,7 +370,7 @@ pub(super) fn completed_inventory_row(
         },
         &sha(&owned),
     )?;
-    let complete = super::private(&session.join("complete.json")).context(R::RuntimeUnavailable)?;
+    let complete = read(&session.join("complete.json")).context(R::RuntimeUnavailable)?;
     let completion: serde_json::Value = serde_json::from_slice(&complete)?;
     ensure!(
         completion["version"] == 1
@@ -311,7 +407,7 @@ pub(super) fn completed_inventory_row(
     );
     let aliases = root.join(provider).join("aliases");
     private_directory(&aliases)?;
-    let alias = super::private(&aliases.join(sha(native_session_id.as_bytes())))?;
+    let alias = read(&aliases.join(sha(native_session_id.as_bytes())))?;
     let target: String = serde_json::from_slice(&alias)?;
     ensure!(
         target.starts_with("session-")
@@ -504,6 +600,108 @@ mod tests {
     }
 
 
+    fn physical_observations(f:&Fixture)->Vec<PhysicalObservation> {
+        f.request.inventory.iter().map(|row|PhysicalObservation {
+            runtime_relative_path:row.runtime_relative_path.clone(),creation_receipt_sha256:row.creation_receipt_sha256.clone(),
+            authority:Authority {owner:row.effective_owner.clone(),audit_path:row.effective_audit_path.clone()},
+            launch_sha256:"f".repeat(64),inventory:Some(row.clone()),
+        }).collect()
+    }
+    #[test]
+    fn native_physical_scan_filters_retired_uncertain_metadata_without_rewriting_it() {
+        let f=fixture(false);let mut observations=physical_observations(&f);
+        let path=f.root.join(&observations[0].runtime_relative_path);
+        super::super::retire(&super::super::test_retirement(path.clone(),observations[0].authority.clone()));
+        observations[0].inventory=None;
+        let lock=super::super::StateLock::acquire(&f.root).unwrap();let ledger=Ledger::open(&f.root,&lock).unwrap();
+        let scan=scan_inventory(&f.root,&ledger,"workflow",&f.request.source_owners,&observations).unwrap();
+        assert_eq!(scan.inventory,vec![f.request.inventory[1].clone()]);
+        assert_eq!(scan.retired,vec![observations[0].runtime_relative_path.clone()]);
+        assert!(observations[0].inventory.is_none() && path.join("owned.json").exists());
+    }
+    #[test]
+    fn native_physical_scan_keeps_session_locks_until_result_is_dropped() {
+        let f=fixture(false);let observations=physical_observations(&f);
+        let lock=super::super::StateLock::acquire(&f.root).unwrap();let ledger=Ledger::open(&f.root,&lock).unwrap();
+        let scan=scan_inventory(&f.root,&ledger,"workflow",&f.request.source_owners,&observations).unwrap();
+        assert_eq!(scan.inventory,f.request.inventory);
+        let path=f.root.join(&observations[0].runtime_relative_path);
+        assert!(session_lock(&path).is_err());drop(scan);assert!(session_lock(&path).is_ok());
+    }
+    #[test]
+    fn native_physical_scan_retired_namespace_can_have_zero_retained_sessions() {
+        let f=fixture(false);let observations=physical_observations(&f);
+        for observed in &observations {super::super::retire(&super::super::test_retirement(f.root.join(&observed.runtime_relative_path),observed.authority.clone()));}
+        let lock=super::super::StateLock::acquire(&f.root).unwrap();let ledger=Ledger::open(&f.root,&lock).unwrap();
+        let scan=scan_inventory(&f.root,&ledger,"workflow",&f.request.source_owners,&observations).unwrap();
+        assert!(scan.inventory.is_empty());assert_eq!(scan.retired.len(),2);
+        assert!(!ledger.is_closed(&f.request.source_owners[0].owner).unwrap(),"scan manufactured source closure");
+    }
+    #[test]
+    fn native_physical_scan_holds_unknown_missing_changed_and_busy_runtime() {
+        for fault in ["unknown","missing","uncertain","creation","authority","launch","alias","busy","legacy-marker","sources"] {
+            let f=fixture(false);let mut observations=physical_observations(&f);let path=f.root.join(&observations[0].runtime_relative_path);
+            let mut held=None;let mut sources=f.request.source_owners.clone();
+            match fault {
+                "unknown"=>{observations.remove(0);},
+                "missing"=>{std::fs::remove_dir_all(&path).unwrap();},
+                "uncertain"=>observations[0].inventory=None,
+                "creation"=>observations[0].creation_receipt_sha256="a".repeat(64),
+                "authority"=>observations[0].authority.owner.lease_generation=99,
+                "launch"=>observations[0].launch_sha256="a".repeat(64),
+                "alias"=>{let alias=f.root.join(observations[0].inventory.as_ref().unwrap().provider.as_str()).join("aliases").join(sha(observations[0].inventory.as_ref().unwrap().native_session_id.as_bytes()));std::fs::remove_file(&alias).unwrap();super::super::write(&alias,b"\"session-other\"").unwrap();},
+                "busy"=>held=Some(session_lock(&path).unwrap()),
+                "legacy-marker"=>super::super::write(&path.join("retired.json"),b"{\"version\":1}").unwrap(),
+                "sources"=>sources.clear(),_=>unreachable!(),
+            }
+            let before=std::fs::read(f.sources[0].path()).unwrap();
+            let lock=super::super::StateLock::acquire(&f.root).unwrap();let ledger=Ledger::open(&f.root,&lock).unwrap();
+            assert!(scan_inventory(&f.root,&ledger,"workflow",&sources,&observations).is_err(),"{fault}");
+            assert_eq!(std::fs::read(f.sources[0].path()).unwrap(),before,"{fault}");drop(held);
+        }
+    }
+    #[test]
+    fn native_physical_scan_bounds_entries_and_metadata_including_foreign_namespaces() {
+        let f=fixture(false);let observations=physical_observations(&f);
+        let lock=super::super::StateLock::acquire(&f.root).unwrap();let ledger=Ledger::open(&f.root,&lock).unwrap();
+        for (entries,metadata) in [(1,64*1024*1024),(4096,1)] {
+            let result=scan_inventory_bounded(&f.root,&ledger,"workflow",&f.request.source_owners,&observations,entries,metadata);
+            assert_eq!(result.err().unwrap().downcast_ref::<R>(),Some(&R::StateCapacity));
+        }
+        let mut foreign=f.request.source_owners.clone();foreign[0].owner.workflow_id="foreign".into();
+        let result=scan_inventory_bounded(&f.root,&ledger,"foreign",&foreign,&[],4096,1);
+        assert_eq!(result.err().unwrap().downcast_ref::<R>(),Some(&R::StateCapacity),"foreign metadata escaped read budget");
+        // Even unrelated provider entries count: a full bounded scan cannot
+        // silently stop before a live runtime at the end of enumeration.
+        for index in 0..4097 {super::super::write(&f.root.join("codex").join(format!("foreign-entry-{index}")),b"").unwrap();}
+        let result=scan_inventory(&f.root,&ledger,"workflow",&f.request.source_owners,&observations);
+        assert_eq!(result.err().unwrap().downcast_ref::<R>(),Some(&R::StateCapacity));
+        for row in &f.request.inventory {assert!(session_lock(&f.root.join(&row.runtime_relative_path)).is_ok(),"failed scan leaked a lock");}
+    }
+    #[test]
+    fn native_physical_scan_holds_changed_export_and_incomplete_completion() {
+        for fault in ["export","completion"] {
+            let f=fixture(false);let observations=physical_observations(&f);let session=f.root.join(&observations[0].runtime_relative_path);
+            let changed=if fault=="export" {session.join("generation-one/context")}else{session.join("complete.json")};
+            std::fs::remove_file(&changed).unwrap();super::super::write(&changed,if fault=="export" {b"changed export"}else{b"{}"}).unwrap();
+            let lock=super::super::StateLock::acquire(&f.root).unwrap();let ledger=Ledger::open(&f.root,&lock).unwrap();
+            assert!(scan_inventory(&f.root,&ledger,"workflow",&f.request.source_owners,&observations).is_err(),"{fault}");
+            for row in &f.request.inventory {assert!(session_lock(&f.root.join(&row.runtime_relative_path)).is_ok(),"{fault} leaked lock");}
+        }
+    }
+    #[test]
+    fn native_physical_scan_cannot_ignore_malformed_foreign_creation_authority() {
+        for invalid in ["workflow","generation"] {
+            let f=fixture(false);let mut observations=physical_observations(&f);
+            let observed=observations.remove(0);let path=f.root.join(&observed.runtime_relative_path).join("owned.json");
+            let mut owned:serde_json::Value=serde_json::from_slice(&super::super::private(&path).unwrap()).unwrap();
+            owned["owner"]["workflow_id"]=json!(if invalid=="workflow" {""}else{"foreign"});
+            if invalid=="generation" {owned["owner"]["lease_generation"]=json!(0);}
+            std::fs::remove_file(&path).unwrap();super::super::write(&path,&serde_json::to_vec(&owned).unwrap()).unwrap();
+            let lock=super::super::StateLock::acquire(&f.root).unwrap();let ledger=Ledger::open(&f.root,&lock).unwrap();
+            assert!(scan_inventory(&f.root,&ledger,"workflow",&f.request.source_owners,&observations).is_err(),"{invalid} silently classified as a foreign namespace");
+        }
+    }
     #[test]
     fn native_inventory_marker_owner_match_without_ledger_retirement_is_refused() {
         let mut f=fixture(false);let row=f.request.inventory.remove(0);

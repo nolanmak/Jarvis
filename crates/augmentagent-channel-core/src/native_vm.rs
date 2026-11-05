@@ -125,14 +125,19 @@ pub(crate) fn required(logger: Option<&std::sync::Arc<crate::tool_audit::AuditLo
     logger.is_some_and(|logger| logger.run_resources_required())
 }
 fn private(path: &Path) -> Result<Vec<u8>> {
+    private_with_limit(path,2*1024*1024)
+}
+fn private_with_limit(path:&Path,limit:u64)->Result<Vec<u8>> {
+    let limit=limit.min(2*1024*1024);
     let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(path)?;
     let metadata = file.metadata()?;
     ensure!(metadata.is_file() && metadata.uid() == unsafe { libc::geteuid() }
-        && metadata.mode() & 0o077 == 0 && metadata.nlink() == 1 && metadata.len() <= 2*1024*1024,
+        && metadata.mode() & 0o077 == 0 && metadata.nlink() == 1 && metadata.len() <= limit,
         "native VM policy is not an owner-private regular file");
     use std::io::Read;
     let mut bytes = Vec::new();
-    file.take(2*1024*1024+1).read_to_end(&mut bytes)?;
+    file.take(limit+1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64<=limit,"native private metadata grew past read limit");
     Ok(bytes)
 }
 fn write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -221,13 +226,13 @@ struct ScopeRetirementMarker {
 fn store_digest(store:&owner_store::StoreIdentity)->Result<String> {
     Ok(digest(ownership::canonical_bytes(&serde_json::to_value(store)?)?))
 }
-fn validate_scope_marker(root:&Path,ledger:&owner_ledger::Ledger<'_>,session:&Path,bytes:&[u8])->Result<()> {
+fn validate_scope_marker(root:&Path,ledger:&owner_ledger::Ledger<'_>,session:&Path,bytes:&[u8],owned:&[u8])->Result<()> {
     let marker:ScopeRetirementMarker=serde_json::from_slice(bytes)?;
     ensure!(marker.version==2 && marker.reason=="native_scope_retired"
         && marker.runtime_relative_path==relative_runtime(root,session)?
-        && marker.creation_receipt_sha256==digest(private(&session.join("owned.json"))?)
+        && marker.creation_receipt_sha256==digest(owned)
         && marker.store_identity_sha256==store_digest(&ledger.store_identity()?)?
-        && marker.authority==runtime_authority(root,ledger,session)?,"native scope retirement provenance invalid");
+        && marker.authority==runtime_authority_from(root,ledger,session,owned)?,"native scope retirement provenance invalid");
     Ok(())
 }
 pub(crate) fn retire(retirement:&Retirement) {
@@ -265,9 +270,13 @@ fn relative_runtime<'a>(root:&Path,session:&'a Path)->Result<&'a str> {
 fn runtime_authority(root:&Path,ledger:&owner_ledger::Ledger<'_>,session:&Path)->Result<ownership::Authority> {
     ensure!(session.is_dir() && !session.is_symlink(),"native runtime directory unavailable");
     let bytes=private(&session.join("owned.json"))?;
-    let receipt:serde_json::Value=serde_json::from_slice(&bytes)?;
+    runtime_authority_from(root,ledger,session,&bytes)
+}
+fn runtime_authority_from(root:&Path,ledger:&owner_ledger::Ledger<'_>,session:&Path,bytes:&[u8])->Result<ownership::Authority> {
+    let receipt:serde_json::Value=serde_json::from_slice(bytes)?;
     ensure!(receipt["version"]==1,"invalid native creation receipt version");
     let owner:RuntimeOwner=serde_json::from_value(receipt.get("owner").context("native runtime owner missing")?.clone())?;
+    ensure!(!owner.workflow_id.trim().is_empty() && owner.lease_generation>0,ownership::TransferReason::MetadataInvalid);
     let audit_path=receipt["audit_path"].as_str().context("native runtime audit missing")?.to_string();
     use sha2::{Digest,Sha256};
     ledger.resolve(relative_runtime(root,session)?,&ownership::Authority{owner,audit_path},&format!("{:x}",Sha256::digest(bytes)))

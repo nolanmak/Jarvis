@@ -1,16 +1,16 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "469d18d73d5af7243c08cb64ead1931bc9ce2a39",
+  "source_parent_commit": "dd1cfa806a302fd029e4beb0ce6262f9f9ce1cf5",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
     {
       "path": "crates/augmentagent-channel-core/src/native_vm.rs",
-      "sha256": "70f89083cef7f9ad4a5bd3eec414f62be8837c3e5f4887d8c0b089eaaa56ccf0"
+      "sha256": "3c3d41e9253600be0bcae6ae65308db4891b034fa89a257077fc1acf6d900e40"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_handoff.rs",
-      "sha256": "3d351b55d04602d96fee8d3cc4f42f48b2c71e1d37faf998ebcf173ccdd22620"
+      "sha256": "51f98b0dc1ca12ce27a20ecd7b523c6e06834f55db17443953afddd071850cb2"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
@@ -61,20 +61,23 @@
     "handoff_snapshot_cases": 10,
     "pending_handoff_cases": 8,
     "retained_logs": [
-      "autoship-native-scope-marker-red.log",
-      "autoship-native-scope-marker-green.log",
-      "autoship-native-scope-marker-full-core.log",
-      "autoship-native-scope-marker-full-cli.log"
+      "autoship-native-physical-scan-red.log",
+      "autoship-native-physical-scan-red-corrected.log",
+      "autoship-native-physical-scan-green.log",
+      "autoship-native-physical-scan-foreign-red.log",
+      "autoship-native-physical-scan-full-core.log",
+      "autoship-native-physical-scan-full-cli.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
     "owner_eligibility_cases": 6,
     "focused_native_observation_cases": 33,
-    "core_passed": 863,
+    "core_passed": 870,
     "core_failed": 0,
     "core_ignored": 15,
     "owner_retirement_marker_cases": 3,
-    "scope_retirement_marker_cases": 6
+    "scope_retirement_marker_cases": 6,
+    "physical_inventory_scan_cases": 7
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -98,7 +101,11 @@
     "a matching owner marker also requires an exact retired_owner entry; transfer closure is insufficient",
     "strict scope-retirement v2 binds captured authority, runtime path, creation bytes and original store epoch",
     "classification and root-wide pruning share marker provenance validation; malformed and legacy markers retain runtimes and aliases while valid peers advance",
-    "scope completion does not override an active session lock; delayed retirement refuses changed creation bytes"
+    "scope completion does not override an active session lock; delayed retirement refuses changed creation bytes",
+    "bounded physical namespace scan filters authenticated retirement from latest metadata without rewriting uncertain observations",
+    "retained missing/unknown-ID/uncertain, creation/authority/launch/alias/export substitutions, busy locks and malformed foreign authorities hold the scan",
+    "session locks remain held in the scan result and are released on partial failure; zero retained sessions never creates source closure",
+    "4096-entry enumeration and 64-MiB metadata read budget include unrelated provider entries and foreign creation receipts"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -110,7 +117,7 @@
   "hosted_ci": "pending current published head",
   "remaining": [
     "production preparation/promotion caller integration across all acquisition, owner-turn, recovery and merge-sweep leases",
-    "actual retained/retired-runtime inventory scan join before productive handoff preparation",
+    "connect physical retained/retired inventory scan to workflow persistence and core prepare under the same original locks",
     "terminal and namespace cleanup-only settlement and authenticated legacy/uncertainty/corrupt-state recovery",
     "normal protected rollout and actual Codex/Claude Discord continuation acceptance",
     "C actual-backend freshness/storage/quiescence cutover, private verifier recovery/application and full epic soak",
@@ -134,5 +141,8 @@
     "implementation_complete": false,
     "production_ready": false
   },
-  "scope_marker_red_evidence": "Initial red run: two behavioral failures; third foreign-workflow fixture failed create_new before assertion. Fixture corrected; all six cases pass in full core suite."
+  "scope_marker_red_evidence": "Initial red run: two behavioral failures; third foreign-workflow fixture failed create_new before assertion. Fixture corrected; all six cases pass in full core suite.",
+  "physical_scan_component_executed": true,
+  "physical_scan_scope": "internal component under an existing ledger/state lock; synthetic native filesystem fixtures only; no workflow callback or productive consumer enabled",
+  "physical_scan_red_evidence": "Corrected initial scan red: three behavioral failures and one hold test passed. Initial hold fixture used the wrong provider alias directory; retained initial log. Separate malformed-foreign-authority test failed behaviorally before the validation fix."
 }
