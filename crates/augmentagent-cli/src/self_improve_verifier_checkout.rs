@@ -1,5 +1,5 @@
-//! Verifiers consume committed Git blobs, never the worker's ignored files,
-//! staged substitutions, symlinks, bytecode or dependency search directories.
+//! Export literal product Git blobs and independently registered adapter bytes.
+//! Worker ignored files, staged substitutions and symlinks supply no product source.
 use super::*;
 pub(in crate::self_improve) const EXPORTER: &str = include_str!("../../../scripts/autoship-verifier-checkout.py");
 /// Stable source pathname preserves Cargo dependency fingerprints. Contents are
@@ -114,13 +114,42 @@ pub(in crate::self_improve) fn allocate(parent: &Path, head: &str, contract: &st
         _lock: lock,
     })
 }
+pub(super) async fn materialize_from_files(
+    root: &Path,
+    head: &str,
+    registration: &RegisteredContract,
+    files: &std::collections::BTreeMap<String, String>,
+    target: &Path,
+) -> Result<OwnedCheckout> {
+    materialize_registered(root, head, registration, files, target, false).await
+}
+
 pub(super) async fn materialize(
     root: &Path,
     head: &str,
     registration: &RegisteredContract,
     target: &Path,
 ) -> Result<OwnedCheckout> {
+    // Transitional adapter for existing callers. New private-source callers
+    // supply protected proposal bytes through materialize_from_files instead.
     registration.verify_integrity(root)?;
+    let files = registration.contract().verifiers.iter()
+        .flat_map(|verifier| &verifier.pinned_files)
+        .map(|path| Ok((path.clone(), std::fs::read_to_string(root.join(path))?)))
+        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+    materialize_registered(root, head, registration, &files, target, true).await
+}
+
+async fn materialize_registered(
+    root: &Path,
+    head: &str,
+    registration: &RegisteredContract,
+    files: &std::collections::BTreeMap<String, String>,
+    target: &Path,
+    legacy_committed_harness: bool,
+) -> Result<OwnedCheckout> {
+    use std::io::Write;
+    registration.verify_files(files)?;
     let source = allocate(
         target.parent().context("verifier target parent missing")?,
         head,
@@ -167,31 +196,27 @@ pub(super) async fn materialize(
     let modified = std::time::UNIX_EPOCH
         .checked_add(std::time::Duration::from_secs(source_mtime))
         .context("invalid committed timestamp")?;
-    // Baseline harnesses intentionally do not belong to the original commit.
-    // Overlay only independently pinned bytes, never a worker directory walk.
-    for path in registration
-        .contract()
-        .verifiers
-        .iter()
-        .flat_map(|verifier| &verifier.pinned_files)
-    {
-        let expected = std::fs::read(root.join(path))?;
+    // Product bytes come only from the literal Git export; adapter bytes come
+    // only from the independently registered map. Neither ignored files nor
+    // mutable worker source can supply this overlay.
+    for (path, expected) in files {
         let target = source.path().join(path);
         if target.exists() {
-            ensure!(
-                std::fs::read(&target)? == expected,
-                "committed harness differs from registered independent harness"
-            );
+            ensure!(legacy_committed_harness,
+                "private verifier path collides with committed product source: {path}");
+            ensure!(std::fs::read(&target)? == expected.as_bytes(),
+                "committed harness differs from registered independent harness");
         } else {
             std::fs::create_dir_all(target.parent().context("verifier file lacks parent")?)?;
-            std::fs::write(&target, &expected)?;
+            let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(&target)?;
+            output.write_all(expected.as_bytes())?;
         }
-        // Identical immutable inputs retain identical mtimes and pathnames,
-        // so a fresh clean export does not invalidate Cargo's warm cache.
+        // Preserve the current export convention. Timestamps do not establish
+        // compiled-input freshness; that remains the single C proof contract.
         std::fs::File::open(&target)?
             .set_times(std::fs::FileTimes::new().set_modified(modified))?;
     }
-    registration.verify_integrity(root)?;
+    registration.verify_files(files)?;
     registration.verify_integrity(source.path())?;
     ensure!(
         actual_head(root).await? == head,
@@ -272,4 +297,58 @@ mod tests {
         assert!(allocate(parent.path(), "head", "contract").is_err());
         assert_eq!(std::fs::read(path.join("foreign")).unwrap(), b"keep");
     }
+    #[tokio::test]
+    async fn private_adapter_export_uses_protected_bytes_without_publishing_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("product");
+        let target = directory.path().join("cache");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        trusted_git(&root, &["init", "--initial-branch=main"]).await.unwrap();
+        std::fs::write(root.join("arithmetic.py"), "def add(a, b): return a + b\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "autoship_verifiers/\n").unwrap();
+        trusted_git(&root, &["add", "arithmetic.py", ".gitignore"]).await.unwrap();
+        trusted_git(&root, &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "-m", "synthetic product"]).await.unwrap();
+        let head = actual_head(&root).await.unwrap();
+        let example = CONTRACT_PROMPT.split_once("Complete schema example:\n").unwrap().1
+            .split_once("\nEnd schema example.").unwrap().0;
+        let proposal = parse_proposal_for(&format!("```autoship-contract\n{example}\n```"),
+            AcceptanceSource::PullRequest(841)).unwrap();
+        let registration = RegisteredContract::register_from_files(proposal.contract.clone(),
+            head.clone(), "synthetic-environment".into(), &proposal.files).unwrap();
+        let adapter = "autoship_verifiers/observe.py";
+        std::fs::create_dir(root.join("autoship_verifiers")).unwrap();
+        std::fs::write(root.join(adapter), "IGNORED_WORKER_POISON").unwrap();
+        let before = trusted_git(&root, &["status", "--porcelain", "--untracked-files=all"]).await.unwrap();
+        assert!(before.is_empty());
+        let source = materialize_from_files(&root, &head, &registration, &proposal.files, &target)
+            .await.expect("private source must not require registered adapters in product checkout");
+        assert_eq!(std::fs::read_to_string(source.path().join(adapter)).unwrap(), proposal.files[adapter]);
+        assert_eq!(std::fs::read_to_string(root.join(adapter)).unwrap(), "IGNORED_WORKER_POISON");
+        assert_eq!(std::fs::read(source.path().join("arithmetic.py")).unwrap(),
+            std::fs::read(root.join("arithmetic.py")).unwrap());
+        registration.verify_integrity(source.path()).unwrap();
+        assert_eq!(actual_head(&root).await.unwrap(), head);
+        assert_eq!(trusted_git(&root, &["status", "--porcelain", "--untracked-files=all"]).await.unwrap(), before);
+        let exported = source.path().to_owned();
+        drop(source);
+        assert!(!exported.exists());
+        assert!(root.join(adapter).exists());
+        let mut substituted = proposal.files.clone();
+        substituted.insert(adapter.into(), "print('forged green')".into());
+        assert!(materialize_from_files(&root, &head, &registration, &substituted, &target).await.is_err());
+        // Even byte-identical registered adapters may not be published in the
+        // product tree through the new API.
+        std::fs::write(root.join(adapter), &proposal.files[adapter]).unwrap();
+        trusted_git(&root, &["add", "-f", adapter]).await.unwrap();
+        trusted_git(&root, &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "-m", "synthetic adapter collision"]).await.unwrap();
+        let collision_head = actual_head(&root).await.unwrap();
+        let error = materialize_from_files(&root, &collision_head, &registration, &proposal.files, &target)
+            .await.err().expect("tracked adapter must be refused even with registered bytes");
+        assert!(error.to_string().contains("collides with committed product source"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(root.join(adapter)).unwrap(), proposal.files[adapter]);
+    }
+
 }
