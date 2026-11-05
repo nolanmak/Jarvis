@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "27a9d3209fd1bc8d633b771984456f5d720504e7",
+  "source_parent_commit": "7409527e1ab9d9d692d441e62e47f09e1eabcf57",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -26,7 +26,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
-      "sha256": "b2013dc874c29eb30194642682330d36d2f449a6e8c7c34f1b60ceb08f5a870d"
+      "sha256": "223c59a94748405facb73c7e21c01c5fd888def83f34a96d423d893446b94b9c"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
@@ -34,7 +34,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
-      "sha256": "220592c52f8cde6e9fe8914f0c9269e94ace501016b585218d8c81d64f07b1a8"
+      "sha256": "1c81d71e7e81c19ec8bc263e7bc88662cc5bd04f4e99f1adf9e8852effe59d9a"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_settlement.rs",
@@ -50,7 +50,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
-      "sha256": "6cd5f4db705818f86ff77181e1aa68f466ffdf5023624135c26b07b791d90ef2"
+      "sha256": "99730033255264f0c8bb039dde23c58d03394b3c765dd338dc58a227b346f512"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_preparation.rs",
@@ -82,7 +82,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_terminal.rs",
-      "sha256": "380efa595e08f8fbf70048fc03765984fc85a24b5324e724d090f3a872321cd9"
+      "sha256": "9484bcea9848b682ec29bda84c30cd68ea5c6fa9abfc3b3da893f802cd567d60"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_aborted.rs",
@@ -110,7 +110,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "3999baf359b15f4e04c23461a0fe796ecdc28d3f00a58c4823f81658f65f1fc3"
+      "sha256": "0cb16dc7435a7966ea4ec75ec2bc2e1d96f37fd037cf3880d932d1fc02d3de00"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_recovery.rs",
@@ -119,11 +119,19 @@
     {
       "path": "crates/augmentagent-cli/src/autoship_native_recovery.rs",
       "sha256": "f177ce47b4d0e783d5a01db74eb7b8568c3db92a482d99f32c1f00cfc5cc586d"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_terminal_cleanup.rs",
+      "sha256": "b62d1cfc40fd24ed17f8eab201ea90ddeb04ec200d192eb3070b0ae1404b541b"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/tests/phone_call_reliability.rs",
+      "sha256": "2843f25472d30fa28e1f5ef4899457c20de5816885b3fccdbd6f08de2456302a"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1841,
+    "passed": 1845,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
@@ -196,7 +204,19 @@
       "autoship-native-closed-workflow-publication-behavior-red.log",
       "autoship-native-closed-workflow-full-core.log",
       "autoship-native-closed-workflow-full-cli.log",
-      "autoship-native-closed-workflow-production-check.log"
+      "autoship-native-closed-workflow-production-check.log",
+      "autoship-native-terminal-cleanup-red.log",
+      "autoship-native-terminal-cleanup-red-retry.log",
+      "autoship-native-terminal-cleanup-behavior-red.log",
+      "autoship-native-terminal-cleanup-green.log",
+      "autoship-native-terminal-cleanup-worker-red.log",
+      "autoship-native-terminal-cleanup-worker-red-retry.log",
+      "autoship-native-terminal-cleanup-worker-green.log",
+      "autoship-native-terminal-cleanup-full-cli.log",
+      "autoship-native-terminal-cleanup-production-check.log",
+      "autoship-native-terminal-phone-clock-check.log",
+      "autoship-7409527e-hosted-targeted-failed.log",
+      "autoship-7409527e-hosted-phone-failed.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -224,21 +244,24 @@
     "core_validation_scope": "full managed core library suite; source inventory is post-run and grants no compiled-source freshness authority",
     "pending_reconciliation_cases": 9,
     "joined_reconciliation_adapter_cases": 1,
-    "core_validation_source_commit": "current working source before publication; full managed library suite rerun; source inventory grants no compiled-source freshness authority",
+    "core_validation_source_commit": "7409527e1ab9d9d692d441e62e47f09e1eabcf57 (895 passed, 15 ignored; core library unchanged for terminal CLI orchestration and phone fixture change)",
     "callback_journal_cases": 4,
     "production_configuration_check": {
       "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
       "passed": true,
-      "log": "autoship-native-closed-workflow-production-check.log"
+      "log": "autoship-native-terminal-cleanup-production-check.log"
     },
     "guard_promotion_cases": 3,
     "read_only_audit_probe_cases": 2,
-    "actual_guard_subprocess_modes": 18,
+    "actual_guard_subprocess_modes": 19,
     "sweep_related_cases": 20,
     "guard_abort_resolver_cases": 3,
     "closed_workflow_core_cases": 2,
     "closed_workflow_core_refusal_faults": 11,
-    "closed_workflow_guard_modes": 3
+    "closed_workflow_guard_modes": 3,
+    "terminal_namespace_cleanup_cases": 4,
+    "phone_reliability_passed": 6,
+    "phone_reliability_failed": 0
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -344,7 +367,12 @@
     "all-closed registration atomically rechecks complete latest protected runtime and source census, preserves original binding and history, records immutable recovery evidence and advances the audit pointer without resetting accounting, completing owner input or granting review/CI/merge authority",
     "actual guard recovery preserves original epoch, binding and model count; an injected recovery-record failure rolls back registration/promotion and a later lease retries safely",
     "recovery history survives database reopen; missing recovery projection blocks native dispatch, publication intent and guard side-effect admission even with a valid current lease",
-    "core refusals cover missing runtime/store epoch/audit lock, omitted or unretired namespace, substituted creation, busy runtime, invalid kernel identity, changed policy, stale fence and callback failure/replay"
+    "core refusals cover missing runtime/store epoch/audit lock, omitted or unretired namespace, substituted creation, busy runtime, invalid kernel identity, changed policy, stale fence and callback failure/replay",
+    "free worker reconciliation routes terminal pending requests through shared original-store reconciliation, then records exact terminal/request/namespace retirement authorization under actual Aborted inspection before native effects",
+    "unpromoted aborted destinations are retired under the original binding without registration, a productive lease, checkpoint/accounting changes or owner-input completion; barriers resolve only through fresh original-bound audit/kernel proofs",
+    "retirement intents replay idempotently after reopen; failed intent writes prevent effects; audit/projection failure retains affected barriers while verified peers advance; stale terminal/store authority refuses",
+    "bounded terminal namespace scheduling uses a durable logical ordinal that grants no authority; the real worker entry holds no workflow mutex across native inspection, retirement or audit/kernel IO",
+    "phone integration fixture observes actual fake-source sleep completion after virtual time advance and before real-clock resume, retaining the original three-second deadline assertions; all six integration cases pass locally"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -356,12 +384,13 @@
   "hosted_ci": "pending current published head",
   "remaining": [
     "production preparation/promotion caller integration across remaining owner-turn and recovery leases",
-    "remaining authenticated retirement intent routing and terminal resolution integration and interrupted namespace recovery and authenticated legacy/uncertainty/corrupt-state recovery",
+    "remaining nonterminal owner execution-retry/owner-turn retirement routing and interrupted namespace recovery and authenticated legacy/uncertainty/corrupt-state recovery",
     "normal protected rollout and actual Codex/Claude Discord continuation acceptance",
     "C actual-backend freshness/storage/quiescence cutover, private verifier recovery/application and full epic soak",
     "persist post-intent transient-I/O S backoff, actual input-change early wake before activation",
     "remaining authenticated retirement intent routing and interrupted/legacy/vanished namespace recovery; remaining owner-turn and recovery consumers; actual runtime/provider continuation acceptance",
-    "actual provider/VM continuation after closed-workflow recovery, authenticated retirement intent routing for unpromoted/terminal namespaces, and missing/legacy/vanished authority recovery remain unproven"
+    "actual provider/VM continuation after closed-workflow recovery, remaining nonterminal owner execution-retry/owner-turn retirement routing, and missing/legacy/vanished authority recovery remain unproven",
+    "hosted phone/aggregate checks for the newly published combined head; local phone clock fix passed six cases but hosted recovery is not yet proven"
   ],
   "native_transfer_scope": "isolated synthetic-controller/native-filesystem fixtures only; zero production transfers or provider/model dispatch",
   "opaque_receipt_producer": "actual original-bound ownership::transfer_receipt lookup or Completed NativeTransferInspection under the held original native lock; no wire/serialized-receipt constructor",
@@ -440,10 +469,12 @@
     "ordinary_and_observational_guard_acquisition": true,
     "merge_sweep": true,
     "runtime_deployed": false,
-    "guard_fixture_scope": "18 actual guard subprocess modes, including 3 closed-recovery modes; zero-runtime native guard sources and zero provider/model dispatch; actual core retirement fixtures include physical retained runtime files, synthetic controller/resources; not live continuation acceptance",
+    "guard_fixture_scope": "19 actual guard subprocess modes, including real free worker terminal cleanup entry; zero-runtime native guard fixtures; no provider/model dispatch or production acceptance",
     "pre_guard_retired_aborted_namespace_resolution": true,
     "all_closed_original_binding_recovery": true,
-    "all_closed_original_binding_recovery_scope": "complete intact original history, registered retired namespaces and resolved aborted destinations, original selected policy and existing audit authority; vanished/legacy/corrupt authority remains held"
+    "all_closed_original_binding_recovery_scope": "complete intact original history, registered retired namespaces and resolved aborted destinations, original selected policy and existing audit authority; vanished/legacy/corrupt authority remains held",
+    "terminal_worker_cleanup": true,
+    "terminal_worker_cleanup_scope": "exact terminal checkpoints and original Aborted namespace intents; shared Absent/Completed metadata reconciliation; Prepared remains pending until authorized retirement succeeds; no provider/model dispatch or production activation"
   },
   "productive_caller_enabled_scope": "deployment activation remains unproven; supported guard source paths are connected as described in source_caller_integration",
   "closed_workflow_recovery_limits": {

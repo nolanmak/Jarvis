@@ -27,7 +27,7 @@ pub(super) fn verify_history(conn:&Connection,terminal:&TerminalNativeCheckpoint
         && digest(&serde_json::to_value(&checkpoint)?)?==terminal.checkpoint_sha256,TransferReason::AuthorityConflict);
     Ok(())
 }
-pub(super) fn capture(conn:&Connection,workflow:&str)->Result<TerminalNativeCheckpoint> {
+pub(crate) fn capture(conn:&Connection,workflow:&str)->Result<TerminalNativeCheckpoint> {
     let (generation,raw):(i64,String)=conn.query_row("SELECT generation,checkpoint FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?)))?;
     let checkpoint=checked_checkpoint(&raw)?;
     let sequence:i64=conn.query_row("SELECT seq FROM workflow_event WHERE workflow=?1 AND kind='checkpoint' ORDER BY seq DESC LIMIT 1",[workflow],|r|r.get(0))?;

@@ -81,6 +81,9 @@ pub(super) mod aborted;
 pub(super) mod terminal;
 #[path = "autoship_native_unstarted.rs"]
 mod unstarted;
+pub(super) fn require_aborted_reference(conn:&Connection,pending:&PendingNativeHandoff)->Result<()> {
+    validate_dispositions(conn,&pending.request.workflow_id)?;ensure!(aborted::acknowledged(conn,pending)?,TransferReason::InventoryMissing);Ok(())
+}
 pub(super) fn closed_abort_namespaces(conn:&Connection,workflow:&str)->Result<Vec<(Authority,TransferBinding)>> {aborted::closed_namespaces(conn,workflow)}
 pub(super) fn validate_dispositions(conn:&Connection,workflow:&str)->Result<()> {
     unstarted::validate_history(conn,workflow)?;aborted::validate_history(conn,workflow)?;native_recovery::validate(conn,workflow)?;

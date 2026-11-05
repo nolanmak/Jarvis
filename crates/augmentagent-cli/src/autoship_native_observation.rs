@@ -1596,6 +1596,51 @@ mod tests {
             let barriers=store.lock().unwrap().unresolved_native_abort_namespaces(&lease.workflow).unwrap();assert_eq!(barriers.len(),if stale {2}else{1});assert!(store.lock().unwrap().native_owner_binding(&lease.workflow,lease.generation).unwrap().is_none());
         }
     }
+    fn terminal_cleanup_audit(f:&Fixture,pending:&PendingNativeHandoff,namespace:&ownership::Authority)->Result<std::sync::Arc<AuditLogger>> {
+        if pending.request.source_owners.contains(namespace) {return Ok(std::sync::Arc::new(f.audit.clone()));}
+        let audit=AuditLogger::protected(PathBuf::from(&namespace.audit_path),f._root.path().join("anchors/joined-destination.json"),&[])?;audit.set_native_runtime_owner(namespace.owner.clone())?;audit.set_native_store_binding(pending.original_binding.clone())?;Ok(std::sync::Arc::new(audit))
+    }
+    #[test]
+    fn terminal_namespace_cleanup_retires_unpromoted_destination_without_reopening_or_charging() {
+        if child("terminal_namespace_cleanup_retires_unpromoted_destination_without_reopening_or_charging") {return;}
+        for stage in [Stage::Merged,Stage::Retired] {
+            let mut f=Fixture::new();let (lease,pending,store)=prepared_abort_fixture(&mut f);let mut checkpoint=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=stage;store.lock().unwrap().checkpoint(&lease,&checkpoint,now()).unwrap();let terminal=store.lock().unwrap().terminal_native_checkpoint(&lease.workflow).unwrap();let before=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap();let allowance=store.lock().unwrap().merge_allowance(now(),5).unwrap();
+            let mut open=|pending:&PendingNativeHandoff,namespace:&ownership::Authority|terminal_cleanup_audit(&f,pending,namespace);
+            assert!(super::super::native_terminal_cleanup::run(&store,&terminal,&now,&mut open).unwrap()>0);let mut locked=store.lock().unwrap();assert!(locked.unresolved_native_abort_namespaces(&lease.workflow).unwrap().is_empty());assert_eq!(locked.native_aborted_handoff(&lease.workflow,&pending.request.transfer_id).unwrap(),Some(pending.clone()));assert_eq!(locked.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(locked.merge_allowance(now(),5).unwrap(),allowance);assert!(locked.native_owner_binding(&lease.workflow,pending.request.destination.owner.lease_generation).unwrap().is_none());let count:i64=locked.conn.query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).unwrap();assert_eq!(count,0);let events=locked.events(&lease.workflow).unwrap();drop(locked);
+            let destination=&pending.request.destination;let audit=open(&pending,destination).unwrap();ownership::with_retired_aborted_namespace(&pending.original_binding,&pending.request,&pending.observation(),destination,&audit,&||Ok(()),&mut |_|Ok(())).unwrap();assert_eq!(super::super::native_terminal_cleanup::run(&store,&terminal,&now,&mut open).unwrap(),0);assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);
+        }
+    }
+    #[test]
+    fn terminal_namespace_cleanup_keeps_failed_peer_and_retries_original_intent_after_reopen() {
+        if child("terminal_namespace_cleanup_keeps_failed_peer_and_retries_original_intent_after_reopen") {return;}
+        for fault in ["audit","projection"] {
+            let mut f=Fixture::new();let (lease,pending,store)=prepared_abort_fixture(&mut f);let mut checkpoint=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Retired;store.lock().unwrap().checkpoint(&lease,&checkpoint,now()).unwrap();let terminal=store.lock().unwrap().terminal_native_checkpoint(&lease.workflow).unwrap();
+            if fault=="projection" {store.lock().unwrap().conn.execute_batch("CREATE TRIGGER deny_terminal_destination_resolution BEFORE INSERT ON workflow_native_abort_resolution WHEN json_extract(NEW.record,'$.source_retired_at') IS NULL BEGIN SELECT RAISE(ABORT,'injected terminal resolution failure'); END;").unwrap();}
+            let unavailable=std::cell::Cell::new(fault=="audit");let mut open=|p:&PendingNativeHandoff,a:&ownership::Authority|->Result<std::sync::Arc<AuditLogger>> {if unavailable.get() && a==&pending.request.destination {anyhow::bail!("destination audit unavailable");}terminal_cleanup_audit(&f,p,a)};
+            assert!(super::super::native_terminal_cleanup::run(&store,&terminal,&now,&mut open).unwrap()>0);assert_eq!(store.lock().unwrap().unresolved_native_abort_namespaces(&lease.workflow).unwrap(),vec![(pending.request.transfer_id.clone(),pending.request.destination.clone())]);
+            let prior=store.lock().unwrap().events(&lease.workflow).unwrap().into_iter().filter(|e|e.1=="native_terminal_namespace_retirement_requested").count();assert_eq!(prior,2);
+            if fault=="projection" {store.lock().unwrap().conn.execute_batch("DROP TRIGGER deny_terminal_destination_resolution").unwrap();}unavailable.set(false);drop(store);let reopened=std::sync::Arc::new(std::sync::Mutex::new(WorkflowStore::open(&f.path).unwrap()));
+            assert_eq!(super::super::native_terminal_cleanup::run(&reopened,&terminal,&now,&mut open).unwrap(),1);let locked=reopened.lock().unwrap();assert!(locked.unresolved_native_abort_namespaces(&lease.workflow).unwrap().is_empty());assert_eq!(locked.events(&lease.workflow).unwrap().into_iter().filter(|e|e.1=="native_terminal_namespace_retirement_requested").count(),prior);
+        }
+    }
+    #[test]
+    fn terminal_namespace_cleanup_refuses_stale_or_missing_authority_without_new_effects() {
+        if child("terminal_namespace_cleanup_refuses_stale_or_missing_authority_without_new_effects") {return;}
+        for fault in ["terminal","store"] {
+            let mut f=Fixture::new();let (lease,pending,store)=prepared_abort_fixture(&mut f);let mut checkpoint=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Retired;store.lock().unwrap().checkpoint(&lease,&checkpoint,now()).unwrap();let terminal=store.lock().unwrap().terminal_native_checkpoint(&lease.workflow).unwrap();
+            if fault=="terminal" {checkpoint.next.reason="changed-terminal-authority".into();store.lock().unwrap().checkpoint(&lease,&checkpoint,now()).unwrap();}else{std::fs::remove_file(f._root.path().join("native/authority-epoch.json")).unwrap();}
+            let events=store.lock().unwrap().events(&lease.workflow).unwrap();let result=super::super::native_terminal_cleanup::run(&store,&terminal,&now,&mut |p,a|terminal_cleanup_audit(&f,p,a));assert!(result.is_err() || result.unwrap()==0);assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);let native=rusqlite::Connection::open(f._root.path().join("native/runtime-retirement.sqlite")).unwrap();let retired:bool=native.query_row("SELECT EXISTS(SELECT 1 FROM retired_owner WHERE generation=?1)",[pending.request.destination.owner.lease_generation],|r|r.get(0)).unwrap();assert!(!retired);
+            if fault=="store" {assert!(!f._root.path().join("native/authority-epoch.json").exists());}
+        }
+    }
+    #[test]
+    fn terminal_namespace_cleanup_intent_write_failure_prevents_native_effect() {
+        if child("terminal_namespace_cleanup_intent_write_failure_prevents_native_effect") {return;}
+        let mut f=Fixture::new();let (lease,pending,store)=prepared_abort_fixture(&mut f);let mut checkpoint=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Retired;store.lock().unwrap().checkpoint(&lease,&checkpoint,now()).unwrap();let terminal=store.lock().unwrap().terminal_native_checkpoint(&lease.workflow).unwrap();
+        store.lock().unwrap().conn.execute_batch("CREATE TRIGGER deny_terminal_retirement_intent BEFORE INSERT ON workflow_event WHEN NEW.kind='native_terminal_namespace_retirement_requested' BEGIN SELECT RAISE(ABORT,'injected terminal intent failure'); END;").unwrap();let mut open=|p:&PendingNativeHandoff,a:&ownership::Authority|terminal_cleanup_audit(&f,p,a);let _=super::super::native_terminal_cleanup::run(&store,&terminal,&now,&mut open);
+        assert_eq!(store.lock().unwrap().unresolved_native_abort_namespaces(&lease.workflow).unwrap().len(),2);let native=rusqlite::Connection::open(f._root.path().join("native/runtime-retirement.sqlite")).unwrap();let retired:bool=native.query_row("SELECT EXISTS(SELECT 1 FROM retired_owner WHERE generation=?1)",[pending.request.destination.owner.lease_generation],|r|r.get(0)).unwrap();assert!(!retired);drop(native);
+        store.lock().unwrap().conn.execute_batch("DROP TRIGGER deny_terminal_retirement_intent").unwrap();assert!(super::super::native_terminal_cleanup::run(&store,&terminal,&now,&mut open).unwrap()>0);assert!(store.lock().unwrap().unresolved_native_abort_namespaces(&lease.workflow).unwrap().is_empty());
+    }
     #[test]
     fn native_pending_reconcile_absent_ack_survives_restart_and_never_replaces_identity() {
         if child("native_pending_reconcile_absent_ack_survives_restart_and_never_replaces_identity") {return;}

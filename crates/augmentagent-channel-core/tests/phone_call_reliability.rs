@@ -78,6 +78,7 @@ impl ConversationIo for Io {
 }
 struct Source {
     started: Arc<Notify>,
+    completed: Notify,
     reads: AtomicUsize,
     recovering: bool,
 }
@@ -88,6 +89,7 @@ impl AttentionProvider for Source {
         let attempt = self.reads.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
         tokio::time::sleep(Duration::from_secs(2)).await;
+        self.completed.notify_one();
         if self.recovering && attempt == 0 {
             return Ok(Some(
                 "The synthetic inbox is unavailable; the attention check is incomplete.".into(),
@@ -247,6 +249,7 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool, gap: Option<GapRec
     let started = Arc::new(Notify::new());
     let source = Arc::new(Source {
         started: started.clone(),
+        completed: Notify::new(),
         reads: AtomicUsize::new(0),
         recovering,
     });
@@ -500,6 +503,11 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool, gap: Option<GapRec
     tokio::time::advance(Duration::from_secs(if slow { 94 } else { 2 })).await;
     if slow {
         native.release.notify_one();
+    } else {
+        // advance() expires timers but does not guarantee the sleeper was
+        // polled. Observe fake source completion before spending wall time.
+        tokio::time::timeout(Duration::from_millis(1), source.completed.notified())
+            .await.expect("source must finish at its two-second virtual deadline");
     }
     tokio::time::resume();
     if recovering {
@@ -526,6 +534,8 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool, gap: Option<GapRec
         let _ = ws.next().await.unwrap().unwrap();
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::timeout(Duration::from_millis(1), source.completed.notified())
+            .await.expect("retry source must finish at its two-second virtual deadline");
         tokio::time::resume();
     }
     for expected in [140, 141] {

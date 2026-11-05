@@ -278,10 +278,18 @@ fn acquire_audit_generation_inner(
 
 /// Free, bounded reconciliation; durable intent survives terminal workflows and
 /// crash between audit-generation commit and filesystem retirement.
-pub(super) fn reconcile_runtime_retirements()->Result<usize> {
-    let state=path();
+pub(super) fn reconcile_runtime_retirements()->Result<usize> {reconcile_runtime_retirements_at(&path())}
+fn reconcile_runtime_retirements_at(state:&Path)->Result<usize> {
     if !state.exists(){return Ok(0);}
-    reconcile_runtime_retirements_in(&mut WorkflowStore::open(&state)?,millis())
+    let mut store=WorkflowStore::open(state)?;
+    let completed=reconcile_runtime_retirements_in(&mut store,millis())?;
+    // Only this free worker entry creates the shared handle. Acquisition/finish
+    // callers of the inner helper may already hold their workflow mutex.
+    let shared=Arc::new(Mutex::new(store));
+    let terminal=durable::native_terminal_cleanup::sweep(&shared,&millis,&mut |pending,namespace| {
+        existing_native_audit(state,namespace,None,pending.original_binding())
+    })?;
+    Ok(completed+terminal)
 }
 fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<usize> {
     let rows=store.pending_native_retirements(now,16)?;
@@ -3073,7 +3081,7 @@ mod tests {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup"] {
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
                     .env(CHILD,control.path()).env(MODE,mode);
@@ -3173,6 +3181,15 @@ mod tests {
             assert_eq!(rows[0].certainty,crate::autoship_workflow::native_observation::Certainty::Uncertain);
             assert_eq!(rows[0].protected_observation_reference.as_ref(),Some(fact.receipt()));
             assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        }
+        if mode=="terminal-abort-cleanup" {
+            use augmentagent_channel_core::native_vm::ownership;
+            let source=guard.audit_logger();let original=saved.clone().unwrap();guard.finish().unwrap();let mut store=WorkflowStore::open(&state).unwrap();let lease=store.claim(&id,"fixture-terminal-transfer",millis(),LEASE_MS).unwrap().unwrap();let binding=store.snapshot(&id).unwrap().unwrap().checkpoint.binding;
+            let destination=open_audit_generation(&state,&id,None,lease.generation).unwrap();destination.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:id.clone(),lease_generation:lease.generation}).unwrap();destination.set_native_store_binding(original.clone()).unwrap();destination.require_run_resources().unwrap();destination.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":id,"generation":lease.generation})).unwrap();
+            let pending=match store.prepare_or_load_native_handoff(&lease,&binding,destination.path().to_str().unwrap(),millis()).unwrap() {durable::HandoffPreparation::Prepared(p)=>p,_=>panic!("expected exact fixture intent")};let writer=source.begin_write().unwrap();assert!(matches!(ownership::transfer(&original,pending.request(),&pending.observation(),&[source],&destination,&||Ok(())),ownership::TransferOutcome::Deferred {..}));writer.complete();
+            // Disposable fixture retirement creates actual Aborted native state.
+            let old=&pending.request().source_owners[0];augmentagent_channel_core::native_vm::retire_owned_runtimes(&original,Path::new(&old.audit_path),&old.owner,&||Ok(())).unwrap();let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Retired;store.checkpoint(&lease,&checkpoint,millis()).unwrap();let before=store.snapshot(&id).unwrap().unwrap();let allowance=store.merge_allowance(millis(),5).unwrap();let epoch=std::fs::read(native.join("authority-epoch.json")).unwrap();drop(store);
+            assert!(reconcile_runtime_retirements_at(&state).unwrap()>0);let mut store=WorkflowStore::open(&state).unwrap();let count:i64=rusqlite::Connection::open(&state).unwrap().query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&id],|r|r.get(0)).unwrap();assert_eq!(count,0,"worker must reconcile original terminal pending work");assert!(store.unresolved_native_abort_namespaces(&id).unwrap().is_empty());assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.merge_allowance(millis(),5).unwrap(),allowance);assert!(store.native_owner_binding(&id,lease.generation).unwrap().is_none());let events=store.events(&id).unwrap();drop(store);assert_eq!(std::fs::read(native.join("authority-epoch.json")).unwrap(),epoch);assert_eq!(reconcile_runtime_retirements_at(&state).unwrap(),0);assert_eq!(WorkflowStore::open(&state).unwrap().events(&id).unwrap(),events);return;
         }
         if matches!(mode.as_str(),"resolved-abort-acquisition"|"closed-recovery-rollback"|"closed-recovery-history-loss") {
             use augmentagent_channel_core::native_vm::ownership;

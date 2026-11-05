@@ -29,6 +29,8 @@ pub(crate) mod owner_turn;
 mod native_owner_binding;
 #[path = "autoship_native_handoff.rs"]
 mod native_handoff;
+#[path = "autoship_native_terminal_cleanup.rs"]
+pub(crate) mod native_terminal_cleanup;
 #[path = "autoship_native_recovery.rs"]
 pub(crate) mod native_recovery;
 #[path = "autoship_native_reconcile.rs"]
@@ -438,6 +440,10 @@ impl WorkflowStore {
                 binding TEXT NOT NULL, registered_at INTEGER NOT NULL,
                 PRIMARY KEY(workflow,lease_generation),
                 FOREIGN KEY(workflow,lease_generation) REFERENCES workflow_native_owner(workflow,lease_generation));
+            CREATE TABLE IF NOT EXISTS workflow_native_terminal_attempt (
+                workflow TEXT NOT NULL REFERENCES workflow(id),transfer_id TEXT NOT NULL,
+                namespace_sha256 TEXT NOT NULL,ordinal INTEGER NOT NULL,
+                PRIMARY KEY(workflow,transfer_id,namespace_sha256));
             CREATE TABLE IF NOT EXISTS workflow_native_recovery (
                 workflow TEXT NOT NULL REFERENCES workflow(id),generation INTEGER NOT NULL,
                 sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record TEXT NOT NULL,
