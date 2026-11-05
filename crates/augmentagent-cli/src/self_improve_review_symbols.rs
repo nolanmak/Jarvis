@@ -4,17 +4,31 @@ use std::ops::RangeInclusive;
 use syn::{spanned::Spanned, visit::Visit};
 
 pub(super) fn names(source: &str, edits: &[RangeInclusive<usize>]) -> Result<BTreeSet<String>> {
+    Ok(scoped_names(source, edits)?.0)
+}
+/// Changed item names, and the subset that is only ever declared crate-local
+/// (private, `pub(crate)`, `pub(super)`, `pub(in ..)`, outside trait impls).
+/// Rust forbids naming those from another crate, so their callers are found
+/// within the declaring crate; a generic private name such as `first` then no
+/// longer drags every file of the workspace into review evidence (#1888).
+pub(super) fn scoped_names(source: &str, edits: &[RangeInclusive<usize>]) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
     let file = syn::parse_file(source).context("cannot identify changed Rust items")?;
     let mut visitor = Changed {
         edits,
         names: BTreeSet::new(),
+        public: BTreeSet::new(),
+        in_trait_impl: false,
     };
     visitor.visit_file(&file);
-    Ok(visitor.names)
+    let local = visitor.names.difference(&visitor.public).cloned().collect();
+    Ok((visitor.names, local))
 }
 struct Changed<'a> {
     edits: &'a [RangeInclusive<usize>],
     names: BTreeSet<String>,
+    /// Names with at least one changed declaration reachable outside its crate.
+    public: BTreeSet<String>,
+    in_trait_impl: bool,
 }
 impl Changed<'_> {
     fn intersects(&self, span: proc_macro2::Span) -> bool {
@@ -24,9 +38,16 @@ impl Changed<'_> {
             .any(|edit| *edit.start() <= end && *edit.end() >= start)
     }
     fn add(&mut self, name: &syn::Ident, span: proc_macro2::Span) {
+        self.add_vis(name, span, None);
+    }
+    /// `vis` is the declaration's visibility; `None` means it cannot be shown
+    /// crate-local (macros, trait members, impl headers), so it stays public.
+    fn add_vis(&mut self, name: &syn::Ident, span: proc_macro2::Span, vis: Option<&syn::Visibility>) {
         if self.intersects(span) {
-            self.names
-                .insert(name.to_string().trim_start_matches("r#").into());
+            let name: String = name.to_string().trim_start_matches("r#").into();
+            let local = !self.in_trait_impl && vis.is_some_and(|v| !matches!(v, syn::Visibility::Public(_)));
+            if !local { self.public.insert(name.clone()); }
+            self.names.insert(name);
         }
     }
 }
@@ -38,13 +59,21 @@ macro_rules! named_item {
         }
     };
 }
+macro_rules! visible_item {
+    ($method:ident,$kind:ident) => {
+        fn $method(&mut self, item: &'ast syn::$kind) {
+            self.add_vis(&item.ident, item.span(), Some(&item.vis));
+            syn::visit::$method(self, item);
+        }
+    };
+}
 impl<'ast> Visit<'ast> for Changed<'_> {
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-        self.add(&item.sig.ident, item.span());
+        self.add_vis(&item.sig.ident, item.span(), Some(&item.vis));
         syn::visit::visit_item_fn(self, item);
     }
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
-        self.add(&item.sig.ident, item.span());
+        self.add_vis(&item.sig.ident, item.span(), Some(&item.vis));
         syn::visit::visit_impl_item_fn(self, item);
     }
     fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
@@ -55,14 +84,14 @@ impl<'ast> Visit<'ast> for Changed<'_> {
         self.add(&item.sig.ident, item.span());
         syn::visit::visit_foreign_item_fn(self, item);
     }
-    named_item!(visit_item_struct, ItemStruct);
-    named_item!(visit_item_enum, ItemEnum);
-    named_item!(visit_item_union, ItemUnion);
+    visible_item!(visit_item_struct, ItemStruct);
+    visible_item!(visit_item_enum, ItemEnum);
+    visible_item!(visit_item_union, ItemUnion);
     named_item!(visit_item_trait, ItemTrait);
     named_item!(visit_item_trait_alias, ItemTraitAlias);
-    named_item!(visit_item_const, ItemConst);
-    named_item!(visit_item_static, ItemStatic);
-    named_item!(visit_item_type, ItemType);
+    visible_item!(visit_item_const, ItemConst);
+    visible_item!(visit_item_static, ItemStatic);
+    visible_item!(visit_item_type, ItemType);
     named_item!(visit_impl_item_const, ImplItemConst);
     named_item!(visit_impl_item_type, ImplItemType);
     named_item!(visit_trait_item_const, TraitItemConst);
@@ -91,8 +120,9 @@ impl<'ast> Visit<'ast> for Changed<'_> {
         {
             if let Some((_, path, _)) = &item.trait_ {
                 if let Some(part) = path.segments.last() {
-                    self.names
-                        .insert(part.ident.to_string().trim_start_matches("r#").into());
+                    let name: String = part.ident.to_string().trim_start_matches("r#").into();
+                    self.public.insert(name.clone());
+                    self.names.insert(name);
                 }
             }
             let mut target = item.self_ty.as_ref();
@@ -112,8 +142,9 @@ impl<'ast> Visit<'ast> for Changed<'_> {
                         syn::GenericParam::Lifetime(_) => false,
                     });
                     if !generic {
-                        self.names
-                            .insert(part.ident.to_string().trim_start_matches("r#").into());
+                        let name: String = part.ident.to_string().trim_start_matches("r#").into();
+                        self.public.insert(name.clone());
+                        self.names.insert(name);
                     }
                 }
             }
@@ -125,12 +156,16 @@ impl<'ast> Visit<'ast> for Changed<'_> {
                     _ => None,
                 };
                 if let Some(ident) = ident {
-                    self.names
-                        .insert(ident.to_string().trim_start_matches("r#").into());
+                    let name: String = ident.to_string().trim_start_matches("r#").into();
+                    // Header changes affect every member; stay conservative.
+                    self.public.insert(name.clone());
+                    self.names.insert(name);
                 }
             }
         }
+        let outer = std::mem::replace(&mut self.in_trait_impl, item.trait_.is_some());
         syn::visit::visit_item_impl(self, item);
+        self.in_trait_impl = outer;
     }
 }
 
@@ -194,6 +229,24 @@ async fn source(root: &Path, head: &str, path: &str) -> Result<Option<String>> {
     Ok(Some(git(root, &["cat-file", "blob", parts[2]]).await?))
 }
 
+/// `crates/<name>/` for a path inside a workspace crate.
+fn crate_dir(path: &str) -> Option<String> {
+    let mut parts = path.splitn(3, '/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("crates"), Some(name), Some(_)) if !name.is_empty() => Some(format!("crates/{name}/")),
+        _ => None,
+    }
+}
+/// A symbol whose callers are searched only within `dir`. Never reaches git
+/// as a pattern; see [`split_symbol`].
+pub(super) fn scoped_symbol(name: &str, dir: &str) -> String {
+    format!("{name}\u{0}{dir}")
+}
+/// `(pattern, Some(crate dir))` for a crate-local symbol, `(pattern, None)` otherwise.
+pub(super) fn split_symbol(symbol: &str) -> (&str, Option<&str>) {
+    match symbol.split_once('\u{0}') { Some((name, dir)) => (name, Some(dir)), None => (symbol, None) }
+}
+
 pub(super) async fn collect(
     root: &Path,
     base: &str,
@@ -239,11 +292,18 @@ pub(super) async fn collect(
             if edits.is_empty() {
                 continue;
             }
-            symbols.extend(names(&source, &edits).map_err(|error| {
+            let (all, local) = scoped_names(&source, &edits).map_err(|error| {
                 EvidenceBudget(format!(
                     "cannot identify edited Rust items in {path}: {error:#}"
                 ))
-            })?);
+            })?;
+            let scope = crate_dir(path);
+            for name in all {
+                match &scope {
+                    Some(dir) if local.contains(&name) => { symbols.insert(scoped_symbol(&name, dir)); }
+                    _ => { symbols.insert(name); }
+                }
+            }
         }
     }
     Ok(symbols)
@@ -259,6 +319,19 @@ mod tests {
             names(source, &[4..=5]).unwrap(),
             BTreeSet::from(["resolve_person".into()])
         );
+    }
+    #[test]
+    fn private_items_are_crate_local_and_public_or_trait_members_are_not() {
+        let source="enum Handles { One }\nimpl Handles {\n    fn first(self) -> u8 {\n        1\n    }\n}\npub fn close_contacts() -> u8 {\n    2\n}\nimpl Clone for Handles {\n    fn clone(&self) -> Self {\n        Handles::One\n    }\n}\npub(crate) fn helper() {}\n";
+        let (all, local) = scoped_names(source, &[4..=4, 8..=8, 12..=12, 15..=15]).unwrap();
+        assert_eq!(all, BTreeSet::from(["first".into(), "close_contacts".into(), "clone".into(), "helper".into()]));
+        assert_eq!(local, BTreeSet::from(["first".into(), "helper".into()]),
+            "private and pub(crate) are local; pub and trait-impl members are not");
+        assert_eq!(crate_dir("crates/augmentagent-channel-instagram/src/feed.rs").as_deref(), Some("crates/augmentagent-channel-instagram/"));
+        assert_eq!(crate_dir("scripts/x.rs"), None);
+        let token = scoped_symbol("first", "crates/a/");
+        assert_eq!(split_symbol(&token), ("first", Some("crates/a/")));
+        assert_eq!(split_symbol("close_contacts"), ("close_contacts", None));
     }
     #[test]
     fn syntax_failure_cannot_be_treated_as_an_empty_caller_inventory() {
