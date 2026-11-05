@@ -12048,6 +12048,12 @@ impl AutoPrLoop {
                     // Transient controller or network failures retry next tick.
                     Err(e) => {
                         warn!("auto-PR tick failed: {e:#}");
+                        // A bare OS error ("File exists (os error 17)") names no
+                        // operation. With RUST_LIB_BACKTRACE=1 the worker records
+                        // where it was raised, so the failing step is findable.
+                        if e.backtrace().status() == std::backtrace::BacktraceStatus::Captured {
+                            warn!(backtrace = %e.backtrace(), "auto-PR tick failure origin");
+                        }
                         break;
                     }
                 }
