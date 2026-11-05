@@ -69,7 +69,8 @@ class EvidenceTests(unittest.TestCase):
      n=sum('/pulls/' in e and not e.endswith('/files') for e in fixture.calls)
      return fixture.after if n>1 and fixture.after is not None else fixture.pull
     if '/contents/' in endpoint:return {'type':'file','encoding':'base64','content':base64.b64encode(fixture.policy).decode()}
-    if endpoint.endswith('/branches/main'):return {'commit':{'sha':fixture.head}}
+    if endpoint.endswith('/branches/main'):return {'commit':{'sha':getattr(fixture,'main_tip',fixture.head)}}
+    if '/compare/' in endpoint:return getattr(fixture,'compare',{'status':'diverged','behind_by':1})
     raise AssertionError(endpoint)
    def pages(self,endpoint,key=None):
     fixture.calls.append(endpoint)
@@ -118,6 +119,16 @@ class EvidenceTests(unittest.TestCase):
   self.request.update(pr=None,head=self.head)
   self.runs[0].update(event='push',head_branch='main')
   self.assertEqual(self.evaluate()['state'],'passed')
+ def test_main_ancestor_evidence_is_readable_but_diverged_is_not(self):
+  # Auto-ship reads a recent main commit while the tip's run is pending.
+  self.request.update(pr=None,head=self.head)
+  self.runs[0].update(event='push',head_branch='main')
+  self.main_tip='d'*40;self.compare={'status':'ahead','ahead_by':2,'behind_by':0}
+  self.assertEqual(self.evaluate()['state'],'passed')
+  self.assertTrue(any(f'/compare/{self.head}...{self.main_tip}' in c for c in self.calls))
+  for compare in [{'status':'diverged','ahead_by':1,'behind_by':1},{'status':'behind','ahead_by':0,'behind_by':3}]:
+   self.compare=compare;self.calls=[]
+   with self.assertRaisesRegex(ValueError,'main source moved'):self.evaluate()
  def test_main_path_filtered_workflow_can_be_absent(self):
   self.request.update(pr=None,head=self.head)
   self.runs[0].update(event='push',head_branch='main')
