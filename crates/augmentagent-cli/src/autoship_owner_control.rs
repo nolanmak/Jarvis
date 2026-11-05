@@ -73,7 +73,10 @@ fn retry_checkpoint(tx:&Transaction<'_>,workflow:&str,now:i64,require_retired:bo
     let row:Option<(String,i64,i64)>=tx.query_row("SELECT checkpoint,lease_until,generation FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let Some((raw,until,generation))=row else {return Ok(None);};
     let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
-    let original=checkpoint.next.reason=="adopted_execution_retry" && checkpoint.next.action=="resume_preserved_pr";
+    // Both controller paths preserve work after an internal execution refusal.
+    // Owner intent only requeues normal revalidation; it grants no approval.
+    let original=matches!((checkpoint.next.reason.as_str(),checkpoint.next.action.as_str()),
+        ("adopted_execution_retry","resume_preserved_pr") | ("resume_deferred","resume_preserved_work"));
     let pending=checkpoint.next.reason=="owner_execution_retry_pending" && checkpoint.next.action=="reconcile_runtime_retirement"
         && tx.query_row("SELECT EXISTS(SELECT 1 FROM owner_execution_retry WHERE workflow=?1 AND generation=?2 AND binding=?3 AND state IN ('pending','superseded'))",params![workflow,generation,serde_json::to_string(&checkpoint.binding)?],|r|r.get::<_,bool>(0))?;
     if checkpoint.stage!=Stage::Held || (!original && !pending) {return Ok(None);}
@@ -143,45 +146,69 @@ mod tests {
 
     #[test]
     fn owner_resume_retries_only_quiescent_internal_execution_failures() {
-        for blocker in ["none","lease","native","operation"] {
+        for (reason,action) in [("adopted_execution_retry","resume_preserved_pr"),("resume_deferred","resume_preserved_work")] {
+            for blocker in ["none","lease","native","operation"] {
+                let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+                let id=store.submit_authorized("request","github:owner",&request(1),1).unwrap().workflow;
+                store.register(&id,"candidate",binding(),2).unwrap();
+                let lease=store.claim(&id,"worker",3,100).unwrap().unwrap();
+                store.charge(&lease,"previous-attempt",ResourceCharge {model_calls:7,tokens:42,wall_ms:10},3).unwrap();
+                let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+                checkpoint.stage=Stage::Held;
+                checkpoint.evidence=vec!["retained-verification-evidence".into()];
+                checkpoint.next=NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:1000};
+                store.checkpoint(&lease,&checkpoint,4).unwrap();
+                if blocker=="native" {store.register_native_owner(&lease,dir.path().join("native-audit").to_str().unwrap(),5).unwrap();}
+                if blocker=="operation" {
+                    store.conn.execute("INSERT INTO operation VALUES('uncertain-push',?1,?2,?3,NULL,5)",params![id,serde_json::to_string(&OperationKind::Push).unwrap(),serde_json::to_string(&checkpoint.binding).unwrap()]).unwrap();
+                }
+                if blocker!="lease" {store.release(&lease,6).unwrap();}
+                let resumed=store.set_owner_pause(&id,"github:owner",0,false,7);
+                if blocker!="none" && blocker!="native" {
+                    assert!(resumed.is_err(),"{blocker} must prevent an internal retry");
+                    assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint,checkpoint);
+                    assert!(store.owner_control(&id).unwrap().is_none(),"a refused retry must roll back owner control");
+                    continue;
+                }
+                resumed.unwrap();
+                if blocker=="native" {
+                    assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.stage,Stage::Held);
+                    assert_eq!(store.settle_owner_execution_retries(8,16).unwrap(),0,"intent cannot certify native teardown");
+                    store.complete_native_retirement(&id,lease.generation,dir.path().join("native-audit").to_str().unwrap(),9).unwrap();
+                    assert_eq!(store.settle_owner_execution_retries(10,16).unwrap(),1);
+                }
+                let after=store.snapshot(&id).unwrap().unwrap();
+                assert_eq!(after.checkpoint.stage,Stage::Reconcile,"owner resume must make the failed internal attempt runnable");
+                assert_eq!(after.checkpoint.binding,checkpoint.binding);
+                assert_eq!(after.checkpoint.evidence,checkpoint.evidence);
+                assert_eq!(after.checkpoint.next.eligible_at_ms,1000,"resume must preserve retry admission time");
+                assert!(!store.command_queue_due("owner/repo",999).unwrap());
+                assert!(store.command_queue_due("owner/repo",1000).unwrap(),"resumed {reason} must wake the deployed command worker");
+                assert!(store.claim_productive(&id,"next",999,100).unwrap().is_none());
+                assert!(store.claim_productive(&id,"next",1000,100).unwrap().is_some());
+                assert_eq!((after.model_calls,after.tokens,after.wall_ms),(7,42,10),"resume must retain previous compute charges");
+                assert_eq!(store.merge_allowance(1000,5).unwrap().confirmed,0);
+            }
+        }
+    }
+
+    #[test]
+    fn owner_resume_preserves_unrelated_and_mismatched_held_checkpoints() {
+        for (reason,action) in [("security-hold","resume_preserved_work"),("owner-hold","resume_preserved_work"),
+            ("resume_deferred","await_owner_approval"),("adopted_execution_retry","resume_preserved_work")] {
             let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
             let id=store.submit_authorized("request","github:owner",&request(1),1).unwrap().workflow;
             store.register(&id,"candidate",binding(),2).unwrap();
             let lease=store.claim(&id,"worker",3,100).unwrap().unwrap();
-            store.charge(&lease,"previous-attempt",ResourceCharge {model_calls:7,tokens:42,wall_ms:10},3).unwrap();
             let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
             checkpoint.stage=Stage::Held;
-            checkpoint.evidence=vec!["retained-verification-evidence".into()];
-            checkpoint.next=NextAction {reason:"adopted_execution_retry".into(),action:"resume_preserved_pr".into(),eligible_at_ms:1000};
-            store.checkpoint(&lease,&checkpoint,4).unwrap();
-            if blocker=="native" {store.register_native_owner(&lease,dir.path().join("native-audit").to_str().unwrap(),5).unwrap();}
-            if blocker=="operation" {
-                store.conn.execute("INSERT INTO operation VALUES('uncertain-push',?1,?2,?3,NULL,5)",params![id,serde_json::to_string(&OperationKind::Push).unwrap(),serde_json::to_string(&checkpoint.binding).unwrap()]).unwrap();
-            }
-            if blocker!="lease" {store.release(&lease,6).unwrap();}
-            let resumed=store.set_owner_pause(&id,"github:owner",0,false,7);
-            if blocker!="none" && blocker!="native" {
-                assert!(resumed.is_err(),"{blocker} must prevent an internal retry");
-                assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint,checkpoint);
-                assert!(store.owner_control(&id).unwrap().is_none(),"a refused retry must roll back owner control");
-                continue;
-            }
-            resumed.unwrap();
-            if blocker=="native" {
-                assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.stage,Stage::Held);
-                assert_eq!(store.settle_owner_execution_retries(8,16).unwrap(),0,"intent cannot certify native teardown");
-                store.complete_native_retirement(&id,lease.generation,dir.path().join("native-audit").to_str().unwrap(),9).unwrap();
-                assert_eq!(store.settle_owner_execution_retries(10,16).unwrap(),1);
-            }
-            let after=store.snapshot(&id).unwrap().unwrap();
-            assert_eq!(after.checkpoint.stage,Stage::Reconcile,"owner resume must make the failed internal attempt runnable");
-            assert_eq!(after.checkpoint.binding,checkpoint.binding);
-            assert_eq!(after.checkpoint.evidence,checkpoint.evidence);
-            assert_eq!(after.checkpoint.next.eligible_at_ms,1000,"resume must preserve retry admission time");
-            assert!(store.claim_productive(&id,"next",999,100).unwrap().is_none());
-            assert!(store.claim_productive(&id,"next",1000,100).unwrap().is_some());
-            assert_eq!((after.model_calls,after.tokens,after.wall_ms),(7,42,10),"resume must retain previous compute charges");
-            assert_eq!(store.merge_allowance(1000,5).unwrap().confirmed,0);
+            checkpoint.next=NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0};
+            store.checkpoint(&lease,&checkpoint,4).unwrap();store.release(&lease,5).unwrap();
+            store.set_owner_pause(&id,"github:owner",0,true,6).unwrap();
+            store.set_owner_pause(&id,"github:owner",1,false,7).unwrap();
+            assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint,checkpoint,"{reason}/{action} was erased");
+            assert!(!store.command_queue_due("owner/repo",8).unwrap());
+            assert!(store.claim_productive(&id,"next",8,100).unwrap().is_none());
         }
     }
 
