@@ -539,19 +539,27 @@ mod fast {
         rounds: Mutex<std::collections::VecDeque<Vec<FastEvent>>>,
         pub requests: Mutex<Vec<(Instant, Vec<FastMessage>)>>,
         pub systems: Mutex<Vec<String>>,
+        admission_delay: Duration,
     }
     impl Scripted {
         pub fn new(rounds: Vec<Vec<FastEvent>>) -> Arc<Self> {
+            Self::with_admission_delay(rounds, Duration::ZERO)
+        }
+        fn with_admission_delay(rounds: Vec<Vec<FastEvent>>, admission_delay: Duration) -> Arc<Self> {
             Arc::new(Self {
                 rounds: Mutex::new(rounds.into()),
                 requests: Mutex::new(Vec::new()),
                 systems: Mutex::new(Vec::new()),
+                admission_delay,
             })
         }
     }
     #[async_trait]
     impl FastModel for Scripted {
         async fn stream(&self, request: FastRequest) -> Result<FastStream, FastModelError> {
+            // Model scheduling is outside the dispatch tool's causal contract.
+            // Let the regression exercise a slow model admission deliberately.
+            if !self.admission_delay.is_zero() { tokio::time::sleep(self.admission_delay).await; }
             self.systems.lock().unwrap().push(request.system);
             self.requests
                 .lock()
@@ -749,25 +757,26 @@ mod fast {
             release: Arc::new(Notify::new()),
             seen: Mutex::new(Vec::new()),
         });
-        let model = Scripted::new(vec![
+        let model = Scripted::with_admission_delay(vec![
             vec![tool(
                 "dispatch_task",
                 serde_json::json!({"description":"Draft a reply to the last Linear comment"}),
             )],
             vec![token("On it. "), token("The draft will land in chat.")],
-        ]);
+        ], Duration::from_millis(150));
         let bridge = bridge(&f, heavy.clone(), model.clone());
         let (turn_id, speech, _rx) = speech_for(&f.call.id, "draft a reply");
-        let answer = bridge
-            .answer(&f.call, &turn_id, "draft a reply", speech, CancellationToken::new())
+        // This is a deadlock watchdog, not a host/model latency assertion.
+        // The heavy turn has no way to finish until this test releases it.
+        let answer = tokio::time::timeout(Duration::from_secs(5), bridge
+            .answer(&f.call, &turn_id, "draft a reply", speech, CancellationToken::new()))
             .await
+            .expect("dispatch answer must return while the heavy turn remains blocked")
             .unwrap();
         assert_eq!(answer, "On it. The draft will land in chat.");
         {
             let requests = model.requests.lock().unwrap();
             assert_eq!(requests.len(), 2);
-            let waited = requests[1].0.duration_since(requests[0].0);
-            assert!(waited < Duration::from_millis(50), "dispatch_task took {waited:?}");
             let task_id = format!("{turn_id}:dispatch");
             assert!(requests[1].1.iter().any(|m| matches!(m,
                 FastMessage::ToolResult { content, is_error: false, .. } if content.contains(&task_id))));
@@ -777,6 +786,7 @@ mod fast {
             .await
             .expect("heavy turn started on the surface-turn path");
         assert!(sends(&f.store, &f.origin, &key).is_empty(), "nothing before completion");
+        assert!(provider.calls().is_empty(), "native work cannot finish before its explicit release");
         heavy.release.notify_one();
         wait_for(|| !sends(&f.store, &f.origin, &key).is_empty()).await;
         let delivered = sends(&f.store, &f.origin, &key);
