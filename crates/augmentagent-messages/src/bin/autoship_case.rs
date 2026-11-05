@@ -1,20 +1,20 @@
 use augmentagent_messages::people::{resolve_person, MatchKind};
 use augmentagent_store::Store;
 
-fn kind_name(kind: MatchKind) -> String {
+fn kind_name(kind: MatchKind) -> &'static str {
     match kind {
-        MatchKind::Handle => "handle".to_string(),
-        MatchKind::Exact => "exact".to_string(),
-        MatchKind::Partial => "partial".to_string(),
+        MatchKind::Handle => "handle",
+        MatchKind::Exact => "exact",
+        MatchKind::Partial => "partial",
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::temp_dir().join(format!(
-        "autoship-1668-{}-{}.db",
+        "autoship-1668-{}.db",
         std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     ));
+    let _ = std::fs::remove_file(&path);
     let store = Store::open(&path)?;
     store.with_conn(|c| {
         c.execute(
@@ -31,15 +31,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut cases = Vec::new();
         for query in ["jordan", "Jordan Blake", "jordan-blake"] {
             let matches = resolve_person(c, query)?;
-            cases.push(
-                matches
-                    .into_iter()
-                    .map(|candidate| vec![candidate.key, kind_name(candidate.kind)])
-                    .collect::<Vec<_>>(),
-            );
+            let entries = matches
+                .into_iter()
+                .map(|candidate| format!("[\"{}\",\"{}\"]", candidate.key, kind_name(candidate.kind)))
+                .collect::<Vec<_>>();
+            cases.push(format!("[{}]", entries.join(",")));
         }
         Ok::<_, augmentagent_store::rusqlite::Error>(cases)
     })?;
-    println!("{}", serde_json::to_string(&observed)?);
+    println!("[{}]", observed.join(","));
+    let _ = std::fs::remove_file(path);
     Ok(())
 }
