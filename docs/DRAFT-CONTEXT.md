@@ -75,30 +75,6 @@ receipt retention is thirty days, while receipts attached to unresolved
 approvals remain available. Revision receipts retain their own evidence and
 previous owner instructions are read from the existing revision history.
 
-## Where the budget goes
-
-Each receipt also records `step_timings`, one entry per executed step in
-execution order: `kind` (`model_decision` or `retrieval`), `operation`
-(`decision`, or the retrieval operation name), `elapsed_ms` rounded up to the
-next millisecond, and `outcome` (`ok`, `error`, `unavailable`, `timeout` or
-`protocol_error`). A step is timed even when it ends in an error, an
-unavailable source or the overall timeout, so an unfinished review still shows
-what it spent. `budget_consumer` names the step kind with the larger measured
-total — `model_decision`, `retrieval`, or `none` when no step ran at all.
-Timings carry operation names and durations only, never retrieved text, and
-they are receipt telemetry rather than part of the model-visible evidence.
-
-To measure the completion rate asked for in #1837, read seven days of receipts
-from enabled platforms (`augmentagent messages context-receipts` per action,
-or the receipt table directly), and per platform count `review_finished`
-against the total, then group the incomplete ones by `budget_consumer` and by
-the longest `step_timings` entry. Only receipts written after this
-instrumentation shipped carry the fields; earlier receipts have aggregate
-`elapsed_ms` alone. Pick the remediation from the dominant consumer rather
-than assuming reasoner latency or retrieval; the candidate changes (smaller
-seed, parallel retrieval, per-step deadlines, partial finish) stay unshipped
-until that data exists.
-
 ## Integration and validation status
 
 This is an implementation matrix, not a declaration of completed acceptance.
