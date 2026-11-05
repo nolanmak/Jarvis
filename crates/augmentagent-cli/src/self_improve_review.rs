@@ -18,7 +18,11 @@ impl std::error::Error for EvidenceBudget {}
 /// path wrapped it in, so classify on the whole chain and not the outer error
 /// (#1885: PR #1669 was held as missing reviewer capacity because of one).
 fn is_evidence_budget(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.is::<EvidenceBudget>() || cause.is::<aligned::RequestBudgetExceeded>())
+    error.chain().any(is_evidence_budget_cause)
+}
+
+fn is_evidence_budget_cause(cause: &(dyn std::error::Error + 'static)) -> bool {
+    cause.is::<EvidenceBudget>() || cause.is::<aligned::RequestBudgetExceeded>()
 }
 fn unavailable_from_error(provider: augmentagent_channel_core::ProviderKind, error: anyhow::Error) -> IndependentReview {
     IndependentReview::unavailable(if is_evidence_budget(&error) {
