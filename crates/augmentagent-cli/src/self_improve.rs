@@ -4663,6 +4663,9 @@ impl CiGateResult {
             return Err(error);
         }
         if let Some(eligible_at_ms) = workflow.defer_verification_infrastructure(&error).await? {
+            // The classified code alone ("acceptance verifier infrastructure")
+            // never said what failed; keep the underlying error in the log.
+            warn!(workflow = workflow.id(), eligible_at_ms, "verification infrastructure deferred: {error:#}");
             // The gate future has returned. Record a checked release, not
             // a task drop, so the five-minute retry is not lease-blocked.
             workflow.finish_ci_deferral()?;
