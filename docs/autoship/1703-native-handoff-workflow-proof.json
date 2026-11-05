@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "83140a7a1c6f35be4dd20108367da84a70820725",
+  "source_parent_commit": "634bac3a34f3f2d20612b55a0f839d87422eca73",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -191,11 +191,15 @@
     {
       "path": "crates/augmentagent-cli/src/autoship_delivery.rs",
       "sha256": "acc2146ac1146b41c0efcee87bbb18fa6990510badb667f165145da299370860"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_conversations.rs",
+      "sha256": "d3799692eff450a435d39827e2096d783c324eb4a8845cf4f39574aa8ee051c4"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1868,
+    "passed": 1870,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
@@ -351,7 +355,11 @@
       "autoship-owner-first-builder-graft-red.log",
       "autoship-owner-first-builder-graft-green.log",
       "autoship-owner-first-builder-final-cli.log",
-      "autoship-owner-first-builder-final-production-check.log"
+      "autoship-owner-first-builder-final-production-check.log",
+      "autoship-owner-default-provider-red.log",
+      "autoship-owner-default-provider-green.log",
+      "autoship-owner-default-provider-full-cli.log",
+      "autoship-owner-default-provider-production-check.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -384,7 +392,7 @@
     "production_configuration_check": {
       "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
       "passed": true,
-      "log": "autoship-owner-first-builder-final-production-check.log"
+      "log": "autoship-owner-default-provider-production-check.log"
     },
     "guard_promotion_cases": 3,
     "read_only_audit_probe_cases": 2,
@@ -1167,5 +1175,20 @@
     "worker_consumer_enabled": false,
     "live_provider_dispatch": false,
     "live_discord_acceptance": false
+  },
+  "owner_continuation_provider": {
+    "scope": "Provider resolution used by the existing guard session-restoration path. Actual worker consumer remains absent.",
+    "behavioral_red": "On the parent source, a real stored owner workflow with an observed Claude session and no explicit pin accepted Codex and returned an empty session list. The new regression failed before the resolution check and passes with it.",
+    "policy": "Use an explicit persisted pin or the sole observed native provider; ambiguous, unknown or uncertain provider history refuses. A pin cannot replace a sole different observed provider. Never-started workflows retain their pin or unresolved default, subject independently to first-builder original-store proof. No history reset, model call or owner input completion occurs during selection.",
+    "focused_cases": 3,
+    "full_cli": {
+      "passed": 1870,
+      "failed": 0,
+      "ignored": 33
+    },
+    "production_check": "passed",
+    "fixtures": "Actual SQLite command admission, builder observation, restart, authenticated owner inbox and claimed turn. No actual model, VM or Discord transport.",
+    "worker_consumer_enabled": false,
+    "live_provider_dispatch": false
   }
 }
