@@ -24,6 +24,9 @@ pub(super) mod readiness;
 mod adjudicated;
 #[path = "self_improve_legacy_verifier.rs"]
 mod legacy_verifier;
+#[cfg(test)]
+#[path = "self_improve_candidate_source_tests.rs"]
+mod candidate_source_tests;
 pub(super) use adjudicated::apply as apply_adjudicated_amendment;
 
 const SANDBOX: &str = include_str!("../../../scripts/codex-command-sandbox.py");
@@ -1178,24 +1181,20 @@ fn evidence_path(control: &Path, source: AcceptanceSource, base: &str) -> Result
     );
     Ok(control.join(format!("{}-base-{base}.json", source.key())))
 }
-fn validate_candidate_harness(candidate: &Path, prepared: &PreparedAcceptance) -> Result<()> {
-    // Existing files must match exactly, including files installed before a
-    // restart. Never silently restore a builder-modified verifier.
-    for (relative, bytes) in &prepared.proposal.files {
-        let path = candidate.join(relative);
-        if path.exists() {
-            let metadata = std::fs::symlink_metadata(&path)?;
-            ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
-                "candidate verifier is not a regular file"
-            );
-            ensure!(
-                std::fs::read(&path)? == bytes.as_bytes(),
-                "candidate attempted to change registered verifier"
-            );
-        }
-    }
-    prepared.verify_registration()
+async fn validate_candidate_harness(candidate: &Path, prepared: &PreparedAcceptance) -> Result<()> {
+    // Protected proposal bytes are the only adapter source. Worker copies,
+    // including ignored legacy files and symlinks, supply no verifier authority.
+    // A literal committed collision requires explicit legacy recovery instead.
+    prepared.verify_registration()?;
+    let head = actual_head(candidate).await?;
+    assert_no_registered_adapters(
+        candidate, &head, &prepared.baseline.registration, &prepared.proposal.files,
+    ).await?;
+    ensure!(
+        actual_head(candidate).await? == head,
+        "candidate head changed during private verifier validation"
+    );
+    Ok(())
 }
 
 /// `base` comes from the workflow's saved pre-builder base, NEVER current
@@ -1400,8 +1399,7 @@ pub(super) async fn prepare_acceptance_for(
     // Main may have advanced; preserve the original reproduced base. Only a
     // candidate that no longer descends from it needs explicit re-scoping.
     trusted_git(candidate, &["merge-base", "--is-ancestor", base, "HEAD"]).await?;
-    validate_candidate_harness(candidate, &prepared)?;
-    assert_no_registered_adapters(candidate,&actual_head(candidate).await?,&prepared.baseline.registration,&prepared.proposal.files).await?;
+    validate_candidate_harness(candidate, &prepared).await?;
     augmentagent_channel_core::autoship_write_scope::register(
         candidate,
         prepared.baseline.registration.contract_hash(),
@@ -1540,7 +1538,7 @@ mod workflow_tests {
             },
         };
         assert!(
-            validate_candidate_harness(root.path(), &prepared).is_err(),
+            validate_candidate_harness(root.path(), &prepared).await.is_err(),
             "restart must not repair away verifier tampering"
         );
     }
