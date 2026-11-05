@@ -146,15 +146,17 @@ fn session_lock(path: &Path) -> Result<SessionLock> {
     }
     Ok(SessionLock(file))
 }
-fn retired(root:&Path,ledger:&Ledger<'_>,session: &Path) -> Result<bool> {
+pub(super) fn retired(root:&Path,ledger:&Ledger<'_>,session: &Path) -> Result<bool> {
     let mut retired = false;
     for name in ["retired.json", "retired-owner.json"] {
         match session.join(name).symlink_metadata() {
             Ok(_) => {
                 let marker: serde_json::Value =
                     serde_json::from_slice(&super::private(&session.join(name))?)?;
-                ensure!(marker["version"] == 1, R::MetadataInvalid);
-                if name=="retired-owner.json" {
+                if name=="retired.json" {
+                    super::validate_scope_marker(root,ledger,session,&super::private(&session.join(name))?)?;
+                } else {
+                    ensure!(marker["version"] == 1, R::MetadataInvalid);
                     ensure!(marker.as_object().is_some_and(|m|m.len()==4)
                         && marker["reason"]=="fenced_workflow_owner_reconciled",R::MetadataInvalid);
                     let declared:Authority=serde_json::from_value(serde_json::json!({"owner":marker["owner"],"audit_path":marker["audit_path"]}))?;
@@ -2313,7 +2315,7 @@ mod tests {
                     &f.request.destination.owner,
                 )
                 .unwrap();
-                assert_eq!(super::super::prune_and_count(&f.root).unwrap(), 0);
+                assert_eq!(super::super::prune_and_count(&f.root,&Ledger::open(&f.root,&lock).unwrap()).unwrap(), 0);
             }
             assert_eq!(
                 handoff_at(&f.root, 0, &f.request, &f.sources, &f.destination, &|| Ok(

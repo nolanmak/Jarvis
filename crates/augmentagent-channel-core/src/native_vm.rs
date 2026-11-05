@@ -142,9 +142,9 @@ fn write(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent)=path.parent(){std::fs::File::open(parent)?.sync_all()?;}
     Ok(())
 }
-fn digest(value: &str) -> String {
+fn digest(value: impl AsRef<[u8]>) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    format!("{:x}", Sha256::digest(value.as_ref()))
 }
 
 // Conservative per-session upper bound: native executable <=512MiB,
@@ -205,6 +205,30 @@ pub(crate) struct Retirement {
     pub(crate) session:PathBuf,
     pub(crate) expected:ownership::Authority,
     store:owner_store::StoreIdentity,
+    runtime_relative_path:String,
+    creation_receipt_sha256:String,
+}
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopeRetirementMarker {
+    version:u32,
+    reason:String,
+    authority:ownership::Authority,
+    runtime_relative_path:String,
+    creation_receipt_sha256:String,
+    store_identity_sha256:String,
+}
+fn store_digest(store:&owner_store::StoreIdentity)->Result<String> {
+    Ok(digest(ownership::canonical_bytes(&serde_json::to_value(store)?)?))
+}
+fn validate_scope_marker(root:&Path,ledger:&owner_ledger::Ledger<'_>,session:&Path,bytes:&[u8])->Result<()> {
+    let marker:ScopeRetirementMarker=serde_json::from_slice(bytes)?;
+    ensure!(marker.version==2 && marker.reason=="native_scope_retired"
+        && marker.runtime_relative_path==relative_runtime(root,session)?
+        && marker.creation_receipt_sha256==digest(private(&session.join("owned.json"))?)
+        && marker.store_identity_sha256==store_digest(&ledger.store_identity()?)?
+        && marker.authority==runtime_authority(root,ledger,session)?,"native scope retirement provenance invalid");
+    Ok(())
 }
 pub(crate) fn retire(retirement:&Retirement) {
     let session=&retirement.session;
@@ -213,11 +237,16 @@ pub(crate) fn retire(retirement:&Retirement) {
     let Ok(lock)=StateLock::existing(root) else{return};
     let Ok(ledger)=owner_ledger::Ledger::open_bound(root,&lock,&retirement.store,true) else{return};
     let result=(||->Result<()> {
+        ensure!(retirement.runtime_relative_path==relative_runtime(root,session)?
+            && retirement.creation_receipt_sha256==digest(private(&session.join("owned.json"))?),"native creation provenance changed");
         let current=runtime_authority(root,&ledger,session)?;
         ensure!(current==retirement.expected && !ledger.is_closed(&current.owner)?
             && !ledger.held_by_abort(&current.owner)? && !ledger.claimed(&current.owner,relative_runtime(root,session)?)?
             && !ledger.claimed_audit(&current.audit_path)?,"native retirement authority changed or held");
-        write(&session.join("retired.json"),b"{\"version\":1,\"reason\":\"native_scope_retired\"}")?;Ok(())
+        let marker=ScopeRetirementMarker {version:2,reason:"native_scope_retired".into(),
+            authority:retirement.expected.clone(),runtime_relative_path:retirement.runtime_relative_path.clone(),
+            creation_receipt_sha256:retirement.creation_receipt_sha256.clone(),store_identity_sha256:store_digest(&retirement.store)?};
+        write(&session.join("retired.json"),&serde_json::to_vec(&marker)?)?;Ok(())
     })();
     // Drop never creates retirement authority or aborts a pending transfer.
     let _=result;
@@ -244,7 +273,7 @@ fn runtime_authority(root:&Path,ledger:&owner_ledger::Ledger<'_>,session:&Path)-
     ledger.resolve(relative_runtime(root,session)?,&ownership::Authority{owner,audit_path},&format!("{:x}",Sha256::digest(bytes)))
 }
 
-fn prune_and_count(root:&Path) -> Result<usize> {
+fn prune_and_count(root:&Path,ledger:&owner_ledger::Ledger<'_>) -> Result<usize> {
     let mut count=0;
     for provider in std::fs::read_dir(root)? {
         let provider=provider?.path();
@@ -256,7 +285,7 @@ fn prune_and_count(root:&Path) -> Result<usize> {
             if !session.file_name().is_some_and(|name|name.to_string_lossy().starts_with("session-")){continue;}
             ensure!(session.is_dir() && !session.is_symlink(),"native session state is not a directory");
             let reconciled=session.join("retired-owner.json").exists();
-            let retired=session.join("owned.json").exists() && (reconciled
+            let retired=owner_handoff::retired(root,ledger,&session).unwrap_or(false) && (reconciled
                 || (session.join("retired.json").exists() && session.join("complete.json").exists()));
             let lock=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW).open(session.join("lock"))?;
@@ -422,6 +451,8 @@ pub(crate) struct Launch {
     ephemeral: bool,
     authority:ownership::Authority,
     store:owner_store::StoreIdentity,
+    runtime_relative_path:String,
+    creation_receipt_sha256:String,
     audit_log:PathBuf,
     observation:Option<LaunchObservation>,
     _directory: tempfile::TempDir,
@@ -472,7 +503,7 @@ impl Launch {
         let audit_log=owner_logger.protected_log_path().context("native protected audit log missing")?.to_path_buf();
         let reserved=ledger.reserved_bytes()?;
         ensure!(policy.max_state_bytes>=SESSION_BYTES && policy.max_sessions>0,"native state budget is not declared");
-        let count=prune_and_count(&root)?;
+        let count=prune_and_count(&root,&ledger)?;
         let additional=usize::from(!matches!(native,Some(crate::native_session::Launch::Resume{..})));
         if count.saturating_add(additional)>policy.max_sessions
             || (count.saturating_add(additional) as u64).saturating_mul(SESSION_BYTES).saturating_add(reserved)>policy.max_state_bytes
@@ -569,7 +600,7 @@ impl Launch {
         let original_store_binding_sha256=format!("{:x}",Sha256::digest(ownership::canonical_bytes(&serde_json::to_value(&original_binding)?)?));
         let intent=PreparedLaunchIntent {version:2,intent_id:uuid::Uuid::new_v4().to_string(),original_store_binding_sha256,
             source_owner:audit_owner,source_audit_path:owner_logger.path().into(),provider:provider.into(),
-            runtime_relative_path,native_session_id,creation_receipt_sha256,
+            runtime_relative_path:runtime_relative_path.clone(),native_session_id,creation_receipt_sha256:creation_receipt_sha256.clone(),
             launch_sha256:format!("{:x}",Sha256::digest(&spec_bytes))};
         // The protected append and optional workflow journal callback complete
         // before any command can escape preparation or receive prompt bytes.
@@ -577,7 +608,7 @@ impl Launch {
         let mut command = Command::new("/usr/bin/python3");
         command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
             .env("PATH","/usr/bin:/bin");
-        let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), authority, store, audit_log,
+        let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), authority, store, runtime_relative_path, creation_receipt_sha256, audit_log,
             observation:Some(LaunchObservation {prepared,logger:std::sync::Arc::downgrade(owner_logger),actual_session:std::sync::Mutex::new(None),completion_verified:std::sync::atomic::AtomicBool::new(false),completed:std::sync::atomic::AtomicBool::new(false)}),_directory:directory };
         // A requested alias permits later lookup but is not a provider ID event.
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.register_alias(id)?; }
@@ -586,7 +617,7 @@ impl Launch {
         Ok(result)
     }
     pub fn register_retirement(&self, lease:&crate::native_session::Lease) {
-        lease.register_vm_retirement(Retirement{session:self.session.clone(),expected:self.authority.clone(),store:self.store.clone()});
+        lease.register_vm_retirement(Retirement{session:self.session.clone(),expected:self.authority.clone(),store:self.store.clone(),runtime_relative_path:self.runtime_relative_path.clone(),creation_receipt_sha256:self.creation_receipt_sha256.clone()});
     }
     pub fn observe_session(&self, id: &str) -> Result<()> {
         let observed=self.observation.as_ref().context("native observation lacks prepared controller context")?;
@@ -656,7 +687,9 @@ fn test_store_identity(root:&Path)->owner_store::StoreIdentity {
 pub(crate) fn test_retirement(session:PathBuf,expected:ownership::Authority)->Retirement {
     let root=session.parent().and_then(Path::parent).unwrap();
     let store=test_store_identity(root);
-    Retirement {session,expected,store}
+    let runtime_relative_path=relative_runtime(root,&session).unwrap().to_owned();
+    let creation_receipt_sha256=digest(private(&session.join("owned.json")).unwrap());
+    Retirement {session,expected,store,runtime_relative_path,creation_receipt_sha256}
 }
 
 impl Drop for Launch {
@@ -669,7 +702,7 @@ impl Drop for Launch {
                 }
             }
         }
-        if self.ephemeral {retire(&Retirement{session:self.session.clone(),expected:self.authority.clone(),store:self.store.clone()});}
+        if self.ephemeral {retire(&Retirement{session:self.session.clone(),expected:self.authority.clone(),store:self.store.clone(),runtime_relative_path:self.runtime_relative_path.clone(),creation_receipt_sha256:self.creation_receipt_sha256.clone()});}
     }
 }
 
@@ -684,6 +717,10 @@ mod tests {
         write(&path.join("owned.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":owner,"owner":{"workflow_id":"workflow","lease_generation":1}})).unwrap()).unwrap();
         if complete {write(&path.join("complete.json"),b"{\"generation\":\"generation-a\"}").unwrap();}
         path
+    }
+    fn test_prune(root:&Path,lock:&StateLock)->Result<usize> {
+        let ledger=owner_ledger::Ledger::open(root,lock)?;
+        prune_and_count(root,&ledger)
     }
     #[test]
     fn native_preparation_durably_records_exact_launch_before_returning() {
@@ -1017,9 +1054,9 @@ mod tests {
         let aliases=root.join("codex/aliases");std::fs::create_dir(&aliases).unwrap();
         std::fs::set_permissions(&aliases,std::fs::Permissions::from_mode(0o700)).unwrap();
         let expected=ownership::Authority {owner:RuntimeOwner {workflow_id:"workflow".into(),lease_generation:1},audit_path:"/audit/original".into()};
-        let retirement=Retirement {session:runtime.clone(),expected:expected.clone(),store:test_store_identity(&root)};
+        let retirement=test_retirement(runtime.clone(),expected.clone());
         let launch=Launch {command:Command::new("unused-fixture"),resource_policy:serde_json::json!({}),aliases,
-            session:runtime,ephemeral:false,authority:expected,store:test_store_identity(&root),audit_log:"/audit/original".into(),observation:None,_directory:tempfile::tempdir().unwrap()};
+            session:runtime,ephemeral:false,authority:expected,store:test_store_identity(&root),runtime_relative_path:retirement.runtime_relative_path.clone(),creation_receipt_sha256:retirement.creation_receipt_sha256.clone(),audit_log:"/audit/original".into(),observation:None,_directory:tempfile::tempdir().unwrap()};
         (base,root,retirement,launch)
     }
     fn replace_lifecycle_root(base:&Path,root:&Path)->PathBuf {
@@ -1141,14 +1178,14 @@ mod tests {
         let state_lock=StateLock::acquire(temp.path()).unwrap();
         assert_eq!(retire_owned_at(temp.path(),&state_lock,Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:2}).unwrap(),0);
         assert_eq!(retire_owned_at(temp.path(),&state_lock,Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap(),2);
-        assert_eq!(prune_and_count(temp.path()).unwrap(),2);
+        assert_eq!(test_prune(temp.path(),&state_lock).unwrap(),2);
         assert!(held.exists()); assert!(resumable.exists()); assert!(!interrupted.exists());
         // Parallel tests can fork while this fixture lock is open. Explicitly
         // release our flock before dropping it so a child's brief pre-exec FD
         // inheritance cannot turn this immediate reclamation assertion busy.
         assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_UN)},0);
         drop(lock);
-        assert_eq!(prune_and_count(temp.path()).unwrap(),1);
+        assert_eq!(test_prune(temp.path(),&state_lock).unwrap(),1);
         assert!(!held.exists()); assert!(resumable.exists());
         assert!(owner_retired(temp.path(),&state_lock,Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap());
         assert!(!owner_retired(temp.path(),&state_lock,Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:3}).unwrap());
@@ -1175,9 +1212,92 @@ mod tests {
         let interrupted=session(temp.path(),"session-interrupted","/audit/one",false);
         retire(&test_retirement(interrupted.clone(),ownership::Authority{owner:RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1},audit_path:"/audit/one".into()}));
         let state_lock=StateLock::acquire(temp.path()).unwrap();
-        assert_eq!(prune_and_count(temp.path()).unwrap(),1);
+        assert_eq!(test_prune(temp.path(),&state_lock).unwrap(),1);
         assert!(interrupted.exists());
         retire_owned_at(temp.path(),&state_lock,Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap();
-        assert_eq!(prune_and_count(temp.path()).unwrap(),0);
+        assert_eq!(test_prune(temp.path(),&state_lock).unwrap(),0);
     }
+    #[test]
+    fn scope_marker_carries_captured_authority_creation_and_store_provenance() {
+        use sha2::{Digest,Sha256};
+        let (_base,root,retirement,_launch)=lifecycle_fixture();
+        let owned=private(&retirement.session.join("owned.json")).unwrap();
+        retire(&retirement);
+        let marker:serde_json::Value=serde_json::from_slice(&private(&retirement.session.join("retired.json")).unwrap()).unwrap();
+        assert_eq!(marker["version"],2);
+        assert_eq!(marker["authority"],serde_json::to_value(&retirement.expected).unwrap());
+        assert_eq!(marker["runtime_relative_path"],relative_runtime(&root,&retirement.session).unwrap());
+        assert_eq!(marker["creation_receipt_sha256"],format!("{:x}",Sha256::digest(owned)));
+        assert_eq!(marker["store_identity_sha256"],format!("{:x}",Sha256::digest(ownership::canonical_bytes(&serde_json::to_value(&retirement.store).unwrap()).unwrap())));
+    }
+    #[test]
+    fn scope_marker_legacy_ownerless_marker_does_not_authorize_pruning() {
+        let (_base,root,retirement,_launch)=lifecycle_fixture();
+        write(&retirement.session.join("complete.json"),b"{\"version\":1}").unwrap();
+        write(&retirement.session.join("retired.json"),b"{\"version\":1,\"reason\":\"native_scope_retired\"}").unwrap();
+        let state_lock=StateLock::acquire(&root).unwrap();
+        assert_eq!(test_prune(&root,&state_lock).unwrap(),1);
+        assert!(retirement.session.join("owned.json").exists());
+    }
+    #[test]
+    fn scope_marker_tampering_holds_runtime_and_alias_but_valid_peer_is_pruned() {
+        for field in ["authority","runtime_relative_path","creation_receipt_sha256","store_identity_sha256","version","reason","extra"] {
+            let (_base,root,retirement,launch)=lifecycle_fixture();
+            write(&retirement.session.join("complete.json"),b"{}").unwrap();
+            let alias=launch.aliases.join("preserved");
+            write(&alias,&serde_json::to_vec("session-captured").unwrap()).unwrap();
+            retire(&retirement);
+            let marker_path=retirement.session.join("retired.json");
+            let mut marker:serde_json::Value=serde_json::from_slice(&private(&marker_path).unwrap()).unwrap();
+            marker[field]=match field {
+                "authority"=>serde_json::json!({"owner":{"workflow_id":"foreign","lease_generation":1},"audit_path":"/audit/original"}),
+                "version"=>serde_json::json!(1),
+                _=>serde_json::json!("tampered"),
+            };
+            std::fs::remove_file(&marker_path).unwrap();
+            write(&marker_path,&serde_json::to_vec(&marker).unwrap()).unwrap();
+            let peer=session(&root,"session-valid-peer","/audit/peer",true);
+            retire(&test_retirement(peer.clone(),ownership::Authority {owner:RuntimeOwner {workflow_id:"workflow".into(),lease_generation:1},audit_path:"/audit/peer".into()}));
+            let state_lock=StateLock::acquire(&root).unwrap();
+            let ledger=owner_ledger::Ledger::open(&root,&state_lock).unwrap();
+            assert!(owner_handoff::retired(&root,&ledger,&retirement.session).is_err(),"{field}");
+            assert_eq!(prune_and_count(&root,&ledger).unwrap(),1,"{field}");
+            assert!(retirement.session.exists() && alias.exists(),"{field}");
+            assert!(!peer.exists(),"valid peer blocked by {field}");
+        }
+    }
+    #[test]
+    fn scope_marker_valid_completion_waits_for_session_lock() {
+        let (_base,root,retirement,_launch)=lifecycle_fixture();
+        write(&retirement.session.join("complete.json"),b"{}").unwrap();
+        retire(&retirement);
+        let lock=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(retirement.session.join("lock")).unwrap();
+        assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        let state_lock=StateLock::acquire(&root).unwrap();
+        assert_eq!(test_prune(&root,&state_lock).unwrap(),1);
+        assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_UN)},0);
+        assert_eq!(test_prune(&root,&state_lock).unwrap(),0);
+        assert!(!retirement.session.exists());
+    }
+    #[test]
+    fn scope_marker_retirement_refuses_changed_creation_receipt() {
+        let (_base,_root,retirement,_launch)=lifecycle_fixture();
+        let owned=retirement.session.join("owned.json");
+        let mut bytes=private(&owned).unwrap();bytes.push(b' ');
+        std::fs::remove_file(&owned).unwrap();write(&owned,&bytes).unwrap();
+        retire(&retirement);
+        assert!(!retirement.session.join("retired.json").exists());
+    }
+    #[test]
+    fn scope_marker_foreign_workflow_forged_marker_cannot_be_pruned() {
+        let (_base,root,_retirement,_launch)=lifecycle_fixture();
+        let foreign=session(&root,"session-foreign","/audit/foreign",true);
+        std::fs::remove_file(foreign.join("owned.json")).unwrap();
+        write(&foreign.join("owned.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"owner":{"workflow_id":"other-workflow","lease_generation":1},"audit_path":"/audit/foreign"})).unwrap()).unwrap();
+        write(&foreign.join("retired-owner.json"),b"{\"version\":1}").unwrap();
+        let state_lock=StateLock::acquire(&root).unwrap();
+        assert_eq!(test_prune(&root,&state_lock).unwrap(),2);
+        assert!(foreign.exists());
+    }
+
 }

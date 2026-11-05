@@ -1649,11 +1649,7 @@ mod tests {
             }
             drop(ledger);
             drop(lock);
-            super::super::retire(&super::super::Retirement {
-                session: runtime.clone(),
-                expected: request.source_owners[0].clone(),
-                store: super::super::test_store_identity(root.path()),
-            });
+            super::super::retire(&super::super::test_retirement(runtime.clone(),request.source_owners[0].clone()));
             assert!(
                 !runtime.join("retired.json").exists(),
                 "late source scope retired a {phase} runtime"
@@ -1757,6 +1753,8 @@ mod tests {
         let launch = super::super::Launch {
             command: tokio::process::Command::new("unused-fixture"),
             resource_policy: json!({}),
+            runtime_relative_path:super::super::relative_runtime(root.path(),&runtime).unwrap().into(),
+            creation_receipt_sha256:super::super::digest(super::super::private(&runtime.join("owned.json")).unwrap()),
             store: super::super::test_store_identity(root.path()),
             aliases: aliases.clone(),
             session: runtime.clone(),
@@ -1788,6 +1786,8 @@ mod tests {
         let destination = super::super::Launch {
             command: tokio::process::Command::new("unused-fixture"),
             resource_policy: json!({}),
+            runtime_relative_path:super::super::relative_runtime(root.path(),&runtime).unwrap().into(),
+            creation_receipt_sha256:super::super::digest(super::super::private(&runtime.join("owned.json")).unwrap()),
             store: super::super::test_store_identity(root.path()),
             aliases: aliases.clone(),
             session: runtime,
@@ -1824,6 +1824,8 @@ mod tests {
         let launch = super::super::Launch {
             command: tokio::process::Command::new("unused-fixture"),
             resource_policy: json!({}),
+            runtime_relative_path:super::super::relative_runtime(root.path(),&runtime).unwrap().into(),
+            creation_receipt_sha256:super::super::digest(super::super::private(&runtime.join("owned.json")).unwrap()),
             store: super::super::test_store_identity(root.path()),
             aliases: aliases.clone(),
             session: runtime,
