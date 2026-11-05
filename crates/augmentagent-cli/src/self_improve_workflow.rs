@@ -82,6 +82,7 @@ fn millis() -> i64 {
 /// renewal but does not delete work or declare subprocess teardown complete.
 /// Call finish only after child processes have stopped and artifacts are safe.
 pub(super) struct WorkflowGuard {
+    state:PathBuf,
     store: Arc<Mutex<WorkflowStore>>,
     lease: Lease,
     repository: String,
@@ -156,14 +157,48 @@ pub(super) fn workflow_audit(
     Ok(logger)
 }
 
+fn audit_generation_paths(state:&Path,id:&str,generation:i64)->Result<(PathBuf,PathBuf,PathBuf)> {
+    let parent=state.parent().context("workflow state has no parent")?;
+    let parent=if parent.as_os_str().is_empty(){Path::new(".")}else{parent}.canonicalize()?;
+    let root=parent.join("autoship-audit");let key=format!("{:x}",Sha256::digest(id.as_bytes()));
+    let key=if generation==0 {key}else{format!("{key}-generation-{generation}")};
+    Ok((root.clone(),root.join("logs").join(format!("{key}.jsonl")),root.join("anchors").join(format!("{key}.json"))))
+}
+/// Existing registered namespaces are never recreated or health-appended here.
+/// Only known generated paths are supported; legacy/vanished authority holds.
+fn existing_native_audit(state:&Path,authority:&augmentagent_channel_core::native_vm::ownership::Authority,worktree:Option<&Path>,original:&augmentagent_channel_core::native_vm::ownership::TransferBinding)->Result<Arc<augmentagent_channel_core::AuditLogger>> {
+    use std::os::unix::fs::MetadataExt;
+    let mut selected=None;
+    for generation in [authority.owner.lease_generation,0] {
+        let (root,log,anchor)=audit_generation_paths(state,&authority.owner.workflow_id,generation)?;
+        if Path::new(&authority.audit_path)!=log {continue;}
+        for directory in [&root,&root.join("logs"),&root.join("anchors"),&anchor.with_extension("pending")] {
+            let info=std::fs::symlink_metadata(directory)?;
+            anyhow::ensure!(info.is_dir() && !info.file_type().is_symlink() && info.uid()==unsafe{libc::geteuid()} && info.mode()&0o077==0,"native audit directory authority unavailable");
+        }
+        for file in [&log,&anchor,&anchor.with_extension("lock")] {
+            let info=std::fs::symlink_metadata(file)?;
+            anyhow::ensure!(info.is_file() && !info.file_type().is_symlink() && info.uid()==unsafe{libc::geteuid()} && info.nlink()==1 && info.mode()&0o077==0,"native audit file authority unavailable");
+        }
+        selected=Some(generation);break;
+    }
+    let generation=selected.context(augmentagent_channel_core::native_vm::ownership::TransferReason::AuthorityConflict)?;
+    let audit=open_audit_generation(state,&authority.owner.workflow_id,worktree,generation)?;
+    audit.set_native_runtime_owner(authority.owner.clone())?;audit.set_native_store_binding(original.clone())?;Ok(audit)
+}
+fn existing_native_sources(state:&Path,authorities:&[augmentagent_channel_core::native_vm::ownership::Authority],worktree:Option<&Path>,original:&augmentagent_channel_core::native_vm::ownership::TransferBinding)->Result<Vec<Arc<augmentagent_channel_core::AuditLogger>>> {
+    let mut grouped=std::collections::BTreeMap::new();
+    for authority in authorities {
+        let old=grouped.entry(authority.audit_path.clone()).or_insert_with(||authority.clone());
+        if authority.owner.lease_generation>old.owner.lease_generation {*old=authority.clone();}
+    }
+    grouped.values().map(|authority|existing_native_audit(state,authority,worktree,original)).collect()
+}
 fn open_audit_generation(
     state: &Path, id: &str, worktree: Option<&Path>, generation: i64,
 ) -> Result<Arc<augmentagent_channel_core::AuditLogger>> {
     use std::os::unix::fs::PermissionsExt;
-    let root = state
-        .parent()
-        .context("workflow state has no parent")?
-        .join("autoship-audit");
+    let (root,log,anchor)=audit_generation_paths(state,id,generation)?;
     for path in [&root, &root.join("logs"), &root.join("anchors")] {
         std::fs::create_dir_all(path)?;
         anyhow::ensure!(
@@ -186,21 +221,35 @@ fn open_audit_generation(
     }
     // Native worker runtime directories are independently allocated outside
     // protected control state; scope admission rejects overlapping roots.
-    let key = format!("{:x}", Sha256::digest(id.as_bytes()));
-    let key = if generation == 0 { key } else { format!("{key}-generation-{generation}") };
-    let logger = augmentagent_channel_core::AuditLogger::protected(
-        root.join("logs").join(format!("{key}.jsonl")),
-        root.join("anchors").join(format!("{key}.json")),
-        &writes,
-    )?;
+    let logger=augmentagent_channel_core::AuditLogger::protected(log,anchor,&writes)?;
     Ok(Arc::new(logger))
 }
 
-fn acquire_audit_generation(
+fn acquire_audit_generation(state:&Path,store:&mut WorkflowStore,lease:&Lease,worktree:Option<&Path>,binding:&mut Binding,now:i64)->Result<Arc<augmentagent_channel_core::AuditLogger>> {
+    match acquire_audit_generation_inner(state,store,lease,worktree,binding,now) {
+        Ok(audit)=>Ok(audit),Err(error)=>{store.release(lease,millis()).context("failed to release refused audit acquisition")?;Err(error)}
+    }
+}
+fn acquire_audit_generation_inner(
     state: &Path, store: &mut WorkflowStore, lease: &Lease,
     worktree: Option<&Path>, binding: &mut Binding, now: i64,
 ) -> Result<Arc<augmentagent_channel_core::AuditLogger>> {
     reconcile_runtime_retirements_in(store, now)?;
+    if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_some() {
+        if let Some((audit,original))=store.native_owner_context(&lease.workflow,lease.generation)? {
+            let authority=augmentagent_channel_core::native_vm::ownership::Authority {owner:augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:lease.workflow.clone(),lease_generation:lease.generation},audit_path:audit};
+            return existing_native_audit(state,&authority,worktree,&original);
+        }
+        if let Some(pending)=store.native_pending_request(lease,binding,now)? {
+            if pending.request().destination.owner.lease_generation==lease.generation {
+                return existing_native_audit(state,&pending.request().destination,worktree,pending.original_binding());
+            }
+        }
+        if !store.initial_native_owner_available(&lease.workflow)? {
+            return open_audit_generation(state,&lease.workflow,worktree,lease.generation);
+        }
+    }
+
     let generation = store.audit_generation(&lease.workflow)?;
     let old = open_audit_generation(state, &lease.workflow, worktree, generation)?;
     if old.protected_health().is_ok() { return Ok(old); }
@@ -446,6 +495,7 @@ impl SweepGuard {
         }
         let audit = workflow_audit(path, &id, None)?;
         let inner = WorkflowGuard {
+            state:path.to_path_buf(),
             audit,
             store: Arc::new(Mutex::new(store)),
             lease,
@@ -725,6 +775,7 @@ impl WorkflowGuard {
             workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
         })?;
         let mut guard = Self {
+            state:state.to_path_buf(),
             audit,
             store: Arc::new(Mutex::new(store)),
             lease,
@@ -807,32 +858,85 @@ impl WorkflowGuard {
     /// No native transport can escape acquisition before this registration.
     /// Missing selection leaves no unbound owner to strand later setup recovery.
     fn register_native_context(&self)->Result<()> {
-        use augmentagent_channel_core::native_vm::ownership::{self,TransferFenceError,TransferReason};
+        use augmentagent_channel_core::native_vm::ownership::{self,Authority,TransferFenceError,TransferReason};
+        use durable::native_prepare::NativePreparationRun;
+        use durable::native_reconcile::{self,Mode,ReconciliationRun};
         if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_none() {return Ok(());}
+        let owner=augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:self.id().into(),lease_generation:self.lease.generation};
         let current=|| {
-            if self.healthy_lease().is_err() || self.audit.protected_health().is_err() {
-                return Err(TransferFenceError::Unavailable);
+            self.healthy_lease().map_err(|_|TransferFenceError::Unavailable)?;
+            {
+                let mut store=self.store.lock().map_err(|_|TransferFenceError::Unavailable)?;
+                store.validate_dispatch(&self.lease,&self.binding,millis()).map_err(|_|TransferFenceError::NotCurrent)?;
+                if let Some((path,_))=store.native_owner_context(self.id(),self.lease.generation).map_err(|_|TransferFenceError::Unavailable)? {
+                    if Path::new(&path)!=self.audit.path() {return Err(TransferFenceError::NotCurrent);}
+                }
             }
-            let store=self.store.lock().map_err(|_|TransferFenceError::Unavailable)?;
-            match store.native_registration_current(&self.lease,&self.binding,millis()) {
-                Ok(true)=>Ok(()),Ok(false)=>Err(TransferFenceError::NotCurrent),Err(_)=>Err(TransferFenceError::Unavailable),
-            }
+            self.audit.handoff_destination_ready(&owner).map_err(|_|TransferFenceError::Unavailable)
         };
-        let (original,available)={
-            let store=self.store.lock().map_err(|_|anyhow::anyhow!("native registration store poisoned"))?;
-            (store.native_owner_binding(self.id(),self.lease.generation)?,store.initial_native_owner_available(self.id())?)
+        let (registered,available,pending)={
+            let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("native registration store poisoned"))?;
+            (store.native_owner_context(self.id(),self.lease.generation)?,store.initial_native_owner_available(self.id())?,store.native_pending_request(&self.lease,&self.binding,millis())?)
         };
-        let original=if let Some(original)=original {
-            ownership::validate_owner_binding(&original,&current)?;original
-        } else {
-            anyhow::ensure!(available,TransferReason::InventoryMissing);
+        if registered.is_none() && pending.as_ref().is_none_or(|p|p.request().destination.owner.lease_generation!=self.lease.generation) {
+            // This is a leased, provisional controller namespace, not promotion.
+            self.audit.require_run_resources()?;
+            self.audit.record_controller(serde_json::json!({"actor":"controller","kind":"native_destination_prepared","workflow":self.id(),"generation":self.lease.generation}))?;
+        }
+        let original=if let Some((path,original))=registered {
+            anyhow::ensure!(Path::new(&path)==self.audit.path(),TransferReason::AuthorityConflict);original
+        } else if available {
             ownership::with_initial_owner_binding(self.id(),&current,&mut |original| {
                 self.store.lock().map_err(|_|anyhow::anyhow!("native registration store poisoned"))?
-                    .register_initial_native_owner(&self.lease,&self.binding,
-                        self.audit.path().to_str().context("native audit path is not UTF-8")?,original,millis())
+                    .register_initial_native_owner(&self.lease,&self.binding,self.audit.path().to_str().context("native audit is not UTF-8")?,original,millis())
             })?
+        } else {
+            let state=self.state.clone();
+            let worktree=(!self.worktree.as_os_str().is_empty()).then_some(self.worktree.as_path());
+            let mut completed=false;
+            for _ in 0..3 {
+                let pending=self.store.lock().map_err(|_|anyhow::anyhow!("native recovery store poisoned"))?.native_pending_request(&self.lease,&self.binding,millis())?;
+                if let Some(pending)=pending {
+                    let mode=Mode::Lease {lease:&self.lease,binding:&self.binding};
+                    let mut result=native_reconcile::run(&self.store,mode,&pending,None,&millis)?;
+                    if matches!(result,ReconciliationRun::Retained {state:Some(ownership::NativeTransferState::Prepared|ownership::NativeTransferState::Absent),..}) {
+                        let sources=existing_native_sources(&state,&pending.request().source_owners,worktree,pending.original_binding())?;
+                        let destination=existing_native_audit(&state,&pending.request().destination,worktree,pending.original_binding())?;
+                        result=native_reconcile::run(&self.store,mode,&pending,Some((&sources,&destination)),&millis)?;
+                    }
+                    match result {
+                        ReconciliationRun::Settled(settlement) if settlement.current_context=>{completed=true;break;}
+                        ReconciliationRun::KnownUnstarted|ReconciliationRun::Historical|ReconciliationRun::Settled(_)=>continue,
+                        ReconciliationRun::KnownAborted {..}=>anyhow::bail!(TransferReason::AuthorityConflict),
+                        ReconciliationRun::Retained {reason,..}=>anyhow::bail!(reason),
+                    }
+                }
+                let sources=self.store.lock().map_err(|_|anyhow::anyhow!("native facts store poisoned"))?.native_handoff_sources(&self.lease,&self.binding,millis());
+                let sources=match sources {
+                    Ok((authorities,original))=>{self.audit.set_native_store_binding(original.clone())?;existing_native_sources(&state,&authorities,worktree,&original)?}
+                    Err(_)=>Vec::new(),
+                };
+                let result=durable::native_prepare::run(&self.store,&self.lease,&self.binding,&sources,&self.audit,&millis)?;
+                match result {
+                    NativePreparationRun::Pending {settlement:Some(settlement),settlement_failed:false,..} if settlement.current_context=>{completed=true;break;}
+                    NativePreparationRun::Registered {..}=>{completed=true;break;}
+                    NativePreparationRun::Reconciled {result:ReconciliationRun::KnownUnstarted|ReconciliationRun::Historical|ReconciliationRun::Settled(_),..}=>continue,
+                    NativePreparationRun::NoPending {failure,..}=>anyhow::bail!(failure.reason()),
+                    NativePreparationRun::PersistenceUnknown {reason,..}=>anyhow::bail!(reason),
+                    _=>anyhow::bail!(TransferReason::PendingUnknown),
+                }
+            }
+            anyhow::ensure!(completed,TransferReason::PendingUnknown);
+            let (path,original)=self.store.lock().map_err(|_|anyhow::anyhow!("native destination store poisoned"))?.native_owner_context(self.id(),self.lease.generation)?.context(TransferReason::InventoryMissing)?;
+            anyhow::ensure!(Path::new(&path)==self.audit.path(),TransferReason::AuthorityConflict);original
         };
-        self.audit.set_native_store_binding(original)?;
+        self.audit.set_native_store_binding(original.clone())?;
+        ownership::validate_owner_binding(&original,&current)?;
+        let pending=self.store.lock().map_err(|_|anyhow::anyhow!("native promotion store poisoned"))?.current_native_handoff(&self.lease,&self.binding,millis())?;
+        if let Some(pending)=pending {
+            let proof=pending.verified_receipt(&current).map_err(|_|anyhow::anyhow!(TransferReason::PendingUnknown))?.context(TransferReason::PendingUnknown)?;
+            self.store.lock().map_err(|_|anyhow::anyhow!("native promotion store poisoned"))?.promote_native_handoff_audit(&self.lease,&self.binding,&proof,millis())?;
+        }
         current().map_err(anyhow::Error::new)
     }
 
@@ -943,7 +1047,7 @@ impl WorkflowGuard {
         audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
             workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
         })?;
-        let mut guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),binding,
+        let mut guard = Self { state:state.clone(),audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),binding,
             heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false };
         let setup=guard.register_native_context()
             .and_then(|_|guard.install_model_accounting())
@@ -2925,7 +3029,7 @@ mod tests {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority"] {
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
                     .env(CHILD,control.path()).env(MODE,mode);
@@ -3025,6 +3129,24 @@ mod tests {
             assert_eq!(rows[0].certainty,crate::autoship_workflow::native_observation::Certainty::Uncertain);
             assert_eq!(rows[0].protected_observation_reference.as_ref(),Some(fact.receipt()));
             assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        }
+        if matches!(mode.as_str(),"healthy-handoff"|"lost-source-audit"|"pending-settlement-recovery"|"promotion-failure-recovery"|"lost-native-authority") {
+            let old_generation=guard.lease.generation;let old_audit=guard.audit_logger().path().to_path_buf();let old_binding=saved.clone().unwrap();let old_checkpoint=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap().checkpoint;guard.finish().unwrap();
+            let key=format!("{:x}",Sha256::digest(id.as_bytes()));let old_anchor=control.join("autoship-audit/anchors").join(format!("{key}.json"));if mode=="lost-source-audit" {std::fs::remove_file(&old_anchor).unwrap();}
+            if mode=="pending-settlement-recovery" {rusqlite::Connection::open(&state).unwrap().execute_batch("CREATE TRIGGER deny_guard_settlement BEFORE INSERT ON workflow_native_handoff_completed BEGIN SELECT RAISE(ABORT,'injected guard settlement failure'); END;").unwrap();}
+            if mode=="promotion-failure-recovery" {rusqlite::Connection::open(&state).unwrap().execute_batch("CREATE TRIGGER deny_guard_promotion BEFORE INSERT ON workflow_audit_generation BEGIN SELECT RAISE(ABORT,'injected guard promotion failure'); END;").unwrap();}
+            if mode=="lost-native-authority" {std::fs::remove_file(native.join("authority-epoch.json")).unwrap();}
+            let result=WorkflowGuard::acquire_at(&state,start(),millis()).await;
+            if mode=="lost-native-authority" {assert!(result.is_err());assert!(!native.join("authority-epoch.json").exists());let mut store=WorkflowStore::open(&state).unwrap();let snapshot=store.snapshot(&id).unwrap().unwrap();assert_eq!(snapshot.lease_until_ms,0);assert_eq!(snapshot.model_calls,0);assert!(store.native_owner_binding(&id,snapshot.generation).unwrap().is_none());assert_eq!(store.audit_generation(&id).unwrap(),0);assert!(store.pending_native_retirements(millis(),16).unwrap().is_empty());return;}
+            if matches!(mode.as_str(),"pending-settlement-recovery"|"promotion-failure-recovery") {
+                assert!(result.is_err());let mut store=WorkflowStore::open(&state).unwrap();let snapshot=store.snapshot(&id).unwrap().unwrap();assert_eq!(snapshot.lease_until_ms,0);assert_eq!(snapshot.model_calls,0);assert_eq!(store.audit_generation(&id).unwrap(),0);
+                let pending:i64=rusqlite::Connection::open(&state).unwrap().query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&id],|r|r.get(0)).unwrap();assert_eq!(pending,if mode=="pending-settlement-recovery" {1}else{0});
+                rusqlite::Connection::open(&state).unwrap().execute_batch(if mode=="pending-settlement-recovery" {"DROP TRIGGER deny_guard_settlement"}else{"DROP TRIGGER deny_guard_promotion"}).unwrap();drop(store);
+                let recovered=WorkflowGuard::acquire_at(&state,start(),millis()).await.unwrap().unwrap();recovered.validate_before_side_effect().unwrap();assert_eq!(recovered.audit_logger().native_store_binding().unwrap(),Some(old_binding));let mut store=recovered.store.lock().unwrap();assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,0);assert_eq!(store.audit_generation(&id).unwrap(),recovered.lease.generation);let pending:i64=rusqlite::Connection::open(&state).unwrap().query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&id],|r|r.get(0)).unwrap();assert_eq!(pending,0);assert!(store.pending_native_retirements(millis(),16).unwrap().is_empty());drop(store);recovered.finish().unwrap();return;
+            }
+            if mode=="lost-source-audit" {assert!(result.is_err());assert!(!old_anchor.exists(),"missing source authority was recreated");let mut store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&id).unwrap().unwrap().lease_until_ms,0);assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,0);assert_eq!(store.audit_generation(&id).unwrap(),0);assert!(store.pending_native_retirements(millis(),16).unwrap().is_empty());return;}
+            let next=result.unwrap().unwrap();assert!(next.lease.generation>old_generation);assert_ne!(next.audit_logger().path(),old_audit);assert_eq!(next.audit_logger().native_store_binding().unwrap(),Some(old_binding));next.validate_before_side_effect().unwrap();let mut store=next.store.lock().unwrap();assert_eq!(store.audit_generation(&id).unwrap(),next.lease.generation);assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint,old_checkpoint);assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,0);assert!(store.pending_native_retirements(millis(),16).unwrap().is_empty());drop(store);next.finish().unwrap();
+            let third=WorkflowGuard::acquire_at(&state,start(),millis()).await.unwrap().unwrap();assert_eq!(third.store.lock().unwrap().audit_generation(&id).unwrap(),third.lease.generation);third.validate_before_side_effect().unwrap();third.finish().unwrap();return;
         }
         guard.finish().unwrap();println!("native registration guard case passed: {mode}");
     }

@@ -555,7 +555,8 @@ impl AuditLogger {
     pub(crate) fn protected_log_path(&self) -> Option<&Path> {
         self.anchored.as_ref().map(|sink| sink.log_path())
     }
-    pub(crate) fn handoff_destination_ready(
+    /// Read-only protected audit namespace check; never native dispatch authority.
+    pub fn handoff_destination_ready(
         &self,
         expected: &crate::native_vm::RuntimeOwner,
     ) -> anyhow::Result<()> {
@@ -2416,6 +2417,18 @@ mod tests {
             "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1,"limits":{}})
     }
 
+    #[test]
+    fn healthy_destination_probe_never_recreates_a_missing_lock() {
+        let (_dir,logger,_destination,anchor)=handoff_fixture();let source=logger.native_runtime_owner().unwrap().unwrap();logger.handoff_destination_ready(&source).unwrap();
+        let before=std::fs::read(logger.path()).unwrap();let anchored=std::fs::read(&anchor).unwrap();let lock=anchor.with_extension("lock");std::fs::remove_file(&lock).unwrap();assert!(logger.handoff_destination_ready(&source).is_err());assert!(!lock.exists());assert_eq!(std::fs::read(logger.path()).unwrap(),before);assert_eq!(std::fs::read(&anchor).unwrap(),anchored);
+    }
+    #[test]
+    fn healthy_destination_probe_is_read_only_and_reports_busy_gate() {
+        use std::os::fd::AsRawFd;use std::sync::{Arc,mpsc};use std::time::Duration;
+        let (_dir,logger,_destination,anchor)=handoff_fixture();let source=logger.native_runtime_owner().unwrap().unwrap();let logger=Arc::new(logger);let before=std::fs::read(logger.path()).unwrap();let anchored=std::fs::read(&anchor).unwrap();
+        let held=std::fs::OpenOptions::new().read(true).write(true).open(anchor.with_extension("lock")).unwrap();assert_eq!(unsafe {libc::flock(held.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        let (tx,rx)=mpsc::channel();let probe=logger.clone();let worker=std::thread::spawn(move || {tx.send(probe.handoff_destination_ready(&source).is_err()).unwrap();});let while_held=rx.recv_timeout(Duration::from_secs(2));drop(held);worker.join().unwrap();assert_eq!(while_held,Ok(true));assert_eq!(std::fs::read(logger.path()).unwrap(),before);assert_eq!(std::fs::read(&anchor).unwrap(),anchored);
+    }
     #[test]
     fn healthy_handoff_verifies_correlated_kernel_resource_evidence() {
         let (_dir, logger, destination, _) = handoff_fixture();

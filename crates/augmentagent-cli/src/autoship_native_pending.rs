@@ -95,6 +95,17 @@ pub(super) fn orphaned(conn:&Connection,workflow:&str)->Result<bool> {
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub(super) enum NativeHandoffDisposition {Active,Completed,Unstarted,Aborted}
 impl WorkflowStore {
+    /// Protected request context only, never a native outcome or dispatch grant.
+    pub(crate) fn native_pending_request(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<Option<PendingNativeHandoff>> {
+        self.validate_lease(lease,binding,now)?;
+        match self.resolve_native_handoff_persistence(&lease.workflow,None,Err(anyhow::anyhow!(TransferReason::PersistRetry))) {
+            NativePreparationPersistence::Durable(HandoffPreparation::Prepared(p)|HandoffPreparation::ReconcileExisting(p))=>Ok(Some(p)),
+            NativePreparationPersistence::NotCommitted {..}=>Ok(None),
+            NativePreparationPersistence::Unknown {reason,..}=>anyhow::bail!(reason),
+        }
+    }
+}
+impl WorkflowStore {
     pub(super) fn native_handoff_disposition(&mut self,pending:&PendingNativeHandoff)->Result<NativeHandoffDisposition> {
         let workflow=&pending.request.workflow_id;let tx=self.conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         ensure!(!orphaned(&tx,workflow)?,TransferReason::PendingUnknown);
@@ -139,6 +150,10 @@ pub struct VerifiedHandoffReceipt {
 pub struct HandoffSettlement {
     pub(crate) destination: Authority,
     pub(crate) current_context: bool,
+}
+impl VerifiedHandoffReceipt {
+    pub(crate) fn pending(&self)->&PendingNativeHandoff {&self.pending}
+    pub(crate) fn receipt(&self)->&augmentagent_channel_core::native_vm::ownership::TransferReceipt {&self.receipt}
 }
 impl PendingNativeHandoff {
     /// The borrowed inspection was produced by the actual original native ledger
@@ -253,7 +268,7 @@ impl WorkflowStore {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         require_binding(&tx,lease,binding,now)?;
         require_clear_abort_barriers(&tx,&lease.workflow)?;
-        owner_control::require_dispatch(&tx,&lease.workflow)?;
+        owner_turn::require_native_dispatch(&tx,lease,now)?;
         let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;
         let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
         ensure!(!matches!(checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired),TransferReason::AuthorityConflict);
@@ -319,7 +334,7 @@ impl WorkflowStore {
             });
         }
         require_clear_abort_barriers(&tx,&lease.workflow)?;
-        owner_control::require_dispatch(&tx,&lease.workflow).context(TransferReason::AuthorityConflict)?;
+        owner_turn::require_native_dispatch(&tx,lease,now).context(TransferReason::AuthorityConflict)?;
         let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed')) OR EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2)",params![lease.workflow,lease.generation],|r|r.get(0))?;
         ensure!(!blocked, TransferReason::AuthorityConflict);
         let snapshot=if let Some((basis,inventory,retired))=selection {

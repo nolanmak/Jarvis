@@ -1695,6 +1695,27 @@ mod tests {
         }
     }
     #[test]
+    fn native_guard_promotion_uses_current_actual_receipt_without_changing_candidate_or_accounting() {
+        if child("native_guard_promotion_uses_current_actual_receipt_without_changing_candidate_or_accounting") {return;}
+        let mut f=Fixture::new();let (lease,pending,proof)=completed_native_handoff(&mut f);f.store.settle_native_handoff(&lease,&f.binding,&proof,now()).unwrap();let before=f.store.snapshot(&lease.workflow).unwrap().unwrap();let allowance=f.store.merge_allowance(now(),5).unwrap();
+        assert_eq!(f.store.current_native_handoff(&lease,&f.binding,now()).unwrap(),Some(pending));assert_eq!(f.store.promote_native_handoff_audit(&lease,&f.binding,&proof,now()).unwrap(),lease.generation);let events=f.store.events(&lease.workflow).unwrap();f.store.promote_native_handoff_audit(&lease,&f.binding,&proof,now()).unwrap();assert_eq!(f.store.events(&lease.workflow).unwrap(),events);assert_eq!(f.store.audit_generation(&lease.workflow).unwrap(),lease.generation);assert_eq!(f.store.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(f.store.merge_allowance(now(),5).unwrap(),allowance);
+    }
+    #[test]
+    fn native_guard_promotion_refuses_historical_receipt_and_changed_candidate() {
+        if child("native_guard_promotion_refuses_historical_receipt_and_changed_candidate") {return;}
+        for fault in ["lease","head","held"] {
+            let mut f=Fixture::new();let (old,_pending,proof)=completed_native_handoff(&mut f);f.store.settle_native_handoff(&old,&f.binding,&proof,now()).unwrap();let mut lease=old.clone();let mut binding=f.binding.clone();
+            if fault=="lease" {f.store.release(&old,now()).unwrap();lease=f.store.claim(&old.workflow,"new-promotion-owner",now(),60_000).unwrap().unwrap();}
+            else {let mut checkpoint=f.store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;if fault=="head" {binding.head="changed-promotion-head".into();checkpoint.binding=binding.clone();}else{checkpoint.stage=Stage::Held;}f.store.checkpoint(&lease,&checkpoint,now()).unwrap();}
+            let events=f.store.events(&lease.workflow).unwrap();assert!(f.store.promote_native_handoff_audit(&lease,&binding,&proof,now()).is_err(),"{fault}");assert_eq!(f.store.events(&lease.workflow).unwrap(),events);assert_eq!(f.store.audit_generation(&lease.workflow).unwrap(),0);
+        }
+    }
+    #[test]
+    fn native_guard_promotion_projection_failure_retains_verified_settlement_for_retry() {
+        if child("native_guard_promotion_projection_failure_retains_verified_settlement_for_retry") {return;}
+        let mut f=Fixture::new();let (lease,pending,proof)=completed_native_handoff(&mut f);f.store.settle_native_handoff(&lease,&f.binding,&proof,now()).unwrap();f.store.conn.execute_batch("CREATE TRIGGER deny_native_promotion BEFORE INSERT ON workflow_audit_generation BEGIN SELECT RAISE(ABORT,'injected promotion failure'); END;").unwrap();let events=f.store.events(&lease.workflow).unwrap();assert!(f.store.promote_native_handoff_audit(&lease,&f.binding,&proof,now()).is_err());assert_eq!(f.store.events(&lease.workflow).unwrap(),events);assert_eq!(f.store.current_native_handoff(&lease,&f.binding,now()).unwrap(),Some(pending));assert_eq!(f.store.audit_generation(&lease.workflow).unwrap(),0);f.store.conn.execute_batch("DROP TRIGGER deny_native_promotion").unwrap();f.store.promote_native_handoff_audit(&lease,&f.binding,&proof,now()).unwrap();
+    }
+    #[test]
     fn native_handoff_pending_request_survives_restart_without_new_identity() {
         if child("native_handoff_pending_request_survives_restart_without_new_identity") {
             return;

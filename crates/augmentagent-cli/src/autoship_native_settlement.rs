@@ -146,6 +146,13 @@ pub(crate) struct History {
 impl History {
     /// Historical workflow intent only. This cannot construct a verified
     /// native receipt or grant productive destination ownership.
+    pub(crate) fn current_pending(&self,generation:i64,binding:&Binding)->Result<Option<PendingNativeHandoff>> {
+        let records=self.records.iter().filter(|r|r.terminal.is_none() && r.pending.request.destination.owner.lease_generation==generation && r.pending.workflow_binding==*binding).collect::<Vec<_>>();
+        ensure!(records.len()<=1,TransferReason::InventoryMissing);Ok(records.first().map(|r|r.pending.clone()))
+    }
+    pub(crate) fn matches_current_receipt(&self,proof:&VerifiedHandoffReceipt)->bool {
+        self.records.iter().any(|r|r.terminal.is_none() && r.pending==*proof.pending() && r.receipt==*proof.receipt())
+    }
     pub(super) fn pending_for_id(&self,id:&str)->Option<&PendingNativeHandoff> {
         self.records.iter().find(|record|record.pending.request.transfer_id==id).map(|record|&record.pending)
     }

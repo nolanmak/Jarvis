@@ -513,3 +513,44 @@ mod tests {
         );
     }
 }
+
+impl WorkflowStore {
+    pub(crate) fn native_handoff_sources(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<(Vec<augmentagent_channel_core::native_vm::ownership::Authority>,TransferBinding)> {
+        let facts=self.native_handoff_facts(lease,binding,now)?;Ok((facts.source_owners,facts.original_binding))
+    }
+    /// Read current registration only; this never captures a missing binding.
+    pub(crate) fn native_owner_context(&self,workflow:&str,generation:i64)->Result<Option<(String,TransferBinding)>> {
+        let exists:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2)",params![workflow,generation],|r|r.get(0))?;
+        if !exists {return Ok(None);}
+        let (audit,_)=native_launch::original_context(&self.conn,workflow,generation,true)?;
+        let binding=self.native_owner_binding(workflow,generation)?.context("native owner original binding missing")?;Ok(Some((audit,binding)))
+    }
+    pub(crate) fn current_native_handoff(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<Option<PendingNativeHandoff>> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Deferred)?;require_native_dispatch_tx(&tx,lease,binding,now)?;
+        let history=native_pending::settlement::History::load(&tx,&lease.workflow,u64::MAX)?;
+        let pending=history.current_pending(lease.generation,binding)?;tx.commit()?;Ok(pending)
+    }
+    /// Metadata audit-index promotion requires the actual native receipt and a
+    /// current exact context. It is still not provider/resource admission.
+    pub(crate) fn promote_native_handoff_audit(&mut self,lease:&Lease,binding:&Binding,proof:&VerifiedHandoffReceipt,now:i64)->Result<i64> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_native_dispatch_tx(&tx,lease,binding,now)?;
+        let pending=proof.pending();proof.receipt().verify(pending.request())?;
+        ensure!(pending.request().workflow_id==lease.workflow && pending.request().destination.owner.lease_generation==lease.generation
+            && pending.workflow_binding()==binding,augmentagent_channel_core::native_vm::ownership::TransferReason::AuthorityConflict);
+        let history=native_pending::settlement::History::load(&tx,&lease.workflow,u64::MAX)?;
+        ensure!(history.matches_current_receipt(proof),"native promotion requires matching settled current receipt");
+        let (audit,digest)=native_launch::original_context(&tx,&lease.workflow,lease.generation,true)?;
+        ensure!(audit==pending.request().destination.audit_path && digest==native_launch::binding_digest(pending.original_binding())?,"native promotion original destination changed");
+        let value=serde_json::json!({"kind":"native_handoff_promoted","transfer_id":pending.request().transfer_id,"receipt_sha256":proof.receipt().receipt_sha256,"audit_generation":lease.generation,"destination_audit":audit});let raw=serde_json::to_string(&value)?;
+        let old:Option<(i64,i64,String)>=tx.query_row("SELECT generation,lease_generation,recovery FROM workflow_audit_generation WHERE workflow=?1",[&lease.workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        if let Some((generation,owner,prior))=old {
+            ensure!(generation<=lease.generation && owner<=lease.generation,"native audit generation moved");
+            if generation==lease.generation {
+                ensure!(owner==lease.generation && serde_json::from_str::<serde_json::Value>(&prior)?==value,"native audit generation has different authority");
+                let found:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='native_audit_promoted' AND payload=?3)",params![lease.workflow,lease.generation,raw],|r|r.get(0))?;ensure!(found,"native audit promotion event missing");tx.commit()?;return Ok(lease.generation);
+            }
+        }
+        tx.execute("INSERT INTO workflow_audit_generation VALUES(?1,?2,?2,?3) ON CONFLICT(workflow) DO UPDATE SET generation=excluded.generation,lease_generation=excluded.lease_generation,recovery=excluded.recovery",params![lease.workflow,lease.generation,raw])?;
+        event(&tx,&lease.workflow,lease.generation,"native_audit_promoted",&raw,now)?;tx.commit()?;Ok(lease.generation)
+    }
+}

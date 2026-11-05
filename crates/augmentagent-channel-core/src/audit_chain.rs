@@ -489,7 +489,7 @@ impl AnchoredAudit {
     where
         F: FnOnce(&[serde_json::Value]) -> Result<()>,
     {
-        let (_lock, anchor, rows, clean) = self.locked_snapshot()?;
+        let (_lock, anchor, rows, clean) = self.locked_snapshot_from(true)?;
         ensure!(
             clean && anchor.sealed.is_none(),
             "audit generation is not healthy and open"

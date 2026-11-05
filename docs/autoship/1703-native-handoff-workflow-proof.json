@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "c0a941b7d5738962544d34f6cb0ae301001e8f57",
+  "source_parent_commit": "21ac2f87ddee8bd1111b18377f23dbf01d122837",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -26,19 +26,19 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
-      "sha256": "6d00a3adbe573aa1204924ad811d88004483907bedcee189b4d1dd7c24980332"
+      "sha256": "4744a85e2a7e163f5ba964e4e6ce8d84a692e4891dd4b9860a9fe9ce3992c85f"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
-      "sha256": "7219a8c984f8cc20206fc50911b913b0770bd3a02b9fb8894b0959e3c2b0ccfb"
+      "sha256": "00e70f67c0bd924a3c3e99cf7846351845c770f10348411dc825098c7bf27364"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
-      "sha256": "2edff526c5010ea0635e4212605682ed6876eadcd881564d18e2eac7a474666f"
+      "sha256": "7787919d0c38a3451ff85528b04e65014c878fb4353e98958eb4d82b6d1f7e2c"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_settlement.rs",
-      "sha256": "252ea9eb6e3cde077775b80c5bea41f955f2092336144a697415299c482df66a"
+      "sha256": "663f819138ae3ca80bf9a5247437116f05ee9f8c464ce50952ead0982139a2a1"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_control.rs",
@@ -90,11 +90,11 @@
     },
     {
       "path": "crates/augmentagent-channel-core/src/audit_chain.rs",
-      "sha256": "4e45be6f383d0fb5d58fe9e42d86b25db1f7a15227836a14f455bed051d70ed1"
+      "sha256": "e599e259562d33af95a6891db078b52b36518c29da4437a16911a78612dd2496"
     },
     {
       "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
-      "sha256": "c5f28af1ced6333c78e53fb561449e89392d6e49aca98435e7d908c68c55c1a3"
+      "sha256": "16bbd769db8c55c64a84bb1b458074487a8e7f34702a05fe9de8c561a1ff7d2f"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_abort_resolution.rs",
@@ -110,12 +110,12 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "06b717518fca875167f09261b3b72ae2b8a1884c7004c882d5093821059c6d67"
+      "sha256": "b51309f8621c3ef638c2bddbbde91db52344c14f131c1bc7c540133f64c3cdda"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1834,
+    "passed": 1837,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
@@ -150,13 +150,22 @@
       "autoship-native-callback-journal-red.log",
       "autoship-native-callback-journal-green.log",
       "autoship-native-callback-journal-production-check.log",
-      "autoship-native-callback-journal-full-cli.log"
+      "autoship-native-callback-journal-full-cli.log",
+      "autoship-native-guard-promotion-red.log",
+      "autoship-native-guard-promotion-green.log",
+      "autoship-native-guard-factory-red.log",
+      "autoship-native-guard-factory-green.log",
+      "autoship-native-guard-factory-fault-green.log",
+      "autoship-native-guard-audit-probe-red.log",
+      "autoship-native-guard-factory-full-core.log",
+      "autoship-native-guard-factory-production-check.log",
+      "autoship-native-guard-factory-full-cli.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
     "owner_eligibility_cases": 6,
     "focused_native_observation_cases": 33,
-    "core_passed": 891,
+    "core_passed": 893,
     "core_failed": 0,
     "core_ignored": 15,
     "owner_retirement_marker_cases": 3,
@@ -178,13 +187,16 @@
     "core_validation_scope": "full managed core library suite; source inventory is post-run and grants no compiled-source freshness authority",
     "pending_reconciliation_cases": 9,
     "joined_reconciliation_adapter_cases": 1,
-    "core_validation_source_commit": "2a1baf51dd96379f32625513591fc4edf422c59b (891 passed, 15 ignored; core sources unchanged and not rerun for workflow-only change)",
+    "core_validation_source_commit": "current working source before publication; full suite rerun; post-run inventory grants no compiled-source freshness authority",
     "callback_journal_cases": 4,
     "production_configuration_check": {
       "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
       "passed": true,
-      "log": "autoship-native-callback-journal-production-check.log"
-    }
+      "log": "autoship-native-guard-factory-production-check.log"
+    },
+    "guard_promotion_cases": 3,
+    "read_only_audit_probe_cases": 2,
+    "actual_guard_subprocess_modes": 13
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -275,7 +287,11 @@
     "launch and observation commits recheck lease/candidate, checkpoint holds/terminal state, owner-turn/pause authority and original registered context in the publication transaction; lease/head/held/retired changes after capture publish no event",
     "actual core launch-prepared and uncertainty publication invoke the same installed callback implementation used by WorkflowGuard, journaling nullable identity and uncertainty without model dispatch",
     "deterministic concurrent late launch and observation callbacks read real receipts while another thread owns the workflow mutex, then attempt metadata publication while real native transfer holds state/session/audit locks; both stale commits refuse and the original transfer settles successfully",
-    "legacy receipt-reading store wrappers and raw launch-journal entry are test-only; a successful non-test production configuration check proves real guard callers use the new receipt-capability ingress"
+    "legacy receipt-reading store wrappers and raw launch-journal entry are test-only; a successful non-test production configuration check proves real guard callers use the new receipt-capability ingress",
+    "ordinary and observational guard source paths use distinct namespaces and shared original-pending reconciliation/preparation; healthy repeated acquisition preserves original binding, checkpoint and accounting",
+    "actual guard subprocesses recover original completed settlement and audit promotion after injected database write failures; missing original audit/native authority refuses and releases the unstarted lease without recreating authority",
+    "audit pointer promotion requires opaque actual current receipt and matching settled history; historical, changed-head and held contexts refuse; replay is idempotent and projection failure retains settlement",
+    "read-only healthy audit inspection never recreates missing lock authority and reports a busy lock without waiting or mutating log/anchor"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -290,10 +306,9 @@
     "automatic authenticated retirement/resolution routing and interrupted namespace recovery and authenticated legacy/uncertainty/corrupt-state recovery",
     "normal protected rollout and actual Codex/Claude Discord continuation acceptance",
     "C actual-backend freshness/storage/quiescence cutover, private verifier recovery/application and full epic soak",
-    "real WorkflowGuard/worker pending-recovery invocation, authenticated cleanup routing",
-    "connect all real guard acquisition/promotion callers only after original-state interrupted/legacy namespace resolution and recovery routing are implemented",
     "persist post-intent transient-I/O S backoff, actual input-change early wake before activation",
-    "guarded all-closed-source re-preparation using the original binding and verified history; no fresh-origin backfill or budget/owner-input reset"
+    "guarded all-closed-source re-preparation using the original binding and verified history; no fresh-origin backfill or budget/owner-input reset",
+    "authenticated cleanup routing and all-closed original-binding recovery; remaining owner-turn, recovery and merge-sweep consumers; actual runtime/provider continuation acceptance"
   ],
   "native_transfer_scope": "isolated synthetic-controller/native-filesystem fixtures only; zero production transfers or provider/model dispatch",
   "opaque_receipt_producer": "actual original-bound ownership::transfer_receipt lookup or Completed NativeTransferInspection under the held original native lock; no wire/serialized-receipt constructor",
@@ -367,5 +382,12 @@
   "legacy_receipt_io_helpers_test_only": true,
   "callback_lock_order_component_proved": true,
   "callback_journal_scope": "isolated actual protected append/core uncertainty ingress, WorkflowStore transactions and native transfer with concurrent late launch/observation callbacks. Synthetic controller/resource evidence, zero provider/model dispatch; production guard observer installation code compiles, but no deployed provider continuation or VM quiescence acceptance is claimed.",
-  "callback_journal_red_evidence": "Initial compile used a core-private intent validation method; corrected workflow validation and retained the initial log separately. Corrected red: two behavioral failures (observer persistence placeholder and workflow mutex retained across capture), two refusal cases passing. Final full CLI suite includes all four cases. The actual concurrent race runs both launch and observation callbacks under real state/session/audit locks and rejects their stale metadata commits while transfer and verified settlement complete."
+  "callback_journal_red_evidence": "Initial compile used a core-private intent validation method; corrected workflow validation and retained the initial log separately. Corrected red: two behavioral failures (observer persistence placeholder and workflow mutex retained across capture), two refusal cases passing. Final full CLI suite includes all four cases. The actual concurrent race runs both launch and observation callbacks under real state/session/audit locks and rejects their stale metadata commits while transfer and verified settlement complete.",
+  "source_caller_integration": {
+    "ordinary_and_observational_guard_acquisition": true,
+    "merge_sweep": false,
+    "runtime_deployed": false,
+    "guard_fixture_scope": "13 actual guard subprocess modes; zero-runtime native sources; zero provider/model dispatch; not live continuation acceptance"
+  },
+  "productive_caller_enabled_scope": "deployment activation remains unproven; supported guard source paths are connected as described in source_caller_integration"
 }
