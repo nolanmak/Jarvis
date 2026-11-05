@@ -162,6 +162,15 @@ def discard_unpublished_generation(guest, policy_path):
     shutil.rmtree(guest)
 
 
+def record_fresh_store(state):
+    info = state.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_mode & 0o077 or any(state.iterdir())):
+        raise ValueError('fresh native authority requires a newly provisioned private root')
+    root_identity = hashlib.sha256(json.dumps({'device': info.st_dev, 'inode': info.st_ino}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    helper('native-provider-vm.py').atomic(state / 'authority-bootstrap.json', json.dumps({'version': 1, 'epoch': str(uuid.uuid4()), 'root_identity_sha256': root_identity}, sort_keys=True, separators=(',', ':')).encode())
+
+
 def provision(args):
     runtime_helper = helper('native-provider-vm.py')
     policy_path = args.extend_policy
@@ -190,6 +199,7 @@ def provision(args):
         root = root.resolve()
         state = root / 'state'
         state.mkdir(mode=0o700)
+        record_fresh_store(state)
         policy_path = root / 'policy.json'
         policy = {'version': 1, 'runtime_config': str(args.runtime_config.resolve()),
                   'state_root': str(state), 'memory_mb': args.memory_mb if args.memory_mb is not None else 1024,

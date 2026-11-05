@@ -302,11 +302,42 @@ pub struct AuditLogger {
     path: PathBuf,
     model_call_observer:
         Arc<std::sync::Mutex<Option<Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>>>>,
-    dispatch_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>>,
+    dispatch_observer:
+        Arc<std::sync::Mutex<Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>>,
     run_resources_required: Arc<std::sync::atomic::AtomicBool>,
     native_runtime_owner: Arc<std::sync::Mutex<Option<crate::native_vm::RuntimeOwner>>>,
+    native_store_binding:
+        Arc<std::sync::Mutex<Option<crate::native_vm::ownership::TransferBinding>>>,
+    native_launch_observer: Arc<
+        std::sync::Mutex<
+            Option<
+                Arc<
+                    dyn Fn(&crate::native_vm::PreparedLaunchRecord) -> anyhow::Result<()>
+                        + Send
+                        + Sync,
+                >,
+            >,
+        >,
+    >,
+    native_observation_observer: Arc<
+        std::sync::Mutex<
+            Option<
+                Arc<
+                    dyn Fn(
+                            &crate::native_vm::ownership::VerifiedNativeObservation,
+                        ) -> anyhow::Result<()>
+                        + Send
+                        + Sync,
+                >,
+            >,
+        >,
+    >,
     resource_capacity_seen: Arc<std::sync::atomic::AtomicBool>,
-    resource_capacity_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>>>>,
+    resource_capacity_observer: Arc<
+        std::sync::Mutex<
+            Option<Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>>,
+        >,
+    >,
     anchored: Option<crate::audit_chain::AnchoredAudit>,
     failure_path: Option<PathBuf>,
     pending_dir: Option<PathBuf>,
@@ -368,96 +399,251 @@ impl std::fmt::Debug for AuditLogger {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct AuditWritersBusy;
+impl std::fmt::Display for AuditWritersBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("workflow audit writers have not drained")
+    }
+}
+impl std::error::Error for AuditWritersBusy {}
+
 impl AuditLogger {
-    pub(crate) fn handoff_evidence(&self,request_sha256:&str,destination:&crate::native_vm::RuntimeOwner)->anyhow::Result<serde_json::Value> {
-        anyhow::ensure!(!destination.workflow_id.is_empty() && destination.lease_generation>0,"invalid handoff destination");
-        let proof=self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("handoff requires protected audit"))?
-            .seal_for_handoff(request_sha256,|rows| {
+    pub fn handoff_evidence(
+        &self,
+        request_sha256: &str,
+        destination: &crate::native_vm::RuntimeOwner,
+        assert_current: &dyn Fn() -> anyhow::Result<()>,
+    ) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            !destination.workflow_id.is_empty() && destination.lease_generation > 0,
+            "invalid handoff destination"
+        );
+        let source = self
+            .native_runtime_owner()?
+            .ok_or_else(|| anyhow::anyhow!("handoff source authority missing"))?;
+        anyhow::ensure!(
+            source.workflow_id == destination.workflow_id
+                && source.lease_generation > 0
+                && source.lease_generation < destination.lease_generation,
+            "handoff requires a newer owner of the same workflow"
+        );
+        assert_current()?;
+        let proof = self
+            .anchored
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("handoff requires protected audit"))?
+            .seal_for_handoff(request_sha256, |rows| {
+                assert_current()?;
                 self.check_protected_continuity()?;
-                Self::handoff_validation(rows,destination)
+                let validation = Self::handoff_validation(rows, destination)?;
+                assert_current()?;
+                Ok(validation)
             })?;
         // A matching immutable request must keep the same destination even
         // when a caller reopens an already sealed source logger.
-        anyhow::ensure!(proof["validation"]["workflow_id"]==destination.workflow_id
-            && proof["validation"]["destination_lease_generation"]==destination.lease_generation,
-            "handoff proof destination mismatch");
+        anyhow::ensure!(
+            proof["validation"]["workflow_id"] == destination.workflow_id
+                && proof["validation"]["destination_lease_generation"]
+                    == destination.lease_generation,
+            "handoff proof destination mismatch"
+        );
+        assert_current()?;
         Ok(proof)
     }
-    fn handoff_validation(rows:&[serde_json::Value],destination:&crate::native_vm::RuntimeOwner)->anyhow::Result<serde_json::Value> {
-        let mut previous=0i64;let mut required=false;
-        let mut admissions:Vec<(String,serde_json::Value,bool)>=Vec::new();
+    fn handoff_validation(
+        rows: &[serde_json::Value],
+        destination: &crate::native_vm::RuntimeOwner,
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut previous = 0i64;
+        let mut required = false;
+        let mut admissions: Vec<(String, serde_json::Value, bool)> = Vec::new();
         for row in rows {
-            let controller=row["actor"]=="controller";
+            anyhow::ensure!(
+                row.get("workflow").is_none() || row["workflow"] == destination.workflow_id,
+                "foreign workflow in handoff audit"
+            );
+            let controller = row["actor"] == "controller";
             if controller && row.get("generation").is_some() {
-                let generation=row["generation"].as_i64().ok_or_else(||anyhow::anyhow!("handoff source generation missing"))?;
-                anyhow::ensure!(generation>0 && row["workflow"]==destination.workflow_id,"handoff source workflow mismatch");
-                previous=previous.max(generation);
+                let generation = row["generation"]
+                    .as_i64()
+                    .ok_or_else(|| anyhow::anyhow!("handoff source generation missing"))?;
+                anyhow::ensure!(
+                    generation > 0 && row["workflow"] == destination.workflow_id,
+                    "handoff source workflow mismatch"
+                );
+                previous = previous.max(generation);
             }
             match row["kind"].as_str() {
-                Some("run_resources_required")=>{
-                    anyhow::ensure!(controller && row["version"]==1,"handoff requires controller resource policy");
-                    required=true;
+                Some("run_resources_required") => {
+                    anyhow::ensure!(
+                        controller && row["version"] == 1,
+                        "handoff requires controller resource policy"
+                    );
+                    required = true;
                 }
-                Some("run_resource_admitted")=>{
-                    anyhow::ensure!(controller && required,"handoff resource admission lacks protected policy");
-                    let provider=row["provider"].as_str().filter(|p|!p.is_empty()).ok_or_else(||anyhow::anyhow!("handoff resource provider missing"))?;
-                    let identity=&row["observation"]["identity"];
-                    anyhow::ensure!(identity.is_object(),"handoff resource identity missing");
-                    anyhow::ensure!(!admissions.iter().any(|(p,id,_)|p==provider && id==identity),"duplicate handoff resource admission");
-                    admissions.push((provider.into(),identity.clone(),false));
+                Some("run_resource_admitted") => {
+                    anyhow::ensure!(
+                        controller && required,
+                        "handoff resource admission lacks protected policy"
+                    );
+                    let provider = row["provider"]
+                        .as_str()
+                        .filter(|p| !p.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("handoff resource provider missing"))?;
+                    let identity = &row["observation"]["identity"];
+                    anyhow::ensure!(identity.is_object(), "handoff resource identity missing");
+                    anyhow::ensure!(
+                        !admissions.iter().any(|(_, id, _)| id == identity),
+                        "duplicate handoff resource admission"
+                    );
+                    admissions.push((provider.into(), identity.clone(), false));
                 }
-                Some("model_call_admitted")=>{
-                    anyhow::ensure!(controller && required && row["admission_schema_version"]==2 && row["resource_identity"].is_object(),
-                        "handoff requires resource-bound schema 2 model admissions");
-                    let provider=row["actual_provider"].as_str().ok_or_else(||anyhow::anyhow!("handoff model provider missing"))?;
-                    let admission=admissions.iter_mut().find(|(p,id,_)|p==provider && id==&row["resource_identity"])
-                        .ok_or_else(||anyhow::anyhow!("handoff model has no identical preceding resource admission"))?;
-                    anyhow::ensure!(!admission.2,"handoff resource reused by multiple model admissions");
-                    admission.2=true;
+                Some("model_call_admitted") => {
+                    anyhow::ensure!(
+                        controller
+                            && required
+                            && row["admission_schema_version"] == 2
+                            && row["resource_identity"].is_object(),
+                        "handoff requires resource-bound schema 2 model admissions"
+                    );
+                    let provider = row["actual_provider"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("handoff model provider missing"))?;
+                    let admission = admissions
+                        .iter_mut()
+                        .find(|(p, id, _)| p == provider && id == &row["resource_identity"])
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "handoff model has no identical preceding resource admission"
+                            )
+                        })?;
+                    anyhow::ensure!(
+                        !admission.2,
+                        "handoff resource reused by multiple model admissions"
+                    );
+                    admission.2 = true;
                 }
-                _=>(),
+                _ => (),
             }
         }
-        anyhow::ensure!(required && previous>0 && previous<destination.lease_generation,"handoff requires a newer fenced workflow generation");
+        anyhow::ensure!(
+            required && previous > 0 && previous < destination.lease_generation,
+            "handoff requires a newer fenced workflow generation"
+        );
         // Validate the complete correlation before touching any kernel scope.
         // Unused admissions still need independent stop proof.
-        let resources=admissions.iter().map(|(_,identity,_)|crate::run_resources::verify_quiescent(identity))
+        let resources = admissions
+            .iter()
+            .map(|(_, identity, _)| crate::run_resources::verify_quiescent(identity))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(serde_json::json!({"workflow_id":destination.workflow_id,"previous_lease_generation":previous,
-            "destination_lease_generation":destination.lease_generation,"quiescent_resources":resources}))
+        Ok(
+            serde_json::json!({"workflow_id":destination.workflow_id,"previous_lease_generation":previous,
+            "destination_lease_generation":destination.lease_generation,"quiescent_resources":resources}),
+        )
+    }
+    pub(crate) fn protected_log_path(&self) -> Option<&Path> {
+        self.anchored.as_ref().map(|sink| sink.log_path())
+    }
+    pub(crate) fn handoff_destination_ready(
+        &self,
+        expected: &crate::native_vm::RuntimeOwner,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.native_runtime_owner()?.as_ref() == Some(expected),
+            "destination native authority mismatch"
+        );
+        self.anchored
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("protected destination required"))?
+            .inspect_open(|rows| {
+                self.check_protected_continuity()?;
+                anyhow::ensure!(
+                    rows.iter().any(|row| row["actor"] == "controller"
+                        && row["kind"] == "run_resources_required"),
+                    "destination resource policy missing"
+                );
+                anyhow::ensure!(
+                    rows.iter()
+                        .filter(|row| row["actor"] == "controller")
+                        .filter_map(|row| row["generation"].as_i64())
+                        .max()
+                        == Some(expected.lease_generation)
+                        && rows.iter().all(|row| row.get("workflow").is_none()
+                            || row["workflow"] == expected.workflow_id),
+                    "destination audit authority mismatch"
+                );
+                Ok(())
+            })
+    }
+    pub(crate) fn protected_anchor_path(&self) -> Option<&Path> {
+        self.anchored.as_ref().map(|sink| sink.anchor_path())
     }
     /// Seal a failed generation only after a new fenced workflow lease and
     /// independent kernel proof that no admitted worker remains alive.
-    pub fn recovery_evidence(&self, new_lease_generation: i64) -> anyhow::Result<serde_json::Value> {
-        anyhow::ensure!(self.pending_writers.load(std::sync::atomic::Ordering::Acquire) == 0, "audit writers still active");
-        let sink = self.anchored.as_ref().ok_or_else(|| anyhow::anyhow!("recovery requires protected audit"))?;
+    pub fn recovery_evidence(
+        &self,
+        new_lease_generation: i64,
+    ) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            self.pending_writers
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0,
+            "audit writers still active"
+        );
+        let sink = self
+            .anchored
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("recovery requires protected audit"))?;
         let mut tickets = Vec::new();
         if let Some(dir) = &self.pending_dir {
             for entry in std::fs::read_dir(dir)? {
                 let entry = entry?;
-                anyhow::ensure!(entry.file_type()?.is_file(), "invalid interrupted audit ticket");
+                anyhow::ensure!(
+                    entry.file_type()?.is_file(),
+                    "invalid interrupted audit ticket"
+                );
                 tickets.push(entry.file_name().to_string_lossy().into_owned());
             }
         }
         tickets.sort();
-        anyhow::ensure!(self.audit_failed.load(std::sync::atomic::Ordering::Acquire)
-            || self.failure_path.as_ref().is_some_and(|path| path.exists())
-            || !tickets.is_empty(), "healthy audit generation cannot be replaced");
+        anyhow::ensure!(
+            self.audit_failed.load(std::sync::atomic::Ordering::Acquire)
+                || self.failure_path.as_ref().is_some_and(|path| path.exists())
+                || !tickets.is_empty(),
+            "healthy audit generation cannot be replaced"
+        );
         sink.seal_for_recovery(|rows| {
-            let generation = rows.iter().filter(|r| r["actor"] == "controller")
-                .filter_map(|r| r["generation"].as_i64()).max()
+            let generation = rows
+                .iter()
+                .filter(|r| r["actor"] == "controller")
+                .filter_map(|r| r["generation"].as_i64())
+                .max()
                 .ok_or_else(|| anyhow::anyhow!("previous workflow lease evidence missing"))?;
-            anyhow::ensure!(generation < new_lease_generation, "recovery requires a newer fenced lease");
-            let required = rows.iter().position(|r| r["actor"] == "controller" && r["kind"] == "run_resources_required")
+            anyhow::ensure!(
+                generation < new_lease_generation,
+                "recovery requires a newer fenced lease"
+            );
+            let required = rows
+                .iter()
+                .position(|r| r["actor"] == "controller" && r["kind"] == "run_resources_required")
                 .ok_or_else(|| anyhow::anyhow!("durable required resource policy missing"))?;
             let mut proofs = Vec::new();
             for (index, row) in rows.iter().enumerate() {
                 if row["kind"] == "run_resource_admitted" {
-                    anyhow::ensure!(index > required && row["actor"] == "controller", "unprotected resource admission");
-                    proofs.push(crate::run_resources::verify_quiescent(&row["observation"]["identity"])?);
+                    anyhow::ensure!(
+                        index > required && row["actor"] == "controller",
+                        "unprotected resource admission"
+                    );
+                    proofs.push(crate::run_resources::verify_quiescent(
+                        &row["observation"]["identity"],
+                    )?);
                 }
                 if row["kind"] == "model_call_admitted" {
-                    anyhow::ensure!(index > required && !proofs.is_empty(), "model dispatch without protected resource admission");
+                    anyhow::ensure!(
+                        index > required && !proofs.is_empty(),
+                        "model dispatch without protected resource admission"
+                    );
                 }
             }
             Ok(serde_json::json!({"previous_lease_generation":generation,
@@ -466,36 +652,76 @@ impl AuditLogger {
         })
     }
 
-    pub fn set_resource_capacity_observer(&self, observer: Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>) -> anyhow::Result<()> {
-        *self.resource_capacity_observer.lock().map_err(|_|anyhow::anyhow!("resource observer lock poisoned"))?=Some(observer);
+    pub fn set_resource_capacity_observer(
+        &self,
+        observer: Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>,
+    ) -> anyhow::Result<()> {
+        *self
+            .resource_capacity_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource observer lock poisoned"))? = Some(observer);
         Ok(())
     }
     /// Controller-owned workflow requirement, independent of model/child env.
     pub fn require_run_resources(&self) -> anyhow::Result<()> {
         self.protected_health()?;
-        anyhow::ensure!(self.is_protected(),"workflow resources require protected audit");
-        self.record_controller(serde_json::json!({"actor":"controller","kind":"run_resources_required","version":1}))?;
-        self.run_resources_required.store(true,std::sync::atomic::Ordering::SeqCst);
+        anyhow::ensure!(
+            self.is_protected(),
+            "workflow resources require protected audit"
+        );
+        self.record_controller(
+            serde_json::json!({"actor":"controller","kind":"run_resources_required","version":1}),
+        )?;
+        self.run_resources_required
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
-    pub fn run_resources_required(&self) -> bool { self.run_resources_required.load(std::sync::atomic::Ordering::SeqCst) }
-    pub fn resource_capacity_seen(&self) -> bool { self.resource_capacity_seen.load(std::sync::atomic::Ordering::SeqCst) }
-    pub fn resource_capacity_exhausted(&self, observation: &serde_json::Value) -> anyhow::Result<()> {
-        self.resource_capacity_seen.store(true,std::sync::atomic::Ordering::SeqCst);
-        let observer=self.resource_capacity_observer.lock().map_err(|_|anyhow::anyhow!("resource observer lock poisoned"))?.clone();
-        if let Some(observer)=observer {observer(observation)?;}
+    pub fn run_resources_required(&self) -> bool {
+        self.run_resources_required
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn resource_capacity_seen(&self) -> bool {
+        self.resource_capacity_seen
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn resource_capacity_exhausted(
+        &self,
+        observation: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.resource_capacity_seen
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let observer = self
+            .resource_capacity_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource observer lock poisoned"))?
+            .clone();
+        if let Some(observer) = observer {
+            observer(observation)?;
+        }
         Ok(())
     }
 
     /// Workflow admission for both model and verification launches. This must
     /// run again at the supervisor's final release, after asynchronous setup.
-    pub fn set_dispatch_observer(&self,observer:Arc<dyn Fn()->anyhow::Result<()>+Send+Sync>)->anyhow::Result<()> {
-        *self.dispatch_observer.lock().map_err(|_|anyhow::anyhow!("dispatch observer lock poisoned"))?=Some(observer);
+    pub fn set_dispatch_observer(
+        &self,
+        observer: Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
+    ) -> anyhow::Result<()> {
+        *self
+            .dispatch_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("dispatch observer lock poisoned"))? = Some(observer);
         Ok(())
     }
-    pub fn dispatch_allowed(&self)->anyhow::Result<()> {
-        let observer=self.dispatch_observer.lock().map_err(|_|anyhow::anyhow!("dispatch observer lock poisoned"))?.clone();
-        if let Some(observer)=observer {observer()?;}
+    pub fn dispatch_allowed(&self) -> anyhow::Result<()> {
+        let observer = self
+            .dispatch_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("dispatch observer lock poisoned"))?
+            .clone();
+        if let Some(observer) = observer {
+            observer()?;
+        }
         Ok(())
     }
 
@@ -511,16 +737,24 @@ impl AuditLogger {
     }
 
     pub fn model_call_admitted(&self, provider: &str) -> anyhow::Result<()> {
-        self.record_model_admission(provider,None)
+        self.record_model_admission(provider, None)
     }
 
     /// Bind a protected model turn to the exact controller resource receipt.
     /// Ordering alone cannot associate it with a later quiescence proof.
-    pub(crate) fn model_call_admitted_in_scope(&self,provider:&str,identity:&serde_json::Value)->anyhow::Result<()> {
-        self.record_model_admission(provider,Some(identity))
+    pub(crate) fn model_call_admitted_in_scope(
+        &self,
+        provider: &str,
+        identity: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.record_model_admission(provider, Some(identity))
     }
 
-    fn record_model_admission(&self,provider:&str,identity:Option<&serde_json::Value>)->anyhow::Result<()> {
+    fn record_model_admission(
+        &self,
+        provider: &str,
+        identity: Option<&serde_json::Value>,
+    ) -> anyhow::Result<()> {
         let observer = self
             .model_call_observer
             .lock()
@@ -530,10 +764,10 @@ impl AuditLogger {
             observer(provider)?;
         }
         if self.anchored.is_some() {
-            let mut record=serde_json::json!({"actor":"controller","kind":"model_call_admitted","actual_provider":provider});
-            if let Some(identity)=identity {
-                record["admission_schema_version"]=2.into();
-                record["resource_identity"]=identity.clone();
+            let mut record = serde_json::json!({"actor":"controller","kind":"model_call_admitted","actual_provider":provider});
+            if let Some(identity) = identity {
+                record["admission_schema_version"] = 2.into();
+                record["resource_identity"] = identity.clone();
             }
             self.record_controller(record)?;
         }
@@ -543,15 +777,307 @@ impl AuditLogger {
     /// Build a logger writing to the given path. Use
     /// [`default_audit_log_path`] for the standard location.
     /// Set once for this logger instance after the workflow's fenced claim.
-    pub fn set_native_runtime_owner(&self, owner:crate::native_vm::RuntimeOwner)->anyhow::Result<()> {
-        anyhow::ensure!(self.is_protected() && owner.lease_generation>0 && !owner.workflow_id.is_empty(),"invalid native runtime owner");
-        let mut current=self.native_runtime_owner.lock().map_err(|_|anyhow::anyhow!("native owner lock poisoned"))?;
-        anyhow::ensure!(current.as_ref().is_none_or(|existing|existing==&owner),"native runtime owner cannot change within a logger instance");
-        *current=Some(owner);
+    pub fn set_native_runtime_owner(
+        &self,
+        owner: crate::native_vm::RuntimeOwner,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.is_protected() && owner.lease_generation > 0 && !owner.workflow_id.is_empty(),
+            "invalid native runtime owner"
+        );
+        let mut current = self
+            .native_runtime_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native owner lock poisoned"))?;
+        anyhow::ensure!(
+            current.as_ref().is_none_or(|existing| existing == &owner),
+            "native runtime owner cannot change within a logger instance"
+        );
+        *current = Some(owner);
         Ok(())
     }
-    pub fn native_runtime_owner(&self)->anyhow::Result<Option<crate::native_vm::RuntimeOwner>> {
-        Ok(self.native_runtime_owner.lock().map_err(|_|anyhow::anyhow!("native owner lock poisoned"))?.clone())
+    /// Install once, before native preparation. A controller's durable journal
+    /// may reject the launch; replacement cannot silently remove that fence.
+    pub fn set_native_launch_observer(
+        &self,
+        observer: Arc<
+            dyn Fn(&crate::native_vm::PreparedLaunchRecord) -> anyhow::Result<()> + Send + Sync,
+        >,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.is_protected() && self.native_runtime_owner()?.is_some(),
+            "native launch observer requires protected owner"
+        );
+        let mut current = self
+            .native_launch_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native launch observer lock poisoned"))?;
+        anyhow::ensure!(
+            current.is_none(),
+            "native launch observer already installed"
+        );
+        *current = Some(observer);
+        Ok(())
+    }
+    pub fn set_native_observation_observer(
+        &self,
+        observer: Arc<
+            dyn Fn(&crate::native_vm::ownership::VerifiedNativeObservation) -> anyhow::Result<()>
+                + Send
+                + Sync,
+        >,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.is_protected() && self.native_runtime_owner()?.is_some(),
+            "native observation journal requires protected owner"
+        );
+        let mut saved = self
+            .native_observation_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native observation journal poisoned"))?;
+        anyhow::ensure!(
+            saved.is_none(),
+            "native observation journal already installed"
+        );
+        *saved = Some(observer);
+        Ok(())
+    }
+    pub(crate) fn publish_native_observation(
+        &self,
+        observation: &crate::native_vm::ownership::VerifiedNativeObservation,
+    ) -> anyhow::Result<()> {
+        let observer = self
+            .native_observation_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native observation journal poisoned"))?
+            .clone();
+        if let Some(observer) = observer {
+            observer(observation)?;
+        }
+        Ok(())
+    }
+    /// Commit controller-captured preparation and its exact receipt before the
+    /// command can escape to a provider. This does not prove native submission.
+    pub fn native_launch_prepared(
+        &self,
+        intent: &crate::native_vm::PreparedLaunchIntent,
+    ) -> anyhow::Result<crate::native_vm::PreparedLaunchRecord> {
+        intent.validate()?;
+        let original = self
+            .native_store_binding()?
+            .ok_or_else(|| anyhow::anyhow!("original native store binding missing"))?;
+        use sha2::Digest;
+        let original_hash = format!(
+            "{:x}",
+            sha2::Sha256::digest(crate::native_vm::ownership::canonical_bytes(
+                &serde_json::to_value(original)?
+            )?)
+        );
+        anyhow::ensure!(
+            intent.original_store_binding_sha256 == original_hash,
+            "native launch original store digest mismatch"
+        );
+        anyhow::ensure!(
+            self.native_runtime_owner()?.as_ref() == Some(&intent.source_owner)
+                && intent.source_audit_path == self.path,
+            "native launch source audit mismatch"
+        );
+        self.dispatch_allowed()?;
+        let observer = self
+            .native_launch_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native launch observer lock poisoned"))?
+            .clone();
+        let mut row = serde_json::to_value(intent)?;
+        row["actor"] = "controller".into();
+        row["kind"] = "native_launch_intent".into();
+        let controller_receipt = self.record_controller_receipted(row)?;
+        let record = crate::native_vm::PreparedLaunchRecord {
+            intent: intent.clone(),
+            controller_receipt,
+        };
+        if let Some(observer) = observer {
+            observer(&record)?;
+        }
+        self.dispatch_allowed()?;
+        Ok(record)
+    }
+
+    /// Actual provider ID observation, bound to this exact prepared launch.
+    /// This records no completion, export validity or transferable certainty.
+    pub(crate) fn native_session_observed(
+        &self,
+        prepared: &crate::native_vm::PreparedLaunchRecord,
+        id: &str,
+    ) -> anyhow::Result<crate::audit_chain::AppendReceipt> {
+        anyhow::ensure!(
+            !id.is_empty() && id.len() <= 256 && id.bytes().all(|byte| byte.is_ascii_graphic()),
+            "invalid observed native session"
+        );
+        self.verify_native_launch_reference(prepared)?;
+        let receipt=self.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
+            "kind":"native_session_observed","launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,
+            "native_session_id":id,"observed_at_ms":chrono::Utc::now().timestamp_millis()}))?;
+        self.dispatch_allowed()?;
+        Ok(receipt)
+    }
+    /// Correlate preparation with the supervisor's exact admitted resource scope.
+    /// This precedes model charge/release and proves neither submission nor completion.
+    pub(crate) fn native_launch_resource_binding(
+        &self,
+        prepared: &crate::native_vm::PreparedLaunchRecord,
+        provider: &str,
+        identity: &serde_json::Value,
+    ) -> anyhow::Result<crate::audit_chain::AppendReceipt> {
+        anyhow::ensure!(
+            prepared.intent.provider == provider && identity.is_object(),
+            "native launch resource provider/identity mismatch"
+        );
+        self.verify_native_launch_reference(prepared)?;
+        let receipt=self.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
+            "kind":"native_launch_resource_binding","launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,
+            "resource_identity":identity,"recorded_at_ms":chrono::Utc::now().timestamp_millis()}))?;
+        self.dispatch_allowed()?;
+        Ok(receipt)
+    }
+    pub(crate) fn native_launch_uncertain(
+        &self,
+        prepared: &crate::native_vm::PreparedLaunchRecord,
+        session: Option<&crate::audit_chain::AppendReceipt>,
+    ) -> anyhow::Result<crate::native_vm::ownership::VerifiedNativeObservation> {
+        self.verify_native_launch_reference(prepared)?;
+        let native_session_id = if let Some(receipt) = session {
+            let row = self.read_append_receipt(receipt)?;
+            anyhow::ensure!(
+                row["version"] == 1
+                    && row["actor"] == "controller"
+                    && row["kind"] == "native_session_observed"
+                    && row["launch_intent"] == serde_json::to_value(&prepared.intent)?
+                    && row["launch_receipt"] == serde_json::to_value(&prepared.controller_receipt)?
+                    && receipt.sequence > prepared.controller_receipt.sequence,
+                "uncertainty references another native observation"
+            );
+            let id = row["native_session_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("actual native ID unavailable"))?;
+            anyhow::ensure!(
+                !id.is_empty() && id.len() <= 256 && id.bytes().all(|b| b.is_ascii_graphic()),
+                "invalid actual native ID"
+            );
+            Some(id.to_string())
+        } else {
+            None
+        };
+        let observed_at_ms = chrono::Utc::now().timestamp_millis();
+        let receipt=self.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
+            "kind":"native_launch_uncertain","launch_intent":prepared.intent,
+            "launch_receipt":prepared.controller_receipt,"session_observation_receipt":session,
+            "native_session_id":native_session_id,"reason":"completion-not-verified","observed_at_ms":observed_at_ms}))?;
+        let fact = crate::native_vm::ownership::VerifiedNativeObservation {
+            prepared: prepared.clone(),
+            receipt,
+            native_session_id,
+            inventory: None,
+            observed_at_ms,
+        };
+        self.publish_native_observation(&fact)?;
+        Ok(fact)
+    }
+    pub(crate) fn native_launch_completion(
+        &self,
+        prepared: &crate::native_vm::PreparedLaunchRecord,
+        session: &crate::audit_chain::AppendReceipt,
+        resource: &crate::audit_chain::AppendReceipt,
+    ) -> anyhow::Result<crate::audit_chain::AppendReceipt> {
+        crate::native_vm::ownership::observe_native_completion(self, prepared, session, resource)
+            .map(|fact| fact.receipt().clone())
+    }
+    pub(crate) fn verify_native_launch_reference(
+        &self,
+        prepared: &crate::native_vm::PreparedLaunchRecord,
+    ) -> anyhow::Result<()> {
+        prepared.intent.validate()?;
+        anyhow::ensure!(
+            self.native_runtime_owner()?.as_ref() == Some(&prepared.intent.source_owner)
+                && prepared.intent.source_audit_path == self.path,
+            "native observation source owner mismatch"
+        );
+        let original = self
+            .native_store_binding()?
+            .ok_or_else(|| anyhow::anyhow!("original native store binding missing"))?;
+        use sha2::Digest;
+        let original_hash = format!(
+            "{:x}",
+            sha2::Sha256::digest(crate::native_vm::ownership::canonical_bytes(
+                &serde_json::to_value(original)?
+            )?)
+        );
+        anyhow::ensure!(
+            prepared.intent.original_store_binding_sha256 == original_hash,
+            "native observation original store digest mismatch"
+        );
+        self.dispatch_allowed()?;
+        let mut actual = self.read_append_receipt(&prepared.controller_receipt)?;
+        actual
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("native launch record is not an object"))?
+            .remove("audit_chain");
+        let mut expected = serde_json::to_value(&prepared.intent)?;
+        expected["actor"] = "controller".into();
+        expected["kind"] = "native_launch_intent".into();
+        anyhow::ensure!(
+            actual == expected,
+            "native observation references another prepared launch"
+        );
+        self.dispatch_allowed()?;
+        Ok(())
+    }
+
+    /// Install a protected original registration, never capture current policy
+    /// here. Dispatch separately verifies selection and the existing store.
+    pub fn set_native_store_binding(
+        &self,
+        binding: crate::native_vm::ownership::TransferBinding,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.is_protected() && self.native_runtime_owner()?.is_some(),
+            "native store binding requires protected owner"
+        );
+        binding.validate()?;
+        let mut original = self
+            .native_store_binding
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native store binding lock poisoned"))?;
+        anyhow::ensure!(
+            original.as_ref().is_none_or(|value| value == &binding),
+            "original native store binding cannot change"
+        );
+        *original = Some(binding);
+        Ok(())
+    }
+    pub fn native_store_binding(
+        &self,
+    ) -> anyhow::Result<Option<crate::native_vm::ownership::TransferBinding>> {
+        Ok(self
+            .native_store_binding
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native store binding lock poisoned"))?
+            .clone())
+    }
+    pub fn validate_native_store_binding(&self) -> anyhow::Result<()> {
+        let binding = self
+            .native_store_binding()?
+            .ok_or_else(|| anyhow::anyhow!("original native store binding missing"))?;
+        crate::native_vm::ownership::validate_owner_binding(&binding, &|| Ok(()))?;
+        Ok(())
+    }
+
+    pub fn native_runtime_owner(&self) -> anyhow::Result<Option<crate::native_vm::RuntimeOwner>> {
+        Ok(self
+            .native_runtime_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native owner lock poisoned"))?
+            .clone())
     }
 
     pub fn new(path: PathBuf) -> Self {
@@ -563,6 +1089,9 @@ impl AuditLogger {
             resource_capacity_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             run_resources_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             native_runtime_owner: Arc::new(std::sync::Mutex::new(None)),
+            native_store_binding: Arc::new(std::sync::Mutex::new(None)),
+            native_launch_observer: Arc::new(std::sync::Mutex::new(None)),
+            native_observation_observer: Arc::new(std::sync::Mutex::new(None)),
             anchored: None,
             failure_path: None,
             pending_dir: None,
@@ -615,17 +1144,37 @@ impl AuditLogger {
 
     /// Controller receipts have their own actor kind, never a fictional model.
     pub fn record_controller(&self, value: serde_json::Value) -> anyhow::Result<()> {
+        self.record_controller_receipted(value).map(|_| ())
+    }
+
+    /// Capture the reference while the record's append lock is still held.
+    pub fn record_controller_receipted(
+        &self,
+        value: serde_json::Value,
+    ) -> anyhow::Result<crate::audit_chain::AppendReceipt> {
         let sink = self
             .anchored
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("protected audit required"))?;
         let ticket = self.begin_write()?;
-        let result = sink.append(value);
+        let result = sink.append_receipted(value);
         if result.is_err() {
             self.mark_failed();
         }
         ticket.complete();
         result
+    }
+
+    /// Read one historical record through this logger's original anchor. This
+    /// does not attest current writer health, ownership, or model admission.
+    pub fn read_append_receipt(
+        &self,
+        receipt: &crate::audit_chain::AppendReceipt,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.anchored
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("protected audit required"))?
+            .read_receipt(receipt)
     }
 
     async fn record_value_checked(&self, value: serde_json::Value) -> anyhow::Result<()> {
@@ -683,16 +1232,21 @@ impl AuditLogger {
     /// Register BEFORE spawning a writer. Durable tickets survive cancellation
     /// and process death; a restarted logger cannot silently forget lost rows.
     pub fn begin_write(&self) -> anyhow::Result<AuditWriteGuard> {
-        if let Some(sink)=&self.anchored {
-            let result=sink.with_open_generation(||self.register_writer_ticket());
-            if result.as_ref().is_err_and(|error|!error.is::<crate::audit_chain::GenerationSealed>()) {
+        if let Some(sink) = &self.anchored {
+            let result = sink.with_open_generation(|| self.register_writer_ticket());
+            if result
+                .as_ref()
+                .is_err_and(|error| !error.is::<crate::audit_chain::GenerationSealed>())
+            {
                 self.mark_failed();
             }
             result
-        } else {self.register_writer_ticket()}
+        } else {
+            self.register_writer_ticket()
+        }
     }
 
-    fn register_writer_ticket(&self)->anyhow::Result<AuditWriteGuard> {
+    fn register_writer_ticket(&self) -> anyhow::Result<AuditWriteGuard> {
         let pending = if let Some(dir) = &self.pending_dir {
             let path = dir.join(uuid::Uuid::new_v4().to_string());
             let result = (|| -> anyhow::Result<()> {
@@ -755,7 +1309,7 @@ impl AuditLogger {
             self.pending_writers
                 .load(std::sync::atomic::Ordering::Acquire)
                 == 0,
-            "workflow audit writers have not drained"
+            AuditWritersBusy
         );
         if let Some(dir) = &self.pending_dir {
             anyhow::ensure!(
@@ -911,19 +1465,29 @@ pub trait AuditNotifier: Send + Sync + std::fmt::Debug {
 }
 
 fn is_private_imessage_compose(tool: &str, args: &serde_json::Value) -> bool {
-    static COMPOSE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
-        regex::Regex::new(r#"(?i)\bimessage["']?\s+["']?compose\b"#).expect("compose audit pattern"));
-    tool == "Bash" && args.get("command").and_then(|v|v.as_str())
-        .is_some_and(|command| COMPOSE.is_match(&command.replace("\\\n", "")))
+    static COMPOSE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)\bimessage["']?\s+["']?compose\b"#).expect("compose audit pattern")
+    });
+    tool == "Bash"
+        && args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|command| COMPOSE.is_match(&command.replace("\\\n", "")))
 }
 
-const PRIVATE_COMPOSE_COMMAND: &str = "augmentagent imessage compose [recipient and body omitted; inspect approval card]";
+const PRIVATE_COMPOSE_COMMAND: &str =
+    "augmentagent imessage compose [recipient and body omitted; inspect approval card]";
 
 fn is_private_draft_context(tool: &str, args: &serde_json::Value) -> bool {
-    static CONTEXT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
-        regex::Regex::new(r#"(?i)\bmessages["']?\s+["']?context(?:-receipts)?\b"#).expect("context audit pattern"));
-    tool == "Bash" && args.get("command").and_then(|v|v.as_str())
-        .is_some_and(|command|CONTEXT.is_match(&command.replace("\\\n", "")))
+    static CONTEXT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)\bmessages["']?\s+["']?context(?:-receipts)?\b"#)
+            .expect("context audit pattern")
+    });
+    tool == "Bash"
+        && args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|command| CONTEXT.is_match(&command.replace("\\\n", "")))
 }
 
 /// Pair a captured `tool_use` block with its later `tool_result` and produce
@@ -948,13 +1512,20 @@ pub fn build_audit_record(
     // and result echoes, rather than attempting to parse private shell args.
     let private_compose = is_private_imessage_compose(&tool, &args);
     let private_context = is_private_draft_context(&tool, &args);
-    let args = if private_compose { serde_json::json!({"command": PRIVATE_COMPOSE_COMMAND}) }
-        else if private_context {serde_json::json!({"command":"augmentagent messages context [private request and evidence omitted]"})} else { args };
+    let args = if private_compose {
+        serde_json::json!({"command": PRIVATE_COMPOSE_COMMAND})
+    } else if private_context {
+        serde_json::json!({"command":"augmentagent messages context [private request and evidence omitted]"})
+    } else {
+        args
+    };
     let (captured, _truncated) = truncate_stream(if private_compose {
         "[iMessage compose output omitted; inspect approval card]"
     } else if private_context {
         "[Private draft evidence omitted; inspect the context receipt]"
-    } else { result_content });
+    } else {
+        result_content
+    });
     // Bash failures from the CLI surface as `is_error=true` with the command
     // output in the result content. We have no real exit code from the
     // stream-json event shape, but recording the captured text on the
@@ -999,7 +1570,9 @@ pub fn format_notice(record: &AuditRecord) -> String {
     // pathological input.
     let safe_args = if is_private_imessage_compose(&record.tool, &record.args) {
         serde_json::json!({"command": PRIVATE_COMPOSE_COMMAND})
-    } else { record.args.clone() };
+    } else {
+        record.args.clone()
+    };
     let arg_summary = safe_args
         .get("file_path")
         .or_else(|| safe_args.get("path"))
@@ -1448,100 +2021,492 @@ mod tests {
         (dir, logger, log, anchor)
     }
 
-    #[cfg(target_os="linux")]
-    fn handoff_test_identity()->serde_json::Value {
-        use sha2::{Digest,Sha256};
-        let path=format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple());
+    #[cfg(target_os = "linux")]
+    fn handoff_test_identity() -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        let path = format!("/sys/fs/cgroup/run-{}", uuid::Uuid::new_v4().simple());
         assert!(!std::path::Path::new(&path).exists());
         serde_json::json!({"host_sha256":format!("{:x}",Sha256::digest(std::fs::read("/etc/machine-id").unwrap())),
             "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),"path":path,"inode":1})
     }
-    #[cfg(target_os="linux")]
-    fn seed_handoff_audit(logger:&AuditLogger,identity:&serde_json::Value,workflow:&str) {
+    #[cfg(target_os = "linux")]
+    fn seed_handoff_audit(logger: &AuditLogger, identity: &serde_json::Value, workflow: &str) {
+        logger
+            .set_native_runtime_owner(crate::native_vm::RuntimeOwner {
+                workflow_id: workflow.into(),
+                lease_generation: 1,
+            })
+            .unwrap();
         logger.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":workflow,"generation":1})).unwrap();
         logger.require_run_resources().unwrap();
         logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"codex","observation":{"identity":identity}})).unwrap();
     }
-    #[cfg(target_os="linux")]
+    #[cfg(target_os = "linux")]
     #[test]
     fn healthy_handoff_refuses_uncorrelated_or_reused_model_admissions() {
-        for case in ["legacy","different_identity","missing_identity","wrong_provider","duplicate_resource","reused","model_before_resource","foreign_workflow","forged_host","unused_forged_scope","noncontroller_model"] {
-            let (_dir,logger,_,anchor)=protected_fixture();let mut identity=handoff_test_identity();
-            if case=="forged_host" {identity["host_sha256"]="different-host".into();}
-            if case=="model_before_resource" {
+        for case in [
+            "legacy",
+            "different_identity",
+            "missing_identity",
+            "wrong_provider",
+            "duplicate_resource",
+            "reused",
+            "model_before_resource",
+            "foreign_workflow",
+            "forged_host",
+            "unused_forged_scope",
+            "noncontroller_model",
+        ] {
+            let (_dir, logger, _, anchor) = protected_fixture();
+            let mut identity = handoff_test_identity();
+            if case == "forged_host" {
+                identity["host_sha256"] = "different-host".into();
+            }
+            if case == "model_before_resource" {
+                logger
+                    .set_native_runtime_owner(crate::native_vm::RuntimeOwner {
+                        workflow_id: "fixture".into(),
+                        lease_generation: 1,
+                    })
+                    .unwrap();
                 logger.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":"fixture","generation":1})).unwrap();
-                logger.require_run_resources().unwrap();logger.model_call_admitted_in_scope("codex",&identity).unwrap();
+                logger.require_run_resources().unwrap();
+                logger
+                    .model_call_admitted_in_scope("codex", &identity)
+                    .unwrap();
                 logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"codex","observation":{"identity":identity}})).unwrap();
-            }else{seed_handoff_audit(&logger,&identity,if case=="foreign_workflow" {"other"}else{"fixture"});}
-            if case=="duplicate_resource" {logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"codex","observation":{"identity":identity}})).unwrap();}
-            if case=="unused_forged_scope" {
-                let mut unused=handoff_test_identity();unused["host_sha256"]="different-host".into();
+            } else {
+                seed_handoff_audit(
+                    &logger,
+                    &identity,
+                    if case == "foreign_workflow" {
+                        "other"
+                    } else {
+                        "fixture"
+                    },
+                );
+            }
+            if case == "duplicate_resource" {
+                logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"codex","observation":{"identity":identity}})).unwrap();
+            }
+            if case == "unused_forged_scope" {
+                let mut unused = handoff_test_identity();
+                unused["host_sha256"] = "different-host".into();
                 logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"claude","observation":{"identity":unused}})).unwrap();
             }
-            if case=="noncontroller_model" {logger.record_controller(serde_json::json!({"actor":"worker","kind":"model_call_admitted","actual_provider":"codex","admission_schema_version":2,"resource_identity":identity})).unwrap();}
-            let mut model_identity=identity.clone();
-            if case=="different_identity" {model_identity["inode"]=2.into();}
-            if case=="missing_identity" {model_identity=serde_json::Value::Null;}
-            if case=="legacy" {logger.model_call_admitted("codex").unwrap();}
-            else {logger.model_call_admitted_in_scope(if case=="wrong_provider" {"claude"}else{"codex"},&model_identity).unwrap();}
-            if case=="reused" {logger.model_call_admitted_in_scope("codex",&identity).unwrap();}
-            let before=std::fs::read(&anchor).unwrap();
-            assert!(logger.handoff_evidence(&"a".repeat(64),&crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:2}).is_err(),"{case} authorized healthy handoff");
-            assert_eq!(std::fs::read(&anchor).unwrap(),before,"{case} mutated the source anchor");
+            if case == "noncontroller_model" {
+                logger.record_controller(serde_json::json!({"actor":"worker","kind":"model_call_admitted","actual_provider":"codex","admission_schema_version":2,"resource_identity":identity})).unwrap();
+            }
+            let mut model_identity = identity.clone();
+            if case == "different_identity" {
+                model_identity["inode"] = 2.into();
+            }
+            if case == "missing_identity" {
+                model_identity = serde_json::Value::Null;
+            }
+            if case == "legacy" {
+                logger.model_call_admitted("codex").unwrap();
+            } else {
+                logger
+                    .model_call_admitted_in_scope(
+                        if case == "wrong_provider" {
+                            "claude"
+                        } else {
+                            "codex"
+                        },
+                        &model_identity,
+                    )
+                    .unwrap();
+            }
+            if case == "reused" {
+                logger
+                    .model_call_admitted_in_scope("codex", &identity)
+                    .unwrap();
+            }
+            let before = std::fs::read(&anchor).unwrap();
+            assert!(
+                logger
+                    .handoff_evidence(
+                        &"a".repeat(64),
+                        &crate::native_vm::RuntimeOwner {
+                            workflow_id: "fixture".into(),
+                            lease_generation: 2
+                        },
+                        &|| Ok(())
+                    )
+                    .is_err(),
+                "{case} authorized healthy handoff"
+            );
+            assert_eq!(
+                std::fs::read(&anchor).unwrap(),
+                before,
+                "{case} mutated the source anchor"
+            );
         }
     }
-    #[cfg(target_os="linux")]
+    #[cfg(target_os = "linux")]
     #[test]
     fn healthy_handoff_requires_drained_writers_and_unbroken_continuity() {
-        for interrupted in [false,true] {
-            let (_dir,logger,_,anchor)=protected_fixture();let identity=handoff_test_identity();
-            seed_handoff_audit(&logger,&identity,"fixture");logger.model_call_admitted_in_scope("codex",&identity).unwrap();
-            let ticket=if interrupted {logger.mark_failed();None}else{Some(logger.begin_write().unwrap())};
-            let before=std::fs::read(&anchor).unwrap();
-            assert!(logger.handoff_evidence(&"a".repeat(64),&crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:2}).is_err());
-            assert_eq!(std::fs::read(&anchor).unwrap(),before);drop(ticket);
+        for interrupted in [false, true] {
+            let (_dir, logger, _, anchor) = protected_fixture();
+            let identity = handoff_test_identity();
+            seed_handoff_audit(&logger, &identity, "fixture");
+            logger
+                .model_call_admitted_in_scope("codex", &identity)
+                .unwrap();
+            let ticket = if interrupted {
+                logger.mark_failed();
+                None
+            } else {
+                Some(logger.begin_write().unwrap())
+            };
+            let before = std::fs::read(&anchor).unwrap();
+            assert!(logger
+                .handoff_evidence(
+                    &"a".repeat(64),
+                    &crate::native_vm::RuntimeOwner {
+                        workflow_id: "fixture".into(),
+                        lease_generation: 2
+                    },
+                    &|| Ok(())
+                )
+                .is_err());
+            assert_eq!(std::fs::read(&anchor).unwrap(), before);
+            drop(ticket);
         }
     }
-    #[cfg(target_os="linux")]
+    #[cfg(target_os = "linux")]
     #[test]
     fn healthy_handoff_requires_a_newer_fence_for_the_same_workflow() {
-        let (_dir,logger,_,anchor)=protected_fixture();let identity=handoff_test_identity();
-        seed_handoff_audit(&logger,&identity,"fixture");logger.model_call_admitted_in_scope("codex",&identity).unwrap();
-        let before=std::fs::read(&anchor).unwrap();
-        for (workflow,generation) in [("fixture",0),("fixture",1),("other",2)] {
-            assert!(logger.handoff_evidence(&"a".repeat(64),&crate::native_vm::RuntimeOwner {workflow_id:workflow.into(),lease_generation:generation}).is_err());
-            assert_eq!(std::fs::read(&anchor).unwrap(),before);
+        let (_dir, logger, _, anchor) = protected_fixture();
+        let identity = handoff_test_identity();
+        seed_handoff_audit(&logger, &identity, "fixture");
+        logger
+            .model_call_admitted_in_scope("codex", &identity)
+            .unwrap();
+        let before = std::fs::read(&anchor).unwrap();
+        for (workflow, generation) in [("fixture", 0), ("fixture", 1), ("other", 2)] {
+            assert!(logger
+                .handoff_evidence(
+                    &"a".repeat(64),
+                    &crate::native_vm::RuntimeOwner {
+                        workflow_id: workflow.into(),
+                        lease_generation: generation
+                    },
+                    &|| Ok(())
+                )
+                .is_err());
+            assert_eq!(std::fs::read(&anchor).unwrap(), before);
         }
     }
-    #[cfg(target_os="linux")]
+    #[cfg(target_os = "linux")]
     #[test]
     fn healthy_handoff_binds_kernel_proof_and_replays_after_closed_generation_health_refusal() {
-        let (_dir,logger,log,anchor)=protected_fixture();let identity=handoff_test_identity();
-        seed_handoff_audit(&logger,&identity,"fixture");logger.model_call_admitted_in_scope("codex",&identity).unwrap();
-        let claude=handoff_test_identity();
+        let (_dir, logger, log, anchor) = protected_fixture();
+        let identity = handoff_test_identity();
+        seed_handoff_audit(&logger, &identity, "fixture");
+        logger
+            .model_call_admitted_in_scope("codex", &identity)
+            .unwrap();
+        let claude = handoff_test_identity();
         logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"claude","observation":{"identity":claude}})).unwrap();
-        logger.model_call_admitted_in_scope("claude",&claude).unwrap();
-        let destination=crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:2};
-        let proof=logger.handoff_evidence(&"a".repeat(64),&destination).unwrap();
-        assert_eq!(proof["validation"]["quiescent_resources"][0]["verified_state"],"removed_empty_subtree");
-        assert_eq!(proof["validation"]["quiescent_resources"].as_array().unwrap().len(),2);
-        assert_eq!(proof["validation"]["quiescent_resources"][1]["verified_state"],"removed_empty_subtree");
-        let before=(std::fs::read(&log).unwrap(),std::fs::read(&anchor).unwrap());
+        logger
+            .model_call_admitted_in_scope("claude", &claude)
+            .unwrap();
+        let destination = crate::native_vm::RuntimeOwner {
+            workflow_id: "fixture".into(),
+            lease_generation: 2,
+        };
+        let proof = logger
+            .handoff_evidence(&"a".repeat(64), &destination, &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            proof["validation"]["quiescent_resources"][0]["verified_state"],
+            "removed_empty_subtree"
+        );
+        assert_eq!(
+            proof["validation"]["quiescent_resources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            proof["validation"]["quiescent_resources"][1]["verified_state"],
+            "removed_empty_subtree"
+        );
+        let before = (
+            std::fs::read(&log).unwrap(),
+            std::fs::read(&anchor).unwrap(),
+        );
         assert!(logger.protected_health().is_err());
-        assert_eq!(logger.handoff_evidence(&"a".repeat(64),&destination).unwrap(),proof);
-        assert_eq!((std::fs::read(&log).unwrap(),std::fs::read(&anchor).unwrap()),before);
-        assert!(logger.handoff_evidence(&"a".repeat(64),&crate::native_vm::RuntimeOwner {lease_generation:3,..destination}).is_err());
+        assert_eq!(
+            logger
+                .handoff_evidence(&"a".repeat(64), &destination, &|| Ok(()))
+                .unwrap(),
+            proof
+        );
+        assert_eq!(
+            (
+                std::fs::read(&log).unwrap(),
+                std::fs::read(&anchor).unwrap()
+            ),
+            before
+        );
+        assert!(logger
+            .handoff_evidence(
+                &"a".repeat(64),
+                &crate::native_vm::RuntimeOwner {
+                    lease_generation: 3,
+                    ..destination
+                },
+                &|| Ok(())
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn receipt_reader_rejects_bad_references_without_poisoning_the_writer() {
+        let (_directory, logger, log, anchor) = protected_fixture();
+        let receipt = logger
+            .record_controller_receipted(
+                serde_json::json!({"actor":"controller","kind":"native_launch_fixture"}),
+            )
+            .unwrap();
+        let before_log = std::fs::read(&log).unwrap();
+        let before_anchor = std::fs::read(&anchor).unwrap();
+        let pending = || {
+            std::fs::read_dir(logger.pending_dir.as_ref().unwrap())
+                .unwrap()
+                .count()
+        };
+        let before_pending = pending();
+        let mut wrong = receipt.clone();
+        wrong.record_sha256 = "0".repeat(64);
+        assert!(logger.read_append_receipt(&wrong).is_err());
+        let row = logger.read_append_receipt(&receipt).unwrap();
+        assert_eq!(row["kind"], "native_launch_fixture");
+        assert_eq!(std::fs::read(&log).unwrap(), before_log);
+        assert_eq!(std::fs::read(&anchor).unwrap(), before_anchor);
+        assert_eq!(
+            pending(),
+            before_pending,
+            "lookup must not register a writer"
+        );
+        // The existing health operation appends an integrity-check record.
+        // Keep its separate write outside the receipt read's byte comparison.
+        logger.protected_health().unwrap();
+    }
+
+    #[test]
+    fn receipt_reader_requires_a_protected_logger_without_creating_a_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("absent.log");
+        let logger = AuditLogger::new(path.clone());
+        let receipt = crate::audit_chain::AppendReceipt {
+            version: 1,
+            sequence: 1,
+            record_sha256: "a".repeat(64),
+            committed_audit_sha256: "b".repeat(64),
+        };
+        let error = logger.read_append_receipt(&receipt).unwrap_err();
+        assert!(error.to_string().contains("protected audit required"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn healthy_handoff_seals_once_and_replays_after_late_rejection() {
+        let (_dir, logger, log, anchor) = protected_fixture();
+        let source = crate::native_vm::RuntimeOwner {
+            workflow_id: "owner/repo#pr42".into(),
+            lease_generation: 1,
+        };
+        let destination = crate::native_vm::RuntimeOwner {
+            lease_generation: 2,
+            ..source.clone()
+        };
+        logger.set_native_runtime_owner(source.clone()).unwrap();
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":source.workflow_id,"generation":1})).unwrap();
+        logger.require_run_resources().unwrap();
+        let request = "a".repeat(64);
+        let proof = logger
+            .handoff_evidence(&request, &destination, &|| Ok(()))
+            .expect("healthy runtime has no handoff seal path");
+        assert_eq!(proof["request_sha256"], request);
+        assert!(logger
+            .record_controller(serde_json::json!({"actor":"controller","kind":"late"}))
+            .is_err());
+        assert!(logger.protected_health().is_err()); // A late health append is also closed.
+        assert!(logger.failure_path.as_ref().unwrap().exists());
+        let sealed_bytes = std::fs::read(&anchor).unwrap();
+        let reopened = AuditLogger::protected(log.clone(), anchor.clone(), &[]).unwrap();
+        reopened.set_native_runtime_owner(source).unwrap();
+        assert_eq!(
+            reopened
+                .handoff_evidence(&request, &destination, &|| Ok(()))
+                .unwrap(),
+            proof
+        );
+        assert_eq!(
+            std::fs::read(&anchor).unwrap(),
+            sealed_bytes,
+            "replay rewrote the sealed anchor"
+        );
+        assert!(reopened
+            .handoff_evidence(&"b".repeat(64), &destination, &|| Ok(()))
+            .is_err());
+        assert!(reopened
+            .handoff_evidence(
+                &request,
+                &crate::native_vm::RuntimeOwner {
+                    lease_generation: 3,
+                    ..destination.clone()
+                },
+                &|| Ok(())
+            )
+            .is_err());
+        std::fs::write(log, b"changed committed audit").unwrap();
+        assert!(
+            reopened
+                .handoff_evidence(&request, &destination, &|| Ok(()))
+                .is_err(),
+            "replay accepted modified committed bytes"
+        );
+    }
+
+    fn handoff_fixture() -> (
+        tempfile::TempDir,
+        AuditLogger,
+        crate::native_vm::RuntimeOwner,
+        PathBuf,
+    ) {
+        let (dir, logger, _, anchor) = protected_fixture();
+        let source = crate::native_vm::RuntimeOwner {
+            workflow_id: "workflow".into(),
+            lease_generation: 1,
+        };
+        logger.set_native_runtime_owner(source.clone()).unwrap();
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":"workflow","generation":1})).unwrap();
+        logger.require_run_resources().unwrap();
+        (
+            dir,
+            logger,
+            crate::native_vm::RuntimeOwner {
+                lease_generation: 2,
+                ..source
+            },
+            anchor,
+        )
+    }
+
+    fn completed_resource_identity() -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        serde_json::json!({"host_sha256":format!("{:x}",Sha256::digest(std::fs::read("/etc/machine-id").unwrap())),
+            "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),
+            "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1,"limits":{}})
+    }
+
+    #[test]
+    fn healthy_handoff_verifies_correlated_kernel_resource_evidence() {
+        let (_dir, logger, destination, _) = handoff_fixture();
+        let identity = completed_resource_identity();
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"codex","observation":{"identity":identity}})).unwrap();
+        logger
+            .model_call_admitted_in_scope("codex", &identity)
+            .unwrap();
+        let proof = logger
+            .handoff_evidence(&"a".repeat(64), &destination, &|| Ok(()))
+            .unwrap();
+        let observations = proof["validation"]["quiescent_resources"]
+            .as_array()
+            .unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0]["identity"], identity);
+        assert_eq!(observations[0]["verified_state"], "removed_empty_subtree");
+    }
+
+    #[test]
+    fn healthy_handoff_never_seals_ambiguous_or_unsettled_evidence() {
+        for case in [
+            "pending",
+            "interrupted",
+            "legacy",
+            "orphan",
+            "provider",
+            "duplicate",
+            "forged-host",
+            "foreign-workflow",
+        ] {
+            let (_dir, logger, destination, anchor) = handoff_fixture();
+            let mut identity = completed_resource_identity();
+            if case == "forged-host" {
+                identity["host_sha256"] = "0".repeat(64).into();
+            }
+            let ticket = if case == "pending" {
+                Some(logger.begin_write().unwrap())
+            } else {
+                None
+            };
+            if case == "interrupted" {
+                drop(logger.begin_write().unwrap());
+            }
+            if ["legacy", "provider", "duplicate", "forged-host"].contains(&case) {
+                logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"codex","observation":{"identity":identity}})).unwrap();
+            }
+            match case {
+                "legacy"=>logger.model_call_admitted("codex").unwrap(),
+                "provider"=>logger.model_call_admitted_in_scope("claude",&identity).unwrap(),
+                "orphan"|"forged-host"=>logger.model_call_admitted_in_scope("codex",&identity).unwrap(),
+                "duplicate"=>{logger.model_call_admitted_in_scope("codex",&identity).unwrap();logger.model_call_admitted_in_scope("codex",&identity).unwrap();},
+                "foreign-workflow"=>logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture","workflow":"foreign"})).unwrap(),
+                _=>{},
+            }
+            assert!(
+                logger
+                    .handoff_evidence(&"a".repeat(64), &destination, &|| Ok(()))
+                    .is_err(),
+                "accepted {case}"
+            );
+            let persisted: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(anchor).unwrap()).unwrap();
+            assert!(
+                persisted["sealed"].is_null(),
+                "invalid evidence sealed the source: {case}"
+            );
+            drop(ticket);
+        }
     }
 
     #[tokio::test]
     async fn sealed_generation_refuses_writer_registration_without_leaving_a_ticket() {
-        let (_dir,logger,_,_)=protected_fixture();
-        logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture"})).unwrap();
-        logger.anchored.as_ref().unwrap().seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"sealed"}))).unwrap();
-        assert!(logger.begin_write().is_err(),"sealed audit accepted a new writer ticket");
-        assert_eq!(logger.pending_writers.load(std::sync::atomic::Ordering::Acquire),0);
-        assert!(std::fs::read_dir(logger.pending_dir.as_ref().unwrap()).unwrap().next().is_none());
-        assert!(!logger.failure_path.as_ref().unwrap().exists(),"expected closed-generation refusal poisoned continuity");
+        let (_dir, logger, _, _) = protected_fixture();
+        logger
+            .record_controller(serde_json::json!({"actor":"controller","kind":"fixture"}))
+            .unwrap();
+        logger
+            .anchored
+            .as_ref()
+            .unwrap()
+            .seal_for_recovery(|_| Ok(serde_json::json!({"fixture":"sealed"})))
+            .unwrap();
+        assert!(
+            logger.begin_write().is_err(),
+            "sealed audit accepted a new writer ticket"
+        );
+        assert_eq!(
+            logger
+                .pending_writers
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert!(std::fs::read_dir(logger.pending_dir.as_ref().unwrap())
+            .unwrap()
+            .next()
+            .is_none());
+        assert!(
+            !logger.failure_path.as_ref().unwrap().exists(),
+            "expected closed-generation refusal poisoned continuity"
+        );
     }
 
     #[test]
@@ -1552,46 +2517,82 @@ mod tests {
     fn healthy_handoff_seal_serializes_cross_process_writer_registration() {
         check_audit_seal_serialization(true);
     }
-    fn check_audit_seal_serialization(healthy:bool) {
-        const CHILD:&str="AUDIT_INGRESS_CHILD_ROOT";
-        if let Some(root)=std::env::var_os(CHILD) {
-            let root=PathBuf::from(root);
-            let logger=AuditLogger::protected(root.join("logs/workflow.log"),root.join("anchors/workflow.json"),&[]).unwrap();
-            std::fs::write(root.join("writer-ready"),b"ready").unwrap();
-            assert!(logger.begin_write().is_err(),"writer crossed a sealed generation");
+    fn check_audit_seal_serialization(healthy: bool) {
+        const CHILD: &str = "AUDIT_INGRESS_CHILD_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let logger = AuditLogger::protected(
+                root.join("logs/workflow.log"),
+                root.join("anchors/workflow.json"),
+                &[],
+            )
+            .unwrap();
+            std::fs::write(root.join("writer-ready"), b"ready").unwrap();
+            assert!(
+                logger.begin_write().is_err(),
+                "writer crossed a sealed generation"
+            );
             return;
         }
-        let (dir,logger,_,_)=protected_fixture();
-        logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture"})).unwrap();
-        let sink=logger.anchored.as_ref().unwrap().clone();
-        let (entered,ready)=std::sync::mpsc::channel();
-        let (release,proceed)=std::sync::mpsc::channel();
-        let sealer=std::thread::spawn(move || {
-            let validation=|_:&[serde_json::Value]| {
+        let (dir, logger, _, _) = protected_fixture();
+        logger
+            .record_controller(serde_json::json!({"actor":"controller","kind":"fixture"}))
+            .unwrap();
+        let sink = logger.anchored.as_ref().unwrap().clone();
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        let sealer = std::thread::spawn(move || {
+            let validation = |_: &[serde_json::Value]| {
                 entered.send(()).unwrap();
                 proceed.recv_timeout(std::time::Duration::from_secs(10))?;
                 Ok(serde_json::json!({"fixture":"sealed"}))
             };
-            if healthy {sink.seal_for_handoff(&"a".repeat(64),validation)}else{sink.seal_for_recovery(validation)}
+            if healthy {
+                sink.seal_for_handoff(&"a".repeat(64), validation)
+            } else {
+                sink.seal_for_recovery(validation)
+            }
         });
-        ready.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        ready
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
         let mut child=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact",if healthy {"tool_audit::tests::healthy_handoff_seal_serializes_cross_process_writer_registration"}else{"tool_audit::tests::audit_seal_serializes_cross_process_writer_registration"},"--nocapture"])
             .env(CHILD,dir.path()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
-        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
-        while !dir.path().join("writer-ready").exists() && std::time::Instant::now()<deadline {
-            if child.try_wait().unwrap().is_some(){break;}
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !dir.path().join("writer-ready").exists() && std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let saw_ready=dir.path().join("writer-ready").exists();
-        let pending_during_seal=std::fs::read_dir(logger.pending_dir.as_ref().unwrap()).unwrap().next().is_some();
+        let saw_ready = dir.path().join("writer-ready").exists();
+        let pending_during_seal = std::fs::read_dir(logger.pending_dir.as_ref().unwrap())
+            .unwrap()
+            .next()
+            .is_some();
         release.send(()).unwrap();
         sealer.join().unwrap().unwrap();
-        let output=child.wait_with_output().unwrap();
-        assert!(saw_ready,"child failed before registration: {}",String::from_utf8_lossy(&output.stderr));
-        assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
-        assert!(!pending_during_seal,"writer registered while the sealer held the anchor gate");
-        assert!(std::fs::read_dir(logger.pending_dir.as_ref().unwrap()).unwrap().next().is_none());
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            saw_ready,
+            "child failed before registration: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !pending_during_seal,
+            "writer registered while the sealer held the anchor gate"
+        );
+        assert!(std::fs::read_dir(logger.pending_dir.as_ref().unwrap())
+            .unwrap()
+            .next()
+            .is_none());
         assert!(!logger.failure_path.as_ref().unwrap().exists());
     }
 

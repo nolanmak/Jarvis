@@ -234,6 +234,13 @@ pub(crate) fn admission_failed(
     .into())
 }
 
+#[derive(Debug)]
+pub(crate) struct ResourceNotQuiescent;
+impl std::fmt::Display for ResourceNotQuiescent {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("resource descendants are still running")}
+}
+impl std::error::Error for ResourceNotQuiescent {}
+
 /// Kernel evidence only: never trust a model-produced completion statement.
 /// Missing scopes on the same host are quiescent because cgroup removal requires
 /// an empty subtree. Reboot on that host also terminates every old descendant.
@@ -256,11 +263,15 @@ pub fn verify_quiescent(identity: &serde_json::Value) -> Result<serde_json::Valu
                 use std::os::unix::fs::MetadataExt;
                 anyhow::ensure!(path.canonicalize()? == path && meta.ino() == identity["inode"].as_u64().context("resource inode missing")?, "resource identity changed");
                 let events = std::fs::read_to_string(path.join("cgroup.events"))?;
-                anyhow::ensure!(events.lines().any(|line| line == "populated 0"), "resource descendants are still running");
+                anyhow::ensure!(events.lines().any(|line| line == "populated 0"), ResourceNotQuiescent);
                 // Remove the empty group to revoke a waiting supervisor's
                 // open cgroup.procs handle before it can release a child.
                 // A racing attachment makes rmdir fail, retaining the hold.
-                std::fs::remove_dir(path)?;
+                std::fs::remove_dir(path).map_err(|error| {
+                    if matches!(error.raw_os_error(),Some(libc::EBUSY)|Some(libc::ENOTEMPTY)) {
+                        anyhow::Error::new(error).context(ResourceNotQuiescent)
+                    } else {error.into()}
+                })?;
                 "kernel_empty_subtree_removed"
             }
         }
