@@ -138,7 +138,7 @@ pub(super) fn read_facts(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i
         "native handoff preparation blocked by checkpoint"
     );
     history_closed(&tx, &lease.workflow)?;
-    native_pending::validate_dispositions(tx,&lease.workflow)?;
+    native_pending::require_clear_abort_barriers(tx,&lease.workflow)?;
     let transfers = native_pending::settlement::History::load(tx, &lease.workflow, u64::MAX)?;
     let owners = {
         let mut query=tx.prepare("SELECT lease_generation,audit_path FROM workflow_native_owner WHERE workflow=?1 AND lease_generation<?2 AND retirement_reason IS NULL AND retired_at IS NULL AND NOT EXISTS(SELECT 1 FROM workflow_native_transferred_source d WHERE d.workflow=workflow_native_owner.workflow AND d.lease_generation=workflow_native_owner.lease_generation AND d.audit_path=workflow_native_owner.audit_path) ORDER BY lease_generation,audit_path LIMIT 65")?;

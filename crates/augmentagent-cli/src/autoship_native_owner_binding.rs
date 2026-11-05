@@ -31,11 +31,13 @@ pub(super) fn unretired_owners(conn:&Connection,workflow:&str)->Result<bool> {
 impl WorkflowStore {
     /// A selection hint only: registration rechecks history in its transaction.
     pub fn initial_native_owner_available(&self,workflow:&str)->Result<bool> {
+        native_pending::require_clear_abort_barriers(&self.conn,workflow)?;
         Ok(initial_registration_origin(&self.conn,workflow)? && !initial_registration_history(&self.conn,workflow)?)
     }
     /// Read failures remain distinct from an expired/superseded candidate.
     /// This is a metadata fence; native dispatch retains its additional gates.
     pub fn native_registration_current(&self,lease:&Lease,binding:&Binding,now:i64)->Result<bool> {
+        native_pending::require_clear_abort_barriers(&self.conn,&lease.workflow)?;
         binding.validate()?;
         let raw:Option<String>=self.conn.query_row(
             "SELECT checkpoint FROM workflow WHERE id=?1 AND owner=?2 AND generation=?3 AND lease_until>?4 AND NOT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?3 AND (retirement_reason IS NOT NULL OR retired_at IS NOT NULL))",
@@ -72,6 +74,7 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx, lease, workflow_binding, now)?;
+        native_pending::require_clear_abort_barriers(&tx,&lease.workflow)?;
         let old: Option<String> = tx.query_row(
             "SELECT audit_path FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",
             params![lease.workflow, lease.generation], |row| row.get(0),

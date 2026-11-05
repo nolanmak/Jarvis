@@ -271,6 +271,7 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx, lease, binding, now)?;
+        require_clear_abort_barriers(&tx,&lease.workflow)?;
         let raw: String = tx.query_row(
             "SELECT checkpoint FROM workflow WHERE id=?1",
             [&lease.workflow],

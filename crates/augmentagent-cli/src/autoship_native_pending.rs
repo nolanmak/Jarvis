@@ -75,14 +75,21 @@ impl WorkflowStore {
         }
     }
 }
+#[path = "autoship_native_aborted.rs"]
+pub(super) mod aborted;
 #[path = "autoship_native_terminal.rs"]
 pub(super) mod terminal;
 #[path = "autoship_native_unstarted.rs"]
 mod unstarted;
-pub(super) fn validate_dispositions(conn:&Connection,workflow:&str)->Result<()> {unstarted::validate_history(conn,workflow)}
+pub(super) fn validate_dispositions(conn:&Connection,workflow:&str)->Result<()> {
+    unstarted::validate_history(conn,workflow)?;aborted::validate_history(conn,workflow)?;
+    let duplicate:bool=conn.query_row("SELECT EXISTS(SELECT sequence FROM (SELECT sequence FROM workflow_native_handoff_pending WHERE workflow=?1 UNION ALL SELECT pending_sequence FROM workflow_native_handoff_completed WHERE workflow=?1 UNION ALL SELECT pending_sequence FROM workflow_native_handoff_unstarted WHERE workflow=?1 UNION ALL SELECT pending_sequence FROM workflow_native_handoff_aborted WHERE workflow=?1) GROUP BY sequence HAVING count(*)>1)",[workflow],|r|r.get(0))?;
+    ensure!(!duplicate,TransferReason::InventoryMissing);Ok(())
+}
+pub(super) fn require_clear_abort_barriers(conn:&Connection,workflow:&str)->Result<()> {aborted::require_clear(conn,workflow)}
 pub(super) fn orphaned(conn:&Connection,workflow:&str)->Result<bool> {
     validate_dispositions(conn,workflow)?;
-    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=?1 AND e.kind='native_handoff_prepared' AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_pending p WHERE p.workflow=e.workflow AND p.sequence=e.seq) AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_completed c WHERE c.workflow=e.workflow AND c.pending_sequence=e.seq) AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_unstarted u WHERE u.workflow=e.workflow AND u.pending_sequence=e.seq))",[workflow],|r|r.get(0))?)
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=?1 AND e.kind='native_handoff_prepared' AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_pending p WHERE p.workflow=e.workflow AND p.sequence=e.seq) AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_completed c WHERE c.workflow=e.workflow AND c.pending_sequence=e.seq) AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_unstarted u WHERE u.workflow=e.workflow AND u.pending_sequence=e.seq) AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_aborted a WHERE a.workflow=e.workflow AND a.pending_sequence=e.seq))",[workflow],|r|r.get(0))?)
 }
 
 impl PendingNativeHandoff {
@@ -215,6 +222,7 @@ impl WorkflowStore {
     pub(super) fn native_handoff_pending_is_current(&mut self,lease:&Lease,binding:&Binding,pending:&PendingNativeHandoff,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         require_binding(&tx,lease,binding,now)?;
+        require_clear_abort_barriers(&tx,&lease.workflow)?;
         owner_control::require_dispatch(&tx,&lease.workflow)?;
         let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;
         let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
@@ -280,6 +288,7 @@ impl WorkflowStore {
                 HandoffPreparation::ReconcileExisting(pending)
             });
         }
+        require_clear_abort_barriers(&tx,&lease.workflow)?;
         owner_control::require_dispatch(&tx,&lease.workflow).context(TransferReason::AuthorityConflict)?;
         let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed')) OR EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2)",params![lease.workflow,lease.generation],|r|r.get(0))?;
         ensure!(!blocked, TransferReason::AuthorityConflict);

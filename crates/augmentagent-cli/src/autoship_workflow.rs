@@ -442,6 +442,15 @@ impl WorkflowStore {
                 pending_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
                 snapshot_sequence INTEGER NOT NULL REFERENCES workflow_native_handoff_snapshot(sequence),
                 sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_native_handoff_aborted (
+                transfer_id TEXT PRIMARY KEY,workflow TEXT NOT NULL REFERENCES workflow(id),
+                pending_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                snapshot_sequence INTEGER NOT NULL REFERENCES workflow_native_handoff_snapshot(sequence),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_native_abort_namespace (
+                workflow TEXT NOT NULL REFERENCES workflow(id),transfer_id TEXT NOT NULL REFERENCES workflow_native_handoff_aborted(transfer_id),
+                namespace_sha256 TEXT NOT NULL,namespace TEXT NOT NULL,
+                PRIMARY KEY(transfer_id,namespace_sha256));
             CREATE TABLE IF NOT EXISTS workflow_native_transferred_source (
                 workflow TEXT NOT NULL,lease_generation INTEGER NOT NULL,audit_path TEXT NOT NULL,
                 transfer_id TEXT NOT NULL REFERENCES workflow_native_handoff_completed(transfer_id) DEFERRABLE INITIALLY DEFERRED,
@@ -1556,6 +1565,7 @@ impl WorkflowStore {
         ensure!(std::path::Path::new(audit_path).is_absolute() && audit_path.len()<=4096,"invalid native owner audit path");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx,lease,now)?;
+        native_pending::require_clear_abort_barriers(&tx,&lease.workflow)?;
         let old:Option<String>=tx.query_row("SELECT audit_path FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",params![lease.workflow,lease.generation],|row|row.get(0)).optional()?;
         if let Some(old)=old {ensure!(old==audit_path,"native owner audit path is immutable");}
         else {
@@ -1609,6 +1619,7 @@ impl WorkflowStore {
     pub fn validate_dispatch(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,binding,now)?;
+        native_pending::require_clear_abort_barriers(&tx,&lease.workflow)?;
         let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|row|row.get(0))?;
         let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
         ensure!(!matches!(checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired),"workflow checkpoint blocks native dispatch");
