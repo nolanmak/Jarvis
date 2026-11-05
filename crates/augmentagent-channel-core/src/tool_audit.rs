@@ -369,6 +369,63 @@ impl std::fmt::Debug for AuditLogger {
 }
 
 impl AuditLogger {
+    pub(crate) fn handoff_evidence(&self,request_sha256:&str,destination:&crate::native_vm::RuntimeOwner)->anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(!destination.workflow_id.is_empty() && destination.lease_generation>0,"invalid handoff destination");
+        let proof=self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("handoff requires protected audit"))?
+            .seal_for_handoff(request_sha256,|rows| {
+                self.check_protected_continuity()?;
+                Self::handoff_validation(rows,destination)
+            })?;
+        // A matching immutable request must keep the same destination even
+        // when a caller reopens an already sealed source logger.
+        anyhow::ensure!(proof["validation"]["workflow_id"]==destination.workflow_id
+            && proof["validation"]["destination_lease_generation"]==destination.lease_generation,
+            "handoff proof destination mismatch");
+        Ok(proof)
+    }
+    fn handoff_validation(rows:&[serde_json::Value],destination:&crate::native_vm::RuntimeOwner)->anyhow::Result<serde_json::Value> {
+        let mut previous=0i64;let mut required=false;
+        let mut admissions:Vec<(String,serde_json::Value,bool)>=Vec::new();
+        for row in rows {
+            let controller=row["actor"]=="controller";
+            if controller && row.get("generation").is_some() {
+                let generation=row["generation"].as_i64().ok_or_else(||anyhow::anyhow!("handoff source generation missing"))?;
+                anyhow::ensure!(generation>0 && row["workflow"]==destination.workflow_id,"handoff source workflow mismatch");
+                previous=previous.max(generation);
+            }
+            match row["kind"].as_str() {
+                Some("run_resources_required")=>{
+                    anyhow::ensure!(controller && row["version"]==1,"handoff requires controller resource policy");
+                    required=true;
+                }
+                Some("run_resource_admitted")=>{
+                    anyhow::ensure!(controller && required,"handoff resource admission lacks protected policy");
+                    let provider=row["provider"].as_str().filter(|p|!p.is_empty()).ok_or_else(||anyhow::anyhow!("handoff resource provider missing"))?;
+                    let identity=&row["observation"]["identity"];
+                    anyhow::ensure!(identity.is_object(),"handoff resource identity missing");
+                    anyhow::ensure!(!admissions.iter().any(|(p,id,_)|p==provider && id==identity),"duplicate handoff resource admission");
+                    admissions.push((provider.into(),identity.clone(),false));
+                }
+                Some("model_call_admitted")=>{
+                    anyhow::ensure!(controller && required && row["admission_schema_version"]==2 && row["resource_identity"].is_object(),
+                        "handoff requires resource-bound schema 2 model admissions");
+                    let provider=row["actual_provider"].as_str().ok_or_else(||anyhow::anyhow!("handoff model provider missing"))?;
+                    let admission=admissions.iter_mut().find(|(p,id,_)|p==provider && id==&row["resource_identity"])
+                        .ok_or_else(||anyhow::anyhow!("handoff model has no identical preceding resource admission"))?;
+                    anyhow::ensure!(!admission.2,"handoff resource reused by multiple model admissions");
+                    admission.2=true;
+                }
+                _=>(),
+            }
+        }
+        anyhow::ensure!(required && previous>0 && previous<destination.lease_generation,"handoff requires a newer fenced workflow generation");
+        // Validate the complete correlation before touching any kernel scope.
+        // Unused admissions still need independent stop proof.
+        let resources=admissions.iter().map(|(_,identity,_)|crate::run_resources::verify_quiescent(identity))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(serde_json::json!({"workflow_id":destination.workflow_id,"previous_lease_generation":previous,
+            "destination_lease_generation":destination.lease_generation,"quiescent_resources":resources}))
+    }
     /// Seal a failed generation only after a new fenced workflow lease and
     /// independent kernel proof that no admitted worker remains alive.
     pub fn recovery_evidence(&self, new_lease_generation: i64) -> anyhow::Result<serde_json::Value> {
@@ -687,7 +744,7 @@ impl AuditLogger {
         Ok(())
     }
 
-    pub fn protected_health(&self) -> anyhow::Result<()> {
+    fn check_protected_continuity(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.anchored.is_some(), "protected audit required");
         anyhow::ensure!(
             !self.audit_failed.load(std::sync::atomic::Ordering::Acquire)
@@ -706,6 +763,11 @@ impl AuditLogger {
                 "workflow audit has interrupted writer receipts"
             );
         }
+        Ok(())
+    }
+
+    pub fn protected_health(&self) -> anyhow::Result<()> {
+        self.check_protected_continuity()?;
         let result = self.anchored.as_ref().unwrap().append(serde_json::json!({
             "actor": "controller", "kind": "audit_integrity_check"
         }));
@@ -1384,6 +1446,91 @@ mod tests {
         let anchor = dir.path().join("anchors/workflow.json");
         let logger = AuditLogger::protected(log.clone(), anchor.clone(), &[]).unwrap();
         (dir, logger, log, anchor)
+    }
+
+    #[cfg(target_os="linux")]
+    fn handoff_test_identity()->serde_json::Value {
+        use sha2::{Digest,Sha256};
+        let path=format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple());
+        assert!(!std::path::Path::new(&path).exists());
+        serde_json::json!({"host_sha256":format!("{:x}",Sha256::digest(std::fs::read("/etc/machine-id").unwrap())),
+            "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),"path":path,"inode":1})
+    }
+    #[cfg(target_os="linux")]
+    fn seed_handoff_audit(logger:&AuditLogger,identity:&serde_json::Value,workflow:&str) {
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":workflow,"generation":1})).unwrap();
+        logger.require_run_resources().unwrap();
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"codex","observation":{"identity":identity}})).unwrap();
+    }
+    #[cfg(target_os="linux")]
+    #[test]
+    fn healthy_handoff_refuses_uncorrelated_or_reused_model_admissions() {
+        for case in ["legacy","different_identity","missing_identity","wrong_provider","duplicate_resource","reused","model_before_resource","foreign_workflow","forged_host","unused_forged_scope","noncontroller_model"] {
+            let (_dir,logger,_,anchor)=protected_fixture();let mut identity=handoff_test_identity();
+            if case=="forged_host" {identity["host_sha256"]="different-host".into();}
+            if case=="model_before_resource" {
+                logger.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":"fixture","generation":1})).unwrap();
+                logger.require_run_resources().unwrap();logger.model_call_admitted_in_scope("codex",&identity).unwrap();
+                logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"codex","observation":{"identity":identity}})).unwrap();
+            }else{seed_handoff_audit(&logger,&identity,if case=="foreign_workflow" {"other"}else{"fixture"});}
+            if case=="duplicate_resource" {logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"codex","observation":{"identity":identity}})).unwrap();}
+            if case=="unused_forged_scope" {
+                let mut unused=handoff_test_identity();unused["host_sha256"]="different-host".into();
+                logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"claude","observation":{"identity":unused}})).unwrap();
+            }
+            if case=="noncontroller_model" {logger.record_controller(serde_json::json!({"actor":"worker","kind":"model_call_admitted","actual_provider":"codex","admission_schema_version":2,"resource_identity":identity})).unwrap();}
+            let mut model_identity=identity.clone();
+            if case=="different_identity" {model_identity["inode"]=2.into();}
+            if case=="missing_identity" {model_identity=serde_json::Value::Null;}
+            if case=="legacy" {logger.model_call_admitted("codex").unwrap();}
+            else {logger.model_call_admitted_in_scope(if case=="wrong_provider" {"claude"}else{"codex"},&model_identity).unwrap();}
+            if case=="reused" {logger.model_call_admitted_in_scope("codex",&identity).unwrap();}
+            let before=std::fs::read(&anchor).unwrap();
+            assert!(logger.handoff_evidence(&"a".repeat(64),&crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:2}).is_err(),"{case} authorized healthy handoff");
+            assert_eq!(std::fs::read(&anchor).unwrap(),before,"{case} mutated the source anchor");
+        }
+    }
+    #[cfg(target_os="linux")]
+    #[test]
+    fn healthy_handoff_requires_drained_writers_and_unbroken_continuity() {
+        for interrupted in [false,true] {
+            let (_dir,logger,_,anchor)=protected_fixture();let identity=handoff_test_identity();
+            seed_handoff_audit(&logger,&identity,"fixture");logger.model_call_admitted_in_scope("codex",&identity).unwrap();
+            let ticket=if interrupted {logger.mark_failed();None}else{Some(logger.begin_write().unwrap())};
+            let before=std::fs::read(&anchor).unwrap();
+            assert!(logger.handoff_evidence(&"a".repeat(64),&crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:2}).is_err());
+            assert_eq!(std::fs::read(&anchor).unwrap(),before);drop(ticket);
+        }
+    }
+    #[cfg(target_os="linux")]
+    #[test]
+    fn healthy_handoff_requires_a_newer_fence_for_the_same_workflow() {
+        let (_dir,logger,_,anchor)=protected_fixture();let identity=handoff_test_identity();
+        seed_handoff_audit(&logger,&identity,"fixture");logger.model_call_admitted_in_scope("codex",&identity).unwrap();
+        let before=std::fs::read(&anchor).unwrap();
+        for (workflow,generation) in [("fixture",0),("fixture",1),("other",2)] {
+            assert!(logger.handoff_evidence(&"a".repeat(64),&crate::native_vm::RuntimeOwner {workflow_id:workflow.into(),lease_generation:generation}).is_err());
+            assert_eq!(std::fs::read(&anchor).unwrap(),before);
+        }
+    }
+    #[cfg(target_os="linux")]
+    #[test]
+    fn healthy_handoff_binds_kernel_proof_and_replays_after_closed_generation_health_refusal() {
+        let (_dir,logger,log,anchor)=protected_fixture();let identity=handoff_test_identity();
+        seed_handoff_audit(&logger,&identity,"fixture");logger.model_call_admitted_in_scope("codex",&identity).unwrap();
+        let claude=handoff_test_identity();
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"claude","observation":{"identity":claude}})).unwrap();
+        logger.model_call_admitted_in_scope("claude",&claude).unwrap();
+        let destination=crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:2};
+        let proof=logger.handoff_evidence(&"a".repeat(64),&destination).unwrap();
+        assert_eq!(proof["validation"]["quiescent_resources"][0]["verified_state"],"removed_empty_subtree");
+        assert_eq!(proof["validation"]["quiescent_resources"].as_array().unwrap().len(),2);
+        assert_eq!(proof["validation"]["quiescent_resources"][1]["verified_state"],"removed_empty_subtree");
+        let before=(std::fs::read(&log).unwrap(),std::fs::read(&anchor).unwrap());
+        assert!(logger.protected_health().is_err());
+        assert_eq!(logger.handoff_evidence(&"a".repeat(64),&destination).unwrap(),proof);
+        assert_eq!((std::fs::read(&log).unwrap(),std::fs::read(&anchor).unwrap()),before);
+        assert!(logger.handoff_evidence(&"a".repeat(64),&crate::native_vm::RuntimeOwner {lease_generation:3,..destination}).is_err());
     }
 
     #[tokio::test]
