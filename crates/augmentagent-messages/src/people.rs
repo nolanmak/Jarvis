@@ -356,11 +356,9 @@ fn handle_of(q: &str) -> String {
     handles::canonical(q)
 }
 
-/// Candidates for a person reference. Exact matches win over partial ones,
-/// except that a single-word reference also carries every partial match
-/// (#1668): a page keyed by a bare first name (`jordan`) must not silently
-/// swallow `jordan-blake`, whose handles hold the thread. Several candidates
-/// mean the reference is ambiguous and the caller must not pick one.
+/// Candidates for a person reference. Exact matches win over partial ones;
+/// several candidates of the best kind mean the reference is ambiguous and
+/// the caller must not pick one.
 pub fn resolve_person(
     c: &Connection,
     query: &str,
@@ -412,8 +410,9 @@ pub fn resolve_person(
         }
     }
     // A multi-word reference that matches exactly is settled. A single word
-    // is only settled when nobody else's name contains that word: otherwise
-    // the bare-key page wins by accident of slug, not by evidence (#1668).
+    // also carries every partial match (#1668): otherwise a page keyed by a
+    // bare first name swallows the longer-named sibling whose handles hold
+    // the thread, winning by accident of slug rather than by evidence.
     let mut partial: BTreeMap<String, String> = BTreeMap::new();
     if exact.is_empty() || !n.contains(' ') {
         let mut stmt = c.prepare(
