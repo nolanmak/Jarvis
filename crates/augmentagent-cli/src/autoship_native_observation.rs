@@ -399,6 +399,17 @@ impl WorkflowStore {
     }
 }
 
+/// Decode one exact original protected reference through its unique index.
+/// This is persisted evidence only; callers still need fresh core authority.
+pub(super) fn referenced(conn:&Connection,workflow:&str,audit:&str,reference:&AppendReceipt)->Result<NativeObservation> {
+    let sequence=i64::try_from(reference.sequence)?;
+    let idx=conn.query_row(&format!("SELECT {COLUMNS} FROM workflow_native_observation WHERE source_audit_path=?1 AND receipt_sequence=?2"),params![audit,sequence],indexed)
+        .optional()?.context("protected native observation reference missing")?;
+    let row=decode(conn,idx)?;
+    ensure!(row.workflow_id==workflow && row.protected_observation_reference.as_ref()==Some(reference),"protected native observation reference changed");
+    Ok(row)
+}
+
 pub(super) fn history(conn: &Connection, workflow: &str) -> Result<Vec<NativeObservation>> {
         let mut query=conn.prepare(&format!("SELECT {COLUMNS} FROM workflow_native_observation WHERE workflow=?1 ORDER BY sequence LIMIT 8193"))?;
         let rows = query.query_map([workflow], indexed)?;
@@ -2991,11 +3002,14 @@ pub(crate) mod tests {
         let fact=f.complete();f.record(&fact).unwrap();let dispatch=f.owner_dispatch.take().unwrap();
         let observed=augmentagent_channel_core::native_session::ObservedConversation {provider:augmentagent_channel_core::ProviderKind::Codex,id:"actual-session".into(),uncertain:false};
         let (prepared,reference)=f.store.owner_body_completion_reference(&dispatch,&observed,now()).unwrap();
-        f.store.conn.execute_batch("CREATE TRIGGER deny_result BEFORE INSERT ON workflow_owner_body_result BEGIN SELECT RAISE(ABORT,'unavailable'); END;").unwrap();
         let before=f.store.snapshot(&f.lease.workflow).unwrap().unwrap();let store=std::sync::Mutex::new(f.store);
-        assert!(ownership::with_current_native_completion(&f.audit,&prepared,&reference,&||store.lock().unwrap().validate_owner_body_dispatch(&dispatch,now()),
-            &mut |proof|store.lock().unwrap().complete_owner_body(&dispatch,proof,&f.binding,"private reply",now())).is_err());
-        {let mut s=store.lock().unwrap();assert_eq!(s.snapshot(&f.lease.workflow).unwrap().unwrap(),before);assert_eq!(s.pending_owner_messages(&f.lease.workflow).unwrap(),1);s.validate_owner_body_dispatch(&dispatch,now()).unwrap();s.conn.execute_batch("DROP TRIGGER deny_result").unwrap();}
+        for table in ["workflow_owner_body_result","workflow_owner_reply_delivery"] {
+            store.lock().unwrap().conn.execute_batch(&format!("CREATE TRIGGER deny_result BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT,'unavailable'); END;")).unwrap();
+            assert!(ownership::with_current_native_completion(&f.audit,&prepared,&reference,&||store.lock().unwrap().validate_owner_body_dispatch(&dispatch,now()),
+                &mut |proof|store.lock().unwrap().complete_owner_body(&dispatch,proof,&f.binding,"private reply",now())).is_err());
+            let mut s=store.lock().unwrap();assert_eq!(s.snapshot(&f.lease.workflow).unwrap().unwrap(),before);assert_eq!(s.pending_owner_messages(&f.lease.workflow).unwrap(),1);s.validate_owner_body_dispatch(&dispatch,now()).unwrap();
+            assert_eq!(s.conn.query_row("SELECT count(*) FROM workflow_owner_reply_delivery",[],|r|r.get::<_,i64>(0)).unwrap(),0);s.conn.execute_batch("DROP TRIGGER deny_result").unwrap();
+        }
         ownership::with_current_native_completion(&f.audit,&prepared,&reference,&||store.lock().unwrap().validate_owner_body_dispatch(&dispatch,now()),
             &mut |proof|store.lock().unwrap().complete_owner_body(&dispatch,proof,&f.binding,"private reply",now())).unwrap();
         assert_eq!(store.lock().unwrap().pending_owner_messages(&f.lease.workflow).unwrap(),0);
@@ -3012,5 +3026,72 @@ pub(crate) mod tests {
             &mut |proof|store.lock().unwrap().complete_owner_body(&dispatch,proof,&f.binding,"private response",now())).is_err());
         let s=store.lock().unwrap();assert_eq!(s.snapshot(&f.lease.workflow).unwrap().unwrap(),before);assert_eq!(s.pending_owner_messages(&f.lease.workflow).unwrap(),1);
         assert_eq!(s.conn.query_row("SELECT count(*) FROM workflow_owner_body_result",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+    #[tokio::test]
+    async fn private_owner_reply_stored_recovery_preserves_chunks_and_reconciles_unknown_send() {
+        if child("private_owner_reply_stored_recovery_preserves_chunks_and_reconciles_unknown_send") {return;}
+        use augmentagent_approval_discord::{autoship as gateway,QueryHandler,AuditCtx};
+        use std::sync::{Mutex,atomic::{AtomicBool,Ordering}};
+        let response=format!("Private model reply \n{}", "🦀λabc".repeat(900));
+        let mut f=Fixture::with_owner_mode(true,true);file(&f._root.path().join("native/codex/session-fixture/lock"),b"");
+        let fact=f.complete();f.record(&fact).unwrap();let dispatch=f.owner_dispatch.take().unwrap();
+        let store=Mutex::new(f.store);
+        ownership::with_current_native_completion(&f.audit,&f.prepared,fact.receipt(),&||store.lock().unwrap().validate_owner_body_dispatch(&dispatch,now()),
+            &mut |proof|store.lock().unwrap().complete_owner_body(&dispatch,proof,&f.binding,&response,now())).unwrap();
+        let mut store=store.into_inner().unwrap();
+        let deliveries=store.pending_owner_replies(11,22).unwrap();assert!(deliveries.len()>2);
+        assert!(store.pending_owner_replies(11,99).unwrap().is_empty());
+        assert!(store.claim_owner_reply(&deliveries[1],now()).unwrap().is_none(),"later chunks bypassed earlier replies");
+        assert!(store.confirm_owner_reply(&deliveries[0],88,now()).is_err(),"unstarted send gained a receipt");
+        let mut foreign=deliveries[0].clone();foreign.origin.channel=99;assert!(store.claim_owner_reply(&foreign,now()).is_err());
+        store.configure_delivery("owner/repo","github:owner",super::super::delivery::Destination {bot:11,owner:22,channel:99},now()).unwrap();
+        assert!(store.bind_delivery(&f.lease.workflow,"github:owner",super::super::delivery::Destination {bot:11,owner:22,channel:99},now()).is_err(),"pending private replies were moved to a progress destination");
+        let mut reconstructed=String::new();
+        let mut query=store.conn.prepare("SELECT content FROM workflow_owner_reply_delivery ORDER BY part").unwrap();
+        for row in query.query_map([],|r|r.get::<_,String>(0)).unwrap() {let content=row.unwrap();assert!(content.encode_utf16().count()<=1900);reconstructed.push_str(content.split_once("\n\n").unwrap().1.rsplit_once("\n[autoship:").unwrap().0);}
+        drop(query);assert_eq!(reconstructed,response);
+        store.conn.execute_batch("SAVEPOINT fixture_part_fault; UPDATE workflow_owner_reply_delivery SET content='changed' WHERE part=0").unwrap();
+        assert!(store.claim_owner_reply(&deliveries[0],now()).is_err());
+        assert!(owner_dispatch::validate_history(&store.conn,&f.lease.workflow).is_err());
+        store.conn.execute_batch("ROLLBACK TO fixture_part_fault; RELEASE fixture_part_fault").unwrap();
+        store.conn.execute_batch("SAVEPOINT fixture_part_fault; DELETE FROM workflow_owner_reply_delivery WHERE part=0").unwrap();
+        assert!(store.claim_owner_reply(&deliveries[1],now()).is_err());
+        store.conn.execute_batch("ROLLBACK TO fixture_part_fault; RELEASE fixture_part_fault").unwrap();
+        let mut wrong=fact.receipt().clone();wrong.record_sha256="c".repeat(64);
+        assert!(super::referenced(&store.conn,&f.lease.workflow,f.audit.path().to_str().unwrap(),&wrong).is_err());
+        assert!(super::referenced(&store.conn,"another/workflow",f.audit.path().to_str().unwrap(),fact.receipt()).is_err());
+        drop(store);
+        struct Stored(PathBuf);
+        #[async_trait::async_trait]
+        impl QueryHandler for Stored {
+            async fn answer(&self,_:&AuditCtx,_:&str)->Result<String> {panic!("private reply cannot create another model turn")}
+            fn autoship_owner_reply_pending(&self,b:u64,o:u64)->Result<Vec<gateway::OwnerReplyDelivery>> {crate::autoship_discord_command::owner_reply_pending(&self.0,b,o)}
+            fn autoship_owner_reply_uncertain(&self,b:u64,o:u64)->Result<Vec<gateway::UncertainOwnerReply>> {crate::autoship_discord_command::owner_reply_uncertain(&self.0,b,o)}
+            fn autoship_owner_reply_claim(&self,d:&gateway::OwnerReplyDelivery)->Result<Option<gateway::Reply>> {crate::autoship_discord_command::owner_reply_claim(&self.0,d)}
+            fn autoship_owner_reply_confirm(&self,d:&gateway::OwnerReplyDelivery,m:u64)->Result<()> {crate::autoship_discord_command::owner_reply_confirm(&self.0,d,m)}
+        }
+        struct Wire {sent:Mutex<std::collections::BTreeMap<String,(u64,String)>>,fail_once:AtomicBool}
+        #[async_trait::async_trait]
+        impl gateway::Transport for Wire {
+            async fn verify_owner_dm(&self,c:&gateway::Context)->Result<bool> {assert_eq!((c.bot,c.owner,c.author,c.channel,c.message),(11,Some(22),22,33,45));Ok(true)}
+            async fn send(&self,c:&gateway::Context,r:&gateway::Reply)->Result<u64> {
+                assert_eq!(c.channel,33);let mut sent=self.sent.lock().unwrap();let id=1000+sent.len() as u64;let nonce=r.nonce.clone().unwrap();
+                assert!(sent.insert(nonce,(id,r.content.clone())).is_none(),"unknown send was repeated");
+                anyhow::ensure!(!self.fail_once.swap(false,Ordering::SeqCst),"accepted remotely but response lost");Ok(id)
+            }
+            async fn find_progress(&self,_:&gateway::Context,nonce:&str,content:&str)->Result<Option<u64>> {
+                Ok(self.sent.lock().unwrap().get(nonce).and_then(|(id,actual)|(actual==content).then_some(*id)))
+            }
+        }
+        let wire=Wire {sent:Mutex::new(Default::default()),fail_once:AtomicBool::new(true)};
+        assert_eq!(gateway::drain_queued(&Stored(f.path.clone()),&wire,11,22).await.unwrap(),0);
+        let store=WorkflowStore::open(&f.path).unwrap();assert_eq!(store.uncertain_owner_replies(11,22).unwrap().len(),1);assert!(store.pending_owner_replies(11,22).unwrap().is_empty());drop(store);
+        assert_eq!(gateway::drain_queued(&Stored(f.path.clone()),&wire,11,22).await.unwrap(),deliveries.len());
+        assert_eq!(wire.sent.lock().unwrap().len(),deliveries.len());
+        let store=WorkflowStore::open(&f.path).unwrap();assert!(store.uncertain_owner_replies(11,22).unwrap().is_empty());assert!(store.pending_owner_replies(11,22).unwrap().is_empty());
+        let state:String=store.conn.query_row("SELECT state FROM workflow_owner_body_result WHERE request_id=?1",[dispatch.request_id()],|r|r.get(0)).unwrap();assert_eq!(state,"confirmed");
+        assert_eq!(store.snapshot(&f.lease.workflow).unwrap().unwrap().model_calls,0);
+        owner_dispatch::validate_history(&store.conn,&f.lease.workflow).unwrap();
+        assert_eq!(gateway::drain_queued(&Stored(f.path.clone()),&wire,11,22).await.unwrap(),0);
     }
 }

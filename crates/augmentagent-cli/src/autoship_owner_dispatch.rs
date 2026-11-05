@@ -79,14 +79,8 @@ fn completion_record(conn: &Connection, record: &Record, dispatch_sequence: i64)
             && launch.workflow_binding == record.binding,
         "owner completion launch predates or differs from dispatch"
     );
-    let observations = super::native_observation::history(conn, &record.workflow)?;
-    let observed = observations
-        .iter()
-        .find(|row| {
-            row.protected_observation_reference.as_ref() == Some(&value.reference)
-                && row.launch_intent_id == value.launch_intent_id
-        })
-        .context("owner completion protected observation missing")?;
+    let observed=super::native_observation::referenced(conn,&record.workflow,&launch.source_audit_path,&value.reference)?;
+    ensure!(observed.launch_intent_id==value.launch_intent_id,"owner completion launch reference changed");
     ensure!(
         observed.certainty == native_observation::Certainty::Certain
             && observed.provider == record.provider
@@ -102,6 +96,8 @@ fn completion_record(conn: &Connection, record: &Record, dispatch_sequence: i64)
                     .context("owner completion inventory missing")?["inventory"],
         "owner completion native observation changed"
     );
+    let origin=super::owner_inbox::message_evidence(conn,&record.workflow,&record.request_id)?.origin;
+    super::owner_reply::validate_persisted_parts(conn,&record.workflow,&record.request_id,&origin,&response)?;
     Ok(true)
 }
 /// A successful reservation permits one caller to start the accepted body.
@@ -234,6 +230,17 @@ pub(super) fn validate_history(conn: &Connection, workflow: &str) -> Result<()> 
         "owner completion history is incomplete"
     );
     Ok(())
+}
+/// Read one completed private response with its original authenticated origin.
+/// No route change, lease or serialized reference grants dispatch authority.
+pub(super) fn completed_reply(conn:&Connection,workflow:&str,request:&str)->Result<(discord_ingress::DiscordOrigin,String,i64)> {
+    let (sequence,raw):(i64,String)=conn.query_row("SELECT sequence,record FROM workflow_owner_body_dispatch WHERE workflow=?1 AND request_id=?2",params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    let record=decode(conn,request,workflow,sequence,&raw)?;
+    ensure!(completion_record(conn,&record,sequence)?,"owner reply has no completed dispatch");
+    let (response,completion):(String,i64)=conn.query_row("SELECT response,sequence FROM workflow_owner_body_result WHERE workflow=?1 AND request_id=?2",params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    let counts:(i64,i64)=conn.query_row("SELECT (SELECT count(*) FROM workflow_owner_body_result WHERE workflow=?1),(SELECT count(*) FROM workflow_event WHERE workflow=?1 AND kind='owner_body_completed')",[workflow],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    ensure!(counts.0==counts.1,"owner reply completion history is incomplete");
+    Ok((super::owner_inbox::message_evidence(conn,workflow,request)?.origin,response,completion))
 }
 impl WorkflowStore {
     pub(crate) fn has_owner_acceptance_for_turn(
@@ -428,6 +435,7 @@ impl WorkflowStore {
             &raw,
             now,
         )?;
+        super::owner_reply::enqueue(&tx,&record.workflow,&record.request_id,response)?;
         validate_history(&tx, &record.workflow)?;
         tx.commit()?;
         Ok(())

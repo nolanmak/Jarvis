@@ -23,6 +23,8 @@ mod review_epoch;
 mod conversations;
 #[path = "autoship_owner_revision.rs"]
 mod owner_revision;
+#[path = "autoship_owner_reply.rs"]
+pub(crate) mod owner_reply;
 #[path = "autoship_owner_dispatch.rs"]
 pub(crate) mod owner_dispatch;
 #[path = "autoship_owner_turn.rs"]
@@ -400,6 +402,13 @@ impl WorkflowStore {
                 workflow TEXT NOT NULL REFERENCES workflow(id),request_id TEXT NOT NULL,
                 generation INTEGER NOT NULL,sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
                 record TEXT NOT NULL,PRIMARY KEY(workflow,request_id,generation));
+            CREATE TABLE IF NOT EXISTS workflow_owner_reply_delivery (
+                request_id TEXT NOT NULL REFERENCES workflow_owner_body_result(request_id),
+                workflow TEXT NOT NULL REFERENCES workflow(id),part INTEGER NOT NULL,total INTEGER NOT NULL,
+                bot TEXT NOT NULL,owner TEXT NOT NULL,channel TEXT NOT NULL,nonce TEXT NOT NULL UNIQUE,
+                content TEXT NOT NULL,state TEXT NOT NULL,dispatched_at INTEGER,message TEXT,confirmed_at INTEGER,
+                PRIMARY KEY(request_id,part));
+            CREATE INDEX IF NOT EXISTS owner_reply_due ON workflow_owner_reply_delivery(bot,owner,state,workflow,request_id,part);
             CREATE TABLE IF NOT EXISTS workflow_owner_body_result (
                 request_id TEXT PRIMARY KEY REFERENCES workflow_owner_body_dispatch(request_id),
                 workflow TEXT NOT NULL REFERENCES workflow(id),

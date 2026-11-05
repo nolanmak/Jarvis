@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "352ef32f",
+  "source_parent_commit": "afed63e887bf26a3a0bab3e973e25a2a62d31547",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -26,7 +26,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
-      "sha256": "2a10ed99015f2088aae1ec036910046ed051875c915ee9907cd85f836882d03e"
+      "sha256": "d259fb08fd72bd4aa49e79c414fc66fba3793fcd94c2dea22920ab76ef774783"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
@@ -50,7 +50,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
-      "sha256": "8f89ff16d4e13b6449dd3bf01a14613ad0a1db28aa843dfa873f2e04615e757b"
+      "sha256": "e8fb7fc42ea1c12c10ae232c58886038513f3fb8914c756b7645a3aa091a86a1"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_preparation.rs",
@@ -166,12 +166,36 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_dispatch.rs",
-      "sha256": "e0d188e6352c96df1b2cb110df01014f19c4d6bb92a7115bac7456db60f8b3bc"
+      "sha256": "f3680a70ad1bf8ab4e7883ca862ed876f79b6c2d8ee6ee0769bca89a2902c290"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_reply.rs",
+      "sha256": "c618e7201d0b573a08e88001ab41131b3ddcf7d0a9bcd7f6979df01256e1373e"
+    },
+    {
+      "path": "crates/augmentagent-approval-discord/src/autoship.rs",
+      "sha256": "614c15c11d364ecadb70ac171d5207cd0c383a5de60c091754e2f936267e08e6"
+    },
+    {
+      "path": "crates/augmentagent-approval-discord/src/lib.rs",
+      "sha256": "88b8cf8199479bb46bb6cbe2e4ba72699fcf737e6e56f1d3dbbe7d647bbbb5f0"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_command.rs",
+      "sha256": "07fe7c256a6651d4c8fdf2f443d6ebb602a2bdcc8440af7cf00b999f8107e06f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/main.rs",
+      "sha256": "f5610b5dc7ba1a4fbb650a1b783f4f3bdc2c40bd27897527217e105391ea4699"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_delivery.rs",
+      "sha256": "acc2146ac1146b41c0efcee87bbb18fa6990510badb667f165145da299370860"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1867,
+    "passed": 1868,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
@@ -311,7 +335,15 @@
       "autoship-owner-body-joined-green.log",
       "autoship-owner-body-validated-green.log",
       "autoship-owner-body-full-cli.log",
-      "autoship-owner-body-production-check.log"
+      "autoship-owner-body-production-check.log",
+      "autoship-owner-reply-gateway-red.log",
+      "autoship-owner-reply-gateway-green.log",
+      "autoship-owner-reply-completion-green.log",
+      "autoship-owner-reply-stored-green.log",
+      "autoship-owner-reply-full-discord.log",
+      "autoship-owner-reply-atomic-queue-green.log",
+      "autoship-owner-reply-full-cli.log",
+      "autoship-owner-reply-production-check.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -1043,7 +1075,7 @@
     "merge_commit": "023cb4fb0a1255b96709bb3affa5e6fea233f577",
     "merged_at": "2026-11-05T22:06:40Z",
     "independent_review": "CodeRabbit COMMENTED review on exact 23081a0f head, both changed files; no functional inline findings. No-op Claude check is not review.",
-    "deployment": "not verified; normal updater only",
+    "deployment": "Normal updater built and stamped 023cb4fb and restarted the daemon at 2026-11-05T22:10:50Z. Auto-ship worker still observed on the previous executable at 22:24Z; deployment readiness remains unverified. No manual restart or autonomous shipment claimed.",
     "shipment_attribution": "manual repair merge; not an autonomous shipment"
   },
   "owner_body_execution": {
@@ -1074,9 +1106,33 @@
       "Authorized worker routing and owner-independent acceptance preparation",
       "actual first-builder provenance handling and provider/VM dispatch acceptance",
       "interrupted owner execution/result recovery",
-      "private per-request reply delivery and uncertainty/rebind recovery",
-      "bounded exact-reference lookup to avoid rescanning full native observation history once per completed owner request on every guard validation",
+      "actual private per-request delivery acceptance and rare irrecoverable-send operator resolution",
       "normal hosted CI/review/deployment and full #1715 acceptance"
-    ]
+    ],
+    "reply_delivery_source_connected": true
+  },
+  "owner_reply_delivery": {
+    "scope": "Private per-request reply delivery wired in the source through WikiQuerier, the CLI gateway bridge, QueryHandler and the existing gateway recovery loop. Actual owner coding consumer/gateway and real Discord/provider acceptance remain unavailable.",
+    "protocol": "Reply chunks commit atomically with input/turn completion. Each part retains original authenticated inbound DM, deterministic nonce, UTF16 message bound and exact stored content. Ordered parts and requests are not coalesced with progress. Claims persist uncertainty before sending. Unknown sends reconcile only an exact remote bot-authored receipt; they are never resent on timeout. Inbound route replacement refuses unconfirmed private replies; changing the progress default does not retarget private model content.",
+    "gateway_behavioral_red": "Three new actual drain-loop tests failed behaviorally before private reply dispatch was connected: zero replies, no timeout claim and no destination-loss claim. All three now pass.",
+    "full_discord": {
+      "passed": 297,
+      "failed": 0,
+      "ignored": 0
+    },
+    "full_cli": {
+      "passed": 1868,
+      "failed": 0,
+      "ignored": 33
+    },
+    "production_check": "passed",
+    "stored_gateway_fixture": "One actual SQLite/native completion/gateway bridge fixture verifies multi-part Unicode response reconstruction, wrong identity, out-of-order/unstarted receipt refusal, altered/missing parts, progress-default isolation, route replacement refusal and restart recovery from remotely accepted/response-lost send. Transport is simulated; no live Discord, model or VM dispatch.",
+    "atomicity": "Existing result-write rollback fixture now also refuses a late chunk-insert failure without applying input, changing the candidate or retaining partial reply rows.",
+    "reference_lookup": "Completed reply history uses one exact original audit path/protected receipt sequence indexed lookup, full immutable decoding and exact receipt equality. It no longer scans all native observation history once per completed owner request. Persisted references grant no current native authority.",
+    "limits": "At most eight pending parts per workflow and 128 total per pass; malformed/removed-route private records retain their state and emit generic diagnostics while other deliveries continue. Irrecoverably unknown send operator resolution and end-to-end health reporting still require closure.",
+    "source_connected": true,
+    "live_provider_dispatch": false,
+    "live_discord_acceptance": false,
+    "worker_owner_consumer_enabled": false
   }
 }
