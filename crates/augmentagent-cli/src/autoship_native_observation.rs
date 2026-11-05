@@ -1359,4 +1359,415 @@ mod tests {
         );
     }
 
+    fn completed_native_handoff(
+        f: &mut Fixture,
+    ) -> (
+        Lease,
+        super::super::native_pending::PendingNativeHandoff,
+        super::super::native_pending::VerifiedHandoffReceipt,
+    ) {
+        use std::sync::Arc;
+        let fact = f.complete();
+        f.record(&fact).unwrap();
+        file(
+            &f._root.path().join("native/codex/session-fixture/lock"),
+            b"",
+        );
+        // This fixture dispatches no model. Seed actual protected controller
+        // policy/owner rows required by the real core healthy-seal protocol.
+        f.audit.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":f.lease.workflow,"generation":f.lease.generation})).unwrap();
+        f.audit.require_run_resources().unwrap();
+        let lease = next_handoff_lease(f);
+        let base = f._root.path().canonicalize().unwrap();
+        let destination = Arc::new(
+            AuditLogger::protected(
+                base.join("logs/destination.jsonl"),
+                base.join("anchors/destination.json"),
+                &[],
+            )
+            .unwrap(),
+        );
+        destination
+            .set_native_runtime_owner(RuntimeOwner {
+                workflow_id: lease.workflow.clone(),
+                lease_generation: lease.generation,
+            })
+            .unwrap();
+        destination
+            .set_native_store_binding(
+                f.store
+                    .native_owner_binding(&lease.workflow, f.lease.generation)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        destination.require_run_resources().unwrap();
+        destination.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":lease.workflow,"generation":lease.generation})).unwrap();
+        let pending = pending_record(
+            f.store
+                .prepare_or_load_native_handoff(
+                    &lease,
+                    &f.binding,
+                    destination.path().to_str().unwrap(),
+                    now(),
+                )
+                .unwrap(),
+        );
+        assert!(
+            pending.verified_receipt(&|| Ok(())).unwrap().is_none(),
+            "pending workflow data forged native completion"
+        );
+        let outcome = ownership::transfer(
+            pending.original_binding(),
+            pending.request(),
+            &pending.observation(),
+            &[Arc::new(f.audit.clone())],
+            &destination,
+            &|| Ok(()),
+        );
+        assert!(
+            matches!(outcome, ownership::TransferOutcome::Completed(_)),
+            "real core fixture handoff failed: {outcome:?}"
+        );
+        let proof = pending
+            .verified_receipt(&|| Ok(()))
+            .unwrap()
+            .expect("core completion must have an original-ledger receipt");
+        (lease, pending, proof)
+    }
+    #[test]
+    fn native_handoff_settlement_requires_verified_core_receipt_and_replays_atomically() {
+        if child("native_handoff_settlement_requires_verified_core_receipt_and_replays_atomically")
+        {
+            return;
+        }
+        let mut f = Fixture::new();
+        let (lease, pending, proof) = completed_native_handoff(&mut f);
+        let settled = f
+            .store
+            .settle_native_handoff(&lease, &f.binding, &proof, now())
+            .unwrap();
+        assert_eq!(settled.destination, pending.request.destination);
+        assert!(settled.current_context);
+        assert_eq!(
+            f.store
+                .native_owner_binding(&lease.workflow, lease.generation)
+                .unwrap(),
+            Some(pending.original_binding.clone())
+        );
+        let events = f.store.events(&lease.workflow).unwrap();
+        let mut reopened = WorkflowStore::open(&f.path).unwrap();
+        assert_eq!(
+            reopened
+                .settle_native_handoff(&lease, &f.binding, &proof, now())
+                .unwrap(),
+            settled
+        );
+        assert_eq!(reopened.events(&lease.workflow).unwrap(), events);
+    }
+
+    #[test]
+    fn native_handoff_settlement_write_failure_retains_pending_and_native_receipt() {
+        if child("native_handoff_settlement_write_failure_retains_pending_and_native_receipt") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let (lease, pending, proof) = completed_native_handoff(&mut f);
+        let events = f.store.events(&lease.workflow).unwrap();
+        f.store.conn.execute_batch("CREATE TRIGGER deny_handoff_completion BEFORE INSERT ON workflow_native_handoff_completed BEGIN SELECT RAISE(ABORT,'synthetic settlement failure'); END;").unwrap();
+        assert!(f
+            .store
+            .settle_native_handoff(&lease, &f.binding, &proof, now())
+            .is_err());
+        assert_eq!(f.store.events(&lease.workflow).unwrap(), events);
+        assert!(f
+            .store
+            .native_owner_binding(&lease.workflow, lease.generation)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            f.store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM workflow_native_transferred_source",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            pending_record(
+                f.store
+                    .prepare_or_load_native_handoff(
+                        &lease,
+                        &f.binding,
+                        &pending.request.destination.audit_path,
+                        now()
+                    )
+                    .unwrap()
+            ),
+            pending
+        );
+        let original = pending.verified_receipt(&|| Ok(())).unwrap().unwrap();
+        f.store
+            .conn
+            .execute_batch("DROP TRIGGER deny_handoff_completion")
+            .unwrap();
+        assert!(f
+            .store
+            .settle_native_handoff(&lease, &f.binding, &original, now())
+            .is_ok());
+    }
+    #[test]
+    fn native_handoff_settlement_new_lease_acknowledges_only_historical_destination() {
+        if child("native_handoff_settlement_new_lease_acknowledges_only_historical_destination") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let (lease, pending, proof) = completed_native_handoff(&mut f);
+        f.store.release(&lease, now()).unwrap();
+        let next = f
+            .store
+            .claim(&lease.workflow, "later-reconciler", now(), 60_000)
+            .unwrap()
+            .unwrap();
+        assert!(f
+            .store
+            .settle_native_handoff(&lease, &f.binding, &proof, now())
+            .is_err());
+        let result = f
+            .store
+            .settle_native_handoff(&next, &f.binding, &proof, now())
+            .unwrap();
+        assert!(!result.current_context);
+        assert_eq!(result.destination, pending.request.destination);
+        assert!(f
+            .store
+            .native_owner_binding(&next.workflow, next.generation)
+            .unwrap()
+            .is_none());
+        let subsequent = pending_record(
+            f.store
+                .prepare_or_load_native_handoff(
+                    &next,
+                    &f.binding,
+                    "/private/later-destination",
+                    now(),
+                )
+                .unwrap(),
+        );
+        assert_ne!(subsequent.request.transfer_id, pending.request.transfer_id);
+        assert_eq!(
+            subsequent.request.source_owners,
+            vec![pending.request.destination]
+        );
+        assert_eq!(
+            subsequent.request.inventory[0]
+                .effective_owner
+                .lease_generation,
+            lease.generation
+        );
+    }
+    #[test]
+    fn native_handoff_settlement_policy_change_uses_original_completed_store() {
+        if child("native_handoff_settlement_policy_change_uses_original_completed_store") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let (lease, pending, _) = completed_native_handoff(&mut f);
+        std::env::set_var(
+            "AUGMENTAGENT_NATIVE_VM_POLICY",
+            "/missing/changed-selection.json",
+        );
+        let proof = pending.verified_receipt(&|| Ok(())).unwrap().unwrap();
+        f.store
+            .settle_native_handoff(&lease, &f.binding, &proof, now())
+            .unwrap();
+        assert_eq!(
+            f.store
+                .native_owner_binding(&lease.workflow, lease.generation)
+                .unwrap(),
+            Some(pending.original_binding.clone())
+        );
+        assert!(
+            ownership::validate_owner_binding(&pending.original_binding, &|| Ok(())).is_err(),
+            "metadata acknowledgement granted changed-selection dispatch"
+        );
+    }
+    #[test]
+    fn native_handoff_settlement_missing_original_store_cannot_make_verified_receipt() {
+        if child("native_handoff_settlement_missing_original_store_cannot_make_verified_receipt") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let (_, pending, _) = completed_native_handoff(&mut f);
+        let ledger = f._root.path().join("native/runtime-retirement.sqlite");
+        std::fs::remove_file(&ledger).unwrap();
+        let error = pending.verified_receipt(&|| Ok(())).unwrap_err();
+        assert!(
+            matches!(error,ownership::TransferOutcome::Unknown {transfer_id,..} if transfer_id==pending.request.transfer_id)
+        );
+        assert!(
+            !ledger.exists(),
+            "historical receipt lookup recreated lost native authority"
+        );
+    }
+    #[test]
+    fn native_handoff_settlement_corrupt_completion_holds_instead_of_new_owner() {
+        if child("native_handoff_settlement_corrupt_completion_holds_instead_of_new_owner") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let (lease, _, proof) = completed_native_handoff(&mut f);
+        f.store
+            .settle_native_handoff(&lease, &f.binding, &proof, now())
+            .unwrap();
+        f.store.conn.execute("UPDATE workflow_native_handoff_completed SET record=json_set(record,'$.receipt.receipt_sha256','corrupt') WHERE workflow=?1",[&lease.workflow]).unwrap();
+        let events = f.store.events(&lease.workflow).unwrap();
+        assert!(f
+            .store
+            .settle_native_handoff(&lease, &f.binding, &proof, now())
+            .is_err());
+        assert_eq!(f.store.events(&lease.workflow).unwrap(), events);
+        f.store.release(&lease, now()).unwrap();
+        let next = f
+            .store
+            .claim(&lease.workflow, "next", now(), 60_000)
+            .unwrap()
+            .unwrap();
+        assert!(f
+            .store
+            .native_handoff_snapshot(&next, &f.binding, now())
+            .is_err());
+    }
+    fn settlement_audit(f: &Fixture, name: &str, generation: i64) -> std::sync::Arc<AuditLogger> {
+        let base = f._root.path().canonicalize().unwrap();
+        let audit = std::sync::Arc::new(
+            AuditLogger::protected(
+                base.join(format!("logs/{name}.jsonl")),
+                base.join(format!("anchors/{name}.json")),
+                &[],
+            )
+            .unwrap(),
+        );
+        audit
+            .set_native_runtime_owner(RuntimeOwner {
+                workflow_id: f.lease.workflow.clone(),
+                lease_generation: generation,
+            })
+            .unwrap();
+        audit
+            .set_native_store_binding(
+                f.store
+                    .native_owner_binding(&f.lease.workflow, f.lease.generation)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        audit.require_run_resources().unwrap();
+        audit.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":f.lease.workflow,"generation":generation})).unwrap();
+        audit
+    }
+    #[test]
+    fn native_handoff_settlement_repeated_core_transfers_preserve_creation_and_exports() {
+        if child("native_handoff_settlement_repeated_core_transfers_preserve_creation_and_exports")
+        {
+            return;
+        }
+        let mut f = Fixture::new();
+        let (lease, first, proof) = completed_native_handoff(&mut f);
+        f.store
+            .settle_native_handoff(&lease, &f.binding, &proof, now())
+            .unwrap();
+        let root = f._root.path().join("native");
+        let paths = [
+            "codex/session-fixture/owned.json",
+            "codex/session-fixture/complete.json",
+            "codex/session-fixture/generation-fixture/context",
+        ];
+        let bytes: Vec<_> = paths
+            .iter()
+            .map(|path| std::fs::read(root.join(path)).unwrap())
+            .collect();
+        f.store.release(&lease, now()).unwrap();
+        let next = f
+            .store
+            .claim(&lease.workflow, "third-controller", now(), 60_000)
+            .unwrap()
+            .unwrap();
+        let source = settlement_audit(&f, "destination", lease.generation);
+        let destination = settlement_audit(&f, "third-destination", next.generation);
+        let pending = pending_record(
+            f.store
+                .prepare_or_load_native_handoff(
+                    &next,
+                    &f.binding,
+                    destination.path().to_str().unwrap(),
+                    now(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            pending.request.source_owners,
+            vec![first.request.destination]
+        );
+        assert_eq!(
+            pending.request.inventory[0]
+                .effective_owner
+                .lease_generation,
+            lease.generation
+        );
+        assert_eq!(
+            pending.request.inventory[0].creation_owner.lease_generation,
+            f.lease.generation
+        );
+        let outcome = ownership::transfer(
+            pending.original_binding(),
+            pending.request(),
+            &pending.observation(),
+            &[source],
+            &destination,
+            &|| Ok(()),
+        );
+        assert!(
+            matches!(outcome, ownership::TransferOutcome::Completed(_)),
+            "second actual core handoff failed: {outcome:?}"
+        );
+        let proof = pending.verified_receipt(&|| Ok(())).unwrap().unwrap();
+        f.store
+            .settle_native_handoff(&next, &f.binding, &proof, now())
+            .unwrap();
+        for (path, before) in paths.iter().zip(bytes) {
+            assert_eq!(std::fs::read(root.join(path)).unwrap(), before);
+        }
+        f.store.release(&next, now()).unwrap();
+        let final_lease = f
+            .store
+            .claim(&lease.workflow, "fourth-controller", now(), 60_000)
+            .unwrap()
+            .unwrap();
+        let snapshot = f
+            .store
+            .native_handoff_snapshot(&final_lease, &f.binding, now())
+            .unwrap();
+        assert_eq!(snapshot.source_owners, vec![pending.request.destination]);
+        assert_eq!(
+            snapshot.inventory[0].effective_owner.lease_generation,
+            next.generation
+        );
+        assert_eq!(
+            snapshot.inventory[0].creation_owner.lease_generation,
+            f.lease.generation
+        );
+        assert_eq!(
+            f.store
+                .snapshot(&lease.workflow)
+                .unwrap()
+                .unwrap()
+                .model_calls,
+            0
+        );
+    }
+
 }

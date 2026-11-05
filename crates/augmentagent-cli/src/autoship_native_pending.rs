@@ -41,10 +41,50 @@ impl PendingNativeHandoff {
         }
     }
 }
+/// Constructible only by an actual read of the original bound native ledger.
+/// A serialized receipt or a wire-valid hash does not create this capability.
+#[derive(Debug, Clone)]
+pub struct VerifiedHandoffReceipt {
+    pending: PendingNativeHandoff,
+    receipt: augmentagent_channel_core::native_vm::ownership::TransferReceipt,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffSettlement {
+    pub(crate) destination: Authority,
+    pub(crate) current_context: bool,
+}
+impl PendingNativeHandoff {
+    pub(crate) fn verified_receipt(
+        &self,
+        current: &dyn Fn() -> std::result::Result<
+            (),
+            augmentagent_channel_core::native_vm::ownership::TransferFenceError,
+        >,
+    ) -> std::result::Result<
+        Option<VerifiedHandoffReceipt>,
+        augmentagent_channel_core::native_vm::ownership::TransferOutcome,
+    > {
+        augmentagent_channel_core::native_vm::ownership::transfer_receipt(
+            &self.original_binding,
+            &self.request,
+            &self.observation(),
+            current,
+        )
+        .map(|receipt| {
+            receipt.map(|receipt| VerifiedHandoffReceipt {
+                pending: self.clone(),
+                receipt,
+            })
+        })
+    }
+}
+#[path = "autoship_native_settlement.rs"]
+pub(super) mod settlement;
+
 fn digest(value: &serde_json::Value) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(canonical_bytes(value)?)))
 }
-fn decode(
+pub(super) fn decode(
     tx: &Transaction<'_>,
     workflow: &str,
     row: (String, i64, u64, String),
@@ -122,7 +162,7 @@ impl WorkflowStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx, lease, binding, now)?;
         let old:Option<(String,i64,u64,String)>=tx.query_row("SELECT transfer_id,sequence,snapshot_sequence,record FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-        let orphan:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=?1 AND e.kind='native_handoff_prepared' AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_pending p WHERE p.workflow=e.workflow AND p.sequence=e.seq))",[&lease.workflow],|r|r.get(0))?;
+        let orphan:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=?1 AND e.kind='native_handoff_prepared' AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_pending p WHERE p.workflow=e.workflow AND p.sequence=e.seq) AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_completed c WHERE c.workflow=e.workflow AND c.pending_sequence=e.seq))",[&lease.workflow],|r|r.get(0))?;
         ensure!(!orphan, TransferReason::InventoryMissing);
         if let Some(old) = old {
             let pending = decode(&tx, &lease.workflow, old)?;

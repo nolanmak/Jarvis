@@ -102,8 +102,9 @@ pub(super) fn capture(
         "native handoff preparation blocked by checkpoint"
     );
     history_closed(&tx, &lease.workflow)?;
+    let transfers = native_pending::settlement::History::load(tx, &lease.workflow, u64::MAX)?;
     let owners = {
-        let mut query=tx.prepare("SELECT lease_generation,audit_path FROM workflow_native_owner WHERE workflow=?1 AND lease_generation<?2 AND retirement_reason IS NULL AND retired_at IS NULL ORDER BY lease_generation,audit_path LIMIT 65")?;
+        let mut query=tx.prepare("SELECT lease_generation,audit_path FROM workflow_native_owner WHERE workflow=?1 AND lease_generation<?2 AND retirement_reason IS NULL AND retired_at IS NULL AND NOT EXISTS(SELECT 1 FROM workflow_native_transferred_source d WHERE d.workflow=workflow_native_owner.workflow AND d.lease_generation=workflow_native_owner.lease_generation AND d.audit_path=workflow_native_owner.audit_path) ORDER BY lease_generation,audit_path LIMIT 65")?;
         let rows = query
             .query_map(params![lease.workflow, lease.generation], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
@@ -186,7 +187,21 @@ pub(super) fn capture(
     }
     // Resolve latest history before selecting retained owners; filtering
     // first could revive a superseded success from an older namespace.
-    latest_launch.retain(|_, launch| eligible(&launch.source_owner, &launch.source_audit_path));
+    let mut retained_launch = BTreeMap::new();
+    for (key, launch) in latest_launch {
+        let owner = transfers.resolve(
+            &launch.intent.runtime_relative_path,
+            &launch.intent.creation_receipt_sha256,
+            Authority {
+                owner: launch.source_owner.clone(),
+                audit_path: launch.source_audit_path.clone(),
+            },
+        )?;
+        if eligible(&owner.owner, &owner.audit_path) {
+            retained_launch.insert(key, launch);
+        }
+    }
+    let latest_launch = retained_launch;
     let mut latest = BTreeMap::new();
     for row in &observations {
         latest.insert(
@@ -200,7 +215,21 @@ pub(super) fn capture(
             row,
         );
     }
-    latest.retain(|_, row| eligible(&row.source_owner, &row.source_audit_path));
+    let mut retained = BTreeMap::new();
+    for (key, row) in latest {
+        let owner = transfers.resolve(
+            &row.runtime_relative_path,
+            &row.creation_receipt_sha256,
+            Authority {
+                owner: row.source_owner.clone(),
+                audit_path: row.source_audit_path.clone(),
+            },
+        )?;
+        if eligible(&owner.owner, &owner.audit_path) {
+            retained.insert(key, row);
+        }
+    }
+    let latest = retained;
     for (key, launch) in &latest_launch {
         ensure!(
             latest
@@ -326,12 +355,14 @@ pub(super) fn capture(
     let mut inventory = Vec::new();
     for row in &projection.observations {
         if row.certainty == native_observation::Certainty::Certain {
-            inventory.push(serde_json::from_value::<RuntimeInventoryRow>(
-                row.proof
-                    .as_ref()
-                    .context(TransferReason::InventoryMissing)?["inventory"]
-                    .clone(),
-            )?);
+            inventory.push(
+                transfers.map_inventory(serde_json::from_value::<RuntimeInventoryRow>(
+                    row.proof
+                        .as_ref()
+                        .context(TransferReason::InventoryMissing)?["inventory"]
+                        .clone(),
+                )?)?,
+            );
         }
     }
     inventory.sort_by(|a, b| {
@@ -351,7 +382,7 @@ pub(super) fn capture(
     })
 }
 /// Historical reference read. This is not a physical/native-ledger proof.
-pub(super) fn validate_reference(
+pub(super) fn validate_reference_raw(
     tx: &Transaction<'_>,
     workflow: &str,
     revision: u64,
@@ -410,4 +441,18 @@ pub(super) fn validate_reference(
             .cmp(&(b.provider, b.runtime_relative_path.as_bytes()))
     });
     Ok(inventory)
+}
+
+pub(super) fn validate_reference(
+    tx: &Transaction<'_>,
+    workflow: &str,
+    revision: u64,
+    sha: &str,
+    binding: &Binding,
+) -> Result<Vec<RuntimeInventoryRow>> {
+    let raw = validate_reference_raw(tx, workflow, revision, sha, binding)?;
+    let history = native_pending::settlement::History::load(tx, workflow, revision)?;
+    raw.into_iter()
+        .map(|row| history.map_inventory(row))
+        .collect()
 }

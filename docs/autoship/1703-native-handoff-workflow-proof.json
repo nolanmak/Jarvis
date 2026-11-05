@@ -1,16 +1,12 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "8e11ece3c21f00d44c33f780afa65b91eb9e3e34",
+  "source_parent_commit": "d38e3fb660306c7259176f9e46d696b6b7a1d997",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
     {
       "path": "crates/augmentagent-cli/src/autoship_native_handoff.rs",
-      "sha256": "0bca76d9e911ed12aca266036a07407e111559c647046181b28198be6ad4b3e7"
-    },
-    {
-      "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
-      "sha256": "902ce53634125e5887bcf0341f13418b60db9728d252df7a49ab5c029afae774"
+      "sha256": "8527c0e2790760e8137c975267cb0bac4f2b276da3f08ab7dfb8e24e05dd80c0"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_launch.rs",
@@ -18,25 +14,37 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
-      "sha256": "c19462a2c6e13c7f759e6819a3d60f05a18fb93de8793d57f615c1e558377ef1"
+      "sha256": "426db9ff9431b9ba3bba77fe8c0706056192577098a9539c95ee8b5637796f7f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
+      "sha256": "1f08ac3a504aa90157d28e398ce3090d6e02b0109a518837ad728e8b19f15c9c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_settlement.rs",
+      "sha256": "c67467c5a3242a2ea07b70a9007c0210c0adbdeb2b5cd03a7737b9eba3fd467d"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
-      "sha256": "16bdfeadc33a7e9d282c4b4d8304f0541a034999b4599b6256130eea595697b0"
+      "sha256": "fddf83bd8c147db5688eca8e75ef16aa41a566487b52e38a74de8f92879be4d1"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1769,
+    "passed": 1776,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
     "pending_handoff_cases": 8,
     "retained_logs": [
-      "autoship-native-handoff-pending-red.log",
-      "autoship-native-handoff-pending-green.log",
-      "autoship-native-handoff-pending-full.log"
-    ]
+      "autoship-native-settlement-initial-fixture-failure.log",
+      "autoship-native-settlement-red.log",
+      "autoship-native-settlement-green.log",
+      "autoship-native-settlement-focused.log",
+      "autoship-native-settlement-full.log"
+    ],
+    "settlement_cases": 7,
+    "handoff_component_cases": 25
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -45,22 +53,38 @@
     "durable pending request and original observation, request ID and destination",
     "restart/new-lease or changed-candidate reconciliation without replacement request",
     "unknown remote operations and same-generation retarget refusal",
-    "lost/corrupt projection refusal and transactional failure rollback"
+    "lost/corrupt projection refusal and transactional failure rollback",
+    "opaque original-ledger receipt capability required for metadata settlement",
+    "atomic transferred-source disposition, destination registration, completed history and pending acknowledgement",
+    "historical settlement under a newer reconciliation lease grants no current-context promotion",
+    "repeated handoffs resolve effective ownership without rewriting original observations or creation/export bytes",
+    "changed policy can reconcile original receipts but cannot grant changed-selection native admission",
+    "corrupt completion and missing original store remain held/unknown"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
-  "native_transfer_executed": false,
+  "native_transfer_executed": true,
   "physical_runtime_inventory_closure": false,
   "production_quiescence_acceptance": false,
   "productive_caller_enabled": false,
   "shipping_authority": false,
   "hosted_ci": "pending current published head",
   "remaining": [
-    "verified core receipt-backed source disposition and destination registration",
-    "pending acknowledgement/completion history and idempotent settlement",
-    "all workflow acquisition/owner-turn/recovery/merge-sweep integration",
-    "legacy original-binding and named uncertainty/corrupt-state recovery",
-    "normal rollout and actual Codex/Claude Discord live acceptance",
-    "remaining C freshness/backend cleanup work and full epic soak"
-  ]
+    "production preparation/promotion caller integration across all acquisition, owner-turn, recovery and merge-sweep leases",
+    "retirement/owner selection must account for transferred source dispositions",
+    "actual retained/retired-runtime inventory scan join before productive handoff preparation",
+    "terminal and namespace cleanup-only settlement and authenticated legacy/uncertainty/corrupt-state recovery",
+    "normal protected rollout and actual Codex/Claude Discord continuation acceptance",
+    "C actual-backend freshness/storage/quiescence cutover, private verifier recovery/application and full epic soak"
+  ],
+  "native_transfer_scope": "isolated synthetic-controller/native-filesystem fixtures only; zero production transfers or provider/model dispatch",
+  "opaque_receipt_producer": "verified lookup through ownership::transfer_receipt in the originally bound native store; no serialized-receipt constructor",
+  "fixture_core_protocol": {
+    "completed": true,
+    "consecutive_transfers": 2,
+    "creation_and_export_bytes_preserved": true,
+    "metadata_failure_replays_same_original_receipt": true,
+    "lost_original_store_refuses_new_verified_receipt": true
+  },
+  "physical_runtime_inventory_closure_scope": "not established for production; retained/retired-runtime scan reconciliation remains required"
 }

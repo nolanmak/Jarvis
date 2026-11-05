@@ -31,7 +31,7 @@ mod native_owner_binding;
 mod native_handoff;
 #[path = "autoship_native_pending.rs"]
 mod native_pending;
-pub(crate) use native_pending::{HandoffPreparation, PendingNativeHandoff};
+pub(crate) use native_pending::{HandoffPreparation, HandoffSettlement, PendingNativeHandoff, VerifiedHandoffReceipt};
 #[path = "autoship_native_observation.rs"]
 pub(crate) mod native_observation;
 #[path = "autoship_native_launch.rs"]
@@ -429,6 +429,17 @@ impl WorkflowStore {
                 workflow TEXT NOT NULL, lease_generation INTEGER NOT NULL,
                 binding TEXT NOT NULL, registered_at INTEGER NOT NULL,
                 PRIMARY KEY(workflow,lease_generation),
+                FOREIGN KEY(workflow,lease_generation) REFERENCES workflow_native_owner(workflow,lease_generation));
+            CREATE TABLE IF NOT EXISTS workflow_native_handoff_completed (
+                transfer_id TEXT PRIMARY KEY, workflow TEXT NOT NULL REFERENCES workflow(id),
+                pending_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                snapshot_sequence INTEGER NOT NULL REFERENCES workflow_native_handoff_snapshot(sequence),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_native_transferred_source (
+                workflow TEXT NOT NULL,lease_generation INTEGER NOT NULL,audit_path TEXT NOT NULL,
+                transfer_id TEXT NOT NULL REFERENCES workflow_native_handoff_completed(transfer_id) DEFERRABLE INITIALLY DEFERRED,
+                receipt_sha256 TEXT NOT NULL,destination_generation INTEGER NOT NULL,destination_audit TEXT NOT NULL,
+                PRIMARY KEY(workflow,lease_generation,audit_path),
                 FOREIGN KEY(workflow,lease_generation) REFERENCES workflow_native_owner(workflow,lease_generation));
             CREATE TABLE IF NOT EXISTS workflow_native_handoff_pending (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id),
