@@ -502,7 +502,7 @@
     "ordinary_and_observational_guard_acquisition": true,
     "merge_sweep": true,
     "runtime_deployed": false,
-    "guard_fixture_scope": "27 actual guard subprocess modes: previous 25 modes plus Codex and Claude retained-runtime continuation factories. The two new modes use protected scripted receipts and physical runtime completion/inventory/transfer; no provider/model/VM dispatch or production acceptance.",
+    "guard_fixture_scope": "30 pre-main-sync guard subprocess modes: 25 earlier modes plus two Codex/Claude session-restoration modes and three owner-revision handoff/failure modes. The five new modes include physical native runtimes and protected scripted completion/resource evidence; zero provider/model/VM dispatch and no production acceptance.",
     "pre_guard_retired_aborted_namespace_resolution": true,
     "all_closed_original_binding_recovery": true,
     "all_closed_original_binding_recovery_scope": "complete intact original history, registered retired namespaces and resolved aborted destinations, original selected policy and existing audit authority; vanished/legacy/corrupt authority remains held",
@@ -512,7 +512,9 @@
     "owner_turn_setup_refusal_recovery": true,
     "owner_coding_consumer": false,
     "discord_coding_gateway_activation": false,
-    "owner_session_restoration_factory": true
+    "owner_session_restoration_factory": true,
+    "owner_contract_revision_guard_handoff": true,
+    "owner_revision_history_validated": true
   },
   "productive_caller_enabled_scope": "deployment activation remains unproven; supported guard source paths are connected as described in source_caller_integration",
   "closed_workflow_recovery_limits": {
@@ -599,6 +601,92 @@
       "guarded completion and durable private reply",
       "Discord gateway activation after the complete consumer works",
       "normal rollout and full #1715 live acceptance"
+    ]
+  },
+  "owner_revision_guard_transition": {
+    "source_parent_commit": "96098da416a79005247caf2aff29bdadfc7abbdf",
+    "implementation_commit": "ab0d5ee4",
+    "main_integrated": "1362ee73b465b8892139b6706d59633f8f8913a9",
+    "source_generation_authority": false,
+    "metadata_history_validated": true,
+    "guard_native_handoff_connected": true,
+    "worker_consumer_connected": false,
+    "discord_coding_gateway_enabled": false,
+    "deployed": false,
+    "provider_transport_dispatch": false,
+    "behavior_red": {
+      "log": "autoship-owner-revision-history-behavior-red.log",
+      "passed": 5,
+      "failed": 1,
+      "assertion": "projection: owner turn accepted damaged activation history"
+    },
+    "initial_fixture_failure": "The first corruption fixture hit SQLite foreign-key enforcement; only the disposable corruption connection now disables it. Production enforcement is unchanged.",
+    "metadata_refusal_cases": [
+      "missing projection",
+      "missing generation fence",
+      "missing activation event",
+      "tampered registration",
+      "unknown binding field",
+      "changed fence generation",
+      "orphan activation event",
+      "missing original claim",
+      "missing authenticated origin",
+      "all revision history removed"
+    ],
+    "owner_tests": {
+      "passed": 23,
+      "failed": 0,
+      "log": "autoship-owner-revision-history-owner-green.log",
+      "scope": "before main synchronization"
+    },
+    "guard_tests": {
+      "passed": 1,
+      "failed": 0,
+      "subprocess_modes": 30,
+      "log": "autoship-owner-revision-guard-green.log",
+      "scope": "before main synchronization; real native completion/inventory/transfer with scripted protected controller evidence; no provider/model/VM dispatch"
+    },
+    "guard_api_red": {
+      "log": "autoship-owner-revision-guard-red.log",
+      "scope": "compile/API red: guard transition method did not exist, not a behavioral parent failure"
+    },
+    "checks": [
+      "revision history joins original owner claim, accepted private message, activation event, generation fence, exact registration and current turn",
+      "consuming guard transition fences old callbacks and re-registers/transfers native ownership before exposing the new guard",
+      "Codex and Claude retain the exact observed builder ID across revision handoff",
+      "failed native setup preserves revised claim and pending input; never records an unstarted refusal or permits timeout replay",
+      "pause, review invalidation, model/merge accounting and shipping denial remain intact"
+    ],
+    "full_cli": "pending merged-source managed run; previous attempt terminated with storage busy before any tests",
+    "production_check": "pending after merged-source full CLI",
+    "remaining": [
+      "actual worker authorization/workspace recovery and owner-message execution",
+      "independently prepared owner contracts and harness/control persistence",
+      "interrupted revision-transition recovery without replaying uncertain owner work",
+      "guarded owner-input completion and durable private replies",
+      "Discord gateway activation and full #1715 deployed acceptance/soak"
+    ],
+    "sources": [
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_revision_history.rs",
+        "sha256": "e4e43c4414c55209defebf61c81006f36de5d0a0bab6e8db0d8213be1d1cbaf7"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_revision.rs",
+        "sha256": "a9fc4ac0bfc7e52d9d53077f86f620ad2d764e5d943a55ecc990833a272a350e"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+        "sha256": "e8b13fd6606d906cf963c102853d3cc39a00f6059eafb8dc30f26d2dc025d67f"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
+        "sha256": "9d0b07ba773364a582d6462b8b64b120f3802812ffc963f5f9f233fc34dde73f"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+        "sha256": "b68b201e5092cefb4eb3842dbdf6e77b8ce53fd2bc51452c32d0cf07c4142a92"
+      }
     ]
   }
 }
