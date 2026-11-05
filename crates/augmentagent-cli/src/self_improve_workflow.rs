@@ -1271,7 +1271,7 @@ impl WorkflowGuard {
     /// guarded native builder scope. This is not input completion or permission
     /// to publish: the returned private result still needs locked completion
     /// and an atomic per-request reply/owner-turn transaction.
-    pub(super) async fn run_owner_body(&self,reasoner:&FallbackReasoner)->Result<OwnerBodyResult> {
+    pub(super) async fn run_owner_body(&self,reasoner:&FallbackReasoner,prepared:&acceptance::PreparedAcceptance)->Result<OwnerBodyResult> {
         self.native_builder_owner()?;
         anyhow::ensure!(self.contract==format!("registered:{}",self.binding.contract),
             "owner body requires independently registered acceptance");
@@ -1281,7 +1281,17 @@ impl WorkflowGuard {
             _=>anyhow::bail!("owner body requires native Codex or Claude")};
         self.bind_builder(reasoner)?;
         let sessions=self.owner_turn_native_builder_sessions(provider)?;
-        let (turn,dispatch)={
+        let origin=adoption::origin_for_candidate(&self.worktree,Some(self)).await?;
+        let authors=reasoner.review_authors()?;
+        let first=!origin.is_imported() && authors.as_ref().is_some_and(|authors|authors.is_empty());
+        anyhow::ensure!(origin.is_imported() || authors.as_ref().is_some_and(|authors|!authors.is_empty()) || first,"owner body requires known builder provenance or authorized imported history");
+        let (turn,dispatch)=if first {
+            anyhow::ensure!(sessions.observed().is_empty(),"first builder cannot replace an observed conversation");
+            let main=remote_main_head(&self.worktree,&self.repository).await?;
+            let dispatch=self.reserve_first_owner_body(prepared,selected,&main).await?;
+            let turn=self.store.lock().map_err(|_|anyhow::anyhow!("owner dispatch store poisoned"))?.owner_turn_for_lease(&self.lease,millis())?;
+            (turn,dispatch)
+        }else {
             let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("owner dispatch store poisoned"))?;
             let now=millis();let turn=store.owner_turn_for_lease(&self.lease,now)?;
             let activated:bool=store.has_owner_acceptance_for_turn(&turn)?;
@@ -1291,7 +1301,10 @@ impl WorkflowGuard {
         };
         let mut opts=fix_opts(self.worktree.clone());opts.audit_logger=Some(self.audit.clone());
         let prompt=format!("Work on this guarded candidate under its registered acceptance contract. Apply the owner's instruction below using the admitted tools. Do not publish, push, merge or change protected controller/verifier files. Return a concise private summary of what happened; a model response does not prove tests passed or that shipping occurred.\n\nOwner instruction:\n{}",turn.body);
-        let outcome=sessions.scope(adoption::revise(reasoner,self,&opts,&prompt)).await;
+        let outcome=sessions.scope(async {
+            if first {reasoner.call_with_storage(&opts,&prompt).await}
+            else {adoption::revise(reasoner,self,&opts,&prompt).await}
+        }).await;
         self.audit_health().await?;
         self.record_episode_sessions(&sessions)?;
         let response=outcome?;
@@ -1304,6 +1317,39 @@ impl WorkflowGuard {
         // result. Completion must repeat this check in its atomic visitor.
         self.with_owner_body_completion(&result,&mut |_|Ok(()))?;
         Ok(result)
+    }
+    /// A first builder may start only on a real linked candidate still equal
+    /// to its original main baseline, with only pinned verifier files added.
+    /// Actual native absence is checked under original-store locks at reservation.
+    async fn reserve_first_owner_body(&self,prepared:&acceptance::PreparedAcceptance,provider:durable::submission::Provider,canonical_main:&str)->Result<durable::owner_dispatch::OwnerBodyDispatch> {
+        self.native_builder_owner()?;
+        let registration=&prepared.baseline.registration;
+        anyhow::ensure!(self.contract==format!("registered:{}",registration.contract_hash())
+            && prepared.proposal.contract==*registration.contract(),"first builder acceptance changed");
+        registration.verify_integrity(&self.worktree)?;
+        let base=registration.baseline_head();
+        anyhow::ensure!(matches!(canonical_main.len(),40|64) && canonical_main.bytes().all(|b|b.is_ascii_hexdigit()),"first builder canonical main identity missing");
+        let primary=workspace::primary_root(&self.worktree).await?;
+        recovery::existing_checkout(&primary,&self.worktree).await?;
+        anyhow::ensure!(self.worktree.canonicalize()?.starts_with(workspace::candidate_parent(&primary).await?),"first builder requires an owned candidate checkout");
+        let actual=first_builder_git(&self.worktree,&["rev-parse","HEAD"]).await?;
+        anyhow::ensure!(actual.trim()==base,"first builder candidate is not the original baseline");
+        first_builder_git(&self.worktree,&["merge-base","--is-ancestor",base,canonical_main]).await?;
+        for args in [vec!["diff","--cached","--no-ext-diff","--no-textconv","--name-only","-z",base,"--"],vec!["diff","--no-ext-diff","--no-textconv","--name-only","-z",base,"--"]] {
+            anyhow::ensure!(first_builder_git(&self.worktree,&args).await?.is_empty(),"first builder candidate has staged or tracked owner changes");
+        }
+        let untracked=first_builder_git(&self.worktree,&["ls-files","--others","-z","--"]).await?;
+        anyhow::ensure!(untracked.len()<=512*1024,"first builder untracked inventory exceeds bound");
+        let pinned=registration.contract().verifiers.iter().flat_map(|v|v.pinned_files.iter()).collect::<std::collections::BTreeSet<_>>();
+        let mut count=0;for path in untracked.split('\0').filter(|p|!p.is_empty()) {count+=1;anyhow::ensure!(count<=4096 && pinned.contains(&path.to_owned()),"first builder has untracked or ignored owner data");}
+        let current=||->Result<()> {self.healthy_lease()?;self.store.lock().map_err(|_|anyhow::anyhow!("first builder store poisoned"))?.first_owner_body_turn(&self.lease,provider,base,millis())?;Ok(())};
+        let mut dispatch=None;
+        augmentagent_channel_core::native_vm::ownership::with_unused_native_owner(&self.audit,&current,&mut |proof| {
+            let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("first builder store poisoned"))?;
+            let turn=store.first_owner_body_turn(&self.lease,provider,base,millis())?;
+            dispatch=Some(store.begin_first_owner_body(&turn,provider,base,canonical_main,proof,millis())?);Ok(())
+        })?;
+        dispatch.context("first builder reservation missing")
     }
     /// The owner pause survives completion. Resume/review/CI/publication remain
     /// separate normal service actions; a private model reply grants none.
@@ -2046,6 +2092,15 @@ fn charge_elapsed(
 /// Hash only canonical non-secret evidence. Inputs include both committed tree
 /// and tracked dirty changes, so a failed stage cannot reuse the previous head's
 /// receipt while a builder has left edits in its worktree.
+// Preserve NUL-separated filenames exactly; trimming or lossy UTF-8 decoding
+// could make an owner file look like a registered verifier path.
+async fn first_builder_git(root:&Path,args:&[&str])->Result<String> {
+    let result=Command::new("/usr/bin/git").args(["--no-replace-objects","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false"])
+        .args(args).current_dir(root).env_clear().env("PATH","/usr/bin:/bin").env("GIT_OPTIONAL_LOCKS","0").env("GIT_GRAFT_FILE","/dev/null")
+        .stdin(Stdio::null()).kill_on_drop(true).output().await?;
+    anyhow::ensure!(result.status.success(),"first builder Git source check failed");Ok(String::from_utf8(result.stdout)?)
+}
+
 pub(super) async fn git_binding(
     worktree: &Path,
     contract: &str,
@@ -3313,7 +3368,7 @@ mod tests {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session","owner-setup-codex-revision-unconfigured-session","owner-early-fresh","owner-early-no-input","owner-early-corrupt-input","owner-early-history","owner-early-policy-retry","owner-early-register-write-failure","owner-early-initial-acceptance","owner-early-initial-acceptance-green-baseline","owner-early-initial-acceptance-write-failure","owner-early-initial-acceptance-history-loss","owner-early-initial-acceptance-setup-failure","owner-early-initial-acceptance-baseline-tamper","owner-early-initial-acceptance-unconfigured","owner-early-initial-acceptance-repeat","owner-early-initial-acceptance-wrong-source"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session","owner-setup-codex-revision-unconfigured-session","owner-early-fresh","owner-early-no-input","owner-early-corrupt-input","owner-early-history","owner-early-policy-retry","owner-early-register-write-failure","owner-early-initial-acceptance","owner-early-initial-acceptance-green-baseline","owner-early-initial-acceptance-write-failure","owner-early-initial-acceptance-history-loss","owner-early-initial-acceptance-setup-failure","owner-early-initial-acceptance-baseline-tamper","owner-early-initial-acceptance-unconfigured","owner-early-initial-acceptance-repeat","owner-early-initial-acceptance-wrong-source","owner-early-initial-acceptance-first-build","owner-early-initial-acceptance-first-build-dirty","owner-early-initial-acceptance-first-build-staged","owner-early-initial-acceptance-first-build-ignored","owner-early-initial-acceptance-first-build-off-base","owner-early-initial-acceptance-first-build-orphan-main","owner-early-initial-acceptance-first-build-runtime","owner-early-initial-acceptance-first-build-legacy-call","owner-early-initial-acceptance-first-build-workflow-call","owner-early-initial-acceptance-first-build-readonly-call","owner-early-initial-acceptance-first-build-lost-call-history","owner-early-initial-acceptance-first-build-policy-lost","owner-early-initial-acceptance-first-build-leading-space","owner-early-initial-acceptance-first-build-counter-loss","owner-early-initial-acceptance-first-build-new-verifier","owner-early-initial-acceptance-first-build-retired-native","owner-early-initial-acceptance-first-build-grafted-main"] {
                 if mode.ends_with("-session") && !cfg!(target_os="linux") {continue;}
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
@@ -3338,7 +3393,16 @@ mod tests {
         std::fs::write(&policy,serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/unused-runtime","guest_runtime":"/unused-guest",
             "state_root":native,"memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,"providers":{}})).unwrap()).unwrap();
         std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
-        let dir=repo();let state=control.join("workflow.db");let mode=std::env::var(MODE).unwrap();
+        let mode=std::env::var(MODE).unwrap();
+        struct GuardRepo {root:tempfile::TempDir,candidate:Option<PathBuf>}
+        impl GuardRepo {fn path(&self)->&Path {self.candidate.as_deref().unwrap_or_else(||self.root.path())}}
+        let root=repo();
+        let candidate=if mode.contains("-first-build") {
+            let candidate=root.path().join(".self-improve-worktrees/first-owner");
+            recovery::prepare(root.path(),&candidate,"fixture").await.unwrap();
+            git_evidence(root.path(),&["config","user.name","Fixture"]).await.unwrap();git_evidence(root.path(),&["config","user.email","fixture@example.invalid"]).await.unwrap();Some(candidate)
+        }else{None};
+        let dir=GuardRepo {root,candidate};let state=control.join("workflow.db");
         let id=durable::workflow_id("owner/repo",77).unwrap();
         if mode.starts_with("owner-setup-") || mode.starts_with("owner-early-") {
             let origin=durable::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
@@ -3375,12 +3439,15 @@ mod tests {
         }
         let revision_contracts=if mode.contains("-revision-") || mode.contains("-initial-acceptance") {
             use crate::autoship_contract::*;
-            let contract=AcceptanceContract {schema_version:SCHEMA_VERSION,revision:1,issue:Some(77),pull_request:None,
+            let mut contract=AcceptanceContract {schema_version:SCHEMA_VERSION,revision:1,issue:Some(77),pull_request:None,
                 criteria:vec![Criterion {id:"C1".into(),requirement:"Original requirement".into(),verifier_ids:vec!["ready".into()]}],
                 allowed_paths:vec![PathScope::File("implementation.txt".into())],
                 verifiers:vec![Verifier {id:"ready".into(),command:VerifierCommand::BlackBox {
                     invocation:BehaviorInvocation::CargoBinary {package:"fixture".into(),bin:"behavior".into(),args:vec![]},
                     oracle:OutputOracle::Json {value:serde_json::json!(true)}},pinned_files:vec!["code.txt".into()],failure_witness:"expected ready".into()}]};
+            if mode.ends_with("-new-verifier") {
+                std::fs::create_dir(dir.path().join("autoship_verifiers")).unwrap();std::fs::write(dir.path().join("autoship_verifiers/first.py"),"print(False)\n").unwrap();contract.verifiers[0].pinned_files.push("autoship_verifiers/first.py".into());
+            }
             let base=git_evidence(dir.path(),&["rev-parse","HEAD"]).await.unwrap();
             let previous=RegisteredContract::register(dir.path(),contract.clone(),base.clone(),"test".into()).unwrap();
             let mut contract=contract;contract.revision=2;
@@ -3427,7 +3494,8 @@ mod tests {
                 let receipt=registration.observe(dir.path(),"ready",registration.binding(registration.baseline_head()).unwrap(),&crate::autoship_contract::Observation {
                     exit_code:Some(0),stdout:if mode.ends_with("-green-baseline"){"true".into()}else{"false".into()},stderr:String::new(),interrupted:false,output_complete:true,
                 }).unwrap();
-                let prepared=acceptance::PreparedAcceptance {proposal:acceptance::ContractProposal {contract:registration.contract().clone(),files:std::collections::BTreeMap::from([("code.txt".into(),"baseline\n".into())])},baseline:acceptance::BaselineEvidence {registration,receipts:vec![receipt]}};
+                let mut prepared=acceptance::PreparedAcceptance {proposal:acceptance::ContractProposal {contract:registration.contract().clone(),files:std::collections::BTreeMap::from([("code.txt".into(),"baseline\n".into())])},baseline:acceptance::BaselineEvidence {registration,receipts:vec![receipt]}};
+                if mode.ends_with("-new-verifier") {prepared.proposal.files.insert("autoship_verifiers/first.py".into(),"print(False)\n".into());}
                 assert!(first.bind_acceptance(&prepared).is_err(),"ordinary binding must not poison an owner turn");
                 let old_lease=first.lease.clone();let old_binding=first.binding.clone();
                 if mode.ends_with("-unconfigured") {unsafe {std::env::remove_var("AUGMENTAGENT_NATIVE_VM_POLICY");}}
@@ -3463,6 +3531,42 @@ mod tests {
                     assert!(first.activate_initial_owner_acceptance(&prepared).await.is_err(),"registered contract was reinterpreted as raw intake");
                     let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&id).unwrap().unwrap().generation,generation);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);return;
                 }
+                if mode.contains("-first-build") {
+                    let mut canonical=prepared.baseline.registration.baseline_head().to_owned();
+                    if mode.ends_with("-dirty") {std::fs::write(dir.path().join("code.txt"),"owner dirty change").unwrap();}
+                    if mode.ends_with("-staged") {std::fs::write(dir.path().join("code.txt"),"owner staged change").unwrap();git_evidence(dir.path(),&["add","code.txt"]).await.unwrap();std::fs::write(dir.path().join("code.txt"),"baseline\n").unwrap();}
+                    if mode.ends_with("-leading-space") {std::fs::write(dir.path().join(" code.txt"),"preserve whitespace owner file").unwrap();}
+                    if mode.ends_with("-retired-native") {let binding=first.audit.native_store_binding().unwrap().unwrap();augmentagent_channel_core::native_vm::retire_owned_runtimes(&binding,first.audit.path(),&first.audit.native_runtime_owner().unwrap().unwrap(),&||Ok(())).unwrap();}
+                    if mode.ends_with("-ignored") {std::fs::write(dir.root.path().join(".git/info/exclude"),"ignored-owner-file\n").unwrap();std::fs::write(dir.path().join("ignored-owner-file"),"preserve owner data").unwrap();}
+                    if mode.ends_with("-off-base") {git_evidence(dir.path(),&["commit","--allow-empty","-m","preserve owner commit"]).await.unwrap();}
+                    if mode.ends_with("-orphan-main") {canonical=git_evidence(dir.path(),&["commit-tree","HEAD^{tree}","-m","unrelated main"]).await.unwrap();}
+                    if mode.ends_with("-grafted-main") {canonical=git_evidence(dir.path(),&["commit-tree","HEAD^{tree}","-m","unrelated main"]).await.unwrap();std::fs::write(dir.root.path().join(".git/info/grafts"),format!("{} {}\n",canonical,prepared.baseline.registration.baseline_head())).unwrap();}
+                    if mode.ends_with("-runtime") {
+                        let provider=native.join("codex");std::fs::create_dir(&provider).unwrap();std::fs::set_permissions(&provider,std::fs::Permissions::from_mode(0o700)).unwrap();
+                        let path=provider.join("session-stray");std::fs::create_dir(&path).unwrap();std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o700)).unwrap();
+                        let owned=path.join("owned.json");std::fs::write(&owned,serde_json::to_vec(&serde_json::json!({"version":1,"owner":first.audit.native_runtime_owner().unwrap().unwrap(),"audit_path":first.audit.path()})).unwrap()).unwrap();std::fs::set_permissions(&owned,std::fs::Permissions::from_mode(0o600)).unwrap();
+                        let lock=path.join("lock");std::fs::write(&lock,"").unwrap();std::fs::set_permissions(&lock,std::fs::Permissions::from_mode(0o600)).unwrap();
+                    }
+                    if mode.ends_with("-legacy-call") {first.store.lock().unwrap().charge(&first.lease,"legacy",ResourceCharge {model_calls:1,..Default::default()},millis()).unwrap();}
+                    if mode.ends_with("-workflow-call") || mode.ends_with("-readonly-call") || mode.ends_with("-lost-call-history") || mode.ends_with("-counter-loss") {
+                        first.store.lock().unwrap().charge_admitted_model(&first.lease,"synthetic-classified-admission",millis(),None,None,Some(durable::submission::Provider::Codex),!mode.ends_with("-workflow-call")).unwrap();
+                        if mode.ends_with("-lost-call-history") {rusqlite::Connection::open(&state).unwrap().execute("DELETE FROM workflow_event WHERE kind='native_model_admitted'",[]).unwrap();}
+                        if mode.ends_with("-counter-loss") {rusqlite::Connection::open(&state).unwrap().execute("UPDATE workflow SET model_calls=0 WHERE id=?1",[&id]).unwrap();}
+                    }
+                    if mode.ends_with("-policy-lost") {unsafe {std::env::remove_var("AUGMENTAGENT_NATIVE_VM_POLICY");}}
+                    let before=WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap();let original=first.audit.native_store_binding().unwrap().unwrap();
+                    let result=first.reserve_first_owner_body(&prepared,durable::submission::Provider::Codex,&canonical).await;
+                    let allowed=mode.ends_with("-first-build") || mode.ends_with("-readonly-call") || mode.ends_with("-new-verifier");
+                    assert_eq!(result.is_ok(),allowed,"first owner body decision: {mode}: {:?}",result.as_ref().err());
+                    if allowed {let dispatch=result.unwrap();first.store.lock().unwrap().validate_owner_body_dispatch(&dispatch,millis()).unwrap();assert!(first.reserve_first_owner_body(&prepared,durable::submission::Provider::Codex,&canonical).await.is_err(),"first body was reserved twice");}
+                    let mut store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(store.owner_control(&id).unwrap().unwrap().paused);
+                    assert_eq!(first.audit.native_store_binding().unwrap(),Some(original));
+                    let count:i64=rusqlite::Connection::open(&state).unwrap().query_row("SELECT count(*) FROM workflow_owner_body_dispatch WHERE workflow=?1",[&id],|r|r.get(0)).unwrap();assert_eq!(count,i64::from(allowed));
+                    if mode.ends_with("-staged") {assert_eq!(git_evidence(dir.path(),&["show",":code.txt"]).await.unwrap(),"owner staged change");}
+                    if mode.ends_with("-ignored") {assert_eq!(std::fs::read_to_string(dir.path().join("ignored-owner-file")).unwrap(),"preserve owner data");}
+                    return;
+                }
+
             }
             first.validate_before_side_effect().unwrap();
             let sessions=first.owner_turn_native_builder_sessions(augmentagent_channel_core::ProviderKind::Codex).unwrap();

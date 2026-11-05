@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "afed63e887bf26a3a0bab3e973e25a2a62d31547",
+  "source_parent_commit": "83140a7a1c6f35be4dd20108367da84a70820725",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -10,7 +10,7 @@
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_handoff.rs",
-      "sha256": "a1dd47daee8ceea08db6ceff7caac460c0d1f7ad64b9bf1d622d481cafa35da0"
+      "sha256": "688e53da4e3962fcfbfb65e1ef884483d0f5c298c8dcfd5a02fbddb2fd9338a9"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
@@ -58,7 +58,7 @@
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_transfer.rs",
-      "sha256": "fb483619ad37b2c35aad2d8d1b82b4cbffb6c44d87016e922cb514072cda9f0d"
+      "sha256": "f11f7e0abe564f0e7ecd583bec0e1a7d10e4ee105483e70811c89130ee774ad1"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_verification_retry.rs",
@@ -110,7 +110,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "779947c1362840bcb4ce193e1e175d7986f1f241ed72b6c929d323082b8586b9"
+      "sha256": "014d42e0fee80ce054638eca5b727e8d78a804c7f34fcb79bb3172d9c1977472"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_recovery.rs",
@@ -154,7 +154,7 @@
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_completion.rs",
-      "sha256": "36166c7cc7c53410d6bfb419637e13eecd37e151aee8438473b229ef70e4885a"
+      "sha256": "ec292b71d9ae9d4015bd4b9290c36a79ae11fd64ecbb907285cb3f695c1dc911"
     },
     {
       "path": "scripts/provider-supervisor.py",
@@ -166,7 +166,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_dispatch.rs",
-      "sha256": "f3680a70ad1bf8ab4e7883ca862ed876f79b6c2d8ee6ee0769bca89a2902c290"
+      "sha256": "a664c1d63ee92b1c669766080d722ed2d751222d139be450d23bd317ca43ffc0"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_reply.rs",
@@ -343,7 +343,15 @@
       "autoship-owner-reply-full-discord.log",
       "autoship-owner-reply-atomic-queue-green.log",
       "autoship-owner-reply-full-cli.log",
-      "autoship-owner-reply-production-check.log"
+      "autoship-owner-reply-production-check.log",
+      "autoship-owner-first-builder-red.log",
+      "autoship-owner-first-builder-validated-green.log",
+      "autoship-owner-first-builder-full-core.log",
+      "autoship-owner-first-builder-graft-fixture-failure.log",
+      "autoship-owner-first-builder-graft-red.log",
+      "autoship-owner-first-builder-graft-green.log",
+      "autoship-owner-first-builder-final-cli.log",
+      "autoship-owner-first-builder-final-production-check.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -371,12 +379,12 @@
     "core_validation_scope": "full managed core library suite; source inventory is post-run and grants no compiled-source freshness authority",
     "pending_reconciliation_cases": 9,
     "joined_reconciliation_adapter_cases": 1,
-    "core_validation_source_commit": "7409527e1ab9d9d692d441e62e47f09e1eabcf57 (895 passed, 15 ignored; core library unchanged for terminal CLI orchestration and phone fixture change)",
+    "core_validation_source_commit": "83140a7a plus first-builder core changes (post-run source inventory only; no compiled-source authority)",
     "callback_journal_cases": 4,
     "production_configuration_check": {
       "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
       "passed": true,
-      "log": "autoship-owner-guard-setup-validated-production-check.log"
+      "log": "autoship-owner-first-builder-final-production-check.log"
     },
     "guard_promotion_cases": 3,
     "read_only_audit_probe_cases": 2,
@@ -1079,7 +1087,7 @@
     "shipment_attribution": "manual repair merge; not an autonomous shipment"
   },
   "owner_body_execution": {
-    "scope": "Guarded execution/completion APIs compiled. Actual command-worker selection, independent owner acceptance orchestration, private reply transport and coding gateway activation are not connected.",
+    "scope": "Guarded execution/completion APIs and private reply transport connected in source. Actual command-worker selection, independent owner acceptance orchestration and coding gateway activation remain absent.",
     "dispatch": "Nonclone private per-request reservation, body digest/provider/current turn binding, native launch floor and immutable joined event/index history; second reservation refuses after restart, never releases pending input based on TTL.",
     "completion": "Fresh borrowed core proof required inside atomic metadata visitor; rejects pre-reservation launch even with current physical completion. Applies input, completes turn, saves private per-request reply, changes candidate binding and invalidates old review evidence atomically. Owner pause, accounting and merge allowance remain unchanged.",
     "focused_passed": 7,
@@ -1104,7 +1112,7 @@
     "reply_delivery_enabled": false,
     "remaining": [
       "Authorized worker routing and owner-independent acceptance preparation",
-      "actual first-builder provenance handling and provider/VM dispatch acceptance",
+      "actual first-builder provider/VM dispatch acceptance and complete retained-history provider resolution",
       "interrupted owner execution/result recovery",
       "actual private per-request delivery acceptance and rare irrecoverable-send operator resolution",
       "normal hosted CI/review/deployment and full #1715 acceptance"
@@ -1134,5 +1142,30 @@
     "live_provider_dispatch": false,
     "live_discord_acceptance": false,
     "worker_owner_consumer_enabled": false
+  },
+  "owner_first_builder": {
+    "scope": "Guarded first-builder reservation and model-wrapper source path implemented. Worker consumer and live model/Discord acceptance remain absent.",
+    "authority": "Original native store binding, active owner, actual empty physical inventory, protected launch audit and kernel closure retained under state/session/audit locks through atomic dispatch reservation.",
+    "provenance": "Original initial acceptance revision and baseline; no prior body/conversation or unknown/mutating model history. Classified readonly calls require exact original charge/event attribution and unchanged counters. Real linked candidate at original baseline, ancestor of canonical main, no staged/tracked owner changes and no unregistered untracked/ignored paths.",
+    "history": "Existing conversation/imported paths still revise retained history; only proven never-started native builders use the normal first call. No accounting reset, refund, allowance debit, fabricated session or automatic input completion.",
+    "guard_subprocess_modes": 63,
+    "first_builder_modes": 17,
+    "behavioral_red": "The real Git graft fixture caused the source guard to accept unrelated canonical main. Ignoring local grafts makes the same fixture refuse. Initial missing API/fixture compile failures and omitted-policy fixture failure are separate and are not behavioral parent regressions.",
+    "full_core": {
+      "passed": 895,
+      "failed": 0,
+      "ignored": 15,
+      "scope": "Full core suite before final CLI-only Git graft correction; core source unchanged since that validation."
+    },
+    "full_cli": {
+      "passed": 1868,
+      "failed": 0,
+      "ignored": 33
+    },
+    "production_check": "passed",
+    "fixtures": "Real linked Git candidates and temporary native ledger/runtime/audit fixtures; synthetic acceptance observations/controller/resource receipts. No actual model/provider/VM/Discord dispatch.",
+    "worker_consumer_enabled": false,
+    "live_provider_dispatch": false,
+    "live_discord_acceptance": false
   }
 }

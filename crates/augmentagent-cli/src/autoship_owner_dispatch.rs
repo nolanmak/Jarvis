@@ -15,6 +15,8 @@ struct Record {
     body_sha256: String,
     launch_floor: i64,
     started_at_ms: i64,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    first_builder:Option<serde_json::Value>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -156,6 +158,13 @@ fn decode(
             ),
         "owner dispatch event changed"
     );
+    if let Some(first)=&record.first_builder {
+        let (_,original)=super::native_launch::original_context(conn,workflow,record.generation,false)?;
+        let namespace=serde_json::json!({"owner":{"workflow_id":workflow,"lease_generation":record.generation},"audit_path":super::native_launch::original_context(conn,workflow,record.generation,false)?.0});
+        ensure!(first["baseline"]==record.binding.head && first["native"]["kind"]=="unused_native_workflow"
+            && first["native"]["namespace"]==namespace && first["native"]["original_binding_sha256"]==original,
+            "first builder original native evidence changed");
+    }
     let input = super::owner_inbox::message_evidence(conn, workflow, request)?;
     ensure!(
         record.body_sha256 == format!("{:x}", Sha256::digest(input.body.as_bytes())),
@@ -242,6 +251,27 @@ pub(super) fn completed_reply(conn:&Connection,workflow:&str,request:&str)->Resu
     ensure!(counts.0==counts.1,"owner reply completion history is incomplete");
     Ok((super::owner_inbox::message_evidence(conn,workflow,request)?.origin,response,completion))
 }
+fn first_builder_policy(conn:&Connection,turn:&owner_turn::OwnerTurn,base:&str)->Result<()> {
+    let registration: String=conn.query_row("SELECT r.registration FROM workflow_owner_revision r JOIN workflow_owner_initial_acceptance i ON i.request_id=r.request_id WHERE r.request_id=?1 AND r.next_contract=?2 AND r.binding=?3",params![turn.request_id,turn.binding.contract,serde_json::to_string(&turn.binding)?],|r|r.get(0))?;
+    let registration:crate::autoship_contract::RegisteredContract=serde_json::from_str(&registration)?;registration.verify_metadata()?;
+    ensure!(registration.contract().revision==1 && registration.baseline_head()==base && turn.binding.head==base,"first owner body differs from original registered baseline");
+    let previous:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_builder_conversation WHERE workflow=?1) OR EXISTS(SELECT 1 FROM workflow_owner_body_dispatch WHERE request_id=?2)",params![turn.lease.workflow,turn.request_id],|r|r.get(0))?;
+    ensure!(!previous,"first owner body has a prior conversation or reservation");
+    #[derive(Serialize,Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Admission {receipt:String,provider:Option<submission::Provider>,reviewer:bool}
+    let mut query=conn.prepare("SELECT generation,payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' ORDER BY seq LIMIT 8193")?;
+    let rows=query.query_map([&turn.lease.workflow],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))?;let mut count=0i64;
+    for row in rows {
+        let (generation,raw)=row?;ensure!(raw.len()<=4096 && generation>0 && generation<=turn.lease.generation && count<8192,"first builder attribution exceeds bounds");
+        let admission:Admission=serde_json::from_str(&raw)?;
+        ensure!(serde_json::to_value(&admission)?==serde_json::from_str::<serde_json::Value>(&raw)? && admission.reviewer && admission.provider.is_some(),"previous native mutation or unknown attribution forbids first builder");
+        let linked:i64=conn.query_row("SELECT count(*) FROM resource_charge c JOIN workflow_event e ON e.workflow=c.workflow AND e.payload=c.id AND e.kind='resource_charged' AND e.generation=?3 WHERE c.workflow=?1 AND c.id=?2 AND c.model_calls=1",params![turn.lease.workflow,admission.receipt,generation],|r|r.get(0))?;
+        ensure!(linked==1,"first builder model attribution lost its charge");count+=1;
+    }
+    let (charged,counter):(i64,i64)=conn.query_row("SELECT (SELECT COALESCE(SUM(model_calls),0) FROM resource_charge WHERE workflow=?1),model_calls FROM workflow WHERE id=?1",[&turn.lease.workflow],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    ensure!(charged==count && counter==count,"unclassified model history forbids first builder");Ok(())
+}
 impl WorkflowStore {
     pub(crate) fn has_owner_acceptance_for_turn(
         &self,
@@ -258,6 +288,19 @@ impl WorkflowStore {
         provider: submission::Provider,
         now: i64,
     ) -> Result<OwnerBodyDispatch> {
+        self.begin_owner_body_dispatch_inner(turn,provider,now,None)
+    }
+    pub(crate) fn first_owner_body_turn(&mut self,lease:&Lease,provider:submission::Provider,base:&str,now:i64)->Result<owner_turn::OwnerTurn> {
+        self.require_command_builder(&lease.workflow,Some(provider))?;
+        let turn=self.owner_turn_for_lease(lease,now)?;first_builder_policy(&self.conn,&turn,base)?;Ok(turn)
+    }
+    pub(crate) fn begin_first_owner_body(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,base:&str,canonical_main:&str,
+        proof:&augmentagent_channel_core::native_vm::ownership::UnusedNativeOwnerProof<'_>,now:i64)->Result<OwnerBodyDispatch> {
+        self.begin_owner_body_dispatch_inner(turn,provider,now,Some((base,canonical_main,proof)))
+    }
+    fn begin_owner_body_dispatch_inner(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,now:i64,
+        first:Option<(&str,&str,&augmentagent_channel_core::native_vm::ownership::UnusedNativeOwnerProof<'_>)>,
+    )->Result<OwnerBodyDispatch> {
         ensure!(now >= 0, "invalid owner dispatch time");
         self.require_command_builder(&turn.lease.workflow, Some(provider))?;
         let tx = self
@@ -273,6 +316,13 @@ impl WorkflowStore {
             !prior,
             "owner body already reserved; reconcile outcome instead of replaying"
         );
+        let first_builder=if let Some((base,main,proof))=first {
+            first_builder_policy(&tx,turn,base)?;
+            ensure!(proof.namespace().owner.workflow_id==turn.lease.workflow && proof.namespace().owner.lease_generation==turn.lease.generation,"first builder native namespace changed");
+            let (audit,original)=super::native_launch::original_context(&tx,&turn.lease.workflow,turn.lease.generation,true)?;
+            ensure!(audit==proof.namespace().audit_path && original==super::native_launch::binding_digest(proof.binding())?,"first builder original native binding changed");
+            Some(serde_json::json!({"baseline":base,"canonical_main":main,"native":proof.evidence()}))
+        }else{None};
         let launch_floor = super::native_launch::history(&tx, &turn.lease.workflow)?
             .last()
             .map_or(0, |r| r.sequence);
@@ -288,6 +338,7 @@ impl WorkflowStore {
             body_sha256: format!("{:x}", Sha256::digest(turn.body.as_bytes())),
             launch_floor,
             started_at_ms: now,
+            first_builder,
         };
         let raw = serde_json::to_string(&record)?;
         event(

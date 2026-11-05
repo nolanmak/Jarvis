@@ -34,6 +34,45 @@ impl VerifiedNativeObservation {
     }
 }
 
+/// Private borrowed proof of an unused current namespace in the original store.
+/// It grants no right to discard or replace an existing conversation.
+pub struct UnusedNativeOwnerProof<'a> {
+    binding:&'a super::ownership::TransferBinding,
+    namespace:&'a super::ownership::Authority,
+    evidence:&'a Value,
+}
+impl UnusedNativeOwnerProof<'_> {
+    pub fn binding(&self)->&super::ownership::TransferBinding {self.binding}
+    pub fn namespace(&self)->&super::ownership::Authority {self.namespace}
+    pub fn evidence(&self)->&Value {self.evidence}
+}
+/// Recheck actual physical absence, active original ownership, protected audit
+/// and kernel closure under the shared state/session/audit locks. The visitor
+/// and current fence perform short workflow metadata operations only.
+pub fn with_unused_native_owner(logger:&AuditLogger,current:&dyn Fn()->Result<()>,visit:&mut dyn FnMut(&UnusedNativeOwnerProof<'_>)->Result<()>)->Result<()> {
+    use sha2::{Digest,Sha256};
+    current()?;
+    let binding=logger.native_store_binding()?.context("unused native owner requires original binding")?;
+    selection(logger,&binding)?;
+    let owner=logger.native_runtime_owner()?.context("unused native owner missing")?;
+    let audit=super::owner_handoff::actual_audit(logger.path())?;
+    ensure!(logger.protected_log_path()==Some(audit.as_path()),"unused native owner audit path changed");
+    let namespace=super::ownership::Authority {owner,audit_path:audit.to_string_lossy().into_owned()};
+    let (root,store)=binding.retirement_store()?;let lock=super::StateLock::existing(root)?;
+    let ledger=super::owner_ledger::Ledger::open_bound(root,&lock,store,true)?;
+    super::ensure_native_admission(&ledger,&namespace.owner,logger)?;
+    super::owner_handoff::with_empty_workflow_inventory(root,&ledger,&namespace,&mut || {
+        logger.with_namespace_quiescence_rows(&namespace,namespace.owner.lease_generation,|rows,audited| {
+            ensure!(!rows.iter().any(|row|row["kind"].as_str().is_some_and(|kind|kind.starts_with("native_launch_") || kind=="model_call_admitted")),"native namespace already prepared or admitted a model call");
+            selection(logger,&binding)?;current()?;
+            let evidence=json!({"version":1,"kind":"unused_native_workflow","namespace":namespace,
+                "original_binding_sha256":format!("{:x}",Sha256::digest(super::ownership::canonical_bytes(&serde_json::to_value(&binding)?)?)),
+                "audit":audited["audit"],"namespace_validation":audited["validation"]});
+            visit(&UnusedNativeOwnerProof {binding:&binding,namespace:&namespace,evidence:&evidence})
+        })
+    })
+}
+
 /// Fresh authority only within the locked visitor. A stored append reference
 /// or a previously verified observation cannot construct this capability.
 pub struct NativeCompletionProof<'a> {

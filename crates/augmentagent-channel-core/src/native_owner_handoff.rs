@@ -219,6 +219,12 @@ fn scan_inventory(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Authorit
 fn scan_inventory_bounded(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Authority],observations:&[PhysicalObservation],max_entries:usize,max_metadata:u64)->Result<PhysicalInventory> {
     scan_inventory_impl(root,ledger,workflow,sources,observations,max_entries,max_metadata,false)
 }
+/// An undeclared live runtime is never evidence of an unused workflow.
+/// Retain every session lock while the caller reserves its first dispatch.
+pub(super) fn with_empty_workflow_inventory(root:&Path,ledger:&Ledger<'_>,namespace:&Authority,visit:&mut dyn FnMut()->Result<()>)->Result<()> {
+    let scan=scan_inventory(root,ledger,&namespace.owner.workflow_id,std::slice::from_ref(namespace),&[])?;
+    ensure!(scan.inventory.is_empty(),R::InventoryMissing);visit()
+}
 pub(super) fn with_retired_workflow_inventory(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Authority],observations:&[PhysicalObservation],visit:&mut dyn FnMut(&[String])->Result<()>)->Result<()> {
     let scan=scan_inventory_impl(root,ledger,workflow,sources,observations,4096,64*1024*1024,true)?;
     ensure!(scan.inventory.is_empty(),R::AuthorityConflict);visit(&scan.retired)
