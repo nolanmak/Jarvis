@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "dd1cfa806a302fd029e4beb0ce6262f9f9ce1cf5",
+  "source_parent_commit": "c55c71aac2e390c07532f68b1e9cd5ac23773ebb",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -10,7 +10,7 @@
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_handoff.rs",
-      "sha256": "51f98b0dc1ca12ce27a20ecd7b523c6e06834f55db17443953afddd071850cb2"
+      "sha256": "59189d4d242caac28a2b4fdedb1e7194ea89beab0f2091cfc597f49bda005959"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
@@ -61,23 +61,23 @@
     "handoff_snapshot_cases": 10,
     "pending_handoff_cases": 8,
     "retained_logs": [
-      "autoship-native-physical-scan-red.log",
-      "autoship-native-physical-scan-red-corrected.log",
-      "autoship-native-physical-scan-green.log",
-      "autoship-native-physical-scan-foreign-red.log",
-      "autoship-native-physical-scan-full-core.log",
-      "autoship-native-physical-scan-full-cli.log"
+      "autoship-native-locked-preparation-red.log",
+      "autoship-native-locked-preparation-expanded-red.log",
+      "autoship-native-locked-preparation-green.log",
+      "autoship-native-locked-preparation-full-core.log",
+      "autoship-native-locked-preparation-full-cli.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
     "owner_eligibility_cases": 6,
     "focused_native_observation_cases": 33,
-    "core_passed": 870,
+    "core_passed": 877,
     "core_failed": 0,
     "core_ignored": 15,
     "owner_retirement_marker_cases": 3,
     "scope_retirement_marker_cases": 6,
-    "physical_inventory_scan_cases": 7
+    "physical_inventory_scan_cases": 7,
+    "locked_preparation_cases": 7
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -105,7 +105,12 @@
     "bounded physical namespace scan filters authenticated retirement from latest metadata without rewriting uncertain observations",
     "retained missing/unknown-ID/uncertain, creation/authority/launch/alias/export substitutions, busy locks and malformed foreign authorities hold the scan",
     "session locks remain held in the scan result and are released on partial failure; zero retained sessions never creates source closure",
-    "4096-entry enumeration and 64-MiB metadata read budget include unrelated provider entries and foreign creation receipts"
+    "4096-entry enumeration and 64-MiB metadata read budget include unrelated provider entries and foreign creation receipts",
+    "private core orchestration holds original state and session locks across filtered-intent callback, native prepare, protected audit seals and commit",
+    "persistence callback failure, changed returned request and stale post-persistence fence produce no native claims or audit seals",
+    "persisted synthetic intent survives stale fencing and retries the same request ID through actual core transfer",
+    "changed creation/export bytes and replaced original store after the callback are rechecked before claims; lost store is never bootstrapped",
+    "real concurrent late scope retirement returns without blocking and cannot retire a runtime during preparation or after transfer"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -117,11 +122,11 @@
   "hosted_ci": "pending current published head",
   "remaining": [
     "production preparation/promotion caller integration across all acquisition, owner-turn, recovery and merge-sweep leases",
-    "connect physical retained/retired inventory scan to workflow persistence and core prepare under the same original locks",
+    "bind real workflow filtered snapshots/pending transaction and typed preparation outcomes to the private core locked callback",
     "terminal and namespace cleanup-only settlement and authenticated legacy/uncertainty/corrupt-state recovery",
     "normal protected rollout and actual Codex/Claude Discord continuation acceptance",
     "C actual-backend freshness/storage/quiescence cutover, private verifier recovery/application and full epic soak",
-    "synchronized physical scan/workflow persistence/native prepare and locked absent/aborted reconciliation"
+    "production workflow persistence callback integration, concurrent workflow/audit lock-order proof and locked absent/aborted reconciliation"
   ],
   "native_transfer_scope": "isolated synthetic-controller/native-filesystem fixtures only; zero production transfers or provider/model dispatch",
   "opaque_receipt_producer": "verified lookup through ownership::transfer_receipt in the originally bound native store; no serialized-receipt constructor",
@@ -144,5 +149,8 @@
   "scope_marker_red_evidence": "Initial red run: two behavioral failures; third foreign-workflow fixture failed create_new before assertion. Fixture corrected; all six cases pass in full core suite.",
   "physical_scan_component_executed": true,
   "physical_scan_scope": "internal component under an existing ledger/state lock; synthetic native filesystem fixtures only; no workflow callback or productive consumer enabled",
-  "physical_scan_red_evidence": "Corrected initial scan red: three behavioral failures and one hold test passed. Initial hold fixture used the wrong provider alias directory; retained initial log. Separate malformed-foreign-authority test failed behaviorally before the validation fix."
+  "physical_scan_red_evidence": "Corrected initial scan red: three behavioral failures and one hold test passed. Initial hold fixture used the wrong provider alias directory; retained initial log. Separate malformed-foreign-authority test failed behaviorally before the validation fix.",
+  "locked_preparation_component_executed": true,
+  "locked_preparation_scope": "private core callback with durable-file intent fixtures and actual native ledger/audit transfer; real workflow SQLite snapshot/pending transaction and typed preparation outcomes are not connected",
+  "locked_preparation_red_evidence": "Initial four callback/locking tests failed behaviorally against the placeholder. Expanded red: one precondition test passed and five failed. Final full core suite includes seven cases, including real concurrent retirement."
 }

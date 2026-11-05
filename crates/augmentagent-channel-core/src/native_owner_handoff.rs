@@ -264,6 +264,32 @@ fn scan_inventory_bounded(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[
     Ok(result)
 }
 
+fn prepare_handoff_bound_at(
+    root:&Path,max_state_bytes:u64,expected:&super::owner_store::StoreIdentity,
+    workflow:&str,source_owners:&[Authority],destination_owner:&Authority,observations:&[PhysicalObservation],
+    sources:&[Arc<AuditLogger>],destination:&Arc<AuditLogger>,current:&dyn Fn()->Result<()>,
+    persist:&mut dyn FnMut(&[RuntimeInventoryRow],&[String])->Result<TransferRequest>,
+)->Result<TransferReceipt> {
+    // This private core boundary takes only an already captured store identity.
+    // Policy, workflow projection, lease and active-pending fences belong to the
+    // caller; current must validate them without reacquiring native StateLock.
+    current()?;
+    super::owner_store::validate_bound_metadata(root,expected)?;
+    let lock=super::StateLock::existing(root)?;
+    let mut ledger=Ledger::open_bound(root,&lock,expected,false)?;
+    let fence=|| {current()?;super::owner_store::validate_bound_metadata(root,expected)};
+    fence()?;
+    let scan=scan_inventory(root,&ledger,workflow,source_owners,observations)?;
+    fence()?;
+    let request=persist(&scan.inventory,&scan.retired).context(R::PersistRetry)?;
+    request.validate().context(R::InvalidRequest)?;
+    ensure!(request.workflow_id==workflow && request.source_owners==source_owners
+        && request.destination==*destination_owner && request.inventory==scan.inventory,R::AuthorityConflict);
+    // The callback has committed durable intent. Every subsequent fence must
+    // also authenticate that exact active request, including before prepare.
+    fence()?;
+    handoff_locked(root,max_state_bytes,&request,sources,destination,&fence,&mut ledger,Some(&scan))
+}
 fn inventory_paths(
     root: &Path,
     ledger: &Ledger<'_>,
@@ -512,6 +538,10 @@ fn handoff_impl(
             }
         }
     };
+    handoff_locked(root,max_state_bytes,request,sources,destination,current,&mut ledger,None)
+}
+fn handoff_locked(root:&Path,max_state_bytes:u64,request:&TransferRequest,sources:&[Arc<AuditLogger>],
+    destination:&Arc<AuditLogger>,current:&dyn Fn()->Result<()>,ledger:&mut Ledger<'_>,held_scan:Option<&PhysicalInventory>)->Result<TransferReceipt> {
     match ledger.state_for(request)? {
         Some(State::Completed(receipt)) => {
             receipt.verify(request)?;
@@ -521,13 +551,17 @@ fn handoff_impl(
         _ => {}
     }
     let plan = audit_plan(request, sources, destination).context(R::AuditCorrupt)?;
-    let paths = inventory_paths(root, &ledger, request)?;
-    let _sessions = paths
-        .iter()
-        .map(|path| session_lock(path))
-        .collect::<Result<Vec<_>>>()?;
+    let paths = inventory_paths(root, ledger, request)?;
+    let _sessions=if let Some(scan)=held_scan {
+        ensure!(scan.inventory==request.inventory,R::InventoryMissing);
+        // scan owns every relevant session lock, including retired runtimes.
+        // Do not flock them again through another open file description.
+        Vec::new()
+    } else {
+        paths.iter().map(|path|session_lock(path)).collect::<Result<Vec<_>>>()?
+    };
     for row in &request.inventory {
-        exact_inventory_row(root, &ledger, row)?;
+        exact_inventory_row(root, ledger, row)?;
     }
     current()?;
     // Read-only destination validation does not append, so overlap/busy/invalid
@@ -562,6 +596,7 @@ fn handoff_impl(
     current()?;
     ledger.commit(request, seals)
 }
+
 #[cfg(test)]
 mod tests {
     use super::super::ownership::{
@@ -701,6 +736,116 @@ mod tests {
             let lock=super::super::StateLock::acquire(&f.root).unwrap();let ledger=Ledger::open(&f.root,&lock).unwrap();
             assert!(scan_inventory(&f.root,&ledger,"workflow",&f.request.source_owners,&observations).is_err(),"{invalid} silently classified as a foreign namespace");
         }
+    }
+    fn native_prepared_rows(root:&Path)->i64 {
+        let db=augmentagent_store::rusqlite::Connection::open_with_flags(root.join("runtime-retirement.sqlite"),augmentagent_store::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        db.query_row("SELECT count(*) FROM native_transfer",[],|row|row.get(0)).unwrap()
+    }
+    #[test]
+    fn native_locked_preparation_persists_filtered_intent_before_claims_and_keeps_locks_through_commit() {
+        let f=fixture(false);let mut observations=physical_observations(&f);
+        let retired=f.root.join(&observations[0].runtime_relative_path);
+        super::super::retire(&super::super::test_retirement(retired,observations[0].authority.clone()));observations[0].inventory=None;
+        let store=super::super::test_store_identity(&f.root);
+        let late_retirement=super::super::test_retirement(f.root.join(&observations[1].runtime_relative_path),observations[1].authority.clone());
+        let persisted=std::cell::RefCell::new(None);let fence_count=std::cell::Cell::new(0);
+        let current=|| {
+            if persisted.borrow().is_some() {
+                fence_count.set(fence_count.get()+1);
+                assert!(super::super::StateLock::existing(&f.root).is_err());
+                for observed in &observations {assert!(session_lock(&f.root.join(&observed.runtime_relative_path)).is_err());}
+            }Ok(())
+        };
+        let receipt=prepare_handoff_bound_at(&f.root,u64::MAX,&store,"workflow",&f.request.source_owners,&f.request.destination,&observations,&f.sources,&f.destination,&current,&mut |inventory,retired| {
+            assert_eq!(native_prepared_rows(&f.root),0,"native claims preceded durable intent");
+            assert!(super::super::StateLock::existing(&f.root).is_err());assert_eq!(retired.len(),1);
+            super::super::retire(&late_retirement);
+            assert!(!late_retirement.session.join("retired.json").exists(),"late scope retirement crossed the preparation lock");
+            let mut request=f.request.clone();request.inventory=inventory.to_vec();
+            super::super::write(&f._temporary.path().join("pending-fixture.json"),&serde_json::to_vec(&request)?)?;
+            *persisted.borrow_mut()=Some(request.clone());Ok(request)
+        }).unwrap();
+        let request=persisted.borrow();receipt.verify(request.as_ref().unwrap()).unwrap();
+        assert!(fence_count.get()>=3,"missing prepare/seal/commit fences");
+        assert_eq!(native_prepared_rows(&f.root),1);
+        for observed in &observations {assert!(session_lock(&f.root.join(&observed.runtime_relative_path)).is_ok());}
+    }
+    #[test]
+    fn native_locked_preparation_callback_failure_leaves_no_claims_or_audit_seals() {
+        let f=fixture(false);let observations=physical_observations(&f);let store=super::super::test_store_identity(&f.root);let before=audit_bytes(&f);let called=std::cell::Cell::new(false);
+        let result=prepare_handoff_bound_at(&f.root,u64::MAX,&store,"workflow",&f.request.source_owners,&f.request.destination,&observations,&f.sources,&f.destination,&||Ok(()),&mut |_,_| {
+            called.set(true);assert_eq!(native_prepared_rows(&f.root),0);anyhow::bail!("injected persistence failure")
+        });
+        assert!(called.get());assert!(result.is_err());assert_eq!(native_prepared_rows(&f.root),0);assert_eq!(audit_bytes(&f),before);
+    }
+    #[test]
+    fn native_locked_preparation_rejects_changed_request_after_callback_without_claims() {
+        for changed in ["inventory","source","destination","workflow"] {
+            let f=fixture(false);let observations=physical_observations(&f);let store=super::super::test_store_identity(&f.root);let before=audit_bytes(&f);let called=std::cell::Cell::new(false);
+            let result=prepare_handoff_bound_at(&f.root,u64::MAX,&store,"workflow",&f.request.source_owners,&f.request.destination,&observations,&f.sources,&f.destination,&||Ok(()),&mut |_,_| {
+                called.set(true);let mut request=f.request.clone();match changed {
+                    "inventory"=>request.inventory.clear(),"source"=>request.source_owners[0].audit_path="/different/source".into(),
+                    "destination"=>request.destination.audit_path="/different/destination".into(),"workflow"=>request.workflow_id="foreign".into(),_=>unreachable!(),
+                }Ok(request)
+            });
+            assert!(called.get());assert!(result.is_err(),"{changed}");assert_eq!(native_prepared_rows(&f.root),0);assert_eq!(audit_bytes(&f),before);
+        }
+    }
+    #[test]
+    fn native_locked_preparation_stale_after_persistence_preserves_intent_without_native_mutation() {
+        let f=fixture(false);let observations=physical_observations(&f);let store=super::super::test_store_identity(&f.root);let before=audit_bytes(&f);let persisted=std::cell::Cell::new(false);
+        let intent=f._temporary.path().join("pending-fixture.json");
+        let current=|| {if persisted.get() {anyhow::bail!(R::AuthorityConflict);}Ok(())};
+        let result=prepare_handoff_bound_at(&f.root,u64::MAX,&store,"workflow",&f.request.source_owners,&f.request.destination,&observations,&f.sources,&f.destination,&current,&mut |_,_| {
+            super::super::write(&intent,&serde_json::to_vec(&f.request)?)?;persisted.set(true);Ok(f.request.clone())
+        });
+        assert!(persisted.get());assert!(result.is_err());assert_eq!(native_prepared_rows(&f.root),0);assert_eq!(audit_bytes(&f),before);
+        let original:TransferRequest=serde_json::from_slice(&std::fs::read(intent).unwrap()).unwrap();assert_eq!(original,f.request);
+        let receipt=handoff_bound_at(&f.root,u64::MAX,&original,&f.sources,&f.destination,&||Ok(()),&store).unwrap();receipt.verify(&original).unwrap();
+    }
+    #[test]
+    fn native_locked_preparation_bad_scan_or_lost_store_never_calls_persistence() {
+        for fault in ["busy","missing-store"] {
+            let f=fixture(false);let observations=physical_observations(&f);let store=super::super::test_store_identity(&f.root);let before=audit_bytes(&f);let called=std::cell::Cell::new(false);
+            let _busy=if fault=="busy" {Some(session_lock(&f.root.join(&observations[0].runtime_relative_path)).unwrap())}else{std::fs::remove_file(f.root.join("authority-epoch.json")).unwrap();None};
+            let result=prepare_handoff_bound_at(&f.root,u64::MAX,&store,"workflow",&f.request.source_owners,&f.request.destination,&observations,&f.sources,&f.destination,&||Ok(()),&mut |_,_| {called.set(true);Ok(f.request.clone())});
+            assert!(!called.get(),"{fault}");assert!(result.is_err());assert_eq!(native_prepared_rows(&f.root),0);assert_eq!(audit_bytes(&f),before);
+            if fault=="missing-store" {assert!(!f.root.join("authority-epoch.json").exists());}
+        }
+    }
+    #[test]
+    fn native_locked_preparation_rechecks_physical_bytes_and_original_store_after_callback() {
+        for fault in ["export","creation","store"] {
+            let f=fixture(false);let observations=physical_observations(&f);let store=super::super::test_store_identity(&f.root);let before=audit_bytes(&f);let called=std::cell::Cell::new(false);
+            let moved=f._temporary.path().join("retained-original-native");
+            let result=prepare_handoff_bound_at(&f.root,u64::MAX,&store,"workflow",&f.request.source_owners,&f.request.destination,&observations,&f.sources,&f.destination,&||Ok(()),&mut |_,_| {
+                called.set(true);
+                if fault=="store" {std::fs::rename(&f.root,&moved)?;std::fs::create_dir(&f.root)?;}else {
+                    let session=f.root.join(&observations[0].runtime_relative_path);
+                    let changed=if fault=="export" {session.join("generation-one/context")}else{session.join("owned.json")};
+                    let mut bytes=std::fs::read(&changed)?;bytes.extend_from_slice(b" ");std::fs::remove_file(&changed)?;super::super::write(&changed,&bytes)?;
+                }Ok(f.request.clone())
+            });
+            assert!(called.get(),"{fault}");assert!(result.is_err(),"{fault}");
+            assert_eq!(native_prepared_rows(if fault=="store" {&moved}else{&f.root}),0);assert_eq!(audit_bytes(&f),before);
+            if fault=="store" {assert_eq!(std::fs::read_dir(&f.root).unwrap().count(),0,"replacement store bootstrapped");}
+        }
+    }
+    #[test]
+    fn native_locked_preparation_serializes_real_concurrent_scope_retirement() {
+        let f=fixture(false);let observations=physical_observations(&f);let store=super::super::test_store_identity(&f.root);
+        let retirement=super::super::test_retirement(f.root.join(&observations[0].runtime_relative_path),observations[0].authority.clone());
+        let receipt=prepare_handoff_bound_at(&f.root,u64::MAX,&store,"workflow",&f.request.source_owners,&f.request.destination,&observations,&f.sources,&f.destination,&||Ok(()),&mut |_,_| {
+            let late=retirement.clone();let (tx,rx)=std::sync::mpsc::channel();
+            let worker=std::thread::spawn(move || {super::super::retire(&late);let _=tx.send(());});
+            ensure!(rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok(),"late retirement blocked behind preparation");
+            worker.join().map_err(|_|anyhow::anyhow!("late retirement panicked"))?;
+            ensure!(!retirement.session.join("retired.json").exists(),"late scope retired a scanned runtime");
+            Ok(f.request.clone())
+        }).unwrap();
+        receipt.verify(&f.request).unwrap();
+        super::super::retire(&retirement);
+        assert!(!retirement.session.join("retired.json").exists(),"source Drop retired destination runtime");
     }
     #[test]
     fn native_inventory_marker_owner_match_without_ledger_retirement_is_refused() {
