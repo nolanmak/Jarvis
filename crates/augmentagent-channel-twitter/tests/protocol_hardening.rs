@@ -20,10 +20,10 @@
 #![allow(clippy::await_holding_lock)]
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use augmentagent_channel_twitter::{
-    validate_session, validate_with_api, with_retry, CheckStatus,
+    base_url, validate_session, validate_with_api, with_retry, CheckStatus,
     QueryIdResolver, TwitterApi, TwitterAuth, TwitterClient, TwitterError,
     ValidateOptions,
 };
@@ -55,18 +55,74 @@ impl QueryIdResolver for FixedChain {
     }
 }
 
-struct EnvGuard;
+/// Owns both the base-URL override and the serialization lock, so the
+/// override is removed *while the lock is still held*. Handing the lock back
+/// as a separate binding (#1857) let it drop first: a case waiting on
+/// `ENV_LOCK` could set its own URL in the gap and then have the previous
+/// guard delete it, dropping the request onto a foreign mock and surfacing a
+/// spurious `AuthExpired`.
+struct EnvGuard {
+    _lock: MutexGuard<'static, ()>,
+}
 impl EnvGuard {
-    fn set(url: &str) -> (Self, std::sync::MutexGuard<'static, ()>) {
-        let g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    fn set(url: &str) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("AUGMENTAGENT_TWITTER_BASE_URL", url);
-        (EnvGuard, g)
+        EnvGuard { _lock: lock }
     }
 }
 impl Drop for EnvGuard {
     fn drop(&mut self) {
+        // Runs before `_lock` is dropped, so no contender can be holding
+        // `ENV_LOCK` (and an override of its own) at this point.
         std::env::remove_var("AUGMENTAGENT_TWITTER_BASE_URL");
     }
+}
+
+/// #1857 — every case's override must still resolve through [`base_url`] for
+/// as long as that case holds `ENV_LOCK`. With the lock handed back as a
+/// separate binding it dropped first, so the cleanup ran unlocked and these
+/// observations intermittently saw a foreign origin (or the `https://x.com`
+/// production fallback) — how a case lost its mock and reported `AuthExpired`.
+#[test]
+fn env_guard_override_survives_contention() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const THREADS: u32 = 4;
+    const ROUNDS: u32 = 200;
+    let stolen = Arc::new(AtomicU32::new(0));
+    let escaped_to_production = Arc::new(AtomicU32::new(0));
+    let mut handles = Vec::new();
+    for t in 0..THREADS {
+        let stolen = Arc::clone(&stolen);
+        let escaped_to_production = Arc::clone(&escaped_to_production);
+        handles.push(std::thread::spawn(move || {
+            for i in 0..ROUNDS {
+                let url = format!("http://127.0.0.1:1/mock-{t}-{i}");
+                let _guard = EnvGuard::set(&url);
+                std::thread::yield_now();
+                let observed = base_url();
+                if observed != url {
+                    stolen.fetch_add(1, Ordering::SeqCst);
+                    if observed == "https://x.com" {
+                        escaped_to_production.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(
+        escaped_to_production.load(Ordering::SeqCst),
+        0,
+        "a mock-backed case resolved to the production origin"
+    );
+    assert_eq!(
+        stolen.load(Ordering::SeqCst),
+        0,
+        "base-URL override was clobbered while ENV_LOCK was held"
+    );
 }
 
 #[tokio::test]
@@ -77,7 +133,7 @@ async fn auth_expired_on_401() {
         .respond_with(ResponseTemplate::new(401))
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let client = TwitterClient::new(test_auth());
     let err = client.fetch_user_tweets("99", None).await.unwrap_err();
     assert!(matches!(err, TwitterError::AuthExpired), "{err:?}");
@@ -91,7 +147,7 @@ async fn auth_expired_on_403() {
         .respond_with(ResponseTemplate::new(403))
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let client = TwitterClient::new(test_auth());
     let err = client.fetch_dm_inbox(None).await.unwrap_err();
     assert!(matches!(err, TwitterError::AuthExpired), "{err:?}");
@@ -110,7 +166,7 @@ async fn rate_limited_parses_retry_after_and_window() {
         )
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let client = TwitterClient::new(test_auth());
     let err = client.fetch_user_tweets("99", None).await.unwrap_err();
     match err {
@@ -144,7 +200,7 @@ async fn rate_limited_derives_delay_from_reset_header() {
         )
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let client = TwitterClient::new(test_auth());
     let err = client.fetch_user_tweets("99", None).await.unwrap_err();
     match err {
@@ -190,7 +246,7 @@ async fn query_id_rotation_falls_through_to_next_candidate() {
         })))
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let client = TwitterClient::with_resolver(
         test_auth(),
         Arc::new(FixedChain(vec!["STALEID".into(), "GOODID".into()])),
@@ -208,7 +264,7 @@ async fn all_query_ids_stale_surfaces_rotation_error() {
         .respond_with(ResponseTemplate::new(400))
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let client = TwitterClient::with_resolver(
         test_auth(),
         Arc::new(FixedChain(vec!["A".into(), "B".into(), "C".into()])),
@@ -232,7 +288,7 @@ async fn schema_drift_when_2xx_body_reshaped() {
         })))
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let client = TwitterClient::new(test_auth());
     let err = client.fetch_user_tweets("55", None).await.unwrap_err();
     match err {
@@ -258,7 +314,7 @@ async fn empty_but_recognized_body_is_not_drift() {
         })))
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let client = TwitterClient::new(test_auth());
     let tweets = client.fetch_user_tweets("55", None).await.unwrap();
     assert!(tweets.is_empty());
@@ -272,7 +328,7 @@ async fn dm_inbox_400_is_generic_api_error_not_rotation() {
         .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let client = TwitterClient::new(test_auth());
     let err = client.fetch_dm_inbox(None).await.unwrap_err();
     // REST endpoint: a 400 is a real API error, NOT the queryId-rotation
@@ -299,7 +355,7 @@ async fn create_tweet_rotation_then_success() {
         })))
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let client = TwitterClient::with_resolver(
         test_auth(),
         Arc::new(FixedChain(vec!["OLD".into(), "NEW".into()])),
@@ -327,7 +383,7 @@ async fn happy_path_dm_inbox_parses() {
         })))
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let client = TwitterClient::new(test_auth());
     let dms = client.fetch_dm_inbox(None).await.unwrap();
     assert_eq!(dms.len(), 1);
@@ -346,7 +402,7 @@ async fn create_tweet_2xx_without_rest_id_is_schema_drift() {
         })))
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let client = TwitterClient::with_resolver(
         test_auth(),
         Arc::new(FixedChain(vec!["Q".into()])),
@@ -371,7 +427,7 @@ async fn dm_send_2xx_without_event_id_is_schema_drift() {
         })))
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let client = TwitterClient::new(test_auth());
     let err = client.send_dm("55-99", "hi").await.unwrap_err();
     assert!(
@@ -392,7 +448,7 @@ async fn create_tweet_2xx_with_rest_id_still_succeeds() {
         })))
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let client = TwitterClient::with_resolver(
         test_auth(),
         Arc::new(FixedChain(vec!["Q".into()])),
@@ -537,7 +593,7 @@ async fn validate_with_api_all_green_against_wiremock() {
         })))
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let auth = test_auth();
     let api: Arc<dyn TwitterApi> = Arc::new(TwitterClient::new(auth.clone()));
     let report = validate_with_api(
@@ -575,7 +631,7 @@ async fn validate_with_api_classifies_401_as_auth_fail() {
         })))
         .mount(&server)
         .await;
-    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let _guard = EnvGuard::set(&server.uri());
     let auth = test_auth();
     let api: Arc<dyn TwitterApi> = Arc::new(TwitterClient::new(auth.clone()));
     let report = validate_with_api(
