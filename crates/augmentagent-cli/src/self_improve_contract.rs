@@ -214,10 +214,24 @@ pub(super) fn install_harness(root: &Path, proposal: &ContractProposal) -> Resul
                 Err(error) => return Err(error.into()),
             }
         }
+        let destination = root.join(relative);
+        // Merged auto-ship PRs keep their pinned harnesses on main, so a
+        // proposal can name a path that already exists at the baseline. The
+        // same bytes are that harness; different bytes must never overwrite
+        // it. Say which path, so the scoped retry picks a unique name instead
+        // of failing on a bare "File exists (os error 17)" every attempt.
+        if let Ok(meta) = std::fs::symlink_metadata(&destination) {
+            ensure!(meta.is_file() && !meta.file_type().is_symlink(),
+                "harness path {relative} already exists at the baseline and is not a regular file");
+            ensure!(std::fs::read(&destination)? == body.as_bytes(),
+                "harness path {relative} already exists at the baseline with different contents; \
+                 name a new harness for this issue (for example autoship_issue_<number>)");
+            continue;
+        }
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(root.join(relative))?;
+            .open(&destination)?;
         file.write_all(body.as_bytes())?;
         file.sync_all()?;
     }
@@ -728,6 +742,23 @@ mod tests {
         assert_eq!(serde_json::from_str::<serde_json::Value>(&observed.stdout).unwrap(),serde_json::json!({"compiler":"operator","private":"denied","write":"denied","network":"denied"}));
         assert_eq!(std::fs::read_to_string(source.join("protected.txt")).unwrap(),"original source");
     }
+    #[test]
+    fn harness_install_reuses_an_identical_pinned_file_and_names_a_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        let path = "autoship_verifiers/observe.py";
+        let proposal = |body: &str| ContractProposal {
+            contract: AcceptanceContract { schema_version: 1, revision: 1, issue: Some(7), pull_request: None,
+                criteria: vec![], allowed_paths: vec![], verifiers: vec![] },
+            files: [(path.into(), body.into())].into(),
+        };
+        install_harness(root.path(), &proposal("print(1)\n")).unwrap();
+        // A merged PR left the same pinned harness on main: reuse it.
+        install_harness(root.path(), &proposal("print(1)\n")).unwrap();
+        let error = install_harness(root.path(), &proposal("print(2)\n")).unwrap_err().to_string();
+        assert!(error.contains(path) && error.contains("different contents"), "{error}");
+        assert_eq!(std::fs::read_to_string(root.path().join(path)).unwrap(), "print(1)\n", "never overwritten");
+    }
+
     #[test]
     fn verifier_environment_binds_operator_compiler_search_path() {
         let Some(root)=verifier_toolchain_child("verifier_environment_binds_operator_compiler_search_path") else{return;};
