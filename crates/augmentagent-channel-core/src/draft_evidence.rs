@@ -72,6 +72,32 @@ pub struct EvidenceRead {
     pub result: Value,
 }
 
+/// Which part of the 90-second budget a step belongs to (#1837).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepKind {
+    ModelDecision,
+    Retrieval,
+}
+
+/// The step kind that consumed most of the budget; `None` when nothing ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetConsumer {
+    ModelDecision,
+    Retrieval,
+    None,
+}
+
+/// Measured cost of one step: operation names and outcomes, never source text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepTiming {
+    pub kind: StepKind,
+    pub operation: String,
+    pub elapsed_ms: u64,
+    pub outcome: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceOutcome {
     pub facts: Vec<GroundedFact>,
@@ -82,6 +108,42 @@ pub struct EvidenceOutcome {
     pub elapsed_ms: u64,
     #[serde(default)]
     pub model_decisions: usize,
+    /// Budget telemetry for receipts; not part of the model-visible evidence.
+    #[serde(skip)]
+    pub step_timings: Vec<StepTiming>,
+}
+
+impl EvidenceOutcome {
+    pub fn budget_consumer(&self) -> BudgetConsumer {
+        let total = |kind| {
+            self.step_timings
+                .iter()
+                .filter(|step| step.kind == kind)
+                .map(|step| step.elapsed_ms)
+                .sum::<u64>()
+        };
+        if self.step_timings.is_empty() {
+            BudgetConsumer::None
+        } else if total(StepKind::Retrieval) > total(StepKind::ModelDecision) {
+            BudgetConsumer::Retrieval
+        } else {
+            BudgetConsumer::ModelDecision
+        }
+    }
+
+    fn record(&mut self, kind: StepKind, operation: &str, elapsed_ms: u64, outcome: &str) {
+        self.step_timings.push(StepTiming {
+            kind,
+            operation: operation.to_string(),
+            elapsed_ms,
+            outcome: outcome.to_string(),
+        });
+    }
+}
+
+/// Sub-millisecond steps are still measured work, so round up instead of zero.
+fn measured_ms(started: std::time::Instant) -> u64 {
+    started.elapsed().as_micros().div_ceil(1_000) as u64
 }
 
 const CONTRACT: &str = r#"You select evidence for a messaging draft; you do not write or send it.
@@ -115,6 +177,7 @@ pub async fn gather(
         complete: false,
         elapsed_ms: 0,
         model_decisions: 0,
+        step_timings: Vec::new(),
     };
     let mut readable: BTreeSet<String> =
         seed.messages.iter().map(|m| m.message_id.clone()).collect();
@@ -142,16 +205,20 @@ pub async fn gather(
         }
         let remaining = std::time::Duration::from_secs(90).saturating_sub(started.elapsed());
         out.model_decisions += 1;
+        let decided = std::time::Instant::now();
         let response = tokio::time::timeout(remaining, reasoner.call(&opts, &prompt)).await;
+        let decision_ms = measured_ms(decided);
         let raw = match response {
             Ok(Ok(raw)) => raw,
             Ok(Err(_)) => {
+                out.record(StepKind::ModelDecision, "decision", decision_ms, "unavailable");
                 out.gaps.push(
                     "The evidence model was unavailable; relevant sources remain unverified".into(),
                 );
                 break;
             }
             Err(_) => {
+                out.record(StepKind::ModelDecision, "decision", decision_ms, "timeout");
                 out.gaps.push(
                     "The context check reached its time limit; relevant sources remain unverified"
                         .into(),
@@ -160,8 +227,17 @@ pub async fn gather(
             }
         };
         let decision: EvidenceDecision = match parse_decision(&raw) {
-            Ok(value) => value,
+            Ok(value) => {
+                out.record(StepKind::ModelDecision, "decision", decision_ms, "ok");
+                value
+            }
             Err(error) => {
+                out.record(
+                    StepKind::ModelDecision,
+                    "decision",
+                    decision_ms,
+                    "protocol_error",
+                );
                 out.reads.push(EvidenceRead {operation:"protocol_error".into(),reason:"Retry the decision using exactly one of the documented JSON schemas; no tools were executed".into(),result:json!({"error":error.to_string().chars().take(300).collect::<String>()})});
                 if protocol_retries == 0 {
                     protocol_retries += 1;
@@ -173,6 +249,7 @@ pub async fn gather(
                 break;
             }
         };
+        let retrieved = std::time::Instant::now();
         let (operation, reason, result) = match decision {
             EvidenceDecision::Ready { facts, gaps } => {
                 if facts.iter().any(|f| {
@@ -266,6 +343,17 @@ pub async fn gather(
                 ("read_wiki".to_string(), reason, result)
             }
         };
+        let outcome = if result.get("error").is_some() {
+            "error"
+        } else {
+            "ok"
+        };
+        out.record(
+            StepKind::Retrieval,
+            &operation,
+            measured_ms(retrieved),
+            outcome,
+        );
         out.reads.push(EvidenceRead {
             operation,
             reason,

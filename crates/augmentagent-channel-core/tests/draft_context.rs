@@ -102,6 +102,203 @@ fn script(values: Vec<serde_json::Value>) -> Scripted {
     ))
 }
 
+struct Delayed {
+    replies: std::sync::Mutex<std::collections::VecDeque<String>>,
+    delay: std::time::Duration,
+}
+#[async_trait::async_trait]
+impl augmentagent_channel_core::Reasoner for Delayed {
+    async fn call(
+        &self,
+        _opts: &augmentagent_channel_core::ReasonerOpts,
+        _prompt: &str,
+    ) -> anyhow::Result<String> {
+        tokio::time::sleep(self.delay).await;
+        Ok(self
+            .replies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected model call"))
+    }
+}
+fn delayed(values: Vec<serde_json::Value>, delay: std::time::Duration) -> Delayed {
+    Delayed {
+        replies: std::sync::Mutex::new(values.into_iter().map(|v| v.to_string()).collect()),
+        delay,
+    }
+}
+
+fn pending_action(store: &Store, incoming: &Email) -> String {
+    store
+        .log_action(
+            &incoming.message_id,
+            incoming.thread_id.as_deref(),
+            &incoming.from,
+            &incoming.subject,
+            Some(&incoming.body),
+            Some("draft"),
+            augmentagent_store::ActionStatus::Pending,
+        )
+        .unwrap()
+}
+
+fn persisted_receipt(
+    store: &Store,
+    context: &augmentagent_channel_core::draft_workflow::PreparedDraftContext,
+    incoming: &Email,
+) -> String {
+    let action = pending_action(store, incoming);
+    assert!(context.attach(store, &action).unwrap());
+    store
+        .draft_context_receipts(&action)
+        .unwrap()
+        .pop()
+        .expect("receipt attached to the action")
+}
+
+#[tokio::test]
+async fn receipt_times_every_step_and_names_the_budget_consumer_on_each_platform() {
+    use augmentagent_channel_core::draft_evidence::{BudgetConsumer, StepKind};
+    use serde_json::{json, Value};
+    let mut schemas = Vec::new();
+    for platform in ["imessage", "gmail"] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        let wiki = dir.path().join("wiki");
+        std::fs::create_dir_all(wiki.join("projects")).unwrap();
+        std::fs::write(
+            wiki.join("projects/cobalt.md"),
+            "SYNTHETIC_WIKI_BODY: launch moved to Friday.",
+        )
+        .unwrap();
+        let mut incoming = message(1);
+        incoming.platform = platform.into();
+        incoming.body = "SYNTHETIC_PRIVATE_MESSAGE_BODY".into();
+        let agent = delayed(
+            vec![
+                json!({"action":"search_wiki","query":"cobalt","reason":"locate launch plan"}),
+                json!({"action":"read_wiki","path":"projects/cobalt.md","reason":"verify date"}),
+                json!({"action":"ready","facts":[{"text":"Launch is Friday","source_ids":["projects/cobalt.md"]}],"gaps":[]}),
+            ],
+            std::time::Duration::from_millis(20),
+        );
+        let context = augmentagent_channel_core::draft_workflow::prepare(
+            &store,
+            &agent,
+            &incoming,
+            "draft a reply",
+            Some(&wiki),
+        )
+        .await
+        .unwrap();
+        assert!(context.evidence.complete, "{:?}", context.evidence.gaps);
+        let timings = &context.evidence.step_timings;
+        assert_eq!(
+            timings
+                .iter()
+                .map(|s| (s.kind, s.operation.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (StepKind::ModelDecision, "decision"),
+                (StepKind::Retrieval, "search_wiki"),
+                (StepKind::ModelDecision, "decision"),
+                (StepKind::Retrieval, "read_wiki"),
+                (StepKind::ModelDecision, "decision"),
+            ]
+        );
+        assert!(timings.iter().all(|s| s.elapsed_ms > 0), "{timings:?}");
+        assert_eq!(
+            context.evidence.budget_consumer(),
+            BudgetConsumer::ModelDecision
+        );
+        let raw = persisted_receipt(&store, &context, &incoming);
+        assert!(!raw.contains("SYNTHETIC_PRIVATE_MESSAGE_BODY"));
+        assert!(!raw.contains("SYNTHETIC_WIKI_BODY"));
+        let receipt: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(receipt["budget_consumer"], "model_decision");
+        let steps = receipt["step_timings"].as_array().unwrap().clone();
+        assert_eq!(steps.len(), 5);
+        assert!(steps.iter().all(|step| {
+            step["elapsed_ms"].as_u64().is_some_and(|ms| ms > 0)
+                && step["kind"].is_string()
+                && step["outcome"] == "ok"
+        }));
+        schemas.push(
+            steps
+                .iter()
+                .map(|step| step.as_object().unwrap().keys().cloned().collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(
+        schemas[0], schemas[1],
+        "iMessage and email receipts share one telemetry schema"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn budget_timeout_blames_the_model_decision_and_keeps_the_card_warning() {
+    use augmentagent_channel_core::draft_evidence::{BudgetConsumer, StepKind};
+    use serde_json::{json, Value};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("db")).unwrap();
+    let incoming = message(1);
+    let agent = delayed(
+        vec![json!({"action":"ready","facts":[],"gaps":[]})],
+        std::time::Duration::from_secs(91),
+    );
+    let context = augmentagent_channel_core::draft_workflow::prepare(
+        &store,
+        &agent,
+        &incoming,
+        "draft a reply",
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!context.evidence.complete);
+    assert_eq!(context.evidence.step_timings.len(), 1);
+    assert_eq!(context.evidence.step_timings[0].kind, StepKind::ModelDecision);
+    assert_eq!(context.evidence.step_timings[0].outcome, "timeout");
+    assert_eq!(
+        context.evidence.budget_consumer(),
+        BudgetConsumer::ModelDecision
+    );
+    let (_, needs) =
+        augmentagent_approval_discord::split_needs_input(&context.guard_draft("Let me check."));
+    assert!(needs.iter().any(|gap| gap.text.contains("time limit")));
+    let receipt: Value =
+        serde_json::from_str(&persisted_receipt(&store, &context, &incoming)).unwrap();
+    assert_eq!(receipt["budget_consumer"], "model_decision");
+    assert_eq!(receipt["step_timings"][0]["kind"], "model_decision");
+    assert!(receipt["gaps"][0].as_str().unwrap().contains("time limit"));
+}
+
+#[tokio::test]
+async fn a_receipt_without_timed_work_reports_no_budget_consumer() {
+    use augmentagent_channel_core::draft_evidence::BudgetConsumer;
+    use serde_json::Value;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("db")).unwrap();
+    let incoming = message(1);
+    let context = augmentagent_channel_core::draft_workflow::prepare(
+        &store,
+        &script(vec![]),
+        &incoming,
+        &"x".repeat(64_001),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(context.evidence.step_timings.is_empty());
+    assert_eq!(context.evidence.budget_consumer(), BudgetConsumer::None);
+    let receipt: Value =
+        serde_json::from_str(&persisted_receipt(&store, &context, &incoming)).unwrap();
+    assert_eq!(receipt["budget_consumer"], "none");
+    assert_eq!(receipt["step_timings"], serde_json::json!([]));
+}
+
 #[tokio::test]
 async fn retrieval_reads_cross_platform_source_before_citing_it() {
     use serde_json::json;
