@@ -53,6 +53,11 @@ if 'show' in sys.argv:
             self.assertEqual((release/'cargo-deps-link').stat().st_mode & 0o777,0o755)
             units = base/'config fixture%[prod]*?\\folder/systemd/user'
             worker = (units/'augmentagent-autopr.service').read_text()
+            # Upgrade exits (75) overlapping the daemon restart must not trip
+            # systemd's default 5-starts-in-10s limit and leave the worker dead.
+            unit_section=worker.split('[Service]')[0]
+            self.assertIn('StartLimitIntervalSec=60',unit_section)
+            self.assertIn('StartLimitBurst=10',unit_section)
             self.assertIn('--dry-run false', worker)
             self.assertIn('Environment="SYNTHETIC=fixture"', worker)
             self.assertIn('EnvironmentFile=-/fixture/config', worker)
