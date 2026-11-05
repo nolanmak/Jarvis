@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "fcb9eed7177c2c8968506d1524cd7630fde3d8cc",
+  "source_parent_commit": "e90a9587178ef9915e7de039af04abc536706e1a",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -26,7 +26,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
-      "sha256": "903a6bf7e2630fa5c5096c9d40dd0c497c9684fb9cc39b74cfdf796b375f6b02"
+      "sha256": "fbe034549628ccfa67e90d16c5d12f64e41388b8d6124659fda02775ce6f9921"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
@@ -34,11 +34,11 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
-      "sha256": "ecb285e91136c5acdf703415aff0f9ca17e71c57141e7a31731e430460344434"
+      "sha256": "047f05fb99ebb2139e6423041874ea80474bd917293d3c2891a34a417ffc4263"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_settlement.rs",
-      "sha256": "f73ff1e8485ee570fccd86d9b655046c925596f60734c60dd7d2c743b466380d"
+      "sha256": "9bf46ef652097d5682bbff5184d4336841ca02e0e82e4e5f8286418490b286e6"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_control.rs",
@@ -67,20 +67,18 @@
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1794,
+    "passed": 1802,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
     "pending_handoff_cases": 8,
     "retained_logs": [
-      "autoship-native-preparation-failure-red.log",
-      "autoship-native-preparation-failure-green.log",
-      "autoship-native-preparation-retry-red.log",
-      "autoship-native-preparation-retry-initial-fixture-failure.log",
-      "autoship-native-preparation-retry-domain-red.log",
-      "autoship-native-preparation-retry-focused.log",
-      "autoship-native-preparation-failure-full-core.log",
-      "autoship-native-preparation-failure-full-cli.log"
+      "autoship-native-persistence-disposition-red.log",
+      "autoship-native-persistence-disposition-green.log",
+      "autoship-native-persistence-orphan-red.log",
+      "autoship-native-persistence-disposition-focused.log",
+      "autoship-native-persistence-disposition-full-cli.log",
+      "autoship-native-preparation-failure-full-core.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -95,7 +93,9 @@
     "locked_preparation_cases": 7,
     "workflow_filtered_preparation_cases": 7,
     "preparation_fingerprint_cases": 4,
-    "preparation_retry_cases": 5
+    "preparation_retry_cases": 5,
+    "persistence_disposition_cases": 8,
+    "core_source_unchanged_since": "e90a9587178ef9915e7de039af04abc536706e1a"
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -138,7 +138,12 @@
     "preparation status defers transient contention/capacity/persistence and holds provenance uncertainty; clock, lease generation and provisional audit are excluded from typed inputs",
     "finite native_handoff_preparation domain uses the existing durable retry service with 5/10/20/40/60-minute capped backoff and independent CI/acceptance epochs",
     "same-generation replay is idempotent, changed fingerprint resets its epoch, unrelated success cannot clear native debt, and unknown domains/cross-domain overwrites are refused",
-    "native no-pending retry write independently refuses active or orphaned native intent and unresolved remote/merge mutations without changing progress, binding, attempts, model charges or allowance"
+    "native no-pending retry write independently refuses active or orphaned native intent and unresolved remote/merge mutations without changing progress, binding, attempts, model charges or allowance",
+    "tracked persistence captures the exact pending request immediately before COMMIT and verifies workflow state after the reported result",
+    "lost commit response recovers original active intent after restart; rollback before commit attempt can be distinguished without inventing an identity",
+    "missing/unreadable/erased evidence after a commit attempt stays Unknown with the saved request, even if the local result claimed success",
+    "readback validates completed history and every orphan in the affected workflow before accepting an active row; unrelated workflows do not block it",
+    "settled intent is returned only for reconciliation and cannot pass the active-pending fence or construct a verified native receipt"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -188,5 +193,8 @@
   "preparation_diagnostic_retry_scope": "typed diagnostic plus actual WorkflowStore retry/event scheduling fixtures; no guarded core preparation adapter or productive caller enabled",
   "early_input_wake_integrated": false,
   "pending_commit_uncertainty_disposition_integrated": false,
-  "preparation_diagnostic_retry_red_evidence": "Four fingerprint tests failed against the placeholder, and native retry initially had three behavioral failures/one refusal passing. Separate domain-overwrite test reproduced its behavioral failure. Initial retry implementation had one fixture failure from claiming before scheduled eligibility; corrected test uses normal admission and proves changed-input epoch reset, not early wake."
+  "preparation_diagnostic_retry_red_evidence": "Four fingerprint tests failed against the placeholder, and native retry initially had three behavioral failures/one refusal passing. Separate domain-overwrite test reproduced its behavioral failure. Initial retry implementation had one fixture failure from claiming before scheduled eligibility; corrected test uses normal admission and proves changed-input epoch reset, not early wake.",
+  "workflow_commit_readback_component_executed": true,
+  "workflow_commit_readback_scope": "actual WorkflowStore transaction/readback fixtures, including historical metadata from an actual isolated core transfer and settlement; no guarded core callback adapter or productive consumer enabled",
+  "persistence_disposition_red_evidence": "Initial five tests: four behavioral failures and one refusal passed against the placeholder. Separate same-workflow orphan test reproduced accepting an active row despite another orphan; fixed readback now checks all affected-workflow orphans. Final focused and full CLI runs contain eight cases."
 }

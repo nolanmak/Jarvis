@@ -132,6 +132,11 @@ pub(crate) struct History {
     outgoing: BTreeMap<(i64, String), usize>,
 }
 impl History {
+    /// Historical workflow intent only. This cannot construct a verified
+    /// native receipt or grant productive destination ownership.
+    pub(super) fn pending_for_id(&self,id:&str)->Option<&PendingNativeHandoff> {
+        self.records.iter().find(|record|record.pending.request.transfer_id==id).map(|record|&record.pending)
+    }
     pub(crate) fn load(tx: &Connection, workflow: &str, before: u64) -> Result<Self> {
         let indexed = {
             let mut q=tx.prepare("SELECT transfer_id,sequence,length(CAST(record AS BLOB)) FROM workflow_native_handoff_completed WHERE workflow=?1 ORDER BY sequence LIMIT 1025")?;

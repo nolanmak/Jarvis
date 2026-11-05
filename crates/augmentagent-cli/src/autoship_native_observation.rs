@@ -1207,6 +1207,95 @@ mod tests {
         }
     }
     #[test]
+    fn native_persistence_disposition_confirms_actual_commit_and_original_request() {
+        if child("native_persistence_disposition_confirms_actual_commit_and_original_request") {return;}
+        let mut f=Fixture::new();let fact=f.complete();f.record(&fact).unwrap();let lease=next_handoff_lease(&mut f);let facts=f.store.native_handoff_facts(&lease,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);
+        let outcome=f.store.prepare_native_handoff_disposition(&lease,&f.binding,"/private/disposition-audit",&facts,&rows,&[],now());
+        let super::super::native_pending::NativePreparationPersistence::Durable(value)=outcome else {panic!("commit not confirmed: {outcome:?}")};let pending=pending_record(value);
+        assert_eq!(pending.request.inventory,rows);assert!(f.store.native_handoff_pending_is_current(&lease,&f.binding,&pending,now()).is_ok());
+    }
+    #[test]
+    fn native_persistence_disposition_precommit_failure_is_known_rollback_without_identity() {
+        if child("native_persistence_disposition_precommit_failure_is_known_rollback_without_identity") {return;}
+        let mut f=Fixture::new();let lease=next_handoff_lease(&mut f);let facts=f.store.native_handoff_facts(&lease,&f.binding,now()).unwrap();let events=f.store.events(&lease.workflow).unwrap();
+        f.store.conn.execute_batch("CREATE TRIGGER deny_disposition_pending BEFORE INSERT ON workflow_native_handoff_pending BEGIN SELECT RAISE(ABORT,'injected precommit failure'); END;").unwrap();
+        let outcome=f.store.prepare_native_handoff_disposition(&lease,&f.binding,"/private/disposition-audit",&facts,&[],&["codex/session-fixture".into()],now());
+        assert!(matches!(outcome,super::super::native_pending::NativePreparationPersistence::NotCommitted {..}),"{outcome:?}");assert_eq!(f.store.events(&lease.workflow).unwrap(),events);
+        let count:i64=f.store.conn.query_row("SELECT count(*) FROM workflow_native_handoff_snapshot",[],|r|r.get(0)).unwrap();assert_eq!(count,0);
+    }
+    #[test]
+    fn native_persistence_disposition_lost_commit_response_recovers_original_after_restart() {
+        if child("native_persistence_disposition_lost_commit_response_recovers_original_after_restart") {return;}
+        let mut f=Fixture::new();let fact=f.complete();f.record(&fact).unwrap();let lease=next_handoff_lease(&mut f);let facts=f.store.native_handoff_facts(&lease,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);
+        let pending=pending_record(f.store.prepare_native_handoff_filtered(&lease,&f.binding,"/private/disposition-audit",&facts,&rows,&[],now()).unwrap());let events=f.store.events(&lease.workflow).unwrap();
+        let mut reopened=WorkflowStore::open(&f.path).unwrap();
+        let outcome=reopened.resolve_native_handoff_persistence(&lease.workflow,Some(pending.clone()),Err(anyhow::anyhow!("lost COMMIT response")));
+        assert_eq!(outcome,super::super::native_pending::NativePreparationPersistence::Durable(super::super::native_pending::HandoffPreparation::ReconcileExisting(pending)));assert_eq!(reopened.events(&lease.workflow).unwrap(),events);
+    }
+    #[test]
+    fn native_persistence_disposition_never_downgrades_attempted_commit_with_missing_evidence() {
+        if child("native_persistence_disposition_never_downgrades_attempted_commit_with_missing_evidence") {return;}
+        for fault in ["missing-row","missing-history","unreadable","false-success","mismatched-attempt"] {
+            let mut f=Fixture::new();let fact=f.complete();f.record(&fact).unwrap();let lease=next_handoff_lease(&mut f);let facts=f.store.native_handoff_facts(&lease,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);
+            let original=pending_record(f.store.prepare_native_handoff_filtered(&lease,&f.binding,"/private/disposition-audit",&facts,&rows,&[],now()).unwrap());let mut attempted=original.clone();
+            match fault {
+                "missing-row"|"missing-history"|"false-success"=>{f.store.conn.execute("DELETE FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow]).unwrap();if fault!="missing-row" {f.store.conn.execute("DELETE FROM workflow_event WHERE workflow=?1 AND kind='native_handoff_prepared'",[&lease.workflow]).unwrap();}},
+                "unreadable"=>f.store.conn.execute_batch("ALTER TABLE workflow_native_handoff_pending RENAME TO unavailable_pending").unwrap(),
+                "mismatched-attempt"=>attempted.request.transfer_id=uuid::Uuid::new_v4().to_string(),_=>unreachable!(),
+            }
+            let events=f.store.events(&lease.workflow).unwrap();
+            let reported=if fault=="false-success" {Ok(super::super::native_pending::HandoffPreparation::Prepared(attempted.clone()))}else{Err(anyhow::anyhow!("commit response uncertain"))};
+            let outcome=f.store.resolve_native_handoff_persistence(&lease.workflow,Some(attempted.clone()),reported);
+            assert!(matches!(outcome,super::super::native_pending::NativePreparationPersistence::Unknown {attempted:Some(ref saved),..} if saved==&attempted),"{fault}: {outcome:?}");
+            assert_eq!(f.store.events(&lease.workflow).unwrap(),events,"{fault}");
+        }
+    }
+    #[test]
+    fn native_persistence_disposition_unavailable_or_orphan_without_attempt_never_claims_absence() {
+        if child("native_persistence_disposition_unavailable_or_orphan_without_attempt_never_claims_absence") {return;}
+        for fault in ["unreadable","orphan"] {
+            let mut f=Fixture::new();let lease=next_handoff_lease(&mut f);
+            if fault=="unreadable" {f.store.conn.execute_batch("ALTER TABLE workflow_native_handoff_pending RENAME TO unavailable_pending").unwrap();}else {
+                let facts=f.store.native_handoff_facts(&lease,&f.binding,now()).unwrap();let _=f.store.prepare_native_handoff_filtered(&lease,&f.binding,"/private/disposition-audit",&facts,&[],&["codex/session-fixture".into()],now()).unwrap();f.store.conn.execute("DELETE FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow]).unwrap();
+            }
+            let events=f.store.events(&lease.workflow).unwrap();
+            let outcome=f.store.resolve_native_handoff_persistence(&lease.workflow,None,Err(anyhow::anyhow!("no local result")));
+            assert!(matches!(outcome,super::super::native_pending::NativePreparationPersistence::Unknown {attempted:None,..}),"{fault}: {outcome:?}");assert_eq!(f.store.events(&lease.workflow).unwrap(),events);
+        }
+    }
+    #[test]
+    fn native_persistence_disposition_recognizes_settled_intent_without_promoting_it() {
+        if child("native_persistence_disposition_recognizes_settled_intent_without_promoting_it") {return;}
+        let mut f=Fixture::new();let (lease,pending,proof)=completed_native_handoff(&mut f);
+        f.store.settle_native_handoff(&lease,&f.binding,&proof,now()).unwrap();let events=f.store.events(&lease.workflow).unwrap();
+        let outcome=f.store.resolve_native_handoff_persistence(&lease.workflow,Some(pending.clone()),Err(anyhow::anyhow!("late response after settlement")));
+        assert_eq!(outcome,super::super::native_pending::NativePreparationPersistence::Durable(super::super::native_pending::HandoffPreparation::ReconcileExisting(pending.clone())));
+        assert!(f.store.native_handoff_pending_is_current(&lease,&f.binding,&pending,now()).is_err());assert_eq!(f.store.events(&lease.workflow).unwrap(),events);
+    }
+    #[test]
+    fn native_persistence_disposition_active_row_cannot_hide_same_workflow_orphan() {
+        if child("native_persistence_disposition_active_row_cannot_hide_same_workflow_orphan") {return;}
+        for same_workflow in [true,false] {
+            let mut f=Fixture::new();let fact=f.complete();f.record(&fact).unwrap();let lease=next_handoff_lease(&mut f);let facts=f.store.native_handoff_facts(&lease,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);
+            let pending=pending_record(f.store.prepare_native_handoff_filtered(&lease,&f.binding,"/private/disposition-audit",&facts,&rows,&[],now()).unwrap());
+            let affected=if same_workflow {lease.workflow.as_str()}else{"owner/repo/pr/other"};
+            if !same_workflow {f.store.register(affected,"other",f.binding.clone(),now()).unwrap();}
+            f.store.conn.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,1,'native_handoff_prepared','{}',?2)",params![affected,now()]).unwrap();
+            let events=f.store.events(&lease.workflow).unwrap();let outcome=f.store.resolve_native_handoff_persistence(&lease.workflow,Some(pending.clone()),Err(anyhow::anyhow!("lost response")));
+            if same_workflow {assert!(matches!(outcome,super::super::native_pending::NativePreparationPersistence::Unknown {attempted:Some(ref saved),..} if saved==&pending),"active row hid orphan: {outcome:?}");}
+            else {assert_eq!(outcome,super::super::native_pending::NativePreparationPersistence::Durable(super::super::native_pending::HandoffPreparation::ReconcileExisting(pending)));}
+            assert_eq!(f.store.events(&lease.workflow).unwrap(),events);
+        }
+    }
+    #[test]
+    fn native_persistence_disposition_stale_precommit_lease_is_authority_failure() {
+        if child("native_persistence_disposition_stale_precommit_lease_is_authority_failure") {return;}
+        let mut f=Fixture::new();let lease=next_handoff_lease(&mut f);let facts=f.store.native_handoff_facts(&lease,&f.binding,now()).unwrap();f.store.release(&lease,now()).unwrap();
+        let _next=f.store.claim(&lease.workflow,"new-controller",now(),60_000).unwrap().unwrap();let events=f.store.events(&lease.workflow).unwrap();
+        let outcome=f.store.prepare_native_handoff_disposition(&lease,&f.binding,"/private/stale-audit",&facts,&[],&["codex/session-fixture".into()],now());
+        assert_eq!(outcome,super::super::native_pending::NativePreparationPersistence::NotCommitted {reason:ownership::TransferReason::AuthorityConflict});assert_eq!(f.store.events(&lease.workflow).unwrap(),events);
+    }
+    #[test]
     fn native_handoff_pending_request_survives_restart_without_new_identity() {
         if child("native_handoff_pending_request_survives_restart_without_new_identity") {
             return;

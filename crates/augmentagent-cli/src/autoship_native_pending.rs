@@ -21,6 +21,60 @@ pub enum HandoffPreparation {
     Prepared(PendingNativeHandoff),
     ReconcileExisting(PendingNativeHandoff),
 }
+/// Workflow persistence only; never a native receipt or native absence proof.
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub(super) enum NativePreparationPersistence {
+    Durable(HandoffPreparation),
+    NotCommitted {reason:TransferReason},
+    Unknown {reason:TransferReason,attempted:Option<PendingNativeHandoff>},
+}
+impl WorkflowStore {
+    pub(super) fn prepare_native_handoff_disposition(&mut self,lease:&Lease,binding:&Binding,audit:&str,basis:&native_handoff::NativeHandoffFacts,inventory:&[augmentagent_channel_core::native_vm::ownership::RuntimeInventoryRow],retired:&[String],now:i64)->NativePreparationPersistence {
+        let mut attempted=None;
+        let reported=self.prepare_native_handoff_tracked(lease,binding,audit,Some((basis,inventory,retired)),now,&mut attempted);
+        self.resolve_native_handoff_persistence(&lease.workflow,attempted,reported)
+    }
+    pub(super) fn resolve_native_handoff_persistence(&mut self,workflow:&str,attempted:Option<PendingNativeHandoff>,reported:Result<HandoffPreparation>)->NativePreparationPersistence {
+        let reported_value=reported.as_ref().ok().cloned();
+        let reported_pending=reported_value.as_ref().map(|value|match value {HandoffPreparation::Prepared(p)|HandoffPreparation::ReconcileExisting(p)=>p});
+        let expected=attempted.or_else(||reported_pending.cloned());
+        if reported_pending.is_some_and(|value|expected.as_ref()!=Some(value)) {
+            return NativePreparationPersistence::Unknown {reason:TransferReason::AuthorityConflict,attempted:expected};
+        }
+        let failed_reason=reported.as_ref().err().and_then(|e|e.downcast_ref::<TransferReason>()).copied().unwrap_or(TransferReason::PersistRetry);
+        let inspected=(||->Result<(bool,Option<PendingNativeHandoff>)> {
+            let tx=self.conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            // Validate completed metadata too: an invalid receipt projection
+            // cannot be used to hide an orphan pending event.
+            let history=settlement::History::load(&tx,workflow,u64::MAX)?;
+            let orphan:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=?1 AND e.kind='native_handoff_prepared' AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_pending p WHERE p.workflow=e.workflow AND p.sequence=e.seq) AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_completed c WHERE c.workflow=e.workflow AND c.pending_sequence=e.seq))",[workflow],|r|r.get(0))?;
+            ensure!(!orphan,TransferReason::PendingUnknown);
+            let row:Option<(String,i64,u64,String)>=tx.query_row("SELECT transfer_id,sequence,snapshot_sequence,record FROM workflow_native_handoff_pending WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+            if let Some(row)=row {
+                let active=decode(&tx,workflow,row)?;
+                ensure!(expected.as_ref().is_none_or(|saved|saved==&active)
+                    && history.pending_for_id(&active.request.transfer_id).is_none(),TransferReason::AuthorityConflict);
+                tx.commit()?;return Ok((true,Some(active)));
+            }
+            if let Some(saved)=&expected {
+                if let Some(original)=history.pending_for_id(&saved.request.transfer_id) {
+                    ensure!(original==saved,TransferReason::AuthorityConflict);
+                    let original=original.clone();tx.commit()?;return Ok((false,Some(original)));
+                }
+            }
+            tx.commit()?;Ok((false,None))
+        })();
+        match inspected {
+            Ok((active,Some(original)))=>NativePreparationPersistence::Durable(if active {reported_value.unwrap_or(HandoffPreparation::ReconcileExisting(original))}else{HandoffPreparation::ReconcileExisting(original)}),
+            // No commit was attempted and an authoritative read found no
+            // durable or orphan intent. This is workflow absence only, not a
+            // native-store absence capability or permission for a new origin.
+            Ok((_,None)) if expected.is_none() && reported_value.is_none()=>NativePreparationPersistence::NotCommitted {reason:failed_reason},
+            Ok((_,None))=>NativePreparationPersistence::Unknown {reason:TransferReason::PendingUnknown,attempted:expected},
+            Err(error)=>NativePreparationPersistence::Unknown {reason:error.downcast_ref::<TransferReason>().copied().unwrap_or(TransferReason::PendingUnknown),attempted:expected},
+        }
+    }
+}
 impl PendingNativeHandoff {
     pub(crate) fn request(&self) -> &TransferRequest {
         &self.request
@@ -182,10 +236,14 @@ impl WorkflowStore {
     }
     pub(super) fn prepare_native_handoff_impl(&mut self,lease:&Lease,binding:&Binding,audit:&str,
         selection:Option<(&native_handoff::NativeHandoffFacts,&[augmentagent_channel_core::native_vm::ownership::RuntimeInventoryRow],&[String])>,now:i64)->Result<HandoffPreparation> {
+        self.prepare_native_handoff_tracked(lease,binding,audit,selection,now,&mut None)
+    }
+    fn prepare_native_handoff_tracked(&mut self,lease:&Lease,binding:&Binding,audit:&str,
+        selection:Option<(&native_handoff::NativeHandoffFacts,&[augmentagent_channel_core::native_vm::ownership::RuntimeInventoryRow],&[String])>,now:i64,attempted:&mut Option<PendingNativeHandoff>)->Result<HandoffPreparation> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_binding(&tx, lease, binding, now)?;
+        require_binding(&tx, lease, binding, now).context(TransferReason::AuthorityConflict)?;
         let old:Option<(String,i64,u64,String)>=tx.query_row("SELECT transfer_id,sequence,snapshot_sequence,record FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
         let orphan:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=?1 AND e.kind='native_handoff_prepared' AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_pending p WHERE p.workflow=e.workflow AND p.sequence=e.seq) AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_completed c WHERE c.workflow=e.workflow AND c.pending_sequence=e.seq))",[&lease.workflow],|r|r.get(0))?;
         ensure!(!orphan, TransferReason::InventoryMissing);
@@ -204,6 +262,7 @@ impl WorkflowStore {
             }
             let same = destination.owner.lease_generation == lease.generation
                 && pending.workflow_binding == *binding;
+            *attempted=Some(pending.clone());
             tx.commit()?;
             return Ok(if same {
                 HandoffPreparation::Prepared(pending)
@@ -211,7 +270,7 @@ impl WorkflowStore {
                 HandoffPreparation::ReconcileExisting(pending)
             });
         }
-        owner_control::require_dispatch(&tx,&lease.workflow)?;
+        owner_control::require_dispatch(&tx,&lease.workflow).context(TransferReason::AuthorityConflict)?;
         let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed')) OR EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2)",params![lease.workflow,lease.generation],|r|r.get(0))?;
         ensure!(!blocked, TransferReason::AuthorityConflict);
         let snapshot=if let Some((basis,inventory,retired))=selection {
@@ -267,6 +326,9 @@ impl WorkflowStore {
                 raw
             ],
         )?;
+        // Capture the exact candidate immediately before attempting COMMIT.
+        // Errors after this point can never infer no-pending from Result alone.
+        *attempted=Some(pending.clone());
         tx.commit()?;
         Ok(HandoffPreparation::Prepared(pending))
     }
