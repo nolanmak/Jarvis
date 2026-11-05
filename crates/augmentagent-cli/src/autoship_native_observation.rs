@@ -1418,6 +1418,64 @@ mod tests {
         let native=rusqlite::Connection::open(f._root.path().join("native/runtime-retirement.sqlite")).unwrap();let count:i64=native.query_row("SELECT count(*) FROM native_transfer",[],|r|r.get(0)).unwrap();assert_eq!(count,0);
     }
     #[test]
+    fn native_terminal_unstarted_ack_needs_no_new_lease_and_preserves_terminal_cleanup() {
+        if child("native_terminal_unstarted_ack_needs_no_new_lease_and_preserves_terminal_cleanup") {return;}
+        for stage in [Stage::Merged,Stage::Retired] {
+            let mut f=Fixture::new();let (lease,_sources,destination,store)=joined_fixture(&mut f);let facts=store.lock().unwrap().native_handoff_facts(&lease,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);let pending=pending_record(store.lock().unwrap().prepare_native_handoff_filtered(&lease,&f.binding,destination.path().to_str().unwrap(),&facts,&rows,&[],now()).unwrap());
+            let mut checkpoint=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=stage;store.lock().unwrap().checkpoint(&lease,&checkpoint,now()).unwrap();
+            let terminal=store.lock().unwrap().terminal_native_checkpoint(&lease.workflow).unwrap();let before=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap();let allowance=store.lock().unwrap().merge_allowance(now(),5).unwrap();
+            let ack=||ownership::with_transfer_inspection(&pending.original_binding,&pending.request,&pending.observation(),&||store.lock().unwrap().terminal_native_is_current(&terminal).map_err(|_|ownership::TransferFenceError::NotCurrent),&mut |proof|store.lock().unwrap().acknowledge_terminal_native_unstarted(&terminal,&pending,proof,now()));ack().unwrap();let events=store.lock().unwrap().events(&lease.workflow).unwrap();ack().unwrap();assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);
+            let mut locked=store.lock().unwrap();assert_eq!(locked.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(locked.merge_allowance(now(),5).unwrap(),allowance);assert!(locked.claim(&lease.workflow,"must-not-reopen",now(),60_000).unwrap().is_none());
+            assert!(locked.native_owner_binding(&lease.workflow,lease.generation).unwrap().is_none());let cleanup:(String,Option<i64>)=locked.conn.query_row("SELECT retirement_reason,retired_at FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",params![lease.workflow,f.lease.generation],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();assert_eq!(cleanup,("terminal_workflow".into(),None));
+            let count:i64=locked.conn.query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).unwrap();assert_eq!(count,0);
+        }
+    }
+    #[test]
+    fn native_terminal_unstarted_ack_rejects_changed_or_missing_terminal_authority() {
+        if child("native_terminal_unstarted_ack_rejects_changed_or_missing_terminal_authority") {return;}
+        for fault in ["stage","head","next","event"] {
+            let mut f=Fixture::new();let (lease,_sources,destination,store)=joined_fixture(&mut f);let facts=store.lock().unwrap().native_handoff_facts(&lease,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);let pending=pending_record(store.lock().unwrap().prepare_native_handoff_filtered(&lease,&f.binding,destination.path().to_str().unwrap(),&facts,&rows,&[],now()).unwrap());
+            let mut checkpoint=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Retired;store.lock().unwrap().checkpoint(&lease,&checkpoint,now()).unwrap();let terminal=store.lock().unwrap().terminal_native_checkpoint(&lease.workflow).unwrap();
+            match fault {"stage"=>checkpoint.stage=Stage::Build,"head"=>checkpoint.binding.head="changed-head".into(),"next"=>checkpoint.next.reason="changed-terminal-authority".into(),"event"=>{},_=>unreachable!()}
+            if fault=="event" {store.lock().unwrap().conn.execute("DELETE FROM workflow_event WHERE workflow=?1 AND kind='checkpoint'",[&lease.workflow]).unwrap();}else{store.lock().unwrap().checkpoint(&lease,&checkpoint,now()).unwrap();}
+            assert!(store.lock().unwrap().terminal_native_is_current(&terminal).is_err(),"{fault}");let events=store.lock().unwrap().events(&lease.workflow).unwrap();
+            let result=ownership::with_transfer_inspection(&pending.original_binding,&pending.request,&pending.observation(),&||Ok(()),&mut |proof|store.lock().unwrap().acknowledge_terminal_native_unstarted(&terminal,&pending,proof,now()));assert!(result.is_err(),"{fault}");assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);
+            let count:i64=store.lock().unwrap().conn.query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).unwrap();assert_eq!(count,1);
+        }
+    }
+    #[test]
+    fn native_terminal_unstarted_ack_failure_keeps_intent_without_reopening_work() {
+        if child("native_terminal_unstarted_ack_failure_keeps_intent_without_reopening_work") {return;}
+        let mut f=Fixture::new();let (lease,_sources,destination,store)=joined_fixture(&mut f);let facts=store.lock().unwrap().native_handoff_facts(&lease,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);let pending=pending_record(store.lock().unwrap().prepare_native_handoff_filtered(&lease,&f.binding,destination.path().to_str().unwrap(),&facts,&rows,&[],now()).unwrap());
+        let mut checkpoint=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Retired;store.lock().unwrap().checkpoint(&lease,&checkpoint,now()).unwrap();let terminal=store.lock().unwrap().terminal_native_checkpoint(&lease.workflow).unwrap();
+        store.lock().unwrap().conn.execute_batch("CREATE TRIGGER deny_terminal_ack BEFORE INSERT ON workflow_native_handoff_unstarted BEGIN SELECT RAISE(ABORT,'injected terminal ack failure'); END;").unwrap();let events=store.lock().unwrap().events(&lease.workflow).unwrap();
+        assert!(ownership::with_transfer_inspection(&pending.original_binding,&pending.request,&pending.observation(),&||Ok(()),&mut |proof|store.lock().unwrap().acknowledge_terminal_native_unstarted(&terminal,&pending,proof,now())).is_err());assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);
+        let locked=store.lock().unwrap();let count:i64=locked.conn.query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).unwrap();assert_eq!(count,1);
+    }
+    #[test]
+    fn native_terminal_unstarted_history_survives_reopen_and_rejects_corruption() {
+        if child("native_terminal_unstarted_history_survives_reopen_and_rejects_corruption") {return;}
+        for fault in ["checkpoint","record"] {
+            let mut f=Fixture::new();let (lease,_sources,destination,store)=joined_fixture(&mut f);
+            let facts=store.lock().unwrap().native_handoff_facts(&lease,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);
+            let pending=pending_record(store.lock().unwrap().prepare_native_handoff_filtered(&lease,&f.binding,destination.path().to_str().unwrap(),&facts,&rows,&[],now()).unwrap());
+            let mut checkpoint=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Retired;
+            store.lock().unwrap().checkpoint(&lease,&checkpoint,now()).unwrap();let terminal=store.lock().unwrap().terminal_native_checkpoint(&lease.workflow).unwrap();
+            // Release produces a later event and removes the old productive lease.
+            store.lock().unwrap().release(&lease,now()).unwrap();
+            ownership::with_transfer_inspection(&pending.original_binding,&pending.request,&pending.observation(),&||store.lock().unwrap().terminal_native_is_current(&terminal).map_err(|_|ownership::TransferFenceError::NotCurrent),&mut |proof|store.lock().unwrap().acknowledge_terminal_native_unstarted(&terminal,&pending,proof,now())).unwrap();
+            let mut reopened=WorkflowStore::open(&f.path).unwrap();assert_eq!(reopened.terminal_native_checkpoint(&lease.workflow).unwrap(),terminal);
+            native_pending::validate_dispositions(&reopened.conn,&lease.workflow).unwrap();assert!(!native_pending::orphaned(&reopened.conn,&lease.workflow).unwrap());
+            match fault {
+                "checkpoint"=>{reopened.conn.execute("UPDATE workflow_event SET payload='{}' WHERE workflow=?1 AND kind='checkpoint'",[&lease.workflow]).unwrap();}
+                "record"=>{reopened.conn.execute("UPDATE workflow_native_handoff_unstarted SET record=json_set(record,'$.terminal.generation',999) WHERE workflow=?1",[&lease.workflow]).unwrap();}
+                _=>unreachable!(),
+            }
+            assert!(native_pending::validate_dispositions(&reopened.conn,&lease.workflow).is_err());assert!(native_pending::orphaned(&reopened.conn,&lease.workflow).is_err());
+            let count:i64=reopened.conn.query_row("SELECT count(*) FROM workflow_native_handoff_unstarted WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).unwrap();assert_eq!(count,1);
+        }
+    }
+    #[test]
     fn native_handoff_pending_request_survives_restart_without_new_identity() {
         if child("native_handoff_pending_request_survives_restart_without_new_identity") {
             return;

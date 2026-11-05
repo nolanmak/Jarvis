@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "3d93092cdf7a8661e3a191722b31131362368d9e",
+  "source_parent_commit": "ae04a085dbaa055a9623bef4ae819afc55491f9e",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -26,7 +26,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
-      "sha256": "19eec63f30a6cc8b9f3ea9fb69dcdbd7fec21707688304a57d8e23a4e2ffaa1a"
+      "sha256": "4665d6d4277d3155aa9832ad174df43f3d077646f8f40e90072d8b51b6f2ae83"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
@@ -34,7 +34,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
-      "sha256": "197e193528de5bd5d92327ade525bde8e50b854b21404a09808a7b180e7e4502"
+      "sha256": "8448d593165d9cf880c475cb13071a46046583f685c7bd9e89828c59b90237df"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_settlement.rs",
@@ -78,12 +78,16 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_unstarted.rs",
-      "sha256": "777bfd7dfe6d9112428dca780e12c3715b25e3cfab48c89745a31bdbda03d2e0"
+      "sha256": "37bbf2bfe3403ddf5994e53c666b88f20773edb80bc9f510ae42320e96181d46"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_terminal.rs",
+      "sha256": "f5c4ff12137cc057852f21b447e88eed3dc16687c4616d715c8050642a14c215"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1810,
+    "passed": 1814,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
@@ -95,7 +99,10 @@
       "autoship-native-unstarted-green.log",
       "autoship-native-unstarted-race-fixture-failure.log",
       "autoship-native-transfer-inspection-full-core.log",
-      "autoship-native-unstarted-full-cli.log"
+      "autoship-native-unstarted-full-cli.log",
+      "autoship-native-terminal-unstarted-red.log",
+      "autoship-native-terminal-unstarted-green.log",
+      "autoship-native-terminal-unstarted-full-cli.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -115,7 +122,9 @@
     "guarded_preparation_adapter_cases": 4,
     "joined_preparation_cases": 4,
     "exact_transfer_inspection_cases": 3,
-    "unstarted_acknowledgement_cases": 4
+    "unstarted_acknowledgement_cases": 4,
+    "terminal_unstarted_acknowledgement_cases": 4,
+    "core_validation_source_commit": "ae04a085dbaa055a9623bef4ae819afc55491f9e (unchanged core sources; core suite not repeated for terminal workflow-only change)"
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -174,7 +183,10 @@
     "missing lock/epoch/ledger and corrupt orphan authority cannot issue an absence proof or initialize replacement state; historical inspection does not depend on selected policy",
     "newer-lease known-Absent acknowledgement atomically preserves exact original pending/snapshot history before clearing active pending; source registrations, checkpoint, paid accounting and owner input are unchanged",
     "shared validated known-unstarted history gates orphan classification, preparation/readback and retry; corrupted records remain held and idempotent acknowledgement never clears a different request",
-    "real old-controller thread paused after its first fence check cannot create a native request after newer-lease acknowledgement and original-lock release"
+    "real old-controller thread paused after its first fence check cannot create a native request after newer-lease acknowledgement and original-lock release",
+    "terminal merged/retired checkpoint acknowledgement under the original native absence lock preserves checkpoint, cleanup intents, counters and allowance without a new productive lease",
+    "exact terminal checkpoint event, generation and canonical hash fence changes to stage, head and next action; missing checkpoint events hold acknowledgement",
+    "terminal acknowledgement transaction rollback retains the pending intent; retained v2 terminal history survives database reopen and rejects checkpoint/projection corruption; legacy v1 serialization remains unchanged"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -186,10 +198,10 @@
   "hosted_ci": "pending current published head",
   "remaining": [
     "production preparation/promotion caller integration across all acquisition, owner-turn, recovery and merge-sweep leases",
-    "terminal and namespace cleanup-only settlement and authenticated legacy/uncertainty/corrupt-state recovery",
+    "aborted namespace cleanup-only settlement and authenticated legacy/uncertainty/corrupt-state recovery",
     "normal protected rollout and actual Codex/Claude Discord continuation acceptance",
     "C actual-backend freshness/storage/quiescence cutover, private verifier recovery/application and full epic soak",
-    "production workflow persistence callback integration, concurrent workflow/audit lock-order proof and locked absent/aborted reconciliation",
+    "production workflow persistence callback integration, concurrent workflow/audit lock-order proof and routing locked absent/aborted reconciliation",
     "connect all real guard acquisition/promotion callers only after original-state Absent/Aborted/legacy recovery barriers are implemented",
     "persist post-intent transient-I/O S backoff, actual input-change early wake and prove concurrent real callback/audit lock ordering before activation"
   ],
@@ -236,9 +248,11 @@
   "guarded_joined_red_evidence": "Three public core adapter cases failed against the placeholder, then passed. Three actual WorkflowStore/core orchestration cases separately failed before composition. Final full suites include four cases in each group, including invalid callback frames and recovery from settlement failure.",
   "exact_transfer_inspection_component_executed": true,
   "newer_lease_unstarted_ack_component_executed": true,
-  "terminal_unstarted_acknowledgement_implemented": false,
+  "terminal_unstarted_acknowledgement_implemented": true,
   "aborted_namespace_barriers_implemented": false,
   "pending_recovery_routed": false,
-  "unstarted_scope": "isolated actual core inspection and WorkflowStore acknowledgement fixtures, including an actual fenced old-controller transfer thread; newer-lease nonterminal acknowledgement only, zero provider/model dispatch",
-  "unstarted_red_evidence": "Core inspection placeholder: two behavioral failures/one refusal passed. Workflow acknowledgement placeholder: two behavioral failures/one refusal passed. Final suites include three inspection cases and four acknowledgement cases. Initial race fixture incorrectly expected transfer error readback to finish under the held native lock; corrected test observes completion after release and verifies zero native requests."
+  "unstarted_scope": "isolated actual core inspection and WorkflowStore acknowledgement fixtures, including a fenced old-controller transfer thread, newer-lease nonterminal and terminal-checkpoint acknowledgements; zero provider/model dispatch",
+  "unstarted_red_evidence": "Core inspection placeholder: two behavioral failures/one refusal passed. Workflow acknowledgement placeholder: two behavioral failures/one refusal passed. Final suites include three inspection cases and four acknowledgement cases. Initial race fixture incorrectly expected transfer error readback to finish under the held native lock; corrected test observes completion after release and verifies zero native requests.",
+  "terminal_unstarted_scope": "isolated actual original-native absence inspection and WorkflowStore transactions; no productive lease acquisition or provider/model dispatch, no production caller routing",
+  "terminal_unstarted_red_evidence": "Three tests failed behaviorally against terminal capture/acknowledgement placeholders; all three passed after implementation. Full CLI suite includes a fourth database-reopen/corrupted-history case."
 }

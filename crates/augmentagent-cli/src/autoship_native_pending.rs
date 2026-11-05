@@ -75,6 +75,8 @@ impl WorkflowStore {
         }
     }
 }
+#[path = "autoship_native_terminal.rs"]
+pub(super) mod terminal;
 #[path = "autoship_native_unstarted.rs"]
 mod unstarted;
 pub(super) fn validate_dispositions(conn:&Connection,workflow:&str)->Result<()> {unstarted::validate_history(conn,workflow)}
