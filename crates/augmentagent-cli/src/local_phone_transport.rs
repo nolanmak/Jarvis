@@ -230,7 +230,9 @@ mod tests {
         }
     }
     fn directory() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+        // AF_UNIX paths must remain short under a managed build TMPDIR.
+        let dir = tempfile::Builder::new().prefix("sock-")
+            .tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         dir
     }
