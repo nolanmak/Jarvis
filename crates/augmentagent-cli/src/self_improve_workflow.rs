@@ -440,7 +440,7 @@ impl SweepGuard {
         if issue.is_none() && existing.is_none() {
             return Ok(None);
         }
-        let binding = existing
+        let mut binding = existing
             .as_ref()
             .map(|s| s.checkpoint.binding.clone())
             .unwrap_or(Binding {
@@ -493,8 +493,18 @@ impl SweepGuard {
                 now,
             )?;
         }
-        let audit = workflow_audit(path, &id, None)?;
-        let inner = WorkflowGuard {
+        let reviewed_binding=binding.clone();
+        let audit=acquire_audit_generation(path,&mut store,&lease,None,&mut binding,now)?;
+        // Recovery changes evidence and clears prior review. Re-enter the normal
+        // verification/review loop before this caller can authorize any merge.
+        if binding!=reviewed_binding {
+            store.release(&lease,now)?;
+            return Ok(None);
+        }
+        audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
+            workflow_id:lease.workflow.clone(),lease_generation:lease.generation,
+        })?;
+        let mut inner = WorkflowGuard {
             state:path.to_path_buf(),
             audit,
             store: Arc::new(Mutex::new(store)),
@@ -511,8 +521,14 @@ impl SweepGuard {
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
             released: false,
         };
-        inner.install_model_accounting()?;
-        inner.audit_event("sweep_claimed", serde_json::json!({}))?;
+        let setup=inner.register_native_context()
+            .and_then(|_|inner.install_model_accounting())
+            .and_then(|_|inner.validate_before_side_effect())
+            .and_then(|_|inner.audit_event("sweep_claimed",serde_json::json!({})));
+        if let Err(error)=setup {
+            inner.release_unstarted_native_registration()?;
+            return Err(error);
+        }
         inner.spawn_renewal();
         Ok(Some(Self {
             inner: Some(inner),
@@ -858,7 +874,7 @@ impl WorkflowGuard {
     /// No native transport can escape acquisition before this registration.
     /// Missing selection leaves no unbound owner to strand later setup recovery.
     fn register_native_context(&self)->Result<()> {
-        use augmentagent_channel_core::native_vm::ownership::{self,Authority,TransferFenceError,TransferReason};
+        use augmentagent_channel_core::native_vm::ownership::{self,TransferFenceError,TransferReason};
         use durable::native_prepare::NativePreparationRun;
         use durable::native_reconcile::{self,Mode,ReconciliationRun};
         if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_none() {return Ok(());}
@@ -2667,6 +2683,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sweep_recovered_audit_requires_new_review() {
+        let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");
+        let builder=WorkflowGuard::acquire_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(7),pr:None,branch:"fix/seven",contract:"C1",environment:"rust-a"},millis()).await.unwrap().unwrap();
+        let head=builder.binding.head.clone();let id=builder.id().to_owned();let audit=builder.audit_logger();
+        builder.record_review("approved",true,"prior approval").unwrap();builder.finish().unwrap();
+        drop(audit.begin_write().unwrap());assert!(audit.protected_health().is_err());
+        assert!(SweepGuard::acquire_at(&path,"owner/repo",7,42,"fix/seven",&head,"old approval",millis()).unwrap().is_none(),"audit recovery invalidates the reviewed binding before merge sweep admission");
+        let store=WorkflowStore::open(&path).unwrap();assert_eq!(store.snapshot(&id).unwrap().unwrap().lease_until_ms,0);assert!(store.current_review_history(&id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn sweep_never_reuses_approval_after_evidence_changes_at_same_head() {
         let dir = repo();
         let state = control_dir();
@@ -3029,7 +3056,7 @@ mod tests {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority"] {
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
                     .env(CHILD,control.path()).env(MODE,mode);
@@ -3129,6 +3156,20 @@ mod tests {
             assert_eq!(rows[0].certainty,crate::autoship_workflow::native_observation::Certainty::Uncertain);
             assert_eq!(rows[0].protected_observation_reference.as_ref(),Some(fact.receipt()));
             assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        }
+        if matches!(mode.as_str(),"native-sweep"|"native-sweep-lost-authority") {
+            guard.record_review("fixture-independent-review",true,"native sweep fixture approval").unwrap();
+            let head=guard.binding.head.clone();let original=saved.clone().unwrap();let old_audit=guard.audit.path().to_path_buf();
+            let reviews=guard.store.lock().unwrap().current_review_history(&id).unwrap();guard.finish().unwrap();
+            if mode=="native-sweep-lost-authority" {std::fs::remove_file(native.join("authority-epoch.json")).unwrap();}
+            let result=SweepGuard::acquire_at(&state,"owner/repo",77,42,"fixture",&head,"untrusted caller approval",millis());
+            if mode=="native-sweep-lost-authority" {
+                assert!(result.is_err(),"sweep must refuse missing native authority");assert!(!native.join("authority-epoch.json").exists());
+                let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&id).unwrap().unwrap().lease_until_ms,0);assert_eq!(store.current_review_history(&id).unwrap(),reviews);return;
+            }
+            let sweep=result.unwrap().unwrap();let inner=sweep.inner.as_ref().unwrap();
+            assert_ne!(inner.audit.path(),old_audit);assert_eq!(inner.audit.native_store_binding().unwrap(),Some(original));inner.validate_before_side_effect().unwrap();
+            let store=inner.store.lock().unwrap();assert!(store.native_owner_context(&id,inner.lease.generation).unwrap().is_some());assert_eq!(store.audit_generation(&id).unwrap(),inner.lease.generation);assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,0);assert_eq!(store.current_review_history(&id).unwrap(),reviews);drop(store);drop(sweep);return;
         }
         if matches!(mode.as_str(),"healthy-handoff"|"lost-source-audit"|"pending-settlement-recovery"|"promotion-failure-recovery"|"lost-native-authority") {
             let old_generation=guard.lease.generation;let old_audit=guard.audit_logger().path().to_path_buf();let old_binding=saved.clone().unwrap();let old_checkpoint=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap().checkpoint;guard.finish().unwrap();

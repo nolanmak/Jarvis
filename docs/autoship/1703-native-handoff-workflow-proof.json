@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "21ac2f87ddee8bd1111b18377f23dbf01d122837",
+  "source_parent_commit": "c0c47147b948fc38b14d7379f99e2256af3a8785",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -110,12 +110,12 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "b51309f8621c3ef638c2bddbbde91db52344c14f131c1bc7c540133f64c3cdda"
+      "sha256": "9527c6317948c31c10976c60bd1e6fea49b3c1f00ffccd398cf47811eebca23f"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1837,
+    "passed": 1838,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
@@ -159,7 +159,13 @@
       "autoship-native-guard-audit-probe-red.log",
       "autoship-native-guard-factory-full-core.log",
       "autoship-native-guard-factory-production-check.log",
-      "autoship-native-guard-factory-full-cli.log"
+      "autoship-native-guard-factory-full-cli.log",
+      "autoship-native-sweep-red.log",
+      "autoship-native-sweep-green.log",
+      "autoship-native-sweep-review-red.log",
+      "autoship-native-sweep-review-green.log",
+      "autoship-native-sweep-full-cli.log",
+      "autoship-native-sweep-production-check.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -187,16 +193,17 @@
     "core_validation_scope": "full managed core library suite; source inventory is post-run and grants no compiled-source freshness authority",
     "pending_reconciliation_cases": 9,
     "joined_reconciliation_adapter_cases": 1,
-    "core_validation_source_commit": "current working source before publication; full suite rerun; post-run inventory grants no compiled-source freshness authority",
+    "core_validation_source_commit": "c0c47147b948fc38b14d7379f99e2256af3a8785 (893 passed, 15 ignored; core unchanged for sweep-only change)",
     "callback_journal_cases": 4,
     "production_configuration_check": {
       "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
       "passed": true,
-      "log": "autoship-native-guard-factory-production-check.log"
+      "log": "autoship-native-sweep-production-check.log"
     },
     "guard_promotion_cases": 3,
     "read_only_audit_probe_cases": 2,
-    "actual_guard_subprocess_modes": 13
+    "actual_guard_subprocess_modes": 15,
+    "sweep_related_cases": 20
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -291,7 +298,9 @@
     "ordinary and observational guard source paths use distinct namespaces and shared original-pending reconciliation/preparation; healthy repeated acquisition preserves original binding, checkpoint and accounting",
     "actual guard subprocesses recover original completed settlement and audit promotion after injected database write failures; missing original audit/native authority refuses and releases the unstarted lease without recreating authority",
     "audit pointer promotion requires opaque actual current receipt and matching settled history; historical, changed-head and held contexts refuse; replay is idempotent and projection failure retains settlement",
-    "read-only healthy audit inspection never recreates missing lock authority and reports a busy lock without waiting or mutating log/anchor"
+    "read-only healthy audit inspection never recreates missing lock authority and reports a busy lock without waiting or mutating log/anchor",
+    "merge-sweep uses shared audit acquisition/native recovery, preserves stored review and original native binding, and releases an unstarted lease on missing native authority",
+    "audit recovery that changes the reviewed binding returns no merge-sweep guard, releases its lease and requires candidate verification/review again"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -302,13 +311,13 @@
   "shipping_authority": false,
   "hosted_ci": "pending current published head",
   "remaining": [
-    "production preparation/promotion caller integration across all acquisition, owner-turn, recovery and merge-sweep leases",
+    "production preparation/promotion caller integration across remaining owner-turn and recovery leases",
     "automatic authenticated retirement/resolution routing and interrupted namespace recovery and authenticated legacy/uncertainty/corrupt-state recovery",
     "normal protected rollout and actual Codex/Claude Discord continuation acceptance",
     "C actual-backend freshness/storage/quiescence cutover, private verifier recovery/application and full epic soak",
     "persist post-intent transient-I/O S backoff, actual input-change early wake before activation",
     "guarded all-closed-source re-preparation using the original binding and verified history; no fresh-origin backfill or budget/owner-input reset",
-    "authenticated cleanup routing and all-closed original-binding recovery; remaining owner-turn, recovery and merge-sweep consumers; actual runtime/provider continuation acceptance"
+    "authenticated cleanup routing and all-closed original-binding recovery; remaining owner-turn and recovery consumers; actual runtime/provider continuation acceptance"
   ],
   "native_transfer_scope": "isolated synthetic-controller/native-filesystem fixtures only; zero production transfers or provider/model dispatch",
   "opaque_receipt_producer": "actual original-bound ownership::transfer_receipt lookup or Completed NativeTransferInspection under the held original native lock; no wire/serialized-receipt constructor",
@@ -385,9 +394,9 @@
   "callback_journal_red_evidence": "Initial compile used a core-private intent validation method; corrected workflow validation and retained the initial log separately. Corrected red: two behavioral failures (observer persistence placeholder and workflow mutex retained across capture), two refusal cases passing. Final full CLI suite includes all four cases. The actual concurrent race runs both launch and observation callbacks under real state/session/audit locks and rejects their stale metadata commits while transfer and verified settlement complete.",
   "source_caller_integration": {
     "ordinary_and_observational_guard_acquisition": true,
-    "merge_sweep": false,
+    "merge_sweep": true,
     "runtime_deployed": false,
-    "guard_fixture_scope": "13 actual guard subprocess modes; zero-runtime native sources; zero provider/model dispatch; not live continuation acceptance"
+    "guard_fixture_scope": "15 actual guard subprocess modes; zero-runtime native sources; zero provider/model dispatch; not live continuation acceptance"
   },
   "productive_caller_enabled_scope": "deployment activation remains unproven; supported guard source paths are connected as described in source_caller_integration"
 }
