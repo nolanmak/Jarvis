@@ -182,10 +182,22 @@ pub fn split_assumes(draft: &str) -> (String, Vec<String>) {
 /// malformed fence alone so the card never shows half-parsed markup: a Gmail
 /// body has no such luxury, so an unclosed `<!--aa:assumes` is truncated away.
 pub fn strip_assumes_for_send(body: &str) -> String {
-    let (clean, _) = split_assumes(body);
-    let cutoff = [ASSUMES_OPEN_PREFIX, "<!--aa:needs-input"].iter()
-        .filter_map(|marker|clean.find(marker)).min();
-    cutoff.map(|at|clean[..at].trim_end().to_string()).unwrap_or(clean)
+    let (mut clean, _) = split_assumes(body);
+    let mut touched = false;
+    // A complete marker comment anywhere (the model sometimes writes a
+    // one-line `<!--aa:assumes …-->` before the reply) is spliced out; only
+    // an unclosed one truncates, since everything after it is marker text.
+    while let Some(at) = [ASSUMES_OPEN_PREFIX, "<!--aa:needs-input"].iter()
+        .filter_map(|marker| clean.find(marker)).min()
+    {
+        touched = true;
+        match clean[at..].find("-->") {
+            Some(len) => clean.replace_range(at..at + len + 3, ""),
+            None => clean.truncate(at),
+        }
+    }
+    // A marker-free draft goes out byte-identical (Gmail keeps its CRLFs).
+    if touched { clean.trim().to_string() } else { clean }
 }
 
 /// Split a persisted draft into the human-facing draft and any needs-input
@@ -322,6 +334,20 @@ pub fn approval_message(
 ) -> CreateMessage {
     let (embed, rows) = approval_embed_and_rows(action_id, email, draft, redraft_count);
     CreateMessage::new().embed(embed).components(rows)
+}
+
+/// #1833 D6 — [`approval_message`] for an active trusted contact the
+/// autonomy gate held back: the same embed and buttons, plus a
+/// `Not auto-sent: <reason>` line as message content.
+pub fn approval_message_noted(
+    action_id: &str,
+    email: &Email,
+    draft: &str,
+    redraft_count: i64,
+    note: &str,
+) -> CreateMessage {
+    approval_message(action_id, email, draft, redraft_count)
+        .content(truncate(&format!("Not auto-sent: {note}"), 1900))
 }
 
 /// #1188 — the in-place edit form of [`approval_message`]. When
@@ -1259,6 +1285,16 @@ mod tests {
         assert_eq!(strip_assumes_for_send("Hello.\n\n<!--aa:needs-input\ncontext|private"),"Hello.");
         let both=append_needs_input_marker(&append_assumes_marker("Hello.",&["private assumption".into()]),&[("context".into(),"private source".into())]);
         assert_eq!(strip_assumes_for_send(&both),"Hello.");
+    }
+
+    #[test]
+    fn send_scrubber_keeps_the_reply_around_a_one_line_leading_marker() {
+        // Live 2026-11-02: the drafter put a single-line assumes comment
+        // before the reply; Approve refused it as "empty after removing card
+        // markers" and the owner could not send.
+        let draft = "<!--aa:assumes The media is unreadable, so this is a generic acknowledgment.-->\nlemme check it out\n\n<!--aa:needs-input\ncontext|time limit\n-->";
+        assert_eq!(strip_assumes_for_send(draft), "lemme check it out");
+        assert_eq!(strip_assumes_for_send("Hi <!--aa:assumes guess--> there."), "Hi  there.");
     }
 
     #[test]

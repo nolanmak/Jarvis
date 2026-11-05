@@ -128,7 +128,7 @@ fn verify_build_config(path:&Path)->Result<(String,BTreeMap<String,String>)> {
     let value:serde_json::Value=serde_json::from_slice(&bytes)?;
     let fields=value.as_object().context("runtime configuration must be an object")?;
     let required=["qemu","kernel","busybox","firmware","data_dir","library_dir","module_dir","modules","memory_mb"];
-    let optional=["toolchain","registry","cargo_git"];
+    let optional=["toolchain","registry","cargo_git","ort_cache"];
     ensure!(required.iter().all(|key|fields.contains_key(*key)) && fields.keys().all(|key|required.contains(&key.as_str()) || optional.contains(&key.as_str())),"invalid runtime fields");
     ensure!(value["memory_mb"].as_u64().is_some_and(|memory|(512..=4096).contains(&memory)),"invalid runtime memory");
     let modules=value["modules"].as_array().filter(|modules|!modules.is_empty() && modules.len()<=32).context("invalid modules")?;
@@ -138,11 +138,12 @@ fn verify_build_config(path:&Path)->Result<(String,BTreeMap<String,String>)> {
         ensure!((metadata.uid()==0 || metadata.uid()==unsafe{libc::geteuid()}) && metadata.mode() & 0o022==0,"runtime artifact is not trusted");
         Ok(metadata)
     };
-    for key in ["data_dir","library_dir","module_dir","toolchain","registry","cargo_git"] {
+    for key in ["data_dir","library_dir","module_dir","toolchain","registry","cargo_git","ort_cache"] {
         if optional.contains(&key) && value.get(key).is_none() {continue;}
         let path=Path::new(value[key].as_str().context("runtime directory missing")?);
         ensure!(path.is_absolute() && path.is_dir(),"invalid runtime directory");
-        if !matches!(key,"registry"|"cargo_git") {trusted(path)?;}
+        if key=="ort_cache" {ensure!(path.canonicalize()?==path,"ONNX dependency cache must be a literal directory");}
+        if !matches!(key,"registry"|"cargo_git"|"ort_cache") {trusted(path)?;}
     }
     let mut paths=BTreeMap::new();
     for key in ["qemu","kernel","busybox","firmware"] {
@@ -306,7 +307,7 @@ mod tests {
     }
     #[test]
     fn build_runtime_requires_complete_trusted_declaration_and_hashes_executables() {
-        for scenario in ["valid","missing","public-config","writable-artifact","unknown-field","bad-memory","no-modules"] {
+        for scenario in ["valid","ort-cache","ort-cache-symlink","ort-cache-missing","missing","public-config","writable-artifact","unknown-field","bad-memory","no-modules"] {
             let root=tempfile::tempdir().unwrap();let config=root.path().join("runtime.json");
             let mut value=serde_json::json!({"memory_mb":1024,"modules":[]});
             for key in ["qemu","kernel","busybox","firmware","module"] {
@@ -318,6 +319,13 @@ mod tests {
                 std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o700)).unwrap();value[key]=serde_json::to_value(path).unwrap();
             }
             match scenario {
+                "ort-cache"|"ort-cache-symlink"|"ort-cache-missing"=>{
+                    let cache=root.path().join("ort");std::fs::create_dir(&cache).unwrap();
+                    let selected=if scenario=="ort-cache-symlink" {
+                        let alias=root.path().join("alias");std::os::unix::fs::symlink(&cache,&alias).unwrap();alias
+                    } else if scenario=="ort-cache-missing" {root.path().join("missing-cache")} else {cache};
+                    value["ort_cache"]=serde_json::to_value(selected).unwrap();
+                },
                 "unknown-field"=>value["unexpected"]=true.into(),
                 "bad-memory"=>value["memory_mb"]=1.into(),
                 "no-modules"=>value["modules"]=serde_json::json!([]),
@@ -327,7 +335,7 @@ mod tests {
             if scenario!="missing" {write(&config,value.to_string().as_bytes()).unwrap();}
             if scenario=="public-config" {std::fs::set_permissions(&config,std::fs::Permissions::from_mode(0o644)).unwrap();}
             let result=verify_build_config(&config);
-            assert_eq!(result.is_ok(),scenario=="valid","{scenario}: {result:?}");
+            assert_eq!(result.is_ok(),matches!(scenario,"valid"|"ort-cache"),"{scenario}: {result:?}");
             if let Ok((hash,artifacts))=result {
                 assert_eq!(hash,format!("{:x}",Sha256::digest(value.to_string().as_bytes())));
                 assert_eq!(artifacts.len(),5);

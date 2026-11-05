@@ -331,7 +331,7 @@ impl CardDrafter<'_> {
                 self.store, &email, self.config.wiki_root.as_deref(),
             )?.prompt()
         } else { String::new() };
-        let (group_policy, group_note) = group_notes(&email.platform);
+        let (group_policy, _) = group_notes(&email.platform);
         if group {
             baseline.push_str(&group_policy);
         }
@@ -360,7 +360,13 @@ impl CardDrafter<'_> {
                 return Ok(Handled::Skipped);
             }
         }
+        self.card(email, group, supersede_reason).await
+    }
 
+    /// Draft and post a card without triage: the caller (the owner, asking
+    /// for one) has already decided this message deserves a reply.
+    pub async fn card(&self, email: Email, group: bool, supersede_reason: &str) -> anyhow::Result<Handled> {
+        let (_, group_note) = group_notes(&email.platform);
         let skill = std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
             .unwrap_or_default();
         let context = augmentagent_channel_core::draft_workflow::prepare(
@@ -587,6 +593,46 @@ mod tests {
         assert_eq!(a.action.draft_body.as_deref(), Some("yes! what time?"));
         assert_eq!(a.email.platform, "imessage");
         assert_eq!(a.email.thread_id.as_deref(), Some(&*format!("imessage:{PHONE}")));
+    }
+
+    /// #1833 C6 (D7) — the autonomy gate reads the evidence receipt by
+    /// action id inside `post_approval`, so it must already be attached
+    /// when the card is posted.
+    #[tokio::test]
+    async fn imessage_receipt_attached_before_card() {
+        struct SeesReceipt {
+            store: Arc<Store>,
+            seen: Mutex<Vec<(String, Vec<String>)>>,
+        }
+        #[async_trait::async_trait]
+        impl ApprovalBroker for SeesReceipt {
+            async fn post_approval(&self, id: &str, _e: &Email, _d: &str) -> Result<(), ApprovalError> {
+                let receipts = self.store.draft_context_receipts(id).unwrap();
+                self.seen.lock().unwrap().push((id.into(), receipts));
+                Ok(())
+            }
+            async fn post_flag_notice(&self, _e: &Email, _r: &str) -> Result<(), ApprovalError> {
+                Ok(())
+            }
+        }
+        let f = fx();
+        f.store.allow_imessage_inbound(PHONE).unwrap();
+        let d = one_to_one(&[(PHONE, "not seeing an invite for this meeting today")]);
+        ingest(&f.store, &d);
+        let broker = Arc::new(SeesReceipt { store: Arc::clone(&f.store), seen: Mutex::new(Vec::new()) });
+        let replier = ImessageReplier {
+            store: Arc::clone(&f.store),
+            reasoner: Scripted::new(&[REPLY, "let me check"]),
+            approvals: broker.clone(),
+            config: ImessageReplyConfig::default(),
+        };
+        assert_eq!(replier.handle_deltas(&[d]).await.cards, 1);
+        let seen = broker.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1.len(), 1, "exactly one receipt attached before the card");
+        let receipt: serde_json::Value = serde_json::from_str(&seen[0].1[0]).unwrap();
+        assert_eq!(receipt["review_finished"], true);
+        assert_eq!(receipt["gaps"], serde_json::json!([]));
     }
 
     #[tokio::test]

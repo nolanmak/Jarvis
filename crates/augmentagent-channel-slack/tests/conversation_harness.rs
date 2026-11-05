@@ -151,6 +151,8 @@ struct FakeAgent {
     /// When set, the answer future fails with this error instead of
     /// reaching the provider.
     fail: Option<fn() -> anyhow::Error>,
+    /// #1779 D4 — fail the next answer the way a deploy restart does.
+    interrupt_next: std::sync::atomic::AtomicBool,
 }
 
 impl FakeAgent {
@@ -159,6 +161,7 @@ impl FakeAgent {
             provider,
             seen: Mutex::new(Vec::new()),
             fail: None,
+            interrupt_next: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -167,6 +170,7 @@ impl FakeAgent {
             provider,
             seen: Mutex::new(Vec::new()),
             fail: Some(fail),
+            interrupt_next: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -208,6 +212,14 @@ impl QueryHandler for FakeAgent {
         });
         if let Some(fail) = self.fail {
             return Err(fail());
+        }
+        if self
+            .interrupt_next
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(augmentagent_channel_core::reasoner::interrupted_error(
+                "claude", 15,
+            ));
         }
         let mut opts = augmentagent_channel_core::reasoner::triage_opts(None);
         opts.session_id = Some(ctx.session_id.clone());
@@ -847,6 +859,65 @@ async fn cancel_stops_the_running_turn_reports_it_and_the_thread_continues() {
 // ---------------------------------------------------------------------------
 // Redelivery and restart
 // ---------------------------------------------------------------------------
+
+/// #1779 D4 (the #1775 live arm) — the provider is stopped by a host signal
+/// while this daemon is still alive: the owner gets `INTERRUPTED_REPLY`, not
+/// an error, the turn is closed as interrupted, and the thread keeps working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_signal_mid_turn_replies_interrupted_and_the_thread_continues() {
+    let h = Harness::new();
+    let provider = Arc::new(RecordingNativeProvider::new(ProviderKind::Claude));
+    let agent = FakeAgent::new(Arc::clone(&provider));
+    agent
+        .interrupt_next
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (connector, mut servers) = DuplexConnector::new();
+    let running = start(h.surface(
+        Arc::clone(&h.store),
+        connector,
+        harness_for(&h.store, agent.clone(), &h.wiki),
+        h.config(false, false),
+    ));
+    let mut server = Server::accept(&mut servers).await;
+
+    server
+        .deliver(&channel_message("e1", "plan my week", A))
+        .await;
+    eventually("interrupted reply", || {
+        h.answers(CONTROL, Some(A))
+            .iter()
+            .any(|t| t == INTERRUPTED_REPLY)
+    })
+    .await;
+    let state = h
+        .store
+        .surface_turn_state(&thread_turn(CONTROL, Some(A), A))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state.resolution,
+        Some(SurfaceTurnResolution::Interrupted),
+        "{state:?}"
+    );
+
+    server
+        .deliver(&thread_reply(
+            "e2",
+            CONTROL,
+            "try again",
+            "1700000100.000200",
+            A,
+        ))
+        .await;
+    eventually("follow-up answered", || {
+        h.answers(CONTROL, Some(A)).len() == 2
+    })
+    .await;
+    let answers = h.answers(CONTROL, Some(A));
+    assert_eq!(answers[0], INTERRUPTED_REPLY, "{answers:?}");
+    assert_ne!(answers[1], INTERRUPTED_REPLY, "{answers:?}");
+    running.stop().await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replayed_event_never_starts_a_second_turn_even_across_restart() {

@@ -3773,6 +3773,34 @@
     "evidence": null
   },
   {
+    "id": "cli:trust",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Owner-only trusted-contacts config (#1833): add/sync from wiki identities on a TTY, explicit-flag add, list, remove, confirm, and per-contact and global pause/resume over store state.",
+    "macos_target": "The same config writer, trust state and pause controls on macOS.",
+    "prerequisites": [
+      "Rust CLI",
+      "Synthetic trusted-contacts.toml and temporary SQLite store"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1833",
+    "test_plan": "Run scripts/cargo-managed.sh test -p augmentagent-cli --test trust_cli and scripts/cargo-managed.sh test -p augmentagent-autonomy on both hosts. Native verification remains unrecorded.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:autonomy",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Trusted-contact autonomy gate (#1833): `autonomy explain` dry-runs the planner and gate for a stored message with no side effects; the AutonomyBroker decorator auto-executes allowlisted actions for confirmed trusted senders and posts a Discord notice with Undo.",
+    "macos_target": "The same explain output, gate decisions and broker auto-execution on macOS.",
+    "prerequisites": [
+      "Rust CLI",
+      "Synthetic trusted-contacts.toml and temporary SQLite store"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1833",
+    "test_plan": "Run scripts/cargo-managed.sh test -p augmentagent-autonomy on both hosts. Native verification remains unrecorded.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
     "id": "cli:team-coverage",
     "source": "crates/augmentagent-cli/src/main.rs",
     "linux_baseline": "Report teammate coverage decisions, record owner reviews, and evaluate the shadow rollout gate.",

@@ -1046,13 +1046,21 @@ async fn slack_only_serve_posts_an_approval_card_and_an_approve_click_sends_once
         .unwrap()
         .to_string();
     let card_ts = {
-        let conn = rusqlite::Connection::open(env.db()).unwrap();
-        conn.query_row(
-            "SELECT message_id FROM surface_approval_cards WHERE action_id = ?1",
-            [&action_id],
-            |r| r.get::<_, String>(0),
-        )
-        .unwrap()
+        use rusqlite::OptionalExtension;
+        // The mock observes the HTTP request before its response is processed
+        // and persisted by the daemon. Wait for that durable publication
+        // receipt before generating the owner's approval click.
+        let mut published = None;
+        eventually("durable approval card receipt", Duration::from_secs(30), || {
+            let conn = rusqlite::Connection::open(env.db()).unwrap();
+            published = conn.query_row(
+                "SELECT message_id FROM surface_approval_cards WHERE action_id = ?1",
+                [&action_id],
+                |r| r.get::<_, String>(0),
+            ).optional().unwrap();
+            published.is_some()
+        }).await;
+        published.unwrap()
     };
     eventually("connected", Duration::from_secs(30), || {
         env.slack_status()["state"] == json!("connected")

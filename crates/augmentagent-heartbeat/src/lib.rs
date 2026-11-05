@@ -12,9 +12,11 @@
 pub mod checklist;
 pub mod config;
 pub mod decision;
+pub mod outreach;
 pub mod runner;
 pub mod store_ext;
 
 pub use config::{ActiveHours, HeartbeatConfig};
 pub use decision::Decision;
+pub use outreach::{Outreach, OutreachEntry, OutreachResult, RosterEntry};
 pub use runner::{heartbeat_opts, HeartbeatRunner, RunOptions, RunReport};

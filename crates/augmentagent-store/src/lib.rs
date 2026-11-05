@@ -4,6 +4,8 @@
 //! Opens the database in WAL journal mode so the Express dashboard can read
 //! concurrently.
 
+// #1833 — trusted-contact autonomy state.
+pub mod autonomy;
 // #1289 — durable approval-card pointers per surface.
 pub mod email_guards;
 pub mod conversation_context;

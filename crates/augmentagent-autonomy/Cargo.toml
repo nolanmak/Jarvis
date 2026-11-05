@@ -1,0 +1,40 @@
+[package]
+name = "augmentagent-autonomy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Trusted-contact autonomy (#1833): trust config, canonical handles, action registry, durable records."
+
+[dependencies]
+augmentagent-store = { path = "../augmentagent-store" }
+augmentagent-messages = { path = "../augmentagent-messages" }
+augmentagent-wiki = { path = "../augmentagent-wiki" }
+# C5–C9: the gate, planner, broker decorator and sweeps live here. Only the
+# CLI depends on this crate, so depending on the channel crates is no cycle.
+augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
+augmentagent-channel-core = { path = "../augmentagent-channel-core" }
+augmentagent-channel-calendar = { path = "../augmentagent-channel-calendar" }
+augmentagent-channel-email = { path = "../augmentagent-channel-email" }
+# C10: the heartbeat outreach sink is implemented here (the heartbeat
+# crate depends on neither this crate nor the CLI).
+augmentagent-heartbeat = { path = "../augmentagent-heartbeat" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+tokio = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+mockito = "1"

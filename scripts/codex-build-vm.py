@@ -44,7 +44,7 @@ class Runtime:
     def load(cls, path):
         config = private_json(path)
         expected = {'qemu', 'kernel', 'busybox', 'firmware', 'data_dir', 'library_dir', 'module_dir', 'modules', 'memory_mb'}
-        optional = {'toolchain', 'registry', 'cargo_git'}
+        optional = {'toolchain', 'registry', 'cargo_git', 'ort_cache'}
         if not expected <= set(config) or set(config) - expected - optional or type(config['memory_mb']) is not int or not 512 <= config['memory_mb'] <= 4096:
             raise Unavailable('invalid VM runtime configuration')
         if not isinstance(config['modules'], list) or not 1 <= len(config['modules']) <= 32:
@@ -52,9 +52,13 @@ class Runtime:
         for key in optional & set(config):
             # Dependency trees are untrusted guest inputs, not host executables.
             # Cargo commonly creates them group-writable; export them read-only.
+            if not isinstance(config[key], str):
+                raise Unavailable('invalid read-only dependency directory')
             candidate = Path(config[key])
             if not candidate.is_absolute() or not candidate.is_dir():
                 raise Unavailable('invalid read-only dependency directory')
+            if key == 'ort_cache' and candidate.resolve() != candidate:
+                raise Unavailable('ONNX dependency cache must be a literal directory')
             if key == 'toolchain':
                 info = candidate.stat()
                 if info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022:
@@ -114,6 +118,10 @@ def seed_build_cache():
 if job.get('build_cache'):
     environment.update({'CARGO_HOME':'/build-cache/cargo-home','CARGO_TARGET_DIR':'/build-cache/target'})
 environment.update(job['environment'])
+if job.get('ort_cache'):
+    # ort-sys uses its target/distribution hash beneath this cache. Export only
+    # the explicit operator dependency tree; never the host's cache or HOME.
+    environment['ORT_CACHE_DIR']='/ort-cache'
 if job.get('ci_context'):
     environment.update({'GIT_ALTERNATE_OBJECT_DIRECTORIES':'/ci-git-objects','GIT_CONFIG_NOSYSTEM':'1','RUSTUP_TOOLCHAIN':'/toolchain','CARGO_NET_OFFLINE':'false',
         'CARGO_BUILD_JOBS':'1','CARGO_PROFILE_DEV_DEBUG':'0','CARGO_PROFILE_TEST_DEBUG':'0'})
@@ -325,7 +333,7 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
             raise Unavailable('registry gateway certificate setup failed') from error
         entries = []
         for name in ('bootstrap', 'dev', 'proc', 'sys', 'tmp', 'modules', 'usr', 'workspace', 'etc', 'home',
-                     'cargo', 'cargo/registry', 'cargo/git', 'toolchain', 'etc/alternatives'):
+                     'cargo', 'cargo/registry', 'cargo/git', 'toolchain', 'ort-cache', 'etc/alternatives'):
             entries.append((name, stat.S_IFDIR | (0o1777 if name == 'tmp' else 0o755), b'', 0, 0))
         entries.extend([('root', stat.S_IFDIR | 0o700, b'', 0, 0), ('root/control', stat.S_IFDIR | 0o700, b'', 0, 0)])
         entries.extend([('etc/jarvis-registry-ca.pem', stat.S_IFREG | 0o444, certificate.read_bytes(), 0, 0),
@@ -356,7 +364,7 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
         if build_cache is not None:
             dependency_mounts.append(f'/bootstrap/busybox mkdir -p {BUILD_CACHE_MOUNT} || poweroff -f')
             dependency_mounts.append(f'mount -t ext4 -o nosuid,nodev,discard /dev/vda {BUILD_CACHE_MOUNT} || poweroff -f')
-        for key, destination in [('toolchain', '/toolchain'), ('registry', '/cargo/registry'), ('cargo_git', '/cargo/git')]:
+        for key, destination in [('toolchain', '/toolchain'), ('registry', '/cargo/registry'), ('cargo_git', '/cargo/git'), ('ort_cache', '/ort-cache')]:
             if key in config:
                 shares.append((key, Path(config[key]), True))
                 dependency_mounts.append(f'mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev {key} {destination} || poweroff -f')
@@ -385,7 +393,8 @@ poweroff -f
         entries.extend([('init', stat.S_IFREG | 0o755, boot.encode(), 0, 0),
             ('guest.py', stat.S_IFREG | 0o400, GUEST_RUNNER.encode(), 0, 0),
             ('job.json', stat.S_IFREG | 0o400, json.dumps({'argv': argv, 'environment': environment,
-                'uid': os.getuid(), 'gid': os.getgid(), 'build_cache': build_cache is not None,'ci_context':ci_context is not None}).encode(), 0, 0)])
+                'uid': os.getuid(), 'gid': os.getgid(), 'build_cache': build_cache is not None,'ci_context':ci_context is not None,
+                'ort_cache':'ort_cache' in config}).encode(), 0, 0)])
         image = private / 'initrd.gz'; image.write_bytes(initrd(entries))
         command = qemu_command(config, image, shares, build_cache)
         host_environment = {'PATH': os.defpath, 'LD_LIBRARY_PATH': config['library_dir'], 'QEMU_MODULE_DIR': config['module_dir']}

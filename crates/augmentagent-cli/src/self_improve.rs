@@ -42,6 +42,10 @@ use augmentagent_channel_core::{build_workflow_reasoner as build_reasoner, Fallb
 
 #[path = "self_improve_ci.rs"]
 mod shared_ci;
+#[path = "self_improve_hosted_ci.rs"]
+mod hosted_ci;
+#[path = "self_improve_baseline_priority.rs"]
+mod baseline_priority;
 
 #[path = "self_improve_episode.rs"]
 mod episode;
@@ -1864,11 +1868,12 @@ async fn ready_for_merge(repo_root: &Path, pr: u64, draft: Option<bool>) -> Opti
 mod optional_checks;
 
 async fn checks_green(repo_root: &Path, pr: u64) -> Option<bool> {
-    // gh can return nonzero with valid JSON when an optional check is pending
-    // or failing. Decide from individual checks, not its aggregate exit code.
-    let (_, out, _) = run(&gh_bin(),
-        &["pr", "checks", &pr.to_string(), "--json", "name,state,link"], repo_root).await.ok()?;
-    ci_checks_green(&optional_checks::classify(repo_root,pr,&out).await)
+    let evidence = hosted_ci::observe(repo_root, Some(pr), None).await.ok()?;
+    match evidence.state.as_str() {
+        "passed" => Some(true),
+        "pending" | "failed" => Some(false),
+        _ => None,
+    }
 }
 
 fn is_optional_review_check(row: &serde_json::Value) -> bool {
@@ -1899,10 +1904,10 @@ fn failed_ci_checks(raw: &str) -> Vec<(String, Option<u64>)> {
 }
 
 async fn failed_ci_findings(repo_root: &Path, pr: u64) -> Option<String> {
-    // gh returns nonzero for red/pending checks, with valid JSON on stdout.
-    let (_, out, _) = run(&gh_bin(), &["pr", "checks", &pr.to_string(),
-        "--json", "name,bucket,link"], repo_root).await.ok()?;
-    let failed = failed_ci_checks(&optional_checks::classify(repo_root,pr,&out).await);
+    let evidence = hosted_ci::observe(repo_root, Some(pr), None).await.ok()?;
+    if evidence.state != "failed" { return None; }
+    let failed: Vec<_> = evidence.failures.iter().take(5).map(|row|
+        (row["name"].as_str().unwrap_or("unnamed check").to_owned(), row["job"].as_u64())).collect();
     if failed.is_empty() { return None; }
     let mut findings = String::from(
         "GitHub CI failed on the previously pushed PR head. Reproduce these failures \
@@ -1912,8 +1917,7 @@ async fn failed_ci_findings(repo_root: &Path, pr: u64) -> Option<String> {
     for (name, job) in failed {
         findings.push_str(&format!("\nFailed check: {name}\n"));
         if let Some(job) = job {
-            if let Ok((true, log, _)) = run(&gh_bin(), &["run", "view", "--job",
-                &job.to_string(), "--log-failed"], repo_root).await {
+            if let Ok((true, log, _)) = run(&gh_bin(), &["api", &format!("repos/{{owner}}/{{repo}}/actions/jobs/{job}/logs")], repo_root).await {
                 findings.push_str(&truncate_tail(&log, 2000));
             }
         }
@@ -4570,26 +4574,91 @@ fn changed_crates(paths: &str) -> Option<Vec<String>> {
 /// Build + test ONLY the given crates (#870). Used between revision rounds,
 /// where the full single-threaded workspace suite (~5 min) was re-verifying
 /// 30+ untouched crates after every round — ~20 of the 49 minutes of a
-/// three-round run. The FULL gate still runs exactly once before anything is
-/// pushed or merged; this trims the redundancy, not the bar.
-async fn verification_gate_targeted(worktree: &Path, crates: &[String], audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<()> {
-    gate_disk_guard()?;
-    shared_ci::targeted(worktree, crates, audit).await
+/// three-round run. Hosted CI now runs after publication; intermediate rounds
+/// record a pending publication preflight instead of starting local CI.
+async fn verification_gate_targeted(worktree: &Path, crates: &[String], audit: &Arc<augmentagent_channel_core::AuditLogger>) -> CiGateResult {
+    CiGateResult(async {
+        #[cfg(test)]
+        if shared_ci::fixture::selected(worktree)?.is_some() {
+            gate_disk_guard()?;
+            return shared_ci::targeted(worktree, crates, audit).await;
+        }
+        let _ = crates;
+        hosted_ci::preflight(worktree, audit).await
+    }.await)
 }
 
 /// Gate for an intermediate revision round: targeted when the diff stays
 /// inside `crates/`, full otherwise.
-async fn gate_for_round(worktree: &Path, changed_paths: &str, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<()> {
+async fn gate_for_round(worktree: &Path, changed_paths: &str, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> CiGateResult {
     match changed_crates(changed_paths) {
         Some(crates) => verification_gate_targeted(worktree, &crates, audit).await,
         None => verification_gate(worktree, audit).await,
     }
 }
 
-async fn verification_gate(worktree: &Path, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<()> {
-    audit.dispatch_allowed()?;
-    gate_disk_guard()?;
-    shared_ci::verify(worktree, audit).await
+async fn verification_gate(worktree: &Path, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> CiGateResult {
+    CiGateResult(async {
+        audit.dispatch_allowed()?;
+        #[cfg(test)]
+        if shared_ci::fixture::selected(worktree)?.is_some() {
+            gate_disk_guard()?;
+            return shared_ci::verify(worktree, audit).await;
+        }
+        hosted_ci::preflight(worktree, audit).await
+    }.await)
+}
+
+/// Productive callers must persist infrastructure recovery before treating a
+/// gate error as repairable code. Diagnostics have no productive workflow.
+#[must_use]
+struct CiGateResult(Result<()>);
+
+#[derive(Debug)]
+struct CiInfrastructureDeferred {
+    workflow: String,
+    eligible_at_ms: i64,
+}
+impl std::fmt::Display for CiInfrastructureDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: CI infrastructure deferred until {}; candidate and evidence preserved",
+            self.workflow, self.eligible_at_ms)
+    }
+}
+impl std::error::Error for CiInfrastructureDeferred {}
+
+impl CiGateResult {
+    /// Outer errors stop the attempt. Only the inner code failure may enter a
+    /// repair branch, after infrastructure and capacity have been ruled out.
+    async fn for_workflow(self, workflow: &mut workflow::WorkflowGuard) -> Result<Result<()>> {
+        let error=match self.0 {
+            Ok(())=>{
+                workflow.verification_gate_passed(crate::autoship_workflow::VerificationDomain::Ci).await?;
+                return Ok(Ok(()));
+            }
+            Err(error)=>error,
+        };
+        if error.downcast_ref::<hosted_ci::AwaitingHostedCi>().is_some() {
+            // Publication can proceed. Do not clear infrastructure history or
+            // record verification_gate_passed before GitHub has tested the head.
+            return Ok(Ok(()));
+        }
+        // Capacity has its own durable recovery and accounting boundary.
+        if workflow.audit_logger().resource_capacity_seen() {
+            return Err(error);
+        }
+        if let Some(eligible_at_ms) = workflow.defer_verification_infrastructure(&error).await? {
+            // The gate future has returned. Record a checked release, not
+            // a task drop, so the five-minute retry is not lease-blocked.
+            workflow.finish_ci_deferral()?;
+            return Err(CiInfrastructureDeferred {
+                workflow: workflow.id().to_owned(), eligible_at_ms,
+            }.into());
+        }
+        Ok(Err(error))
+    }
+
+    fn diagnostic(self) -> Result<()> { self.0 }
 }
 
 // ---------------------------------------------------------------------------
@@ -4952,66 +5021,14 @@ struct RedMain {
     gate_err: Option<String>,
 }
 
-/// #932 — is `origin/main` red? The full verification gate runs once per
-/// main SHA on a clean detached worktree (sandboxed env, shared target dir)
-/// and the answer is cached; every later tick costs one `git rev-parse`.
-/// `None` also when the gate itself could not run (worktree/fetch failure)
-/// — the loop then proceeds exactly as before #932.
-async fn main_is_red(repo_root: &Path) -> Option<RedMain> {
-    let sha = origin_main_sha(repo_root).await?;
-    let path = baseline_cache_path();
-    let mut cache = BaselineCache::load(&path);
-    if cache.needs_full_check(&sha) {
-        let short = sha.get(..7).unwrap_or(&sha);
-        info!(
-            sha = short,
-            "self-improve: full gate on origin/main (once per main commit)"
-        );
-        let now = chrono::Utc::now();
-        match full_gate_on_main(repo_root).await {
-            Ok(Ok(())) => cache.record_full(&sha, &[], None, now),
-            Ok(Err(gate_err)) => {
-                let text = format!("{gate_err:#}");
-                // #1407 (#960 item 1) — a gate that died on the box (full
-                // disk, OOM, network) says nothing about `main`. Recording
-                // it would hold the loop on a red verdict nothing re-checks.
-                if let Some(why) = baseline_infra_reason(&text) {
-                    warn!(
-                        sha = short,
-                        "full gate on origin/main failed on infra ({why}); verdict not recorded, \
-                         next tick re-runs it"
-                    );
-                    return None;
-                }
-                let failing = failing_tests(&text);
-                warn!(
-                    sha = short,
-                    failing = %failing.join(", "),
-                    "origin/main is RED: {}",
-                    truncate(&text, 600)
-                );
-                cache.record_full(&sha, &failing, Some(truncate(&text, 4000)), now);
-            }
-            Err(e) => {
-                warn!("could not run the full gate on origin/main; proceeding as before: {e:#}");
-                return None;
-            }
-        }
-        cache.save(&path);
-    }
-    if !cache.is_red(&sha) {
-        return None;
-    }
-    let gate_err = cache.gate_err_for(&sha).cloned();
-    let packages = gate_err
-        .as_deref()
-        .map(failing_packages)
-        .unwrap_or_default();
-    Some(RedMain {
-        failing: cache.failing_for(&sha).to_vec(),
-        packages,
-        gate_err,
-        sha,
+/// Main health comes from exact-commit GitHub Actions. Incomplete or unknown
+/// hosted evidence yields without a local build or a cached red/green verdict.
+async fn main_is_red(repo_root: &Path) -> std::result::Result<Option<RedMain>, baseline_priority::Deferred> {
+    // Re-read hosted evidence on every observation: reruns can change the
+    // verdict without a new commit. Never reuse the legacy local-gate cache.
+    hosted_ci::main_status(repo_root).await.map_err(|error| {
+        warn!("GitHub main CI unavailable; yielding without local build: {error:#}");
+        baseline_priority::Deferred::DiagnosticUnavailable
     })
 }
 
@@ -5023,7 +5040,7 @@ fn baseline_infra_reason(gate_text: &str) -> Option<&'static str> {
 
 /// Run [`verification_gate`] on a clean detached checkout of `origin/main`.
 /// Outer `Err` = could not even try; inner `Err` = the gate is red.
-async fn full_gate_on_main(repo_root: &Path) -> Result<Result<()>> {
+async fn full_gate_on_main(repo_root: &Path, source: &str) -> Result<Result<()>> {
     // Outer `Err`: with no room to build, the gate was not run at all.
     gate_disk_guard()?;
     let lane = lane_from_env().worktree_name();
@@ -5039,7 +5056,7 @@ async fn full_gate_on_main(repo_root: &Path) -> Result<Result<()>> {
             "add",
             "--detach",
             &worktree.to_string_lossy(),
-            "origin/main",
+            source,
         ],
         repo_root,
     )
@@ -5047,7 +5064,7 @@ async fn full_gate_on_main(repo_root: &Path) -> Result<Result<()>> {
     if !ok {
         bail!("baseline: worktree add from origin/main failed: {e}");
     }
-    let verdict = verification_gate(&worktree, &standalone_resource_audit(&worktree)?).await;
+    let verdict = verification_gate(&worktree, &standalone_resource_audit(&worktree)?).await.diagnostic();
     if let Err(error)=reclaim_worktree(repo_root, &worktree, &branch).await {
         warn!(path=%worktree.display(),"baseline cleanup failed; preserving gate verdict and checkout: {error:#}");
     }
@@ -5088,8 +5105,8 @@ fn red_main_title(red: &RedMain) -> String {
 
 fn red_main_body(red: &RedMain, recent_commits: &str) -> String {
     let mut b = format!(
-        "{RED_MAIN_MARKER}\nAuto-filed by the auto-PR loop: `origin/main` at `{}` fails its \
-         own verification gate, so every issue's gate is red until this is fixed. \
+        "{RED_MAIN_MARKER}\nAuto-filed by the auto-PR loop: `origin/main` at `{}` fails its GitHub Actions \
+         checks, so autonomous merges wait until this is fixed. \
          This issue outranks all other work.\n\n",
         red.sha
     );
@@ -6285,13 +6302,15 @@ const RABBIT_NOT_WAITED_FOR: &str =
     "CodeRabbit is advisory and was not waited for; it reviews the merged \
      commit and anything it finds becomes a follow-up issue.";
 
-/// Optional notes must not hold up a merge, even when GitHub hangs.
+/// Optional notes must not hold up a merge or replace its canonical source.
+/// PR bodies carry owner requirements and closing-issue references; recovery
+/// observations belong in comments so later adoption cannot scope the note.
 async fn write_optional_pr_note(repo_root: &Path, selector: &str, body: &str) -> bool {
     if augmentagent_channel_core::public_report::validate("", body).is_err() {
         return false;
     }
     let mut command = Command::new(gh_bin());
-    command.args(["pr", "edit", selector, "--body", body])
+    command.args(["pr", "comment", selector, "--body", body])
         .current_dir(repo_root).stdin(Stdio::null()).kill_on_drop(true);
     matches!(tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await,
         Ok(Ok(out)) if out.status.success())
@@ -6495,7 +6514,7 @@ async fn resume_draft_pr(
         return Ok(RunReport::held(format!("PR #{pr}: another worker owns its worktree")));
     };
     let repository = workflow::canonical_repository(repo_root).await?;
-    let worktree = workflow::prepare_resume_worktree_at_head(repo_root, pr, branch, expected_head).await?;
+    let worktree = workflow::prepare_resume_candidate(repo_root, &repository, pr, branch, expected_head).await?;
     let contract = format!("{}\n{}\n{}", issue.title, issue.body, pr_body);
     let (toolchain_ok, toolchain, _) = run("rustc", &["--version", "--verbose"], &worktree).await?;
     anyhow::ensure!(toolchain_ok, "cannot identify verifier toolchain");
@@ -6837,7 +6856,7 @@ async fn resume_draft_pr(
             let (_ok, names, _) =
                 run("git", &["diff", "--name-only", "origin/main...HEAD"], &worktree).await?;
             gate_for_round(&worktree, &names, &workflow.audit_logger()).await
-        };
+        }.for_workflow(&mut workflow).await?;
         if let Err(gate_err) = gate_result {
             if workflow.audit_logger().resource_capacity_seen() { return Err(gate_err); }
             if let Some(report)=capacity_accounting.report()? {return Ok(report);}
@@ -7010,7 +7029,7 @@ async fn resume_draft_pr(
                 &issue.title, &worktree, &mut prepared_acceptance, &acceptance_control, structured, &mut workflow).await? {
                 previous_review = None; prior_qa = None; prior_notes = None;
                 resumed_criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
-                verification_gate(&worktree, &workflow.audit_logger()).await?;
+                verification_gate(&worktree, &workflow.audit_logger()).await.for_workflow(&mut workflow).await??;
                 continue;
             }
             workflow.record_review(&format!("resume-structured-{review_attempt}"), independent.approved(),
@@ -7090,7 +7109,7 @@ async fn resume_draft_pr(
             if rounds_done > 0 {
                 // Revisions were verified crate-targeted; nothing merges
                 // without the full suite passing once (#870).
-                if let Err(gate_err) = verification_gate(&worktree, &workflow.audit_logger()).await {
+                if let Err(gate_err) = verification_gate(&worktree, &workflow.audit_logger()).await.for_workflow(&mut workflow).await? {
                     workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                     let _ = run(
                         &gh,
@@ -7309,7 +7328,7 @@ async fn resume_draft_pr(
     }
     }.await;
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
-    outcome
+    capacity_accounting.settle_ci(outcome)
 }
 
 /// Reclaim only clean, registered, detached baseline worktrees.
@@ -7317,6 +7336,8 @@ async fn reclaim_worktree(repo_root: &Path, worktree: &Path, branch: &str) -> Re
     let primary = workspace::primary_root(repo_root).await?;
     recovery::checkout_path(&primary, worktree)?;
     if !worktree.try_exists()? { return Ok(()); }
+    anyhow::ensure!(crate::build_storage::ci_holds::may_cleanup_after_reconcile(worktree)?,
+        "checkout has an unresolved CI cleanup hold; preserved");
     // Only disposable baseline checkouts are reclaimed here. Candidates use
     // durable recovery; unknown paths and dirty/unmerged work are never erased.
     anyhow::ensure!(matches!(branch, "agent-baseline/current" | "agent-baseline/resume"),
@@ -7594,6 +7615,15 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 }};
                 crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
                     .finish_command_attempt(&id,selected_at,outcome,reason,chrono::Utc::now().timestamp_millis())?;
+                // One job's rejected target is that job's outcome (recorded
+                // above with its retry backoff), not a failed tick: the next
+                // turn still serves other work.
+                if let Err(error)=&result {
+                    if let Some(failure)=error.downcast_ref::<targeted::CommandFailure>().filter(|failure|failure.code==2) {
+                        warn!(workflow=%id,reason=failure.reason,"auto-PR command job rejected; other work continues: {error:#}");
+                        return Ok(RunReport::triage(format!("Command job {id} rejected: {}",failure.reason)));
+                    }
+                }
                 return result;
             }
         }
@@ -7612,7 +7642,10 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             targeted::Resolved::Issue(issue)=>crate::autoship_workflow::submission::Target::Issue(issue.number),
             targeted::Resolved::Pr(pr)=>crate::autoship_workflow::submission::Target::Pr(pr.pr),
         });
-        targeted::execution_preflight(repo_root,target,mode).await?;
+        let selected_pr=selected.as_ref().and_then(|selected|match selected {
+            targeted::Resolved::Pr(pr)=>Some(pr),_=>None,
+        });
+        targeted::execution_preflight(repo_root,target,mode,selected_pr).await?;
     }
     // #816 — single-flight. Held for the whole run; dropped on every exit
     // path. A losing run reports idle so it consumes no daily budget.
@@ -7647,8 +7680,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     // the tick unbilled rather than buy a doomed build.
     let lane = lane_from_env();
     let red_main_issue: Option<Issue> = if let Some(issue)=selected_issue {Some(issue)} else { match main_is_red(repo_root).await {
-        None => None,
-        Some(red) => {
+        Err(reason) => return Ok(RunReport::held(format!("optional main diagnostic deferred: {reason}"))),
+        Ok(None) => None,
+        Ok(Some(red)) => {
             let short = red.sha.get(..7).unwrap_or(&red.sha).to_string();
             let what = if red.failing.is_empty() {
                 "workspace does not build".to_string()
@@ -8322,7 +8356,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         // compiler/test output verbatim and repairs while budget remains. The
         // rounds come out of the same revise budget the review loop draws on,
         // so a run never spends more revision calls than it could before.
-        let mut gate_result = verification_gate(&worktree, &workflow_guard.audit_logger()).await;
+        let mut gate_result = verification_gate(&worktree, &workflow_guard.audit_logger()).await.for_workflow(&mut workflow_guard).await?;
         while let Err(gate_err) = &gate_result {
             if workflow_guard.audit_logger().resource_capacity_seen() { return Err(gate_result.unwrap_err()); }
             if let Some(report)=capacity_accounting.report()? {return Ok(report);}
@@ -8376,7 +8410,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                     let names = run("git", &["diff", "--cached", "--name-only", candidate_base], &worktree).await?.1;
                     gated = touches_verify_gated_path(&names);
                     summary = format!("{summary}\n\nGate repair {round}: {}", truncate(&rs, 200));
-                    gate_result = verification_gate(&worktree, &workflow_guard.audit_logger()).await;
+                    gate_result = verification_gate(&worktree, &workflow_guard.audit_logger()).await.for_workflow(&mut workflow_guard).await?;
                 }
             }
         }
@@ -8520,7 +8554,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                     acceptance_receipt = Some(acceptance::verify_with_repair(reasoner.as_ref(), &issue, &worktree,
                         &mut prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
                     criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
-                    verification_gate(&worktree, &workflow_guard.audit_logger()).await?;
+                    verification_gate(&worktree, &workflow_guard.audit_logger()).await.for_workflow(&mut workflow_guard).await??;
                     let (ok, revised_diff, error) = run("git", &["diff", "origin/main...HEAD"], &worktree).await?;
                     anyhow::ensure!(ok, "amended candidate diff unavailable: {error}");
                     lines = diff_line_count(&revised_diff); full_diff = revised_diff;
@@ -8690,7 +8724,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                     }
                     let (_ok, names2, _) =
                         run("git", &["diff", "--cached", "--name-only", candidate_base], &worktree).await?;
-                    if let Err(gate_err) = gate_for_round(&worktree, &names2, &workflow_guard.audit_logger()).await {
+                    if let Err(gate_err) = gate_for_round(&worktree, &names2, &workflow_guard.audit_logger()).await.for_workflow(&mut workflow_guard).await? {
                         warn!(issue = issue.number, "post-revision gate failed: {gate_err:#}");
                         // #873 — a red gate gets a repair round while budget
                         // remains: red→fix is the other half of TDD, and a
@@ -8867,7 +8901,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             // Intermediate rounds ran the targeted gate (#870); everything that
             // ships — or even lands as a PR claiming workspace-pass — gets the
             // FULL suite exactly once here.
-            if let Err(gate_err) = verification_gate(&worktree, &workflow_guard.audit_logger()).await {
+            if let Err(gate_err) = verification_gate(&worktree, &workflow_guard.audit_logger()).await.for_workflow(&mut workflow_guard).await? {
                 warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:final-gate", &detail, &diff_touched_paths(&full_after), lines) })).await.unwrap_or_else(|_| Tally::uncounted());
@@ -9419,7 +9453,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     )))
     }.await;
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
-    outcome
+    capacity_accounting.settle_ci(outcome)
 }
 
 /// The pipeline owns this untracked worktree. It must not make the deploy
@@ -11288,6 +11322,7 @@ impl AttemptRecord {
 /// charged; a failure `main` already has is handled by #931 instead.
 fn infra_failure_reason(text: &str) -> Option<&'static str> {
     const SIGNS: &[(&str, &str)] = &[
+        ("acceptance infrastructure unavailable", "acceptance verifier infrastructure"),
         ("shared ci prerequisite unavailable", "shared CI environment prerequisite"),
         ("storage busy:", "storage busy"),
         ("build storage busy; retry admission", "storage busy"),
@@ -11992,6 +12027,9 @@ impl AutoPrLoop {
 #[cfg(test)]
 #[path = "self_improve_lifecycle_tests.rs"]
 mod lifecycle_tests;
+#[cfg(test)]
+#[path = "self_improve_pr_notes_tests.rs"]
+mod pr_notes_tests;
 
 #[cfg(test)]
 #[path = "self_improve_progress_tests.rs"]
@@ -12959,9 +12997,13 @@ for tool, arguments in [
             let body = &src[at..at + 900];
             assert!(body.contains("gate_disk_guard()?"), "{sig} skips the disk guard");
         }
-        // And the baseline must not cache an infra failure as red.
+        // Hosted main observations never enter local storage admission or
+        // reuse a cached local verdict; missing evidence yields the tick.
         let at = src.find("async fn main_is_red(").expect("main_is_red");
-        assert!(src[at..at + 2000].contains("baseline_infra_reason(&text)"));
+        let body = &src[at..src[at..].find("\n///").unwrap() + at];
+        assert!(body.contains("hosted_ci::main_status"));
+        assert!(!body.contains("gate_disk_guard"));
+        assert!(!body.contains("full_gate_on_main("));
     }
 
     #[test]
@@ -18439,7 +18481,7 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
         let start = src.find("async fn run_selected(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end");
         let body = &src[start..end];
-        let gate = body.find("if let Err(gate_err) = verification_gate(&worktree, &workflow_guard.audit_logger()).await {").expect("gate arm");
+        let gate = body.find("if let Err(gate_err) = verification_gate(&worktree, &workflow_guard.audit_logger()).await.for_workflow(&mut workflow_guard).await? {").expect("gate arm");
         // The arm's first return is #931's unbilled "red on main too" exit;
         // the charged path (after record_attempt) must be the billed one.
         let charged = gate + body[gate..].find("record_attempt(").expect("gate record");
