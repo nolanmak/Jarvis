@@ -21,7 +21,7 @@ impl WorkflowStore {
         let mut reviews=Vec::new();
         for row in rows {
             let (kind,payload)=row?;
-            if matches!(kind.as_str(),"audit_generation_recovered"|"owner_turn_claimed"|"owner_contract_revised") {break;}
+            if matches!(kind.as_str(),"audit_generation_recovered"|"owner_turn_claimed"|"owner_contract_revised"|"owner_acceptance_registered") {break;}
             if kind=="review_recorded" {
                 if let Ok(review)=serde_json::from_str::<Review>(&payload) {
                     if review.binding==snapshot.checkpoint.binding {reviews.push(review);}

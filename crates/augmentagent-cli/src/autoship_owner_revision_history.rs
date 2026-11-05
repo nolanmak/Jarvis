@@ -12,6 +12,8 @@ struct Activation {
     next_contract: String,
     revision: u64,
     owner_message_sha256: String,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    baseline_receipts_sha256:Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,16 +37,18 @@ fn claimed(conn: &Connection, workflow: &str, generation: i64) -> Result<(i64, C
 }
 
 pub(super) fn validate(conn: &Connection, workflow: &str) -> Result<()> {
-    let mut query=conn.prepare("SELECT seq,generation,payload,at_ms FROM workflow_event WHERE workflow=?1 AND kind='owner_contract_revised' ORDER BY seq LIMIT 1025")?;
+    let mut query=conn.prepare("SELECT seq,generation,payload,at_ms,kind FROM workflow_event WHERE workflow=?1 AND kind IN ('owner_contract_revised','owner_acceptance_registered') ORDER BY seq LIMIT 1025")?;
     let mut rows=query.query([workflow])?;
     let mut revisions=BTreeMap::<String,(i64,Binding,i64)>::new();
-    let mut bytes=0usize;
+    let mut bytes=0usize;let mut initial_count=0i64;
     while let Some(row)=rows.next()? {
         ensure!(revisions.len()<1024,"owner revision history exceeds bound");
         let sequence:i64=row.get(0)?;let generation:i64=row.get(1)?;
         let raw:String=row.get(2)?;let at:i64=row.get(3)?;
         ensure!(raw.len()<=32*1024 && at>=0,"owner revision activation exceeds bound");
         let activation:Activation=strict(&raw)?;
+        let kind:String=row.get(4)?;let initial=kind=="owner_acceptance_registered";
+        ensure!(initial==activation.baseline_receipts_sha256.is_some(),"owner contract activation kind changed");
         ensure!(!revisions.contains_key(&activation.request_id),"duplicate owner revision activation");
         let (old,new,binding,body_hash,registration,activated_at):(String,String,String,String,String,i64)=conn.query_row(
             "SELECT previous_contract,next_contract,binding,owner_message_sha256,registration,activated_at FROM workflow_owner_revision WHERE request_id=?1",
@@ -58,6 +62,15 @@ pub(super) fn validate(conn: &Connection, workflow: &str) -> Result<()> {
             && body_hash==activation.owner_message_sha256 && activated_at==at
             && registration.contract_hash()==new && registration.contract().revision==activation.revision
             && binding.contract==new,"owner revision activation differs from registration");
+        if initial {
+            let receipts:String=conn.query_row("SELECT receipts FROM workflow_owner_initial_acceptance WHERE request_id=?1",[&activation.request_id],|r|r.get(0))?;
+            ensure!(receipts.len()<=4*1024*1024,"initial owner baseline exceeds bound");bytes=bytes.checked_add(receipts.len()).context("owner baseline history overflow")?;
+            ensure!(bytes<=128*1024*1024,"owner baseline history exceeds byte bound");
+            let receipts:Vec<VerifierReceipt>=strict(&receipts)?;
+            ensure!(registration.contract().revision==1 && registration.baseline_result(&receipts)?==BaselineResult::Reproduced
+                && activation.baseline_receipts_sha256.as_deref()==Some(baseline_digest(&receipts)?.as_str()),"initial owner baseline history changed");
+            initial_count+=1;
+        }
         let (before,after):(i64,i64)=conn.query_row(
             "SELECT previous_generation,next_generation FROM workflow_owner_revision_fence WHERE request_id=?1",
             [&activation.request_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
@@ -94,6 +107,8 @@ pub(super) fn validate(conn: &Connection, workflow: &str) -> Result<()> {
         let count:i64=conn.query_row(&format!("SELECT count(*) FROM {table} r JOIN workflow_owner_turn t ON t.request_id=r.request_id WHERE t.workflow=?1"),[workflow],|r|r.get(0))?;
         ensure!(count==revisions.len() as i64,"owner revision activation history missing");
     }
+    let count:i64=conn.query_row("SELECT count(*) FROM workflow_owner_initial_acceptance r JOIN workflow_owner_turn t ON t.request_id=r.request_id WHERE t.workflow=?1",[workflow],|r|r.get(0))?;
+    ensure!(count==initial_count,"initial owner acceptance history missing");
     let mut query=conn.prepare("SELECT request_id,lease_generation,binding,pause_revision FROM workflow_owner_turn WHERE workflow=?1 AND state IN ('claimed','uncertain','setup_refused') LIMIT 1026")?;
     let mut rows=query.query([workflow])?;let mut count=0;
     while let Some(row)=rows.next()? {

@@ -385,6 +385,8 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS workflow_review_floor (
                 workflow TEXT PRIMARY KEY REFERENCES command_job(workflow), after_seq INTEGER NOT NULL,
                 request_id TEXT NOT NULL REFERENCES discord_control_request(request_id));
+            CREATE TABLE IF NOT EXISTS workflow_owner_initial_acceptance (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_revision(request_id), receipts TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS workflow_owner_revision_fence (
                 request_id TEXT PRIMARY KEY REFERENCES workflow_owner_revision(request_id),
                 previous_generation INTEGER NOT NULL, next_generation INTEGER NOT NULL);

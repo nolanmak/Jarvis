@@ -175,6 +175,29 @@ mod tests {
     }
 
     #[test]
+    fn queued_followups_preserve_only_the_current_live_owner_turn() {
+        for disposition in ["active","expired","explicitly-fenced"] {
+            let dir=tempfile::tempdir().unwrap();let (mut store,id)=setup(&dir.path().join("state.db"));
+            let turn=store.claim_owner_turn(&id,"consumer",4,if disposition=="expired"{1}else{100}).unwrap().unwrap();
+            if disposition=="explicitly-fenced" {store.set_owner_pause(&id,"owner",turn.pause_revision,true,5).unwrap();}
+            let before=store.owner_control(&id).unwrap().unwrap();
+            let origin=discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:46};
+            assert!(store.enqueue_owner_message(&origin,&id,"Then fix the next test",None,6).unwrap().accepted);
+            let after=store.owner_control(&id).unwrap().unwrap();assert!(after.paused);assert_eq!(store.pending_owner_messages(&id).unwrap(),2);
+            if disposition=="active" {
+                assert_eq!(after,before,"queued follow-up revoked the active coding turn");
+                store.validate_owner_turn(&turn,7).unwrap();store.validate_dispatch(&turn.lease,&turn.binding,7).unwrap();
+                assert!(store.begin_operation(&turn.lease,OperationKind::Push,&turn.binding,7).is_err());
+                store.set_owner_pause(&id,"owner",after.revision,true,8).unwrap();
+                assert!(store.validate_dispatch(&turn.lease,&turn.binding,9).is_err(),"explicit pause lost its fence");
+            }else {
+                assert_eq!(after.revision,before.revision+1);assert!(store.validate_dispatch(&turn.lease,&turn.binding,7).is_err());
+            }
+            assert!(store.claim_owner_turn(&id,"must-not-overtake",8,100).unwrap().is_none());assert_eq!(store.merge_allowance(8,5).unwrap().confirmed,0);
+        }
+    }
+
+    #[test]
     fn owner_turn_claim_is_exclusive_and_timeout_never_replays_an_uncertain_turn() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let (mut store,id)=setup(&path);
         let turn=store.claim_owner_turn(&id,"owner-consumer",4,100).unwrap().expect("owner turn cannot acquire its paused candidate");

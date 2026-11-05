@@ -73,8 +73,16 @@ impl WorkflowStore {
             nonce:format!("{:x}",Sha256::digest(request_id.as_bytes()))[..24].into()};
         tx.execute("INSERT INTO discord_control_request(request_id,principal,origin,message_sha256,workflow,response,state,created_at) VALUES(?1,?2,?3,?4,?5,?6,'queued',?7)",params![request_id,origin.principal(),serde_json::to_string(origin)?,digest,workflow,serde_json::to_string(&reply)?,now])?;
         if accepted {
-            let revision=super::owner_control::read(&tx,workflow)?.map_or(0,|c|c.revision);
-            super::owner_control::apply_in_transaction(&tx,workflow,&origin.principal(),revision,true,now)?;
+            let control=super::owner_control::read(&tx,workflow)?;
+            let revision=control.as_ref().map_or(0,|c|c.revision);
+            // Ordinary follow-ups queue behind the same unexpired owner turn.
+            // They pause future automation without revoking a turn already
+            // processing accepted input. Explicit controls still advance the
+            // revision and fence it, as do expired or superseded leases.
+            let owner_turn=control.as_ref().is_some_and(|c|c.paused) && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_owner_turn t JOIN workflow w ON w.id=t.workflow WHERE t.workflow=?1 AND t.state='claimed' AND t.owner=w.owner AND t.lease_generation=w.generation AND t.pause_revision=?2 AND w.lease_until>?3)",
+                params![workflow,revision,now],|r|r.get::<_,bool>(0))?;
+            if !owner_turn {super::owner_control::apply_in_transaction(&tx,workflow,&origin.principal(),revision,true,now)?;}
             tx.execute("INSERT INTO workflow_owner_message VALUES(?1,?2,?3,'pending',?4)",params![request_id,workflow,body,now])?;
             super::review_epoch::invalidate(&tx,workflow,&request_id)?;
         }

@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "af881938532ac593d13a0253133625875d36af64",
+  "source_parent_commit": "29b94a650da1883dfc293d6f6973c75fdb7c470d",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -46,11 +46,11 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
-      "sha256": "4d1ac5211f1bc9013f53e1244a04b593d6b686171665509541b2a6de83dee044"
+      "sha256": "0daea20dd5acc60969a2d1d001bb2d1081755bd5bd87d2124061591f20c2c5eb"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
-      "sha256": "5f68dec3ae81d7ca94a64129cd2c669391666e4861855d26cb3493294ef10db9"
+      "sha256": "706b6a7847f0ffec7663d20e57ca5593a103bcd01ef1f2a271f7c9bef01350be"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_preparation.rs",
@@ -110,7 +110,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "02eba342552eab6510711e8552fc9a438424b643bcfbf49bae86d240973f8a57"
+      "sha256": "55549550568d0b87bd45be4c581e2d2a21277827ad38a9a536b2d3a47a6bf81b"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_recovery.rs",
@@ -134,24 +134,28 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve.rs",
-      "sha256": "5809cf093bff767c8729412583b55b0a176d32d2b152edf25b0a6411124ffe3c"
+      "sha256": "6c896dfa7063003d74683da2471d072ce692be64ea1cc785351d7ef6c2d45440"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_revision_history.rs",
-      "sha256": "e4e43c4414c55209defebf61c81006f36de5d0a0bab6e8db0d8213be1d1cbaf7"
+      "sha256": "ca747bd294917fa0f97e455c8bb76c950c7fbd2826bcf9ac4bfa38d80e425f3b"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_revision.rs",
-      "sha256": "a9fc4ac0bfc7e52d9d53077f86f620ad2d764e5d943a55ecc990833a272a350e"
+      "sha256": "5091aa71a9a3d7f461605e46cc7bdb7072d0ccb4032022f85bca46dbf14c95b7"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_inbox.rs",
-      "sha256": "7391154ae0e9fcfabe941e47f81ee4e4c83384b037cf0237b126ae16ecf38f1c"
+      "sha256": "534b225890e6571989f14c931ca415fdbf564342c37bc49e1084da8657d2a0ec"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_review_epoch.rs",
+      "sha256": "f283cba8cfc19de7d343b3ff78e97ca78503c168ea555e5ffb9396c973aae922"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1854,
+    "passed": 1855,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
@@ -268,7 +272,15 @@
       "autoship-owner-early-candidate-red.log",
       "autoship-owner-early-candidate-green.log",
       "autoship-owner-early-candidate-full-cli.log",
-      "autoship-owner-early-candidate-production-check.log"
+      "autoship-owner-early-candidate-production-check.log",
+      "autoship-owner-initial-acceptance-red.log",
+      "autoship-owner-initial-acceptance-green.log",
+      "autoship-owner-initial-acceptance-full-cli.log",
+      "autoship-owner-initial-acceptance-production-check.log",
+      "autoship-owner-followup-serialization-red.log",
+      "autoship-owner-followup-serialization-green.log",
+      "autoship-owner-initial-acceptance-validated-full-cli.log",
+      "autoship-owner-initial-acceptance-validated-production-check.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -439,7 +451,9 @@
     "consuming owner contract revision returns a new native guard only after original-store handoff; Codex/Claude retain their exact session; failed setup stays claimed with pending input and no timeout replay",
     "owner revision checks selected native configuration and original binding before metadata activation, then revalidates the native owner/binding before returning; disappearance regression preserves old contract/generation and pending input",
     "owner turn claim and dispatch authenticate exact pending input against immutable accepted ingress; ten corruption/routing cases refuse, and active selector changes never retarget accepted input",
-    "owner input arriving before candidate registration can enter the first native guard while preserving the owner pause; registration event failure rolls back origin and candidate together; surviving history never becomes a fresh origin"
+    "owner input arriving before candidate registration can enter the first native guard while preserving the owner pause; registration event failure rolls back origin and candidate together; surviving history never becomes a fresh origin",
+    "raw owner intake can register its first pinned acceptance contract through a private guard capability, atomic baseline history and a new native guard; old callbacks are fenced and input remains pending",
+    "a queued plain follow-up preserves only a matching unexpired owner turn; expired/superseded leases and explicit pause retain their fences"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -537,7 +551,7 @@
     "ordinary_and_observational_guard_acquisition": true,
     "merge_sweep": true,
     "runtime_deployed": false,
-    "guard_fixture_scope": "37 actual guard subprocess modes in the full CLI: 31 earlier modes plus six early-input registration/refusal/retry modes. Real protected native-store operations, scripted private Discord metadata and disposable Git candidates; no provider/model/VM dispatch or deployed acceptance.",
+    "guard_fixture_scope": "46 actual guard subprocess modes in the full CLI: 37 earlier modes plus nine initial-acceptance success/refusal/history/setup modes. Real protected native-store operations and disposable Git, scripted Discord ingress and synthetic baseline receipts; no provider/model/VM dispatch or deployed acceptance.",
     "pre_guard_retired_aborted_namespace_resolution": true,
     "all_closed_original_binding_recovery": true,
     "all_closed_original_binding_recovery_scope": "complete intact original history, registered retired namespaces and resolved aborted destinations, original selected policy and existing audit authority; vanished/legacy/corrupt authority remains held",
@@ -551,7 +565,9 @@
     "owner_contract_revision_guard_handoff": true,
     "owner_revision_history_validated": true,
     "owner_first_candidate_registration": true,
-    "owner_inbox_payload_authentication": true
+    "owner_inbox_payload_authentication": true,
+    "owner_initial_acceptance_registration": true,
+    "owner_followup_serialization": true
   },
   "productive_caller_enabled_scope": "deployment activation remains unproven; supported guard source paths are connected as described in source_caller_integration",
   "closed_workflow_recovery_limits": {
@@ -845,6 +861,114 @@
       {
         "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
         "sha256": "02eba342552eab6510711e8552fc9a438424b643bcfbf49bae86d240973f8a57"
+      }
+    ]
+  },
+  "owner_initial_acceptance": {
+    "source_parent_commit": "29b94a650da1883dfc293d6f6973c75fdb7c470d",
+    "source_generation_authority": false,
+    "guard_transition_connected": true,
+    "initial_kind_distinct_from_registered_revision": true,
+    "private_unregistered_intake_capability": true,
+    "baseline_receipts_durable_and_hashed": true,
+    "worker_consumer_connected": false,
+    "discord_coding_gateway_enabled": false,
+    "deployed": false,
+    "provider_transport_dispatch": false,
+    "behavior_red": [
+      {
+        "log": "autoship-owner-initial-acceptance-red.log",
+        "assertion": "initial acceptance must rebind its owner turn before dispatch: head or contract changed"
+      },
+      {
+        "log": "autoship-owner-followup-serialization-red.log",
+        "assertion": "queued follow-up revoked the active coding turn"
+      }
+    ],
+    "targeted_owner_tests": {
+      "log": "autoship-owner-followup-serialization-green.log",
+      "passed": 27,
+      "failed": 0
+    },
+    "guard_subprocess_modes": 46,
+    "initial_modes": [
+      "registered first contract advances generation/native guard",
+      "green baseline refuses",
+      "activation event failure rolls back",
+      "missing baseline history blocks dispatch",
+      "native setup failure preserves claimed input",
+      "tampered baseline blocks dispatch",
+      "missing native configuration refuses before activation",
+      "registered contract cannot be reinterpreted as raw intake",
+      "wrong source refuses"
+    ],
+    "serialization_cases": [
+      "unexpired current owner turn keeps its control revision when plain follow-up queues",
+      "expired owner turn remains fenced",
+      "explicitly fenced turn is not revived",
+      "explicit pause still fences an active owner turn after a follow-up queued"
+    ],
+    "checks": [
+      "nonserializable guard-only capability permits raw intake to register revision one without inventing a prior RegisteredContract",
+      "canonical source, unchanged head, pinned registration integrity and intended-red baseline classification are required",
+      "initial activation, baseline receipt digest, generation fence and current turn join atomically; corrupt or missing history refuses dispatch",
+      "the shared original-store native handoff completes before a new guard escapes; failed setup never becomes an unstarted replay",
+      "ordinary acceptance binding refuses paused owner turns before changing local binding state",
+      "pending input, pause, review invalidation and shipping denial remain; owner input is not marked applied"
+    ],
+    "fixture_scope": "Real disposable Git and original native-store guard/handoff operations; scripted private Discord ingress and synthetic baseline observations/receipts. No executable-baseline, model/provider/VM/Discord live acceptance is claimed by these guard fixtures.",
+    "full_cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "passed": 1855,
+      "failed": 0,
+      "ignored": 33,
+      "log": "autoship-owner-initial-acceptance-validated-full-cli.log"
+    },
+    "production_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "exit_code": 0,
+      "log": "autoship-owner-initial-acceptance-validated-production-check.log"
+    },
+    "remaining": [
+      "actual owner worker scheduling and execution",
+      "independent owner contract/harness preparation and private verifier/control-root integration",
+      "current native proof tied to real owner dispatch before input completion, plus durable private reply",
+      "interrupted initial/revision transition and fenced/uncertain input recovery",
+      "Discord gateway activation, required hosted CI/exact-head review and normal rollout",
+      "full #1715 CLI/Discord acceptance and unattended soak"
+    ],
+    "sources": [
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_revision.rs",
+        "sha256": "5091aa71a9a3d7f461605e46cc7bdb7072d0ccb4032022f85bca46dbf14c95b7"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_revision_history.rs",
+        "sha256": "ca747bd294917fa0f97e455c8bb76c950c7fbd2826bcf9ac4bfa38d80e425f3b"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_inbox.rs",
+        "sha256": "534b225890e6571989f14c931ca415fdbf564342c37bc49e1084da8657d2a0ec"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+        "sha256": "0daea20dd5acc60969a2d1d001bb2d1081755bd5bd87d2124061591f20c2c5eb"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_review_epoch.rs",
+        "sha256": "f283cba8cfc19de7d343b3ff78e97ca78503c168ea555e5ffb9396c973aae922"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+        "sha256": "706b6a7847f0ffec7663d20e57ca5593a103bcd01ef1f2a271f7c9bef01350be"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/self_improve.rs",
+        "sha256": "6c896dfa7063003d74683da2471d072ce692be64ea1cc785351d7ef6c2d45440"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+        "sha256": "55549550568d0b87bd45be4c581e2d2a21277827ad38a9a536b2d3a47a6bf81b"
       }
     ]
   }

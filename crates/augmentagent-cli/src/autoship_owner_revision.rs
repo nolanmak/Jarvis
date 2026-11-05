@@ -1,33 +1,66 @@
 //! Owner-request-bound activation of registered contract metadata.
 use super::*;
 use super::owner_turn::OwnerTurn;
-use crate::autoship_contract::RegisteredContract;
+use crate::autoship_contract::{RegisteredContract,VerifierReceipt,BaselineResult,AcceptanceSource};
 #[path="autoship_owner_revision_history.rs"]
 mod history;
 pub(super) fn validate_history(conn:&Connection,workflow:&str)->Result<()> {history::validate(conn,workflow)}
+fn baseline_digest(receipts:&[VerifierReceipt])->Result<String> {
+    Ok(format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(receipts)?)?)))
+}
 impl WorkflowStore {
     /// Controller supplies an independently prepared registration. This records
     /// metadata activation only: baseline/candidate checks and review still gate shipping.
     pub fn activate_owner_revision(&mut self,turn:&OwnerTurn,previous:&RegisteredContract,next:&RegisteredContract,binding:&Binding,root:&Path,now:i64)->Result<OwnerTurn> {
-        previous.verify_metadata()?;next.verify_integrity(root)?;binding.validate()?;
-        ensure!(previous.contract().source()?==next.contract().source()? && next.contract().revision==previous.contract().revision.checked_add(1).context("contract revision overflow")?,"owner contract source or revision mismatch");
-        ensure!(previous.baseline_head()==next.baseline_head(),"owner revision changed the registered baseline");
-        ensure!(binding.head==turn.binding.head && binding.contract==next.contract_hash(),"owner revision binding mismatch");
-        for prior in &previous.contract().criteria {
-            ensure!(next.contract().criteria.iter().any(|criterion|criterion.id==prior.id && criterion.requirement==prior.requirement),"owner revision dropped or changed a prior requirement");
-        }
+        self.activate_owner_contract(turn,Some(previous),next,None,binding,root,now)
+    }
+    /// Only the owning guard can attest that its current contract is still
+    /// unregistered intake. Registration is not owner-input completion.
+    pub(crate) fn activate_initial_owner_acceptance(&mut self,proof:&crate::self_improve::InitialOwnerAcceptance,
+        turn:&OwnerTurn,next:&RegisteredContract,baseline:&[VerifierReceipt],binding:&Binding,root:&Path,now:i64)->Result<OwnerTurn> {
+        ensure!(proof.matches(turn),"initial owner acceptance guard changed");
+        let request=self.command_request(&turn.lease.workflow)?.context("initial owner acceptance command missing")?;
+        let expected=match next.contract().source()? {
+            AcceptanceSource::Issue(n)=>workflow_id(&request.repository,n)?,
+            AcceptanceSource::PullRequest(n)=>pr_workflow_id(&request.repository,n)?,
+        };
+        ensure!(expected==turn.lease.workflow,"initial owner acceptance source changed");
+        self.activate_owner_contract(turn,None,next,Some(baseline),binding,root,now)
+    }
+    fn activate_owner_contract(&mut self,turn:&OwnerTurn,previous:Option<&RegisteredContract>,next:&RegisteredContract,
+        baseline:Option<&[VerifierReceipt]>,binding:&Binding,root:&Path,now:i64)->Result<OwnerTurn> {
+        next.verify_integrity(root)?;binding.validate()?;
+        ensure!(binding.head==turn.binding.head && binding.contract==next.contract_hash(),"owner contract binding mismatch");
+        let (old,kind)=if let Some(previous)=previous {
+            previous.verify_metadata()?;
+            ensure!(baseline.is_none() && previous.contract().source()?==next.contract().source()?
+                && next.contract().revision==previous.contract().revision.checked_add(1).context("contract revision overflow")?,"owner contract source or revision mismatch");
+            ensure!(previous.baseline_head()==next.baseline_head(),"owner revision changed the registered baseline");
+            for prior in &previous.contract().criteria {ensure!(next.contract().criteria.iter().any(|criterion|criterion.id==prior.id && criterion.requirement==prior.requirement),"owner revision dropped or changed a prior requirement");}
+            (previous.contract_hash(),"owner_contract_revised")
+        }else{
+            ensure!(next.contract().revision==1 && next.baseline_result(baseline.context("initial owner baseline missing")?)?==BaselineResult::Reproduced,
+                "initial owner acceptance requires revision one and reproduced baseline");
+            (turn.binding.contract.as_str(),"owner_acceptance_registered")
+        };
         for scope in &next.contract().allowed_paths {
             let path=match scope {crate::autoship_contract::PathScope::File(path)|crate::autoship_contract::PathScope::Directory(path)=>path};
-            ensure!(!crate::autoship_review::immutable_control_path(path),"owner revision touches protected controls");
-            if matches!(scope,crate::autoship_contract::PathScope::Directory(_)) {ensure!(previous.contract().allowed_paths.contains(scope),"owner revision adds a broad directory scope");}
+            ensure!(!crate::autoship_review::immutable_control_path(path),"owner contract touches protected controls");
+            if let Some(previous)=previous {if matches!(scope,crate::autoship_contract::PathScope::Directory(_)) {ensure!(previous.contract().allowed_paths.contains(scope),"owner revision adds a broad directory scope");}}
         }
+        let baseline_json=baseline.map(serde_json::to_string).transpose()?;
+        ensure!(baseline_json.as_ref().is_none_or(|raw|raw.len()<=4*1024*1024),"initial owner baseline exceeds bound");
+        let baseline_hash=baseline.map(baseline_digest).transpose()?;
         let registration=serde_json::to_string(next)?;ensure!(registration.len()<=4*1024*1024,"owner revision registration exceeds bound");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_history(&tx,&turn.lease.workflow)?;
         let body_hash=format!("{:x}",Sha256::digest(turn.body.as_bytes()));
+        let expected_old=old;
         let prior:Option<(String,String,String,String)>=tx.query_row("SELECT previous_contract,next_contract,binding,owner_message_sha256 FROM workflow_owner_revision WHERE request_id=?1",[&turn.request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
         if let Some((old,new,recorded,body))=prior {
-            ensure!(old==previous.contract_hash() && new==next.contract_hash() && recorded==serde_json::to_string(binding)? && body==body_hash,"owner revision replay changed");
+            ensure!(old==expected_old && new==next.contract_hash() && recorded==serde_json::to_string(binding)? && body==body_hash,"owner revision replay changed");
+            let recorded_baseline:Option<String>=tx.query_row("SELECT receipts FROM workflow_owner_initial_acceptance WHERE request_id=?1",[&turn.request_id],|r|r.get(0)).optional()?;
+            ensure!(recorded_baseline==baseline_json,"owner contract activation kind or baseline replay changed");
             let fence:Option<(i64,i64)>=tx.query_row("SELECT previous_generation,next_generation FROM workflow_owner_revision_fence WHERE request_id=?1",[&turn.request_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             let (before,after)=fence.context("unfenced legacy owner revision requires reconciliation")?;
             ensure!(turn.lease.generation==before || turn.lease.generation==after,"owner revision lease changed");
@@ -35,16 +68,19 @@ impl WorkflowStore {
             super::owner_turn::validate_turn(&tx,&revised,now)?;return Ok(revised);
         }
         super::owner_turn::validate_turn(&tx,turn,now)?;
-        ensure!(turn.binding.contract==previous.contract_hash(),"previous contract differs from claimed owner turn");
-        tx.execute("INSERT INTO workflow_owner_revision VALUES(?1,?2,?3,?4,?5,?6,?7)",params![turn.request_id,previous.contract_hash(),next.contract_hash(),serde_json::to_string(binding)?,body_hash,registration,now])?;
+        ensure!(turn.binding.contract==expected_old,"previous contract differs from claimed owner turn");
+        tx.execute("INSERT INTO workflow_owner_revision VALUES(?1,?2,?3,?4,?5,?6,?7)",params![turn.request_id,expected_old,next.contract_hash(),serde_json::to_string(binding)?,body_hash,registration,now])?;
+        if let Some(raw)=baseline_json {tx.execute("INSERT INTO workflow_owner_initial_acceptance VALUES(?1,?2)",params![turn.request_id,raw])?;}
         let generation=turn.lease.generation.checked_add(1).context("owner revision generation overflow")?;
         let revised=OwnerTurn {lease:Lease {generation,..turn.lease.clone()},binding:binding.clone(),..turn.clone()};
         tx.execute("INSERT INTO workflow_owner_revision_fence VALUES(?1,?2,?3)",params![turn.request_id,turn.lease.generation,generation])?;
-        let checkpoint=Checkpoint {stage:Stage::Scope,binding:binding.clone(),evidence:Vec::new(),next:NextAction {reason:"owner_contract_revised".into(),action:"verify_owner_revision".into(),eligible_at_ms:now}};
+        let checkpoint=Checkpoint {stage:Stage::Scope,binding:binding.clone(),evidence:Vec::new(),next:NextAction {reason:kind.into(),action:if baseline.is_some(){"verify_owner_acceptance".into()}else{"verify_owner_revision".into()},eligible_at_ms:now}};
         tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3,generation=?4 WHERE id=?1",params![turn.lease.workflow,serde_json::to_string(&checkpoint)?,now,generation])?;
         tx.execute("UPDATE workflow_owner_turn SET binding=?2,lease_generation=?3 WHERE request_id=?1",params![turn.request_id,serde_json::to_string(binding)?,generation])?;
         super::review_epoch::invalidate(&tx,&turn.lease.workflow,&turn.request_id)?;
-        event(&tx,&turn.lease.workflow,generation,"owner_contract_revised",&serde_json::json!({"request_id":turn.request_id,"previous_contract":previous.contract_hash(),"next_contract":next.contract_hash(),"revision":next.contract().revision,"owner_message_sha256":body_hash}).to_string(),now)?;
+        let mut activation=serde_json::json!({"request_id":turn.request_id,"previous_contract":expected_old,"next_contract":next.contract_hash(),"revision":next.contract().revision,"owner_message_sha256":body_hash});
+        if let Some(hash)=baseline_hash {activation["baseline_receipts_sha256"]=hash.into();}
+        event(&tx,&turn.lease.workflow,generation,kind,&activation.to_string(),now)?;
         event(&tx,&turn.lease.workflow,generation,"checkpoint",&serde_json::to_string(&checkpoint)?,now)?;
         validate_history(&tx,&turn.lease.workflow)?;tx.commit()?;Ok(revised)
     }

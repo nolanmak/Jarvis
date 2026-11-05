@@ -75,7 +75,7 @@ pub(crate) fn policy_held_drafts() -> Vec<(u64, String)> {
 mod source_reconcile;
 #[path = "self_improve_workflow.rs"]
 mod workflow;
-pub(crate) use workflow::UnstartedOwnerTurnSetup;
+pub(crate) use workflow::{UnstartedOwnerTurnSetup,InitialOwnerAcceptance};
 #[path = "self_improve_recovery.rs"]
 mod recovery;
 #[path = "self_improve_workspace.rs"]
