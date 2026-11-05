@@ -1,12 +1,12 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "d38e3fb660306c7259176f9e46d696b6b7a1d997",
+  "source_parent_commit": "73728c80195ea653f43baa10b405aa3d2ba0dccd",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
     {
       "path": "crates/augmentagent-cli/src/autoship_native_handoff.rs",
-      "sha256": "8527c0e2790760e8137c975267cb0bac4f2b276da3f08ab7dfb8e24e05dd80c0"
+      "sha256": "7e6930d9b817bf7097693c30547796f94386564c2dd906c85f70d18b45b021bc"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_launch.rs",
@@ -14,7 +14,11 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
-      "sha256": "426db9ff9431b9ba3bba77fe8c0706056192577098a9539c95ee8b5637796f7f"
+      "sha256": "8a653df31c747b44e9e1b02925815a7139865247e7b23ccd24c21bf45e22b1e8"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
+      "sha256": "2983be5b396df1483b8a8a157bfb918bc0e134a2215335a04b7db2654092346a"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
@@ -22,29 +26,39 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_settlement.rs",
-      "sha256": "c67467c5a3242a2ea07b70a9007c0210c0adbdeb2b5cd03a7737b9eba3fd467d"
+      "sha256": "f73ff1e8485ee570fccd86d9b655046c925596f60734c60dd7d2c743b466380d"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_control.rs",
+      "sha256": "504a72a8c244abf35fbd64ce6e1bc5177e88ae3927a2957e21307976bae3d94a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+      "sha256": "1297f37d94b0a6543b63b4ff5fde57d02bb313b44a073a5874f4663a9dce67b1"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
-      "sha256": "fddf83bd8c147db5688eca8e75ef16aa41a566487b52e38a74de8f92879be4d1"
+      "sha256": "9fbad8fc1a529014f83105589f6ba4729eef4032a013228a2ca859aa60274011"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1776,
+    "passed": 1782,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
     "pending_handoff_cases": 8,
     "retained_logs": [
-      "autoship-native-settlement-initial-fixture-failure.log",
-      "autoship-native-settlement-red.log",
-      "autoship-native-settlement-green.log",
-      "autoship-native-settlement-focused.log",
-      "autoship-native-settlement-full.log"
+      "autoship-native-owner-eligibility-red.log",
+      "autoship-native-owner-eligibility-green.log",
+      "autoship-native-owner-eligibility-json-failure.log",
+      "autoship-native-owner-eligibility-focused.log",
+      "autoship-native-owner-eligibility-full.log"
     ],
     "settlement_cases": 7,
-    "handoff_component_cases": 25
+    "handoff_component_cases": 31,
+    "owner_eligibility_cases": 6,
+    "focused_native_observation_cases": 33
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -59,7 +73,11 @@
     "historical settlement under a newer reconciliation lease grants no current-context promotion",
     "repeated handoffs resolve effective ownership without rewriting original observations or creation/export bytes",
     "changed policy can reconcile original receipts but cannot grant changed-selection native admission",
-    "corrupt completion and missing original store remain held/unknown"
+    "corrupt completion and missing original store remain held/unknown",
+    "transferred registrations remain history without blocking active-owner or retirement selection",
+    "bound retry cleanup requires matching durable owner resume event and original native binding",
+    "plain-text/malformed event payloads cannot create cleanup authority or break JSON parsing",
+    "unavailable transfer history retains cleanup/retry intents while eligible peers advance"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -71,7 +89,6 @@
   "hosted_ci": "pending current published head",
   "remaining": [
     "production preparation/promotion caller integration across all acquisition, owner-turn, recovery and merge-sweep leases",
-    "retirement/owner selection must account for transferred source dispositions",
     "actual retained/retired-runtime inventory scan join before productive handoff preparation",
     "terminal and namespace cleanup-only settlement and authenticated legacy/uncertainty/corrupt-state recovery",
     "normal protected rollout and actual Codex/Claude Discord continuation acceptance",

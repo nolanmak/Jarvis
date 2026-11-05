@@ -12,7 +12,7 @@ struct Completed {
     pending: PendingNativeHandoff,
     receipt: TransferReceipt,
 }
-fn read_completed(tx: &Transaction<'_>, workflow: &str, id: &str) -> Result<(i64, Completed)> {
+fn read_completed(tx: &Connection, workflow: &str, id: &str) -> Result<(i64, Completed)> {
     let (pending_sequence,snapshot,sequence,raw):(i64,u64,i64,String)=tx.query_row(
         "SELECT pending_sequence,snapshot_sequence,sequence,record FROM workflow_native_handoff_completed WHERE workflow=?1 AND transfer_id=?2",
         params![workflow,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?.context(TransferReason::InventoryMissing)?;
@@ -111,7 +111,7 @@ fn read_completed(tx: &Transaction<'_>, workflow: &str, id: &str) -> Result<(i64
     Ok((sequence, completed))
 }
 fn validate_owner(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     workflow: &str,
     owner: &Authority,
     binding: &TransferBinding,
@@ -132,7 +132,7 @@ pub(crate) struct History {
     outgoing: BTreeMap<(i64, String), usize>,
 }
 impl History {
-    pub(crate) fn load(tx: &Transaction<'_>, workflow: &str, before: u64) -> Result<Self> {
+    pub(crate) fn load(tx: &Connection, workflow: &str, before: u64) -> Result<Self> {
         let indexed = {
             let mut q=tx.prepare("SELECT transfer_id,sequence,length(CAST(record AS BLOB)) FROM workflow_native_handoff_completed WHERE workflow=?1 ORDER BY sequence LIMIT 1025")?;
             let rows = q
@@ -191,6 +191,9 @@ impl History {
             TransferReason::InventoryMissing
         );
         Ok(result)
+    }
+    pub(crate) fn transferred_source(&self, generation: i64, audit: &str) -> bool {
+        self.outgoing.contains_key(&(generation, audit.to_owned()))
     }
     pub(crate) fn resolve(
         &self,

@@ -21,6 +21,13 @@ fn initial_registration_history(conn:&Connection,workflow:&str)->Result<bool> {
         [workflow],|row|row.get(0))?)
 }
 
+/// Logical closure comes from verified handoff history, never a bare flag.
+/// Original registrations remain immutable history and cannot become fresh origins.
+pub(super) fn unretired_owners(conn:&Connection,workflow:&str)->Result<bool> {
+    native_pending::settlement::History::load(conn,workflow,u64::MAX)?;
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner o WHERE o.workflow=?1 AND o.retired_at IS NULL AND NOT EXISTS(SELECT 1 FROM workflow_native_transferred_source d WHERE d.workflow=o.workflow AND d.lease_generation=o.lease_generation AND d.audit_path=o.audit_path))",[workflow],|r|r.get(0))?)
+}
+
 impl WorkflowStore {
     /// A selection hint only: registration rechecks history in its transaction.
     pub fn initial_native_owner_available(&self,workflow:&str)->Result<bool> {
@@ -141,8 +148,9 @@ impl WorkflowStore {
         .transpose()
     }
 
-    /// A saved binding alone grants no cleanup. Only an exact durable terminal
-    /// or independently verified audit-recovery intent may close its owner.
+    /// A saved binding alone grants no cleanup. Require the exact terminal,
+    /// audit-recovery or authenticated owner execution-retry intent. A source
+    /// already transferred cannot authorize retirement of its new owner.
     pub fn native_retirement_is_current(&self,workflow:&str,generation:i64,audit_path:&str,binding:&TransferBinding)->Result<bool> {
         native_retirement_matches(&self.conn,workflow,generation,audit_path,binding,true)
     }
@@ -159,8 +167,9 @@ impl WorkflowStore {
 }
 fn native_retirement_matches(conn:&Connection,workflow:&str,generation:i64,audit_path:&str,binding:&TransferBinding,pending_only:bool)->Result<bool> {
     binding.validate()?;
+    native_pending::settlement::History::load(conn,workflow,u64::MAX)?;
     let raw:Option<String>=conn.query_row(
-        "SELECT b.binding FROM workflow_native_owner o JOIN workflow_native_owner_binding b ON b.workflow=o.workflow AND b.lease_generation=o.lease_generation WHERE o.workflow=?1 AND o.lease_generation=?2 AND o.audit_path=?3 AND o.retirement_reason IN ('terminal_workflow','quiescent_audit_recovery') AND (?4=0 OR o.retired_at IS NULL)",
+        "SELECT b.binding FROM workflow_native_owner o JOIN workflow_native_owner_binding b ON b.workflow=o.workflow AND b.lease_generation=o.lease_generation WHERE o.workflow=?1 AND o.lease_generation=?2 AND o.audit_path=?3 AND (o.retirement_reason IN ('terminal_workflow','quiescent_audit_recovery') OR (o.retirement_reason='owner_execution_retry' AND EXISTS(SELECT 1 FROM owner_execution_retry r JOIN workflow_owner_control_event c ON c.workflow=r.workflow AND c.revision=r.owner_revision AND c.paused=0 JOIN workflow_event e ON e.workflow=r.workflow AND e.generation=r.generation AND e.kind='owner_execution_retry_requested' WHERE r.workflow=o.workflow AND r.generation>=o.lease_generation AND r.state IN ('pending','superseded','completed') AND json_extract(CASE WHEN json_valid(e.payload) THEN e.payload ELSE '{}' END,'$.owner_revision')=r.owner_revision AND json_extract(CASE WHEN json_valid(e.payload) THEN e.payload ELSE '{}' END,'$.principal')=c.principal))) AND (?4=0 OR o.retired_at IS NULL) AND NOT EXISTS(SELECT 1 FROM workflow_native_transferred_source d WHERE d.workflow=o.workflow AND d.lease_generation=o.lease_generation AND d.audit_path=o.audit_path)",
         params![workflow,generation,audit_path,pending_only],|row|row.get(0)).optional()?;
     raw.map(|raw|->Result<bool> {
         let saved:TransferBinding=serde_json::from_str(&raw)?;saved.validate()?;Ok(saved==*binding)

@@ -1568,9 +1568,22 @@ impl WorkflowStore {
             let rows=statement.query_map([limit as i64],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
+        let mut eligible=std::collections::BTreeSet::new();
+        let workflows:std::collections::BTreeSet<_>=rows.iter().map(|r|r.0.as_str()).collect();
+        for workflow in workflows {
+            match native_pending::settlement::History::load(&tx,workflow,u64::MAX) {
+                Ok(history)=>for row in rows.iter().filter(|r|r.0==workflow) {
+                    if !history.transferred_source(row.1,&row.2) {eligible.insert(row.clone());}
+                },
+                Err(_)=>tracing::warn!(workflow,"native retirement held: handoff history unavailable; original intents retained"),
+            }
+        }
+        // Rotate even held/transferred rows so one namespace cannot monopolize
+        // the bounded cleanup window and starve eligible peers.
         for (workflow,generation,_) in &rows {
             tx.execute("UPDATE workflow_native_owner SET attempted_at=?3 WHERE workflow=?1 AND lease_generation=?2",params![workflow,generation,now])?;
         }
+        let rows=rows.into_iter().filter(|r|eligible.contains(r)).collect();
         tx.commit()?;
         Ok(rows)
     }

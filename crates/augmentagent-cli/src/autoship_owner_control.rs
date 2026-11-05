@@ -45,7 +45,10 @@ impl WorkflowStore {
             let candidate=match retry_checkpoint(&tx,&workflow,now,true) {
                 Ok(candidate)=>candidate,
                 Err(error) if error.to_string()=="execution-retry-not-quiescent"=>continue,
-                Err(error)=>return Err(error),
+                Err(error)=>{
+                    tracing::warn!(workflow,error=%error,"owner retry held: reconciliation evidence unavailable; intent retained");
+                    continue;
+                },
             };
             let Some((mut checkpoint,current_generation))=candidate else {
                 tx.execute("UPDATE owner_execution_retry SET state='superseded' WHERE workflow=?1",[&workflow])?;
@@ -84,7 +87,7 @@ fn retry_checkpoint(tx:&Transaction<'_>,workflow:&str,now:i64,require_retired:bo
     let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed'))",[workflow],|r|r.get(0))?;
     ensure!(!blocked,"execution-retry-not-quiescent");
     if require_retired {
-        ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND retired_at IS NULL)",[workflow],|r|r.get::<_,bool>(0))?,"execution-retry-not-quiescent");
+        ensure!(!super::native_owner_binding::unretired_owners(tx,workflow)?,"execution-retry-not-quiescent");
     }
     Ok(Some((checkpoint,generation)))
 }
@@ -108,7 +111,7 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
             params![workflow,revision,paused,principal,now])?;
         tx.execute("INSERT INTO workflow_owner_control_event VALUES(?1,?2,?3,?4,?5)",params![workflow,revision,paused,principal,now])?;
         if let Some((mut checkpoint,generation))=retry {
-            let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND retired_at IS NULL)",[workflow],|r|r.get(0))?;
+            let pending=super::native_owner_binding::unretired_owners(tx,workflow)?;
             tx.execute("UPDATE workflow_native_owner SET retirement_reason='owner_execution_retry' WHERE workflow=?1 AND retired_at IS NULL AND retirement_reason IS NULL",[workflow])?;
             tx.execute("INSERT INTO owner_execution_retry(workflow,owner_revision,generation,binding,state,requested_at,attempted_at) VALUES(?1,?2,?3,?4,?5,?6,0) ON CONFLICT(workflow) DO UPDATE SET owner_revision=excluded.owner_revision,generation=excluded.generation,binding=excluded.binding,state=excluded.state,requested_at=excluded.requested_at,attempted_at=0",
                 params![workflow,revision,generation,serde_json::to_string(&checkpoint.binding)?,if pending {"pending"}else{"completed"},now])?;

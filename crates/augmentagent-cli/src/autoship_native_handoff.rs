@@ -383,7 +383,7 @@ pub(super) fn capture(
 }
 /// Historical reference read. This is not a physical/native-ledger proof.
 pub(super) fn validate_reference_raw(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     workflow: &str,
     revision: u64,
     sha: &str,

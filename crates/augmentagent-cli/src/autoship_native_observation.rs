@@ -1770,4 +1770,347 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_transferred_source_is_not_a_retirement_candidate() {
+        if child("native_transferred_source_is_not_a_retirement_candidate") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let (lease, pending, proof) = completed_native_handoff(&mut f);
+        f.store
+            .settle_native_handoff(&lease, &f.binding, &proof, now())
+            .unwrap();
+        let mut checkpoint = f
+            .store
+            .snapshot(&lease.workflow)
+            .unwrap()
+            .unwrap()
+            .checkpoint;
+        checkpoint.stage = Stage::Retired;
+        f.store.checkpoint(&lease, &checkpoint, now()).unwrap();
+        let rows = f.store.pending_native_retirements(now(), 16).unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                lease.workflow.clone(),
+                lease.generation,
+                pending.request.destination.audit_path.clone()
+            )]
+        );
+        let source = &pending.request.source_owners[0];
+        assert!(!f
+            .store
+            .native_retirement_is_current(
+                &lease.workflow,
+                source.owner.lease_generation,
+                &source.audit_path,
+                &pending.original_binding
+            )
+            .unwrap());
+        assert!(f
+            .store
+            .native_retirement_is_current(
+                &lease.workflow,
+                lease.generation,
+                &pending.request.destination.audit_path,
+                &pending.original_binding
+            )
+            .unwrap());
+    }
+    #[test]
+    fn native_transferred_sources_do_not_keep_a_retired_destination_active() {
+        if child("native_transferred_sources_do_not_keep_a_retired_destination_active") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let (lease, pending, proof) = completed_native_handoff(&mut f);
+        f.store
+            .settle_native_handoff(&lease, &f.binding, &proof, now())
+            .unwrap();
+        let mut checkpoint = f
+            .store
+            .snapshot(&lease.workflow)
+            .unwrap()
+            .unwrap()
+            .checkpoint;
+        checkpoint.stage = Stage::Retired;
+        f.store.checkpoint(&lease, &checkpoint, now()).unwrap();
+        augmentagent_channel_core::native_vm::retire_owned_runtimes(
+            &pending.original_binding,
+            Path::new(&pending.request.destination.audit_path),
+            &pending.request.destination.owner,
+            &|| Ok(()),
+        )
+        .unwrap();
+        f.store
+            .complete_bound_native_retirement(
+                &lease.workflow,
+                lease.generation,
+                &pending.request.destination.audit_path,
+                &pending.original_binding,
+                now(),
+            )
+            .unwrap();
+        assert!(!super::super::native_owner_binding::unretired_owners(
+            &f.store.conn,
+            &lease.workflow
+        )
+        .unwrap());
+        assert!(
+            !f.store
+                .initial_native_owner_available(&lease.workflow)
+                .unwrap(),
+            "historical owners were erased to manufacture a fresh origin"
+        );
+        let remaining:i64=f.store.conn.query_row("SELECT count(*) FROM workflow_native_owner WHERE workflow=?1 AND retired_at IS NULL",[&lease.workflow],|r|r.get(0)).unwrap();
+        assert_eq!(remaining, 1, "transfer was rewritten as retirement");
+    }
+
+    #[test]
+    fn native_owner_retry_accepts_only_the_authenticated_cleanup_intent() {
+        if child("native_owner_retry_accepts_only_the_authenticated_cleanup_intent") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let (lease, pending, proof) = completed_native_handoff(&mut f);
+        f.store
+            .settle_native_handoff(&lease, &f.binding, &proof, now())
+            .unwrap();
+        let mut checkpoint = f
+            .store
+            .snapshot(&lease.workflow)
+            .unwrap()
+            .unwrap()
+            .checkpoint;
+        checkpoint.stage = Stage::Held;
+        checkpoint.next = NextAction {
+            reason: "adopted_execution_retry".into(),
+            action: "resume_preserved_pr".into(),
+            eligible_at_ms: 0,
+        };
+        f.store.checkpoint(&lease, &checkpoint, now()).unwrap();
+        f.store.release(&lease, now()).unwrap();
+        f.store
+            .set_owner_pause(&lease.workflow, "github:owner", 0, false, now())
+            .unwrap();
+        assert!(f
+            .store
+            .native_retirement_is_current(
+                &lease.workflow,
+                lease.generation,
+                &pending.request.destination.audit_path,
+                &pending.original_binding
+            )
+            .unwrap());
+        let rows = f.store.pending_native_retirements(now(), 16).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, lease.generation);
+        augmentagent_channel_core::native_vm::retire_owned_runtimes(
+            &pending.original_binding,
+            Path::new(&pending.request.destination.audit_path),
+            &pending.request.destination.owner,
+            &|| Ok(()),
+        )
+        .unwrap();
+        f.store
+            .complete_bound_native_retirement(
+                &lease.workflow,
+                lease.generation,
+                &pending.request.destination.audit_path,
+                &pending.original_binding,
+                now(),
+            )
+            .unwrap();
+        assert_eq!(
+            f.store.settle_owner_execution_retries(now(), 16).unwrap(),
+            1
+        );
+        assert_eq!(
+            f.store
+                .snapshot(&lease.workflow)
+                .unwrap()
+                .unwrap()
+                .checkpoint
+                .stage,
+            Stage::Reconcile
+        );
+    }
+    #[test]
+    fn native_owner_retry_reason_without_resume_evidence_cannot_authorize_cleanup() {
+        if child("native_owner_retry_reason_without_resume_evidence_cannot_authorize_cleanup") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let (lease, pending, proof) = completed_native_handoff(&mut f);
+        f.store
+            .settle_native_handoff(&lease, &f.binding, &proof, now())
+            .unwrap();
+        f.store.conn.execute("UPDATE workflow_native_owner SET retirement_reason='owner_execution_retry' WHERE workflow=?1 AND lease_generation=?2",params![lease.workflow,lease.generation]).unwrap();
+        assert!(!f
+            .store
+            .native_retirement_is_current(
+                &lease.workflow,
+                lease.generation,
+                &pending.request.destination.audit_path,
+                &pending.original_binding
+            )
+            .unwrap());
+    }
+    #[test]
+    fn native_corrupt_transfer_history_retains_intents_without_starving_peer_cleanup() {
+        if child("native_corrupt_transfer_history_retains_intents_without_starving_peer_cleanup") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let (lease, pending, proof) = completed_native_handoff(&mut f);
+        f.store
+            .settle_native_handoff(&lease, &f.binding, &proof, now())
+            .unwrap();
+        let mut checkpoint = f
+            .store
+            .snapshot(&lease.workflow)
+            .unwrap()
+            .unwrap()
+            .checkpoint;
+        checkpoint.stage = Stage::Retired;
+        f.store.checkpoint(&lease, &checkpoint, now()).unwrap();
+        f.store.conn.execute("UPDATE workflow_native_transferred_source SET receipt_sha256='corrupt' WHERE workflow=?1",[&lease.workflow]).unwrap();
+        let peer = "owner/repo/pr/8";
+        f.store
+            .register(peer, "peer", f.binding.clone(), now())
+            .unwrap();
+        let peer_lease = f
+            .store
+            .claim(peer, "peer-controller", now(), 60_000)
+            .unwrap()
+            .unwrap();
+        let audit = f._root.path().join("logs/peer.jsonl");
+        f.store
+            .register_initial_native_owner(
+                &peer_lease,
+                &f.binding,
+                audit.to_str().unwrap(),
+                &pending.original_binding,
+                now(),
+            )
+            .unwrap();
+        let mut cp = f.store.snapshot(peer).unwrap().unwrap().checkpoint;
+        cp.stage = Stage::Retired;
+        f.store.checkpoint(&peer_lease, &cp, now()).unwrap();
+        let rows = f.store.pending_native_retirements(now(), 16).unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                peer.into(),
+                peer_lease.generation,
+                audit.to_str().unwrap().into()
+            )]
+        );
+        assert!(f
+            .store
+            .native_retirement_is_current(
+                &lease.workflow,
+                lease.generation,
+                &pending.request.destination.audit_path,
+                &pending.original_binding
+            )
+            .is_err());
+        let unretired:i64=f.store.conn.query_row("SELECT count(*) FROM workflow_native_owner WHERE workflow=?1 AND retired_at IS NULL",[&lease.workflow],|r|r.get(0)).unwrap();
+        assert_eq!(unretired, 2);
+    }
+
+    #[test]
+    fn native_bad_transfer_history_does_not_starve_ready_owner_retry() {
+        if child("native_bad_transfer_history_does_not_starve_ready_owner_retry") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let (lease, pending, proof) = completed_native_handoff(&mut f);
+        f.store
+            .settle_native_handoff(&lease, &f.binding, &proof, now())
+            .unwrap();
+        let mut checkpoint = f
+            .store
+            .snapshot(&lease.workflow)
+            .unwrap()
+            .unwrap()
+            .checkpoint;
+        checkpoint.stage = Stage::Held;
+        checkpoint.next = NextAction {
+            reason: "adopted_execution_retry".into(),
+            action: "resume_preserved_pr".into(),
+            eligible_at_ms: 0,
+        };
+        f.store.checkpoint(&lease, &checkpoint, now()).unwrap();
+        f.store.release(&lease, now()).unwrap();
+        f.store
+            .set_owner_pause(&lease.workflow, "github:owner", 0, false, now())
+            .unwrap();
+        f.store.conn.execute("UPDATE workflow_native_transferred_source SET receipt_sha256='corrupt' WHERE workflow=?1",[&lease.workflow]).unwrap();
+        let peer = "owner/repo/pr/8";
+        f.store
+            .register(peer, "peer", f.binding.clone(), now())
+            .unwrap();
+        let next = f
+            .store
+            .claim(peer, "peer-worker", now(), 60_000)
+            .unwrap()
+            .unwrap();
+        let audit = f._root.path().join("logs/peer.jsonl");
+        f.store
+            .register_initial_native_owner(
+                &next,
+                &f.binding,
+                audit.to_str().unwrap(),
+                &pending.original_binding,
+                now(),
+            )
+            .unwrap();
+        let mut cp = f.store.snapshot(peer).unwrap().unwrap().checkpoint;
+        cp.stage = Stage::Held;
+        cp.next = checkpoint.next.clone();
+        f.store.checkpoint(&next, &cp, now()).unwrap();
+        f.store.release(&next, now()).unwrap();
+        f.store
+            .set_owner_pause(peer, "github:owner", 0, false, now())
+            .unwrap();
+        let owner = RuntimeOwner {
+            workflow_id: peer.into(),
+            lease_generation: next.generation,
+        };
+        augmentagent_channel_core::native_vm::retire_owned_runtimes(
+            &pending.original_binding,
+            &audit,
+            &owner,
+            &|| Ok(()),
+        )
+        .unwrap();
+        f.store
+            .complete_bound_native_retirement(
+                peer,
+                next.generation,
+                audit.to_str().unwrap(),
+                &pending.original_binding,
+                now(),
+            )
+            .unwrap();
+        assert_eq!(
+            f.store.settle_owner_execution_retries(now(), 16).unwrap(),
+            1
+        );
+        assert_eq!(
+            f.store.snapshot(peer).unwrap().unwrap().checkpoint.stage,
+            Stage::Reconcile
+        );
+        assert_eq!(
+            f.store
+                .snapshot(&lease.workflow)
+                .unwrap()
+                .unwrap()
+                .checkpoint
+                .stage,
+            Stage::Held
+        );
+    }
+
 }
