@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "c97353c158e90a514a474d88800f0b17d398f2d0",
+  "source_parent_commit": "2a1baf51dd96379f32625513591fc4edf422c59b",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -26,7 +26,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
-      "sha256": "0369cb26107c9f398a6e77750c71bfe0173df194025ed0d2f85366f651921ef0"
+      "sha256": "d73b247b82c0a6dcd29be6316f6da0392780324dcdd61c0d959eb06e51e49d99"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
@@ -34,11 +34,11 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
-      "sha256": "0ca5063f3c6f84765eb5e830a62ce2a7f7d07892c8789721336d80d6da89c25a"
+      "sha256": "2edff526c5010ea0635e4212605682ed6876eadcd881564d18e2eac7a474666f"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_settlement.rs",
-      "sha256": "db4813a47f622e76fc06dab335a8041ed6f64f48e62e93900596854e60c5962d"
+      "sha256": "252ea9eb6e3cde077775b80c5bea41f955f2092336144a697415299c482df66a"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_control.rs",
@@ -50,7 +50,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
-      "sha256": "824ed46b4e228ef17e9e1cddb336c6714f29d20026c2567ff4ba2652af6eb842"
+      "sha256": "cc84a093f652a556ca398301b0805efb148f6190b30fea312449d12b241ca9a4"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_preparation.rs",
@@ -70,7 +70,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_prepare.rs",
-      "sha256": "224bf105065015150d91113a173bcc8e98c298ff95763405cfdd06bd93fe0ed4"
+      "sha256": "11f7cd3a464aba9d6e2674b27b71873bcae2d6972ec6af821762499fe94de2f4"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_reconciliation.rs",
@@ -78,15 +78,15 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_unstarted.rs",
-      "sha256": "37bbf2bfe3403ddf5994e53c666b88f20773edb80bc9f510ae42320e96181d46"
+      "sha256": "70544b9f926f5c89a59f5cedcb191d35ce6887ed4573d9325aa802b320b0553f"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_terminal.rs",
-      "sha256": "f5c4ff12137cc057852f21b447e88eed3dc16687c4616d715c8050642a14c215"
+      "sha256": "380efa595e08f8fbf70048fc03765984fc85a24b5324e724d090f3a872321cd9"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_aborted.rs",
-      "sha256": "b98e3c038df7cc38d5c3962cc5f03b7eafd7574b4233b4b322c0b89a1b55f47e"
+      "sha256": "4a3920e43932e20866e6305226eeece4e20875e4860844253f7ed59c6e22a997"
     },
     {
       "path": "crates/augmentagent-channel-core/src/audit_chain.rs",
@@ -99,11 +99,15 @@
     {
       "path": "crates/augmentagent-cli/src/autoship_native_abort_resolution.rs",
       "sha256": "7b109c410c9ea015fe8a8515bfd9a16649cbfe9d9bfb9975fe06b70ba90a4347"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_reconcile.rs",
+      "sha256": "5aa2a3af0b57c9fde323262ce5ab202ac69009b4cd3243dd7ebc0487d37e9a9f"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1821,
+    "passed": 1830,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
@@ -129,7 +133,11 @@
       "autoship-native-abort-resolution-red.log",
       "autoship-native-abort-resolution-green.log",
       "autoship-native-abort-resolution-full-core.log",
-      "autoship-native-abort-resolution-full-cli.log"
+      "autoship-native-abort-resolution-full-cli.log",
+      "autoship-native-pending-reconcile-red.log",
+      "autoship-native-pending-reconcile-green.log",
+      "autoship-native-reconcile-adapter-red.log",
+      "autoship-native-pending-reconcile-full-cli.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -154,7 +162,10 @@
     "aborted_acknowledgement_cases": 4,
     "retired_namespace_proof_cases": 3,
     "abort_namespace_resolution_cases": 3,
-    "core_validation_scope": "full managed core library suite; source inventory is post-run and grants no compiled-source freshness authority"
+    "core_validation_scope": "full managed core library suite; source inventory is post-run and grants no compiled-source freshness authority",
+    "pending_reconciliation_cases": 9,
+    "joined_reconciliation_adapter_cases": 1,
+    "core_validation_source_commit": "2a1baf51dd96379f32625513591fc4edf422c59b (891 passed, 15 ignored; core sources unchanged and not rerun for workflow-only change)"
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -229,7 +240,17 @@
     "immutable per-namespace resolution events/projections consume the borrowed capability; source retirement is acknowledged without creating an unpromoted destination registration, altering checkpoint/budgets/owner input or spending merge allowance",
     "one resolved namespace leaves its peers blocked; metadata barriers clear only after every namespace has validated retained resolution history, which survives database reopen",
     "namespace resolution insertion failure rolls back source disposition/events and retains barriers; corrupted resolution history holds readers/preparation/dispatch after reopen; exact terminal identity fences cleanup",
-    "original known-aborted pending context remains available as protected historical metadata after active acknowledgement and resolution; it never grants a native proof or new origin"
+    "original known-aborted pending context remains available as protected historical metadata after active acknowledgement and resolution; it never grants a native proof or new origin",
+    "shared reconciliation classifies the exact saved request in the original store; known Absent/Aborted acknowledgement, actual Completed settlement and Prepared replay retain UUID/observation/binding and perform no replacement allocation",
+    "same-generation known-Absent work replays the original request rather than acknowledging it as unstarted; newer leases acknowledge absence before later re-preparation",
+    "Prepared replay under a newer current lease revalidates exact active pending identity, owner/operation/source fences and current selected native policy, settles the historical destination without current-context promotion",
+    "Completed inspection supplies the opaque verified receipt under the native lock, allowing metadata settlement without audit handles or recursive native IO under the workflow mutex",
+    "terminal completion uses immutable v2 checkpoint-bound history, preserves source cleanup intents/terminal checkpoint/allowance, records transferred-source dispositions and registers only destination cleanup without acquiring a productive lease",
+    "terminal completion handles sources whose earlier terminal cleanup was already acknowledged, excludes transferred source intents and exposes the actual destination to existing cleanup selection",
+    "terminal Prepared remains pending for authorized retirement; terminal Absent and Aborted use exact checkpoint acknowledgements; changed terminal identity and missing original authority remain held without initialization",
+    "terminal completed-record insertion failure rolls back destination registration/source dispositions/events and retains pending; corrupted terminal history is refused after database reopen",
+    "the preparation adapter releases its mutex before invoking shared recovery; a failed settlement reuses the original actual native completion and succeeds on a later call after the injected failure is removed",
+    "validated historical dispositions support controller database reopen/replay without synthesizing native receipts, owner input completion or productive authority"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -241,16 +262,16 @@
   "hosted_ci": "pending current published head",
   "remaining": [
     "production preparation/promotion caller integration across all acquisition, owner-turn, recovery and merge-sweep leases",
-    "automatic authenticated retirement/resolution routing, interrupted namespace recovery and cleanup-only settlement and authenticated legacy/uncertainty/corrupt-state recovery",
+    "automatic authenticated retirement/resolution routing and interrupted namespace recovery and authenticated legacy/uncertainty/corrupt-state recovery",
     "normal protected rollout and actual Codex/Claude Discord continuation acceptance",
     "C actual-backend freshness/storage/quiescence cutover, private verifier recovery/application and full epic soak",
-    "production workflow persistence callback integration, concurrent workflow/audit lock-order proof and routing locked absent/aborted reconciliation",
+    "real WorkflowGuard/worker pending-recovery invocation, concurrent workflow/audit lock-order proof and authenticated cleanup routing",
     "connect all real guard acquisition/promotion callers only after original-state interrupted/legacy namespace resolution and recovery routing are implemented",
     "persist post-intent transient-I/O S backoff, actual input-change early wake and prove concurrent real callback/audit lock ordering before activation",
     "guarded all-closed-source re-preparation using the original binding and verified history; no fresh-origin backfill or budget/owner-input reset"
   ],
   "native_transfer_scope": "isolated synthetic-controller/native-filesystem fixtures only; zero production transfers or provider/model dispatch",
-  "opaque_receipt_producer": "verified lookup through ownership::transfer_receipt in the originally bound native store; no serialized-receipt constructor",
+  "opaque_receipt_producer": "actual original-bound ownership::transfer_receipt lookup or Completed NativeTransferInspection under the held original native lock; no wire/serialized-receipt constructor",
   "fixture_core_protocol": {
     "completed": true,
     "consecutive_transfers": 2,
@@ -309,5 +330,10 @@
   "all_retired_namespace_repreparation_integrated": false,
   "authenticated_interrupted_namespace_recovery_implemented": false,
   "retired_namespace_scope": "isolated actual original-native ledger/retirement inspection, held state/session/audit locks and WorkflowStore resolution transactions. Synthetic protected controller/admission evidence; fresh kernel host/boot/missing-cgroup checks, zero actual admitted workers, zero provider/model dispatch, no production acceptance.",
-  "namespace_resolution_red_evidence": "Initial core red had two behavioral failures and one fixture failure from create_new on an existing test creation file. Corrected core red had two behavioral failures and one refusal case passing. Final full core run contains all three cases with added missing-audit-lock and vanished-runtime assertions. Workflow resolution separately had three behavioral failures against method placeholders; all three pass in focused and full CLI runs."
+  "namespace_resolution_red_evidence": "Initial core red had two behavioral failures and one fixture failure from create_new on an existing test creation file. Corrected core red had two behavioral failures and one refusal case passing. Final full core run contains all three cases with added missing-audit-lock and vanished-runtime assertions. Workflow resolution separately had three behavioral failures against method placeholders; all three pass in focused and full CLI runs.",
+  "pending_reconciliation_service_connected": true,
+  "preparation_adapter_pending_recovery_connected": true,
+  "terminal_completed_settlement_implemented": true,
+  "pending_reconciliation_scope": "actual isolated core/WorkflowStore recovery through the preparation adapter; synthetic protected controller/resources, zero provider/model dispatch. Real WorkflowGuard/worker callers remain disabled; no production recovery or continuation acceptance.",
+  "pending_reconciliation_red_evidence": "Initial six routing tests: five behavioral failures and one refusal passed against the service placeholder. After implementation all six passed. The existing joined settlement-failure case then failed behaviorally because the preparation adapter still returned ReconcileExisting; it now invokes recovery and retries the original verified settlement. Final full CLI suite contains nine routing cases plus that adapter regression."
 }

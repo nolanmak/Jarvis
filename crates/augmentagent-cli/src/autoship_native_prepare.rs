@@ -5,7 +5,7 @@ use std::sync::{Arc,Mutex};
 #[derive(Debug)]
 pub(crate) enum NativePreparationRun {
     Registered {original_binding:TransferBinding},
-    ReconcileExisting(PendingNativeHandoff),
+    Reconciled {pending:PendingNativeHandoff,result:super::native_reconcile::ReconciliationRun},
     NoPending {failure:NoPendingPreparationFailure,next_eligible_ms:Option<i64>},
     Pending {pending:PendingNativeHandoff,outcome:TransferOutcome,settlement:Option<HandoffSettlement>,settlement_failed:bool},
     PersistenceUnknown {reason:TransferReason,attempted:Option<PendingNativeHandoff>},
@@ -18,13 +18,20 @@ pub(crate) fn run(store:&Arc<Mutex<WorkflowStore>>,lease:&Lease,binding:&Binding
     // No workflow mutex guard survives any of these metadata-only blocks.
     let facts={
         let mut locked=match store.lock() {Ok(locked)=>locked,Err(_)=>return Ok(NativePreparationRun::PersistenceUnknown {reason:TransferReason::PendingUnknown,attempted:None})};
-        if locked.validate_dispatch(lease,binding,clock()).is_err() {
+        if locked.validate_lease(lease,binding,clock()).is_err() {
             return Ok(NativePreparationRun::PersistenceUnknown {reason:TransferReason::AuthorityConflict,attempted:None});
         }
         match locked.resolve_native_handoff_persistence(&lease.workflow,None,Err(anyhow::anyhow!(TransferReason::PersistRetry))) {
-            NativePreparationPersistence::Durable(value)=>return Ok(NativePreparationRun::ReconcileExisting(take_pending(value))),
+            NativePreparationPersistence::Durable(value)=>{
+                let pending=take_pending(value);drop(locked);
+                let result=super::native_reconcile::run(store,super::native_reconcile::Mode::Lease {lease,binding},&pending,Some((sources,destination)),clock)?;
+                return Ok(NativePreparationRun::Reconciled {pending,result});
+            },
             NativePreparationPersistence::Unknown {reason,attempted}=>return Ok(NativePreparationRun::PersistenceUnknown {reason,attempted}),
             NativePreparationPersistence::NotCommitted {..}=>{},
+        }
+        if locked.validate_dispatch(lease,binding,clock()).is_err() {
+            return Ok(NativePreparationRun::PersistenceUnknown {reason:TransferReason::AuthorityConflict,attempted:None});
         }
         if let Some(original_binding)=locked.native_owner_binding(&lease.workflow,lease.generation)? {
             let (audit,_)=native_launch::original_context(&locked.conn,&lease.workflow,lease.generation,true)?;

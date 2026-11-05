@@ -29,6 +29,8 @@ pub(crate) mod owner_turn;
 mod native_owner_binding;
 #[path = "autoship_native_handoff.rs"]
 mod native_handoff;
+#[path = "autoship_native_reconcile.rs"]
+pub(crate) mod native_reconcile;
 #[path = "autoship_native_prepare.rs"]
 pub(crate) mod native_prepare;
 #[path = "autoship_native_pending.rs"]

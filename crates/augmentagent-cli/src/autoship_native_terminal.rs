@@ -6,10 +6,10 @@ pub(crate) struct TerminalNativeCheckpoint {
     workflow:String,generation:i64,checkpoint_sha256:String,event_sequence:i64,binding:Binding,
 }
 impl TerminalNativeCheckpoint {
-    pub(super) fn workflow(&self)->&str {&self.workflow}
-    pub(super) fn generation(&self)->i64 {self.generation}
-    pub(super) fn event_sequence(&self)->i64 {self.event_sequence}
-    pub(super) fn binding(&self)->&Binding {&self.binding}
+    pub(crate) fn workflow(&self)->&str {&self.workflow}
+    pub(crate) fn generation(&self)->i64 {self.generation}
+    pub(crate) fn event_sequence(&self)->i64 {self.event_sequence}
+    pub(crate) fn binding(&self)->&Binding {&self.binding}
 }
 fn checked_checkpoint(raw:&str)->Result<Checkpoint> {
     ensure!(raw.len()<=32*1024,TransferReason::HistoryCapacity);

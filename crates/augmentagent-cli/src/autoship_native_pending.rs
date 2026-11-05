@@ -92,6 +92,22 @@ pub(super) fn orphaned(conn:&Connection,workflow:&str)->Result<bool> {
     Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=?1 AND e.kind='native_handoff_prepared' AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_pending p WHERE p.workflow=e.workflow AND p.sequence=e.seq) AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_completed c WHERE c.workflow=e.workflow AND c.pending_sequence=e.seq) AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_unstarted u WHERE u.workflow=e.workflow AND u.pending_sequence=e.seq) AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_aborted a WHERE a.workflow=e.workflow AND a.pending_sequence=e.seq))",[workflow],|r|r.get(0))?)
 }
 
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+pub(super) enum NativeHandoffDisposition {Active,Completed,Unstarted,Aborted}
+impl WorkflowStore {
+    pub(super) fn native_handoff_disposition(&mut self,pending:&PendingNativeHandoff)->Result<NativeHandoffDisposition> {
+        let workflow=&pending.request.workflow_id;let tx=self.conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        ensure!(!orphaned(&tx,workflow)?,TransferReason::PendingUnknown);
+        let completed=settlement::History::load(&tx,workflow,u64::MAX)?;
+        let row:Option<(String,i64,u64,String)>=tx.query_row("SELECT transfer_id,sequence,snapshot_sequence,record FROM workflow_native_handoff_pending WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let mut dispositions=Vec::new();
+        if let Some(row)=row {let active=decode(&tx,workflow,row)?;if active.request.transfer_id==pending.request.transfer_id {ensure!(active==*pending,TransferReason::AuthorityConflict);dispositions.push(NativeHandoffDisposition::Active);}}
+        if let Some(old)=completed.pending_for_id(&pending.request.transfer_id) {ensure!(old==pending,TransferReason::AuthorityConflict);dispositions.push(NativeHandoffDisposition::Completed);}
+        if unstarted::acknowledged(&tx,pending)? {dispositions.push(NativeHandoffDisposition::Unstarted);}
+        if aborted::acknowledged(&tx,pending)? {dispositions.push(NativeHandoffDisposition::Aborted);}
+        ensure!(dispositions.len()==1,TransferReason::PendingUnknown);let result=dispositions[0];tx.commit()?;Ok(result)
+    }
+}
 impl PendingNativeHandoff {
     pub(crate) fn request(&self) -> &TransferRequest {
         &self.request
@@ -125,6 +141,14 @@ pub struct HandoffSettlement {
     pub(crate) current_context: bool,
 }
 impl PendingNativeHandoff {
+    /// The borrowed inspection was produced by the actual original native ledger
+    /// while its lock is held. Wire/serialized receipt data cannot enter here.
+    pub(crate) fn verified_inspected_receipt(&self,proof:&augmentagent_channel_core::native_vm::ownership::NativeTransferInspection<'_>)->Result<VerifiedHandoffReceipt> {
+        ensure!(proof.state()==augmentagent_channel_core::native_vm::ownership::NativeTransferState::Completed
+            && proof.binding()==&self.original_binding && proof.request()==&self.request && proof.observation()==&self.observation(),TransferReason::AuthorityConflict);
+        let receipt=proof.receipt().context(TransferReason::InventoryMissing)?;receipt.verify(&self.request)?;
+        Ok(VerifiedHandoffReceipt {pending:self.clone(),receipt:receipt.clone()})
+    }
     pub(crate) fn verified_receipt(
         &self,
         current: &dyn Fn() -> std::result::Result<
@@ -220,6 +244,12 @@ impl WorkflowStore {
     /// Exact active intent fence. Metadata only; never opens native state or
     /// protected audit files while holding the workflow transaction.
     pub(super) fn native_handoff_pending_is_current(&mut self,lease:&Lease,binding:&Binding,pending:&PendingNativeHandoff,now:i64)->Result<()> {
+        self.native_handoff_pending_current(lease,binding,pending,now,false)
+    }
+    pub(super) fn native_handoff_replay_is_current(&mut self,lease:&Lease,binding:&Binding,pending:&PendingNativeHandoff,now:i64)->Result<()> {
+        self.native_handoff_pending_current(lease,binding,pending,now,true)
+    }
+    fn native_handoff_pending_current(&mut self,lease:&Lease,binding:&Binding,pending:&PendingNativeHandoff,now:i64,historical:bool)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         require_binding(&tx,lease,binding,now)?;
         require_clear_abort_barriers(&tx,&lease.workflow)?;
@@ -229,8 +259,8 @@ impl WorkflowStore {
         ensure!(!matches!(checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired),TransferReason::AuthorityConflict);
         let row:Option<(String,i64,u64,String)>=tx.query_row("SELECT transfer_id,sequence,snapshot_sequence,record FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
         let active=decode(&tx,&lease.workflow,row.context(TransferReason::AuthorityConflict)?)?;
-        ensure!(active==*pending && active.workflow_binding==*binding
-            && active.request.destination.owner.lease_generation==lease.generation,TransferReason::AuthorityConflict);
+        ensure!(active==*pending && active.request.destination.owner.lease_generation<=lease.generation
+            && (if active.request.destination.owner.lease_generation==lease.generation {active.workflow_binding==*binding}else{historical}),TransferReason::AuthorityConflict);
         let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed')) OR EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2)",params![lease.workflow,lease.generation],|r|r.get(0))?;
         ensure!(!blocked,TransferReason::AuthorityConflict);
         for source in &active.request.source_owners {

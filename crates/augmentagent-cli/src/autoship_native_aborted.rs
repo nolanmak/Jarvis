@@ -122,3 +122,11 @@ impl WorkflowStore {
 
 #[path="autoship_native_abort_resolution.rs"]
 mod resolution;
+
+pub(super) fn acknowledged(conn:&Connection,pending:&PendingNativeHandoff)->Result<bool> {
+    let records=history(conn,&pending.request.workflow_id)?;
+    if let Some(record)=records.iter().find(|r|r.pending.request.transfer_id==pending.request.transfer_id) {
+        ensure!(record.pending==*pending,TransferReason::AuthorityConflict);return Ok(true);
+    }
+    Ok(false)
+}

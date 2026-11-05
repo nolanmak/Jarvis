@@ -11,6 +11,8 @@ struct Completed {
     pending_sequence: i64,
     pending: PendingNativeHandoff,
     receipt: TransferReceipt,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    terminal:Option<terminal::TerminalNativeCheckpoint>,
 }
 fn read_completed(tx: &Connection, workflow: &str, id: &str) -> Result<(i64, Completed)> {
     let (pending_sequence,snapshot,sequence,raw):(i64,u64,i64,String)=tx.query_row(
@@ -22,7 +24,7 @@ fn read_completed(tx: &Connection, workflow: &str, id: &str) -> Result<(i64, Com
     let pending = &completed.pending;
     ensure!(
         value == serde_json::from_str::<serde_json::Value>(&raw)?
-            && completed.version == 1
+            && matches!(completed.version,1|2)
             && pending.version == 1
             && completed.pending_sequence == pending_sequence
             && pending_sequence > 0
@@ -35,6 +37,16 @@ fn read_completed(tx: &Connection, workflow: &str, id: &str) -> Result<(i64, Com
             && pending.observation_certain,
         TransferReason::InventoryMissing
     );
+    match (completed.version,&completed.terminal) {
+        (1,None)=>{},
+        (2,Some(terminal))=>{
+            ensure!(terminal.workflow()==workflow && terminal.generation()>=pending.request.destination.owner.lease_generation
+                && terminal.event_sequence()<sequence,TransferReason::InventoryMissing);terminal::verify_history(tx,terminal)?;
+            let generation:i64=tx.query_row("SELECT generation FROM workflow_event WHERE workflow=?1 AND seq=?2",params![workflow,sequence],|r|r.get(0))?;
+            ensure!(generation==terminal.generation(),TransferReason::InventoryMissing);
+        }
+        _=>anyhow::bail!(TransferReason::InventoryMissing),
+    }
     pending.original_binding.validate()?;
     pending.workflow_binding.validate()?;
     completed.receipt.verify(&pending.request)?;
@@ -258,41 +270,31 @@ impl History {
     }
 }
 impl WorkflowStore {
-    /// Settle a proven historical core result. This never dispatches a model or
-    /// completes an owner message; current native admission remains separate.
-    pub fn settle_native_handoff(
-        &mut self,
-        lease: &Lease,
-        binding: &Binding,
-        proof: &VerifiedHandoffReceipt,
-        now: i64,
-    ) -> Result<HandoffSettlement> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_binding(&tx, lease, binding, now)?;
-        require_clear_abort_barriers(&tx,&lease.workflow)?;
-        let raw: String = tx.query_row(
-            "SELECT checkpoint FROM workflow WHERE id=?1",
-            [&lease.workflow],
-            |r| r.get(0),
-        )?;
-        let checkpoint: Checkpoint = serde_json::from_str(&raw)?;
-        ensure!(
-            !matches!(checkpoint.stage, Stage::Merged | Stage::Retired),
-            "terminal handoff needs cleanup-only settlement"
-        );
+    pub fn settle_native_handoff(&mut self,lease:&Lease,binding:&Binding,proof:&VerifiedHandoffReceipt,now:i64)->Result<HandoffSettlement> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;require_clear_abort_barriers(&tx,&lease.workflow)?;
+        let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
+        ensure!(!matches!(checkpoint.stage,Stage::Merged|Stage::Retired),"terminal handoff needs cleanup-only settlement");
+        let result=settle(&tx,&lease.workflow,lease.generation,binding,None,proof,now)?;tx.commit()?;Ok(result)
+    }
+    pub(crate) fn settle_terminal_native_handoff(&mut self,terminal:&terminal::TerminalNativeCheckpoint,proof:&VerifiedHandoffReceipt,now:i64)->Result<HandoffSettlement> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure!(terminal::capture(&tx,terminal.workflow())?==*terminal,TransferReason::AuthorityConflict);require_clear_abort_barriers(&tx,terminal.workflow())?;
+        let result=settle(&tx,terminal.workflow(),terminal.generation(),terminal.binding(),Some(terminal),proof,now)?;tx.commit()?;Ok(result)
+    }
+}
+fn settle(tx:&Transaction<'_>,workflow:&str,generation:i64,binding:&Binding,terminal:Option<&terminal::TerminalNativeCheckpoint>,proof:&VerifiedHandoffReceipt,now:i64)->Result<HandoffSettlement> {
         let pending = &proof.pending;
         proof.receipt.verify(&pending.request)?;
         ensure!(
-            pending.request.workflow_id == lease.workflow
-                && pending.request.destination.owner.lease_generation <= lease.generation,
+            pending.request.workflow_id == workflow
+                && pending.request.destination.owner.lease_generation <= generation,
             TransferReason::AuthorityConflict
         );
         let result = HandoffSettlement {
             destination: pending.request.destination.clone(),
-            current_context: pending.request.destination.owner.lease_generation == lease.generation
-                && pending.workflow_binding == *binding,
+            current_context: pending.request.destination.owner.lease_generation == generation
+                && pending.workflow_binding == *binding && terminal.is_none(),
         };
         let existing: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_native_handoff_completed WHERE transfer_id=?1)",
@@ -300,42 +302,43 @@ impl WorkflowStore {
             |r| r.get(0),
         )?;
         if existing {
-            let (_, stored) = read_completed(&tx, &lease.workflow, &pending.request.transfer_id)?;
+            let (_, stored) = read_completed(&tx, &workflow, &pending.request.transfer_id)?;
             ensure!(
                 stored.pending == *pending && stored.receipt == proof.receipt,
                 TransferReason::AuthorityConflict
             );
-            History::load(&tx, &lease.workflow, u64::MAX)?;
-            tx.commit()?;
+            History::load(&tx, &workflow, u64::MAX)?;
             return Ok(result);
         }
-        let row:(String,i64,u64,String)=tx.query_row("SELECT transfer_id,sequence,snapshot_sequence,record FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?.context(TransferReason::InventoryMissing)?;
+        let row:(String,i64,u64,String)=tx.query_row("SELECT transfer_id,sequence,snapshot_sequence,record FROM workflow_native_handoff_pending WHERE workflow=?1",[&workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?.context(TransferReason::InventoryMissing)?;
         let pending_sequence = row.1;
-        let stored = decode(&tx, &lease.workflow, row)?;
+        let stored = decode(&tx, &workflow, row)?;
         ensure!(stored == *pending, TransferReason::AuthorityConflict);
+        if terminal.is_none() {
         for source in &pending.request.source_owners {
-            let active:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2 AND audit_path=?3 AND retirement_reason IS NULL AND retired_at IS NULL)",params![lease.workflow,source.owner.lease_generation,source.audit_path],|r|r.get(0))?;
+            let active:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2 AND audit_path=?3 AND retirement_reason IS NULL AND retired_at IS NULL)",params![workflow,source.owner.lease_generation,source.audit_path],|r|r.get(0))?;
             ensure!(active, TransferReason::AuthorityConflict);
         }
+        }
         let destination = &pending.request.destination;
-        let occupied:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2)",params![lease.workflow,destination.owner.lease_generation],|r|r.get(0))?;
+        let occupied:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2)",params![workflow,destination.owner.lease_generation],|r|r.get(0))?;
         ensure!(!occupied, TransferReason::AuthorityConflict);
-        tx.execute("INSERT INTO workflow_native_owner(workflow,lease_generation,audit_path) VALUES(?1,?2,?3)",params![lease.workflow,destination.owner.lease_generation,destination.audit_path])?;
+        tx.execute("INSERT INTO workflow_native_owner(workflow,lease_generation,audit_path,retirement_reason) VALUES(?1,?2,?3,?4)",params![workflow,destination.owner.lease_generation,destination.audit_path,terminal.map(|_|"terminal_workflow")])?;
         tx.execute(
             "INSERT INTO workflow_native_owner_binding VALUES(?1,?2,?3,?4)",
             params![
-                lease.workflow,
+                workflow,
                 destination.owner.lease_generation,
                 serde_json::to_string(&pending.original_binding)?,
                 now
             ],
         )?;
-        event(&tx,&lease.workflow,destination.owner.lease_generation,"native_runtime_owner_registered",&serde_json::json!({"original_binding_sha256":digest(&serde_json::to_value(&pending.original_binding)?)?,"transfer_id":pending.request.transfer_id}).to_string(),now)?;
+        event(&tx,&workflow,destination.owner.lease_generation,"native_runtime_owner_registered",&serde_json::json!({"original_binding_sha256":digest(&serde_json::to_value(&pending.original_binding)?)?,"transfer_id":pending.request.transfer_id}).to_string(),now)?;
         for source in &pending.request.source_owners {
             tx.execute(
                 "INSERT INTO workflow_native_transferred_source VALUES(?1,?2,?3,?4,?5,?6,?7)",
                 params![
-                    lease.workflow,
+                    workflow,
                     source.owner.lease_generation,
                     source.audit_path,
                     pending.request.transfer_id,
@@ -346,25 +349,26 @@ impl WorkflowStore {
             )?;
         }
         let completed = Completed {
-            version: 1,
+            version: if terminal.is_some(){2}else{1},
             pending_sequence,
             pending: pending.clone(),
             receipt: proof.receipt.clone(),
+            terminal:terminal.cloned(),
         };
         let value = serde_json::to_value(&completed)?;
         let raw = serde_json::to_string(&value)?;
         ensure!(raw.len() <= 1024 * 1024, TransferReason::HistoryCapacity);
-        event(&tx,&lease.workflow,lease.generation,"native_handoff_settled",&serde_json::json!({"transfer_id":pending.request.transfer_id,"record_sha256":digest(&value)?}).to_string(),now)?;
+        event(&tx,&workflow,generation,"native_handoff_settled",&serde_json::json!({"transfer_id":pending.request.transfer_id,"record_sha256":digest(&value)?}).to_string(),now)?;
         let sequence: i64 = tx.query_row(
             "SELECT max(seq) FROM workflow_event WHERE workflow=?1",
-            [&lease.workflow],
+            [&workflow],
             |r| r.get(0),
         )?;
         tx.execute(
             "INSERT INTO workflow_native_handoff_completed VALUES(?1,?2,?3,?4,?5,?6)",
             params![
                 pending.request.transfer_id,
-                lease.workflow,
+                workflow,
                 pending_sequence,
                 pending.observation_revision,
                 sequence,
@@ -373,10 +377,8 @@ impl WorkflowStore {
         )?;
         tx.execute(
             "DELETE FROM workflow_native_handoff_pending WHERE workflow=?1 AND transfer_id=?2",
-            params![lease.workflow, pending.request.transfer_id],
+            params![workflow, pending.request.transfer_id],
         )?;
-        History::load(&tx, &lease.workflow, u64::MAX)?;
-        tx.commit()?;
+        History::load(&tx, &workflow, u64::MAX)?;
         Ok(result)
-    }
 }

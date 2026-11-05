@@ -1349,10 +1349,10 @@ mod tests {
         let result=super::super::native_prepare::run(&store,&lease,&f.binding,&sources,&destination,&now).unwrap();
         let super::super::native_prepare::NativePreparationRun::Pending {pending,outcome:ownership::TransferOutcome::Completed(_),settlement:None,settlement_failed:true}=result else {panic!("lost native completion identity: {result:?}")};
         let events=store.lock().unwrap().events(&lease.workflow).unwrap();let next=super::super::native_prepare::run(&store,&lease,&f.binding,&sources,&destination,&now).unwrap();
-        assert!(matches!(next,super::super::native_prepare::NativePreparationRun::ReconcileExisting(ref saved) if saved==&pending));assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);
-        let proof=pending.verified_receipt(&||Ok(())).unwrap().unwrap();
+        assert!(matches!(next,super::super::native_prepare::NativePreparationRun::Reconciled {pending:ref saved,result:super::super::native_reconcile::ReconciliationRun::Retained {..}} if saved==&pending),"{next:?}");assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);
         store.lock().unwrap().conn.execute_batch("DROP TRIGGER deny_joined_settlement").unwrap();
-        assert!(store.lock().unwrap().settle_native_handoff(&lease,&f.binding,&proof,now()).unwrap().current_context);
+        let recovered=super::super::native_prepare::run(&store,&lease,&f.binding,&sources,&destination,&now).unwrap();
+        assert!(matches!(recovered,super::super::native_prepare::NativePreparationRun::Reconciled {pending:ref saved,result:super::super::native_reconcile::ReconciliationRun::Settled(HandoffSettlement {current_context:true,..})} if saved==&pending),"{recovered:?}");
     }
     #[test]
     fn native_unstarted_ack_preserves_history_and_budgets_before_new_request() {
@@ -1567,6 +1567,96 @@ mod tests {
             let before=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap();let source=&pending.request.source_owners[0];let result=ownership::with_retired_aborted_namespace(&pending.original_binding,&pending.request,&pending.observation(),source,&f.audit,&||Ok(()),&mut |proof|store.lock().unwrap().settle_terminal_native_abort_namespace(&terminal,proof,now()));assert_eq!(result.is_ok(),!stale);assert_eq!(store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap(),before);
             let barriers=store.lock().unwrap().unresolved_native_abort_namespaces(&lease.workflow).unwrap();assert_eq!(barriers.len(),if stale {2}else{1});assert!(store.lock().unwrap().native_owner_binding(&lease.workflow,lease.generation).unwrap().is_none());
         }
+    }
+    #[test]
+    fn native_pending_reconcile_absent_ack_survives_restart_and_never_replaces_identity() {
+        if child("native_pending_reconcile_absent_ack_survives_restart_and_never_replaces_identity") {return;}
+        use super::super::native_reconcile::{self,Mode,ReconciliationRun};
+        let mut f=Fixture::new();let (old,_sources,destination,store)=joined_fixture(&mut f);let facts=store.lock().unwrap().native_handoff_facts(&old,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);let pending=pending_record(store.lock().unwrap().prepare_native_handoff_filtered(&old,&f.binding,destination.path().to_str().unwrap(),&facts,&rows,&[],now()).unwrap());
+        store.lock().unwrap().release(&old,now()).unwrap();let lease=store.lock().unwrap().claim(&old.workflow,"recover-exact-absent",now(),60_000).unwrap().unwrap();let before=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap();
+        assert!(matches!(native_reconcile::run(&store,Mode::Lease {lease:&lease,binding:&f.binding},&pending,None,&now).unwrap(),ReconciliationRun::KnownUnstarted));assert_eq!(store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap(),before);
+        let reopened=std::sync::Arc::new(std::sync::Mutex::new(WorkflowStore::open(&f.path).unwrap()));assert!(matches!(native_reconcile::run(&reopened,Mode::Lease {lease:&lease,binding:&f.binding},&pending,None,&now).unwrap(),ReconciliationRun::Historical));
+        let native=rusqlite::Connection::open(f._root.path().join("native/runtime-retirement.sqlite")).unwrap();let count:i64=native.query_row("SELECT count(*) FROM native_transfer",[],|r|r.get(0)).unwrap();assert_eq!(count,0);
+    }
+    #[test]
+    fn native_pending_reconcile_prepared_replays_original_destination_under_newer_lease() {
+        if child("native_pending_reconcile_prepared_replays_original_destination_under_newer_lease") {return;}
+        use super::super::native_reconcile::{self,Mode,ReconciliationRun};
+        let mut f=Fixture::new();let (old,sources,destination,store)=joined_fixture(&mut f);let facts=store.lock().unwrap().native_handoff_facts(&old,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);let pending=pending_record(store.lock().unwrap().prepare_native_handoff_filtered(&old,&f.binding,destination.path().to_str().unwrap(),&facts,&rows,&[],now()).unwrap());
+        let writer=sources[0].begin_write().unwrap();assert!(matches!(ownership::transfer(&pending.original_binding,&pending.request,&pending.observation(),&sources,&destination,&||Ok(())),ownership::TransferOutcome::Deferred {..}));writer.complete();store.lock().unwrap().release(&old,now()).unwrap();let lease=store.lock().unwrap().claim(&old.workflow,"recover-prepared",now(),60_000).unwrap().unwrap();let before=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap();
+        let result=native_reconcile::run(&store,Mode::Lease {lease:&lease,binding:&f.binding},&pending,Some((&sources,&destination)),&now).unwrap();let ReconciliationRun::Settled(settlement)=result else {panic!("prepared recovery failed: {result:?}")};assert!(!settlement.current_context);assert_eq!(settlement.destination,pending.request.destination);assert_eq!(store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap(),before);assert!(store.lock().unwrap().native_owner_binding(&lease.workflow,lease.generation).unwrap().is_none());
+        let native=rusqlite::Connection::open(f._root.path().join("native/runtime-retirement.sqlite")).unwrap();let ids:Vec<String>=native.prepare("SELECT id FROM native_transfer").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();assert_eq!(ids,vec![pending.request.transfer_id]);
+    }
+    #[test]
+    fn native_pending_reconcile_aborted_ack_preserves_namespaces_and_unknown_store_keeps_pending() {
+        if child("native_pending_reconcile_aborted_ack_preserves_namespaces_and_unknown_store_keeps_pending") {return;}
+        use super::super::native_reconcile::{self,Mode,ReconciliationRun};
+        for lost in [false,true] {
+            let mut f=Fixture::new();let (old,pending,store)=prepared_abort_fixture(&mut f);store.lock().unwrap().release(&old,now()).unwrap();let lease=store.lock().unwrap().claim(&old.workflow,"recover-abort-or-unknown",now(),60_000).unwrap().unwrap();let before=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap();
+            if lost {std::fs::remove_file(f._root.path().join("native/authority-epoch.json")).unwrap();}
+            let result=native_reconcile::run(&store,Mode::Lease {lease:&lease,binding:&f.binding},&pending,None,&now).unwrap();if lost {assert!(matches!(result,ReconciliationRun::Retained {..}));assert!(!f._root.path().join("native/authority-epoch.json").exists());}else{assert!(matches!(result,ReconciliationRun::KnownAborted {unresolved:2}),"{result:?}");}
+            assert_eq!(store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap(),before);let count:i64=store.lock().unwrap().conn.query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).unwrap();assert_eq!(count,if lost {1}else{0});
+        }
+    }
+    #[test]
+    fn native_pending_reconcile_completed_settles_after_restart_without_audit_handles() {
+        if child("native_pending_reconcile_completed_settles_after_restart_without_audit_handles") {return;}
+        use super::super::native_reconcile::{self,Mode,ReconciliationRun};
+        let mut f=Fixture::new();let (lease,pending,_proof)=completed_native_handoff(&mut f);let store=std::sync::Arc::new(std::sync::Mutex::new(WorkflowStore::open(&f.path).unwrap()));let before=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap();
+        let result=native_reconcile::run(&store,Mode::Lease {lease:&lease,binding:&f.binding},&pending,None,&now).unwrap();assert!(matches!(result,ReconciliationRun::Settled(HandoffSettlement {current_context:true,..})),"{result:?}");assert_eq!(store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap(),before);
+    }
+    #[test]
+    fn native_pending_reconcile_terminal_completed_registers_cleanup_without_productive_lease() {
+        if child("native_pending_reconcile_terminal_completed_registers_cleanup_without_productive_lease") {return;}
+        use super::super::native_reconcile::{self,Mode,ReconciliationRun};
+        for retired_source in [false,true] {
+            let mut f=Fixture::new();let (lease,pending,_proof)=completed_native_handoff(&mut f);let mut checkpoint=f.store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Retired;f.store.checkpoint(&lease,&checkpoint,now()).unwrap();let terminal=f.store.terminal_native_checkpoint(&lease.workflow).unwrap();
+            if retired_source {let source=&pending.request.source_owners[0];augmentagent_channel_core::native_vm::retire_owned_runtimes(&pending.original_binding,Path::new(&source.audit_path),&source.owner,&||Ok(())).unwrap();f.store.complete_bound_native_retirement(&lease.workflow,source.owner.lease_generation,&source.audit_path,&pending.original_binding,now()).unwrap();}
+            let store=std::sync::Arc::new(std::sync::Mutex::new(WorkflowStore::open(&f.path).unwrap()));let before=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap();let allowance=store.lock().unwrap().merge_allowance(now(),5).unwrap();let result=native_reconcile::run(&store,Mode::Terminal(&terminal),&pending,None,&now).unwrap();assert!(matches!(result,ReconciliationRun::Settled(HandoffSettlement {current_context:false,..})),"{result:?}");
+            let mut locked=store.lock().unwrap();assert_eq!(locked.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(locked.merge_allowance(now(),5).unwrap(),allowance);assert!(locked.claim(&lease.workflow,"must-not-reopen",now(),60_000).unwrap().is_none());let reason:String=locked.conn.query_row("SELECT retirement_reason FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",params![lease.workflow,pending.request.destination.owner.lease_generation],|r|r.get(0)).unwrap();assert_eq!(reason,"terminal_workflow");let pending_count:i64=locked.conn.query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).unwrap();assert_eq!(pending_count,0);
+            let cleanup=locked.pending_native_retirements(now(),16).unwrap();assert!(cleanup.iter().any(|r|r.1==pending.request.destination.owner.lease_generation));assert!(!cleanup.iter().any(|r|r.1==pending.request.source_owners[0].owner.lease_generation));
+        }
+    }
+    #[test]
+    fn native_pending_reconcile_terminal_stale_authority_retains_pending() {
+        if child("native_pending_reconcile_terminal_stale_authority_retains_pending") {return;}
+        use super::super::native_reconcile::{self,Mode,ReconciliationRun};
+        let mut f=Fixture::new();let (lease,pending,_proof)=completed_native_handoff(&mut f);let mut checkpoint=f.store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Retired;f.store.checkpoint(&lease,&checkpoint,now()).unwrap();let terminal=f.store.terminal_native_checkpoint(&lease.workflow).unwrap();checkpoint.next.reason="changed-terminal-completion".into();f.store.checkpoint(&lease,&checkpoint,now()).unwrap();let store=std::sync::Arc::new(std::sync::Mutex::new(WorkflowStore::open(&f.path).unwrap()));let events=store.lock().unwrap().events(&lease.workflow).unwrap();assert!(matches!(native_reconcile::run(&store,Mode::Terminal(&terminal),&pending,None,&now).unwrap(),ReconciliationRun::Retained {..}));assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);
+    }
+    #[test]
+    fn native_pending_reconcile_terminal_state_matrix_retains_prepared_and_acks_unstarted_or_aborted() {
+        if child("native_pending_reconcile_terminal_state_matrix_retains_prepared_and_acks_unstarted_or_aborted") {return;}
+        use super::super::native_reconcile::{self,Mode,ReconciliationRun};
+        for phase in ["absent","prepared","aborted"] {
+            let mut f=Fixture::new();let (lease,pending,store)=if phase=="aborted" {prepared_abort_fixture(&mut f)}else {
+                let (lease,sources,destination,store)=joined_fixture(&mut f);let facts=store.lock().unwrap().native_handoff_facts(&lease,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);let pending=pending_record(store.lock().unwrap().prepare_native_handoff_filtered(&lease,&f.binding,destination.path().to_str().unwrap(),&facts,&rows,&[],now()).unwrap());
+                if phase=="prepared" {let writer=sources[0].begin_write().unwrap();assert!(matches!(ownership::transfer(&pending.original_binding,&pending.request,&pending.observation(),&sources,&destination,&||Ok(())),ownership::TransferOutcome::Deferred {..}));writer.complete();}
+                (lease,pending,store)
+            };
+            let mut checkpoint=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Retired;store.lock().unwrap().checkpoint(&lease,&checkpoint,now()).unwrap();let terminal=store.lock().unwrap().terminal_native_checkpoint(&lease.workflow).unwrap();let before=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap();
+            let result=native_reconcile::run(&store,Mode::Terminal(&terminal),&pending,None,&now).unwrap();match phase {
+                "absent"=>assert!(matches!(result,ReconciliationRun::KnownUnstarted)),
+                "prepared"=>assert!(matches!(result,ReconciliationRun::Retained {state:Some(ownership::NativeTransferState::Prepared),..}),"{result:?}"),
+                "aborted"=>assert!(matches!(result,ReconciliationRun::KnownAborted {unresolved:2}),"{result:?}"),_=>unreachable!(),
+            }
+            assert_eq!(store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap(),before);let count:i64=store.lock().unwrap().conn.query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).unwrap();assert_eq!(count,if phase=="prepared" {1}else{0});
+        }
+    }
+    #[test]
+    fn native_pending_reconcile_same_generation_absent_replays_without_acknowledging_unstarted() {
+        if child("native_pending_reconcile_same_generation_absent_replays_without_acknowledging_unstarted") {return;}
+        use super::super::native_reconcile::{self,Mode,ReconciliationRun};
+        let mut f=Fixture::new();let (lease,sources,destination,store)=joined_fixture(&mut f);let facts=store.lock().unwrap().native_handoff_facts(&lease,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);let pending=pending_record(store.lock().unwrap().prepare_native_handoff_filtered(&lease,&f.binding,destination.path().to_str().unwrap(),&facts,&rows,&[],now()).unwrap());
+        let result=native_reconcile::run(&store,Mode::Lease {lease:&lease,binding:&f.binding},&pending,Some((&sources,&destination)),&now).unwrap();assert!(matches!(result,ReconciliationRun::Settled(HandoffSettlement {current_context:true,..})),"{result:?}");let count:i64=store.lock().unwrap().conn.query_row("SELECT count(*) FROM workflow_native_handoff_unstarted WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).unwrap();assert_eq!(count,0);
+    }
+    #[test]
+    fn native_pending_reconcile_terminal_settlement_rolls_back_and_rejects_corrupted_history() {
+        if child("native_pending_reconcile_terminal_settlement_rolls_back_and_rejects_corrupted_history") {return;}
+        use super::super::native_reconcile::{self,Mode,ReconciliationRun};
+        let mut f=Fixture::new();let (lease,pending,_proof)=completed_native_handoff(&mut f);let mut checkpoint=f.store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Retired;f.store.checkpoint(&lease,&checkpoint,now()).unwrap();let terminal=f.store.terminal_native_checkpoint(&lease.workflow).unwrap();let store=std::sync::Arc::new(std::sync::Mutex::new(WorkflowStore::open(&f.path).unwrap()));
+        store.lock().unwrap().conn.execute_batch("CREATE TRIGGER deny_terminal_completed BEFORE INSERT ON workflow_native_handoff_completed BEGIN SELECT RAISE(ABORT,'injected terminal completion failure'); END;").unwrap();let events=store.lock().unwrap().events(&lease.workflow).unwrap();let result=native_reconcile::run(&store,Mode::Terminal(&terminal),&pending,None,&now).unwrap();assert!(matches!(result,ReconciliationRun::Retained {..}));assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);assert!(store.lock().unwrap().native_owner_binding(&lease.workflow,lease.generation).unwrap().is_none());let count:i64=store.lock().unwrap().conn.query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).unwrap();assert_eq!(count,1);
+        store.lock().unwrap().conn.execute_batch("DROP TRIGGER deny_terminal_completed").unwrap();assert!(matches!(native_reconcile::run(&store,Mode::Terminal(&terminal),&pending,None,&now).unwrap(),ReconciliationRun::Settled(HandoffSettlement {current_context:false,..})));
+        store.lock().unwrap().conn.execute("UPDATE workflow_native_handoff_completed SET record=json_set(record,'$.terminal.checkpoint_sha256','corrupt') WHERE workflow=?1",[&lease.workflow]).unwrap();let reopened=std::sync::Arc::new(std::sync::Mutex::new(WorkflowStore::open(&f.path).unwrap()));assert!(matches!(native_reconcile::run(&reopened,Mode::Terminal(&terminal),&pending,None,&now).unwrap(),ReconciliationRun::Retained {..}));
     }
     #[test]
     fn native_handoff_pending_request_survives_restart_without_new_identity() {
