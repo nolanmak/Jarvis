@@ -72,7 +72,7 @@ struct IdentitiesBlock {
 }
 
 /// #1796: `instagram: handle` and `instagram: [a, b]` are both valid; the
-/// feed follows the first handle, as before.
+/// feed follows the first usable handle of a list (#1887).
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum Handles {
@@ -81,12 +81,20 @@ enum Handles {
 }
 
 impl Handles {
-    fn first(self) -> Option<String> {
+    /// #1887: a list may lead with a blank or bare `@` entry, so take the
+    /// first entry that still has something left after normalising.
+    fn first_usable(self) -> Option<String> {
         match self {
-            Handles::One(h) => Some(h),
-            Handles::Many(v) => v.into_iter().next(),
+            Handles::One(h) => normalize_handle(&h),
+            Handles::Many(v) => v.iter().map(String::as_str).find_map(normalize_handle),
         }
     }
+}
+
+/// Strip surrounding whitespace and the `@` sigil; `None` when nothing is left.
+fn normalize_handle(raw: &str) -> Option<String> {
+    let handle = raw.trim().trim_start_matches('@').trim();
+    (!handle.is_empty()).then(|| handle.to_string())
 }
 
 /// Walk `layout.people_dir()`, returning every page that is BOTH `close:
@@ -121,13 +129,7 @@ pub fn close_instagram_contacts(layout: &WikiLayout) -> Vec<CloseContact> {
         match serde_yaml_ng::from_str::<CloseFrontMatter>(yaml) {
             Ok(fm) => {
                 if fm.close {
-                    if let Some(handle) = fm
-                        .identities
-                        .instagram
-                        .and_then(Handles::first)
-                        .map(|h| h.trim_start_matches('@').to_string())
-                        .filter(|h| !h.is_empty())
-                    {
+                    if let Some(handle) = fm.identities.instagram.and_then(Handles::first_usable) {
                         out.push(CloseContact {
                             slug,
                             instagram_handle: handle,
@@ -408,6 +410,34 @@ mod tests {
         let contacts = close_instagram_contacts(&layout);
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].instagram_handle, "first_ig");
+    }
+
+    #[test]
+    fn a_list_of_handles_skips_blank_entries() {
+        // #1887: a leading `@`-only / blank entry used to drop the whole page.
+        for (slug, list, want) in [
+            ("ava", "[\"@\", \"real_ig\"]", Some("real_ig")),
+            ("ben", "[\"\", \"real_ig\"]", Some("real_ig")),
+            ("cleo", "[\" @ \", \" @real_ig \"]", Some("real_ig")),
+            ("dana", "[\"@first_ig\", second_ig]", Some("first_ig")),
+            ("elia", "[\"@\", \"\"]", None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = WikiLayout::new(dir.path().to_path_buf());
+            std::fs::create_dir_all(layout.people_dir()).unwrap();
+            write_page(
+                &layout.people_dir(),
+                slug,
+                &format!("kind: person\nclose: true\nidentities:\n  instagram: {list}"),
+            );
+            let contacts = close_instagram_contacts(&layout);
+            assert_eq!(
+                contacts.first().map(|c| c.instagram_handle.as_str()),
+                want,
+                "{slug}: {list}"
+            );
+            assert_eq!(contacts.len(), usize::from(want.is_some()), "{slug}: {list}");
+        }
     }
 
     #[test]
