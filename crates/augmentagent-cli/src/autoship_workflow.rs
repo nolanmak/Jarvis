@@ -1212,13 +1212,13 @@ impl WorkflowStore {
         charge: ResourceCharge,
         now_ms: i64,
     ) -> Result<()> {
-        self.charge_inner(lease, receipt_id, charge, now_ms, None, None)
+        self.charge_inner(lease, receipt_id, charge, now_ms, None, None, None)
     }
 
     pub fn charge_observation(&mut self, lease: &Lease, receipt_id: &str,
         charge: ResourceCharge, now_ms: i64, daily_cap: u64) -> Result<()> {
         ensure!(lease.workflow.starts_with("autoship-observation/") || lease.workflow.starts_with("autoship-canary/"), "observation budget requires diagnostic workflow namespace");
-        self.charge_inner(lease, receipt_id, charge, now_ms, Some(daily_cap), None)
+        self.charge_inner(lease, receipt_id, charge, now_ms, Some(daily_cap), None, None)
     }
 
     /// Bound actual native dispatches in the same transaction as quota charging.
@@ -1228,7 +1228,17 @@ impl WorkflowStore {
         ensure!(observation_cap.is_none() || lease.workflow.starts_with("autoship-observation/") || lease.workflow.starts_with("autoship-canary/"),
             "observation budget requires diagnostic workflow namespace");
         self.charge_inner(lease,receipt_id,ResourceCharge{model_calls:1,..Default::default()},now_ms,observation_cap,
-            Some((purpose,binding,limit)))
+            Some((purpose,binding,limit)),None)
+    }
+
+    /// Called only by the controller's actual model-admission observer. Persist
+    /// attribution and its charge together; requested configuration is not evidence.
+    pub(crate) fn charge_admitted_model(&mut self,lease:&Lease,receipt:&str,now:i64,
+        observation_cap:Option<u64>,bounded:Option<(&str,&Binding,u32)>,
+        provider:Option<submission::Provider>,reviewer:bool)->Result<()> {
+        ensure!(observation_cap.is_none() || lease.workflow.starts_with("autoship-observation/") || lease.workflow.starts_with("autoship-canary/"),"observation budget requires diagnostic workflow namespace");
+        self.charge_inner(lease,receipt,ResourceCharge {model_calls:1,..Default::default()},now,
+            observation_cap,bounded,Some((provider,reviewer)))
     }
 
     pub fn observation_available(&self, now_ms: i64, required: u64, daily_cap: u64) -> Result<bool> {
@@ -1247,7 +1257,8 @@ impl WorkflowStore {
     }
 
     fn charge_inner(&mut self, lease: &Lease, receipt_id: &str,
-        charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>, bounded:Option<(&str,&Binding,u32)>) -> Result<()> {
+        charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>, bounded:Option<(&str,&Binding,u32)>, admission:Option<(Option<submission::Provider>,bool)>) -> Result<()> {
+        let admission=admission.map(|(provider,reviewer)|serde_json::json!({"receipt":receipt_id,"provider":provider,"reviewer":reviewer}).to_string());
         ensure!(!receipt_id.is_empty(), "charge receipt required");
         let values = (
             i64::try_from(charge.wall_ms)?,
@@ -1262,6 +1273,10 @@ impl WorkflowStore {
             params![lease.workflow,receipt_id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         if let Some(prior) = prior {
             ensure!(prior == values, "charge receipt conflict");
+            if let Some(expected)=&admission {
+                let recorded:Option<String>=tx.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' AND json_extract(payload,'$.receipt')=?2",params![lease.workflow,receipt_id],|r|r.get(0)).optional()?;
+                ensure!(recorded.as_ref()==Some(expected),"model admission attribution conflict");
+            }
         } else {
             if charge.model_calls>0 {owner_turn::require_native_dispatch(&tx,lease,now_ms)?;}
             if let Some((purpose,binding,limit))=bounded {
@@ -1331,6 +1346,9 @@ impl WorkflowStore {
                 receipt_id,
                 now_ms,
             )?;
+            if let Some(admission)=admission {
+                event(&tx,&lease.workflow,lease.generation,"native_model_admitted",&admission,now_ms)?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -2627,6 +2645,41 @@ mod tests {
         assert!(store
             .admit_epoch_attempt(&successor, "acceptance-repair", "new-epoch", 2, 1023)
             .unwrap());
+    }
+
+    #[test]
+    fn admitted_provider_survives_restart_and_unknown_admission_clears_stale_identity() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        store.charge_admitted_model(&lease,"review",30,None,None,Some(submission::Provider::Claude),true).unwrap();
+        store.charge_admitted_model(&lease,"review",31,None,None,Some(submission::Provider::Claude),true).unwrap();
+        assert!(store.charge_admitted_model(&lease,"review",32,None,None,Some(submission::Provider::Codex),true).is_err());
+        assert!(store.charge_admitted_model(&lease,"review",32,None,None,Some(submission::Provider::Claude),false).is_err());
+        drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let prior=store.progress_events(&lease.workflow).unwrap().pop().unwrap();
+        assert_eq!(prior.actual_provider.as_deref(),Some("claude"));
+        assert_eq!(prior.actual_provider_role.as_deref(),Some("reviewer"));
+        store.charge_admitted_model(&lease,"unknown",33,None,None,None,false).unwrap();
+        let latest=store.progress_events(&lease.workflow).unwrap().pop().unwrap();
+        assert_eq!(latest.actual_provider,None,"unknown admission must not retain the preceding model's identity");
+        assert_eq!(latest.actual_provider_role.as_deref(),Some("workflow"));
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,2);
+        assert_eq!(store.events(&lease.workflow).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_model_admitted").count(),2);
+    }
+
+    #[test]
+    fn admitted_provider_projection_failure_rolls_back_charge_and_bounded_budget() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        store.conn.execute_batch("CREATE TRIGGER refuse_progress BEFORE INSERT ON workflow_progress_event BEGIN SELECT RAISE(ABORT,'projection refused'); END;").unwrap();
+        assert!(store.charge_admitted_model(&lease,"call",30,None,Some(("component",&binding(),1)),Some(submission::Provider::Codex),false).is_err());
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,0);
+        assert!(!store.events(&lease.workflow).unwrap().iter().any(|(_,kind,_,_)|kind=="native_model_admitted"));
+        store.conn.execute_batch("DROP TRIGGER refuse_progress;").unwrap();
+        store.charge_admitted_model(&lease,"call",31,None,Some(("component",&binding(),1)),Some(submission::Provider::Codex),false).unwrap();
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,1);
+        assert!(store.charge_admitted_model(&lease,"extra",32,None,Some(("component",&binding(),1)),Some(submission::Provider::Codex),false).is_err());
     }
 
     #[test]

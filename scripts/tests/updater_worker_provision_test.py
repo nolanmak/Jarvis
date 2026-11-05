@@ -20,13 +20,26 @@ class WorkerProvisionTests(unittest.TestCase):
     def test_failed_provisioning_retries_on_unchanged_head_without_rebuild(self):
         self.run_update(False,manager_failure=True)
 
-    def run_update(self,invalid,manager_failure=False):
+    def test_unchanged_tick_runs_worker_recovery_and_reports_failure_without_rebuild(self):
+        self.run_update(False,verify_recovery=True)
+
+    def run_update(self,invalid,manager_failure=False,verify_recovery=False):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)
             for name in ['check-for-updates.sh','lib/service-restart.sh','lib/update-build.sh',
-                         'ensure-autopr-worker.sh','secure-release-executables.py','systemd/augmentagent-autopr.service']:
+                         'ensure-autopr-worker.sh','secure-release-executables.py','systemd/augmentagent-autopr.service',
+                         'recover-autopr-worker.py']:
                 target=root/'scripts'/name;target.parent.mkdir(parents=True,exist_ok=True)
                 shutil.copy(ROOT/'scripts'/name,target)
+            if verify_recovery:
+                # The caller is the real updater; the separately tested recovery
+                # boundary stands in for a failed systemd worker in this fixture.
+                (root/'scripts/recover-autopr-worker.py').write_text('''import os,sys
+from pathlib import Path
+assert sys.argv[1:]==['--repository',str(Path(__file__).resolve().parents[1]),'--state',str(Path(os.environ['XDG_STATE_HOME'])/'augmentagent')]
+with open(os.environ['CALLS'],'a') as f:f.write('worker-recovery\\n')
+raise SystemExit(1 if os.environ.get('FAIL_RECOVERY') else 0)
+''')
             tools=root/'bin';tools.mkdir();release=root/'target/release';release.mkdir(parents=True)
             cli=release/'augmentagent'
             cli.write_text('''#!/bin/sh
@@ -92,5 +105,15 @@ if 'show' in sys.argv:
             self.assertNotIn('restart augmentagent.service',text)
             self.assertNotIn('forbidden-cargo',text)
             self.assertNotIn('unsafe-cli',text,'a CLI preflight executed a writable artifact')
+            if verify_recovery:
+                retry=subprocess.run(['bash',str(root/'scripts/check-for-updates.sh')],env=env,capture_output=True,text=True,timeout=30)
+                self.assertEqual(retry.returncode,0,retry.stderr)
+                self.assertIn('worker-recovery',calls.read_text(),'unchanged build skipped independent worker recovery')
+                env['FAIL_RECOVERY']='1'
+                failed=subprocess.run(['bash',str(root/'scripts/check-for-updates.sh')],env=env,capture_output=True,text=True,timeout=30)
+                self.assertNotEqual(failed.returncode,0,'failed recovery was reported as a healthy update')
+                self.assertEqual(stamp.read_text().strip(),'b'*40)
+                self.assertNotIn('restart augmentagent.service',calls.read_text())
+                self.assertNotIn('forbidden-cargo',calls.read_text())
 
 if __name__=='__main__':unittest.main()
