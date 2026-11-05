@@ -94,6 +94,31 @@ fn validate_correction(
 ) -> Result<()> {
     validate_correction_with_files(old, next, candidate_environment, &[])
 }
+#[derive(Debug)]
+struct NoOpCorrection;
+impl std::fmt::Display for NoOpCorrection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("amendment is a no-op")
+    }
+}
+impl std::error::Error for NoOpCorrection {}
+
+fn correction_is_actionable(
+    old: &PreparedAcceptance,
+    next: &ContractProposal,
+    candidate_environment: &str,
+    additional_files: &[String],
+    adjudicated: bool,
+) -> Result<bool> {
+    match validate_correction_with_files(old, next, candidate_environment, additional_files) {
+        Ok(()) => Ok(true),
+        // Ordinary unchanged proposals decline the amendment and leave the
+        // existing bounded implementation repair in charge. A final ruling
+        // must still be implemented, and every other validation stays strict.
+        Err(error) if !adjudicated && error.is::<NoOpCorrection>() => Ok(false),
+        Err(error) => Err(error),
+    }
+}
 fn validate_correction_with_files(
     old: &PreparedAcceptance,
     next: &ContractProposal,
@@ -149,13 +174,13 @@ fn validate_correction_with_files(
         );
     }
     let old_candidate = old.baseline.registration.candidate_environment_id();
-    ensure!(
-        next.files != old.proposal.files
-            || next.contract.allowed_paths != old.proposal.contract.allowed_paths
-            || next.contract.verifiers != old.proposal.contract.verifiers
-            || candidate_environment != old_candidate,
-        "amendment is a no-op"
-    );
+    if next.files == old.proposal.files
+        && next.contract.allowed_paths == old.proposal.contract.allowed_paths
+        && next.contract.verifiers == old.proposal.contract.verifiers
+        && candidate_environment == old_candidate
+    {
+        return Err(NoOpCorrection.into());
+    }
     Ok(())
 }
 #[derive(Debug, Serialize)]
@@ -447,12 +472,23 @@ pub(super) async fn try_amend(
         "scope expansion requires final adjudication"
     );
     validate_bound_scope_files(adjudication,&decision.approve_additional_files)?;
-    validate_correction_with_files(
+    if !correction_is_actionable(
         old,
         &proposal,
         &candidate_environment,
         &decision.approve_additional_files,
-    )?;
+        adjudication.is_some(),
+    )? {
+        workflow.audit_logger().record_controller(serde_json::json!({
+            "actor": "controller",
+            "kind": "verifier_amendment_declined",
+            "workflow": workflow.id(),
+            "reason_code": "no_op_correction",
+            "input_sha256": input_hash,
+            "previous_contract_hash": old.baseline.registration.contract_hash(),
+        }))?;
+        return Ok(None);
+    }
     environments.authorize(decision.approve_environment_transition)?;
     let directory = tempfile::Builder::new()
         .prefix("amend-baseline-")
@@ -1077,6 +1113,32 @@ mod tests {
                 },
             },
         )
+    }
+    #[test]
+    fn ordinary_noop_approval_is_declined_while_the_validator_and_final_ruling_stay_strict() {
+        let (_root, old) = fixture();
+        let mut next = old.proposal.clone();
+        next.contract.revision += 1;
+        assert!(
+            validate_correction(&old, &next, "environment-a").is_err(),
+            "a no-op must never become an admissible correction"
+        );
+        assert!(
+            !correction_is_actionable(&old, &next, "environment-a", &[], false).unwrap(),
+            "an unchanged proposal must return to the existing bounded repair path"
+        );
+        assert!(
+            correction_is_actionable(&old, &next, "environment-a", &[], true).is_err(),
+            "an unimplemented final adjudication cannot be treated as an ordinary denial"
+        );
+        assert!(correction_is_actionable(&old, &next, "environment-b", &[], false).unwrap());
+        next.contract.criteria[0].requirement = "A weaker requirement".into();
+        for environment in ["environment-a", "environment-b"] {
+            assert!(
+                correction_is_actionable(&old, &next, environment, &[], false).is_err(),
+                "requirement weakening must still halt instead of falling through to repair"
+            );
+        }
     }
     #[test]
     fn controller_engine_migration_requires_explicit_environment_approval() {
