@@ -161,6 +161,8 @@ fn validate_correction_with_files(
 #[derive(Debug, Serialize)]
 struct EnvironmentEvidence {
     original_base: String,
+    canonical_main: Option<String>,
+    current_canonical_main: Option<String>,
     registered_baseline: String,
     registered_candidate: String,
     current_original_baseline: String,
@@ -181,7 +183,7 @@ impl EnvironmentEvidence {
         Ok(())
     }
     fn prompt(&self) -> Result<String> {
-        Ok(format!("Controller-measured environment evidence: {}\nThe registered environment is a composite fingerprint, including the controller verifier engine, source-controlled compiler inputs and runner identity. An older engine may omit committed-source export and use in-process assertions; its old receipts authorize nothing. A changed original-base fingerprint under the current engine is not by itself evidence that the candidate changed dependencies. Compare current_original_baseline with current_candidate, the candidate contribution diff, and the separately identified integrated upstream paths to distinguish current source-input changes. Historical component identities cannot be inferred from an opaque old digest. You may explicitly approve_environment_transition for a legitimate controller-engine migration/rebaseline as well as legitimate runner/compiler/dependency changes. Never silently carry old red/green claims forward: the exact recorded original base must produce intended assertion red under the current engine and the candidate must separately produce green. Preserve every owner requirement; reject unknown setup failures or requirement weakening.", serde_json::to_string(self)?))
+        Ok(format!("Controller-measured environment evidence: {}\nThe registered environment is a composite fingerprint, including the controller verifier engine, source-controlled compiler inputs and runner identity. An older engine may omit committed-source export and use in-process assertions; its old receipts authorize nothing. A changed original-base fingerprint under the current engine is not by itself evidence that the candidate changed dependencies. Compare current_original_baseline with current_candidate, the candidate contribution diff, and the separately identified integrated upstream paths to distinguish current source-input changes. When provided, current_canonical_main is independently measured from the exact GitHub canonical_main commit under the same current controller and runner. Equality with current_candidate means their fingerprinted compiler/dependency inputs match, even if both differ from the historical original baseline. Equality is environment evidence only: it grants no verifier approval or behavioral receipt. Historical component identities cannot be inferred from an opaque old digest. You may explicitly approve_environment_transition for a legitimate controller-engine migration/rebaseline as well as legitimate runner/compiler/dependency changes. Never silently carry old red/green claims forward: the exact recorded original base must produce intended assertion red under the current engine and the candidate must separately produce green. Preserve every owner requirement; reject unknown setup failures or requirement weakening.", serde_json::to_string(self)?))
     }
 }
 async fn environment_evidence(root: &Path, control: &Path, old: &PreparedAcceptance) -> Result<EnvironmentEvidence> {
@@ -196,6 +198,8 @@ async fn environment_evidence(root: &Path, control: &Path, old: &PreparedAccepta
     cleanup?;
     Ok(EnvironmentEvidence {
         original_base: base.into(),
+        canonical_main: None,
+        current_canonical_main: None,
         registered_baseline: old.baseline.registration.binding(base)?.environment_id,
         registered_candidate: old.baseline.registration.candidate_environment_id().into(),
         current_original_baseline,
@@ -205,6 +209,21 @@ async fn environment_evidence(root: &Path, control: &Path, old: &PreparedAccepta
         current_exporter_sha256: digest(verifier_checkout::EXPORTER.as_bytes()),
         current_registry_audit_sha256: digest(DEPENDENCY_AUDIT.as_bytes()),
     })
+}
+
+async fn environment_evidence_against_main(root:&Path,control:&Path,old:&PreparedAcceptance,canonical_main:&str)->Result<EnvironmentEvidence> {
+    let mut evidence=environment_evidence(root,control,old).await?;
+    let temporary=tempfile::Builder::new().prefix("environment-main-").tempdir_in(control)?;
+    let checkout=temporary.path().join("checkout");
+    let path=checkout.to_str().context("canonical main environment path UTF8")?;
+    trusted_git(root,&["worktree","add","--detach",path,canonical_main]).await?;
+    let measured=environment_id(&checkout);
+    let cleanup=trusted_git(root,&["worktree","remove","--force",path]).await;
+    let current_canonical_main=measured?;
+    cleanup?;
+    evidence.canonical_main=Some(canonical_main.into());
+    evidence.current_canonical_main=Some(current_canonical_main);
+    Ok(evidence)
 }
 
 fn decode_authority_response(raw:&str,expected_contract:&str)->Result<Decision> {
@@ -366,7 +385,7 @@ pub(super) async fn try_amend(
             &[format!("amendment-input:{input_hash}")],
         )
         .await?;
-    let environments = environment_evidence(root, control, old).await?;
+    let environments = environment_evidence_against_main(root, control, old,&canonical_main).await?;
     let candidate_environment = environments.current_candidate.clone();
     let original_base = old.baseline.registration.baseline_head();
     let prompt=format!("Determine whether this failure is an objectively bad/outdated verifier or an implementation defect. Reject amendment for implementation defects, weakened criteria, always-green/no-op tests, or missing setup dependencies. For legitimate compiler/dependency input changes you may explicitly approve the candidate environment transition; old-base red must still be reproduced independently. Preserve every previous criterion ID and exact requirement text; do not expand implementation paths. A correction must produce revision {} and the same real source {}. All new fixtures are public: synthetic examples only, no secrets/private literals. Return JSON {{\"approved\":bool,\"previous_contract_hash\":\"{}\",\"approve_environment_transition\":bool,\"reason\":\"objective cause\",\"proposal\":null or {{\"contract\":...,\"files\":...}}}}.\nIntent: {title}\nFailure: {failure}\nOriginal proposal: {}\nOriginal behavioral baseline (unchanged): {original_base}\nCanonical main: {canonical_main}\nCandidate contribution base: {scope_base}\nExact candidate head: {head}\nCandidate contribution diff (every change here remains subject to allowed paths):\n{diff}\nIntegrated upstream paths (original baseline to contribution base; these are context, not candidate edits):\n{upstream_paths}\nApproval only permits constructing and independently testing a correction. A proposed replacement harness cannot have its new red receipt before it exists: the controller must subsequently reproduce intended assertion red at the unchanged original baseline under the current engine and separately obtain candidate green before activation. Never treat approval or historical receipts as those measurements.",old.proposal.contract.revision+1,source,old.baseline.registration.contract_hash(),serde_json::to_string(&old.proposal)?);
@@ -1062,6 +1081,7 @@ mod tests {
     #[test]
     fn controller_engine_migration_requires_explicit_environment_approval() {
         let evidence = EnvironmentEvidence {
+            canonical_main: None, current_canonical_main: None,
             original_base: "a".repeat(40), registered_baseline: "previous-engine".into(),
             registered_candidate: "previous-engine".into(), current_original_baseline: "current-engine".into(),
             current_candidate: "current-engine".into(), legacy_proof_migration: true,
@@ -1076,6 +1096,33 @@ mod tests {
         // Equal current source-input fingerprints do not silently grandfather
         // historical assertions from a different controller engine.
         assert!(evidence.transition_required());
+    }
+
+    #[tokio::test]
+    async fn environment_authority_distinguishes_upstream_dependency_changes_from_candidate_changes() {
+        let (root,mut old,base)=authority_fixture().await;
+        let baseline_environment=environment_id(root.path()).unwrap();
+        old.baseline.registration=RegisteredContract::register(root.path(),old.proposal.contract.clone(),base.clone(),baseline_environment.clone()).unwrap();
+        let control=tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.lock"),"# upstream dependency revision\nversion = 4\n").unwrap();
+        for args in [&["add","Cargo.lock"][..],&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","upstream dependencies"]] {
+            trusted_git(root.path(),args).await.unwrap();
+        }
+        let main=actual_head(root.path()).await.unwrap();
+        let main_environment=environment_id(root.path()).unwrap();
+        assert_ne!(baseline_environment,main_environment);
+        let upstream=environment_evidence_against_main(root.path(),control.path(),&old,&main).await.unwrap();
+        let measured=serde_json::to_value(&upstream).unwrap();
+        assert_eq!(measured["canonical_main"],main);
+        assert_eq!(measured["current_canonical_main"],main_environment);
+        assert_eq!(upstream.current_candidate,main_environment);
+        assert!(upstream.authorize(false).is_err(),"matching main must never approve a new verifier environment automatically");
+        std::fs::write(root.path().join("Cargo.lock"),"# candidate dependency revision\nversion = 4\n").unwrap();
+        let candidate=environment_evidence_against_main(root.path(),control.path(),&old,&main).await.unwrap();
+        let measured=serde_json::to_value(&candidate).unwrap();
+        assert_eq!(measured["current_canonical_main"],main_environment);
+        assert_ne!(candidate.current_candidate,main_environment,"candidate edits must remain distinct from trusted main inputs");
+        assert!(candidate.authorize(false).is_err());
     }
 
     #[test]

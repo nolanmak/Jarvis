@@ -37,6 +37,7 @@ make_case() {
   git clone -q "$TMP/origin.git" "$TMP/work" 2>/dev/null
   mkdir -p "$TMP/work/scripts/lib" "$TMP/work/crates" "$TMP/work/target/release"
   cp "$REPO_ROOT/scripts/check-for-updates.sh" "$TMP/work/scripts/"
+  cp "$REPO_ROOT/scripts/recover-autopr-worker.py" "$TMP/work/scripts/"
   printf 'import sys; sys.exit(0)\n' > "$TMP/work/scripts/pdf-runtime.py"
   printf '#!/bin/sh\nexec ./target/release/augmentagent "$@"\n' > "$TMP/work/scripts/run-rs.sh"
   cp "$REPO_ROOT/scripts/lib/service-restart.sh" "$TMP/work/scripts/lib/"

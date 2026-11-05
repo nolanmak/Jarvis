@@ -43,6 +43,17 @@ def resolve(value, matrix):
     return re.sub(r'\$\{\{(.*?)\}\}', replace, value)
 
 
+def on_main(github, prefix, head):
+    """`head` is main's tip or a first-parent ancestor of it. Auto-ship reads
+    a recent main commit's CI while the tip's own run is still pending; a
+    diverged or unrelated commit is never main evidence."""
+    branch = github.api(f'{prefix}/branches/main')['commit']['sha']
+    if branch == head:
+        return True
+    compared = github.api(f'{prefix}/compare/{head}...{branch}')
+    return compared.get('status') == 'ahead' and compared.get('behind_by') == 0
+
+
 def expected_jobs(contract, changed, event):
     result = {}
     for path, workflow in contract['workflows'].items():
@@ -147,7 +158,7 @@ def evaluate(request, github):
         changed = [f['filename'] for f in files]
         changed.extend(f['previous_filename'] for f in files if 'previous_filename' in f)
     else:
-        if github.api(f'{prefix}/branches/main')['commit']['sha'] != head:
+        if not on_main(github, prefix, head):
             raise ValueError('main source moved')
     if not pull:
         # The commit API exposes the diff to the first parent, including the
@@ -227,7 +238,7 @@ def evaluate(request, github):
         current = github.api(f'{prefix}/pulls/{pr}')
         if current['head']['sha'] != head or current['base']['sha'] != pull['base']['sha'] or current['state'] != 'open':
             raise ValueError('PR moved during CI observation')
-    elif github.api(f'{prefix}/branches/main')['commit']['sha'] != head:
+    elif not on_main(github, prefix, head):
         raise ValueError('main moved during CI observation')
     return {'state': 'failed' if failures else 'pending' if pending else 'passed',
             'head': head, 'failures': failures, 'receipts': receipts}
