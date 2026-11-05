@@ -732,7 +732,7 @@
       ]
     },
     "rust/cli/6": {
-      "body": "bash scripts/ci-hosted-space.sh\ncargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1\ncargo test -p augmentagent-cli --test autoship_commands_cli --test autoship_resolution_cli --test autoship_submit_cli --locked\n",
+      "body": ". scripts/ci-hosted-space.sh\ncargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1\ncargo test -p augmentagent-cli --test autoship_commands_cli --test autoship_resolution_cli --test autoship_submit_cli --locked\n",
       "shell": "bash",
       "vm_provisioning": [
         "pdf-python-runtime"
@@ -921,7 +921,7 @@
       "shell": "bash"
     },
     "targeted/targeted/9": {
-      "body": "bash scripts/ci-hosted-space.sh\npython3 scripts/ci-targeted.py test --plan \"$RUNNER_TEMP/targeted-plan.json\"\n",
+      "body": ". scripts/ci-hosted-space.sh\npython3 scripts/ci-targeted.py test --plan \"$RUNNER_TEMP/targeted-plan.json\"\n",
       "shell": "bash"
     }
   },
