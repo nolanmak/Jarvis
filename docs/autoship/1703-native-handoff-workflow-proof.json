@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "1eed3285fd6e77cf33ada44916b84a70769b4255",
+  "source_parent_commit": "352ef32f",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -26,7 +26,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
-      "sha256": "7419718a8f567337e2e606dff707972a5995a7550fd332b755178a0abbd15b18"
+      "sha256": "2a10ed99015f2088aae1ec036910046ed051875c915ee9907cd85f836882d03e"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
@@ -46,11 +46,11 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
-      "sha256": "0daea20dd5acc60969a2d1d001bb2d1081755bd5bd87d2124061591f20c2c5eb"
+      "sha256": "a3f3d11fddf6f42810a209f163dfa8dcacdb337683c3334497bd7306bbc14d27"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
-      "sha256": "706b6a7847f0ffec7663d20e57ca5593a103bcd01ef1f2a271f7c9bef01350be"
+      "sha256": "8f89ff16d4e13b6449dd3bf01a14613ad0a1db28aa843dfa873f2e04615e757b"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_preparation.rs",
@@ -110,7 +110,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "55549550568d0b87bd45be4c581e2d2a21277827ad38a9a536b2d3a47a6bf81b"
+      "sha256": "779947c1362840bcb4ce193e1e175d7986f1f241ed72b6c929d323082b8586b9"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_recovery.rs",
@@ -163,11 +163,15 @@
     {
       "path": "scripts/test-native-provider-vm.py",
       "sha256": "a44a895a7a66e9fbde95ea58543d1e7c23b4e9dc581c2e7b0b6a733605d8b95a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_dispatch.rs",
+      "sha256": "e0d188e6352c96df1b2cb110df01014f19c4d6bb92a7115bac7456db60f8b3bc"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1860,
+    "passed": 1867,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
@@ -299,7 +303,15 @@
       "autoship-owner-current-completion-final-green.log",
       "autoship-owner-current-completion-full-core.log",
       "autoship-owner-current-completion-full-cli.log",
-      "autoship-owner-current-completion-production-check.log"
+      "autoship-owner-current-completion-production-check.log",
+      "autoship-owner-body-dispatch-red.log",
+      "autoship-owner-body-dispatch-final-green.log",
+      "autoship-owner-body-completion-red.log",
+      "autoship-owner-body-completion-green.log",
+      "autoship-owner-body-joined-green.log",
+      "autoship-owner-body-validated-green.log",
+      "autoship-owner-body-full-cli.log",
+      "autoship-owner-body-production-check.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -992,7 +1004,7 @@
     ]
   },
   "owner_current_completion": {
-    "scope": "Borrowed fresh original-store completion capability retained under state, runtime session and protected audit locks through a short metadata visitor. Not connected to owner dispatch or completion yet.",
+    "scope": "Borrowed fresh original-store completion capability retained under state, runtime session and protected audit locks through a short metadata visitor. Connected to the new guard execution/completion APIs; actual worker consumer and Discord ingress remain disabled.",
     "focused_passed": 5,
     "core_passed": 895,
     "cli_passed": 1860,
@@ -1026,6 +1038,45 @@
     "main_based_launcher_tests": 20,
     "scope": "Actual local supervisor subprocess, deterministic paused empty/prefix readiness writer, explicit controller admission, malformed and cancellation refusal with cleanup. No VM/provider dispatch.",
     "local_bridge_step": "All commands passed directly; 9 delegated cgroup cases skip outside isolated service. --hosted wrapper refuses without real runner temporary directory; not represented as hosted verification.",
-    "hosted_ci": "pending on new standalone PR and recovery head"
+    "hosted_ci": "All standalone PR checks passed on 23081a0f, including Linux platform/bridge/targeted, privacy and node-release.",
+    "status": "MERGED",
+    "merge_commit": "023cb4fb0a1255b96709bb3affa5e6fea233f577",
+    "merged_at": "2026-11-05T22:06:40Z",
+    "independent_review": "CodeRabbit COMMENTED review on exact 23081a0f head, both changed files; no functional inline findings. No-op Claude check is not review.",
+    "deployment": "not verified; normal updater only",
+    "shipment_attribution": "manual repair merge; not an autonomous shipment"
+  },
+  "owner_body_execution": {
+    "scope": "Guarded execution/completion APIs compiled. Actual command-worker selection, independent owner acceptance orchestration, private reply transport and coding gateway activation are not connected.",
+    "dispatch": "Nonclone private per-request reservation, body digest/provider/current turn binding, native launch floor and immutable joined event/index history; second reservation refuses after restart, never releases pending input based on TTL.",
+    "completion": "Fresh borrowed core proof required inside atomic metadata visitor; rejects pre-reservation launch even with current physical completion. Applies input, completes turn, saves private per-request reply, changes candidate binding and invalidates old review evidence atomically. Owner pause, accounting and merge allowance remain unchanged.",
+    "focused_passed": 7,
+    "cli_passed": 1867,
+    "cli_ignored": 33,
+    "production_check": "passed",
+    "red_scope": "Missing dispatch/completion APIs failed compilation. Joined fixture initially lacked namespace resource policy/generation; fixture corrected without weakening production proof. No behavioral parent regression is claimed for the absent APIs.",
+    "faults": [
+      "restart and duplicate reservation",
+      "changed authenticated body or pinned provider",
+      "reservation insert rollback",
+      "missing/corrupt reservation index and event",
+      "reported session ID without native observation",
+      "completed native launch prepared before dispatch",
+      "completion result insert rollback and metadata reconciliation without model replay",
+      "missing/corrupt reply/event/applied-input/completed-turn history",
+      "resume/new owner input preserves queued prior private reply"
+    ],
+    "fixtures": "Temporary actual private native ledger/runtime and current byte/kernel closure, synthetic protected controller/resource receipts and absent-cgroup scope. Zero real provider/model/VM/Discord dispatch. Guard model wrapper compiled, not exercised against real transport.",
+    "worker_consumer_enabled": false,
+    "discord_coding_enabled": false,
+    "reply_delivery_enabled": false,
+    "remaining": [
+      "Authorized worker routing and owner-independent acceptance preparation",
+      "actual first-builder provenance handling and provider/VM dispatch acceptance",
+      "interrupted owner execution/result recovery",
+      "private per-request reply delivery and uncertainty/rebind recovery",
+      "bounded exact-reference lookup to avoid rescanning full native observation history once per completed owner request on every guard validation",
+      "normal hosted CI/review/deployment and full #1715 acceptance"
+    ]
   }
 }

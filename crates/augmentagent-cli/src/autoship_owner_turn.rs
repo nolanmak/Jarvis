@@ -280,5 +280,6 @@ mod tests {
 mod setup_refusal;
 pub(super) fn validate_history(conn:&Connection,workflow:&str)->Result<()> {
     setup_refusal::validate(conn,workflow)?;
-    super::owner_revision::validate_history(conn,workflow)
+    super::owner_revision::validate_history(conn,workflow)?;
+    super::owner_dispatch::validate_history(conn,workflow)
 }

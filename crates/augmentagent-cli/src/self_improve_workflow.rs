@@ -25,6 +25,12 @@ tokio::task_local! {
 const LEASE_MS: i64 = 10 * 60 * 1000;
 const RENEW_SECS: u64 = 60;
 
+pub(super) struct OwnerBodyResult {
+    dispatch:durable::owner_dispatch::OwnerBodyDispatch,
+    response:String,
+    observed:augmentagent_channel_core::native_session::ObservedConversation,
+}
+
 pub(super) struct Start<'a> {
     pub repo_root: &'a Path,
     pub worktree: &'a Path,
@@ -1257,6 +1263,77 @@ impl WorkflowGuard {
         // request. Drop charges elapsed usage and stops renewal without release.
         self.spawn_renewal();
         Ok(self)
+    }
+
+    /// The caller supplies a builder with its original authorship history bound,
+    /// as in the ordinary worker lane; imported unknown history stays unknown.
+    /// Execute the authenticated pending body exactly once, inside the real
+    /// guarded native builder scope. This is not input completion or permission
+    /// to publish: the returned private result still needs locked completion
+    /// and an atomic per-request reply/owner-turn transaction.
+    pub(super) async fn run_owner_body(&self,reasoner:&FallbackReasoner)->Result<OwnerBodyResult> {
+        self.native_builder_owner()?;
+        anyhow::ensure!(self.contract==format!("registered:{}",self.binding.contract),
+            "owner body requires independently registered acceptance");
+        let provider=reasoner.builder_provider_pin().context("owner body requires pinned native builder")?;
+        let selected=match provider {augmentagent_channel_core::ProviderKind::Codex=>durable::submission::Provider::Codex,
+            augmentagent_channel_core::ProviderKind::Claude=>durable::submission::Provider::Claude,
+            _=>anyhow::bail!("owner body requires native Codex or Claude")};
+        self.bind_builder(reasoner)?;
+        let sessions=self.owner_turn_native_builder_sessions(provider)?;
+        let (turn,dispatch)={
+            let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("owner dispatch store poisoned"))?;
+            let now=millis();let turn=store.owner_turn_for_lease(&self.lease,now)?;
+            let activated:bool=store.has_owner_acceptance_for_turn(&turn)?;
+            anyhow::ensure!(activated,"owner request acceptance has not been independently activated");
+            let dispatch=store.begin_owner_body_dispatch(&turn,selected,now)?;
+            (turn,dispatch)
+        };
+        let mut opts=fix_opts(self.worktree.clone());opts.audit_logger=Some(self.audit.clone());
+        let prompt=format!("Work on this guarded candidate under its registered acceptance contract. Apply the owner's instruction below using the admitted tools. Do not publish, push, merge or change protected controller/verifier files. Return a concise private summary of what happened; a model response does not prove tests passed or that shipping occurred.\n\nOwner instruction:\n{}",turn.body);
+        let outcome=sessions.scope(adoption::revise(reasoner,self,&opts,&prompt)).await;
+        self.audit_health().await?;
+        self.record_episode_sessions(&sessions)?;
+        let response=outcome?;
+        anyhow::ensure!(response.len()<=1024*1024,"owner body response exceeds private result bound");
+        let observed=sessions.observed();
+        anyhow::ensure!(observed.len()==1 && observed[0].provider==provider && !observed[0].uncertain,
+            "owner body has no unique certain native conversation");
+        let result=OwnerBodyResult {dispatch,response,observed:observed.into_iter().next().unwrap()};
+        // The first fresh check catches stale observations before returning a
+        // result. Completion must repeat this check in its atomic visitor.
+        self.with_owner_body_completion(&result,&mut |_|Ok(()))?;
+        Ok(result)
+    }
+    /// The owner pause survives completion. Resume/review/CI/publication remain
+    /// separate normal service actions; a private model reply grants none.
+    pub(super) async fn finish_owner_body(mut self,result:OwnerBodyResult)->Result<()> {
+        self.audit_health().await?;
+        let binding=git_binding(&self.worktree,&self.contract,&self.environment,&[]).await?;
+        self.with_owner_body_completion(&result,&mut |proof| {
+            self.store.lock().map_err(|_|anyhow::anyhow!("owner completion store poisoned"))?
+                .complete_owner_body(&result.dispatch,proof,&binding,&result.response,millis())
+        })?;
+        self.binding=binding;
+        self.finish()
+    }
+    pub(super) fn with_owner_body_completion(&self,result:&OwnerBodyResult,
+        visitor:&mut dyn FnMut(&augmentagent_channel_core::native_vm::ownership::NativeCompletionProof<'_>)->Result<()>,
+    )->Result<()> {
+        self.healthy_lease()?;
+        let (prepared,reference)={
+            self.store.lock().map_err(|_|anyhow::anyhow!("owner completion store poisoned"))?
+                .owner_body_completion_reference(&result.dispatch,&result.observed,millis())?
+        };
+        let current=||->Result<()> {
+            self.healthy_lease()?;
+            // Metadata only. Full audit health would invert the retained
+            // native/session/audit -> short workflow metadata lock order.
+            self.store.lock().map_err(|_|anyhow::anyhow!("owner completion store poisoned"))?
+                .validate_owner_body_dispatch(&result.dispatch,millis())
+        };
+        augmentagent_channel_core::native_vm::ownership::with_current_native_completion(
+            &self.audit,&prepared,&reference,&current,visitor)
     }
 
     pub(super) fn record_episode_sessions(

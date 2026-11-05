@@ -513,10 +513,13 @@ pub(crate) mod tests {
         prepared: PreparedLaunchRecord,
         session: AppendReceipt,
         resource: AppendReceipt,
+        owner_dispatch: Option<owner_dispatch::OwnerBodyDispatch>,
     }
     impl Fixture {
         fn new() -> Self {Self::with_owner_binding(false)}
-        fn with_owner_binding(owner_bound:bool) -> Self {
+        fn with_owner_binding(owner_bound:bool) -> Self {Self::with_owner_mode(owner_bound,false)}
+        fn with_owner_mode(owner_bound:bool,body_turn:bool) -> Self {Self::with_owner_timing(owner_bound,body_turn,false)}
+        fn with_owner_timing(owner_bound:bool,body_turn:bool,late_dispatch:bool) -> Self {
             let root = tempfile::tempdir().unwrap();
             let base = root.path().canonicalize().unwrap();
             let state = base.join("native");
@@ -552,10 +555,13 @@ pub(crate) mod tests {
             store
                 .register("owner/repo/pr/7", "candidate", binding.clone(), now())
                 .unwrap();
-            let lease = store
-                .claim("owner/repo/pr/7", "controller", now(), 60_000)
-                .unwrap()
-                .unwrap();
+            let turn=if body_turn {
+                let origin=discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:45};
+                store.enqueue_owner_message(&origin,"owner/repo/pr/7","Private owner response fixture",None,now()).unwrap();
+                Some(store.claim_owner_turn("owner/repo/pr/7","controller",now(),60_000).unwrap().unwrap())
+            } else {None};
+            let lease=turn.as_ref().map(|t|t.lease.clone()).unwrap_or_else(||
+                store.claim("owner/repo/pr/7","controller",now(),60_000).unwrap().unwrap());
             let original = ownership::with_initial_owner_binding(
                 &lease.workflow,
                 &|| Ok(()),
@@ -578,9 +584,15 @@ pub(crate) mod tests {
                 })
                 .unwrap();
             audit.set_native_store_binding(original.clone()).unwrap();
+            if body_turn {
+                audit.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":lease.workflow,"generation":lease.generation})).unwrap();
+                audit.require_run_resources().unwrap();
+            }
+            let mut owner_dispatch=turn.as_ref().filter(|_|!late_dispatch).map(|t|store.begin_owner_body_dispatch(t,submission::Provider::Codex,now()).unwrap());
             let (prepared,session,resource)=retained_launch_fixture(&state,&audit,"codex",|prepared| {
                 store.record_verified_native_launch(&lease,&binding,&audit,prepared,now()).unwrap();
             });
+            if late_dispatch {owner_dispatch=turn.as_ref().map(|t|store.begin_owner_body_dispatch(t,submission::Provider::Codex,now()).unwrap());}
             Self {
                 _root: root,
                 path,
@@ -591,6 +603,7 @@ pub(crate) mod tests {
                 prepared,
                 session,
                 resource,
+                owner_dispatch,
             }
         }
         fn complete(&self) -> VerifiedNativeObservation {
@@ -2924,4 +2937,80 @@ pub(crate) mod tests {
         assert!(ownership::with_current_native_completion(&f.audit,&f.prepared,fact.receipt(),&||Ok(()),&mut |_| {visited=true;Ok(())}).is_err(),"caller fence substituted for native owner authority");assert!(!visited);
     }
 
+    #[test]
+    fn owner_body_completion_commits_input_and_private_reply_under_fresh_native_proof() {
+        if child("owner_body_completion_commits_input_and_private_reply_under_fresh_native_proof") {return;}
+        let mut f=Fixture::with_owner_mode(true,true);
+        file(&f._root.path().join("native/codex/session-fixture/lock"),b"");
+        let fact=f.complete();f.record(&fact).unwrap();
+        let dispatch=f.owner_dispatch.take().unwrap();
+        let observed=augmentagent_channel_core::native_session::ObservedConversation {provider:augmentagent_channel_core::ProviderKind::Codex,id:"actual-session".into(),uncertain:false};
+        let (prepared,reference)=f.store.owner_body_completion_reference(&dispatch,&observed,now()).unwrap();
+        let old=f.store.snapshot(&f.lease.workflow).unwrap().unwrap();
+        let next=Binding {evidence_hash:"new-evidence".into(),..f.binding.clone()};
+        let response="Private model response, never a public progress event";
+        let store=std::sync::Mutex::new(f.store);
+        ownership::with_current_native_completion(&f.audit,&prepared,&reference,
+            &||store.lock().unwrap().validate_owner_body_dispatch(&dispatch,now()),
+            &mut |proof|store.lock().unwrap().complete_owner_body(&dispatch,proof,&next,response,now())).unwrap();
+        let mut store=store.into_inner().unwrap();
+        assert_eq!(store.pending_owner_messages(&f.lease.workflow).unwrap(),0);
+        assert!(store.owner_control(&f.lease.workflow).unwrap().unwrap().paused);
+        assert!(store.validate_dispatch(&f.lease,&next,now()).is_err(),"old native callbacks survived owner completion");
+        let after=store.snapshot(&f.lease.workflow).unwrap().unwrap();assert_eq!(after.checkpoint.binding,next);
+        assert_eq!(after.model_calls,old.model_calls);assert_eq!(after.attempts,old.attempts);
+        assert_eq!(after.checkpoint.stage,Stage::Build);
+        assert!(store.current_reviews(&f.lease.workflow).unwrap().is_empty());
+        let reply:String=store.conn.query_row("SELECT response FROM workflow_owner_body_result WHERE request_id=?1",[dispatch.request_id()],|r|r.get(0)).unwrap();assert_eq!(reply,response);
+        for (_,_,payload,_) in store.events(&f.lease.workflow).unwrap() {assert!(!payload.contains(response));}
+        assert!(store.begin_owner_body_dispatch(&owner_turn::OwnerTurn {lease:f.lease.clone(),request_id:dispatch.request_id().into(),body:"Private owner response fixture".into(),pause_revision:1,binding:f.binding.clone()},submission::Provider::Codex,now()).is_err());
+        drop(store);let mut store=WorkflowStore::open(&f.path).unwrap();
+        owner_dispatch::validate_history(&store.conn,&f.lease.workflow).unwrap();
+        for progress in store.progress_events(&f.lease.workflow).unwrap() {assert!(!serde_json::to_string(&progress).unwrap().contains(response));}
+        store.conn.pragma_update(None,"foreign_keys",false).unwrap();
+        for fault in ["DELETE FROM workflow_owner_body_result", "DELETE FROM workflow_event WHERE kind='owner_body_completed'",
+            "UPDATE workflow_owner_body_result SET response='changed private reply'", "UPDATE workflow_owner_message SET state='pending'",
+            "UPDATE workflow_owner_turn SET state='claimed'"] {
+            store.conn.execute_batch("SAVEPOINT fixture_fault").unwrap();store.conn.execute_batch(fault).unwrap();
+            assert!(owner_dispatch::validate_history(&store.conn,&f.lease.workflow).is_err(),"{fault}");
+            store.conn.execute_batch("ROLLBACK TO fixture_fault; RELEASE fixture_fault").unwrap();
+            owner_dispatch::validate_history(&store.conn,&f.lease.workflow).unwrap();
+        }
+        store.release(&f.lease,now()).unwrap();
+        let revision=store.owner_control(&f.lease.workflow).unwrap().unwrap().revision;
+        store.set_owner_pause(&f.lease.workflow,"discord:22",revision,false,now()).unwrap();
+        store.enqueue_owner_message(&discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:46},&f.lease.workflow,"Second private owner instruction",None,now()).unwrap();
+        assert!(store.claim_owner_turn_for_setup(&f.lease.workflow,"next-consumer",now(),60_000).unwrap().is_some());
+        assert_eq!(store.pending_owner_messages(&f.lease.workflow).unwrap(),1);
+        assert_eq!(store.conn.query_row("SELECT count(*) FROM workflow_owner_body_result WHERE state='queued'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+    #[test]
+    fn owner_body_completion_write_failure_preserves_pending_input_and_can_reconcile() {
+        if child("owner_body_completion_write_failure_preserves_pending_input_and_can_reconcile") {return;}
+        let mut f=Fixture::with_owner_mode(true,true);file(&f._root.path().join("native/codex/session-fixture/lock"),b"");
+        let fact=f.complete();f.record(&fact).unwrap();let dispatch=f.owner_dispatch.take().unwrap();
+        let observed=augmentagent_channel_core::native_session::ObservedConversation {provider:augmentagent_channel_core::ProviderKind::Codex,id:"actual-session".into(),uncertain:false};
+        let (prepared,reference)=f.store.owner_body_completion_reference(&dispatch,&observed,now()).unwrap();
+        f.store.conn.execute_batch("CREATE TRIGGER deny_result BEFORE INSERT ON workflow_owner_body_result BEGIN SELECT RAISE(ABORT,'unavailable'); END;").unwrap();
+        let before=f.store.snapshot(&f.lease.workflow).unwrap().unwrap();let store=std::sync::Mutex::new(f.store);
+        assert!(ownership::with_current_native_completion(&f.audit,&prepared,&reference,&||store.lock().unwrap().validate_owner_body_dispatch(&dispatch,now()),
+            &mut |proof|store.lock().unwrap().complete_owner_body(&dispatch,proof,&f.binding,"private reply",now())).is_err());
+        {let mut s=store.lock().unwrap();assert_eq!(s.snapshot(&f.lease.workflow).unwrap().unwrap(),before);assert_eq!(s.pending_owner_messages(&f.lease.workflow).unwrap(),1);s.validate_owner_body_dispatch(&dispatch,now()).unwrap();s.conn.execute_batch("DROP TRIGGER deny_result").unwrap();}
+        ownership::with_current_native_completion(&f.audit,&prepared,&reference,&||store.lock().unwrap().validate_owner_body_dispatch(&dispatch,now()),
+            &mut |proof|store.lock().unwrap().complete_owner_body(&dispatch,proof,&f.binding,"private reply",now())).unwrap();
+        assert_eq!(store.lock().unwrap().pending_owner_messages(&f.lease.workflow).unwrap(),0);
+    }
+    #[test]
+    fn owner_body_completion_refuses_a_launch_prepared_before_body_dispatch() {
+        if child("owner_body_completion_refuses_a_launch_prepared_before_body_dispatch") {return;}
+        let mut f=Fixture::with_owner_timing(true,true,true);file(&f._root.path().join("native/codex/session-fixture/lock"),b"");
+        let fact=f.complete();f.record(&fact).unwrap();let dispatch=f.owner_dispatch.take().unwrap();
+        let observed=augmentagent_channel_core::native_session::ObservedConversation {provider:augmentagent_channel_core::ProviderKind::Codex,id:"actual-session".into(),uncertain:false};
+        assert!(f.store.owner_body_completion_reference(&dispatch,&observed,now()).is_err());
+        let before=f.store.snapshot(&f.lease.workflow).unwrap().unwrap();let store=std::sync::Mutex::new(f.store);
+        assert!(ownership::with_current_native_completion(&f.audit,&f.prepared,fact.receipt(),&||store.lock().unwrap().validate_owner_body_dispatch(&dispatch,now()),
+            &mut |proof|store.lock().unwrap().complete_owner_body(&dispatch,proof,&f.binding,"private response",now())).is_err());
+        let s=store.lock().unwrap();assert_eq!(s.snapshot(&f.lease.workflow).unwrap().unwrap(),before);assert_eq!(s.pending_owner_messages(&f.lease.workflow).unwrap(),1);
+        assert_eq!(s.conn.query_row("SELECT count(*) FROM workflow_owner_body_result",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
 }
