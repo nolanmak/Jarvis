@@ -2,6 +2,51 @@
 use super::*;
 use super::discord_ingress::DiscordOrigin;
 use super::discord_controls::ControlReply;
+
+pub(super) struct OwnerMessage {
+    pub request_id:String,
+    pub body:String,
+    pub origin:DiscordOrigin,
+    pub state:String,
+}
+/// Immutable ingress evidence only. Repository grants and the configured
+/// transport owner must still be reauthorized by the worker before dispatch.
+pub(super) fn message_evidence(conn:&Connection,workflow:&str,request_id:&str)->Result<OwnerMessage> {
+    let (body,state):(String,String)=conn.query_row(
+        "SELECT body,state FROM workflow_owner_message WHERE workflow=?1 AND request_id=?2",
+        params![workflow,request_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    ensure!(!body.trim().is_empty() && body.len()<=16*1024,"owner input exceeds bound");
+    let (principal,origin,digest,response):(String,String,String,String)=conn.query_row(
+        "SELECT principal,origin,message_sha256,response FROM discord_control_request WHERE workflow=?1 AND request_id=?2",
+        params![workflow,request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+    ensure!(origin.len()<=4096 && response.len()<=32*1024,"owner input ingress exceeds bound");
+    let origin_value:DiscordOrigin=serde_json::from_str(&origin)?;origin_value.validate()?;
+    let reply:ControlReply=serde_json::from_str(&response)?;
+    ensure!(serde_json::from_str::<serde_json::Value>(&origin)?==serde_json::to_value(&origin_value)?
+        && serde_json::from_str::<serde_json::Value>(&response)?==serde_json::to_value(&reply)?,
+        "owner input ingress has unrecognized fields");
+    ensure!(origin_value.request_id()==request_id && origin_value.principal()==principal
+        && digest==format!("{:x}",Sha256::digest(body.as_bytes()))
+        && reply.request_id==request_id && reply.workflow==workflow && reply.accepted
+        && reply.reason=="owner-followup-queued"
+        && reply.nonce==format!("{:x}",Sha256::digest(request_id.as_bytes()))[..24],
+        "owner input differs from its authenticated ingress");
+    Ok(OwnerMessage {request_id:request_id.into(),body,origin:origin_value,state})
+}
+pub(super) fn require_pending(conn:&Connection,workflow:&str,request_id:&str)->Result<OwnerMessage> {
+    let message=message_evidence(conn,workflow,request_id)?;
+    ensure!(message.state=="pending","owner input no longer pending");
+    // A changed active selector must not retarget already accepted input. A
+    // removed/rebound private destination, however, cannot dispatch old input.
+    super::discord_ingress::bound_workflow(conn,&message.origin,Some(workflow))?;
+    Ok(message)
+}
+pub(super) fn next_pending(conn:&Connection,workflow:&str)->Result<Option<OwnerMessage>> {
+    // Discord snowflakes are unsigned; do not truncate them to SQLite i64.
+    let next:Option<String>=conn.query_row("SELECT request_id FROM workflow_owner_message WHERE workflow=?1 AND state='pending' ORDER BY length(substr(request_id,instr(substr(request_id,9),':')+9)),substr(request_id,instr(substr(request_id,9),':')+9),request_id LIMIT 1",
+        [workflow],|r|r.get(0)).optional()?;
+    next.map(|id|require_pending(conn,workflow,&id)).transpose()
+}
 impl WorkflowStore {
     pub fn pending_owner_messages(&self,workflow:&str)->Result<i64> {pending(&self.conn,workflow)}
     /// Gateway authenticates the immutable owner/private destination and current

@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "67a6f1b0264275394bafa9ed38159daa246f490f",
+  "source_parent_commit": "af881938532ac593d13a0253133625875d36af64",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -46,11 +46,11 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
-      "sha256": "e8b13fd6606d906cf963c102853d3cc39a00f6059eafb8dc30f26d2dc025d67f"
+      "sha256": "4d1ac5211f1bc9013f53e1244a04b593d6b686171665509541b2a6de83dee044"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
-      "sha256": "698d31d94cf50cc4959138f595e59c2e779f351ddfb2c2e8fa7cd9b46e23edf2"
+      "sha256": "5f68dec3ae81d7ca94a64129cd2c669391666e4861855d26cb3493294ef10db9"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_preparation.rs",
@@ -110,7 +110,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "d2c677737de5e5de1873a2e677c5c0293a55d4a14c2bfb9ff4dfbbdcaedc91ec"
+      "sha256": "02eba342552eab6510711e8552fc9a438424b643bcfbf49bae86d240973f8a57"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_recovery.rs",
@@ -143,11 +143,15 @@
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_revision.rs",
       "sha256": "a9fc4ac0bfc7e52d9d53077f86f620ad2d764e5d943a55ecc990833a272a350e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_inbox.rs",
+      "sha256": "7391154ae0e9fcfabe941e47f81ee4e4c83384b037cf0237b126ae16ecf38f1c"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1851,
+    "passed": 1854,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
@@ -258,7 +262,13 @@
       "autoship-owner-revision-merged-production-check.log",
       "autoship-owner-revision-native-configuration-red.log",
       "autoship-owner-revision-native-configuration-full-cli.log",
-      "autoship-owner-revision-native-configuration-production-check.log"
+      "autoship-owner-revision-native-configuration-production-check.log",
+      "autoship-owner-input-auth-red.log",
+      "autoship-owner-input-auth-green.log",
+      "autoship-owner-early-candidate-red.log",
+      "autoship-owner-early-candidate-green.log",
+      "autoship-owner-early-candidate-full-cli.log",
+      "autoship-owner-early-candidate-production-check.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -427,7 +437,9 @@
     "guarded owner continuation factory restores the exact saved Codex/Claude conversation after physical runtime completion and original-store handoff; mismatched provider and uncertain conversation refuse; no worker/gateway/provider-transport acceptance",
     "owner revision dispatch/replay refuses ten damaged-history cases, including total revision-history loss; original claim, accepted owner input, activation, registration and generation fence must agree",
     "consuming owner contract revision returns a new native guard only after original-store handoff; Codex/Claude retain their exact session; failed setup stays claimed with pending input and no timeout replay",
-    "owner revision checks selected native configuration and original binding before metadata activation, then revalidates the native owner/binding before returning; disappearance regression preserves old contract/generation and pending input"
+    "owner revision checks selected native configuration and original binding before metadata activation, then revalidates the native owner/binding before returning; disappearance regression preserves old contract/generation and pending input",
+    "owner turn claim and dispatch authenticate exact pending input against immutable accepted ingress; ten corruption/routing cases refuse, and active selector changes never retarget accepted input",
+    "owner input arriving before candidate registration can enter the first native guard while preserving the owner pause; registration event failure rolls back origin and candidate together; surviving history never becomes a fresh origin"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -525,7 +537,7 @@
     "ordinary_and_observational_guard_acquisition": true,
     "merge_sweep": true,
     "runtime_deployed": false,
-    "guard_fixture_scope": "31 actual guard subprocess modes in the merged-source full CLI: 25 earlier modes plus two session-restoration and four owner-revision handoff/refusal modes. Six new modes use physical native runtimes and protected scripted completion/resource evidence. No provider/model/VM dispatch or production acceptance.",
+    "guard_fixture_scope": "37 actual guard subprocess modes in the full CLI: 31 earlier modes plus six early-input registration/refusal/retry modes. Real protected native-store operations, scripted private Discord metadata and disposable Git candidates; no provider/model/VM dispatch or deployed acceptance.",
     "pre_guard_retired_aborted_namespace_resolution": true,
     "all_closed_original_binding_recovery": true,
     "all_closed_original_binding_recovery_scope": "complete intact original history, registered retired namespaces and resolved aborted destinations, original selected policy and existing audit authority; vanished/legacy/corrupt authority remains held",
@@ -537,7 +549,9 @@
     "discord_coding_gateway_activation": false,
     "owner_session_restoration_factory": true,
     "owner_contract_revision_guard_handoff": true,
-    "owner_revision_history_validated": true
+    "owner_revision_history_validated": true,
+    "owner_first_candidate_registration": true,
+    "owner_inbox_payload_authentication": true
   },
   "productive_caller_enabled_scope": "deployment activation remains unproven; supported guard source paths are connected as described in source_caller_integration",
   "closed_workflow_recovery_limits": {
@@ -729,5 +743,109 @@
       "assertion": "owner revision returned a guard without native configuration",
       "scope": "actual guard regression against the initial revision-transition implementation; no VM/model/provider dispatch"
     }
+  },
+  "owner_early_candidate": {
+    "source_parent_commit": "af881938532ac593d13a0253133625875d36af64",
+    "source_generation_authority": false,
+    "authenticated_payload_checks_connected": true,
+    "first_candidate_guard_registration_connected": true,
+    "worker_consumer_connected": false,
+    "discord_coding_gateway_enabled": false,
+    "deployed": false,
+    "provider_transport_dispatch": false,
+    "behavior_red": [
+      {
+        "log": "autoship-owner-input-auth-red.log",
+        "passed": 6,
+        "failed": 2,
+        "assertions": [
+          "body: damaged owner input was claimed",
+          "changed persisted body became authorized by reconstructing the turn"
+        ]
+      },
+      {
+        "log": "autoship-owner-early-candidate-red.log",
+        "assertion": "early owner input must acquire its first candidate without unpausing: owner turn requires the current owned candidate binding"
+      }
+    ],
+    "targeted_green": [
+      {
+        "log": "autoship-owner-input-auth-green.log",
+        "passed": 25,
+        "failed": 0,
+        "scope": "before adding the positive selector-change regression"
+      },
+      {
+        "log": "autoship-owner-early-candidate-green.log",
+        "guard_subprocess_modes": 36,
+        "failed": 0,
+        "scope": "before adding registration-write rollback case; all final cases repeated by full CLI"
+      }
+    ],
+    "guard_subprocess_modes": 37,
+    "new_early_modes": [
+      "fresh admitted command with input before candidate registration",
+      "no input creates no candidate",
+      "corrupt input creates no candidate",
+      "surviving execution history refuses fresh registration",
+      "native policy repair retries only unstarted setup",
+      "failed registration event rolls back candidate and origin, then retries"
+    ],
+    "input_refusal_cases": [
+      "changed persisted body",
+      "changed origin",
+      "changed principal",
+      "refused acknowledgement",
+      "wrong request kind",
+      "missing acknowledgement",
+      "removed private route",
+      "unknown origin fields",
+      "unknown reply fields",
+      "changed nonce"
+    ],
+    "checks": [
+      "claim and native dispatch rejoin exact body with accepted immutable ingress, principal, origin, workflow and acknowledgement",
+      "active selector changes preserve the original queued workflow; removed destinations cannot dispatch old input",
+      "first candidate registration shares the ordinary atomic registered event/origin transaction and refuses surviving execution history",
+      "pause, pending input, publication denial and model/merge counters remain unchanged; native setup still uses original-store registration/handoff"
+    ],
+    "fixture_scope": "Scripted Discord ingress metadata with real disposable Git candidate and guard/native-store registration. No live Discord, provider/model/VM execution or input completion.",
+    "full_cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "passed": 1854,
+      "failed": 0,
+      "ignored": 33,
+      "log": "autoship-owner-early-candidate-full-cli.log"
+    },
+    "production_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "exit_code": 0,
+      "log": "autoship-owner-early-candidate-production-check.log"
+    },
+    "remaining": [
+      "actual owner worker scheduling and execution",
+      "initial registered acceptance binding for pre-candidate input, and independent owner contract/harness preparation",
+      "guarded owner-input completion and durable private replies",
+      "fenced/uncertain input and interrupted revision recovery",
+      "Discord gateway activation, normal rollout and full #1715 live acceptance/soak"
+    ],
+    "sources": [
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_inbox.rs",
+        "sha256": "7391154ae0e9fcfabe941e47f81ee4e4c83384b037cf0237b126ae16ecf38f1c"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+        "sha256": "4d1ac5211f1bc9013f53e1244a04b593d6b686171665509541b2a6de83dee044"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+        "sha256": "5f68dec3ae81d7ca94a64129cd2c669391666e4861855d26cb3493294ef10db9"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+        "sha256": "02eba342552eab6510711e8552fc9a438424b643bcfbf49bae86d240973f8a57"
+      }
+    ]
   }
 }

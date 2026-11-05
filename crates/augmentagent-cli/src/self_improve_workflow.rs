@@ -760,7 +760,7 @@ impl WorkflowGuard {
                     .context("issue or PR identity required")?,
             )?
         };
-        let existing = store.snapshot(&id)?;
+        let mut existing = store.snapshot(&id)?;
         let receipts = existing
             .as_ref()
             .map(|s| s.checkpoint.evidence.clone())
@@ -774,6 +774,12 @@ impl WorkflowGuard {
             binding = git_binding(start.worktree, start.contract, start.environment, &[]).await?;
         }
         if owner_turn {
+            if existing.is_none() {
+                if !store.register_owner_candidate(&id,start.repository,start.branch,binding.clone(),now)? {
+                    return Ok(None);
+                }
+                existing=store.snapshot(&id)?;
+            }
             anyhow::ensure!(existing.as_ref().is_some_and(|s|s.checkpoint.binding==binding),"owner turn requires the current owned candidate binding");
         } else {store.register(&id,start.branch,binding.clone(),now)?;}
         let owner=format!("{}:{}",std::process::id(),uuid::Uuid::new_v4());
@@ -3191,7 +3197,7 @@ mod tests {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session","owner-setup-codex-revision-unconfigured-session"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session","owner-setup-codex-revision-unconfigured-session","owner-early-fresh","owner-early-no-input","owner-early-corrupt-input","owner-early-history","owner-early-policy-retry","owner-early-register-write-failure"] {
                 if mode.ends_with("-session") && !cfg!(target_os="linux") {continue;}
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
@@ -3218,7 +3224,7 @@ mod tests {
         std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
         let dir=repo();let state=control.join("workflow.db");let mode=std::env::var(MODE).unwrap();
         let id=durable::workflow_id("owner/repo",77).unwrap();
-        if mode.starts_with("owner-setup-") {
+        if mode.starts_with("owner-setup-") || mode.starts_with("owner-early-") {
             let origin=durable::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
             let request=durable::submission::Request {repository:"owner/repo".into(),target:durable::submission::Target::Issue(77),provider:Some(if mode.contains("-claude-") {durable::submission::Provider::Claude}else{durable::submission::Provider::Codex}),until:durable::submission::Milestone::Merged};
             WorkflowStore::open(&state).unwrap().submit_discord_authorized(&origin,&request,&"a".repeat(64),millis()).unwrap();
@@ -3268,6 +3274,42 @@ mod tests {
         let contract_label=revision_contracts.as_ref().map(|(previous,_)|format!("registered:{}",previous.contract_hash())).unwrap_or_else(||"C1".into());
         let start=||Start{repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",
             source_issue:Some(77),pr:None,branch:"fixture",contract:&contract_label,environment:"test"};
+        if mode.starts_with("owner-early-") {
+            let mut store=WorkflowStore::open(&state).unwrap();
+            assert!(store.snapshot(&id).unwrap().is_none(),"fixture must start before workflow candidate registration");
+            if mode=="owner-early-no-input" {
+                assert!(WorkflowGuard::acquire_mode_at(&state,start(),millis(),true).await.unwrap().is_none());
+                assert!(store.snapshot(&id).unwrap().is_none());return;
+            }
+            let origin=durable::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:45};
+            store.enqueue_owner_message(&origin,&id,"Early synthetic clarification",None,millis()).unwrap();
+            let control_before=store.owner_control(&id).unwrap();drop(store);
+            let policy_bytes=std::fs::read(&policy).unwrap();
+            if mode=="owner-early-corrupt-input" {rusqlite::Connection::open(&state).unwrap().execute("UPDATE workflow_owner_message SET body='Different instruction' WHERE workflow=?1",[&id]).unwrap();}
+            if mode=="owner-early-history" {let db=rusqlite::Connection::open(&state).unwrap();db.pragma_update(None,"foreign_keys",false).unwrap();db.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,4,'native_model_admitted','lost candidate history',1)",[&id]).unwrap();}
+            if mode=="owner-early-policy-retry" {std::fs::remove_file(&policy).unwrap();}
+            if mode=="owner-early-register-write-failure" {rusqlite::Connection::open(&state).unwrap().execute_batch("CREATE TRIGGER deny_early_owner_registration BEFORE INSERT ON workflow_event WHEN NEW.kind='registered' BEGIN SELECT RAISE(ABORT,'injected early registration failure'); END;").unwrap();}
+            let result=WorkflowGuard::acquire_mode_at(&state,start(),millis(),true).await;
+            if matches!(mode.as_str(),"owner-early-corrupt-input"|"owner-early-history") {
+                assert!(result.is_err());let store=WorkflowStore::open(&state).unwrap();assert!(store.snapshot(&id).unwrap().is_none(),"refused first owner input created a fresh origin");assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.owner_control(&id).unwrap(),control_before);return;
+            }
+            let first=if mode=="owner-early-register-write-failure" {
+                assert!(result.is_err());let store=WorkflowStore::open(&state).unwrap();assert!(store.snapshot(&id).unwrap().is_none());assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.owner_control(&id).unwrap(),control_before);assert!(store.events(&id).unwrap().is_empty());drop(store);
+                let db=rusqlite::Connection::open(&state).unwrap();let origins:i64=db.query_row("SELECT count(*) FROM workflow_native_registration_origin WHERE workflow=?1",[&id],|r|r.get(0)).unwrap();assert_eq!(origins,0);db.execute_batch("DROP TRIGGER deny_early_owner_registration").unwrap();drop(db);
+                WorkflowGuard::acquire_mode_at(&state,start(),millis(),true).await.unwrap().expect("rolled-back first registration must retry without a new origin")
+            }else if mode=="owner-early-policy-retry" {
+                assert!(result.is_err());let store=WorkflowStore::open(&state).unwrap();assert!(store.snapshot(&id).unwrap().is_some(),"legitimate first-candidate binding was lost during native setup refusal");drop(store);
+                std::fs::write(&policy,&policy_bytes).unwrap();std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
+                WorkflowGuard::acquire_mode_at(&state,start(),millis(),true).await.unwrap().expect("early owner turn must retry only its unstarted setup")
+            }else{result.expect("early owner input must acquire its first candidate without unpausing").unwrap()};
+            first.validate_before_side_effect().unwrap();
+            let sessions=first.owner_turn_native_builder_sessions(augmentagent_channel_core::ProviderKind::Codex).unwrap();
+            sessions.scope(async {let session=augmentagent_channel_core::native_session::current_for(augmentagent_channel_core::ProviderKind::Codex).unwrap().unwrap();let turn=session.begin(augmentagent_channel_core::ProviderKind::Codex).unwrap();assert!(matches!(turn.launch(),augmentagent_channel_core::native_session::Launch::Create {..}));}).await;
+            let mut store=WorkflowStore::open(&state).unwrap();let snapshot=store.snapshot(&id).unwrap().unwrap();
+            assert!(store.native_owner_binding(&id,snapshot.generation).unwrap().is_some());assert_eq!(snapshot.model_calls,0);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.owner_control(&id).unwrap(),control_before);
+            assert!(store.claim_productive(&id,"must-not-unpause",millis(),LEASE_MS).unwrap().is_none());assert!(store.begin_operation(&first.lease,OperationKind::Push,first.binding(),millis()).is_err());assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+            drop(store);first.finish().unwrap();return;
+        }
         let result=WorkflowGuard::acquire_at(&state,start(),millis()).await;
         if matches!(mode.as_str(),"missing-policy"|"legacy-owner"|"legacy-call"|"legacy-workflow"|"physical-prior-state") {
             assert!(result.is_err(),"registration should have refused: {mode}");

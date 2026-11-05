@@ -751,48 +751,11 @@ impl WorkflowStore {
     /// Register authorized ownership only. Existing registration is not reset
     /// by restart/adoption and never manufactures an approval.
     pub fn register(
-        &mut self,
-        workflow: &str,
-        branch: &str,
-        binding: Binding,
-        now_ms: i64,
-    ) -> Result<bool> {
-        binding.validate()?;
-        ensure!(
-            !workflow.is_empty() && !branch.is_empty(),
-            "identity and branch required"
-        );
-        let checkpoint = Checkpoint {
-            stage: Stage::Intake,
-            binding,
-            evidence: vec![],
-            next: NextAction {
-                reason: "registered".into(),
-                action: "scope".into(),
-                eligible_at_ms: now_ms,
-            },
-        };
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let inserted = tx.execute(
-            "INSERT INTO workflow(id, branch, checkpoint, heartbeat_at, progress_at)
-            VALUES (?1,?2,?3,?4,?4) ON CONFLICT(id) DO NOTHING",
-            params![
-                workflow,
-                branch,
-                serde_json::to_string(&checkpoint)?,
-                now_ms
-            ],
-        )? == 1;
-        if inserted {
-            event(&tx, workflow, 0, "registered", branch, now_ms)?;
-            let sequence:i64=tx.query_row("SELECT seq FROM workflow_event WHERE workflow=?1 AND generation=0 AND kind='registered' ORDER BY seq DESC LIMIT 1",
-                [workflow],|row|row.get(0))?;
-            tx.execute("INSERT INTO workflow_native_registration_origin VALUES(?1,1,?2)",params![workflow,sequence])?;
-        }
-        tx.commit()?;
-        Ok(inserted)
+        &mut self,workflow:&str,branch:&str,binding:Binding,now_ms:i64,
+    )->Result<bool> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted=register_workflow_in_transaction(&tx,workflow,branch,binding,now_ms)?;
+        tx.commit()?;Ok(inserted)
     }
 
     /// Free merge reconciliation preserves command holds and merge ceilings.
@@ -1996,6 +1959,44 @@ impl WorkflowStore {
         )
         .transpose()
     }
+}
+
+fn register_workflow_in_transaction(
+    tx:&Transaction<'_>,workflow:&str,branch:&str,binding:Binding,now_ms:i64,
+)->Result<bool> {
+        binding.validate()?;
+        ensure!(
+            !workflow.is_empty() && !branch.is_empty(),
+            "identity and branch required"
+        );
+        let checkpoint = Checkpoint {
+            stage: Stage::Intake,
+            binding,
+            evidence: vec![],
+            next: NextAction {
+                reason: "registered".into(),
+                action: "scope".into(),
+                eligible_at_ms: now_ms,
+            },
+        };
+        let inserted = tx.execute(
+            "INSERT INTO workflow(id, branch, checkpoint, heartbeat_at, progress_at)
+            VALUES (?1,?2,?3,?4,?4) ON CONFLICT(id) DO NOTHING",
+            params![
+                workflow,
+                branch,
+                serde_json::to_string(&checkpoint)?,
+                now_ms
+            ],
+        )? == 1;
+        if inserted {
+            event(tx, workflow, 0, "registered", branch, now_ms)?;
+            let sequence:i64=tx.query_row("SELECT seq FROM workflow_event WHERE workflow=?1 AND generation=0 AND kind='registered' ORDER BY seq DESC LIMIT 1",
+                [workflow],|row|row.get(0))?;
+            tx.execute("INSERT INTO workflow_native_registration_origin VALUES(?1,1,?2)",params![workflow,sequence])?;
+        }
+        Ok(inserted)
+
 }
 
 fn require_lease(tx: &Transaction<'_>, lease: &Lease, now_ms: i64) -> Result<()> {
