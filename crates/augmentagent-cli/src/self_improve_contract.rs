@@ -173,7 +173,7 @@ fn parse_proposal_data(
     proposal.contract.validate()?;
     Ok(proposal)
 }
-fn harness_path(path: &str) -> bool {
+pub(super) fn harness_path(path: &str) -> bool {
     let parts: Vec<_> = path.split('/').collect();
     if parts
         .iter()
