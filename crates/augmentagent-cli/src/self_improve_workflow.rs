@@ -81,6 +81,11 @@ fn millis() -> i64 {
 /// Acquire after trusted candidate resolution. Dropping the guard stops lease
 /// renewal but does not delete work or declare subprocess teardown complete.
 /// Call finish only after child processes have stopped and artifacts are safe.
+/// Constructed only on a failure path before this module publishes a guard.
+/// This attests no provider dispatch in this setup, not native quiescence.
+pub(crate) struct UnstartedOwnerTurnSetup {lease:Lease}
+impl UnstartedOwnerTurnSetup {pub(crate) fn lease(&self)->&Lease {&self.lease}}
+
 pub(super) struct WorkflowGuard {
     state:PathBuf,
     store: Arc<Mutex<WorkflowStore>>,
@@ -540,7 +545,7 @@ impl SweepGuard {
             .and_then(|_|inner.validate_before_side_effect())
             .and_then(|_|inner.audit_event("sweep_claimed",serde_json::json!({})));
         if let Err(error)=setup {
-            inner.release_unstarted_native_registration()?;
+            inner.release_unstarted_native_registration(false)?;
             return Err(error);
         }
         inner.spawn_renewal();
@@ -733,6 +738,7 @@ impl WorkflowGuard {
         Self::acquire_mode_at(state,start,now,false).await
     }
     async fn acquire_mode_at(state:&Path,start:Start<'_>,now:i64,owner_turn:bool)->Result<Option<Self>> {
+        if owner_turn {anyhow::ensure!(std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_some(),"owner-turn-native-configuration-unavailable");}
         anyhow::ensure!(
             !start.repository.trim().is_empty(),
             "canonical repository required"
@@ -771,9 +777,10 @@ impl WorkflowGuard {
             anyhow::ensure!(existing.as_ref().is_some_and(|s|s.checkpoint.binding==binding),"owner turn requires the current owned candidate binding");
         } else {store.register(&id,start.branch,binding.clone(),now)?;}
         let owner=format!("{}:{}",std::process::id(),uuid::Uuid::new_v4());
-        let lease=if owner_turn {store.claim_owner_turn(&id,&owner,now,LEASE_MS)?.map(|turn|turn.lease)}
+        let lease=if owner_turn {store.claim_owner_turn_for_setup(&id,&owner,now,LEASE_MS)?.map(|turn|turn.lease)}
             else {store.claim_productive(&id,&owner,now,LEASE_MS)?};
         let Some(lease)=lease else {return Ok(None);};
+        let prepared=(||->Result<Arc<augmentagent_channel_core::AuditLogger>> {
         if let Some(pr) = start.pr {
             store.attach_pr_in_repo(&lease, start.repository, pr, now)?;
         }
@@ -799,11 +806,21 @@ impl WorkflowGuard {
                 now,
             )?;
         }
-        let audit = acquire_audit_generation(state, &mut store, &lease,
+        let audit = acquire_audit_generation_inner(state, &mut store, &lease,
             Some(start.worktree), &mut binding, now)?;
         audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
             workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
         })?;
+            Ok(audit)
+        })();
+        let audit=match prepared {
+            Ok(audit)=>audit,
+            Err(error)=>{
+                if owner_turn {store.release_unstarted_owner_turn(&UnstartedOwnerTurnSetup {lease:lease.clone()},millis())?;}
+                else {store.release(&lease,millis())?;}
+                return Err(error);
+            }
+        };
         let mut guard = Self {
             state:state.to_path_buf(),
             audit,
@@ -826,7 +843,7 @@ impl WorkflowGuard {
             .and_then(|_|guard.validate_before_side_effect())
             .and_then(|_|guard.audit_event("workflow_claimed",serde_json::json!({})));
         if let Err(error)=setup {
-            guard.release_unstarted_native_registration()?;
+            guard.release_unstarted_native_registration(owner_turn)?;
             return Err(error);
         }
         guard.spawn_renewal();
@@ -983,10 +1000,12 @@ impl WorkflowGuard {
 
     /// Acquisition has not returned and no provider/observer can have executed.
     /// This narrowly releases a refused setup, never a running turn.
-    fn release_unstarted_native_registration(&mut self)->Result<()> {
+    fn release_unstarted_native_registration(&mut self,owner_turn:bool)->Result<()> {
         let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("native registration store poisoned"))?;
         let now=millis();charge_elapsed(&mut store,&self.lease,self.started,&self.accounted_ms,now)?;
-        store.release(&self.lease,now)?;self.released=true;Ok(())
+        if owner_turn {store.release_unstarted_owner_turn(&UnstartedOwnerTurnSetup {lease:self.lease.clone()},now)?;}
+        else {store.release(&self.lease,now)?;}
+        self.released=true;Ok(())
     }
 
     fn install_model_accounting(&self) -> Result<()> {
@@ -1095,7 +1114,7 @@ impl WorkflowGuard {
             .and_then(|_|guard.validate_before_side_effect())
             .and_then(|_|guard.audit_event("observation_claimed",serde_json::json!({"key":key})));
         if let Err(error)=setup {
-            guard.release_unstarted_native_registration()?;
+            guard.release_unstarted_native_registration(false)?;
             return Err(error);
         }
         guard.spawn_renewal();
@@ -2134,6 +2153,18 @@ mod tests {
 
     #[tokio::test]
     async fn claimed_owner_guard_admits_native_work_without_granting_shipping() {
+        const CHILD:&str="AUTOSHIP_CONFIGURED_OWNER_GUARD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let control=control_dir();let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","self_improve::workflow::tests::claimed_owner_guard_admits_native_work_without_granting_shipping","--nocapture","--test-threads=1"])
+                .env(CHILD,control.path()).env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json")).output().unwrap();
+            assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
+        }
+        use std::os::unix::fs::{MetadataExt,PermissionsExt};
+        let control=PathBuf::from(std::env::var_os(CHILD).unwrap());let native=control.join("native");std::fs::create_dir(&native).unwrap();std::fs::set_permissions(&native,std::fs::Permissions::from_mode(0o700)).unwrap();let metadata=native.metadata().unwrap();
+        let identity=format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::json!({"device":metadata.dev(),"inode":metadata.ino()})).unwrap()));
+        let bootstrap=native.join("authority-bootstrap.json");std::fs::write(&bootstrap,serde_json::to_vec(&serde_json::json!({"version":1,"epoch":uuid::Uuid::new_v4().to_string(),"root_identity_sha256":identity})).unwrap()).unwrap();std::fs::set_permissions(&bootstrap,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let policy=control.join("policy.json");std::fs::write(&policy,serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/unused-runtime","guest_runtime":"/unused-guest","state_root":native,"memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,"providers":{}})).unwrap()).unwrap();std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
         let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");let now=millis();
         let mut store=WorkflowStore::open(&path).unwrap();
         let origin=durable::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
@@ -3081,7 +3112,7 @@ mod tests {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption"] {
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
                     .env(CHILD,control.path()).env(MODE,mode);
@@ -3107,6 +3138,11 @@ mod tests {
         std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
         let dir=repo();let state=control.join("workflow.db");let mode=std::env::var(MODE).unwrap();
         let id=durable::workflow_id("owner/repo",77).unwrap();
+        if mode.starts_with("owner-setup-") {
+            let origin=durable::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
+            let request=durable::submission::Request {repository:"owner/repo".into(),target:durable::submission::Target::Issue(77),provider:Some(durable::submission::Provider::Codex),until:durable::submission::Milestone::Merged};
+            WorkflowStore::open(&state).unwrap().submit_discord_authorized(&origin,&request,&"a".repeat(64),millis()).unwrap();
+        }
         if mode=="legacy-workflow" {
             let binding=git_binding(dir.path(),"C1","test",&[]).await.unwrap();
             // No live WorkflowStore connection exists while this fixture
@@ -3181,6 +3217,29 @@ mod tests {
             assert_eq!(rows[0].certainty,crate::autoship_workflow::native_observation::Certainty::Uncertain);
             assert_eq!(rows[0].protected_observation_reference.as_ref(),Some(fact.receipt()));
             assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        }
+        if mode.starts_with("owner-setup-") {
+            let original=saved.clone().unwrap();guard.finish().unwrap();let mut store=WorkflowStore::open(&state).unwrap();
+            let origin=durable::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:45};let reply=store.enqueue_owner_message(&origin,&id,"Synthetic owner clarification",None,millis()).unwrap();assert!(reply.accepted);let control_before=store.owner_control(&id).unwrap().unwrap();let generation_before=store.snapshot(&id).unwrap().unwrap().generation;let policy_bytes=std::fs::read(&policy).unwrap();drop(store);
+            if mode=="owner-setup-unconfigured" {unsafe{std::env::remove_var("AUGMENTAGENT_NATIVE_VM_POLICY");}}
+            else if mode!="owner-setup-healthy" {std::fs::remove_file(&policy).unwrap();}
+            if mode=="owner-setup-write-failure" {rusqlite::Connection::open(&state).unwrap().execute_batch("CREATE TRIGGER deny_owner_setup_refusal BEFORE INSERT ON workflow_owner_turn_setup_refusal BEGIN SELECT RAISE(ABORT,'injected owner setup refusal failure'); END;").unwrap();}
+            let result=WorkflowGuard::acquire_mode_at(&state,start(),millis(),true).await;
+            if mode=="owner-setup-unconfigured" {assert!(result.is_err());let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&id).unwrap().unwrap().generation,generation_before);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.owner_control(&id).unwrap(),Some(control_before));return;}
+            let recovered=if mode=="owner-setup-healthy" {result.unwrap().expect("guarded native owner handoff must acquire the paused owner turn")}else{
+                assert!(result.is_err());let mut store=WorkflowStore::open(&state).unwrap();let snapshot=store.snapshot(&id).unwrap().unwrap();assert_eq!(snapshot.model_calls,0);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.owner_control(&id).unwrap(),Some(control_before.clone()));assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+                let row_state:String=rusqlite::Connection::open(&state).unwrap().query_row("SELECT state FROM workflow_owner_turn WHERE request_id=?1",[&reply.request_id],|r|r.get(0)).unwrap();
+                if mode=="owner-setup-write-failure" {assert_eq!(row_state,"claimed");assert!(snapshot.lease_until_ms>0);rusqlite::Connection::open(&state).unwrap().execute_batch("DROP TRIGGER deny_owner_setup_refusal").unwrap();assert!(store.claim_owner_turn(&id,"must-not-replay",millis()+LEASE_MS+1,LEASE_MS).unwrap().is_none());return;}
+                assert_eq!(row_state,"setup_refused");assert_eq!(snapshot.lease_until_ms,0);assert!(store.native_owner_binding(&id,snapshot.generation).unwrap().is_none());drop(store);std::fs::write(&policy,&policy_bytes).unwrap();std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
+                if matches!(mode.as_str(),"owner-setup-history-loss"|"owner-setup-index-corruption") {
+                    let db=rusqlite::Connection::open(&state).unwrap();
+                    if mode=="owner-setup-history-loss" {db.execute("DELETE FROM workflow_owner_turn_setup_refusal WHERE workflow=?1",[&id]).unwrap();}
+                    else {db.execute("UPDATE workflow_owner_turn SET binding=json_set(binding,'$.unexpected_scope','unrecognized') WHERE workflow=?1",[&id]).unwrap();}
+                    drop(db);assert!(WorkflowGuard::acquire_mode_at(&state,start(),millis(),true).await.is_err(),"corrupt owner setup authority must remain held");assert_eq!(WorkflowStore::open(&state).unwrap().pending_owner_messages(&id).unwrap(),1);return;
+                }
+                WorkflowGuard::acquire_mode_at(&state,start(),millis(),true).await.unwrap().expect("same unstarted owner request must retry after configuration recovery")
+            };
+            recovered.validate_before_side_effect().unwrap();assert_eq!(recovered.audit.native_store_binding().unwrap(),Some(original));let mut store=recovered.store.lock().unwrap();let turn=store.owner_turn_for_lease(&recovered.lease,millis()).unwrap();assert_eq!(turn.request_id,reply.request_id);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.owner_control(&id).unwrap(),Some(control_before));assert!(store.begin_operation(&recovered.lease,OperationKind::Push,&recovered.binding,millis()).is_err());assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,0);drop(store);recovered.finish().unwrap();assert!(WorkflowStore::open(&state).unwrap().claim_owner_turn(&id,"published-turn-must-not-replay",millis()+LEASE_MS+1,LEASE_MS).unwrap().is_none());return;
         }
         if mode=="terminal-abort-cleanup" {
             use augmentagent_channel_core::native_vm::ownership;

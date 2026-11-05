@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "7409527e1ab9d9d692d441e62e47f09e1eabcf57",
+  "source_parent_commit": "22498a8bc820f86fd674611607d2f9bb7247137a",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -26,7 +26,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
-      "sha256": "223c59a94748405facb73c7e21c01c5fd888def83f34a96d423d893446b94b9c"
+      "sha256": "ad96cbbc6df54ac5bfa2b99af682bebac35829ece92cb9de764274591b805dc7"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
@@ -34,7 +34,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
-      "sha256": "1c81d71e7e81c19ec8bc263e7bc88662cc5bd04f4e99f1adf9e8852effe59d9a"
+      "sha256": "35df7d00a3b4468702330ce11ae720f66e3f19f0e6d27bd44aa0baea119966b4"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_settlement.rs",
@@ -46,11 +46,11 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
-      "sha256": "1297f37d94b0a6543b63b4ff5fde57d02bb313b44a073a5874f4663a9dce67b1"
+      "sha256": "bb9321a4770bf34934066dcd681a3ed933f27d47bf815b737e4d963d65bbe1a9"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
-      "sha256": "99730033255264f0c8bb039dde23c58d03394b3c765dd338dc58a227b346f512"
+      "sha256": "698d31d94cf50cc4959138f595e59c2e779f351ddfb2c2e8fa7cd9b46e23edf2"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_preparation.rs",
@@ -110,7 +110,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "0cb16dc7435a7966ea4ec75ec2bc2e1d96f37fd037cf3880d932d1fc02d3de00"
+      "sha256": "349a998a7d0e7bc836b00260ff70a51582c6c4df1839d13674bc8b88522598c6"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_recovery.rs",
@@ -127,11 +127,19 @@
     {
       "path": "crates/augmentagent-channel-core/tests/phone_call_reliability.rs",
       "sha256": "2843f25472d30fa28e1f5ef4899457c20de5816885b3fccdbd6f08de2456302a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_setup_refusal.rs",
+      "sha256": "68ca8db8cf07aa5270aa9fb3fba28cd00c3f4a0fde225e9edb9951ec1977c6cd"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve.rs",
+      "sha256": "11f4943769d297ee406d0dc5d1220a4a06e4d967ddc17d97b9cbf86cb5a8616d"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1845,
+    "passed": 1846,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
@@ -216,7 +224,18 @@
       "autoship-native-terminal-cleanup-production-check.log",
       "autoship-native-terminal-phone-clock-check.log",
       "autoship-7409527e-hosted-targeted-failed.log",
-      "autoship-7409527e-hosted-phone-failed.log"
+      "autoship-7409527e-hosted-phone-failed.log",
+      "autoship-owner-guard-setup-red.log",
+      "autoship-owner-guard-setup-green.log",
+      "autoship-owner-guard-setup-full-cli.log",
+      "autoship-owner-guard-setup-owner-green.log",
+      "autoship-owner-guard-setup-owner-green-retry.log",
+      "autoship-owner-guard-setup-owner-final-green.log",
+      "autoship-owner-guard-setup-final-cli.log",
+      "autoship-owner-guard-index-corruption-red.log",
+      "autoship-owner-guard-index-corruption-green.log",
+      "autoship-owner-guard-setup-validated-cli.log",
+      "autoship-owner-guard-setup-validated-production-check.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -249,11 +268,11 @@
     "production_configuration_check": {
       "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
       "passed": true,
-      "log": "autoship-native-terminal-cleanup-production-check.log"
+      "log": "autoship-owner-guard-setup-validated-production-check.log"
     },
     "guard_promotion_cases": 3,
     "read_only_audit_probe_cases": 2,
-    "actual_guard_subprocess_modes": 19,
+    "actual_guard_subprocess_modes": 25,
     "sweep_related_cases": 20,
     "guard_abort_resolver_cases": 3,
     "closed_workflow_core_cases": 2,
@@ -261,7 +280,10 @@
     "closed_workflow_guard_modes": 3,
     "terminal_namespace_cleanup_cases": 4,
     "phone_reliability_passed": 6,
-    "phone_reliability_failed": 0
+    "phone_reliability_failed": 0,
+    "owner_guard_setup_modes": 6,
+    "retained_runtime_owner_pause_cases": 1,
+    "focused_owner_cases": 115
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -372,7 +394,13 @@
     "unpromoted aborted destinations are retired under the original binding without registration, a productive lease, checkpoint/accounting changes or owner-input completion; barriers resolve only through fresh original-bound audit/kernel proofs",
     "retirement intents replay idempotently after reopen; failed intent writes prevent effects; audit/projection failure retains affected barriers while verified peers advance; stale terminal/store authority refuses",
     "bounded terminal namespace scheduling uses a durable logical ordinal that grants no authority; the real worker entry holds no workflow mutex across native inspection, retirement or audit/kernel IO",
-    "phone integration fixture observes actual fake-source sleep completion after virtual time advance and before real-clock resume, retaining the original three-second deadline assertions; all six integration cases pass locally"
+    "phone integration fixture observes actual fake-source sleep completion after virtual time advance and before real-clock resume, retaining the original three-second deadline assertions; all six integration cases pass locally",
+    "guard-only owner-turn metadata acquisition can reach actual shared handoff for bound retained native owners; ordinary metadata claims keep their retained-owner block and publication/merge remains owner-paused",
+    "only a private nonserializable capability constructed before guard publication can persist an unstarted owner setup disposition; failed setup atomically preserves refusal history and releases its own lease without consuming input, unpausing, clearing native intent or resetting accounting",
+    "same owner request can be reclaimed only after validated setup_refused history; escaped/expired claimed turns remain blocked, refusal write failure stays conservative, and lost/corrupt authority history holds future claims",
+    "owner-turn acquisition requires selected native configuration before claiming; configured counter-admission fixture preserves its pause/publication assertions and performs no provider transport dispatch",
+    "actual joined preparation transfers a retained physical runtime under the guarded owner pause exception while preserving creation bytes, checkpoint, pending input and allowance",
+    "unrecognized binding fields in the current owner-turn authority index are refused rather than normalized and overwritten; the actual guard corruption regression failed before the fix"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -390,7 +418,8 @@
     "persist post-intent transient-I/O S backoff, actual input-change early wake before activation",
     "remaining authenticated retirement intent routing and interrupted/legacy/vanished namespace recovery; remaining owner-turn and recovery consumers; actual runtime/provider continuation acceptance",
     "actual provider/VM continuation after closed-workflow recovery, remaining nonterminal owner execution-retry/owner-turn retirement routing, and missing/legacy/vanished authority recovery remain unproven",
-    "hosted phone/aggregate checks for the newly published combined head; local phone clock fix passed six cases but hosted recovery is not yet proven"
+    "real owner-message worker consumption, guarded completion/reply and Discord coding gateway activation remain unimplemented; metadata/guard readiness never substitutes for actual provider/VM/Discord acceptance",
+    "new published head hosted checks and protected main synchronization/review remain required"
   ],
   "native_transfer_scope": "isolated synthetic-controller/native-filesystem fixtures only; zero production transfers or provider/model dispatch",
   "opaque_receipt_producer": "actual original-bound ownership::transfer_receipt lookup or Completed NativeTransferInspection under the held original native lock; no wire/serialized-receipt constructor",
@@ -469,12 +498,16 @@
     "ordinary_and_observational_guard_acquisition": true,
     "merge_sweep": true,
     "runtime_deployed": false,
-    "guard_fixture_scope": "19 actual guard subprocess modes, including real free worker terminal cleanup entry; zero-runtime native guard fixtures; no provider/model dispatch or production acceptance",
+    "guard_fixture_scope": "25 actual guard subprocess modes, 6 owner setup modes, plus joined paused-owner retained-runtime service fixture; no provider/model transport dispatch or production acceptance. Existing configured counter test makes one synthetic metadata model admission.",
     "pre_guard_retired_aborted_namespace_resolution": true,
     "all_closed_original_binding_recovery": true,
     "all_closed_original_binding_recovery_scope": "complete intact original history, registered retired namespaces and resolved aborted destinations, original selected policy and existing audit authority; vanished/legacy/corrupt authority remains held",
     "terminal_worker_cleanup": true,
-    "terminal_worker_cleanup_scope": "exact terminal checkpoints and original Aborted namespace intents; shared Absent/Completed metadata reconciliation; Prepared remains pending until authorized retirement succeeds; no provider/model dispatch or production activation"
+    "terminal_worker_cleanup_scope": "exact terminal checkpoints and original Aborted namespace intents; shared Absent/Completed metadata reconciliation; Prepared remains pending until authorized retirement succeeds; no provider/model dispatch or production activation",
+    "owner_turn_guard_acquisition": true,
+    "owner_turn_setup_refusal_recovery": true,
+    "owner_coding_consumer": false,
+    "discord_coding_gateway_activation": false
   },
   "productive_caller_enabled_scope": "deployment activation remains unproven; supported guard source paths are connected as described in source_caller_integration",
   "closed_workflow_recovery_limits": {
@@ -485,5 +518,11 @@
     "workflow_recovery_records": 1024,
     "record_bytes": 1048576
   },
-  "closed_workflow_recovery_native_mutations": false
+  "closed_workflow_recovery_native_mutations": false,
+  "hosted_phone_fix_previous_head": {
+    "head": "22498a8bc820f86fd674611607d2f9bb7247137a",
+    "phone": "SUCCESS",
+    "targeted_linux_aggregate": "SUCCESS",
+    "scope": "previous published head only; new-head checks pending"
+  }
 }

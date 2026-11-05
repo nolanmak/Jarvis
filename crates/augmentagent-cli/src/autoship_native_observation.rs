@@ -458,7 +458,8 @@ mod tests {
         resource: AppendReceipt,
     }
     impl Fixture {
-        fn new() -> Self {
+        fn new() -> Self {Self::with_owner_binding(false)}
+        fn with_owner_binding(owner_bound:bool) -> Self {
             let root = tempfile::tempdir().unwrap();
             let base = root.path().canonicalize().unwrap();
             let state = base.join("native");
@@ -481,6 +482,11 @@ mod tests {
             .unwrap();
             let path = base.join("workflow.db");
             let mut store = WorkflowStore::open(&path).unwrap();
+            if owner_bound {
+                let origin=discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
+                let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Pr(7),provider:Some(submission::Provider::Codex),until:submission::Milestone::Merged};
+                assert!(store.submit_discord_authorized(&origin,&request,&"a".repeat(64),now()).unwrap().admission.accepted);
+            }
             let binding = Binding {
                 head: "head".into(),
                 contract: "contract".into(),
@@ -1300,6 +1306,19 @@ mod tests {
         let after=locked.snapshot(&lease.workflow).unwrap().unwrap();assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.attempts,before.attempts);assert_eq!(locked.merge_allowance(now(),5).unwrap(),allowance);
         assert!(!locked.native_handoff_pending_is_current(&lease,&f.binding,&pending,now()).is_ok());let events=locked.events(&lease.workflow).unwrap();drop(locked);
         assert!(matches!(super::super::native_prepare::run(&store,&lease,&f.binding,&sources,&destination,&now).unwrap(),super::super::native_prepare::NativePreparationRun::Registered {..}));assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);
+    }
+    #[test]
+    fn owner_turn_preparation_transfers_retained_runtime_under_pause_without_consuming_input() {
+        if child("owner_turn_preparation_transfers_retained_runtime_under_pause_without_consuming_input") {return;}
+        use std::sync::{Arc,Mutex};
+        let mut f=Fixture::with_owner_binding(true);let completed=f.complete();f.record(&completed).unwrap();file(&f._root.path().join("native/codex/session-fixture/lock"),b"");
+        f.audit.require_run_resources().unwrap();f.audit.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":f.lease.workflow,"generation":f.lease.generation})).unwrap();
+        let origin=discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
+        f.store.enqueue_owner_message(&discord_ingress::DiscordOrigin {message:45,..origin},&f.lease.workflow,"Synthetic native owner continuation",None,now()).unwrap();f.store.release(&f.lease,now()).unwrap();assert!(f.store.claim_owner_turn(&f.lease.workflow,"ordinary-consumer",now(),60_000).unwrap().is_none());
+        let turn=f.store.claim_owner_turn_for_setup(&f.lease.workflow,"guard-constructor",now(),60_000).unwrap().unwrap();let original=f.store.native_owner_binding(&f.lease.workflow,f.lease.generation).unwrap().unwrap();let base=f._root.path().canonicalize().unwrap();let destination=Arc::new(AuditLogger::protected(base.join("logs/owner-destination.jsonl"),base.join("anchors/owner-destination.json"),&[]).unwrap());destination.set_native_runtime_owner(RuntimeOwner {workflow_id:turn.lease.workflow.clone(),lease_generation:turn.lease.generation}).unwrap();destination.set_native_store_binding(original.clone()).unwrap();destination.require_run_resources().unwrap();destination.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":turn.lease.workflow,"generation":turn.lease.generation})).unwrap();
+        let before=f.store.snapshot(&turn.lease.workflow).unwrap().unwrap();let allowance=f.store.merge_allowance(now(),5).unwrap();let bytes=std::fs::read(base.join("native/codex/session-fixture/owned.json")).unwrap();let store=Arc::new(Mutex::new(WorkflowStore::open(&f.path).unwrap()));
+        let result=super::super::native_prepare::run(&store,&turn.lease,&turn.binding,&[Arc::new(f.audit.clone())],&destination,&now).unwrap();assert!(matches!(result,super::super::native_prepare::NativePreparationRun::Pending {settlement:Some(ref settled),settlement_failed:false,..} if settled.current_context),"{result:?}");
+        let mut locked=store.lock().unwrap();assert_eq!(locked.snapshot(&turn.lease.workflow).unwrap().unwrap(),before);assert_eq!(locked.merge_allowance(now(),5).unwrap(),allowance);assert_eq!(locked.pending_owner_messages(&turn.lease.workflow).unwrap(),1);assert!(locked.owner_control(&turn.lease.workflow).unwrap().unwrap().paused);assert_eq!(locked.native_owner_binding(&turn.lease.workflow,turn.lease.generation).unwrap(),Some(original));assert!(locked.begin_operation(&turn.lease,OperationKind::MergePr,&turn.binding,now()).is_err());assert_eq!(std::fs::read(base.join("native/codex/session-fixture/owned.json")).unwrap(),bytes);
     }
     #[test]
     fn native_joined_preparation_rollback_schedules_free_retry_without_native_claims() {

@@ -12,15 +12,30 @@ impl WorkflowStore {
     /// Shared service must authenticate current owner/repository authority and
     /// validate workspace provenance before acquiring this exclusive turn.
     pub fn claim_owner_turn(&mut self,workflow:&str,owner:&str,now:i64,ttl:i64)->Result<Option<OwnerTurn>> {
+        self.claim_owner_turn_inner(workflow,owner,now,ttl,false)
+    }
+    /// Guard-constructor metadata only. Native handoff/readiness must complete
+    /// before the caller publishes its guard or exposes any provider.
+    pub(crate) fn claim_owner_turn_for_setup(&mut self,workflow:&str,owner:&str,now:i64,ttl:i64)->Result<Option<OwnerTurn>> {
+        self.claim_owner_turn_inner(workflow,owner,now,ttl,true)
+    }
+    fn claim_owner_turn_inner(&mut self,workflow:&str,owner:&str,now:i64,ttl:i64,guarded:bool)->Result<Option<OwnerTurn>> {
         ensure!(!owner.is_empty() && owner.len()<=256 && owner.bytes().all(|b|b.is_ascii_graphic()) && ttl>0,"invalid owner turn lease");
         let until=now.checked_add(ttl).context("owner turn lease overflow")?;
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        setup_refusal::validate(&tx,workflow)?;
+        native_pending::require_clear_abort_barriers(&tx,workflow)?;
         let candidate:Option<(String,i64,i64)>=tx.query_row("SELECT checkpoint,lease_until,generation FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         let Some((raw,leased,generation))=candidate else {return Ok(None);};
         let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
         if leased>now || matches!(checkpoint.stage,Stage::Merged|Stage::Retired|Stage::Held) {return Ok(None);}
         let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1 AND state IN ('claimed','uncertain')) OR EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed'))",[workflow],|r|r.get(0))?;
-        if blocked || super::native_owner_binding::unretired_owners(&tx,workflow)? {return Ok(None);}
+        let retained=super::native_owner_binding::unretired_owners(&tx,workflow)?;
+        if blocked || (retained && !guarded) {return Ok(None);}
+        if retained {
+            let unbound:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner o WHERE o.workflow=?1 AND o.retired_at IS NULL AND NOT EXISTS(SELECT 1 FROM workflow_native_owner_binding b WHERE b.workflow=o.workflow AND b.lease_generation=o.lease_generation))",[workflow],|r|r.get(0))?;
+            if unbound {return Ok(None);}
+        }
         let Some(control)=super::owner_control::read(&tx,workflow)? else {return Ok(None);};
         if !control.paused {return Ok(None);}
         // Canonical request IDs end in an unsigned decimal Discord snowflake.
@@ -29,7 +44,8 @@ impl WorkflowStore {
         let Some((request_id,body))=next else {return Ok(None);};
         let generation=generation.checked_add(1).context("owner lease generation overflow")?;
         tx.execute("UPDATE workflow SET owner=?2,generation=?3,lease_until=?4,heartbeat_at=?5 WHERE id=?1",params![workflow,owner,generation,until,now])?;
-        tx.execute("INSERT INTO workflow_owner_turn VALUES(?1,?2,?3,?4,?5,?6,'claimed',?7)",params![workflow,request_id,owner,generation,control.revision,serde_json::to_string(&checkpoint.binding)?,now])?;
+        let changed=tx.execute("INSERT INTO workflow_owner_turn VALUES(?1,?2,?3,?4,?5,?6,'claimed',?7) ON CONFLICT(request_id) DO UPDATE SET owner=excluded.owner,lease_generation=excluded.lease_generation,pause_revision=excluded.pause_revision,binding=excluded.binding,state=excluded.state,started_at=excluded.started_at WHERE workflow_owner_turn.state='setup_refused' AND workflow_owner_turn.workflow=excluded.workflow",params![workflow,request_id,owner,generation,control.revision,serde_json::to_string(&checkpoint.binding)?,now])?;
+        ensure!(changed==1,"owner request has no verified unstarted setup disposition");
         // An owner clarification can change acceptance even before the head
         // changes. Preserve history, invalidate only the current approval index.
         tx.execute("DELETE FROM review WHERE workflow=?1",[workflow])?;
@@ -54,6 +70,7 @@ impl WorkflowStore {
     }
 }
 pub(super) fn validate_turn(tx:&Transaction<'_>,turn:&OwnerTurn,now:i64)->Result<()> {
+        setup_refusal::validate(tx,&turn.lease.workflow)?;
         require_binding(tx,&turn.lease,&turn.binding,now)?;
         let matches:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1 AND request_id=?2 AND owner=?3 AND lease_generation=?4 AND pause_revision=?5 AND binding=?6 AND state='claimed' AND EXISTS(SELECT 1 FROM workflow_owner_message m WHERE m.request_id=?2 AND m.workflow=?1 AND m.body=?7 AND m.state='pending'))",params![turn.lease.workflow,turn.request_id,turn.lease.owner,turn.lease.generation,turn.pause_revision,serde_json::to_string(&turn.binding)?,turn.body],|r|r.get(0))?;
         ensure!(matches,"owner turn identity changed");
@@ -66,6 +83,7 @@ pub(super) fn validate_turn(tx:&Transaction<'_>,turn:&OwnerTurn,now:i64)->Result
 // Only model/verifier admission uses this exception. Publication and merge
 // retain the ordinary owner-pause checks even for an active owner turn.
 pub(super) fn require_native_dispatch(tx:&Transaction<'_>,lease:&Lease,now:i64)->Result<()> {
+    setup_refusal::validate(tx,&lease.workflow)?;
     let turn:Option<(String,i64,String)>=tx.query_row("SELECT request_id,pause_revision,binding FROM workflow_owner_turn WHERE workflow=?1 AND owner=?2 AND lease_generation=?3 AND state='claimed'",params![lease.workflow,lease.owner,lease.generation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let Some((request,revision,raw))=turn else {return super::owner_control::require_dispatch(tx,&lease.workflow);};
     let binding:Binding=serde_json::from_str(&raw)?;require_binding(tx,lease,&binding,now)?;
@@ -166,3 +184,7 @@ mod tests {
     }
 
 }
+
+#[path="autoship_owner_setup_refusal.rs"]
+mod setup_refusal;
+pub(super) fn validate_setup_refusals(conn:&Connection,workflow:&str)->Result<()> {setup_refusal::validate(conn,workflow)}

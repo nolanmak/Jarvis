@@ -392,6 +392,10 @@ impl WorkflowStore {
                 request_id TEXT PRIMARY KEY REFERENCES workflow_owner_turn(request_id), previous_contract TEXT NOT NULL,
                 next_contract TEXT NOT NULL, binding TEXT NOT NULL, owner_message_sha256 TEXT NOT NULL,
                 registration TEXT NOT NULL, activated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_turn_setup_refusal (
+                workflow TEXT NOT NULL REFERENCES workflow(id),request_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                record TEXT NOT NULL,PRIMARY KEY(workflow,request_id,generation));
             CREATE TABLE IF NOT EXISTS workflow_owner_turn (
                 workflow TEXT NOT NULL REFERENCES workflow(id), request_id TEXT PRIMARY KEY REFERENCES workflow_owner_message(request_id),
                 owner TEXT NOT NULL, lease_generation INTEGER NOT NULL, pause_revision INTEGER NOT NULL,
