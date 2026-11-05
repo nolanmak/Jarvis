@@ -1140,8 +1140,13 @@ mod tests {
                 for layer in 0..depth {assert!(detail.contains(&format!("review layer {layer}")),"the reported detail keeps every context layer");}
             }
         }
-        let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,anyhow::anyhow!("provider down"));
-        assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity");
+        for depth in 0..3 {
+            let mut error=anyhow::anyhow!("provider down");
+            for layer in 0..depth {error=error.context(format!("review layer {layer}"));}
+            let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
+            assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity",
+                "an unrelated reviewer failure wrapped in {depth} context layers is not an evidence budget");
+        }
     }
 
     #[tokio::test]
