@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "8c5217cd",
+  "source_parent_commit": "6a80c129cb0b3b7d5d21210128ea118265e90ef6",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -34,7 +34,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
-      "sha256": "35df7d00a3b4468702330ce11ae720f66e3f19f0e6d27bd44aa0baea119966b4"
+      "sha256": "9d0b07ba773364a582d6462b8b64b120f3802812ffc963f5f9f233fc34dde73f"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_settlement.rs",
@@ -46,7 +46,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
-      "sha256": "bb9321a4770bf34934066dcd681a3ed933f27d47bf815b737e4d963d65bbe1a9"
+      "sha256": "e8b13fd6606d906cf963c102853d3cc39a00f6059eafb8dc30f26d2dc025d67f"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
@@ -110,7 +110,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "887a303e0bd18b1dc68d526aa0948bc689b67d37fa0907a33b05b935d104a69e"
+      "sha256": "b68b201e5092cefb4eb3842dbdf6e77b8ce53fd2bc51452c32d0cf07c4142a92"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_recovery.rs",
@@ -134,12 +134,20 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve.rs",
-      "sha256": "11f4943769d297ee406d0dc5d1220a4a06e4d967ddc17d97b9cbf86cb5a8616d"
+      "sha256": "5809cf093bff767c8729412583b55b0a176d32d2b152edf25b0a6411124ffe3c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_revision_history.rs",
+      "sha256": "e4e43c4414c55209defebf61c81006f36de5d0a0bab6e8db0d8213be1d1cbaf7"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_revision.rs",
+      "sha256": "a9fc4ac0bfc7e52d9d53077f86f620ad2d764e5d943a55ecc990833a272a350e"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1846,
+    "passed": 1851,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
@@ -238,7 +246,16 @@
       "autoship-owner-guard-setup-validated-production-check.log",
       "autoship-owner-session-restore-validated-guard.log",
       "autoship-owner-session-restore-full-cli.log",
-      "autoship-owner-session-restore-production-check.log"
+      "autoship-owner-session-restore-production-check.log",
+      "autoship-owner-revision-history-red.log",
+      "autoship-owner-revision-history-behavior-red.log",
+      "autoship-owner-revision-history-green.log",
+      "autoship-owner-revision-history-owner-green.log",
+      "autoship-owner-revision-guard-red.log",
+      "autoship-owner-revision-guard-green.log",
+      "autoship-owner-revision-validated-full-cli.log",
+      "autoship-owner-revision-merged-full-cli.log",
+      "autoship-owner-revision-merged-production-check.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -404,7 +421,9 @@
     "owner-turn acquisition requires selected native configuration before claiming; configured counter-admission fixture preserves its pause/publication assertions and performs no provider transport dispatch",
     "actual joined preparation transfers a retained physical runtime under the guarded owner pause exception while preserving creation bytes, checkpoint, pending input and allowance",
     "unrecognized binding fields in the current owner-turn authority index are refused rather than normalized and overwritten; the actual guard corruption regression failed before the fix",
-    "guarded owner continuation factory restores the exact saved Codex/Claude conversation after physical runtime completion and original-store handoff; mismatched provider and uncertain conversation refuse; no worker/gateway/provider-transport acceptance"
+    "guarded owner continuation factory restores the exact saved Codex/Claude conversation after physical runtime completion and original-store handoff; mismatched provider and uncertain conversation refuse; no worker/gateway/provider-transport acceptance",
+    "owner revision dispatch/replay refuses ten damaged-history cases, including total revision-history loss; original claim, accepted owner input, activation, registration and generation fence must agree",
+    "consuming owner contract revision returns a new native guard only after original-store handoff; Codex/Claude retain their exact session; failed setup stays claimed with pending input and no timeout replay"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -502,7 +521,7 @@
     "ordinary_and_observational_guard_acquisition": true,
     "merge_sweep": true,
     "runtime_deployed": false,
-    "guard_fixture_scope": "30 pre-main-sync guard subprocess modes: 25 earlier modes plus two Codex/Claude session-restoration modes and three owner-revision handoff/failure modes. The five new modes include physical native runtimes and protected scripted completion/resource evidence; zero provider/model/VM dispatch and no production acceptance.",
+    "guard_fixture_scope": "30 actual guard subprocess modes in the merged-source full CLI: 25 earlier modes plus two Codex/Claude session-restoration modes and three owner-revision handoff/failure modes. The five new modes include physical native runtimes and protected scripted completion/resource evidence; zero provider/model/VM dispatch and no production acceptance.",
     "pre_guard_retired_aborted_namespace_resolution": true,
     "all_closed_original_binding_recovery": true,
     "all_closed_original_binding_recovery_scope": "complete intact original history, registered retired namespaces and resolved aborted destinations, original selected policy and existing audit authority; vanished/legacy/corrupt authority remains held",
@@ -637,14 +656,14 @@
       "passed": 23,
       "failed": 0,
       "log": "autoship-owner-revision-history-owner-green.log",
-      "scope": "before main synchronization"
+      "scope": "standalone before main synchronization, repeated by merged-source full CLI"
     },
     "guard_tests": {
       "passed": 1,
       "failed": 0,
       "subprocess_modes": 30,
       "log": "autoship-owner-revision-guard-green.log",
-      "scope": "before main synchronization; real native completion/inventory/transfer with scripted protected controller evidence; no provider/model/VM dispatch"
+      "scope": "standalone before main synchronization, repeated by merged-source full CLI; real native completion/inventory/transfer with scripted protected controller evidence; no provider/model/VM dispatch"
     },
     "guard_api_red": {
       "log": "autoship-owner-revision-guard-red.log",
@@ -657,8 +676,19 @@
       "failed native setup preserves revised claim and pending input; never records an unstarted refusal or permits timeout replay",
       "pause, review invalidation, model/merge accounting and shipping denial remain intact"
     ],
-    "full_cli": "pending merged-source managed run; previous attempt terminated with storage busy before any tests",
-    "production_check": "pending after merged-source full CLI",
+    "full_cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "passed": 1851,
+      "failed": 0,
+      "ignored": 33,
+      "log": "autoship-owner-revision-merged-full-cli.log",
+      "source_parent": "6a80c129cb0b3b7d5d21210128ea118265e90ef6"
+    },
+    "production_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "exit_code": 0,
+      "log": "autoship-owner-revision-merged-production-check.log"
+    },
     "remaining": [
       "actual worker authorization/workspace recovery and owner-message execution",
       "independently prepared owner contracts and harness/control persistence",
