@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "6a80c129cb0b3b7d5d21210128ea118265e90ef6",
+  "source_parent_commit": "67a6f1b0264275394bafa9ed38159daa246f490f",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -110,7 +110,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "b68b201e5092cefb4eb3842dbdf6e77b8ce53fd2bc51452c32d0cf07c4142a92"
+      "sha256": "d2c677737de5e5de1873a2e677c5c0293a55d4a14c2bfb9ff4dfbbdcaedc91ec"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_recovery.rs",
@@ -255,7 +255,10 @@
       "autoship-owner-revision-guard-green.log",
       "autoship-owner-revision-validated-full-cli.log",
       "autoship-owner-revision-merged-full-cli.log",
-      "autoship-owner-revision-merged-production-check.log"
+      "autoship-owner-revision-merged-production-check.log",
+      "autoship-owner-revision-native-configuration-red.log",
+      "autoship-owner-revision-native-configuration-full-cli.log",
+      "autoship-owner-revision-native-configuration-production-check.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -423,7 +426,8 @@
     "unrecognized binding fields in the current owner-turn authority index are refused rather than normalized and overwritten; the actual guard corruption regression failed before the fix",
     "guarded owner continuation factory restores the exact saved Codex/Claude conversation after physical runtime completion and original-store handoff; mismatched provider and uncertain conversation refuse; no worker/gateway/provider-transport acceptance",
     "owner revision dispatch/replay refuses ten damaged-history cases, including total revision-history loss; original claim, accepted owner input, activation, registration and generation fence must agree",
-    "consuming owner contract revision returns a new native guard only after original-store handoff; Codex/Claude retain their exact session; failed setup stays claimed with pending input and no timeout replay"
+    "consuming owner contract revision returns a new native guard only after original-store handoff; Codex/Claude retain their exact session; failed setup stays claimed with pending input and no timeout replay",
+    "owner revision checks selected native configuration and original binding before metadata activation, then revalidates the native owner/binding before returning; disappearance regression preserves old contract/generation and pending input"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -521,7 +525,7 @@
     "ordinary_and_observational_guard_acquisition": true,
     "merge_sweep": true,
     "runtime_deployed": false,
-    "guard_fixture_scope": "30 actual guard subprocess modes in the merged-source full CLI: 25 earlier modes plus two Codex/Claude session-restoration modes and three owner-revision handoff/failure modes. The five new modes include physical native runtimes and protected scripted completion/resource evidence; zero provider/model/VM dispatch and no production acceptance.",
+    "guard_fixture_scope": "31 actual guard subprocess modes in the merged-source full CLI: 25 earlier modes plus two session-restoration and four owner-revision handoff/refusal modes. Six new modes use physical native runtimes and protected scripted completion/resource evidence. No provider/model/VM dispatch or production acceptance.",
     "pre_guard_retired_aborted_namespace_resolution": true,
     "all_closed_original_binding_recovery": true,
     "all_closed_original_binding_recovery_scope": "complete intact original history, registered retired namespaces and resolved aborted destinations, original selected policy and existing audit authority; vanished/legacy/corrupt authority remains held",
@@ -661,9 +665,9 @@
     "guard_tests": {
       "passed": 1,
       "failed": 0,
-      "subprocess_modes": 30,
+      "subprocess_modes": 31,
       "log": "autoship-owner-revision-guard-green.log",
-      "scope": "standalone before main synchronization, repeated by merged-source full CLI; real native completion/inventory/transfer with scripted protected controller evidence; no provider/model/VM dispatch"
+      "scope": "31 scenarios repeated in the merged-source full CLI, including refusal before contract/generation change when native configuration disappears; scripted protected controller evidence and real native inventory/transfer, no provider/model/VM dispatch"
     },
     "guard_api_red": {
       "log": "autoship-owner-revision-guard-red.log",
@@ -681,13 +685,13 @@
       "passed": 1851,
       "failed": 0,
       "ignored": 33,
-      "log": "autoship-owner-revision-merged-full-cli.log",
-      "source_parent": "6a80c129cb0b3b7d5d21210128ea118265e90ef6"
+      "log": "autoship-owner-revision-native-configuration-full-cli.log",
+      "source_parent": "67a6f1b0264275394bafa9ed38159daa246f490f"
     },
     "production_check": {
       "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
       "exit_code": 0,
-      "log": "autoship-owner-revision-merged-production-check.log"
+      "log": "autoship-owner-revision-native-configuration-production-check.log"
     },
     "remaining": [
       "actual worker authorization/workspace recovery and owner-message execution",
@@ -715,8 +719,15 @@
       },
       {
         "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-        "sha256": "b68b201e5092cefb4eb3842dbdf6e77b8ce53fd2bc51452c32d0cf07c4142a92"
+        "sha256": "d2c677737de5e5de1873a2e677c5c0293a55d4a14c2bfb9ff4dfbbdcaedc91ec"
       }
-    ]
+    ],
+    "native_configuration_preflight": true,
+    "native_binding_revalidated_before_guard_return": true,
+    "configuration_behavior_red": {
+      "log": "autoship-owner-revision-native-configuration-red.log",
+      "assertion": "owner revision returned a guard without native configuration",
+      "scope": "actual guard regression against the initial revision-transition implementation; no VM/model/provider dispatch"
+    }
   }
 }

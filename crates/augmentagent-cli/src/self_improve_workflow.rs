@@ -1171,8 +1171,9 @@ impl WorkflowGuard {
         previous: &crate::autoship_contract::RegisteredContract,
         next: &crate::autoship_contract::RegisteredContract,
     ) -> Result<Self> {
+        anyhow::ensure!(std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_some(),"owner-turn-native-configuration-unavailable");
         self.audit_health().await?;
-        self.validate_before_side_effect()?;
+        self.native_builder_owner()?;
         let contract=format!("registered:{}",next.contract_hash());
         let environment=next.binding(&self.binding.head)?.environment_id;
         let binding=git_binding(&self.worktree,&contract,&environment,&[]).await?;
@@ -1203,7 +1204,7 @@ impl WorkflowGuard {
         })?;
         self.register_native_context()?;
         self.install_model_accounting()?;
-        self.validate_before_side_effect()?;
+        self.native_builder_owner()?;
         self.audit_event("owner_revision_guard_ready",serde_json::json!({
             "request_id":revised.request_id,"previous_contract":previous.contract_hash(),
             "next_contract":next.contract_hash(),
@@ -3190,7 +3191,7 @@ mod tests {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session","owner-setup-codex-revision-unconfigured-session"] {
                 if mode.ends_with("-session") && !cfg!(target_os="linux") {continue;}
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
@@ -3355,6 +3356,14 @@ mod tests {
             if let Some((previous,next))=&revision_contracts {
                 let old_lease=recovered.lease.clone();let old_binding=recovered.binding.clone();
                 let old_native=recovered.audit.native_runtime_owner().unwrap().unwrap();
+                if mode.contains("-revision-unconfigured-") {
+                    unsafe {std::env::remove_var("AUGMENTAGENT_NATIVE_VM_POLICY");}
+                    assert!(recovered.activate_owner_revision(previous,next).await.is_err(),"owner revision returned a guard without native configuration");
+                    let mut store=WorkflowStore::open(&state).unwrap();let snapshot=store.snapshot(&id).unwrap().unwrap();
+                    assert_eq!(snapshot.generation,old_lease.generation);assert_eq!(snapshot.checkpoint.binding,old_binding);
+                    assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(store.owner_control(&id).unwrap().unwrap().paused);
+                    assert!(!store.events(&id).unwrap().iter().any(|(_,kind,_,_)|kind=="owner_contract_revised"));return;
+                }
                 if mode.contains("-setup-failure-") {
                     let before=recovered.store.lock().unwrap().snapshot(&id).unwrap().unwrap();
                     let input_before=WorkflowStore::open(&state).unwrap().owner_control(&id).unwrap();
