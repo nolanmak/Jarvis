@@ -914,6 +914,39 @@ mod tests {
         }
     }
     #[test]
+    fn native_transfer_inspection_absence_keeps_original_lock_and_never_reads_new_policy() {
+        use super::super::ownership::*;
+        let f=fixture(false);let path=policy(&f);let binding=binding_for(&f,&path);std::fs::remove_file(path).unwrap();let before=std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();let called=std::cell::Cell::new(false);
+        let state=with_transfer_inspection(&binding,&f.request,&observation(),&||Ok(()),&mut |proof| {
+            called.set(true);assert!(super::super::StateLock::existing(&f.root).is_err());assert_eq!(proof.state(),NativeTransferState::Absent);assert_eq!(proof.binding(),&binding);assert_eq!(proof.request(),&f.request);assert_eq!(proof.observation(),&observation());assert!(proof.receipt().is_none());Ok(())
+        }).unwrap();assert!(called.get());assert_eq!(state,NativeTransferState::Absent);assert_eq!(std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(),before);
+    }
+    #[test]
+    fn native_transfer_inspection_distinguishes_prepared_completed_and_aborted() {
+        use super::super::ownership::*;
+        for phase in ["prepared","completed","aborted"] {
+            let f=fixture(false);let path=policy(&f);let binding=binding_for(&f,&path);
+            if phase=="completed" {handoff_bound_at(&f.root,u64::MAX,&f.request,&f.sources,&f.destination,&||Ok(()),binding.retirement_store().unwrap().1).unwrap();}else {
+                let lock=super::super::StateLock::existing(&f.root).unwrap();let mut ledger=Ledger::open(&f.root,&lock).unwrap();let plan=audit_plan(&f.request,&f.sources,&f.destination).unwrap();ledger.prepare(&f.request,&plan.endpoints,u64::MAX).unwrap();
+                if phase=="aborted" {ledger.abort_and_retire(&f.request.source_owners[0].audit_path,&f.request.source_owners[0].owner).unwrap();}
+            }
+            let expected=match phase {"prepared"=>NativeTransferState::Prepared,"completed"=>NativeTransferState::Completed,_=>NativeTransferState::Aborted};
+            let before=std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();
+            assert_eq!(with_transfer_inspection(&binding,&f.request,&observation(),&||Ok(()),&mut |proof| {assert_eq!(proof.state(),expected);assert_eq!(proof.receipt().is_some(),phase=="completed");if let Some(receipt)=proof.receipt() {receipt.verify(&f.request)?;}assert!(super::super::StateLock::existing(&f.root).is_err());Ok(())}).unwrap(),expected);
+            assert_eq!(std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(),before);
+        }
+    }
+    #[test]
+    fn native_transfer_inspection_missing_or_corrupt_authority_cannot_issue_absence() {
+        use super::super::ownership::*;
+        for lost in ["state.lock","authority-epoch.json","runtime-retirement.sqlite","orphan-claim"] {
+            let f=fixture(false);let path=policy(&f);let binding=binding_for(&f,&path);
+            if lost=="orphan-claim" {let db=augmentagent_store::rusqlite::Connection::open(f.root.join("runtime-retirement.sqlite")).unwrap();db.execute_batch("PRAGMA foreign_keys=OFF; INSERT INTO native_transfer_claim(kind,key,transfer_id) VALUES('owner','orphan','missing-transfer');").unwrap();}else{std::fs::remove_file(f.root.join(lost)).unwrap();}
+            let called=std::cell::Cell::new(false);assert!(with_transfer_inspection(&binding,&f.request,&observation(),&||Ok(()),&mut |_| {called.set(true);Ok(())}).is_err(),"{lost}");assert!(!called.get(),"{lost}");
+            if lost!="orphan-claim" {assert!(!f.root.join(lost).exists(),"{lost} recreated");}
+        }
+    }
+    #[test]
     fn native_inventory_marker_owner_match_without_ledger_retirement_is_refused() {
         let mut f=fixture(false);let row=f.request.inventory.remove(0);
         super::super::write(&f.root.join(&row.runtime_relative_path).join("retired-owner.json"),

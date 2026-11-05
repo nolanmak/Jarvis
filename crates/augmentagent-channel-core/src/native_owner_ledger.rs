@@ -522,6 +522,13 @@ impl<'a> Ledger<'a> {
     pub fn state(&self, id: &str) -> Result<Option<State>> {
         Ok(load(&self.db, id)?.map(|record| record.state))
     }
+    /// Absence is meaningful only in a fully validated, bounded original
+    /// ledger; a row lookup alone cannot rule out damaged retained authority.
+    pub fn inspected_state(&self,request:&TransferRequest)->Result<Option<State>> {
+        ensure!(history_bytes(self.root)?<=HISTORY_LIMIT,R::HistoryCapacity);
+        validate_all_history(&self.db)?;
+        self.state_for(request)
+    }
     pub fn state_for(&self, request: &TransferRequest) -> Result<Option<State>> {
         let Some(prior) = load(&self.db, &request.transfer_id)? else {
             return Ok(None);

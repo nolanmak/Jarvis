@@ -47,7 +47,7 @@ impl WorkflowStore {
             // Validate completed metadata too: an invalid receipt projection
             // cannot be used to hide an orphan pending event.
             let history=settlement::History::load(&tx,workflow,u64::MAX)?;
-            let orphan:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=?1 AND e.kind='native_handoff_prepared' AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_pending p WHERE p.workflow=e.workflow AND p.sequence=e.seq) AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_completed c WHERE c.workflow=e.workflow AND c.pending_sequence=e.seq))",[workflow],|r|r.get(0))?;
+            let orphan=orphaned(&tx,workflow)?;
             ensure!(!orphan,TransferReason::PendingUnknown);
             let row:Option<(String,i64,u64,String)>=tx.query_row("SELECT transfer_id,sequence,snapshot_sequence,record FROM workflow_native_handoff_pending WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
             if let Some(row)=row {
@@ -75,6 +75,14 @@ impl WorkflowStore {
         }
     }
 }
+#[path = "autoship_native_unstarted.rs"]
+mod unstarted;
+pub(super) fn validate_dispositions(conn:&Connection,workflow:&str)->Result<()> {unstarted::validate_history(conn,workflow)}
+pub(super) fn orphaned(conn:&Connection,workflow:&str)->Result<bool> {
+    validate_dispositions(conn,workflow)?;
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=?1 AND e.kind='native_handoff_prepared' AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_pending p WHERE p.workflow=e.workflow AND p.sequence=e.seq) AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_completed c WHERE c.workflow=e.workflow AND c.pending_sequence=e.seq) AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_unstarted u WHERE u.workflow=e.workflow AND u.pending_sequence=e.seq))",[workflow],|r|r.get(0))?)
+}
+
 impl PendingNativeHandoff {
     pub(crate) fn request(&self) -> &TransferRequest {
         &self.request
@@ -139,7 +147,7 @@ fn digest(value: &serde_json::Value) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(canonical_bytes(value)?)))
 }
 pub(super) fn decode(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     workflow: &str,
     row: (String, i64, u64, String),
 ) -> Result<PendingNativeHandoff> {
@@ -245,7 +253,7 @@ impl WorkflowStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx, lease, binding, now).context(TransferReason::AuthorityConflict)?;
         let old:Option<(String,i64,u64,String)>=tx.query_row("SELECT transfer_id,sequence,snapshot_sequence,record FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-        let orphan:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=?1 AND e.kind='native_handoff_prepared' AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_pending p WHERE p.workflow=e.workflow AND p.sequence=e.seq) AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_completed c WHERE c.workflow=e.workflow AND c.pending_sequence=e.seq))",[&lease.workflow],|r|r.get(0))?;
+        let orphan=orphaned(&tx,&lease.workflow)?;
         ensure!(!orphan, TransferReason::InventoryMissing);
         if let Some(old) = old {
             let pending = decode(&tx, &lease.workflow, old)?;

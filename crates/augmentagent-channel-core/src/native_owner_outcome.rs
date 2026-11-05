@@ -354,7 +354,7 @@ fn capture_store_binding(
         store,
     })
 }
-fn historical_context<'a>(
+pub(super) fn historical_context<'a>(
     binding: &TransferBinding,
     request: &TransferRequest,
     observation: &'a TransferObservation,
@@ -766,7 +766,7 @@ impl<'a> FingerprintContext<'a> {
             .and_then(|value| super::ownership::canonical_bytes(&value).ok())
             .map(|bytes| sha(&bytes));
     }
-    fn failure(&self, reason: TransferReason, io_category: &str) -> TransferOutcome {
+    pub(super) fn failure(&self, reason: TransferReason, io_category: &str) -> TransferOutcome {
         use TransferReason as R;
         let mut value = serde_json::json!({"version":1,"reason":reason.code(),"request_sha256":self.request_sha256,"binding_sha256":self.binding_sha256,
             "policy_sha256":self.policy_sha256,"root_identity_sha256":self.root_identity_sha256,

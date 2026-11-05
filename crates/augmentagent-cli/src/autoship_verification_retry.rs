@@ -151,8 +151,9 @@ impl WorkflowStore {
         if domain==VerificationDomain::NativeHandoffPreparation {
             // No-pending diagnostics are descriptive, never proof that a
             // possibly committed request vanished. Fence absence in this write.
-            let unresolved:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_handoff_pending WHERE workflow=?1) OR EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=?1 AND e.kind='native_handoff_prepared' AND NOT EXISTS(SELECT 1 FROM workflow_native_handoff_completed c WHERE c.workflow=e.workflow AND c.pending_sequence=e.seq)) OR EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed'))",[&lease.workflow],|r|r.get(0))?;
-            ensure!(!unresolved,"native preparation retry cannot replace unresolved durable intent");
+            let orphan=native_pending::orphaned(&tx,&lease.workflow)?;
+            let unresolved:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_handoff_pending WHERE workflow=?1) OR EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed'))",[&lease.workflow],|r|r.get(0))?;
+            ensure!(!unresolved && !orphan,"native preparation retry cannot replace unresolved durable intent");
         }
         let (retry_reason,retry_action)=if domain==VerificationDomain::NativeHandoffPreparation {("native_handoff_preparation_retry","retry_native_handoff_preparation")} else {("verification_infrastructure_retry","retry_verification")};
         let (raw, progress_at): (String, i64) = tx.query_row(

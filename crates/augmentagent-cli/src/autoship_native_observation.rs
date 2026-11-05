@@ -1355,6 +1355,69 @@ mod tests {
         assert!(store.lock().unwrap().settle_native_handoff(&lease,&f.binding,&proof,now()).unwrap().current_context);
     }
     #[test]
+    fn native_unstarted_ack_preserves_history_and_budgets_before_new_request() {
+        if child("native_unstarted_ack_preserves_history_and_budgets_before_new_request") {return;}
+        let mut f=Fixture::new();let (old,sources,destination,store)=joined_fixture(&mut f);let facts=store.lock().unwrap().native_handoff_facts(&old,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);
+        let pending=pending_record(store.lock().unwrap().prepare_native_handoff_filtered(&old,&f.binding,destination.path().to_str().unwrap(),&facts,&rows,&[],now()).unwrap());
+        store.lock().unwrap().release(&old,now()).unwrap();let lease=store.lock().unwrap().claim(&old.workflow,"reconcile-unstarted",now(),60_000).unwrap().unwrap();
+        let before=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap();let allowance=store.lock().unwrap().merge_allowance(now(),5).unwrap();let audit=std::fs::read(sources[0].path()).unwrap();
+        ownership::with_transfer_inspection(&pending.original_binding,&pending.request,&pending.observation(),&|| {store.lock().unwrap().validate_dispatch(&lease,&f.binding,now()).map_err(|_|ownership::TransferFenceError::NotCurrent)},&mut |proof|store.lock().unwrap().acknowledge_native_unstarted(&lease,&f.binding,&pending,proof,now())).unwrap();
+        let mut locked=store.lock().unwrap();let after=locked.snapshot(&lease.workflow).unwrap().unwrap();assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.attempts,before.attempts);assert_eq!(after.checkpoint,before.checkpoint);assert_eq!(locked.merge_allowance(now(),5).unwrap(),allowance);assert_eq!(std::fs::read(sources[0].path()).unwrap(),audit);
+        assert!(locked.native_owner_binding(&lease.workflow,old.generation).unwrap().is_none());let count:i64=locked.conn.query_row("SELECT count(*) FROM workflow_native_handoff_unstarted WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).unwrap();assert_eq!(count,1);
+        let next=pending_record(locked.prepare_or_load_native_handoff(&lease,&f.binding,"/private/new-unstarted-destination",now()).unwrap());assert_ne!(next.request.transfer_id,pending.request.transfer_id);assert_eq!(next.request.source_owners,pending.request.source_owners);assert_eq!(next.original_binding,pending.original_binding);
+    }
+    #[test]
+    fn native_unstarted_ack_same_generation_and_prepared_state_cannot_clear_pending() {
+        if child("native_unstarted_ack_same_generation_and_prepared_state_cannot_clear_pending") {return;}
+        for prepared in [false,true] {
+            let mut f=Fixture::new();let (old,sources,destination,store)=joined_fixture(&mut f);let facts=store.lock().unwrap().native_handoff_facts(&old,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);let pending=pending_record(store.lock().unwrap().prepare_native_handoff_filtered(&old,&f.binding,destination.path().to_str().unwrap(),&facts,&rows,&[],now()).unwrap());
+            let writer=if prepared {Some(sources[0].begin_write().unwrap())}else{None};
+            if prepared {let outcome=ownership::transfer(&pending.original_binding,&pending.request,&pending.observation(),&sources,&destination,&||Ok(()));assert!(matches!(outcome,ownership::TransferOutcome::Deferred {..}),"{outcome:?}");}
+            let lease=if prepared {store.lock().unwrap().release(&old,now()).unwrap();store.lock().unwrap().claim(&old.workflow,"prepared-reconciler",now(),60_000).unwrap().unwrap()}else{old.clone()};
+            let events=store.lock().unwrap().events(&lease.workflow).unwrap();
+            let result=ownership::with_transfer_inspection(&pending.original_binding,&pending.request,&pending.observation(),&||Ok(()),&mut |proof|store.lock().unwrap().acknowledge_native_unstarted(&lease,&f.binding,&pending,proof,now()));assert!(result.is_err());assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);
+            let count:i64=store.lock().unwrap().conn.query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).unwrap();assert_eq!(count,1);if let Some(writer)=writer {writer.complete();}
+        }
+    }
+    #[test]
+    fn native_unstarted_ack_insert_failure_retains_intent_and_corrupt_history_holds_replacement() {
+        if child("native_unstarted_ack_insert_failure_retains_intent_and_corrupt_history_holds_replacement") {return;}
+        let mut f=Fixture::new();let (old,_sources,destination,store)=joined_fixture(&mut f);let facts=store.lock().unwrap().native_handoff_facts(&old,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);let pending=pending_record(store.lock().unwrap().prepare_native_handoff_filtered(&old,&f.binding,destination.path().to_str().unwrap(),&facts,&rows,&[],now()).unwrap());
+        store.lock().unwrap().release(&old,now()).unwrap();let lease=store.lock().unwrap().claim(&old.workflow,"ack-retry",now(),60_000).unwrap().unwrap();
+        store.lock().unwrap().conn.execute_batch("CREATE TRIGGER deny_unstarted BEFORE INSERT ON workflow_native_handoff_unstarted BEGIN SELECT RAISE(ABORT,'injected acknowledgement failure'); END;").unwrap();let events=store.lock().unwrap().events(&lease.workflow).unwrap();
+        let ack=||ownership::with_transfer_inspection(&pending.original_binding,&pending.request,&pending.observation(),&||Ok(()),&mut |proof|store.lock().unwrap().acknowledge_native_unstarted(&lease,&f.binding,&pending,proof,now()));
+        assert!(ack().is_err());assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);store.lock().unwrap().conn.execute_batch("DROP TRIGGER deny_unstarted").unwrap();ack().unwrap();let events=store.lock().unwrap().events(&lease.workflow).unwrap();ack().unwrap();assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);
+        store.lock().unwrap().conn.execute("UPDATE workflow_native_handoff_unstarted SET record=json_set(record,'$.pending.observation_sha256','corrupt') WHERE workflow=?1",[&lease.workflow]).unwrap();
+        assert!(store.lock().unwrap().prepare_or_load_native_handoff(&lease,&f.binding,"/private/new-destination",now()).is_err());
+    }
+    #[test]
+    fn native_unstarted_ack_fences_real_old_controller_after_its_first_current_check() {
+        if child("native_unstarted_ack_fences_real_old_controller_after_its_first_current_check") {return;}
+        use std::sync::mpsc;use std::time::Duration;
+        let mut f=Fixture::new();let (old,sources,destination,store)=joined_fixture(&mut f);let facts=store.lock().unwrap().native_handoff_facts(&old,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);
+        let pending=pending_record(store.lock().unwrap().prepare_native_handoff_filtered(&old,&f.binding,destination.path().to_str().unwrap(),&facts,&rows,&[],now()).unwrap());
+        let (entered_tx,entered_rx)=mpsc::channel();let (release_tx,release_rx)=mpsc::channel();let (done_tx,done_rx)=mpsc::channel();
+        let worker_store=store.clone();let worker_lease=old.clone();let worker_pending=pending.clone();let worker_binding=f.binding.clone();
+        let worker=std::thread::spawn(move || {
+            let first=std::cell::Cell::new(true);
+            let current=|| {
+                let result=worker_store.lock().unwrap().native_handoff_pending_is_current(&worker_lease,&worker_binding,&worker_pending,now()).map_err(|_|ownership::TransferFenceError::NotCurrent);
+                if first.replace(false) {let _=entered_tx.send(());if release_rx.recv_timeout(Duration::from_secs(5)).is_err() {return Err(ownership::TransferFenceError::Unavailable);}}
+                result
+            };
+            let outcome=ownership::transfer(&worker_pending.original_binding,&worker_pending.request,&worker_pending.observation(),&sources,&destination,&current);let _=done_tx.send(outcome);
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();store.lock().unwrap().release(&old,now()).unwrap();let lease=store.lock().unwrap().claim(&old.workflow,"new-reconciler",now(),60_000).unwrap().unwrap();
+        ownership::with_transfer_inspection(&pending.original_binding,&pending.request,&pending.observation(),&|| {store.lock().unwrap().validate_dispatch(&lease,&f.binding,now()).map_err(|_|ownership::TransferFenceError::NotCurrent)},&mut |proof| {
+            store.lock().unwrap().acknowledge_native_unstarted(&lease,&f.binding,&pending,proof,now())?;
+            release_tx.send(()).map_err(|_|anyhow::anyhow!("old controller disappeared"))?;
+            Ok(())
+        }).unwrap();
+        let outcome=done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!matches!(outcome,ownership::TransferOutcome::Completed(_)),"old controller committed after acknowledgement");worker.join().unwrap();
+        let native=rusqlite::Connection::open(f._root.path().join("native/runtime-retirement.sqlite")).unwrap();let count:i64=native.query_row("SELECT count(*) FROM native_transfer",[],|r|r.get(0)).unwrap();assert_eq!(count,0);
+    }
+    #[test]
     fn native_handoff_pending_request_survives_restart_without_new_identity() {
         if child("native_handoff_pending_request_survives_restart_without_new_identity") {
             return;

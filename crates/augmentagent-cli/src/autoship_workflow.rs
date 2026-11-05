@@ -437,6 +437,11 @@ impl WorkflowStore {
                 pending_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
                 snapshot_sequence INTEGER NOT NULL REFERENCES workflow_native_handoff_snapshot(sequence),
                 sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_native_handoff_unstarted (
+                transfer_id TEXT PRIMARY KEY,workflow TEXT NOT NULL REFERENCES workflow(id),
+                pending_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                snapshot_sequence INTEGER NOT NULL REFERENCES workflow_native_handoff_snapshot(sequence),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS workflow_native_transferred_source (
                 workflow TEXT NOT NULL,lease_generation INTEGER NOT NULL,audit_path TEXT NOT NULL,
                 transfer_id TEXT NOT NULL REFERENCES workflow_native_handoff_completed(transfer_id) DEFERRABLE INITIALLY DEFERRED,
