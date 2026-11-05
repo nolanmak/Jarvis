@@ -29,6 +29,9 @@ pub(crate) mod owner_turn;
 mod native_owner_binding;
 #[path = "autoship_native_handoff.rs"]
 mod native_handoff;
+#[path = "autoship_native_pending.rs"]
+mod native_pending;
+pub(crate) use native_pending::{HandoffPreparation, PendingNativeHandoff};
 #[path = "autoship_native_observation.rs"]
 pub(crate) mod native_observation;
 #[path = "autoship_native_launch.rs"]
@@ -427,6 +430,12 @@ impl WorkflowStore {
                 binding TEXT NOT NULL, registered_at INTEGER NOT NULL,
                 PRIMARY KEY(workflow,lease_generation),
                 FOREIGN KEY(workflow,lease_generation) REFERENCES workflow_native_owner(workflow,lease_generation));
+            CREATE TABLE IF NOT EXISTS workflow_native_handoff_pending (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id),
+                transfer_id TEXT NOT NULL UNIQUE,
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                snapshot_sequence INTEGER NOT NULL REFERENCES workflow_native_handoff_snapshot(sequence),
+                record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS workflow_native_handoff_snapshot (
                 workflow TEXT NOT NULL REFERENCES workflow(id),
                 sequence INTEGER PRIMARY KEY REFERENCES workflow_event(seq),

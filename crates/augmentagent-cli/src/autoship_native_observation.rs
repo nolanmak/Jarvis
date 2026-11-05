@@ -1088,4 +1088,275 @@ mod tests {
         );
     }
 
+    fn pending_record(
+        value: super::super::native_pending::HandoffPreparation,
+    ) -> super::super::native_pending::PendingNativeHandoff {
+        match value {
+            super::super::native_pending::HandoffPreparation::Prepared(p) => p,
+            _ => panic!("expected original pending request"),
+        }
+    }
+    #[test]
+    fn native_handoff_pending_request_survives_restart_without_new_identity() {
+        if child("native_handoff_pending_request_survives_restart_without_new_identity") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let fact = f.complete();
+        f.record(&fact).unwrap();
+        let lease = next_handoff_lease(&mut f);
+        let first = pending_record(
+            f.store
+                .prepare_or_load_native_handoff(
+                    &lease,
+                    &f.binding,
+                    "/private/destination-audit",
+                    now(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            first.request.destination.owner.lease_generation,
+            lease.generation
+        );
+        assert_eq!(
+            first.request.source_owners[0].owner.lease_generation,
+            f.lease.generation
+        );
+        assert_eq!(first.request.inventory.len(), 1);
+        assert!(first.observation_certain);
+        let events = f.store.events(&lease.workflow).unwrap();
+        let mut reopened = WorkflowStore::open(&f.path).unwrap();
+        assert_eq!(
+            pending_record(
+                reopened
+                    .prepare_or_load_native_handoff(
+                        &lease,
+                        &f.binding,
+                        "/private/destination-audit",
+                        now()
+                    )
+                    .unwrap()
+            ),
+            first
+        );
+        assert_eq!(reopened.events(&lease.workflow).unwrap(), events);
+    }
+    #[test]
+    fn native_handoff_pending_new_lease_reconciles_original_request_and_binding() {
+        if child("native_handoff_pending_new_lease_reconciles_original_request_and_binding") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let fact = f.complete();
+        f.record(&fact).unwrap();
+        let lease = next_handoff_lease(&mut f);
+        let first = pending_record(
+            f.store
+                .prepare_or_load_native_handoff(
+                    &lease,
+                    &f.binding,
+                    "/private/destination-audit",
+                    now(),
+                )
+                .unwrap(),
+        );
+        f.store.release(&lease, now()).unwrap();
+        let next = f
+            .store
+            .claim(&lease.workflow, "restart", now(), 60_000)
+            .unwrap()
+            .unwrap();
+        std::env::set_var(
+            "AUGMENTAGENT_NATIVE_VM_POLICY",
+            "/missing/new-selection.json",
+        );
+        let value = f
+            .store
+            .prepare_or_load_native_handoff(&next, &f.binding, "/private/restarted-audit", now())
+            .unwrap();
+        assert_eq!(
+            value,
+            super::super::native_pending::HandoffPreparation::ReconcileExisting(first)
+        );
+    }
+    #[test]
+    fn native_handoff_pending_uncertainty_cannot_create_request_or_snapshot() {
+        if child("native_handoff_pending_uncertainty_cannot_create_request_or_snapshot") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let uncertain = f.uncertain(false);
+        f.record(&uncertain).unwrap();
+        let lease = next_handoff_lease(&mut f);
+        let events = f.store.events(&lease.workflow).unwrap();
+        let error = f
+            .store
+            .prepare_or_load_native_handoff(&lease, &f.binding, "/private/destination-audit", now())
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ownership::TransferReason>(),
+            Some(&ownership::TransferReason::ConversationUncertain)
+        );
+        assert_eq!(f.store.events(&lease.workflow).unwrap(), events);
+    }
+    #[test]
+    fn native_handoff_pending_remote_unknown_blocks_preparation() {
+        if child("native_handoff_pending_remote_unknown_blocks_preparation") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let fact = f.complete();
+        f.record(&fact).unwrap();
+        let lease = next_handoff_lease(&mut f);
+        f.store
+            .begin_operation(&lease, OperationKind::Push, &f.binding, now())
+            .unwrap();
+        let events = f.store.events(&lease.workflow).unwrap();
+        assert!(f
+            .store
+            .prepare_or_load_native_handoff(&lease, &f.binding, "/private/destination-audit", now())
+            .is_err());
+        assert_eq!(f.store.events(&lease.workflow).unwrap(), events);
+    }
+    #[test]
+    fn native_handoff_pending_lost_projection_never_mints_replacement_request() {
+        if child("native_handoff_pending_lost_projection_never_mints_replacement_request") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let fact = f.complete();
+        f.record(&fact).unwrap();
+        let lease = next_handoff_lease(&mut f);
+        f.store
+            .prepare_or_load_native_handoff(&lease, &f.binding, "/private/destination-audit", now())
+            .unwrap();
+        f.store
+            .conn
+            .execute(
+                "DELETE FROM workflow_native_handoff_pending WHERE workflow=?1",
+                [&lease.workflow],
+            )
+            .unwrap();
+        let events = f.store.events(&lease.workflow).unwrap();
+        assert!(f
+            .store
+            .prepare_or_load_native_handoff(&lease, &f.binding, "/private/destination-audit", now())
+            .is_err());
+        assert_eq!(f.store.events(&lease.workflow).unwrap(), events);
+    }
+
+    #[test]
+    fn native_handoff_pending_insert_failure_rolls_back_snapshot_and_event() {
+        if child("native_handoff_pending_insert_failure_rolls_back_snapshot_and_event") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let fact = f.complete();
+        f.record(&fact).unwrap();
+        let lease = next_handoff_lease(&mut f);
+        let events = f.store.events(&lease.workflow).unwrap();
+        f.store.conn.execute_batch("CREATE TRIGGER deny_handoff_pending BEFORE INSERT ON workflow_native_handoff_pending BEGIN SELECT RAISE(ABORT,'synthetic pending failure'); END;").unwrap();
+        assert!(f
+            .store
+            .prepare_or_load_native_handoff(&lease, &f.binding, "/private/destination-audit", now())
+            .is_err());
+        assert_eq!(f.store.events(&lease.workflow).unwrap(), events);
+        assert_eq!(
+            f.store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM workflow_native_handoff_snapshot",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        f.store
+            .conn
+            .execute_batch("DROP TRIGGER deny_handoff_pending")
+            .unwrap();
+        assert!(f
+            .store
+            .prepare_or_load_native_handoff(&lease, &f.binding, "/private/destination-audit", now())
+            .is_ok());
+    }
+    #[test]
+    fn native_handoff_pending_changed_candidate_preserves_original_for_reconciliation() {
+        if child("native_handoff_pending_changed_candidate_preserves_original_for_reconciliation") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let fact = f.complete();
+        f.record(&fact).unwrap();
+        let lease = next_handoff_lease(&mut f);
+        let first = pending_record(
+            f.store
+                .prepare_or_load_native_handoff(
+                    &lease,
+                    &f.binding,
+                    "/private/destination-audit",
+                    now(),
+                )
+                .unwrap(),
+        );
+        let mut checkpoint = f
+            .store
+            .snapshot(&lease.workflow)
+            .unwrap()
+            .unwrap()
+            .checkpoint;
+        checkpoint.binding.head = "changed-head".into();
+        f.store.checkpoint(&lease, &checkpoint, now()).unwrap();
+        assert_eq!(
+            f.store
+                .prepare_or_load_native_handoff(
+                    &lease,
+                    &checkpoint.binding,
+                    "/private/destination-audit",
+                    now()
+                )
+                .unwrap(),
+            super::super::native_pending::HandoffPreparation::ReconcileExisting(first)
+        );
+    }
+    #[test]
+    fn native_handoff_pending_cannot_retarget_same_generation() {
+        if child("native_handoff_pending_cannot_retarget_same_generation") {
+            return;
+        }
+        let mut f = Fixture::new();
+        let fact = f.complete();
+        f.record(&fact).unwrap();
+        let lease = next_handoff_lease(&mut f);
+        let first = pending_record(
+            f.store
+                .prepare_or_load_native_handoff(
+                    &lease,
+                    &f.binding,
+                    "/private/destination-audit",
+                    now(),
+                )
+                .unwrap(),
+        );
+        assert!(f
+            .store
+            .prepare_or_load_native_handoff(&lease, &f.binding, "/private/different-audit", now())
+            .is_err());
+        assert_eq!(
+            pending_record(
+                f.store
+                    .prepare_or_load_native_handoff(
+                        &lease,
+                        &f.binding,
+                        "/private/destination-audit",
+                        now()
+                    )
+                    .unwrap()
+            ),
+            first
+        );
+    }
+
 }

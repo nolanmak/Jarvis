@@ -1,0 +1,66 @@
+{
+  "kind": "native-handoff-workflow-component-validation",
+  "source_parent_commit": "8e11ece3c21f00d44c33f780afa65b91eb9e3e34",
+  "source_inventory_is_post_run_inventory": true,
+  "source_generation_authority": false,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_handoff.rs",
+      "sha256": "0bca76d9e911ed12aca266036a07407e111559c647046181b28198be6ad4b3e7"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
+      "sha256": "902ce53634125e5887bcf0341f13418b60db9728d252df7a49ab5c029afae774"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_launch.rs",
+      "sha256": "9c2424b7e7617550ee8381176fe7c30a1722b192c57b881e3bfa3796bae3597d"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+      "sha256": "c19462a2c6e13c7f759e6819a3d60f05a18fb93de8793d57f615c1e558377ef1"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "16bdfeadc33a7e9d282c4b4d8304f0541a034999b4599b6256130eea595697b0"
+    }
+  ],
+  "results": {
+    "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+    "passed": 1769,
+    "failed": 0,
+    "ignored": 33,
+    "handoff_snapshot_cases": 10,
+    "pending_handoff_cases": 8,
+    "retained_logs": [
+      "autoship-native-handoff-pending-red.log",
+      "autoship-native-handoff-pending-green.log",
+      "autoship-native-handoff-pending-full.log"
+    ]
+  },
+  "coverage": [
+    "atomic immutable observation snapshots and exact-input sequence reuse",
+    "latest per-runtime history, multiple sessions per provider and preserved uncertainty",
+    "immutable original native-store binding independent of current policy selection",
+    "durable pending request and original observation, request ID and destination",
+    "restart/new-lease or changed-candidate reconciliation without replacement request",
+    "unknown remote operations and same-generation retarget refusal",
+    "lost/corrupt projection refusal and transactional failure rollback"
+  ],
+  "synthetic_controller_fixtures": true,
+  "live_provider_dispatch": false,
+  "native_transfer_executed": false,
+  "physical_runtime_inventory_closure": false,
+  "production_quiescence_acceptance": false,
+  "productive_caller_enabled": false,
+  "shipping_authority": false,
+  "hosted_ci": "pending current published head",
+  "remaining": [
+    "verified core receipt-backed source disposition and destination registration",
+    "pending acknowledgement/completion history and idempotent settlement",
+    "all workflow acquisition/owner-turn/recovery/merge-sweep integration",
+    "legacy original-binding and named uncertainty/corrupt-state recovery",
+    "normal rollout and actual Codex/Claude Discord live acceptance",
+    "remaining C freshness/backend cleanup work and full epic soak"
+  ]
+}
