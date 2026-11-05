@@ -1096,6 +1096,105 @@ mod tests {
             _ => panic!("expected original pending request"),
         }
     }
+    fn filtered_rows(facts:&super::super::native_handoff::NativeHandoffFacts)->Vec<ownership::RuntimeInventoryRow> {
+        facts.runtimes.iter().map(|r|serde_json::from_value(r.latest_observation.as_ref().unwrap().proof.as_ref().unwrap()["inventory"].clone()).unwrap()).collect()
+    }
+    #[test]
+    fn native_filtered_handoff_census_has_no_side_effects_and_preserves_missing_outcomes() {
+        if child("native_filtered_handoff_census_has_no_side_effects_and_preserves_missing_outcomes") {return;}
+        for outcome in ["none","uncertain","certain"] {
+            let mut f=Fixture::new();match outcome {"uncertain"=>{let fact=f.uncertain(false);f.record(&fact).unwrap();},"certain"=>{let fact=f.complete();f.record(&fact).unwrap();},_=>{}}
+            let lease=next_handoff_lease(&mut f);let events=f.store.events(&lease.workflow).unwrap();
+            let facts=f.store.native_handoff_facts(&lease,&f.binding,now()).unwrap();
+            assert_eq!(facts.runtimes.len(),1);assert_eq!(facts.source_owners.len(),1);
+            assert_eq!(facts.runtimes[0].latest_launch.intent.intent_id,f.prepared.intent.intent_id);
+            assert_eq!(facts.runtimes[0].latest_observation.is_none(),outcome=="none");
+            let latest:Vec<_>=facts.runtimes.iter().map(|r|serde_json::json!({"provider":r.latest_launch.intent.provider,"runtime_relative_path":r.latest_launch.intent.runtime_relative_path,"latest_launch":r.latest_launch,"latest_observation":r.latest_observation})).collect();
+            assert_eq!(facts.latest_input_sha256,sha(&ownership::canonical_bytes(&serde_json::json!(latest)).unwrap()));
+            assert_eq!(f.store.events(&lease.workflow).unwrap(),events);
+            let snapshots:i64=f.store.conn.query_row("SELECT count(*) FROM workflow_native_handoff_snapshot",[],|r|r.get(0)).unwrap();assert_eq!(snapshots,0);
+        }
+    }
+    #[test]
+    fn native_filtered_handoff_omits_retired_uncertainty_but_keeps_source_and_original_pending() {
+        if child("native_filtered_handoff_omits_retired_uncertainty_but_keeps_source_and_original_pending") {return;}
+        for outcome in ["none","uncertain"] {
+            let mut f=Fixture::new();if outcome=="uncertain" {let fact=f.uncertain(false);f.record(&fact).unwrap();}
+            let lease=next_handoff_lease(&mut f);let facts=f.store.native_handoff_facts(&lease,&f.binding,now()).unwrap();
+            let retired=vec![facts.runtimes[0].latest_launch.intent.runtime_relative_path.clone()];
+            let pending=pending_record(f.store.prepare_native_handoff_filtered(&lease,&f.binding,"/private/filtered-audit",&facts,&[],&retired,now()).unwrap());
+            assert!(pending.request.inventory.is_empty());assert_eq!(pending.request.source_owners,facts.source_owners);assert_eq!(pending.original_binding,facts.original_binding);
+            assert!(pending.observation_certain && pending.observation_revision>0);
+            let events=f.store.events(&lease.workflow).unwrap();let mut reopened=WorkflowStore::open(&f.path).unwrap();
+            assert_eq!(pending_record(reopened.prepare_or_load_native_handoff(&lease,&f.binding,"/private/filtered-audit",now()).unwrap()),pending);
+            assert_eq!(reopened.events(&lease.workflow).unwrap(),events);
+            assert!(reopened.native_observation_history(&lease.workflow).unwrap().iter().all(|row|row.certainty==Certainty::Uncertain));
+        }
+    }
+    #[test]
+    fn native_filtered_handoff_retained_certain_rows_match_the_latest_complete_inputs() {
+        if child("native_filtered_handoff_retained_certain_rows_match_the_latest_complete_inputs") {return;}
+        let mut f=Fixture::new();let fact=f.complete();f.record(&fact).unwrap();let lease=next_handoff_lease(&mut f);
+        let facts=f.store.native_handoff_facts(&lease,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);
+        let pending=pending_record(f.store.prepare_native_handoff_filtered(&lease,&f.binding,"/private/filtered-audit",&facts,&rows,&[],now()).unwrap());
+        assert_eq!(pending.request.inventory,rows);assert_eq!(pending.request.source_owners,facts.source_owners);
+    }
+    #[test]
+    fn native_filtered_handoff_rejects_stale_basis_incomplete_and_changed_selection_atomically() {
+        if child("native_filtered_handoff_rejects_stale_basis_incomplete_and_changed_selection_atomically") {return;}
+        for fault in ["source-hash","latest-hash","missing","row","overlap","duplicate-retirement","uncertain"] {
+            let mut f=Fixture::new();let fact=f.complete();f.record(&fact).unwrap();let rows=vec![serde_json::from_value::<ownership::RuntimeInventoryRow>(f.store.native_observation_history(&f.lease.workflow).unwrap()[0].proof.as_ref().unwrap()["inventory"].clone()).unwrap()];
+            if fault=="uncertain" {let fact=f.uncertain(false);f.record(&fact).unwrap();}
+            let lease=next_handoff_lease(&mut f);let mut facts=f.store.native_handoff_facts(&lease,&f.binding,now()).unwrap();let mut proposed=rows;let mut retired=Vec::new();
+            match fault {"source-hash"=>facts.source_registration_sha256="a".repeat(64),"latest-hash"=>facts.latest_input_sha256="b".repeat(64),"missing"=>proposed.clear(),"row"=>proposed[0].alias_sha256="c".repeat(64),"overlap"=>retired.push(proposed[0].runtime_relative_path.clone()),"duplicate-retirement"=>{proposed.clear();retired=vec!["codex/session-fixture".into();2];},_=>{}}
+            let events=f.store.events(&lease.workflow).unwrap();
+            assert!(f.store.prepare_native_handoff_filtered(&lease,&f.binding,"/private/filtered-audit",&facts,&proposed,&retired,now()).is_err(),"{fault}");
+            assert_eq!(f.store.events(&lease.workflow).unwrap(),events,"{fault}");
+            let pending:i64=f.store.conn.query_row("SELECT count(*) FROM workflow_native_handoff_pending",[],|r|r.get(0)).unwrap();assert_eq!(pending,0,"{fault}");
+        }
+    }
+    #[test]
+    fn native_filtered_handoff_pending_insert_failure_rolls_back_filtered_snapshot_and_events() {
+        if child("native_filtered_handoff_pending_insert_failure_rolls_back_filtered_snapshot_and_events") {return;}
+        let mut f=Fixture::new();let lease=next_handoff_lease(&mut f);let facts=f.store.native_handoff_facts(&lease,&f.binding,now()).unwrap();let events=f.store.events(&lease.workflow).unwrap();
+        f.store.conn.execute_batch("CREATE TRIGGER deny_filtered_pending BEFORE INSERT ON workflow_native_handoff_pending BEGIN SELECT RAISE(ABORT,'injected filtered pending failure'); END;").unwrap();
+        assert!(f.store.prepare_native_handoff_filtered(&lease,&f.binding,"/private/filtered-audit",&facts,&[],&["codex/session-fixture".into()],now()).is_err());
+        assert_eq!(f.store.events(&lease.workflow).unwrap(),events);
+        let snapshots:i64=f.store.conn.query_row("SELECT count(*) FROM workflow_native_handoff_snapshot",[],|r|r.get(0)).unwrap();assert_eq!(snapshots,0);
+        f.store.conn.execute_batch("DROP TRIGGER deny_filtered_pending").unwrap();
+        assert!(f.store.prepare_native_handoff_filtered(&lease,&f.binding,"/private/filtered-audit",&facts,&[],&["codex/session-fixture".into()],now()).is_ok());
+    }
+    #[test]
+    fn native_filtered_handoff_pending_fence_requires_exact_active_intent_without_writes() {
+        if child("native_filtered_handoff_pending_fence_requires_exact_active_intent_without_writes") {return;}
+        let mut f=Fixture::new();let fact=f.complete();f.record(&fact).unwrap();let lease=next_handoff_lease(&mut f);
+        let facts=f.store.native_handoff_facts(&lease,&f.binding,now()).unwrap();let rows=filtered_rows(&facts);
+        let pending=pending_record(f.store.prepare_native_handoff_filtered(&lease,&f.binding,"/private/filtered-audit",&facts,&rows,&[],now()).unwrap());
+        let events=f.store.events(&lease.workflow).unwrap();
+        assert!(f.store.native_handoff_pending_is_current(&lease,&f.binding,&pending,now()).is_ok());
+        for fault in ["uuid","observation","destination"] {
+            let mut changed=pending.clone();match fault {"uuid"=>changed.request.transfer_id=uuid::Uuid::new_v4().to_string(),"observation"=>changed.observation_revision+=1,"destination"=>changed.request.destination.audit_path="/wrong/namespace".into(),_=>unreachable!()}
+            assert!(f.store.native_handoff_pending_is_current(&lease,&f.binding,&changed,now()).is_err(),"{fault}");
+        }
+        assert_eq!(f.store.events(&lease.workflow).unwrap(),events);
+        f.store.conn.execute("DELETE FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow]).unwrap();
+        assert!(f.store.native_handoff_pending_is_current(&lease,&f.binding,&pending,now()).is_err(),"cleared intent remained current");
+    }
+    #[test]
+    fn native_filtered_handoff_pending_fence_refuses_newer_lease_and_terminal_checkpoint() {
+        if child("native_filtered_handoff_pending_fence_refuses_newer_lease_and_terminal_checkpoint") {return;}
+        for fault in ["new-lease","held","source-retiring"] {
+            let mut f=Fixture::new();let lease=next_handoff_lease(&mut f);let facts=f.store.native_handoff_facts(&lease,&f.binding,now()).unwrap();
+            let pending=pending_record(f.store.prepare_native_handoff_filtered(&lease,&f.binding,"/private/filtered-audit",&facts,&[],&["codex/session-fixture".into()],now()).unwrap());
+            assert!(f.store.native_handoff_pending_is_current(&lease,&f.binding,&pending,now()).is_ok());
+            if fault=="new-lease" {
+                f.store.release(&lease,now()).unwrap();let next=f.store.claim(&lease.workflow,"new-reconciler",now(),60_000).unwrap().unwrap();
+                assert!(f.store.native_handoff_pending_is_current(&next,&f.binding,&pending,now()).is_err(),"historical destination promoted under new lease");
+            }else if fault=="source-retiring" {f.store.conn.execute("UPDATE workflow_native_owner SET retirement_reason='pending-terminal' WHERE workflow=?1",[&lease.workflow]).unwrap();
+            }else{let raw:String=f.store.conn.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0)).unwrap();let mut cp:Checkpoint=serde_json::from_str(&raw).unwrap();cp.stage=Stage::Held;f.store.conn.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",params![lease.workflow,serde_json::to_string(&cp).unwrap()]).unwrap();}
+            assert!(f.store.native_handoff_pending_is_current(&lease,&f.binding,&pending,now()).is_err(),"{fault}");
+        }
+    }
     #[test]
     fn native_handoff_pending_request_survives_restart_without_new_identity() {
         if child("native_handoff_pending_request_survives_restart_without_new_identity") {

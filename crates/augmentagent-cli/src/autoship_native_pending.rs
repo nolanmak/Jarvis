@@ -146,6 +146,27 @@ pub(super) fn decode(
     Ok(pending)
 }
 impl WorkflowStore {
+    /// Exact active intent fence. Metadata only; never opens native state or
+    /// protected audit files while holding the workflow transaction.
+    pub(super) fn native_handoff_pending_is_current(&mut self,lease:&Lease,binding:&Binding,pending:&PendingNativeHandoff,now:i64)->Result<()> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        require_binding(&tx,lease,binding,now)?;
+        owner_control::require_dispatch(&tx,&lease.workflow)?;
+        let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;
+        let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
+        ensure!(!matches!(checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired),TransferReason::AuthorityConflict);
+        let row:Option<(String,i64,u64,String)>=tx.query_row("SELECT transfer_id,sequence,snapshot_sequence,record FROM workflow_native_handoff_pending WHERE workflow=?1",[&lease.workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let active=decode(&tx,&lease.workflow,row.context(TransferReason::AuthorityConflict)?)?;
+        ensure!(active==*pending && active.workflow_binding==*binding
+            && active.request.destination.owner.lease_generation==lease.generation,TransferReason::AuthorityConflict);
+        let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed')) OR EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2)",params![lease.workflow,lease.generation],|r|r.get(0))?;
+        ensure!(!blocked,TransferReason::AuthorityConflict);
+        for source in &active.request.source_owners {
+            let retained:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2 AND audit_path=?3 AND retirement_reason IS NULL AND retired_at IS NULL)",params![lease.workflow,source.owner.lease_generation,source.audit_path],|r|r.get(0))?;
+            ensure!(retained,TransferReason::AuthorityConflict);
+        }
+        tx.commit()?;Ok(())
+    }
     /// Before any native/audit mutation, persist one exact request, immutable
     /// observation and original store binding. No core handoff runs here.
     /// Newer leases only reconcile the old request; they cannot rewrite its
@@ -157,6 +178,10 @@ impl WorkflowStore {
         audit: &str,
         now: i64,
     ) -> Result<HandoffPreparation> {
+        self.prepare_native_handoff_impl(lease,binding,audit,None,now)
+    }
+    pub(super) fn prepare_native_handoff_impl(&mut self,lease:&Lease,binding:&Binding,audit:&str,
+        selection:Option<(&native_handoff::NativeHandoffFacts,&[augmentagent_channel_core::native_vm::ownership::RuntimeInventoryRow],&[String])>,now:i64)->Result<HandoffPreparation> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -186,9 +211,15 @@ impl WorkflowStore {
                 HandoffPreparation::ReconcileExisting(pending)
             });
         }
+        owner_control::require_dispatch(&tx,&lease.workflow)?;
         let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed')) OR EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2)",params![lease.workflow,lease.generation],|r|r.get(0))?;
         ensure!(!blocked, TransferReason::AuthorityConflict);
-        let snapshot = native_handoff::capture(&tx, lease, binding, now)?;
+        let snapshot=if let Some((basis,inventory,retired))=selection {
+            let fresh=native_handoff::read_facts(&tx,lease,binding,now)?;
+            ensure!(fresh==*basis,TransferReason::AuthorityConflict);
+            let rows=native_handoff::selected_rows(&tx,&fresh,inventory,retired)?;
+            native_handoff::capture_selected(&tx,lease,binding,&fresh,rows,now)?
+        } else {native_handoff::capture(&tx,lease,binding,now)?};
         ensure!(
             snapshot.observation.certain,
             TransferReason::ConversationUncertain
