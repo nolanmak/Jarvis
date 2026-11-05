@@ -155,6 +155,14 @@
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_completion.rs",
       "sha256": "36166c7cc7c53410d6bfb419637e13eecd37e151aee8438473b229ef70e4885a"
+    },
+    {
+      "path": "scripts/provider-supervisor.py",
+      "sha256": "10929702ac75f16314592bd2c0ca80d12b4aa0c44ed44097b5b88f85bf09c201"
+    },
+    {
+      "path": "scripts/test-native-provider-vm.py",
+      "sha256": "a44a895a7a66e9fbde95ea58543d1e7c23b4e9dc581c2e7b0b6a733605d8b95a"
     }
   ],
   "results": {
@@ -1001,5 +1009,23 @@
     "red_evidence": "Initial API red is compilation failure, not behavioral parent regression. A fixture compile failure used the wrong retirement namespace; corrected separately.",
     "worker_consumer_enabled": false,
     "input_completion_enabled": false
+  },
+  "native_readiness_publication": {
+    "standalone_pr": "https://github.com/nolanmak/Jarvis/pull/1886",
+    "standalone_head": "23081a0f",
+    "recovery_cherry_pick": "b3bb3aba",
+    "hosted_failure_observed": "42109585408, bridge-suites, empty readiness publication exits 1 before launch-ready",
+    "behavioral_red_log": "autoship-native-readiness-partial-red.log",
+    "local_green_logs": [
+      "autoship-native-readiness-validated-green.log",
+      "autoship-native-readiness-local-contract-tests.log",
+      "autoship-native-readiness-main-green.log",
+      "autoship-native-readiness-main-contract-tests.log"
+    ],
+    "recovery_launcher_tests": 21,
+    "main_based_launcher_tests": 20,
+    "scope": "Actual local supervisor subprocess, deterministic paused empty/prefix readiness writer, explicit controller admission, malformed and cancellation refusal with cleanup. No VM/provider dispatch.",
+    "local_bridge_step": "All commands passed directly; 9 delegated cgroup cases skip outside isolated service. --hosted wrapper refuses without real runner temporary directory; not represented as hosted verification.",
+    "hosted_ci": "pending on new standalone PR and recovery head"
   }
 }
