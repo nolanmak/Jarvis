@@ -540,6 +540,20 @@ impl RegisteredContract {
         registration.verify_files(files)?;
         Ok(registration)
     }
+    pub fn register_transition_from_files(
+        contract: AcceptanceContract,
+        baseline_head: String,
+        baseline_environment: String,
+        candidate_environment: String,
+        files: &BTreeMap<String, String>,
+    ) -> Result<Self> {
+        ensure!(!candidate_environment.is_empty(), "candidate environment missing");
+        let mut registration = Self::register_from_files(contract, baseline_head, baseline_environment, files)?;
+        registration.candidate_environment_id = Some(candidate_environment);
+        registration.contract_hash = registration.computed_hash()?;
+        registration.verify_files(files)?;
+        Ok(registration)
+    }
     /// Verify exact registered names and bytes, never a worker directory walk.
     pub fn verify_files(&self, files: &BTreeMap<String, String>) -> Result<()> {
         self.verify_metadata()?;

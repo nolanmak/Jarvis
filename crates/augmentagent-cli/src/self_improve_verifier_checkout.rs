@@ -121,33 +121,6 @@ pub(super) async fn materialize_from_files(
     files: &std::collections::BTreeMap<String, String>,
     target: &Path,
 ) -> Result<OwnedCheckout> {
-    materialize_registered(root, head, registration, files, target, false).await
-}
-
-pub(super) async fn materialize(
-    root: &Path,
-    head: &str,
-    registration: &RegisteredContract,
-    target: &Path,
-) -> Result<OwnedCheckout> {
-    // Transitional adapter for existing callers. New private-source callers
-    // supply protected proposal bytes through materialize_from_files instead.
-    registration.verify_integrity(root)?;
-    let files = registration.contract().verifiers.iter()
-        .flat_map(|verifier| &verifier.pinned_files)
-        .map(|path| Ok((path.clone(), std::fs::read_to_string(root.join(path))?)))
-        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
-    materialize_registered(root, head, registration, &files, target, true).await
-}
-
-async fn materialize_registered(
-    root: &Path,
-    head: &str,
-    registration: &RegisteredContract,
-    files: &std::collections::BTreeMap<String, String>,
-    target: &Path,
-    legacy_committed_harness: bool,
-) -> Result<OwnedCheckout> {
     use std::io::Write;
     registration.verify_files(files)?;
     let source = allocate(
@@ -202,10 +175,8 @@ async fn materialize_registered(
     for (path, expected) in files {
         let target = source.path().join(path);
         if target.exists() {
-            ensure!(legacy_committed_harness,
-                "private verifier path collides with committed product source: {path}");
-            ensure!(std::fs::read(&target)? == expected.as_bytes(),
-                "committed harness differs from registered independent harness");
+            return Err(VerifierSourceCollision {head:head.into(),contract_hash:registration.contract_hash().into(),
+                paths:vec![path.clone()]}.into());
         } else {
             std::fs::create_dir_all(target.parent().context("verifier file lacks parent")?)?;
             let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(&target)?;

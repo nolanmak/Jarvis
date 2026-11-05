@@ -411,7 +411,7 @@ else: raise Exception('unexpected call '+repr(a))
         repo_root:&root,worktree:&candidate,repository:"fixture-owner/project",source_issue:Some(10),pr:Some(20),branch:"agent-fix/issue-10",contract:"synthetic migration",environment:"fixture-bootstrap",
     }).await.unwrap().unwrap();
     workflow.transition(crate::autoship_workflow::Stage::Scope,"legacy_verifier_proof_invalidated","migrate_behavioral_oracle",0).await.unwrap();
-    prepared=acceptance::migrate_historical_fixture(&candidate,&directories.workflow_acceptance,&prepared,modern.proposal.clone()).await.unwrap();
+    prepared=acceptance::migrate_historical_fixture(&candidate,&directories.workflow_acceptance,&prepared,modern.proposal.clone(),&workflow).await.unwrap();
     assert_eq!(prepared.proposal.contract.revision,2);
     let mut receipt=acceptance::verify_and_persist_candidate(&candidate,&prepared,&directories.workflow_acceptance,&acceptance::worker_roots(&candidate), &test_resource_audit(&directories.workflow_acceptance)).await.unwrap();
     receipt.alignment=Some(alignment::persist_shipping_fixture(&candidate,&prepared,&directories.workflow_acceptance,&directories.repository_policy).await.unwrap());

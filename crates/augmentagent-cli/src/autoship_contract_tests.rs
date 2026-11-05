@@ -611,3 +611,17 @@ fn private_byte_registration_preserves_the_existing_format_and_exact_closure() {
         assert!(RegisteredContract::register_from_files(contract(),base.into(),environment.into(),&files).is_err());
     }
 }
+
+#[test]
+fn private_byte_environment_transition_preserves_existing_registration_identity() {
+    let (root,_) = registered();
+    let files=BTreeMap::from([("verifier.rs".into(),std::fs::read_to_string(root.path().join("verifier.rs")).unwrap())]);
+    let existing=RegisteredContract::register_transition(root.path(),contract(),BASE.into(),"old".into(),"new".into()).unwrap();
+    let private=RegisteredContract::register_transition_from_files(contract(),BASE.into(),"old".into(),"new".into(),&files).unwrap();
+    assert_eq!(serde_json::to_vec(&existing).unwrap(),serde_json::to_vec(&private).unwrap());
+    private.verify_files(&files).unwrap();
+    assert_eq!(private.binding(BASE).unwrap().environment_id,"old");
+    assert_eq!(private.binding(HEAD).unwrap().environment_id,"new");
+    assert!(RegisteredContract::register_transition_from_files(contract(),BASE.into(),"old".into(),String::new(),&files).is_err());
+    assert!(RegisteredContract::register_transition_from_files(contract(),BASE.into(),"old".into(),"new".into(),&BTreeMap::new()).is_err());
+}
