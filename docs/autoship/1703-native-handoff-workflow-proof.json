@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "c0c47147b948fc38b14d7379f99e2256af3a8785",
+  "source_parent_commit": "cc8aadde843aa7805eee9bf33a957c85e49fe01b",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -26,7 +26,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
-      "sha256": "4744a85e2a7e163f5ba964e4e6ce8d84a692e4891dd4b9860a9fe9ce3992c85f"
+      "sha256": "b2013dc874c29eb30194642682330d36d2f449a6e8c7c34f1b60ceb08f5a870d"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
@@ -102,7 +102,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_reconcile.rs",
-      "sha256": "5aa2a3af0b57c9fde323262ce5ab202ac69009b4cd3243dd7ebc0487d37e9a9f"
+      "sha256": "5291d2576bcf681aab3052191f05562541f4a102d9e3c9a0ddf08d0d034b7697"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_native_callbacks.rs",
@@ -110,12 +110,12 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "9527c6317948c31c10976c60bd1e6fea49b3c1f00ffccd398cf47811eebca23f"
+      "sha256": "43b47e7b20737aa5a0f690ae79a2897aeea16f625556c2b06c6db75938ab2515"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1838,
+    "passed": 1841,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
@@ -165,7 +165,18 @@
       "autoship-native-sweep-review-red.log",
       "autoship-native-sweep-review-green.log",
       "autoship-native-sweep-full-cli.log",
-      "autoship-native-sweep-production-check.log"
+      "autoship-native-sweep-production-check.log",
+      "autoship-native-guard-abort-resolver-red.log",
+      "autoship-native-guard-abort-resolver-green.log",
+      "autoship-native-guard-abort-acquisition-red.log",
+      "autoship-native-guard-abort-acquisition-green.log",
+      "autoship-native-guard-abort-acquisition-green-retry.log",
+      "autoship-native-guard-abort-full-cli.log",
+      "autoship-native-guard-abort-production-check.log",
+      "autoship-native-guard-abort-fairness-red.log",
+      "autoship-native-guard-abort-fairness-green.log",
+      "autoship-native-guard-abort-fair-full-cli.log",
+      "autoship-native-guard-abort-fair-production-check.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -198,12 +209,13 @@
     "production_configuration_check": {
       "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
       "passed": true,
-      "log": "autoship-native-sweep-production-check.log"
+      "log": "autoship-native-guard-abort-fair-production-check.log"
     },
     "guard_promotion_cases": 3,
     "read_only_audit_probe_cases": 2,
-    "actual_guard_subprocess_modes": 15,
-    "sweep_related_cases": 20
+    "actual_guard_subprocess_modes": 16,
+    "sweep_related_cases": 20,
+    "guard_abort_resolver_cases": 3
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -300,7 +312,11 @@
     "audit pointer promotion requires opaque actual current receipt and matching settled history; historical, changed-head and held contexts refuse; replay is idempotent and projection failure retains settlement",
     "read-only healthy audit inspection never recreates missing lock authority and reports a busy lock without waiting or mutating log/anchor",
     "merge-sweep uses shared audit acquisition/native recovery, preserves stored review and original native binding, and releases an unstarted lease on missing native authority",
-    "audit recovery that changes the reviewed binding returns no merge-sweep guard, releases its lease and requires candidate verification/review again"
+    "audit recovery that changes the reviewed binding returns no merge-sweep guard, releases its lease and requires candidate verification/review again",
+    "controller-local pre-guard acquisition invokes original-bound retired-aborted namespace proofs without a shared workflow mutex; exact metadata settlement occurs under original native/session/audit locks",
+    "unavailable audit/native authority or failed projection retains the affected barrier; verified peers resolve independently without model/allowance changes; stale lease fences further work",
+    "bounded namespace windows rotate with durable lease generations so an unavailable prefix cannot starve a later verified peer; a reduced-budget integration fixture exercises actual native proofs across two genuine workflow leases",
+    "actual guard acquisition resolves verified source and unpromoted-destination abort barriers, then refuses all-closed source reuse without creating a fresh owner or binding"
   ],
   "synthetic_controller_fixtures": true,
   "live_provider_dispatch": false,
@@ -312,12 +328,12 @@
   "hosted_ci": "pending current published head",
   "remaining": [
     "production preparation/promotion caller integration across remaining owner-turn and recovery leases",
-    "automatic authenticated retirement/resolution routing and interrupted namespace recovery and authenticated legacy/uncertainty/corrupt-state recovery",
+    "remaining authenticated retirement intent routing and terminal resolution integration and interrupted namespace recovery and authenticated legacy/uncertainty/corrupt-state recovery",
     "normal protected rollout and actual Codex/Claude Discord continuation acceptance",
     "C actual-backend freshness/storage/quiescence cutover, private verifier recovery/application and full epic soak",
     "persist post-intent transient-I/O S backoff, actual input-change early wake before activation",
     "guarded all-closed-source re-preparation using the original binding and verified history; no fresh-origin backfill or budget/owner-input reset",
-    "authenticated cleanup routing and all-closed original-binding recovery; remaining owner-turn and recovery consumers; actual runtime/provider continuation acceptance"
+    "remaining authenticated retirement intent routing and all-closed original-binding recovery; remaining owner-turn and recovery consumers; actual runtime/provider continuation acceptance"
   ],
   "native_transfer_scope": "isolated synthetic-controller/native-filesystem fixtures only; zero production transfers or provider/model dispatch",
   "opaque_receipt_producer": "actual original-bound ownership::transfer_receipt lookup or Completed NativeTransferInspection under the held original native lock; no wire/serialized-receipt constructor",
@@ -396,7 +412,9 @@
     "ordinary_and_observational_guard_acquisition": true,
     "merge_sweep": true,
     "runtime_deployed": false,
-    "guard_fixture_scope": "15 actual guard subprocess modes; zero-runtime native sources; zero provider/model dispatch; not live continuation acceptance"
+    "guard_fixture_scope": "16 actual guard subprocess modes; zero-runtime native sources; zero provider/model dispatch; not live continuation acceptance",
+    "pre_guard_retired_aborted_namespace_resolution": true,
+    "all_closed_original_binding_recovery": false
   },
   "productive_caller_enabled_scope": "deployment activation remains unproven; supported guard source paths are connected as described in source_caller_integration"
 }

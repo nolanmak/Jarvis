@@ -236,6 +236,12 @@ fn acquire_audit_generation_inner(
 ) -> Result<Arc<augmentagent_channel_core::AuditLogger>> {
     reconcile_runtime_retirements_in(store, now)?;
     if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_some() {
+        // This store is controller-local: no shared workflow mutex exists yet.
+        // Each proof keeps original native/session/audit locks while its short
+        // workflow transaction resolves only that exact retired namespace.
+        durable::native_reconcile::resolve_retired_aborted(store,lease,binding,&millis,&mut |pending,namespace| {
+            existing_native_audit(state,namespace,worktree,pending.original_binding())
+        })?;
         if let Some((audit,original))=store.native_owner_context(&lease.workflow,lease.generation)? {
             let authority=augmentagent_channel_core::native_vm::ownership::Authority {owner:augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:lease.workflow.clone(),lease_generation:lease.generation},audit_path:audit};
             return existing_native_audit(state,&authority,worktree,&original);
@@ -3056,7 +3062,7 @@ mod tests {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition"] {
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
                     .env(CHILD,control.path()).env(MODE,mode);
@@ -3156,6 +3162,20 @@ mod tests {
             assert_eq!(rows[0].certainty,crate::autoship_workflow::native_observation::Certainty::Uncertain);
             assert_eq!(rows[0].protected_observation_reference.as_ref(),Some(fact.receipt()));
             assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        }
+        if mode=="resolved-abort-acquisition" {
+            use augmentagent_channel_core::native_vm::ownership;
+            let source=guard.audit_logger();let original=saved.clone().unwrap();guard.finish().unwrap();
+            let mut store=WorkflowStore::open(&state).unwrap();let lease=store.claim(&id,"fixture-interrupted-transfer",millis(),LEASE_MS).unwrap().unwrap();let binding=store.snapshot(&id).unwrap().unwrap().checkpoint.binding;
+            let destination=open_audit_generation(&state,&id,None,lease.generation).unwrap();destination.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:id.clone(),lease_generation:lease.generation}).unwrap();destination.set_native_store_binding(original.clone()).unwrap();destination.require_run_resources().unwrap();destination.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":id,"generation":lease.generation})).unwrap();
+            let pending=match store.prepare_or_load_native_handoff(&lease,&binding,destination.path().to_str().unwrap(),millis()).unwrap() {durable::HandoffPreparation::Prepared(p)=>p,_=>panic!("expected exact fixture intent")};
+            let writer=source.begin_write().unwrap();let outcome=ownership::transfer(&original,pending.request(),&pending.observation(),&[source.clone()],&destination,&||Ok(()));assert!(matches!(outcome,ownership::TransferOutcome::Deferred {..}),"{outcome:?}");writer.complete();
+            // Disposable fixture cleanup; this does not create production owner authorization.
+            for authority in pending.request().source_owners.iter().chain(std::iter::once(&pending.request().destination)) {augmentagent_channel_core::native_vm::retire_owned_runtimes(&original,Path::new(&authority.audit_path),&authority.owner,&||Ok(())).unwrap();}
+            store.release(&lease,millis()).unwrap();let recovery=store.claim(&id,"fixture-abort-ack",millis(),LEASE_MS).unwrap().unwrap();
+            ownership::with_transfer_inspection(&original,pending.request(),&pending.observation(),&||Ok(()),&mut |proof|store.acknowledge_native_aborted(&recovery,&binding,&pending,proof,millis())).unwrap();store.release(&recovery,millis()).unwrap();assert_eq!(store.unresolved_native_abort_namespaces(&id).unwrap().len(),2);let calls=store.snapshot(&id).unwrap().unwrap().model_calls;drop(store);
+            // All-closed reuse is still held, but verified abort barriers must be resolved.
+            assert!(WorkflowGuard::acquire_at(&state,start(),millis()).await.is_err());let mut store=WorkflowStore::open(&state).unwrap();assert!(store.unresolved_native_abort_namespaces(&id).unwrap().is_empty());let snapshot=store.snapshot(&id).unwrap().unwrap();assert_eq!(snapshot.lease_until_ms,0);assert_eq!(snapshot.model_calls,calls);assert!(store.native_owner_binding(&id,snapshot.generation).unwrap().is_none());assert!(!store.initial_native_owner_available(&id).unwrap());assert_eq!(store.native_aborted_handoff(&id,&pending.request().transfer_id).unwrap(),Some(pending));return;
         }
         if matches!(mode.as_str(),"native-sweep"|"native-sweep-lost-authority") {
             guard.record_review("fixture-independent-review",true,"native sweep fixture approval").unwrap();

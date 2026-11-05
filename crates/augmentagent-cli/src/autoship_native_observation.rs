@@ -1519,6 +1519,52 @@ mod tests {
         ownership::with_transfer_inspection(&pending.original_binding,&pending.request,&pending.observation(),&||Ok(()),&mut |proof|store.lock().unwrap().acknowledge_native_aborted(&lease,&f.binding,&pending,proof,now())).unwrap();(lease,pending,store)
     }
     #[test]
+    fn native_abort_guard_resolver_advances_verified_peer_and_replays_without_accounting_changes() {
+        if child("native_abort_guard_resolver_advances_verified_peer_and_replays_without_accounting_changes") {return;}
+        let mut f=Fixture::new();let (lease,pending,shared)=acknowledged_abort_fixture(&mut f);
+        let mut store=std::sync::Arc::try_unwrap(shared).ok().unwrap().into_inner().unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();let allowance=store.merge_allowance(now(),5).unwrap();
+        let mut open=|_pending:&PendingNativeHandoff,namespace:&ownership::Authority|->Result<std::sync::Arc<AuditLogger>> {
+            if namespace==&pending.request.source_owners[0] {Ok(std::sync::Arc::new(f.audit.clone()))}else{anyhow::bail!("unavailable peer audit")}
+        };
+        assert_eq!(super::super::native_reconcile::resolve_retired_aborted(&mut store,&lease,&f.binding,&now,&mut open).unwrap(),1);
+        assert_eq!(store.unresolved_native_abort_namespaces(&lease.workflow).unwrap(),vec![(pending.request.transfer_id.clone(),pending.request.destination.clone())]);
+        let events=store.events(&lease.workflow).unwrap();assert_eq!(super::super::native_reconcile::resolve_retired_aborted(&mut store,&lease,&f.binding,&now,&mut open).unwrap(),0);assert_eq!(store.events(&lease.workflow).unwrap(),events);
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(store.merge_allowance(now(),5).unwrap(),allowance);assert!(store.validate_dispatch(&lease,&f.binding,now()).is_err());
+    }
+    #[test]
+    fn native_abort_guard_resolver_bounded_pass_reaches_later_peer_on_next_lease() {
+        if child("native_abort_guard_resolver_bounded_pass_reaches_later_peer_on_next_lease") {return;}
+        let mut f=Fixture::new();let (mut lease,pending,shared)=acknowledged_abort_fixture(&mut f);let mut store=std::sync::Arc::try_unwrap(shared).ok().unwrap().into_inner().unwrap();
+        let destination=&pending.request.destination;augmentagent_channel_core::native_vm::retire_owned_runtimes(&pending.original_binding,Path::new(&destination.audit_path),&destination.owner,&||Ok(())).unwrap();
+        let audit=AuditLogger::protected(PathBuf::from(&destination.audit_path),f._root.path().join("anchors/joined-destination.json"),&[]).unwrap();audit.set_native_runtime_owner(destination.owner.clone()).unwrap();audit.set_native_store_binding(pending.original_binding.clone()).unwrap();let audit=std::sync::Arc::new(audit);
+        if lease.generation%2!=0 {store.release(&lease,now()).unwrap();lease=store.claim(&lease.workflow,"even-bounded-pass",now(),60_000).unwrap().unwrap();}
+        let barriers=store.unresolved_native_abort_namespaces(&lease.workflow).unwrap();let unavailable=barriers[0].1.clone();let calls=store.snapshot(&lease.workflow).unwrap().unwrap().model_calls;let allowance=store.merge_allowance(now(),5).unwrap();
+        let mut open=|_pending:&PendingNativeHandoff,namespace:&ownership::Authority|->Result<std::sync::Arc<AuditLogger>> {
+            if namespace==&unavailable {anyhow::bail!("first namespace remains unavailable");}
+            Ok(if namespace==destination {audit.clone()}else{std::sync::Arc::new(f.audit.clone())})
+        };
+        assert_eq!(super::super::native_reconcile::resolve_retired_aborted_batch::<1>(&mut store,&lease,&f.binding,&now,&mut open).unwrap(),0);
+        store.release(&lease,now()).unwrap();lease=store.claim(&lease.workflow,"next-bounded-pass",now(),60_000).unwrap().unwrap();
+        assert_eq!(super::super::native_reconcile::resolve_retired_aborted_batch::<1>(&mut store,&lease,&f.binding,&now,&mut open).unwrap(),1,"an unavailable prefix must not starve a later verified namespace");
+        assert_eq!(store.unresolved_native_abort_namespaces(&lease.workflow).unwrap(),vec![(pending.request.transfer_id.clone(),unavailable)]);assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,calls);assert_eq!(store.merge_allowance(now(),5).unwrap(),allowance);
+    }
+    #[test]
+    fn native_abort_guard_resolver_retains_failed_or_missing_proof_and_fences_stale_lease() {
+        if child("native_abort_guard_resolver_retains_failed_or_missing_proof_and_fences_stale_lease") {return;}
+        for fault in ["projection","native-store","lease"] {
+            let mut f=Fixture::new();let (lease,pending,shared)=acknowledged_abort_fixture(&mut f);let mut store=std::sync::Arc::try_unwrap(shared).ok().unwrap().into_inner().unwrap();
+            if fault=="projection" {store.conn.execute_batch("CREATE TRIGGER deny_guard_resolution BEFORE INSERT ON workflow_native_abort_resolution BEGIN SELECT RAISE(ABORT,'injected resolver failure'); END;").unwrap();}
+            if fault=="native-store" {std::fs::remove_file(f._root.path().join("native/authority-epoch.json")).unwrap();}
+            if fault=="lease" {store.release(&lease,now()).unwrap();store.claim(&lease.workflow,"replacement",now(),60_000).unwrap().unwrap();}
+            let events=store.events(&lease.workflow).unwrap();let mut open=|_pending:&PendingNativeHandoff,namespace:&ownership::Authority|->Result<std::sync::Arc<AuditLogger>> {if namespace==&pending.request.source_owners[0] {Ok(std::sync::Arc::new(f.audit.clone()))}else{anyhow::bail!("unavailable peer audit")}};
+            let result=super::super::native_reconcile::resolve_retired_aborted(&mut store,&lease,&f.binding,&now,&mut open);if fault=="lease" {assert!(result.is_err());}else{assert_eq!(result.unwrap(),0);}
+            assert_eq!(store.events(&lease.workflow).unwrap(),events);assert_eq!(store.unresolved_native_abort_namespaces(&lease.workflow).unwrap().len(),2);
+            if fault=="projection" {store.conn.execute_batch("DROP TRIGGER deny_guard_resolution").unwrap();assert_eq!(super::super::native_reconcile::resolve_retired_aborted(&mut store,&lease,&f.binding,&now,&mut open).unwrap(),1);}
+            if fault=="native-store" {assert!(!f._root.path().join("native/authority-epoch.json").exists());}
+        }
+    }
+    #[test]
     fn native_abort_resolution_clears_only_verified_namespace_and_preserves_accounting() {
         if child("native_abort_resolution_clears_only_verified_namespace_and_preserves_accounting") {return;}
         let mut f=Fixture::new();let (lease,pending,store)=acknowledged_abort_fixture(&mut f);let source=&pending.request.source_owners[0];let before=store.lock().unwrap().snapshot(&lease.workflow).unwrap().unwrap();let allowance=store.lock().unwrap().merge_allowance(now(),5).unwrap();
