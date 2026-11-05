@@ -6,6 +6,16 @@ from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('shared_ci',ROOT/'scripts/ci-contract.py');ci=importlib.util.module_from_spec(spec);spec.loader.exec_module(ci)
 class ContractTests(unittest.TestCase):
+ def test_main_carries_no_autoship_acceptance_harness(self):
+  # Harnesses (verifier scripts, autoship_case binaries) live only in the
+  # loop's private verifier checkouts. One merged by hand (#1804, #1805) made
+  # every later proposal that reuses the canonical name fail "File exists".
+  real_tests={'crates/augmentagent-cli/tests/autoship_commands_cli.rs','crates/augmentagent-cli/tests/autoship_resolution_cli.rs','crates/augmentagent-cli/tests/autoship_submit_cli.rs'}
+  tracked=subprocess.run(['git','ls-files'],cwd=ROOT,capture_output=True,text=True,check=True).stdout.splitlines()
+  leaked=[p for p in tracked if p.startswith('autoship_verifiers/')
+   or ('/src/bin/' in p and p.rsplit('/',1)[-1].startswith('autoship_') and p.endswith('.rs'))
+   or ('/tests/' in p and p.rsplit('/',1)[-1].startswith('autoship_') and p.endswith('.rs') and p not in real_tests)]
+  self.assertEqual(leaked,[],'acceptance harness files must not be committed')
  def test_autoship_cli_suites_execute_as_separate_cargo_commands(self):
   body=json.loads((ROOT/'scripts/ci-contract.json').read_text())['commands']['rust/cli/6']['body']
   with tempfile.TemporaryDirectory() as directory:
