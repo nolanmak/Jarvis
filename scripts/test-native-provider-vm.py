@@ -125,6 +125,81 @@ class LaunchInputSnapshotTests(unittest.TestCase):
                                  'receipt hashed replacement path bytes instead of the consumed launch input')
 
 
+class AssetInputBindingTests(unittest.TestCase):
+    def manifest(self, source, name='asset-0', data=b'original instructions'):
+        return {'version': 1, 'source': str(source), 'name': name, 'bytes': len(data),
+                'sha256': hashlib.sha256(data).hexdigest()}
+
+    def test_changed_asset_digest_is_refused_before_guest_materialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'snapshot'
+            source.write_bytes(b'changed! instructions')
+            source.chmod(0o400)
+            binary = root / 'provider'
+            binary.mkdir(mode=0o700)
+            with self.assertRaisesRegex(ValueError, 'asset.*(digest|bytes|size)'):
+                vm.stage_input_assets([self.manifest(source)], binary)
+            self.assertEqual(list(binary.iterdir()), [])
+
+    def test_entire_batch_is_checked_before_writing_guest_assets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'snapshot'
+            source.write_bytes(b'original instructions')
+            source.chmod(0o400)
+            binary = root / 'provider'
+            binary.mkdir(mode=0o700)
+            first = self.manifest(source)
+            second = {**self.manifest(source, 'asset-1'), 'sha256': 'f' * 64}
+            with self.assertRaisesRegex(ValueError, 'asset.*digest'):
+                vm.stage_input_assets([first, second], binary)
+            self.assertEqual(list(binary.iterdir()), [])
+            vm.stage_input_assets([first, self.manifest(source, 'asset-1')], binary)
+            for name in ('asset-0', 'asset-1'):
+                self.assertEqual((binary / name).read_bytes(), b'original instructions')
+                self.assertEqual((binary / name).stat().st_mode & 0o777, 0o444)
+
+    def test_manifest_and_snapshot_identity_refuse_unknown_or_mutable_inputs(self):
+        changes = ({'version': True}, {'version': 2}, {'bytes': True}, {'bytes': -1},
+                   {'bytes': 16 * 1024 * 1024 + 1}, {'sha256': 'A' * 64}, {'extra': 1},
+                   {'name': 'asset-other'}, {'name': '../asset-0'}, {'source': 'relative'})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'snapshot'
+            source.write_bytes(b'original instructions')
+            source.chmod(0o400)
+            binary = root / 'provider'
+            binary.mkdir(mode=0o700)
+            for change in changes:
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    vm.stage_input_assets([{**self.manifest(source), **change}], binary)
+                self.assertEqual(list(binary.iterdir()), [])
+            for field in ('version', 'bytes', 'sha256'):
+                unknown = {k: v for k, v in self.manifest(source).items() if k != field}
+                with self.subTest(missing=field), self.assertRaises(ValueError):
+                    vm.stage_input_assets([unknown], binary)
+            source.chmod(0o600)
+            with self.assertRaises(ValueError):
+                vm.stage_input_assets([self.manifest(source)], binary)
+            source.chmod(0o400)
+            link = root / 'hardlink'
+            os.link(source, link)
+            with self.assertRaises(ValueError):
+                vm.stage_input_assets([self.manifest(source)], binary)
+            link.unlink()
+            symlink = root / 'symlink'
+            symlink.symlink_to(source)
+            with self.assertRaises(OSError):
+                vm.stage_input_assets([self.manifest(symlink)], binary)
+            fifo = root / 'fifo'
+            os.mkfifo(fifo, 0o400)
+            with self.assertRaises(ValueError):
+                vm.stage_input_assets([self.manifest(fifo)], binary)
+            self.assertEqual(list(binary.iterdir()), [])
+
+
+
 class NativeVmTests(unittest.TestCase):
     def test_export_target_rejects_existing_public_or_symlink_parents(self):
         for case in ('public-root', 'public-parent', 'symlink-parent'):

@@ -569,6 +569,46 @@ def stage_native_companions(executable, guest_runtime, destination):
         os.fchmod(stream.fileno(), 0o555)
 
 
+def stage_input_assets(assets, binary):
+    if type(assets) is not list or len(assets) > 32:
+        raise ValueError('native asset count exceeds budget')
+    loaded = []
+    asset_bytes = 0
+    for index, asset in enumerate(assets):
+        if (type(asset) is not dict or set(asset) - {'version', 'source', 'name', 'bytes', 'sha256', 'origin'}
+                or type(asset.get('version')) is not int or asset['version'] != 1
+                or type(asset.get('source')) is not str or type(asset.get('name')) is not str
+                or type(asset.get('bytes')) is not int or not 0 <= asset['bytes'] <= 16 * 1024 * 1024
+                or type(asset.get('sha256')) is not str or len(asset['sha256']) != 64
+                or any(c not in '0123456789abcdef' for c in asset['sha256'])):
+            raise ValueError('native input asset manifest invalid')
+        name = safe_relative(asset['name'])
+        if str(name) != f'asset-{index}' or len(name.parts) != 1:
+            raise ValueError('invalid native input asset name')
+        source = Path(asset['source'])
+        if not source.is_absolute():
+            raise ValueError('native input asset snapshot is not absolute')
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid()
+                    or info.st_mode & 0o377 or info.st_size != asset['bytes']):
+                raise ValueError('native input asset snapshot size or identity invalid')
+            asset_bytes += asset['bytes']
+            if asset_bytes > 16 * 1024 * 1024:
+                raise ValueError('native total asset budget exceeded')
+            data = stream.read(asset['bytes'] + 1)
+            if len(data) != asset['bytes'] or hashlib.sha256(data).hexdigest() != asset['sha256']:
+                raise ValueError('native input asset digest or bytes changed')
+            loaded.append((name, data))
+    # Verify the entire bounded batch before creating any guest asset file.
+    for name, data in loaded:
+        with open(binary / name, 'xb') as stream:
+            os.fchmod(stream.fileno(), 0o444)
+            stream.write(data)
+
+
+
 def read_launch_spec(spec_path):
     # Hash the exact bounded bytes parsed for this invocation. Completion and
     # failure receipts must never reread a potentially changed launch path.
@@ -625,26 +665,7 @@ def main(spec_path):
         shutil.copyfile(executable, binary / 'cli')
         (binary / 'cli').chmod(0o555)
         stage_native_companions(executable, spec['guest_runtime'], binary)
-        assets = spec.get('assets', [])
-        if len(assets) > 32:
-            raise ValueError('native asset count exceeds budget')
-        asset_bytes = 0
-        for asset in assets:
-            name = safe_relative(asset['name'])
-            if len(name.parts) != 1 or not str(name).startswith('asset-'):
-                raise ValueError('invalid native input asset')
-            source = Path(asset['source'])
-            fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-            with os.fdopen(fd, 'rb') as stream:
-                info = os.fstat(stream.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_size > 16 * 1024 * 1024:
-                    raise ValueError('native input asset exceeds policy')
-                data = stream.read(16 * 1024 * 1024 + 1)
-                asset_bytes += len(data)
-                if asset_bytes > 16 * 1024 * 1024:
-                    raise ValueError('native total asset budget exceeded')
-                (binary / name).write_bytes(data)
-                (binary / name).chmod(0o444)
+        stage_input_assets(spec.get('assets', []), binary)
         # The guest receives only a relay executable, never the host bridge
         # policy, settings, hooks, source checkout or daemon credential store.
         shutil.copyfile(Path(__file__).with_name('native-provider-mcp-relay.py'), binary / 'mcp-relay.py')

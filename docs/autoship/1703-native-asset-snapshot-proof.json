@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "kind": "captured-and-digest-bound-native-input-asset-component",
+  "source_parent_commit": "f30a584a62c266b877dca2335f4c97bae1118355",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "5365569cf84742068a4f7a7c8b66cea081477b9372ca6dcc97e9e7af33b51a21"
+    },
+    {
+      "path": "scripts/native-provider-vm.py",
+      "sha256": "532594a4304aa94f02d4202ba63a91d3fd367ae09831430a123c56d6fd93fa4d"
+    },
+    {
+      "path": "scripts/test-native-provider-vm.py",
+      "sha256": "8753216a297af6387896c6aa5bbf6038677327c4c9b27ec28ae5fc71f66a33a7"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/codex.rs",
+      "sha256": "b1e888df1e20239e8380ee57286cab3d458e4bf2c1f5bb48c914641dbcefc0d4"
+    },
+    {
+      "path": "scripts/native-provider-vm-guest.py",
+      "sha256": "3eb2c054440e1714c1c2a0ea50cc6e86baa7413b830deab7b37db240239e17d9"
+    }
+  ],
+  "behavioral_reds": [
+    {
+      "session": 35964,
+      "result": "terminal1;managed exit101",
+      "log": "/tmp/autoship-native-asset-snapshot-red-20261106.log",
+      "failure": "prepared spec retained mutable original asset path"
+    },
+    {
+      "result": "terminal1",
+      "log": "/tmp/autoship-native-asset-staging-red-20261106.log",
+      "failure": "runner staged substituted bytes without verifying declared asset digest/size"
+    },
+    {
+      "session": 41637,
+      "result": "terminal1;managed exit101",
+      "log": "/tmp/autoship-native-asset-preflight-red-20261106.log",
+      "failure": "missing asset preflight stranded an unobserved native runtime"
+    }
+  ],
+  "validation": {
+    "full_core": {
+      "session": 27357,
+      "result": "terminal0",
+      "passed": 946,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 37.21,
+      "log": "/tmp/autoship-native-asset-snapshot-full-core-final-20261106.log"
+    },
+    "python_vm": {
+      "session": 18940,
+      "result": "terminal0",
+      "tests": 27,
+      "seconds": 1.307,
+      "log": "/tmp/autoship-native-asset-staging-full-python-20261106.log"
+    },
+    "python_io": {
+      "result": "terminal0",
+      "tests": 9,
+      "seconds": 0.098,
+      "log": "/tmp/autoship-native-asset-staging-io-20261106.log"
+    },
+    "isolated_full_cli": {
+      "session": 10975,
+      "result": "terminal0",
+      "passed": 1949,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 321.25,
+      "log": "/tmp/autoship-native-asset-snapshot-isolated-full-cli-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    },
+    "isolated_production_check": {
+      "session": 82105,
+      "result": "terminal0",
+      "seconds": 13.57,
+      "log": "/tmp/autoship-native-asset-snapshot-isolated-production-check-20261106.log"
+    }
+  },
+  "implemented": [
+    "Capture referenced instruction/image bytes through bounded original no-follow/nonblocking descriptor with stable metadata",
+    "Fsync exclusive owner-readonly snapshots in existing owned launch directory; close capture writers; no mutation/deletion of originals",
+    "Actual launch spec binds snapshot content SHA/size and descriptive original identity, count32/total16MiB",
+    "Capture before native session allocation prevents missing/unsafe/oversized input from stranding a runtime or launch observation",
+    "Runner verifies strict manifest and actual private readonly snapshot bytes/hash for entire batch before guest asset materialization",
+    "Unknown legacy unhashed assets refuse; launches without assets retain normal admission"
+  ],
+  "test_scope": {
+    "actual_preparation": "instruction/image snapshots preserve original bytes after original mutation/removal; missing/symlink/directory/oversized preflight leaves no native session, launch capture or observer event",
+    "runner_staging": "same-length substitution, multi-asset refusal before any guest file, exact successful copies, malformed/missing schema, unsafe names, relative paths, writable/shared/symlink/FIFO sources",
+    "vm_or_provider_executed": false
+  },
+  "not_proven_or_implemented": [
+    "Complete runtime/credential/kernel/compiled/allocation/writer/associated-input census and source/resource authority",
+    "Trusted startup consumed-input attestation joined before model/body admission",
+    "Body nonrelease and semantic coding-conversation continuation",
+    "Typed recovery/terminal metadata producers, distinct productive successor bridge/claim and shared productive admission",
+    "Connected owner worker, aggregate protected-storage admission, independent exact-head review, rollout and original live acceptance/soaks"
+  ],
+  "preserved_unpublished_work": "/tmp/autoship-productive-gate-preserved-20261106.patch"
+}

@@ -191,13 +191,35 @@ fn write(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent)=path.parent(){std::fs::File::open(parent)?.sync_all()?;}
     Ok(())
 }
+const MAX_INPUT_ASSETS:usize=32;
+const MAX_INPUT_ASSET_BYTES:u64=16*1024*1024;
+fn snapshot_input_asset(directory:&Path,source:&Path,index:usize,total:&mut u64)->Result<serde_json::Value> {
+    use std::io::Read;
+    ensure!(index<MAX_INPUT_ASSETS,"native asset count exceeds budget");
+    let remaining=MAX_INPUT_ASSET_BYTES.checked_sub(*total).context("native asset budget overflow")?;
+    let file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(source)?;
+    let before=file.metadata()?;
+    ensure!(before.is_file() && before.len()<=remaining,"native input asset exceeds policy");
+    let identity=|m:&std::fs::Metadata|(m.dev(),m.ino(),m.nlink(),m.mode(),m.uid(),m.gid(),m.len(),m.mtime(),m.mtime_nsec(),m.ctime(),m.ctime_nsec());
+    let mut bytes=Vec::new();(&file).take(remaining+1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64==before.len() && identity(&before)==identity(&file.metadata()?),"native input asset changed during capture");
+    let snapshot=directory.join(format!("input-asset-{index}"));
+    let mut captured=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o400).custom_flags(libc::O_NOFOLLOW).open(&snapshot)?;
+    captured.write_all(&bytes)?;captured.set_permissions(std::fs::Permissions::from_mode(0o400))?;captured.sync_all()?;drop(captured);
+    std::fs::File::open(directory)?.sync_all()?;
+    *total=total.checked_add(bytes.len() as u64).context("native asset budget overflow")?;
+    Ok(serde_json::json!({"version":1,"source":snapshot,"name":format!("asset-{index}"),"bytes":bytes.len(),"sha256":digest(&bytes),
+        "origin":{"path":source,"device":before.dev(),"inode":before.ino(),"bytes":before.len(),"mode":before.mode(),"uid":before.uid(),"gid":before.gid(),
+            "mtime":[before.mtime(),before.mtime_nsec()],"ctime":[before.ctime(),before.ctime_nsec()]}}))
+}
+
 fn digest(value: impl AsRef<[u8]>) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(value.as_ref()))
 }
 
 // Conservative per-session upper bound: native executable <=512MiB,
-// assets <=16MiB, two64MiB generations, one64MiB seed and export, metadata.
+// asset snapshots + guest copies <=32MiB, two64MiB generations, one64MiB seed and export, metadata.
 const SESSION_BYTES: u64 = 1024 * 1024 * 1024;
 struct StateLock(std::fs::File);
 impl StateLock {
@@ -615,6 +637,52 @@ impl Launch {
         let aliases = provider_root.join("aliases");
         std::fs::create_dir_all(&aliases)?;
         std::fs::set_permissions(&aliases, std::fs::Permissions::from_mode(0o700))?;
+        let directory = tempfile::Builder::new().prefix("launch-").tempdir_in(&provider_root)?;
+        for (name, contents) in HELPERS { write(&directory.path().join(name), contents)?; }
+        let source = original.as_std();
+        let program = PathBuf::from(source.get_program());
+        let executable = if program.is_absolute() { program.canonicalize()? } else {
+            let search = source.get_envs().find(|(key,_)|*key=="PATH").and_then(|(_,value)|value)
+                .map(std::ffi::OsString::from).unwrap_or_else(|| "/usr/bin:/bin".into());
+            std::env::split_paths(&search).map(|path|path.join(&program)).find(|path|path.is_file())
+                .context("native executable unavailable")?.canonicalize()?
+        };
+        let mut assets = Vec::new();let mut asset_bytes=0u64;
+        let asset_base=match source.get_current_dir() {Some(path)=>path.to_path_buf(),None=>std::env::current_dir()?};
+        let mut arguments: Vec<String> = source.get_args().map(|arg|arg.to_str().context("non-UTF8 native argument").map(str::to_owned)).collect::<Result<_>>()?;
+        let mut index = 0;
+        while index < arguments.len() {
+            if arguments[index].starts_with("mcp_servers.jarvis=") {
+                arguments[index] = "mcp_servers.jarvis={command=\"/usr/bin/python3\",args=[\"-I\",\"/native/mcp-relay.py\"],required=true,startup_timeout_sec=120,tool_timeout_sec=900,default_tools_approval_mode=\"approve\"}".into();
+            } else if let Some(raw) = arguments[index].strip_prefix("model_instructions_file=") {
+                let path: String = serde_json::from_str(raw)?;
+                let guest = format!("/native/asset-{}",assets.len());
+                let input=PathBuf::from(path);let input=if input.is_absolute() {input}else{asset_base.join(input)};
+                assets.push(snapshot_input_asset(directory.path(),&input,assets.len(),&mut asset_bytes)?);
+                arguments[index] = format!("model_instructions_file={}",serde_json::to_string(&guest)?);
+            } else if matches!(arguments[index].as_str(), "-C" | "--mcp-config" | "-i") && index+1 < arguments.len() {
+                let option = arguments[index].clone();
+                index += 1;
+                if option == "-C" { arguments[index] = "/workspace".into(); }
+                else if option == "--mcp-config" && bridge.is_some() {
+                    arguments[index] = r#"{"mcpServers":{"jarvis":{"command":"/usr/bin/python3","args":["-I","/native/mcp-relay.py"]}}}"#.into();
+                } else if option == "-i" {
+                    let guest = format!("/native/asset-{}",assets.len());
+                    let input=PathBuf::from(&arguments[index]);let input=if input.is_absolute() {input}else{asset_base.join(input)};
+                    assets.push(snapshot_input_asset(directory.path(),&input,assets.len(),&mut asset_bytes)?);
+                    arguments[index] = guest;
+                }
+            }
+            index += 1;
+        }
+        let mut environment = BTreeMap::new();
+        for (name,value) in source.get_envs() {
+            let Some(value) = value else { continue };
+            let name = name.to_str().context("invalid native environment key")?;
+            if profile.environment.iter().any(|allowed|allowed==name) || matches!(name,"LANG"|"TERM") {
+                environment.insert(name.to_owned(), value.to_str().context("invalid native environment value")?.to_owned());
+            }
+        }
         let resume = matches!(native, Some(crate::native_session::Launch::Resume { .. }));
         let session = match native {
             Some(crate::native_session::Launch::Resume { id }) => {
@@ -638,49 +706,6 @@ impl Launch {
         use sha2::{Digest,Sha256};
         let creation_receipt_sha256=format!("{:x}",Sha256::digest(private(&session.join("owned.json"))?));
         drop(ledger);drop(state_lock);
-        let directory = tempfile::Builder::new().prefix("launch-").tempdir_in(&provider_root)?;
-        for (name, contents) in HELPERS { write(&directory.path().join(name), contents)?; }
-        let source = original.as_std();
-        let program = PathBuf::from(source.get_program());
-        let executable = if program.is_absolute() { program.canonicalize()? } else {
-            let search = source.get_envs().find(|(key,_)|*key=="PATH").and_then(|(_,value)|value)
-                .map(std::ffi::OsString::from).unwrap_or_else(|| "/usr/bin:/bin".into());
-            std::env::split_paths(&search).map(|path|path.join(&program)).find(|path|path.is_file())
-                .context("native executable unavailable")?.canonicalize()?
-        };
-        let mut assets = Vec::new();
-        let mut arguments: Vec<String> = source.get_args().map(|arg|arg.to_str().context("non-UTF8 native argument").map(str::to_owned)).collect::<Result<_>>()?;
-        let mut index = 0;
-        while index < arguments.len() {
-            if arguments[index].starts_with("mcp_servers.jarvis=") {
-                arguments[index] = "mcp_servers.jarvis={command=\"/usr/bin/python3\",args=[\"-I\",\"/native/mcp-relay.py\"],required=true,startup_timeout_sec=120,tool_timeout_sec=900,default_tools_approval_mode=\"approve\"}".into();
-            } else if let Some(raw) = arguments[index].strip_prefix("model_instructions_file=") {
-                let path: String = serde_json::from_str(raw)?;
-                let guest = format!("/native/asset-{}",assets.len());
-                assets.push(serde_json::json!({"source":path,"name":guest.trim_start_matches("/native/")}));
-                arguments[index] = format!("model_instructions_file={}",serde_json::to_string(&guest)?);
-            } else if matches!(arguments[index].as_str(), "-C" | "--mcp-config" | "-i") && index+1 < arguments.len() {
-                let option = arguments[index].clone();
-                index += 1;
-                if option == "-C" { arguments[index] = "/workspace".into(); }
-                else if option == "--mcp-config" && bridge.is_some() {
-                    arguments[index] = r#"{"mcpServers":{"jarvis":{"command":"/usr/bin/python3","args":["-I","/native/mcp-relay.py"]}}}"#.into();
-                } else if option == "-i" {
-                    let guest = format!("/native/asset-{}",assets.len());
-                    assets.push(serde_json::json!({"source":arguments[index],"name":guest.trim_start_matches("/native/")}));
-                    arguments[index] = guest;
-                }
-            }
-            index += 1;
-        }
-        let mut environment = BTreeMap::new();
-        for (name,value) in source.get_envs() {
-            let Some(value) = value else { continue };
-            let name = name.to_str().context("invalid native environment key")?;
-            if profile.environment.iter().any(|allowed|allowed==name) || matches!(name,"LANG"|"TERM") {
-                environment.insert(name.to_owned(), value.to_str().context("invalid native environment value")?.to_owned());
-            }
-        }
         let mcp_argv = bridge.map(|bridge| vec!["/usr/bin/python3".to_string(), "-I".into(),
             bridge.native_cwd.parent().expect("bridge launch directory").join("tool-bridge.py").to_string_lossy().into_owned(),
             bridge.policy_path.to_string_lossy().into_owned()]);
@@ -894,6 +919,8 @@ mod tests {
     #[test]
     fn native_preparation_binds_original_owner_preparation_context() {launch_intent_child("preparation-context");}
     #[test]
+    fn native_preparation_snapshots_referenced_asset_bytes() {launch_intent_child("asset-input");}
+    #[test]
     fn native_preparation_requires_original_store_binding() {launch_intent_child("unbound");}
     #[test]
     fn native_preparation_rejects_changed_original_policy_before_allocating_runtime() {launch_intent_child("reselect");}
@@ -993,6 +1020,7 @@ mod tests {
                 return;
             }
             let test = if mode=="preparation-context" {"native_preparation_binds_original_owner_preparation_context"}
+                else if mode=="asset-input" {"native_preparation_snapshots_referenced_asset_bytes"}
                 else if mode=="input-lock-success" {"native_input_release_holds_authority_through_blocked_stdin"}
                 else if mode=="input-lock-cancel" {"native_input_release_cancellation_releases_authority_without_replay"}
                 else if mode=="input-lock-error" {"native_input_release_write_failure_releases_authority_without_replay"}
@@ -1044,6 +1072,7 @@ mod tests {
         std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",&policy);
         for (provider,id) in [("codex",Some("requested-codex-id")),("claude",None)] {
             if mode=="input-crash" && std::env::var("JARVIS_TEST_INPUT_CRASH_PROVIDER").unwrap()!=provider {continue;}
+            if mode=="asset-input" && provider!="codex" {continue;}
             let logs=root.as_path().join(format!("logs-{provider}")); let anchors=root.as_path().join(format!("anchors-{provider}"));
             std::fs::create_dir(&logs).unwrap(); std::fs::create_dir(&anchors).unwrap();
             let logger=std::sync::Arc::new(crate::tool_audit::AuditLogger::protected(logs.join("model.jsonl"),anchors.join("model.json"),&[]).unwrap());
@@ -1103,13 +1132,34 @@ mod tests {
                     assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);
                 }
             }
+            let original_asset=root.join("original-instructions.txt");
+            let mut command=Command::new("/usr/bin/false");
+            if mode=="asset-input" {
+                write(&original_asset,b"original supplied instructions").unwrap();
+                command.arg("-c").arg(format!("model_instructions_file={}",serde_json::to_string(&original_asset).unwrap()));
+                let image=root.join("original-image.bin");write(&image,b"synthetic image input bytes").unwrap();command.arg("-i").arg(&image);
+                let linked=root.join("linked-instructions");std::os::unix::fs::symlink(&original_asset,&linked).unwrap();
+                let oversized=root.join("oversized-instructions");let large=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&oversized).unwrap();large.set_len(MAX_INPUT_ASSET_BYTES+1).unwrap();drop(large);
+                for bad in [root.join("missing-instructions.txt"),linked,oversized,root.clone()] {
+                    let mut invalid=Command::new("/usr/bin/false");invalid.arg("-c").arg(format!("model_instructions_file={}",serde_json::to_string(&bad).unwrap()));
+                    assert!(Launch::prepare(provider,&opts,&invalid,None,Some(&native)).is_err(),"accepted {}",bad.display());
+                    let provider_path=state.join(provider);
+                    if provider_path.exists() {
+                        assert!(!std::fs::read_dir(&provider_path).unwrap().any(|entry|entry.unwrap().file_name().to_string_lossy().starts_with("session-")),
+                            "failed asset preflight stranded an unobserved native runtime");
+                        assert!(!std::fs::read_dir(&provider_path).unwrap().any(|entry|entry.unwrap().file_name().to_string_lossy().starts_with("launch-")),
+                            "failed asset preflight retained temporary capture output");
+                    }
+                    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);
+                }
+            }
             let launch=if mode=="preparation-context" {
                 tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(context.scope(async {
                     crate::native_session::FRESH_REVIEW.scope(true,async {
                         Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native))
                     }).await
                 }))
-            }else {Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native))};
+            }else {Launch::prepare(provider,&opts,&command,None,Some(&native))};
             if matches!(mode,"unbound"|"reselect") {
                 assert!(launch.is_err(),"native preparation ignored the original store binding ({mode})");
                 assert!(!state.join(provider).exists(),"refused preparation allocated runtime state");
@@ -1125,6 +1175,21 @@ mod tests {
                 assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);continue;
             }
             let launch=launch.unwrap();
+            if mode=="asset-input" {
+                let spec:serde_json::Value=serde_json::from_slice(&std::fs::read(launch._directory.path().join("launch.json")).unwrap()).unwrap();
+                assert_eq!(spec["assets"].as_array().unwrap().len(),2);
+                let image=&spec["assets"][1];let image_snapshot=PathBuf::from(image["source"].as_str().unwrap());
+                assert_eq!(image["sha256"],digest(b"synthetic image input bytes"));assert_eq!(image["name"],"asset-1");
+                std::fs::remove_file(root.join("original-image.bin")).unwrap();assert_eq!(std::fs::read(image_snapshot).unwrap(),b"synthetic image input bytes");
+                let asset=&spec["assets"][0];let snapshot=PathBuf::from(asset["source"].as_str().unwrap());
+                assert_ne!(snapshot,original_asset,"native launch retained a mutable original asset path");
+                assert_eq!(asset["sha256"],digest(b"original supplied instructions"));
+                assert_eq!(asset["bytes"],b"original supplied instructions".len());
+                std::fs::write(&original_asset,b"changed after preparation").unwrap();
+                assert_eq!(std::fs::read(&snapshot).unwrap(),b"original supplied instructions");
+                std::fs::remove_file(&original_asset).unwrap();
+                assert_eq!(std::fs::read(&snapshot).unwrap(),b"original supplied instructions");
+            }
             assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);
             let before=std::fs::read(logger.path()).unwrap();
             let prepared=saved.lock().unwrap()[0].clone();
