@@ -362,6 +362,9 @@ impl BridgeLaunch {
         let (write_roots, write_files) = if writes && scoped {
             let state = crate::state_dir::state_dir().ok_or_else(|| anyhow::anyhow!("autoship scope state unavailable"))?;
             let grants = crate::autoship_write_scope::grants(&state, &cwd)?;
+            if let (Some(logger),Some(created))=(opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger),grants.materialization.clone()) {
+                logger.capture_scope_materialization(created)?;
+            }
             (grants.directories, grants.files)
         } else { (if writes { vec![cwd.clone()] } else { vec![] }, Vec::new()) };
         let mut environment: BTreeMap<String, String> = BTreeMap::new();

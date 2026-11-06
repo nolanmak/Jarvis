@@ -12,6 +12,10 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+#[path="autoship_scope_materialization.rs"]
+mod materialization;
+pub(crate) use materialization::ScopeMaterialization;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeclaredPath {
@@ -31,6 +35,7 @@ struct Admission {
 pub(crate) struct Grants {
     pub directories: Vec<PathBuf>,
     pub files: Vec<PathBuf>,
+    pub materialization:Option<std::sync::Arc<ScopeMaterialization>>,
 }
 const CONTROLS: &[&str] = &[".git", ".claude", ".mcp.json", ".github", ".gitmodules"];
 fn relative(path: &str) -> Result<()> {
@@ -136,6 +141,7 @@ pub(crate) fn grants(state: &Path, worktree: &Path) -> Result<Grants> {
         admission.version == 1 && admission.worktree == worktree,
         "write admission identity mismatch"
     );
+    let mut materialization=ScopeMaterialization::new(reference_for(&admission)?);
     let pins: Vec<PathBuf> = admission.pinned.iter().map(|p| worktree.join(p)).collect();
     let mut grants = Grants::default();
     for declared in admission.allowed {
@@ -154,11 +160,7 @@ pub(crate) fn grants(state: &Path, worktree: &Path) -> Result<Grants> {
         } else {
             ensure_parent(&worktree, relative_path.parent().unwrap_or(Path::new("")))?;
             if !path.try_exists()? {
-                fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(&path)?;
+                materialization.create(&declared.path)?;
             }
             file_grant(&path, &mut grants)?;
         }
@@ -172,6 +174,7 @@ pub(crate) fn grants(state: &Path, worktree: &Path) -> Result<Grants> {
         "write admission expands beyond limit"
     );
     _scope.validate_current()?;
+    if materialization.paths().next().is_some() {grants.materialization=Some(std::sync::Arc::new(materialization));}
     Ok(grants)
 }
 fn file_grant(path: &Path, grants: &mut Grants) -> Result<()> {
@@ -288,6 +291,15 @@ impl RegisteredScope<'_> {
         let current=read(&self.path)?;
         ensure!(current==*self._admission && format!("{:x}",Sha256::digest(serde_json::to_vec(&current)?))==self.reference.record_sha256,"registered scope changed during metadata visitor");Ok(())
     }
+}
+fn reference_for(admission:&Admission)->Result<ScopeReference> {
+    Ok(ScopeReference {version:1,worktree:admission.worktree.clone(),contract_hash:admission.contract_hash.clone(),
+        record_sha256:format!("{:x}",Sha256::digest(serde_json::to_vec(admission)?))})
+}
+pub(crate) fn current_scope_reference(state:&Path,worktree:&Path)->Result<ScopeReference> {
+    let worktree=worktree.canonicalize()?;let lock=ScopeLock::acquire(state,&worktree,false)?;
+    let admission=read(&location(state,&worktree))?;
+    ensure!(admission.version==1 && admission.worktree==worktree,"current scope identity changed");lock.validate_current()?;reference_for(&admission)
 }
 pub fn with_registered_scope<T>(worktree:&Path,expected:Option<&str>,next:&str,allowed:Vec<DeclaredPath>,pinned:Vec<String>,visit:impl FnOnce(&RegisteredScope<'_>)->Result<T>)->Result<T> {
     let state=crate::state_dir::state_dir().context("scope control state unavailable")?;

@@ -21,6 +21,7 @@ pub struct NativeScope {
     script: PathBuf,
     policy: PathBuf,
     runtime: PathBuf,
+    materialization:Option<std::sync::Arc<crate::autoship_write_scope::ScopeMaterialization>>,
 }
 
 fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -77,7 +78,11 @@ impl NativeScope {
             .iter()
             .find(|(k, _)| k == "CARGO_TARGET_DIR")
             .map(|(_, p)| PathBuf::from(p));
-        Self::prepare(worktree, build.as_deref(), &state, &source_config).map(Some)
+        let scope=Self::prepare(worktree,build.as_deref(),&state,&source_config)?;
+        if let (Some(logger),Some(created))=(opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger),scope.materialization.clone()) {
+            logger.capture_scope_materialization(created)?;
+        }
+        Ok(Some(scope))
     }
 
     fn prepare(
@@ -188,6 +193,7 @@ impl NativeScope {
             script,
             policy,
             runtime,
+            materialization:source_grants.materialization,
         })
     }
 

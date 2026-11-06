@@ -302,6 +302,12 @@ struct OwnerInputState {
     authorizer:Option<Arc<dyn crate::native_vm::OwnerInputAuthorizer>>,
     launches:std::collections::BTreeMap<String,(crate::native_vm::PreparedLaunchRecord,crate::audit_chain::AppendReceipt,crate::native_vm::OwnerInputReference)>,
 }
+struct CapturedScopeMaterialization {
+    data:Arc<crate::autoship_write_scope::ScopeMaterialization>,
+    owner:crate::native_vm::RuntimeOwner,
+    event:serde_json::Value,
+    receipt:crate::audit_chain::AppendReceipt,
+}
 #[derive(Clone)]
 pub struct AuditLogger {
     path: PathBuf,
@@ -312,6 +318,7 @@ pub struct AuditLogger {
     run_resources_required: Arc<std::sync::atomic::AtomicBool>,
     native_runtime_owner: Arc<std::sync::Mutex<Option<crate::native_vm::RuntimeOwner>>>,
     owner_input:Arc<std::sync::Mutex<OwnerInputState>>,
+    scope_materializations:Arc<std::sync::Mutex<Vec<Arc<CapturedScopeMaterialization>>>>,
     native_store_binding:
         Arc<std::sync::Mutex<Option<crate::native_vm::ownership::TransferBinding>>>,
     native_launch_observer: Arc<
@@ -1200,6 +1207,45 @@ impl AuditLogger {
             .clone())
     }
 
+    pub(crate) fn capture_scope_materialization(&self,data:Arc<crate::autoship_write_scope::ScopeMaterialization>)->anyhow::Result<()> {
+        let Some(owner)=self.native_runtime_owner()? else{return Ok(())};
+        if !self.is_protected() {return Ok(())}
+        self.dispatch_allowed()?;data.validate_current()?;
+        let check=|saved:&[Arc<CapturedScopeMaterialization>]|->anyhow::Result<()> {
+            anyhow::ensure!(saved.len()<64 && saved.iter().map(|c|c.data.handle_count()).sum::<usize>()+data.handle_count()<=1024,"scope setup retained handle limit exceeded");Ok(())
+        };
+        {let saved=self.scope_materializations.lock().map_err(|_|anyhow::anyhow!("scope setup state poisoned"))?;check(&saved)?;}
+        let event=serde_json::json!({"actor":"controller","kind":"scope_setup_materialized","version":1,
+            "workflow":owner.workflow_id,"generation":owner.lease_generation,"scope":data.reference(),
+            "created_sha256":data.digest()?,"created_files":data.paths().count(),"retained_handles":data.handle_count()});
+        let receipt=self.record_controller_receipted(event.clone())?;
+        self.dispatch_allowed()?;data.validate_current()?;
+        let mut saved=self.scope_materializations.lock().map_err(|_|anyhow::anyhow!("scope setup state poisoned"))?;check(&saved)?;
+        saved.push(Arc::new(CapturedScopeMaterialization {data,owner,event,receipt}));Ok(())
+    }
+    /// Current live creation identities only. Protected receipt JSON never
+    /// reconstructs retained handles, nonrelease, source or execution authority.
+    /// Call outside the native/audit/workflow locked metadata visitor.
+    pub fn validate_scope_setup_paths(&self,worktree:&Path,contract:&str,untracked:&[String])->anyhow::Result<()> {
+        self.protected_health()?;
+        let owner=self.native_runtime_owner()?.ok_or_else(||anyhow::anyhow!("scope setup original owner missing"))?;
+        let state=crate::state_dir::state_dir().ok_or_else(||anyhow::anyhow!("scope setup control state missing"))?;
+        let reference=crate::autoship_write_scope::current_scope_reference(&state,worktree)?;
+        anyhow::ensure!(reference.contract_hash==contract,"scope setup registered contract changed");
+        let captures=self.scope_materializations.lock().map_err(|_|anyhow::anyhow!("scope setup state poisoned"))?.clone();
+        let mut known=std::collections::BTreeSet::new();
+        for captured in captures.iter().filter(|c|c.data.reference().worktree==reference.worktree && c.data.reference().contract_hash==contract) {
+            anyhow::ensure!(captured.owner==owner && captured.data.reference()==&reference,"scope setup original admission changed");
+            let mut actual=self.read_append_receipt(&captured.receipt)?;
+            actual.as_object_mut().ok_or_else(||anyhow::anyhow!("scope setup audit row is not an object"))?.remove("audit_chain");
+            anyhow::ensure!(actual==captured.event && captured.event["created_sha256"]==captured.data.digest()?,"scope setup original audit receipt changed");
+            captured.data.validate_current()?;known.extend(captured.data.paths().map(str::to_owned));
+        }
+        anyhow::ensure!(untracked.len()<=10000 && untracked.iter().collect::<std::collections::BTreeSet<_>>().len()==untracked.len()
+            && untracked.iter().all(|path|known.contains(path)),"first builder acquired untracked or ignored owner data during setup");
+        Ok(())
+    }
+
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
@@ -1211,6 +1257,7 @@ impl AuditLogger {
             native_runtime_owner: Arc::new(std::sync::Mutex::new(None)),
             native_store_binding: Arc::new(std::sync::Mutex::new(None)),
             owner_input: Arc::new(std::sync::Mutex::new(OwnerInputState::default())),
+            scope_materializations:Arc::new(std::sync::Mutex::new(Vec::new())),
             native_launch_observer: Arc::new(std::sync::Mutex::new(None)),
             native_observation_observer: Arc::new(std::sync::Mutex::new(None)),
             anchored: None,

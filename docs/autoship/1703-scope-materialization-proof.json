@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "kind": "original-live-controlled-literal-file-creation-component",
+  "source_parent_commit": "93c44578461ecb81f6f1e8f1b66b136689e22411",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/autoship_scope_materialization.rs",
+      "sha256": "115b0059b55977bf8c27754751591e297029ab7f09f7bc6b4fabeb9cf67f4937"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/autoship_write_scope.rs",
+      "sha256": "dfd38cd14eee15e2c146f40fe22fbd27f3a4d564496b92fef0e7edb5b67ad308"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/autoship_scope.rs",
+      "sha256": "90a712d7b25bd9f6ac83f198d80c45bd9cf826a4751f5a1a8642503fe64ffa00"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/codex_tools.rs",
+      "sha256": "1cc8c0c5c614a476697f3201afec19b838f94995adc791055ffdfa8a956a43fc"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "52d076261148bd88d84d45f1fc48a94e3f1a4d7ae925a5a269ea2201f108dee6"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "0eb3e09c36a4d80cf7c6ac7309ed4d4e6747f23b5abc3157e648b2e1578711ff"
+    }
+  ],
+  "behavior": [
+    "Grant builder captures only files it actually creates, retaining original file and directory identities; no live authority is deserialized.",
+    "Codex bridge and Claude scope producers bind those objects to the original protected logger, workflow/generation and exact scope reference.",
+    "First-body source census admits only matching unchanged controlled empty files, keeping all existing baseline/ancestry/tracked checks.",
+    "Original handles are read-only and close-on-exec. New loggers cannot recover them from JSON; unknown effects remain held without deleting or resetting input."
+  ],
+  "validation": {
+    "bridge_source_behavioral_red": {
+      "log": "/tmp/autoship-scope-materialization-red-2-20261106.log",
+      "log_sha256": "a83e4124c3da854d28d175834a6387461cfd727d3307c9637fe617518141d2b0",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "passed": 0,
+      "failed": 1,
+      "reason": "Actual Codex bridge materialized declared file; inherited final source guard rejected its untracked path. New test/method declaration present, not a pristine-parent binary."
+    },
+    "descriptor_rights_red": {
+      "log": "/tmp/autoship-scope-materialization-fd-red-20261106.log",
+      "log_sha256": "394577294a260946083e8baa69fc2a9195ef2dbcfb326e14232a9f55f92d0d6d",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "passed": 0,
+      "failed": 1,
+      "reason": "Intermediate retained creation file had O_RDWR (2), expected O_RDONLY (0)."
+    },
+    "codex_focused": {
+      "log": "/tmp/autoship-scope-materialization-focused-2-20261106.log",
+      "log_sha256": "068c9b3378444923985ba45d05739e08c402409af16b5a6d986274b819d5780c",
+      "exit": 0,
+      "passed": 1,
+      "failed": 0,
+      "fixture_cases": 16
+    },
+    "claude_focused": {
+      "log": "/tmp/autoship-scope-materialization-claude-focused-20261106.log",
+      "log_sha256": "4a1f76d2a0d0db2a654a22757a4ac2035404e56af134b7bb652b69ff2329fdcd",
+      "exit": 0,
+      "passed": 1,
+      "failed": 0
+    },
+    "final_full_core": {
+      "log": "/tmp/autoship-scope-materialization-full-core-20261106.log",
+      "log_sha256": "cbc68b89a9da8c6ee921e600e1eb3fb20a4c532781550e3cc5027f742334fa63",
+      "exit": 0,
+      "passed": 929,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 36.17,
+      "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib",
+      "includes": "retained_scope_creation_handles_are_read_only_and_close_on_exec: passed"
+    },
+    "development_corrections": [
+      "First fixture placed anchor in log directory and failed before exercising the seam; corrected before behavioral red.",
+      "First green fixture attempted cross-device rename between target scratch and /tmp. Replaced with a same-filesystem sibling fixture directory.",
+      "The descriptor regression exposed a retained writer; final implementation closes creator and retains a separately checked read-only handle."
+    ],
+    "final_full_cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-scope-materialization-full-cli-20261106.log",
+      "log_sha256": "bac6a8a8ceee61a99bd93f6caa209bb7afb7b158814e509e252c454d04709754",
+      "exit": 0,
+      "passed": 1938,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 289.36,
+      "includes": [
+        "first_owner_source_check_accepts_only_original_scope_materialization: passed, 16 fixture cases",
+        "first_owner_claude_scope_creation_is_bound_before_body_reservation: passed"
+      ]
+    },
+    "final_production_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-scope-materialization-production-check-20261106.log",
+      "log_sha256": "b008b7eaa4ab88bd8342814f0faeed7973a8ad4092b296ce46992a1014988720",
+      "exit": 0,
+      "compiler_seconds": 38.26
+    },
+    "build_environment": {
+      "CARGO_TARGET_DIR": "/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_TEST_DEBUG": "0"
+    }
+  },
+  "cases": {
+    "accepted": [
+      "actual controlled creation",
+      "same original audit clone",
+      "unchanged tracked existing file / no creation exception needed"
+    ],
+    "refused": [
+      "preexisting empty owner file",
+      "edited file",
+      "replaced file",
+      "replaced parent directory",
+      "hard-linked file",
+      "additional empty owner file",
+      "deleted controlled file",
+      "write followed by truncation",
+      "different audit",
+      "same audit reopened without original handles",
+      "changed scope",
+      "damaged protected audit",
+      "sealed audit / failed capture; uncertain file retained"
+    ]
+  },
+  "limits": [
+    "Actual bridge/scope preparation and Git source checks, without inference, provider execution or a VM boot. Full composed original owner body remains unverified.",
+    "Only current live handles and private receipt digest/counts are retained. Saved JSON is not a crash-recoverable allocation inventory; missing original state does not authorize empty-file adoption or replay.",
+    "Scope lookup and inode/timestamp checks are observations, not all-writer exclusion, complete input closure, source freshness, semantic continuation, native nonrelease or compiled-source authority.",
+    "P1/P2 must still retain original native/scope/source/resource proofs through actual mutation boundaries. Continuation proof/factory, owner publication journal/consumer, P3-P5, C/R, rollout, live CLI/Discord acceptance and fault/unattended soaks remain open."
+  ],
+  "epic_complete": false
+}

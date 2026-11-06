@@ -42,7 +42,9 @@ struct InitialOwnerBodyFactory {
 }
 struct FirstOwnerBodySetup {worktree:PathBuf,baseline:String,canonical_main:String}
 impl FirstOwnerBodySetup {
-    fn validate_current(&self)->Result<()> {
+    fn validate_current_with_setup(&self,audit:&augmentagent_channel_core::AuditLogger,contract:&str)->Result<()> {self.validate_source(Some((audit,contract)))}
+    fn validate_current(&self)->Result<()> {self.validate_source(None)}
+    fn validate_source(&self,setup:Option<(&augmentagent_channel_core::AuditLogger,&str)>)->Result<()> {
         let git=|args:&[&str]|->Result<String> {
             let output=std::process::Command::new("/usr/bin/git").args(["--no-replace-objects","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false"])
                 .args(args).current_dir(&self.worktree).env_clear().env("PATH","/usr/bin:/bin").env("GIT_OPTIONAL_LOCKS","0").env("GIT_GRAFT_FILE","/dev/null").stdin(Stdio::null()).output()?;
@@ -54,7 +56,12 @@ impl FirstOwnerBodySetup {
             anyhow::ensure!(git(&args)?.is_empty(),"first builder source changed during setup");
         }
         let untracked=git(&["ls-files","--others","-z","--"])?;
-        anyhow::ensure!(untracked.len()<=512*1024 && untracked.is_empty(),"first builder acquired untracked or ignored owner data during setup");Ok(())
+        anyhow::ensure!(untracked.len()<=512*1024 && (untracked.is_empty() || untracked.ends_with('\0')),"first builder untracked census exceeds bound or has invalid framing");
+        if let Some((audit,contract))=setup {
+            let paths=if untracked.is_empty() {Vec::new()}else{untracked.split_terminator('\0').map(str::to_owned).collect::<Vec<_>>()};
+            audit.validate_scope_setup_paths(&self.worktree,contract,&paths)?;
+        }else {anyhow::ensure!(untracked.is_empty(),"first builder acquired untracked or ignored owner data during setup");}
+        Ok(())
     }
 }
 struct OwnerInputController {
@@ -71,9 +78,9 @@ impl OwnerInputController {
     fn reserve_initial(&self,admission:&augmentagent_channel_core::native_vm::NativeResourceAdmission<'_>)->Result<()> {
         let factory=self.initial.as_ref().context("owner body has no initial factory")?;
         anyhow::ensure!(self.body.get().is_none(),"owner body resource-ready reservation already consumed");
-        factory.source.validate_current()?;
-        let preparation=factory.preparation.activation_binding()?;
         let audit=self.audit.upgrade().context("owner body factory controller expired")?;
+        factory.source.validate_current_with_setup(&audit,factory.preparation.prepared().baseline.registration.contract_hash())?;
+        let preparation=factory.preparation.activation_binding()?;
         let current=||->Result<()> {
             let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("owner factory store poisoned"))?;
             let turn=store.first_owner_body_turn(&self.lease,factory.provider,&factory.source.baseline,millis())?;
@@ -3751,6 +3758,88 @@ mod tests {
         assert!(owner_body_prompt(&prepared,"wrong-contract","Fix").is_err());
         prepared.proposal.files.insert("autoship_verifiers/private.py".into(),"changed adapter".into());
         assert!(owner_body_prompt(&prepared,prepared.baseline.registration.contract_hash(),"Fix").is_err());
+    }
+
+    #[cfg(target_os="linux")]
+    #[tokio::test]
+    async fn first_owner_claude_scope_creation_is_bound_before_body_reservation() {
+        const CHILD:&str="JARVIS_CLAUDE_SCOPE_CREATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let control=tempfile::tempdir_in("/tmp").unwrap();
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::workflow::tests::first_owner_claude_scope_creation_is_bound_before_body_reservation","--test-threads=1"])
+                .env(CHILD,control.path()).env("XDG_STATE_HOME",control.path().join("state")).env("CLAUDE_CONFIG_DIR",control.path().join("empty-claude-config")).output().unwrap();
+            assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
+        }
+        let control=PathBuf::from(std::env::var_os(CHILD).unwrap());let dir=repo();
+        for name in ["logs","anchors","empty-claude-config"] {std::fs::create_dir(control.join(name)).unwrap();}
+        let baseline=first_builder_git(dir.path(),&["rev-parse","HEAD"]).await.unwrap().trim().to_owned();
+        let source=FirstOwnerBodySetup {worktree:dir.path().into(),baseline:baseline.clone(),canonical_main:baseline};source.validate_current().unwrap();
+        let audit=Arc::new(augmentagent_channel_core::AuditLogger::protected(control.join("logs/audit.jsonl"),control.join("anchors/audit.anchor"),&[dir.path().into()]).unwrap());
+        audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:"claude-scope-materialization-fixture".into(),lease_generation:1}).unwrap();
+        augmentagent_channel_core::autoship_write_scope::register(dir.path(),"fixture-scope",vec![augmentagent_channel_core::autoship_write_scope::DeclaredPath {path:"claude/new_literal.rs".into(),directory:false}],vec![]).unwrap();
+        let mut opts=augmentagent_channel_core::reasoner::triage_opts(None);opts.cwd=Some(dir.path().into());opts.audit_logger=Some(audit.clone());
+        opts.env=vec![(augmentagent_channel_core::autoship_scope::SCOPE_ENV.into(),"1".into())];
+        let _scope=augmentagent_channel_core::autoship_scope::NativeScope::from_opts(&opts).unwrap().unwrap();
+        assert_eq!(std::fs::metadata(dir.path().join("claude/new_literal.rs")).unwrap().len(),0);
+        source.validate_current_with_setup(&audit,"fixture-scope").unwrap();
+        let rows=std::fs::read_to_string(audit.path()).unwrap();
+        assert_eq!(rows.lines().filter(|line|serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"]=="scope_setup_materialized").count(),1);
+    }
+
+    #[tokio::test]
+    async fn first_owner_source_check_accepts_only_original_scope_materialization() {
+        use augmentagent_channel_core::{autoship_write_scope::{register,replace_registered,DeclaredPath},native_vm::RuntimeOwner,AuditLogger};
+        for fault in ["created","same-audit-clone","tracked-existing","existing","edited","replaced","parent-replaced","shared","extra","deleted","rewrite-empty","other-audit","reopened-audit","scope-changed","damaged-audit","failed-capture"] {
+            let dir=repo();let control=tempfile::tempdir_in("/tmp").unwrap();
+            let baseline=first_builder_git(dir.path(),&["rev-parse","HEAD"]).await.unwrap().trim().to_owned();
+            let source=FirstOwnerBodySetup {worktree:dir.path().into(),baseline:baseline.clone(),canonical_main:baseline};source.validate_current().unwrap();
+            for name in ["logs","anchors"] {std::fs::create_dir(control.path().join(name)).unwrap();}
+            let logger=Arc::new(AuditLogger::protected(control.path().join("logs/audit.jsonl"),control.path().join("anchors/audit.anchor"),&[dir.path().into()]).unwrap());
+            logger.set_native_runtime_owner(RuntimeOwner {workflow_id:"scope-materialization-fixture".into(),lease_generation:1}).unwrap();
+            let relative=if fault=="tracked-existing" {"code.txt"}else{"src/new_literal.rs"};
+            register(dir.path(),"fixture-scope",vec![DeclaredPath {path:relative.into(),directory:false}],vec![]).unwrap();
+            let path=dir.path().join(relative);let retained=tempfile::tempdir_in(dir.path().parent().unwrap()).unwrap();
+            if fault=="existing" {std::fs::create_dir(dir.path().join("src")).unwrap();std::fs::write(&path,b"").unwrap();}
+            let launch=tempfile::tempdir_in("/tmp").unwrap();let mut opts=augmentagent_channel_core::reasoner::triage_opts(None);
+            opts.cwd=Some(dir.path().into());opts.add_dirs=vec![dir.path().into()];opts.settings_json=None;opts.allowed_tools=vec!["Write".into()];
+            opts.env=vec![(augmentagent_channel_core::autoship_scope::SCOPE_ENV.into(),"1".into())];opts.audit_logger=Some(logger.clone());
+            if fault=="failed-capture" {
+                logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture_before_seal"})).unwrap();
+                augmentagent_channel_core::audit_chain::AnchoredAudit::new(control.path().join("logs/audit.jsonl"),control.path().join("anchors/audit.anchor"),&[dir.path().into()]).unwrap().seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"sealed"}))).unwrap();
+            }
+            let prepared_bridge=augmentagent_channel_core::codex_tools::BridgeLaunch::prepare(&opts,launch.path());
+            if fault=="failed-capture" {
+                assert!(prepared_bridge.is_err(),"unrecorded creation escaped native setup");assert!(path.exists(),"failed capture deleted uncertain setup effect");
+                assert!(source.validate_current_with_setup(&logger,"fixture-scope").is_err());continue;
+            }
+            let _bridge=prepared_bridge.unwrap();
+            assert!(path.is_file(),"actual native bridge did not materialize the declared literal file");
+            match fault {
+                "edited"=>std::fs::write(&path,b"preserve owner content").unwrap(),
+                "replaced"=>{std::fs::rename(&path,retained.path().join("retained-created-file")).unwrap();std::fs::write(&path,b"").unwrap();},
+                "parent-replaced"=>{
+                    std::fs::rename(dir.path().join("src"),retained.path().join("src")).unwrap();std::fs::create_dir(dir.path().join("src")).unwrap();
+                    std::fs::hard_link(retained.path().join("src/new_literal.rs"),&path).unwrap();std::fs::remove_file(retained.path().join("src/new_literal.rs")).unwrap();
+                },
+                "shared"=>std::fs::hard_link(&path,retained.path().join("shared-file")).unwrap(),
+                "damaged-audit"=>{use std::io::Write;std::fs::OpenOptions::new().append(true).open(control.path().join("logs/audit.jsonl")).unwrap().write_all(b" ").unwrap();},
+                "extra"=>std::fs::write(dir.path().join("extra-owner-file"),b"").unwrap(),
+                "deleted"=>std::fs::remove_file(&path).unwrap(),
+                "rewrite-empty"=>{std::thread::sleep(std::time::Duration::from_millis(2));std::fs::write(&path,b"owner write").unwrap();std::fs::write(&path,b"").unwrap();},
+                "scope-changed"=>replace_registered(dir.path(),"fixture-scope","other-scope",vec![],vec![]).unwrap(),_=>(),
+            }
+            let other=AuditLogger::protected(control.path().join("logs/other.jsonl"),control.path().join("anchors/other.anchor"),&[dir.path().into()]).unwrap();
+            other.set_native_runtime_owner(RuntimeOwner {workflow_id:"scope-materialization-fixture".into(),lease_generation:1}).unwrap();
+            let cloned=logger.as_ref().clone();
+            let reopened=AuditLogger::protected(control.path().join("logs/audit.jsonl"),control.path().join("anchors/audit.anchor"),&[dir.path().into()]);
+            let selected=if fault=="other-audit" {&other}else if fault=="same-audit-clone" {&cloned}else if fault=="reopened-audit" {reopened.as_ref().unwrap()}else{logger.as_ref()};
+            if fault=="reopened-audit" {selected.set_native_runtime_owner(RuntimeOwner {workflow_id:"scope-materialization-fixture".into(),lease_generation:1}).unwrap();}
+            let result=source.validate_current_with_setup(selected,"fixture-scope");
+            if fault=="parent-replaced" {assert!(format!("{:#}",result.as_ref().unwrap_err()).contains("directory identity changed"));}
+            assert_eq!(result.is_ok(),matches!(fault,"created"|"same-audit-clone"|"tracked-existing"),"{fault}: source admission result: {:?}",result.err());
+            if fault=="edited" {assert_eq!(std::fs::read(&path).unwrap(),b"preserve owner content");}
+            if fault=="extra" {assert!(dir.path().join("extra-owner-file").exists());}
+        }
     }
 
     #[tokio::test]
