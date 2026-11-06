@@ -544,11 +544,12 @@ def validate_runtime(path):
 
 def stage_native_companions(executable, guest_runtime, destination):
     executable = Path(executable)
-    if executable.resolve().name != 'codex':
+    if executable.name != 'codex':
         return
     runtime = Path(guest_runtime)
     manifest = json.loads((runtime / 'manifest.json').read_text())
-    digest = hashlib.sha256((Path(destination) / 'cli').read_bytes()).hexdigest()
+    with open(Path(destination) / 'cli', 'rb') as stream:
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
     entries = manifest.get('native_companions', {}).get(digest)
     if not isinstance(entries, list) or len(entries) != 1:
         raise ValueError('Codex runtime companion missing for executable digest; reprovision runtime')
@@ -567,6 +568,65 @@ def stage_native_companions(executable, guest_runtime, destination):
     with open(target, 'xb') as stream:
         stream.write(data)
         os.fchmod(stream.fileno(), 0o555)
+
+
+def executable_origin(info):
+    return {'device': info.st_dev, 'inode': info.st_ino, 'nlink': info.st_nlink,
+            'mode': info.st_mode, 'uid': info.st_uid, 'gid': info.st_gid, 'bytes': info.st_size,
+            'mtime': [info.st_mtime_ns // 10**9, info.st_mtime_ns % 10**9],
+            'ctime': [info.st_ctime_ns // 10**9, info.st_ctime_ns % 10**9]}
+
+
+def stage_executable_input(manifest, executable, binary):
+    executable = Path(executable)
+    if (type(manifest) is not dict or set(manifest) != {'version', 'source', 'bytes', 'sha256', 'origin'}
+            or type(manifest['version']) is not int or manifest['version'] != 1
+            or type(manifest['source']) is not str or manifest['source'] != str(executable)
+            or not executable.is_absolute() or type(manifest['bytes']) is not int
+            or not 0 < manifest['bytes'] <= 512 * 1024 * 1024
+            or type(manifest['sha256']) is not str or len(manifest['sha256']) != 64
+            or any(c not in '0123456789abcdef' for c in manifest['sha256'])):
+        raise ValueError('native executable input manifest invalid')
+    origin = manifest['origin']
+    fields = {'device', 'inode', 'nlink', 'mode', 'uid', 'gid', 'bytes', 'mtime', 'ctime'}
+    if (type(origin) is not dict or set(origin) != fields
+            or any(type(origin[key]) is not int for key in fields - {'mtime', 'ctime'})
+            or any(type(origin[key]) is not list or len(origin[key]) != 2
+                   or any(type(value) is not int for value in origin[key]) for key in ('mtime', 'ctime'))):
+        raise ValueError('native executable origin invalid')
+    target = Path(binary) / 'cli'
+    created = False
+    fd = os.open(executable, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        with os.fdopen(fd, 'rb') as source:
+            before = os.fstat(source.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid not in (0, os.getuid())
+                    or before.st_mode & 0o022 or not before.st_mode & 0o111
+                    or before.st_size != manifest['bytes'] or executable_origin(before) != origin):
+                raise ValueError('native executable identity or size changed')
+            digest = hashlib.sha256()
+            total = 0
+            with open(target, 'xb') as destination:
+                created = True
+                while True:
+                    data = source.read(min(1024 * 1024, manifest['bytes'] - total + 1))
+                    if not data:
+                        break
+                    total += len(data)
+                    if total > manifest['bytes']:
+                        raise ValueError('native executable grew during staging')
+                    digest.update(data)
+                    destination.write(data)
+                if (total != manifest['bytes'] or digest.hexdigest() != manifest['sha256']
+                        or executable_origin(os.fstat(source.fileno())) != origin):
+                    raise ValueError('native executable bytes or identity changed')
+                destination.flush()
+                os.fchmod(destination.fileno(), 0o555)
+                os.fsync(destination.fileno())
+    except BaseException:
+        if created:
+            target.unlink()
+        raise
 
 
 def stage_input_assets(assets, binary):
@@ -659,11 +719,7 @@ def main(spec_path):
         binary = private / 'provider'
         binary.mkdir()
         executable = Path(spec['executable'])
-        info = executable.stat()
-        if not executable.is_absolute() or info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022 or info.st_size > 512 * 1024 * 1024:
-            raise ValueError('native executable is not trusted or exceeds budget')
-        shutil.copyfile(executable, binary / 'cli')
-        (binary / 'cli').chmod(0o555)
+        stage_executable_input(spec.get('executable_input'), executable, binary)
         stage_native_companions(executable, spec['guest_runtime'], binary)
         stage_input_assets(spec.get('assets', []), binary)
         # The guest receives only a relay executable, never the host bridge

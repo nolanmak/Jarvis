@@ -69,6 +69,7 @@ fn append_receipt(row:&Value,bytes:&[u8],prefix:&Sha256)->Result<AppendReceipt> 
 fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,binding:&TransferBinding,ledger:&Ledger<'_>)->Result<(Vec<Value>,BTreeSet<RuntimeKey>,Vec<Value>,Vec<Value>,Vec<Value>)> {
     let mut prefix=Sha256::new();let mut launches=BTreeMap::new();let mut resources=Vec::new();let mut bound=BTreeSet::new();
     let mut preparation_bindings=BTreeMap::new();let mut preparations=Vec::new();let mut readonly_transports=BTreeMap::new();
+    let mut executables=BTreeMap::new();
     let mut startups=BTreeMap::new();let mut model_resources=BTreeSet::new();let mut session_launches=BTreeSet::new();let mut resource_identities=BTreeMap::new();
     let mut resource_receipts=BTreeMap::new();let mut owner_inputs=BTreeMap::new();let mut attempts=BTreeSet::new();let mut inputs=Vec::new();
     for row in rows {
@@ -97,6 +98,15 @@ fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,bindin
                 resources.push(crate::run_resources::verify_quiescent(&row["resource_identity"])?);
                 ensure!(resources.len()<=4096,R::HistoryCapacity);
                 bound.insert((intent.runtime_relative_path,intent.launch_sha256,intent.creation_receipt_sha256));
+            }
+            Some("native_executable_input_binding")=>{
+                let mut raw=row.clone();raw.as_object_mut().context("native executable binding is not object")?.remove("audit_chain");
+                let record:super::executable_input::ExecutableInputBindingRecord=serde_json::from_value(raw.clone())?;
+                let original=launches.get(&record.launch_intent.intent_id).context("native executable binding has no original launch")?;
+                record.validate(original)?;
+                ensure!(!resource_receipts.contains_key(&record.launch_intent.intent_id),"native executable binding follows resource admission");
+                ensure!(executables.insert(record.launch_intent.intent_id,json!({"record":raw,"receipt":append_receipt(row,&bytes,&prefix)?})).is_none(),
+                    "native executable binding duplicated");ensure!(executables.len()<=4096,R::HistoryCapacity);
             }
             Some("native_startup_inputs_observed")=>{
                 let mut raw=row.clone();raw.as_object_mut().context("native startup record is not object")?.remove("audit_chain");
@@ -181,7 +191,7 @@ fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,bindin
         let key=(authority.owner.lease_generation,authority.audit_path.clone());
         if !closures.contains_key(&key) {closures.insert(key.clone(),ledger.input_writer_closure(&authority)?);}
         writers.push(json!({"launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"closure":closures[&key],
-            "resource_receipt":resource_receipts.get(&prepared.intent.intent_id),"startup_inputs":startups.get(&prepared.intent.intent_id),"release_attempted":attempts.contains(&prepared.intent.intent_id),
+            "resource_receipt":resource_receipts.get(&prepared.intent.intent_id),"startup_inputs":startups.get(&prepared.intent.intent_id),"executable_input":executables.get(&prepared.intent.intent_id),"release_attempted":attempts.contains(&prepared.intent.intent_id),
             "preparation_context":preparation_bindings.get(&prepared.intent.intent_id),"readonly_transport":readonly_transports.get(&prepared.intent.intent_id),"owner_input":owner_inputs.get(&prepared.intent.intent_id)}));
     }
     Ok((resources,bound,inputs,preparations,writers))

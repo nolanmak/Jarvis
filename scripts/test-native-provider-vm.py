@@ -52,7 +52,7 @@ class ReadonlyTransportAdmissionTests(unittest.TestCase):
 
 class LaunchInputSnapshotTests(unittest.TestCase):
     def test_completed_and_failed_receipts_bind_consumed_spec_not_later_path_contents(self):
-        for outcome in ('complete', 'disconnect', 'complete-removed', 'disconnect-removed', 'asset-invalid'):
+        for outcome in ('complete', 'disconnect', 'complete-removed', 'disconnect-removed', 'asset-invalid', 'executable-changed', 'executable-unbound', 'executable-digest'):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
                 state = root / 'session'
@@ -60,6 +60,13 @@ class LaunchInputSnapshotTests(unittest.TestCase):
                 executable = root / 'provider'
                 executable.write_bytes(b'synthetic provider never executed')
                 executable.chmod(0o700)
+                info = executable.stat()
+                executable_input = {'version': 1, 'source': str(executable), 'bytes': info.st_size,
+                    'sha256': hashlib.sha256(executable.read_bytes()).hexdigest(), 'origin': {
+                        'device': info.st_dev, 'inode': info.st_ino, 'nlink': info.st_nlink, 'mode': info.st_mode,
+                        'uid': info.st_uid, 'gid': info.st_gid, 'bytes': info.st_size,
+                        'mtime': [info.st_mtime_ns // 10**9, info.st_mtime_ns % 10**9],
+                        'ctime': [info.st_ctime_ns // 10**9, info.st_ctime_ns % 10**9]}}
                 asset = root / 'asset-snapshot'
                 asset.write_bytes(b'original bounded instructions')
                 asset.chmod(0o400)
@@ -72,6 +79,12 @@ class LaunchInputSnapshotTests(unittest.TestCase):
                           'session_directory': str(state), 'memory_mb': 512, 'refresh_auth': False,
                           'executable': str(executable), 'gateway': {}, 'auth_relative': '.codex/auth.json',
                           'argv': ['consumed-original-argument'], 'environment': {}, 'assets': [asset_manifest]}
+                if outcome != 'executable-unbound':
+                    launch['executable_input'] = executable_input
+                if outcome == 'executable-changed':
+                    executable.write_bytes(b'substituted provider executable!')
+                if outcome == 'executable-digest':
+                    executable_input['sha256'] = 'f' * 64
                 path = root / 'launch.json'
                 original = json.dumps(launch).encode()
                 path.write_bytes(original)
@@ -127,8 +140,8 @@ class LaunchInputSnapshotTests(unittest.TestCase):
                         mock.patch.object(vm.threading, 'Thread'), \
                         mock.patch.dict(os.environ, {'JARVIS_NATIVE_VM_READY': str(root / 'ready'),
                                                     'JARVIS_NATIVE_VM_CONTINUE': str(proceed)}):
-                    if outcome == 'asset-invalid':
-                        with self.assertRaisesRegex(ValueError, 'asset.*digest'):
+                    if outcome in ('asset-invalid', 'executable-changed', 'executable-unbound', 'executable-digest'):
+                        with self.assertRaisesRegex(ValueError, 'asset.*digest|executable'):
                             vm.main(path)
                         self.assertFalse((root / 'ready').exists())
                         self.assertFalse((root / 'vm-startup-inputs.json').exists())
@@ -148,6 +161,87 @@ class LaunchInputSnapshotTests(unittest.TestCase):
                 self.assertFalse(boot.call_args.args[1]['mcp'])
                 self.assertEqual(receipt['launch_sha256'], hashlib.sha256(original).hexdigest(),
                                  'receipt hashed replacement path bytes instead of the consumed launch input')
+
+
+class ExecutableInputBindingTests(unittest.TestCase):
+    def manifest(self, source):
+        info = source.stat()
+        return {'version': 1, 'source': str(source), 'bytes': info.st_size,
+                'sha256': hashlib.sha256(source.read_bytes()).hexdigest(), 'origin': {
+                    'device': info.st_dev, 'inode': info.st_ino, 'nlink': info.st_nlink,
+                    'mode': info.st_mode, 'uid': info.st_uid, 'gid': info.st_gid, 'bytes': info.st_size,
+                    'mtime': [info.st_mtime_ns // 10**9, info.st_mtime_ns % 10**9],
+                    'ctime': [info.st_ctime_ns // 10**9, info.st_ctime_ns % 10**9]}}
+
+    def test_exact_executable_is_copied_readonly_without_clobbering_existing_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / 'executable'
+            source.write_bytes(b'original provider bytes')
+            source.chmod(0o700)
+            manifest = self.manifest(source)
+            vm.stage_executable_input(manifest, source, root)
+            self.assertEqual((root / 'cli').read_bytes(), b'original provider bytes')
+            self.assertEqual((root / 'cli').stat().st_mode & 0o777, 0o555)
+            with self.assertRaises(FileExistsError):
+                vm.stage_executable_input(manifest, source, root)
+            self.assertEqual((root / 'cli').read_bytes(), b'original provider bytes')
+            self.assertEqual(source.read_bytes(), b'original provider bytes')
+
+    def test_same_size_substitution_and_changed_source_inode_are_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / 'executable'
+            source.write_bytes(b'original provider bytes')
+            source.chmod(0o700)
+            original = self.manifest(source)
+            source.write_bytes(b'changed! provider bytes')
+            changed = {**self.manifest(source), 'sha256': original['sha256']}
+            with self.assertRaisesRegex(ValueError, 'executable bytes'):
+                vm.stage_executable_input(changed, source, root)
+            self.assertFalse((root / 'cli').exists(), 'failed copy retained executable output')
+            replacement = root / 'replacement'
+            replacement.write_bytes(b'original provider bytes')
+            replacement.chmod(0o700)
+            os.replace(replacement, source)
+            with self.assertRaisesRegex(ValueError, 'executable identity'):
+                vm.stage_executable_input(original, source, root)
+            self.assertFalse((root / 'cli').exists())
+
+    def test_missing_unknown_manifest_and_unsafe_source_refuse_without_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / 'executable'
+            source.write_bytes(b'original provider bytes')
+            source.chmod(0o700)
+            original = self.manifest(source)
+            changes = ({'version': True}, {'version': 2}, {'bytes': True}, {'bytes': 0},
+                       {'bytes': 512 * 1024**2 + 1}, {'sha256': 'F' * 64}, {'source': 'relative'},
+                       {'extra': 1}, {'origin': {**original['origin'], 'uid': False}})
+            invalid = [None] + [{**original, **change} for change in changes]
+            invalid += [{key: value for key, value in original.items() if key != missing} for missing in original]
+            for manifest in invalid:
+                with self.subTest(manifest=manifest), self.assertRaises(ValueError):
+                    vm.stage_executable_input(manifest, source, root)
+                self.assertFalse((root / 'cli').exists())
+            for unsafe in ('symlink', 'fifo', 'writable', 'directory'):
+                path = root / unsafe
+                if unsafe == 'symlink':
+                    path.symlink_to(source)
+                    manifest = {**original, 'source': str(path)}
+                elif unsafe == 'fifo':
+                    os.mkfifo(path, 0o700)
+                    manifest = {**original, 'source': str(path)}
+                elif unsafe == 'directory':
+                    path.mkdir(mode=0o700)
+                    manifest = {**original, 'source': str(path)}
+                else:
+                    path.write_bytes(b'original provider bytes')
+                    path.chmod(0o720)
+                    manifest = self.manifest(path)
+                with self.subTest(unsafe=unsafe), self.assertRaises((ValueError, OSError)):
+                    vm.stage_executable_input(manifest, path, root)
+                self.assertFalse((root / 'cli').exists())
 
 
 class AssetInputBindingTests(unittest.TestCase):

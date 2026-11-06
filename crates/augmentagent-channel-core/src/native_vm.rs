@@ -210,6 +210,10 @@ fn write(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent)=path.parent(){std::fs::File::open(parent)?.sync_all()?;}
     Ok(())
 }
+#[path="native_executable_input.rs"]
+pub(crate) mod executable_input;
+use executable_input::capture_executable_input;
+#[cfg(test)] use executable_input::MAX_EXECUTABLE_BYTES;
 const MAX_INPUT_ASSETS:usize=32;
 const MAX_INPUT_ASSET_BYTES:u64=16*1024*1024;
 fn snapshot_input_asset(directory:&Path,source:&Path,index:usize,total:&mut u64)->Result<serde_json::Value> {
@@ -666,6 +670,7 @@ impl Launch {
             std::env::split_paths(&search).map(|path|path.join(&program)).find(|path|path.is_file())
                 .context("native executable unavailable")?.canonicalize()?
         };
+        let executable_input=capture_executable_input(&executable)?;
         let mut assets = Vec::new();let mut asset_bytes=0u64;
         let asset_base=match source.get_current_dir() {Some(path)=>path.to_path_buf(),None=>std::env::current_dir()?};
         let mut arguments: Vec<String> = source.get_args().map(|arg|arg.to_str().context("non-UTF8 native argument").map(str::to_owned)).collect::<Result<_>>()?;
@@ -729,7 +734,7 @@ impl Launch {
             bridge.native_cwd.parent().expect("bridge launch directory").join("tool-bridge.py").to_string_lossy().into_owned(),
             bridge.policy_path.to_string_lossy().into_owned()]);
         let spec = serde_json::json!({"version":1,"readonly_review":readonly_review,"runtime_config":policy.runtime_config,"guest_runtime":policy.guest_runtime,"memory_mb":policy.memory_mb,
-            "provider":provider,"refresh_auth":profile.refresh_auth,"credential_directory":root.join("credentials"),"session_directory":session,"resume":resume,"executable":executable,"argv":arguments,
+            "provider":provider,"refresh_auth":profile.refresh_auth,"credential_directory":root.join("credentials"),"session_directory":session,"resume":resume,"executable":executable,"executable_input":executable_input,"argv":arguments,
             "environment":environment,"auth_file":profile.auth_file,"auth_relative":profile.auth_relative,
             "gateway":profile.gateway,"mcp_argv":mcp_argv,"assets":assets});
         let spec_path = directory.path().join("launch.json");
@@ -748,6 +753,11 @@ impl Launch {
         // The protected append and optional workflow journal callback complete
         // before any command can escape preparation or receive prompt bytes.
         let prepared=owner_logger.native_launch_prepared(&intent)?;
+        let executable_binding=executable_input::ExecutableInputBindingRecord {version:1,actor:"controller".into(),kind:"native_executable_input_binding".into(),
+            launch_intent:prepared.intent.clone(),launch_receipt:prepared.controller_receipt.clone(),executable_input};
+        executable_binding.validate(&prepared)?;
+        owner_logger.record_controller_receipted(serde_json::to_value(executable_binding)?)?;
+        owner_logger.dispatch_allowed()?;
         if let Some(context)=&preparation_context {
             context.validate_launch(&prepared.intent)?;
             owner_logger.dispatch_allowed()?;
@@ -938,6 +948,8 @@ mod tests {
     #[test]
     fn native_preparation_binds_original_owner_preparation_context() {launch_intent_child("preparation-context");}
     #[test]
+    fn native_preparation_binds_executable_before_runtime_allocation() {launch_intent_child("executable-input");}
+    #[test]
     fn native_preparation_snapshots_referenced_asset_bytes() {launch_intent_child("asset-input");}
     #[test]
     fn native_preparation_requires_original_store_binding() {launch_intent_child("unbound");}
@@ -1040,6 +1052,7 @@ mod tests {
             }
             let test = if mode=="preparation-context" {"native_preparation_binds_original_owner_preparation_context"}
                 else if mode=="asset-input" {"native_preparation_snapshots_referenced_asset_bytes"}
+                else if mode=="executable-input" {"native_preparation_binds_executable_before_runtime_allocation"}
                 else if mode=="input-lock-success" {"native_input_release_holds_authority_through_blocked_stdin"}
                 else if mode=="input-lock-cancel" {"native_input_release_cancellation_releases_authority_without_replay"}
                 else if mode=="input-lock-error" {"native_input_release_write_failure_releases_authority_without_replay"}
@@ -1153,6 +1166,24 @@ mod tests {
             }
             let original_asset=root.join("original-instructions.txt");
             let mut command=Command::new("/usr/bin/false");
+            let executable=root.join(format!("original-provider-{provider}"));
+            if mode=="executable-input" {
+                write(&executable,b"original native executable bytes").unwrap();
+                std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o700)).unwrap();
+                let writable=root.join(format!("writable-provider-{provider}"));write(&writable,b"untrusted writable executable").unwrap();std::fs::set_permissions(&writable,std::fs::Permissions::from_mode(0o720)).unwrap();
+                let oversized=root.join(format!("oversized-provider-{provider}"));let huge=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o700).open(&oversized).unwrap();huge.set_len(MAX_EXECUTABLE_BYTES+1).unwrap();drop(huge);
+                let empty=root.join(format!("empty-provider-{provider}"));write(&empty,b"").unwrap();std::fs::set_permissions(&empty,std::fs::Permissions::from_mode(0o700)).unwrap();
+                let fifo=root.join(format!("fifo-provider-{provider}"));let raw=std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();assert_eq!(unsafe{libc::mkfifo(raw.as_ptr(),0o700)},0);
+                for bad in [writable,oversized,empty,fifo,root.join("missing-provider"),root.clone()] {
+                    assert!(Launch::prepare(provider,&opts,&Command::new(&bad),None,Some(&native)).is_err(),"accepted {}",bad.display());
+                    let provider_path=state.join(provider);
+                    if provider_path.exists() {assert!(!std::fs::read_dir(provider_path).unwrap().any(|entry| {
+                        let name=entry.unwrap().file_name();let name=name.to_string_lossy();name.starts_with("session-") || name.starts_with("launch-")
+                    }),"failed executable preflight stranded runtime or capture output");}
+                    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);
+                }
+                let alias=root.join(format!("provider-alias-{provider}"));std::os::unix::fs::symlink(&executable,&alias).unwrap();command=Command::new(alias);
+            }
             if mode=="asset-input" {
                 write(&original_asset,b"original supplied instructions").unwrap();
                 command.arg("-c").arg(format!("model_instructions_file={}",serde_json::to_string(&original_asset).unwrap()));
@@ -1194,6 +1225,22 @@ mod tests {
                 assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);continue;
             }
             let launch=launch.unwrap();
+            if mode=="executable-input" {
+                let spec:serde_json::Value=serde_json::from_slice(&std::fs::read(launch._directory.path().join("launch.json")).unwrap()).unwrap();
+                let input=&spec["executable_input"];
+                assert_eq!(input["sha256"],digest(b"original native executable bytes"),"prepared executable is bound only by mutable path");
+                assert_eq!(input["version"],1);assert_eq!(input["bytes"],b"original native executable bytes".len());
+                assert_eq!(input["source"],serde_json::to_value(&executable).unwrap());
+                assert_eq!(input["origin"]["inode"],executable.metadata().unwrap().ino());
+                let rows:Vec<serde_json::Value>=std::fs::read_to_string(logger.path()).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+                let binding=rows.iter().find(|row|row["kind"]=="native_executable_input_binding").expect("prepared executable input vanished with temporary launch spec");
+                let prepared=launch.prepared_record().unwrap();
+                assert_eq!(binding["executable_input"],*input);
+                assert_eq!(binding["launch_receipt"],serde_json::to_value(prepared.controller_receipt).unwrap());
+                assert_eq!(binding["launch_intent"],serde_json::to_value(prepared.intent).unwrap());
+                std::fs::write(&executable,b"changed executable bytes").unwrap();
+                assert_eq!(input["sha256"],digest(b"original native executable bytes"));
+            }
             if mode=="asset-input" {
                 let spec:serde_json::Value=serde_json::from_slice(&std::fs::read(launch._directory.path().join("launch.json")).unwrap()).unwrap();
                 assert_eq!(spec["assets"].as_array().unwrap().len(),2);

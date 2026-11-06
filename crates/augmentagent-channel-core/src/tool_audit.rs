@@ -582,7 +582,7 @@ impl AuditLogger {
         anyhow::ensure!(admission.is_initial() && self.native_runtime_owner()?.as_ref()==Some(&namespace.owner),"initial prepared namespace owner/mode changed");
         self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("prepared namespace requires protected audit"))?.with_retained_snapshot(|rows,audit| {
             self.check_protected_continuity()?;
-            let prepared=admission.prepared();let mut launches=0usize;let mut bindings=0usize;let mut startups=0usize;let mut current=0usize;
+            let prepared=admission.prepared();let mut launches=0usize;let mut bindings=0usize;let mut startups=0usize;let mut executables=0usize;let mut current=0usize;
             let mut retained=Vec::new();
             for row in rows {
                 anyhow::ensure!(row["actor"]=="controller","initial prepared namespace has unclassified actor effects");
@@ -599,6 +599,11 @@ impl AuditLogger {
                             && row["resource_identity"]==*admission.identity()
                             && row["audit_chain"]["sequence"]==admission.resource_receipt().sequence,
                             "another native resource binding in initial prepared namespace");bindings+=1;
+                    }
+                    Some("native_executable_input_binding")=>{
+                        let mut raw=row.clone();raw.as_object_mut().ok_or_else(||anyhow::anyhow!("native executable binding is not object"))?.remove("audit_chain");
+                        let record:crate::native_vm::executable_input::ExecutableInputBindingRecord=serde_json::from_value(raw)?;record.validate(prepared)?;
+                        anyhow::ensure!(launches==1 && bindings==0,"initial executable binding reordered");executables+=1;
                     }
                     Some("native_startup_inputs_observed")=>{
                         let mut raw=row.clone();raw.as_object_mut().ok_or_else(||anyhow::anyhow!("native startup is not object"))?.remove("audit_chain");
@@ -619,7 +624,7 @@ impl AuditLogger {
                 }
                 retained.push(row.clone());
             }
-            anyhow::ensure!(launches==1 && bindings==1 && startups==1 && current==1,"initial prepared namespace is incomplete or duplicated");
+            anyhow::ensure!(launches==1 && executables==1 && bindings==1 && startups==1 && current==1,"initial prepared namespace is incomplete or duplicated");
             let (generation,resources)=Self::namespace_resources(&retained,&namespace.owner.workflow_id)?;
             anyhow::ensure!(generation==namespace.owner.lease_generation,"initial prepared namespace generation changed");
             admission.validate_unreleased()?;self.check_protected_continuity()?;

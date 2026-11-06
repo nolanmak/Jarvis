@@ -492,6 +492,14 @@ pub(crate) mod tests {
         };
         let prepared = audit.native_launch_prepared(&intent).unwrap();
         record(&prepared);
+        if startup {
+            let executable=Path::new("/usr/bin/false");let info=executable.metadata().unwrap();
+            audit.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_executable_input_binding",
+                "launch_intent":intent,"launch_receipt":prepared.controller_receipt,"executable_input":{
+                    "version":1,"source":executable,"bytes":info.len(),"sha256":sha(&std::fs::read(executable).unwrap()),"origin":{
+                        "device":info.dev(),"inode":info.ino(),"nlink":info.nlink(),"mode":info.mode(),"uid":info.uid(),"gid":info.gid(),"bytes":info.len(),
+                        "mtime":[info.mtime(),info.mtime_nsec()],"ctime":[info.ctime(),info.ctime_nsec()]}}})).unwrap();
+        }
         // Synthetic protected controller resource/session receipts. The
         // completion producer still reads private runtime/export bytes and
         // performs actual same-host absent-cgroup kernel verification.
@@ -845,8 +853,9 @@ pub(crate) mod tests {
     fn retained_native_metadata_proof_preserves_actual_completed_session() {
         if child("retained_native_metadata_proof_preserves_actual_completed_session") {return;}
         use std::sync::{Arc,Mutex};use std::os::fd::AsRawFd;
-        for provider in ["codex","claude"] {for input_fault in ["resource","input","preparation","readonly-transport","startup-input","startup-hash","startup-receipt","startup-version","startup-extra","startup-duplicate","startup-post-model","startup-post-input","startup-post-session"] {for original_input in ["none","generic","owner","preparation","readonly-preparation"] {
+        for provider in ["codex","claude"] {for input_fault in ["resource","input","preparation","readonly-transport","startup-input","startup-hash","startup-receipt","startup-version","startup-extra","startup-duplicate","startup-post-model","startup-post-input","startup-post-session","executable-foreign","executable-receipt","executable-version","executable-schema","executable-digest","executable-duplicate","executable-post-resource"] {for original_input in ["none","generic","owner","preparation","readonly-preparation"] {
         if input_fault.starts_with("startup-") && input_fault!="startup-input" && original_input!="readonly-preparation" {continue;}
+        if input_fault.starts_with("executable-") && original_input!="readonly-preparation" {continue;}
         let mut f=Fixture::with_native_provider_preparation_startup(false,false,false,provider,match original_input {"preparation"=>1,"readonly-preparation"=>2,_=>0},original_input=="readonly-preparation");
         // Protected journal fixtures describe prior input uncertainty; they do
         // not invoke a model or reconstruct the original live input authorizer.
@@ -900,6 +909,13 @@ pub(crate) mod tests {
             let writers=proof.evidence()["audits"].as_array().unwrap().iter().flat_map(|a|a["native_input_writers"].as_array()
                 .expect("native metadata omitted its original input-writer closure census")).collect::<Vec<_>>();
             assert_eq!(writers.len(),1);assert_eq!(writers[0]["launch_intent"],serde_json::to_value(&f.prepared.intent).unwrap());
+            assert!(writers[0].as_object().unwrap().contains_key("executable_input"),"retained metadata omitted executable input certainty");
+            assert_eq!(writers[0]["executable_input"].is_null(),original_input!="readonly-preparation");
+            if original_input=="readonly-preparation" {
+                assert_eq!(writers[0]["executable_input"]["record"]["executable_input"]["source"],"/usr/bin/false");
+                assert_eq!(writers[0]["executable_input"]["record"]["launch_receipt"],serde_json::to_value(&f.prepared.controller_receipt).unwrap());
+                assert!(writers[0]["executable_input"]["receipt"]["sequence"].as_u64().unwrap()<f.resource.sequence);
+            }
             assert!(writers[0].as_object().unwrap().contains_key("startup_inputs"),"retained native metadata omitted startup input certainty");
             assert_eq!(writers[0]["startup_inputs"].is_null(),original_input!="readonly-preparation");
             if original_input=="readonly-preparation" {
@@ -981,6 +997,23 @@ pub(crate) mod tests {
             current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_input_release_attempt",
                 "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_receipt":f.resource,
                 "prompt_sha256":"a".repeat(64),"prompt_bytes":42,"recorded_at_ms":now()})).unwrap();
+        }else if input_fault.starts_with("executable-") {
+            let mut record=std::fs::read_to_string(f.audit.path()).unwrap().lines().map(|line|serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|row|row["kind"]=="native_executable_input_binding").unwrap();record.as_object_mut().unwrap().remove("audit_chain");
+            if input_fault!="executable-foreign" {record["launch_intent"]=serde_json::to_value(&live).unwrap();record["launch_receipt"]=serde_json::to_value(&live_receipt).unwrap();}
+            match input_fault {
+                "executable-foreign"=>(),
+                "executable-receipt"=>record["launch_receipt"]=serde_json::to_value(&f.prepared.controller_receipt).unwrap(),
+                "executable-version"=>record["version"]=2.into(),
+                "executable-schema"=>record["executable_input"]["origin"]["unknown"]=true.into(),
+                "executable-digest"=>record["executable_input"]["sha256"]="F".repeat(64).into(),
+                "executable-duplicate"=>{current.record_controller(record.clone()).unwrap();},
+                "executable-post-resource"=>{let identity=f.audit.read_append_receipt(&f.resource).unwrap()["resource_identity"].clone();
+                    current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_launch_resource_binding",
+                        "launch_intent":live,"launch_receipt":live_receipt,"resource_identity":identity})).unwrap();},
+                _=>unreachable!(),
+            }
+            current.record_controller(record).unwrap();
         }else if input_fault.starts_with("startup-") && input_fault!="startup-input" {
             let identity=f.audit.read_append_receipt(&f.resource).unwrap()["resource_identity"].clone();
             let resource=current.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller","kind":"native_launch_resource_binding",
@@ -1029,7 +1062,9 @@ pub(crate) mod tests {
         let error=ownership::with_metadata_native_owner(&current,&runtimes,&fence,&mut load,&mut |_| {visited=true;Ok(())}).unwrap_err();
         assert!(!visited);assert!(format!("{error:#}").contains(match input_fault {"input"=>"native metadata input has no original launch","preparation"=>"native preparation binding has no original launch","readonly-transport"=>"original readonly preparation transport changed","startup-input"=>"native startup observation has no original launch","startup-hash"=>"different or unknown launch inputs",
             "startup-receipt"|"startup-version"=>"native startup observation original references changed","startup-extra"=>"unknown field",
-            "startup-duplicate"=>"native startup observation duplicated","startup-post-model"|"startup-post-input"|"startup-post-session"=>"follows model/input/session exposure",_=>"native metadata resource has no original launch"}),"{error:#}");
+            "executable-foreign"=>"native executable binding has no original launch","executable-receipt"|"executable-version"=>"native executable input original references changed",
+            "executable-schema"=>"unknown field","executable-digest"=>"native executable input manifest invalid","executable-duplicate"=>"native executable binding duplicated",
+            "executable-post-resource"=>"native executable binding follows resource admission","startup-duplicate"=>"native startup observation duplicated","startup-post-model"|"startup-post-input"|"startup-post-session"=>"follows model/input/session exposure",_=>"native metadata resource has no original launch"}),"{error:#}");
         f.store.release(&lease,now()).unwrap();refuse(&runtimes,audits.clone());
         }}}
     }
