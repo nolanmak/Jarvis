@@ -55,6 +55,12 @@ impl OwnerInputController {
     }
 }
 impl augmentagent_channel_core::native_vm::OwnerInputAuthorizer for OwnerInputController {
+    fn resources_ready(&self,admission:&augmentagent_channel_core::native_vm::NativeResourceAdmission<'_>)->Result<()> {
+        admission.validate_unreleased()?;
+        self.check_native(admission.prepared(),admission.resource_receipt())?;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("owner resource-ready store poisoned"))?;
+        self.body.validate(&mut store,&self.lease,millis())
+    }
     fn bind_model(&self,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,resource:&augmentagent_channel_core::audit_chain::AppendReceipt)->Result<augmentagent_channel_core::native_vm::OwnerInputReference> {
         self.check_native(prepared,resource)?;
         let preparation=self.body.preparation.activation_binding()?;

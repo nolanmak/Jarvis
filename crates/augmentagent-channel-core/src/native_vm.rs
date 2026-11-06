@@ -60,9 +60,11 @@ impl OwnerInputReference {
             "invalid owner input admission reference");Ok(())
     }
 }
-/// Installed once by the original owner controller. Neither method may wait
-/// for a provider or perform native IO while holding its workflow transaction.
+pub use crate::process_tree::NativeResourceAdmission;
+/// Installed once by the original owner controller. Callbacks never wait for
+/// providers or perform native IO inside a workflow transaction.
 pub trait OwnerInputAuthorizer:Send+Sync {
+    fn resources_ready(&self,admission:&NativeResourceAdmission<'_>)->Result<()>;
     fn bind_model(&self,prepared:&PreparedLaunchRecord,resource:&crate::audit_chain::AppendReceipt)->Result<OwnerInputReference>;
     fn authorize_input(&self,prepared:&PreparedLaunchRecord,resource:&crate::audit_chain::AppendReceipt,
         reference:&OwnerInputReference,prompt_sha256:&str,prompt_bytes:usize)->Result<()>;
@@ -890,6 +892,7 @@ mod tests {
     fn native_input_release_refuses_different_valid_resource_for_owner_model() { launch_intent_child("input-owner-resource"); }
     struct FixtureOwnerInput;
     impl OwnerInputAuthorizer for FixtureOwnerInput {
+        fn resources_ready(&self,admission:&NativeResourceAdmission<'_>)->Result<()> {admission.validate_unreleased()}
         fn bind_model(&self,prepared:&PreparedLaunchRecord,_resource:&crate::audit_chain::AppendReceipt)->Result<OwnerInputReference> {
             Ok(OwnerInputReference {version:1,workflow:prepared.intent.source_owner.workflow_id.clone(),request_id:"synthetic-original-request".into(),
                 dispatch_sequence:10,model_admission_sequence:20,model_receipt:"synthetic-admitted-model".into(),claim_sha256:"a".repeat(64)})

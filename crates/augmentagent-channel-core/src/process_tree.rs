@@ -24,6 +24,40 @@ pub(crate) struct ProcessGroup {
     _directory: Option<tempfile::TempDir>,
 }
 
+/// Borrowed observation from this actual supervisor's closed release boundary.
+/// This is not kernel quiescence, native absence, or permission to replay input.
+/// Only this module can construct it; it cannot outlive the owning group.
+pub struct NativeResourceAdmission<'a> {
+    group:&'a ProcessGroup,
+    prepared:&'a crate::native_vm::PreparedLaunchRecord,
+    resource:&'a crate::audit_chain::AppendReceipt,
+    identity:&'a serde_json::Value,
+}
+impl NativeResourceAdmission<'_> {
+    pub fn prepared(&self)->&crate::native_vm::PreparedLaunchRecord {self.prepared}
+    pub fn resource_receipt(&self)->&crate::audit_chain::AppendReceipt {self.resource}
+    pub fn identity(&self)->&serde_json::Value {self.identity}
+    pub fn validate_unreleased(&self)->anyhow::Result<()> {
+        let absent=|path:&std::path::Path|->anyhow::Result<()> {
+            match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind()==std::io::ErrorKind::NotFound=>Ok(()),
+                Err(error)=>Err(error.into()),
+                Ok(_)=>anyhow::bail!("native resource boundary already released or completed"),
+            }
+        };
+        absent(&self.group.receipt)?;
+        absent(&self.group.receipt.with_file_name("launch-continue"))?;
+        anyhow::ensure!(launch_readiness(&self.group.receipt.with_file_name("launch-ready"))?,"native resource readiness publication is pending");
+        let original:serde_json::Value=serde_json::from_slice(&private_read(&self.group.receipt.with_file_name("resource-admitted.json"))?)?;
+        let current:serde_json::Value=serde_json::from_slice(&private_read(&self.group.receipt.with_file_name("resource-accounting.json"))?)?;
+        anyhow::ensure!(original==*self.identity && current["phase"]=="admitted" && current["exhausted"]==false
+            && current["identity"]==*self.identity && self.group.native_launch.as_ref()==Some(self.prepared)
+            && self.group.resource_required && self.group.vm_preflight,
+            "native resource boundary lost its original admission");
+        Ok(())
+    }
+}
+
 impl ProcessGroup {
     pub(crate) fn bind_resource_audit(&self, provider:&str, logger:Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
         if let Some(logger)=logger { *self.resource_audit.lock().map_err(|_|anyhow::anyhow!("resource audit lock poisoned"))?=Some((provider.into(),logger.clone())); }
@@ -50,7 +84,7 @@ impl ProcessGroup {
         // finishing) before it writes launch-ready; give it that long.
         let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(
             ADMISSION_WAIT_SECS+if self.vm_preflight { 65 } else { 5 });
-        while !ready.exists() {
+        while !launch_readiness(&ready)? {
             if self.receipt.exists() || tokio::time::Instant::now()>=deadline {
                 self.resource_outcome(provider,logger)?;
                 let startup=private_read(&self.receipt.with_file_name("vm-startup-failure.json")).ok()
@@ -104,7 +138,12 @@ impl ProcessGroup {
             let prepared=self.native_launch.as_ref().ok_or_else(||anyhow::anyhow!("native VM model admission requires prepared controller receipt"))?;
             let identity=resource_identity.as_ref().ok_or_else(||anyhow::anyhow!("native VM model admission requires exact resource identity"))?;
             let receipt=logger.unwrap().native_launch_resource_binding(prepared,provider,identity)?;
-            *self.native_resource.lock().map_err(|_|anyhow::anyhow!("native resource receipt lock poisoned"))?=Some(receipt);
+            *self.native_resource.lock().map_err(|_|anyhow::anyhow!("native resource receipt lock poisoned"))?=Some(receipt.clone());
+            let admission=NativeResourceAdmission {group:self,prepared,resource:&receipt,identity};
+            admission.validate_unreleased()?;
+            logger.unwrap().owner_native_resources_ready(&admission)?;
+            admission.validate_unreleased()?;
+            logger.unwrap().dispatch_allowed()?;
         }
         if model { if let Some(logger)=logger {
             match &resource_identity {
@@ -224,6 +263,26 @@ pub(crate) fn private_directory(path: &std::path::Path) -> std::io::Result<()> {
         return Err(std::io::Error::other("lifecycle directory must be owner-private"));
     }
     Ok(())
+}
+
+/// A publisher may create/chmod/write the inode in separate operations. Only
+/// its complete private marker is readiness; a valid prefix remains pending.
+fn launch_readiness(path:&std::path::Path)->std::io::Result<bool> {
+    const READY:&[u8]=b"ready\n";
+    private_directory(path.parent().ok_or_else(||std::io::Error::other("invalid readiness path"))?)?;
+    let file=match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(path) {
+        Ok(file)=>file,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(false),Err(error)=>return Err(error),
+    };
+    let metadata=file.metadata()?;
+    if !metadata.is_file() || metadata.uid()!=unsafe{libc::geteuid()} || metadata.nlink()!=1 || metadata.len()>READY.len() as u64 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,"invalid launch readiness receipt"));
+    }
+    // Both supervisor paths chmod their owner-private ready inode after
+    // creation. It cannot authorize dispatch until that publication finishes.
+    if metadata.permissions().mode()&0o077!=0 {return Ok(false)}
+    let mut bytes=Vec::new();file.take(READY.len() as u64+1).read_to_end(&mut bytes)?;
+    if bytes==READY {Ok(true)} else if READY.starts_with(&bytes) {Ok(false)}
+    else {Err(std::io::Error::new(std::io::ErrorKind::InvalidData,"invalid launch readiness bytes"))}
 }
 
 fn private_read(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
@@ -752,6 +811,7 @@ mod tests {
         let mut child=std::process::Command::new("sleep").arg("30").spawn().unwrap();
         let directory=tempfile::tempdir_in(root.path()).unwrap();let receipt=directory.path().join("cleanup-complete");
         std::fs::write(directory.path().join("launch-ready"),"ready\n").unwrap();
+        std::fs::set_permissions(directory.path().join("launch-ready"),std::fs::Permissions::from_mode(0o600)).unwrap();
         let group=ProcessGroup {id:child.id() as libc::pid_t,receipt:receipt.clone(),clean:Arc::new(AtomicBool::new(false)),
             active_request:None,resource_required:false,vm_preflight:true,resource_observed:AtomicBool::new(false),
             resource_audit:std::sync::Mutex::new(None),native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
@@ -808,7 +868,8 @@ mod tests {
             std::fs::set_permissions(&resource,std::fs::Permissions::from_mode(0o600)).unwrap();
         };
         write(&serde_json::json!({"phase":"admitted","exhausted":false,"identity":identity}));
-        std::fs::write(directory.path().join("launch-ready"),b"ready").unwrap();
+        std::fs::write(directory.path().join("launch-ready"),b"ready\n").unwrap();
+        std::fs::set_permissions(directory.path().join("launch-ready"),std::fs::Permissions::from_mode(0o600)).unwrap();
         let group=ProcessGroup {id:i32::MAX,receipt,clean:Arc::new(AtomicBool::new(false)),
             active_request:None,resource_required:true,vm_preflight:false,
             resource_observed:AtomicBool::new(false),resource_audit:std::sync::Mutex::new(None),
@@ -1114,10 +1175,55 @@ mod tests {
     async fn native_model_release_requires_resource_identity_before_charge() {native_release_context_fixture("resource").await;}
     #[tokio::test]
     async fn native_model_release_refuses_sealed_audit_before_charge() {native_release_context_fixture("sealed").await;}
+    #[tokio::test]
+    async fn native_resource_ready_precedes_owner_model_charge_and_release() {native_release_context_fixture("owner-ready").await;}
+    #[tokio::test]
+    async fn native_resource_ready_refusal_prevents_model_charge_and_release() {native_release_context_fixture("owner-refuse").await;}
+    #[tokio::test]
+    async fn native_resource_ready_is_not_called_without_resource_admission() {native_release_context_fixture("owner-no-resource").await;}
+    #[tokio::test]
+    async fn native_resource_ready_rechecks_changed_admission_before_charge() {native_release_context_fixture("owner-changed").await;}
+    #[tokio::test]
+    async fn native_resource_ready_rechecks_owner_fence_before_charge() {native_release_context_fixture("owner-fenced").await;}
+    #[tokio::test]
+    async fn native_resource_ready_waits_for_complete_private_ready_marker() {native_release_context_fixture("owner-prefix").await;}
+    #[tokio::test]
+    async fn native_resource_ready_waits_for_private_ready_permissions() {native_release_context_fixture("owner-permissions").await;}
+    #[tokio::test]
+    async fn native_resource_ready_rejects_corrupt_ready_marker_before_callback() {native_release_context_fixture("owner-corrupt").await;}
+    struct ReadyOwnerFixture {
+        visits:Arc<std::sync::atomic::AtomicUsize>,billed:Arc<std::sync::atomic::AtomicUsize>,refuse:bool,changed:Option<PathBuf>,published:Option<Arc<AtomicBool>>,
+    }
+    impl crate::native_vm::OwnerInputAuthorizer for ReadyOwnerFixture {
+        fn resources_ready(&self,admission:&crate::native_vm::NativeResourceAdmission<'_>)->anyhow::Result<()> {
+            admission.validate_unreleased()?;
+            anyhow::ensure!(self.published.as_ref().is_none_or(|p|p.load(Ordering::SeqCst)),"partial readiness reached owner callback");
+            anyhow::ensure!(self.billed.load(Ordering::SeqCst)==0,"owner resources observed after model charge");
+            anyhow::ensure!(admission.prepared().intent.provider=="codex" && admission.identity()["inode"]==42
+                && admission.resource_receipt().sequence>admission.prepared().controller_receipt.sequence,"resource-ready facts changed");
+            self.visits.fetch_add(1,Ordering::SeqCst);
+            if let Some(path)=&self.changed {std::fs::write(path,br#"{"phase":"completed"}"#).unwrap();}
+            anyhow::ensure!(!self.refuse,"fixture owner resource-ready refusal");Ok(())
+        }
+        fn bind_model(&self,prepared:&crate::native_vm::PreparedLaunchRecord,_resource:&crate::audit_chain::AppendReceipt)->anyhow::Result<crate::native_vm::OwnerInputReference> {
+            Ok(crate::native_vm::OwnerInputReference {version:1,workflow:prepared.intent.source_owner.workflow_id.clone(),request_id:"fixture-owner-request".into(),dispatch_sequence:1,
+                model_admission_sequence:2,model_receipt:"fixture-owner-model".into(),claim_sha256:"a".repeat(64)})
+        }
+        fn authorize_input(&self,_prepared:&crate::native_vm::PreparedLaunchRecord,_resource:&crate::audit_chain::AppendReceipt,
+            _reference:&crate::native_vm::OwnerInputReference,_sha:&str,_len:usize)->anyhow::Result<()> {Ok(())}
+    }
     async fn native_release_context_fixture(mode:&str) {
         const CHILD:&str="JARVIS_TEST_NATIVE_RELEASE_CONTEXT_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let test=match mode {
+                "owner-ready"=>"native_resource_ready_precedes_owner_model_charge_and_release",
+                "owner-prefix"=>"native_resource_ready_waits_for_complete_private_ready_marker",
+                "owner-permissions"=>"native_resource_ready_waits_for_private_ready_permissions",
+                "owner-corrupt"=>"native_resource_ready_rejects_corrupt_ready_marker_before_callback",
+                "owner-fenced"=>"native_resource_ready_rechecks_owner_fence_before_charge",
+                "owner-refuse"=>"native_resource_ready_refusal_prevents_model_charge_and_release",
+                "owner-no-resource"=>"native_resource_ready_is_not_called_without_resource_admission",
+                "owner-changed"=>"native_resource_ready_rechecks_changed_admission_before_charge",
                 "missing"=>"native_model_release_requires_prepared_receipt_before_model_charge",
                 "bound"=>"native_model_release_binds_exact_preparation_and_supervisor_resource",
                 "changed"=>"native_model_release_refuses_changed_preparation_before_charge",
@@ -1166,14 +1272,53 @@ mod tests {
             crate::audit_chain::AnchoredAudit::new(logger.path().into(),root.path().join("anchors/audit.json"),&[]).unwrap()
                 .seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"closed-before-release"}))).unwrap();
         }
-        group.resource_required=mode!="resource";group.vm_preflight=true;
+        let visits=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let published=Arc::new(AtomicBool::new(false));
+        let publisher=if matches!(mode,"owner-prefix"|"owner-permissions"|"owner-corrupt") {
+            let ready=group.receipt.with_file_name("launch-ready");
+            tokio::time::timeout(std::time::Duration::from_secs(5),async {
+                while private_read(&ready).ok().as_deref()!=Some(b"ready\n") {tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+            }).await.unwrap();
+            if mode=="owner-corrupt" {std::fs::write(&ready,b"not-ready").unwrap();None}
+            else {
+                let permissions=mode=="owner-permissions";
+                if permissions {std::fs::set_permissions(&ready,std::fs::Permissions::from_mode(0o644)).unwrap();}
+                else {std::fs::write(&ready,b"rea").unwrap();}
+                let done=published.clone();
+                Some(tokio::spawn(async move {tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    if permissions {std::fs::set_permissions(ready,std::fs::Permissions::from_mode(0o600)).unwrap();}
+                    else {std::fs::write(ready,b"ready\n").unwrap();}
+                    done.store(true,Ordering::SeqCst);} ))
+            }
+        } else {None};
+        if mode.starts_with("owner-") {
+            logger.set_owner_input_authorizer(Arc::new(ReadyOwnerFixture {visits:visits.clone(),billed:count.clone(),refuse:mode=="owner-refuse",
+                changed:(mode=="owner-changed").then(||group.receipt.with_file_name("resource-accounting.json")),published:matches!(mode,"owner-prefix"|"owner-permissions").then(||published.clone())})).unwrap();
+            if mode=="owner-fenced" {
+                let visited=visits.clone();
+                logger.set_dispatch_observer(Arc::new(move || {
+                    anyhow::ensure!(visited.load(Ordering::SeqCst)==0,"fixture owner fenced during resource-ready callback");Ok(())
+                })).unwrap();
+            }
+            let ready=visits.clone();let billed=count.clone();
+            logger.set_model_call_observer(Arc::new(move |_| {
+                anyhow::ensure!(ready.load(Ordering::SeqCst)==1,"model admission preceded actual owner resource-ready callback");
+                billed.fetch_add(1,Ordering::SeqCst);Ok(())
+            })).unwrap();
+        }
+        group.resource_required=!matches!(mode,"resource"|"owner-no-resource");group.vm_preflight=true;
         let outcome=group.admit_model("codex",Some(&logger)).await;
+        if let Some(publisher)=publisher {publisher.await.unwrap();}
         let proceeded=group.receipt.with_file_name("launch-continue").exists();
         let retained_resource=group.native_resource_receipt().unwrap();
         drop(group);let _=child.wait().await;
         let rows:Vec<serde_json::Value>=std::fs::read_to_string(logger.path()).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
         let binding=rows.iter().find(|row|row["kind"]=="native_launch_resource_binding");
-        if mode=="bound" {
+        if mode.starts_with("owner-") {
+            assert_eq!(visits.load(Ordering::SeqCst),if matches!(mode,"owner-no-resource"|"owner-corrupt") {0}else{1},"owner resource-ready was never observed");
+            if matches!(mode,"owner-ready"|"owner-prefix"|"owner-permissions") {outcome.unwrap();assert!(proceeded);assert_eq!(count.load(Ordering::SeqCst),1);}
+            else {assert!(outcome.is_err());assert!(!proceeded);assert_eq!(count.load(Ordering::SeqCst),0);}
+        } else if mode=="bound" {
             outcome.unwrap();assert!(proceeded);assert_eq!(count.load(Ordering::SeqCst),1);
             let binding=binding.expect("released native model has no exact launch/resource correlation");
             assert_eq!(logger.read_append_receipt(&retained_resource.unwrap()).unwrap(),*binding,

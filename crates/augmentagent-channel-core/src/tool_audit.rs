@@ -845,6 +845,23 @@ impl AuditLogger {
         anyhow::ensure!(state.authorizer.is_none(),"owner input authorizer already installed");
         state.authorizer=Some(authorizer);Ok(())
     }
+    /// Resource setup is complete but the actual supervisor remains behind its
+    /// release barrier. This callback precedes both billing and model binding.
+    pub(crate) fn owner_native_resources_ready(&self,admission:&crate::native_vm::NativeResourceAdmission<'_>)->anyhow::Result<()> {
+        let authorizer=self.owner_input.lock().map_err(|_|anyhow::anyhow!("owner input lock poisoned"))?.authorizer.clone();
+        let Some(authorizer)=authorizer else {return Ok(())};
+        admission.validate_unreleased()?;
+        self.verify_native_launch_reference(admission.prepared())?;
+        let row=self.read_append_receipt(admission.resource_receipt())?;
+        anyhow::ensure!(row["kind"]=="native_launch_resource_binding"
+            && row["launch_intent"]==serde_json::to_value(&admission.prepared().intent)?
+            && row["launch_receipt"]==serde_json::to_value(&admission.prepared().controller_receipt)?
+            && row["resource_identity"]==*admission.identity(),"owner resource-ready original receipt changed");
+        self.dispatch_allowed()?;
+        authorizer.resources_ready(admission)?;
+        admission.validate_unreleased()?;
+        self.dispatch_allowed()
+    }
     /// Called by the supervisor only after actual model admission, before it
     /// releases launch-continue. No saved reference populates the live map.
     pub(crate) fn bind_owner_native_model(&self,prepared:&crate::native_vm::PreparedLaunchRecord,
