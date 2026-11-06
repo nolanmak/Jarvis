@@ -271,6 +271,12 @@ impl OwnerPublicationGuard<'_> {
         }))
     }
 
+    /// Separate fresh closure fact from the original metadata-only turn. This
+    /// grants no body/input/model permit and never promotes the retained guard.
+    fn with_revoked_original_input_writers(&self,visit:&mut dyn FnMut(&augmentagent_channel_core::native_vm::ownership::OriginalInputWriterRevocationProof<'_>)->Result<()>)->Result<()> {
+        self.with_native_metadata(&mut |metadata|metadata.with_revoked_input_writers(|proof|visit(proof)))
+    }
+
     /// General retained-session metadata inspection. Actual physical/resource
     /// proof is distinct from the captured facts; no productive guard escapes.
     fn with_native_metadata(&self,visit:&mut dyn FnMut(&augmentagent_channel_core::native_vm::ownership::MetadataNativeOwnerProof<'_>)->Result<()>)->Result<()> {
@@ -4463,6 +4469,12 @@ mod tests {
                         std::fs::write(&scope,&scope_bytes).unwrap();std::fs::write(&canonical,&next_canonical).unwrap();
                     }
                     pending.publish_canonical().unwrap();
+                    let mut inspected_revocation=false;
+                    pending.with_revoked_original_input_writers(&mut |proof| {
+                        assert_eq!(proof.namespace().owner.workflow_id,id);assert_eq!(proof.namespace().owner.lease_generation,pending._guard.lease.generation);
+                        assert!(pending._guard.audit.dispatch_allowed().is_err());assert!(pending._guard.audit.model_call_admitted("codex").is_err());
+                        inspected_revocation=true;Ok(())
+                    }).unwrap();assert!(inspected_revocation);
                     let raw=std::fs::read(control.join("issue-77-workflow.json")).expect("canonical owner publication missing");
                     let manifest:serde_json::Value=serde_json::from_slice(&raw).unwrap();
                     assert_eq!(manifest["contract_hash"],prepared.prepared().baseline.registration.contract_hash());

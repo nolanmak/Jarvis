@@ -1,5 +1,5 @@
 //! Controller-owned runtime handoff; creation receipts remain immutable.
-pub use super::owner_metadata::{with_metadata_native_owner,MetadataNativeOwnerProof};
+pub use super::owner_metadata::{with_metadata_native_owner,MetadataNativeOwnerProof,OriginalInputWriterRevocationProof};
 pub use super::owner_recovery::{ClosedWorkflowPlan,ClosedWorkflowProof,with_closed_workflow};
 pub use super::owner_outcome::{
     capture_owner_binding, capture_transfer_binding, transfer, transfer_receipt,

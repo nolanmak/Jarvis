@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "kind": "held-original-native-input-writer-revocation-observation-component",
+  "source_parent_commit": "3405ef9a0c9847039b66fd3eda600e50e5ffd651",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
+      "sha256": "b744e1b84ffbaa0f379b77dd69bc57ea29a385ae257b5649413d0c7cfd3a3bfb"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_metadata.rs",
+      "sha256": "c86d37a3255069a0e2cdf99939e7467b475f74283ab453394caa0f44ca893d29"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_transfer.rs",
+      "sha256": "2ad8ffa00419a4b1dc088ef4b3f605cc8910641df1a55dbbe18a7e85466245e7"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "8e88889ec6a0dec8e44fca242b6d47251d557c10bbf5ef5b4e9906f9207eb14d"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_handoff.rs",
+      "sha256": "97b920f99469db6328add3dd0dc4dfec3420bea58d48e84bb5fe0951cf6cd82f"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "97e852039be6749a12e1df876ce7e7c51efb286fee4adaf8fb8c5524fe83174a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+      "sha256": "b88c0c1846bcb1198e52442796d8bbe3d735746c227174af9b8282adec826d8b"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "3c76c0f6a8e0eb3897fde29439fc2dbdeddef5c88f30801e997c56a795e1030a"
+    }
+  ],
+  "behavioral_red": {
+    "session": 52940,
+    "result": "terminal1; managed exit101",
+    "log": "/tmp/autoship-native-writer-revocation-red-20261106.log",
+    "failure": "retained native metadata omitted the original input-writer closure census"
+  },
+  "validation": {
+    "full_core": {
+      "session": 45850,
+      "result": "terminal0",
+      "passed": 945,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 36.99,
+      "log": "/tmp/autoship-native-writer-revocation-full-core-20261106.log"
+    },
+    "isolated_full_cli": {
+      "session": 96493,
+      "result": "terminal0",
+      "passed": 1949,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 309.01,
+      "log": "/tmp/autoship-native-writer-revocation-isolated-full-cli-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    },
+    "isolated_production_check": {
+      "session": 3568,
+      "result": "terminal0",
+      "seconds": 16.11,
+      "log": "/tmp/autoship-native-writer-revocation-isolated-production-check-20261106.log"
+    }
+  },
+  "implemented": [
+    "Every recorded prepared launch is included, even before resource admission or release attempt",
+    "Exact original source owner/audit joined under held native locks to completed transfer references or permanent retirement",
+    "Separate borrowed nonserializable OriginalInputWriterRevocationProof rechecks current metadata/policy fence and refuses any recorded writer without permanent closure",
+    "Original launch/resource receipts, release-attempt status and preparation/owner-input references retained in bounded private census",
+    "Private publication guard consumes the fresh metadata producer through original opaque draft/turn without model or dispatch authority"
+  ],
+  "test_scope": {
+    "retained_metadata_providers": [
+      "codex",
+      "claude"
+    ],
+    "completed_transfers": 2,
+    "original_input": [
+      "none",
+      "generic",
+      "owner-bound",
+      "preparation-associated"
+    ],
+    "negative_checks": [
+      "current unexecuted launch refuses revocation although retained runtime creation owner is closed and general metadata is valid",
+      "selected policy changed within held metadata visit refuses revocation",
+      "foreign original resource/input/preparation records refuse",
+      "omitted/corrupt original namespace, seal, inventory and resource evidence still refuse"
+    ],
+    "ledger_checks": [
+      "live owner has no closure",
+      "prepared transfer has no closure",
+      "completed transfer preserves original request/receipt reference",
+      "permanent retirement uses exact source authority",
+      "wrong source audit refuses for closed owner",
+      "closure observations persist after reopen"
+    ],
+    "private_guard_checks": "actual initial/revision publication fixture obtains fresh revocation observation after completion while dispatch/model remain refused and snapshots/input/accounting remain unchanged",
+    "actual_provider_or_vm_invoked": false
+  },
+  "not_proven_or_implemented": [
+    "New closure operation: this observes existing durable closure only",
+    "Full associated invocation/input census, kernel/source/resource authority and readonly preparation proof",
+    "Body input nonrelease: markers remain exposure uncertainty and empty recorded census is not nonrelease",
+    "Semantic coding-conversation restoration/continuation",
+    "Typed recovery/terminal producers and separately consumed productive successor bridge/claim",
+    "Shared productive admission, connected owner worker, protected aggregate storage, independent exact-head review, rollout and full original live acceptance/soaks"
+  ],
+  "preserved_unpublished_work": "/tmp/autoship-productive-gate-preserved-20261106.patch"
+}

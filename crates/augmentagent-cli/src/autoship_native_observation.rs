@@ -882,6 +882,24 @@ pub(crate) mod tests {
             assert_eq!(proof.inventory().len(),1);assert_eq!(proof.namespace(),&namespace);
             assert_eq!(proof.inventory()[0].creation_owner,f.prepared.intent.source_owner);assert_eq!(proof.inventory()[0].effective_owner,namespace.owner);
             assert_eq!(proof.evidence()["audits"].as_array().unwrap().len(),3);
+            let writers=proof.evidence()["audits"].as_array().unwrap().iter().flat_map(|a|a["native_input_writers"].as_array()
+                .expect("native metadata omitted its original input-writer closure census")).collect::<Vec<_>>();
+            assert_eq!(writers.len(),1);assert_eq!(writers[0]["launch_intent"],serde_json::to_value(&f.prepared.intent).unwrap());
+            assert_eq!(writers[0]["closure"]["kind"],"completed_native_transfer");
+            assert_eq!(writers[0]["closure"]["transfer_id"],first.request().transfer_id);
+            let mut revoked=false;
+            proof.with_revoked_input_writers(|closed| {
+                assert_eq!(closed.namespace(),proof.namespace());assert_eq!(closed.evidence()["writers"].as_array().unwrap().len(),1);
+                assert_eq!(closed.evidence()["writers"][0]["release_attempted"],original_input!="none");
+                let fd=std::fs::OpenOptions::new().read(true).open(native.join("state.lock")).unwrap();
+                assert_ne!(unsafe{libc::flock(fd.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+                revoked=true;Ok(())
+            }).unwrap();assert!(revoked);
+            let policy=std::path::PathBuf::from(std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").unwrap());let saved=std::fs::read(&policy).unwrap();
+            std::fs::write(&policy,b"{}").unwrap();let mut stale_entered=false;
+            let result=proof.with_revoked_input_writers(|_| {stale_entered=true;Ok(())});std::fs::write(&policy,saved).unwrap();
+            assert!(result.is_err());assert!(!stale_entered,"revocation factory reused a stale current-policy check");
+
             let input_count=proof.evidence()["audits"].as_array().unwrap().iter().map(|a|a["native_input_records"].as_array().unwrap().len()).sum::<usize>();
             assert_eq!(input_count,match original_input {"none"=>0,"owner"=>2,_=>1});
             let preparation_count=proof.evidence()["audits"].as_array().unwrap().iter().map(|a|a["native_preparation_bindings"].as_array().unwrap().len()).sum::<usize>();
@@ -923,6 +941,16 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(native.join("authority-epoch.json")).unwrap(),epoch);
         assert_eq!(audits.iter().map(|a|std::fs::read(a.path()).unwrap()).collect::<Vec<_>>(),audit_before);
         assert_eq!(f.store.merge_allowance(now(),5).unwrap().confirmed,0);
+        // An additional unexecuted launch in the current namespace is not
+        // permanently revoked, even though the retained runtime's creation
+        // owner is closed and general metadata inspection remains possible.
+        let mut live=f.prepared.intent.clone();live.intent_id=uuid::Uuid::new_v4().to_string();live.source_owner=namespace.owner.clone();live.source_audit_path=current.path().into();
+        let mut row=serde_json::to_value(&live).unwrap();row["actor"]="controller".into();row["kind"]="native_launch_intent".into();current.record_controller(row).unwrap();
+        ownership::with_metadata_native_owner(&current,&runtimes,&fence,&mut load,&mut |proof| {
+            let count=proof.evidence()["audits"].as_array().unwrap().iter().map(|a|a["native_input_writers"].as_array().unwrap().len()).sum::<usize>();assert_eq!(count,2);
+            let mut entered=false;let error=proof.with_revoked_input_writers(|_| {entered=true;Ok(())}).unwrap_err();
+            assert!(!entered);assert!(format!("{error:#}").contains("no permanent closure"),"{error:#}");Ok(())
+        }).unwrap();
         if input_fault=="input" {
             current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_input_release_attempt",
                 "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_receipt":f.resource,

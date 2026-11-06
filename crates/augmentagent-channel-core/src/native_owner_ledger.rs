@@ -553,6 +553,24 @@ impl<'a> Ledger<'a> {
     pub fn is_closed(&self, owner: &RuntimeOwner) -> Result<bool> {
         closed(&self.db, owner)
     }
+    /// Exact permanent closure used by the trusted input admission predicate.
+    /// Caller retains the original state lock and validated full history.
+    pub(super) fn input_writer_closure(&self,authority:&Authority)->Result<Option<serde_json::Value>> {
+        let id:Option<String>=self.db.query_row("SELECT transfer_id FROM native_transfer_close WHERE workflow=?1 AND generation=?2 AND audit_path=?3",
+            params![authority.owner.workflow_id,authority.owner.lease_generation,authority.audit_path],|r|r.get(0)).optional()?;
+        if let Some(id)=id {
+            let record=load(&self.db,&id)?.context(R::PreparedCorrupt)?;
+            ensure!(record.request.source_owners.contains(authority),R::AuthorityConflict);
+            let State::Completed(receipt)=record.state else {anyhow::bail!(R::PreparedCorrupt)};
+            return Ok(Some(serde_json::json!({"version":1,"kind":"completed_native_transfer","source":authority,
+                "transfer_id":id,"request_sha256":sha(&encoded(&record.request)?),"receipt_sha256":sha(&encoded(&receipt)?)})));
+        }
+        if self.retired_authority(authority)? {
+            return Ok(Some(serde_json::json!({"version":1,"kind":"retired_native_owner","source":authority})));
+        }
+        ensure!(!self.is_closed(&authority.owner)?,R::AuthorityConflict);
+        Ok(None)
+    }
     /// Transfer closure alone is not retirement of the current namespace.
     pub fn retired_authority(&self, authority:&Authority)->Result<bool> {
         Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM retired_owner WHERE workflow=?1 AND generation=?2 AND audit_path=?3)",
@@ -1047,6 +1065,27 @@ mod tests {
             std::fs::read(root.path().join("authority-epoch.json")).unwrap(),
             epoch
         );
+    }
+    #[test]
+    fn original_input_writer_closure_requires_exact_permanent_native_authority() {
+        let root=fixture();let lock=StateLock::acquire(root.path()).unwrap();let mut ledger=Ledger::open(root.path(),&lock).unwrap();
+        let request=request("workflow");let source=&request.source_owners[0];
+        assert!(ledger.input_writer_closure(source).unwrap().is_none());
+        ledger.prepare(&request,&endpoints(&request),u64::MAX).unwrap();
+        assert!(ledger.input_writer_closure(source).unwrap().is_none(),"pending transfer is not revocation");
+        ledger.commit(&request,seals(&request)).unwrap();
+        let closed=ledger.input_writer_closure(source).unwrap().unwrap();
+        assert_eq!(closed["kind"],"completed_native_transfer");assert_eq!(closed["transfer_id"],request.transfer_id);
+        assert_eq!(closed["source"],serde_json::to_value(source).unwrap());
+        assert!(ledger.input_writer_closure(&request.destination).unwrap().is_none());
+        let mut wrong=source.clone();wrong.audit_path.push_str("-foreign");assert!(ledger.input_writer_closure(&wrong).is_err());
+        ledger.abort_and_retire(&request.destination.audit_path,&request.destination.owner).unwrap();
+        let retired=ledger.input_writer_closure(&request.destination).unwrap().unwrap();
+        assert_eq!(retired["kind"],"retired_native_owner");assert_eq!(retired["source"],serde_json::to_value(&request.destination).unwrap());
+        let mut wrong=request.destination.clone();wrong.audit_path.push_str("-foreign");assert!(ledger.input_writer_closure(&wrong).is_err());
+        drop(ledger);let reopened=Ledger::open(root.path(),&lock).unwrap();
+        assert_eq!(reopened.input_writer_closure(source).unwrap().unwrap(),closed);
+        assert_eq!(reopened.input_writer_closure(&request.destination).unwrap().unwrap(),retired);
     }
     fn migration_refuses_terminal_corruption(completed: bool) {
         let root = fixture();
