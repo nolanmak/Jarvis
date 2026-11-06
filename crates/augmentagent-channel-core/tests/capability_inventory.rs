@@ -449,6 +449,7 @@ fn core_presets_match_permission_contracts() {
         ("social_adapter_opts", social_adapter_opts("Synthetic adaptation instructions".into()), TextOnly, false),
         ("loop_parse_opts", loop_parse_opts(), TextOnly, false),
         ("archetype_pick_opts", archetype_pick_opts(), TextOnly, false),
+        ("autonomy_plan_opts", autonomy_plan_opts(), TextOnly, false),
     ];
     let manifest: serde_json::Value = serde_json::from_str(include_str!("../../../docs/reasoner-capabilities.json")).unwrap();
     for (name, opts, class, writable) in presets {

@@ -36,6 +36,27 @@ impl GoogleTokens for augmentagent_channel_email::google::GoogleGmail {
     }
 }
 
+/// Per-call options for [`GoogleCalendar::call_with`] (#1833 C4). The
+/// default is exactly what [`GoogleCalendar::call`] has always done.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CallOptions<'a> {
+    /// Send `If-Match: <etag>`; a 412 then surfaces as
+    /// [`CalendarError::PreconditionFailed`] (nothing was written).
+    pub if_match: Option<&'a str>,
+    /// Treat a non-GET whose outcome is unknown (transport error, 5xx,
+    /// unreadable 2xx body) as [`CalendarError::Unconfirmed`], as creates
+    /// already are. Such a write is never retried.
+    pub unconfirmed_writes: bool,
+}
+
+/// A successful call's body plus the resource's etag (`ETag` header, else
+/// the body's `etag` field).
+#[derive(Debug, Clone)]
+pub struct CallResponse {
+    pub body: serde_json::Value,
+    pub etag: Option<String>,
+}
+
 pub struct GoogleCalendar {
     http: reqwest::Client,
     base: String,
@@ -70,11 +91,29 @@ impl GoogleCalendar {
         query: &[(&str, &str)],
         body: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, CalendarError> {
+        self.call_with(email, method, path, query, body, CallOptions::default())
+            .await
+            .map(|r| r.body)
+    }
+
+    /// [`Self::call`] with conditional-write and etag support (#1833 C4).
+    /// With default options it behaves exactly like `call`.
+    pub async fn call_with(
+        &self,
+        email: &str,
+        method: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<serde_json::Value>,
+        opts: CallOptions<'_>,
+    ) -> Result<CallResponse, CalendarError> {
         let token = self.tokens.access_token(email).await.map_err(|e| CalendarError::Google {
             message: format!("Google credential for {email}: {e}"),
         })?;
         let read = method == "GET";
-        let creating = method == "POST";
+        // An unknown-outcome write is Unconfirmed: creates always, other
+        // writes when the caller opts in.
+        let creating = method == "POST" || (opts.unconfirmed_writes && !read);
         let max_attempts = if read { 3 } else { 1 };
         let method_v = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|e| CalendarError::Invalid(format!("method {method}: {e}")))?;
@@ -90,6 +129,9 @@ impl GoogleCalendar {
             if let Some(b) = &body {
                 req = req.json(b);
             }
+            if let Some(etag) = opts.if_match {
+                req = req.header(reqwest::header::IF_MATCH, etag);
+            }
             let resp = match req.send().await {
                 Ok(r) => r,
                 Err(e) if attempt < max_attempts => {
@@ -104,13 +146,21 @@ impl GoogleCalendar {
             };
             let status = resp.status();
             if status.is_success() {
-                return resp.json::<serde_json::Value>().await.map_err(|e| {
+                let header_etag = resp
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let body = resp.json::<serde_json::Value>().await.map_err(|e| {
                     if creating {
                         CalendarError::Unconfirmed(format!("calendar {method} {path}: unreadable response ({e})"))
                     } else {
                         CalendarError::Http(e)
                     }
-                });
+                })?;
+                let etag = header_etag
+                    .or_else(|| body.get("etag").and_then(|e| e.as_str()).map(str::to_string));
+                return Ok(CallResponse { body, etag });
             }
             let text = resp.text().await.unwrap_or_default();
             let detail = serde_json::from_str::<serde_json::Value>(&text)
@@ -122,6 +172,10 @@ impl GoogleCalendar {
             // access (scope or revoked consent): same remedy as 403.
             if status.as_u16() == 403 || status.as_u16() == 401 {
                 return Err(CalendarError::Forbidden { message });
+            }
+            // 412 only means "precondition failed" when we sent one.
+            if status.as_u16() == 412 && opts.if_match.is_some() {
+                return Err(CalendarError::PreconditionFailed { message });
             }
             if creating && status.is_server_error() {
                 return Err(CalendarError::Unconfirmed(message));

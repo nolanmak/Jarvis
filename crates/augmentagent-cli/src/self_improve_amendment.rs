@@ -94,6 +94,31 @@ fn validate_correction(
 ) -> Result<()> {
     validate_correction_with_files(old, next, candidate_environment, &[])
 }
+#[derive(Debug)]
+struct NoOpCorrection;
+impl std::fmt::Display for NoOpCorrection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("amendment is a no-op")
+    }
+}
+impl std::error::Error for NoOpCorrection {}
+
+fn correction_is_actionable(
+    old: &PreparedAcceptance,
+    next: &ContractProposal,
+    candidate_environment: &str,
+    additional_files: &[String],
+    adjudicated: bool,
+) -> Result<bool> {
+    match validate_correction_with_files(old, next, candidate_environment, additional_files) {
+        Ok(()) => Ok(true),
+        // Ordinary unchanged proposals decline the amendment and leave the
+        // existing bounded implementation repair in charge. A final ruling
+        // must still be implemented, and every other validation stays strict.
+        Err(error) if !adjudicated && error.is::<NoOpCorrection>() => Ok(false),
+        Err(error) => Err(error),
+    }
+}
 fn validate_correction_with_files(
     old: &PreparedAcceptance,
     next: &ContractProposal,
@@ -149,18 +174,20 @@ fn validate_correction_with_files(
         );
     }
     let old_candidate = old.baseline.registration.candidate_environment_id();
-    ensure!(
-        next.files != old.proposal.files
-            || next.contract.allowed_paths != old.proposal.contract.allowed_paths
-            || next.contract.verifiers != old.proposal.contract.verifiers
-            || candidate_environment != old_candidate,
-        "amendment is a no-op"
-    );
+    if next.files == old.proposal.files
+        && next.contract.allowed_paths == old.proposal.contract.allowed_paths
+        && next.contract.verifiers == old.proposal.contract.verifiers
+        && candidate_environment == old_candidate
+    {
+        return Err(NoOpCorrection.into());
+    }
     Ok(())
 }
 #[derive(Debug, Serialize)]
 struct EnvironmentEvidence {
     original_base: String,
+    canonical_main: Option<String>,
+    current_canonical_main: Option<String>,
     registered_baseline: String,
     registered_candidate: String,
     current_original_baseline: String,
@@ -181,7 +208,7 @@ impl EnvironmentEvidence {
         Ok(())
     }
     fn prompt(&self) -> Result<String> {
-        Ok(format!("Controller-measured environment evidence: {}\nThe registered environment is a composite fingerprint, including the controller verifier engine, source-controlled compiler inputs and runner identity. An older engine may omit committed-source export and use in-process assertions; its old receipts authorize nothing. A changed original-base fingerprint under the current engine is not by itself evidence that the candidate changed dependencies. Compare current_original_baseline with current_candidate, the candidate contribution diff, and the separately identified integrated upstream paths to distinguish current source-input changes. Historical component identities cannot be inferred from an opaque old digest. You may explicitly approve_environment_transition for a legitimate controller-engine migration/rebaseline as well as legitimate runner/compiler/dependency changes. Never silently carry old red/green claims forward: the exact recorded original base must produce intended assertion red under the current engine and the candidate must separately produce green. Preserve every owner requirement; reject unknown setup failures or requirement weakening.", serde_json::to_string(self)?))
+        Ok(format!("Controller-measured environment evidence: {}\nThe registered environment is a composite fingerprint, including the controller verifier engine, source-controlled compiler inputs and runner identity. An older engine may omit committed-source export and use in-process assertions; its old receipts authorize nothing. A changed original-base fingerprint under the current engine is not by itself evidence that the candidate changed dependencies. Compare current_original_baseline with current_candidate, the candidate contribution diff, and the separately identified integrated upstream paths to distinguish current source-input changes. When provided, current_canonical_main is independently measured from the exact GitHub canonical_main commit under the same current controller and runner. Equality with current_candidate means their fingerprinted compiler/dependency inputs match, even if both differ from the historical original baseline. Equality is environment evidence only: it grants no verifier approval or behavioral receipt. Historical component identities cannot be inferred from an opaque old digest. You may explicitly approve_environment_transition for a legitimate controller-engine migration/rebaseline as well as legitimate runner/compiler/dependency changes. Never silently carry old red/green claims forward: the exact recorded original base must produce intended assertion red under the current engine and the candidate must separately produce green. Preserve every owner requirement; reject unknown setup failures or requirement weakening.", serde_json::to_string(self)?))
     }
 }
 async fn environment_evidence(root: &Path, control: &Path, old: &PreparedAcceptance) -> Result<EnvironmentEvidence> {
@@ -196,6 +223,8 @@ async fn environment_evidence(root: &Path, control: &Path, old: &PreparedAccepta
     cleanup?;
     Ok(EnvironmentEvidence {
         original_base: base.into(),
+        canonical_main: None,
+        current_canonical_main: None,
         registered_baseline: old.baseline.registration.binding(base)?.environment_id,
         registered_candidate: old.baseline.registration.candidate_environment_id().into(),
         current_original_baseline,
@@ -207,11 +236,61 @@ async fn environment_evidence(root: &Path, control: &Path, old: &PreparedAccepta
     })
 }
 
+async fn environment_evidence_against_main(root:&Path,control:&Path,old:&PreparedAcceptance,canonical_main:&str)->Result<EnvironmentEvidence> {
+    let mut evidence=environment_evidence(root,control,old).await?;
+    let temporary=tempfile::Builder::new().prefix("environment-main-").tempdir_in(control)?;
+    let checkout=temporary.path().join("checkout");
+    let path=checkout.to_str().context("canonical main environment path UTF8")?;
+    trusted_git(root,&["worktree","add","--detach",path,canonical_main]).await?;
+    let measured=environment_id(&checkout);
+    let cleanup=trusted_git(root,&["worktree","remove","--force",path]).await;
+    let current_canonical_main=measured?;
+    cleanup?;
+    evidence.canonical_main=Some(canonical_main.into());
+    evidence.current_canonical_main=Some(current_canonical_main);
+    Ok(evidence)
+}
+
+fn decode_authority_response(raw:&str,expected_contract:&str)->Result<Decision> {
+    ensure!(raw.len()<=2*1024*1024,"authority_response_oversized");
+    let text=raw.trim().strip_prefix("```json\n").and_then(|s|s.strip_suffix("```")).unwrap_or(raw.trim());
+    let decision:Decision=serde_json::from_str(text).map_err(|_|anyhow::anyhow!("authority_invalid_json_or_schema"))?;
+    if decision.approved {
+        ensure!(decision.proposal.is_some(),"approved_without_proposal");
+        ensure!(decision.previous_contract_hash==expected_contract,"approved_wrong_previous_contract");
+        ensure!(decision.reason.trim().len()>=20,"approved_without_grounded_reason");
+    }
+    Ok(decision)
+}
+
+async fn authority_response<F,T,G>(root:&Path,head:&str,expected_contract:&str,prompt:&str,mut call:F,mut admit_correction:G)->Result<(Decision,String)>
+where F:FnMut(String)->T,T:std::future::Future<Output=Result<(String,String)>>,G:FnMut()->Result<bool> {
+    let original=format!("{prompt}\nDecision consistency: approved=true requires a complete non-null proposal with contract and files. If no justified complete correction can be supplied, return approved=false. Preserve every original owner requirement; approval alone is never executable proof.");
+    let mut request=original.clone();
+    for attempt in 0..2 {
+        ensure!(actual_head(root).await?==head,"amendment candidate changed before authority call");
+        let (raw,session)=call(request).await?;
+        ensure!(actual_head(root).await?==head,"amendment candidate changed during authority call");
+        match decode_authority_response(&raw,expected_contract) {
+            Ok(decision)=>return Ok((decision,session)),
+            Err(error)=> {
+                ensure!(attempt==0,"authority response invalid after bounded correction: {error}");
+                ensure!(admit_correction()?,"amendment authority correction budget exhausted");
+                // Only controller-defined error codes enter the correction;
+                // provider prose never supplies new instructions or authority.
+                request=format!("{original}\nYour previous completed response failed controller validation: {error}. Return the complete requested JSON. This is a consistency repair, not permission to approve; a justified denial remains valid.");
+            }
+        }
+    }
+    unreachable!("bounded authority correction must return or fail")
+}
+
 async fn authority(
     builder: &FallbackReasoner,
     workflow: &workflow::WorkflowGuard,
     root: &Path,
     prompt: &str,
+    expected_contract:&str,input_hash:&str,epoch:&str,
 ) -> Result<(Decision, String, String)> {
     let head = actual_head(root).await?;
     let origin = adoption::origin_for_candidate(root, Some(workflow)).await?;
@@ -236,30 +315,25 @@ async fn authority(
     if provider == augmentagent_channel_core::ProviderKind::Claude {
         opts.model = Some(build_model());
     }
-    let (raw, session) = augmentagent_channel_core::native_session::fresh_review_scope(
-        provider,
-        augmentagent_channel_core::model_router::native_reviewer_scope(
-            provider,
-            reasoner.call(&opts, prompt),
-        ),
-    )
-    .await?;
-    origin.validate(&head)?;
-    ensure!(
-        actual_head(root).await? == head,
-        "amendment candidate changed during authority call"
-    );
-    ensure!(
-        raw.len() <= 2 * 1024 * 1024,
-        "amendment authority response oversized"
-    );
-    let text = raw
-        .trim()
-        .strip_prefix("```json\n")
-        .and_then(|s| s.strip_suffix("```"))
-        .unwrap_or(raw.trim());
-    let decision: Decision = serde_json::from_str(text)?;
+    let reasoner=&reasoner;let opts=&opts;let origin=&origin;
+    let (decision,session)=authority_response(root,&head,expected_contract,prompt,|request|async move {
+        origin.validate(&actual_head(root).await?)?;
+        let answer=augmentagent_channel_core::native_session::fresh_review_scope(provider,
+            augmentagent_channel_core::model_router::native_reviewer_scope(provider,reasoner.call(opts,&request))).await?;
+        origin.validate(&actual_head(root).await?)?;
+        Ok(answer)
+    },||Ok(workflow.admit_epoch_attempt("verifier-amend-input",input_hash,2)?
+        && workflow.admit_epoch_attempt("verifier-amend-total",epoch,4)?)).await?;
     Ok((decision, provider.name().into(), session))
+}
+
+fn append_verifier_schema(prompt:&str,revision:u64)->Result<String> {
+    ensure!(revision>0,"amendment revision must be positive");
+    // Initial scoping uses revision 1. An amendment's normative instructions
+    // and every complete schema example must agree on its next revision.
+    let schema=CONTRACT_PROMPT.replace("revision=1,",&format!("revision={revision},"))
+        .replace("\"revision\":1,",&format!("\"revision\":{revision},"));
+    Ok(format!("{prompt}\nCurrent controller verifier schema (mandatory for all proposed commands): {schema}\nLegacy in-process assertions are unsupported proof. If migration is requested, independently translate preserved owner requirements into behavioral adapters and controller oracles; legacy stored red/green receipts are not evidence. Original-base behavior must be measured again."))
 }
 
 pub(super) async fn try_amend(
@@ -345,16 +419,17 @@ pub(super) async fn try_amend(
             &[format!("amendment-input:{input_hash}")],
         )
         .await?;
-    let environments = environment_evidence(root, control, old).await?;
+    let environments = environment_evidence_against_main(root, control, old,&canonical_main).await?;
     let candidate_environment = environments.current_candidate.clone();
     let original_base = old.baseline.registration.baseline_head();
-    let prompt=format!("Determine whether this failure is an objectively bad/outdated verifier or an implementation defect. Reject amendment for implementation defects, weakened criteria, always-green/no-op tests, or missing setup dependencies. For legitimate compiler/dependency input changes you may explicitly approve the candidate environment transition; old-base red must still be reproduced independently. Preserve every previous criterion ID and exact requirement text; do not expand implementation paths. A correction must produce revision {} and the same real source {}. All new fixtures are public: synthetic examples only, no secrets/private literals. Return JSON {{\"approved\":bool,\"previous_contract_hash\":\"{}\",\"approve_environment_transition\":bool,\"reason\":\"objective cause\",\"proposal\":null or {{\"contract\":...,\"files\":...}}}}.\nIntent: {title}\nFailure: {failure}\nOriginal proposal: {}\nOriginal behavioral baseline (unchanged): {original_base}\nCanonical main: {canonical_main}\nCandidate contribution base: {scope_base}\nExact candidate head: {head}\nCandidate contribution diff (every change here remains subject to allowed paths):\n{diff}\nIntegrated upstream paths (original baseline to contribution base; these are context, not candidate edits):\n{upstream_paths}\nApproval only permits constructing and independently testing a correction. A proposed replacement harness cannot have its new red receipt before it exists: the controller must subsequently reproduce intended assertion red at the unchanged original baseline under the current engine and separately obtain candidate green before activation. Never treat approval or historical receipts as those measurements.",old.proposal.contract.revision+1,source,old.baseline.registration.contract_hash(),serde_json::to_string(&old.proposal)?);
+    let next_revision=old.proposal.contract.revision.checked_add(1).context("verifier contract revision overflow")?;
+    let prompt=format!("Determine whether this failure is an objectively bad/outdated verifier or an implementation defect. Reject amendment for implementation defects, weakened criteria, always-green/no-op tests, or missing setup dependencies. For legitimate compiler/dependency input changes you may explicitly approve the candidate environment transition; old-base red must still be reproduced independently. Preserve every previous criterion ID and exact requirement text; do not expand implementation paths. A correction must produce revision {} and the same real source {}. All new fixtures are public: synthetic examples only, no secrets/private literals. Return JSON {{\"approved\":bool,\"previous_contract_hash\":\"{}\",\"approve_environment_transition\":bool,\"reason\":\"objective cause\",\"proposal\":null or {{\"contract\":...,\"files\":...}}}}.\nIntent: {title}\nFailure: {failure}\nOriginal proposal: {}\nOriginal behavioral baseline (unchanged): {original_base}\nCanonical main: {canonical_main}\nCandidate contribution base: {scope_base}\nExact candidate head: {head}\nCandidate contribution diff (every change here remains subject to allowed paths):\n{diff}\nIntegrated upstream paths (original baseline to contribution base; these are context, not candidate edits):\n{upstream_paths}\nApproval only permits constructing and independently testing a correction. A proposed replacement harness cannot have its new red receipt before it exists: the controller must subsequently reproduce intended assertion red at the unchanged original baseline under the current engine and separately obtain candidate green before activation. Never treat approval or historical receipts as those measurements.",next_revision,source,old.baseline.registration.contract_hash(),serde_json::to_string(&old.proposal)?);
     ensure!(
         prompt.len() <= 512 * 1024,
         "verifier authority evidence needs smaller scoped revision"
     );
     let prompt = format!("{prompt}\n{}", environments.prompt()?);
-    let prompt = format!("{prompt}\nCurrent controller verifier schema (mandatory for all proposed commands): {CONTRACT_PROMPT}\nLegacy in-process assertions are unsupported proof. If migration is requested, independently translate preserved owner requirements into behavioral adapters and controller oracles; legacy stored red/green receipts are not evidence. Original-base behavior must be measured again.");
+    let prompt = append_verifier_schema(&prompt,next_revision)?;
     let prompt = if let Some(directive) = adjudication {
         format!("{prompt}\nA final native Codex adjudicator already decided this derived-criterion interpretation. Translate it into executable verifier/scope changes, preserving EVERY original owner requirement verbatim. Do not reconsider its technical ruling; reject only if it cannot be implemented without changing owner intent or protected controls. You may add literal implementation files by returning approve_additional_files:[exact paths], never broaden directories. For a contract_scope directive, additional files must be a subset of its explicit bound paths and necessary for that unchanged owner requirement. Never authorize Git/provider configuration, credentials, CI or daemon control state; if a requested path is protected, derive a compliant implementation alternative or report the immutable authorization conflict. All deterministic checks rerun. Bound final ruling: {directive}")
     } else {
@@ -368,7 +443,7 @@ pub(super) async fn try_amend(
         "contribution_diff_sha256": digest(diff.as_bytes()), "shipping_authority": false,
     }))?;
     let (decision, native_provider, native_session) =
-        authority(builder, workflow, root, &prompt).await?;
+        authority(builder, workflow, root, &prompt,old.baseline.registration.contract_hash(),&input_hash,&epoch).await?;
     immutable(
         control,
         &format!(
@@ -407,12 +482,23 @@ pub(super) async fn try_amend(
         "scope expansion requires final adjudication"
     );
     validate_bound_scope_files(adjudication,&decision.approve_additional_files)?;
-    validate_correction_with_files(
+    if !correction_is_actionable(
         old,
         &proposal,
         &candidate_environment,
         &decision.approve_additional_files,
-    )?;
+        adjudication.is_some(),
+    )? {
+        workflow.audit_logger().record_controller(serde_json::json!({
+            "actor": "controller",
+            "kind": "verifier_amendment_declined",
+            "workflow": workflow.id(),
+            "reason_code": "no_op_correction",
+            "input_sha256": input_hash,
+            "previous_contract_hash": old.baseline.registration.contract_hash(),
+        }))?;
+        return Ok(None);
+    }
     environments.authorize(decision.approve_environment_transition)?;
     let directory = tempfile::Builder::new()
         .prefix("amend-baseline-")
@@ -830,7 +916,90 @@ pub(super) async fn resume_pending(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn amendment_schema_uses_the_requested_version_in_every_example() {
+        for revision in [2,3,12] {
+            let prompt=super::append_verifier_schema("Preserve every original owner requirement.",revision).unwrap();
+            let example=prompt.split_once("Complete schema example:\n").unwrap().1.split_once("\nEnd schema example.").unwrap().0;
+            let actual:serde_json::Value=serde_json::from_str(example).unwrap();
+            assert_eq!(actual["contract"]["revision"],revision,"authority schema contradicts the requested amendment revision");
+            assert!(prompt.contains(&format!("schema_version=1, revision={revision},")));
+            assert!(prompt.contains(&format!("\"revision\":{revision},\"pull_request\":841")));
+            assert!(prompt.contains(&format!("\"revision\":{revision},\"issue\":840")));
+            let initial=super::CONTRACT_PROMPT.split_once("Complete schema example:\n").unwrap().1.split_once("\nEnd schema example.").unwrap().0;
+            let mut expected:serde_json::Value=serde_json::from_str(initial).unwrap();
+            expected["contract"]["revision"]=revision.into();
+            assert_eq!(actual,expected,"schema rendering changed requirements,source,commands or oracle");
+        }
+        assert!(super::append_verifier_schema("untrusted revision",0).is_err());
+        assert!(super::CONTRACT_PROMPT.contains("schema_version=1, revision=1,"));
+    }
     use super::*;
+    #[tokio::test]
+    async fn authority_correction_is_bounded_and_cannot_bypass_its_call_budget() {
+        for allow in [false,true] {
+            let (root,old,head)=authority_fixture().await;
+            let raw=authority_json(&old,true,None);let calls=std::sync::atomic::AtomicUsize::new(0);
+            let result=authority_response(root.path(),&head,old.baseline.registration.contract_hash(),"Preserve criteria",|_| {
+                calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);let raw=raw.clone();async move {Ok((raw,"scripted-native-session".into()))}
+            },||Ok(allow)).await;
+            assert!(result.is_err());assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),if allow {2}else{1});
+        }
+    }
+    #[tokio::test]
+    async fn complete_authority_approval_needs_no_correction() {
+        let (root,old,head)=authority_fixture().await;let mut proposal=old.proposal.clone();proposal.contract.revision+=1;
+        let raw=authority_json(&old,true,Some(proposal));
+        let (decision,session)=authority_response(root.path(),&head,old.baseline.registration.contract_hash(),"Preserve criteria",|_| {
+            let raw=raw.clone();async move {Ok((raw,"scripted-native-session".into()))}
+        },||panic!("valid response must not reserve a correction")).await.unwrap();
+        assert!(decision.approved);assert!(decision.proposal.is_some());assert_eq!(session,"scripted-native-session");
+    }
+    #[tokio::test]
+    async fn candidate_change_during_invalid_authority_response_prevents_a_second_dispatch() {
+        let (root,old,head)=authority_fixture().await;let raw=authority_json(&old,true,None);
+        let calls=std::sync::atomic::AtomicUsize::new(0);let path=root.path();
+        let result=authority_response(path,&head,old.baseline.registration.contract_hash(),"Preserve criteria",|_| {
+            calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);let raw=raw.clone();async move {
+                let out=Command::new("/usr/bin/git").args(["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","--allow-empty","-qm","changed source"])
+                    .current_dir(path).env_clear().env("PATH","/usr/bin:/bin").output().await?;ensure!(out.status.success(),"fixture commit failed");
+                Ok((raw,"scripted-native-session".into()))
+            }
+        },||panic!("changed source must not authorize another model call")).await;
+        assert!(result.unwrap_err().to_string().contains("candidate changed"));assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),1);
+    }
+    #[tokio::test]
+    async fn native_authority_failure_is_not_retried_as_response_correction() {
+        let (root,old,head)=authority_fixture().await;
+        let result=authority_response(root.path(),&head,old.baseline.registration.contract_hash(),"Preserve criteria",|_|async {
+            Err(anyhow::anyhow!("scripted native resource refusal"))
+        },||panic!("native refusal is not malformed model output")).await;
+        assert!(result.unwrap_err().to_string().contains("native resource refusal"));
+    }
+    async fn authority_fixture()->(tempfile::TempDir,PreparedAcceptance,String) {
+        let (root,old)=fixture();
+        for args in [&["init","-q"][..],&["add","."],&["commit","-qm","fixture"]] {
+            let out=Command::new("/usr/bin/git").args(["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null"])
+                .args(args).current_dir(root.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();assert!(out.status.success());
+        }
+        let head=actual_head(root.path()).await.unwrap();(root,old,head)
+    }
+    fn authority_json(old:&PreparedAcceptance,approved:bool,proposal:Option<ContractProposal>)->String {
+        serde_json::to_string(&Decision {approved,previous_contract_hash:old.baseline.registration.contract_hash().into(),approve_environment_transition:false,approve_additional_files:vec![],reason:"Independent authority preserves every owner requirement".into(),proposal}).unwrap()
+    }
+    #[tokio::test]
+    async fn incomplete_authority_approval_gets_one_bounded_correction_without_forcing_approval() {
+        let (root,old,head)=authority_fixture().await;
+        let mut replies=std::collections::VecDeque::from([authority_json(&old,true,None),authority_json(&old,false,None)]);
+        let prompts=std::sync::Mutex::new(Vec::new());let reservations=std::sync::atomic::AtomicUsize::new(0);
+        let (decision,_)=authority_response(root.path(),&head,old.baseline.registration.contract_hash(),"Preserve the original criteria",|request| {
+            prompts.lock().unwrap().push(request);let raw=replies.pop_front().unwrap();async move {Ok((raw,"scripted-native-session".into()))}
+        },|| {reservations.fetch_add(1,std::sync::atomic::Ordering::SeqCst);Ok(true)}).await.unwrap();
+        assert!(!decision.approved,"a schema correction must permit a legitimate denial, not accept approval without a proposal");
+        let prompts=prompts.lock().unwrap();assert_eq!(prompts.len(),2);assert!(prompts[1].contains("approved_without_proposal"));
+        assert_eq!(reservations.load(std::sync::atomic::Ordering::SeqCst),1);
+    }
+
     #[tokio::test]
     async fn amendment_scope_excludes_integrated_main_but_keeps_candidate_conflict_resolution() {
         let root=tempfile::tempdir().unwrap();
@@ -974,8 +1143,35 @@ mod tests {
         )
     }
     #[test]
+    fn ordinary_noop_approval_is_declined_while_the_validator_and_final_ruling_stay_strict() {
+        let (_root, old) = fixture();
+        let mut next = old.proposal.clone();
+        next.contract.revision += 1;
+        assert!(
+            validate_correction(&old, &next, "environment-a").is_err(),
+            "a no-op must never become an admissible correction"
+        );
+        assert!(
+            !correction_is_actionable(&old, &next, "environment-a", &[], false).unwrap(),
+            "an unchanged proposal must return to the existing bounded repair path"
+        );
+        assert!(
+            correction_is_actionable(&old, &next, "environment-a", &[], true).is_err(),
+            "an unimplemented final adjudication cannot be treated as an ordinary denial"
+        );
+        assert!(correction_is_actionable(&old, &next, "environment-b", &[], false).unwrap());
+        next.contract.criteria[0].requirement = "A weaker requirement".into();
+        for environment in ["environment-a", "environment-b"] {
+            assert!(
+                correction_is_actionable(&old, &next, environment, &[], false).is_err(),
+                "requirement weakening must still halt instead of falling through to repair"
+            );
+        }
+    }
+    #[test]
     fn controller_engine_migration_requires_explicit_environment_approval() {
         let evidence = EnvironmentEvidence {
+            canonical_main: None, current_canonical_main: None,
             original_base: "a".repeat(40), registered_baseline: "previous-engine".into(),
             registered_candidate: "previous-engine".into(), current_original_baseline: "current-engine".into(),
             current_candidate: "current-engine".into(), legacy_proof_migration: true,
@@ -990,6 +1186,33 @@ mod tests {
         // Equal current source-input fingerprints do not silently grandfather
         // historical assertions from a different controller engine.
         assert!(evidence.transition_required());
+    }
+
+    #[tokio::test]
+    async fn environment_authority_distinguishes_upstream_dependency_changes_from_candidate_changes() {
+        let (root,mut old,base)=authority_fixture().await;
+        let baseline_environment=environment_id(root.path()).unwrap();
+        old.baseline.registration=RegisteredContract::register(root.path(),old.proposal.contract.clone(),base.clone(),baseline_environment.clone()).unwrap();
+        let control=tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.lock"),"# upstream dependency revision\nversion = 4\n").unwrap();
+        for args in [&["add","Cargo.lock"][..],&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","upstream dependencies"]] {
+            trusted_git(root.path(),args).await.unwrap();
+        }
+        let main=actual_head(root.path()).await.unwrap();
+        let main_environment=environment_id(root.path()).unwrap();
+        assert_ne!(baseline_environment,main_environment);
+        let upstream=environment_evidence_against_main(root.path(),control.path(),&old,&main).await.unwrap();
+        let measured=serde_json::to_value(&upstream).unwrap();
+        assert_eq!(measured["canonical_main"],main);
+        assert_eq!(measured["current_canonical_main"],main_environment);
+        assert_eq!(upstream.current_candidate,main_environment);
+        assert!(upstream.authorize(false).is_err(),"matching main must never approve a new verifier environment automatically");
+        std::fs::write(root.path().join("Cargo.lock"),"# candidate dependency revision\nversion = 4\n").unwrap();
+        let candidate=environment_evidence_against_main(root.path(),control.path(),&old,&main).await.unwrap();
+        let measured=serde_json::to_value(&candidate).unwrap();
+        assert_eq!(measured["current_canonical_main"],main_environment);
+        assert_ne!(candidate.current_candidate,main_environment,"candidate edits must remain distinct from trusted main inputs");
+        assert!(candidate.authorize(false).is_err());
     }
 
     #[test]

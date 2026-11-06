@@ -174,12 +174,22 @@ def supervise(receipt, argv, *, forward_fds=(), close_after_spawn=(),
         if vm_preflight:
             vm_ready = Path(receipt).with_name('vm-ready')
             deadline = time.monotonic() + 60
-            while not vm_ready.exists():
+            expected = b'ready\n'
+            while True:
                 if stopping or child.poll() is not None or time.monotonic() >= deadline:
                     return 125
+                try:
+                    with vm_ready.open('rb') as stream:
+                        published = stream.read(len(expected) + 1)
+                except FileNotFoundError:
+                    published = b''
+                if published == expected:
+                    break
+                # The VM launcher may create the inode before publishing its
+                # bytes. A visible prefix is still pending, never readiness.
+                if not expected.startswith(published):
+                    raise RuntimeError('invalid VM readiness')
                 time.sleep(0.005)
-            if vm_ready.read_text() != 'ready\n':
-                raise RuntimeError('invalid VM readiness')
             ready = Path(receipt).with_name('launch-ready')
             ready.write_text('ready\n')
             ready.chmod(0o600)

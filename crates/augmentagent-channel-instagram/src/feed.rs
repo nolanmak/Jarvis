@@ -68,7 +68,25 @@ struct CloseFrontMatter {
 #[derive(Debug, Default, Deserialize)]
 struct IdentitiesBlock {
     #[serde(default)]
-    instagram: Option<String>,
+    instagram: Option<Handles>,
+}
+
+/// #1796: `instagram: handle` and `instagram: [a, b]` are both valid; the
+/// feed follows the first handle, as before.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Handles {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Handles {
+    fn first(self) -> Option<String> {
+        match self {
+            Handles::One(h) => Some(h),
+            Handles::Many(v) => v.into_iter().next(),
+        }
+    }
 }
 
 /// Walk `layout.people_dir()`, returning every page that is BOTH `close:
@@ -106,6 +124,7 @@ pub fn close_instagram_contacts(layout: &WikiLayout) -> Vec<CloseContact> {
                     if let Some(handle) = fm
                         .identities
                         .instagram
+                        .and_then(Handles::first)
                         .map(|h| h.trim_start_matches('@').to_string())
                         .filter(|h| !h.is_empty())
                     {
@@ -373,6 +392,22 @@ mod tests {
         assert_eq!(contacts[0].slug, "tony");
         // @ stripped
         assert_eq!(contacts[0].instagram_handle, "tony_ig");
+    }
+
+    #[test]
+    fn a_close_contact_with_a_list_of_handles_is_not_skipped() {
+        // #1796: list-shaped `instagram:` used to fail the whole page.
+        let dir = tempfile::tempdir().unwrap();
+        let layout = WikiLayout::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(layout.people_dir()).unwrap();
+        write_page(
+            &layout.people_dir(),
+            "jenna",
+            "kind: person\nclose: true\nidentities:\n  instagram: [\"@first_ig\", second_ig]",
+        );
+        let contacts = close_instagram_contacts(&layout);
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].instagram_handle, "first_ig");
     }
 
     #[test]

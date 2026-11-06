@@ -8,6 +8,8 @@ pub(crate) mod control_command;
 pub(crate) mod run_command;
 #[path = "autoship_merge_recovery.rs"]
 pub(crate) mod merge_recovery;
+#[path = "autoship_delivery_command.rs"]
+pub(crate) mod delivery_command;
 // Shared command projections. Read paths never create state or launch work.
 use crate::autoship_workflow::{OperationKind, Stage, WorkflowStore};
 use anyhow::{ensure, Result};

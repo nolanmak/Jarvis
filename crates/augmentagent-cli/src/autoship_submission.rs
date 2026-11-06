@@ -42,22 +42,27 @@ pub struct Admission {
     pub provider: Option<Provider>,
 }
 
+pub(crate) fn normalized_repository(repository:&str)->Result<String> {
+    ensure!(
+        repository.len() <= 256,
+        "repository identity exceeds bound"
+    );
+    let parts: Vec<_> = repository.split('/').collect();
+    ensure!(
+        parts.len() == 2
+        && parts.iter().all(|part| !part.is_empty()
+            && !matches!(*part, "." | "..")
+            && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))),
+        "invalid repository identity"
+    );
+    Ok(repository.to_ascii_lowercase())
+}
+
 impl Request {
     pub(crate) fn normalized(&self) -> Result<Self> {
-        ensure!(
-            self.repository.len() <= 256,
-            "repository identity exceeds bound"
-        );
-        let parts: Vec<_> = self.repository.split('/').collect();
-        ensure!(
-            parts.len() == 2
-                && parts.iter().all(|part| !part.is_empty()
-                    && !matches!(*part, "." | "..")
-                    && part
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))),
-            "invalid repository identity"
-        );
+        normalized_repository(&self.repository)?;
         let number = match self.target {
             Target::Issue(n) | Target::Pr(n) => n,
         };

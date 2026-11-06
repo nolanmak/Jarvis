@@ -1,0 +1,33 @@
+# Trusted-contact autonomy (#1833) — EXAMPLE ONLY. Fake people and data.
+#
+# The real file is config/trusted-contacts.toml (gitignored), or the path in
+# AUGMENTAGENT_TRUSTED_CONTACTS. Write it with the owner-run CLI only:
+#
+#   augmentagent --wiki-dir ./wiki trust add <slug> --tier actions
+#   augmentagent trust add <slug> --tier actions --handle imessage:+12025550100 \
+#       --handle email:jane@work.example.test --calendar-email jane@work.example.test \
+#       --allow calendar.add_guest --allow calendar.send_details
+#   augmentagent trust confirm <slug>     # new or changed entries stay pending until confirmed
+#
+# Every handle must be canonical: `email:<lowercased address>` or
+# `imessage:<E.164 phone | lowercased Apple-ID email>`. Autonomy is off unless
+# AUGMENTAGENT_AUTONOMY=on.
+
+# `actions` tier: only the listed registry actions run without a click, and
+# every message is a fixed template built from the calendar event.
+[[contact]]
+wiki = "jane-doe"
+tier = "actions"
+allowed_actions = ["calendar.add_guest", "calendar.send_details"]
+handles = ["imessage:+12025550100", "email:jane@work.example.test"]
+calendar_email = "jane@work.example.test"
+daily_cap = 10
+
+# `full` tier: registry actions plus the drafter's own reply (subject to the
+# evidence, 1:1, content-floor and cap checks). allowed_actions stays empty.
+[[contact]]
+wiki = "sam-roe"
+tier = "full"
+handles = ["imessage:sam@icloud.example.test", "email:sam@example.test"]
+calendar_email = "sam@example.test"
+preferred_channel = "imessage:sam@icloud.example.test"

@@ -251,6 +251,13 @@ pub static PRODUCERS: &[Producer] = &[
     act(p("owner_alert_scheduler", "crates/augmentagent-approval-discord/src/owner_alerts.rs", ".post_owner_alert(", 1, BROKER, "persistent owner alert escalation")),
     act(p("owner_alert_route", "crates/augmentagent-approval-discord/src/sync.rs", ".post_owner_alert(", 1, BROKER, "Discord-only route for owner alert controls")),
     p("owner_alert_layout", "crates/augmentagent-approval-discord/src/owner_alerts.rs", "CreateMessage::new(", 1, TRANSPORT, "owner alert presentation"),
+    // -- Trusted-contact autonomy (#1833) --------------------------------------
+    act(p("autonomy_cards", "crates/augmentagent-approval-discord/src/broker.rs", "send_message(&", 3, BROKER, "autonomy: noted cards, plan notices (Undo / Pause), trusted-contacts notices (Confirm)")),
+    p("autonomy_layout", "crates/augmentagent-approval-discord/src/autonomy.rs", "CreateMessage::new(", 2, TRANSPORT, "autonomy notice and trusted-contacts notice builders"),
+    p("trust_notice_default", "crates/augmentagent-approval-discord/src/lib.rs", ".post_digest(", 1, BROKER, "trusted-contacts notice on surfaces without buttons"),
+    p("autonomy_forwarding", "crates/augmentagent-autonomy/src/broker.rs", ".post_digest(", 1, BROKER, "AutonomyBroker forwards to the inner broker"),
+    p("autonomy_forwarding", "crates/augmentagent-autonomy/src/broker.rs", ".post_flag_notice(", 1, BROKER, "AutonomyBroker forwards to the inner broker"),
+    p("autonomy_forwarding", "crates/augmentagent-autonomy/src/broker.rs", ".post_owner_alert(", 1, BROKER, "AutonomyBroker forwards to the inner broker"),
     p("broker_fan_out", "crates/augmentagent-approval-discord/src/sync.rs", ".post_digest(", 1, BROKER, "MultiSurfaceBroker fan-out"),
     p("broker_fan_out", "crates/augmentagent-approval-discord/src/sync.rs", ".post_flag_notice(", 1, BROKER, "MultiSurfaceBroker fan-out"),
     p("broker_default_notice", "crates/augmentagent-approval-discord/src/lib.rs", ".post_flag_notice(", 1, BROKER, "ApprovalBroker default notice"),

@@ -257,6 +257,58 @@ impl ApprovalBroker for MultiSurfaceBroker {
         any_ok("card", results).map(|_| ())
     }
 
+    async fn post_approval_noted(
+        &self,
+        action_id: &str,
+        email: &Email,
+        draft: &str,
+        note: &str,
+    ) -> Result<(), ApprovalError> {
+        let mut results = Vec::new();
+        for (name, broker) in &self.surfaces {
+            if !broker.is_available() {continue;}
+            results.push((*name, broker.post_approval_noted(action_id, email, draft, note).await));
+        }
+        any_ok("card", results).map(|_| ())
+    }
+
+    /// #1833 D10 — any available surface that can post the notice counts.
+    fn can_post_autonomy_notice(&self) -> bool {
+        self.surfaces.iter().any(|(_, b)| b.is_available() && b.can_post_autonomy_notice())
+    }
+
+    /// #1833 D10 — the notice goes to the first available surface that can
+    /// post it (Discord today): its message id is the plan's notice id.
+    async fn post_autonomy_notice(
+        &self,
+        notice: &crate::autonomy::AutonomyNotice,
+    ) -> Result<String, ApprovalError> {
+        let mut last = None;
+        for (name, broker) in &self.surfaces {
+            if !broker.is_available() || !broker.can_post_autonomy_notice() {continue;}
+            match broker.post_autonomy_notice(notice).await {
+                Ok(id) => return Ok(id),
+                Err(e) => {
+                    warn!(surface = name, "autonomy notice failed on this surface: {e}");
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| ApprovalError::Unsupported("autonomy notices".into())))
+    }
+
+    async fn post_trust_notice(
+        &self,
+        notice: &crate::autonomy::TrustNotice,
+    ) -> Result<(), ApprovalError> {
+        let mut results = Vec::new();
+        for (name, broker) in &self.surfaces {
+            if !broker.is_available() || !broker.can_post_notices() {continue;}
+            results.push((*name, broker.post_trust_notice(notice).await));
+        }
+        any_ok("trust notice", results).map(|_| ())
+    }
+
     async fn note_compose_activity(&self, action_id: &str, email: &Email) -> Result<(), ApprovalError> {
         let mut results = Vec::new();
         for (name, broker) in &self.surfaces {

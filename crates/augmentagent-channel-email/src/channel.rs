@@ -2998,6 +2998,77 @@ Where: Microsoft Teams
         .await;
     }
 
+    /// #1833 C6 (D7) — the autonomy gate reads the evidence receipt by
+    /// action id inside `post_approval`, so it must already be attached
+    /// when the card is posted.
+    #[tokio::test]
+    async fn email_receipt_attached_before_card() {
+        struct SeesReceipt {
+            store: Arc<Store>,
+            seen: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+        }
+        #[async_trait]
+        impl ApprovalBroker for SeesReceipt {
+            async fn post_approval(
+                &self,
+                action_id: &str,
+                _email: &Email,
+                _draft: &str,
+            ) -> Result<(), augmentagent_approval_discord::ApprovalError> {
+                let receipts = self.store.draft_context_receipts(action_id).unwrap();
+                self.seen.lock().unwrap().push((action_id.to_string(), receipts));
+                Ok(())
+            }
+            async fn post_flag_notice(
+                &self,
+                _email: &Email,
+                _reason: &str,
+            ) -> Result<(), augmentagent_approval_discord::ApprovalError> {
+                Ok(())
+            }
+        }
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                attachments: Vec::new(),
+                to: String::new(),
+                cc: String::new(),
+                message_id: "m-c6".into(),
+                thread_id: Some("t-c6".into()),
+                from: "user@example.com".into(),
+                subject: "Invite".into(),
+                body: "not seeing an invite for this meeting today".into(),
+                date: "2026-04-13".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"invite"}"#,
+            "Let me check.",
+        ]));
+        let broker = Arc::new(SeesReceipt { store: store.clone(), seen: Default::default() });
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(ch.poll_once().await.unwrap().awaiting_approval, 1);
+        let seen = broker.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(!seen[0].1.is_empty(), "the receipt was attached before the card");
+        let receipt: serde_json::Value = serde_json::from_str(seen[0].1.last().unwrap()).unwrap();
+        assert_eq!(receipt["review_finished"], true);
+        assert_eq!(receipt["gaps"], serde_json::json!([]));
+    }
+
     #[tokio::test]
     async fn live_reply_flow_posts_approval_card() {
         let (store, _f) = tmp_store();

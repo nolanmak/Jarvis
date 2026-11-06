@@ -554,7 +554,12 @@ pub(super) async fn gate_for(
         tracing::warn!(error = %error, "autoship constraint learning deferred");
     }
     let (rules, policy_hash) = policy(&policy_root)?;
-    let evidence = hunks(root, &base, &head).await?;
+    // Judge only the candidate's own changes. `main` moves while a build runs
+    // (other sessions merge every 10-40 minutes); a two-dot diff against the
+    // new tip also contains upstream commits, reversed, and refused candidates
+    // for "editing" files they never touched (#1883, #1885 on 2026-11-05).
+    let since = git(root, &["merge-base", &base, &head]).await?.trim().to_owned();
+    let evidence = hunks(root, &since, &head).await?;
     let actual: Vec<_> = evidence.iter().map(|e| e.hunk.clone()).collect();
     for hunk in &actual {
         ensure!(
@@ -768,7 +773,8 @@ pub(super) async fn assert_current(
         "alignment promoted constraints changed"
     );
     assess(prepared, &artifact.hunks, &artifact.mappings)?;
-    let evidence = hunks(root, &reference.base, &reference.head).await?;
+    let since = git(root, &["merge-base", &reference.base, &reference.head]).await?.trim().to_owned();
+    let evidence = hunks(root, &since, &reference.head).await?;
     let (rules, _) = policy(&reference.policy_root)?;
     exceptions::assert_current(
         &rules,
@@ -872,6 +878,34 @@ mod tests {
                 evidence: "Independently registered baseline regression harness".into(),
             },
         ]
+    }
+    #[tokio::test]
+    async fn hunks_since_the_merge_base_exclude_files_main_changed_after_the_candidate_branched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git").args(["-c","user.name=t","-c","user.email=t@example.invalid","-c","commit.gpgsign=false"])
+                .args(args).current_dir(root).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("candidate.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("upstream.rs"), "fn u() {}\n").unwrap();
+        run(&["add", "."]); run(&["commit", "-qm", "base"]);
+        run(&["checkout", "-qb", "candidate"]);
+        std::fs::write(root.join("candidate.rs"), "fn a() { 1; }\n").unwrap();
+        run(&["commit", "-qam", "candidate"]);
+        let head = run(&["rev-parse", "HEAD"]);
+        run(&["checkout", "-q", "main"]);
+        std::fs::write(root.join("upstream.rs"), "fn u() { 2; }\n").unwrap();
+        run(&["commit", "-qam", "upstream moved on"]);
+        let main = run(&["rev-parse", "HEAD"]);
+        let two_dot: Vec<_> = hunks(root, &main, &head).await.unwrap().into_iter().map(|e| e.hunk.path).collect();
+        assert!(two_dot.contains(&"upstream.rs".to_string()), "the old comparison saw upstream work as the candidate's");
+        let since = git(root, &["merge-base", &main, &head]).await.unwrap().trim().to_owned();
+        let own: Vec<_> = hunks(root, &since, &head).await.unwrap().into_iter().map(|e| e.hunk.path).collect();
+        assert_eq!(own, vec!["candidate.rs".to_string()]);
     }
     #[test]
     fn complete_support_mapping_passes_but_partial_issue_cannot_hide_behind_harness() {

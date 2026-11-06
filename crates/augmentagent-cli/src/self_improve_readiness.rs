@@ -36,11 +36,46 @@ fn unique_slots<'de,D:serde::Deserializer<'de>>(deserializer:D)->std::result::Re
     deserializer.deserialize_map(UniqueSlots)
 }
 fn request_hash(issue:&Issue)->String { amendment::digest(serde_json::to_string(&(issue.number,&issue.title,&issue.body)).unwrap().as_bytes()) }
+/// The closers (`}` / `]`) a JSON text still needs when it ends with every
+/// string terminated and only structure left open. `None` when it ends inside
+/// a string or has unbalanced closers: then nothing is guessed.
+fn close_truncated_json(raw:&str)->Option<String> {
+    let mut stack=Vec::new();
+    let (mut in_string,mut escaped)=(false,false);
+    for c in raw.chars() {
+        if in_string {
+            match c { _ if escaped=>escaped=false, '\\'=>escaped=true, '"'=>in_string=false, _=>{} }
+            continue;
+        }
+        match c {
+            '"'=>in_string=true,
+            '{'=>stack.push('}'),
+            '['=>stack.push(']'),
+            '}'|']'=>{ if stack.pop()!=Some(c) {return None;} }
+            _=>{}
+        }
+    }
+    if in_string || stack.is_empty() || stack.len()>4 {return None;}
+    Some(raw.to_owned()+&stack.into_iter().rev().collect::<String>())
+}
+
 fn decode(raw:&str)->Result<Assessment> {
     let raw=raw.trim();
     let raw=raw.strip_prefix("```json").and_then(|s|s.strip_suffix("```")).unwrap_or(raw).trim();
     ensure!(raw.len()<=64*1024,"readiness output exceeds bound");
-    let assessment:Assessment=serde_json::from_str(raw)?;
+    let assessment:Assessment=match serde_json::from_str(raw) {
+        Ok(assessment)=>assessment,
+        // Models sometimes drop the final closing brace(s). Completed outputs
+        // are replayed, so one such response failed every tick (#1883:
+        // "EOF while parsing an object at line 1 column 2066"). Only append
+        // the closers the open structure requires; content is never changed
+        // and the result is validated exactly like any other response.
+        Err(error) if error.is_eof() => match close_truncated_json(raw) {
+            Some(closed)=>serde_json::from_str(&closed).map_err(|_| error)?,
+            None=>return Err(error.into()),
+        },
+        Err(error)=>return Err(error.into()),
+    };
     let observed=assessment.slots.keys().map(String::as_str).collect::<BTreeSet<_>>();
     let expected=SLOTS.into_iter().collect::<BTreeSet<_>>();
     let missing=expected.difference(&observed).copied().collect::<Vec<_>>().join(",");
@@ -273,6 +308,15 @@ pub(in crate::self_improve) async fn decompose_unverifiable(repo:&Path,root:&Pat
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_response_missing_its_final_braces_is_closed_without_changing_content() {
+        assert_eq!(close_truncated_json(r#"{"a":{"b":[1,{"c":"x}"}]}"#).as_deref(), Some(r#"{"a":{"b":[1,{"c":"x}"}]}}"#));
+        assert_eq!(close_truncated_json(r#"{"a":"open string"#), None, "never guess inside a string");
+        assert_eq!(close_truncated_json(r#"{"a":1}}"#), None, "unbalanced closers are not repaired");
+        assert_eq!(close_truncated_json(r#"{"a":1}"#), None, "complete text needs nothing");
+        assert_eq!(close_truncated_json(r#"{"q":"a \" } quote","b":["#).as_deref(), Some(r#"{"q":"a \" } quote","b":[]}"#));
+    }
+
     use super::*;
     #[tokio::test]
     async fn schema_correction_is_grounded_and_completed_raw_response_survives_restart() {

@@ -228,7 +228,7 @@ pub(super) fn reconcile_runtime_retirements()->Result<usize> {
     reconcile_runtime_retirements_in(&mut WorkflowStore::open(&state)?,millis())
 }
 fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<usize> {
-    if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_none(){return Ok(0);}
+    if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_none(){store.settle_owner_execution_retries(now,16)?;return Ok(0);}
     let rows=store.pending_native_retirements(now,16)?;
     let mut completed=0;
     for (workflow,generation,audit_path) in rows {
@@ -238,6 +238,7 @@ fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<us
             Err(error)=>warn!("native runtime retirement retained for retry: {error:#}"),
         }
     }
+    store.settle_owner_execution_retries(now,16)?;
     Ok(completed)
 }
 
@@ -820,22 +821,19 @@ impl WorkflowGuard {
         let store = self.store.clone();
         let lease = self.lease.clone();
         let observational = self.repository.starts_with("autoship-observation/") || self.repository.starts_with("autoship-canary/");
-        self.audit.set_model_call_observer(Arc::new(move |_provider| {
+        self.audit.set_model_call_observer(Arc::new(move |provider| {
             anyhow::ensure!(!capacity_flag.load(Ordering::SeqCst), "resource_capacity: await_capacity checkpoint retained");
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
             anyhow::ensure!(!matches!(store.snapshot(&lease.workflow)?.context("workflow missing")?.checkpoint.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot admit another model call");
             let receipt = format!("model-call:{}", uuid::Uuid::new_v4());
-            let charge = ResourceCharge { model_calls:1, ..Default::default() };
-            if let Ok(bounded)=BOUNDED_NATIVE_CALL.try_with(Clone::clone) {
+            let bounded=BOUNDED_NATIVE_CALL.try_with(Clone::clone).ok();
+            if let Some(bounded)=&bounded {
                 anyhow::ensure!(bounded.workflow==lease.workflow,"bounded native call used a different workflow audit sink");
-                return store.charge_bounded_call(&lease,&receipt,millis(),observational.then(observation_call_cap),
-                    &bounded.purpose,&bounded.binding,bounded.limit);
             }
-            if observational {
-                store.charge_observation(&lease,&receipt,charge,millis(),observation_call_cap())
-            } else {
-                store.charge(&lease,&receipt,charge,millis())
-            }
+            let actual=match provider {"codex"=>Some(durable::submission::Provider::Codex),"claude"=>Some(durable::submission::Provider::Claude),_=>None};
+            store.charge_admitted_model(&lease,&receipt,millis(),observational.then(observation_call_cap),
+                bounded.as_ref().map(|b|(b.purpose.as_str(),&b.binding,b.limit)),actual,
+                augmentagent_channel_core::native_session::is_fresh_review())
         }))
     }
     /// Builder identity is checked independently of audit binding so reviewer
@@ -2863,12 +2861,16 @@ mod tests {
             assert!(result.is_err());
         }
         assert!(guard.bounded_native_calls("component".into(),2,async {guard.audit_logger().model_call_admitted("codex")}).await.is_err());
-        assert_eq!(WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,2);
+        let store=WorkflowStore::open(&path).unwrap();
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,2);
+        let progress=store.progress_events(guard.id()).unwrap();
+        assert_eq!(progress.last().unwrap().requested_provider,None);
+        assert_eq!(progress.last().unwrap().actual_provider.as_deref(),Some("codex"),"native admission must project the provider that actually ran, independently of the requested pin");
     }
 
     #[tokio::test]
     async fn ci_gate_reports_meaningful_success_only_after_a_passing_result() {
-        for disposition in ["passed","source-failed","infrastructure-failed"] {
+        for disposition in ["passed","hosted-pending","source-failed","infrastructure-failed"] {
             let directory=repo();let state=control_dir();let path=state.path().join("workflow.db");
             let mut guard=WorkflowGuard::acquire_at(&path,Start {
                 repo_root:directory.path(),worktree:directory.path(),repository:"owner/repo",
@@ -2878,12 +2880,13 @@ mod tests {
             let before=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
             let result=match disposition {
                 "passed"=>Ok(()),
+                "hosted-pending"=>Err(hosted_ci::AwaitingHostedCi.into()),
                 "source-failed"=>Err(anyhow::anyhow!("error[E0308]: mismatched types")),
                 _=>Err(anyhow::anyhow!("shared CI prerequisite unavailable: network offline")),
             };
             let outcome=CiGateResult(result).for_workflow(&mut guard).await;
             match disposition {
-                "passed"=>assert!(matches!(outcome,Ok(Ok(())))),
+                "passed" | "hosted-pending"=>assert!(matches!(outcome,Ok(Ok(())))),
                 "source-failed"=>assert!(matches!(outcome,Ok(Err(_)))),
                 _=>assert!(outcome.unwrap_err().downcast_ref::<CiInfrastructureDeferred>().is_some()),
             }

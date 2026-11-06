@@ -100,6 +100,18 @@ reconcile_worker_provisioning() {
   rm -f "$PROVISION_PENDING"
 }
 
+reconcile_worker_recovery() {
+  [ "$(uname -s)" = Linux ] || return 0
+  # This is runtime reconciliation, independent of provisioning/build stamps.
+  # The helper proves the live daemon's external mode and process birth before
+  # starting only a managed worker that exhausted systemd's restart allowance.
+  if ! python3 "$REPO_ROOT/scripts/recover-autopr-worker.py" \
+      --repository "$REPO_ROOT" --state "$AUGMENTAGENT_STATE_DIR" >> "$LOG" 2>&1; then
+    log "AUTO-SHIP WORKER RECOVERY FAILED — retry on the next normal update tick"
+    return 1
+  fi
+}
+
 # #1571 — the unit no longer runs what this script builds. A drop-in that
 # overrides ExecStart (2026-10-20: a rollout pinned a frozen copy of the
 # daemon) turns every tick into pull + rebuild + a verified bounce back onto
@@ -468,6 +480,7 @@ if [ "$LOCAL" = "$REMOTE" ]; then
       reconcile_worker_provisioning || exit 1
     fi
     reconcile_native_selection
+    reconcile_worker_recovery || exit 1
     log "up to date ($LOCAL)"
     exit 0
   fi
@@ -581,7 +594,7 @@ fi
 # Missing one means the PR merges but the daemon keeps the stale embedded copy.
 # scripts/tests/updater-rebuild-trigger.test.sh fails when a new include target
 # outside crates/ is added without being classified here.
-RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(ci-build-vm|ci-cargo-(boundary|relay|planner|staging|views|observer)|ci-cache-generation|ci-legacy-recovery-preview|ci-runtime-identity|ci-input-(manifest|lookups)|ci-lookup-inputs|ci-worker-scope|ci-dependency-(seed|artifacts|workspace|store|driver|guest)|native-provider-(vm(-guest)?|mcp-relay|gateway)|run-resource-scope|autoship-deployment-readiness|autoship-verifier-checkout|autoship-registry-integrity|autoship-scope-guard|codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor|pdf-runtime|code-mode-compute(-guest|-prepare)?)\.py$|scripts/ci-contract\.(py|json)$|scripts/run-rs\.sh$|sidecars/code-mode-runner/runner\.ts$)'
+RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(autoship-hosted-ci|ci-build-vm|ci-cargo-(boundary|relay|planner|staging|views|observer)|ci-cache-generation|ci-legacy-recovery-preview|ci-runtime-identity|ci-input-(manifest|lookups)|ci-lookup-inputs|ci-worker-scope|ci-dependency-(seed|artifacts|workspace|store|driver|guest)|native-provider-(vm(-guest)?|mcp-relay|gateway)|run-resource-scope|autoship-deployment-readiness|autoship-verifier-checkout|autoship-registry-integrity|autoship-scope-guard|codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor|pdf-runtime|code-mode-compute(-guest|-prepare)?)\.py$|scripts/ci-contract\.(py|json)$|scripts/run-rs\.sh$|sidecars/code-mode-runner/runner\.ts$)'
 if printf '%s\n' "$CHANGED_FILES" | grep -qE "$RUST_REBUILD_PATHS"; then
   NEEDS_REBUILD=1
 fi

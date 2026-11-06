@@ -513,7 +513,7 @@ class AdapterTests(unittest.TestCase):
    def format_image(argv,**kwargs):
     fd=int(argv[-1].split('/')[-1]);header=bytearray(1024)
     import struct
-    struct.pack_into('<I',header,4,capacity//4096);struct.pack_into('<I',header,24,2);header[56:58]=b'\x53\xef'
+    struct.pack_into('<I',header,4,capacity//4096);struct.pack_into('<I',header,12,capacity//4096);struct.pack_into('<I',header,24,2);header[56:58]=b'\x53\xef'
     os.pwrite(fd,header,1024)
    with patch.object(adapter.subprocess,'run',side_effect=format_image) as formatter:
     adapter.ensure_cache(image,capacity,lease);inode=image.stat().st_ino
@@ -522,6 +522,54 @@ class AdapterTests(unittest.TestCase):
     with self.assertRaisesRegex(vm.Unavailable,'capacity changed'):adapter.ensure_cache(image,capacity*2,lease)
     image.chmod(0o644)
     with self.assertRaisesRegex(vm.Unavailable,'identity'):adapter.ensure_cache(image,capacity,lease)
+ def test_nearly_full_protected_image_preserves_original_inode_and_retained_evidence(self):
+  # #1841 could discard a disposable legacy cache. Protected images also carry
+  # original ownership/recovery evidence; free-space percentages cannot retire it.
+  with tempfile.TemporaryDirectory() as d:
+   root=Path(d);request=self.fixture(root);target=root/'target';(target/'ci-vm').mkdir(parents=True,mode=0o700)
+   self.hold_cache_target(request,target);lease=adapter.InheritedStorage(request['storage'],root/'scratch')
+   image=target/'ci-vm/cache.img';capacity=64*1024*1024
+   marker=b'retained unknown original producer cleanup'
+   def format_image(argv,**kwargs):
+    fd=int(argv[-1].split('/')[-1]);header=bytearray(1024)
+    import struct
+    struct.pack_into('<I',header,4,capacity//4096)
+    struct.pack_into('<I',header,12,(capacity//4096)//20)
+    struct.pack_into('<I',header,24,2);header[56:58]=b'\x53\xef'
+    os.pwrite(fd,header,1024);os.pwrite(fd,marker,4096)
+   with patch.object(adapter.subprocess,'run',side_effect=format_image) as formatter:
+    adapter.ensure_cache(image,capacity,lease);identity=(image.stat().st_dev,image.stat().st_ino)
+    adapter.ensure_cache(image,capacity,lease)
+    adapter.ensure_cache(image,capacity,lease,allow_create=False)
+    self.assertEqual(formatter.call_count,1)
+    self.assertEqual((image.stat().st_dev,image.stat().st_ino),identity)
+    with image.open('rb') as stream:
+     stream.seek(4096);self.assertEqual(stream.read(len(marker)),marker)
+
+ def test_full_cache_outcomes_never_delete_protected_state_or_relaunch(self):
+  for failure in [vm.Unavailable('VM build cache is full'),
+    {'exit_code':101,'stdout':'','stderr':'No space left on device'},
+    {'exit_code':101,'stdout':'','stderr':'test result: FAILED. 1 failed'}]:
+   with self.subTest(failure=str(failure)),tempfile.TemporaryDirectory() as d:
+    root=Path(d);request=self.fixture(root);image=root/'cache.img'
+    marker=b'protected producer, live consumer, and unknown original cleanup'
+    image.write_bytes(marker);image.chmod(0o600);identity=(image.stat().st_dev,image.stat().st_ino)
+    request.update(operation='step',id='platform/platform/3',build_cache=str(image),cache_bytes=67108864)
+    calls=[]
+    def run(*a,**options):
+     calls.append(1)
+     if isinstance(failure,Exception):raise failure
+     return self.prepared_result(options,**failure)
+    with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache') as ensured:
+     if isinstance(failure,Exception):
+      with self.assertRaisesRegex(vm.Unavailable,'VM build cache is full'):adapter.execute(request,run=run)
+     else:
+      result=adapter.execute(request,run=run)
+      self.assertEqual(result['status'],'failed');self.assertNotIn('cache_reset',result)
+    self.assertEqual(len(calls),1);self.assertEqual(ensured.call_count,1)
+    self.assertEqual((image.stat().st_dev,image.stat().st_ino),identity)
+    self.assertEqual(image.read_bytes(),marker)
+
  def test_cache_refuses_symlink_and_missing_target_admission(self):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d);request=self.fixture(root);target=root/'target';(target/'ci-vm').mkdir(parents=True,mode=0o700)

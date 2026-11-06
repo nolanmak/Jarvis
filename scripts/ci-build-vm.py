@@ -148,7 +148,13 @@ class InheritedStorage:
 
 
 def ensure_cache(path, capacity, lease, *, allow_create=True):
-    """Provision only inside the controller's registered, already leased target."""
+    """Provision only inside the controller's registered, already leased target.
+
+    Unlike the former disposable cache, this image retains original producer,
+    consumer and recovery ownership. Neither a free-space percentage nor an
+    ENOSPC-looking build message authorizes unlink/reformat or a fresh retry.
+    Original generation retirement and checked cleanup own reclamation.
+    """
     path=Path(path)
     if type(allow_create) is not bool or type(capacity) is not int or capacity<64*1024*1024 or capacity%4096:
         raise vm.Unavailable('invalid managed CI cache capacity')

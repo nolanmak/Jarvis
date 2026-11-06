@@ -920,6 +920,22 @@ impl EventHandler for Handler {
                     }
                     return;
                 }
+                // #1833 D10 — autonomy notice controls (Undo / Pause this
+                // person / Pause all / Confirm): owner-only, routed to the
+                // controls the CLI installed.
+                if comp.data.custom_id.starts_with(crate::autonomy::CUSTOM_ID_PREFIX) {
+                    if !is_authorized(self.state.allowed_user_id, comp.user.id) {
+                        ack_ephemeral(&ctx, &comp, "Only the configured owner can change autonomy.").await;
+                        return;
+                    }
+                    if let Err(e) = defer_ephemeral(&ctx, &comp).await {
+                        warn!("failed to defer autonomy control: {e}");
+                        return;
+                    }
+                    let text = crate::autonomy::handle_control(&comp.data.custom_id).await;
+                    followup(&ctx, &comp, &text).await;
+                    return;
+                }
                 let Some(cid) = CustomId::parse(&comp.data.custom_id) else {
                     debug!("unrecognized custom_id: {}", comp.data.custom_id);
                     return;

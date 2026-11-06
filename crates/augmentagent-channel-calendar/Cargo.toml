@@ -25,6 +25,7 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

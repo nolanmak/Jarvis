@@ -45,8 +45,9 @@ impl Inputs<'_> {
             value["evidence_recovery"] = recovery;
         }
         let prompt = serde_json::to_string(&value)?;
-        anyhow::ensure!(prompt.len().saturating_add(self.system_bytes)<=aligned::MAX_PROMPT_BYTES,
-            "review evidence dependency exceeds serialized request budget; split the candidate or narrow the named dependency; no evidence truncated");
+        if prompt.len().saturating_add(self.system_bytes)>aligned::MAX_PROMPT_BYTES {
+            return Err(EvidenceBudget("review evidence dependency exceeds serialized request budget; split the candidate or narrow the named dependency; no evidence truncated".into()).into());
+        }
         coverage.prompt_hash = aligned::digest(prompt.as_bytes());
         Ok(Request {
             prompt,
@@ -84,10 +85,9 @@ impl Inputs<'_> {
             while middle > 0 && !body.is_char_boundary(middle) {
                 middle -= 1;
             }
-            anyhow::ensure!(
-                middle > 0,
-                "one evidence scalar/header exceeds the serialized request budget"
-            );
+            if middle == 0 {
+                return Err(EvidenceBudget("one evidence scalar/header exceeds the serialized request budget".into()).into());
+            }
             pending.push_front((format!("{path}/split1"), body[middle..].into()));
             pending.push_front((format!("{path}/split0"), body[..middle].into()));
         }
@@ -168,10 +168,9 @@ async fn immutable_file(root: &Path, head: &str, path: &str) -> Result<String> {
     let size = String::from_utf8(read(root, &["cat-file", "-s", parts[2]]).await?)?
         .trim()
         .parse::<usize>()?;
-    anyhow::ensure!(
-        size <= aligned::MAX_PROMPT_BYTES,
-        "requested source exceeds recovery bound: {path}"
-    );
+    if size > aligned::MAX_PROMPT_BYTES {
+        return Err(EvidenceBudget(format!("requested source exceeds recovery bound: {path}")).into());
+    }
     let bytes = read(root, &["cat-file", "blob", parts[2]]).await?;
     anyhow::ensure!(
         bytes.len() == size && !bytes.contains(&0),

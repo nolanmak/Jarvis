@@ -162,7 +162,11 @@ const RULES: &[(FailureClass, &[&str])] = &[
         "not logged in",
         "failed to authenticate",
         "could not be refreshed",
+        // Covers "please run /login" too.
         "run /login",
+        // The claude CLI's login is OAuth; codex has no oauth wording that
+        // isn't an auth failure.
+        "oauth",
         "invalid api key",
         "incorrect api key",
         "invalid_api_key",
@@ -340,6 +344,9 @@ mod tests {
             "Failed to authenticate: OAuth session expired and could not be refreshed",
             "Invalid API key · Please run /login",
             "Not logged in · Please run /login",
+            "OAuth token has expired. Please obtain a new token or refresh your existing token.",
+            "OAuth session expired",
+            "Please run /login",
         ] {
             assert_eq!(classify(detail, true), Auth, "{detail}");
         }

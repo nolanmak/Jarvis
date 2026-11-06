@@ -15,6 +15,10 @@ pub const OK_TOKEN: &str = "HEARTBEAT_OK";
 /// model said something substantive while also claiming "nothing to report".
 pub const ACK_MAX_CHARS: usize = 300;
 
+use crate::outreach::{
+    OutreachEntry, OutreachResult, MAX_OUTREACH, MAX_OUTREACH_CHARS, MAX_WHY_CHARS,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// Nothing needs attention.
@@ -58,6 +62,99 @@ fn from_object(object: &serde_json::Map<String, serde_json::Value>) -> Decision 
         },
         None => Decision::Invalid("`notify` is not a boolean".into()),
     }
+}
+
+/// D16 — the valid `outreach` entries of a reply, and what was dropped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutreachParse {
+    pub entries: Vec<OutreachEntry>,
+    pub dropped: Vec<OutreachResult>,
+}
+
+/// D16 — read the optional `"outreach"` list of the decision object.
+/// `roster` is the slugs the prompt offered (active `full`-tier contacts).
+///
+/// Fail closed per entry: an entry that is not an object, has any key
+/// besides `contact`/`message`/`why`, misses one, names a slug that is not
+/// on the roster (unknown, `actions` tier, pending, or a handle), repeats a
+/// contact, or is over length is dropped; the rest stands. Valid entries
+/// past the first [`MAX_OUTREACH`] are dropped. An [`Decision::Invalid`] reply yields
+/// nothing at all.
+pub fn parse_outreach(reply: &str, roster: &[String]) -> OutreachParse {
+    let mut out = OutreachParse::default();
+    if matches!(parse(reply), Decision::Invalid(_)) {
+        return out;
+    }
+    let Some(object) = last_decision_object(reply) else {
+        return out;
+    };
+    let items = match object.get("outreach") {
+        None | Some(serde_json::Value::Null) => return out,
+        Some(serde_json::Value::Array(items)) => items,
+        Some(_) => {
+            out.dropped
+                .push(OutreachResult::dropped(None, "`outreach` is not a list"));
+            return out;
+        }
+    };
+    for item in items {
+        let contact = item
+            .get("contact")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim);
+        match outreach_entry(item, roster) {
+            Ok(entry) if out.entries.iter().any(|e| e.contact == entry.contact) => {
+                out.dropped.push(OutreachResult::dropped(
+                    Some(&entry.contact),
+                    "a second message to the same person in one run",
+                ));
+            }
+            Ok(entry) if out.entries.len() >= MAX_OUTREACH => {
+                out.dropped.push(OutreachResult::dropped(
+                    Some(&entry.contact),
+                    format!("over the cap of {MAX_OUTREACH} per run"),
+                ));
+            }
+            Ok(entry) => out.entries.push(entry),
+            Err(why) => out.dropped.push(OutreachResult::dropped(contact, why)),
+        }
+    }
+    out
+}
+
+fn outreach_entry(item: &serde_json::Value, roster: &[String]) -> Result<OutreachEntry, String> {
+    let serde_json::Value::Object(map) = item else {
+        return Err("entry is not an object".into());
+    };
+    if let Some(extra) = map
+        .keys()
+        .find(|k| !matches!(k.as_str(), "contact" | "message" | "why"))
+    {
+        return Err(format!("unexpected field `{extra}`"));
+    }
+    let field = |name: &str| -> Result<String, String> {
+        map.get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("`{name}` missing or empty"))
+    };
+    let (contact, message, why) = (field("contact")?, field("message")?, field("why")?);
+    if !roster.contains(&contact) {
+        return Err("not a full-tier trusted contact".into());
+    }
+    if message.chars().count() > MAX_OUTREACH_CHARS {
+        return Err(format!("message over {MAX_OUTREACH_CHARS} characters"));
+    }
+    if why.chars().count() > MAX_WHY_CHARS {
+        return Err(format!("why over {MAX_WHY_CHARS} characters"));
+    }
+    Ok(OutreachEntry {
+        contact,
+        message,
+        why,
+    })
 }
 
 /// The last top-level JSON object in `text` that has a `notify` key. Prose,
@@ -210,5 +307,146 @@ mod tests {
         assert!(invalid(parse("Your flight moved to 6pm.")));
         assert!(invalid(parse("")));
         assert!(invalid(parse("{not json}")));
+    }
+
+    // ----- D16 / C10 outreach --------------------------------------------
+
+    fn roster(slugs: &[&str]) -> Vec<String> {
+        slugs.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn contacts(p: &OutreachParse) -> Vec<&str> {
+        p.entries.iter().map(|e| e.contact.as_str()).collect()
+    }
+
+    #[test]
+    fn outreach_parsed_and_capped_at_two() {
+        let reply = r#"{"notify": false, "outreach": [
+            {"contact": "jane-doe", "message": "Can you send the deck by 3?", "why": "deck due today"},
+            {"contact": "sam-roe", "message": "Running 10 min late", "why": "calendar overlap"},
+            {"contact": "alex-poe", "message": "Third one", "why": "over the cap"}
+        ]}"#;
+        // The notify contract is untouched by the extra key.
+        assert_eq!(parse(reply), Decision::Silent);
+        let p = parse_outreach(reply, &roster(&["jane-doe", "sam-roe", "alex-poe"]));
+        assert_eq!(contacts(&p), vec!["jane-doe", "sam-roe"]);
+        assert_eq!(p.entries[0].message, "Can you send the deck by 3?");
+        assert_eq!(p.entries[0].why, "deck due today");
+        assert_eq!(p.dropped.len(), 1, "{:?}", p.dropped);
+        assert_eq!(p.dropped[0].contact, "alex-poe");
+        assert_eq!(p.dropped[0].status, "dropped");
+        assert_eq!(MAX_OUTREACH, 2);
+
+        // Alongside a notice, both stand.
+        let reply = r#"{"notify": true, "message": "Deck due at 3", "outreach": [
+            {"contact": "jane-doe", "message": "Deck by 3?", "why": "due"}]}"#;
+        assert_eq!(parse(reply), Decision::Notify("Deck due at 3".into()));
+        assert_eq!(
+            contacts(&parse_outreach(reply, &roster(&["jane-doe"]))),
+            vec!["jane-doe"]
+        );
+
+        // No outreach key, an empty list, or the bare token: nothing.
+        for reply in [
+            r#"{"notify": false}"#,
+            r#"{"notify": false, "outreach": []}"#,
+            "HEARTBEAT_OK",
+        ] {
+            let p = parse_outreach(reply, &roster(&["jane-doe"]));
+            assert!(p.entries.is_empty() && p.dropped.is_empty(), "{reply}");
+        }
+    }
+
+    #[test]
+    fn unknown_or_actions_tier_slug_dropped() {
+        // The roster holds only active full-tier slugs: an actions-tier
+        // contact (bob-roe) is simply not on it, like an unknown slug.
+        let reply = r#"{"notify": false, "outreach": [
+            {"contact": "bob-roe", "message": "hi", "why": "actions tier"},
+            {"contact": "nobody-here", "message": "hi", "why": "unknown"},
+            {"contact": "jane-doe", "message": "hi Jane", "why": "full tier"}
+        ]}"#;
+        let p = parse_outreach(reply, &roster(&["jane-doe"]));
+        assert_eq!(contacts(&p), vec!["jane-doe"]);
+        let dropped: Vec<&str> = p.dropped.iter().map(|d| d.contact.as_str()).collect();
+        assert_eq!(dropped, vec!["bob-roe", "nobody-here"]);
+        // A handle is never accepted in place of a slug.
+        let reply = r#"{"notify": false, "outreach": [
+            {"contact": "imessage:+12025550100", "message": "hi", "why": "handle"}]}"#;
+        assert!(parse_outreach(reply, &roster(&["jane-doe"]))
+            .entries
+            .is_empty());
+        // With no roster (outreach off) nothing is ever valid.
+        let reply = r#"{"notify": false, "outreach": [
+            {"contact": "jane-doe", "message": "hi", "why": "x"}]}"#;
+        assert!(parse_outreach(reply, &[]).entries.is_empty());
+    }
+
+    #[test]
+    fn extra_field_drops_entry() {
+        let reply = r#"{"notify": true, "message": "FYI", "outreach": [
+            {"contact": "jane-doe", "message": "hi", "why": "x", "to": "+12025550100"},
+            {"contact": "jane-doe", "message": "hi"},
+            {"contact": "jane-doe", "message": "  ", "why": "blank"},
+            "just a string"
+        ]}"#;
+        let p = parse_outreach(reply, &roster(&["jane-doe", "sam-roe"]));
+        assert!(p.entries.is_empty(), "{:?}", p.entries);
+        assert_eq!(p.dropped.len(), 4);
+        // The rest of the decision stands.
+        assert_eq!(parse(reply), Decision::Notify("FYI".into()));
+
+        // One bad entry does not take the good one with it.
+        let reply = r#"{"notify": false, "outreach": [
+            {"contact": "jane-doe", "message": "hi", "why": "x", "recipient": "someone"},
+            {"contact": "sam-roe", "message": "hello Sam", "why": "y"}
+        ]}"#;
+        let p = parse_outreach(reply, &roster(&["jane-doe", "sam-roe"]));
+        assert_eq!(contacts(&p), vec!["sam-roe"]);
+
+        // Over-long messages are dropped, not truncated; so is a list that
+        // is not a list.
+        let long = format!(
+            r#"{{"notify": false, "outreach": [{{"contact": "jane-doe", "message": "{}", "why": "x"}}]}}"#,
+            "a".repeat(MAX_OUTREACH_CHARS + 1)
+        );
+        assert!(parse_outreach(&long, &roster(&["jane-doe"]))
+            .entries
+            .is_empty());
+        let long_why = format!(
+            r#"{{"notify": false, "outreach": [{{"contact": "jane-doe", "message": "hi", "why": "{}"}}]}}"#,
+            "w".repeat(MAX_WHY_CHARS + 1)
+        );
+        assert!(parse_outreach(&long_why, &roster(&["jane-doe"]))
+            .entries
+            .is_empty());
+        let p = parse_outreach(
+            r#"{"notify": false, "outreach": {"contact": "jane-doe"}}"#,
+            &roster(&["jane-doe"]),
+        );
+        assert!(p.entries.is_empty());
+        assert_eq!(p.dropped.len(), 1);
+        // Two entries for the same person in one run: the second is dropped.
+        let reply = r#"{"notify": false, "outreach": [
+            {"contact": "jane-doe", "message": "one", "why": "x"},
+            {"contact": "jane-doe", "message": "two", "why": "y"}]}"#;
+        let p = parse_outreach(reply, &roster(&["jane-doe"]));
+        assert_eq!(p.entries.len(), 1);
+        assert_eq!(p.entries[0].message, "one");
+    }
+
+    #[test]
+    fn invalid_decision_never_outreaches() {
+        let entry = r#"[{"contact": "jane-doe", "message": "hi", "why": "x"}]"#;
+        for reply in [
+            format!(r#"{{"notify": true, "outreach": {entry}}}"#),
+            format!(r#"{{"notify": "yes", "message": "m", "outreach": {entry}}}"#),
+            format!(r#"{{"outreach": {entry}}}"#),
+            format!(r#"Sure! {{"notify": true, "message": "", "outreach": {entry}}}"#),
+        ] {
+            assert!(invalid(parse(&reply)), "{reply}");
+            let p = parse_outreach(&reply, &roster(&["jane-doe"]));
+            assert!(p.entries.is_empty(), "{reply}");
+        }
     }
 }
