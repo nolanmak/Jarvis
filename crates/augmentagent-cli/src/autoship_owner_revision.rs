@@ -31,6 +31,7 @@ pub(crate) struct OwnerPreparationBinding {
     baseline_receipts_sha256:String,
 }
 impl OwnerPreparationBinding {
+    pub(crate) fn context_sha256(&self)->&str {&self.context_sha256}
     pub(crate) fn from_artifact(artifact_sha256:String,context_sha256:String,
         registration:&RegisteredContract,receipts:&[VerifierReceipt])->Result<Self> {
         let value=Self {version:1,artifact_sha256,context_sha256,
@@ -60,7 +61,7 @@ impl WorkflowStore {
     /// metadata activation only: baseline/candidate checks and review still gate shipping.
     #[cfg(test)]
     pub fn activate_owner_revision(&mut self,turn:&OwnerTurn,previous:&RegisteredContract,next:&RegisteredContract,binding:&Binding,root:&Path,now:i64)->Result<OwnerTurn> {
-        self.activate_owner_contract(turn,Some(previous),next,None,binding,VerifierAuthority::Candidate(root),now)
+        self.activate_owner_contract(turn,Some(previous),next,None,binding,VerifierAuthority::Candidate(root),None,now)
     }
     /// Only the owning guard can attest that its current contract is still
     /// unregistered intake. Registration is not owner-input completion.
@@ -74,12 +75,21 @@ impl WorkflowStore {
             AcceptanceSource::PullRequest(n)=>pr_workflow_id(&request.repository,n)?,
         };
         ensure!(expected==turn.lease.workflow,"initial owner acceptance source changed");
-        self.activate_owner_contract(turn,None,next,Some(baseline),binding,VerifierAuthority::Candidate(root),now)
+        self.activate_owner_contract(turn,None,next,Some(baseline),binding,VerifierAuthority::Candidate(root),None,now)
     }
     /// Trusted controller metadata only. Adapter authority comes from the
     /// protected registration map, never from worker files or ignored copies.
+    #[cfg(test)]
     pub(crate) fn activate_private_owner_acceptance(&mut self,proof:Option<&crate::self_improve::InitialOwnerAcceptance>,
         turn:&OwnerTurn,previous:Option<&RegisteredContract>,next:&RegisteredContract,baseline:&[VerifierReceipt],files:&std::collections::BTreeMap<String,String>,preparation:&OwnerPreparationBinding,binding:&Binding,now:i64)->Result<OwnerTurn> {
+        self.activate_private_owner_acceptance_inner(proof,turn,previous,next,baseline,files,preparation,binding,None,now)
+    }
+    pub(crate) fn activate_private_owner_acceptance_with_publication(&mut self,proof:Option<&crate::self_improve::InitialOwnerAcceptance>,
+        turn:&OwnerTurn,previous:Option<&RegisteredContract>,next:&RegisteredContract,baseline:&[VerifierReceipt],files:&std::collections::BTreeMap<String,String>,preparation:&OwnerPreparationBinding,binding:&Binding,publication:&crate::self_improve::OwnerPublicationDraft<'_>,now:i64)->Result<OwnerTurn> {
+        self.activate_private_owner_acceptance_inner(proof,turn,previous,next,baseline,files,preparation,binding,Some(publication),now)
+    }
+    fn activate_private_owner_acceptance_inner(&mut self,proof:Option<&crate::self_improve::InitialOwnerAcceptance>,
+        turn:&OwnerTurn,previous:Option<&RegisteredContract>,next:&RegisteredContract,baseline:&[VerifierReceipt],files:&std::collections::BTreeMap<String,String>,preparation:&OwnerPreparationBinding,binding:&Binding,publication:Option<&crate::self_improve::OwnerPublicationDraft<'_>>,now:i64)->Result<OwnerTurn> {
         ensure!(next.baseline_result(baseline)?==BaselineResult::Reproduced,"private owner acceptance lacks intended-red baseline");
         if previous.is_none() {
             ensure!(proof.context("initial owner acceptance guard missing")?.matches(turn),"initial owner acceptance guard changed");
@@ -87,10 +97,10 @@ impl WorkflowStore {
             let expected=match next.contract().source()? {AcceptanceSource::Issue(n)=>workflow_id(&request.repository,n)?,AcceptanceSource::PullRequest(n)=>pr_workflow_id(&request.repository,n)?};
             ensure!(expected==turn.lease.workflow,"initial owner acceptance source changed");
         }else {ensure!(proof.is_none(),"revised owner acceptance cannot reuse intake proof");}
-        self.activate_owner_contract(turn,previous,next,previous.is_none().then_some(baseline),binding,VerifierAuthority::Private(files,preparation,baseline),now)
+        self.activate_owner_contract(turn,previous,next,previous.is_none().then_some(baseline),binding,VerifierAuthority::Private(files,preparation,baseline),publication,now)
     }
     fn activate_owner_contract(&mut self,turn:&OwnerTurn,previous:Option<&RegisteredContract>,next:&RegisteredContract,
-        baseline:Option<&[VerifierReceipt]>,binding:&Binding,authority:VerifierAuthority<'_>,now:i64)->Result<OwnerTurn> {
+        baseline:Option<&[VerifierReceipt]>,binding:&Binding,authority:VerifierAuthority<'_>,publication:Option<&crate::self_improve::OwnerPublicationDraft<'_>>,now:i64)->Result<OwnerTurn> {
         let preparation=match authority {VerifierAuthority::Private(files,preparation,receipts)=>{
                 next.verify_files(files)?;preparation.validate(next,receipts)?;
                 let raw=serde_json::to_string(receipts)?;ensure!(raw.len()<=4*1024*1024,"owner preparation baseline exceeds bound");
@@ -124,6 +134,7 @@ impl WorkflowStore {
         let registration=serde_json::to_string(next)?;ensure!(registration.len()<=4*1024*1024,"owner revision registration exceeds bound");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_history(&tx,&turn.lease.workflow)?;
+        let publication_raw=publication.map(|draft|draft.encode_for_activation(turn,next,preparation.as_ref().context("owner publication preparation missing").map(|p|&p.0)?,binding)).transpose()?;
         let body_hash=format!("{:x}",Sha256::digest(turn.body.as_bytes()));
         let expected_old=old;
         let prior:Option<(String,String,String,String)>=tx.query_row("SELECT previous_contract,next_contract,binding,owner_message_sha256 FROM workflow_owner_revision WHERE request_id=?1",[&turn.request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
@@ -136,6 +147,7 @@ impl WorkflowStore {
             let fence:Option<(i64,i64)>=tx.query_row("SELECT previous_generation,next_generation FROM workflow_owner_revision_fence WHERE request_id=?1",[&turn.request_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             let (before,after)=fence.context("unfenced legacy owner revision requires reconciliation")?;
             ensure!(turn.lease.generation==before || turn.lease.generation==after,"owner revision lease changed");
+            if let Some(raw)=&publication_raw {super::owner_publication::require(&tx,&turn.request_id,&super::owner_publication::reference(raw),raw)?;}
             let revised=OwnerTurn {lease:Lease {generation:after,..turn.lease.clone()},binding:binding.clone(),..turn.clone()};
             super::owner_turn::validate_turn(&tx,&revised,now)?;return Ok(revised);
         }
@@ -156,7 +168,9 @@ impl WorkflowStore {
         let mut activation=serde_json::json!({"request_id":turn.request_id,"previous_contract":expected_old,"next_contract":next.contract_hash(),"revision":next.contract().revision,"owner_message_sha256":body_hash});
         if let Some(hash)=baseline_hash {activation["baseline_receipts_sha256"]=hash.into();}
         if let Some((record,_))=&preparation {activation["preparation"]=serde_json::to_value(record)?;}
+        if let Some(raw)=&publication_raw {activation["publication"]=serde_json::to_value(super::owner_publication::reference(raw))?;}
         event(&tx,&turn.lease.workflow,generation,kind,&activation.to_string(),now)?;
+        if let Some(raw)=&publication_raw {super::owner_publication::persist(&tx,raw,now)?;}
         event(&tx,&turn.lease.workflow,generation,"checkpoint",&serde_json::to_string(&checkpoint)?,now)?;
         validate_history(&tx,&turn.lease.workflow)?;tx.commit()?;Ok(revised)
     }

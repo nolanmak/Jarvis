@@ -1385,12 +1385,13 @@ impl WorkflowGuard {
         // across native settlement before changing its registered scope.
         owner_prepared.validate_current(&self,&self.worktree,previous)?;
         let preparation=owner_prepared.activation_binding()?;
+        let publication=acceptance::owner::publication::stage(&self,owner_prepared,previous,&binding)?;
         let initial=previous.is_none().then(||InitialOwnerAcceptance {lease:self.lease.clone(),binding:self.binding.clone()});
         let revised={
             let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("private owner acceptance store poisoned"))?;
             let now=millis();let turn=store.owner_turn_for_lease(&self.lease,now)?;
             charge_elapsed(&mut store,&self.lease,self.started,&self.accounted_ms,now)?;
-            store.activate_private_owner_acceptance(initial.as_ref(),&turn,previous,next,&prepared.baseline.receipts,&prepared.proposal.files,&preparation,&binding,now)?
+            store.activate_private_owner_acceptance_with_publication(initial.as_ref(),&turn,previous,next,&prepared.baseline.receipts,&prepared.proposal.files,&preparation,&binding,&publication,now)?
         };
         let guard=self.finish_owner_contract_change(revised,contract,environment,"owner_private_acceptance_guard_ready",&old,next.contract_hash())?;
         anyhow::ensure!(owner_prepared.activation_binding()?==preparation,"owner preparation changed during native settlement");
@@ -1724,6 +1725,7 @@ impl WorkflowGuard {
             .issue_fresh_review_origin(&self.lease, &self.binding, millis())
     }
 
+    pub(super) fn candidate_path(&self)->&Path {&self.worktree}
     pub(super) fn repository(&self) -> &str {
         &self.repository
     }
@@ -3862,6 +3864,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_publication_failure_rolls_back_activation_and_retains_staged_evidence() {
+        let control=control_dir();
+        let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--test-threads=1"])
+            .env("AUTOSHIP_INITIAL_GUARD_CHILD",control.path()).env("AUTOSHIP_INITIAL_GUARD_MODE","owner-early-acceptance-producer-publication-write-failure")
+            .env("XDG_STATE_HOME",control.path().join("operator-state")).env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json")).output().unwrap();
+        assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[tokio::test]
     async fn owner_body_admission_rechecks_original_preparation_in_actual_callbacks() {
         let control=control_dir();
         let status=std::process::Command::new(std::env::current_exe().unwrap())
@@ -4022,7 +4033,7 @@ mod tests {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session","owner-setup-codex-revision-unconfigured-session","owner-early-fresh","owner-early-explicit-pause","owner-early-no-input","owner-early-corrupt-input","owner-early-history","owner-early-policy-retry","owner-early-register-write-failure","owner-early-initial-acceptance","owner-early-initial-acceptance-green-baseline","owner-early-initial-acceptance-write-failure","owner-early-initial-acceptance-history-loss","owner-early-initial-acceptance-setup-failure","owner-early-initial-acceptance-baseline-tamper","owner-early-initial-acceptance-unconfigured","owner-early-initial-acceptance-repeat","owner-early-initial-acceptance-wrong-source","owner-early-initial-acceptance-first-build","owner-early-initial-acceptance-first-build-dirty","owner-early-initial-acceptance-first-build-staged","owner-early-initial-acceptance-first-build-ignored","owner-early-initial-acceptance-first-build-off-base","owner-early-initial-acceptance-first-build-orphan-main","owner-early-initial-acceptance-first-build-runtime","owner-early-initial-acceptance-first-build-legacy-call","owner-early-initial-acceptance-first-build-workflow-call","owner-early-initial-acceptance-first-build-readonly-call","owner-early-initial-acceptance-first-build-lost-call-history","owner-early-initial-acceptance-first-build-policy-lost","owner-early-initial-acceptance-first-build-leading-space","owner-early-initial-acceptance-first-build-counter-loss","owner-early-initial-acceptance-first-build-new-verifier","owner-early-initial-acceptance-first-build-retired-native","owner-early-initial-acceptance-first-build-grafted-main","owner-early-acceptance-producer","owner-early-acceptance-producer-fenced","owner-early-acceptance-producer-replaced-checkout","owner-early-acceptance-producer-body-admission"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session","owner-setup-codex-revision-unconfigured-session","owner-early-fresh","owner-early-explicit-pause","owner-early-no-input","owner-early-corrupt-input","owner-early-history","owner-early-policy-retry","owner-early-register-write-failure","owner-early-initial-acceptance","owner-early-initial-acceptance-green-baseline","owner-early-initial-acceptance-write-failure","owner-early-initial-acceptance-history-loss","owner-early-initial-acceptance-setup-failure","owner-early-initial-acceptance-baseline-tamper","owner-early-initial-acceptance-unconfigured","owner-early-initial-acceptance-repeat","owner-early-initial-acceptance-wrong-source","owner-early-initial-acceptance-first-build","owner-early-initial-acceptance-first-build-dirty","owner-early-initial-acceptance-first-build-staged","owner-early-initial-acceptance-first-build-ignored","owner-early-initial-acceptance-first-build-off-base","owner-early-initial-acceptance-first-build-orphan-main","owner-early-initial-acceptance-first-build-runtime","owner-early-initial-acceptance-first-build-legacy-call","owner-early-initial-acceptance-first-build-workflow-call","owner-early-initial-acceptance-first-build-readonly-call","owner-early-initial-acceptance-first-build-lost-call-history","owner-early-initial-acceptance-first-build-policy-lost","owner-early-initial-acceptance-first-build-leading-space","owner-early-initial-acceptance-first-build-counter-loss","owner-early-initial-acceptance-first-build-new-verifier","owner-early-initial-acceptance-first-build-retired-native","owner-early-initial-acceptance-first-build-grafted-main","owner-early-acceptance-producer","owner-early-acceptance-producer-fenced","owner-early-acceptance-producer-replaced-checkout","owner-early-acceptance-producer-body-admission","owner-early-acceptance-producer-publication-write-failure"] {
                 if mode.ends_with("-session") && !cfg!(target_os="linux") {continue;}
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
@@ -4174,6 +4185,23 @@ mod tests {
                 let original=first.audit.native_store_binding().unwrap().unwrap();
                 let prepared=acceptance::owner::test_cached_preparation(dir.path(),&control.join("owner-producer-control"),&first).await.unwrap();
                 assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap(),before,"preparation changed workflow state");
+                if mode.ends_with("-publication-write-failure") {
+                    let db=rusqlite::Connection::open(&state).unwrap();
+                    db.execute_batch("CREATE TRIGGER deny_publication_intent BEFORE INSERT ON workflow_owner_publication_intent BEGIN SELECT RAISE(ABORT,'injected publication intent failure'); END;").unwrap();
+                    let error=first.activate_prepared_owner_acceptance(&prepared,None).await.err().expect("intent write failure exposed activated guard");
+                    assert!(format!("{error:#}").contains("injected publication intent failure"),"{error:#}");
+                    let snapshot=WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap();
+                    assert_eq!(snapshot.generation,before.generation);assert_eq!(snapshot.checkpoint,before.checkpoint);assert_eq!(snapshot.model_calls,before.model_calls);
+                    for table in ["workflow_owner_revision","workflow_owner_revision_fence","workflow_owner_preparation","workflow_owner_publication_intent","workflow_owner_publication_pending"] {
+                        let count:i64=db.query_row(&format!("SELECT count(*) FROM {table}"),[],|r|r.get(0)).unwrap();assert_eq!(count,0,"{table}: partial publication activation survived rollback");
+                    }
+                    let count:i64=db.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1 AND kind IN ('owner_acceptance_registered','owner_publication_intended')",[&id],|r|r.get(0)).unwrap();assert_eq!(count,0);
+                    let canonical=control.join("owner-producer-control/issue-77-workflow.json");assert!(!canonical.exists());
+                    let staged=std::fs::read_dir(control.join("owner-producer-control")).unwrap().map(|e|e.unwrap().path()).filter(|p|p.file_name().unwrap().to_string_lossy().starts_with("issue-77-owner-")).collect::<Vec<_>>();
+                    assert_eq!(staged.len(),1);assert_eq!(std::fs::read(&staged[0]).unwrap(),serde_json::to_vec(prepared.prepared()).unwrap());
+                    let mut store=WorkflowStore::open(&state).unwrap();assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.owner_control(&id).unwrap(),control_before);
+                    assert!(store.claim_owner_turn(&id,"no-replay-after-intent-failure",millis()+LEASE_MS+1,LEASE_MS).unwrap().is_none());assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);return;
+                }
                 if mode.ends_with("-replaced-checkout") {
                     for replacement in ["git-directory","worktree-root"] {
                         let source=if replacement=="git-directory" {dir.path().join(".git")}else{dir.path().to_path_buf()};
@@ -4206,6 +4234,27 @@ mod tests {
                     let db=rusqlite::Connection::open(&state).unwrap();
                     let raw:String=db.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='owner_acceptance_registered'",[&id],|row|row.get(0)).unwrap();
                     let activation:serde_json::Value=serde_json::from_str(&raw).unwrap();
+                    let request=activation["request_id"].as_str().unwrap();
+                    let (intent_sequence,intent_sha,intent_raw):(i64,String,String)=db.query_row("SELECT sequence,record_sha256,record FROM workflow_owner_publication_intent WHERE request_id=?1",[request],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                    assert_eq!(activation["publication"]["record_sha256"],intent_sha);
+                    let event_raw:String=db.query_row("SELECT payload FROM workflow_event WHERE seq=?1",[intent_sequence],|r|r.get(0)).unwrap();
+                    for fault in ["pending-pointer","intent","event","activation-reference"] {
+                        match fault {
+                            "pending-pointer"=>{db.execute("DELETE FROM workflow_owner_publication_pending WHERE workflow=?1",[&id]).unwrap();},
+                            "intent"=>{db.execute("UPDATE workflow_owner_publication_intent SET record='{}' WHERE request_id=?1",[request]).unwrap();},
+                            "event"=>{db.execute("UPDATE workflow_event SET payload='{}' WHERE seq=?1",[intent_sequence]).unwrap();},
+                            "activation-reference"=>{db.execute("UPDATE workflow_event SET payload=json_remove(payload,'$.publication') WHERE workflow=?1 AND kind='owner_acceptance_registered'",[&id]).unwrap();},_=>unreachable!(),
+                        }
+                        assert!(first.validate_before_side_effect().is_err(),"{fault}: damaged pending publication passed history admission");
+                        match fault {
+                            "pending-pointer"=>{db.execute("INSERT INTO workflow_owner_publication_pending VALUES(?1,?2)",rusqlite::params![id,request]).unwrap();},
+                            "intent"=>{db.execute("UPDATE workflow_owner_publication_intent SET record=?2 WHERE request_id=?1",rusqlite::params![request,intent_raw]).unwrap();},
+                            "event"=>{db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![intent_sequence,event_raw]).unwrap();},
+                            "activation-reference"=>{db.execute("UPDATE workflow_event SET payload=?2 WHERE workflow=?1 AND kind='owner_acceptance_registered'",rusqlite::params![id,raw]).unwrap();},_=>unreachable!(),
+                        }
+                        first.validate_before_side_effect().unwrap();
+                    }
+                    assert!(!control.join("owner-producer-control/issue-77-workflow.json").exists(),"intent staging exposed a canonical manifest");
                     let artifacts=std::fs::read_dir(control.join("owner-producer-control/owner-preparations")).unwrap().collect::<std::io::Result<Vec<_>>>().unwrap();
                     assert_eq!(artifacts.len(),1);
                     let bytes=std::fs::read(artifacts[0].path()).unwrap();

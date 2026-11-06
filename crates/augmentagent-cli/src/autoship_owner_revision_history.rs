@@ -16,6 +16,8 @@ struct Activation {
     baseline_receipts_sha256:Option<String>,
     #[serde(default,skip_serializing_if="Option::is_none")]
     preparation:Option<OwnerPreparationBinding>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    publication:Option<super::super::owner_publication::Reference>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,6 +79,12 @@ pub(super) fn validate(conn: &Connection, workflow: &str) -> Result<()> {
             },
             (None,None)=>{},
             _=>anyhow::bail!("owner preparation activation history missing"),
+        }
+        if let Some(reference)=&activation.publication {
+            let raw:String=conn.query_row("SELECT record FROM workflow_owner_publication_intent WHERE request_id=?1",[&activation.request_id],|r|r.get(0))?;
+            super::super::owner_publication::require(conn,&activation.request_id,reference,&raw)?;
+            bytes=bytes.checked_add(raw.len()).context("owner publication history size overflow")?;
+            ensure!(bytes<=128*1024*1024,"owner revision/publication aggregate history exceeds bound");
         }
         if initial {
             let receipts:String=conn.query_row("SELECT receipts FROM workflow_owner_initial_acceptance WHERE request_id=?1",[&activation.request_id],|r|r.get(0))?;
@@ -141,5 +149,6 @@ pub(super) fn validate(conn: &Connection, workflow: &str) -> Result<()> {
                 "owner turn has neither its original claim nor intact revision history");
         }
     }
+    super::super::owner_publication::validate_history(conn,workflow)?;
     Ok(())
 }

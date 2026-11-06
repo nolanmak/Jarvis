@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "kind": "original-canonical-preparation-and-atomic-pending-owner-publication-intent-component",
+  "source_parent_commit": "3ea55cbb5364c00cc96f4a6a33567621692b8176",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication.rs",
+      "sha256": "476f18f13d75ad33abcef50e59702b4f9aab87b8045198435361d9db053a4059"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication.rs",
+      "sha256": "a37f9e5f40dbb349df0f08b10c74ae0e7612a45d7599945880d53c7c3eeea7a7"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_acceptance.rs",
+      "sha256": "e05fd0506c14b90388b9c2c10ff3c351b4bbdeef54dbc0f690d5899f48b03be7"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "b1896a7b7f8449085eaef945a884f50aa53d6888acb2e2d07e51154ef3a67d12"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve.rs",
+      "sha256": "96bab44bd7f061e913a39c5e655f1e0975867a345842738738666bcb39b7114f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_revision.rs",
+      "sha256": "39abaaba7fdc81ae91203c0a809878b382b3022af5528e7973c6a0376af51750"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_revision_history.rs",
+      "sha256": "35db4799b7390deff9bde619af5d81caf71f80d1fd9e0d4ee2cc72a07205e568"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "c8f60b8514111a32b54d29c07e1a65118404dec2bbb15d6c10278756f18a3d90"
+    }
+  ],
+  "behavior": [
+    "Version-3 preparation retains exact original canonical state at the unchanged input key; initial absence, orphan originals and cached reuse are checked before preparation.",
+    "Borrowed original draft stages immutable exact next evidence without changing the canonical manifest.",
+    "Production private activation requires the draft and records intent/pending metadata atomically with activation, preparation, review invalidation and generation fencing.",
+    "Row/event/reference/pending history joins refuse corruption; failed intent insert rolls back activation and preserves staged evidence plus original claimed input."
+  ],
+  "validation": {
+    "stale_canonical_behavioral_red": {
+      "log": "/tmp/autoship-owner-publication-canonical-red-20261106.log",
+      "log_sha256": "243f056c8be12060138453f99e31d72796c1a0538e809999e923f845283274d6",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "passed": 0,
+      "failed": 1,
+      "reason": "Cached producer ignored a newly present canonical acceptance. Test plumbing present; not a pristine-parent binary."
+    },
+    "intermediate_callback_green": {
+      "log": "/tmp/autoship-owner-publication-focused-3-20261106.log",
+      "log_sha256": "4432c6c98c976e540e36856664c23caaf97d3f1268e7b6502488a20c558a4bff",
+      "exit": 0,
+      "passed": 1,
+      "failed": 0
+    },
+    "rollback_focused": {
+      "log": "/tmp/autoship-owner-publication-rollback-focused-20261106.log",
+      "log_sha256": "b25a65c97528b02123ab82ef1ed4d5b13e151c829914b26cd327b84e563d839f",
+      "exit": 0,
+      "passed": 1,
+      "failed": 0
+    },
+    "development_corrections": [
+      "Initial compile accessed private preparation context field; added a descriptive hash getter.",
+      "New publication history originally surfaced a bare missing-row error for removed original preparation; contextualized it as owner preparation loss before the final callback green."
+    ],
+    "final_full_cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-publication-full-cli-20261106.log",
+      "log_sha256": "343fd71be32c3b1dd809600b5ec4f649be4cda7776c098ce96596a8b06b08312",
+      "exit": 0,
+      "passed": 1939,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 296.82,
+      "includes": [
+        "owner_publication_failure_rolls_back_activation_and_retains_staged_evidence passed",
+        "actual producer: newly present canonical refusal, orphan original restoration/refusal, old envelope refusal, four damaged intent/event/pointer/reference cases passed"
+      ]
+    },
+    "final_production_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-publication-production-check-20261106.log",
+      "log_sha256": "0c12602747acdf3962d5f5fc6ee220994a5d154c1fd802c1fdeb19acf19e7b7b",
+      "exit": 0,
+      "compiler_seconds": 29.43
+    },
+    "build_environment": {
+      "CARGO_TARGET_DIR": "/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_TEST_DEBUG": "0"
+    }
+  },
+  "limits": [
+    "Metadata staging and intent only: shared completed-publication productive predicate, metadata-only authority, original native publication proof, writer/completion/lineage consumers and recovery remain unimplemented. No valid pending row is an execution grant.",
+    "Baseline observations are synthetic fixtures with real guard/native-registration and SQLite transaction plumbing. No provider inference, VM execution, completed publication or live acceptance is established.",
+    "Envelope versions without the original canonical snapshot refuse; no migration or automatic recovery is claimed.",
+    "Rows and individual files are bounded; complete protected aggregate artifact storage admission and crash recovery remain P1/P2/R work.",
+    "No body replay, budget/counter reset, owner-hold change, rollout, five confirmed autonomous merges, live Discord coding or fault/unattended soak completion is established."
+  ],
+  "epic_complete": false
+}

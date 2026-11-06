@@ -4,6 +4,9 @@ use super::*;
 #[path="self_improve_owner_candidate.rs"]
 mod candidate;
 use candidate::CandidateIdentity;
+#[path="self_improve_owner_publication.rs"]
+pub(crate) mod publication;
+use publication::CanonicalSnapshot;
 
 use crate::autoship_contract::PathScope;
 use crate::autoship_workflow::{Binding,owner_turn::OwnerTurn};
@@ -90,7 +93,7 @@ impl Input {
 }
 #[derive(Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Stored {version:u32,input:Input,candidate:CandidateIdentity,prepared:PreparedAcceptance}
+struct Stored {version:u32,input:Input,candidate:CandidateIdentity,canonical:CanonicalSnapshot,prepared:PreparedAcceptance}
 
 /// Constructible only by this independent producer. A private file alone cannot
 /// construct activation authority. Adapter bytes remain controller-private;
@@ -99,6 +102,7 @@ struct Stored {version:u32,input:Input,candidate:CandidateIdentity,prepared:Prep
 pub(in crate::self_improve) struct PreparedOwnerAcceptance {
     input:Input,
     candidate:CandidateIdentity,
+    canonical:CanonicalSnapshot,
     prepared:PreparedAcceptance,
     path:PathBuf,
 }
@@ -115,7 +119,7 @@ impl PreparedOwnerAcceptance {
         let mut bytes=Vec::new();(&mut file).take(4*1024*1024+1).read_to_end(&mut bytes)?;
         ensure!(bytes.len()<=4*1024*1024 && bytes.len() as u64==metadata.len(),"owner preparation artifact changed while reading");
         let stored:Stored=serde_json::from_slice(&bytes)?;
-        ensure!(stored.version==2 && stored.input==self.input && stored.candidate==self.candidate && serde_json::to_value(&stored.prepared)?==serde_json::to_value(&self.prepared)?
+        ensure!(stored.version==3 && stored.input==self.input && stored.candidate==self.candidate && stored.canonical==self.canonical && serde_json::to_value(&stored.prepared)?==serde_json::to_value(&self.prepared)?
             && serde_json::to_vec(&stored)?==bytes,"owner preparation artifact or encoding changed");
         self.prepared.verify_registration()?;
         crate::autoship_workflow::OwnerPreparationBinding::from_artifact(amendment::digest(&bytes),self.input.key()?,
@@ -123,7 +127,7 @@ impl PreparedOwnerAcceptance {
     }
     pub(in crate::self_improve) fn validate_current(&self,workflow:&workflow::WorkflowGuard,candidate:&Path,previous:Option<&RegisteredContract>)->Result<()> {
         let turn=workflow.owner_acceptance_turn(candidate,self.input.source,previous)?;
-        self.candidate.verify(candidate)?;
+        self.candidate.verify(candidate)?;self.canonical.verify_current()?;
         ensure!(turn.request_id==self.input.request_id && turn.lease.owner==self.input.owner && turn.lease.generation==self.input.generation
             && turn.pause_revision==self.input.pause_revision && turn.binding==self.input.binding && turn.body==self.input.body && amendment::digest(turn.body.as_bytes())==self.input.body_sha256,
             "owner acceptance current request changed");
@@ -159,11 +163,11 @@ fn preparation_directory(candidate:&Path,control:&Path)->Result<PathBuf> {
     ensure!(meta.is_dir() && !meta.file_type().is_symlink() && meta.uid()==unsafe{libc::geteuid()} && meta.mode()&0o077==0,"owner acceptance directory is not private");
     Ok(directory)
 }
-fn persist_preparation(directory:&Path,input:&Input,candidate:&CandidateIdentity,prepared:&PreparedAcceptance)->Result<PathBuf> {
+fn persist_preparation(directory:&Path,input:&Input,candidate:&CandidateIdentity,canonical:&CanonicalSnapshot,prepared:&PreparedAcceptance)->Result<PathBuf> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let path=directory.join(format!("{}.json",input.key()?));
-    let stored=Stored {version:2,input:input.clone(),candidate:candidate.clone(),prepared:prepared.clone()};let bytes=serde_json::to_vec(&stored)?;
+    let stored=Stored {version:3,input:input.clone(),candidate:candidate.clone(),canonical:canonical.clone(),prepared:prepared.clone()};let bytes=serde_json::to_vec(&stored)?;
     ensure!(bytes.len()<=4*1024*1024,"owner acceptance artifact exceeds bound");
     let mut file=tempfile::NamedTempFile::new_in(directory)?;file.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
     file.write_all(&bytes)?;file.as_file().sync_all()?;file.persist_noclobber(&path).map_err(|error|error.error)?;
@@ -186,9 +190,10 @@ async fn prepare_at(candidate:&Path,workflow:&workflow::WorkflowGuard,source:Acc
     let input=Input::new(&turn,source,base,scope,required,previous)?;let epoch=input.key()?;
     let candidate_identity=CandidateIdentity::capture(candidate)?;
     let directory=preparation_directory(candidate,control)?;
+    let canonical=CanonicalSnapshot::capture(workflow,control,source,previous)?;
     let path=directory.join(format!("{epoch}.json"));
     let prepared=if path.try_exists()? {
-        let stored:Stored=private_json(&path)?;ensure!(stored.version==2 && stored.input==input && stored.candidate==candidate_identity,"owner acceptance persisted request or physical candidate changed");
+        let stored:Stored=private_json(&path)?;ensure!(stored.version==3 && stored.input==input && stored.candidate==candidate_identity && stored.canonical==canonical,"owner acceptance persisted request or physical candidate changed");
         input.validate_prepared(&stored.prepared,previous)?;stored.prepared
     }else {
         let prompt=input.prompt(scope,previous)?;
@@ -205,12 +210,12 @@ async fn prepare_at(candidate:&Path,workflow:&workflow::WorkflowGuard,source:Acc
         }.await;
         let cleanup=trusted_git(candidate,&["worktree","remove","--force",checkout]).await;
         let prepared=result?;cleanup.context("remove owner acceptance baseline checkout")?;
-        let current=PreparedOwnerAcceptance {input:input.clone(),candidate:candidate_identity.clone(),prepared:prepared.clone(),path:path.clone()};current.validate_current(workflow,candidate,previous)?;
+        let current=PreparedOwnerAcceptance {input:input.clone(),candidate:candidate_identity.clone(),canonical:canonical.clone(),prepared:prepared.clone(),path:path.clone()};current.validate_current(workflow,candidate,previous)?;
         ensure!(actual_head(candidate).await?==turn.binding.head,"owner acceptance candidate moved while preparing baseline");
-        ensure!(persist_preparation(&directory,&input,&candidate_identity,&prepared)?==path,"owner acceptance artifact path changed");
+        ensure!(persist_preparation(&directory,&input,&candidate_identity,&canonical,&prepared)?==path,"owner acceptance artifact path changed");
         prepared
     };
-    let result=PreparedOwnerAcceptance {input,candidate:candidate_identity,prepared,path};result.validate_current(workflow,candidate,previous)?;result.activation_binding()?;
+    let result=PreparedOwnerAcceptance {input,candidate:candidate_identity,canonical,prepared,path};result.validate_current(workflow,candidate,previous)?;result.activation_binding()?;
     ensure!(actual_head(candidate).await?==turn.binding.head,"owner acceptance candidate moved after preparation");
     Ok(result)
 }
@@ -224,8 +229,9 @@ pub(in crate::self_improve) fn test_from_prepared(candidate:&Path,workflow:&work
     input.validate_prepared(prepared,None)?;
     let control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
     let directory=preparation_directory(candidate,&control)?;let identity=CandidateIdentity::capture(candidate)?;
-    let path=persist_preparation(&directory,&input,&identity,prepared)?;
-    Ok(PreparedOwnerAcceptance {input,candidate:identity,prepared:prepared.clone(),path})
+    let canonical=CanonicalSnapshot::capture(workflow,&control,source,None)?;
+    let path=persist_preparation(&directory,&input,&identity,&canonical,prepared)?;
+    Ok(PreparedOwnerAcceptance {input,candidate:identity,canonical,prepared:prepared.clone(),path})
 }
 
 /// Exercise the production cached factory with actual guarded owner metadata.
@@ -242,13 +248,26 @@ pub(in crate::self_improve) async fn test_cached_preparation(candidate:&Path,con
     let required=vec!["Original requirement".to_owned()];let input=Input::new(&turn,source,&turn.binding.head,"fixture source",&required,None)?;
     let directory=control.join("owner-preparations");std::fs::create_dir_all(&directory)?;std::fs::set_permissions(&directory,std::fs::Permissions::from_mode(0o700))?;
     let path=directory.join(format!("{}.json",input.key()?));
-    let store=Stored {version:2,input,candidate:CandidateIdentity::capture(candidate)?,prepared};let bytes=serde_json::to_vec(&store)?;
+    let store=Stored {version:3,input,candidate:CandidateIdentity::capture(candidate)?,canonical:CanonicalSnapshot::absent(control,source),prepared};let bytes=serde_json::to_vec(&store)?;
     std::fs::write(&path,&bytes)?;std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600))?;
     let result=prepare_at(candidate,workflow,source,&turn.binding.head,"fixture source",&required,None,control).await?;
-    for fault in ["legacy-envelope","missing-candidate","unknown-candidate","changed-candidate"] {
+    let canonical=control.join(format!("{}-workflow.json",source.key()));
+    let claimed=serde_json::to_vec(&WorkflowManifest::from_prepared(source,result.prepared()))?;
+    std::fs::write(&canonical,&claimed)?;std::fs::set_permissions(&canonical,std::fs::Permissions::from_mode(0o600))?;
+    ensure!(prepare_at(candidate,workflow,source,&turn.binding.head,"fixture source",&required,None,control).await.is_err(),"cached owner preparation ignored a newly present canonical acceptance");
+    ensure!(std::fs::read(&canonical)?==claimed && std::fs::read(&path)?==bytes,"refused canonical mismatch rewrote original evidence");
+    std::fs::remove_file(&canonical)?;
+    let orphan=evidence_path(control,source,&turn.binding.head)?;let original_evidence=serde_json::to_vec(result.prepared())?;
+    std::fs::write(&orphan,&original_evidence)?;std::fs::set_permissions(&orphan,std::fs::Permissions::from_mode(0o600))?;
+    ensure!(prepare_at(candidate,workflow,source,&turn.binding.head,"fixture source",&required,None,control).await.is_err(),"orphan original acceptance was treated as absent by owner preparation");
+    ensure!(std::fs::read(&orphan)?==original_evidence && std::fs::read(&canonical)?==claimed && std::fs::read(&path)?==bytes,"orphan canonical recovery changed original evidence");
+    std::fs::remove_file(&canonical)?;std::fs::remove_file(&orphan)?;
+    for fault in ["legacy-envelope","legacy-v2","missing-canonical","missing-candidate","unknown-candidate","changed-candidate"] {
         let mut changed:serde_json::Value=serde_json::from_slice(&bytes)?;
         match fault {
             "legacy-envelope"=>{changed["version"]=1.into();},
+            "legacy-v2"=>{changed["version"]=2.into();},
+            "missing-canonical"=>{changed.as_object_mut().unwrap().remove("canonical");},
             "missing-candidate"=>{changed.as_object_mut().unwrap().remove("candidate");},
             "unknown-candidate"=>{changed["candidate"]["unrecognized"]=true.into();},
             "changed-candidate"=>{changed["candidate"]["root"]["inode"]=0.into();},
@@ -304,12 +323,13 @@ mod tests {
         let prepared=PreparedAcceptance {proposal,baseline:BaselineEvidence {registration:registration.clone(),receipts:vec![observe("false")]}};
         let input=Input::new(&turn(),AcceptanceSource::Issue(42),&"a".repeat(40),"source",&["Original requirement".into()],None).unwrap();
         input.validate_prepared(&prepared,None).unwrap();
-        let path=persist_preparation(control.path(),&input,&candidate,&prepared).unwrap();let bytes=std::fs::read(&path).unwrap();
-        let packet=PreparedOwnerAcceptance {input:input.clone(),candidate,prepared:prepared.clone(),path};
+        let canonical=CanonicalSnapshot::absent(control.path(),input.source);
+        let path=persist_preparation(control.path(),&input,&candidate,&canonical,&prepared).unwrap();let bytes=std::fs::read(&path).unwrap();
+        let packet=PreparedOwnerAcceptance {input:input.clone(),candidate,canonical,prepared:prepared.clone(),path};
         let binding=packet.activation_binding().unwrap();let encoded=serde_json::to_value(&binding).unwrap();
         assert_eq!(encoded["artifact_sha256"],amendment::digest(&bytes));assert_eq!(encoded["context_sha256"],input.key().unwrap());
         let mut revised=prepared;revised.baseline.receipts=vec![observe("false\n")];input.validate_prepared(&revised,None).unwrap();
-        assert!(persist_preparation(control.path(),&input,&packet.candidate,&revised).is_err(),"a second valid preparation replaced the original context artifact");
+        assert!(persist_preparation(control.path(),&input,&packet.candidate,&packet.canonical,&revised).is_err(),"a second valid preparation replaced the original context artifact");
         assert_eq!(std::fs::read(&packet.path).unwrap(),bytes);
         for fault in ["encoding","context","map","unknown","permissions","symlink","fifo","missing"] {
             std::fs::remove_file(&packet.path).unwrap();
@@ -334,7 +354,7 @@ mod tests {
                 _=>unreachable!(),
             }
             if fault=="fifo" {
-                let cloned=PreparedOwnerAcceptance {input:packet.input.clone(),candidate:packet.candidate.clone(),prepared:packet.prepared.clone(),path:packet.path.clone()};
+                let cloned=PreparedOwnerAcceptance {input:packet.input.clone(),candidate:packet.candidate.clone(),canonical:packet.canonical.clone(),prepared:packet.prepared.clone(),path:packet.path.clone()};
                 let (sent,received)=std::sync::mpsc::channel();
                 let thread=std::thread::spawn(move||sent.send(cloned.activation_binding().is_err() && private_json::<Stored>(&cloned.path).is_err()).unwrap());
                 assert_eq!(received.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),true,"a FIFO artifact blocked a protected reader");thread.join().unwrap();
