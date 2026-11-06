@@ -17,8 +17,13 @@ impl std::error::Error for EvidenceBudget {}
 /// A budget refusal keeps its meaning however many `context` layers the review
 /// path wrapped it in, so classify on the whole chain and not the outer error
 /// (#1885: PR #1669 was held as missing reviewer capacity because of one).
+/// The chain holds the wrapping error of a `context`, never the context value
+/// itself, so a budget attached as one is reached only by `anyhow` downcasting:
+/// recognizing a budget at every level needs both inspections.
 fn is_evidence_budget(error: &anyhow::Error) -> bool {
-    error.chain().any(is_evidence_budget_cause)
+    error.is::<EvidenceBudget>()
+        || error.is::<aligned::RequestBudgetExceeded>()
+        || error.chain().any(is_evidence_budget_cause)
 }
 
 fn is_evidence_budget_cause(cause: &(dyn std::error::Error + 'static)) -> bool {
@@ -26,11 +31,11 @@ fn is_evidence_budget_cause(cause: &(dyn std::error::Error + 'static)) -> bool {
 }
 
 /// Only the inline caller-evidence budget has a streamed fallback, so it is
-/// matched on its own - and, like [`is_evidence_budget`], over the whole chain:
-/// `anyhow` downcasting walks its own `context` layers but stops at the first
-/// cause reached through [`std::error::Error::source`].
+/// matched on its own - and, like [`is_evidence_budget`], at every level:
+/// `anyhow` downcasting walks its own `context` layers and values but stops at
+/// the first cause reached through [`std::error::Error::source`].
 fn is_caller_evidence_budget(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.is::<EvidenceBudget>())
+    error.is::<EvidenceBudget>() || error.chain().any(|cause| cause.is::<EvidenceBudget>())
 }
 fn unavailable_from_error(provider: augmentagent_channel_core::ProviderKind, error: anyhow::Error) -> IndependentReview {
     IndependentReview::unavailable(if is_evidence_budget(&error) {
@@ -1215,6 +1220,20 @@ mod tests {
             assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity",
                 "an unrelated reviewer failure {depth} chain levels down is not an evidence budget");
         }
+    }
+
+    #[test]
+    fn budget_carried_as_a_context_value_stays_evidence_budget() {
+        let budgets:[fn()->anyhow::Error;2]=[
+            ||anyhow::anyhow!("serialized review request refused").context(aligned::RequestBudgetExceeded),
+            ||anyhow::anyhow!("inline caller evidence refused").context(EvidenceBudget("bounded caller inventory".into()))];
+        for budget in budgets {
+            let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,budget().context("review evidence"));
+            assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"review-evidence-budget",
+                "a budget carried as an anyhow context value is not missing reviewer capacity");
+        }
+        assert!(is_caller_evidence_budget(&anyhow::anyhow!("inline caller evidence refused").context(EvidenceBudget("bounded caller inventory".into()))),
+            "an inline caller budget carried as a context value still streams instead of failing the review");
     }
 
     #[test]
