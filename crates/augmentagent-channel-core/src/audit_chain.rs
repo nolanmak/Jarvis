@@ -473,6 +473,9 @@ impl AnchoredAudit {
     /// Read committed healthy evidence while retaining the writer ingress gate.
     /// Existing seals remain unchanged; no append or new generation is created.
     pub(crate) fn with_retained_snapshot<T>(&self, validate:impl FnOnce(&[serde_json::Value],serde_json::Value)->Result<T>)->Result<T> {
+        self.with_retained_snapshot_seal(|rows,audit,_|validate(rows,audit))
+    }
+    pub(crate) fn with_retained_snapshot_seal<T>(&self, validate:impl FnOnce(&[serde_json::Value],serde_json::Value,Option<&serde_json::Value>)->Result<T>)->Result<T> {
         let (_lock,anchor,rows,clean)=self.locked_snapshot_from(true)?;
         ensure!(clean,"namespace cleanup requires complete committed audit evidence");
         if let Some(proof)=&anchor.sealed {
@@ -483,7 +486,7 @@ impl AnchoredAudit {
                     && seal.request_sha256.bytes().all(|c|c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),"invalid retained handoff seal");
             } else {verify_recovery_seal(&anchor,proof)?;}
         }
-        validate(&rows,serde_json::json!({"committed_sha256":anchor.hash,"committed_bytes":anchor.bytes,"sequence":anchor.sequence,"sealed":anchor.sealed.is_some()}))
+        validate(&rows,serde_json::json!({"committed_sha256":anchor.hash,"committed_bytes":anchor.bytes,"sequence":anchor.sequence,"sealed":anchor.sealed.is_some()}),anchor.sealed.as_ref())
     }
     pub(crate) fn inspect_open<F>(&self, validate: F) -> Result<()>
     where

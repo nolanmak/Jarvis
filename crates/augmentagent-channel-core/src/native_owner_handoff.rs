@@ -225,6 +225,13 @@ pub(super) fn with_empty_workflow_inventory(root:&Path,ledger:&Ledger<'_>,namesp
     let scan=scan_inventory(root,ledger,&namespace.owner.workflow_id,std::slice::from_ref(namespace),&[])?;
     ensure!(scan.inventory.is_empty(),R::InventoryMissing);visit()
 }
+/// Fresh physical retained-session selection, with every scan/session lock
+/// retained through the metadata visitor. Observations are descriptive only.
+pub(super) fn with_metadata_workflow_inventory(root:&Path,ledger:&Ledger<'_>,namespace:&Authority,observations:&[PhysicalObservation],
+    visit:&mut dyn FnMut(&[RuntimeInventoryRow],&[String])->Result<()>)->Result<()> {
+    let scan=scan_inventory(root,ledger,&namespace.owner.workflow_id,std::slice::from_ref(namespace),observations)?;
+    visit(&scan.inventory,&scan.retired)
+}
 /// Initial prepared census; this metadata inspection grants no execution.
 pub(super) fn with_initial_prepared_inventory(root:&Path,ledger:&Ledger<'_>,namespace:&Authority,
     prepared:&super::PreparedLaunchRecord,visit:&mut dyn FnMut()->Result<()>)->Result<()> {

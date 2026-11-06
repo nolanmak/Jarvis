@@ -562,13 +562,16 @@ impl AuditLogger {
         self.with_namespace_quiescence_rows(namespace,highest_generation,|_,evidence|visit(evidence))
     }
     pub(crate) fn with_namespace_quiescence_rows<T>(&self,namespace:&crate::native_vm::ownership::Authority,highest_generation:i64,visit:impl FnOnce(&[serde_json::Value],&serde_json::Value)->anyhow::Result<T>)->anyhow::Result<T> {
+        self.with_namespace_quiescence_rows_seal(namespace,highest_generation,|rows,evidence,_|visit(rows,evidence))
+    }
+    pub(crate) fn with_namespace_quiescence_rows_seal<T>(&self,namespace:&crate::native_vm::ownership::Authority,highest_generation:i64,visit:impl FnOnce(&[serde_json::Value],&serde_json::Value,Option<&serde_json::Value>)->anyhow::Result<T>)->anyhow::Result<T> {
         anyhow::ensure!(self.native_runtime_owner()?.as_ref()==Some(&crate::native_vm::RuntimeOwner {workflow_id:namespace.owner.workflow_id.clone(),lease_generation:highest_generation}),"namespace audit owner mismatch");
-        self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("namespace requires protected audit"))?.with_retained_snapshot(|rows,audit| {
+        self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("namespace requires protected audit"))?.with_retained_snapshot_seal(|rows,audit,seal| {
             self.check_protected_continuity()?;
             let (previous,resources)=Self::namespace_resources(rows,&namespace.owner.workflow_id)?;
             anyhow::ensure!(previous==highest_generation && previous>=namespace.owner.lease_generation,"namespace audit generation mismatch");
             let evidence=serde_json::json!({"audit":audit,"validation":{"namespace":namespace,"highest_lease_generation":previous,"quiescent_resources":resources}});
-            self.check_protected_continuity()?;visit(rows,&evidence)
+            self.check_protected_continuity()?;visit(rows,&evidence,seal)
         })
     }
     /// Validate the complete original namespace while excluding exactly the

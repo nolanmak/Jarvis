@@ -530,7 +530,8 @@ pub(crate) mod tests {
         fn new() -> Self {Self::with_owner_binding(false)}
         fn with_owner_binding(owner_bound:bool) -> Self {Self::with_owner_mode(owner_bound,false)}
         fn with_owner_mode(owner_bound:bool,body_turn:bool) -> Self {Self::with_owner_timing(owner_bound,body_turn,false)}
-        fn with_owner_timing(owner_bound:bool,body_turn:bool,late_dispatch:bool) -> Self {
+        fn with_owner_timing(owner_bound:bool,body_turn:bool,late_dispatch:bool) -> Self {Self::with_native_provider(owner_bound,body_turn,late_dispatch,"codex")}
+        fn with_native_provider(owner_bound:bool,body_turn:bool,late_dispatch:bool,provider:&str) -> Self {
             let root = tempfile::tempdir().unwrap();
             let base = root.path().canonicalize().unwrap();
             let state = base.join("native");
@@ -600,7 +601,7 @@ pub(crate) mod tests {
                 audit.require_run_resources().unwrap();
             }
             let mut owner_dispatch=turn.as_ref().filter(|_|!late_dispatch).map(|t|store.begin_owner_body_dispatch(t,submission::Provider::Codex,now()).unwrap());
-            let (prepared,session,resource)=retained_launch_fixture(&state,&audit,"codex",|prepared| {
+            let (prepared,session,resource)=retained_launch_fixture(&state,&audit,provider,|prepared| {
                 store.record_verified_native_launch(&lease,&binding,&audit,prepared,now()).unwrap();
             });
             if late_dispatch {owner_dispatch=turn.as_ref().map(|t|store.begin_owner_body_dispatch(t,submission::Provider::Codex,now()).unwrap());}
@@ -816,6 +817,91 @@ pub(crate) mod tests {
         let tx=f.store.conn.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
         assert!(super::super::native_handoff::read_current_metadata_facts(&tx,&f.lease,&f.binding,&namespace,now()).is_err(),"losing latest uncertainty exposed an older success");
 
+    }
+
+    #[test]
+    fn retained_native_metadata_proof_preserves_actual_completed_session() {
+        if child("retained_native_metadata_proof_preserves_actual_completed_session") {return;}
+        use std::sync::{Arc,Mutex};use std::os::fd::AsRawFd;
+        for provider in ["codex","claude"] {
+        let mut f=Fixture::with_native_provider(false,false,false,provider);let (middle_lease,first,first_proof)=completed_native_handoff(&mut f);
+        assert!(f.store.settle_native_handoff(&middle_lease,&f.binding,&first_proof,now()).unwrap().current_context);
+        let base=f._root.path().canonicalize().unwrap();
+        let middle=Arc::new(AuditLogger::protected(PathBuf::from(&first.request().destination.audit_path),base.join("anchors/destination.json"),&[]).unwrap());
+        middle.set_native_runtime_owner(first.request().destination.owner.clone()).unwrap();middle.set_native_store_binding(first.original_binding().clone()).unwrap();
+        // Intermediate namespace has a real protected generic resource receipt
+        // but no native launch. It must not disappear from the proof's audits.
+        middle.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":provider,"observation":{"identity":{
+            "host_sha256":sha(&std::fs::read("/etc/machine-id").unwrap()),"boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),
+            "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1}}})).unwrap();
+        f.store.release(&middle_lease,now()).unwrap();let lease=f.store.claim(&middle_lease.workflow,"metadata-final-owner",now(),60_000).unwrap().unwrap();
+        let current=Arc::new(AuditLogger::protected(base.join("logs/metadata-final.jsonl"),base.join("anchors/metadata-final.json"),&[]).unwrap());
+        current.set_native_runtime_owner(RuntimeOwner {workflow_id:lease.workflow.clone(),lease_generation:lease.generation}).unwrap();current.set_native_store_binding(first.original_binding().clone()).unwrap();current.require_run_resources().unwrap();
+        current.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":lease.workflow,"generation":lease.generation})).unwrap();
+        let second=pending_record(f.store.prepare_or_load_native_handoff(&lease,&f.binding,current.path().to_str().unwrap(),now()).unwrap());
+        assert!(matches!(ownership::transfer(second.original_binding(),second.request(),&second.observation(),&[middle.clone()],&current,&||Ok(())),ownership::TransferOutcome::Completed(_)));
+        let proof=second.verified_receipt(&||Ok(())).unwrap().unwrap();assert!(f.store.settle_native_handoff(&lease,&f.binding,&proof,now()).unwrap().current_context);
+        let namespace=second.request().destination.clone();
+        let store=Arc::new(Mutex::new(WorkflowStore::open(&f.path).unwrap()));let checked=store.clone();let owned=lease.clone();let binding=f.binding.clone();
+        current.restrict_to_metadata(Arc::new(move ||checked.lock().unwrap().validate_lease(&owned,&binding,now()))).unwrap();
+        let tx=f.store.conn.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        let facts=super::super::native_handoff::read_current_metadata_facts(&tx,&lease,&f.binding,&namespace,now()).unwrap();tx.commit().unwrap();
+        let facts=super::super::owner_publication::current_facts_fixture(facts);let runtimes=facts.runtimes().unwrap();
+        let audits=vec![Arc::new(f.audit.clone()),middle.clone(),current.clone()];
+        let audit_before=audits.iter().map(|a|std::fs::read(a.path()).unwrap()).collect::<Vec<_>>();
+        let native=base.join("native");let epoch=std::fs::read(native.join("authority-epoch.json")).unwrap();
+        let before=f.store.snapshot(&lease.workflow).unwrap().unwrap();let events=f.store.events(&lease.workflow).unwrap();
+        let fence=||store.lock().unwrap().validate_lease(&lease,&f.binding,now());
+        let mut load=|namespaces:&[ownership::Authority]| {assert_eq!(namespaces.len(),3);Ok(audits.clone())};
+        let mut entered=false;
+        ownership::with_metadata_native_owner(&current,&runtimes,&fence,&mut load,&mut |proof| {
+            assert_eq!(proof.inventory().len(),1);assert_eq!(proof.namespace(),&namespace);
+            assert_eq!(proof.inventory()[0].creation_owner,f.prepared.intent.source_owner);assert_eq!(proof.inventory()[0].effective_owner,namespace.owner);
+            assert_eq!(proof.evidence()["audits"].as_array().unwrap().len(),3);
+            for path in [native.join("state.lock"),native.join(format!("{provider}/session-fixture/lock")),base.join("anchors/native.lock"),base.join("anchors/destination.lock"),base.join("anchors/metadata-final.lock")] {
+                let fd=std::fs::OpenOptions::new().read(true).open(path).unwrap();assert_ne!(unsafe{libc::flock(fd.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+            }
+            assert!(current.dispatch_allowed().is_err());assert!(current.model_call_admitted(provider).is_err());entered=true;Ok(())
+        }).expect("retained completed session needs native metadata proof without being labelled unused");assert!(entered);
+        let refuse=|data:&[ownership::PreparationRuntime],loaded:Vec<Arc<AuditLogger>>| {
+            let mut visited=false;
+            assert!(ownership::with_metadata_native_owner(&current,data,&fence,&mut |_|Ok(loaded.clone()),&mut |_| {visited=true;Ok(())}).is_err());assert!(!visited);
+        };
+        refuse(&runtimes,vec![audits[0].clone(),current.clone()]); // omit launch-free middle namespace
+        let alternate=base.join("anchors/alternate-native.json");std::fs::copy(base.join("anchors/native.json"),&alternate).unwrap();
+        let swapped=Arc::new(AuditLogger::protected(f.audit.path().to_path_buf(),alternate,&[]).unwrap());
+        swapped.set_native_runtime_owner(f.audit.native_runtime_owner().unwrap().unwrap()).unwrap();swapped.set_native_store_binding(first.original_binding().clone()).unwrap();
+        refuse(&runtimes,vec![swapped,middle.clone(),current.clone()]);
+        let original_anchor=base.join("anchors/native.json");let saved_anchor=std::fs::read(&original_anchor).unwrap();
+        let mut changed:serde_json::Value=serde_json::from_slice(&saved_anchor).unwrap();changed["sealed"]["validation"]["metadata_fixture"]="changed".into();
+        std::fs::write(&original_anchor,serde_json::to_vec(&changed).unwrap()).unwrap();
+        let mut visited=false;let error=ownership::with_metadata_native_owner(&current,&runtimes,&fence,&mut load,&mut |_| {visited=true;Ok(())}).unwrap_err();
+        assert!(!visited);assert!(format!("{error:#}").contains("native metadata original completed seal changed"),"{error:#}");
+        std::fs::write(&original_anchor,saved_anchor).unwrap();
+        refuse(&[],audits.clone()); // saved absence cannot hide a retained runtime
+        let mut unknown=runtimes.clone();unknown[0].inventory=None;refuse(&unknown,audits.clone());
+        let runtime=native.join(format!("{provider}/session-fixture"));
+        let policy=std::path::PathBuf::from(std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").unwrap());let policy_bytes=std::fs::read(&policy).unwrap();
+        std::fs::write(&policy,b"{}").unwrap();refuse(&runtimes,audits.clone());std::fs::write(&policy,&policy_bytes).unwrap();
+        let export=runtime.join("generation-fixture/context");let export_bytes=std::fs::read(&export).unwrap();
+        std::fs::write(&export,b"changed provider export").unwrap();refuse(&runtimes,audits.clone());assert_eq!(std::fs::read(&export).unwrap(),b"changed provider export");std::fs::write(&export,export_bytes).unwrap();
+        let held=std::fs::OpenOptions::new().read(true).write(true).open(runtime.join("lock")).unwrap();assert_eq!(unsafe{libc::flock(held.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        refuse(&runtimes,audits.clone());unsafe{libc::flock(held.as_raw_fd(),libc::LOCK_UN)};drop(held);
+        let complete=std::fs::read(runtime.join("complete.json")).unwrap();std::fs::write(runtime.join("complete.json"),b"{}").unwrap();refuse(&runtimes,audits.clone());assert_eq!(std::fs::read(runtime.join("complete.json")).unwrap(),b"{}");std::fs::write(runtime.join("complete.json"),complete).unwrap();
+        std::fs::write(middle.path(),b"damaged original intermediate audit\n").unwrap();refuse(&runtimes,audits.clone());std::fs::write(middle.path(),&audit_before[1]).unwrap();
+        assert!(ownership::with_metadata_native_owner(&current,&runtimes,&fence,&mut load,&mut |_|anyhow::bail!("injected metadata failure")).is_err());
+        ownership::with_metadata_native_owner(&current,&runtimes,&fence,&mut load,&mut |_|Ok(())).unwrap();
+        assert_eq!(f.store.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(f.store.events(&lease.workflow).unwrap(),events);
+        assert_eq!(std::fs::read(native.join("authority-epoch.json")).unwrap(),epoch);
+        assert_eq!(audits.iter().map(|a|std::fs::read(a.path()).unwrap()).collect::<Vec<_>>(),audit_before);
+        assert_eq!(f.store.merge_allowance(now(),5).unwrap().confirmed,0);
+        current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_launch_resource_binding",
+            "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_identity":{}})).unwrap();
+        let mut visited=false;
+        let error=ownership::with_metadata_native_owner(&current,&runtimes,&fence,&mut load,&mut |_| {visited=true;Ok(())}).unwrap_err();
+        assert!(!visited);assert!(format!("{error:#}").contains("native metadata resource has no original launch"),"{error:#}");
+        f.store.release(&lease,now()).unwrap();refuse(&runtimes,audits.clone());
+        }
     }
 
     #[test]
@@ -2201,7 +2287,7 @@ pub(crate) mod tests {
         let fact = f.complete();
         f.record(&fact).unwrap();
         file(
-            &f._root.path().join("native/codex/session-fixture/lock"),
+            &f._root.path().join("native").join(&f.prepared.intent.runtime_relative_path).join("lock"),
             b"",
         );
         // This fixture dispatches no model. Seed actual protected controller

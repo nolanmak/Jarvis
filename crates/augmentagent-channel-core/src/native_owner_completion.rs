@@ -288,7 +288,7 @@ fn selection(logger: &AuditLogger, binding: &super::ownership::TransferBinding) 
     logger.dispatch_allowed()?;
     selected_binding(binding)
 }
-fn selected_binding(binding: &super::ownership::TransferBinding) -> Result<()> {
+pub(super) fn selected_binding(binding: &super::ownership::TransferBinding) -> Result<()> {
     let path = std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY")
         .context("native completion selected policy missing")?;
     let bytes = super::private(Path::new(&path))?;

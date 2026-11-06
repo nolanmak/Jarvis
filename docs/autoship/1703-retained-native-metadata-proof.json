@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "kind": "held-original-retained-completed-session-native-metadata-proof-component",
+  "source_parent_commit": "358044635d5fb85c3fe1298c775b9b9d6e56dc4e",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_metadata.rs",
+      "sha256": "a6e18673f6c959c79f27ae4fe31ca2217acddfa6f17baba2c43c6612fd8380c6"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
+      "sha256": "d4f440182da52995c371c390fc8eebfab7d82b6d12045154bdabd63dc6adaf5d"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_handoff.rs",
+      "sha256": "97b920f99469db6328add3dd0dc4dfec3420bea58d48e84bb5fe0951cf6cd82f"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_completion.rs",
+      "sha256": "6b05b85127751a87fc685479db6541f4c6d3d41bbacc41d25356014318b13a31"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "27eb4707d87d7ef151d9e1b3bdd3b7083ba896d4d7f7f8961214dc27062322ba"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_transfer.rs",
+      "sha256": "c299385044969f5972b4bb38a11994ee2a810f6ce37b5e55ba8bb9c5e5344545"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/audit_chain.rs",
+      "sha256": "201a6fa6e1c444d48ca543af545fcc27ea627d8e51f7adecc29784308af760fb"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "9ac174d3d5ee5c47becf52d090a374aee9e420477d02f25abc88e2bc7caf7c50"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+      "sha256": "32cbf45587045ddbebccdc4709eb8b0b2a80febb947017039775203b0df82826"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "af3b273f9fd41a6adeea85cc67856023298b6349bfae7eb899b5de4f76c00e1e"
+    },
+    {
+      "path": "docs/autoship/owner-publication-protocol.md",
+      "sha256": "c9bd5f29c89d87bbf7fbc588a9f45354a0901da5a539876405d39dfe25783ca0"
+    },
+    {
+      "path": "docs/autoship/owner-acceptance-publication.md",
+      "sha256": "d63993155de3c13c43648dbcac2f74ffa2927d8fe9931cff991e915343c211b8"
+    }
+  ],
+  "behavior": [
+    "Private borrowed MetadataNativeOwnerProof retains original state, physical session and every required audit snapshot lock through a short metadata visitor. It cannot be cloned/deserialized or converted to productive/input authority.",
+    "Original validated native ledger derives the complete bounded workflow namespace frontier, including intermediate namespaces with resource admissions but no retained launch. Caller-supplied audit subsets cannot hide them.",
+    "Actual log/anchor endpoints and completed source-seal digests are bound to original native claims/receipts. Current anchor matches the original current logger; unbound/forensic/unknown historical seals refuse.",
+    "Existing physical census freshly verifies runtime creation/effective ownership/completion/alias/provider exports and retains all scanned session locks. Unknown outcomes and unknown physical state refuse.",
+    "Held snapshots freshly verify recorded generic resources and native resource bindings correlated to exact original protected launch/prefix receipts, source namespace and store binding. Retained runtimes require a bound original launch key.",
+    "Original publication guard preflights its retained opaque draft outside native locks and revalidates exact current facts/intent/control through SQL-only callbacks while locks are held. Existing-only source loader performs no provider/model work.",
+    "Inspection creates no publication, workflow/event transition, model charge, lease change, epoch rewrite or audit append."
+  ],
+  "validation": {
+    "behavioral_red": {
+      "original_session_id": 34642,
+      "terminal_exit": 1,
+      "cargo_exit": 101,
+      "log": "/tmp/autoship-retained-native-proof-red-20261106.log",
+      "failure": "unused namespace proof rejects an actual completed retained session after a core transfer"
+    },
+    "provider_matrix": {
+      "original_session_id": 94482,
+      "log": "/tmp/autoship-retained-native-proof-providers-focused-2-20261106.log",
+      "providers": [
+        "codex",
+        "claude"
+      ],
+      "passed": true
+    },
+    "actual_original_guard_focused": {
+      "original_session_id": 33126,
+      "terminal_exit": 0,
+      "log": "/tmp/autoship-retained-native-proof-guard-focused-20261106.log"
+    },
+    "final": {
+      "original_session_id": 94482,
+      "terminal_exit": 0,
+      "core": {
+        "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib",
+        "passed": 934,
+        "failed": 0,
+        "ignored": 15,
+        "seconds": 36.77,
+        "log": "/tmp/autoship-retained-native-proof-full-core-20261106.log"
+      },
+      "cli": {
+        "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+        "passed": 1948,
+        "failed": 0,
+        "ignored": 34,
+        "seconds": 320.76,
+        "log": "/tmp/autoship-retained-native-proof-full-cli-20261106.log"
+      },
+      "production_check": {
+        "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+        "seconds": 20.59,
+        "log": "/tmp/autoship-retained-native-proof-production-check-20261106.log"
+      }
+    },
+    "cases": [
+      "two completed actual core handoffs across three generations in both provider metadata layouts",
+      "launch-free intermediate resource namespace cannot be omitted or corrupted",
+      "actual state, runtime-session and all three audit locks retained through visitor",
+      "original runtime creation owner versus current effective owner preserved",
+      "alternate valid source anchor and mutated completed source seal refuse",
+      "changed selected policy, provider export and completion bytes refuse without rewriting unknown bytes",
+      "missing runtime declarations, uncertain inventory and held runtime lock refuse before visitor",
+      "unmatched native resource binding in current audit refuses before visitor",
+      "visitor error releases all locks and permits a subsequent valid inspection",
+      "stale lease refuses; proof-only success preserves exact workflow/events/audit/epoch and confirmed allowance",
+      "actual opaque publication guard general visitor plus policy/artifact/canonical/intent/native-projection/retirement/pause refusal cases"
+    ],
+    "intermediate_notes": [
+      "Initial compile setup had an export before an inner doc comment and a missing closure result type; corrected before positive validation.",
+      "First Claude fixture attempt used a Codex-specific test lock path. The shared test handoff helper now uses the actual prepared runtime path; both providers then pass. This was a fixture correction, not a production provider bypass."
+    ]
+  },
+  "limits": [
+    "Recorded generic/native resources are freshly verified, but complete independent C/R source/compiled-artifact/writer/allocation/input-census guarantees remain required; this component does not supply them.",
+    "The visitor supports active current namespaces and retained completed runtime inventories. Uncertain/missing physical outcomes and historical seals lacking required original completed authority refuse and need actual recovery/terminal producers.",
+    "Bounded evidence: namespace frontier<=128, existing physical/session limits, aggregate committed audit<=128MiB, version-1 metadata proof<=1MiB. These are not aggregate protected-artifact storage admission or permission to evict original evidence.",
+    "Fixtures exercise actual protected append, native registration/ledger/census/transfer machinery and same-host absent-resource checks with synthetic private provider exports/resource observations. No real VM or provider model is executed.",
+    "No provider conversation restoration, input nonrelease, protected canonical writer/completion/disposition, ready bridge, shared productive predicate, productive owner consumer, new live work, autonomous merge, deployment or full acceptance is established.",
+    "P2-P5, continuation, authenticated recovery/terminal authority, canonical lineage, C/R, protected aggregate storage, independent exact-head review, hosted checks, normal rollout and full live CLI/Discord/soak/five-merge acceptance remain required."
+  ]
+}

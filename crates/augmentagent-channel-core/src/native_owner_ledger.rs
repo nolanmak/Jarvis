@@ -585,6 +585,58 @@ impl<'a> Ledger<'a> {
         }
         ensure!(actual==wanted,R::InventoryMissing);Ok(())
     }
+    /// Complete original workflow namespace set for metadata inspection. No
+    /// supplied subset may hide an intermediate or aborted resource admission.
+    /// Immutable original audit endpoint and completed source seal, never a
+    /// caller-selected alternate anchor for the same protected log pathname.
+    pub fn metadata_audit_binding(&self,namespace:&Authority)->Result<Option<(String,String,Option<String>)>> {
+        let mut endpoint=None;let mut seal=None;
+        let mut query=self.db.prepare("SELECT id FROM native_transfer ORDER BY id")?;
+        for id in query.query_map([],|r|r.get::<_,String>(0))? {
+            let record=load(&self.db,&id?)?.context(R::PreparedCorrupt)?;
+            if record.request.workflow_id!=namespace.owner.workflow_id
+                || !(record.request.source_owners.contains(namespace) || record.request.destination==*namespace) {continue;}
+            for claim in record.claims.iter().filter(|c|c.kind=="audit-binding") {
+                let value:Endpoint=serde_json::from_str(&claim.key)?;
+                if value.audit_path!=namespace.audit_path {continue;}
+                let actual=(value.actual_audit_path,value.anchor_path);
+                ensure!(endpoint.as_ref().is_none_or(|old|old==&actual),R::AuthorityConflict);endpoint=Some(actual);
+            }
+            if record.request.source_owners.contains(namespace) {
+                if let State::Completed(receipt)=record.state {
+                    let value=&receipt.source_seals.iter().find(|s|s.audit_path==namespace.audit_path).context(R::PreparedCorrupt)?.seal_sha256;
+                    ensure!(seal.as_ref().is_none_or(|old|old==value),R::AuthorityConflict);seal=Some(value.clone());
+                }
+            }
+        }
+        Ok(endpoint.map(|(log,anchor)|(log,anchor,seal)))
+    }
+    pub fn metadata_workflow_frontier(&self,current:&Authority)->Result<Vec<Authority>> {
+        ensure!(!current.owner.workflow_id.is_empty() && current.owner.lease_generation>0,R::InvalidRequest);
+        ensure!(history_bytes(self.root)?<=HISTORY_LIMIT,R::HistoryCapacity);validate_all_history(&self.db)?;
+        let key=|a:&Authority|(a.owner.lease_generation,a.audit_path.clone());
+        let mut known=BTreeMap::new();known.insert(key(current),current.clone());
+        let mut query=self.db.prepare("SELECT id FROM native_transfer ORDER BY id")?;
+        for id in query.query_map([],|r|r.get::<_,String>(0))? {
+            let record=load(&self.db,&id?)?.context(R::PreparedCorrupt)?;
+            if record.request.workflow_id!=current.owner.workflow_id {continue;}
+            ensure!(!matches!(record.state,State::Prepared),R::PendingUnknown);
+            for authority in record.request.source_owners.into_iter().chain(std::iter::once(record.request.destination)) {
+                known.insert(key(&authority),authority);
+            }
+            ensure!(known.len()<=128,R::HistoryCapacity);
+        }
+        let mut query=self.db.prepare("SELECT generation,audit_path FROM retired_owner WHERE workflow=?1 ORDER BY generation,audit_path LIMIT 129")?;
+        for row in query.query_map([&current.owner.workflow_id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))? {
+            let (generation,audit_path)=row?;let authority=Authority {owner:RuntimeOwner {workflow_id:current.owner.workflow_id.clone(),lease_generation:generation},audit_path};known.insert(key(&authority),authority);
+            ensure!(known.len()<=128,R::HistoryCapacity);
+        }
+        for authority in known.values() {
+            ensure!(authority.owner.lease_generation>0 && authority.owner.lease_generation<=current.owner.lease_generation,R::AuthorityConflict);
+            if authority!=current {ensure!(self.is_closed(&authority.owner)? || self.retired_authority(authority)?,R::AuthorityConflict);}
+        }
+        Ok(known.into_values().collect())
+    }
     pub fn held_by_abort(&self, owner: &RuntimeOwner) -> Result<bool> {
         conflict(&self.db, owner)
     }

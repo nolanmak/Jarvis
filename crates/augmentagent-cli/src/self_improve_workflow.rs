@@ -262,6 +262,33 @@ pub(super) struct OwnerPublicationGuard<'a> {
 }
 
 impl OwnerPublicationGuard<'_> {
+    /// General retained-session metadata inspection. Actual physical/resource
+    /// proof is distinct from the captured facts; no productive guard escapes.
+    fn with_native_metadata(&self,visit:&mut dyn FnMut(&augmentagent_channel_core::native_vm::ownership::MetadataNativeOwnerProof<'_>)->Result<()>)->Result<()> {
+        let guard=&self._guard;guard.healthy_lease()?;
+        anyhow::ensure!(guard.metadata_only,"publication metadata role missing");
+        let turn=self._publication.metadata_turn(&guard.repository,&guard.lease,&guard.binding,&guard.worktree)?;
+        let facts=guard.store.lock().map_err(|_|anyhow::anyhow!("publication native facts store poisoned"))?
+            .owner_publication_native_facts(&turn,&self._publication,guard.audit.path(),millis())?;
+        let runtimes=facts.runtimes()?;
+        let current=|| {
+            guard.healthy_lease()?;
+            guard.store.lock().map_err(|_|anyhow::anyhow!("publication native facts store poisoned"))?
+                .revalidate_owner_publication_native_facts(&turn,&self._publication,guard.audit.path(),&facts,millis())
+        };
+        let mut load=|namespaces:&[augmentagent_channel_core::native_vm::ownership::Authority]| {
+            let mut grouped=std::collections::BTreeMap::new();
+            for namespace in namespaces {let entry=grouped.entry(namespace.audit_path.clone()).or_insert_with(||namespace.clone());if namespace.owner.lease_generation>entry.owner.lease_generation {*entry=namespace.clone();}}
+            grouped.values().map(|namespace| {
+                if Path::new(&namespace.audit_path)==guard.audit.path() {Ok(guard.audit.clone())}
+                else {existing_native_audit(&guard.state,namespace,Some(&guard.worktree),facts.original_binding())}
+            }).collect::<Result<Vec<_>>>()
+        };
+        augmentagent_channel_core::native_vm::ownership::with_metadata_native_owner(&guard.audit,&runtimes,&current,&mut load,&mut |proof| {
+            anyhow::ensure!(proof.namespace()==facts.namespace() && proof.binding()==facts.original_binding(),"publication retained native namespace changed");
+            self._publication.validate_native_binding(proof.binding())?;visit(proof)
+        })
+    }
     /// Current metadata snapshot only; original native proof remains mandatory.
     fn native_facts(&self)->Result<durable::OwnerPublicationNativeFacts> {
         let guard=&self._guard;guard.healthy_lease()?;
@@ -4336,6 +4363,8 @@ mod tests {
                         use augmentagent_channel_core::native_vm::ownership;
                         let before=WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap();
                         let current_facts=pending.native_facts().unwrap();
+                        let mut general=false;
+                        pending.with_native_metadata(&mut |proof| {assert!(proof.inventory().is_empty());general=true;Ok(())}).unwrap();assert!(general);
                         assert_eq!(current_facts.namespace().owner.lease_generation,guard.lease.generation);
                         assert_eq!(current_facts.original_binding(),&original);assert!(current_facts.runtimes().unwrap().is_empty());
                         let current_turn=guard.store.lock().unwrap().owner_turn_for_lease(&guard.lease,millis()).unwrap();
@@ -4348,6 +4377,8 @@ mod tests {
                             let mut entered=false;
                             assert!(pending.with_unused_native_metadata(&mut |_| {entered=true;Ok(())}).is_err());
                             assert!(!entered,"refused metadata context reached locked visitor");
+                            let mut general=false;
+                            assert!(pending.with_native_metadata(&mut |_| {general=true;Ok(())}).is_err());assert!(!general,"refused context reached retained metadata visitor");
                         };
                         let mut visited=false;
                         pending.with_unused_native_metadata(&mut |proof| {
@@ -4440,6 +4471,7 @@ mod tests {
                         let mut entered=false;
                         assert!(pending.with_unused_native_metadata(&mut |_| {entered=true;Ok(())}).is_err());assert!(!entered);
                         assert!(pending.native_facts().is_err(),"damaged intent exposed current native metadata");
+                        let mut general=false;assert!(pending.with_native_metadata(&mut |_| {general=true;Ok(())}).is_err());assert!(!general);
                     }
                     db.execute("UPDATE workflow_owner_publication_intent SET record=?2 WHERE request_id=?1",rusqlite::params![turn.request_id,saved]).unwrap();
                     guard.store.lock().unwrap().validate_owner_publication_metadata(&turn,&binding,guard.audit.path(),millis()).unwrap();
@@ -4451,6 +4483,7 @@ mod tests {
                         let mut entered=false;
                         assert!(pending.with_unused_native_metadata(&mut |_| {entered=true;Ok(())}).is_err());assert!(!entered,"new owner pause reached metadata visitor");
                         assert!(pending.native_facts().is_err(),"new owner pause exposed current native metadata");
+                        let mut general=false;assert!(pending.with_native_metadata(&mut |_| {general=true;Ok(())}).is_err());assert!(!general);
                         assert!(guard.store.lock().unwrap().revalidate_owner_publication_native_facts(&cached_turn,&pending._publication,guard.audit.path(),&cached_facts,millis()).is_err(),"cached native facts bypassed newer owner pause");
                         assert_eq!(WorkflowStore::open(&state).unwrap().pending_owner_messages(&id).unwrap(),1);
                         assert_eq!(WorkflowStore::open(&state).unwrap().merge_allowance(millis(),5).unwrap().confirmed,0);

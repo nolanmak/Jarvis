@@ -124,6 +124,8 @@ mod owner_inventory;
 mod owner_handoff;
 #[path = "native_owner_recovery.rs"]
 mod owner_recovery;
+#[path = "native_owner_metadata.rs"]
+mod owner_metadata;
 #[path = "native_owner_reconciliation.rs"]
 mod owner_reconciliation;
 #[path = "native_owner_preparation.rs"]
