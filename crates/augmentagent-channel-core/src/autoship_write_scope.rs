@@ -312,46 +312,95 @@ pub fn with_registered_scope<T>(worktree:&Path,expected:Option<&str>,next:&str,a
     let state=crate::state_dir::state_dir().context("scope control state unavailable")?;
     with_registered_scope_at(&state,worktree,expected,next,allowed,pinned,visit)
 }
-fn with_registered_scope_at<T>(state:&Path,worktree:&Path,expected:Option<&str>,next:&str,allowed:Vec<DeclaredPath>,pinned:Vec<String>,visit:impl FnOnce(&RegisteredScope<'_>)->Result<T>)->Result<T> {
+fn admission_for(worktree:&Path,next:&str,allowed:Vec<DeclaredPath>,pinned:Vec<String>)->Result<Admission> {
     let worktree=worktree.canonicalize()?;
     ensure!(!next.is_empty() && allowed.len()<=256 && pinned.len()<=256,"invalid scope admission");
     for path in allowed.iter().map(|p|&p.path).chain(pinned.iter()) {relative(path)?;}
-    let lock=ScopeLock::acquire(state,&worktree,true)?;
-    let path=lock.directory.join(location(state,&worktree).file_name().context("scope path missing")?);
-    let admission=Admission {version:1,worktree:worktree.clone(),contract_hash:next.into(),allowed,pinned};
-    let previous=match fs::symlink_metadata(&path) {
-        Ok(_)=>Some(read(&path)?),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>None,Err(e)=>return Err(e.into()),
-    };
-    let bytes=serde_json::to_vec(&admission)?;ensure!(bytes.len()<=1024*1024,"write admission exceeds bound");
-    if let Some(previous)=&previous {
-        ensure!(previous.version==1 && previous.worktree==worktree,"write admission source identity changed");
-        if previous.contract_hash==next {ensure!(previous==&admission,"active write admission differs from registered permissions");}
-        if previous!=&admission {
-            ensure!(expected==Some(previous.contract_hash.as_str()),"write contract changed without a new authorized workflow");
+    let admission=Admission {version:1,worktree,contract_hash:next.into(),allowed,pinned};
+    ensure!(serde_json::to_vec(&admission)?.len()<=1024*1024,"write admission exceeds bound");Ok(admission)
+}
+/// Compute a descriptive reference from independently retained permission bytes.
+/// Reading a current scope and treating that as the expected source defeats the
+/// comparison. This value never grants native execution or publication authority.
+pub fn scope_reference_for(worktree:&Path,contract:&str,allowed:Vec<DeclaredPath>,pinned:Vec<String>)->Result<ScopeReference> {
+    reference_for(&admission_for(worktree,contract,allowed,pinned)?)
+}
+/// Locked, conditional scope mutation. Acquire under native proof, then enter
+/// the workflow transaction and revalidate publication before calling register.
+/// Acquiring this object does not change the registered scope. Dropping it never
+/// rolls back an effect whose filesystem acknowledgement may have been lost.
+pub struct ScopeTransition {admission:Admission,previous:Option<Admission>,path:PathBuf,lock:ScopeLock,registered:std::cell::Cell<bool>}
+impl ScopeTransition {
+    fn read_current(&self)->Result<Option<Admission>> {
+        self.lock.validate_current()?;
+        match fs::symlink_metadata(&self.path) {
+            Ok(_)=>Ok(Some(read(&self.path)?)),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(None),Err(e)=>Err(e.into()),
+        }
+    }
+    pub fn register(&self)->Result<RegisteredScope<'_>> {
+        let previous=self.read_current()?;
+        ensure!(previous==self.previous || previous.as_ref()==Some(&self.admission),"write admission changed before conditional publication");
+        let bytes=serde_json::to_vec(&self.admission)?;
+        if let Some(previous)=previous.as_ref().filter(|previous|*previous!=&self.admission) {
             let historical=serde_json::to_vec(previous)?;
-            let history=path.parent().unwrap().join(format!("historical-{:x}.json",Sha256::digest(&historical)));
+            let history=self.lock.directory.join(format!("historical-{:x}.json",Sha256::digest(&historical)));
             match fs::symlink_metadata(&history) {
                 Ok(_)=>ensure!(read(&history)?==*previous,"historical write admission changed"),
                 Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{
-                    lock.validate_current()?;
-                    let mut file=tempfile::NamedTempFile::new_in(&lock.directory)?;file.write_all(&historical)?;file.as_file().sync_all()?;
+                    self.lock.validate_current()?;
+                    let mut file=tempfile::NamedTempFile::new_in(&self.lock.directory)?;file.write_all(&historical)?;file.as_file().sync_all()?;
                     file.persist_noclobber(&history).map_err(|e|e.error)?;
                 },Err(e)=>return Err(e.into()),
             }
         }
-    }else {ensure!(expected.is_none(),"amended write admission source missing");}
-    if previous.as_ref()!=Some(&admission) {
-        let mut staged=tempfile::NamedTempFile::new_in(&lock.directory)?;staged.write_all(&bytes)?;staged.as_file().sync_all()?;
-        lock.validate_current()?;
-        if let Some(previous)=&previous {
-            ensure!(read(&path)?==*previous,"write admission changed during amendment");staged.persist(&path).map_err(|e|e.error)?;
-        }else {staged.persist_noclobber(&path).map_err(|e|e.error)?;}
+        if previous.as_ref()!=Some(&self.admission) {
+            let mut staged=tempfile::NamedTempFile::new_in(&self.lock.directory)?;staged.write_all(&bytes)?;staged.as_file().sync_all()?;
+            ensure!(self.read_current()?==previous,"write admission changed during amendment");
+            if previous.is_some() {staged.persist(&self.path).map_err(|e|e.error)?;}
+            else {staged.persist_noclobber(&self.path).map_err(|e|e.error)?;}
+        }
+        // Exact replay settles an earlier directory-fsync acknowledgement.
+        fs::File::open(&self.lock.directory)?.sync_all()?;
+        let proof=RegisteredScope {reference:reference_for(&self.admission)?,path:self.path.clone(),_admission:&self.admission,lock:&self.lock};
+        proof.validate_current()?;self.registered.set(true);Ok(proof)
     }
-    // Idempotent replay also settles an earlier directory-fsync acknowledgement.
-    fs::File::open(&lock.directory)?.sync_all()?;
-    let reference=ScopeReference {version:1,worktree,contract_hash:next.into(),record_sha256:format!("{:x}",Sha256::digest(&bytes))};
-    let proof=RegisteredScope {reference,path,_admission:&admission,lock:&lock};proof.validate_current()?;
-    let result=visit(&proof)?;proof.validate_current()?;Ok(result)
+}
+enum ExpectedScope<'a> {Contract(Option<&'a str>),Exact(Option<&'a ScopeReference>)}
+/// Holds the same lock used by ordinary writers, without writing scope metadata
+/// before the visitor's workflow transaction. Exact next permission replay is
+/// allowed; any other existing source must match the independently retained
+/// reference. Some(next) requires an existing scope, including on replay.
+pub fn with_scope_transition<T>(worktree:&Path,expected:Option<&ScopeReference>,next:&str,allowed:Vec<DeclaredPath>,pinned:Vec<String>,
+    visit:impl FnOnce(&ScopeTransition)->Result<T>)->Result<T> {
+    let state=crate::state_dir::state_dir().context("scope control state unavailable")?;
+    with_scope_transition_at(&state,worktree,ExpectedScope::Exact(expected),next,allowed,pinned,visit)
+}
+fn with_scope_transition_at<T>(state:&Path,worktree:&Path,expected:ExpectedScope<'_>,next:&str,allowed:Vec<DeclaredPath>,pinned:Vec<String>,
+    visit:impl FnOnce(&ScopeTransition)->Result<T>)->Result<T> {
+    let admission=admission_for(worktree,next,allowed,pinned)?;
+    let lock=ScopeLock::acquire(state,&admission.worktree,true)?;
+    let path=lock.directory.join(location(state,&admission.worktree).file_name().context("scope path missing")?);
+    let mut transition=ScopeTransition {admission,previous:None,path,lock,registered:std::cell::Cell::new(false)};
+    let previous=transition.read_current()?;
+    if let Some(previous)=&previous {
+        ensure!(previous.version==1 && previous.worktree==transition.admission.worktree,"write admission source identity changed");
+        if previous.contract_hash==next {ensure!(previous==&transition.admission,"active write admission differs from registered permissions");}
+        if previous!=&transition.admission {
+            match expected {
+                ExpectedScope::Contract(expected)=>ensure!(expected==Some(previous.contract_hash.as_str()),"write contract changed without a new authorized workflow"),
+                ExpectedScope::Exact(expected)=>ensure!(expected==Some(&reference_for(previous)?),"previous registered permissions changed before publication"),
+            }
+        }
+    }else {ensure!(match expected {ExpectedScope::Contract(e)=>e.is_none(),ExpectedScope::Exact(e)=>e.is_none()},"amended write admission source missing");}
+    transition.previous=previous;
+    let result=visit(&transition)?;transition.lock.validate_current()?;
+    if transition.registered.get() {ensure!(transition.read_current()?.as_ref()==Some(&transition.admission),"registered scope changed before transition return");}
+    Ok(result)
+}
+fn with_registered_scope_at<T>(state:&Path,worktree:&Path,expected:Option<&str>,next:&str,allowed:Vec<DeclaredPath>,pinned:Vec<String>,visit:impl FnOnce(&RegisteredScope<'_>)->Result<T>)->Result<T> {
+    with_scope_transition_at(state,worktree,ExpectedScope::Contract(expected),next,allowed,pinned,|transition| {
+        let proof=transition.register()?;let result=visit(&proof)?;proof.validate_current()?;Ok(result)
+    })
 }
 
 /// Controller-only activation after independently verified contract amendment.
@@ -432,6 +481,95 @@ mod replay_tests {
 #[cfg(test)]
 mod publication_lock_tests {
     use super::*;
+    #[test]
+    fn publication_scope_rejects_changed_previous_permissions_before_mutation() {
+        for fault in ["allowed", "pinned"] {
+            let state=tempfile::tempdir().unwrap();let tree=tempfile::tempdir().unwrap();
+            let allowed=vec![DeclaredPath {path:"src".into(),directory:true}];let pinned=vec!["protected.py".to_owned()];
+            register_at(state.path(),tree.path(),"old",allowed,pinned).unwrap();
+            let expected=current_scope_reference(state.path(),tree.path()).unwrap();
+            let path=location(state.path(),&tree.path().canonicalize().unwrap());
+            let mut suspect=read(&path).unwrap();
+            if fault=="allowed" {suspect.allowed=vec![DeclaredPath {path:"unexpected.rs".into(),directory:false}];}
+            else {suspect.pinned=vec!["different.py".into()];}
+            let bytes=serde_json::to_vec(&suspect).unwrap();fs::write(&path,&bytes).unwrap();
+            let called=std::cell::Cell::new(false);
+            let result=with_scope_transition_at(state.path(),tree.path(),ExpectedScope::Exact(Some(&expected)),"next",vec![],vec![],|transition| {called.set(true);transition.register()?;Ok(())});
+            assert!(result.is_err(),"{fault}: altered previous permissions accepted under the same contract hash");
+            assert!(!called.get());assert_eq!(fs::read(&path).unwrap(),bytes);
+        }
+    }
+    #[test]
+    fn publication_scope_transaction_refusal_preserves_previous_scope() {
+        let state=tempfile::tempdir().unwrap();let tree=tempfile::tempdir().unwrap();
+        register_at(state.path(),tree.path(),"old",vec![],vec![]).unwrap();
+        let expected=current_scope_reference(state.path(),tree.path()).unwrap();
+        let path=location(state.path(),&tree.path().canonicalize().unwrap());let before=fs::read(&path).unwrap();
+        let result:Result<()>=with_scope_transition_at(state.path(),tree.path(),ExpectedScope::Exact(Some(&expected)),"next",vec![],vec![],|_| {
+            anyhow::bail!("workflow transaction refused publication before scope mutation")
+        });
+        assert!(result.is_err());assert_eq!(fs::read(&path).unwrap(),before,"scope changed before workflow admission");
+    }
+
+    #[test]
+    fn publication_scope_effect_survives_transaction_loss_and_replays_exactly() {
+        for revision in [false,true] {
+            let state=tempfile::tempdir().unwrap();let tree=tempfile::tempdir().unwrap();
+            let expected=if revision {
+                register_at(state.path(),tree.path(),"old",vec![],vec![]).unwrap();
+                Some(scope_reference_for(tree.path(),"old",vec![],vec![]).unwrap())
+            }else {None};
+            let allowed=vec![DeclaredPath {path:"src".into(),directory:true}];let pinned=vec!["private.py".into()];
+            let next=scope_reference_for(tree.path(),"next",allowed.clone(),pinned.clone()).unwrap();
+            let mut db=rusqlite::Connection::open_in_memory().unwrap();db.execute_batch("CREATE TABLE completion (contract TEXT);").unwrap();
+            let result:Result<()>=with_scope_transition_at(state.path(),tree.path(),ExpectedScope::Exact(expected.as_ref()),"next",allowed.clone(),pinned.clone(),|transition| {
+                let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let proof=transition.register()?;assert_eq!(proof.reference(),&next);
+                assert!(register_at(state.path(),tree.path(),"next",allowed.clone(),pinned.clone()).is_err());
+                assert!(grants(state.path(),tree.path()).is_err());
+                tx.execute("INSERT INTO completion VALUES('next')",[])?;
+                anyhow::bail!("completion acknowledgement lost after actual scope effect")
+            });
+            assert!(result.is_err());assert_eq!(db.query_row("SELECT count(*) FROM completion",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+            assert_eq!(current_scope_reference(state.path(),tree.path()).unwrap(),next);
+            with_scope_transition_at(state.path(),tree.path(),ExpectedScope::Exact(expected.as_ref()),"next",allowed.clone(),pinned.clone(),|transition| {
+                let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let proof=transition.register()?;assert_eq!(proof.reference(),&next);proof.validate_current()?;
+                tx.execute("INSERT INTO completion VALUES('next')",[])?;tx.commit()?;Ok(())
+            }).unwrap();
+            assert_eq!(db.query_row("SELECT count(*) FROM completion",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+            // Once canonical publication names next, its caller must require
+            // this exact existing effect, rather than recreate a missing scope.
+            let path=location(state.path(),&tree.path().canonicalize().unwrap());fs::remove_file(&path).unwrap();
+            let called=std::cell::Cell::new(false);
+            assert!(with_scope_transition_at(state.path(),tree.path(),ExpectedScope::Exact(Some(&next)),"next",allowed,pinned,|transition| {
+                called.set(true);transition.register()?;Ok(())
+            }).is_err());assert!(!called.get());assert!(!path.exists());
+        }
+    }
+    #[test]
+    fn publication_scope_refuses_mutation_after_registration_even_if_visitor_returns_success() {
+        let state=tempfile::tempdir().unwrap();let tree=tempfile::tempdir().unwrap();
+        let path=location(state.path(),&tree.path().canonicalize().unwrap());
+        let result=with_scope_transition_at(state.path(),tree.path(),ExpectedScope::Exact(None),"next",vec![],vec![],|transition| {
+            transition.register()?.validate_current()?;
+            let mut suspect=read(&path)?;suspect.pinned=vec!["unexpected.py".into()];fs::write(&path,serde_json::to_vec(&suspect)?)?;Ok(())
+        });
+        assert!(result.is_err());assert_eq!(read(&path).unwrap().pinned,vec!["unexpected.py"]);
+    }
+    #[test]
+    fn publication_scope_rechecks_source_after_entering_workflow_transaction() {
+        let state=tempfile::tempdir().unwrap();let tree=tempfile::tempdir().unwrap();
+        register_at(state.path(),tree.path(),"old",vec![],vec![]).unwrap();
+        let expected=scope_reference_for(tree.path(),"old",vec![],vec![]).unwrap();
+        let path=location(state.path(),&tree.path().canonicalize().unwrap());
+        let mut suspect=read(&path).unwrap();suspect.pinned=vec!["unexpected.py".into()];let bytes=serde_json::to_vec(&suspect).unwrap();
+        let result:Result<()>=with_scope_transition_at(state.path(),tree.path(),ExpectedScope::Exact(Some(&expected)),"next",vec![],vec![],|transition| {
+            fs::write(&path,&bytes)?;
+            transition.register()?;Ok(())
+        });
+        assert!(result.is_err());assert_eq!(fs::read(&path).unwrap(),bytes);
+    }
     #[test]
     fn registered_scope_visitor_excludes_other_registered_writers_until_return() {
         let state=tempfile::tempdir().unwrap();let tree=tempfile::tempdir().unwrap();
