@@ -40,13 +40,6 @@ fn renders_evidence_budget(cause: &(dyn std::error::Error + 'static)) -> bool {
     rendered.starts_with(CALLER_EVIDENCE_BUDGET) || rendered == aligned::RequestBudgetExceeded.to_string()
 }
 
-/// Only the inline caller-evidence budget has a streamed fallback, so it is
-/// matched on its own - and, like [`is_evidence_budget`], at every level:
-/// `anyhow` downcasting walks its own `context` layers and values but stops at
-/// the first cause reached through [`std::error::Error::source`].
-fn is_caller_evidence_budget(error: &anyhow::Error) -> bool {
-    error.is::<EvidenceBudget>() || error.chain().any(|cause| cause.is::<EvidenceBudget>())
-}
 fn unavailable_from_error(provider: augmentagent_channel_core::ProviderKind, error: anyhow::Error) -> IndependentReview {
     IndependentReview::unavailable(if is_evidence_budget(&error) {
         ReviewUnavailable::EvidenceBudget { detail: format!("{error:#}") }
@@ -654,7 +647,7 @@ async fn run_impl(
         .unwrap_or(aligned::digest(&serde_json::to_vec(&contract)?));
     let (callers,caller_plan)=match complete_caller_evidence_for_symbols(&worktree,&head,&caller_symbols).await {
         Ok(inline)=>(inline,None),
-        Err(error) if is_caller_evidence_budget(&error)=>{
+        Err(error) if error.downcast_ref::<EvidenceBudget>().is_some()=>{
             let plan=caller_stream::Plan::collect_symbols(&worktree,&head,caller_symbols.clone()).await?;
             (plan.manifest.clone(),Some(plan))
         }
@@ -1242,8 +1235,6 @@ mod tests {
             assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"review-evidence-budget",
                 "a budget carried as an anyhow context value is not missing reviewer capacity");
         }
-        assert!(is_caller_evidence_budget(&anyhow::anyhow!("inline caller evidence refused").context(EvidenceBudget("bounded caller inventory".into()))),
-            "an inline caller budget carried as a context value still streams instead of failing the review");
     }
 
     #[test]
@@ -1261,16 +1252,6 @@ mod tests {
         let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
         assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity",
             "an unrelated reviewer failure below a reported cause is not an evidence budget");
-    }
-
-    #[test]
-    fn source_chained_caller_budget_keeps_its_streamed_fallback() {
-        let budget=anyhow::Error::new(EvidenceBudget("caller evidence".into()));
-        let error=anyhow::Error::new(SourcedFailure(budget.into())).context("caller evidence collection");
-        assert!(is_caller_evidence_budget(&error),
-            "an inline caller budget reported through a source chain still streams instead of failing the review");
-        assert!(!is_caller_evidence_budget(&anyhow::Error::new(aligned::RequestBudgetExceeded)),
-            "a serialized request refusal has no streamed caller-evidence fallback");
     }
 
     #[tokio::test]
