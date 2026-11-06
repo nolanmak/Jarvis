@@ -1223,6 +1223,7 @@ impl WorkflowGuard {
     pub(super) async fn activate_prepared_owner_acceptance(self,prepared:&acceptance::owner::PreparedOwnerAcceptance,
         previous:Option<&crate::autoship_contract::RegisteredContract>)->Result<Self> {
         prepared.validate_current(&self,&self.worktree,previous)?;
+        let preparation=prepared.activation_binding()?;
         let prepared=prepared.prepared();
         acceptance::validate_candidate_harness(&self.worktree,prepared).await?;
         self.audit_health().await?;self.native_builder_owner()?;
@@ -1234,7 +1235,7 @@ impl WorkflowGuard {
             let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("private owner acceptance store poisoned"))?;
             let now=millis();let turn=store.owner_turn_for_lease(&self.lease,now)?;
             charge_elapsed(&mut store,&self.lease,self.started,&self.accounted_ms,now)?;
-            store.activate_private_owner_acceptance(initial.as_ref(),&turn,previous,next,&prepared.baseline.receipts,&prepared.proposal.files,&binding,now)?
+            store.activate_private_owner_acceptance(initial.as_ref(),&turn,previous,next,&prepared.baseline.receipts,&prepared.proposal.files,&preparation,&binding,now)?
         };
         let guard=self.finish_owner_contract_change(revised,contract,environment,"owner_private_acceptance_guard_ready",&old,next.contract_hash())?;
         acceptance::bind_write_scope(&guard.worktree,prepared,previous)?;
@@ -3591,6 +3592,14 @@ mod tests {
                     first=first.activate_prepared_owner_acceptance(&prepared,None).await.expect("private owner acceptance must activate without installing adapters into product");first.validate_before_side_effect().unwrap();
                     assert!(!dir.path().join("autoship_verifiers/observe.py").exists(),"owner activation installed a private adapter into product");
                     assert!(prepared.validate_current(&first,dir.path(),None).is_err(),"old producer proof survived activation");
+                    let db=rusqlite::Connection::open(&state).unwrap();
+                    let raw:String=db.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='owner_acceptance_registered'",[&id],|row|row.get(0)).unwrap();
+                    let activation:serde_json::Value=serde_json::from_str(&raw).unwrap();
+                    let artifacts=std::fs::read_dir(control.join("owner-producer-control/owner-preparations")).unwrap().collect::<std::io::Result<Vec<_>>>().unwrap();
+                    assert_eq!(artifacts.len(),1);
+                    let bytes=std::fs::read(artifacts[0].path()).unwrap();
+                    assert_eq!(activation["preparation"]["artifact_sha256"],format!("{:x}",Sha256::digest(&bytes)),"owner activation must retain the exact protected preparation bytes");
+                    drop(db);
                     assert_eq!(first.audit.native_store_binding().unwrap(),Some(original));first.finish().unwrap();
                 }
                 let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(store.owner_control(&id).unwrap().unwrap().paused);

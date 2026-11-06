@@ -23,6 +23,7 @@ mod review_epoch;
 mod conversations;
 #[path = "autoship_owner_revision.rs"]
 mod owner_revision;
+pub(crate) use owner_revision::OwnerPreparationBinding;
 #[path = "autoship_owner_reply.rs"]
 pub(crate) mod owner_reply;
 #[path = "autoship_owner_dispatch.rs"]
@@ -391,6 +392,9 @@ impl WorkflowStore {
                 request_id TEXT NOT NULL REFERENCES discord_control_request(request_id));
             CREATE TABLE IF NOT EXISTS workflow_owner_initial_acceptance (
                 request_id TEXT PRIMARY KEY REFERENCES workflow_owner_revision(request_id), receipts TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_preparation (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_revision(request_id),
+                record TEXT NOT NULL, receipts TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS workflow_owner_revision_fence (
                 request_id TEXT PRIMARY KEY REFERENCES workflow_owner_revision(request_id),
                 previous_generation INTEGER NOT NULL, next_generation INTEGER NOT NULL);

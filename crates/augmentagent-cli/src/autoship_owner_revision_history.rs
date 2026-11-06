@@ -14,6 +14,8 @@ struct Activation {
     owner_message_sha256: String,
     #[serde(default,skip_serializing_if="Option::is_none")]
     baseline_receipts_sha256:Option<String>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    preparation:Option<OwnerPreparationBinding>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,7 +42,7 @@ pub(super) fn validate(conn: &Connection, workflow: &str) -> Result<()> {
     let mut query=conn.prepare("SELECT seq,generation,payload,at_ms,kind FROM workflow_event WHERE workflow=?1 AND kind IN ('owner_contract_revised','owner_acceptance_registered') ORDER BY seq LIMIT 1025")?;
     let mut rows=query.query([workflow])?;
     let mut revisions=BTreeMap::<String,(i64,Binding,i64)>::new();
-    let mut bytes=0usize;let mut initial_count=0i64;
+    let mut bytes=0usize;let mut initial_count=0i64;let mut preparation_count=0i64;
     while let Some(row)=rows.next()? {
         ensure!(revisions.len()<1024,"owner revision history exceeds bound");
         let sequence:i64=row.get(0)?;let generation:i64=row.get(1)?;
@@ -62,6 +64,20 @@ pub(super) fn validate(conn: &Connection, workflow: &str) -> Result<()> {
             && body_hash==activation.owner_message_sha256 && activated_at==at
             && registration.contract_hash()==new && registration.contract().revision==activation.revision
             && binding.contract==new,"owner revision activation differs from registration");
+        let preparation:Option<(String,String)>=conn.query_row("SELECT record,receipts FROM workflow_owner_preparation WHERE request_id=?1",[&activation.request_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        match (&activation.preparation,preparation) {
+            (Some(expected),Some((raw,receipts)))=>{
+                ensure!(raw.len()<=4096 && receipts.len()<=4*1024*1024,"owner preparation projection exceeds bound");
+                let recorded:OwnerPreparationBinding=strict(&raw)?;
+                ensure!(&recorded==expected,"owner preparation activation differs from projection");
+                let observed:Vec<VerifierReceipt>=strict(&receipts)?;recorded.validate(&registration,&observed)?;
+                ensure!(!initial || activation.baseline_receipts_sha256.as_ref()==Some(&recorded.baseline_receipts_sha256),"initial owner preparation baseline differs from activation");
+                bytes=bytes.checked_add(raw.len()).and_then(|n|n.checked_add(receipts.len())).context("owner preparation history overflow")?;
+                ensure!(bytes<=128*1024*1024,"owner preparation history exceeds byte bound");preparation_count+=1;
+            },
+            (None,None)=>{},
+            _=>anyhow::bail!("owner preparation activation history missing"),
+        }
         if initial {
             let receipts:String=conn.query_row("SELECT receipts FROM workflow_owner_initial_acceptance WHERE request_id=?1",[&activation.request_id],|r|r.get(0))?;
             ensure!(receipts.len()<=4*1024*1024,"initial owner baseline exceeds bound");bytes=bytes.checked_add(receipts.len()).context("owner baseline history overflow")?;
@@ -109,6 +125,8 @@ pub(super) fn validate(conn: &Connection, workflow: &str) -> Result<()> {
     }
     let count:i64=conn.query_row("SELECT count(*) FROM workflow_owner_initial_acceptance r JOIN workflow_owner_turn t ON t.request_id=r.request_id WHERE t.workflow=?1",[workflow],|r|r.get(0))?;
     ensure!(count==initial_count,"initial owner acceptance history missing");
+    let count:i64=conn.query_row("SELECT count(*) FROM workflow_owner_preparation r JOIN workflow_owner_turn t ON t.request_id=r.request_id WHERE t.workflow=?1",[workflow],|r|r.get(0))?;
+    ensure!(count==preparation_count,"owner preparation activation history missing");
     let mut query=conn.prepare("SELECT request_id,lease_generation,binding,pause_revision FROM workflow_owner_turn WHERE workflow=?1 AND state IN ('claimed','uncertain','setup_refused') LIMIT 1026")?;
     let mut rows=query.query([workflow])?;let mut count=0;
     while let Some(row)=rows.next()? {

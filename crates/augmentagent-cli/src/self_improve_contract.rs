@@ -1600,7 +1600,7 @@ fn private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK)
         .open(path)?;
     let metadata = file.metadata()?;
     ensure!(

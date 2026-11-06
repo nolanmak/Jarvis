@@ -96,9 +96,26 @@ struct Stored {input:Input,prepared:PreparedAcceptance}
 pub(in crate::self_improve) struct PreparedOwnerAcceptance {
     input:Input,
     prepared:PreparedAcceptance,
+    path:PathBuf,
 }
 impl PreparedOwnerAcceptance {
     pub(in crate::self_improve) fn prepared(&self)->&PreparedAcceptance {&self.prepared}
+    pub(in crate::self_improve) fn activation_binding(&self)->Result<crate::autoship_workflow::OwnerPreparationBinding> {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
+        let mut file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(&self.path)?;
+        let metadata=file.metadata()?;
+        ensure!(metadata.is_file() && metadata.nlink()==1 && metadata.uid()==unsafe{libc::geteuid()}
+            && metadata.mode()&0o077==0 && metadata.len()<=4*1024*1024,"owner preparation artifact is not private");
+        let mut bytes=Vec::new();(&mut file).take(4*1024*1024+1).read_to_end(&mut bytes)?;
+        ensure!(bytes.len()<=4*1024*1024 && bytes.len() as u64==metadata.len(),"owner preparation artifact changed while reading");
+        let stored:Stored=serde_json::from_slice(&bytes)?;
+        ensure!(stored.input==self.input && serde_json::to_value(&stored.prepared)?==serde_json::to_value(&self.prepared)?
+            && serde_json::to_vec(&stored)?==bytes,"owner preparation artifact or encoding changed");
+        self.prepared.verify_registration()?;
+        crate::autoship_workflow::OwnerPreparationBinding::from_artifact(amendment::digest(&bytes),self.input.key()?,
+            &self.prepared.baseline.registration,&self.prepared.baseline.receipts)
+    }
     pub(in crate::self_improve) fn validate_current(&self,workflow:&workflow::WorkflowGuard,candidate:&Path,previous:Option<&RegisteredContract>)->Result<()> {
         let turn=workflow.owner_acceptance_turn(candidate,self.input.source,previous)?;
         ensure!(turn.request_id==self.input.request_id && turn.lease.owner==self.input.owner && turn.lease.generation==self.input.generation
@@ -106,6 +123,27 @@ impl PreparedOwnerAcceptance {
             "owner acceptance current request changed");
         self.input.validate_prepared(&self.prepared,previous)
     }
+}
+
+fn preparation_directory(candidate:&Path,control:&Path)->Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt,MetadataExt};
+    std::fs::create_dir_all(control)?;let control=control.canonicalize()?;
+    for root in worker_roots(candidate) {ensure!(!control.starts_with(root.canonicalize()?),"owner acceptance store is writable by worker");}
+    let directory=control.join("owner-preparations");
+    if !directory.try_exists()? {std::fs::DirBuilder::new().mode(0o700).create(&directory)?;}
+    let meta=std::fs::symlink_metadata(&directory)?;
+    ensure!(meta.is_dir() && !meta.file_type().is_symlink() && meta.uid()==unsafe{libc::geteuid()} && meta.mode()&0o077==0,"owner acceptance directory is not private");
+    Ok(directory)
+}
+fn persist_preparation(directory:&Path,input:&Input,prepared:&PreparedAcceptance)->Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let path=directory.join(format!("{}.json",input.key()?));
+    let stored=Stored {input:input.clone(),prepared:prepared.clone()};let bytes=serde_json::to_vec(&stored)?;
+    ensure!(bytes.len()<=4*1024*1024,"owner acceptance artifact exceeds bound");
+    let mut file=tempfile::NamedTempFile::new_in(directory)?;file.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(&bytes)?;file.as_file().sync_all()?;file.persist_noclobber(&path).map_err(|error|error.error)?;
+    std::fs::File::open(directory)?.sync_all()?;Ok(path)
 }
 
 /// Read-only native scoping and actual sandboxed baseline execution reuse the
@@ -118,19 +156,11 @@ pub(in crate::self_improve) async fn prepare(candidate:&Path,workflow:&workflow:
 }
 async fn prepare_at(candidate:&Path,workflow:&workflow::WorkflowGuard,source:AcceptanceSource,base:&str,
     scope:&str,required:&[String],previous:Option<&RegisteredContract>,control:&Path)->Result<PreparedOwnerAcceptance> {
-    use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt,MetadataExt,PermissionsExt};
     let turn=workflow.owner_acceptance_turn(candidate,source,previous)?;
     if let Some(previous)=previous {previous.verify_metadata()?;}
     ensure!(actual_head(candidate).await?==turn.binding.head,"owner acceptance candidate head changed");
     let input=Input::new(&turn,source,base,scope,required,previous)?;let epoch=input.key()?;
-    std::fs::create_dir_all(control)?;
-    let control=control.canonicalize()?;
-    for root in worker_roots(candidate) {ensure!(!control.starts_with(root.canonicalize()?),"owner acceptance store is writable by worker");}
-    let directory=control.join("owner-preparations");
-    if !directory.try_exists()? {std::fs::DirBuilder::new().mode(0o700).create(&directory)?;}
-    let meta=std::fs::symlink_metadata(&directory)?;
-    ensure!(meta.is_dir() && !meta.file_type().is_symlink() && meta.uid()==unsafe{libc::geteuid()} && meta.mode()&0o077==0,"owner acceptance directory is not private");
+    let directory=preparation_directory(candidate,control)?;
     let path=directory.join(format!("{epoch}.json"));
     let prepared=if path.try_exists()? {
         let stored:Stored=private_json(&path)?;ensure!(stored.input==input,"owner acceptance persisted request changed");
@@ -150,15 +180,12 @@ async fn prepare_at(candidate:&Path,workflow:&workflow::WorkflowGuard,source:Acc
         }.await;
         let cleanup=trusted_git(candidate,&["worktree","remove","--force",checkout]).await;
         let prepared=result?;cleanup.context("remove owner acceptance baseline checkout")?;
-        let current=PreparedOwnerAcceptance {input:input.clone(),prepared:prepared.clone()};current.validate_current(workflow,candidate,previous)?;
+        let current=PreparedOwnerAcceptance {input:input.clone(),prepared:prepared.clone(),path:path.clone()};current.validate_current(workflow,candidate,previous)?;
         ensure!(actual_head(candidate).await?==turn.binding.head,"owner acceptance candidate moved while preparing baseline");
-        let stored=Stored {input:input.clone(),prepared:prepared.clone()};let bytes=serde_json::to_vec(&stored)?;
-        ensure!(bytes.len()<=4*1024*1024,"owner acceptance artifact exceeds bound");
-        let mut file=tempfile::NamedTempFile::new_in(&directory)?;file.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        file.write_all(&bytes)?;file.as_file().sync_all()?;file.persist_noclobber(&path).map_err(|error|error.error)?;std::fs::File::open(&directory)?.sync_all()?;
+        ensure!(persist_preparation(&directory,&input,&prepared)?==path,"owner acceptance artifact path changed");
         prepared
     };
-    let result=PreparedOwnerAcceptance {input,prepared};result.validate_current(workflow,candidate,previous)?;
+    let result=PreparedOwnerAcceptance {input,prepared,path};result.validate_current(workflow,candidate,previous)?;result.activation_binding()?;
     ensure!(actual_head(candidate).await?==turn.binding.head,"owner acceptance candidate moved after preparation");
     Ok(result)
 }
@@ -169,7 +196,10 @@ pub(in crate::self_improve) fn test_from_prepared(candidate:&Path,workflow:&work
     let source=prepared.proposal.contract.source()?;let turn=workflow.owner_acceptance_turn(candidate,source,None)?;
     let required=prepared.proposal.contract.criteria.iter().map(|c|c.requirement.clone()).collect::<Vec<_>>();
     let input=Input::new(&turn,source,prepared.baseline.registration.baseline_head(),"fixture source",&required,None)?;
-    input.validate_prepared(prepared,None)?;Ok(PreparedOwnerAcceptance {input,prepared:prepared.clone()})
+    input.validate_prepared(prepared,None)?;
+    let control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
+    let directory=preparation_directory(candidate,&control)?;let path=persist_preparation(&directory,&input,prepared)?;
+    Ok(PreparedOwnerAcceptance {input,prepared:prepared.clone(),path})
 }
 
 /// Exercise the production cached factory with actual guarded owner metadata.
@@ -220,6 +250,58 @@ mod tests {
             verifiers:vec![Verifier {id:"ready".into(),command:VerifierCommand::BlackBox {invocation:BehaviorInvocation::PythonScript {file:"autoship_verifiers/observe.py".into(),args:vec![]},oracle:OutputOracle::Json {value:serde_json::json!(true)}},pinned_files:vec!["autoship_verifiers/observe.py".into()],failure_witness:"ready differs".into()}]},
             files:BTreeMap::from([("autoship_verifiers/observe.py".into(),"print(False)\n".into())])};
         parse_proposal_for(&format!("```autoship-contract\n{}\n```",serde_json::to_string(&proposal).unwrap()),AcceptanceSource::Issue(42)).unwrap()
+    }
+    #[test]
+    fn owner_preparation_identity_requires_exact_private_immutable_artifact_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let root=tempfile::tempdir().unwrap();let control=tempfile::tempdir().unwrap();let proposal=proposal();
+        install_harness(root.path(),&proposal).unwrap();
+        let registration=RegisteredContract::register(root.path(),proposal.contract.clone(),"a".repeat(40),"fixture-v1".into()).unwrap();
+        let observe=|stdout:&str|registration.observe(root.path(),"ready",registration.binding(registration.baseline_head()).unwrap(),
+            &Observation {exit_code:Some(0),stdout:stdout.into(),stderr:String::new(),interrupted:false,output_complete:true}).unwrap();
+        let prepared=PreparedAcceptance {proposal,baseline:BaselineEvidence {registration:registration.clone(),receipts:vec![observe("false")]}};
+        let input=Input::new(&turn(),AcceptanceSource::Issue(42),&"a".repeat(40),"source",&["Original requirement".into()],None).unwrap();
+        input.validate_prepared(&prepared,None).unwrap();
+        let path=persist_preparation(control.path(),&input,&prepared).unwrap();let bytes=std::fs::read(&path).unwrap();
+        let packet=PreparedOwnerAcceptance {input:input.clone(),prepared:prepared.clone(),path};
+        let binding=packet.activation_binding().unwrap();let encoded=serde_json::to_value(&binding).unwrap();
+        assert_eq!(encoded["artifact_sha256"],amendment::digest(&bytes));assert_eq!(encoded["context_sha256"],input.key().unwrap());
+        let mut revised=prepared;revised.baseline.receipts=vec![observe("false\n")];input.validate_prepared(&revised,None).unwrap();
+        assert!(persist_preparation(control.path(),&input,&revised).is_err(),"a second valid preparation replaced the original context artifact");
+        assert_eq!(std::fs::read(&packet.path).unwrap(),bytes);
+        for fault in ["encoding","context","map","unknown","permissions","symlink","fifo","missing"] {
+            std::fs::remove_file(&packet.path).unwrap();
+            std::fs::write(&packet.path,&bytes).unwrap();std::fs::set_permissions(&packet.path,std::fs::Permissions::from_mode(0o600)).unwrap();
+            match fault {
+                "encoding"=>{let mut changed=bytes.clone();changed.push(b' ');std::fs::write(&packet.path,changed).unwrap();},
+                "context"|"map"|"unknown"=>{
+                    let mut changed:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
+                    if fault=="context" {changed["input"]["body"]="different owner instruction".into();}
+                    else if fault=="map" {changed["prepared"]["proposal"]["files"]["autoship_verifiers/observe.py"]="print(True)\n".into();}
+                    else {changed["unexpected"]=true.into();}
+                    std::fs::write(&packet.path,serde_json::to_vec(&changed).unwrap()).unwrap();
+                },
+                "permissions"=>std::fs::set_permissions(&packet.path,std::fs::Permissions::from_mode(0o644)).unwrap(),
+                "symlink"=>{std::fs::remove_file(&packet.path).unwrap();std::os::unix::fs::symlink(root.path().join("autoship_verifiers/observe.py"),&packet.path).unwrap();},
+                "fifo"=>{
+                    use std::os::unix::ffi::OsStrExt;
+                    std::fs::remove_file(&packet.path).unwrap();let path=std::ffi::CString::new(packet.path.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe{libc::mkfifo(path.as_ptr(),0o600)},0);
+                },
+                "missing"=>std::fs::remove_file(&packet.path).unwrap(),
+                _=>unreachable!(),
+            }
+            if fault=="fifo" {
+                let cloned=PreparedOwnerAcceptance {input:packet.input.clone(),prepared:packet.prepared.clone(),path:packet.path.clone()};
+                let (sent,received)=std::sync::mpsc::channel();
+                let thread=std::thread::spawn(move||sent.send(cloned.activation_binding().is_err() && private_json::<Stored>(&cloned.path).is_err()).unwrap());
+                assert_eq!(received.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),true,"a FIFO artifact blocked a protected reader");thread.join().unwrap();
+            }else {assert!(packet.activation_binding().is_err(),"{fault}: changed preparation acquired activation identity");}
+            if !packet.path.exists() {std::fs::write(&packet.path,&bytes).unwrap();}
+        }
+        std::fs::remove_file(&packet.path).unwrap();std::fs::write(&packet.path,&bytes).unwrap();std::fs::set_permissions(&packet.path,std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(packet.activation_binding().unwrap(),binding);
+        assert_eq!(std::fs::read_to_string(root.path().join("autoship_verifiers/observe.py")).unwrap(),"print(False)\n");
     }
     #[test]
     fn owner_acceptance_preserves_full_private_body_and_all_original_requirements() {
