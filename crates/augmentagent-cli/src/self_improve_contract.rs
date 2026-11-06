@@ -1285,7 +1285,7 @@ pub(super) async fn prepare_acceptance_for(
         );
     }
     amendment::resume_pending(candidate, &control, source, workflow).await?;
-    let manifest = original_manifest(&control, source)?;
+    let manifest = guarded_original_manifest(workflow, &control, source)?;
     let original_base = manifest
         .as_ref()
         .map(|m| m.original_base.as_str())
@@ -1394,16 +1394,14 @@ pub(super) async fn prepare_acceptance_for(
         let (proposal, baseline) = result?;
         cleanup.context("remove acceptance baseline worktree")?;
         let prepared = PreparedAcceptance { proposal, baseline };
-        let mut staged = tempfile::NamedTempFile::new_in(&control)?;
-        staged
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        staged.write_all(&serde_json::to_vec(&prepared)?)?;
-        staged.as_file().sync_all()?;
-        staged
-            .persist_noclobber(&path)
-            .map_err(|error| error.error)?;
-        std::fs::File::open(&control)?.sync_all()?;
+        workflow.with_acceptance_metadata(|_access| {
+            let mut staged = tempfile::NamedTempFile::new_in(&control)?;
+            staged.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            staged.write_all(&serde_json::to_vec(&prepared)?)?;
+            staged.as_file().sync_all()?;
+            staged.persist_noclobber(&path).map_err(|error| error.error)?;
+            std::fs::File::open(&control)?.sync_all()?;Ok(())
+        })?;
         prepared
     };
     for required in required_criteria {
@@ -1427,7 +1425,7 @@ pub(super) async fn prepare_acceptance_for(
             "workflow contract revision changed without bound adjudication"
         );
     } else {
-        write_manifest(&control, &binding)?;
+        workflow.with_acceptance_metadata(|access| write_manifest_with_metadata(&control, &binding, access))?;
     }
     // Main may have advanced; preserve the original reproduced base. Only a
     // candidate that no longer descends from it needs explicit re-scoping.
@@ -1613,7 +1611,14 @@ fn private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     );
     Ok(serde_json::from_reader(file)?)
 }
-fn original_manifest(control: &Path, source: AcceptanceSource) -> Result<Option<WorkflowManifest>> {
+fn read_manifest(control:&Path,source:AcceptanceSource)->Result<Option<WorkflowManifest>> {
+    amendment::require_no_pending(control,source)?;
+    let manifest=read_manifest_unsettled(control,source)?;
+    if let Some(manifest)=&manifest {amendment::require_completed_manifest(control,source,manifest)?;}
+    Ok(manifest)
+}
+/// Metadata recovery only: this observation grants no completed-revision admission.
+fn read_manifest_unsettled(control: &Path, source: AcceptanceSource) -> Result<Option<WorkflowManifest>> {
     let index = control.join(format!("{}-workflow.json", source.key()));
     if index.try_exists()? {
         let manifest: WorkflowManifest = private_json(&index)?;
@@ -1624,6 +1629,13 @@ fn original_manifest(control: &Path, source: AcceptanceSource) -> Result<Option<
         evidence_path(control, source, &manifest.original_base)?;
         return Ok(Some(manifest));
     }
+    Ok(None)
+}
+fn guarded_original_manifest(workflow:&workflow::WorkflowGuard,control:&Path,source:AcceptanceSource)->Result<Option<WorkflowManifest>> {
+    workflow.with_acceptance_metadata(|access| recover_original_manifest(control,source,access))
+}
+fn recover_original_manifest(control:&Path,source:AcceptanceSource,access:&crate::autoship_workflow::AcceptanceMetadata<'_>)->Result<Option<WorkflowManifest>> {
+    if let Some(manifest)=read_manifest(control,source)? {return Ok(Some(manifest));}
     // Recover the crash window between durable baseline and manifest creation.
     // Never choose a newer baseline by timestamp or silently supersede evidence.
     let prefix = format!("{}-base-", source.key());
@@ -1659,11 +1671,12 @@ fn original_manifest(control: &Path, source: AcceptanceSource) -> Result<Option<
         }
     }
     if let Some(manifest) = &recovered {
-        write_manifest(control, manifest)?;
+        write_manifest_with_metadata(control, manifest, access)?;
     }
     Ok(recovered)
 }
-fn write_manifest(control: &Path, manifest: &WorkflowManifest) -> Result<()> {
+fn write_manifest_with_metadata(control: &Path, manifest: &WorkflowManifest,
+    _access:&crate::autoship_workflow::AcceptanceMetadata<'_>)->Result<()> {
     use std::io::Write;
     let path = control.join(format!("{}-workflow.json", manifest.source()?.key()));
     let mut file = tempfile::NamedTempFile::new_in(control)?;
@@ -1673,6 +1686,24 @@ fn write_manifest(control: &Path, manifest: &WorkflowManifest) -> Result<()> {
     std::fs::File::open(control)?.sync_all()?;
     Ok(())
 }
+#[cfg(test)]
+fn with_fixture_acceptance_metadata<T>(operation:impl FnOnce(&crate::autoship_workflow::AcceptanceMetadata<'_>)->Result<T>)->Result<T> {
+    let temporary=tempfile::tempdir()?;
+    let mut store=crate::autoship_workflow::WorkflowStore::open(&temporary.path().join("metadata.db"))?;
+    let binding=crate::autoship_workflow::Binding {head:"fixture-head".into(),contract:"fixture-contract".into(),evidence_hash:"fixture-evidence".into()};
+    store.register("fixture/acceptance#1","fixture",binding.clone(),1)?;
+    let lease=store.claim("fixture/acceptance#1","fixture",2,10000)?.context("fixture metadata lease missing")?;
+    store.with_acceptance_metadata(&lease,&binding,&||3,operation)
+}
+#[cfg(test)]
+fn write_manifest(control:&Path,manifest:&WorkflowManifest)->Result<()> {
+    with_fixture_acceptance_metadata(|access|write_manifest_with_metadata(control,manifest,access))
+}
+#[cfg(test)]
+fn original_manifest(control:&Path,source:AcceptanceSource)->Result<Option<WorkflowManifest>> {
+    with_fixture_acceptance_metadata(|access|recover_original_manifest(control,source,access))
+}
+
 /// Map independently generated harness hunks to the criteria those pinned
 /// files verify. Implementation hunks still require an independent mapper.
 pub(super) fn harness_alignment(
@@ -2436,6 +2467,7 @@ pub(super) async fn assert_sweep_receipt(
     source: AcceptanceSource,
     reference: &CandidateReceiptReference,
     expected_head: &str,
+    workflow:&workflow::WorkflowGuard,
 ) -> Result<()> {
     use sha2::{Digest, Sha256};
     let control = protected_control.canonicalize()?;
@@ -2453,7 +2485,8 @@ pub(super) async fn assert_sweep_receipt(
         reference.artifact == control.join(format!("candidate-{}.json", reference.artifact_sha256)),
         "sweep candidate evidence escaped protected store"
     );
-    let manifest = original_manifest(&control, source)?
+    // Sweep inspection never repairs a missing canonical index.
+    let manifest = workflow.read_acceptance_metadata(||read_manifest(&control,source))?
         .context("sweep original acceptance manifest missing")?;
     ensure!(
         manifest.contract_hash == reference.binding.contract_hash

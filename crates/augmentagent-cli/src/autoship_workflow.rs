@@ -144,6 +144,10 @@ pub struct Checkpoint {
     pub next: NextAction,
 }
 
+/// Borrowed metadata ordering token. It is not serializable, cloneable or
+/// native execution authority, and cannot outlive its store transaction.
+pub(crate) struct AcceptanceMetadata<'a> {_transaction:&'a Connection}
+
 #[derive(Debug, Clone)]
 pub struct Lease {
     pub workflow: String,
@@ -1655,6 +1659,17 @@ impl WorkflowStore {
         if changed>0 {event(&tx,workflow,generation,"native_runtime_owner_retired",audit_path,now)?;}
         tx.commit()?;
         Ok(())
+    }
+
+    /// Synchronous protected acceptance files only. Native/audit lock I/O,
+    /// subprocesses and awaits must stay outside this store critical section.
+    pub(crate) fn with_acceptance_metadata<T>(&mut self,lease:&Lease,binding:&Binding,
+        clock:&dyn Fn()->i64,operation:impl FnOnce(&AcceptanceMetadata<'_>)->Result<T>)->Result<T> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_native_dispatch_tx(&tx,lease,binding,clock())?;
+        let result=operation(&AcceptanceMetadata {_transaction:&tx})?;
+        require_native_dispatch_tx(&tx,lease,binding,clock())?;
+        tx.commit()?;Ok(result)
     }
 
     pub fn validate_dispatch(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<()> {

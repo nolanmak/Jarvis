@@ -1,0 +1,157 @@
+{
+  "schema_version": 1,
+  "kind": "ordinary-acceptance-metadata-admission-and-replay-component",
+  "source_parent_commit": "75b0df89347ada0ef9ba5a02ead4c0b75758322e",
+  "source_inventory_is_post_run_inventory": true,
+  "source_generation_authority": false,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "903ca1e9a01c85216fec6766c82340a14a4693841f361ec978e8ba6cb1d18541"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_amendment.rs",
+      "sha256": "4c19efe322888ff66ecf04dabec0bd6b8a256095cbfea124212a7ced7df756e5"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_contract.rs",
+      "sha256": "7fa1098486db1892af3343243b145a8847d64fb3470f96f84b30536fe4e21f0d"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "3aedbe800bacb3857cb7398c9d3376f69e0e9c7652c524379a9fa8a7685bdb57"
+    },
+    {
+      "path": "docs/autoship/owner-acceptance-publication.md",
+      "sha256": "55cec4363130e39950157965ec6a5363ae8f8eb29c8c866dba7417fe94468f9d"
+    }
+  ],
+  "validation": {
+    "concurrent_pause_red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent acceptance_metadata_commit_serializes",
+      "log": "/tmp/autoship-acceptance-metadata-ordering-red.log",
+      "log_sha256": "eb8318d633b8ae55afb458526e2c15b1575b8d7d214f0dfcc1d4c70bafac3e99",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "observed": "owner pause committed between metadata admission and its file write"
+    },
+    "uncertain_callback_and_fifo_red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent acceptance_metadata",
+      "log": "/tmp/autoship-acceptance-metadata-uncertain-and-fifo-red.log",
+      "log_sha256": "4f5b08806069f2cb15485cc1dde453596d1c9e0b47f3cd97164428f183aa5713",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "passed": 2,
+      "failed": 2,
+      "observed": [
+        "old native observer remained usable after a durable file write followed by visitor failure",
+        "real FIFO blocked immutable-file admission; only isolated test child killed"
+      ]
+    },
+    "ordinary_pending_reader_red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent approved_ready_pr_preserves_review_but_never_replays_uncertain_merge",
+      "log": "/tmp/autoship-acceptance-metadata-pending-reader-red.log",
+      "log_sha256": "73696d84618b69fc7b1bd0aafe13f3ff661a43e8a9f09797cd338d3824ae84c7",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "observed": "ordinary reader accepted canonical manifest while its amendment remained pending"
+    },
+    "waiting_callback_red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent acceptance_metadata_waiting_model",
+      "log": "/tmp/autoship-acceptance-metadata-waiting-callback-red.log",
+      "log_sha256": "5c5e7517ee0c1e8b90fdf69a8c9aa8827cf81b5cfa28fa86d3ea36841948c88b",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "observed": "model callback waiting before metadata failure escaped its fence and was charged"
+    },
+    "focused": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent acceptance_metadata",
+      "log": "/tmp/autoship-acceptance-metadata-final-focused.log",
+      "log_sha256": "0f8192e2e6d264285cc2ca062486cf8496edb77745e7e449dc125b4b4e8fa802",
+      "exit": 0,
+      "passed": 5,
+      "failed": 0,
+      "seconds": 0.66
+    },
+    "final_full_cli": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-acceptance-metadata-final-full-cli-2.log",
+      "log_sha256": "3bb050a4136ff1126002c93a4b8c4629a6b53847ff00582901b2e4390200a598",
+      "exit": 0,
+      "passed": 1929,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 276.03,
+      "native_guard_subprocess_modes": 68
+    },
+    "production_check": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-acceptance-metadata-production-check.log",
+      "log_sha256": "9f06f5423b7600512f922a511028ef452bd9bcedff05d3806eadd36cf45ef74a",
+      "exit": 0,
+      "compiler_seconds": 15.38
+    },
+    "superseded_full_runs": [
+      {
+        "log": "/tmp/autoship-acceptance-metadata-full-cli.log",
+        "passed": 1926,
+        "failed": 0,
+        "ignored": 34,
+        "seconds": 277.17
+      },
+      {
+        "log": "/tmp/autoship-acceptance-metadata-final-full-cli.log",
+        "passed": 1928,
+        "failed": 0,
+        "ignored": 34,
+        "seconds": 279.42
+      }
+    ]
+  },
+  "coverage": [
+    "SQLite immediate transaction and borrowed metadata writer token serialize protected file operations with owner control/generation mutation",
+    "actual canonical orphan recovery and immutable amendment writer refuse paused guard; pure sweep never recreates missing manifest",
+    "initially admitted durable file effect retained after visitor failure and fake-clock postwrite expiry; old dispatch/model observers fenced with no new model charge",
+    "callback already queued behind failed metadata writer observes failure under same Storemutex before model accounting",
+    "read-only refusal gets no writer token and does not imply uncertain mutation",
+    "bounded nonblocking private immutable read refuses FIFO rather than holding store indefinitely",
+    "ordinary pending amendment blocks productive readers; exact old-or-next metadata recovery uses original approval/baseline without new authority call",
+    "existing measured baseline migration fixture covers completion/pending acknowledgement loss and next-manifest/pending/missing-completion replay",
+    "manifest alone without pending/completion, conflicting completion and missing original manifest-history anchor refuse without rewriting authority",
+    "exact original fixture completion/history restored and recognized; caller still revalidates candidate/source/receipt before shipping",
+    "original owner controls, compute budgets and confirmed-merge accounting retained"
+  ],
+  "audit": {
+    "pass_a_agent": "acceptance_metadata_spec_audit_20261106",
+    "initial_findings": 2,
+    "ordinary_file_failure_policy": "resolved Decision11",
+    "preparation_retention": "parked P5 before productive owner producer; no aggregate quota or cleanup claimed",
+    "followup_additional_findings": 0,
+    "pass_b_code_contract_alignment": true,
+    "final_seam_pass_c": false
+  },
+  "ordinary_durable_file_policy": "Initial admission authorizes exact metadata file effects. Later error or death is unknown acknowledgement, not rollback. Failed entered writer fences old guard. Fresh authorized guard replays intact pending or reads validated exact completion; missing/conflicting authority holds.",
+  "limits": [
+    "Model observer calls are controlled accounting fixtures, not actual provider execution.",
+    "Ordinary migration uses real isolated verifier measurements plus scripted approval/review/remote fixture data; no live native/provider/source closure or autonomous shipment proved.",
+    "Fault states are constructed metadata boundary states; no real process-loss/SQLite-commit-failure injection or 72-hour fault/24-hour unattended acceptance soak is claimed.",
+    "Post-run source inventory is not compiled-source freshness or original locked native/storage proof.",
+    "Private owner publication journal and process-loss settlement remain absent; ordinary file recovery cannot substitute for P1/P2.",
+    "Aggregate owner preparation quota and reference-aware retention remain P5 work; no automatic deletion or existing quota is claimed."
+  ],
+  "original_native_closure_proved_for_live_work": false,
+  "private_owner_canonical_publication": false,
+  "private_owner_process_loss_recovery": false,
+  "productive_owner_consumer_enabled": false,
+  "shipping_authority": false,
+  "production_restored": false,
+  "goal_complete": false,
+  "remaining": [
+    "P1 full intent/activation/native/scope/publication admission protocol and cached/ordinary canonical-contract preservation",
+    "P2 authenticated original-native recovery, immutable lineage and terminal/superseded settlement",
+    "P3 public-output allowlist and all writers",
+    "P4 independently authorized correction contexts",
+    "P5 aggregate preparation storage/retention",
+    "Full C/R CI cutover, exact-head hosted checks/independent review, normal rollout and all epic live acceptance exits"
+  ]
+}

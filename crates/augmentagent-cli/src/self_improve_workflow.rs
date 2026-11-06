@@ -677,6 +677,7 @@ impl SweepGuard {
                 self.source,
                 &reference,
                 expected,
+                inner,
             )
             .await
         }
@@ -1101,20 +1102,24 @@ impl WorkflowGuard {
     fn install_model_observers(&self,body:Option<Arc<OwnerBodyAdmission>>) -> Result<()> {
         let dispatch_body=body.clone();
         let dispatch_store=self.store.clone();let dispatch_lease=self.lease.clone();
+        let dispatch_failure=self.lease_failure.clone();
         self.audit.set_dispatch_observer(Arc::new(move || {
             let mut store=dispatch_store.lock().map_err(|_|anyhow::anyhow!("workflow dispatch lock poisoned"))?;
+            anyhow::ensure!(dispatch_failure.lock().map_err(|_|anyhow::anyhow!("workflow failure lock poisoned"))?.is_none(),"workflow guard fenced; fresh guarded recovery required");
             let binding=store.snapshot(&dispatch_lease.workflow)?.context("workflow missing")?.checkpoint.binding;
             store.validate_dispatch(&dispatch_lease,&binding,millis())?;
             if let Some(body)=&dispatch_body {body.validate(&mut store,&dispatch_lease,millis())?;}
             Ok(())
         }))?;
         let capacity_flag = self.capacity_exhausted.clone();
+        let model_failure=self.lease_failure.clone();
         let store = self.store.clone();
         let lease = self.lease.clone();
         let observational = self.repository.starts_with("autoship-observation/") || self.repository.starts_with("autoship-canary/");
         self.audit.set_model_call_observer(Arc::new(move |provider| {
             anyhow::ensure!(!capacity_flag.load(Ordering::SeqCst), "resource_capacity: await_capacity checkpoint retained");
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
+            anyhow::ensure!(model_failure.lock().map_err(|_|anyhow::anyhow!("workflow failure lock poisoned"))?.is_none(),"workflow guard fenced; fresh guarded recovery required");
             anyhow::ensure!(!matches!(store.snapshot(&lease.workflow)?.context("workflow missing")?.checkpoint.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot admit another model call");
             let receipt = format!("model-call:{}", uuid::Uuid::new_v4());
             let bounded=BOUNDED_NATIVE_CALL.try_with(Clone::clone).ok();
@@ -1643,7 +1648,7 @@ impl WorkflowGuard {
             .lock()
             .map_err(|_| anyhow::anyhow!("workflow failure lock poisoned"))?;
         if let Some(error) = failure.as_ref() {
-            anyhow::bail!("workflow lease renewal failed: {error}");
+            anyhow::bail!("workflow guard fenced: {error}");
         }
         Ok(())
     }
@@ -1697,24 +1702,56 @@ impl WorkflowGuard {
         Ok(())
     }
 
+    /// Bounded synchronous acceptance-store I/O, serialized with owner controls
+    /// and workflow claims. No native/audit I/O or subprocess enters the visitor.
+    pub(super) fn with_acceptance_metadata<T>(&self,
+        operation:impl FnOnce(&durable::AcceptanceMetadata<'_>)->Result<T>)->Result<T> {
+        self.with_acceptance_metadata_at(&millis,operation)
+    }
+    fn with_acceptance_metadata_at<T>(&self,clock:&dyn Fn()->i64,
+        operation:impl FnOnce(&durable::AcceptanceMetadata<'_>)->Result<T>)->Result<T> {
+        self.visit_acceptance_metadata_at(clock,true,operation)
+    }
+    /// Inspection gets no writer token and cannot claim a refused read changed files.
+    pub(super) fn read_acceptance_metadata<T>(&self,operation:impl FnOnce()->Result<T>)->Result<T> {
+        self.visit_acceptance_metadata_at(&millis,false,|_access|operation())
+    }
+    fn visit_acceptance_metadata_at<T>(&self,clock:&dyn Fn()->i64,mutating:bool,
+        operation:impl FnOnce(&durable::AcceptanceMetadata<'_>)->Result<T>)->Result<T> {
+        self.healthy_lease()?;
+        self.audit.protected_health()?;
+        let entered=std::cell::Cell::new(false);
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("acceptance metadata store poisoned"))?;
+        let outcome=store.with_acceptance_metadata(&self.lease,&self.binding,clock,|access| {
+            self.healthy_lease()?;
+            entered.set(true);operation(access)
+        });
+        // Publish the local failure fence before releasing the shared store.
+        // A model/dispatch callback already queued there must see it too.
+        if outcome.is_err() && mutating && entered.get() {
+            let mut failure=self.lease_failure.lock().map_err(|_|anyhow::anyhow!("workflow failure lock poisoned"))?;
+            if failure.is_none() {*failure=Some("acceptance metadata outcome uncertain; retain durable files for fresh guarded recovery".into());}
+        }
+        outcome
+    }
+
     /// Check immediately before gh/git side effects. Also pass GitHub the
     /// exact expected SHA; this local check cannot fence an in-flight RPC.
     pub(super) fn validate_before_side_effect(&self) -> Result<()> {
         self.healthy_lease()?;
         self.audit.protected_health()?;
-        self.store
-            .lock()
-            .map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?
-            .validate_dispatch(&self.lease, &self.binding, millis())
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
+        self.healthy_lease()?;
+        store.validate_dispatch(&self.lease, &self.binding, millis())
     }
 
     pub(super) fn intent(&self, kind: OperationKind) -> Result<Operation> {
         self.validate_before_side_effect()?;
-        let operation = self
-            .store
-            .lock()
-            .map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?
-            .begin_operation(&self.lease, kind, &self.binding, millis())?;
+        let operation = {
+            let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
+            self.healthy_lease()?;
+            store.begin_operation(&self.lease, kind, &self.binding, millis())?
+        };
         self.audit_event(
             "operation_intent",
             serde_json::json!({"operation_id":operation.id,"operation_kind":kind}),
@@ -2648,6 +2685,81 @@ mod tests {
         guard.finish().unwrap();
     }
 
+    #[tokio::test]
+    async fn acceptance_metadata_uncertain_file_effect_fences_original_native_observers() {
+        for failure in ["visitor-error","lease-expiry-after-write"] {
+            let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");
+            let guard=WorkflowGuard::acquire_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(77),pr:None,branch:"candidate",contract:"C1",environment:"rust-a"},millis()).await.unwrap().unwrap();
+            let inspected:Result<()>=guard.read_acceptance_metadata(||anyhow::bail!("missing completion requires metadata replay"));
+            assert!(inspected.is_err());guard.audit_logger().dispatch_allowed().unwrap();
+            let canonical=state.path().join("metadata-written-before-error.json");
+            let clock_calls=std::cell::Cell::new(0);let initial=millis();
+            let clock=|| {let n=clock_calls.get();clock_calls.set(n+1);if n==0 {initial}else{initial+LEASE_MS+1}};
+            let selected_clock:&dyn Fn()->i64=if failure=="visitor-error" {&millis}else{&clock};
+            let result:Result<()>=guard.with_acceptance_metadata_at(selected_clock,|_access| {
+                std::fs::write(&canonical,b"authorized durable file effect")?;
+                std::fs::File::open(&canonical)?.sync_all()?;
+                anyhow::ensure!(failure!="visitor-error","injected failure after durable file publication");Ok(())
+            });
+            assert!(result.is_err());assert_eq!(std::fs::read(&canonical).unwrap(),b"authorized durable file effect");
+            assert!(guard.audit_logger().dispatch_allowed().is_err(),"failed metadata admission left its old native dispatch callback usable: {failure}");
+            assert!(guard.audit_logger().model_call_admitted("codex").is_err(),"failed metadata admission charged another model call");
+            let mut store=WorkflowStore::open(&path).unwrap();assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+            assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+            assert!(guard.finish().is_err(),"uncertain metadata did not require fresh guarded recovery");
+        }
+    }
+    #[tokio::test]
+    async fn acceptance_metadata_waiting_model_callback_is_fenced_before_accounting() {
+        let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");
+        let guard=WorkflowGuard::acquire_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(77),pr:None,branch:"candidate",contract:"C1",environment:"rust-a"},millis()).await.unwrap().unwrap();
+        std::thread::scope(|scope| {
+            let (started,ready)=std::sync::mpsc::channel();let (finished,observed)=std::sync::mpsc::channel();
+            let mut worker=None;
+            let outcome:Result<()>=guard.with_acceptance_metadata(|_access| {
+                let audit=guard.audit_logger();
+                worker=Some(scope.spawn(move || {started.send(()).unwrap();finished.send(audit.model_call_admitted("codex").is_ok()).unwrap();}));
+                ready.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+                assert!(matches!(observed.recv_timeout(std::time::Duration::from_millis(100)),Err(std::sync::mpsc::RecvTimeoutError::Timeout)),"model callback did not wait for metadata store ownership");
+                anyhow::bail!("injected metadata mutation acknowledgement failure")
+            });
+            assert!(outcome.is_err());
+            assert!(!observed.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),"model callback waiting before metadata failure escaped its fence and was charged");
+            worker.take().unwrap().join().unwrap();
+        });
+        assert_eq!(WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        assert!(guard.finish().is_err());
+    }
+    #[tokio::test]
+    async fn acceptance_metadata_commit_serializes_owner_pause_and_refuses_stale_writers() {
+        let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");
+        let guard=WorkflowGuard::acquire_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(77),pr:None,branch:"candidate",contract:"C1",environment:"rust-a"},millis()).await.unwrap().unwrap();
+        let mut owner=WorkflowStore::open(&path).unwrap();let id=guard.id().to_owned();
+        let before=owner.snapshot(&id).unwrap().unwrap();let canonical=state.path().join("canonical-metadata.json");
+        std::thread::scope(|scope| {
+            let (started,ready)=std::sync::mpsc::channel();let (committed,observed)=std::sync::mpsc::channel();
+            let mut owner_thread=None;
+            guard.with_acceptance_metadata(|_access| {
+                owner_thread=Some(scope.spawn(move || {
+                    started.send(()).unwrap();
+                    let control=owner.set_owner_pause(&id,"github:owner",0,true,millis()).unwrap();
+                    committed.send(control).unwrap();
+                }));
+                ready.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+                assert!(matches!(observed.recv_timeout(std::time::Duration::from_millis(100)),Err(std::sync::mpsc::RecvTimeoutError::Timeout)),"owner pause committed between metadata admission and its file write");
+                std::fs::write(&canonical,b"durable canonical metadata")?;
+                std::fs::File::open(&canonical)?.sync_all()?;Ok(())
+            }).unwrap();
+            assert!(observed.recv_timeout(std::time::Duration::from_secs(2)).unwrap().paused);
+            owner_thread.take().unwrap().join().unwrap();
+        });
+        assert_eq!(std::fs::read(&canonical).unwrap(),b"durable canonical metadata");
+        assert!(guard.with_acceptance_metadata(|_access| {std::fs::write(&canonical,b"stale overwrite")?;Ok(())}).is_err());
+        assert_eq!(std::fs::read(&canonical).unwrap(),b"durable canonical metadata");
+        let mut store=WorkflowStore::open(&path).unwrap();let after=store.snapshot(guard.id()).unwrap().unwrap();
+        assert_eq!(after.checkpoint,before.checkpoint);assert_eq!(after.model_calls,0);assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+        guard.finish().unwrap();
+    }
     #[tokio::test]
     async fn owner_input_defers_an_interrupted_ordinary_run_without_changing_its_checkpoint() {
         for paid in [false,true] {
