@@ -21,36 +21,89 @@ impl MetadataNativeOwnerProof<'_> {
 }
 fn digest<T:serde::Serialize>(value:&T)->Result<String> {Ok(format!("{:x}",Sha256::digest(super::ownership::canonical_bytes(&serde_json::to_value(value)?)?)))}
 type RuntimeKey=(String,String,String);
-fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,binding:&TransferBinding)->Result<(Vec<Value>,BTreeSet<RuntimeKey>)> {
-    let mut prefix=Sha256::new();let mut launches=BTreeMap::new();let mut resources=Vec::new();let mut bound=BTreeSet::new();let mut ids=BTreeSet::new();
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputRecord {
+    version:u32,actor:String,kind:String,
+    launch_intent:super::PreparedLaunchIntent,launch_receipt:AppendReceipt,resource_receipt:AppendReceipt,
+    #[serde(default)] owner_input:Option<super::OwnerInputReference>,
+    #[serde(default)] prompt_sha256:Option<String>,
+    #[serde(default)] prompt_bytes:Option<u64>,
+    #[serde(default)] recorded_at_ms:Option<i64>,
+}
+fn append_receipt(row:&Value,bytes:&[u8],prefix:&Sha256)->Result<AppendReceipt> {
+    Ok(AppendReceipt {version:1,sequence:row["audit_chain"]["sequence"].as_u64().context("native record sequence missing")?,
+        record_sha256:format!("{:x}",Sha256::digest(bytes)),committed_audit_sha256:format!("{:x}",prefix.clone().finalize())})
+}
+fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,binding:&TransferBinding)->Result<(Vec<Value>,BTreeSet<RuntimeKey>,Vec<Value>)> {
+    let mut prefix=Sha256::new();let mut launches=BTreeMap::new();let mut resources=Vec::new();let mut bound=BTreeSet::new();
+    let mut resource_receipts=BTreeMap::new();let mut owner_inputs=BTreeMap::new();let mut attempts=BTreeSet::new();let mut inputs=Vec::new();
     for row in rows {
         let bytes=serde_json::to_vec(row)?;prefix.update(&bytes);prefix.update(b"\n");
         match row["kind"].as_str() {
             Some("native_launch_intent")=>{
                 ensure!(row["actor"]=="controller","native metadata launch has unclassified actor");
                 let mut raw=row.clone();raw.as_object_mut().context("native launch is not object")?.remove("audit_chain");raw.as_object_mut().unwrap().remove("actor");raw.as_object_mut().unwrap().remove("kind");
-                let intent:super::PreparedLaunchIntent=serde_json::from_value(raw)?;
-                ensure!(intent.version==2 && intent.source_owner.workflow_id==namespace.owner.workflow_id
-                    && intent.source_owner.lease_generation>0 && intent.source_owner.lease_generation<=namespace.owner.lease_generation
+                let intent:super::PreparedLaunchIntent=serde_json::from_value(raw)?;intent.validate()?;
+                ensure!(intent.source_owner.workflow_id==namespace.owner.workflow_id
+                    && intent.source_owner.lease_generation<=namespace.owner.lease_generation
                     && intent.source_audit_path==audit.path() && intent.original_store_binding_sha256==digest(binding)?,"native metadata launch context changed");
-                let sequence=row["audit_chain"]["sequence"].as_u64().context("native launch sequence missing")?;
-                let receipt=AppendReceipt {version:1,sequence,record_sha256:format!("{:x}",Sha256::digest(&bytes)),committed_audit_sha256:format!("{:x}",prefix.clone().finalize())};
-                ensure!(launches.insert(intent.intent_id.clone(),(intent,receipt)).is_none(),"native metadata duplicate launch");
+                let receipt=append_receipt(row,&bytes,&prefix)?;
+                ensure!(launches.insert(intent.intent_id.clone(),super::PreparedLaunchRecord {intent,controller_receipt:receipt}).is_none(),"native metadata duplicate launch");
+                ensure!(launches.len()<=4096,R::HistoryCapacity);
             }
             Some("native_launch_resource_binding")=>{
                 ensure!(row["actor"]=="controller" && row["version"]==1,"native metadata resource has unclassified actor");
                 let intent:super::PreparedLaunchIntent=serde_json::from_value(row["launch_intent"].clone())?;
                 let receipt:AppendReceipt=serde_json::from_value(row["launch_receipt"].clone())?;
                 let original=launches.get(&intent.intent_id).context("native metadata resource has no original launch")?;
-                ensure!(original==&(intent.clone(),receipt) && ids.insert(intent.intent_id.clone()),"native metadata resource launch changed or duplicated");
+                ensure!(original.intent==intent && original.controller_receipt==receipt
+                    && !resource_receipts.contains_key(&intent.intent_id),"native metadata resource launch changed or duplicated");
+                resource_receipts.insert(intent.intent_id.clone(),append_receipt(row,&bytes,&prefix)?);
                 resources.push(crate::run_resources::verify_quiescent(&row["resource_identity"])?);
                 ensure!(resources.len()<=4096,R::HistoryCapacity);
                 bound.insert((intent.runtime_relative_path,intent.launch_sha256,intent.creation_receipt_sha256));
             }
+            Some("native_owner_model_bound"|"native_input_release_attempt")=>{
+                let mut raw=row.clone();raw.as_object_mut().context("native input record is not object")?.remove("audit_chain");
+                let input:InputRecord=serde_json::from_value(raw.clone())?;
+                ensure!(input.actor=="controller","native metadata input has unclassified actor");
+                let original=launches.get(&input.launch_intent.intent_id).context("native metadata input has no original launch")?;
+                ensure!(original.intent==input.launch_intent && original.controller_receipt==input.launch_receipt,
+                    "native metadata input original launch changed");
+                ensure!(resource_receipts.get(&input.launch_intent.intent_id)==Some(&input.resource_receipt),
+                    "native metadata input original resource changed");
+                if input.kind=="native_owner_model_bound" {
+                    ensure!(input.version==1 && !raw.as_object().unwrap().contains_key("prompt_sha256")
+                        && !raw.as_object().unwrap().contains_key("prompt_bytes") && !raw.as_object().unwrap().contains_key("recorded_at_ms"),
+                        "native metadata owner binding shape changed");
+                    let reference=input.owner_input.context("native metadata owner binding missing")?;reference.validate(original)?;
+                    ensure!(!attempts.contains(&input.launch_intent.intent_id)
+                        && owner_inputs.insert(input.launch_intent.intent_id,reference).is_none(),"native metadata owner binding reordered or duplicated");
+                }else {
+                    let hash=input.prompt_sha256.context("native metadata input digest missing")?;
+                    ensure!(hash.len()==64 && hash.bytes().all(|b|matches!(b,b'0'..=b'9'|b'a'..=b'f'))
+                        && input.prompt_bytes.is_some() && input.recorded_at_ms.is_some_and(|t|t>0),"native metadata input bounds invalid");
+                    match input.version {
+                        1=>ensure!(!raw.as_object().unwrap().contains_key("owner_input")
+                            && !owner_inputs.contains_key(&input.launch_intent.intent_id),"native metadata owner input downgraded"),
+                        2=>{
+                            let reference=input.owner_input.context("native metadata input owner reference missing")?;reference.validate(original)?;
+                            ensure!(owner_inputs.get(&input.launch_intent.intent_id)==Some(&reference),"native metadata input original owner binding changed");
+                        }
+                        _=>anyhow::bail!("native metadata input version unknown"),
+                    }
+                    ensure!(attempts.insert(input.launch_intent.intent_id),"native metadata duplicate input release attempt");
+                }
+                inputs.push(json!({"record":raw,"receipt":append_receipt(row,&bytes,&prefix)?}));
+                ensure!(inputs.len()<=8192,R::HistoryCapacity);
+            }
             _=>(),
         }
     }
-    Ok((resources,bound))
+    // Descriptive audit census only. Even zero attempts does not establish
+    // nonrelease or revoke an original writer's ability to release input.
+    Ok((resources,bound,inputs))
 }
 
 /// `current` performs short workflow metadata checks only. `load_audits` opens
@@ -99,9 +152,9 @@ pub fn with_metadata_native_owner(logger:&AuditLogger,runtimes:&[PreparationRunt
                     (None,None)=>(),
                     _=>anyhow::bail!("native metadata audit seal lacks original completed authority"),
                 }
-                let (native,new_bound)=native_resources(rows,audit,namespace,binding)?;
+                let (native,new_bound,inputs)=native_resources(rows,audit,namespace,binding)?;
                 let previous=bound.clone();bound.extend(new_bound);
-                evidence.push(json!({"namespace":namespace,"audit":audited["audit"],"validation":audited["validation"],"native_quiescent_resources":native}));
+                evidence.push(json!({"namespace":namespace,"audit":audited["audit"],"validation":audited["validation"],"native_quiescent_resources":native,"native_input_records":inputs}));
                 let bytes=evidence.iter().try_fold(0u64,|sum,row|sum.checked_add(row["audit"]["committed_bytes"].as_u64().unwrap_or(u64::MAX))).context(R::HistoryCapacity)?;
                 ensure!(bytes<=128*1024*1024,R::HistoryCapacity);
                 let result=inspect(index+1,ordered,binding,evidence,bound,visit);evidence.pop();*bound=previous;result

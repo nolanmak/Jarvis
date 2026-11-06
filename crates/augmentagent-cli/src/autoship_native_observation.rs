@@ -823,8 +823,24 @@ pub(crate) mod tests {
     fn retained_native_metadata_proof_preserves_actual_completed_session() {
         if child("retained_native_metadata_proof_preserves_actual_completed_session") {return;}
         use std::sync::{Arc,Mutex};use std::os::fd::AsRawFd;
-        for provider in ["codex","claude"] {
-        let mut f=Fixture::with_native_provider(false,false,false,provider);let (middle_lease,first,first_proof)=completed_native_handoff(&mut f);
+        for provider in ["codex","claude"] {for input_fault in [false,true] {for original_input in ["none","generic","owner"] {
+        let mut f=Fixture::with_native_provider(false,false,false,provider);
+        // Protected journal fixtures describe prior input uncertainty; they do
+        // not invoke a model or reconstruct the original live input authorizer.
+        if original_input!="none" {
+            let reference=serde_json::json!({"version":1,"workflow":f.lease.workflow,"request_id":"original-request",
+                "dispatch_sequence":1,"model_admission_sequence":2,"model_receipt":"original-model","claim_sha256":"b".repeat(64)});
+            if original_input=="owner" {
+                f.audit.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_owner_model_bound",
+                    "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_receipt":f.resource,"owner_input":reference})).unwrap();
+            }
+            let mut marker=serde_json::json!({"version":1,"actor":"controller","kind":"native_input_release_attempt",
+                "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_receipt":f.resource,
+                "prompt_sha256":"a".repeat(64),"prompt_bytes":42,"recorded_at_ms":now()});
+            if original_input=="owner" {marker["version"]=2.into();marker["owner_input"]=reference;}
+            f.audit.record_controller(marker).unwrap();
+        }
+        let (middle_lease,first,first_proof)=completed_native_handoff(&mut f);
         assert!(f.store.settle_native_handoff(&middle_lease,&f.binding,&first_proof,now()).unwrap().current_context);
         let base=f._root.path().canonicalize().unwrap();
         let middle=Arc::new(AuditLogger::protected(PathBuf::from(&first.request().destination.audit_path),base.join("anchors/destination.json"),&[]).unwrap());
@@ -858,6 +874,8 @@ pub(crate) mod tests {
             assert_eq!(proof.inventory().len(),1);assert_eq!(proof.namespace(),&namespace);
             assert_eq!(proof.inventory()[0].creation_owner,f.prepared.intent.source_owner);assert_eq!(proof.inventory()[0].effective_owner,namespace.owner);
             assert_eq!(proof.evidence()["audits"].as_array().unwrap().len(),3);
+            let input_count=proof.evidence()["audits"].as_array().unwrap().iter().map(|a|a["native_input_records"].as_array().unwrap().len()).sum::<usize>();
+            assert_eq!(input_count,match original_input {"none"=>0,"generic"=>1,_=>2});
             for path in [native.join("state.lock"),native.join(format!("{provider}/session-fixture/lock")),base.join("anchors/native.lock"),base.join("anchors/destination.lock"),base.join("anchors/metadata-final.lock")] {
                 let fd=std::fs::OpenOptions::new().read(true).open(path).unwrap();assert_ne!(unsafe{libc::flock(fd.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
             }
@@ -895,13 +913,19 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(native.join("authority-epoch.json")).unwrap(),epoch);
         assert_eq!(audits.iter().map(|a|std::fs::read(a.path()).unwrap()).collect::<Vec<_>>(),audit_before);
         assert_eq!(f.store.merge_allowance(now(),5).unwrap().confirmed,0);
-        current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_launch_resource_binding",
-            "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_identity":{}})).unwrap();
+        if input_fault {
+            current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_input_release_attempt",
+                "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_receipt":f.resource,
+                "prompt_sha256":"a".repeat(64),"prompt_bytes":42,"recorded_at_ms":now()})).unwrap();
+        }else {
+            current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_launch_resource_binding",
+                "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_identity":{}})).unwrap();
+        }
         let mut visited=false;
         let error=ownership::with_metadata_native_owner(&current,&runtimes,&fence,&mut load,&mut |_| {visited=true;Ok(())}).unwrap_err();
-        assert!(!visited);assert!(format!("{error:#}").contains("native metadata resource has no original launch"),"{error:#}");
+        assert!(!visited);assert!(format!("{error:#}").contains(if input_fault {"native metadata input has no original launch"}else{"native metadata resource has no original launch"}),"{error:#}");
         f.store.release(&lease,now()).unwrap();refuse(&runtimes,audits.clone());
-        }
+        }}}
     }
 
     #[test]
