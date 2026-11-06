@@ -3708,6 +3708,14 @@ mod tests {
             }
             prepared.validate_activated(guard,&guard.worktree).unwrap();
         }
+        // Even losing both slot metadata and its new event field must not
+        // broaden a previously used captured callback into legacy admission.
+        db.execute("DELETE FROM workflow_owner_body_model_admission WHERE workflow=?1",[guard.id()]).unwrap();
+        db.execute("UPDATE workflow_event SET payload=json_remove(payload,'$.owner_body') WHERE workflow=?1 AND kind='native_model_admitted'",[guard.id()]).unwrap();
+        let before=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
+        assert!(guard.audit.model_call_admitted("codex").is_err(),
+            "owner body reservation admitted a second native call that could replay the original input");
+        assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap(),before);
         let mut store=guard.store.lock().unwrap();
         assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,1);
         assert_eq!(store.pending_owner_messages(guard.id()).unwrap(),1);assert!(!store.owner_control(guard.id()).unwrap().unwrap().paused);

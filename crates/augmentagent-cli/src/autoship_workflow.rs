@@ -422,6 +422,12 @@ impl WorkflowStore {
                 workflow TEXT NOT NULL REFERENCES workflow(id),
                 sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
                 record TEXT NOT NULL, response TEXT NOT NULL, state TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_body_model_admission (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_body_dispatch(request_id),
+                workflow TEXT NOT NULL REFERENCES workflow(id),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                receipt TEXT NOT NULL, record TEXT NOT NULL,
+                FOREIGN KEY(workflow,receipt) REFERENCES resource_charge(workflow,id));
             CREATE TABLE IF NOT EXISTS workflow_owner_body_dispatch (
                 request_id TEXT PRIMARY KEY REFERENCES workflow_owner_turn(request_id),
                 workflow TEXT NOT NULL REFERENCES workflow(id),
@@ -1377,7 +1383,11 @@ impl WorkflowStore {
         charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>, bounded:Option<(&str,&Binding,u32)>, admission:Option<(Option<submission::Provider>,bool)>,
         owner_body:Option<(&owner_dispatch::OwnerBodyDispatch,&OwnerPreparationBinding)>) -> Result<()> {
         let owner_provider=admission.as_ref().and_then(|(provider,reviewer)|if *reviewer {None}else{provider.clone()});
-        let admission=admission.map(|(provider,reviewer)|serde_json::json!({"receipt":receipt_id,"provider":provider,"reviewer":reviewer}).to_string());
+        let admission=admission.map(|(provider,reviewer)| {
+            let mut value=serde_json::json!({"receipt":receipt_id,"provider":provider,"reviewer":reviewer});
+            if let Some((dispatch,preparation))=owner_body {value["owner_body"]=owner_dispatch::model_admission_binding(dispatch,preparation);}
+            value.to_string()
+        });
         ensure!(!receipt_id.is_empty(), "charge receipt required");
         let values = (
             i64::try_from(charge.wall_ms)?,
@@ -1394,6 +1404,12 @@ impl WorkflowStore {
         }
         let prior: Option<(i64,i64,i64)> = tx.query_row("SELECT wall_ms,model_calls,tokens FROM resource_charge WHERE workflow=?1 AND id=?2",
             params![lease.workflow,receipt_id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        if let Some((dispatch,_))=owner_body {
+            owner_dispatch::require_model_admission_slot(&tx,dispatch,receipt_id,
+                admission.as_deref().context("owner model admission missing attribution")?,prior.is_some())?;
+        } else if charge.model_calls>0 {
+            owner_dispatch::require_no_body_reservation(&tx,lease)?;
+        }
         if let Some(prior) = prior {
             ensure!(prior == values, "charge receipt conflict");
             if let Some(expected)=&admission {
@@ -1471,9 +1487,15 @@ impl WorkflowStore {
             )?;
             if let Some(admission)=admission {
                 event(&tx,&lease.workflow,lease.generation,"native_model_admitted",&admission,now_ms)?;
+                if let Some((dispatch,_))=owner_body {
+                    owner_dispatch::index_model_admission(&tx,dispatch,receipt_id,&admission)?;
+                }
             }
         }
         tx.commit()?;
+        if let Some((dispatch,_))=owner_body {
+            owner_dispatch::capture_model_admission(dispatch,receipt_id)?;
+        }
         Ok(())
     }
 

@@ -253,6 +253,83 @@ mod tests {
         }
     }
     #[test]
+    fn prepared_owner_model_admission_is_once_after_reopen_and_generic_paths_refuse() {
+        let dir=tempfile::tempdir().unwrap();let (mut store,turn,previous,next,binding)=setup(dir.path());
+        let (receipts,files,preparation)=private_preparation(dir.path(),&next);
+        let turn=store.activate_private_owner_acceptance(None,&turn,Some(&previous),&next,&receipts,&files,&preparation,&binding,5).unwrap();
+        let dispatch=store.begin_prepared_owner_body_dispatch(&turn,submission::Provider::Codex,&preparation,6).unwrap();
+        store.charge_prepared_owner_model(&turn.lease,"first-body",7,None,submission::Provider::Codex,&dispatch,&preparation).unwrap();
+        let before=store.snapshot(&turn.lease.workflow).unwrap().unwrap();let events=store.events(&turn.lease.workflow).unwrap();
+        drop(store);let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        // Retain the actual in-process capability; reopening the database does
+        // not manufacture another dispatch. Same-receipt metadata is idempotent.
+        store.charge_prepared_owner_model(&turn.lease,"first-body",8,None,submission::Provider::Codex,&dispatch,&preparation).unwrap();
+        assert!(store.charge_prepared_owner_model(&turn.lease,"second-body",8,None,submission::Provider::Codex,&dispatch,&preparation).is_err());
+        assert!(store.charge_admitted_model(&turn.lease,"ordinary-bypass",8,None,None,Some(submission::Provider::Codex),false).is_err());
+        assert!(store.charge(&turn.lease,"raw-bypass",ResourceCharge {model_calls:1,..Default::default()},8).is_err());
+        assert_eq!(store.snapshot(&turn.lease.workflow).unwrap().unwrap(),before);assert_eq!(store.events(&turn.lease.workflow).unwrap(),events);
+        assert_eq!(store.pending_owner_messages(&turn.lease.workflow).unwrap(),1);
+        assert_eq!(store.merge_allowance(8,5).unwrap().confirmed,0);
+    }
+    #[test]
+    fn prepared_owner_model_admission_projection_failure_rolls_back_all_charges() {
+        let dir=tempfile::tempdir().unwrap();let (mut store,turn,previous,next,binding)=setup(dir.path());
+        let (receipts,files,preparation)=private_preparation(dir.path(),&next);
+        let turn=store.activate_private_owner_acceptance(None,&turn,Some(&previous),&next,&receipts,&files,&preparation,&binding,5).unwrap();
+        let dispatch=store.begin_prepared_owner_body_dispatch(&turn,submission::Provider::Codex,&preparation,6).unwrap();
+        let before=store.snapshot(&turn.lease.workflow).unwrap().unwrap();let events=store.events(&turn.lease.workflow).unwrap();
+        store.conn.execute_batch("CREATE TRIGGER deny_body_slot BEFORE INSERT ON workflow_owner_body_model_admission BEGIN SELECT RAISE(ABORT,'injected body slot failure'); END;").unwrap();
+        assert!(store.charge_prepared_owner_model(&turn.lease,"first-body",7,Some(("body-model",&binding,3)),submission::Provider::Codex,&dispatch,&preparation).is_err());
+        assert_eq!(store.snapshot(&turn.lease.workflow).unwrap().unwrap(),before);assert_eq!(store.events(&turn.lease.workflow).unwrap(),events);
+        for table in ["resource_charge","bounded_attempt","workflow_owner_body_model_admission"] {
+            assert_eq!(store.conn.query_row(&format!("SELECT count(*) FROM {table} WHERE workflow=?1"),[&turn.lease.workflow],|row|row.get::<_,i64>(0)).unwrap(),0);
+        }
+        store.conn.execute_batch("DROP TRIGGER deny_body_slot").unwrap();
+        store.charge_prepared_owner_model(&turn.lease,"first-body",8,Some(("body-model",&binding,3)),submission::Provider::Codex,&dispatch,&preparation).unwrap();
+        assert_eq!(store.snapshot(&turn.lease.workflow).unwrap().unwrap().model_calls,1);
+    }
+    #[test]
+    fn prepared_owner_model_admission_history_damage_cannot_release_another_call() {
+        for fault in ["index","event","payload","charge","legacy-pair"] {
+            let dir=tempfile::tempdir().unwrap();let (mut store,turn,previous,next,binding)=setup(dir.path());
+            let (receipts,files,preparation)=private_preparation(dir.path(),&next);
+            let turn=store.activate_private_owner_acceptance(None,&turn,Some(&previous),&next,&receipts,&files,&preparation,&binding,5).unwrap();
+            let dispatch=store.begin_prepared_owner_body_dispatch(&turn,submission::Provider::Codex,&preparation,6).unwrap();
+            store.charge_prepared_owner_model(&turn.lease,"first-body",7,None,submission::Provider::Codex,&dispatch,&preparation).unwrap();
+            match fault {
+                "index"=>{store.conn.execute("DELETE FROM workflow_owner_body_model_admission",[]).unwrap();},
+                "event"=>{store.conn.execute("UPDATE workflow_event SET kind='damaged-admission' WHERE kind='native_model_admitted'",[]).unwrap();},
+                "payload"=>{store.conn.execute("UPDATE workflow_owner_body_model_admission SET record='{}'",[]).unwrap();},
+                "charge"=>{store.conn.execute("UPDATE resource_charge SET model_calls=0 WHERE id='first-body'",[]).unwrap();},
+                "legacy-pair"=>{
+                    store.conn.execute("DELETE FROM workflow_owner_body_model_admission",[]).unwrap();
+                    store.conn.execute("UPDATE workflow_event SET payload=json_remove(payload,'$.owner_body') WHERE kind='native_model_admitted'",[]).unwrap();
+                },
+                _=>unreachable!(),
+            }
+            let before=store.events(&turn.lease.workflow).unwrap();
+            assert!(store.charge_prepared_owner_model(&turn.lease,"second-body",8,None,submission::Provider::Codex,&dispatch,&preparation).is_err(),"{fault}: damaged history authorized replay");
+            assert_eq!(store.events(&turn.lease.workflow).unwrap(),before);
+        }
+    }
+    #[test]
+    fn prepared_owner_model_admission_competing_connections_charge_only_one() {
+        use std::sync::{Arc,Barrier};
+        let dir=tempfile::tempdir().unwrap();let (mut store,turn,previous,next,binding)=setup(dir.path());
+        let (receipts,files,preparation)=private_preparation(dir.path(),&next);
+        let turn=store.activate_private_owner_acceptance(None,&turn,Some(&previous),&next,&receipts,&files,&preparation,&binding,5).unwrap();
+        let dispatch=Arc::new(store.begin_prepared_owner_body_dispatch(&turn,submission::Provider::Codex,&preparation,6).unwrap());
+        let peers=[WorkflowStore::open(&dir.path().join("state.db")).unwrap(),WorkflowStore::open(&dir.path().join("state.db")).unwrap()];
+        let barrier=Arc::new(Barrier::new(2));
+        let workers=peers.into_iter().enumerate().map(|(i,mut peer)| {
+            let barrier=barrier.clone();let dispatch=dispatch.clone();let turn=turn.clone();let preparation=preparation.clone();
+            std::thread::spawn(move || {barrier.wait();peer.charge_prepared_owner_model(&turn.lease,&format!("racing-body-{i}"),7,None,submission::Provider::Codex,&dispatch,&preparation).is_ok()})
+        }).collect::<Vec<_>>();
+        assert_eq!(workers.into_iter().map(|worker|worker.join().unwrap()).filter(|ok|*ok).count(),1);
+        assert_eq!(store.snapshot(&turn.lease.workflow).unwrap().unwrap().model_calls,1);
+        store.validate_owner_turn(&turn,8).unwrap();
+    }
+    #[test]
     fn private_owner_revision_retains_its_exact_preparation_and_revised_baseline_after_reopen() {
         let dir=tempfile::tempdir().unwrap();let (mut store,turn,previous,next,binding)=setup(dir.path());
         let (receipts,files,preparation)=private_preparation(dir.path(),&next);

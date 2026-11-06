@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "kind": "once-only-original-owner-body-model-admission-component",
+  "source_parent_commit": "666d3ab0e3f67a9e5de4de7a40bb06c4ec563781",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_dispatch.rs",
+      "sha256": "94e63cf34e82ccb0ac24075fe27a82b45e3982a139307916cd3b7aff17f65e17"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_revision.rs",
+      "sha256": "8b306e83fce4dccd52aa84de620854e81b252dc0abb4f31036039b6b14805cdf"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "20eee06df849f5eabdf06204db907ff9f2f8a5f90861b5409869f24e3285f826"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "83b233e725d88e948c285797575c65a7a928b71155230b40ab8e9950971d2761"
+    }
+  ],
+  "behavior": [
+    "Original owner body permits one attributed native model admission; another receipt refuses before bounded/resource charging.",
+    "Same receipt remains idempotent accounting after original binding/history/charge validation; it is not permission to execute a provider again.",
+    "The existing native_model_admitted event binds original request, reservation sequence/digest and preparation. Its unique-per-request projection and charge commit in one SQLite transaction.",
+    "The original nonserializable OwnerBodyDispatch captures its first admitted receipt after commit. Removing the new projection plus event field cannot authorize a second call through that retained capability.",
+    "Generic model-charge APIs reject a current reserved owner body lacking its prepared admission.",
+    "Projection/event/charge damage refuses, projection failure rolls back bounded attempts/charges, and competing connections charge only one."
+  ],
+  "validation": {
+    "parent_callback_red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent owner_body_admission_rechecks_original_preparation_in_actual_callbacks",
+      "log": "/tmp/autoship-owner-body-model-once-red-20261106.log",
+      "log_sha256": "87701e96d3192361be35c1c5708fbe15023601958e8422827dc2a84b20bcda17",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "passed": 0,
+      "failed": 1,
+      "observed": "owner body reservation admitted a second native call that could replay the original input"
+    },
+    "captured_capability_red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent prepared_owner_model_admission_history_damage_cannot_release_another_call",
+      "log": "/tmp/autoship-owner-body-model-once-captured-red-20261106.log",
+      "log_sha256": "2ab2a59f6713f3a8cfb450ac73ccae6c8b9a237659ccdf1bc195fe311402723b",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "passed": 0,
+      "failed": 1,
+      "observed": "legacy-pair: damaged history authorized replay"
+    },
+    "final_focused": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent prepared_owner_",
+      "log": "/tmp/autoship-owner-body-model-once-final-focused-20261106.log",
+      "log_sha256": "e1c4ebe671c0058a55e33f427d2b396f0deb4c75272133a1f45e8231d698adc9",
+      "exit": 0,
+      "passed": 5,
+      "failed": 0,
+      "seconds": 0.7
+    },
+    "superseded_full_cli": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-body-model-once-full-cli-20261106.log",
+      "log_sha256": "16463d5d0d6b5c57cfdc06f5d96e45817964888255e0adf9ec2e5618054b736f",
+      "exit": 0,
+      "passed": 1933,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 279.16,
+      "superseded_by_final_capability_change": true
+    },
+    "final_full_cli": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-body-model-once-final-full-cli-20261106.log",
+      "log_sha256": "8a1bafccd6bd686372841d4487a8732c34410339c235054c573b545f21f9893f",
+      "exit": 0,
+      "passed": 1933,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 277.64
+    },
+    "final_production_cli_check": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-body-model-once-final-production-check-20261106.log",
+      "log_sha256": "4889924e689bb81f8e928bd1b15fec401e84db851d6a43e215473663e8feb45c",
+      "exit": 0,
+      "compiler_seconds": 9.95
+    }
+  },
+  "limits": [
+    "The initial red test adds only a behavioral assertion to the source parent and exercises the actual guard model callback in an isolated native-owner subprocess fixture. It is not a full provider execution.",
+    "The second red run tests an intermediate implementation with a callback-only used flag; it reproduces the direct-store legacy-shaped metadata-loss hole.",
+    "The final source inventory is post-run data, not compiled-source generation/freshness authority.",
+    "One initial model admission is not proof of input delivery, coding completion, an autonomous merge or safe replay.",
+    "Actual prompt/native launch/resource input-release linkage is still unimplemented. Do not infer the latest launch or a session string is that link.",
+    "Automatic nonrelease/successor/continuation recovery remains gated; retain original charges and pending request rather than clearing a slot or resending input.",
+    "No owner worker ingress, canonical publication, correction/public projection/storage completion, production rollout, live acceptance or soak is claimed."
+  ],
+  "epic_complete": false
+}

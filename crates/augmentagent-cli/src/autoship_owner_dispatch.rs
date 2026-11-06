@@ -110,6 +110,9 @@ fn completion_record(conn: &Connection, record: &Record, dispatch_sequence: i64)
 pub(crate) struct OwnerBodyDispatch {
     record: Record,
     sequence: i64,
+    // Captured only after a successful charge commit. Saved history never
+    // constructs this used state or another executable dispatch capability.
+    model_receipt: std::sync::OnceLock<String>,
 }
 impl OwnerBodyDispatch {
     pub(crate) fn request_id(&self) -> &str {
@@ -207,6 +210,73 @@ fn decode(
     }
     Ok(record)
 }
+/// Descriptive event binding; only the captured live reservation can supply it.
+/// Neither this value nor its saved event reconstructs dispatch authority.
+pub(super) fn model_admission_binding(dispatch:&OwnerBodyDispatch,preparation:&OwnerPreparationBinding)->serde_json::Value {
+    model_binding(&dispatch.record,dispatch.sequence,preparation)
+}
+fn model_binding(record:&Record,sequence:i64,preparation:&OwnerPreparationBinding)->serde_json::Value {
+    serde_json::json!({"version":1,"request_id":record.request_id,
+        "dispatch_sequence":sequence,"dispatch_sha256":format!("{:x}",Sha256::digest(serde_json::to_vec(record).expect("serializable reservation"))),
+        "preparation":preparation})
+}
+pub(super) fn require_model_admission_slot(conn:&Connection,dispatch:&OwnerBodyDispatch,receipt:&str,expected:&str,already_charged:bool)->Result<()> {
+    if let Some(captured)=dispatch.model_receipt.get() {
+        ensure!(already_charged && captured==receipt,
+            "owner body model already admitted; reconcile original outcome");
+    }
+    validate_model_admissions(conn,&dispatch.record.workflow)?;
+    let prior:Option<(String,String)>=conn.query_row("SELECT receipt,record FROM workflow_owner_body_model_admission WHERE request_id=?1 AND workflow=?2",
+        params![dispatch.record.request_id,dispatch.record.workflow],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+    match prior {
+        Some((prior,record))=>ensure!(already_charged && prior==receipt && record==expected,
+            "owner body already admitted a model call; recover its original outcome instead of replaying"),
+        None=>ensure!(!already_charged,"owner model admission lost its original reservation binding"),
+    }
+    Ok(())
+}
+pub(super) fn capture_model_admission(dispatch:&OwnerBodyDispatch,receipt:&str)->Result<()> {
+    ensure!(dispatch.model_receipt.get_or_init(||receipt.to_owned())==receipt,
+        "owner body captured model receipt changed after commit");Ok(())
+}
+pub(super) fn index_model_admission(tx:&Transaction<'_>,dispatch:&OwnerBodyDispatch,receipt:&str,record:&str)->Result<()> {
+    ensure!(record.len()<=16384,"owner model admission exceeds bound");
+    let sequence:i64=tx.query_row("SELECT MAX(seq) FROM workflow_event WHERE workflow=?1",[&dispatch.record.workflow],|row|row.get(0))?;
+    tx.execute("INSERT INTO workflow_owner_body_model_admission VALUES(?1,?2,?3,?4,?5)",
+        params![dispatch.record.request_id,dispatch.record.workflow,sequence,receipt,record])?;
+    Ok(())
+}
+pub(super) fn require_no_body_reservation(conn:&Connection,lease:&Lease)->Result<()> {
+    validate_history(conn,&lease.workflow)?;
+    let reserved:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_body_dispatch WHERE workflow=?1 AND json_extract(record,'$.generation')=?2)",
+        params![lease.workflow,lease.generation],|row|row.get(0))?;
+    ensure!(!reserved,"reserved owner body requires its original prepared model admission");Ok(())
+}
+fn validate_model_admissions(conn:&Connection,workflow:&str)->Result<()> {
+    let events:i64=conn.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' AND json_type(payload,'$.owner_body') IS NOT NULL",
+        [workflow],|row|row.get(0))?;
+    let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_body_model_admission')",[],|row|row.get(0))?;
+    if !exists {ensure!(events==0,"owner model admission index missing");return Ok(())}
+    let mut query=conn.prepare("SELECT request_id,sequence,receipt,record FROM workflow_owner_body_model_admission WHERE workflow=?1 ORDER BY sequence LIMIT 4097")?;
+    let mut count=0i64;
+    for row in query.query_map([workflow],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?)))? {
+        let (request,sequence,receipt,raw)=row?;count+=1;
+        ensure!(count<=4096 && raw.len()<=16384,"owner model admission history exceeds bound");
+        let (dispatch_sequence,dispatch_raw):(i64,String)=conn.query_row("SELECT sequence,record FROM workflow_owner_body_dispatch WHERE workflow=?1 AND request_id=?2",params![workflow,request],|row|Ok((row.get(0)?,row.get(1)?)))?;
+        let record=decode(conn,&request,workflow,dispatch_sequence,&dispatch_raw)?;
+        let preparation=record.preparation.as_ref().context("owner model admission lacks original preparation")?;
+        let value:serde_json::Value=serde_json::from_str(&raw)?;
+        let expected=serde_json::json!({"receipt":receipt,"provider":record.provider,"reviewer":false,
+            "owner_body":model_binding(&record,dispatch_sequence,preparation)});
+        ensure!(value==expected && sequence>dispatch_sequence,"owner model admission reservation changed");
+        let event:(String,i64,String,i64)=conn.query_row("SELECT kind,generation,payload,at_ms FROM workflow_event WHERE seq=?1 AND workflow=?2",params![sequence,workflow],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+        ensure!(event.0=="native_model_admitted" && event.1==record.generation && event.2==raw && event.3>=record.started_at_ms,
+            "owner model admission event changed");
+        let charge:(i64,i64,i64)=conn.query_row("SELECT wall_ms,model_calls,tokens FROM resource_charge WHERE workflow=?1 AND id=?2",params![workflow,receipt],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+        ensure!(charge==(0,1,0),"owner model admission charge changed");
+    }
+    ensure!(events==count,"owner model admission history is incomplete");Ok(())
+}
 pub(super) fn validate_history(conn: &Connection, workflow: &str) -> Result<()> {
     // Read-only inspection may see a pre-migration store. No record is inferred
     // when either half of an already persisted reservation is missing.
@@ -246,7 +316,8 @@ pub(super) fn validate_history(conn: &Connection, workflow: &str) -> Result<()> 
         results == completed && results <= count,
         "owner completion history is incomplete"
     );
-    Ok(())
+    validate_model_admissions(conn,workflow)
+
 }
 /// Read one completed private response with its original authenticated origin.
 /// No route change, lease or serialized reference grants dispatch authority.
@@ -379,7 +450,7 @@ impl WorkflowStore {
             params![record.request_id, record.workflow, sequence, raw],
         )?;
         tx.commit()?;
-        Ok(OwnerBodyDispatch { record, sequence })
+        Ok(OwnerBodyDispatch { record, sequence, model_receipt:std::sync::OnceLock::new() })
     }
     /// Only a fresh borrowed core capability can enter this transaction. The
     /// private response is stored per request, never coalesced into progress.
