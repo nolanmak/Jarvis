@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "kind": "original-owner-model-native-input-association-component",
+  "source_parent_commit": "ac56bf3ac8b8f22621322e9014cee3d7e39e94d2",
+  "source_inventory_is_post_run_inventory": true,
+  "source_generation_authority": false,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/codex.rs",
+      "sha256": "bf6abd339e8b41e465295890fa8b0a0285df2c9626d47028d950f93c984dda44"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/images.rs",
+      "sha256": "bdd9c09cfb4c3b9f627c88025d46d022ef78253b22eab3cf689cc74bed42c58e"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "180e441392ba4d4e2cb7ba99ca6f5a8dac38ec25185e7ed80d0ce011b24208dd"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/process_tree.rs",
+      "sha256": "b0fc4e6d8cdb9cab8fa3622c07b4b6008dcd10a80f78d2248d4257f6643f1f4d"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "ad4a006cb48dfd89a61b6fbb5cca519535541fd2b73ecfe00834aa6100731fcb"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_dispatch.rs",
+      "sha256": "bc87292a0bf673b55953ba7eec0191fd68841bbbe76ee4d76c0602bdb22f36a4"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "b5e7b92a1a7f03d515d19580e705f58596489d27a93090c52945db0c74da3f9f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "d7ee55a7e07cd35be51b00d56bec88c9b7e163ada0c7bfef6ebf97d9a7cf114c"
+    }
+  ],
+  "behavior": [
+    "Original owner controller seals the exact expected wire prompt and installs one immutable native authorizer; Codex uses its shared existing image translation.",
+    "Actual supervisor admission binds its exact prepared launch/resource to the original captured body/model admission before launch-continue, with current dispatch checks and original protected native append.",
+    "Private native association projection/event commit atomically. The original nonserializable dispatch captures that association and refuses replacement or regeneration after paired history loss.",
+    "The core live map is keyed by exact native intent and holds the complete prepared record/resource/original model reference; saved data never populates it.",
+    "Before stdin, the real native writer requires exact map membership, original body/model/preparation/lease/native association and sealed wire prompt. Version-2 owner release markers retain the original reference; ordinary native markers remain version 1."
+  ],
+  "validation": {
+    "missing_input_gate_red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-channel-core --lib native_input_release_",
+      "log": "/tmp/autoship-owner-native-input-binding-red-20261106.log",
+      "log_sha256": "6486816e7a4c0415fcb274375ef08aecc2200162d5c3dc38ca80c7e02cacd06c",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "passed": 7,
+      "failed": 3
+    },
+    "initial_core_focused": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-channel-core --lib native_input_release_",
+      "log": "/tmp/autoship-owner-native-input-binding-core-green-20261106.log",
+      "log_sha256": "ffc724476a6a9913d39298b7076410af7b61931c06704aaf29ffa26485c27183",
+      "exit": 0,
+      "passed": 10,
+      "failed": 0,
+      "seconds": 1.02,
+      "superseded_by_additional_resource_substitution_test": true
+    },
+    "owner_guard_focused": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent owner_body_admission_rechecks_original_preparation_in_actual_callbacks",
+      "log": "/tmp/autoship-owner-native-input-binding-cli-focused-2-20261106.log",
+      "log_sha256": "a02451c3ad3bbabe7bb3cc4fb565c490ee513bf1b8823428856e59a6464866d4",
+      "exit": 0,
+      "passed": 1,
+      "failed": 0,
+      "seconds": 2.06
+    },
+    "full_channel_core": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-channel-core --lib",
+      "log": "/tmp/autoship-owner-native-input-binding-full-core-20261106.log",
+      "log_sha256": "8059d60754c80b4681c8a1a6f873a822819e8130291620b3a518637e0fa681d2",
+      "exit": 0,
+      "passed": 908,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 34.19
+    },
+    "compile_correction": {
+      "initial_cli_focused_log": "/tmp/autoship-owner-native-input-binding-cli-focused-20261106.log",
+      "initial_exit": 1,
+      "cause": "Fixture called private binding_digest helper. Replaced with the exact existing canonical digest formula without widening production visibility; final focused passed."
+    },
+    "final_full_cli": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-native-input-binding-full-cli-20261106.log",
+      "log_sha256": "56e8c7bddea4a3bd280efedfc6b94dbaa0d2a74a4fe7d6319e36db95aa115280",
+      "exit": 0,
+      "passed": 1933,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 297.84
+    },
+    "production_cli_check": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-native-input-binding-production-check-20261106.log",
+      "log_sha256": "38909f6eb134105c92579a28ac500c06a1f8174f2fd7b88059f796a89d2472c8",
+      "exit": 0,
+      "compiler_seconds": 47.24
+    }
+  },
+  "limits": [
+    "Red run introduced authorizer configuration/model-binding plumbing and fixture configuration while retaining the inherited stdin release body unchanged. It was not a pristine-parent binary.",
+    "Core transport tests use the prepared native-store fixture, a fixture authorizer/reference and a real Python stdin recipient through the shared production boundary; no actual VM/provider or kernel resource admission is established.",
+    "CLI focused regression uses the actual original owner guard/model callback and private controller with synthetic native intent/resource metadata. It does not traverse a complete reasoner/VM/provider owner call.",
+    "No live native input-map reconstruction is supplied after process death. Saved model/native references remain descriptive metadata.",
+    "Resource setup still follows the outer body reservation; moving reservation to the prepared native input boundary and recovering proven-unexposed preflight failure remain required.",
+    "No nonrelease/quiescence/retained-writer exclusion across asynchronous transport, positive provider delivery, retained response recovery, original conversation continuation or successor authorization is proved.",
+    "Canonical publication/all-reader admission, correction/public projection/storage, owner worker ingress, rollout and full CLI/Discord/live/fault/soak acceptance remain incomplete.",
+    "Post-run source inventory grants no compiled-source freshness or shipping authority."
+  ],
+  "epic_complete": false
+}

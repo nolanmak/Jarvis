@@ -297,6 +297,11 @@ pub fn default_audit_log_path() -> PathBuf {
 
 /// Append-only NDJSON writer. Cheap to clone (`Arc<Mutex<…>>` inside) so
 /// the caller can hand it to spawned tasks.
+#[derive(Default)]
+struct OwnerInputState {
+    authorizer:Option<Arc<dyn crate::native_vm::OwnerInputAuthorizer>>,
+    launches:std::collections::BTreeMap<String,(crate::native_vm::PreparedLaunchRecord,crate::audit_chain::AppendReceipt,crate::native_vm::OwnerInputReference)>,
+}
 #[derive(Clone)]
 pub struct AuditLogger {
     path: PathBuf,
@@ -306,6 +311,7 @@ pub struct AuditLogger {
         Arc<std::sync::Mutex<Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>>,
     run_resources_required: Arc<std::sync::atomic::AtomicBool>,
     native_runtime_owner: Arc<std::sync::Mutex<Option<crate::native_vm::RuntimeOwner>>>,
+    owner_input:Arc<std::sync::Mutex<OwnerInputState>>,
     native_store_binding:
         Arc<std::sync::Mutex<Option<crate::native_vm::ownership::TransferBinding>>>,
     native_launch_observer: Arc<
@@ -833,6 +839,45 @@ impl AuditLogger {
         *current = Some(observer);
         Ok(())
     }
+    pub fn set_owner_input_authorizer(&self,authorizer:Arc<dyn crate::native_vm::OwnerInputAuthorizer>)->anyhow::Result<()> {
+        anyhow::ensure!(self.is_protected() && self.native_runtime_owner()?.is_some(),"owner input requires original protected owner");
+        let mut state=self.owner_input.lock().map_err(|_|anyhow::anyhow!("owner input lock poisoned"))?;
+        anyhow::ensure!(state.authorizer.is_none(),"owner input authorizer already installed");
+        state.authorizer=Some(authorizer);Ok(())
+    }
+    /// Called by the supervisor only after actual model admission, before it
+    /// releases launch-continue. No saved reference populates the live map.
+    pub(crate) fn bind_owner_native_model(&self,prepared:&crate::native_vm::PreparedLaunchRecord,
+        resource:&crate::audit_chain::AppendReceipt)->anyhow::Result<()> {
+        let authorizer=self.owner_input.lock().map_err(|_|anyhow::anyhow!("owner input lock poisoned"))?.authorizer.clone();
+        let Some(authorizer)=authorizer else {return Ok(())};
+        self.verify_native_launch_reference(prepared)?;
+        let row=self.read_append_receipt(resource)?;
+        anyhow::ensure!(resource.sequence>prepared.controller_receipt.sequence && row["kind"]=="native_launch_resource_binding"
+            && row["launch_intent"]==serde_json::to_value(&prepared.intent)?
+            && row["launch_receipt"]==serde_json::to_value(&prepared.controller_receipt)? && row["resource_identity"].is_object(),
+            "owner model resource differs from prepared launch");
+        let reference=authorizer.bind_model(prepared,resource)?;reference.validate(prepared)?;
+        self.dispatch_allowed()?;
+        self.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller","kind":"native_owner_model_bound",
+            "launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"resource_receipt":resource,"owner_input":reference}))?;
+        self.dispatch_allowed()?;
+        let mut state=self.owner_input.lock().map_err(|_|anyhow::anyhow!("owner input lock poisoned"))?;
+        let value=(prepared.clone(),resource.clone(),reference);
+        if let Some(old)=state.launches.get(&prepared.intent.intent_id) {anyhow::ensure!(old==&value,"owner native launch binding changed");}
+        else {anyhow::ensure!(state.launches.len()<4096,"owner native input bindings exceed bound");state.launches.insert(prepared.intent.intent_id.clone(),value);}
+        Ok(())
+    }
+    pub(crate) fn authorize_owner_native_input(&self,prepared:&crate::native_vm::PreparedLaunchRecord,
+        resource:&crate::audit_chain::AppendReceipt,prompt_sha256:&str,prompt_bytes:usize)->anyhow::Result<Option<crate::native_vm::OwnerInputReference>> {
+        let (authorizer,bound)={let state=self.owner_input.lock().map_err(|_|anyhow::anyhow!("owner input lock poisoned"))?;
+            (state.authorizer.clone(),state.launches.get(&prepared.intent.intent_id).cloned())};
+        let Some(authorizer)=authorizer else {return Ok(None)};
+        let (actual,admitted,reference)=bound.ok_or_else(||anyhow::anyhow!("owner input lacks its actual native model binding"))?;
+        anyhow::ensure!(actual==*prepared && admitted==*resource,"owner input native launch/resource changed");
+        authorizer.authorize_input(prepared,resource,&reference,prompt_sha256,prompt_bytes)?;
+        self.dispatch_allowed()?;Ok(Some(reference))
+    }
     pub fn set_native_observation_observer(
         &self,
         observer: Arc<
@@ -1104,6 +1149,7 @@ impl AuditLogger {
             run_resources_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             native_runtime_owner: Arc::new(std::sync::Mutex::new(None)),
             native_store_binding: Arc::new(std::sync::Mutex::new(None)),
+            owner_input: Arc::new(std::sync::Mutex::new(OwnerInputState::default())),
             native_launch_observer: Arc::new(std::sync::Mutex::new(None)),
             native_observation_observer: Arc::new(std::sync::Mutex::new(None)),
             anchored: None,

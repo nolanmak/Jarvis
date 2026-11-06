@@ -224,19 +224,7 @@ impl CodexCliReasoner {
         // The marker lines are stripped from the stdin prompt; codex embeds
         // the images in the request itself, so an image turn survives a
         // claude→codex failover instead of arriving as a dead file path.
-        let extracted = crate::images::extract_image_markers(user_message);
-        let (user_message, image_paths) = if extracted.images.is_empty() {
-            (user_message.to_string(), Vec::new())
-        } else {
-            (
-                format!(
-                    "{}\n\n[{} image attachment(s) are embedded in this prompt]",
-                    extracted.text,
-                    extracted.images.len()
-                ),
-                extracted.images,
-            )
-        };
+        let (user_message, image_paths) = crate::images::codex_input(user_message);
         let user_message = user_message.as_str();
 
         // System prompt travels via a temp file (`model_instructions_file`

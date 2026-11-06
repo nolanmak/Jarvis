@@ -36,6 +36,37 @@ pub struct PreparedLaunchRecord {
     pub intent: PreparedLaunchIntent,
     pub controller_receipt: crate::audit_chain::AppendReceipt,
 }
+/// Descriptive original body/model reference. Serialized data is never input
+/// release authority: only the installed live authorizer and exact launch map
+/// can authorize the production writer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerInputReference {
+    pub version:u32,
+    pub workflow:String,
+    pub request_id:String,
+    pub dispatch_sequence:i64,
+    pub model_admission_sequence:i64,
+    pub model_receipt:String,
+    pub claim_sha256:String,
+}
+impl OwnerInputReference {
+    pub(crate) fn validate(&self,prepared:&PreparedLaunchRecord)->Result<()> {
+        ensure!(self.version==1 && self.workflow==prepared.intent.source_owner.workflow_id
+            && !self.request_id.is_empty() && self.request_id.len()<=1024
+            && self.dispatch_sequence>0 && self.model_admission_sequence>self.dispatch_sequence
+            && !self.model_receipt.is_empty() && self.model_receipt.len()<=1024
+            && self.claim_sha256.len()==64 && self.claim_sha256.bytes().all(|b|matches!(b,b'0'..=b'9'|b'a'..=b'f')),
+            "invalid owner input admission reference");Ok(())
+    }
+}
+/// Installed once by the original owner controller. Neither method may wait
+/// for a provider or perform native IO while holding its workflow transaction.
+pub trait OwnerInputAuthorizer:Send+Sync {
+    fn bind_model(&self,prepared:&PreparedLaunchRecord,resource:&crate::audit_chain::AppendReceipt)->Result<OwnerInputReference>;
+    fn authorize_input(&self,prepared:&PreparedLaunchRecord,resource:&crate::audit_chain::AppendReceipt,
+        reference:&OwnerInputReference,prompt_sha256:&str,prompt_bytes:usize)->Result<()>;
+}
 impl PreparedLaunchIntent {
     pub(crate) fn validate(&self) -> Result<()> {
         let id=uuid::Uuid::parse_str(&self.intent_id)?;
@@ -687,12 +718,16 @@ impl Launch {
         // transport release is later; this marker deliberately grants no
         // quiescence/nonrelease proof across that interval.
         logger.dispatch_allowed()?;
-        logger.record_controller_receipted(serde_json::json!({
+        let prompt_sha256=format!("{:x}",Sha256::digest(prompt.as_bytes()));
+        let owner_input=logger.authorize_owner_native_input(&observed.prepared,resource,&prompt_sha256,prompt.len())?;
+        let mut row=serde_json::json!({
             "version":1,"actor":"controller","kind":"native_input_release_attempt",
             "launch_intent":observed.prepared.intent,"launch_receipt":observed.prepared.controller_receipt,
-            "resource_receipt":resource,"prompt_sha256":format!("{:x}",Sha256::digest(prompt.as_bytes())),
+            "resource_receipt":resource,"prompt_sha256":prompt_sha256,
             "prompt_bytes":prompt.len(),"recorded_at_ms":chrono::Utc::now().timestamp_millis()
-        }))?;
+        });
+        if let Some(reference)=owner_input {row["version"]=2.into();row["owner_input"]=serde_json::to_value(reference)?;}
+        logger.record_controller_receipted(row)?;
         logger.dispatch_allowed()?;
         Ok(())
     }
@@ -845,6 +880,27 @@ mod tests {
     fn native_input_release_retains_marker_if_final_fence_refuses() { launch_intent_child("input-final-fence"); }
     #[test]
     fn native_input_release_survives_process_death_before_stdin() { launch_intent_child("input-crash"); }
+    #[test]
+    fn native_input_release_requires_sealed_owner_prompt() { launch_intent_child("input-owner-prompt"); }
+    #[test]
+    fn native_input_release_requires_actual_owner_model_binding() { launch_intent_child("input-owner-unbound"); }
+    #[test]
+    fn native_input_release_records_exact_original_owner_admission() { launch_intent_child("input-owner-ready"); }
+    #[test]
+    fn native_input_release_refuses_different_valid_resource_for_owner_model() { launch_intent_child("input-owner-resource"); }
+    struct FixtureOwnerInput;
+    impl OwnerInputAuthorizer for FixtureOwnerInput {
+        fn bind_model(&self,prepared:&PreparedLaunchRecord,_resource:&crate::audit_chain::AppendReceipt)->Result<OwnerInputReference> {
+            Ok(OwnerInputReference {version:1,workflow:prepared.intent.source_owner.workflow_id.clone(),request_id:"synthetic-original-request".into(),
+                dispatch_sequence:10,model_admission_sequence:20,model_receipt:"synthetic-admitted-model".into(),claim_sha256:"a".repeat(64)})
+        }
+        fn authorize_input(&self,_prepared:&PreparedLaunchRecord,_resource:&crate::audit_chain::AppendReceipt,
+            _reference:&OwnerInputReference,sha:&str,len:usize)->Result<()> {
+            use sha2::{Digest,Sha256};
+            ensure!(sha==format!("{:x}",Sha256::digest(b"synthetic exact private input")) && len=="synthetic exact private input".len(),
+                "owner input differs from sealed original body");Ok(())
+        }
+    }
     fn launch_intent_child(mode: &str) {
         let seal=mode=="seal";let refuse=mode=="refuse";
         const CHILD: &str = "JARVIS_TEST_NATIVE_LAUNCH_INTENT_CHILD";
@@ -880,7 +936,11 @@ mod tests {
                 }
                 return;
             }
-            let test = if mode=="input-resource" {"native_input_release_refuses_wrong_resource_receipt"}
+            let test = if mode=="input-owner-resource" {"native_input_release_refuses_different_valid_resource_for_owner_model"}
+                else if mode=="input-owner-prompt" {"native_input_release_requires_sealed_owner_prompt"}
+                else if mode=="input-owner-unbound" {"native_input_release_requires_actual_owner_model_binding"}
+                else if mode=="input-owner-ready" {"native_input_release_records_exact_original_owner_admission"}
+                else if mode=="input-resource" {"native_input_release_refuses_wrong_resource_receipt"}
                 else if mode=="input-no-resource" {"native_input_release_requires_resource_receipt"}
                 else if mode=="input-final-fence" {"native_input_release_retains_marker_if_final_fence_refuses"}
                 else if mode=="input-ready" {"native_input_release_is_durable_before_prompt_bytes"}
@@ -1021,6 +1081,12 @@ mod tests {
                         ensure!(!std::fs::read_to_string(&log)?.contains("native_input_release_attempt"),"fixture final input fence");Ok(())
                     })).unwrap();
                 }
+                if mode.starts_with("input-owner-") {
+                    logger.set_owner_input_authorizer(std::sync::Arc::new(FixtureOwnerInput)).unwrap();
+                    assert!(logger.clone().set_owner_input_authorizer(std::sync::Arc::new(FixtureOwnerInput)).is_err(),"clone replaced original owner input authority");
+                    if mode!="input-owner-unbound" {logger.bind_owner_native_model(&prepared,&resource).unwrap();}
+                }
+                let other_resource=if mode=="input-owner-resource" {Some(logger.native_launch_resource_binding(&prepared,provider,&serde_json::json!({"fixture":"different-admitted-resource"})).unwrap())} else {None};
                 let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 let send = || runtime.block_on(async {
                     use std::process::Stdio;
@@ -1045,15 +1111,17 @@ else: print(result)
                     let mut child=command.spawn().unwrap();
                     let mut stdin=child.stdin.take().unwrap();
                     let selected=if mode=="input-no-resource" {None}
-                        else if mode=="input-resource" {Some(&prepared.controller_receipt)} else {Some(&resource)};
-                    let result=submit_provider_input(&mut stdin,"synthetic exact private input",Some(&launch),selected,None).await;
+                        else if mode=="input-resource" {Some(&prepared.controller_receipt)}
+                        else if mode=="input-owner-resource" {other_resource.as_ref()} else {Some(&resource)};
+                    let prompt=if mode=="input-owner-prompt" {"substituted unauthorized input"} else {"synthetic exact private input"};
+                    let result=submit_provider_input(&mut stdin,prompt,Some(&launch),selected,None).await;
                     drop(stdin);
                     let output=tokio::time::timeout(std::time::Duration::from_secs(5),child.wait_with_output()).await.unwrap().unwrap();
                     assert!(output.status.success());
                     (result,serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap())
                 });
                 let (result,output)=send();
-                if mode!="input-ready" {
+                if !matches!(mode,"input-ready"|"input-owner-ready") {
                     assert!(result.is_err(),"native input escaped despite failed durable admission: {mode}");
                     assert_eq!(output["received"],"","refused native input still reached child");
                     let raw=std::fs::read_to_string(logger.path()).unwrap();
@@ -1068,6 +1136,11 @@ else: print(result)
                 let markers:Vec<_>=rows.iter().filter(|row|row["kind"]=="native_input_release_attempt").collect();
                 assert_eq!(markers.len(),1,"prompt bytes escaped without exactly one durable release marker");
                 let marker=markers[0];
+                if mode=="input-owner-ready" {
+                    assert_eq!(marker["version"],2,"owner-bound input requires explicit schema");
+                    assert_eq!(marker["owner_input"]["request_id"],"synthetic-original-request");
+                    assert_eq!(marker["owner_input"]["model_receipt"],"synthetic-admitted-model");
+                }
                 assert_eq!(marker["launch_intent"],serde_json::to_value(&prepared.intent).unwrap());
                 assert_eq!(marker["launch_receipt"],serde_json::to_value(&prepared.controller_receipt).unwrap());
                 assert_eq!(marker["resource_receipt"],serde_json::to_value(&resource).unwrap());

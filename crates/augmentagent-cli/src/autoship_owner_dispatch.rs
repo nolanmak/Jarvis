@@ -113,6 +113,7 @@ pub(crate) struct OwnerBodyDispatch {
     // Captured only after a successful charge commit. Saved history never
     // constructs this used state or another executable dispatch capability.
     model_receipt: std::sync::OnceLock<String>,
+    native_admission: std::sync::OnceLock<NativeAdmission>,
 }
 impl OwnerBodyDispatch {
     pub(crate) fn request_id(&self) -> &str {
@@ -277,6 +278,104 @@ fn validate_model_admissions(conn:&Connection,workflow:&str)->Result<()> {
     }
     ensure!(events==count,"owner model admission history is incomplete");Ok(())
 }
+#[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeAdmission {
+    version:u32,
+    reference:augmentagent_channel_core::native_vm::OwnerInputReference,
+    intent_id:String,
+    launch_receipt:augmentagent_channel_core::audit_chain::AppendReceipt,
+    resource_receipt:augmentagent_channel_core::audit_chain::AppendReceipt,
+}
+fn model_reference(conn:&Connection,workflow:&str,request:&str)->Result<augmentagent_channel_core::native_vm::OwnerInputReference> {
+    let (model_sequence,receipt,raw):(i64,String,String)=conn.query_row("SELECT sequence,receipt,record FROM workflow_owner_body_model_admission WHERE workflow=?1 AND request_id=?2",params![workflow,request],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+    ensure!(raw.len()<=16384,"owner model reference exceeds bound");
+    let value:serde_json::Value=serde_json::from_str(&raw)?;
+    Ok(augmentagent_channel_core::native_vm::OwnerInputReference {version:1,workflow:workflow.into(),request_id:request.into(),
+        dispatch_sequence:value["owner_body"]["dispatch_sequence"].as_i64().context("owner model dispatch missing")?,
+        model_admission_sequence:model_sequence,model_receipt:receipt,claim_sha256:format!("{:x}",Sha256::digest(raw.as_bytes()))})
+}
+fn validate_native_admissions(conn:&Connection,workflow:&str)->Result<()> {
+    let events:i64=conn.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1 AND kind='owner_body_native_bound'",[workflow],|row|row.get(0))?;
+    let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_body_native_admission')",[],|row|row.get(0))?;
+    if !exists {ensure!(events==0,"owner native admission index missing");return Ok(())}
+    let mut query=conn.prepare("SELECT request_id,sequence,intent_id,record FROM workflow_owner_body_native_admission WHERE workflow=?1 ORDER BY sequence LIMIT 4097")?;
+    let mut count=0i64;
+    for row in query.query_map([workflow],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?)))? {
+        let (request,sequence,intent,raw)=row?;count+=1;ensure!(count<=4096 && raw.len()<=16384,"owner native history exceeds bound");
+        let value:NativeAdmission=serde_json::from_str(&raw)?;
+        ensure!(value.version==1 && value.intent_id==intent && serde_json::to_string(&value)?==raw
+            && value.reference==model_reference(conn,workflow,&request)?,"owner native admission reference changed");
+        let launch=super::native_launch::recorded_launch(conn,&intent)?;
+        let (dispatch_sequence,dispatch_raw):(i64,String)=conn.query_row("SELECT sequence,record FROM workflow_owner_body_dispatch WHERE workflow=?1 AND request_id=?2",params![workflow,request],|row|Ok((row.get(0)?,row.get(1)?)))?;
+        let dispatch=decode(conn,&request,workflow,dispatch_sequence,&dispatch_raw)?;
+        ensure!(launch.workflow_id==workflow && launch.source_owner.lease_generation==dispatch.generation
+            && launch.workflow_binding==dispatch.binding && launch.intent.provider==dispatch.provider
+            && launch.intent.controller_receipt.as_ref()==Some(&value.launch_receipt)
+            && launch.sequence>dispatch_sequence && value.reference.model_admission_sequence>launch.sequence
+            && sequence>value.reference.model_admission_sequence && value.resource_receipt.version==1
+            && value.resource_receipt.sequence>value.launch_receipt.sequence,
+            "owner native admission differs from original body/model launch");
+        let event:(String,i64,String,i64)=conn.query_row("SELECT kind,generation,payload,at_ms FROM workflow_event WHERE seq=?1 AND workflow=?2",params![sequence,workflow],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+        ensure!(event.0=="owner_body_native_bound" && event.1==dispatch.generation && event.2==raw && event.3>=dispatch.started_at_ms,
+            "owner native admission event changed");
+    }
+    ensure!(events==count,"owner native admission history incomplete");Ok(())
+}
+fn require_same_prepared(launch:&super::native_launch::NativeLaunchRecord,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord)->Result<()> {
+    let provider=match launch.intent.provider {submission::Provider::Codex=>"codex",submission::Provider::Claude=>"claude"};
+    ensure!(prepared.intent.version==2 && launch.source_owner==prepared.intent.source_owner
+        && launch.original_native_binding_sha256==prepared.intent.original_store_binding_sha256
+        && launch.intent.controller_receipt.as_ref()==Some(&prepared.controller_receipt)
+        && provider==prepared.intent.provider && launch.intent.launch_sha256==prepared.intent.launch_sha256
+        && launch.intent.creation_receipt_sha256==prepared.intent.creation_receipt_sha256
+        && launch.intent.runtime_relative_path==prepared.intent.runtime_relative_path
+        && launch.intent.native_session_id==prepared.intent.native_session_id
+        && prepared.intent.source_audit_path.to_str()==Some(launch.source_audit_path.as_str()),
+        "owner input native launch differs from admitted model");Ok(())
+}
+impl WorkflowStore {
+    pub(crate) fn bind_prepared_owner_native(&mut self,lease:&Lease,dispatch:&OwnerBodyDispatch,preparation:&OwnerPreparationBinding,
+        provider:submission::Provider,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,
+        resource:&augmentagent_channel_core::audit_chain::AppendReceipt,now:i64)->Result<augmentagent_channel_core::native_vm::OwnerInputReference> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_prepared_dispatch_tx(&tx,lease,dispatch,preparation,provider,now)?;
+        let reference=model_reference(&tx,&lease.workflow,&dispatch.record.request_id)?;
+        ensure!(dispatch.model_receipt.get()==Some(&reference.model_receipt),"owner native binding lacks original captured model admission");
+        let launch=super::native_launch::recorded_launch(&tx,&prepared.intent.intent_id)?;
+        require_same_prepared(&launch,prepared)?;
+        ensure!(launch.workflow_binding==dispatch.record.binding && launch.sequence>dispatch.sequence
+            && reference.model_admission_sequence>launch.sequence,"owner input launch predates its original model admission");
+        let value=NativeAdmission {version:1,reference:reference.clone(),intent_id:prepared.intent.intent_id.clone(),
+            launch_receipt:prepared.controller_receipt.clone(),resource_receipt:resource.clone()};
+        if let Some(captured)=dispatch.native_admission.get() {ensure!(captured==&value,"owner input cannot bind a replacement native launch");}
+        let raw=serde_json::to_string(&value)?;ensure!(raw.len()<=16384,"owner native binding exceeds bound");
+        let prior:Option<String>=tx.query_row("SELECT record FROM workflow_owner_body_native_admission WHERE workflow=?1 AND request_id=?2",params![lease.workflow,dispatch.record.request_id],|row|row.get(0)).optional()?;
+        if let Some(prior)=prior {ensure!(prior==raw,"owner native binding is immutable");}
+        else {
+            ensure!(dispatch.native_admission.get().is_none(),"owner native binding lost its original history");
+            event(&tx,&lease.workflow,lease.generation,"owner_body_native_bound",&raw,now)?;
+            let sequence:i64=tx.query_row("SELECT MAX(seq) FROM workflow_event WHERE workflow=?1",[&lease.workflow],|row|row.get(0))?;
+            tx.execute("INSERT INTO workflow_owner_body_native_admission VALUES(?1,?2,?3,?4,?5)",params![dispatch.record.request_id,lease.workflow,sequence,value.intent_id,raw])?;
+        }
+        validate_native_admissions(&tx,&lease.workflow)?;tx.commit()?;
+        ensure!(dispatch.native_admission.get_or_init(||value.clone())==&value,"owner native captured binding changed");
+        Ok(reference)
+    }
+    pub(crate) fn validate_prepared_owner_native_input(&mut self,lease:&Lease,dispatch:&OwnerBodyDispatch,preparation:&OwnerPreparationBinding,
+        provider:submission::Provider,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,
+        resource:&augmentagent_channel_core::audit_chain::AppendReceipt,reference:&augmentagent_channel_core::native_vm::OwnerInputReference,now:i64)->Result<()> {
+        let captured=dispatch.native_admission.get().context("owner input lacks original captured native binding")?;
+        ensure!(&captured.reference==reference && captured.intent_id==prepared.intent.intent_id
+            && captured.launch_receipt==prepared.controller_receipt && captured.resource_receipt==*resource,
+            "owner input native reference changed");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_prepared_dispatch_tx(&tx,lease,dispatch,preparation,provider,now)?;
+        require_same_prepared(&super::native_launch::recorded_launch(&tx,&prepared.intent.intent_id)?,prepared)?;
+        let raw:String=tx.query_row("SELECT record FROM workflow_owner_body_native_admission WHERE workflow=?1 AND request_id=?2",params![lease.workflow,dispatch.record.request_id],|row|row.get(0))?;
+        ensure!(raw==serde_json::to_string(captured)?,"owner input lost original native binding");tx.commit()?;Ok(())
+    }
+}
 pub(super) fn validate_history(conn: &Connection, workflow: &str) -> Result<()> {
     // Read-only inspection may see a pre-migration store. No record is inferred
     // when either half of an already persisted reservation is missing.
@@ -316,7 +415,8 @@ pub(super) fn validate_history(conn: &Connection, workflow: &str) -> Result<()> 
         results == completed && results <= count,
         "owner completion history is incomplete"
     );
-    validate_model_admissions(conn,workflow)
+    validate_model_admissions(conn,workflow)?;
+    validate_native_admissions(conn,workflow)
 
 }
 /// Read one completed private response with its original authenticated origin.
@@ -450,7 +550,7 @@ impl WorkflowStore {
             params![record.request_id, record.workflow, sequence, raw],
         )?;
         tx.commit()?;
-        Ok(OwnerBodyDispatch { record, sequence, model_receipt:std::sync::OnceLock::new() })
+        Ok(OwnerBodyDispatch { record, sequence, model_receipt:std::sync::OnceLock::new(), native_admission:std::sync::OnceLock::new() })
     }
     /// Only a fresh borrowed core capability can enter this transaction. The
     /// private response is stored per request, never coalesced into progress.

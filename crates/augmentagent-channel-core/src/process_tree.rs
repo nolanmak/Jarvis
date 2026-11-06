@@ -112,6 +112,12 @@ impl ProcessGroup {
                 None=>logger.model_call_admitted(provider)?,
             }
         } }
+        if model && self.vm_preflight {
+            let logger=logger.ok_or_else(||anyhow::anyhow!("native owner input logger missing"))?;
+            let prepared=self.native_launch.as_ref().ok_or_else(||anyhow::anyhow!("native owner prepared launch missing"))?;
+            let resource=self.native_resource_receipt()?.ok_or_else(||anyhow::anyhow!("native owner resource receipt missing"))?;
+            logger.bind_owner_native_model(prepared,&resource)?;
+        }
         // Publish only complete, synced admission bytes. Both the supervisor
         // and native VM can observe this path immediately after creation.
         let mut proceed=tempfile::NamedTempFile::new_in(self.receipt.parent().ok_or_else(||std::io::Error::other("admission directory missing"))?)?;

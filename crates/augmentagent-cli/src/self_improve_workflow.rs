@@ -33,6 +33,44 @@ impl OwnerBodyAdmission {
     }
 }
 
+/// Live original controller; private saved references cannot construct it.
+struct OwnerInputController {
+    store:Arc<Mutex<WorkflowStore>>,
+    lease:Lease,
+    body:Arc<OwnerBodyAdmission>,
+    audit:std::sync::Weak<augmentagent_channel_core::AuditLogger>,
+    prompt_sha256:String,
+    prompt_bytes:usize,
+}
+impl OwnerInputController {
+    fn check_native(&self,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,resource:&augmentagent_channel_core::audit_chain::AppendReceipt)->Result<()> {
+        let audit=self.audit.upgrade().context("owner input controller expired")?;
+        // Protected native IO must finish before the workflow mutex is acquired.
+        durable::native_launch::verify_launch_append(&audit,prepared)?;
+        let row=audit.read_append_receipt(resource)?;
+        anyhow::ensure!(row["kind"]=="native_launch_resource_binding" && resource.sequence>prepared.controller_receipt.sequence
+            && row["launch_intent"]==serde_json::to_value(&prepared.intent)?
+            && row["launch_receipt"]==serde_json::to_value(&prepared.controller_receipt)? && row["resource_identity"].is_object(),
+            "owner input original resource receipt changed");Ok(())
+    }
+}
+impl augmentagent_channel_core::native_vm::OwnerInputAuthorizer for OwnerInputController {
+    fn bind_model(&self,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,resource:&augmentagent_channel_core::audit_chain::AppendReceipt)->Result<augmentagent_channel_core::native_vm::OwnerInputReference> {
+        self.check_native(prepared,resource)?;
+        let preparation=self.body.preparation.activation_binding()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("owner input store poisoned"))?
+            .bind_prepared_owner_native(&self.lease,&self.body.dispatch,&preparation,self.body.provider,prepared,resource,millis())
+    }
+    fn authorize_input(&self,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,resource:&augmentagent_channel_core::audit_chain::AppendReceipt,
+        reference:&augmentagent_channel_core::native_vm::OwnerInputReference,sha:&str,len:usize)->Result<()> {
+        anyhow::ensure!(sha==self.prompt_sha256 && len==self.prompt_bytes,"owner native input differs from sealed original body");
+        self.check_native(prepared,resource)?;
+        let preparation=self.body.preparation.activation_binding()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("owner input store poisoned"))?
+            .validate_prepared_owner_native_input(&self.lease,&self.body.dispatch,&preparation,self.body.provider,prepared,resource,reference,millis())
+    }
+}
+
 const LEASE_MS: i64 = 10 * 60 * 1000;
 const RENEW_SECS: u64 = 60;
 
@@ -1418,6 +1456,13 @@ impl WorkflowGuard {
         anyhow::ensure!(turn.request_id==expected_turn.request_id && turn.body==expected_turn.body && turn.binding==expected_turn.binding,"owner prompt request changed before dispatch");
         let dispatch=Arc::new(dispatch);
         let admission=Arc::new(OwnerBodyAdmission {dispatch:dispatch.clone(),preparation:owner_prepared.clone(),provider:selected});
+        let wire_prompt=if selected==durable::submission::Provider::Codex {
+            augmentagent_channel_core::images::codex_input(&prompt).0
+        } else {prompt.clone()};
+        self.audit.set_owner_input_authorizer(Arc::new(OwnerInputController {
+            store:self.store.clone(),lease:self.lease.clone(),body:admission.clone(),audit:Arc::downgrade(&self.audit),
+            prompt_sha256:format!("{:x}",Sha256::digest(wire_prompt.as_bytes())),prompt_bytes:wire_prompt.len(),
+        }))?;
         self.install_model_observers(Some(admission))?;
         let outcome=sessions.scope(async {
             if first {reasoner.call_with_storage(&opts,&prompt).await}
@@ -3654,7 +3699,23 @@ mod tests {
         let turn=guard.store.lock().unwrap().owner_turn_for_lease(&guard.lease,millis()).unwrap();
         let dispatch=Arc::new(guard.store.lock().unwrap().begin_prepared_owner_body_dispatch(&turn,durable::submission::Provider::Codex,&preparation,millis()).unwrap());
         let admission=Arc::new(OwnerBodyAdmission {dispatch:dispatch.clone(),preparation:prepared.clone(),provider:durable::submission::Provider::Codex});
-        guard.install_model_observers(Some(admission)).unwrap();
+        guard.install_model_observers(Some(admission.clone())).unwrap();
+        let controller=OwnerInputController {store:guard.store.clone(),lease:guard.lease.clone(),body:admission,
+            audit:Arc::downgrade(&guard.audit),prompt_sha256:format!("{:x}",Sha256::digest(b"synthetic exact private input")),prompt_bytes:"synthetic exact private input".len()};
+        use augmentagent_channel_core::native_vm::OwnerInputAuthorizer;
+        let original=guard.audit.native_store_binding().unwrap().unwrap();
+        let native=guard.audit.native_launch_prepared(&augmentagent_channel_core::native_vm::PreparedLaunchIntent {
+            version:2,intent_id:uuid::Uuid::new_v4().to_string(),source_owner:augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:guard.id().into(),lease_generation:guard.lease.generation},
+            source_audit_path:guard.audit.path().into(),provider:"codex".into(),runtime_relative_path:"codex/session-owner-input-fixture".into(),native_session_id:None,
+            launch_sha256:"d".repeat(64),creation_receipt_sha256:"e".repeat(64),original_store_binding_sha256:format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(&original).unwrap()).unwrap())),
+        }).unwrap();
+        let resource=guard.audit.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller","kind":"native_launch_resource_binding",
+            "launch_intent":native.intent,"launch_receipt":native.controller_receipt,"resource_identity":{"fixture":"synthetic-input-scope"}})).unwrap();
+        assert!(controller.bind_model(&native,&resource).is_err(),"unadmitted native model received an owner input binding");
+        let mut early=native.intent.clone();early.intent_id=uuid::Uuid::new_v4().to_string();early.runtime_relative_path="codex/session-concurrent-input-fixture".into();
+        let early=guard.audit.native_launch_prepared(&early).unwrap();
+        let early_resource=guard.audit.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller","kind":"native_launch_resource_binding",
+            "launch_intent":early.intent,"launch_receipt":early.controller_receipt,"resource_identity":{"fixture":"concurrent-input-scope"}})).unwrap();
         let db=rusqlite::Connection::open(&guard.state).unwrap();
         let (original_preparation,original_receipts):(String,String)=db.query_row("SELECT record,receipts FROM workflow_owner_preparation WHERE request_id=?1",[&turn.request_id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         let activation:String=db.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='owner_acceptance_registered'",[guard.id()],|r|r.get(0)).unwrap();
@@ -3708,6 +3769,38 @@ mod tests {
             }
             prepared.validate_activated(guard,&guard.worktree).unwrap();
         }
+        // The exact old prepared launch is the admitted one. A newer valid
+        // protected launch cannot substitute for it after model admission.
+        let mut later=native.intent.clone();later.intent_id=uuid::Uuid::new_v4().to_string();later.runtime_relative_path="codex/session-later-input-fixture".into();
+        let later=guard.audit.native_launch_prepared(&later).unwrap();
+        let later_resource=guard.audit.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller","kind":"native_launch_resource_binding",
+            "launch_intent":later.intent,"launch_receipt":later.controller_receipt,"resource_identity":{"fixture":"later-input-scope"}})).unwrap();
+        assert!(controller.bind_model(&later,&later_resource).is_err(),"latest launch replaced actual admitted launch");
+        let before=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
+        let history=guard.store.lock().unwrap().events(guard.id()).unwrap();
+        db.execute_batch("CREATE TRIGGER deny_native_input_bind BEFORE INSERT ON workflow_owner_body_native_admission BEGIN SELECT RAISE(ABORT,'injected native input binding failure'); END;").unwrap();
+        assert!(controller.bind_model(&native,&resource).is_err());
+        assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap(),before);
+        assert_eq!(guard.store.lock().unwrap().events(guard.id()).unwrap(),history);
+        db.execute_batch("DROP TRIGGER deny_native_input_bind").unwrap();
+        let reference=controller.bind_model(&native,&resource).unwrap();
+        assert_eq!(controller.bind_model(&native,&resource).unwrap(),reference,"binding replay changed original admission");
+        controller.authorize_input(&native,&resource,&reference,&controller.prompt_sha256,controller.prompt_bytes).unwrap();
+        assert!(controller.authorize_input(&native,&resource,&reference,&"f".repeat(64),controller.prompt_bytes).is_err());
+        assert!(controller.authorize_input(&later,&later_resource,&reference,&controller.prompt_sha256,controller.prompt_bytes).is_err());
+        let mut forged=reference.clone();forged.claim_sha256="f".repeat(64);
+        assert!(controller.authorize_input(&native,&resource,&forged,&controller.prompt_sha256,controller.prompt_bytes).is_err());
+        let original_native:String=db.query_row("SELECT record FROM workflow_owner_body_native_admission WHERE request_id=?1",[&turn.request_id],|row|row.get(0)).unwrap();
+        db.execute("UPDATE workflow_owner_body_native_admission SET record='{}' WHERE request_id=?1",[&turn.request_id]).unwrap();
+        assert!(controller.authorize_input(&native,&resource,&reference,&controller.prompt_sha256,controller.prompt_bytes).is_err());
+        db.execute("UPDATE workflow_owner_body_native_admission SET record=?2 WHERE request_id=?1",rusqlite::params![turn.request_id,original_native]).unwrap();
+        controller.authorize_input(&native,&resource,&reference,&controller.prompt_sha256,controller.prompt_bytes).unwrap();
+        db.execute("DELETE FROM workflow_owner_body_native_admission WHERE request_id=?1",[&turn.request_id]).unwrap();
+        db.execute("DELETE FROM workflow_event WHERE workflow=?1 AND kind='owner_body_native_bound'",[guard.id()]).unwrap();
+        assert!(controller.bind_model(&later,&later_resource).is_err(),"captured body retargeted after paired native history loss");
+        assert!(controller.bind_model(&early,&early_resource).is_err(),"captured body retargeted to another pre-admission launch after history loss");
+        assert!(controller.bind_model(&native,&resource).is_err(),"captured body regenerated missing native history");
+        assert!(controller.authorize_input(&native,&resource,&reference,&controller.prompt_sha256,controller.prompt_bytes).is_err());
         // Even losing both slot metadata and its new event field must not
         // broaden a previously used captured callback into legacy admission.
         db.execute("DELETE FROM workflow_owner_body_model_admission WHERE workflow=?1",[guard.id()]).unwrap();

@@ -422,6 +422,11 @@ impl WorkflowStore {
                 workflow TEXT NOT NULL REFERENCES workflow(id),
                 sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
                 record TEXT NOT NULL, response TEXT NOT NULL, state TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_body_native_admission (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_body_model_admission(request_id),
+                workflow TEXT NOT NULL REFERENCES workflow(id),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                intent_id TEXT NOT NULL UNIQUE REFERENCES workflow_native_launch(intent_id),record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS workflow_owner_body_model_admission (
                 request_id TEXT PRIMARY KEY REFERENCES workflow_owner_body_dispatch(request_id),
                 workflow TEXT NOT NULL REFERENCES workflow(id),
