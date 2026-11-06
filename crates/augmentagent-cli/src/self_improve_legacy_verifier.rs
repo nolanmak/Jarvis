@@ -58,6 +58,9 @@ async fn git_bytes(
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("GIT_TERMINAL_PROMPT", "0")
+        // --no-replace-objects does not disable info/grafts. Ancestry must
+        // come from original commit parents, including in linked worktrees.
+        .env("GIT_GRAFT_FILE", "/dev/null")
         // Inspection must not refresh the worker's real index stat cache.
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::piped())
@@ -529,6 +532,40 @@ mod tests {
                 },
             )
             .await
+        }
+    }
+    #[tokio::test]
+    async fn legacy_removal_plan_cannot_adopt_grafted_unrelated_history() {
+        for linked in [false,true] {
+            let mut f=Fixture::new().await;
+            let tree=git_text(f.root.path(),&["rev-parse","HEAD^{tree}"]).await.unwrap();
+            let root_commit=format!("tree {tree}\nauthor Fixture <fixture@example.invalid> 1790000000 +0000\ncommitter Fixture <fixture@example.invalid> 1790000000 +0000\n\nUnrelated product snapshot\n");
+            let unrelated=String::from_utf8(git_bytes(f.root.path(),None,
+                &["hash-object","-w","-t","commit","--stdin"],root_commit.as_bytes()).await.unwrap()).unwrap().trim().to_owned();
+            trusted_git(f.root.path(),&["update-ref","HEAD",&unrelated,&f.head]).await.unwrap();
+            f.head=unrelated;
+            assert!(f.plan().await.is_err(),"unrelated original history must refuse without grafts");
+            let common=PathBuf::from(git_text(f.root.path(),&["rev-parse","--path-format=absolute","--git-common-dir"]).await.unwrap());
+            let graft=common.join("info/grafts");let bytes=format!("{} {}\n",f.head,f.base).into_bytes();
+            std::fs::create_dir_all(graft.parent().unwrap()).unwrap();std::fs::write(&graft,&bytes).unwrap();
+            let linked_directory=tempfile::tempdir().unwrap();let checkout=linked_directory.path().join("candidate");
+            if linked {
+                trusted_git(f.root.path(),&["worktree","add","--detach",checkout.to_str().unwrap(),&f.head]).await.unwrap();
+            }
+            let candidate=if linked {checkout.as_path()} else {f.root.path()};
+            // Establish that this local Git actually honors the forged graph,
+            // including --no-replace-objects and a linked worktree's common dir.
+            let forged=Command::new("/usr/bin/git").args(["--no-replace-objects","merge-base","--is-ancestor",&f.base,&f.head])
+                .current_dir(candidate).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
+            assert!(forged.status.success(),"fixture did not exercise repository grafts: {}",String::from_utf8_lossy(&forged.stderr));
+            let result=prepare(candidate,f.control.path(),&f.prepared,&f.prepared,"fixture/repository#42",&f.head,&f.base,
+                CommitIdentity {name:"Fixture".into(),email:"fixture@example.invalid".into(),seconds:1_790_000_000}).await;
+            assert!(result.is_err(),"repository graft supplied false original-baseline ancestry (linked={linked})");
+            assert_eq!(actual_head(candidate).await.unwrap(),f.head);
+            assert_eq!(std::fs::read(&graft).unwrap(),bytes,"planning changed repository metadata");
+            for (path,body) in &f.prepared.proposal.files {
+                assert_eq!(std::fs::read(candidate.join(path)).unwrap(),body.as_bytes());
+            }
         }
     }
     #[tokio::test]

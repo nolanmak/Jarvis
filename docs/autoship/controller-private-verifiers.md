@@ -96,6 +96,8 @@ An additional regression changes only a product file's timestamp and compares th
 
 Validation for the legacy planning checkpoint: the managed CLI suite passes **1,745 tests, 0 failures, 34 opt-in tests ignored**, including all 12 planner regressions. The index-refresh test failed before the optional-write fix and passes in this full run. These results do not establish production application, runtime quiescence, remote-operation reconciliation or live shipping.
 
+The 2026-11-06 ancestry regression reproduced a false plan: a local Git graft made an unrelated candidate commit appear descended from the protected original baseline, despite `--no-replace-objects`. The planner now pins `GIT_GRAFT_FILE=/dev/null` on every Git invocation so reachability follows original commit parents. All **13 focused planner tests pass**; the new case verifies actual graft behavior in ordinary and linked worktrees, rejects the forged baseline ancestry, and preserves the graft bytes, candidate head and installed verifier files. This closes that planning defect only; it adds no deletion, commit, activation or cleanup authority.
+
 
 ## Initial candidate-source validation checkpoint — 2026-11-05
 
