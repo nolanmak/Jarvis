@@ -4057,7 +4057,7 @@ mod tests {
     #[tokio::test]
     async fn expired_owner_publication_has_authenticated_metadata_recovery() {
         use std::os::unix::fs::PermissionsExt;
-        for mode in ["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery","owner-early-acceptance-producer-recovery-revised-metadata-recovery","owner-early-acceptance-producer-claude-recovery-revised-metadata-recovery","owner-early-acceptance-producer-transfer-recovery","owner-early-acceptance-producer-claude-transfer-recovery"] {
+        for mode in ["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery","owner-early-acceptance-producer-recovery-revised-metadata-recovery","owner-early-acceptance-producer-claude-recovery-revised-metadata-recovery","owner-early-acceptance-producer-transfer-recovery","owner-early-acceptance-producer-claude-transfer-recovery","owner-early-acceptance-producer-absent-transfer-recovery","owner-early-acceptance-producer-claude-absent-transfer-recovery","owner-early-acceptance-producer-prepared-transfer-recovery","owner-early-acceptance-producer-claude-prepared-transfer-recovery","owner-early-acceptance-producer-aborted-transfer-recovery","owner-early-acceptance-producer-claude-aborted-transfer-recovery"] {
         let control=control_dir();let gh=control.path().join("gh-recovery");
         std::fs::write(&gh,r#"#!/usr/bin/python3
 import json,sys
@@ -4604,7 +4604,12 @@ else: raise SystemExit('unexpected authority call')
                 assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap(),before,"preparation changed workflow state");
                 if mode.ends_with("-transfer-recovery") {
                     let db=rusqlite::Connection::open(&state).unwrap();
-                    db.execute_batch("CREATE TRIGGER deny_owner_transfer_settlement BEFORE INSERT ON workflow_native_handoff_completed BEGIN SELECT RAISE(ABORT,'injected owner transfer settlement failure'); END;").unwrap();
+                    let before_native=mode.contains("-absent-") || mode.contains("-prepared-") || mode.contains("-aborted-");
+                    if before_native {
+                        // Persist the exact workflow request, then interrupt its
+                        // authority before the core creates any native claim.
+                        db.execute_batch("CREATE TRIGGER deny_owner_transfer_settlement AFTER INSERT ON workflow_native_handoff_pending BEGIN UPDATE workflow SET lease_until=0 WHERE id=NEW.workflow; END;").unwrap();
+                    }else {db.execute_batch("CREATE TRIGGER deny_owner_transfer_settlement BEFORE INSERT ON workflow_native_handoff_completed BEGIN SELECT RAISE(ABORT,'injected owner transfer settlement failure'); END;").unwrap();}
                     let failure=first.activate_prepared_owner_acceptance(&prepared,None).await.err().expect("failed transfer settlement returned an owner publication guard");
                     drop(failure);drop(prepared);
                     let mut store=WorkflowStore::open(&state).unwrap();let activated=store.snapshot(&id).unwrap().unwrap().generation;
@@ -4628,12 +4633,62 @@ else: raise SystemExit('unexpected authority call')
                     assert!(store.validate_dispatch(&copied,&before.checkpoint.binding,millis()).is_err(),"generic execution admission accepted a metadata recovery generation");
                     store.owner_recovery_transfer_replay_is_current(&recovery,&authorization,&pending,millis()).unwrap();
                     let shared=Arc::new(Mutex::new(WorkflowStore::open(&state).unwrap()));
-                    let mode=durable::native_reconcile::Mode::OwnerRecovery {lease:&recovery,authorization:&authorization};
-                    assert!(matches!(durable::native_reconcile::run(&shared,mode,&changed,None,&millis).unwrap(),durable::native_reconcile::ReconciliationRun::Retained {..}));
+                    let reconciliation=durable::native_reconcile::Mode::OwnerRecovery {lease:&recovery,authorization:&authorization};
+                    assert!(matches!(durable::native_reconcile::run(&shared,reconciliation,&changed,None,&millis).unwrap(),durable::native_reconcile::ReconciliationRun::Retained {..}));
                     assert_eq!(db.query_row("SELECT transfer_id FROM workflow_native_handoff_pending WHERE workflow=?1",[&id],|r|r.get::<_,String>(0)).unwrap(),transfer);
-                    let result=durable::native_reconcile::run(&shared,mode,&pending,None,&millis).unwrap();
+                    let audits=if before_native {
+                        use augmentagent_channel_core::native_vm::ownership as native_owner;
+                        let absent=durable::native_reconcile::run(&shared,reconciliation,&pending,None,&millis).unwrap();
+                        assert!(matches!(absent,durable::native_reconcile::ReconciliationRun::Retained {state:Some(native_owner::NativeTransferState::Absent),..}),"durable-only request was not absent: {absent:?}");
+                        assert_eq!(db.query_row("SELECT transfer_id FROM workflow_native_handoff_pending WHERE workflow=?1",[&id],|r|r.get::<_,String>(0)).unwrap(),transfer);
+                        let sources=existing_native_sources(&state,&pending.request().source_owners,Some(dir.path()),pending.original_binding()).unwrap();
+                        let destination=existing_native_audit(&state,&pending.request().destination,Some(dir.path()),pending.original_binding()).unwrap();
+                        if mode.contains("-prepared-") || mode.contains("-aborted-") {
+                            let interrupted=std::cell::Cell::new(false);
+                            let fence=|| {
+                                store.validate_owner_recovery_transfer(&recovery,&authorization,&pending,millis()).map_err(|_|native_owner::TransferFenceError::NotCurrent)?;
+                                let ledger=rusqlite::Connection::open_with_flags(native.join("runtime-retirement.sqlite"),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+                                let prepared:bool=ledger.query_row("SELECT EXISTS(SELECT 1 FROM native_transfer WHERE id=?1 AND state='prepared')",[&transfer],|r|r.get(0)).unwrap();
+                                if prepared {interrupted.set(true);return Err(native_owner::TransferFenceError::NotCurrent);}Ok(())
+                            };
+                            let outcome=native_owner::transfer(pending.original_binding(),pending.request(),&pending.observation(),&sources,&destination,&fence);
+                            assert!(interrupted.get() && !matches!(outcome,native_owner::TransferOutcome::Completed(_)),"controlled loss did not interrupt actual prepared native request: {outcome:?}");
+                            let prepared=durable::native_reconcile::run(&shared,reconciliation,&pending,None,&millis).unwrap();
+                            assert!(matches!(prepared,durable::native_reconcile::ReconciliationRun::Retained {state:Some(native_owner::NativeTransferState::Prepared),..}),"prepared request was not retained: {prepared:?}");
+                            if mode.contains("-aborted-") {
+                                // Deliberate retirement of this disposable fixture
+                                // destination creates a real native aborted state.
+                                let current=||store.validate_owner_recovery_transfer(&recovery,&authorization,&pending,millis()).map_err(|_|native_owner::TransferFenceError::NotCurrent);
+                                augmentagent_channel_core::native_vm::retire_owned_runtimes(pending.original_binding(),Path::new(&pending.request().destination.audit_path),&pending.request().destination.owner,&current).unwrap();
+                                let aborted=durable::native_reconcile::run(&shared,reconciliation,&pending,None,&millis).unwrap();
+                                assert!(matches!(aborted,durable::native_reconcile::ReconciliationRun::KnownAborted {unresolved:2}),"aborted request lost namespace barriers: {aborted:?}");
+                                assert_eq!(store.native_aborted_handoff(&id,&transfer).unwrap(),Some(pending.clone()));
+                                assert_eq!(store.unresolved_native_abort_namespaces(&id).unwrap().len(),2);
+                                let current=||shared.lock().unwrap().validate_owner_recovery_transfer(&recovery,&authorization,&pending,millis()).map_err(|_|native_owner::TransferFenceError::NotCurrent);
+                                let mut unretired_visited=false;
+                                assert!(native_owner::with_retired_aborted_namespace(pending.original_binding(),pending.request(),&pending.observation(),&pending.request().source_owners[0],&sources[0],&current,&mut |_| {unretired_visited=true;Ok(())}).is_err());
+                                assert!(!unretired_visited,"unretired original source acquired cleanup proof");
+                                let mut settled=false;
+                                native_owner::with_retired_aborted_namespace(pending.original_binding(),pending.request(),&pending.observation(),&pending.request().destination,&destination,&current,&mut |proof| {
+                                    store.settle_owner_recovery_abort_namespace(&recovery,&authorization,&pending,proof,millis())?;settled=true;Ok(())
+                                }).unwrap();assert!(settled);
+                                let remaining=store.unresolved_native_abort_namespaces(&id).unwrap();assert_eq!(remaining.len(),1);assert_eq!(remaining[0].1,pending.request().source_owners[0]);
+                                let events=store.events(&id).unwrap();
+                                native_owner::with_retired_aborted_namespace(pending.original_binding(),pending.request(),&pending.observation(),&pending.request().destination,&destination,&current,&mut |proof|
+                                    store.settle_owner_recovery_abort_namespace(&recovery,&authorization,&pending,proof,millis())).unwrap();
+                                assert_eq!(store.events(&id).unwrap(),events,"retired namespace acknowledgement was not idempotent");
+                                assert!(store.owner_recovery_pending_transfer(&recovery,&authorization,millis()).unwrap().is_none());
+                                assert!(store.owner_publication_recovery_native_facts(&recovery,&authorization,millis()).is_err());
+                                assert!(matches!(durable::native_reconcile::run(&shared,reconciliation,&pending,Some((&sources,&destination)),&millis).unwrap(),durable::native_reconcile::ReconciliationRun::Historical));
+                                assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.owner_control(&id).unwrap(),control_before);assert_eq!(store.pending_owner_messages(&id).unwrap(),2);
+                                assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);return;
+                            }
+                        }
+                        Some((sources,destination))
+                    }else {None};
+                    let result=durable::native_reconcile::run(&shared,reconciliation,&pending,audits.as_ref().map(|(sources,destination)|(sources.as_slice(),destination)),&millis).unwrap();
                     match result {durable::native_reconcile::ReconciliationRun::Settled(result)=>{assert!(!result.current_context);assert_eq!(result.destination.owner.lease_generation,activated);},other=>panic!("original owner transfer did not settle: {other:?}")}
-                    assert!(matches!(durable::native_reconcile::run(&shared,mode,&pending,None,&millis).unwrap(),durable::native_reconcile::ReconciliationRun::Historical));
+                    assert!(matches!(durable::native_reconcile::run(&shared,reconciliation,&pending,None,&millis).unwrap(),durable::native_reconcile::ReconciliationRun::Historical));
                     assert!(store.owner_recovery_pending_transfer(&recovery,&authorization,millis()).unwrap().is_none());
                     assert_eq!(db.query_row("SELECT transfer_id FROM workflow_native_handoff_completed WHERE workflow=?1 AND transfer_id=?2",rusqlite::params![id,transfer],|r|r.get::<_,String>(0)).unwrap(),transfer);
                     assert_eq!(db.query_row("SELECT count(*) FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,recovery.generation()],|r|r.get::<_,i64>(0)).unwrap(),0);

@@ -101,6 +101,16 @@ impl WorkflowStore {
         ensure!(!matches!(checkpoint.stage,Stage::Merged|Stage::Retired) && proof.request().workflow_id==lease.workflow && lease.generation>proof.request().destination.owner.lease_generation,TransferReason::AuthorityConflict);
         settle(&tx,&lease.workflow,lease.generation,binding,None,proof,now)?;tx.commit()?;Ok(())
     }
+    /// Acknowledge only an actual already-retired original namespace. This
+    /// neither retires another namespace nor grants replacement execution.
+    pub(crate) fn settle_owner_recovery_abort_namespace(&mut self,lease:&crate::autoship_workflow::owner_publication_recovery::RecoveryLease,
+        authorization:&crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,pending:&PendingNativeHandoff,proof:&RetiredNativeNamespace<'_>,now:i64)->Result<()> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::autoship_workflow::owner_publication_recovery::require_transfer_context(&tx,lease,authorization,pending,now)?;
+        ensure!(proof.request()==pending.request() && proof.binding()==pending.original_binding() && proof.observation()==&pending.observation(),TransferReason::AuthorityConflict);
+        settle(&tx,&pending.request().workflow_id,lease.generation(),pending.workflow_binding(),None,proof,now)?;
+        tx.commit()?;Ok(())
+    }
     pub(crate) fn settle_terminal_native_abort_namespace(&mut self,terminal:&terminal::TerminalNativeCheckpoint,proof:&RetiredNativeNamespace<'_>,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure!(terminal::capture(&tx,terminal.workflow())?==*terminal && proof.request().workflow_id==terminal.workflow() && terminal.generation()>=proof.request().destination.owner.lease_generation,TransferReason::AuthorityConflict);
