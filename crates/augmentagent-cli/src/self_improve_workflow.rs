@@ -247,7 +247,25 @@ pub(super) struct WorkflowGuard {
     accounted_ms: Arc<AtomicU64>,
     capacity_exhausted: Arc<AtomicBool>,
     released: bool,
+    metadata_only: bool,
     audit: Arc<augmentagent_channel_core::AuditLogger>,
+}
+
+/// Uninterrupted publication reconciliation only. No Clone, Deref, audit
+/// accessor, builder binding, input, model, publication or merge API escapes.
+/// Recovery and terminal metadata authorities need their own real producers.
+pub(super) struct OwnerPublicationGuard<'a> {
+    _guard: WorkflowGuard,
+    // Keep the original opaque producer and exact draft alive. A future
+    // publication writer must not reconstruct them from journal JSON.
+    _publication: acceptance::owner::publication::OwnerPublicationDraft<'a>,
+}
+
+enum OwnerActivationMode {
+    Metadata,
+    // Accounting component fixtures are not productive publication acceptance.
+    #[cfg(test)]
+    AccountingFixture,
 }
 
 /// A run-local view of durable admissions. It survives guard consumption on
@@ -687,6 +705,7 @@ impl SweepGuard {
             accounted_ms: Arc::new(AtomicU64::new(0)),
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
             released: false,
+            metadata_only: false,
         };
         let setup=inner.register_native_context()
             .and_then(|_|inner.install_model_accounting())
@@ -992,6 +1011,7 @@ impl WorkflowGuard {
             accounted_ms: Arc::new(AtomicU64::new(0)),
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
             released: false,
+            metadata_only: false,
         };
         let setup=guard.register_native_context()
             .and_then(|_|guard.install_model_accounting())
@@ -1012,6 +1032,7 @@ impl WorkflowGuard {
         let stop = self.heartbeat.clone();
         let failure = self.lease_failure.clone();
         let started = self.started;
+        let metadata_only = self.metadata_only;
         let accounted = self.accounted_ms.clone();
         tokio::spawn(async move {
             loop {
@@ -1028,7 +1049,7 @@ impl WorkflowGuard {
                         .map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?;
                     let now = millis();
                     store.heartbeat(&lease, now, LEASE_MS)?;
-                    charge_elapsed(&mut store, &lease, started, &accounted, now)
+                    if metadata_only {Ok(())} else {charge_elapsed(&mut store, &lease, started, &accounted, now)}
                 })
                 .await;
                 let error = match result {
@@ -1291,7 +1312,7 @@ impl WorkflowGuard {
             workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
         })?;
         let mut guard = Self { state:state.clone(),audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),binding,
-            heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false };
+            heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false,metadata_only:false };
         let setup=guard.register_native_context()
             .and_then(|_|guard.install_model_accounting())
             .and_then(|_|guard.validate_before_side_effect())
@@ -1371,8 +1392,21 @@ impl WorkflowGuard {
     /// Preparation is neither installation nor activation. The current request
     /// and its independently reproduced private baseline are rechecked before
     /// consuming the old guard. Adapter files are never installed in product.
-    pub(super) async fn activate_prepared_owner_acceptance(self,prepared:&acceptance::owner::PreparedOwnerAcceptance,
+    pub(super) async fn activate_prepared_owner_acceptance<'a>(self,prepared:&'a acceptance::owner::PreparedOwnerAcceptance,
+        previous:Option<&crate::autoship_contract::RegisteredContract>)->Result<OwnerPublicationGuard<'a>> {
+        let (guard,publication)=self.activate_prepared_owner_acceptance_inner(prepared,previous,OwnerActivationMode::Metadata).await?;
+        Ok(OwnerPublicationGuard {_guard:guard,_publication:publication})
+    }
+
+    #[cfg(test)]
+    async fn activate_prepared_owner_acceptance_accounting_fixture(self,prepared:&acceptance::owner::PreparedOwnerAcceptance,
         previous:Option<&crate::autoship_contract::RegisteredContract>)->Result<Self> {
+        let (guard,_component_draft)=self.activate_prepared_owner_acceptance_inner(prepared,previous,OwnerActivationMode::AccountingFixture).await?;
+        Ok(guard)
+    }
+
+    async fn activate_prepared_owner_acceptance_inner<'a>(self,prepared:&'a acceptance::owner::PreparedOwnerAcceptance,
+        previous:Option<&crate::autoship_contract::RegisteredContract>,mode:OwnerActivationMode)->Result<(Self,acceptance::owner::publication::OwnerPublicationDraft<'a>)> {
         prepared.validate_current(&self,&self.worktree,previous)?;
         let owner_prepared=prepared;
         let prepared=prepared.prepared();
@@ -1393,11 +1427,17 @@ impl WorkflowGuard {
             charge_elapsed(&mut store,&self.lease,self.started,&self.accounted_ms,now)?;
             store.activate_private_owner_acceptance_with_publication(initial.as_ref(),&turn,previous,next,&prepared.baseline.receipts,&prepared.proposal.files,&preparation,&binding,&publication,now)?
         };
-        let guard=self.finish_owner_contract_change(revised,contract,environment,"owner_private_acceptance_guard_ready",&old,next.contract_hash())?;
+        let metadata=match mode {OwnerActivationMode::Metadata=>Some(preparation.clone()),#[cfg(test)] OwnerActivationMode::AccountingFixture=>None};
+        let guard=self.finish_owner_contract_change(revised,contract,environment,"owner_private_acceptance_metadata_ready",&old,next.contract_hash(),metadata)?;
         anyhow::ensure!(owner_prepared.activation_binding()?==preparation,"owner preparation changed during native settlement");
-        acceptance::bind_write_scope(&guard.worktree,prepared,previous)?;
-        anyhow::ensure!(owner_prepared.activation_binding()?==preparation,"owner preparation changed during scope registration");
-        Ok(guard)
+        #[cfg(test)]
+        if matches!(mode,OwnerActivationMode::AccountingFixture) {
+            // These older fixtures exercise accounting independently, without
+            // a completed canonical publication or productive consumer.
+            acceptance::bind_write_scope(&guard.worktree,prepared,previous)?;
+            anyhow::ensure!(owner_prepared.activation_binding()?==preparation,"owner preparation changed during scope registration");
+        }
+        Ok((guard,publication))
     }
 
     /// The independently prepared registration changes the owner turn's
@@ -1424,7 +1464,7 @@ impl WorkflowGuard {
             charge_elapsed(&mut store,&self.lease,self.started,&self.accounted_ms,now)?;
             store.activate_owner_revision(&turn,previous,next,&binding,&self.worktree,now)?
         };
-        self.finish_owner_contract_change(revised,contract,environment,"owner_revision_guard_ready",previous.contract_hash(),next.contract_hash())
+        self.finish_owner_contract_change(revised,contract,environment,"owner_revision_guard_ready",previous.contract_hash(),next.contract_hash(),None)
     }
 
     #[cfg(test)]
@@ -1446,11 +1486,14 @@ impl WorkflowGuard {
             charge_elapsed(&mut store,&self.lease,self.started,&self.accounted_ms,now)?;
             store.activate_initial_owner_acceptance(&proof,&turn,next,&prepared.baseline.receipts,&binding,&self.worktree,now)?
         };
-        self.finish_owner_contract_change(revised,contract,environment,"owner_initial_acceptance_guard_ready",&old,next.contract_hash())
+        self.finish_owner_contract_change(revised,contract,environment,"owner_initial_acceptance_guard_ready",&old,next.contract_hash(),None)
     }
 
     fn finish_owner_contract_change(mut self,revised:durable::owner_turn::OwnerTurn,
-        contract:String,environment:String,kind:&str,previous_contract:&str,next_contract:&str)->Result<Self> {
+        contract:String,environment:String,kind:&str,previous_contract:&str,next_contract:&str,
+        publication:Option<durable::OwnerPreparationBinding>)->Result<Self> {
+        let original_turn=revised.clone();
+        self.metadata_only=publication.is_some();
         self.heartbeat.cancel();
         self.lease=revised.lease;
         self.binding=revised.binding;
@@ -1470,8 +1513,17 @@ impl WorkflowGuard {
             workflow_id:self.id().into(),lease_generation:self.lease.generation,
         })?;
         self.register_native_context()?;
-        self.install_model_accounting()?;
-        self.native_builder_owner()?;
+        if let Some(preparation)=publication {
+            let store=self.store.clone();let failure=self.lease_failure.clone();
+            self.audit.restrict_to_metadata(Arc::new(move || {
+                anyhow::ensure!(failure.lock().map_err(|_|anyhow::anyhow!("metadata failure lock poisoned"))?.is_none(),"metadata owner guard fenced");
+                store.lock().map_err(|_|anyhow::anyhow!("metadata publication store poisoned"))?
+                    .validate_owner_publication_metadata(&original_turn,&preparation,millis())
+            }))?;
+        }else {
+            self.install_model_accounting()?;
+            self.native_builder_owner()?;
+        }
         self.audit_event(kind,serde_json::json!({
             "request_id":revised.request_id,"previous_contract":previous_contract,
             "next_contract":next_contract,
@@ -1479,7 +1531,8 @@ impl WorkflowGuard {
         // Unlike initial constructor refusal, this turn has already escaped a
         // guard and may have performed work. Failed setup stays claimed; it
         // must never be relabelled as an unstarted, automatically replayable
-        // request. Drop charges elapsed usage and stops renewal without release.
+        // request. Drop stops renewal without release; metadata reconciliation
+        // does not add execution usage charges.
         self.spawn_renewal();
         Ok(self)
     }
@@ -1863,6 +1916,7 @@ impl WorkflowGuard {
     /// Check immediately before gh/git side effects. Also pass GitHub the
     /// exact expected SHA; this local check cannot fence an in-flight RPC.
     pub(super) fn validate_before_side_effect(&self) -> Result<()> {
+        anyhow::ensure!(!self.metadata_only,"metadata-only owner cannot authorize productive side effects");
         self.healthy_lease()?;
         self.audit.protected_health()?;
         let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
@@ -2321,7 +2375,7 @@ impl WorkflowGuard {
 impl Drop for WorkflowGuard {
     fn drop(&mut self) {
         self.heartbeat.cancel();
-        if !self.released {
+        if !self.released && !self.metadata_only {
             // Best-effort final usage accounting, never release/cleanup here:
             // dropping an async task is not proof its descendants are gone.
             if let Ok(mut store) = self.store.lock() {
@@ -3864,6 +3918,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_owner_publication_returns_only_metadata_authority() {
+        let control=control_dir();
+        let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--test-threads=1"])
+            .env("AUTOSHIP_INITIAL_GUARD_CHILD",control.path()).env("AUTOSHIP_INITIAL_GUARD_MODE","owner-early-acceptance-producer-metadata-only")
+            .env("XDG_STATE_HOME",control.path().join("operator-state")).env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json")).output().unwrap();
+        assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[tokio::test]
     async fn owner_publication_failure_rolls_back_activation_and_retains_staged_evidence() {
         let control=control_dir();
         let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--test-threads=1"])
@@ -4221,6 +4284,33 @@ mod tests {
                         prepared.test_reload_cached(dir.path(),&first).await.unwrap();
                     }
                     first.finish().unwrap();
+                }else if mode.ends_with("-metadata-only") {
+                    let retained=first.audit.clone();
+                    let pending=first.activate_prepared_owner_acceptance(&prepared,None).await.unwrap();
+                    // Test module can inspect the private inner; product callers cannot.
+                    let guard=&pending._guard;
+                    assert!(guard.metadata_only);
+                    assert!(guard.validate_before_side_effect().is_err());
+                    assert!(guard.audit.dispatch_allowed().is_err(),"pending owner publication escaped as productive guard");
+                    assert!(guard.audit.model_call_admitted("codex").is_err());
+                    assert!(retained.dispatch_allowed().is_err(),"old audit retained productive generation authority");
+                    let scope_state=augmentagent_channel_core::state_dir::state_dir().unwrap();
+                    let scope_file=scope_state.join("autoship-write-admission").join(format!("{:x}.json",Sha256::digest(dir.path().canonicalize().unwrap().as_os_str().as_encoded_bytes())));
+                    assert!(!scope_file.exists(),"metadata activation registered productive scope");
+                    let turn=guard.store.lock().unwrap().owner_turn_for_lease(&guard.lease,millis()).unwrap();
+                    let binding=prepared.activation_binding().unwrap();
+                    guard.store.lock().unwrap().validate_owner_publication_metadata(&turn,&binding,millis()).unwrap();
+                    let db=rusqlite::Connection::open(&state).unwrap();
+                    let saved:String=db.query_row("SELECT record FROM workflow_owner_publication_intent WHERE request_id=?1",[&turn.request_id],|r|r.get(0)).unwrap();
+                    db.execute("UPDATE workflow_owner_publication_intent SET record='{}' WHERE request_id=?1",[&turn.request_id]).unwrap();
+                    assert!(guard.store.lock().unwrap().validate_owner_publication_metadata(&turn,&binding,millis()).is_err());
+                    db.execute("UPDATE workflow_owner_publication_intent SET record=?2 WHERE request_id=?1",rusqlite::params![turn.request_id,saved]).unwrap();
+                    guard.store.lock().unwrap().validate_owner_publication_metadata(&turn,&binding,millis()).unwrap();
+                    let snapshot=WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap();
+                    drop(pending);
+                    assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap(),snapshot,"dropping metadata authority changed execution accounting or released original work");
+                    assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap().model_calls,0);
+                    assert!(!control.join("owner-producer-control/issue-77-workflow.json").exists());
                 }else if mode.ends_with("-fenced") {
                     let mut store=WorkflowStore::open(&state).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
                     store.set_owner_pause(&id,"fixture-owner",revision,true,millis()).unwrap();drop(store);
@@ -4228,7 +4318,7 @@ mod tests {
                     assert!(first.activate_prepared_owner_acceptance(&prepared,None).await.is_err());
                 }else {
                     assert!(!dir.path().join("autoship_verifiers/observe.py").exists());
-                    first=first.activate_prepared_owner_acceptance(&prepared,None).await.expect("private owner acceptance must activate without installing adapters into product");first.validate_before_side_effect().unwrap();
+                    first=first.activate_prepared_owner_acceptance_accounting_fixture(&prepared,None).await.expect("private owner acceptance must activate without installing adapters into product");first.validate_before_side_effect().unwrap();
                     assert!(!dir.path().join("autoship_verifiers/observe.py").exists(),"owner activation installed a private adapter into product");
                     assert!(prepared.validate_current(&first,dir.path(),None).is_err(),"old producer proof survived activation");
                     let db=rusqlite::Connection::open(&state).unwrap();
@@ -4287,7 +4377,7 @@ mod tests {
                 if mode.ends_with("-setup-failure") {rusqlite::Connection::open(&state).unwrap().execute_batch("CREATE TRIGGER deny_initial_handoff BEFORE INSERT ON workflow_native_handoff_pending BEGIN SELECT RAISE(ABORT,'injected initial handoff failure'); END;").unwrap();}
                 let private=private_first_files.as_ref().map(|_|acceptance::owner::test_from_prepared(dir.path(),&first,&prepared).unwrap());
                 let activated=if let Some(private)=private.as_ref() {
-                    first.activate_prepared_owner_acceptance(private,None).await
+                    first.activate_prepared_owner_acceptance_accounting_fixture(private,None).await
                 }else {first.activate_initial_owner_acceptance(&prepared).await};
                 if mode.ends_with("-green-baseline") || mode.ends_with("-write-failure") || mode.ends_with("-wrong-source") || mode.ends_with("-unconfigured") {
                     assert!(activated.is_err());let mut store=WorkflowStore::open(&state).unwrap();let snapshot=store.snapshot(&id).unwrap().unwrap();

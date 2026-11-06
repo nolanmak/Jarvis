@@ -315,6 +315,9 @@ pub struct AuditLogger {
         Arc<std::sync::Mutex<Option<Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>>>>,
     dispatch_observer:
         Arc<std::sync::Mutex<Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>>,
+    // Monotonic for this original logger and every clone; observer replacement
+    // cannot promote metadata reconciliation into productive execution.
+    metadata_only: Arc<std::sync::RwLock<Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>>,
     run_resources_required: Arc<std::sync::atomic::AtomicBool>,
     native_runtime_owner: Arc<std::sync::Mutex<Option<crate::native_vm::RuntimeOwner>>>,
     owner_input:Arc<std::sync::Mutex<OwnerInputState>>,
@@ -784,7 +787,44 @@ impl AuditLogger {
             .map_err(|_| anyhow::anyhow!("dispatch observer lock poisoned"))? = Some(observer);
         Ok(())
     }
+    /// Irreversibly restrict this original logger (including retained clones)
+    /// to metadata reconciliation. A failed current fence leaves it restricted.
+    /// This grants no native quiescence, body, model, or publication proof.
+    pub fn restrict_to_metadata(
+        &self,
+        current: Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.is_protected() && self.native_runtime_owner()?.is_some(),
+            "metadata reconciliation requires original protected owner");
+        {
+            let mut mode=self.metadata_only.write().map_err(|_|anyhow::anyhow!("metadata admission lock poisoned"))?;
+            anyhow::ensure!(mode.is_none(),"metadata reconciliation fence already installed");
+            *mode=Some(current);
+        }
+        self.metadata_reconciliation_allowed()
+    }
+
+    /// Check only the original metadata fence and protected continuity.
+    /// Callers must separately retain the native/scope proofs their write needs.
+    pub(crate) fn metadata_reconciliation_allowed(&self) -> anyhow::Result<()> {
+        let current=self.metadata_only.read().map_err(|_|anyhow::anyhow!("metadata admission lock poisoned"))?
+            .clone().ok_or_else(||anyhow::anyhow!("metadata reconciliation fence missing"))?;
+        self.check_protected_continuity()?;
+        self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("protected metadata audit missing"))?
+            .with_retained_snapshot(|_,_| {
+                self.check_protected_continuity()?;
+                current()
+            })
+    }
+
+    fn productive_admission(&self) -> anyhow::Result<std::sync::RwLockReadGuard<'_,Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>> {
+        let mode=self.metadata_only.read().map_err(|_|anyhow::anyhow!("metadata admission lock poisoned"))?;
+        anyhow::ensure!(mode.is_none(),"metadata-only owner cannot authorize productive execution");
+        Ok(mode)
+    }
+
     pub fn dispatch_allowed(&self) -> anyhow::Result<()> {
+        let _mode=self.productive_admission()?;
         let observer = self
             .dispatch_observer
             .lock()
@@ -826,6 +866,9 @@ impl AuditLogger {
         provider: &str,
         identity: Option<&serde_json::Value>,
     ) -> anyhow::Result<()> {
+        // Retain the read side through charging and protected append. Installing
+        // the metadata fence waits for an already-admitted call to settle.
+        let _mode=self.productive_admission()?;
         let observer = self
             .model_call_observer
             .lock()
@@ -1251,6 +1294,7 @@ impl AuditLogger {
             path,
             model_call_observer: Arc::new(std::sync::Mutex::new(None)),
             dispatch_observer: Arc::new(std::sync::Mutex::new(None)),
+            metadata_only: Arc::new(std::sync::RwLock::new(None)),
             resource_capacity_observer: Arc::new(std::sync::Mutex::new(None)),
             resource_capacity_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             run_resources_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2179,6 +2223,98 @@ mod tests {
         assert_eq!(parsed2.tool, "Bash");
         assert_eq!(parsed2.exit_code, Some(0));
     }
+    #[test]
+    fn metadata_reconciliation_cannot_admit_models_or_dispatch_through_retained_clones() {
+        use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering};
+        let (_dir,logger,_log,_anchor)=protected_fixture();
+        logger.set_native_runtime_owner(crate::native_vm::RuntimeOwner {workflow_id:"metadata-owner".into(),lease_generation:1}).unwrap();
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"metadata_fixture"})).unwrap();
+        let retained=logger.clone();
+        let current=Arc::new(AtomicBool::new(true));
+        let fence=current.clone();
+        logger.restrict_to_metadata(Arc::new(move || {anyhow::ensure!(fence.load(Ordering::SeqCst),"stale metadata owner");Ok(())})).unwrap();
+        let charged=Arc::new(AtomicUsize::new(0));
+        let calls=charged.clone();
+        retained.set_model_call_observer(Arc::new(move |_| {calls.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
+        retained.set_dispatch_observer(Arc::new(||Ok(()))).unwrap();
+        for audit in [&logger,&retained] {
+            audit.metadata_reconciliation_allowed().unwrap();
+            assert!(audit.dispatch_allowed().is_err(),"metadata-only logger authorized dispatch");
+            assert!(audit.model_call_admitted("codex").is_err(),"metadata-only logger authorized a model");
+            assert!(audit.model_call_admitted_in_scope("claude",&serde_json::json!({})).is_err());
+        }
+        assert_eq!(charged.load(Ordering::SeqCst),0,"refused models reached charging observer");
+        assert!(logger.restrict_to_metadata(Arc::new(||Ok(()))).is_err());
+        current.store(false,Ordering::SeqCst);
+        assert!(retained.metadata_reconciliation_allowed().is_err());
+        assert!(retained.dispatch_allowed().is_err());
+        let rows=std::fs::read_to_string(logger.path()).unwrap().lines().map(|line|serde_json::from_str::<serde_json::Value>(line).unwrap()).collect::<Vec<_>>();
+        assert!(!rows.iter().any(|row|row["kind"]=="model_call_admitted"));
+    }
+
+    #[test]
+    fn metadata_restriction_waits_for_existing_model_admission_before_fencing_clones() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_dir,logger,_log,_anchor)=protected_fixture();
+        logger.set_native_runtime_owner(crate::native_vm::RuntimeOwner {workflow_id:"metadata-owner".into(),lease_generation:1}).unwrap();
+        let (admitted_tx,admitted_rx)=mpsc::channel();
+        let (release_tx,release_rx)=mpsc::channel();
+        let release=std::sync::Mutex::new(release_rx);
+        logger.set_model_call_observer(Arc::new(move |_| {
+            admitted_tx.send(()).unwrap();
+            release.lock().unwrap().recv_timeout(Duration::from_secs(10)).unwrap();
+            Ok(())
+        })).unwrap();
+        let call=logger.clone();
+        let model=std::thread::spawn(move ||call.model_call_admitted("codex"));
+        admitted_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let restrict=logger.clone();
+        let (started_tx,started_rx)=mpsc::channel();
+        let (done_tx,done_rx)=mpsc::channel();
+        let transition=std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result=restrict.restrict_to_metadata(Arc::new(||Ok(())));
+            done_tx.send(()).unwrap();result
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(matches!(done_rx.recv_timeout(Duration::from_millis(100)),Err(mpsc::RecvTimeoutError::Timeout)),"metadata transition crossed an unsettled model admission");
+        release_tx.send(()).unwrap();
+        model.join().unwrap().unwrap();
+        transition.join().unwrap().unwrap();
+        logger.metadata_reconciliation_allowed().unwrap();
+        assert!(logger.model_call_admitted("claude").is_err());
+        let rows=std::fs::read_to_string(logger.path()).unwrap();
+        assert_eq!(rows.lines().map(|line|serde_json::from_str::<serde_json::Value>(line).unwrap()).filter(|row|row["kind"]=="model_call_admitted").count(),1);
+    }
+
+    #[test]
+    fn metadata_reconciliation_refuses_damaged_protected_audit() {
+        let (_dir,logger,log,_anchor)=protected_fixture();
+        logger.set_native_runtime_owner(crate::native_vm::RuntimeOwner {workflow_id:"metadata-owner".into(),lease_generation:1}).unwrap();
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"metadata_fixture"})).unwrap();
+        logger.restrict_to_metadata(Arc::new(||Ok(()))).unwrap();
+        std::fs::write(log,b"damaged original evidence\n").unwrap();
+        assert!(logger.metadata_reconciliation_allowed().is_err());
+        assert!(logger.dispatch_allowed().is_err());
+        assert!(logger.model_call_admitted("codex").is_err());
+    }
+
+    #[test]
+    fn stale_metadata_fence_still_restricts_original_logger() {
+        let (_dir,logger,_log,_anchor)=protected_fixture();
+        logger.set_native_runtime_owner(crate::native_vm::RuntimeOwner {workflow_id:"metadata-owner".into(),lease_generation:1}).unwrap();
+        assert!(logger.restrict_to_metadata(Arc::new(||anyhow::bail!("stale original owner"))).is_err());
+        assert!(logger.dispatch_allowed().is_err());
+        assert!(logger.model_call_admitted("codex").is_err());
+        assert!(logger.metadata_reconciliation_allowed().is_err());
+        let plain=AuditLogger::new(PathBuf::from("unused-metadata-test.log"));
+        assert!(plain.restrict_to_metadata(Arc::new(||Ok(()))).is_err());
+        let (_dir,unowned,_log,_anchor)=protected_fixture();
+        assert!(unowned.restrict_to_metadata(Arc::new(||Ok(()))).is_err());
+        assert!(unowned.metadata_reconciliation_allowed().is_err());
+    }
+
     fn protected_fixture() -> (tempfile::TempDir, AuditLogger, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("logs")).unwrap();

@@ -136,3 +136,9 @@ Fresh-reader Pass A found an unspecified ordinary file-effect failure policy and
 The final full managed CLI suite passed **1,929 tests, zero failures, 34 opt-in tests ignored**, including all **68** native guard subprocess modes. Earlier full runs of 1,926 and 1,928 tests are superseded by the final run. `1703-acceptance-metadata-proof.json` records commands, behavioral red evidence and validation limits. No private owner publication-intent writer, productive owner consumer, production rollout or autonomous shipment is established.
 
 The final managed production CLI compile check also passed (exit 0).
+
+## Uninterrupted metadata-only activation checkpoint — 2026-11-06
+
+Private activation now returns a non-cloneable metadata-only guard with no productive API. After original native ownership settlement, its logger refuses dispatch and model admission across retained clones and observer replacement. The current fence checks original preparation, pending request and turn/history atomically. Activation no longer binds the next productive scope; canonical completion is still pending. Metadata renewal/drop preserve the claimed work without adding execution usage charges.
+
+The production-path regression reproduced the escaping productive guard before this change. The [protocol checkpoint](owner-publication-protocol.md#18-uninterrupted-metadata-only-activation-component-implemented) and [component evidence](1703-owner-metadata-admission-proof.json) distinguish this live constructor restriction from the still-unfinished durable all-reader predicate, recovery/terminal authorities, native proof and protected publication writer. Older body/accounting fixtures use an explicit test-only entry and do not prove productive publication. The owner consumer remains unconnected, this branch remains undeployed, and the original full acceptance scope is unchanged.
