@@ -1203,6 +1203,8 @@ mod tests {
     #[tokio::test]
     async fn initial_prepared_proof_refuses_prior_model_history() {native_release_context_fixture("owner-initial-model").await;}
     #[tokio::test]
+    async fn initial_prepared_proof_refuses_owner_preparation_launch() {native_release_context_fixture("owner-initial-preparation").await;}
+    #[tokio::test]
     async fn initial_prepared_proof_refuses_prior_input_release() {native_release_context_fixture("owner-initial-input").await;}
     #[tokio::test]
     async fn initial_prepared_proof_refuses_unclassified_actor() {native_release_context_fixture("owner-initial-actor").await;}
@@ -1251,6 +1253,7 @@ mod tests {
                 "owner-initial-peer"=>"initial_prepared_proof_refuses_undeclared_peer",
                 "owner-initial-model"=>"initial_prepared_proof_refuses_prior_model_history",
                 "owner-initial-input"=>"initial_prepared_proof_refuses_prior_input_release",
+                "owner-initial-preparation"=>"initial_prepared_proof_refuses_owner_preparation_launch",
                 "owner-initial-actor"=>"initial_prepared_proof_refuses_unclassified_actor",
                 "owner-ready"=>"native_resource_ready_precedes_owner_model_charge_and_release",
                 "owner-prefix"=>"native_resource_ready_waits_for_complete_private_ready_marker",
@@ -1309,6 +1312,11 @@ mod tests {
                 peer_launch=Some(crate::native_vm::Launch::prepare("codex",&opts,&Command::new("/usr/bin/false"),None,Some(&native)).unwrap());
             }
             if mode=="owner-initial-model" {logger.record_controller(serde_json::json!({"actor":"controller","kind":"model_call_admitted","actual_provider":"codex"})).unwrap();}
+            if mode=="owner-initial-preparation" {
+                let context=crate::native_vm::OwnerPreparationContext::new(prepared.intent.source_owner.clone(),"original-owner-request".into(),"c".repeat(64)).unwrap();
+                logger.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_owner_preparation_binding",
+                    "launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"context":context,"transport_role":"fresh_tool_free_review"})).unwrap();
+            }
             if mode=="owner-initial-input" {logger.record_controller(serde_json::json!({"actor":"controller","kind":"native_input_release_attempt"})).unwrap();}
             if mode=="owner-initial-actor" {logger.record_controller(serde_json::json!({"actor":"provider","kind":"fixture_effect"})).unwrap();}
             group.native_initial=launch.is_initial() && mode!="owner-initial-resume";

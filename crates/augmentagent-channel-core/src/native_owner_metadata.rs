@@ -31,12 +31,19 @@ struct InputRecord {
     #[serde(default)] prompt_bytes:Option<u64>,
     #[serde(default)] recorded_at_ms:Option<i64>,
 }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparationBindingRecord {
+    version:u32,actor:String,kind:String,launch_intent:super::PreparedLaunchIntent,
+    launch_receipt:AppendReceipt,context:super::OwnerPreparationContext,transport_role:String,
+}
 fn append_receipt(row:&Value,bytes:&[u8],prefix:&Sha256)->Result<AppendReceipt> {
     Ok(AppendReceipt {version:1,sequence:row["audit_chain"]["sequence"].as_u64().context("native record sequence missing")?,
         record_sha256:format!("{:x}",Sha256::digest(bytes)),committed_audit_sha256:format!("{:x}",prefix.clone().finalize())})
 }
-fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,binding:&TransferBinding)->Result<(Vec<Value>,BTreeSet<RuntimeKey>,Vec<Value>)> {
+fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,binding:&TransferBinding)->Result<(Vec<Value>,BTreeSet<RuntimeKey>,Vec<Value>,Vec<Value>)> {
     let mut prefix=Sha256::new();let mut launches=BTreeMap::new();let mut resources=Vec::new();let mut bound=BTreeSet::new();
+    let mut preparation_bindings=BTreeMap::new();let mut preparations=Vec::new();
     let mut resource_receipts=BTreeMap::new();let mut owner_inputs=BTreeMap::new();let mut attempts=BTreeSet::new();let mut inputs=Vec::new();
     for row in rows {
         let bytes=serde_json::to_vec(row)?;prefix.update(&bytes);prefix.update(b"\n");
@@ -64,6 +71,20 @@ fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,bindin
                 ensure!(resources.len()<=4096,R::HistoryCapacity);
                 bound.insert((intent.runtime_relative_path,intent.launch_sha256,intent.creation_receipt_sha256));
             }
+            Some("native_owner_preparation_binding")=>{
+                let mut raw=row.clone();raw.as_object_mut().context("native preparation record is not object")?.remove("audit_chain");
+                let record:PreparationBindingRecord=serde_json::from_value(raw.clone())?;
+                ensure!(record.version==1 && record.actor=="controller" && record.kind=="native_owner_preparation_binding"
+                    && record.transport_role=="fresh_tool_free_review","native preparation binding shape changed");
+                let original=launches.get(&record.launch_intent.intent_id).context("native preparation binding has no original launch")?;
+                record.context.validate_launch(&original.intent)?;
+                ensure!(original.intent==record.launch_intent && original.controller_receipt==record.launch_receipt
+                    && !resource_receipts.contains_key(&record.launch_intent.intent_id)
+                    && preparation_bindings.insert(record.launch_intent.intent_id,record.context).is_none(),
+                    "native preparation binding changed, duplicated or reordered");
+                preparations.push(json!({"record":raw,"receipt":append_receipt(row,&bytes,&prefix)?}));
+                ensure!(preparations.len()<=4096,R::HistoryCapacity);
+            }
             Some("native_owner_model_bound"|"native_input_release_attempt")=>{
                 let mut raw=row.clone();raw.as_object_mut().context("native input record is not object")?.remove("audit_chain");
                 let input:InputRecord=serde_json::from_value(raw.clone())?;
@@ -74,6 +95,7 @@ fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,bindin
                 ensure!(resource_receipts.get(&input.launch_intent.intent_id)==Some(&input.resource_receipt),
                     "native metadata input original resource changed");
                 if input.kind=="native_owner_model_bound" {
+                    ensure!(!preparation_bindings.contains_key(&input.launch_intent.intent_id),"preparation review cannot bind owner body input");
                     ensure!(input.version==1 && !raw.as_object().unwrap().contains_key("prompt_sha256")
                         && !raw.as_object().unwrap().contains_key("prompt_bytes") && !raw.as_object().unwrap().contains_key("recorded_at_ms"),
                         "native metadata owner binding shape changed");
@@ -103,7 +125,7 @@ fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,bindin
     }
     // Descriptive audit census only. Even zero attempts does not establish
     // nonrelease or revoke an original writer's ability to release input.
-    Ok((resources,bound,inputs))
+    Ok((resources,bound,inputs,preparations))
 }
 
 /// `current` performs short workflow metadata checks only. `load_audits` opens
@@ -152,9 +174,9 @@ pub fn with_metadata_native_owner(logger:&AuditLogger,runtimes:&[PreparationRunt
                     (None,None)=>(),
                     _=>anyhow::bail!("native metadata audit seal lacks original completed authority"),
                 }
-                let (native,new_bound,inputs)=native_resources(rows,audit,namespace,binding)?;
+                let (native,new_bound,inputs,preparations)=native_resources(rows,audit,namespace,binding)?;
                 let previous=bound.clone();bound.extend(new_bound);
-                evidence.push(json!({"namespace":namespace,"audit":audited["audit"],"validation":audited["validation"],"native_quiescent_resources":native,"native_input_records":inputs}));
+                evidence.push(json!({"namespace":namespace,"audit":audited["audit"],"validation":audited["validation"],"native_quiescent_resources":native,"native_input_records":inputs,"native_preparation_bindings":preparations}));
                 let bytes=evidence.iter().try_fold(0u64,|sum,row|sum.checked_add(row["audit"]["committed_bytes"].as_u64().unwrap_or(u64::MAX))).context(R::HistoryCapacity)?;
                 ensure!(bytes<=128*1024*1024,R::HistoryCapacity);
                 let result=inspect(index+1,ordered,binding,evidence,bound,visit);evidence.pop();*bound=previous;result

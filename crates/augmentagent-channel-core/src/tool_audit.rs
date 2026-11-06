@@ -605,6 +605,7 @@ impl AuditLogger {
                             && row["observation"]["phase"]=="admitted" && row["observation"]["exhausted"]==false,
                             "initial prepared resource admission changed");current+=1;continue;
                     }
+                    Some("native_owner_preparation_binding")=>anyhow::bail!("preparation review cannot authorize an initial coding body"),
                     Some("model_call_admitted"|"native_input_release_attempt"|"native_session_observed"|"native_owner_model_bound")=>anyhow::bail!("initial prepared namespace already admitted model/input/session"),
                     Some(kind) if kind.starts_with("native_launch_")=>anyhow::bail!("initial prepared namespace has another native outcome"),
                     _=>(),

@@ -532,6 +532,9 @@ pub(crate) mod tests {
         fn with_owner_mode(owner_bound:bool,body_turn:bool) -> Self {Self::with_owner_timing(owner_bound,body_turn,false)}
         fn with_owner_timing(owner_bound:bool,body_turn:bool,late_dispatch:bool) -> Self {Self::with_native_provider(owner_bound,body_turn,late_dispatch,"codex")}
         fn with_native_provider(owner_bound:bool,body_turn:bool,late_dispatch:bool,provider:&str) -> Self {
+            Self::with_native_provider_preparation(owner_bound,body_turn,late_dispatch,provider,false)
+        }
+        fn with_native_provider_preparation(owner_bound:bool,body_turn:bool,late_dispatch:bool,provider:&str,preparation:bool) -> Self {
             let root = tempfile::tempdir().unwrap();
             let base = root.path().canonicalize().unwrap();
             let state = base.join("native");
@@ -603,6 +606,11 @@ pub(crate) mod tests {
             let mut owner_dispatch=turn.as_ref().filter(|_|!late_dispatch).map(|t|store.begin_owner_body_dispatch(t,submission::Provider::Codex,now()).unwrap());
             let (prepared,session,resource)=retained_launch_fixture(&state,&audit,provider,|prepared| {
                 store.record_verified_native_launch(&lease,&binding,&audit,prepared,now()).unwrap();
+                if preparation {
+                    let context=augmentagent_channel_core::native_vm::OwnerPreparationContext::new(prepared.intent.source_owner.clone(),"original-owner-request".into(),"c".repeat(64)).unwrap();
+                    audit.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_owner_preparation_binding",
+                        "launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"context":context,"transport_role":"fresh_tool_free_review"})).unwrap();
+                }
             });
             if late_dispatch {owner_dispatch=turn.as_ref().map(|t|store.begin_owner_body_dispatch(t,submission::Provider::Codex,now()).unwrap());}
             Self {
@@ -823,8 +831,8 @@ pub(crate) mod tests {
     fn retained_native_metadata_proof_preserves_actual_completed_session() {
         if child("retained_native_metadata_proof_preserves_actual_completed_session") {return;}
         use std::sync::{Arc,Mutex};use std::os::fd::AsRawFd;
-        for provider in ["codex","claude"] {for input_fault in [false,true] {for original_input in ["none","generic","owner"] {
-        let mut f=Fixture::with_native_provider(false,false,false,provider);
+        for provider in ["codex","claude"] {for input_fault in ["resource","input","preparation"] {for original_input in ["none","generic","owner","preparation"] {
+        let mut f=Fixture::with_native_provider_preparation(false,false,false,provider,original_input=="preparation");
         // Protected journal fixtures describe prior input uncertainty; they do
         // not invoke a model or reconstruct the original live input authorizer.
         if original_input!="none" {
@@ -875,7 +883,9 @@ pub(crate) mod tests {
             assert_eq!(proof.inventory()[0].creation_owner,f.prepared.intent.source_owner);assert_eq!(proof.inventory()[0].effective_owner,namespace.owner);
             assert_eq!(proof.evidence()["audits"].as_array().unwrap().len(),3);
             let input_count=proof.evidence()["audits"].as_array().unwrap().iter().map(|a|a["native_input_records"].as_array().unwrap().len()).sum::<usize>();
-            assert_eq!(input_count,match original_input {"none"=>0,"generic"=>1,_=>2});
+            assert_eq!(input_count,match original_input {"none"=>0,"owner"=>2,_=>1});
+            let preparation_count=proof.evidence()["audits"].as_array().unwrap().iter().map(|a|a["native_preparation_bindings"].as_array().unwrap().len()).sum::<usize>();
+            assert_eq!(preparation_count,usize::from(original_input=="preparation"));
             for path in [native.join("state.lock"),native.join(format!("{provider}/session-fixture/lock")),base.join("anchors/native.lock"),base.join("anchors/destination.lock"),base.join("anchors/metadata-final.lock")] {
                 let fd=std::fs::OpenOptions::new().read(true).open(path).unwrap();assert_ne!(unsafe{libc::flock(fd.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
             }
@@ -913,17 +923,21 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(native.join("authority-epoch.json")).unwrap(),epoch);
         assert_eq!(audits.iter().map(|a|std::fs::read(a.path()).unwrap()).collect::<Vec<_>>(),audit_before);
         assert_eq!(f.store.merge_allowance(now(),5).unwrap().confirmed,0);
-        if input_fault {
+        if input_fault=="input" {
             current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_input_release_attempt",
                 "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_receipt":f.resource,
                 "prompt_sha256":"a".repeat(64),"prompt_bytes":42,"recorded_at_ms":now()})).unwrap();
+        }else if input_fault=="preparation" {
+            let context=augmentagent_channel_core::native_vm::OwnerPreparationContext::new(f.prepared.intent.source_owner.clone(),"original-owner-request".into(),"c".repeat(64)).unwrap();
+            current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_owner_preparation_binding",
+                "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"context":context,"transport_role":"fresh_tool_free_review"})).unwrap();
         }else {
             current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_launch_resource_binding",
                 "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_identity":{}})).unwrap();
         }
         let mut visited=false;
         let error=ownership::with_metadata_native_owner(&current,&runtimes,&fence,&mut load,&mut |_| {visited=true;Ok(())}).unwrap_err();
-        assert!(!visited);assert!(format!("{error:#}").contains(if input_fault {"native metadata input has no original launch"}else{"native metadata resource has no original launch"}),"{error:#}");
+        assert!(!visited);assert!(format!("{error:#}").contains(match input_fault {"input"=>"native metadata input has no original launch","preparation"=>"native preparation binding has no original launch",_=>"native metadata resource has no original launch"}),"{error:#}");
         f.store.release(&lease,now()).unwrap();refuse(&runtimes,audits.clone());
         }}}
     }

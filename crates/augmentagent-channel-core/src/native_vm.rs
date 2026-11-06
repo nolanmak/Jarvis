@@ -60,6 +60,9 @@ impl OwnerInputReference {
             "invalid owner input admission reference");Ok(())
     }
 }
+#[path="native_owner_preparation_context.rs"]
+mod preparation_context;
+pub use preparation_context::OwnerPreparationContext;
 pub use crate::process_tree::NativeResourceAdmission;
 /// Installed once by the original owner controller. Callbacks never wait for
 /// providers or perform native IO inside a workflow transaction.
@@ -540,6 +543,14 @@ impl Launch {
         bridge: Option<&crate::codex_tools::BridgeLaunch>, native: Option<&crate::native_session::Launch>) -> Result<Self> {
         let owner_logger=opts.audit_logger.as_ref().context("native runtime owner audit unavailable")?;
         let audit_owner=owner_logger.native_runtime_owner()?.context("native runtime fenced owner unavailable")?;
+        let preparation_context=preparation_context::current();
+        if let Some(context)=&preparation_context {
+            context.validate_owner(&audit_owner)?;
+            ensure!(crate::native_session::is_fresh_review() && opts.allowed_tools.is_empty()
+                && opts.settings_json.is_none() && opts.handoff_path.is_none()
+                && matches!(provider,"codex"|"claude") && matches!(native,Some(crate::native_session::Launch::Create {..})),
+                "owner preparation association requires a fresh tool-free review launch");
+        }
         if let Some(expected)=crate::native_session::current_builder_owner() {
             ensure!(audit_owner==expected,"native builder scope owner mismatch");
         }
@@ -678,6 +689,13 @@ impl Launch {
         // The protected append and optional workflow journal callback complete
         // before any command can escape preparation or receive prompt bytes.
         let prepared=owner_logger.native_launch_prepared(&intent)?;
+        if let Some(context)=&preparation_context {
+            context.validate_launch(&prepared.intent)?;
+            owner_logger.dispatch_allowed()?;
+            owner_logger.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller","kind":"native_owner_preparation_binding",
+                "launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"context":context,"transport_role":"fresh_tool_free_review"}))?;
+            owner_logger.dispatch_allowed()?;
+        }
         let mut command = Command::new("/usr/bin/python3");
         command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
             .env("PATH","/usr/bin:/bin");
@@ -856,6 +874,8 @@ mod tests {
         launch_intent_child("refuse");
     }
     #[test]
+    fn native_preparation_binds_original_owner_preparation_context() {launch_intent_child("preparation-context");}
+    #[test]
     fn native_preparation_requires_original_store_binding() {launch_intent_child("unbound");}
     #[test]
     fn native_preparation_rejects_changed_original_policy_before_allocating_runtime() {launch_intent_child("reselect");}
@@ -943,7 +963,8 @@ mod tests {
                 }
                 return;
             }
-            let test = if mode=="input-owner-resource" {"native_input_release_refuses_different_valid_resource_for_owner_model"}
+            let test = if mode=="preparation-context" {"native_preparation_binds_original_owner_preparation_context"}
+                else if mode=="input-owner-resource" {"native_input_release_refuses_different_valid_resource_for_owner_model"}
                 else if mode=="input-owner-prompt" {"native_input_release_requires_sealed_owner_prompt"}
                 else if mode=="input-owner-unbound" {"native_input_release_requires_actual_owner_model_binding"}
                 else if mode=="input-owner-ready" {"native_input_release_records_exact_original_owner_admission"}
@@ -1028,7 +1049,33 @@ mod tests {
                 .seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"sealed"}))).unwrap();}
             let mut opts=crate::reasoner::triage_opts(None);opts.audit_logger=Some(logger.clone());
             let native=crate::native_session::Launch::Create {requested_id:id.map(str::to_owned)};
-            let launch=Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native));
+            let context=OwnerPreparationContext::new(owner.clone(),"original-owner-request".into(),"c".repeat(64)).unwrap();
+            if mode=="preparation-context" {
+                for fault in ["owner","tools","settings","handoff","resume","not-review"] {
+                    let mut invalid=opts.clone();
+                    match fault {"tools"=>invalid.allowed_tools.push("Write".into()),"settings"=>invalid.settings_json=Some("{}".into()),
+                        "handoff"=>invalid.handoff_path=Some(root.join("untrusted.json")),_=>()}
+                    let wrong=OwnerPreparationContext::new(RuntimeOwner {lease_generation:2,..owner.clone()},"original-owner-request".into(),"c".repeat(64)).unwrap();
+                    let selected=if fault=="owner" {&wrong}else{&context};
+                    let resume=crate::native_session::Launch::Resume {id:"old-conversation".into()};
+                    let session=if fault=="resume" {&resume}else{&native};
+                    let refused=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(selected.scope(async {
+                        crate::native_session::FRESH_REVIEW.scope(fault!="not-review",async {
+                            Launch::prepare(provider,&invalid,&Command::new("/usr/bin/false"),None,Some(session))
+                        }).await
+                    }));
+                    assert!(refused.is_err(),"preparation association accepted {fault}");
+                    assert!(!state.join(provider).exists(),"refused association allocated runtime for {fault}");
+                    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);
+                }
+            }
+            let launch=if mode=="preparation-context" {
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(context.scope(async {
+                    crate::native_session::FRESH_REVIEW.scope(true,async {
+                        Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native))
+                    }).await
+                }))
+            }else {Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native))};
             if matches!(mode,"unbound"|"reselect") {
                 assert!(launch.is_err(),"native preparation ignored the original store binding ({mode})");
                 assert!(!state.join(provider).exists(),"refused preparation allocated runtime state");
@@ -1067,6 +1114,14 @@ mod tests {
             assert_eq!(row["launch_sha256"],format!("{:x}",Sha256::digest(std::fs::read(launch._directory.path().join("launch.json")).unwrap())));
             assert_eq!(row["creation_receipt_sha256"],format!("{:x}",Sha256::digest(std::fs::read(launch.session.join("owned.json")).unwrap())));
             assert!(uuid::Uuid::parse_str(row["intent_id"].as_str().unwrap()).is_ok());
+            if mode=="preparation-context" {
+                let binding=rows.iter().find(|row|row["kind"]=="native_owner_preparation_binding")
+                    .expect("native launch escaped without its original owner preparation association");
+                assert_eq!(binding["context"],serde_json::to_value(&context).unwrap());
+                assert_eq!(binding["launch_intent"],serde_json::to_value(&prepared.intent).unwrap());
+                assert_eq!(binding["launch_receipt"],serde_json::to_value(&prepared.controller_receipt).unwrap());
+                assert!(!rows.iter().any(|r|r["kind"]=="native_input_release_attempt"));
+            }
             if mode.starts_with("input-") {
                 let resource=logger.native_launch_resource_binding(&prepared,provider,&serde_json::json!({"fixture":"input-resource"})).unwrap();
                 if mode=="input-sealed" {

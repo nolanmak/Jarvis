@@ -208,9 +208,12 @@ async fn prepare_at(candidate:&Path,workflow:&workflow::WorkflowGuard,source:Acc
         let baseline_root=temp.path().join("checkout");let checkout=baseline_root.to_str().context("owner baseline checkout path is not UTF-8")?;
         trusted_git(candidate,&["worktree","add","--detach",checkout,base]).await?;
         let result=async {
-            let proposal=scope_authority::persistent_revision(&baseline_root,workflow,"owner_acceptance_proposal",&epoch,&prompt,input.revision,|raw| {
+            let context=augmentagent_channel_core::native_vm::OwnerPreparationContext::new(
+                augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:input.workflow.clone(),lease_generation:input.generation},
+                input.request_id.clone(),epoch.clone())?;
+            let proposal=context.scope(scope_authority::persistent_revision(&baseline_root,workflow,"owner_acceptance_proposal",&epoch,&prompt,input.revision,|raw| {
                 let proposal=parse_proposal_for(raw,source)?;input.validate_proposal(&proposal,previous)?;Ok(proposal)
-            }).await?;
+            })).await?;
             let baseline=register_and_reproduce(&baseline_root,proposal.clone(),&workflow.audit_logger()).await?;
             let prepared=PreparedAcceptance {proposal,baseline};input.validate_prepared(&prepared,previous)?;
             Ok::<_,anyhow::Error>(prepared)

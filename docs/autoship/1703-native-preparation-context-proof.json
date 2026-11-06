@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "kind": "original-owner-preparation-native-launch-association-component",
+  "source_parent_commit": "af9e55eaf5ef867c749baf457b613d0a6c789399",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_preparation_context.rs",
+      "sha256": "22d17568c47e138b605f968f7e989d16ac24a98d8364bb1838a2004d66dcc7bb"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "52db8161ea2ddaba686bb8c0769ac40714d01e9e4a58fc09381bd9aa4197470b"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_metadata.rs",
+      "sha256": "db4c0dc5785015e168dfdce835920da548df5d46f018263994092fdb6e37a964"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "97e852039be6749a12e1df876ce7e7c51efb286fee4adaf8fb8c5524fe83174a"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/process_tree.rs",
+      "sha256": "2ec34353428bf81848ec17c0790b6d6af20dd5dfbeb9cd428c0f82566e306b25"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_session.rs",
+      "sha256": "4137049620d75f1c086077fa8bcddf161ba5c4fe20f7b092526347a14640c216"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/reasoner.rs",
+      "sha256": "d53871b569c3d2ce121b329bdc16cdc88c1b5c57a8117ef354a61331334e970e"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/codex.rs",
+      "sha256": "bf6abd339e8b41e465295890fa8b0a0285df2c9626d47028d950f93c984dda44"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_acceptance.rs",
+      "sha256": "4db177319037293acd06bb9c0524c86cf32c374f4490d79d0a5bce11b2fe9696"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_scope.rs",
+      "sha256": "ced3a6e8e8b8b1f8f4004d8d1f24215488a3ad1d56cb840f80038720eae92c50"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+      "sha256": "791d828ea9db0ccd5d1aae2c56de75f7c461e7b7410da46362562ba426db3725"
+    }
+  ],
+  "behavioral_reds": [
+    {
+      "session": 71740,
+      "result": "terminal1; managed exit101",
+      "log": "/tmp/autoship-native-preparation-context-red-20261106.log",
+      "failure": "actual native launch returned without preserving original owner preparation association"
+    },
+    {
+      "session": 74690,
+      "result": "terminal1; managed exit101",
+      "log": "/tmp/autoship-native-preparation-body-red-20261106.log",
+      "failure": "initial coding-body proof ignored preparation association at actual supervisor resource boundary and allowed model admission"
+    }
+  ],
+  "validation": {
+    "launch_boundary": {
+      "session": 43611,
+      "result": "terminal0",
+      "passed": 1,
+      "failed": 0,
+      "seconds": 0.32,
+      "providers": [
+        "codex",
+        "claude"
+      ],
+      "negative_cases": [
+        "different owner",
+        "tools",
+        "settings",
+        "handoff history",
+        "resume mode",
+        "outside fresh review"
+      ],
+      "negative_case_runtime_allocations": 0,
+      "negative_case_launch_observer_calls": 0
+    },
+    "retained_metadata_matrix": {
+      "session": 68959,
+      "result": "terminal0",
+      "passed": 1,
+      "failed": 0,
+      "seconds": 25.8,
+      "protected_journal_cases": 24,
+      "providers": [
+        "codex",
+        "claude"
+      ],
+      "original_input": [
+        "none",
+        "generic",
+        "owner-bound",
+        "preparation-associated"
+      ],
+      "foreign_current_audit_record": [
+        "resource",
+        "input",
+        "preparation"
+      ],
+      "actual_provider_or_vm_invoked": false
+    },
+    "full_core": {
+      "session": 24246,
+      "result": "terminal0",
+      "passed": 941,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 36.77
+    },
+    "isolated_full_cli": {
+      "session": 98219,
+      "result": "terminal0",
+      "passed": 1949,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 309.26,
+      "log": "/tmp/autoship-native-preparation-context-isolated-full-cli-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    },
+    "isolated_production_check": {
+      "session": 98326,
+      "result": "terminal0",
+      "seconds": 41.25,
+      "log": "/tmp/autoship-native-preparation-context-isolated-production-check-20261106.log"
+    }
+  },
+  "implemented": [
+    "Original input key, request and owner association scoped around real independent owner preparation/source-selection calls",
+    "Fresh tool-free review/create constraints checked before native runtime allocation",
+    "Exact original launch and committed receipt bound to original preparation context before command escapes",
+    "Strict locked metadata validation of original preparation bindings; reject foreign/duplicate/reordered records and owner-body binding on associated preparation launch",
+    "Actual initial coding-body resource-boundary proof refuses preparation-associated launches before model billing or release"
+  ],
+  "not_proven_or_implemented": [
+    "Full kernel/source/tool-policy proof for readonly preparation",
+    "Historical association backfill: old generic native launches remain unknown",
+    "Original native writer revocation and body nonrelease",
+    "Semantic coding-conversation restoration/continuation",
+    "Typed recovery/terminal producers and separately consumed productive successor bridge",
+    "Shared productive admission, complete C/R, protected-storage aggregate admission",
+    "Independent exact-head review, rollout, original live acceptance and soaks"
+  ],
+  "preserved_unpublished_work": "/tmp/autoship-productive-gate-preserved-20261106.patch"
+}
