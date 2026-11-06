@@ -91,6 +91,17 @@ print('PYTHON_ASYNC_RELAY_COMPLETE',flush=True)
         self.assertEqual(len(server.completed),1)
         self.assertEqual(server.completed[0]['cleanup'],'all-descendants-reaped')
 
+    def test_closefrom_actions_preserve_order_parent_fds_and_spawn_error_reporting(self):
+        with relay.Relay(self.root,library=self.library,timeout=10) as server:
+            fd=server.config_fd()
+            try:result=self.launch(fd,extra_env={'JARVIS_RELAY_TEST_MODE':'spawn-closefrom'})
+            finally:os.close(fd)
+        self.assertEqual(result.returncode,0,(result.stdout+result.stderr).decode(errors='replace'))
+        self.assertIn(b'RELAY_CLOSEFROM_COMPLETE',result.stdout)
+        self.assertEqual(result.stdout.count(b'CLOSEFROM_CHILD_COMPLETE'),2)
+        self.assertEqual(len(server.completed),3)
+        self.assertTrue(all(item['cleanup']=='all-descendants-reaped' for item in server.completed))
+
     def test_unsealed_configuration_refuses_before_rust_main(self):
         fd = os.memfd_create('unsealed-config', os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         try:

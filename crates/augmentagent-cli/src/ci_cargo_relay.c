@@ -494,14 +494,15 @@ int posix_spawn_file_actions_addchdir_np(posix_spawn_file_actions_t *actions, co
 int posix_spawn_file_actions_addfchdir_np(posix_spawn_file_actions_t *actions, int fd) {
     return add_action(actions, 4, fd, 0, NULL);
 }
+int posix_spawn_file_actions_addclosefrom_np(posix_spawn_file_actions_t *actions, int from) {
+    if (from < 0) return EBADF;
+    return add_action(actions, 5, from, 0, NULL);
+}
 /* Opaque/unimplemented operations never reach a native spawn fallback. */
 int posix_spawn_file_actions_addopen(posix_spawn_file_actions_t *restrict actions,
         int fd, const char *restrict path, int flags, mode_t mode) {
     (void)actions; (void)fd; (void)path; (void)flags; (void)mode;
     return ENOTSUP;
-}
-int posix_spawn_file_actions_addclosefrom_np(posix_spawn_file_actions_t *actions, int from) {
-    (void)actions; (void)from; return ENOTSUP;
 }
 int posix_spawn_file_actions_addtcsetpgrp_np(posix_spawn_file_actions_t *actions, int fd) {
     (void)actions; (void)fd; return ENOTSUP;
@@ -523,6 +524,8 @@ static int spawn_relay(pid_t *pid, const char *file, const posix_spawn_file_acti
     if (pipe2(pipe, O_CLOEXEC) < 0) return errno;
     int floor = pipe[0] > pipe[1] ? pipe[0] : pipe[1];
     if (state) for (size_t i=0; i<state->count; ++i) {
+        /* A closefrom threshold is not a referenced descriptor. */
+        if (state->actions[i].kind==5) continue;
         if (state->actions[i].source > floor) floor=state->actions[i].source;
         if (state->actions[i].target > floor) floor=state->actions[i].target;
     }
@@ -552,6 +555,17 @@ static int spawn_relay(pid_t *pid, const char *file, const posix_spawn_file_acti
                 if (chdir(action->path)<0) goto child_failed;
             } else if (action->kind==4) {
                 if (fchdir(action->source)<0) goto child_failed;
+            } else if (action->kind==5) {
+                /* Keep the private exec-error pipe until the controller's
+                 * START acknowledgement. Closing it here would falsely report
+                 * successful spawn before file actions or delegation finish.
+                 * Apply each range in order, without touching the parent's FD
+                 * table or retaining any application descriptor above it. */
+                unsigned from=(unsigned)action->source;
+                if (from<(unsigned)report && syscall(SYS_close_range,from,(unsigned)report-1,0)<0)
+                    goto child_failed;
+                unsigned after=from>(unsigned)report ? from : (unsigned)report+1;
+                if (syscall(SYS_close_range,after,UINT_MAX,0)<0) goto child_failed;
             } else { errno=ENOTSUP; goto child_failed; }
         }
         delegate_exec(file,argv,envp,lookup);

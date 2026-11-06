@@ -194,6 +194,50 @@ fn cargo_relay_spawn_interface_fixture() {
     assert_eq!(std::io::Error::last_os_error().raw_os_error(),Some(libc::EPERM));
     println!("RAW_EXEC_DENIED");
     let mode=std::env::var("JARVIS_RELAY_TEST_MODE").unwrap_or_default();
+    if mode=="spawn-closefrom" {
+        use std::os::fd::AsRawFd;
+        let file=std::fs::File::create("closefrom-private").unwrap();
+        let private=unsafe {libc::fcntl(file.as_raw_fd(),libc::F_DUPFD,80)};
+        assert!(private>=80);
+        let mut pipes=[0;2];assert_eq!(unsafe {libc::pipe2(pipes.as_mut_ptr(),libc::O_CLOEXEC)},0);
+        assert_eq!(unsafe {libc::dup2(pipes[0],20)},20);
+        assert_eq!(unsafe {libc::write(pipes[1],b"+".as_ptr().cast(),1)},1);
+        let spawn=|ordered:bool,missing:bool,invalid_source:bool| {
+            let mut actions=unsafe {std::mem::zeroed::<libc::posix_spawn_file_actions_t>()};
+            assert_eq!(unsafe {libc::posix_spawn_file_actions_init(&mut actions)},0);
+            assert_eq!(unsafe {libc::posix_spawn_file_actions_addclosefrom_np(&mut actions,-1)},libc::EBADF);
+            assert_eq!(unsafe {libc::posix_spawn_file_actions_addclosefrom_np(&mut actions,libc::c_int::MAX)},0);
+            assert_eq!(unsafe {libc::posix_spawn_file_actions_addclosefrom_np(&mut actions,if ordered {50} else {3})},0);
+            if ordered {
+                assert_eq!(unsafe {libc::posix_spawn_file_actions_adddup2(&mut actions,20,60)},0);
+                assert_eq!(unsafe {libc::posix_spawn_file_actions_addclose(&mut actions,20)},0);
+                assert_eq!(unsafe {libc::posix_spawn_file_actions_addclosefrom_np(&mut actions,61)},0);
+            }
+            if invalid_source {
+                assert_eq!(unsafe {libc::posix_spawn_file_actions_adddup2(&mut actions,private,1)},0);
+            }
+            let script=std::ffi::CString::new(format!(
+                "import os,errno\ntry:os.fstat({private})\nexcept OSError as e:assert e.errno==errno.EBADF\nelse:raise AssertionError('private FD leaked')\n{}\nprint('CLOSEFROM_CHILD_COMPLETE',flush=True)",
+                if ordered {"assert os.read(60,1)==b'+'"} else {""})).unwrap();
+            let executable=if missing {c"/missing-closefrom-tool"} else {c"/usr/bin/python3"};
+            let args=[executable.as_ptr(),c"-I".as_ptr(),c"-c".as_ptr(),script.as_ptr(),std::ptr::null()];
+            let environment:[*const libc::c_char;1]=[std::ptr::null()];let mut child=0;
+            let error=unsafe {libc::posix_spawn(&mut child,executable.as_ptr(),&actions,
+                std::ptr::null(),args.as_ptr().cast(),environment.as_ptr().cast())};
+            assert_eq!(unsafe {libc::posix_spawn_file_actions_destroy(&mut actions)},0);
+            if missing || invalid_source {
+                assert_eq!(error,if invalid_source {libc::EBADF} else {libc::ENOENT});
+                assert_eq!(child,0,"failed spawn published a PID");
+            } else {
+                assert_eq!(error,0);let mut status=0;
+                assert_eq!(unsafe {libc::waitpid(child,&mut status,0)},child);assert_eq!(status,0);
+            }
+            assert!(unsafe {libc::fcntl(private,libc::F_GETFD)}>=0,"child actions closed the parent's FD");
+        };
+        spawn(false,false,false);spawn(false,true,false);spawn(true,false,false);spawn(false,false,true);
+        for fd in [private,20,pipes[0],pipes[1]] {unsafe {libc::close(fd)};}
+        println!("RELAY_CLOSEFROM_COMPLETE");return;
+    }
     if mode=="signal-state" {
         let mut mask=unsafe {std::mem::zeroed::<libc::sigset_t>()};
         assert_eq!(unsafe {libc::sigemptyset(&mut mask)},0);
@@ -245,7 +289,7 @@ fn same_uid_cargo_relay_exercises_real_rust_spawns_and_refuses_unsupported_reque
     let directory=tempfile::tempdir().unwrap();let library=directory.path().join("relay.so");
     std::fs::write(&library,CARGO_RELAY_LIBRARY).unwrap();
     let policy=directory.path().join("native.so");std::fs::write(&policy,CARGO_EXEC_DENIAL_LIBRARY).unwrap();
-    for (name,count) in [("ci_cargo_relay_test.py",5),("ci_cargo_relay_native_test.py",9)] {
+    for (name,count) in [("ci_cargo_relay_test.py",5),("ci_cargo_relay_native_test.py",10)] {
         let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests").join(name);
         let output=std::process::Command::new("python3").arg("-I").arg(tests)
             .env("AUGMENTAGENT_CARGO_RELAY_LIBRARY",&library)
