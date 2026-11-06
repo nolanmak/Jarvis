@@ -561,6 +561,50 @@ impl AuditLogger {
             self.check_protected_continuity()?;visit(rows,&evidence)
         })
     }
+    /// Validate the complete original namespace while excluding exactly the
+    /// current borrowed pre-model resource from teardown. It is controlled
+    /// setup, never labelled quiescent; all other admissions require stop proof.
+    pub(crate) fn with_initial_prepared_namespace<T>(&self,namespace:&crate::native_vm::ownership::Authority,
+        admission:&crate::native_vm::NativeResourceAdmission<'_>,visit:impl FnOnce(&serde_json::Value)->anyhow::Result<T>)->anyhow::Result<T> {
+        anyhow::ensure!(admission.is_initial() && self.native_runtime_owner()?.as_ref()==Some(&namespace.owner),"initial prepared namespace owner/mode changed");
+        self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("prepared namespace requires protected audit"))?.with_retained_snapshot(|rows,audit| {
+            self.check_protected_continuity()?;
+            let prepared=admission.prepared();let mut launches=0usize;let mut bindings=0usize;let mut current=0usize;
+            let mut retained=Vec::new();
+            for row in rows {
+                anyhow::ensure!(row["actor"]=="controller","initial prepared namespace has unclassified actor effects");
+                match row["kind"].as_str() {
+                    Some("native_launch_intent")=>{
+                        let mut actual=row.clone();actual.as_object_mut().ok_or_else(||anyhow::anyhow!("native intent is not object"))?.remove("audit_chain");
+                        let mut expected=serde_json::to_value(&prepared.intent)?;expected["actor"]="controller".into();expected["kind"]="native_launch_intent".into();
+                        anyhow::ensure!(actual==expected && row["audit_chain"]["sequence"]==prepared.controller_receipt.sequence,"another native intent in initial prepared namespace");launches+=1;
+                    }
+                    Some("native_launch_resource_binding")=>{
+                        anyhow::ensure!(row["actor"]=="controller" && row["version"]==1
+                            && row["launch_intent"]==serde_json::to_value(&prepared.intent)?
+                            && row["launch_receipt"]==serde_json::to_value(&prepared.controller_receipt)?
+                            && row["resource_identity"]==*admission.identity()
+                            && row["audit_chain"]["sequence"]==admission.resource_receipt().sequence,
+                            "another native resource binding in initial prepared namespace");bindings+=1;
+                    }
+                    Some("run_resource_admitted") if row["observation"]["identity"]==*admission.identity()=>{
+                        anyhow::ensure!(row["actor"]=="controller" && row["provider"]==prepared.intent.provider
+                            && row["observation"]["phase"]=="admitted" && row["observation"]["exhausted"]==false,
+                            "initial prepared resource admission changed");current+=1;continue;
+                    }
+                    Some("model_call_admitted"|"native_input_release_attempt"|"native_session_observed"|"native_owner_model_bound")=>anyhow::bail!("initial prepared namespace already admitted model/input/session"),
+                    Some(kind) if kind.starts_with("native_launch_")=>anyhow::bail!("initial prepared namespace has another native outcome"),
+                    _=>(),
+                }
+                retained.push(row.clone());
+            }
+            anyhow::ensure!(launches==1 && bindings==1 && current==1,"initial prepared namespace is incomplete or duplicated");
+            let (generation,resources)=Self::namespace_resources(&retained,&namespace.owner.workflow_id)?;
+            anyhow::ensure!(generation==namespace.owner.lease_generation,"initial prepared namespace generation changed");
+            admission.validate_unreleased()?;self.check_protected_continuity()?;
+            visit(&serde_json::json!({"audit":audit,"validation":{"namespace":namespace,"controlled_preflight_resource":admission.identity(),"other_quiescent_resources":resources}}))
+        })
+    }
     pub(crate) fn protected_log_path(&self) -> Option<&Path> {
         self.anchored.as_ref().map(|sink| sink.log_path())
     }

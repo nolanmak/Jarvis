@@ -217,7 +217,7 @@ fn scan_inventory(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Authorit
     scan_inventory_bounded(root,ledger,workflow,sources,observations,4096,64*1024*1024)
 }
 fn scan_inventory_bounded(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Authority],observations:&[PhysicalObservation],max_entries:usize,max_metadata:u64)->Result<PhysicalInventory> {
-    scan_inventory_impl(root,ledger,workflow,sources,observations,max_entries,max_metadata,false)
+    scan_inventory_impl(root,ledger,workflow,sources,observations,max_entries,max_metadata,false,None)
 }
 /// An undeclared live runtime is never evidence of an unused workflow.
 /// Retain every session lock while the caller reserves its first dispatch.
@@ -225,11 +225,17 @@ pub(super) fn with_empty_workflow_inventory(root:&Path,ledger:&Ledger<'_>,namesp
     let scan=scan_inventory(root,ledger,&namespace.owner.workflow_id,std::slice::from_ref(namespace),&[])?;
     ensure!(scan.inventory.is_empty(),R::InventoryMissing);visit()
 }
+/// Initial prepared census; this metadata inspection grants no execution.
+pub(super) fn with_initial_prepared_inventory(root:&Path,ledger:&Ledger<'_>,namespace:&Authority,
+    prepared:&super::PreparedLaunchRecord,visit:&mut dyn FnMut()->Result<()>)->Result<()> {
+    let scan=scan_inventory_impl(root,ledger,&namespace.owner.workflow_id,std::slice::from_ref(namespace),&[],4096,64*1024*1024,false,Some((namespace,prepared)))?;
+    ensure!(scan.inventory.is_empty(),R::InventoryMissing);visit()
+}
 pub(super) fn with_retired_workflow_inventory(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Authority],observations:&[PhysicalObservation],visit:&mut dyn FnMut(&[String])->Result<()>)->Result<()> {
-    let scan=scan_inventory_impl(root,ledger,workflow,sources,observations,4096,64*1024*1024,true)?;
+    let scan=scan_inventory_impl(root,ledger,workflow,sources,observations,4096,64*1024*1024,true,None)?;
     ensure!(scan.inventory.is_empty(),R::AuthorityConflict);visit(&scan.retired)
 }
-fn scan_inventory_impl(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Authority],observations:&[PhysicalObservation],max_entries:usize,max_metadata:u64,closed:bool)->Result<PhysicalInventory> {
+fn scan_inventory_impl(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Authority],observations:&[PhysicalObservation],max_entries:usize,max_metadata:u64,closed:bool,prepared:Option<(&Authority,&super::PreparedLaunchRecord)>)->Result<PhysicalInventory> {
     ensure!(!workflow.is_empty() && !sources.is_empty() && sources.len()<=if closed {128}else{64} && observations.len()<=4096,R::StateCapacity);
     let store=ledger.store_identity()?;
     super::owner_store::validate_bound_metadata(root,&store)?;
@@ -260,6 +266,7 @@ fn scan_inventory_impl(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Aut
         Ok(bytes)
     };
     let mut result=PhysicalInventory {inventory:Vec::new(),retired:Vec::new(),_sessions:Vec::new()};
+    let mut found_prepared=false;
     for provider in ["codex","claude","qwen","glm"] {
         let directory=root.join(provider);
         match directory.symlink_metadata() {
@@ -273,8 +280,37 @@ fn scan_inventory_impl(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Aut
             let owned=read(&path.join("owned.json"))?;
             let authority=super::runtime_authority_from(root,ledger,&path,&owned)?;
             if authority.owner.workflow_id!=workflow {continue;}
-            result._sessions.push(session_lock(&path)?);
             let relative=super::relative_runtime(root,&path)?;
+            if let Some((expected,current))=prepared {
+                if relative==current.intent.runtime_relative_path {
+                    let creation:serde_json::Value=serde_json::from_slice(&owned)?;
+                    ensure!(!found_prepared && authority==*expected && current.intent.source_owner==expected.owner
+                        && current.intent.source_audit_path==Path::new(&expected.audit_path)
+                        && sha(&owned)==current.intent.creation_receipt_sha256
+                        && creation["version"]==1 && creation.as_object().is_some_and(|v|v.len()==3)
+                        && creation["owner"]==serde_json::to_value(&expected.owner)? && creation["audit_path"]==expected.audit_path,
+                        R::AuthorityConflict);
+                    super::ensure_unretired(&path)?;
+                    match path.join("complete.json").symlink_metadata() {
+                        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>(),Err(error)=>return Err(error.into()),Ok(_)=>anyhow::bail!(R::ConversationUncertain),
+                    }
+                    let _=read(&path.join("lock"))?;
+                    let mut warmups=0usize;
+                    for entry in std::fs::read_dir(&path)? {
+                        let child=entry?.path();charge_entry()?;
+                        let name=child.file_name().and_then(|v|v.to_str()).context(R::MetadataInvalid)?;
+                        if matches!(name,"owned.json"|"lock") {continue;}
+                        ensure!(name.starts_with("native-vm-launch-") && name.len()>"native-vm-launch-".len(),R::ConversationUncertain);
+                        private_directory(&child)?;warmups+=1;
+                    }
+                    ensure!(warmups==1,R::InventoryMissing);
+                    found_prepared=true;
+                    // The current controlled preflight holds its own runtime
+                    // lock. Retain all *other* session locks as before.
+                    continue;
+                }
+            }
+            result._sessions.push(session_lock(&path)?);
             let observed=declared.remove(relative);
             if closed {ensure!(sources.contains(&authority) && ledger.retired_authority(&authority)?,R::AuthorityConflict);}
             if let Some(observed)=observed {
@@ -295,6 +331,7 @@ fn scan_inventory_impl(root:&Path,ledger:&Ledger<'_>,workflow:&str,sources:&[Aut
         }
     }
     ensure!(declared.is_empty(),R::InventoryMissing);
+    ensure!(prepared.is_none() || found_prepared,R::InventoryMissing);
     result.inventory.sort_by(|a,b|(a.provider,a.runtime_relative_path.as_bytes()).cmp(&(b.provider,b.runtime_relative_path.as_bytes())));
     result.retired.sort();
     super::owner_store::validate_bound_metadata(root,&store)?;

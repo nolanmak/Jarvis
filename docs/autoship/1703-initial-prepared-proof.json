@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "kind": "initial-prepared-native-owner-component",
+  "source_parent_commit": "cbec1948a7f5fa0bdf6f7c5dcee8ee389bb3becd",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_completion.rs",
+      "sha256": "3bd986f01e2d0e246fa320e46cb0d2df0d1c189a5fef343c67ca3e53ea293135"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_handoff.rs",
+      "sha256": "24e707627142c350c73d4fd7015bdad1d0ce50a8fdbe70d70264e2bed6fe021f"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
+      "sha256": "2bef41d17ae2a92cac3ace6614868decf61ed4f4a0df0eb013575228c2c2f060"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_transfer.rs",
+      "sha256": "123accf5c6298a4040ca1081ac4f72fbd078a0ede54e262d3cc22345f99da5ad"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "3ddb438258d8edad14fc6e148f393d2cb0b89f935a6d3cd6a825ff02e8a9a497"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/process_tree.rs",
+      "sha256": "07ba25033411da5d98a7204d497a74c0d67ef1ba9d358a7d0e9811ee28dc81f3"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "b322a8c5db28ed9361d96af585db2c158d0eaca7556895e5d2179e1401853643"
+    }
+  ],
+  "behavior": [
+    "Privately captured initial mode and borrowed actual resource boundary bind the original prepared intent/resource receipt.",
+    "Retain original state, other-session and protected audit locks through a short metadata visitor.",
+    "Bounded physical census admits exactly current controlled setup; undeclared live peers refuse and remain intact.",
+    "Protected audit refuses prior model/input/session work and unclassified actors; all other resources still require independent quiescence."
+  ],
+  "validation": {
+    "census_behavioral_red": {
+      "log": "/tmp/autoship-initial-prepared-census-valid-red-20261106.log",
+      "log_sha256": "9c8aaefc032eaa83409de86b06e1bc00de547cacf605b29a3b806d5af5cb5136",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "reason": "Old empty census refuses the exact held current runtime with native-transfer-lock-busy; new declarations and fixture are present, so not a pristine-parent binary."
+    },
+    "focused_intermediate": {
+      "log": "/tmp/autoship-initial-prepared-focused-2-20261106.log",
+      "log_sha256": "5341edf3036fb51846150ac02b5fe44cc95186d4cbc3a49c6c75f0535fa1a5f8",
+      "exit": 0,
+      "passed": 5,
+      "failed": 0
+    },
+    "final_full_core": {
+      "log": "/tmp/autoship-initial-prepared-full-core-20261106.log",
+      "log_sha256": "afa89aa4e9e385ea37b7aae74963ac7aa0e68217c3c76a71c2e88fda75fc4c83",
+      "exit": 0,
+      "passed": 923,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 35.48,
+      "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib",
+      "includes_initial_prepared_regressions": 7
+    },
+    "fixture_corrections": [
+      "Early census fixture had nonprivate provider parent; corrected before behavioral red.",
+      "Missing initial-mode fields in retained runtime fixtures caused an early compile failure.",
+      "Initial supervisor fixtures lacked the Codex policy profile; all four failed at setup before exercising the new proof, then passed after correction."
+    ],
+    "final_full_cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-initial-prepared-full-cli-20261106.log",
+      "log_sha256": "5c421e6945643bc289c6f5c6b23c0e8c7d33f6c53cb9fc117514fb2a8715203d",
+      "exit": 0,
+      "passed": 1933,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 283.95
+    },
+    "build_environment": {
+      "CARGO_TARGET_DIR": "/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_TEST_DEBUG": "0"
+    },
+    "final_production_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-initial-prepared-production-check-20261106.log",
+      "log_sha256": "138f4c034d595f438da72eb89e2b67509b787d0da84d3b613853a2bb4ba46f0f",
+      "exit": 0,
+      "compiler_seconds": 32.86
+    }
+  },
+  "limits": [
+    "Real prepared launch and supervisor/child; synthetic resource metadata and simulated preflight lock/directory. No actual VM/provider execution or kernel current-scope readback.",
+    "Resume refusal uses private fixture mode, not a live resumed provider conversation.",
+    "Outer body reservation remains before resource setup. Delayed factory and versioned original dispatch/prepared ordering remain required.",
+    "No current-source build authority, all-writer exclusion, successor/body replay, publication, deployment, live coding or soak completion is established."
+  ],
+  "epic_complete": false
+}

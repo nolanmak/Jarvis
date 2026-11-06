@@ -73,6 +73,50 @@ pub fn with_unused_native_owner(logger:&AuditLogger,current:&dyn Fn()->Result<()
     })
 }
 
+/// Initial namespace containing exactly this controlled pre-model setup.
+/// The live setup is not quiescent or unused. Construction retains original
+/// state, other-session and audit locks through the short metadata visitor.
+pub struct InitialPreparedNativeOwnerProof<'a> {
+    binding:&'a super::ownership::TransferBinding,
+    namespace:&'a super::ownership::Authority,
+    prepared:&'a PreparedLaunchRecord,
+    resource:&'a AppendReceipt,
+    evidence:&'a Value,
+    _state:&'a super::StateLock,
+}
+impl InitialPreparedNativeOwnerProof<'_> {
+    pub fn binding(&self)->&super::ownership::TransferBinding {self.binding}
+    pub fn namespace(&self)->&super::ownership::Authority {self.namespace}
+    pub fn prepared(&self)->&PreparedLaunchRecord {self.prepared}
+    pub fn resource_receipt(&self)->&AppendReceipt {self.resource}
+    pub fn evidence(&self)->&Value {self.evidence}
+}
+pub fn with_initial_prepared_native_owner(logger:&AuditLogger,admission:&super::NativeResourceAdmission<'_>,current:&dyn Fn()->Result<()>,
+    visit:&mut dyn FnMut(&InitialPreparedNativeOwnerProof<'_>)->Result<()>)->Result<()> {
+    use sha2::{Digest,Sha256};
+    ensure!(admission.is_initial(),"initial prepared proof requires actual create-mode setup");
+    admission.validate_unreleased()?;current()?;
+    let prepared=admission.prepared();logger.verify_native_launch_reference(prepared)?;
+    let binding=logger.native_store_binding()?.context("initial prepared original binding missing")?;selection(logger,&binding)?;
+    let namespace=super::ownership::Authority {owner:logger.native_runtime_owner()?.context("initial prepared owner missing")?,
+        audit_path:super::owner_handoff::actual_audit(logger.path())?.to_string_lossy().into_owned()};
+    ensure!(prepared.intent.source_owner==namespace.owner && prepared.intent.source_audit_path==Path::new(&namespace.audit_path)
+        && logger.protected_log_path()==Some(Path::new(&namespace.audit_path)),"initial prepared original namespace changed");
+    let (root,store)=binding.retirement_store()?;let lock=super::StateLock::existing(root)?;
+    let ledger=super::owner_ledger::Ledger::open_bound(root,&lock,store,true)?;
+    super::ensure_native_admission(&ledger,&namespace.owner,logger)?;
+    super::owner_handoff::with_initial_prepared_inventory(root,&ledger,&namespace,prepared,&mut || {
+        logger.with_initial_prepared_namespace(&namespace,admission,|audited| {
+            selection(logger,&binding)?;admission.validate_unreleased()?;current()?;
+            let evidence=json!({"version":1,"kind":"initial_prepared_native_owner","namespace":namespace,
+                "original_binding_sha256":format!("{:x}",Sha256::digest(super::ownership::canonical_bytes(&serde_json::to_value(&binding)?)?)),
+                "prepared_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"resource_receipt":admission.resource_receipt(),
+                "audit":audited["audit"],"namespace_validation":audited["validation"]});
+            visit(&InitialPreparedNativeOwnerProof {binding:&binding,namespace:&namespace,prepared,resource:admission.resource_receipt(),evidence:&evidence,_state:&lock})
+        })
+    })
+}
+
 /// Fresh authority only within the locked visitor. A stored append reference
 /// or a previously verified observation cannot construct this capability.
 pub struct NativeCompletionProof<'a> {

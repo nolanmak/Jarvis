@@ -498,6 +498,7 @@ pub(crate) struct Launch {
     aliases: PathBuf,
     session: PathBuf,
     ephemeral: bool,
+    initial: bool,
     authority:ownership::Authority,
     store:owner_store::StoreIdentity,
     runtime_relative_path:String,
@@ -527,6 +528,7 @@ pub(crate) async fn submit_provider_input(
 }
 
 impl Launch {
+    pub(crate) fn is_initial(&self)->bool {self.initial}
     pub(crate) fn prepared_record(&self)->Result<PreparedLaunchRecord> {
         let observation=self.observation.as_ref().context("native launch lacks prepared controller context")?;
         ensure!(observation.logger.upgrade().is_some(),"native launch controller expired");
@@ -677,7 +679,7 @@ impl Launch {
         let mut command = Command::new("/usr/bin/python3");
         command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
             .env("PATH","/usr/bin:/bin");
-        let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), authority, store, runtime_relative_path, creation_receipt_sha256, audit_log,
+        let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), initial:!resume, authority, store, runtime_relative_path, creation_receipt_sha256, audit_log,
             observation:Some(LaunchObservation {prepared,logger:std::sync::Arc::downgrade(owner_logger),actual_session:std::sync::Mutex::new(None),input_attempted:std::sync::atomic::AtomicBool::new(false),completion_verified:std::sync::atomic::AtomicBool::new(false),completed:std::sync::atomic::AtomicBool::new(false)}),_directory:directory };
         // A requested alias permits later lookup but is not a provider ID event.
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.register_alias(id)?; }
@@ -1348,8 +1350,30 @@ else: print(result)
         let expected=ownership::Authority {owner:RuntimeOwner {workflow_id:"workflow".into(),lease_generation:1},audit_path:"/audit/original".into()};
         let retirement=test_retirement(runtime.clone(),expected.clone());
         let launch=Launch {command:Command::new("unused-fixture"),resource_policy:serde_json::json!({}),aliases,
-            session:runtime,ephemeral:false,authority:expected,store:test_store_identity(&root),runtime_relative_path:retirement.runtime_relative_path.clone(),creation_receipt_sha256:retirement.creation_receipt_sha256.clone(),audit_log:"/audit/original".into(),observation:None,_directory:tempfile::tempdir().unwrap()};
+            session:runtime,ephemeral:false,initial:true,authority:expected,store:test_store_identity(&root),runtime_relative_path:retirement.runtime_relative_path.clone(),creation_receipt_sha256:retirement.creation_receipt_sha256.clone(),audit_log:"/audit/original".into(),observation:None,_directory:tempfile::tempdir().unwrap()};
         (base,root,retirement,launch)
+    }
+    #[test]
+    fn initial_prepared_census_admits_only_its_exact_current_runtime() {
+        let (_base,root,retirement,_launch)=lifecycle_fixture();
+        std::fs::set_permissions(root.join("codex"),std::fs::Permissions::from_mode(0o700)).unwrap();
+        write(&retirement.session.join("lock"),b"").unwrap();
+        let _runtime_lock=owner_handoff::session_lock(&retirement.session).unwrap();
+        std::fs::create_dir(retirement.session.join("native-vm-launch-fixture")).unwrap();
+        std::fs::set_permissions(retirement.session.join("native-vm-launch-fixture"),std::fs::Permissions::from_mode(0o700)).unwrap();
+        let binding=lifecycle_binding(&root,&retirement);
+        let prepared=PreparedLaunchRecord {intent:PreparedLaunchIntent {version:2,intent_id:uuid::Uuid::new_v4().to_string(),
+            source_owner:retirement.expected.owner.clone(),source_audit_path:retirement.expected.audit_path.clone().into(),provider:"codex".into(),
+            runtime_relative_path:retirement.runtime_relative_path.clone(),native_session_id:None,launch_sha256:"a".repeat(64),
+            creation_receipt_sha256:retirement.creation_receipt_sha256.clone(),original_store_binding_sha256:digest(ownership::canonical_bytes(&serde_json::to_value(binding).unwrap()).unwrap())},
+            controller_receipt:crate::audit_chain::AppendReceipt {version:1,sequence:1,record_sha256:"b".repeat(64),committed_audit_sha256:"c".repeat(64)}};
+        let lock=StateLock::existing(&root).unwrap();let ledger=owner_ledger::Ledger::open_bound(&root,&lock,&retirement.store,true).unwrap();
+        let mut visited=0;
+        owner_handoff::with_initial_prepared_inventory(&root,&ledger,&retirement.expected,&prepared,&mut || {visited+=1;Ok(())}).unwrap();
+        assert_eq!(visited,1);
+        let peer=session(&root,"session-undeclared","/audit/original",false);
+        assert!(owner_handoff::with_initial_prepared_inventory(&root,&ledger,&retirement.expected,&prepared,&mut ||anyhow::bail!("unexpected census admission")).is_err(),"undeclared peer was treated as the current preflight");
+        assert!(peer.is_dir(),"census removed unknown peer data");
     }
     fn replace_lifecycle_root(base:&Path,root:&Path)->PathBuf {
         std::fs::rename(root,base.join("retained-native")).unwrap();std::fs::create_dir(root).unwrap();

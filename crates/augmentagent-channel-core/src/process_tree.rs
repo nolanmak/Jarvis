@@ -18,6 +18,7 @@ pub(crate) struct ProcessGroup {
     vm_preflight: bool,
     resource_observed: AtomicBool,
     resource_audit: std::sync::Mutex<Option<(String,Arc<crate::tool_audit::AuditLogger>)>>,
+    native_initial:bool,
     native_launch:Option<crate::native_vm::PreparedLaunchRecord>,
     native_resource:std::sync::Mutex<Option<crate::audit_chain::AppendReceipt>>,
     resource_admission: std::sync::Mutex<Option<serde_json::Value>>,
@@ -34,6 +35,7 @@ pub struct NativeResourceAdmission<'a> {
     identity:&'a serde_json::Value,
 }
 impl NativeResourceAdmission<'_> {
+    pub fn is_initial(&self)->bool {self.group.native_initial}
     pub fn prepared(&self)->&crate::native_vm::PreparedLaunchRecord {self.prepared}
     pub fn resource_receipt(&self)->&crate::audit_chain::AppendReceipt {self.resource}
     pub fn identity(&self)->&serde_json::Value {self.identity}
@@ -667,6 +669,7 @@ pub(crate) fn spawn_admitted_vm(launch: &crate::native_vm::Launch, clean: Arc<At
     -> std::io::Result<(Child, ProcessGroup)> {
     let prepared=launch.prepared_record().map_err(std::io::Error::other)?;
     let (child,mut group)=spawn_supervised_inner(&launch.command,true,clean,journal,true,true,true,Some(&launch.resource_policy),&[],None)?;
+    group.native_initial=launch.is_initial();
     group.native_launch=Some(prepared);
     Ok((child,group))
 }
@@ -761,7 +764,7 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
     };
     let id = child.id().expect("newly spawned child has a pid") as libc::pid_t;
     clean.store(false, Ordering::SeqCst);
-    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory: owned_directory }))
+    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory: owned_directory }))
 }
 
 #[cfg(test)]
@@ -814,7 +817,7 @@ mod tests {
         std::fs::set_permissions(directory.path().join("launch-ready"),std::fs::Permissions::from_mode(0o600)).unwrap();
         let group=ProcessGroup {id:child.id() as libc::pid_t,receipt:receipt.clone(),clean:Arc::new(AtomicBool::new(false)),
             active_request:None,resource_required:false,vm_preflight:true,resource_observed:AtomicBool::new(false),
-            resource_audit:std::sync::Mutex::new(None),native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
+            resource_audit:std::sync::Mutex::new(None),native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
         let outcome=group.admit_model("codex",Some(&logger)).await;
         let _=child.kill();child.wait().unwrap();std::fs::write(&receipt,"all-descendants-reaped\n").unwrap();
         std::fs::set_permissions(&receipt,std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -842,7 +845,7 @@ mod tests {
             let clean=Arc::new(AtomicBool::new(false));
             let group=ProcessGroup{id,receipt,clean:clean.clone(),active_request:None,
                 resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),
-                resource_audit:std::sync::Mutex::new(None),native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
+                resource_audit:std::sync::Mutex::new(None),native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
             drop(group);writer.join().unwrap();
             assert!(clean.load(Ordering::SeqCst),"receipt existence was mistaken for completed publication");
         }
@@ -873,7 +876,7 @@ mod tests {
         let group=ProcessGroup {id:i32::MAX,receipt,clean:Arc::new(AtomicBool::new(false)),
             active_request:None,resource_required:true,vm_preflight:false,
             resource_observed:AtomicBool::new(false),resource_audit:std::sync::Mutex::new(None),
-            native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
+            native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
         assert!(group.verified_quiescence().is_err(),"a file without admission is not authority");
         group.admit_command("verification",None).await.unwrap();
         assert!(group.verified_quiescence().is_err(),"admitted is not completed");
@@ -1191,8 +1194,20 @@ mod tests {
     async fn native_resource_ready_waits_for_private_ready_permissions() {native_release_context_fixture("owner-permissions").await;}
     #[tokio::test]
     async fn native_resource_ready_rejects_corrupt_ready_marker_before_callback() {native_release_context_fixture("owner-corrupt").await;}
+    #[tokio::test]
+    async fn initial_prepared_proof_is_fresh_at_the_real_resource_boundary() {native_release_context_fixture("owner-initial").await;}
+    #[tokio::test]
+    async fn initial_prepared_proof_refuses_resume_mode() {native_release_context_fixture("owner-initial-resume").await;}
+    #[tokio::test]
+    async fn initial_prepared_proof_refuses_undeclared_peer() {native_release_context_fixture("owner-initial-peer").await;}
+    #[tokio::test]
+    async fn initial_prepared_proof_refuses_prior_model_history() {native_release_context_fixture("owner-initial-model").await;}
+    #[tokio::test]
+    async fn initial_prepared_proof_refuses_prior_input_release() {native_release_context_fixture("owner-initial-input").await;}
+    #[tokio::test]
+    async fn initial_prepared_proof_refuses_unclassified_actor() {native_release_context_fixture("owner-initial-actor").await;}
     struct ReadyOwnerFixture {
-        visits:Arc<std::sync::atomic::AtomicUsize>,billed:Arc<std::sync::atomic::AtomicUsize>,refuse:bool,changed:Option<PathBuf>,published:Option<Arc<AtomicBool>>,
+        visits:Arc<std::sync::atomic::AtomicUsize>,billed:Arc<std::sync::atomic::AtomicUsize>,refuse:bool,changed:Option<PathBuf>,published:Option<Arc<AtomicBool>>,initial_audit:Option<std::sync::Weak<crate::tool_audit::AuditLogger>>,proofs:Arc<std::sync::atomic::AtomicUsize>,
     }
     impl crate::native_vm::OwnerInputAuthorizer for ReadyOwnerFixture {
         fn resources_ready(&self,admission:&crate::native_vm::NativeResourceAdmission<'_>)->anyhow::Result<()> {
@@ -1202,6 +1217,21 @@ mod tests {
             anyhow::ensure!(admission.prepared().intent.provider=="codex" && admission.identity()["inode"]==42
                 && admission.resource_receipt().sequence>admission.prepared().controller_receipt.sequence,"resource-ready facts changed");
             self.visits.fetch_add(1,Ordering::SeqCst);
+            if let Some(weak)=&self.initial_audit {
+                let logger=weak.upgrade().ok_or_else(||anyhow::anyhow!("initial fixture logger expired"))?;
+                crate::native_vm::ownership::with_initial_prepared_native_owner(&logger,admission,&||Ok(()),&mut |proof| {
+                    anyhow::ensure!(proof.prepared()==admission.prepared() && proof.resource_receipt()==admission.resource_receipt()
+                        && proof.namespace().owner==admission.prepared().intent.source_owner
+                        && proof.evidence()["kind"]=="initial_prepared_native_owner"
+                        && proof.evidence()["namespace_validation"]["controlled_preflight_resource"]==*admission.identity(),"initial prepared proof binding changed");
+                    let binding=serde_json::to_value(proof.binding())?;
+                    let file=std::fs::File::open(PathBuf::from(binding["canonical_state_root"].as_str().unwrap()).join("state.lock"))?;
+                    let held=unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0;
+                    if !held {unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_UN)};}
+                    anyhow::ensure!(held,"initial proof lost original state lock");
+                    self.proofs.fetch_add(1,Ordering::SeqCst);Ok(())
+                })?;
+            }
             if let Some(path)=&self.changed {std::fs::write(path,br#"{"phase":"completed"}"#).unwrap();}
             anyhow::ensure!(!self.refuse,"fixture owner resource-ready refusal");Ok(())
         }
@@ -1216,6 +1246,12 @@ mod tests {
         const CHILD:&str="JARVIS_TEST_NATIVE_RELEASE_CONTEXT_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let test=match mode {
+                "owner-initial"=>"initial_prepared_proof_is_fresh_at_the_real_resource_boundary",
+                "owner-initial-resume"=>"initial_prepared_proof_refuses_resume_mode",
+                "owner-initial-peer"=>"initial_prepared_proof_refuses_undeclared_peer",
+                "owner-initial-model"=>"initial_prepared_proof_refuses_prior_model_history",
+                "owner-initial-input"=>"initial_prepared_proof_refuses_prior_input_release",
+                "owner-initial-actor"=>"initial_prepared_proof_refuses_unclassified_actor",
                 "owner-ready"=>"native_resource_ready_precedes_owner_model_charge_and_release",
                 "owner-prefix"=>"native_resource_ready_waits_for_complete_private_ready_marker",
                 "owner-permissions"=>"native_resource_ready_waits_for_private_ready_permissions",
@@ -1242,7 +1278,7 @@ mod tests {
         crate::native_vm::initialize_native_test_store(&state);
         let policy=root.path().join("policy.json");
         write_private(&policy,serde_json::json!({"version":1,"state_root":state,"memory_mb":512,"max_state_bytes":8589934592u64,
-            "max_sessions":8,"runtime_config":"/fixture/runtime","guest_runtime":"/fixture/guest","providers":{}}).to_string().as_bytes());
+            "max_sessions":8,"runtime_config":"/fixture/runtime","guest_runtime":"/fixture/guest","providers":{"codex":{"gateway":{},"auth_file":null,"auth_relative":".codex/auth.json"}}}).to_string().as_bytes());
         std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",policy);
         for name in ["logs","anchors"] {std::fs::create_dir(root.path().join(name)).unwrap();}
         let logger=Arc::new(crate::tool_audit::AuditLogger::protected(root.path().join("logs/audit.jsonl"),root.path().join("anchors/audit.json"),&[]).unwrap());
@@ -1255,7 +1291,29 @@ mod tests {
         let (mut child,mut group)=spawn_admitted(&Command::new("/usr/bin/true"),true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
         let identity=serde_json::json!({"host_sha256":"synthetic-host","boot_id":"synthetic-boot","path":"/sys/fs/cgroup/synthetic-run","inode":42,"limits":{}});
         write_private(&group.receipt.with_file_name("resource-accounting.json"),serde_json::json!({"phase":"admitted","exhausted":false,"identity":identity}).to_string().as_bytes());
-        let prepared=if mode!="missing" {
+        let mut actual_launch=None;let mut peer_launch=None;let mut runtime_lock=None;
+        let prepared=if mode.starts_with("owner-initial") {
+            std::env::set_var("AUGMENTAGENT_RUN_RESOURCES","1");
+            logger.require_run_resources().unwrap();
+            logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture_owner","workflow":"fixture","generation":1})).unwrap();
+            let mut opts=crate::reasoner::triage_opts(None);opts.audit_logger=Some(logger.clone());
+            let native=crate::native_session::Launch::Create {requested_id:None};
+            let launch=crate::native_vm::Launch::prepare("codex",&opts,&Command::new("/usr/bin/false"),None,Some(&native)).unwrap();
+            let prepared=launch.prepared_record().unwrap();
+            let directory=state.join(&prepared.intent.runtime_relative_path);
+            let file=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(directory.join("lock")).unwrap();
+            assert_eq!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);runtime_lock=Some(file);
+            std::fs::create_dir(directory.join("native-vm-launch-fixture")).unwrap();
+            std::fs::set_permissions(directory.join("native-vm-launch-fixture"),std::fs::Permissions::from_mode(0o700)).unwrap();
+            if mode=="owner-initial-peer" {
+                peer_launch=Some(crate::native_vm::Launch::prepare("codex",&opts,&Command::new("/usr/bin/false"),None,Some(&native)).unwrap());
+            }
+            if mode=="owner-initial-model" {logger.record_controller(serde_json::json!({"actor":"controller","kind":"model_call_admitted","actual_provider":"codex"})).unwrap();}
+            if mode=="owner-initial-input" {logger.record_controller(serde_json::json!({"actor":"controller","kind":"native_input_release_attempt"})).unwrap();}
+            if mode=="owner-initial-actor" {logger.record_controller(serde_json::json!({"actor":"provider","kind":"fixture_effect"})).unwrap();}
+            group.native_initial=launch.is_initial() && mode!="owner-initial-resume";
+            actual_launch=Some(launch);Some(prepared)
+        } else if mode!="missing" {
             use sha2::{Digest,Sha256};
             let original=logger.native_store_binding().unwrap().unwrap();
             let provider=if mode=="provider" {"claude"} else {"codex"};
@@ -1273,6 +1331,7 @@ mod tests {
                 .seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"closed-before-release"}))).unwrap();
         }
         let visits=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let proofs=Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let published=Arc::new(AtomicBool::new(false));
         let publisher=if matches!(mode,"owner-prefix"|"owner-permissions"|"owner-corrupt") {
             let ready=group.receipt.with_file_name("launch-ready");
@@ -1293,7 +1352,7 @@ mod tests {
         } else {None};
         if mode.starts_with("owner-") {
             logger.set_owner_input_authorizer(Arc::new(ReadyOwnerFixture {visits:visits.clone(),billed:count.clone(),refuse:mode=="owner-refuse",
-                changed:(mode=="owner-changed").then(||group.receipt.with_file_name("resource-accounting.json")),published:matches!(mode,"owner-prefix"|"owner-permissions").then(||published.clone())})).unwrap();
+                changed:(mode=="owner-changed").then(||group.receipt.with_file_name("resource-accounting.json")),published:matches!(mode,"owner-prefix"|"owner-permissions").then(||published.clone()),initial_audit:mode.starts_with("owner-initial").then(||Arc::downgrade(&logger)),proofs:proofs.clone()})).unwrap();
             if mode=="owner-fenced" {
                 let visited=visits.clone();
                 logger.set_dispatch_observer(Arc::new(move || {
@@ -1312,12 +1371,14 @@ mod tests {
         let proceeded=group.receipt.with_file_name("launch-continue").exists();
         let retained_resource=group.native_resource_receipt().unwrap();
         drop(group);let _=child.wait().await;
+        drop(runtime_lock);drop(actual_launch);drop(peer_launch);
         let rows:Vec<serde_json::Value>=std::fs::read_to_string(logger.path()).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
         let binding=rows.iter().find(|row|row["kind"]=="native_launch_resource_binding");
         if mode.starts_with("owner-") {
             assert_eq!(visits.load(Ordering::SeqCst),if matches!(mode,"owner-no-resource"|"owner-corrupt") {0}else{1},"owner resource-ready was never observed");
-            if matches!(mode,"owner-ready"|"owner-prefix"|"owner-permissions") {outcome.unwrap();assert!(proceeded);assert_eq!(count.load(Ordering::SeqCst),1);}
+            if matches!(mode,"owner-ready"|"owner-prefix"|"owner-permissions"|"owner-initial") {outcome.unwrap();assert!(proceeded);assert_eq!(count.load(Ordering::SeqCst),1);}
             else {assert!(outcome.is_err());assert!(!proceeded);assert_eq!(count.load(Ordering::SeqCst),0);}
+            if mode.starts_with("owner-initial") {assert_eq!(proofs.load(Ordering::SeqCst),usize::from(mode=="owner-initial"));}
         } else if mode=="bound" {
             outcome.unwrap();assert!(proceeded);assert_eq!(count.load(Ordering::SeqCst),1);
             let binding=binding.expect("released native model has no exact launch/resource correlation");
