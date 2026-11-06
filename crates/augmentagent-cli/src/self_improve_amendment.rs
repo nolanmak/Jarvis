@@ -351,7 +351,7 @@ pub(super) async fn try_amend(
     // This is the paid amendment ingress, including repair-exhausted and
     // resumed callers. Missing infrastructure cannot authorize a correction.
     acceptance::defer_transient_verifier_infrastructure(failure,workflow).await?;
-    if let Some(prepared) = resume_pending(root, control, source).await? {
+    if let Some(prepared) = resume_pending(root, control, source, workflow).await? {
         return Ok(Some(prepared));
     }
     // Ordinary red assertions mean implementation repair, not permission to
@@ -363,7 +363,7 @@ pub(super) async fn try_amend(
     {
         return Ok(None);
     }
-    old.baseline.registration.verify_integrity(root)?;
+    old.verify_registration()?;
     let head = actual_head(root).await?;
     let tree = trusted_git(root, &["--no-replace-objects", "rev-parse", &format!("{head}^{{tree}}")]).await?;
     // GitHub supplies the canonical main identity; a candidate can mutate its
@@ -508,26 +508,25 @@ pub(super) async fn try_amend(
     let base = old.baseline.registration.baseline_head();
     trusted_git(root, &["worktree", "add", "--detach", checkout, base]).await?;
     let reproduce = async {
-        install_harness(&baseline_root, &proposal)?;
         let baseline_environment = environment_id(&baseline_root)?;
         ensure!(baseline_environment == environments.current_original_baseline, "runner environment changed during independent amendment");
         let registration = if decision.approve_environment_transition {
-            RegisteredContract::register_transition(
-                &baseline_root,
+            RegisteredContract::register_transition_from_files(
                 proposal.contract.clone(),
                 base.into(),
                 baseline_environment,
                 candidate_environment,
+                &proposal.files,
             )?
         } else {
-            RegisteredContract::register(
-                &baseline_root,
+            RegisteredContract::register_from_files(
                 proposal.contract.clone(),
                 base.into(),
                 baseline_environment,
+                &proposal.files,
             )?
         };
-        let receipts = execute_registered(&baseline_root, &registration, &workflow.audit_logger()).await?;
+        let receipts = execute_registered(&baseline_root, &registration, &proposal.files, &workflow.audit_logger()).await?;
         ensure!(
             registration.baseline_result(&receipts)? == BaselineResult::Reproduced,
             "amended verifier failed intended-red baseline: {}",
@@ -569,7 +568,7 @@ pub(super) async fn try_amend(
     };
     cleanup?;
     let pending = Pending {
-        version: 1,
+        version: 2,
         source,
         original_head: head,
         input_hash,
@@ -594,7 +593,7 @@ pub(super) async fn try_amend(
             .unwrap(),
         &bytes,
     )?;
-    resume_pending(root, control, source).await
+    resume_pending(root, control, source, workflow).await
 }
 
 fn staging_path(relative: &str, contract: &str) -> Result<PathBuf> {
@@ -667,16 +666,21 @@ pub(super) async fn resume_pending(
     root: &Path,
     control: &Path,
     source: AcceptanceSource,
+    workflow: &workflow::WorkflowGuard,
 ) -> Result<Option<PreparedAcceptance>> {
     use std::io::Write;
-    use std::os::unix::fs::MetadataExt;
     let path = pending_path(control, source);
     if !path.exists() {
         return Ok(None);
     }
+    workflow.validate_before_side_effect()?;
     let pending: Pending = private_json(&path)?;
+    ensure!(pending.version != 1,
+        "legacy pending amendment requires authenticated original transaction recovery; record retained");
+    ensure!(pending.version == 2,
+        "unsupported pending amendment protocol; await a compatible controller; record retained");
     ensure!(
-        pending.version == 1
+        pending.version == 2
             && pending.source == source
             && pending.next.proposal.contract.source()? == source
             && pending.authority.approved
@@ -686,26 +690,9 @@ pub(super) async fn resume_pending(
             && pending.prompt_hash.len() == 64,
         "invalid pending verifier authority"
     );
-    if pending
-        .next
-        .proposal
-        .contract
-        .verifiers
-        .iter()
-        .all(|verifier| verifier.command.controller_asserted())
-    {
-        ensure!(
-            pending
-                .next
-                .baseline
-                .registration
-                .baseline_result(&pending.next.baseline.receipts)?
-                == BaselineResult::Reproduced,
-            "pending amendment lacks red baseline"
-        );
-    }
-    // Finish an interrupted legacy file transaction as recovery metadata only;
-    // the migration gate rejects its old proof before any shipping/review.
+    validate_private_amendment_baseline(&pending.next)?;
+    // Only independently approved private-source transactions activate here.
+    // Historical file-writing protocols remain retained for explicit recovery.
     let approved_proposal = parse_proposal_data(
         &format!(
             "```autoship-contract\n{}\n```",
@@ -755,97 +742,11 @@ pub(super) async fn resume_pending(
             || current.contract_hash == pending.old.baseline.registration.contract_hash(),
         "amendment was superseded"
     );
-    let paths: std::collections::BTreeSet<_> = pending
-        .old
-        .proposal
-        .files
-        .keys()
-        .chain(pending.next.proposal.files.keys())
-        .cloned()
-        .collect();
-    let staging: std::collections::BTreeSet<String> = pending
-        .next
-        .proposal
-        .files
-        .keys()
-        .map(|relative| {
-            Ok(
-                staging_path(relative, pending.next.baseline.registration.contract_hash())?
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-        })
-        .collect::<Result<_>>()?;
-    let tracked = trusted_git(root, &["ls-files", "-z"]).await?;
-    ensure!(
-        !tracked.split('\0').any(|path| staging.contains(path)),
-        "amendment staging name collides with tracked source"
-    );
-    if !already_active {
-        let changed = trusted_git(
-            root,
-            &["diff", "--name-only", "-z", &pending.original_head, "--"],
-        )
-        .await?;
-        let untracked =
-            trusted_git(root, &["ls-files", "--others", "--exclude-standard", "-z"]).await?;
-        ensure!(
-            changed
-                .split('\0')
-                .chain(untracked.split('\0'))
-                .filter(|p| !p.is_empty())
-                .all(|p| paths.contains(p) || staging.contains(p)),
-            "candidate implementation changed during verifier amendment; new authority required"
-        );
-    }
-    for relative in &paths {
-        let target = root.join(relative);
-        if target.exists() {
-            let meta = std::fs::symlink_metadata(&target)?;
-            ensure!(
-                meta.is_file()
-                    && !meta.file_type().is_symlink()
-                    && meta.nlink() == 1
-                    && target.canonicalize()?.starts_with(root.canonicalize()?),
-                "amended harness is not a regular file"
-            );
-            let actual = std::fs::read(&target)?;
-            ensure!(
-                pending
-                    .old
-                    .proposal
-                    .files
-                    .get(relative)
-                    .is_some_and(|s| s.as_bytes() == actual)
-                    || pending
-                        .next
-                        .proposal
-                        .files
-                        .get(relative)
-                        .is_some_and(|s| s.as_bytes() == actual),
-                "harness changed outside approved amendment"
-            );
-        }
-        if let Some(contents) = pending.next.proposal.files.get(relative) {
-            install_amended_atomic(
-                root,
-                relative,
-                contents,
-                pending.next.baseline.registration.contract_hash(),
-            )?;
-        } else if target.exists() {
-            std::fs::remove_file(target)?;
-        }
-    }
-    pending.next.baseline.registration.verify_integrity(root)?;
-    recovery::commit_candidate_named(
-        root,
-        &format!(
-            "test: amend {source} acceptance revision {}",
-            pending.next.proposal.contract.revision
-        ),
-    )
-    .await?;
+    // This protocol changes protected controller metadata only. Validate the
+    // original head and clean product even after the manifest became active;
+    // no candidate files or Git commit may be manufactured during replay.
+    validate_private_pending_product(root,&pending).await?;
+    workflow.validate_before_side_effect()?;
     let mut manifest = WorkflowManifest::from_prepared(source, &pending.next);
     let evidence = format!(
         "{}-revision-{}-{}.json",
@@ -853,8 +754,10 @@ pub(super) async fn resume_pending(
         manifest.contract_revision,
         manifest.contract_hash
     );
+    workflow.validate_before_side_effect()?;
     immutable(control, &evidence, &serde_json::to_vec(&pending.next)?)?;
     manifest.evidence_file = Some(evidence);
+    workflow.validate_before_side_effect()?;
     immutable(
         control,
         &format!(
@@ -866,6 +769,7 @@ pub(super) async fn resume_pending(
         &serde_json::to_vec(&current)?,
     )?;
     if !already_active {
+        workflow.validate_before_side_effect()?;
         augmentagent_channel_core::autoship_write_scope::replace_registered(
             root,
             pending.old.baseline.registration.contract_hash(),
@@ -896,10 +800,12 @@ pub(super) async fn resume_pending(
         let mut file = tempfile::NamedTempFile::new_in(control)?;
         file.write_all(&serde_json::to_vec(&manifest)?)?;
         file.as_file().sync_all()?;
+        workflow.validate_before_side_effect()?;
         file.persist(control.join(format!("{}-workflow.json", source.key())))
             .map_err(|e| e.error)?;
         std::fs::File::open(control)?.sync_all()?;
     }
+    workflow.validate_before_side_effect()?;
     immutable(
         control,
         &format!(
@@ -909,9 +815,31 @@ pub(super) async fn resume_pending(
         ),
         &serde_json::to_vec(&pending)?,
     )?;
+    workflow.validate_before_side_effect()?;
     std::fs::remove_file(path)?;
     std::fs::File::open(control)?.sync_all()?;
     Ok(Some(pending.next))
+}
+fn validate_private_amendment_baseline(prepared:&PreparedAcceptance)->Result<()> {
+    prepared.verify_registration()?;
+    ensure!(prepared.proposal.contract.verifiers.iter().all(|verifier|verifier.command.controller_asserted()),
+        "private amendment requires current independent behavioral oracles");
+    ensure!(prepared.baseline.registration.baseline_result(&prepared.baseline.receipts)?==BaselineResult::Reproduced,
+        "pending amendment lacks red baseline");
+    Ok(())
+}
+async fn validate_private_pending_product(root:&Path,pending:&Pending)->Result<()> {
+    pending.old.verify_registration()?;
+    pending.next.verify_registration()?;
+    ensure!(actual_head(root).await?==pending.original_head,
+        "candidate head changed during private verifier amendment");
+    ensure!(trusted_git(root,&["status","--porcelain","--untracked-files=all"]).await?.is_empty(),
+        "candidate files changed during private verifier amendment");
+    assert_no_registered_adapters(root,&pending.original_head,&pending.old.baseline.registration,&pending.old.proposal.files).await?;
+    assert_no_registered_adapters(root,&pending.original_head,&pending.next.baseline.registration,&pending.next.proposal.files).await?;
+    ensure!(actual_head(root).await?==pending.original_head,
+        "candidate head changed while validating private verifier amendment");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1141,6 +1069,55 @@ mod tests {
                 },
             },
         )
+    }
+    #[test]
+    fn private_amendment_requires_current_oracles_and_independent_red_evidence() {
+        let (_root,legacy)=fixture();
+        assert!(validate_private_amendment_baseline(&legacy).is_err(),
+            "private activation accepted a legacy claimed-test oracle without independent red");
+        let mut current=legacy.clone();
+        current.proposal.contract.verifiers[0].command=crate::autoship_contract::VerifierCommand::BlackBox {
+            invocation:crate::autoship_contract::BehaviorInvocation::PythonScript {file:"regression.py".into(),args:vec![]},
+            oracle:crate::autoship_contract::OutputOracle::Json {value:serde_json::json!(true)}};
+        current.baseline.registration=RegisteredContract::register_from_files(current.proposal.contract.clone(),
+            "a".repeat(40),"environment-a".into(),&current.proposal.files).unwrap();
+        assert!(validate_private_amendment_baseline(&current).is_err(),
+            "private activation accepted a current oracle with no independently red receipts");
+    }
+    #[tokio::test]
+    async fn private_amendment_replay_refuses_changed_product_and_never_repairs_it() {
+        let (root,old)=fixture();
+        std::fs::remove_file(root.path().join("regression.py")).unwrap();
+        trusted_git(root.path(),&["init","--initial-branch=main"]).await.unwrap();
+        std::fs::write(root.path().join("behavior.py"),"original product\n").unwrap();
+        trusted_git(root.path(),&["add","behavior.py"]).await.unwrap();
+        trusted_git(root.path(),&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+            "commit","-m","synthetic original product"]).await.unwrap();
+        // This tests the product precondition only, not approval or red proof.
+        // The outer resume path independently rejects this unapproved record.
+        let pending=Pending {version:2,source:AcceptanceSource::Issue(42),
+            original_head:actual_head(root.path()).await.unwrap(),input_hash:digest(b"unit input"),
+            old:old.clone(),next:old.clone(),authority:Decision {approved:false,
+                previous_contract_hash:old.baseline.registration.contract_hash().into(),
+                approve_environment_transition:false,reason:"unapproved product-precondition fixture".into(),
+                proposal:None,approve_additional_files:vec![]},native_provider:String::new(),
+            native_session:String::new(),prompt_hash:String::new()};
+        validate_private_pending_product(root.path(),&pending).await.unwrap();
+        std::fs::write(root.path().join("unrelated"),"preserve owner edit").unwrap();
+        assert!(validate_private_pending_product(root.path(),&pending).await.is_err());
+        assert_eq!(std::fs::read_to_string(root.path().join("unrelated")).unwrap(),"preserve owner edit");
+        std::fs::remove_file(root.path().join("unrelated")).unwrap();
+        std::fs::write(root.path().join("behavior.py"),"changed staged product\n").unwrap();
+        trusted_git(root.path(),&["add","behavior.py"]).await.unwrap();
+        assert!(validate_private_pending_product(root.path(),&pending).await.is_err());
+        assert!(!trusted_git(root.path(),&["diff","--cached"]).await.unwrap().is_empty());
+        trusted_git(root.path(),&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+            "commit","-m","synthetic changed product"]).await.unwrap();
+        let changed=actual_head(root.path()).await.unwrap();
+        assert!(validate_private_pending_product(root.path(),&pending).await.unwrap_err().to_string().contains("candidate head changed"));
+        assert_eq!(actual_head(root.path()).await.unwrap(),changed);
+        assert_eq!(std::fs::read_to_string(root.path().join("behavior.py")).unwrap(),"changed staged product\n");
+        assert!(!root.path().join("regression.py").exists());
     }
     #[test]
     fn ordinary_noop_approval_is_declined_while_the_validator_and_final_ruling_stay_strict() {
@@ -1385,7 +1362,7 @@ mod tests {
 /// Scripted independent scope authority for the end-to-end migration fixture.
 /// New baseline and candidate observations still use real isolated subprocesses.
 #[cfg(test)]
-pub(crate) async fn migrate_fixture(root:&Path, control:&Path, old:&PreparedAcceptance, mut proposal:ContractProposal)->Result<PreparedAcceptance> {
+pub(crate) async fn migrate_fixture(root:&Path, control:&Path, old:&PreparedAcceptance, mut proposal:ContractProposal, workflow:&workflow::WorkflowGuard)->Result<PreparedAcceptance> {
     proposal.contract.revision=old.proposal.contract.revision+1;
     let environments = environment_evidence(root, control, old).await?;
     ensure!(environments.legacy_proof_migration, "fixture must exercise actual legacy migration");
@@ -1404,10 +1381,19 @@ pub(crate) async fn migrate_fixture(root:&Path, control:&Path, old:&PreparedAcce
         let (path,directory)=match scope {crate::autoship_contract::PathScope::File(path)=>(path,false),crate::autoship_contract::PathScope::Directory(path)=>(path,true)};
         augmentagent_channel_core::autoship_write_scope::DeclaredPath{path:path.clone(),directory}
     }).collect(),old.proposal.files.keys().cloned().collect())?;
-    let pending=Pending{version:1,source:old.proposal.contract.source()?,original_head:actual_head(root).await?,input_hash:digest(b"scripted migration input"),
+    let pending=Pending{version:2,source:old.proposal.contract.source()?,original_head:actual_head(root).await?,input_hash:digest(b"scripted migration input"),
         old:old.clone(),next,authority:Decision{approved:true,previous_contract_hash:old.baseline.registration.contract_hash().into(),approve_environment_transition:true,approve_additional_files:vec![],reason:"Replace legacy claimed test status with independently measured arithmetic behavior".into(),proposal:Some(proposal)},
         native_provider:"scripted-test-authority".into(),native_session:"scripted-distinct-test-session".into(),prompt_hash:digest(prompt.as_bytes())};
     let path=pending_path(control,pending.source);
     immutable(control,path.file_name().unwrap().to_str().unwrap(),&serde_json::to_vec(&pending)?)?;
-    resume_pending(root,control,pending.source).await?.context("migration fixture did not activate")
+    let before=actual_head(root).await?;
+    let activated=resume_pending(root,control,pending.source,workflow).await?.context("migration fixture did not activate")?;
+    ensure!(actual_head(root).await?==before,"private migration changed product head");
+    // Recreate exactly the durable state after completion was synced but the
+    // final pending-file deletion acknowledgement was lost. No authority call.
+    immutable(control,path.file_name().unwrap().to_str().unwrap(),&serde_json::to_vec(&pending)?)?;
+    let replay=resume_pending(root,control,pending.source,workflow).await?.context("private migration replay missing")?;
+    ensure!(replay.baseline.registration==activated.baseline.registration && actual_head(root).await?==before,
+        "private activation replay changed registration or product head");
+    Ok(replay)
 }

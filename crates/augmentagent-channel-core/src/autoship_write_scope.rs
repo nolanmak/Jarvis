@@ -294,13 +294,6 @@ pub fn replace_registered(
     let worktree = worktree.canonicalize()?;
     let path = location(&state, &worktree);
     let previous = read(&path)?;
-    if previous.contract_hash == next_contract {
-        return Ok(());
-    }
-    ensure!(
-        previous.contract_hash == expected_contract,
-        "write admission amendment is stale"
-    );
     ensure!(
         !next_contract.is_empty() && allowed.len() <= 256 && pinned.len() <= 256,
         "invalid amended write admission"
@@ -308,6 +301,19 @@ pub fn replace_registered(
     for value in allowed.iter().map(|p| &p.path).chain(pinned.iter()) {
         relative(value)?;
     }
+    ensure!(previous.version==1 && previous.worktree==worktree,"write admission source identity changed");
+    let next = Admission {
+        version: 1,
+        worktree,
+        contract_hash: next_contract.into(),
+        allowed,
+        pinned,
+    };
+    if previous.contract_hash == next_contract {
+        ensure!(previous==next,"active write admission differs from registered permissions");
+        return Ok(());
+    }
+    ensure!(previous.contract_hash==expected_contract,"write admission amendment is stale");
     let historical = serde_json::to_vec(&previous)?;
     let history = path
         .parent()
@@ -319,21 +325,44 @@ pub fn replace_registered(
         file.as_file().sync_all()?;
         file.persist_noclobber(history).map_err(|e| e.error)?;
     }
-    let next = Admission {
-        version: 1,
-        worktree,
-        contract_hash: next_contract.into(),
-        allowed,
-        pinned,
-    };
     let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
     file.write_all(&serde_json::to_vec(&next)?)?;
     file.as_file().sync_all()?;
     ensure!(
-        read(&path)?.contract_hash == expected_contract,
+        read(&path)? == previous,
         "write admission changed during amendment"
     );
     file.persist(&path).map_err(|e| e.error)?;
     fs::File::open(path.parent().unwrap())?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    #[test]
+    fn registered_scope_replacement_replays_only_the_exact_permissions() {
+        let worktree=tempfile::tempdir().unwrap();
+        register(worktree.path(),"previous",vec![DeclaredPath {path:"old.rs".into(),directory:false}],vec![]).unwrap();
+        let allowed=vec![DeclaredPath {path:"src".into(),directory:true}];let pinned=vec!["private/observe.py".to_owned()];
+        replace_registered(worktree.path(),"previous","next",allowed.clone(),pinned.clone()).unwrap();
+        replace_registered(worktree.path(),"previous","next",allowed.clone(),pinned.clone()).unwrap();
+        assert!(replace_registered(worktree.path(),"stale","other",allowed.clone(),pinned.clone()).is_err());
+        register(worktree.path(),"next",allowed,pinned).unwrap();
+    }
+    #[test]
+    fn active_contract_replay_refuses_different_allowed_or_pinned_permissions() {
+        for fault in ["allowed", "pinned"] {
+            let worktree=tempfile::tempdir().unwrap();
+            let allowed=vec![DeclaredPath {path:"src".into(),directory:true}];
+            let pinned=vec!["private/observe.py".to_owned()];
+            let stored_allowed=if fault=="allowed" {vec![DeclaredPath {path:"owner.txt".into(),directory:false}]}else{allowed.clone()};
+            let stored_pinned=if fault=="pinned" {vec!["private/different.py".to_owned()]}else{pinned.clone()};
+            register(worktree.path(),"next",stored_allowed.clone(),stored_pinned.clone()).unwrap();
+            assert!(replace_registered(worktree.path(),"previous","next",allowed,pinned).is_err(),"{fault}: same contract name accepted different permission bytes");
+            // Refusal preserves the suspect record for inspection instead of
+            // silently rewriting it or granting the requested replacement.
+            register(worktree.path(),"next",stored_allowed,stored_pinned).unwrap();
+        }
+    }
 }

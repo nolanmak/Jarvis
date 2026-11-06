@@ -31,6 +31,22 @@ pub(super) struct OwnerBodyResult {
     observed:augmentagent_channel_core::native_session::ObservedConversation,
 }
 
+/// Supply registered intent and product paths without exposing private oracle
+/// data or adapter code. Formatting a prompt grants no execution authority.
+fn owner_body_prompt(prepared:&acceptance::PreparedAcceptance,contract:&str,body:&str)->Result<String> {
+    prepared.verify_registration()?;
+    anyhow::ensure!(prepared.baseline.registration.contract_hash()==contract,"owner builder acceptance contract changed");
+    anyhow::ensure!(!body.trim().is_empty() && body.len()<=16*1024,"owner builder input exceeds bound");
+    let criteria=prepared.proposal.contract.criteria.iter().map(|c|serde_json::json!({"id":c.id,"requirement":c.requirement})).collect::<Vec<_>>();
+    let paths=prepared.proposal.contract.allowed_paths.iter().filter(|scope| {
+        let path=match scope {crate::autoship_contract::PathScope::File(path)|crate::autoship_contract::PathScope::Directory(path)=>path};
+        !prepared.proposal.files.contains_key(path)
+    }).collect::<Vec<_>>();
+    let prompt=format!("Work on this guarded candidate under registered acceptance {contract}. Preserve every registered requirement and use only the declared product paths and admitted tools. Verifier adapters and oracles remain in private controller storage; do not create verifier copies or change protected control files. Do not publish, push or merge. Return a concise private summary; a model response does not prove tests passed or that shipping occurred.\nRegistered requirements:{}\nDeclared product paths:{}\n\nOwner instruction:\n{}",serde_json::to_string(&criteria)?,serde_json::to_string(&paths)?,body);
+    anyhow::ensure!(prompt.len()<=512*1024,"owner builder context requires scoped decomposition");
+    Ok(prompt)
+}
+
 pub(super) struct Start<'a> {
     pub repo_root: &'a Path,
     pub worktree: &'a Path,
@@ -1202,13 +1218,27 @@ impl WorkflowGuard {
     }
 
     /// Preparation is neither installation nor activation. The current request
-    /// and its independently reproduced baseline are rechecked before the old
-    /// guard is consumed; changed verifier files must already be safely applied.
+    /// and its independently reproduced private baseline are rechecked before
+    /// consuming the old guard. Adapter files are never installed in product.
     pub(super) async fn activate_prepared_owner_acceptance(self,prepared:&acceptance::owner::PreparedOwnerAcceptance,
         previous:Option<&crate::autoship_contract::RegisteredContract>)->Result<Self> {
         prepared.validate_current(&self,&self.worktree,previous)?;
-        if let Some(previous)=previous {self.activate_owner_revision(previous,&prepared.prepared().baseline.registration).await}
-        else {self.activate_initial_owner_acceptance(prepared.prepared()).await}
+        let prepared=prepared.prepared();
+        acceptance::validate_candidate_harness(&self.worktree,prepared).await?;
+        self.audit_health().await?;self.native_builder_owner()?;
+        let next=&prepared.baseline.registration;let old=self.binding.contract.clone();let contract=format!("registered:{}",next.contract_hash());
+        let environment=next.binding(&self.binding.head)?.environment_id;
+        let binding=git_binding(&self.worktree,&contract,&environment,&[]).await?;
+        let initial=previous.is_none().then(||InitialOwnerAcceptance {lease:self.lease.clone(),binding:self.binding.clone()});
+        let revised={
+            let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("private owner acceptance store poisoned"))?;
+            let now=millis();let turn=store.owner_turn_for_lease(&self.lease,now)?;
+            charge_elapsed(&mut store,&self.lease,self.started,&self.accounted_ms,now)?;
+            store.activate_private_owner_acceptance(initial.as_ref(),&turn,previous,next,&prepared.baseline.receipts,&prepared.proposal.files,&binding,now)?
+        };
+        let guard=self.finish_owner_contract_change(revised,contract,environment,"owner_private_acceptance_guard_ready",&old,next.contract_hash())?;
+        acceptance::bind_write_scope(&guard.worktree,prepared,previous)?;
+        Ok(guard)
     }
 
     /// The independently prepared registration changes the owner turn's
@@ -1216,6 +1246,7 @@ impl WorkflowGuard {
     /// never be reused for the new contract. Native ownership must transfer
     /// through the same original-store service before a new guard escapes.
     /// This does not apply the input, unpause, approve acceptance or ship.
+    #[cfg(test)]
     pub(super) async fn activate_owner_revision(
         self,
         previous: &crate::autoship_contract::RegisteredContract,
@@ -1237,6 +1268,7 @@ impl WorkflowGuard {
         self.finish_owner_contract_change(revised,contract,environment,"owner_revision_guard_ready",previous.contract_hash(),next.contract_hash())
     }
 
+    #[cfg(test)]
     pub(super) async fn activate_initial_owner_acceptance(self,prepared:&acceptance::PreparedAcceptance)->Result<Self> {
         anyhow::ensure!(std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_some(),"owner-turn-native-configuration-unavailable");
         self.audit_health().await?;self.native_builder_owner()?;
@@ -1309,6 +1341,10 @@ impl WorkflowGuard {
             _=>anyhow::bail!("owner body requires native Codex or Claude")};
         self.bind_builder(reasoner)?;
         let sessions=self.owner_turn_native_builder_sessions(provider)?;
+        let expected_turn=self.store.lock().map_err(|_|anyhow::anyhow!("owner prompt store poisoned"))?.owner_turn_for_lease(&self.lease,millis())?;
+        // Reject malformed or oversized context before the once-only body
+        // reservation. No provider submission has begun at this point.
+        let prompt=owner_body_prompt(prepared,&self.binding.contract,&expected_turn.body)?;
         let origin=adoption::origin_for_candidate(&self.worktree,Some(self)).await?;
         let authors=reasoner.review_authors()?;
         let first=!origin.is_imported() && authors.as_ref().is_some_and(|authors|authors.is_empty());
@@ -1328,7 +1364,7 @@ impl WorkflowGuard {
             (turn,dispatch)
         };
         let mut opts=fix_opts(self.worktree.clone());opts.audit_logger=Some(self.audit.clone());
-        let prompt=format!("Work on this guarded candidate under its registered acceptance contract. Apply the owner's instruction below using the admitted tools. Do not publish, push, merge or change protected controller/verifier files. Return a concise private summary of what happened; a model response does not prove tests passed or that shipping occurred.\n\nOwner instruction:\n{}",turn.body);
+        anyhow::ensure!(turn.request_id==expected_turn.request_id && turn.body==expected_turn.body && turn.binding==expected_turn.binding,"owner prompt request changed before dispatch");
         let outcome=sessions.scope(async {
             if first {reasoner.call_with_storage(&opts,&prompt).await}
             else {adoption::revise(reasoner,self,&opts,&prompt).await}
@@ -1347,14 +1383,15 @@ impl WorkflowGuard {
         Ok(result)
     }
     /// A first builder may start only on a real linked candidate still equal
-    /// to its original main baseline, with only pinned verifier files added.
+    /// to its original main baseline, using protected private verifier bytes.
     /// Actual native absence is checked under original-store locks at reservation.
     async fn reserve_first_owner_body(&self,prepared:&acceptance::PreparedAcceptance,provider:durable::submission::Provider,canonical_main:&str)->Result<durable::owner_dispatch::OwnerBodyDispatch> {
         self.native_builder_owner()?;
         let registration=&prepared.baseline.registration;
         anyhow::ensure!(self.contract==format!("registered:{}",registration.contract_hash())
             && prepared.proposal.contract==*registration.contract(),"first builder acceptance changed");
-        registration.verify_integrity(&self.worktree)?;
+        prepared.verify_registration()?;
+        acceptance::validate_candidate_harness(&self.worktree,prepared).await?;
         let base=registration.baseline_head();
         anyhow::ensure!(matches!(canonical_main.len(),40|64) && canonical_main.bytes().all(|b|b.is_ascii_hexdigit()),"first builder canonical main identity missing");
         let primary=workspace::primary_root(&self.worktree).await?;
@@ -1368,8 +1405,7 @@ impl WorkflowGuard {
         }
         let untracked=first_builder_git(&self.worktree,&["ls-files","--others","-z","--"]).await?;
         anyhow::ensure!(untracked.len()<=512*1024,"first builder untracked inventory exceeds bound");
-        let pinned=registration.contract().verifiers.iter().flat_map(|v|v.pinned_files.iter()).collect::<std::collections::BTreeSet<_>>();
-        let mut count=0;for path in untracked.split('\0').filter(|p|!p.is_empty()) {count+=1;anyhow::ensure!(count<=4096 && pinned.contains(&path.to_owned()),"first builder has untracked or ignored owner data");}
+        anyhow::ensure!(untracked.is_empty(),"first builder has untracked or ignored owner data");
         let current=||->Result<()> {self.healthy_lease()?;self.store.lock().map_err(|_|anyhow::anyhow!("first builder store poisoned"))?.first_owner_body_turn(&self.lease,provider,base,millis())?;Ok(())};
         let mut dispatch=None;
         augmentagent_channel_core::native_vm::ownership::with_unused_native_owner(&self.audit,&current,&mut |proof| {
@@ -3391,6 +3427,26 @@ mod tests {
         std::fs::write(PathBuf::from(std::env::var_os(CHILD).unwrap()).join("executed"), "ok").unwrap();
     }
 
+    #[test]
+    fn owner_body_receives_registered_requirements_without_private_verifier_code_or_oracles() {
+        use crate::autoship_contract::*;
+        let files=std::collections::BTreeMap::from([("autoship_verifiers/private.py".to_owned(),"print('PRIVATE_ADAPTER_FIXTURE_ONLY')\n".to_owned())]);
+        let contract=AcceptanceContract {schema_version:1,revision:2,issue:Some(77),pull_request:None,
+            criteria:vec![Criterion {id:"C1".into(),requirement:"Preserve the existing owner settings".into(),verifier_ids:vec!["observe".into()]}],
+            allowed_paths:vec![PathScope::File("src/shipping.rs".into()),PathScope::File("autoship_verifiers/private.py".into())],
+            verifiers:vec![Verifier {id:"observe".into(),command:VerifierCommand::BlackBox {invocation:BehaviorInvocation::PythonScript {file:"autoship_verifiers/private.py".into(),args:vec![]},oracle:OutputOracle::Text {value:"PRIVATE_ORACLE_FIXTURE_ONLY".into()}},pinned_files:vec!["autoship_verifiers/private.py".into()],failure_witness:"behavior differs".into()}]};
+        let registration=RegisteredContract::register_from_files(contract.clone(),"a".repeat(40),"test".into(),&files).unwrap();
+        let mut prepared=acceptance::PreparedAcceptance {proposal:acceptance::ContractProposal {contract,files},baseline:acceptance::BaselineEvidence {registration,receipts:vec![]}};
+        let prompt=owner_body_prompt(&prepared,prepared.baseline.registration.contract_hash(),"Fix the reported bug").unwrap();
+        assert!(prompt.contains("Preserve the existing owner settings"),"registered owner requirement was omitted from builder prompt");
+        assert!(prompt.contains("src/shipping.rs"));assert!(prompt.contains("Fix the reported bug"));
+        assert!(!prompt.contains("PRIVATE_ORACLE_FIXTURE_ONLY"));assert!(!prompt.contains("PRIVATE_ADAPTER_FIXTURE_ONLY"));
+        assert!(!prompt.contains("autoship_verifiers/private.py"),"private verifier path was offered as a product edit path");
+        assert!(owner_body_prompt(&prepared,"wrong-contract","Fix").is_err());
+        prepared.proposal.files.insert("autoship_verifiers/private.py".into(),"changed adapter".into());
+        assert!(owner_body_prompt(&prepared,prepared.baseline.registration.contract_hash(),"Fix").is_err());
+    }
+
     #[tokio::test]
     async fn workflow_guard_initial_native_owner_registers_before_returning() {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
@@ -3400,7 +3456,7 @@ mod tests {
                 if mode.ends_with("-session") && !cfg!(target_os="linux") {continue;}
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
-                    .env(CHILD,control.path()).env(MODE,mode);
+                    .env(CHILD,control.path()).env(MODE,mode).env("XDG_STATE_HOME",control.path().join("operator-state"));
                 if matches!(mode,"unconfigured"|"configuration-recovery") {child.env_remove("AUGMENTAGENT_NATIVE_VM_POLICY");}
                 else {child.env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json"));}
                 assert!(child.status().unwrap().success(),"native registration guard fixture failed: {mode}");
@@ -3465,6 +3521,10 @@ mod tests {
                 "version":1,"audit_path":"/private/prior-audit","owner":{"workflow_id":id,"lease_generation":1}})).unwrap()).unwrap();
             std::fs::set_permissions(&owned,std::fs::Permissions::from_mode(0o600)).unwrap();
         }
+        let private_first_files=mode.contains("-first-build").then(|| {
+            let mut files=std::collections::BTreeMap::from([("autoship_verifiers/first.py".to_owned(),"print(False)\n".to_owned())]);
+            if mode.ends_with("-new-verifier") {files.insert("autoship_verifiers/second.py".into(),"print(False)\n".into());}files
+        });
         let revision_contracts=if mode.contains("-revision-") || mode.contains("-initial-acceptance") {
             use crate::autoship_contract::*;
             let mut contract=AcceptanceContract {schema_version:SCHEMA_VERSION,revision:1,issue:Some(77),pull_request:None,
@@ -3473,14 +3533,17 @@ mod tests {
                 verifiers:vec![Verifier {id:"ready".into(),command:VerifierCommand::BlackBox {
                     invocation:BehaviorInvocation::CargoBinary {package:"fixture".into(),bin:"behavior".into(),args:vec![]},
                     oracle:OutputOracle::Json {value:serde_json::json!(true)}},pinned_files:vec!["code.txt".into()],failure_witness:"expected ready".into()}]};
-            if mode.ends_with("-new-verifier") {
-                std::fs::create_dir(dir.path().join("autoship_verifiers")).unwrap();std::fs::write(dir.path().join("autoship_verifiers/first.py"),"print(False)\n").unwrap();contract.verifiers[0].pinned_files.push("autoship_verifiers/first.py".into());
+            if let Some(files)=&private_first_files {
+                contract.verifiers[0].command=VerifierCommand::BlackBox {invocation:BehaviorInvocation::PythonScript {file:"autoship_verifiers/first.py".into(),args:vec![]},oracle:OutputOracle::Json {value:serde_json::json!(true)}};
+                contract.verifiers[0].pinned_files=files.keys().cloned().collect();
+                contract.allowed_paths.extend(files.keys().cloned().map(PathScope::File));
             }
             let base=git_evidence(dir.path(),&["rev-parse","HEAD"]).await.unwrap();
-            let previous=RegisteredContract::register(dir.path(),contract.clone(),base.clone(),"test".into()).unwrap();
-            let mut contract=contract;contract.revision=2;
+            let register=|contract|if let Some(files)=&private_first_files {RegisteredContract::register_from_files(contract,base.clone(),"test".into(),files).unwrap()}
+                else {RegisteredContract::register(dir.path(),contract,base.clone(),"test".into()).unwrap()};
+            let previous=register(contract.clone());let mut contract=contract;contract.revision=2;
             contract.criteria.push(Criterion {id:"C2".into(),requirement:"Additional owner requirement".into(),verifier_ids:vec!["ready".into()]});
-            let next=RegisteredContract::register(dir.path(),contract,base,"test".into()).unwrap();Some((previous,next))
+            let next=register(contract);Some((previous,next))
         }else{None};
         let contract_label=if mode.contains("-initial-acceptance") {"C1".into()}else{revision_contracts.as_ref().map(|(previous,_)|format!("registered:{}",previous.contract_hash())).unwrap_or_else(||"C1".into())};
         let start=||Start{repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",
@@ -3524,10 +3587,9 @@ mod tests {
                     assert!(prepared.validate_current(&first,dir.path(),None).is_err(),"stale prepared acceptance escaped owner fence");
                     assert!(first.activate_prepared_owner_acceptance(&prepared,None).await.is_err());
                 }else {
-                    // Fixture installation is explicit controller setup, not a
-                    // claim that production recovery/application is connected.
-                    acceptance::install_harness(dir.path(),&prepared.prepared().proposal).unwrap();
-                    first=first.activate_prepared_owner_acceptance(&prepared,None).await.unwrap();first.validate_before_side_effect().unwrap();
+                    assert!(!dir.path().join("autoship_verifiers/observe.py").exists());
+                    first=first.activate_prepared_owner_acceptance(&prepared,None).await.expect("private owner acceptance must activate without installing adapters into product");first.validate_before_side_effect().unwrap();
+                    assert!(!dir.path().join("autoship_verifiers/observe.py").exists(),"owner activation installed a private adapter into product");
                     assert!(prepared.validate_current(&first,dir.path(),None).is_err(),"old producer proof survived activation");
                     assert_eq!(first.audit.native_store_binding().unwrap(),Some(original));first.finish().unwrap();
                 }
@@ -3540,17 +3602,21 @@ mod tests {
                     let mut contract=registration.contract().clone();contract.issue=Some(88);
                     registration=crate::autoship_contract::RegisteredContract::register(dir.path(),contract,registration.baseline_head().into(),"test".into()).unwrap();
                 }
-                let receipt=registration.observe(dir.path(),"ready",registration.binding(registration.baseline_head()).unwrap(),&crate::autoship_contract::Observation {
+                let fixture=tempfile::tempdir().unwrap();
+                if let Some(files)=&private_first_files {acceptance::install_harness(fixture.path(),&acceptance::ContractProposal {contract:registration.contract().clone(),files:files.clone()}).unwrap();}
+                let receipt=registration.observe(if private_first_files.is_some(){fixture.path()}else{dir.path()},"ready",registration.binding(registration.baseline_head()).unwrap(),&crate::autoship_contract::Observation {
                     exit_code:Some(0),stdout:if mode.ends_with("-green-baseline"){"true".into()}else{"false".into()},stderr:String::new(),interrupted:false,output_complete:true,
                 }).unwrap();
-                let mut prepared=acceptance::PreparedAcceptance {proposal:acceptance::ContractProposal {contract:registration.contract().clone(),files:std::collections::BTreeMap::from([("code.txt".into(),"baseline\n".into())])},baseline:acceptance::BaselineEvidence {registration,receipts:vec![receipt]}};
-                if mode.ends_with("-new-verifier") {prepared.proposal.files.insert("autoship_verifiers/first.py".into(),"print(False)\n".into());}
+                let mut prepared=acceptance::PreparedAcceptance {proposal:acceptance::ContractProposal {contract:registration.contract().clone(),files:private_first_files.clone().unwrap_or_else(||std::collections::BTreeMap::from([("code.txt".into(),"baseline\n".into())]))},baseline:acceptance::BaselineEvidence {registration,receipts:vec![receipt]}};
                 assert!(first.bind_acceptance(&prepared).is_err(),"ordinary binding must not poison an owner turn");
                 let old_lease=first.lease.clone();let old_binding=first.binding.clone();
                 if mode.ends_with("-unconfigured") {unsafe {std::env::remove_var("AUGMENTAGENT_NATIVE_VM_POLICY");}}
                 if mode.ends_with("-write-failure") {rusqlite::Connection::open(&state).unwrap().execute_batch("CREATE TRIGGER deny_initial_acceptance BEFORE INSERT ON workflow_event WHEN NEW.kind='owner_acceptance_registered' BEGIN SELECT RAISE(ABORT,'injected initial acceptance write failure'); END;").unwrap();}
                 if mode.ends_with("-setup-failure") {rusqlite::Connection::open(&state).unwrap().execute_batch("CREATE TRIGGER deny_initial_handoff BEFORE INSERT ON workflow_native_handoff_pending BEGIN SELECT RAISE(ABORT,'injected initial handoff failure'); END;").unwrap();}
-                let activated=first.activate_initial_owner_acceptance(&prepared).await;
+                let activated=if private_first_files.is_some() {
+                    let private=acceptance::owner::test_from_prepared(dir.path(),&first,&prepared).unwrap();
+                    first.activate_prepared_owner_acceptance(&private,None).await
+                }else {first.activate_initial_owner_acceptance(&prepared).await};
                 if mode.ends_with("-green-baseline") || mode.ends_with("-write-failure") || mode.ends_with("-wrong-source") || mode.ends_with("-unconfigured") {
                     assert!(activated.is_err());let mut store=WorkflowStore::open(&state).unwrap();let snapshot=store.snapshot(&id).unwrap().unwrap();
                     assert_eq!(snapshot.generation,old_lease.generation);assert_eq!(snapshot.checkpoint.binding,old_binding);assert_eq!(snapshot.model_calls,0);

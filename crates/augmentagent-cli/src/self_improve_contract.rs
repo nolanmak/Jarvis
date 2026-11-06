@@ -24,6 +24,11 @@ pub(super) mod owner;
 pub(super) mod readiness;
 #[path = "self_improve_adjudicated_contract.rs"]
 mod adjudicated;
+#[path = "self_improve_legacy_verifier.rs"]
+mod legacy_verifier;
+#[cfg(test)]
+#[path = "self_improve_candidate_source_tests.rs"]
+mod candidate_source_tests;
 pub(super) use adjudicated::apply as apply_adjudicated_amendment;
 
 const SANDBOX: &str = include_str!("../../../scripts/codex-command-sandbox.py");
@@ -355,6 +360,35 @@ fn compiler_control_inputs(root: &Path) -> Result<Vec<(String, String)>> {
     Ok(inputs)
 }
 
+/// Definition collision, never intended behavioral red or a product defect.
+#[derive(Debug)]
+pub(super) struct VerifierSourceCollision {
+    pub head: String,
+    pub contract_hash: String,
+    pub paths: Vec<String>,
+}
+impl std::fmt::Display for VerifierSourceCollision {
+    fn fmt(&self, f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        write!(f,"private verifier path collides with committed product source at {} (contract {}): {:?}",
+            self.head,self.contract_hash,self.paths)
+    }
+}
+impl std::error::Error for VerifierSourceCollision {}
+async fn assert_no_registered_adapters(root:&Path,head:&str,registration:&RegisteredContract,
+    files:&BTreeMap<String,String>)->Result<()> {
+    registration.verify_files(files)?;
+    let mut paths=Vec::new();
+    // Query literal paths separately: a tracked directory is also a collision;
+    // no filename quoting, glob expansion or worker files select this result.
+    for path in files.keys() {
+        let row=trusted_git(root,&["--no-replace-objects","--literal-pathspecs","ls-tree","-z",head,"--",path]).await?;
+        if !row.is_empty() {paths.push(path.clone());}
+    }
+    if !paths.is_empty() {return Err(VerifierSourceCollision {
+        head:head.into(),contract_hash:registration.contract_hash().into(),paths}.into());}
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(super) struct BaselineNotRed { detail:String }
 impl std::fmt::Display for BaselineNotRed {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"baseline not independently reproduced: {}",self.detail)}}
@@ -380,13 +414,12 @@ async fn register_and_observe(root:&Path,proposal:ContractProposal,audit:&Arc<au
         .await?;
     ensure!(
         status.status.success() && status.stdout.is_empty(),
-        "baseline checkout must be clean before independent verifier installation"
+        "baseline product checkout must be clean before independent verification"
     );
     let head = actual_head(root).await?;
-    install_harness(root, &proposal)?;
-    let registration =
-        RegisteredContract::register(root, proposal.contract, head, environment_id(root)?)?;
-    let receipts = execute_registered(root, &registration, audit).await?;
+    let registration = RegisteredContract::register_from_files(
+        proposal.contract, head, environment_id(root)?, &proposal.files)?;
+    let receipts = execute_registered(root, &registration, &proposal.files, audit).await?;
     Ok(BaselineEvidence {registration,receipts})
 }
 /// Persist only under controller-owned state outside every admitted worker
@@ -421,11 +454,12 @@ pub(super) fn persist_baseline(
     Ok(())
 }
 
-/// Install the identical proposal harness in the candidate before building;
-/// do not recreate or overwrite it here. A candidate cannot re-register itself.
+/// Execute only the independently registered protected adapter bytes. Product
+/// commits never install those adapters and cannot re-register themselves.
 pub(super) async fn verify_candidate(
     root: &Path,
     evidence: &BaselineEvidence,
+    files: &BTreeMap<String, String>,
     audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<Vec<VerifierReceipt>> {
     ensure!(
@@ -456,7 +490,7 @@ pub(super) async fn verify_candidate(
                 .environment_id,
         "verifier environment changed; re-register baseline"
     );
-    let receipts = execute_registered(root, &evidence.registration, audit).await?;
+    let receipts = execute_registered(root, &evidence.registration, files, audit).await?;
     let binding = evidence.registration.binding(&actual_head(root).await?)?;
     ensure!(
         evidence
@@ -471,42 +505,55 @@ pub(super) async fn verify_candidate(
 async fn execute_registered(
     root: &Path,
     registration: &RegisteredContract,
+    files: &BTreeMap<String, String>,
     audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<Vec<VerifierReceipt>> {
     let root = root.canonicalize()?;
     let head = actual_head(&root).await?;
     let binding = registration.binding(&head)?;
-    registration.verify_integrity(&root)?;
+    registration.verify_files(files)?;
+    assert_no_registered_adapters(&root,&head,registration,files).await?;
+    ensure!(trusted_git(&root, &["status", "--porcelain", "--untracked-files=all"]).await?.is_empty(),
+        "product checkout changed before private verification");
     let target = protected_verifier_target(&root, registration)?;
     // Admission is the same production lease/storage accounting used by gates.
     // Do not recursively invoke cargo-managed.sh while this lease is held.
     let _lease = crate::build_storage::admit(&root, &target).await?;
-    let committed = verifier_checkout::materialize(&root, &head, registration, &target).await?;
+    let committed = verifier_checkout::materialize_from_files(&root, &head, registration, files, &target).await?;
     let mut receipts = Vec::new();
     for verifier in &registration.contract().verifiers {
-        registration.verify_integrity(&root)?;
+        registration.verify_files(files)?;
+        registration.verify_integrity(committed.path())?;
         let invocation = verifier.command.invocation()?;
         let observation = isolated_observation(committed.path(), &target, invocation, audit).await?;
         ensure!(
             actual_head(&root).await? == head,
             "checkout changed while verifying"
         );
-        receipts.push(registration.observe(&root, &verifier.id, binding.clone(), &observation)?);
+        ensure!(trusted_git(&root, &["status", "--porcelain", "--untracked-files=all"]).await?.is_empty(),
+            "product checkout changed during private verification");
+        receipts.push(registration.observe(committed.path(), &verifier.id, binding.clone(), &observation)?);
     }
     Ok(receipts)
 }
 
 fn protected_verifier_target(root: &Path, registration: &RegisteredContract) -> Result<PathBuf> {
+    protected_verifier_target_at(root,registration,&crate::build_storage::effective_target(root))
+}
+fn protected_verifier_target_at(root:&Path,registration:&RegisteredContract,builder:&Path)->Result<PathBuf> {
     use sha2::{Digest, Sha256};
     let binding = registration.binding(registration.baseline_head())?;
+    // Physical cache partition only: the existing managed owner still admits
+    // access, and this key provides no compiled-input freshness authority.
     let key = format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&(
+            crate::build_storage::repo_id(root)?,
             registration.contract_hash(),
             &binding.environment_id
         ))?)
     );
-    verifier_cache_sibling(root, &crate::build_storage::effective_target(root), &key)
+    verifier_cache_sibling(root, builder, &key)
 }
 fn verifier_cache_sibling(root: &Path, builder: &Path, key: &str) -> Result<PathBuf> {
     let parent = builder
@@ -564,6 +611,22 @@ async fn attest_registry(root: &Path, registry: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A pathname check, not a substitute for C's complete inode/input closure.
+fn check_verifier_root_separation(roots:&[(&str,&Path)])->Result<()> {
+    let canonical=roots.iter().map(|(name,path)| {
+        let path=path.canonicalize().context("verifier infrastructure: cannot resolve isolation root")?;
+        ensure!(path.is_dir(),"verifier infrastructure: isolation root is not a directory: {name}");
+        Ok((*name,path))
+    }).collect::<Result<Vec<_>>>()?;
+    for (index,(left_name,left)) in canonical.iter().enumerate() {
+        for (right_name,right) in &canonical[index+1..] {
+            ensure!(!left.starts_with(right) && !right.starts_with(left),
+                "verifier infrastructure: isolation roots overlap: {left_name}/{right_name}");
+        }
+    }
+    Ok(())
+}
+
 async fn isolated_observation(
     root: &Path,
     target: &Path,
@@ -571,16 +634,17 @@ async fn isolated_observation(
     audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<Observation> {
     use std::os::unix::fs::{symlink, PermissionsExt};
-    let canonical_target = target.canonicalize()?;
-    ensure!(
-        !root.starts_with(&canonical_target),
-        "build cache cannot contain verifier source"
-    );
+    let canonical_root=root.canonicalize().context("verifier infrastructure: cannot resolve source root")?;
+    let canonical_target=target.canonicalize().context("verifier infrastructure: cannot resolve cache root")?;
+    let root=canonical_root.as_path();
+    let target=canonical_target.as_path();
+    check_verifier_root_separation(&[("source",root),("cache",target)])?;
     let private = tempfile::Builder::new()
         .prefix("autoship-verifier-")
         .tempdir()?;
     let runtime = private.path().join("runtime");
     std::fs::create_dir(&runtime)?;
+    check_verifier_root_separation(&[("source",root),("cache",target),("runtime",&runtime)])?;
     let home = runtime.join("home");
     std::fs::create_dir(&home)?;
     let cargo_home = runtime.join("cargo");
@@ -805,10 +869,10 @@ mod tests {
             files:BTreeMap::from([(adapter.into(),"fn main(){println!(\"{}\",autoship_live_fixture::add(3,4));}\n".into())])};
         // execute_registered owns managed storage itself; run this already-built
         // opt-in test after cargo-managed exits, never inside its outer lease.
-        let baseline=register_and_reproduce(&root,proposal,&audit).await?;
+        let baseline=register_and_reproduce(&root,proposal.clone(),&audit).await?;
         ensure!(baseline.receipts.iter().all(|r|r.result==crate::autoship_contract::CheckResult::IntendedFailure),"baseline did not execute valid differing behavior");
         std::fs::write(root.join("src/lib.rs"),"pub fn add(left:i32,right:i32)->i32 {left+right}\n")?;commit(&root).await?;
-        let candidate=verify_candidate(&root,&baseline,&audit).await?;
+        let candidate=verify_candidate(&root,&baseline,&proposal.files,&audit).await?;
         let binding=baseline.registration.binding(&actual_head(&root).await?)?;
         ensure!(baseline.registration.candidate_passes(&baseline.receipts,&candidate,&binding)?,"actual Rust candidate was not verified green");
         audit.protected_health()?;
@@ -816,6 +880,63 @@ mod tests {
             "candidate":candidate,"binding":binding,"model_calls":0,"production_workflow_acceptance":false,"shipping_authority":false});
         audit.record_controller(receipt.clone())?;audit.protected_health()?;
         std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&receipt)?)?;
+        Ok(())
+    }
+    #[cfg(target_os="linux")]
+    #[tokio::test]
+    #[ignore = "requires delegated resources and execution outside the managed Cargo lease"]
+    async fn live_private_python_baseline_and_candidate_leave_product_clean() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let evidence=PathBuf::from(std::env::var("AUTOSHIP_PRIVATE_SOURCE_EVIDENCE")?);
+        ensure!(evidence.is_absolute(),"explicit private evidence path required");
+        std::fs::create_dir(&evidence)?;
+        std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+        let root=evidence.join("product");std::fs::create_dir(&root)?;
+        trusted_git(&root,&["init","--initial-branch=main"]).await?;
+        std::fs::write(root.join("arithmetic.py"),"def add(a,b): return a-b\n")?;
+        trusted_git(&root,&["add","arithmetic.py"]).await?;
+        trusted_git(&root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+            "commit","-m","synthetic original behavior"]).await?;
+        let base=actual_head(&root).await?;
+        let example=CONTRACT_PROMPT.split_once("Complete schema example:\n").context("example missing")?.1
+            .split_once("\nEnd schema example.").context("example incomplete")?.0;
+        let proposal=parse_proposal_for(&format!("```autoship-contract\n{example}\n```"),AcceptanceSource::PullRequest(841))?;
+        let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"private-python-roundtrip",Some(&root))?;
+        audit.require_run_resources()?;
+        let baseline=register_and_reproduce(&root,proposal.clone(),&audit).await?;
+        ensure!(baseline.registration.baseline_result(&baseline.receipts)?==BaselineResult::Reproduced,
+            "original behavior was not independently intended red");
+        ensure!(actual_head(&root).await?==base,"baseline changed product head");
+        ensure!(trusted_git(&root,&["status","--porcelain","--untracked-files=all"]).await?.is_empty(),
+            "baseline verification installed private adapters in the product checkout");
+        ensure!(!root.join("autoship_verifiers").exists(),"baseline published adapter directory");
+        std::fs::write(root.join("arithmetic.py"),"def add(a,b): return a+b\n")?;
+        trusted_git(&root,&["add","arithmetic.py"]).await?;
+        trusted_git(&root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+            "commit","-m","synthetic corrected behavior"]).await?;
+        let head=actual_head(&root).await?;
+        let control=evidence.join("control");std::fs::create_dir(&control)?;
+        std::fs::set_permissions(&control,std::fs::Permissions::from_mode(0o700))?;
+        let prepared=PreparedAcceptance{proposal,baseline};
+        let reference=verify_and_persist_candidate(&root,&prepared,&control,&worker_roots(&root),&audit).await?;
+        assert_verifier_receipt_current(&root,&prepared,&reference).await?;
+        let artifact:CandidateArtifact=private_json(&reference.artifact)?;
+        let candidate=artifact.receipts;
+        ensure!(prepared.baseline.registration.candidate_passes(&prepared.baseline.receipts,&candidate,&prepared.baseline.registration.binding(&head)?)?,
+            "actual private-source candidate behavior was not verified green");
+        let mut tampered=prepared.clone();
+        tampered.proposal.files.values_mut().next().context("adapter missing")?.push_str("# changed\n");
+        ensure!(assert_verifier_receipt_current(&root,&tampered,&reference).await.is_err(),
+            "modified protected adapter map reused a current receipt");
+        ensure!(actual_head(&root).await?==head && trusted_git(&root,&["status","--porcelain","--untracked-files=all"]).await?.is_empty(),
+            "candidate verification changed product head or files");
+        ensure!(trusted_git(&root,&["ls-tree","-r","--name-only","HEAD"]).await?=="arithmetic.py",
+            "candidate commit includes private adapters");
+        audit.protected_health()?;
+        std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({
+            "version":1,"kind":"private_python_product_clean_red_green","base":base,"head":head,
+            "baseline":prepared.baseline.receipts,"candidate":candidate,"model_calls":0,"shipping_authority":false,
+            "protected_receipt_current":true,"full_freshness_or_cleanup_acceptance":false}))?)?;
         Ok(())
     }
     fn fence_proposal(script:&str)->serde_json::Value {
@@ -914,6 +1035,47 @@ mod tests {
             assert!(harness_path(path));
         }
     }
+    #[test]
+    fn verifier_root_separation_checks_both_directions_runtime_and_symlink_aliases() {
+        let parent=tempfile::tempdir().unwrap();
+        let source=parent.path().join("source");let cache=parent.path().join("cache");let runtime=parent.path().join("runtime");
+        for root in [&source,&cache,&runtime] {std::fs::create_dir(root).unwrap();}
+        check_verifier_root_separation(&[("source",&source),("cache",&cache),("runtime",&runtime)]).unwrap();
+        for (left,right) in [(&source,&cache),(&source,&runtime),(&cache,&runtime)] {
+            check_verifier_root_separation(&[("left",left),("right",right)]).unwrap();
+            let nested=left.join("nested");std::fs::create_dir_all(&nested).unwrap();
+            for roots in [[("left",left.as_path()),("right",nested.as_path())],
+                [("left",nested.as_path()),("right",left.as_path())]] {
+                let error=check_verifier_root_separation(&roots).unwrap_err();
+                assert!(transient_verifier_infrastructure(&format!("{error:#}")));
+            }
+        }
+        let alias=parent.path().join("alias");std::os::unix::fs::symlink(&source,&alias).unwrap();
+        assert!(check_verifier_root_separation(&[("source",&alias),("cache",&source)]).is_err());
+        assert!(check_verifier_root_separation(&[("source",&source),("runtime",&alias)]).is_err());
+        let ancestor_alias=parent.path().join("ancestor-alias");std::os::unix::fs::symlink(parent.path(),&ancestor_alias).unwrap();
+        assert!(check_verifier_root_separation(&[("source",&source),("cache",&ancestor_alias)]).is_err());
+    }
+    #[cfg(target_os="linux")]
+    #[tokio::test]
+    async fn isolated_verifier_refuses_a_writable_cache_inside_its_source_before_launch() {
+        let source=tempfile::tempdir().unwrap();
+        let control=tempfile::tempdir_in("/tmp").unwrap();
+        let cache=source.path().join("cache");std::fs::create_dir(&cache).unwrap();
+        let adapter=cache.join("observer.py");
+        let body="from pathlib import Path\np=Path(__file__)\nsaved=p.read_bytes()\np.write_text('# changed during execution\\n')\np.write_bytes(saved)\n(p.parent/'ran').write_text('executed with writable adapter')\nprint('true')\n";
+        std::fs::write(&adapter,body).unwrap();
+        let result=isolated_observation(source.path(),&cache,
+            crate::autoship_contract::VerifierCommand::BlackBox {
+                invocation:crate::autoship_contract::BehaviorInvocation::PythonScript {file:"cache/observer.py".into(),args:vec![]},
+                oracle:crate::autoship_contract::OutputOracle::Json {value:serde_json::json!(true)}}.invocation().unwrap(),
+            &test_resource_audit(control.path())).await;
+        assert!(result.is_err(),"overlapping writable source was executed: {result:?}");
+        let error=format!("{:#}",result.unwrap_err());
+        assert!(transient_verifier_infrastructure(&error),"isolation refusal must not schedule product repair: {error}");
+        assert!(!cache.join("ran").exists(),"invalid source layout ran before rejection");
+        assert_eq!(std::fs::read_to_string(adapter).unwrap(),body);
+    }
     #[tokio::test]
     async fn real_isolated_python_assertion_and_protected_write() {
         // This tiny Python boundary fixture does not need the production Cargo
@@ -944,7 +1106,8 @@ mod tests {
         assert!(observation.stderr.contains("intended regression witness"));
         let protected = root.path().join("protected");
         std::fs::write(&protected, "unchanged").unwrap();
-        std::fs::write(root.path().join("test_case.py"), "import unittest\nclass Case(unittest.TestCase):\n def test_behavior(self):\n  with self.assertRaises(PermissionError):\n   open('protected', 'w')\n  import socket\n  with self.assertRaises(PermissionError):\n   socket.socket()\n").unwrap();
+        let adapter="import unittest\nfrom pathlib import Path\nclass Case(unittest.TestCase):\n def test_behavior(self):\n  with self.assertRaises(PermissionError):\n   open('protected', 'w')\n  original=Path(__file__).read_bytes()\n  with self.assertRaises(PermissionError):\n   Path(__file__).write_text('# changed before restore')\n   Path(__file__).write_bytes(original)\n  import socket\n  with self.assertRaises(PermissionError):\n   socket.socket()\n";
+        std::fs::write(root.path().join("test_case.py"),adapter).unwrap();
         let invocation = crate::autoship_contract::VerifierCommand::PythonUnittest {
             test: "test_case.Case.test_behavior".into(),
         }
@@ -955,6 +1118,8 @@ mod tests {
             .unwrap();
         assert_eq!(observation.exit_code, Some(0), "{}", observation.stderr);
         assert_eq!(std::fs::read_to_string(protected).unwrap(), "unchanged");
+        assert_eq!(std::fs::read_to_string(root.path().join("test_case.py")).unwrap(),adapter,
+            "read-only adapter changed during the child invocation");
     }
 }
 
@@ -963,6 +1128,13 @@ mod tests {
 pub(super) struct PreparedAcceptance {
     pub proposal: ContractProposal,
     pub baseline: BaselineEvidence,
+}
+impl PreparedAcceptance {
+    pub(super) fn verify_registration(&self)->Result<()> {
+        ensure!(self.proposal.contract==*self.baseline.registration.contract(),
+            "protected proposal differs from registered contract");
+        self.baseline.registration.verify_files(&self.proposal.files)
+    }
 }
 
 async fn trusted_git(root: &Path, args: &[&str]) -> Result<String> {
@@ -1042,29 +1214,20 @@ fn evidence_path(control: &Path, source: AcceptanceSource, base: &str) -> Result
     );
     Ok(control.join(format!("{}-base-{base}.json", source.key())))
 }
-fn install_candidate_harness(candidate: &Path, prepared: &PreparedAcceptance) -> Result<()> {
-    // Existing files must match exactly, including files installed before a
-    // restart. Never silently restore a builder-modified verifier.
-    let mut missing = prepared.proposal.clone();
-    missing
-        .files
-        .retain(|path, _| !candidate.join(path).exists());
-    for (relative, bytes) in &prepared.proposal.files {
-        let path = candidate.join(relative);
-        if path.exists() {
-            let metadata = std::fs::symlink_metadata(&path)?;
-            ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
-                "candidate verifier is not a regular file"
-            );
-            ensure!(
-                std::fs::read(&path)? == bytes.as_bytes(),
-                "candidate attempted to change registered verifier"
-            );
-        }
-    }
-    install_harness(candidate, &missing)?;
-    prepared.baseline.registration.verify_integrity(candidate)
+pub(super) async fn validate_candidate_harness(candidate: &Path, prepared: &PreparedAcceptance) -> Result<()> {
+    // Protected proposal bytes are the only adapter source. Worker copies,
+    // including ignored legacy files and symlinks, supply no verifier authority.
+    // A literal committed collision requires explicit legacy recovery instead.
+    prepared.verify_registration()?;
+    let head = actual_head(candidate).await?;
+    assert_no_registered_adapters(
+        candidate, &head, &prepared.baseline.registration, &prepared.proposal.files,
+    ).await?;
+    ensure!(
+        actual_head(candidate).await? == head,
+        "candidate head changed during private verifier validation"
+    );
+    Ok(())
 }
 
 /// `base` comes from the workflow's saved pre-builder base, NEVER current
@@ -1121,7 +1284,7 @@ pub(super) async fn prepare_acceptance_for(
             "acceptance store is writable by worker"
         );
     }
-    amendment::resume_pending(candidate, &control, source).await?;
+    amendment::resume_pending(candidate, &control, source, workflow).await?;
     let manifest = original_manifest(&control, source)?;
     let original_base = manifest
         .as_ref()
@@ -1208,7 +1371,8 @@ pub(super) async fn prepare_acceptance_for(
         let result:Result<(ContractProposal,BaselineEvidence)> = async { match proposal_result {
             Ok(proposal) => match register_and_reproduce(&baseline_root, proposal.clone(), &workflow.audit_logger()).await {
                 Ok(baseline)=>Ok((proposal,baseline)),
-                Err(error) if error.downcast_ref::<BaselineNotRed>().is_some()=>{
+                Err(error) if error.downcast_ref::<BaselineNotRed>().is_some()
+                    || error.downcast_ref::<VerifierSourceCollision>().is_some()=>{
                     workflow.check_resource_policy()?;
                     let epoch=amendment::digest(format!("{source}|{base}|{}|{}",environment_id(&baseline_root)?,serde_json::to_string(required_criteria)?).as_bytes());
                     // Only this controller-owned disposable baseline is reset.
@@ -1268,33 +1432,22 @@ pub(super) async fn prepare_acceptance_for(
     // Main may have advanced; preserve the original reproduced base. Only a
     // candidate that no longer descends from it needs explicit re-scoping.
     trusted_git(candidate, &["merge-base", "--is-ancestor", base, "HEAD"]).await?;
-    install_candidate_harness(candidate, &prepared)?;
-    augmentagent_channel_core::autoship_write_scope::register(
-        candidate,
-        prepared.baseline.registration.contract_hash(),
-        prepared
-            .proposal
-            .contract
-            .allowed_paths
-            .iter()
-            .map(|scope| match scope {
-                crate::autoship_contract::PathScope::File(path) => {
-                    augmentagent_channel_core::autoship_write_scope::DeclaredPath {
-                        path: path.clone(),
-                        directory: false,
-                    }
-                }
-                crate::autoship_contract::PathScope::Directory(path) => {
-                    augmentagent_channel_core::autoship_write_scope::DeclaredPath {
-                        path: path.clone(),
-                        directory: true,
-                    }
-                }
-            })
-            .collect(),
-        prepared.proposal.files.keys().cloned().collect(),
-    )?;
+    validate_candidate_harness(candidate, &prepared).await?;
+    bind_write_scope(candidate,&prepared,None)?;
     Ok(prepared)
+}
+
+/// Bind the same registered write policy for ordinary and owner execution.
+pub(super) fn bind_write_scope(candidate:&Path,prepared:&PreparedAcceptance,previous:Option<&RegisteredContract>)->Result<()> {
+    prepared.verify_registration()?;
+    let allowed=prepared.proposal.contract.allowed_paths.iter().map(|scope|match scope {
+        crate::autoship_contract::PathScope::File(path)=>augmentagent_channel_core::autoship_write_scope::DeclaredPath {path:path.clone(),directory:false},
+        crate::autoship_contract::PathScope::Directory(path)=>augmentagent_channel_core::autoship_write_scope::DeclaredPath {path:path.clone(),directory:true},
+    }).collect();
+    let pinned=prepared.proposal.files.keys().cloned().collect();
+    if let Some(previous)=previous {
+        augmentagent_channel_core::autoship_write_scope::replace_registered(candidate,previous.contract_hash(),prepared.baseline.registration.contract_hash(),allowed,pinned)
+    }else {augmentagent_channel_core::autoship_write_scope::register(candidate,prepared.baseline.registration.contract_hash(),allowed,pinned)}
 }
 
 #[cfg(test)]
@@ -1407,7 +1560,7 @@ mod workflow_tests {
             },
         };
         assert!(
-            install_candidate_harness(root.path(), &prepared).is_err(),
+            validate_candidate_harness(root.path(), &prepared).await.is_err(),
             "restart must not repair away verifier tampering"
         );
     }
@@ -1599,7 +1752,7 @@ pub(super) async fn verify_and_persist_candidate(
     writable_roots: &[PathBuf],
     audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<CandidateReceiptReference> {
-    let receipts = verify_candidate(candidate, &prepared.baseline, audit).await?;
+    let receipts = verify_candidate(candidate, &prepared.baseline, &prepared.proposal.files, audit).await?;
     let binding = prepared
         .baseline
         .registration
@@ -2043,7 +2196,7 @@ pub(super) async fn verify_with_repair_for(
                         0,
                     )
                     .await?;
-                let prompt = format!("Repair {} against the independently registered executable acceptance contract. Do not modify or remove pinned verifier files. Fix implementation, not assertions. Failure: {}\nContract: {}", source, detail, serde_json::to_string(prepared.baseline.registration.contract())?);
+                let prompt = format!("Repair {} against the independently registered executable acceptance contract. The pinned verifier adapters are private controller source. Preserve every registered criterion and oracle; do not recreate or change adapter paths in the product checkout. Failure: {}\nContract: {}", source, detail, serde_json::to_string(prepared.baseline.registration.contract())?);
                 adoption::revise(
                     reasoner,
                     workflow,
@@ -2101,7 +2254,8 @@ pub(super) async fn assert_verifier_receipt_current(
         prepared.baseline.registration.binding(&head)? == reference.binding,
         "acceptance receipt no longer matches candidate"
     );
-    prepared.baseline.registration.verify_integrity(worktree)?;
+    prepared.verify_registration()?;
+    assert_no_registered_adapters(worktree,&head,&prepared.baseline.registration,&prepared.proposal.files).await?;
     let bytes = std::fs::read(&reference.artifact)?;
     ensure!(
         format!("{:x}", Sha256::digest(&bytes)) == reference.artifact_sha256,
@@ -2151,6 +2305,34 @@ mod control_namespace_tests {
 #[cfg(test)]
 mod verifier_cache_tests {
     use super::*;
+    #[tokio::test]
+    async fn verifier_cache_partitions_repositories_but_shares_their_worktrees() {
+        let parent=tempfile::tempdir().unwrap();
+        let first=parent.path().join("first");let second=parent.path().join("second");
+        for root in [&first,&second] {
+            std::fs::create_dir(root).unwrap();
+            trusted_git(root,&["init","--initial-branch=main"]).await.unwrap();
+            std::fs::write(root.join("product.py"),"SYNTHETIC\n").unwrap();
+            trusted_git(root,&["add","product.py"]).await.unwrap();
+            trusted_git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+                "commit","-m","synthetic product"]).await.unwrap();
+        }
+        let example=CONTRACT_PROMPT.split_once("Complete schema example:\n").unwrap().1
+            .split_once("\nEnd schema example.").unwrap().0;
+        let proposal=parse_proposal_for(&format!("```autoship-contract\n{example}\n```"),AcceptanceSource::PullRequest(841)).unwrap();
+        let registration=RegisteredContract::register_from_files(proposal.contract,"1".repeat(40),
+            "same-synthetic-environment".into(),&proposal.files).unwrap();
+        // Path planning only: this fixture compiles no Cargo output and must
+        // not depend on an operator cache directory existing on a CI runner.
+        let builder=parent.path().join("builder");std::fs::create_dir(&builder).unwrap();
+        let a=protected_verifier_target_at(&first,&registration,&builder).unwrap();
+        let b=protected_verifier_target_at(&second,&registration,&builder).unwrap();
+        assert_ne!(a,b,"independent repositories must not select each other's owned cache");
+        let worktree=parent.path().join("worktree");
+        trusted_git(&first,&["worktree","add","--detach",worktree.to_str().unwrap(),"HEAD"]).await.unwrap();
+        assert_eq!(a,protected_verifier_target_at(&worktree,&registration,&builder).unwrap(),
+            "one repository's worktrees must preserve compatible managed cache reuse");
+    }
     #[test]
     fn verifier_cache_is_a_distinct_sibling_and_symlink_alias_is_refused() {
         let parent = tempfile::tempdir().unwrap();
@@ -2370,7 +2552,7 @@ pub(super) fn historical_fixture(root:&Path, modern:&PreparedAcceptance)->Result
     // binaries and source compiler inputs; never invent a current fingerprint.
     let previous_engine = environment_id_with_exporter(root, None)?;
     ensure!(previous_engine != environment_id(root)?, "historical fixture must have an older engine fingerprint");
-    let registration=RegisteredContract::register(root,proposal.contract.clone(),modern.baseline.registration.baseline_head().into(),previous_engine)?;
+    let registration=RegisteredContract::register_from_files(proposal.contract.clone(),modern.baseline.registration.baseline_head().into(),previous_engine,&proposal.files)?;
     // Historical cached claims are deliberately not re-endorsed by observe().
     let receipts=modern.baseline.receipts.iter().cloned().map(|mut receipt| {
         receipt.binding=registration.binding(registration.baseline_head()).unwrap();receipt

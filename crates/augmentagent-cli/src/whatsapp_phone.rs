@@ -320,7 +320,9 @@ mod tests {
             );
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        // AF_UNIX paths must remain short under a managed build TMPDIR.
+        let dir = tempfile::Builder::new().prefix("sock-")
+            .tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
         let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
         let account = SurfaceAccountRef::new(
             SurfacePlatform::new("whatsapp").unwrap(),

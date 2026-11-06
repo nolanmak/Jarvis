@@ -8113,7 +8113,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
 
     // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
     let opts = fix_opts(worktree.clone());
-    let prompt = format!("{}\nThe controller installed independently registered immutable regression harnesses. Do not edit/remove them; implement against this exact contract: {}",
+    let prompt = format!("{}\nThe controller keeps independently registered immutable verifier adapters outside this product checkout. Do not create, copy or change those adapter paths in product commits; implement against this exact contract: {}",
         build_fix_prompt_with_criteria(&issue, plan.as_deref(), prior_attempts.as_deref(), &criteria),
         serde_json::to_string(prepared_acceptance.baseline.registration.contract())?);
     let mut summary = match reasoner.call_with_storage(&opts, &prompt).await {

@@ -75,7 +75,7 @@ impl Input {
         self.validate_proposal(&prepared.proposal,previous)?;
         let parsed=parse_proposal_for(&format!("```autoship-contract\n{}\n```",serde_json::to_string(&prepared.proposal)?),self.source)?;
         ensure!(serde_json::to_value(&parsed)?==serde_json::to_value(&prepared.proposal)?,"owner acceptance artifact proposal changed");
-        let registration=&prepared.baseline.registration;registration.verify_file_contents(&prepared.proposal.files)?;
+        let registration=&prepared.baseline.registration;registration.verify_files(&prepared.proposal.files)?;
         ensure!(prepared.proposal.contract==*registration.contract() && registration.baseline_head()==self.baseline_head
             && registration.baseline_result(&prepared.baseline.receipts)?==BaselineResult::Reproduced,"owner acceptance lacks its original intended-red baseline");
         if let Some(previous)=previous {
@@ -90,8 +90,9 @@ impl Input {
 struct Stored {input:Input,prepared:PreparedAcceptance}
 
 /// Constructible only by this independent producer. A private file alone cannot
-/// construct activation authority. Applying changed verifier files remains a
-/// separately guarded, recoverable transaction before contract activation.
+/// construct activation authority. Adapter bytes remain controller-private;
+/// canonical manifest publication and interrupted activation recovery still
+/// require their protected journal before the productive worker is enabled.
 pub(in crate::self_improve) struct PreparedOwnerAcceptance {
     input:Input,
     prepared:PreparedAcceptance,
@@ -120,7 +121,7 @@ async fn prepare_at(candidate:&Path,workflow:&workflow::WorkflowGuard,source:Acc
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt,MetadataExt,PermissionsExt};
     let turn=workflow.owner_acceptance_turn(candidate,source,previous)?;
-    if let Some(previous)=previous {previous.verify_integrity(candidate)?;}
+    if let Some(previous)=previous {previous.verify_metadata()?;}
     ensure!(actual_head(candidate).await?==turn.binding.head,"owner acceptance candidate head changed");
     let input=Input::new(&turn,source,base,scope,required,previous)?;let epoch=input.key()?;
     std::fs::create_dir_all(control)?;
@@ -160,6 +161,15 @@ async fn prepare_at(candidate:&Path,workflow:&workflow::WorkflowGuard,source:Acc
     let result=PreparedOwnerAcceptance {input,prepared};result.validate_current(workflow,candidate,previous)?;
     ensure!(actual_head(candidate).await?==turn.binding.head,"owner acceptance candidate moved after preparation");
     Ok(result)
+}
+
+/// Fixture proof after validating synthetic, privately stored baseline data.
+#[cfg(test)]
+pub(in crate::self_improve) fn test_from_prepared(candidate:&Path,workflow:&workflow::WorkflowGuard,prepared:&PreparedAcceptance)->Result<PreparedOwnerAcceptance> {
+    let source=prepared.proposal.contract.source()?;let turn=workflow.owner_acceptance_turn(candidate,source,None)?;
+    let required=prepared.proposal.contract.criteria.iter().map(|c|c.requirement.clone()).collect::<Vec<_>>();
+    let input=Input::new(&turn,source,prepared.baseline.registration.baseline_head(),"fixture source",&required,None)?;
+    input.validate_prepared(prepared,None)?;Ok(PreparedOwnerAcceptance {input,prepared:prepared.clone()})
 }
 
 /// Exercise the production cached factory with actual guarded owner metadata.

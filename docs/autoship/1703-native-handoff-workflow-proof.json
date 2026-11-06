@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "f32f43a2f1d0eae5fb54f84766fc76ea877c8036",
+  "source_parent_commit": "021142d6f714db094f011a09fec73f72e687a84c",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -110,7 +110,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "da63dc9e54789c1cb55f51d113c92f2c59ee15a97bdb70292f197ae43455cef2"
+      "sha256": "b8dc1b87537d14b491e6b8eb32665aa7d8f78766508e9bfc9c0b314931c61206"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_recovery.rs",
@@ -134,7 +134,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve.rs",
-      "sha256": "6c896dfa7063003d74683da2471d072ce692be64ea1cc785351d7ef6c2d45440"
+      "sha256": "7c78d0bac78a5925dd1966e00fec9e5b903c23d0ed71996d8a0f1ca000677d4b"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_revision_history.rs",
@@ -142,7 +142,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_revision.rs",
-      "sha256": "5091aa71a9a3d7f461605e46cc7bdb7072d0ccb4032022f85bca46dbf14c95b7"
+      "sha256": "75a203c30ee58700ce563f1ae5bc98c7adb214df15aa87bcc2702326b39021f6"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_inbox.rs",
@@ -198,11 +198,11 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_contract.rs",
-      "sha256": "bfbf311fdec90c5c33a4c55e83986369b744bcec3cbc3ef80e763a16a04b4aa4"
+      "sha256": "15133a09895615795438bc28b8be3faf9eebde98daa1e9a3f0c75d44d9288fea"
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_contract.rs",
-      "sha256": "91698b334a5bf4d8c500cfaf28c3be96e7806f23abc9faba4b7a3f2edeb2a15d"
+      "sha256": "678b63b23e1689cd448651ca067f48344679fc3afa708111b50766f8d85b7802"
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_scope.rs",
@@ -210,14 +210,58 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_owner_acceptance.rs",
-      "sha256": "75213eff90b02c5a1a5d10fd49fac789035cfe2320b9d922a5da4c961468b5d6"
+      "sha256": "5d3aa9936fb46fd126bdc23d24e8b5fad784cb07eed5893766a11df324fc50c9"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/autoship_write_scope.rs",
+      "sha256": "78319e32495111c6c54241f06084b043f9294810ba80489484afde49ebaa499f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_contract_tests.rs",
+      "sha256": "ffb5d9776b3ba9f22e2705943ac968c4f1d2586c3c993c04d7846cc37329bd6a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/build_storage.rs",
+      "sha256": "1b1dd81bf404877ed1226cfb634706c459e9e19fb726eaa54337b40a01cef046"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_amendment.rs",
+      "sha256": "bb596260ec1c036bf4f86bd795555583a084c4b033adc665ab4d8015804c6327"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_candidate_source_tests.rs",
+      "sha256": "86460041fcca6751b6229397ddbef98cdaf587a288472c55e36fe73e44b7b663"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_episode.rs",
+      "sha256": "eb09c2b801afc7bb518f5d24fc2dd50ff15abb15a0d000915b5e162ee9d770b0"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_legacy_verifier.rs",
+      "sha256": "5b697d5a7a36d3d518b1b82fc058b0df56270fc89d505b2f9f48dd27a1def86f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_progress_tests.rs",
+      "sha256": "6c3af65efa19f121cfeb6f09ed85706588881b16a325e873108e1c68a463ad35"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_review.rs",
+      "sha256": "ef977b8e9c6ed1621081dc03a3ee6cb796fbae5a72d1ecd5f80e096fa0e2a781"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_verifier_checkout.rs",
+      "sha256": "a2444cf1bfd6039750a7d76878ec75db3f0725ad68841093e369a5fa9f8e86b2"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/whatsapp_phone.rs",
+      "sha256": "ddccb3358620088e0089a9bf29232d48d9f641b292d5c1ebc7b19aa7ee6cd89d"
     }
   ],
   "results": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent -- --test-threads=8",
-    "passed": 1875,
+    "passed": 1904,
     "failed": 0,
-    "ignored": 33,
+    "ignored": 34,
     "handoff_snapshot_cases": 10,
     "pending_handoff_cases": 8,
     "retained_logs": [
@@ -386,13 +430,25 @@
       "autoship-owner-acceptance-production-check.log",
       "autoship-owner-acceptance-final-focused.log",
       "autoship-owner-acceptance-final-cli.log",
-      "autoship-owner-acceptance-final-production-check.log"
+      "autoship-owner-acceptance-final-production-check.log",
+      "autoship-owner-private-source-activation-red.log",
+      "autoship-owner-private-source-guard-green.log",
+      "autoship-owner-write-scope-replay-red.log",
+      "autoship-owner-write-scope-replay-green.log",
+      "autoship-owner-private-source-full-core.log",
+      "autoship-owner-private-source-full-cli.log",
+      "autoship-owner-private-source-production-check.log",
+      "autoship-owner-private-body-context-red.log",
+      "autoship-owner-private-body-context-green.log",
+      "autoship-owner-private-source-final-cli.log",
+      "autoship-owner-private-source-final-production-check.log",
+      "autoship-owner-private-source-final-production-check-retry.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
     "owner_eligibility_cases": 6,
     "focused_native_observation_cases": 33,
-    "core_passed": 895,
+    "core_passed": 897,
     "core_failed": 0,
     "core_ignored": 15,
     "owner_retirement_marker_cases": 3,
@@ -414,12 +470,12 @@
     "core_validation_scope": "full managed core library suite; source inventory is post-run and grants no compiled-source freshness authority",
     "pending_reconciliation_cases": 9,
     "joined_reconciliation_adapter_cases": 1,
-    "core_validation_source_commit": "83140a7a plus first-builder core changes (post-run source inventory only; no compiled-source authority)",
+    "core_validation_source_commit": "021142d6 plus PR1872 merge and private-owner integration source (post-run inventory only)",
     "callback_journal_cases": 4,
     "production_configuration_check": {
       "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
       "passed": true,
-      "log": "autoship-owner-acceptance-final-production-check.log"
+      "log": "autoship-owner-private-source-final-production-check-retry.log"
     },
     "guard_promotion_cases": 3,
     "read_only_audit_probe_cases": 2,
@@ -580,7 +636,8 @@
     "actual provider/VM continuation after closed-workflow recovery, remaining nonterminal owner execution-retry/owner-turn retirement routing, and missing/legacy/vanished authority recovery remain unproven",
     "real owner-message worker consumption, guarded completion/reply and Discord coding gateway activation remain unimplemented; metadata/guard readiness never substitutes for actual provider/VM/Discord acceptance",
     "new published head hosted checks and protected main synchronization/review remain required",
-    "Private owner acceptance producer exists, but worker consumption, recoverable verifier application and safe projection of every public GitHub output remain required before native Discord coding activation."
+    "Private owner acceptance producer exists, but worker consumption, recoverable verifier application and safe projection of every public GitHub output remain required before native Discord coding activation.",
+    "Private verifier map integration removes candidate installation for new owner contracts; canonical protected manifest activation/recovery, complete backend C proof, legacy removal and worker/private-output continuation remain required."
   ],
   "native_transfer_scope": "isolated synthetic-controller/native-filesystem fixtures only; zero production transfers or provider/model dispatch",
   "opaque_receipt_producer": "actual original-bound ownership::transfer_receipt lookup or Completed NativeTransferInspection under the held original native lock; no wire/serialized-receipt constructor",
@@ -1148,7 +1205,7 @@
     "discord_coding_enabled": false,
     "reply_delivery_enabled": false,
     "remaining": [
-      "Authorized worker routing, use of independent acceptance producer and safe verifier application",
+      "Authorized worker routing and canonical protected acceptance journal activation/recovery",
       "actual first-builder provider/VM dispatch acceptance and complete retained-history provider resolution",
       "interrupted owner execution/result recovery",
       "actual private per-request delivery acceptance and rare irrecoverable-send operator resolution",
@@ -1246,6 +1303,41 @@
       "Private projection across public PR bodies, review notes, failure comments and all other publication paths before enabling private owner coding",
       "Interrupted owner execution/result recovery and controlled provider switching",
       "Actual fresh native scoping, sandboxed VM baseline/body execution and Discord acceptance through normal deployment; full #1715 closure"
+    ]
+  },
+  "integration_merge_parent": "b26f9f85182754550b9bb2d020667f4f2e449578",
+  "owner_private_source_integration": {
+    "scope": "PR1872 private-verifier source integrated into native-owner recovery. Protected maps now supply productive owner activation and first-builder preparation; candidate adapter installation is unnecessary. Worker owner-message consumer remains disconnected.",
+    "activation": "Current opaque owner preparation, exact registered map and intended-red baseline validate before metadata activation. Literal committed adapter collisions refuse. Native authority transfers through the original store; the registered write policy binds before the guard escapes. Old physical-file metadata activation helpers compile only in tests. Canonical protected manifest publication and interrupted activation recovery remain incomplete.",
+    "first_builder": "Exact protected maps and committed source validation replace worker-file authority. All untracked/ignored owner files refuse first-builder dispatch; private maps need no worker copies. Fixtures use dedicated private maps and private observation roots; no production integrity check is skipped.",
+    "write_scope": "The production replacement API now checks source identity and exact complete permission equality on active-contract replay. A changed allowed or pinned map refuses without silently rewriting it. Final source read compares the complete previous record. This is not a proof of full old-writer/kernel quiescence cutover.",
+    "builder_context": "Registered map/hash and bounded context validate before body reservation. The production prompt includes every registered criterion ID/requirement and product scopes, omitting private adapter bytes, oracle values and explicit adapter edit paths. Actual provider transport remains unexercised.",
+    "behavioral_reds": [
+      "Production cached owner factory/guard activation failed with missing verifier file when the fixture stopped installing it into product. The same path now activates while product remains adapter-free.",
+      "Actual public write-scope replacement accepted mismatched saved permissions under an active contract name; it now refuses both allowed/pinned mismatches. Exact replay and stale replacement controls pass.",
+      "The extracted unchanged owner prompt omitted registered requirements. Its production helper now supplies registered context and refuses wrong/corrupt metadata without exposing private verifier/oracle literals."
+    ],
+    "validation": {
+      "core_passed": 897,
+      "core_failed": 0,
+      "core_ignored": 15,
+      "cli_passed": 1904,
+      "cli_failed": 0,
+      "cli_ignored": 34,
+      "cli_test_threads": 8,
+      "guard_modes_passed": 65,
+      "production_check": "passed on retry after terminal storage-admission deferral"
+    },
+    "fixture_scope": "Private cached factory, real temporary Git/SQLite/native metadata and original-store transfer fixtures. Baseline observations/controller/resource receipts are synthetic. Prompt test exercises the production formatter. No live model/provider/VM/Discord dispatch, compiled-freshness authority, complete kernel cleanup, autonomous merge or deployment acceptance is claimed.",
+    "production_changed": false,
+    "worker_owner_consumer_enabled": false,
+    "live_discord_acceptance": false,
+    "remaining": [
+      "Canonical protected acceptance manifest/journal activation and interrupted owner-turn recovery",
+      "Actual verifier backend freshness/storage descriptor/reservation/kernel-quiescence and old-writer cutover proof (#1807/#1811)",
+      "Authenticated protocol-1 recovery and guarded application of legacy adapter removal plan",
+      "Private projection across every public GitHub output",
+      "Authorized worker/provider/authorship wiring, owner continuation, actual native/Discord acceptance, protected rollout and full #1715 soak"
     ]
   }
 }

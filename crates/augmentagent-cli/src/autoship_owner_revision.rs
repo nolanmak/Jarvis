@@ -8,14 +8,21 @@ pub(super) fn validate_history(conn:&Connection,workflow:&str)->Result<()> {hist
 fn baseline_digest(receipts:&[VerifierReceipt])->Result<String> {
     Ok(format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(receipts)?)?)))
 }
+enum VerifierAuthority<'a> {
+    Private(&'a std::collections::BTreeMap<String,String>),
+    #[cfg(test)]
+    Candidate(&'a Path),
+}
 impl WorkflowStore {
     /// Controller supplies an independently prepared registration. This records
     /// metadata activation only: baseline/candidate checks and review still gate shipping.
+    #[cfg(test)]
     pub fn activate_owner_revision(&mut self,turn:&OwnerTurn,previous:&RegisteredContract,next:&RegisteredContract,binding:&Binding,root:&Path,now:i64)->Result<OwnerTurn> {
-        self.activate_owner_contract(turn,Some(previous),next,None,binding,root,now)
+        self.activate_owner_contract(turn,Some(previous),next,None,binding,VerifierAuthority::Candidate(root),now)
     }
     /// Only the owning guard can attest that its current contract is still
     /// unregistered intake. Registration is not owner-input completion.
+    #[cfg(test)]
     pub(crate) fn activate_initial_owner_acceptance(&mut self,proof:&crate::self_improve::InitialOwnerAcceptance,
         turn:&OwnerTurn,next:&RegisteredContract,baseline:&[VerifierReceipt],binding:&Binding,root:&Path,now:i64)->Result<OwnerTurn> {
         ensure!(proof.matches(turn),"initial owner acceptance guard changed");
@@ -25,11 +32,28 @@ impl WorkflowStore {
             AcceptanceSource::PullRequest(n)=>pr_workflow_id(&request.repository,n)?,
         };
         ensure!(expected==turn.lease.workflow,"initial owner acceptance source changed");
-        self.activate_owner_contract(turn,None,next,Some(baseline),binding,root,now)
+        self.activate_owner_contract(turn,None,next,Some(baseline),binding,VerifierAuthority::Candidate(root),now)
+    }
+    /// Trusted controller metadata only. Adapter authority comes from the
+    /// protected registration map, never from worker files or ignored copies.
+    pub(crate) fn activate_private_owner_acceptance(&mut self,proof:Option<&crate::self_improve::InitialOwnerAcceptance>,
+        turn:&OwnerTurn,previous:Option<&RegisteredContract>,next:&RegisteredContract,baseline:&[VerifierReceipt],files:&std::collections::BTreeMap<String,String>,binding:&Binding,now:i64)->Result<OwnerTurn> {
+        ensure!(next.baseline_result(baseline)?==BaselineResult::Reproduced,"private owner acceptance lacks intended-red baseline");
+        if previous.is_none() {
+            ensure!(proof.context("initial owner acceptance guard missing")?.matches(turn),"initial owner acceptance guard changed");
+            let request=self.command_request(&turn.lease.workflow)?.context("initial owner acceptance command missing")?;
+            let expected=match next.contract().source()? {AcceptanceSource::Issue(n)=>workflow_id(&request.repository,n)?,AcceptanceSource::PullRequest(n)=>pr_workflow_id(&request.repository,n)?};
+            ensure!(expected==turn.lease.workflow,"initial owner acceptance source changed");
+        }else {ensure!(proof.is_none(),"revised owner acceptance cannot reuse intake proof");}
+        self.activate_owner_contract(turn,previous,next,previous.is_none().then_some(baseline),binding,VerifierAuthority::Private(files),now)
     }
     fn activate_owner_contract(&mut self,turn:&OwnerTurn,previous:Option<&RegisteredContract>,next:&RegisteredContract,
-        baseline:Option<&[VerifierReceipt]>,binding:&Binding,root:&Path,now:i64)->Result<OwnerTurn> {
-        next.verify_integrity(root)?;binding.validate()?;
+        baseline:Option<&[VerifierReceipt]>,binding:&Binding,authority:VerifierAuthority<'_>,now:i64)->Result<OwnerTurn> {
+        match authority {VerifierAuthority::Private(files)=>next.verify_files(files)?,
+            #[cfg(test)]
+            VerifierAuthority::Candidate(root)=>next.verify_integrity(root)?,
+        }
+        binding.validate()?;
         ensure!(binding.head==turn.binding.head && binding.contract==next.contract_hash(),"owner contract binding mismatch");
         let (old,kind)=if let Some(previous)=previous {
             previous.verify_metadata()?;
