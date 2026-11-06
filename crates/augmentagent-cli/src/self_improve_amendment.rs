@@ -731,55 +731,35 @@ pub(super) async fn resume_pending(
         &serde_json::to_vec(&current)?,
     )?;
     workflow.read_acceptance_metadata(||require_original_manifest_history(control,&pending))?;
-    if !already_active {
-        workflow.validate_before_side_effect()?;
-        augmentagent_channel_core::autoship_write_scope::replace_registered(
-            root,
-            pending.old.baseline.registration.contract_hash(),
-            pending.next.baseline.registration.contract_hash(),
-            pending
-                .next
-                .proposal
-                .contract
-                .allowed_paths
-                .iter()
-                .map(|scope| match scope {
-                    crate::autoship_contract::PathScope::File(path) => {
-                        augmentagent_channel_core::autoship_write_scope::DeclaredPath {
-                            path: path.clone(),
-                            directory: false,
-                        }
-                    }
-                    crate::autoship_contract::PathScope::Directory(path) => {
-                        augmentagent_channel_core::autoship_write_scope::DeclaredPath {
-                            path: path.clone(),
-                            directory: true,
-                        }
-                    }
-                })
-                .collect(),
-            pending.next.proposal.files.keys().cloned().collect(),
-        )?;
-        let mut file = tempfile::NamedTempFile::new_in(control)?;
-        file.write_all(&serde_json::to_vec(&manifest)?)?;
-        file.as_file().sync_all()?;
-        workflow.with_acceptance_metadata(|_access| {
-            let latest=read_manifest_unsettled(control,source)?.context("amendment original manifest disappeared")?;
-            ensure!(latest==current || latest==manifest,"amendment manifest changed before replacement");
-            if latest!=manifest {
-                file.persist(control.join(format!("{}-workflow.json", source.key()))).map_err(|e|e.error)?;
-                std::fs::File::open(control)?.sync_all()?;
-            }
-            Ok(())
-        })?;
-    }
-    workflow.with_acceptance_metadata(|access| {
-        ensure!(read_manifest_unsettled(control,source)?.as_ref()==Some(&manifest),"amendment canonical manifest changed before completion");
-        let saved:Pending=private_json(&path)?;
-        ensure!(serde_json::to_value(&saved)?==serde_json::to_value(&pending)?,"amendment pending transaction changed before completion");
-        immutable_with_metadata(control,&format!("{}-amendment-complete-{}.json",source.key(),pending.next.baseline.registration.contract_hash()),&serde_json::to_vec(&pending)?,access)?;
-        std::fs::remove_file(&path)?;
-        std::fs::File::open(control)?.sync_all()?;Ok(())
+    workflow.validate_before_side_effect()?;
+    // Every replay, including an already-published manifest, must retain the
+    // exact registered scope while canonical metadata and completion settle.
+    // Scope precedes the short workflow transaction; no subprocess enters it.
+    with_bound_write_scope(root,&pending.next,Some(&pending.old.baseline.registration),|scope| {
+        scope.validate_current()?;
+        if !already_active {
+            let mut file=tempfile::NamedTempFile::new_in(control)?;
+            file.write_all(&serde_json::to_vec(&manifest)?)?;file.as_file().sync_all()?;
+            workflow.with_acceptance_metadata(|_access| {
+                scope.validate_current()?;
+                let latest=read_manifest_unsettled(control,source)?.context("amendment original manifest disappeared")?;
+                ensure!(latest==current || latest==manifest,"amendment manifest changed before replacement");
+                if latest!=manifest {
+                    file.persist(control.join(format!("{}-workflow.json",source.key()))).map_err(|e|e.error)?;
+                    std::fs::File::open(control)?.sync_all()?;
+                }
+                Ok(())
+            })?;
+        }
+        workflow.with_acceptance_metadata(|access| {
+            scope.validate_current()?;
+            ensure!(read_manifest_unsettled(control,source)?.as_ref()==Some(&manifest),"amendment canonical manifest changed before completion");
+            let saved:Pending=private_json(&path)?;
+            ensure!(serde_json::to_value(&saved)?==serde_json::to_value(&pending)?,"amendment pending transaction changed before completion");
+            immutable_with_metadata(control,&format!("{}-amendment-complete-{}.json",source.key(),pending.next.baseline.registration.contract_hash()),&serde_json::to_vec(&pending)?,access)?;
+            std::fs::remove_file(&path)?;
+            std::fs::File::open(control)?.sync_all()?;Ok(())
+        })
     })?;
     Ok(Some(pending.next))
 }
@@ -981,6 +961,31 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
+    #[tokio::test]
+    async fn acceptance_metadata_commit_retains_registered_scope_lock() {
+        let (root,prepared)=fixture();
+        trusted_git(root.path(),&["init","--initial-branch=main"]).await.unwrap();
+        trusted_git(root.path(),&["add","."]).await.unwrap();
+        trusted_git(root.path(),&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-m","scope metadata fixture"]).await.unwrap();
+        let head=actual_head(root.path()).await.unwrap();trusted_git(root.path(),&["update-ref","refs/remotes/origin/main",&head]).await.unwrap();
+        let control=tempfile::tempdir_in("/tmp").unwrap();let state=tempfile::tempdir_in("/tmp").unwrap();
+        let database=state.path().join("workflow.db");
+        let guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:Some(42),pr:None,branch:"fixture",contract:"C1",environment:"fixture"}).await.unwrap().unwrap();
+        // Real metadata guard and write-scope service; no native/provider or
+        // completed publication authority is inferred from this fixture.
+        with_bound_write_scope(root.path(),&prepared,None,|scope| {
+            guard.with_acceptance_metadata(|access| {
+                let error=bind_write_scope(root.path(),&prepared,None).unwrap_err();
+                assert!(format!("{error:#}").contains("write scope busy"),"scope writer refused for a different reason: {error:#}");
+                immutable_with_metadata(control.path(),"scope-metadata.json",&serde_json::to_vec(scope.reference())?,access)?;
+                scope.validate_current()
+            })
+        }).unwrap();
+        let saved:augmentagent_channel_core::autoship_write_scope::ScopeReference=private_json(&control.path().join("scope-metadata.json")).unwrap();
+        assert_eq!(saved.contract_hash,prepared.baseline.registration.contract_hash());
+        bind_write_scope(root.path(),&prepared,None).unwrap();guard.finish().unwrap();
+    }
+
     #[tokio::test]
     async fn acceptance_metadata_sweep_refuses_orphan_repair_and_owner_pause_fences_real_writers() {
         let (root,old,head)=authority_fixture().await;

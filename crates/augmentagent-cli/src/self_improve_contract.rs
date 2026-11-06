@@ -1437,15 +1437,20 @@ pub(super) async fn prepare_acceptance_for(
 
 /// Bind the same registered write policy for ordinary and owner execution.
 pub(super) fn bind_write_scope(candidate:&Path,prepared:&PreparedAcceptance,previous:Option<&RegisteredContract>)->Result<()> {
+    with_bound_write_scope(candidate,prepared,previous,|_scope|Ok(()))
+}
+/// Scope lock is acquired before the visitor's short workflow/file transaction.
+/// This alone establishes no native quiescence or canonical publication.
+pub(super) fn with_bound_write_scope<T>(candidate:&Path,prepared:&PreparedAcceptance,previous:Option<&RegisteredContract>,
+    visit:impl FnOnce(&augmentagent_channel_core::autoship_write_scope::RegisteredScope<'_>)->Result<T>)->Result<T> {
     prepared.verify_registration()?;
     let allowed=prepared.proposal.contract.allowed_paths.iter().map(|scope|match scope {
         crate::autoship_contract::PathScope::File(path)=>augmentagent_channel_core::autoship_write_scope::DeclaredPath {path:path.clone(),directory:false},
         crate::autoship_contract::PathScope::Directory(path)=>augmentagent_channel_core::autoship_write_scope::DeclaredPath {path:path.clone(),directory:true},
     }).collect();
     let pinned=prepared.proposal.files.keys().cloned().collect();
-    if let Some(previous)=previous {
-        augmentagent_channel_core::autoship_write_scope::replace_registered(candidate,previous.contract_hash(),prepared.baseline.registration.contract_hash(),allowed,pinned)
-    }else {augmentagent_channel_core::autoship_write_scope::register(candidate,prepared.baseline.registration.contract_hash(),allowed,pinned)}
+    augmentagent_channel_core::autoship_write_scope::with_registered_scope(candidate,previous.map(|p|p.contract_hash()),
+        prepared.baseline.registration.contract_hash(),allowed,pinned,visit)
 }
 
 #[cfg(test)]

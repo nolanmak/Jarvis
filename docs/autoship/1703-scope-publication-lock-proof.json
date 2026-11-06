@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "kind": "retained-registered-scope-through-metadata-publication-component",
+  "source_parent_commit": "11db979ba9e931b0c82ad5b49ca178ec724669e0",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/autoship_write_scope.rs",
+      "sha256": "668adc8cc6ddbd11ffca68a50f15057489d07b6116128d1f732d0187d0351b8e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_contract.rs",
+      "sha256": "d572ade630fbb6e907d3bce1711a981e68891f8b25c54b4c67a25f14358d1723"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_amendment.rs",
+      "sha256": "f0d522cf68b0b4b458563927a2fb32ede9cc4d4a53b7aad3ce9253b608fdfa46"
+    }
+  ],
+  "behavior": [
+    "All actual scope registration/replacement APIs and native grant construction join a nonblocking per-worktree lock.",
+    "Borrowed current registered scope retains exact admission and protected lock identity across a short metadata visitor; serialized references grant no execution authority.",
+    "Ordinary amendment holds the scope across manifest/completion/pending writes; already-active manifest replay still validates actual scope.",
+    "Same-contract permission changes, replaced locks, damaged history and FIFO metadata refuse. Failed visitor preserves already-written scope effects for reconciliation."
+  ],
+  "validation": {
+    "writer_race_red": {
+      "log": "/tmp/autoship-scope-publication-lock-red-20261106.log",
+      "log_sha256": "022bd9da5e0ff30c6803441a5db0454f17095940e012acc66bcb458256b65c1b",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "passed": 0,
+      "failed": 1,
+      "reason": "Actual old replacement API succeeded while the introduced scope publication visitor was retained. New visitor/type plumbing was present; not a pristine-parent binary."
+    },
+    "focused_core": {
+      "log": "/tmp/autoship-scope-publication-lock-focused-2-20261106.log",
+      "log_sha256": "50475455bf34dea8e2cf5a2dee11a6c975228808638b87f0a0a682a48101584d",
+      "exit": 0,
+      "passed": 8,
+      "failed": 0
+    },
+    "final_full_core": {
+      "log": "/tmp/autoship-scope-publication-lock-full-core-20261106.log",
+      "log_sha256": "a60a3d6a4fad9e311264784ec12e6dee5179cb9e900917612ec570fa2b5d1518",
+      "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib",
+      "exit": 0,
+      "passed": 928,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 36.33
+    },
+    "development_corrections": [
+      "First lock implementation relied on umask for directory creation. Tests exposed writable directory mode; new directories now use explicit 0700, with bounded tightening of verified owned legacy directories.",
+      "Initial CLI metadata fixture lacked origin/main and failed before scope admission. Corrected before full validation. Its competing writer now uses exactly the same permissions and checks the specific busy refusal."
+    ],
+    "final_full_cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-scope-publication-lock-full-cli-20261106.log",
+      "log_sha256": "6501fec216bdaa2d4e3118e2f1eb017835b36bf9adb701f155d6458f637b131e",
+      "exit": 0,
+      "passed": 1936,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 285.78,
+      "includes": "acceptance_metadata_commit_retains_registered_scope_lock passed with same-permission competing writer and specific busy refusal"
+    },
+    "final_production_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-scope-publication-lock-production-check-20261106.log",
+      "log_sha256": "0102bef2623facc803ce49a5bee19392e3316206c591073f373d7145f685de93",
+      "exit": 0,
+      "compiler_seconds": 39.22
+    },
+    "build_environment": {
+      "CARGO_TARGET_DIR": "/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_TEST_DEBUG": "0"
+    }
+  },
+  "callers": [
+    "register/register_at",
+    "replace_registered/private replace_registered_at",
+    "native grants through Codex tools and autoship scope",
+    "ordinary and owner bind_write_scope through with_bound_write_scope",
+    "ordinary amendment resume_pending, including already-active canonical replay",
+    "native route acceptance existing registration"
+  ],
+  "limits": [
+    "File-lock serialization covers cooperating controller metadata operations, not retained native writers, actual resource quiescence or source freshness.",
+    "ScopeReference is descriptive path/contract/record binding, not physical workspace identity, native authority or a completed canonical owner-publication receipt.",
+    "The CLI metadata fixture does not execute a provider/VM or prove the entire ordinary amendment or owner publication recovery workflow.",
+    "Productive owner command/body execution remains unconnected: owner publication journal, metadata recovery, continuation proofs, all consumer fences and live acceptance remain open.",
+    "Source trace found native scope precreation can conflict with the delayed first factory final untracked-file check. It needs explicit controlled materialization proof and a joined red/green test; no new-file live success is claimed.",
+    "No rollout, five autonomous merges, live Discord coding or fault/unattended soak completion is established."
+  ],
+  "epic_complete": false
+}
