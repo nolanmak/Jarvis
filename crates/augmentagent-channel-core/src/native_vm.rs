@@ -227,7 +227,12 @@ impl StateLock {
             .custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(root.join("state.lock"))?;
         let info=file.metadata()?;
         ensure!(info.is_file() && info.uid()==unsafe{libc::geteuid()} && info.nlink()==1 && info.mode() & 0o077==0,"unsafe native state lock");
-        ensure!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX)}==0,"native state lock unavailable");
+        // Native input retains this lock across async stdin settlement. Never
+        // block an executor thread needed by that writer; callers classify
+        // WouldBlock as a deferred native-transfer-lock-busy outcome.
+        if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
         Ok(Self(file))
     }
 }
@@ -512,6 +517,10 @@ pub(crate) struct Launch {
     observation:Option<LaunchObservation>,
     _directory: tempfile::TempDir,
 }
+/// Original input authority retained from its durable marker until stdin is
+/// settled or the submission future is dropped. Never serializable/replayable.
+struct NativeInputRelease {_state:StateLock}
+
 /// Shared Claude/Codex stdin boundary. Native release evidence is deliberately
 /// separate from provider completion and from in-memory session submission.
 pub(crate) async fn submit_provider_input(
@@ -522,9 +531,9 @@ pub(crate) async fn submit_provider_input(
     lease: Option<&crate::native_session::Lease>,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
-    if let Some(native) = native {
-        native.record_input_release_attempt(prompt, resource.context("native input lacks resource receipt")?)?;
-    }
+    let _input_authority=if let Some(native)=native {
+        Some(native.record_input_release_attempt(prompt,resource.context("native input lacks resource receipt")?)?)
+    }else {None};
     if let Some(lease) = lease { lease.mark_submitting(); }
     stdin.write_all(prompt.as_bytes()).await?;
     stdin.shutdown().await?;
@@ -709,7 +718,7 @@ impl Launch {
     }
     /// Records exposure *uncertainty* before the first byte. This is not a
     /// submission/completion receipt or a capability to recover/replay input.
-    fn record_input_release_attempt(&self, prompt: &str, resource: &crate::audit_chain::AppendReceipt) -> Result<()> {
+    fn record_input_release_attempt(&self, prompt: &str, resource: &crate::audit_chain::AppendReceipt) -> Result<NativeInputRelease> {
         use sha2::{Digest, Sha256};
         let observed = self.observation.as_ref().context("native input lacks prepared controller context")?;
         ensure!(!observed.input_attempted.swap(true, std::sync::atomic::Ordering::SeqCst),
@@ -738,9 +747,10 @@ impl Launch {
             && admitted["launch_receipt"] == serde_json::to_value(&observed.prepared.controller_receipt)?
             && admitted["resource_identity"].is_object(),
             "native input resource receipt differs from prepared launch");
-        // Hold original state authority through the protected append. Actual
-        // transport release is later; this marker deliberately grants no
-        // quiescence/nonrelease proof across that interval.
+        // Retain original state authority across the protected append and
+        // asynchronous stdin settlement. A handoff cannot close this owner
+        // while an admitted original writer is still releasing bytes. The
+        // marker remains exposure uncertainty, including after cancellation.
         logger.dispatch_allowed()?;
         let prompt_sha256=format!("{:x}",Sha256::digest(prompt.as_bytes()));
         let owner_input=logger.authorize_owner_native_input(&observed.prepared,resource,&prompt_sha256,prompt.len())?;
@@ -753,7 +763,8 @@ impl Launch {
         if let Some(reference)=owner_input {row["version"]=2.into();row["owner_input"]=serde_json::to_value(reference)?;}
         logger.record_controller_receipted(row)?;
         logger.dispatch_allowed()?;
-        Ok(())
+        drop(ledger);
+        Ok(NativeInputRelease {_state:lock})
     }
     pub fn register_retirement(&self, lease:&crate::native_session::Lease) {
         lease.register_vm_retirement(Retirement{session:self.session.clone(),expected:self.authority.clone(),store:self.store.clone(),runtime_relative_path:self.runtime_relative_path.clone(),creation_receipt_sha256:self.creation_receipt_sha256.clone()});
@@ -893,6 +904,12 @@ mod tests {
     #[test]
     fn native_completion_requires_exact_launch_and_kernel_quiescence() {launch_intent_child("completion");}
     #[test]
+    fn native_input_release_holds_authority_through_blocked_stdin() {launch_intent_child("input-lock-success");}
+    #[test]
+    fn native_input_release_cancellation_releases_authority_without_replay() {launch_intent_child("input-lock-cancel");}
+    #[test]
+    fn native_input_release_write_failure_releases_authority_without_replay() {launch_intent_child("input-lock-error");}
+    #[test]
     fn native_input_release_is_durable_before_prompt_bytes() { launch_intent_child("input-ready"); }
     #[test]
     fn native_input_release_refuses_sealed_audit_without_sending_bytes() { launch_intent_child("input-sealed"); }
@@ -929,6 +946,11 @@ mod tests {
         }
     }
     fn launch_intent_child(mode: &str) {
+        if let Some(root)=std::env::var_os("JARVIS_TEST_INPUT_AUTHORITY_PROBE") {
+            let error=StateLock::acquire(Path::new(&root)).err().expect("handoff acquisition entered an active original input writer");
+            assert_eq!(super::owner_outcome::classify(&error).0,ownership::TransferReason::LockBusy);
+            return;
+        }
         let seal=mode=="seal";let refuse=mode=="refuse";
         const CHILD: &str = "JARVIS_TEST_NATIVE_LAUNCH_INTENT_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -964,6 +986,9 @@ mod tests {
                 return;
             }
             let test = if mode=="preparation-context" {"native_preparation_binds_original_owner_preparation_context"}
+                else if mode=="input-lock-success" {"native_input_release_holds_authority_through_blocked_stdin"}
+                else if mode=="input-lock-cancel" {"native_input_release_cancellation_releases_authority_without_replay"}
+                else if mode=="input-lock-error" {"native_input_release_write_failure_releases_authority_without_replay"}
                 else if mode=="input-owner-resource" {"native_input_release_refuses_different_valid_resource_for_owner_model"}
                 else if mode=="input-owner-prompt" {"native_input_release_requires_sealed_owner_prompt"}
                 else if mode=="input-owner-unbound" {"native_input_release_requires_actual_owner_model_binding"}
@@ -1150,6 +1175,61 @@ mod tests {
                 }
                 let other_resource=if mode=="input-owner-resource" {Some(logger.native_launch_resource_binding(&prepared,provider,&serde_json::json!({"fixture":"different-admitted-resource"})).unwrap())} else {None};
                 let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                if mode.starts_with("input-lock-") {
+                    runtime.block_on(async {
+                        use std::process::Stdio;
+                        let permit=root.join(format!("read-permit-{provider}"));
+                        let mut command=Command::new("/usr/bin/python3");
+                        command.arg("-c").arg(r#"
+import json,os,sys,time
+limit=time.monotonic()+10
+while not os.path.exists(sys.argv[1]):
+    if time.monotonic()>limit: sys.exit(42)
+    time.sleep(.005)
+if sys.argv[2]=='input-lock-error':
+    print(json.dumps({'received':0}));sys.exit(0)
+data=sys.stdin.buffer.read()
+print(json.dumps({'received':len(data)}))
+"#).arg(&permit).arg(mode).stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true);
+                        let mut child=command.spawn().unwrap();let mut stdin=child.stdin.take().unwrap();
+                        let prompt="x".repeat(2*1024*1024);
+                        let mut pending=Box::pin(submit_provider_input(&mut stdin,&prompt,Some(&launch),Some(&resource),None));
+                        tokio::select! {
+                            result=&mut pending=>panic!("input completed before blocked-pipe observation: {result:?}"),
+                            _=tokio::time::sleep(std::time::Duration::from_millis(30))=>(),
+                        }
+                        assert!(std::fs::read_to_string(logger.path()).unwrap().contains("native_input_release_attempt"));
+                        assert!(StateLock::existing(&state).is_err(),"native handoff acquired authority while original stdin write remained pending");
+                        // Exercise the acquisition path used by actual handoff
+                        // in a bounded subprocess: it must report busy rather
+                        // than block the executor needed to finish stdin.
+                        let mut probe=Command::new(std::env::current_exe().unwrap());
+                        probe.args(["--exact","native_vm::tests::native_input_release_holds_authority_through_blocked_stdin","--test-threads=1"])
+                            .env("JARVIS_TEST_INPUT_AUTHORITY_PROBE",&state).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
+                        let probe=probe.spawn().unwrap();
+                        let output=tokio::time::timeout(std::time::Duration::from_secs(2),probe.wait_with_output()).await
+                            .expect("handoff acquisition blocked instead of reporting active input authority").unwrap();
+                        assert!(output.status.success(),"handoff busy probe failed: {}",String::from_utf8_lossy(&output.stderr));
+                        if mode=="input-lock-cancel" {drop(pending);} else {
+                            std::fs::write(&permit,b"release receiver").unwrap();
+                            let result=tokio::time::timeout(std::time::Duration::from_secs(5),pending).await.unwrap();
+                            assert_eq!(result.is_ok(),mode=="input-lock-success","{mode}: {result:?}");
+                        }
+                        // Success, cancellation and EPIPE all release the held
+                        // authority, while the original exposure marker stays.
+                        drop(StateLock::existing(&state).expect("input settlement leaked native authority"));
+                        assert!(launch.record_input_release_attempt("retry must refuse",&resource).is_err());
+                        drop(stdin);std::fs::write(&permit,b"release receiver").unwrap();
+                        let output=tokio::time::timeout(std::time::Duration::from_secs(5),child.wait_with_output()).await.unwrap().unwrap();
+                        assert!(output.status.success(),"receiver failed: {:?}",output.status);
+                        let received:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+                        if mode=="input-lock-success" {assert_eq!(received["received"],prompt.len());}
+                        else {assert!(received["received"].as_u64().unwrap()<prompt.len() as u64);}
+                        let rows=std::fs::read_to_string(logger.path()).unwrap();
+                        assert_eq!(rows.lines().filter(|line|serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"]=="native_input_release_attempt").count(),1);
+                    });
+                    continue;
+                }
                 let send = || runtime.block_on(async {
                     use std::process::Stdio;
                     // A real child receives stdin through the exact shared production
