@@ -34,15 +34,63 @@ impl OwnerBodyAdmission {
 }
 
 /// Live original controller; private saved references cannot construct it.
+struct InitialOwnerBodyFactory {
+    preparation:Arc<acceptance::owner::PreparedOwnerAcceptance>,
+    provider:durable::submission::Provider,
+    expected:durable::owner_turn::OwnerTurn,
+    source:FirstOwnerBodySetup,
+}
+struct FirstOwnerBodySetup {worktree:PathBuf,baseline:String,canonical_main:String}
+impl FirstOwnerBodySetup {
+    fn validate_current(&self)->Result<()> {
+        let git=|args:&[&str]|->Result<String> {
+            let output=std::process::Command::new("/usr/bin/git").args(["--no-replace-objects","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false"])
+                .args(args).current_dir(&self.worktree).env_clear().env("PATH","/usr/bin:/bin").env("GIT_OPTIONAL_LOCKS","0").env("GIT_GRAFT_FILE","/dev/null").stdin(Stdio::null()).output()?;
+            anyhow::ensure!(output.status.success(),"first builder final Git source check failed");Ok(String::from_utf8(output.stdout)?)
+        };
+        anyhow::ensure!(git(&["rev-parse","HEAD"])?.trim()==self.baseline,"first builder baseline changed during setup");
+        git(&["merge-base","--is-ancestor",&self.baseline,&self.canonical_main])?;
+        for args in [vec!["diff","--cached","--no-ext-diff","--no-textconv","--name-only","-z",&self.baseline,"--"],vec!["diff","--no-ext-diff","--no-textconv","--name-only","-z",&self.baseline,"--"]] {
+            anyhow::ensure!(git(&args)?.is_empty(),"first builder source changed during setup");
+        }
+        let untracked=git(&["ls-files","--others","-z","--"])?;
+        anyhow::ensure!(untracked.len()<=512*1024 && untracked.is_empty(),"first builder acquired untracked or ignored owner data during setup");Ok(())
+    }
+}
 struct OwnerInputController {
     store:Arc<Mutex<WorkflowStore>>,
     lease:Lease,
-    body:Arc<OwnerBodyAdmission>,
+    body:Arc<std::sync::OnceLock<Arc<OwnerBodyAdmission>>>,
+    initial:Option<InitialOwnerBodyFactory>,
     audit:std::sync::Weak<augmentagent_channel_core::AuditLogger>,
     prompt_sha256:String,
     prompt_bytes:usize,
 }
 impl OwnerInputController {
+    fn reserved(&self)->Result<&Arc<OwnerBodyAdmission>> {self.body.get().context("owner body awaits resource-ready reservation")}
+    fn reserve_initial(&self,admission:&augmentagent_channel_core::native_vm::NativeResourceAdmission<'_>)->Result<()> {
+        let factory=self.initial.as_ref().context("owner body has no initial factory")?;
+        anyhow::ensure!(self.body.get().is_none(),"owner body resource-ready reservation already consumed");
+        factory.source.validate_current()?;
+        let preparation=factory.preparation.activation_binding()?;
+        let audit=self.audit.upgrade().context("owner body factory controller expired")?;
+        let current=||->Result<()> {
+            let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("owner factory store poisoned"))?;
+            let turn=store.first_owner_body_turn(&self.lease,factory.provider,&factory.source.baseline,millis())?;
+            anyhow::ensure!(turn.request_id==factory.expected.request_id && turn.body==factory.expected.body
+                && turn.binding==factory.expected.binding && turn.pause_revision==factory.expected.pause_revision,"owner factory original request changed");
+            store.validate_owner_preparation_for_turn(&turn,&preparation,millis())
+        };
+        augmentagent_channel_core::native_vm::ownership::with_initial_prepared_native_owner(&audit,admission,&current,&mut |proof| {
+            let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("owner factory store poisoned"))?;
+            let turn=store.first_owner_body_turn(&self.lease,factory.provider,&factory.source.baseline,millis())?;
+            anyhow::ensure!(turn.request_id==factory.expected.request_id && turn.body==factory.expected.body
+                && turn.binding==factory.expected.binding && turn.pause_revision==factory.expected.pause_revision,"owner factory request changed at reservation");
+            let dispatch=store.begin_initial_prepared_owner_body(&turn,factory.provider,&factory.source.baseline,&factory.source.canonical_main,proof,&preparation,millis())?;
+            self.body.set(Arc::new(OwnerBodyAdmission {dispatch:Arc::new(dispatch),preparation:factory.preparation.clone(),provider:factory.provider}))
+                .map_err(|_|anyhow::anyhow!("owner factory reservation raced; reconcile original outcome"))?;Ok(())
+        })
+    }
     fn check_native(&self,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,resource:&augmentagent_channel_core::audit_chain::AppendReceipt)->Result<()> {
         let audit=self.audit.upgrade().context("owner input controller expired")?;
         // Protected native IO must finish before the workflow mutex is acquired.
@@ -58,22 +106,26 @@ impl augmentagent_channel_core::native_vm::OwnerInputAuthorizer for OwnerInputCo
     fn resources_ready(&self,admission:&augmentagent_channel_core::native_vm::NativeResourceAdmission<'_>)->Result<()> {
         admission.validate_unreleased()?;
         self.check_native(admission.prepared(),admission.resource_receipt())?;
+        if self.initial.is_some() {self.reserve_initial(admission)?;}
+        let body=self.reserved()?;
         let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("owner resource-ready store poisoned"))?;
-        self.body.validate(&mut store,&self.lease,millis())
+        body.validate(&mut store,&self.lease,millis())
     }
     fn bind_model(&self,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,resource:&augmentagent_channel_core::audit_chain::AppendReceipt)->Result<augmentagent_channel_core::native_vm::OwnerInputReference> {
         self.check_native(prepared,resource)?;
-        let preparation=self.body.preparation.activation_binding()?;
+        let body=self.reserved()?;
+        let preparation=body.preparation.activation_binding()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("owner input store poisoned"))?
-            .bind_prepared_owner_native(&self.lease,&self.body.dispatch,&preparation,self.body.provider,prepared,resource,millis())
+            .bind_prepared_owner_native(&self.lease,&body.dispatch,&preparation,body.provider,prepared,resource,millis())
     }
     fn authorize_input(&self,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,resource:&augmentagent_channel_core::audit_chain::AppendReceipt,
         reference:&augmentagent_channel_core::native_vm::OwnerInputReference,sha:&str,len:usize)->Result<()> {
         anyhow::ensure!(sha==self.prompt_sha256 && len==self.prompt_bytes,"owner native input differs from sealed original body");
         self.check_native(prepared,resource)?;
-        let preparation=self.body.preparation.activation_binding()?;
+        let body=self.reserved()?;
+        let preparation=body.preparation.activation_binding()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("owner input store poisoned"))?
-            .validate_prepared_owner_native_input(&self.lease,&self.body.dispatch,&preparation,self.body.provider,prepared,resource,reference,millis())
+            .validate_prepared_owner_native_input(&self.lease,&body.dispatch,&preparation,body.provider,prepared,resource,reference,millis())
     }
 }
 
@@ -1143,7 +1195,13 @@ impl WorkflowGuard {
     /// Once a body is reserved, narrow both observers to its captured original
     /// authority. Keep that fence after success/failure and across thread hops;
     /// only a new guarded generation can install an ordinary observer again.
+    fn install_pending_owner_model_observers(&self,body:Arc<std::sync::OnceLock<Arc<OwnerBodyAdmission>>>)->Result<()> {
+        self.install_model_observer_gate(Some(body))
+    }
     fn install_model_observers(&self,body:Option<Arc<OwnerBodyAdmission>>) -> Result<()> {
+        self.install_model_observer_gate(body.map(|body|Arc::new(std::sync::OnceLock::from(body))))
+    }
+    fn install_model_observer_gate(&self,body:Option<Arc<std::sync::OnceLock<Arc<OwnerBodyAdmission>>>>)->Result<()> {
         let dispatch_body=body.clone();
         let dispatch_store=self.store.clone();let dispatch_lease=self.lease.clone();
         let dispatch_failure=self.lease_failure.clone();
@@ -1152,7 +1210,7 @@ impl WorkflowGuard {
             anyhow::ensure!(dispatch_failure.lock().map_err(|_|anyhow::anyhow!("workflow failure lock poisoned"))?.is_none(),"workflow guard fenced; fresh guarded recovery required");
             let binding=store.snapshot(&dispatch_lease.workflow)?.context("workflow missing")?.checkpoint.binding;
             store.validate_dispatch(&dispatch_lease,&binding,millis())?;
-            if let Some(body)=&dispatch_body {body.validate(&mut store,&dispatch_lease,millis())?;}
+            if let Some(body)=dispatch_body.as_ref().and_then(|slot|slot.get()) {body.validate(&mut store,&dispatch_lease,millis())?;}
             Ok(())
         }))?;
         let capacity_flag = self.capacity_exhausted.clone();
@@ -1171,7 +1229,8 @@ impl WorkflowGuard {
                 anyhow::ensure!(bounded.workflow==lease.workflow,"bounded native call used a different workflow audit sink");
             }
             let actual=match provider {"codex"=>Some(durable::submission::Provider::Codex),"claude"=>Some(durable::submission::Provider::Claude),_=>None};
-            if let Some(body)=&body {
+            if let Some(slot)=&body {
+                let body=slot.get().context("owner body model admission awaits resource-ready reservation")?;
                 anyhow::ensure!(!augmentagent_channel_core::native_session::is_fresh_review(),"owner coding cannot use reviewer attribution");
                 let actual=actual.context("owner coding requires its native provider")?;
                 anyhow::ensure!(actual==body.provider,"owner coding provider changed");
@@ -1433,6 +1492,8 @@ impl WorkflowGuard {
         let selected=match provider {augmentagent_channel_core::ProviderKind::Codex=>durable::submission::Provider::Codex,
             augmentagent_channel_core::ProviderKind::Claude=>durable::submission::Provider::Claude,
             _=>anyhow::bail!("owner body requires native Codex or Claude")};
+        let body=Arc::new(std::sync::OnceLock::<Arc<OwnerBodyAdmission>>::new());
+        self.install_pending_owner_model_observers(body.clone())?;
         self.bind_builder(reasoner)?;
         let sessions=self.owner_turn_native_builder_sessions(provider)?;
         let expected_turn=self.store.lock().map_err(|_|anyhow::anyhow!("owner prompt store poisoned"))?.owner_turn_for_lease(&self.lease,millis())?;
@@ -1446,30 +1507,27 @@ impl WorkflowGuard {
         // Revalidate after asynchronous provenance inspection and before the
         // once-only reservation, so a known invalid artifact cannot strand it.
         let preparation=owner_prepared.validate_activated(self,&self.worktree)?;
-        let (turn,dispatch)=if first {
+        let initial=if first {
             anyhow::ensure!(sessions.observed().is_empty(),"first builder cannot replace an observed conversation");
             let main=remote_main_head(&self.worktree,&self.repository).await?;
-            let dispatch=self.reserve_prepared_first_owner_body(owner_prepared,selected,&main).await?;
-            let turn=self.store.lock().map_err(|_|anyhow::anyhow!("owner dispatch store poisoned"))?.owner_turn_for_lease(&self.lease,millis())?;
-            (turn,dispatch)
+            let source=self.prepare_first_owner_body(owner_prepared,selected,&main).await?;
+            Some(InitialOwnerBodyFactory {preparation:owner_prepared.clone(),provider:selected,expected:expected_turn.clone(),source})
         }else {
             let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("owner dispatch store poisoned"))?;
             let now=millis();let turn=store.owner_turn_for_lease(&self.lease,now)?;
+            anyhow::ensure!(turn.request_id==expected_turn.request_id && turn.body==expected_turn.body && turn.binding==expected_turn.binding,"owner prompt request changed before dispatch");
             let dispatch=store.begin_prepared_owner_body_dispatch(&turn,selected,&preparation,now)?;
-            (turn,dispatch)
+            body.set(Arc::new(OwnerBodyAdmission {dispatch:Arc::new(dispatch),preparation:owner_prepared.clone(),provider:selected})).map_err(|_|anyhow::anyhow!("owner body reservation already captured"))?;
+            None
         };
         let mut opts=fix_opts(self.worktree.clone());opts.audit_logger=Some(self.audit.clone());
-        anyhow::ensure!(turn.request_id==expected_turn.request_id && turn.body==expected_turn.body && turn.binding==expected_turn.binding,"owner prompt request changed before dispatch");
-        let dispatch=Arc::new(dispatch);
-        let admission=Arc::new(OwnerBodyAdmission {dispatch:dispatch.clone(),preparation:owner_prepared.clone(),provider:selected});
         let wire_prompt=if selected==durable::submission::Provider::Codex {
             augmentagent_channel_core::images::codex_input(&prompt).0
         } else {prompt.clone()};
         self.audit.set_owner_input_authorizer(Arc::new(OwnerInputController {
-            store:self.store.clone(),lease:self.lease.clone(),body:admission.clone(),audit:Arc::downgrade(&self.audit),
+            store:self.store.clone(),lease:self.lease.clone(),body:body.clone(),initial,audit:Arc::downgrade(&self.audit),
             prompt_sha256:format!("{:x}",Sha256::digest(wire_prompt.as_bytes())),prompt_bytes:wire_prompt.len(),
         }))?;
-        self.install_model_observers(Some(admission))?;
         let outcome=sessions.scope(async {
             if first {reasoner.call_with_storage(&opts,&prompt).await}
             else {adoption::revise(reasoner,self,&opts,&prompt).await}
@@ -1481,6 +1539,7 @@ impl WorkflowGuard {
         let observed=sessions.observed();
         anyhow::ensure!(observed.len()==1 && observed[0].provider==provider && !observed[0].uncertain,
             "owner body has no unique certain native conversation");
+        let dispatch=body.get().context("owner body returned without resource-ready reservation")?.dispatch.clone();
         let result=OwnerBodyResult {dispatch,response,observed:observed.into_iter().next().unwrap()};
         // The first fresh check catches stale observations before returning a
         // result. Completion must repeat this check in its atomic visitor.
@@ -1489,9 +1548,9 @@ impl WorkflowGuard {
     }
     /// A first builder may start only on a real linked candidate still equal
     /// to its original main baseline, using protected private verifier bytes.
-    /// Actual native absence is checked under original-store locks at reservation.
-    async fn reserve_prepared_first_owner_body(&self,owner_prepared:&acceptance::owner::PreparedOwnerAcceptance,provider:durable::submission::Provider,canonical_main:&str)->Result<durable::owner_dispatch::OwnerBodyDispatch> {
-        let preparation=owner_prepared.validate_activated(self,&self.worktree)?;
+    /// Native preparation and resource readiness precede the later reservation.
+    async fn prepare_first_owner_body(&self,owner_prepared:&acceptance::owner::PreparedOwnerAcceptance,_provider:durable::submission::Provider,canonical_main:&str)->Result<FirstOwnerBodySetup> {
+        owner_prepared.validate_activated(self,&self.worktree)?;
         let prepared=owner_prepared.prepared();
         self.native_builder_owner()?;
         let registration=&prepared.baseline.registration;
@@ -1513,6 +1572,12 @@ impl WorkflowGuard {
         let untracked=first_builder_git(&self.worktree,&["ls-files","--others","-z","--"]).await?;
         anyhow::ensure!(untracked.len()<=512*1024,"first builder untracked inventory exceeds bound");
         anyhow::ensure!(untracked.is_empty(),"first builder has untracked or ignored owner data");
+        Ok(FirstOwnerBodySetup {worktree:self.worktree.clone(),baseline:base.into(),canonical_main:canonical_main.into()})
+    }
+    #[cfg(test)]
+    async fn reserve_prepared_first_owner_body(&self,owner_prepared:&acceptance::owner::PreparedOwnerAcceptance,provider:durable::submission::Provider,canonical_main:&str)->Result<durable::owner_dispatch::OwnerBodyDispatch> {
+        let source=self.prepare_first_owner_body(owner_prepared,provider,canonical_main).await?;
+        let base=source.baseline.as_str();let preparation=owner_prepared.activation_binding()?;
         let current=||->Result<()> {self.healthy_lease()?;self.store.lock().map_err(|_|anyhow::anyhow!("first builder store poisoned"))?.first_owner_body_turn(&self.lease,provider,base,millis())?;Ok(())};
         let mut dispatch=None;
         augmentagent_channel_core::native_vm::ownership::with_unused_native_owner(&self.audit,&current,&mut |proof| {
@@ -3689,6 +3754,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_owner_final_source_check_preserves_changes_during_setup() {
+        for fault in ["tracked","staged","untracked","ignored","head"] {
+            let dir=repo();let baseline=first_builder_git(dir.path(),&["rev-parse","HEAD"]).await.unwrap().trim().to_owned();
+            let source=FirstOwnerBodySetup {worktree:dir.path().into(),baseline:baseline.clone(),canonical_main:baseline};
+            source.validate_current().unwrap();
+            match fault {
+                "tracked"|"staged"=>{std::fs::write(dir.path().join("code.txt"),"preserve setup-time owner edit").unwrap();if fault=="staged" {first_builder_git(dir.path(),&["add","code.txt"]).await.unwrap();}},
+                "untracked"=>std::fs::write(dir.path().join("new-owner-data"),"preserve").unwrap(),
+                "ignored"=>{std::fs::write(dir.path().join(".git/info/exclude"),"ignored-owner-data\n").unwrap();std::fs::write(dir.path().join("ignored-owner-data"),"preserve").unwrap();},
+                "head"=>{first_builder_git(dir.path(),&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","--allow-empty","-m","new owner head"]).await.unwrap();},_=>unreachable!(),
+            }
+            assert!(source.validate_current().is_err(),"{fault}: setup-time owner change was accepted");
+            if matches!(fault,"tracked"|"staged") {assert_eq!(std::fs::read_to_string(dir.path().join("code.txt")).unwrap(),"preserve setup-time owner edit");}
+            if fault=="untracked" {assert!(dir.path().join("new-owner-data").exists());}
+            if fault=="ignored" {assert!(dir.path().join("ignored-owner-data").exists());}
+        }
+    }
+
+    #[tokio::test]
     async fn owner_body_admission_rechecks_original_preparation_in_actual_callbacks() {
         let control=control_dir();
         let status=std::process::Command::new(std::env::current_exe().unwrap())
@@ -3703,10 +3787,20 @@ mod tests {
     async fn check_prepared_owner_body_callbacks(guard:&WorkflowGuard,prepared:Arc<acceptance::owner::PreparedOwnerAcceptance>,artifact:&Path) {
         let preparation=prepared.validate_activated(guard,&guard.worktree).unwrap();
         let turn=guard.store.lock().unwrap().owner_turn_for_lease(&guard.lease,millis()).unwrap();
+        let pending=Arc::new(std::sync::OnceLock::<Arc<OwnerBodyAdmission>>::new());
+        guard.install_pending_owner_model_observers(pending).unwrap();
+        assert!(WorkflowStore::open(&guard.state).unwrap().claim_owner_turn(guard.id(),"must-not-replay-setup-without-body-reservation",millis()+LEASE_MS+1,LEASE_MS).unwrap().is_none(),"absence of a body reservation reset claimed owner setup");
+        let before_pending=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
+        let history_pending=guard.store.lock().unwrap().events(guard.id()).unwrap();
+        assert!(guard.audit.dispatch_allowed().is_ok(),"pending owner factory blocked controlled setup");
+        let audit=guard.audit.clone();
+        std::thread::spawn(move||assert!(audit.model_call_admitted("codex").is_err(),"pending owner body admitted a model before resource-ready reservation")).join().unwrap();
+        assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap(),before_pending);
+        assert_eq!(guard.store.lock().unwrap().events(guard.id()).unwrap(),history_pending);
         let dispatch=Arc::new(guard.store.lock().unwrap().begin_prepared_owner_body_dispatch(&turn,durable::submission::Provider::Codex,&preparation,millis()).unwrap());
         let admission=Arc::new(OwnerBodyAdmission {dispatch:dispatch.clone(),preparation:prepared.clone(),provider:durable::submission::Provider::Codex});
         guard.install_model_observers(Some(admission.clone())).unwrap();
-        let controller=OwnerInputController {store:guard.store.clone(),lease:guard.lease.clone(),body:admission,
+        let controller=OwnerInputController {store:guard.store.clone(),lease:guard.lease.clone(),body:Arc::new(std::sync::OnceLock::from(admission)),initial:None,
             audit:Arc::downgrade(&guard.audit),prompt_sha256:format!("{:x}",Sha256::digest(b"synthetic exact private input")),prompt_bytes:"synthetic exact private input".len()};
         use augmentagent_channel_core::native_vm::OwnerInputAuthorizer;
         let original=guard.audit.native_store_binding().unwrap().unwrap();

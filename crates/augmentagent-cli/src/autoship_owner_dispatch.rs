@@ -19,6 +19,15 @@ struct Record {
     first_builder:Option<serde_json::Value>,
     #[serde(default,skip_serializing_if="Option::is_none")]
     preparation:Option<OwnerPreparationBinding>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    prepared_setup:Option<PreparedSetup>,
+}
+#[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedSetup {
+    intent:augmentagent_channel_core::native_vm::PreparedLaunchIntent,
+    launch_receipt:augmentagent_channel_core::audit_chain::AppendReceipt,
+    resource_receipt:augmentagent_channel_core::audit_chain::AppendReceipt,
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +42,21 @@ struct Completion {
     evidence: serde_json::Value,
     response_sha256: String,
     completed_at_ms: i64,
+}
+fn require_dispatch_launch(record:&Record,sequence:i64,launch:&super::native_launch::NativeLaunchRecord)->Result<()> {
+    ensure!(launch.workflow_id==record.workflow && launch.source_owner.lease_generation==record.generation
+        && launch.workflow_binding==record.binding && launch.intent.provider==record.provider,"owner dispatch launch context changed");
+    match (record.version,&record.prepared_setup) {
+        (1,None)=>ensure!(launch.sequence>sequence && launch.sequence>record.launch_floor,"owner launch predates legacy reservation"),
+        (2,Some(setup))=>{
+            require_same_prepared(launch,&augmentagent_channel_core::native_vm::PreparedLaunchRecord {intent:setup.intent.clone(),controller_receipt:setup.launch_receipt.clone()})?;
+            ensure!(launch.sequence==record.launch_floor && launch.sequence<sequence
+                && setup.resource_receipt.version==1 && setup.resource_receipt.sequence>setup.launch_receipt.sequence,
+                "owner prepared setup ordering changed");
+        },
+        _=>bail!("owner dispatch preparation version changed"),
+    }
+    Ok(())
 }
 fn completion_record(conn: &Connection, record: &Record, dispatch_sequence: i64) -> Result<bool> {
     let row:Option<(i64,String,String,String)>=conn.query_row("SELECT sequence,record,response,state FROM workflow_owner_body_result WHERE workflow=?1 AND request_id=?2",params![record.workflow,record.request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
@@ -76,13 +100,7 @@ fn completion_record(conn: &Connection, record: &Record, dispatch_sequence: i64)
         "owner completion event changed"
     );
     let launch = super::native_launch::recorded_launch(conn, &value.launch_intent_id)?;
-    ensure!(
-        launch.sequence > dispatch_sequence
-            && launch.sequence > record.launch_floor
-            && launch.source_owner.lease_generation == record.generation
-            && launch.workflow_binding == record.binding,
-        "owner completion launch predates or differs from dispatch"
-    );
+    require_dispatch_launch(record,dispatch_sequence,&launch)?;
     let observed=super::native_observation::referenced(conn,&record.workflow,&launch.source_audit_path,&value.reference)?;
     ensure!(observed.launch_intent_id==value.launch_intent_id,"owner completion launch reference changed");
     ensure!(
@@ -137,7 +155,8 @@ fn decode(
         "owner dispatch has unknown nested fields"
     );
     ensure!(
-        record.version == 1
+        matches!((record.version,record.prepared_setup.is_some()),(1,false)|(2,true))
+            && (record.version==1 || (record.preparation.is_some() && record.first_builder.is_some()))
             && record.request_id == request
             && record.workflow == workflow
             && record.generation > 0
@@ -167,9 +186,17 @@ fn decode(
     if let Some(first)=&record.first_builder {
         let (_,original)=super::native_launch::original_context(conn,workflow,record.generation,false)?;
         let namespace=serde_json::json!({"owner":{"workflow_id":workflow,"lease_generation":record.generation},"audit_path":super::native_launch::original_context(conn,workflow,record.generation,false)?.0});
-        ensure!(first["baseline"]==record.binding.head && first["native"]["kind"]=="unused_native_workflow"
+        ensure!(first["baseline"]==record.binding.head && first["native"]["kind"]==(if record.version==1 {"unused_native_workflow"}else{"initial_prepared_native_owner"})
             && first["native"]["namespace"]==namespace && first["native"]["original_binding_sha256"]==original,
             "first builder original native evidence changed");
+    }
+    if let Some(setup)=&record.prepared_setup {
+        let launch=super::native_launch::recorded_launch(conn,&setup.intent.intent_id)?;
+        require_dispatch_launch(&record,sequence,&launch)?;
+        let first=record.first_builder.as_ref().context("prepared first builder evidence missing")?;
+        ensure!(first["native"]["prepared_intent"]==serde_json::to_value(&setup.intent)?
+            && first["native"]["launch_receipt"]==serde_json::to_value(&setup.launch_receipt)?
+            && first["native"]["resource_receipt"]==serde_json::to_value(&setup.resource_receipt)?,"prepared first builder evidence changed");
     }
     let input = super::owner_inbox::message_evidence(conn, workflow, request)?;
     ensure!(
@@ -312,10 +339,12 @@ fn validate_native_admissions(conn:&Connection,workflow:&str)->Result<()> {
         ensure!(launch.workflow_id==workflow && launch.source_owner.lease_generation==dispatch.generation
             && launch.workflow_binding==dispatch.binding && launch.intent.provider==dispatch.provider
             && launch.intent.controller_receipt.as_ref()==Some(&value.launch_receipt)
-            && launch.sequence>dispatch_sequence && value.reference.model_admission_sequence>launch.sequence
+            && value.reference.model_admission_sequence>dispatch_sequence && value.reference.model_admission_sequence>launch.sequence
             && sequence>value.reference.model_admission_sequence && value.resource_receipt.version==1
             && value.resource_receipt.sequence>value.launch_receipt.sequence,
             "owner native admission differs from original body/model launch");
+        require_dispatch_launch(&dispatch,dispatch_sequence,&launch)?;
+        if let Some(setup)=&dispatch.prepared_setup {ensure!(setup.resource_receipt==value.resource_receipt,"owner native admission changed prepared resource");}
         let event:(String,i64,String,i64)=conn.query_row("SELECT kind,generation,payload,at_ms FROM workflow_event WHERE seq=?1 AND workflow=?2",params![sequence,workflow],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
         ensure!(event.0=="owner_body_native_bound" && event.1==dispatch.generation && event.2==raw && event.3>=dispatch.started_at_ms,
             "owner native admission event changed");
@@ -324,7 +353,7 @@ fn validate_native_admissions(conn:&Connection,workflow:&str)->Result<()> {
 }
 fn require_same_prepared(launch:&super::native_launch::NativeLaunchRecord,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord)->Result<()> {
     let provider=match launch.intent.provider {submission::Provider::Codex=>"codex",submission::Provider::Claude=>"claude"};
-    ensure!(prepared.intent.version==2 && launch.source_owner==prepared.intent.source_owner
+    ensure!(prepared.intent.version==2 && launch.intent.intent_id==prepared.intent.intent_id && launch.source_owner==prepared.intent.source_owner
         && launch.original_native_binding_sha256==prepared.intent.original_store_binding_sha256
         && launch.intent.controller_receipt.as_ref()==Some(&prepared.controller_receipt)
         && provider==prepared.intent.provider && launch.intent.launch_sha256==prepared.intent.launch_sha256
@@ -344,8 +373,9 @@ impl WorkflowStore {
         ensure!(dispatch.model_receipt.get()==Some(&reference.model_receipt),"owner native binding lacks original captured model admission");
         let launch=super::native_launch::recorded_launch(&tx,&prepared.intent.intent_id)?;
         require_same_prepared(&launch,prepared)?;
-        ensure!(launch.workflow_binding==dispatch.record.binding && launch.sequence>dispatch.sequence
-            && reference.model_admission_sequence>launch.sequence,"owner input launch predates its original model admission");
+        require_dispatch_launch(&dispatch.record,dispatch.sequence,&launch)?;
+        ensure!(reference.model_admission_sequence>dispatch.sequence && reference.model_admission_sequence>launch.sequence,"owner input launch predates its original model admission");
+        if let Some(setup)=&dispatch.record.prepared_setup {ensure!(setup.resource_receipt==*resource,"owner input prepared resource changed");}
         let value=NativeAdmission {version:1,reference:reference.clone(),intent_id:prepared.intent.intent_id.clone(),
             launch_receipt:prepared.controller_receipt.clone(),resource_receipt:resource.clone()};
         if let Some(captured)=dispatch.native_admission.get() {ensure!(captured==&value,"owner input cannot bind a replacement native launch");}
@@ -472,23 +502,29 @@ impl WorkflowStore {
         provider: submission::Provider,
         now: i64,
     ) -> Result<OwnerBodyDispatch> {
-        self.begin_owner_body_dispatch_inner(turn,provider,now,None,None)
+        self.begin_owner_body_dispatch_inner(turn,provider,now,None,None,None)
     }
     pub(crate) fn begin_prepared_owner_body_dispatch(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,
         preparation:&OwnerPreparationBinding,now:i64)->Result<OwnerBodyDispatch> {
-        self.begin_owner_body_dispatch_inner(turn,provider,now,None,Some(preparation))
+        self.begin_owner_body_dispatch_inner(turn,provider,now,None,Some(preparation),None)
     }
     pub(crate) fn first_owner_body_turn(&mut self,lease:&Lease,provider:submission::Provider,base:&str,now:i64)->Result<owner_turn::OwnerTurn> {
         self.require_command_builder(&lease.workflow,Some(provider))?;
         let turn=self.owner_turn_for_lease(lease,now)?;first_builder_policy(&self.conn,&turn,base)?;Ok(turn)
     }
+    #[cfg(test)]
     pub(crate) fn begin_prepared_first_owner_body(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,base:&str,canonical_main:&str,
         proof:&augmentagent_channel_core::native_vm::ownership::UnusedNativeOwnerProof<'_>,preparation:&OwnerPreparationBinding,now:i64)->Result<OwnerBodyDispatch> {
-        self.begin_owner_body_dispatch_inner(turn,provider,now,Some((base,canonical_main,proof)),Some(preparation))
+        self.begin_owner_body_dispatch_inner(turn,provider,now,Some((base,canonical_main,proof)),Some(preparation),None)
+    }
+    pub(crate) fn begin_initial_prepared_owner_body(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,base:&str,main:&str,
+        proof:&augmentagent_channel_core::native_vm::ownership::InitialPreparedNativeOwnerProof<'_>,preparation:&OwnerPreparationBinding,now:i64)->Result<OwnerBodyDispatch> {
+        self.begin_owner_body_dispatch_inner(turn,provider,now,None,Some(preparation),Some((base,main,proof)))
     }
     fn begin_owner_body_dispatch_inner(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,now:i64,
         first:Option<(&str,&str,&augmentagent_channel_core::native_vm::ownership::UnusedNativeOwnerProof<'_>)>,
         preparation:Option<&OwnerPreparationBinding>,
+        initial:Option<(&str,&str,&augmentagent_channel_core::native_vm::ownership::InitialPreparedNativeOwnerProof<'_>)>,
     )->Result<OwnerBodyDispatch> {
         ensure!(now >= 0, "invalid owner dispatch time");
         self.require_command_builder(&turn.lease.workflow, Some(provider))?;
@@ -512,12 +548,19 @@ impl WorkflowStore {
             let (audit,original)=super::native_launch::original_context(&tx,&turn.lease.workflow,turn.lease.generation,true)?;
             ensure!(audit==proof.namespace().audit_path && original==super::native_launch::binding_digest(proof.binding())?,"first builder original native binding changed");
             Some(serde_json::json!({"baseline":base,"canonical_main":main,"native":proof.evidence()}))
+        }else if let Some((base,main,proof))=initial {
+            first_builder_policy(&tx,turn,base)?;
+            ensure!(proof.namespace().owner.workflow_id==turn.lease.workflow && proof.namespace().owner.lease_generation==turn.lease.generation,"prepared first builder namespace changed");
+            let (audit,original)=super::native_launch::original_context(&tx,&turn.lease.workflow,turn.lease.generation,true)?;
+            ensure!(audit==proof.namespace().audit_path && original==super::native_launch::binding_digest(proof.binding())?,"prepared first builder original binding changed");
+            Some(serde_json::json!({"baseline":base,"canonical_main":main,"native":proof.evidence()}))
         }else{None};
+        let prepared_setup=initial.map(|(_,_,proof)|PreparedSetup {intent:proof.prepared().intent.clone(),launch_receipt:proof.prepared().controller_receipt.clone(),resource_receipt:proof.resource_receipt().clone()});
         let launch_floor = super::native_launch::history(&tx, &turn.lease.workflow)?
             .last()
             .map_or(0, |r| r.sequence);
         let record = Record {
-            version: 1,
+            version: if prepared_setup.is_some() {2}else{1},
             workflow: turn.lease.workflow.clone(),
             request_id: turn.request_id.clone(),
             owner: turn.lease.owner.clone(),
@@ -530,8 +573,10 @@ impl WorkflowStore {
             started_at_ms: now,
             first_builder,
             preparation:preparation.cloned(),
+            prepared_setup,
         };
         let raw = serde_json::to_string(&record)?;
+        ensure!(raw.len()<=16384,"owner dispatch record exceeds bound");
         event(
             &tx,
             &record.workflow,
@@ -545,6 +590,9 @@ impl WorkflowStore {
             [&record.workflow],
             |r| r.get(0),
         )?;
+        if let Some(setup)=&record.prepared_setup {
+            require_dispatch_launch(&record,sequence,&super::native_launch::recorded_launch(&tx,&setup.intent.intent_id)?)?;
+        }
         tx.execute(
             "INSERT INTO workflow_owner_body_dispatch VALUES(?1,?2,?3,?4)",
             params![record.request_id, record.workflow, sequence, raw],
@@ -608,11 +656,10 @@ impl WorkflowStore {
                 && prepared.intent.source_audit_path == Path::new(&audit)
                 && original == super::native_launch::binding_digest(proof.binding())?
                 && launch.intent.controller_receipt.as_ref() == Some(&prepared.controller_receipt)
-                && launch.sequence > sequence
-                && launch.sequence > record.launch_floor
                 && launch.workflow_binding == record.binding,
             "owner completion proof differs from reserved native dispatch"
         );
+        require_dispatch_launch(record,sequence,&launch)?;
         let value = Completion {
             version: 1,
             workflow: record.workflow.clone(),
@@ -720,13 +767,7 @@ impl WorkflowStore {
             "owner body native outcome is uncertain or belongs to another dispatch"
         );
         let launch = super::native_launch::recorded_launch(&self.conn, &last.launch_intent_id)?;
-        ensure!(
-            launch.sequence > record.launch_floor
-                && launch.sequence > dispatch.sequence
-                && launch.source_owner.lease_generation == record.generation
-                && launch.workflow_binding == record.binding,
-            "owner body completion predates dispatch reservation"
-        );
+        require_dispatch_launch(record,dispatch.sequence,&launch)?;
         let proof = last
             .proof
             .as_ref()
@@ -911,6 +952,45 @@ mod tests {
             .begin_owner_body_dispatch(&turn, submission::Provider::Codex, 6)
             .unwrap();
     }
+    #[test]
+    fn initial_prepared_dispatch_binds_exact_launch_and_preserves_legacy_ordering() {
+        let dir=tempfile::tempdir().unwrap();let (mut store,turn)=setup(&dir.path().join("state.db"));
+        let dispatch=store.begin_owner_body_dispatch(&turn,submission::Provider::Codex,5).unwrap();
+        let mut record=dispatch.record.clone();let sequence=dispatch.sequence;
+        // Descriptive fixture only; no fresh native proof, executable dispatch,
+        // model admission or real resource scope is constructed by these rows.
+        let receipt=augmentagent_channel_core::audit_chain::AppendReceipt {version:1,sequence:10,record_sha256:"a".repeat(64),committed_audit_sha256:"b".repeat(64)};
+        let intent=augmentagent_channel_core::native_vm::PreparedLaunchIntent {version:2,intent_id:uuid::Uuid::new_v4().to_string(),
+            source_owner:augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:turn.lease.workflow.clone(),lease_generation:turn.lease.generation},
+            source_audit_path:"/original/protected/audit.jsonl".into(),provider:"codex".into(),runtime_relative_path:"codex/session-prepared".into(),native_session_id:None,
+            launch_sha256:"c".repeat(64),creation_receipt_sha256:"d".repeat(64),original_store_binding_sha256:"e".repeat(64)};
+        let mut launch=super::super::native_launch::NativeLaunchRecord {version:1,workflow_id:turn.lease.workflow.clone(),sequence:sequence-1,
+            source_owner:intent.source_owner.clone(),source_audit_path:intent.source_audit_path.to_string_lossy().into_owned(),workflow_binding:turn.binding.clone(),
+            original_native_binding_sha256:intent.original_store_binding_sha256.clone(),recorded_at_ms:4,
+            intent:super::super::native_launch::NativeLaunchIntent {intent_id:intent.intent_id.clone(),provider:submission::Provider::Codex,runtime_relative_path:intent.runtime_relative_path.clone(),native_session_id:None,
+                launch_sha256:intent.launch_sha256.clone(),creation_receipt_sha256:intent.creation_receipt_sha256.clone(),controller_receipt:Some(receipt.clone())}};
+        assert!(require_dispatch_launch(&record,sequence,&launch).is_err(),"legacy ordering silently broadened");
+        launch.sequence=sequence+1;require_dispatch_launch(&record,sequence,&launch).unwrap();
+        launch.sequence=sequence-1;record.version=2;record.launch_floor=launch.sequence;
+        record.prepared_setup=Some(PreparedSetup {intent,launch_receipt:receipt.clone(),resource_receipt:augmentagent_channel_core::audit_chain::AppendReceipt {sequence:11,..receipt}});
+        require_dispatch_launch(&record,sequence,&launch).unwrap();
+        for fault in ["later","intent","launch-receipt","creation","owner","binding","version","missing-setup","resource-order"] {
+            let mut changed=launch.clone();let mut claim=record.clone();
+            match fault {
+                "later"=>changed.sequence=sequence+1,
+                "intent"=>{changed.intent.intent_id=uuid::Uuid::new_v4().to_string();claim.prepared_setup.as_mut().unwrap().intent.intent_id=uuid::Uuid::new_v4().to_string();},
+                "launch-receipt"=>changed.intent.controller_receipt.as_mut().unwrap().record_sha256="f".repeat(64),
+                "creation"=>changed.intent.creation_receipt_sha256="f".repeat(64),
+                "owner"=>changed.source_owner.lease_generation+=1,
+                "binding"=>changed.workflow_binding.head="another-head".into(),
+                "version"=>claim.version=1,
+                "missing-setup"=>claim.prepared_setup=None,
+                "resource-order"=>claim.prepared_setup.as_mut().unwrap().resource_receipt.sequence=10,_=>unreachable!(),
+            }
+            assert!(require_dispatch_launch(&claim,sequence,&changed).is_err(),"{fault}: prepared launch substituted");
+        }
+    }
+
     #[test]
     fn owner_body_dispatch_session_id_alone_cannot_complete_a_request() {
         let dir = tempfile::tempdir().unwrap();
