@@ -1433,7 +1433,16 @@ fn criteria_pr_section(criteria: &[String]) -> String {
 fn required_criteria_from_pr_body(body: &str) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut in_block = false;
-    for line in body.lines() {
+    // The controller writes its criteria section after the summary, plan and
+    // review notes, so the last heading is the authoritative one. An earlier
+    // heading is quoted text: #1893's summary echoed the issue body (and the
+    // scoper prompt after it), and the resume refused on that prose.
+    let lines: Vec<&str> = body.lines().collect();
+    let start = lines
+        .iter()
+        .rposition(|line| line.trim().starts_with("## Acceptance criteria"))
+        .unwrap_or(0);
+    for line in &lines[start..] {
         let t = line.trim();
         if t.starts_with("## Acceptance criteria") {
             in_block = true;
@@ -3407,7 +3416,26 @@ fn resume_may_merge(qa_ok: bool, independent_approved: bool) -> bool {
 /// last QA verdict on this work, so a re-review judges whether its findings
 /// were resolved instead of re-scoping from nothing (the #889 rule, applied
 /// to QA).
-fn qa_review_prompt(issue: &Issue, summary: &str, prior: Option<&str>) -> String {
+/// QA sees the controller's pinned acceptance harness in the diff. It is
+/// registered independently before the build, adjudicated separately, and the
+/// builder is forbidden to change it, so a QA reject of it can never be
+/// repaired: #1893 was parked because QA called its pinned verifier "an
+/// unrelated artifact that must not ship". QA gets the same mutation boundary
+/// the independent reviewer does.
+fn qa_pinned_boundary(pinned: &[&str]) -> String {
+    if pinned.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\nController-pinned acceptance harness (immutable to the builder): {}. \
+         These files were registered independently before the build as the executable \
+         acceptance contract and ship with the change by design; they are judged by the \
+         controller's own adjudication, not by this review. Do not request their removal \
+         or edits. Review the product change against the issue.",
+        pinned.join(", ")
+    )
+}
+fn qa_review_prompt(issue: &Issue, summary: &str, prior: Option<&str>, pinned: &[&str]) -> String {
     let prior = prior
         .map(|p| {
             format!(
@@ -3421,11 +3449,12 @@ fn qa_review_prompt(issue: &Issue, summary: &str, prior: Option<&str>) -> String
         "GitHub issue #{}: {}\n\n{}\n\nBuilder's summary of its change:\n{}{prior}\n\n\
          The change under review is `git diff origin/main...HEAD` (committed \
          work) plus `git diff --cached` (staged work); read both. \
-         Review the worktree's diff now and output your verdict.",
+         Review the worktree's diff now and output your verdict.{}",
         issue.number,
         issue.title,
         truncate(&issue.body, 2000),
-        truncate(summary, 1000)
+        truncate(summary, 1000),
+        qa_pinned_boundary(pinned)
     )
 }
 
@@ -7015,7 +7044,7 @@ async fn resume_draft_pr(
         let reviewed_binding = workflow.binding().clone();
         let review_attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
         let (qa_ok, qa_notes) = match reasoner
-            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, prior_qa.as_deref()))
+            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, prior_qa.as_deref(), &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>()))
             .await
         {
             Ok(r) => parse_review_output(&r),
@@ -8497,7 +8526,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         // and the revised diff is QA'd again before Stage 4 sees it. Runs
         // before the dry-run exit so dry runs exercise the full pipeline.
         match reasoner
-            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None))
+            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None, &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>()))
             .await
         {
             Ok(r) => (qa_ok, review_notes) = parse_review_output(&r),
@@ -8586,7 +8615,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                         pending_guard = Some(ParkReason::Oversize(lines));
                         continue;
                     }
-                    let qa = reasoner.call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None)).await?;
+                    let qa = reasoner.call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None, &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>())).await?;
                     (qa_ok, review_notes) = parse_review_output(&qa);
                     workflow_guard.transition(crate::autoship_workflow::Stage::Review, "amended_candidate_verified", "review", 0).await?;
                     independent = Some(independent_review_with_context(reasoner.as_ref(), &issue, worktree.clone(), &criteria,
@@ -8798,7 +8827,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                     // previous findings, before Stage 4 is asked about it.
                     let prior_qa = review_notes.clone();
                     match reasoner
-                        .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, Some(&prior_qa)))
+                        .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, Some(&prior_qa), &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>()))
                         .await
                     {
                         Ok(r) => (qa_ok, review_notes) = parse_review_output(&r),
@@ -16419,6 +16448,10 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn resume_required_criteria_refuse_an_unparsed_section_instead_of_using_a_prefix() {
         assert!(required_criteria_from_pr_body("## Acceptance criteria\n- first required behavior\n  wrapped owner requirement\n- later required behavior").is_err());
+        let quoted = "## Summary\n## Acceptance criteria\n- quoted from the issue\n\nProduce the verdict header now.\n\n\
+                      ## Acceptance criteria (from the scoping pass)\n- controller criterion\n## Verification\n- gate: passed";
+        assert_eq!(required_criteria_from_pr_body(quoted).unwrap(), vec!["controller criterion".to_string()],
+            "the controller's own (last) criteria section is authoritative over quoted text");
     }
 
     /// Generated scope summaries retain their historical display limits. Owner
@@ -19761,16 +19794,20 @@ mod iterate_not_delete_tests {
             author_trusted: true,
             research_filed: false,
         };
-        let first = qa_review_prompt(&issue, "summary", None);
+        let first = qa_review_prompt(&issue, "summary", None, &[]);
         assert!(first.contains("GitHub issue #7"));
         assert!(!first.contains("Previous QA findings"));
-        let again = qa_review_prompt(&issue, "summary", Some("missing test at a.rs:3"));
+        let again = qa_review_prompt(&issue, "summary", Some("missing test at a.rs:3"), &[]);
         assert!(again.contains("Previous QA findings"));
         assert!(again.contains("missing test at a.rs:3"));
         // Resume reviews committed work, the fresh lane staged work.
         assert!(
             first.contains("git diff origin/main...HEAD") && first.contains("git diff --cached")
         );
+        assert!(!first.contains("Controller-pinned"), "no harness, no boundary text");
+        let pinned = qa_review_prompt(&issue, "summary", None, &["autoship_verifiers/observe.py"]);
+        assert!(pinned.contains("Controller-pinned acceptance harness (immutable to the builder): autoship_verifiers/observe.py"));
+        assert!(pinned.contains("Do not request their removal"));
     }
 
     /// Every revision invalidates old evidence and requires all review roles anew.

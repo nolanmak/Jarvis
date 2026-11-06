@@ -700,10 +700,34 @@ async fn isolated_observation(
     }
 }
 
+/// The alignment failure leaves every criterion covered and nothing out of
+/// scope, and names where each unmapped change sits: the builder can repair it
+/// by dropping (or justifying) those changes alone.
+fn only_unmapped_hunks_named(detail: &str) -> bool {
+    let Some((failure, named)) = detail.split_once(crate::self_improve::alignment::UNMAPPED_LOCATIONS) else {
+        return false;
+    };
+    failure.contains("alignment_incomplete: outside_scope=[], unmapped_hunks=[\"")
+        && failure.ends_with("uncovered_criteria=[]")
+        && !named.trim().is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::ensure;
+    #[test]
+    fn a_narrowing_repair_is_offered_only_when_unmapped_changes_are_the_whole_failure() {
+        let marker = crate::self_improve::alignment::UNMAPPED_LOCATIONS;
+        let only = format!("acceptance failed: alignment_incomplete: outside_scope=[], unmapped_hunks=[\"7da1\"], uncovered_criteria=[]{marker}\n- 7da1: a.rs @@ -1 +1 @@");
+        assert!(only_unmapped_hunks_named(&only));
+        let uncovered = only.replace("uncovered_criteria=[]", "uncovered_criteria=[\"A\"]");
+        assert!(!only_unmapped_hunks_named(&uncovered), "a missing criterion needs real work, not narrowing");
+        let outside = only.replace("outside_scope=[]", "outside_scope=[\"b.rs\"]");
+        assert!(!only_unmapped_hunks_named(&outside));
+        let unnamed = "alignment_incomplete: outside_scope=[], unmapped_hunks=[\"7da1\"], uncovered_criteria=[]";
+        assert!(!only_unmapped_hunks_named(unnamed), "an unnamed hunk gives the builder nothing to act on");
+    }
     fn verifier_toolchain_child(test:&str)->Option<PathBuf> {
         const CHILD:&str="AUTOSHIP_VERIFIER_TOOLCHAIN_CHILD";
         if let Some(root)=std::env::var_os(CHILD) {return Some(root.into());}
@@ -1980,16 +2004,22 @@ pub(super) async fn verify_with_repair_for(
                         continue;
                     }
                 }
-                let infrastructure = detail.contains("infrastructure_failure")
-                    || detail.contains("toolchain")
-                    || detail.contains("environment changed")
-                    || detail.contains("disk")
-                    || detail.contains("admission")
-                    || detail.contains("alignment reviewer unavailable")
-                    || detail.contains("alignment transport")
-                    || detail.contains("constraint authority unavailable")
-                    || detail.contains("constraint authority invalid structured response")
-                    || detail.contains("alignment invalid structured response");
+                // Hunk locations are code, so a path like `disk.rs` must not
+                // classify a scope failure as infrastructure.
+                let classified = detail
+                    .split(crate::self_improve::alignment::UNMAPPED_LOCATIONS)
+                    .next()
+                    .unwrap_or(&detail);
+                let infrastructure = classified.contains("infrastructure_failure")
+                    || classified.contains("toolchain")
+                    || classified.contains("environment changed")
+                    || classified.contains("disk")
+                    || classified.contains("admission")
+                    || classified.contains("alignment reviewer unavailable")
+                    || classified.contains("alignment transport")
+                    || classified.contains("constraint authority unavailable")
+                    || classified.contains("constraint authority invalid structured response")
+                    || classified.contains("alignment invalid structured response");
                 if infrastructure {
                     CiGateResult(Err(error.context("acceptance infrastructure unavailable")))
                         .for_workflow(workflow).await??;
@@ -2000,9 +2030,16 @@ pub(super) async fn verify_with_repair_for(
                     prepared.baseline.registration.baseline_head(),
                     prepared.baseline.registration.candidate_environment_id(),
                 ))?);
-                if round == 2
-                    || !workflow.admit_epoch_attempt("acceptance_repair", &repair_epoch, 3)?
-                {
+                // A spent repair budget normally means re-scope, but re-scope
+                // replays the same contract, so a candidate whose only defect is
+                // a named change outside every criterion would loop forever
+                // (#1885: four identical re-scopes). Give the builder a bounded
+                // narrowing turn: it now knows exactly which change to drop.
+                let repair_admitted = round < 2
+                    && (workflow.admit_epoch_attempt("acceptance_repair", &repair_epoch, 3)?
+                        || (only_unmapped_hunks_named(&detail)
+                            && workflow.admit_epoch_attempt("alignment_narrowing", &repair_epoch, 2)?));
+                if !repair_admitted {
                     if let Some(amended) = amendment::try_amend(
                         reasoner, source, title, worktree, prepared, control, workflow, &detail,
                         true, None,

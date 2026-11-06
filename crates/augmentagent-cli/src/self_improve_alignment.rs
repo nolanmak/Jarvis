@@ -8,7 +8,7 @@ use crate::autoship_contract::{
 use anyhow::ensure;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 #[path = "self_improve_constraint_exception.rs"]
 mod exceptions;
 #[path = "self_improve_constraint_learning.rs"]
@@ -420,10 +420,28 @@ async fn hunks(root: &Path, base: &str, head: &str) -> Result<Vec<HunkEvidence>>
     ensure!(!result.is_empty(), "alignment_empty_patch");
     Ok(result)
 }
+/// Where a hunk sits, for a builder that only ever sees hunk ids: its path and
+/// `@@` header, so an unmapped hunk can be found, removed or justified (#1885
+/// spent its whole repair budget resubmitting one change named only by hash).
+fn locations(evidence: &[HunkEvidence]) -> BTreeMap<String, String> {
+    evidence
+        .iter()
+        .map(|e| {
+            let header = e.patch.lines().find(|l| l.starts_with("@@ ")).unwrap_or("");
+            let header: String = header.chars().take(160).collect();
+            (e.hunk.id.clone(), format!("{} {header}", e.hunk.path).trim_end().to_owned())
+        })
+        .collect()
+}
+/// Separates the unmapped-hunk locations from the failure text. Locations are
+/// code (paths, function names), so failure classification must read only what
+/// precedes this marker.
+pub(crate) const UNMAPPED_LOCATIONS: &str = "\nunmapped hunk locations (remove each change or make it serve a listed criterion):";
 fn assess(
     prepared: &acceptance::PreparedAcceptance,
     hunks: &[ChangedHunk],
     mappings: &[Mapping],
+    locations: &BTreeMap<String, String>,
 ) -> Result<()> {
     let basic: Vec<_> = mappings
         .iter()
@@ -434,13 +452,22 @@ fn assess(
         })
         .collect();
     let result = contract::check_alignment(&prepared.proposal.contract, hunks, &basic)?;
-    ensure!(
-        result.complete(),
-        "alignment_incomplete: outside_scope={:?}, unmapped_hunks={:?}, uncovered_criteria={:?}",
-        result.outside_scope,
-        result.unmapped_hunks,
-        result.uncovered_criteria
-    );
+    if !result.complete() {
+        let mut named = String::new();
+        for id in &result.unmapped_hunks {
+            let fallback = hunks.iter().find(|h| &h.id == id).map(|h| h.path.clone());
+            if let Some(at) = locations.get(id).cloned().or(fallback) {
+                named.push_str(&format!("\n- {}: {at}", &id[..id.len().min(12)]));
+            }
+        }
+        bail!(
+            "alignment_incomplete: outside_scope={:?}, unmapped_hunks={:?}, uncovered_criteria={:?}{}",
+            result.outside_scope,
+            result.unmapped_hunks,
+            result.uncovered_criteria,
+            if named.is_empty() { String::new() } else { format!("{UNMAPPED_LOCATIONS}{named}") }
+        );
+    }
     let mut implemented = BTreeSet::new();
     for mapping in mappings {
         ensure!(
@@ -554,7 +581,12 @@ pub(super) async fn gate_for(
         tracing::warn!(error = %error, "autoship constraint learning deferred");
     }
     let (rules, policy_hash) = policy(&policy_root)?;
-    let evidence = hunks(root, &base, &head).await?;
+    // Judge only the candidate's own changes. `main` moves while a build runs
+    // (other sessions merge every 10-40 minutes); a two-dot diff against the
+    // new tip also contains upstream commits, reversed, and refused candidates
+    // for "editing" files they never touched (#1883, #1885 on 2026-11-05).
+    let since = git(root, &["merge-base", &base, &head]).await?.trim().to_owned();
+    let evidence = hunks(root, &since, &head).await?;
     let actual: Vec<_> = evidence.iter().map(|e| e.hunk.clone()).collect();
     for hunk in &actual {
         ensure!(
@@ -686,7 +718,7 @@ pub(super) async fn gate_for(
         !native_sessions.is_empty(),
         "alignment lacks an observed fresh native session"
     );
-    assess(prepared, &actual, &mappings)?;
+    assess(prepared, &actual, &mappings, &locations(&evidence))?;
     let constraint_exception = exceptions::resolve(
         builder,
         root,
@@ -767,8 +799,9 @@ pub(super) async fn assert_current(
         policy(&reference.policy_root)?.1 == reference.policy_hash,
         "alignment promoted constraints changed"
     );
-    assess(prepared, &artifact.hunks, &artifact.mappings)?;
-    let evidence = hunks(root, &reference.base, &reference.head).await?;
+    assess(prepared, &artifact.hunks, &artifact.mappings, &BTreeMap::new())?;
+    let since = git(root, &["merge-base", &reference.base, &reference.head]).await?.trim().to_owned();
+    let evidence = hunks(root, &since, &reference.head).await?;
     let (rules, _) = policy(&reference.policy_root)?;
     exceptions::assert_current(
         &rules,
@@ -873,14 +906,42 @@ mod tests {
             },
         ]
     }
+    #[tokio::test]
+    async fn hunks_since_the_merge_base_exclude_files_main_changed_after_the_candidate_branched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git").args(["-c","user.name=t","-c","user.email=t@example.invalid","-c","commit.gpgsign=false"])
+                .args(args).current_dir(root).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("candidate.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("upstream.rs"), "fn u() {}\n").unwrap();
+        run(&["add", "."]); run(&["commit", "-qm", "base"]);
+        run(&["checkout", "-qb", "candidate"]);
+        std::fs::write(root.join("candidate.rs"), "fn a() { 1; }\n").unwrap();
+        run(&["commit", "-qam", "candidate"]);
+        let head = run(&["rev-parse", "HEAD"]);
+        run(&["checkout", "-q", "main"]);
+        std::fs::write(root.join("upstream.rs"), "fn u() { 2; }\n").unwrap();
+        run(&["commit", "-qam", "upstream moved on"]);
+        let main = run(&["rev-parse", "HEAD"]);
+        let two_dot: Vec<_> = hunks(root, &main, &head).await.unwrap().into_iter().map(|e| e.hunk.path).collect();
+        assert!(two_dot.contains(&"upstream.rs".to_string()), "the old comparison saw upstream work as the candidate's");
+        let since = git(root, &["merge-base", &main, &head]).await.unwrap().trim().to_owned();
+        let own: Vec<_> = hunks(root, &since, &head).await.unwrap().into_iter().map(|e| e.hunk.path).collect();
+        assert_eq!(own, vec!["candidate.rs".to_string()]);
+    }
     #[test]
     fn complete_support_mapping_passes_but_partial_issue_cannot_hide_behind_harness() {
         let (_root, prepared, hunks) = fixture();
         let complete = mappings(&hunks);
-        assert!(assess(&prepared, &hunks, &complete).is_ok());
+        assert!(assess(&prepared, &hunks, &complete, &BTreeMap::new()).is_ok());
         let mut partial = complete;
         partial[1].criterion_ids = vec!["A".into()];
-        assert!(assess(&prepared, &hunks, &partial)
+        assert!(assess(&prepared, &hunks, &partial, &BTreeMap::new())
             .unwrap_err()
             .to_string()
             .contains("alignment_partial_issue"));
@@ -890,7 +951,7 @@ mod tests {
         let (_root, prepared, mut hunks) = fixture();
         let complete = mappings(&hunks);
         hunks.push(ChangedHunk::new("code.rs", b"unrelated format change").unwrap());
-        assert!(assess(&prepared, &hunks, &complete).is_err());
+        assert!(assess(&prepared, &hunks, &complete, &BTreeMap::new()).is_err());
         let reply = Reply {
             source: AcceptanceSource::Issue(43),
             head: "head".into(),
@@ -909,14 +970,27 @@ mod tests {
         .contains("alignment_wrong_source"));
     }
     #[test]
+    fn an_unmapped_hunk_is_named_by_path_and_header_after_the_classification_marker() {
+        let (_root, prepared, mut hunks) = fixture();
+        let complete = mappings(&hunks);
+        let patch = "diff --git a/code.rs b/code.rs\n@@ -621,7 +644,7 @@ async fn disk_status(\n-a\n+b\n";
+        let stray = HunkEvidence { hunk: ChangedHunk::new("code.rs", patch.as_bytes()).unwrap(), patch: patch.into() };
+        hunks.push(stray.hunk.clone());
+        let detail = format!("{:#}", assess(&prepared, &hunks, &complete, &locations(&[stray])).unwrap_err());
+        let (failure, named) = detail.split_once(UNMAPPED_LOCATIONS).expect("locations follow the marker");
+        assert!(failure.contains("alignment_incomplete"));
+        assert!(named.contains("code.rs @@ -621,7 +644,7 @@ async fn disk_status("), "{named}");
+        assert!(!failure.contains("disk"), "code text stays out of the classified failure");
+    }
+    #[test]
     fn out_of_scope_and_harness_impersonation_are_rejected() {
         let (_root, prepared, mut hunks) = fixture();
         let mut complete = mappings(&hunks);
         complete[0].kind = Kind::IndependentHarness;
-        assert!(assess(&prepared, &hunks, &complete).is_err());
+        assert!(assess(&prepared, &hunks, &complete, &BTreeMap::new()).is_err());
         complete = mappings(&hunks);
         hunks[1].path = "unrelated.rs".into();
-        assert!(assess(&prepared, &hunks, &complete).is_err());
+        assert!(assess(&prepared, &hunks, &complete, &BTreeMap::new()).is_err());
     }
     fn proposal() -> Proposal {
         Proposal {
@@ -999,7 +1073,7 @@ pub(super) async fn persist_shipping_fixture(root: &Path, prepared: &acceptance:
     let mappings = actual.iter().map(|hunk|Mapping { hunk_id:hunk.id.clone(),
         criterion_ids:vec!["SUM".into()], kind:if prepared.proposal.files.contains_key(&hunk.path) {Kind::IndependentHarness} else {Kind::Implementation},
         evidence:"Synthetic arithmetic fixture returns a+b; pinned unittest exercises signed and zero inputs".into() }).collect::<Vec<_>>();
-    assess(prepared,&actual,&mappings)?;
+    assess(prepared,&actual,&mappings,&locations(&evidence))?;
     let policy_hash = policy(policy_root)?.1;
     let contract_hash = prepared.baseline.registration.contract_hash().to_owned();
     let artifact = Artifact { version:1,source:prepared.proposal.contract.source()?,head:head.clone(),base:base.clone(),contract_hash:contract_hash.clone(),
