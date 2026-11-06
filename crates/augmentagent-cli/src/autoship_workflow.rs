@@ -23,6 +23,8 @@ mod review_epoch;
 mod conversations;
 #[path="autoship_owner_publication.rs"]
 mod owner_publication;
+#[path="autoship_owner_publication_recovery.rs"]
+pub(crate) mod owner_publication_recovery;
 pub(crate) use owner_publication::{LiveOwnerTurn,OwnerPublicationNativeFacts,OwnerPublicationCommitMetadata,OwnerPublicationReadContext};
 #[path = "autoship_owner_revision.rs"]
 mod owner_revision;
@@ -410,6 +412,13 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS workflow_owner_publication_completion (
                 request_id TEXT PRIMARY KEY REFERENCES workflow_owner_publication_intent(request_id), workflow TEXT NOT NULL REFERENCES workflow(id),
                 sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq), record_sha256 TEXT NOT NULL, record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_publication_recovery (
+                workflow TEXT NOT NULL REFERENCES workflow(id), generation INTEGER NOT NULL,
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record_sha256 TEXT NOT NULL,record TEXT NOT NULL,
+                PRIMARY KEY(workflow,generation));
+            CREATE TABLE IF NOT EXISTS workflow_owner_publication_recovery_pending (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id),generation INTEGER NOT NULL,
+                FOREIGN KEY(workflow,generation) REFERENCES workflow_owner_publication_recovery(workflow,generation));
             CREATE TABLE IF NOT EXISTS workflow_owner_revision_fence (
                 request_id TEXT PRIMARY KEY REFERENCES workflow_owner_revision(request_id),
                 previous_generation INTEGER NOT NULL, next_generation INTEGER NOT NULL);

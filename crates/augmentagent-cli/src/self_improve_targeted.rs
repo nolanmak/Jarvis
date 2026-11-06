@@ -63,6 +63,29 @@ async fn authorized_repository_name(repo:&Path,requested:&str)->Result<String> {
     Ok(repository)
 }
 
+/// Fresh repository/immutable owner-origin authorization, not execution or
+/// native cleanup authority. The borrowed preview cannot be serialized into it.
+pub(crate) struct AuthorizedOwnerRecovery<'a> {
+    plan:&'a crate::autoship_workflow::owner_publication_recovery::RecoveryPlan,
+    principal:String,authorized_at:i64,
+}
+impl AuthorizedOwnerRecovery<'_> {
+    pub(crate) fn plan(&self)->&crate::autoship_workflow::owner_publication_recovery::RecoveryPlan {self.plan}
+    pub(crate) fn principal(&self)->&str {&self.principal}
+    pub(crate) fn require(&self,plan:&crate::autoship_workflow::owner_publication_recovery::RecoveryPlan,now:i64)->Result<()> {
+        anyhow::ensure!(self.plan.same_original(plan) && now>=self.authorized_at && now-self.authorized_at<=30_000,
+            "owner publication recovery authorization expired or changed");Ok(())
+    }
+}
+pub(crate) async fn authorize_owner_publication_recovery<'a>(repo:&Path,
+    plan:&'a crate::autoship_workflow::owner_publication_recovery::RecoveryPlan,
+    policy:crate::autoship_discord_command::OwnerPolicy)->Result<AuthorizedOwnerRecovery<'a>> {
+    let origin=plan.origin();anyhow::ensure!(policy.bot>0 && policy.owner>0 && policy.bot==origin.bot && policy.owner==origin.owner,
+        "owner publication recovery configured identity changed");
+    let principal=authorize_command(repo,plan.command()).await?;
+    Ok(AuthorizedOwnerRecovery {plan,principal,authorized_at:chrono::Utc::now().timestamp_millis()})
+}
+
 /// Authenticate before looking up a replay; closed targets may replay their
 /// original admission, but a revoked repository grant may not.
 pub(crate) async fn authorize_command(repo: &Path, request: &Request) -> Result<String> {

@@ -4021,6 +4021,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_owner_publication_has_authenticated_metadata_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in ["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery"] {
+        let control=control_dir();let gh=control.path().join("gh-recovery");
+        std::fs::write(&gh,r#"#!/usr/bin/python3
+import json,sys
+from pathlib import Path
+root=Path(__file__).parent
+s=json.loads((root/'recovery-authority.json').read_text())
+a=sys.argv[1:]
+if a[:2]==['repo','view'] and 'nameWithOwner' in a: print(s['repository'])
+elif a[:2]==['repo','view'] and 'viewerPermission' in a: print(s['permission'])
+elif a[:2]==['api','user']: print(s['actor'])
+else: raise SystemExit('unexpected authority call')
+"#).unwrap();std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(control.path().join("recovery-authority.json"),br#"{"repository":"owner/repo","permission":"WRITE","actor":"owner"}"#).unwrap();
+        let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--test-threads=1"])
+            .env("AUTOSHIP_INITIAL_GUARD_CHILD",control.path()).env("AUTOSHIP_INITIAL_GUARD_MODE",mode)
+            .env("GH_BIN",&gh).env("XDG_STATE_HOME",control.path().join("operator-state")).env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json")).output().unwrap();
+        assert!(output.status.success(),"{mode}: {} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        }
+    }
+
+    #[tokio::test]
     async fn pending_owner_publication_returns_only_metadata_authority() {
         let control=control_dir();
         let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--test-threads=1"])
@@ -4578,7 +4602,7 @@ mod tests {
                         prepared.test_reload_cached(dir.path(),&first).await.unwrap();
                     }
                     first.finish().unwrap();
-                }else if mode.ends_with("-metadata-only") || mode.ends_with("-metadata-native-proof") {
+                }else if mode.ends_with("-metadata-only") || mode.ends_with("-metadata-native-proof") || mode.ends_with("-metadata-recovery") {
                     let retained=first.audit.clone();
                     let pending=first.activate_prepared_owner_acceptance(&prepared,None).await.unwrap();
                     // Test module can inspect the private inner; product callers cannot.
@@ -4728,6 +4752,110 @@ mod tests {
                     }
                     db.execute("UPDATE workflow_owner_publication_intent SET record=?2 WHERE request_id=?1",rusqlite::params![turn.request_id,saved]).unwrap();
                     guard.store.lock().unwrap().validate_owner_publication_metadata(&pending._metadata,millis()).unwrap();
+                    if mode.ends_with("-metadata-recovery") {
+                        let policy=crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22};
+                        let live_plan=WorkflowStore::open(&state).unwrap().owner_publication_recovery_plan(&id).unwrap().unwrap();
+                        assert_eq!(live_plan.command().provider,Some(if mode.contains("-claude-") {durable::submission::Provider::Claude}else{durable::submission::Provider::Codex}));
+                        let live_auth=super::super::targeted::authorize_owner_publication_recovery(dir.path(),&live_plan,policy).await.unwrap();
+                        assert!(WorkflowStore::open(&state).unwrap().claim_owner_publication_recovery(&live_auth,"must-wait",millis(),60_000).unwrap().is_none());
+                        let original_generation=guard.lease.generation;let original_request=turn.request_id.clone();
+                        drop(pending);drop(live_auth);drop(live_plan);
+                        // Controlled expiry projection; no native cleanup is inferred.
+                        db.execute("UPDATE workflow SET lease_until=?2 WHERE id=?1",rusqlite::params![id,millis()-1]).unwrap();
+                        let mut store=WorkflowStore::open(&state).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
+                        store.set_owner_pause(&id,"fixture-owner",revision,true,millis()).unwrap();
+                        let later=durable::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:46};
+                        store.enqueue_owner_message(&later,&id,"Later separate owner instruction",None,millis()).unwrap();
+                        let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Held;
+                        db.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",rusqlite::params![id,serde_json::to_string(&checkpoint).unwrap()]).unwrap();
+                        let before=store.snapshot(&id).unwrap().unwrap();let control_before=store.owner_control(&id).unwrap();
+                        let turn_before:(String,i64,String,String)=db.query_row("SELECT owner,lease_generation,binding,state FROM workflow_owner_turn WHERE request_id=?1",[&original_request],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+                        let intent_before:(String,String)=db.query_row("SELECT record,record_sha256 FROM workflow_owner_publication_intent WHERE request_id=?1",[&original_request],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                        let plan=store.owner_publication_recovery_plan(&id).unwrap().unwrap();
+                        assert!(super::super::targeted::authorize_owner_publication_recovery(dir.path(),&plan,crate::autoship_discord_command::OwnerPolicy {bot:11,owner:999}).await.is_err());
+                        let scenario=control.join("recovery-authority.json");
+                        std::fs::write(&scenario,br#"{"repository":"owner/repo","permission":"READ","actor":"owner"}"#).unwrap();
+                        assert!(super::super::targeted::authorize_owner_publication_recovery(dir.path(),&plan,policy).await.is_err());
+                        std::fs::write(&scenario,br#"{"repository":"other/repo","permission":"WRITE","actor":"owner"}"#).unwrap();
+                        assert!(super::super::targeted::authorize_owner_publication_recovery(dir.path(),&plan,policy).await.is_err());
+                        std::fs::write(&scenario,br#"{"repository":"owner/repo","permission":"WRITE","actor":"owner"}"#).unwrap();
+                        let authorization=super::super::targeted::authorize_owner_publication_recovery(dir.path(),&plan,policy).await.unwrap();
+                        let barrier=std::sync::Barrier::new(2);
+                        let winner=std::thread::scope(|scope| {
+                            let mut jobs=Vec::new();for index in 0..2 {let authorization=&authorization;let barrier=&barrier;let state=&state;
+                                jobs.push(scope.spawn(move || {let mut store=WorkflowStore::open(state).unwrap();barrier.wait();
+                                    (index,store.claim_owner_publication_recovery(authorization,&format!("metadata-{index}"),millis(),60_000).unwrap())}));}
+                            let mut winners=jobs.into_iter().map(|job|job.join().unwrap()).filter_map(|(index,lease)|lease.map(|lease|(index,lease))).collect::<Vec<_>>();
+                            assert_eq!(winners.len(),1,"competing metadata recovery claims both won");winners.pop().unwrap()
+                        });
+                        let (index,recovery)=winner;assert_eq!(recovery.generation(),original_generation+1);assert_eq!(recovery.request_id(),original_request);
+                        store.validate_owner_publication_recovery(&recovery,&authorization,millis()).unwrap();
+                        assert!(store.claim_owner_publication_recovery(&authorization,"stale-plan",millis(),60_000).unwrap().is_none());
+                        let after=store.snapshot(&id).unwrap().unwrap();assert_eq!(after.checkpoint,before.checkpoint);assert_eq!(after.progress_at_ms,before.progress_at_ms);
+                        assert_eq!((after.attempts,after.wall_ms,after.model_calls,after.tokens),(before.attempts,before.wall_ms,before.model_calls,before.tokens));
+                        assert_eq!(store.owner_control(&id).unwrap(),control_before);assert_eq!(store.pending_owner_messages(&id).unwrap(),2);
+                        assert_eq!(db.query_row("SELECT owner,lease_generation,binding,state FROM workflow_owner_turn WHERE request_id=?1",[&original_request],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).unwrap(),turn_before);
+                        assert_eq!(db.query_row("SELECT record,record_sha256 FROM workflow_owner_publication_intent WHERE request_id=?1",[&original_request],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).unwrap(),intent_before);
+                        assert!(store.claim(&id,"ordinary",millis(),60_000).unwrap().is_none());
+                        assert!(store.claim_owner_turn(&id,"next-message",millis(),60_000).unwrap().is_none());
+                        let copied=Lease {workflow:id.clone(),owner:format!("metadata-{index}"),generation:recovery.generation()};
+                        assert!(store.charge(&copied,"not-a-model-permit",durable::ResourceCharge {model_calls:1,..Default::default()},millis()).is_err());
+                        assert!(store.begin_operation(&copied,OperationKind::CreatePr,&after.checkpoint.binding,millis()).is_err());
+                        assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+                        db.execute("DELETE FROM workflow_owner_publication_recovery_pending WHERE workflow=?1",[&id]).unwrap();
+                        assert!(store.validate_owner_publication_recovery(&recovery,&authorization,millis()).is_err());
+                        assert!(store.charge(&copied,"missing-pointer",durable::ResourceCharge {model_calls:1,..Default::default()},millis()).is_err());
+                        db.execute("INSERT INTO workflow_owner_publication_recovery_pending VALUES(?1,?2)",rusqlite::params![id,recovery.generation()]).unwrap();
+                        store.validate_owner_publication_recovery(&recovery,&authorization,millis()).unwrap();
+                        let record_before:String=db.query_row("SELECT record FROM workflow_owner_publication_recovery WHERE workflow=?1",[&id],|r|r.get(0)).unwrap();
+                        db.execute("UPDATE workflow_owner_publication_recovery SET record='{}' WHERE workflow=?1",[&id]).unwrap();
+                        assert!(store.validate_owner_publication_recovery(&recovery,&authorization,millis()).is_err());
+                        db.execute("UPDATE workflow_owner_publication_recovery SET record=?2 WHERE workflow=?1",rusqlite::params![id,record_before]).unwrap();
+                        store.validate_owner_publication_recovery(&recovery,&authorization,millis()).unwrap();
+                        assert!(store.claim_owner_publication_recovery(&authorization,"expired-auth",millis()+30_001,60_000).is_err());
+                        // Clearing controls and projecting applied messages cannot turn a
+                        // metadata generation into an ordinary execution capability.
+                        let revision=store.owner_control(&id).unwrap().unwrap().revision;
+                        store.set_owner_pause(&id,"fixture-owner",revision,false,millis()).unwrap();
+                        db.execute("UPDATE workflow_owner_message SET state='applied' WHERE workflow=?1",[&id]).unwrap();
+                        let denied=store.charge(&copied,"applied-is-not-productive",durable::ResourceCharge {model_calls:1,..Default::default()},millis()).unwrap_err();
+                        assert!(format!("{denied:#}").contains("owner-publication-recovery-metadata-only"),"{denied:#}");
+                        assert!(store.begin_operation(&copied,OperationKind::CreatePr,&after.checkpoint.binding,millis()).is_err());
+                        db.execute("UPDATE workflow_owner_message SET state='pending' WHERE workflow=?1",[&id]).unwrap();
+                        // Simulate another interrupted metadata owner, preserving all
+                        // immutable original activation and first-claim history.
+                        db.execute("UPDATE workflow SET lease_until=?2 WHERE id=?1",rusqlite::params![id,millis()-1]).unwrap();
+                        let next_plan=store.owner_publication_recovery_plan(&id).unwrap().unwrap();
+                        let next_auth=super::super::targeted::authorize_owner_publication_recovery(dir.path(),&next_plan,policy).await.unwrap();
+                        let before_retry=store.snapshot(&id).unwrap().unwrap();
+                        let before_events:i64=db.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1",[&id],|r|r.get(0)).unwrap();
+                        db.execute_batch("CREATE TRIGGER reject_recovery_insert BEFORE INSERT ON workflow_owner_publication_recovery BEGIN SELECT RAISE(ABORT,'injected recovery append failure'); END;").unwrap();
+                        let failure=store.claim_owner_publication_recovery(&next_auth,"metadata-retry",millis(),60_000).err().expect("partial recovery claim escaped failed append");
+                        assert!(format!("{failure:#}").contains("injected recovery append failure"),"{failure:#}");
+                        assert_eq!(store.snapshot(&id).unwrap().unwrap(),before_retry);
+                        assert_eq!(db.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),before_events);
+                        assert_eq!(db.query_row("SELECT generation FROM workflow_owner_publication_recovery_pending WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),recovery.generation());
+                        db.execute_batch("DROP TRIGGER reject_recovery_insert;").unwrap();
+                        let second=store.claim_owner_publication_recovery(&next_auth,"metadata-retry",millis(),60_000).unwrap().unwrap();
+                        assert_eq!(second.generation(),original_generation+2);assert_eq!(second.request_id(),original_request);
+                        store.validate_owner_publication_recovery(&second,&next_auth,millis()).unwrap();
+                        assert!(store.validate_owner_publication_recovery(&recovery,&next_auth,millis()).is_err());
+                        let saved_checkpoint:String=db.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&id],|r|r.get(0)).unwrap();
+                        for terminal in [Stage::Merged,Stage::Retired] {
+                            let mut terminal_checkpoint:Checkpoint=serde_json::from_str(&saved_checkpoint).unwrap();terminal_checkpoint.stage=terminal;
+                            db.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",rusqlite::params![id,serde_json::to_string(&terminal_checkpoint).unwrap()]).unwrap();
+                            assert!(store.owner_publication_recovery_plan(&id).unwrap().is_none());
+                            assert!(store.validate_owner_publication_recovery(&second,&next_auth,millis()).is_err());
+                            assert!(store.claim_owner_publication_recovery(&next_auth,"no-terminal-resurrection",millis(),60_000).unwrap().is_none());
+                        }
+                        db.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",rusqlite::params![id,saved_checkpoint]).unwrap();
+
+                        assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,before.model_calls);
+                        assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+                        assert_eq!(db.query_row("SELECT owner,lease_generation,binding,state FROM workflow_owner_turn WHERE request_id=?1",[&original_request],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).unwrap(),turn_before);
+                        assert_eq!(db.query_row("SELECT record,record_sha256 FROM workflow_owner_publication_intent WHERE request_id=?1",[&original_request],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).unwrap(),intent_before);
+                        return;
+                    }
                     if mode.ends_with("-metadata-native-proof") {
                         let cached_facts=pending.native_facts().unwrap();
                         let mut store=WorkflowStore::open(&state).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;

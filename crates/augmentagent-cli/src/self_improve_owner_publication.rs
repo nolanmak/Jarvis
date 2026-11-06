@@ -80,6 +80,10 @@ pub(crate) struct OwnerPublicationRecord {
 }
 impl OwnerPublicationRecord {
     pub(crate) fn workflow(&self)->&str {&self.input.workflow}
+    pub(crate) fn repository(&self)->&str {&self.repository}
+    pub(crate) fn recovery_identity(&self)->Result<(String,i64,crate::autoship_workflow::OwnerPreparationBinding,String)> {
+        Ok((self.input.key()?,self.activated_generation,self.preparation.clone(),self.input.body_sha256.clone()))
+    }
     pub(crate) fn canonical_manifest(&self)->&str {&self.next_manifest}
     pub(crate) fn canonical_contract(&self)->&str {&self.next_binding.contract}
     pub(crate) fn request(&self)->&str {&self.input.request_id}

@@ -134,6 +134,17 @@ mod tests {
         let origin=discord_ingress::DiscordOrigin {message:45,..origin};store.enqueue_owner_message(&origin,&id,"Fix the failing test",None,3).unwrap();(store,id)
     }
     #[test]
+    fn applied_message_does_not_promote_an_unsettled_owner_generation() {
+        let dir=tempfile::tempdir().unwrap();let (store,id)=setup(&dir.path().join("state.db"));let mut store=store;
+        let turn=store.claim_owner_turn(&id,"original-owner",4,100).unwrap().unwrap();
+        // A late/partial outcome projection is not a complete turn settlement.
+        store.conn.execute("UPDATE workflow_owner_message SET state='applied' WHERE request_id=?1",[&turn.request_id]).unwrap();
+        assert_eq!(store.pending_owner_messages(&id).unwrap(),0);
+        assert!(store.require_owner_dispatch(&id).is_err(),"applied message promoted an unsettled owner turn to ordinary dispatch");
+        assert!(store.begin_operation(&turn.lease,OperationKind::CreatePr,&turn.binding,5).is_err());
+        assert_eq!(store.merge_allowance(5,5).unwrap().confirmed,0);
+    }
+    #[test]
     fn explicit_pause_blocks_new_owner_turns_while_pending_input_stays_queued() {
         let dir=tempfile::tempdir().unwrap();let (mut store,id)=setup(&dir.path().join("state.db"));
         let revision=store.owner_control(&id).unwrap().unwrap().revision;

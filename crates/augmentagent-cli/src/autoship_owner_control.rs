@@ -146,6 +146,10 @@ pub(super) fn read(conn:&Connection,workflow:&str)->Result<Option<OwnerControl>>
 }
 
 pub(super) fn require_dispatch(conn:&Connection,workflow:&str)->Result<()> {
+    super::owner_publication_recovery::require_no_recovery_dispatch(conn,workflow)?;
+    let turns:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_turn')",[],|r|r.get(0))?;
+    if turns {ensure!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1 AND state NOT IN ('completed','setup_refused'))",[workflow],|r|r.get::<_,bool>(0))?,"owner-turn-unsettled");}
+
     ensure!(!read(conn,workflow)?.is_some_and(|c|c.paused),"owner-paused");
     ensure!(super::owner_inbox::pending(conn,workflow)?==0,"owner-followup-pending");
     Ok(())
