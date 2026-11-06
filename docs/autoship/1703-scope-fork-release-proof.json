@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "kind": "registered-scope-lock-release-across-fork-component",
+  "source_parent_commit": "176e3ae81a276a1c5d08fe43a981e149ac5df6b8",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/autoship_write_scope.rs",
+      "sha256": "798c410963c6178b19e714192f0da6faecd53e41d0c9457df14021167ad7a972"
+    },
+    {
+      "path": "docs/autoship/owner-publication-protocol.md",
+      "sha256": "c0ecd765a25c364f082069f80d28359a1c95fa0ec5b86482e933159062f52eee"
+    },
+    {
+      "path": "docs/autoship/owner-acceptance-publication.md",
+      "sha256": "2f062de5329544d0913fbab4e2b49b68302cf2a903e3a807abed8dd340c31769"
+    }
+  ],
+  "hosted_incident": {
+    "head": "176e3ae81a276a1c5d08fe43a981e149ac5df6b8",
+    "root_failure": "registered_scope_replacement_replays_only_the_exact_permissions: write scope busy after parent visitor returned",
+    "agents_job": "https://github.com/nolanmak/Jarvis/actions/runs/42218680484/job/127895603891",
+    "targeted_job": "https://github.com/nolanmak/Jarvis/actions/runs/42218680512/job/127895364962",
+    "agents_log": "/tmp/autoship-176e3ae8-ci-agents-failed-20261106.log",
+    "targeted_log": "/tmp/autoship-176e3ae8-ci-targeted-failed-20261106.log",
+    "targeted_is_same_root_failure": true
+  },
+  "behavior": "ScopeLock explicitly unlocks flock on guard drop. Descriptor close alone leaves a fork-inherited open file description holding the lock. Admission/identity checks and writer exclusion during the visitor are unchanged.",
+  "validation": {
+    "behavioral_red": {
+      "original_session_id": 93835,
+      "terminal_exit": 1,
+      "cargo_exit": 101,
+      "log": "/tmp/autoship-scope-fork-release-red-20261106.log",
+      "failure": "parent replay remains busy after visitor return while fork child retains inherited scope descriptor"
+    },
+    "deterministic_case": "Isolated test process forks inside held scope visitor, retains child through parent release/replay, always releases/reaps child before assertions. No test serialization of the full suite or CI bypass.",
+    "final": {
+      "original_session_id": 13924,
+      "terminal_exit": 0,
+      "core": {
+        "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib",
+        "passed": 934,
+        "failed": 0,
+        "ignored": 15,
+        "seconds": 35.98,
+        "log": "/tmp/autoship-current-facts-scope-release-full-core-20261106.log"
+      },
+      "cli": {
+        "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+        "passed": 1947,
+        "failed": 0,
+        "ignored": 34,
+        "seconds": 299.6,
+        "log": "/tmp/autoship-current-facts-scope-release-full-cli-20261106.log"
+      },
+      "production_check": {
+        "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+        "seconds": 35.62,
+        "log": "/tmp/autoship-current-facts-scope-release-production-check-20261106.log"
+      }
+    },
+    "existing_writer_exclusion_tests_retained": true
+  },
+  "limits": [
+    "This fixes registered-scope lock lifetime. It is not native session/source/resource authority or completed publication.",
+    "Hosted checks for the new commit still need verification; local results do not establish deployed/live acceptance."
+  ]
+}

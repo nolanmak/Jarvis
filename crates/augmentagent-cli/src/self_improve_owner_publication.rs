@@ -128,6 +128,15 @@ impl OwnerPublicationRecord {
 /// Borrowed original producer; history JSON cannot reconstruct activation input.
 pub(crate) struct OwnerPublicationDraft<'a> {record:OwnerPublicationRecord,producer:&'a PreparedOwnerAcceptance}
 impl OwnerPublicationDraft<'_> {
+    /// Exact original retained draft join, with no filesystem or native I/O.
+    pub(crate) fn require_metadata_record(&self,conn:&rusqlite::Connection,turn:&crate::autoship_workflow::owner_turn::OwnerTurn)->Result<()> {
+        ensure!(turn.lease.workflow==self.record.input.workflow && turn.lease.owner==self.record.input.owner
+            && turn.lease.generation==self.record.activated_generation && turn.request_id==self.record.input.request_id
+            && turn.pause_revision==self.record.input.pause_revision && turn.body==self.record.input.body && turn.binding==self.record.next_binding,
+            "owner publication retained metadata turn changed");
+        let raw:String=conn.query_row("SELECT record FROM workflow_owner_publication_intent WHERE request_id=?1",[&turn.request_id],|r|r.get(0))?;
+        ensure!(raw==serde_json::to_string(&self.record)?,"owner publication retained original intent changed");Ok(())
+    }
     /// Preflight against the retained original producer. These bounded file
     /// checks precede native locks; the eventual writer must recheck its exact
     /// canonical/evidence bytes at commit, rather than treating this as a grant.
@@ -145,8 +154,8 @@ impl OwnerPublicationDraft<'_> {
         Ok(crate::autoship_workflow::owner_turn::OwnerTurn {lease:lease.clone(),request_id:self.record.input.request_id.clone(),
             body:self.record.input.body.clone(),pause_revision:self.record.input.pause_revision,binding:binding.clone()})
     }
-    pub(in crate::self_improve) fn preparation(&self)->&crate::autoship_workflow::OwnerPreparationBinding {&self.record.preparation}
-    pub(in crate::self_improve) fn validate_native_binding(&self,binding:&augmentagent_channel_core::native_vm::ownership::TransferBinding)->Result<()> {
+    pub(crate) fn preparation(&self)->&crate::autoship_workflow::OwnerPreparationBinding {&self.record.preparation}
+    pub(crate) fn validate_native_binding(&self,binding:&augmentagent_channel_core::native_vm::ownership::TransferBinding)->Result<()> {
         self.record.validate_native_binding(binding)
     }
     pub(crate) fn encode_for_activation(&self,turn:&crate::autoship_workflow::owner_turn::OwnerTurn,next:&RegisteredContract,

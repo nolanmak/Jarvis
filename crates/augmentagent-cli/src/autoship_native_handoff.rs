@@ -122,9 +122,18 @@ pub(super) fn capture(
 fn provider_key(provider:submission::Provider)->&'static str {
     match provider {submission::Provider::Codex=>"codex",submission::Provider::Claude=>"claude"}
 }
-pub(super) fn read_facts(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64)->Result<NativeHandoffFacts> {read_facts_mode(tx,lease,binding,now,false)}
-pub(super) fn read_closed_facts(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64)->Result<NativeHandoffFacts> {read_facts_mode(tx,lease,binding,now,true)}
-fn read_facts_mode(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64,closed:bool)->Result<NativeHandoffFacts> {
+#[derive(Clone,Copy)]
+enum FactOwners<'a> {PriorActive,PriorRetired,CurrentMetadata(&'a Authority)}
+pub(super) fn read_facts(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64)->Result<NativeHandoffFacts> {read_facts_mode(tx,lease,binding,now,FactOwners::PriorActive)}
+pub(super) fn read_closed_facts(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64)->Result<NativeHandoffFacts> {read_facts_mode(tx,lease,binding,now,FactOwners::PriorRetired)}
+/// Read-only current-namespace selection. The caller must validate its actual
+/// metadata authority in this transaction; these facts are never a native proof.
+pub(super) fn read_current_metadata_facts(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,namespace:&Authority,now:i64)->Result<NativeHandoffFacts> {
+    ensure!(namespace.owner.workflow_id==lease.workflow && namespace.owner.lease_generation==lease.generation,TransferReason::AuthorityConflict);
+    read_facts_mode(tx,lease,binding,now,FactOwners::CurrentMetadata(namespace))
+}
+fn read_facts_mode(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64,selection:FactOwners<'_>)->Result<NativeHandoffFacts> {
+    let closed=matches!(selection,FactOwners::PriorRetired);
     require_binding(&tx, lease, binding, now)?;
     let raw: String = tx.query_row(
         "SELECT checkpoint FROM workflow WHERE id=?1",
@@ -144,7 +153,8 @@ fn read_facts_mode(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64,clo
     let transfers = native_pending::settlement::History::load(tx, &lease.workflow, u64::MAX)?;
     let owners = {
         let predicate=if closed {"retirement_reason IS NOT NULL AND retired_at IS NOT NULL"}else{"retirement_reason IS NULL AND retired_at IS NULL"};
-        let mut query=tx.prepare(&format!("SELECT lease_generation,audit_path FROM workflow_native_owner WHERE workflow=?1 AND lease_generation<?2 AND {predicate} AND NOT EXISTS(SELECT 1 FROM workflow_native_transferred_source d WHERE d.workflow=workflow_native_owner.workflow AND d.lease_generation=workflow_native_owner.lease_generation AND d.audit_path=workflow_native_owner.audit_path) ORDER BY lease_generation,audit_path LIMIT 129"))?;
+        let generation=if matches!(selection,FactOwners::CurrentMetadata(_)) {"lease_generation=?2"}else{"lease_generation<?2"};
+        let mut query=tx.prepare(&format!("SELECT lease_generation,audit_path FROM workflow_native_owner WHERE workflow=?1 AND {generation} AND {predicate} AND NOT EXISTS(SELECT 1 FROM workflow_native_transferred_source d WHERE d.workflow=workflow_native_owner.workflow AND d.lease_generation=workflow_native_owner.lease_generation AND d.audit_path=workflow_native_owner.audit_path) ORDER BY lease_generation,audit_path LIMIT 129"))?;
         let rows = query
             .query_map(params![lease.workflow, lease.generation], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
@@ -202,6 +212,9 @@ fn read_facts_mode(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64,clo
         source_projection.push(serde_json::json!({"source":source,"original_binding":native,"registration_sequence":registered[0].0}));
         source_owners.push(source);
         original_binding = Some(native);
+    }
+    if let FactOwners::CurrentMetadata(expected)=selection {
+        ensure!(source_owners.as_slice()==std::slice::from_ref(expected),TransferReason::AuthorityConflict);
     }
     let launches=native_launch::history(tx,&lease.workflow)?;
     let observations=native_observation::history(tx,&lease.workflow)?;

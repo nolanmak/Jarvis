@@ -779,6 +779,73 @@ pub(crate) mod tests {
             .unwrap()
     }
     #[test]
+    fn current_native_metadata_inventory_keeps_the_actual_owner_and_latest_uncertainty() {
+        if child("current_native_metadata_inventory_keeps_the_actual_owner_and_latest_uncertainty") {return;}
+        let mut f=Fixture::new();
+        let completed=f.complete();let observed=f.record(&completed).unwrap();
+        let before=f.store.snapshot(&f.lease.workflow).unwrap().unwrap();
+        let namespace=ownership::Authority {owner:f.audit.native_runtime_owner().unwrap().unwrap(),audit_path:f.audit.path().to_str().unwrap().into()};
+        let tx=f.store.conn.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        let facts=super::super::native_handoff::read_current_metadata_facts(&tx,&f.lease,&f.binding,&namespace,now()).expect("current native metadata inventory must not require a fabricated later lease");tx.commit().unwrap();
+        assert_eq!(facts.source_owners.len(),1);
+        assert_eq!(facts.source_owners[0].owner.lease_generation,f.lease.generation);
+        assert_eq!(facts.runtimes.len(),1);
+        assert_eq!(facts.runtimes[0].latest_observation.as_ref(),Some(&observed));
+        let first_projection=super::super::owner_publication::current_facts_fixture(facts.clone());
+        assert!(first_projection.runtimes().unwrap()[0].inventory.is_some());
+        assert_eq!(f.store.snapshot(&f.lease.workflow).unwrap().unwrap(),before);
+        let uncertain=f.uncertain(true);let latest=f.record(&uncertain).unwrap();
+        let tx=f.store.conn.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        let next=super::super::native_handoff::read_current_metadata_facts(&tx,&f.lease,&f.binding,&namespace,now()).unwrap();tx.commit().unwrap();
+        assert_eq!(next.runtimes.len(),1);assert_eq!(next.runtimes[0].latest_observation.as_ref(),Some(&latest));
+        assert_ne!(next.latest_input_sha256,facts.latest_input_sha256,"new uncertainty exposed an older successful observation");
+        let uncertain_projection=super::super::owner_publication::current_facts_fixture(next.clone());
+        assert!(uncertain_projection.runtimes().unwrap()[0].inventory.is_none(),"uncertainty was converted to an older successful inventory");
+        assert_ne!(first_projection.fingerprint().unwrap(),uncertain_projection.fingerprint().unwrap());
+        let mut newer=f.prepared.intent.clone();newer.intent_id=uuid::Uuid::new_v4().to_string();newer.launch_sha256="b".repeat(64);
+        let newer=f.audit.native_launch_prepared(&newer).unwrap();
+        f.store.record_verified_native_launch(&f.lease,&f.binding,&f.audit,&newer,now()).unwrap();
+        let tx=f.store.conn.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        let no_outcome=super::super::native_handoff::read_current_metadata_facts(&tx,&f.lease,&f.binding,&namespace,now()).unwrap();tx.commit().unwrap();
+        assert_eq!(no_outcome.runtimes[0].latest_launch.intent.intent_id,newer.intent.intent_id);
+        let no_outcome=super::super::owner_publication::current_facts_fixture(no_outcome);
+        assert!(no_outcome.runtimes().unwrap()[0].inventory.is_none(),"newer unobserved launch reused an earlier observation");
+        assert_ne!(no_outcome.fingerprint().unwrap(),uncertain_projection.fingerprint().unwrap());
+        assert_eq!(f.store.snapshot(&f.lease.workflow).unwrap().unwrap(),before);
+        f.store.conn.execute("DELETE FROM workflow_native_observation WHERE sequence=?1",[latest.observation_sequence]).unwrap();
+        let tx=f.store.conn.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        assert!(super::super::native_handoff::read_current_metadata_facts(&tx,&f.lease,&f.binding,&namespace,now()).is_err(),"losing latest uncertainty exposed an older success");
+
+    }
+
+    #[test]
+    fn current_native_metadata_inventory_resolves_actual_completed_transfer() {
+        if child("current_native_metadata_inventory_resolves_actual_completed_transfer") {return;}
+        let mut f=Fixture::new();
+        let (lease,pending,proof)=completed_native_handoff(&mut f);
+        assert!(f.store.settle_native_handoff(&lease,&f.binding,&proof,now()).unwrap().current_context);
+        let namespace=pending.request().destination.clone();
+        let before=f.store.snapshot(&lease.workflow).unwrap().unwrap();let events=f.store.events(&lease.workflow).unwrap();
+        let mut reopened=WorkflowStore::open(&f.path).unwrap();
+        let tx=reopened.conn.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        let facts=super::super::native_handoff::read_current_metadata_facts(&tx,&lease,&f.binding,&namespace,now()).unwrap();tx.commit().unwrap();
+        assert_eq!(facts.source_owners,vec![namespace.clone()]);assert_eq!(facts.runtimes.len(),1);
+        assert_eq!(facts.runtimes[0].effective_authority,namespace);
+        assert_eq!(facts.runtimes[0].latest_launch.source_owner,f.prepared.intent.source_owner,"transfer rewrote original launch ownership");
+        assert_eq!(facts.runtimes[0].latest_observation.as_ref().unwrap().source_owner,f.prepared.intent.source_owner);
+        let projected=super::super::owner_publication::current_facts_fixture(facts.clone());
+        let projected=projected.runtimes().unwrap();let retained=projected[0].inventory.as_ref().unwrap();
+        assert_eq!(retained.creation_owner,f.prepared.intent.source_owner);assert_eq!(retained.effective_owner,namespace.owner);
+        assert_eq!(retained.effective_audit_path,namespace.audit_path);
+        assert_eq!(facts.original_binding,*pending.original_binding());
+        assert_eq!(reopened.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(reopened.events(&lease.workflow).unwrap(),events);
+        assert_eq!(reopened.merge_allowance(now(),5).unwrap().confirmed,0);
+        let mut wrong=namespace.clone();wrong.owner.lease_generation+=1;
+        let tx=reopened.conn.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        assert!(super::super::native_handoff::read_current_metadata_facts(&tx,&lease,&f.binding,&wrong,now()).is_err(),"metadata reader fabricated a later lease");
+    }
+
+    #[test]
     fn native_handoff_snapshot_binds_complete_history_and_survives_reopen() {
         if child("native_handoff_snapshot_binds_complete_history_and_survives_reopen") {
             return;

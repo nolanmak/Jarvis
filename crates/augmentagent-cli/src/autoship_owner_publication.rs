@@ -42,21 +42,68 @@ pub(super) fn validate_history(conn:&Connection,workflow:&str)->Result<()> {
     ensure!(pending==count,"owner publication pending index changed");Ok(())
 }
 
+/// Current metadata projection only. It cannot attest physical inventory,
+/// resource quiescence, publication completion, or provider/input permission.
+pub(crate) struct OwnerPublicationNativeFacts {facts:super::native_handoff::NativeHandoffFacts}
+#[cfg(test)]
+pub(super) fn current_facts_fixture(facts:super::native_handoff::NativeHandoffFacts)->OwnerPublicationNativeFacts {OwnerPublicationNativeFacts {facts}}
+impl OwnerPublicationNativeFacts {
+    pub(crate) fn namespace(&self)->&augmentagent_channel_core::native_vm::ownership::Authority {&self.facts.source_owners[0]}
+    pub(crate) fn original_binding(&self)->&augmentagent_channel_core::native_vm::ownership::TransferBinding {&self.facts.original_binding}
+    pub(crate) fn fingerprint(&self)->Result<String> {
+        Ok(format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::json!({
+            "version":1,"workflow":self.facts.workflow_id,"binding":self.facts.workflow_binding,"namespace":self.namespace(),
+            "original_binding":self.original_binding(),"source":self.facts.source_registration_sha256,"latest":self.facts.latest_input_sha256}))?)))
+    }
+    pub(crate) fn runtimes(&self)->Result<Vec<augmentagent_channel_core::native_vm::ownership::PreparationRuntime>> {
+        use augmentagent_channel_core::native_vm::ownership::{PreparationRuntime,RuntimeInventoryRow};
+        self.facts.runtimes.iter().map(|runtime| {
+            let inventory=if let Some(row)=runtime.latest_observation.as_ref().filter(|row|row.certainty==super::native_observation::Certainty::Certain
+                && row.launch_intent_id==runtime.latest_launch.intent.intent_id) {
+                let mut inventory:RuntimeInventoryRow=serde_json::from_value(row.proof.as_ref().context("native inventory proof missing")?["inventory"].clone())?;
+                inventory.effective_owner=runtime.effective_authority.owner.clone();inventory.effective_audit_path=runtime.effective_authority.audit_path.clone();Some(inventory)
+            }else {None};
+            Ok(PreparationRuntime {runtime_relative_path:runtime.latest_launch.intent.runtime_relative_path.clone(),
+                creation_receipt_sha256:runtime.latest_launch.intent.creation_receipt_sha256.clone(),authority:runtime.effective_authority.clone(),
+                launch_sha256:runtime.latest_launch.intent.launch_sha256.clone(),inventory})
+        }).collect()
+    }
+}
+fn require_metadata(tx:&Transaction<'_>,turn:&owner_turn::OwnerTurn,preparation:&OwnerPreparationBinding,native_audit:&Path,now:i64)->Result<()> {
+        require_native_dispatch_tx(tx,&turn.lease,&turn.binding,now)?;
+        owner_turn::validate_turn(tx,turn,now)?;
+        owner_revision::require_preparation(tx,turn,preparation)?;
+        let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_publication_pending WHERE workflow=?1 AND request_id=?2)",params![turn.lease.workflow,turn.request_id],|r|r.get(0))?;
+        ensure!(pending,"original owner publication is no longer pending");
+        let raw:String=tx.query_row("SELECT record FROM workflow_owner_publication_intent WHERE request_id=?1",[&turn.request_id],|r|r.get(0))?;
+        let record:crate::self_improve::OwnerPublicationRecord=serde_json::from_str(&raw)?;
+        ensure!(record.workflow()==turn.lease.workflow && record.generation()==turn.lease.generation,"owner publication activated native generation changed");
+        record.validate_current_native(tx,native_audit)?;
+    Ok(())
+}
 impl WorkflowStore {
     /// Current metadata authority for an uninterrupted original activation.
     /// This deliberately does not assert publication completion or coding readiness.
     pub(crate) fn validate_owner_publication_metadata(&mut self,turn:&owner_turn::OwnerTurn,
         preparation:&OwnerPreparationBinding,native_audit:&Path,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_native_dispatch_tx(&tx,&turn.lease,&turn.binding,now)?;
-        owner_turn::validate_turn(&tx,turn,now)?;
-        owner_revision::require_preparation(&tx,turn,preparation)?;
-        let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_publication_pending WHERE workflow=?1 AND request_id=?2)",params![turn.lease.workflow,turn.request_id],|r|r.get(0))?;
-        ensure!(pending,"original owner publication is no longer pending");
-        let raw:String=tx.query_row("SELECT record FROM workflow_owner_publication_intent WHERE request_id=?1",[&turn.request_id],|r|r.get(0))?;
-        let record:crate::self_improve::OwnerPublicationRecord=serde_json::from_str(&raw)?;
-        ensure!(record.workflow()==turn.lease.workflow && record.generation()==turn.lease.generation,"owner publication activated native generation changed");
-        record.validate_current_native(&tx,native_audit)?;
-        tx.commit()?;Ok(())
+        require_metadata(&tx,turn,preparation,native_audit,now)?;tx.commit()?;Ok(())
+    }
+    fn publication_native_facts_tx(tx:&Transaction<'_>,turn:&owner_turn::OwnerTurn,publication:&crate::self_improve::OwnerPublicationDraft<'_>,native_audit:&Path,now:i64)->Result<OwnerPublicationNativeFacts> {
+        require_metadata(tx,turn,publication.preparation(),native_audit,now)?;
+        publication.require_metadata_record(tx,turn)?;
+        let namespace=augmentagent_channel_core::native_vm::ownership::Authority {owner:augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:turn.lease.workflow.clone(),lease_generation:turn.lease.generation},audit_path:native_audit.to_str().context("native metadata audit is not UTF-8")?.into()};
+        let facts=super::native_handoff::read_current_metadata_facts(tx,&turn.lease,&turn.binding,&namespace,now)?;
+        publication.validate_native_binding(&facts.original_binding)?;
+        Ok(OwnerPublicationNativeFacts {facts})
+    }
+    pub(crate) fn owner_publication_native_facts(&mut self,turn:&owner_turn::OwnerTurn,publication:&crate::self_improve::OwnerPublicationDraft<'_>,native_audit:&Path,now:i64)->Result<OwnerPublicationNativeFacts> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let facts=Self::publication_native_facts_tx(&tx,turn,publication,native_audit,now)?;tx.commit()?;Ok(facts)
+    }
+    pub(crate) fn revalidate_owner_publication_native_facts(&mut self,turn:&owner_turn::OwnerTurn,publication:&crate::self_improve::OwnerPublicationDraft<'_>,native_audit:&Path,expected:&OwnerPublicationNativeFacts,now:i64)->Result<()> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual=Self::publication_native_facts_tx(&tx,turn,publication,native_audit,now)?;
+        ensure!(actual.fingerprint()?==expected.fingerprint()?,"owner publication native metadata changed");tx.commit()?;Ok(())
     }
 }

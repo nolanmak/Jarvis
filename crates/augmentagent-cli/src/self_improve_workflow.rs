@@ -262,6 +262,14 @@ pub(super) struct OwnerPublicationGuard<'a> {
 }
 
 impl OwnerPublicationGuard<'_> {
+    /// Current metadata snapshot only; original native proof remains mandatory.
+    fn native_facts(&self)->Result<durable::OwnerPublicationNativeFacts> {
+        let guard=&self._guard;guard.healthy_lease()?;
+        anyhow::ensure!(guard.metadata_only,"publication metadata role missing");
+        let turn=self._publication.metadata_turn(&guard.repository,&guard.lease,&guard.binding,&guard.worktree)?;
+        guard.store.lock().map_err(|_|anyhow::anyhow!("publication native facts store poisoned"))?
+            .owner_publication_native_facts(&turn,&self._publication,guard.audit.path(),millis())
+    }
     /// Uninterrupted, originally unused namespace only. The callback performs
     /// short metadata work under original native locks; no productive API is
     /// exposed and existing conversations are never relabelled as unused.
@@ -4327,6 +4335,11 @@ mod tests {
                         use std::os::fd::AsRawFd;
                         use augmentagent_channel_core::native_vm::ownership;
                         let before=WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap();
+                        let current_facts=pending.native_facts().unwrap();
+                        assert_eq!(current_facts.namespace().owner.lease_generation,guard.lease.generation);
+                        assert_eq!(current_facts.original_binding(),&original);assert!(current_facts.runtimes().unwrap().is_empty());
+                        let current_turn=guard.store.lock().unwrap().owner_turn_for_lease(&guard.lease,millis()).unwrap();
+                        guard.store.lock().unwrap().revalidate_owner_publication_native_facts(&current_turn,&pending._publication,guard.audit.path(),&current_facts,millis()).unwrap();
                         let epoch=std::fs::read(native.join("authority-epoch.json")).unwrap();
                         let audit_before=std::fs::read(guard.audit.path()).unwrap();
                         let (_,audit_log,audit_anchor)=audit_generation_paths(&state,&id,guard.lease.generation).unwrap();
@@ -4426,14 +4439,19 @@ mod tests {
                     if mode.ends_with("-metadata-native-proof") {
                         let mut entered=false;
                         assert!(pending.with_unused_native_metadata(&mut |_| {entered=true;Ok(())}).is_err());assert!(!entered);
+                        assert!(pending.native_facts().is_err(),"damaged intent exposed current native metadata");
                     }
                     db.execute("UPDATE workflow_owner_publication_intent SET record=?2 WHERE request_id=?1",rusqlite::params![turn.request_id,saved]).unwrap();
                     guard.store.lock().unwrap().validate_owner_publication_metadata(&turn,&binding,guard.audit.path(),millis()).unwrap();
                     if mode.ends_with("-metadata-native-proof") {
+                        let cached_facts=pending.native_facts().unwrap();
+                        let cached_turn=guard.store.lock().unwrap().owner_turn_for_lease(&guard.lease,millis()).unwrap();
                         let mut store=WorkflowStore::open(&state).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
                         store.set_owner_pause(&id,"fixture-owner",revision,true,millis()).unwrap();drop(store);
                         let mut entered=false;
                         assert!(pending.with_unused_native_metadata(&mut |_| {entered=true;Ok(())}).is_err());assert!(!entered,"new owner pause reached metadata visitor");
+                        assert!(pending.native_facts().is_err(),"new owner pause exposed current native metadata");
+                        assert!(guard.store.lock().unwrap().revalidate_owner_publication_native_facts(&cached_turn,&pending._publication,guard.audit.path(),&cached_facts,millis()).is_err(),"cached native facts bypassed newer owner pause");
                         assert_eq!(WorkflowStore::open(&state).unwrap().pending_owner_messages(&id).unwrap(),1);
                         assert_eq!(WorkflowStore::open(&state).unwrap().merge_allowance(millis(),5).unwrap().confirmed,0);
                     }

@@ -87,6 +87,13 @@ fn read(path: &Path) -> Result<Admission> {
     Ok(admission)
 }
 struct ScopeLock {file:fs::File,path:PathBuf,directory:PathBuf,directory_device:u64,directory_inode:u64}
+impl Drop for ScopeLock {
+    fn drop(&mut self) {
+        // Closing our descriptor alone leaves flock held when a concurrent
+        // fork inherited it. End the visitor's lock lifetime explicitly.
+        unsafe {libc::flock(self.file.as_raw_fd(),libc::LOCK_UN)};
+    }
+}
 impl ScopeLock {
     fn acquire(state:&Path,worktree:&Path,create:bool)->Result<Self> {
         if create {fs::create_dir_all(state)?;}
@@ -366,6 +373,35 @@ fn replace_registered_at(state:&Path,worktree:&Path,expected_contract:&str,next_
 #[cfg(test)]
 mod replay_tests {
     use super::*;
+    #[test]
+    fn scope_release_unlocks_even_when_fork_retains_descriptor() {
+        const CHILD:&str="AUTOSHIP_SCOPE_RELEASE_FORK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","autoship_write_scope::replay_tests::scope_release_unlocks_even_when_fork_retains_descriptor","--test-threads=1"])
+                .env(CHILD,"1").output().unwrap();
+            assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
+        }
+        let state=tempfile::tempdir().unwrap();let tree=tempfile::tempdir().unwrap();
+        let mut pipe=[-1;2];assert_eq!(unsafe{libc::pipe(pipe.as_mut_ptr())},0);
+        let child=std::cell::Cell::new(0);
+        let held=with_registered_scope_at(state.path(),tree.path(),None,"scope",vec![],vec![],|_| {
+            let pid=unsafe{libc::fork()};
+            if pid==0 {
+                // Retain the inherited scope descriptor until parent replay.
+                // Only async-signal-safe calls are permitted in this child.
+                unsafe {libc::close(pipe[1]);let mut byte=0u8;libc::read(pipe[0],(&mut byte as *mut u8).cast(),1);libc::_exit(0);}
+            }
+            ensure!(pid>0,"fork failed");child.set(pid);Ok(())
+        });
+        let replay=held.and_then(|_|register_at(state.path(),tree.path(),"scope",vec![],vec![]));
+        // Always release/reap before asserting, including the failing regression.
+        unsafe {
+            libc::close(pipe[0]);let byte=1u8;libc::write(pipe[1],(&byte as *const u8).cast(),1);libc::close(pipe[1]);
+            if child.get()>0 {libc::waitpid(child.get(),std::ptr::null_mut(),0);}
+        }
+        replay.expect("scope stayed locked after parent release while fork child retained descriptor");
+    }
     #[test]
     fn registered_scope_replacement_replays_only_the_exact_permissions() {
         let worktree=tempfile::tempdir().unwrap();
