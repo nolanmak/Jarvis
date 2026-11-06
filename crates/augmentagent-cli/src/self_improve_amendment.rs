@@ -153,7 +153,7 @@ fn validate_correction_with_files(
     next.contract.validate()?;
     ensure!(
         next.contract.source()? == old.proposal.contract.source()?
-            && next.contract.revision == old.proposal.contract.revision + 1,
+            && Some(next.contract.revision) == old.proposal.contract.revision.checked_add(1),
         "amendment source/revision mismatch"
     );
     for prior in &old.proposal.contract.criteria {
@@ -730,7 +730,7 @@ pub(super) async fn resume_pending(
         ),
         &serde_json::to_vec(&current)?,
     )?;
-    workflow.read_acceptance_metadata(||require_original_manifest_history(control,&pending))?;
+    workflow.read_publication_metadata(|reader|require_original_manifest_history(control,&pending,reader))?;
     workflow.validate_before_side_effect()?;
     // Every replay, including an already-published manifest, must retain the
     // exact registered scope while canonical metadata and completion settle.
@@ -740,8 +740,9 @@ pub(super) async fn resume_pending(
         if !already_active {
             let mut file=tempfile::NamedTempFile::new_in(control)?;
             file.write_all(&serde_json::to_vec(&manifest)?)?;file.as_file().sync_all()?;
-            workflow.with_acceptance_metadata(|_access| {
+            workflow.with_acceptance_metadata(|access| {
                 scope.validate_current()?;
+                require_original_manifest_history(control,&pending,&access.publication_reader())?;
                 let latest=read_manifest_unsettled(control,source)?.context("amendment original manifest disappeared")?;
                 ensure!(latest==current || latest==manifest,"amendment manifest changed before replacement");
                 if latest!=manifest {
@@ -753,6 +754,7 @@ pub(super) async fn resume_pending(
         }
         workflow.with_acceptance_metadata(|access| {
             scope.validate_current()?;
+            require_original_manifest_history(control,&pending,&access.publication_reader())?;
             ensure!(read_manifest_unsettled(control,source)?.as_ref()==Some(&manifest),"amendment canonical manifest changed before completion");
             let saved:Pending=private_json(&path)?;
             ensure!(serde_json::to_value(&saved)?==serde_json::to_value(&pending)?,"amendment pending transaction changed before completion");
@@ -832,24 +834,66 @@ pub(super) fn require_no_pending(control:&Path,source:AcceptanceSource)->Result<
         Err(error)=>Err(error.into()),
     }
 }
-fn require_original_manifest_history(control:&Path,pending:&Pending)->Result<()> {
+fn original_manifest_history(control:&Path,pending:&Pending,used:&mut usize)->Result<WorkflowManifest> {
     let old=&pending.old.baseline.registration;
     let history=control.join(format!("{}-manifest-history-{}-{}.json",pending.source.key(),old.contract().revision,old.contract_hash()));
-    let original:WorkflowManifest=private_json(&history).context("original amendment manifest history missing or invalid")?;
-    let mut expected=WorkflowManifest::from_prepared(pending.source,&pending.old);
-    expected.evidence_file=original.evidence_file.clone();
-    ensure!(original==expected,"original amendment manifest history changed");Ok(())
+    let original:WorkflowManifest=read_lineage_manifest(&history,used).context("original amendment manifest history missing or invalid")?;
+    let mut expected=WorkflowManifest::from_prepared(pending.source,&pending.old);expected.evidence_file=original.evidence_file.clone();
+    ensure!(original==expected,"original amendment manifest history changed");Ok(original)
+}
+fn lineage_bytes(path:&Path,max:usize,used:&mut usize)->Result<Vec<u8>> {
+    use std::io::Read;use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
+    let mut file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(path)?;let meta=file.metadata()?;
+    ensure!(meta.is_file() && meta.nlink()==1 && meta.uid()==unsafe{libc::geteuid()} && meta.mode()&0o077==0 && meta.len()<=max as u64,"canonical lineage artifact is not private/bounded");
+    let mut raw=Vec::new();(&mut file).take(max as u64+1).read_to_end(&mut raw)?;
+    ensure!(raw.len()<=max && raw.len() as u64==meta.len(),"canonical lineage artifact changed while reading");
+    *used=used.checked_add(raw.len()).context("canonical lineage size overflow")?;ensure!(*used<=128*1024*1024,"canonical lineage exceeds byte bound");Ok(raw)
+}
+fn lineage_json<T:serde::de::DeserializeOwned>(path:&Path,max:usize,used:&mut usize)->Result<T> {Ok(serde_json::from_slice(&lineage_bytes(path,max,used)?)?)}
+pub(super) fn read_lineage_manifest(path:&Path,used:&mut usize)->Result<WorkflowManifest> {
+    let raw=lineage_bytes(path,4096,used)?;let manifest:WorkflowManifest=serde_json::from_slice(&raw)?;
+    let source=manifest.source()?;
+    if manifest.evidence_file.as_ref().is_some_and(|name|name.starts_with(&format!("{}-owner-",source.key()))) {
+        ensure!(serde_json::to_vec(&manifest)?==raw,"canonical owner manifest encoding differs from completed publication");
+    }
+    Ok(manifest)
 }
 pub(super) fn require_completed_manifest(control:&Path,source:AcceptanceSource,manifest:&WorkflowManifest)->Result<()> {
-    if manifest.evidence_file.is_none() {return Ok(());}
-    let completion=control.join(format!("{}-amendment-complete-{}.json",source.key(),manifest.contract_hash));
-    let pending:Pending=private_json(&completion).context("canonical amended acceptance completion missing or invalid")?;
-    validate_private_pending(&pending,source)?;
-    require_original_manifest_history(control,&pending)?;
-    let mut expected=WorkflowManifest::from_prepared(source,&pending.next);
-    expected.evidence_file=Some(format!("{}-revision-{}-{}.json",source.key(),expected.contract_revision,expected.contract_hash));
-    ensure!(&expected==manifest,"canonical amendment completion differs from manifest");
-    Ok(())
+    require_completed_manifest_with_reader(control,source,manifest,None)
+}
+pub(super) fn require_completed_manifest_with_reader(control:&Path,source:AcceptanceSource,manifest:&WorkflowManifest,
+    reader:Option<&crate::autoship_workflow::OwnerPublicationReadContext<'_>>)->Result<()> {
+    let mut current=manifest.clone();let mut seen=std::collections::BTreeSet::new();let mut used=0usize;
+    for _ in 0..1024 {
+        ensure!(current.version==1 && current.source()?==source && seen.insert((current.contract_revision,current.contract_hash.clone())),"canonical lineage repeats or changes source/version");
+        evidence_path(control,source,&current.original_base)?;
+        if let Some(reader)=reader {reader.require_manifest_identity(&current.contract_hash,&serde_json::to_string(&current)?)?;}
+        let Some(name)=current.evidence_file.as_ref() else {
+            ensure!(current.contract_revision==1,"canonical revised acceptance lost its completion reference");
+            let original:PreparedAcceptance=lineage_json(&evidence_path(control,source,&current.original_base)?,4*1024*1024,&mut used)?;
+            original.verify_registration()?;ensure!(WorkflowManifest::from_prepared(source,&original)==current,"canonical original baseline evidence changed");return Ok(())
+        };
+        if name.starts_with(&format!("{}-owner-",source.key())) {
+            let raw=serde_json::to_string(&current)?;
+            let ancestor=reader.context("canonical owner lineage requires the original workflow journal")?.ancestor(control,source,&raw,&mut used)?;
+            let Some(raw)=ancestor else {ensure!(current.contract_revision==1,"canonical owner lineage lost its original ancestor");return Ok(())};
+            let old:WorkflowManifest=serde_json::from_str(&raw)?;
+            ensure!(old.contract_revision.checked_add(1)==Some(current.contract_revision) && old.original_base==current.original_base,"owner canonical lineage revision/base changed");current=old;continue;
+        }
+        ensure!(name==&format!("{}-revision-{}-{}.json",source.key(),current.contract_revision,current.contract_hash),"canonical amendment evidence reference changed");
+        let completion=control.join(format!("{}-amendment-complete-{}.json",source.key(),current.contract_hash));
+        let pending:Pending=lineage_json(&completion,4*1024*1024,&mut used).context("canonical amended acceptance completion missing or invalid")?;
+        validate_private_pending(&pending,source)?;
+        let mut expected=WorkflowManifest::from_prepared(source,&pending.next);expected.evidence_file=Some(name.clone());
+        ensure!(expected==current,"canonical amendment completion differs from manifest");
+        ensure!(lineage_bytes(&control.join(name),4*1024*1024,&mut used)?==serde_json::to_vec(&pending.next)?,"canonical amendment evidence differs from completed registration");
+        current=original_manifest_history(control,&pending,&mut used)?;
+    }
+    anyhow::bail!("canonical lineage exceeds revision bound")
+}
+fn require_original_manifest_history(control:&Path,pending:&Pending,reader:&crate::autoship_workflow::OwnerPublicationReadContext<'_>)->Result<()> {
+    let original=original_manifest_history(control,pending,&mut 0)?;
+    require_completed_manifest_with_reader(control,pending.source,&original,Some(reader))
 }
 fn validate_private_amendment_baseline(prepared:&PreparedAcceptance)->Result<()> {
     prepared.verify_registration()?;
@@ -1526,4 +1570,27 @@ pub(crate) async fn migrate_fixture(root:&Path, control:&Path, old:&PreparedAcce
     immutable(control,history.file_name().unwrap().to_str().unwrap(),&history_bytes)?;
     ensure!(read_manifest(control,pending.source)?.is_some(),"exact original history restore was not recognized");
     Ok(replay)
+}
+
+/// Descriptive synthetic amendment files for real owner-lineage reader tests.
+/// No provider approval or productive admission is claimed by this fixture.
+#[cfg(test)]
+pub(in crate::self_improve) fn owner_descendant_fixture(control:&Path,old:&PreparedAcceptance,owner_file:&str)->Result<(Vec<u8>,PreparedAcceptance)> {
+    let source=old.proposal.contract.source()?;let mut proposal=old.proposal.clone();proposal.contract.revision+=1;
+    for contents in proposal.files.values_mut() {contents.push_str("\n# independently amended fixture\n");}
+    let root=tempfile::tempdir()?;install_harness(root.path(),&proposal)?;
+    let registration=RegisteredContract::register(root.path(),proposal.contract.clone(),old.baseline.registration.baseline_head().into(),old.baseline.registration.binding(old.baseline.registration.baseline_head())?.environment_id)?;
+    let receipt=registration.observe(root.path(),"ready",registration.binding(registration.baseline_head())?,&Observation {exit_code:Some(0),stdout:"false".into(),stderr:String::new(),interrupted:false,output_complete:true})?;
+    let next=PreparedAcceptance {proposal:proposal.clone(),baseline:BaselineEvidence {registration,receipts:vec![receipt]}};
+    let pending=Pending {version:2,source,original_head:old.baseline.registration.baseline_head().into(),input_hash:digest(b"synthetic owner descendant"),old:old.clone(),next,
+        authority:Decision {approved:true,previous_contract_hash:old.baseline.registration.contract_hash().into(),approve_environment_transition:false,approve_additional_files:vec![],reason:"Synthetic independent amendment preserves original criteria".into(),proposal:Some(proposal)},
+        native_provider:"synthetic-authority".into(),native_session:"synthetic-independent-lineage-session".into(),prompt_hash:digest(b"synthetic lineage prompt")};
+    validate_private_pending(&pending,source)?;
+    let mut old_manifest=WorkflowManifest::from_prepared(source,old);old_manifest.evidence_file=Some(owner_file.into());
+    immutable(control,&format!("{}-manifest-history-{}-{}.json",source.key(),old_manifest.contract_revision,old_manifest.contract_hash),&serde_json::to_vec(&old_manifest)?)?;
+    let mut next_manifest=WorkflowManifest::from_prepared(source,&pending.next);
+    let name=format!("{}-revision-{}-{}.json",source.key(),next_manifest.contract_revision,next_manifest.contract_hash);
+    immutable(control,&name,&serde_json::to_vec(&pending.next)?)?;next_manifest.evidence_file=Some(name);
+    immutable(control,&format!("{}-amendment-complete-{}.json",source.key(),next_manifest.contract_hash),&serde_json::to_vec(&pending)?)?;
+    Ok((serde_json::to_vec(&next_manifest)?,pending.next))
 }

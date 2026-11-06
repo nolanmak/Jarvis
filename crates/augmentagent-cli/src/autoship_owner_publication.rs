@@ -26,6 +26,50 @@ impl OwnerPublicationCommitMetadata<'_> {
         ensure!(self.workflow==workflow && self.request==request && self.intent_sha256==intent_sha256,"owner publication commit authority differs from original intent");Ok(())
     }
 }
+/// Read-only transaction-bound lineage context. It never grants a model,
+/// native, scope mutation, body or publication capability.
+pub(crate) struct OwnerPublicationReadContext<'a> {conn:&'a Connection,workflow:&'a str,records:std::cell::RefCell<Option<std::collections::BTreeMap<String,(crate::self_improve::OwnerPublicationRecord,Option<crate::self_improve::OwnerPublicationCompletion>)>>>}
+impl AcceptanceMetadata<'_> {
+    pub(crate) fn publication_reader(&self)->OwnerPublicationReadContext<'_> {
+        OwnerPublicationReadContext {conn:self._transaction,workflow:self.workflow,records:std::cell::RefCell::new(None)}
+    }
+}
+impl OwnerPublicationReadContext<'_> {
+    fn load(&self)->Result<()> {
+        if self.records.borrow().is_none() {
+            validate_history(self.conn,self.workflow)?;
+            let mut records=std::collections::BTreeMap::new();let mut used_records=0usize;
+            let mut query=self.conn.prepare("SELECT request_id,substr(record,1,4227073),length(CAST(record AS BLOB)) FROM workflow_owner_publication_intent WHERE workflow=?1 ORDER BY sequence LIMIT 1025")?;
+            let mut rows=query.query([self.workflow])?;let mut count=0;
+            while let Some(row)=rows.next()? {
+                count+=1;let request:String=row.get(0)?;let raw:String=row.get(1)?;let len:i64=row.get(2)?;
+                used_records=used_records.checked_add(raw.len()).context("owner lineage journal size overflow")?;
+                ensure!(count<=1024 && used_records<=128*1024*1024 && (1..=4*1024*1024+32*1024).contains(&len) && raw.len() as i64==len,"owner lineage intent exceeds bound");
+                let record:crate::self_improve::OwnerPublicationRecord=serde_json::from_str(&raw)?;
+                let completed=completion(self.conn,self.workflow,&request,&record,&raw)?;
+                ensure!(records.insert(record.canonical_contract().to_owned(),(record,completed)).is_none(),"canonical owner registration has ambiguous original publication intents");
+            }
+            *self.records.borrow_mut()=Some(records);
+        }
+        Ok(())
+    }
+    pub(crate) fn require_manifest_identity(&self,contract:&str,manifest:&str)->Result<()> {
+        self.load()?;
+        if let Some((record,_))=self.records.borrow().as_ref().and_then(|records|records.get(contract)) {
+            ensure!(record.canonical_manifest()==manifest,"known owner registration changed its original canonical identity");
+        }
+        Ok(())
+    }
+    pub(crate) fn ancestor(&self,control:&Path,source:crate::autoship_contract::AcceptanceSource,manifest:&str,used:&mut usize)->Result<Option<String>> {
+        self.load()?;
+        let value:serde_json::Value=serde_json::from_str(manifest)?;
+        let contract=value["contract_hash"].as_str().context("owner canonical contract missing")?;
+        let records=self.records.borrow();
+        let (record,completed)=records.as_ref().and_then(|records|records.get(contract)).context("canonical owner manifest has no original publication intent")?;
+        ensure!(record.canonical_manifest()==manifest,"owner canonical manifest differs from original publication");
+        record.read_canonical_ancestor(control,source,manifest,completed.as_ref().context("canonical owner publication is not completed")?,used)
+    }
+}
 fn completion(conn:&Connection,workflow:&str,request:&str,intent:&crate::self_improve::OwnerPublicationRecord,raw_intent:&str)->Result<Option<crate::self_improve::OwnerPublicationCompletion>> {
     let row:Option<(i64,String,String,i64,i64)>=conn.query_row("SELECT sequence,substr(record_sha256,1,65),substr(record,1,32769),length(CAST(record AS BLOB)),length(CAST(record_sha256 AS BLOB)) FROM workflow_owner_publication_completion WHERE workflow=?1 AND request_id=?2",params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
     let Some((sequence,sha,raw,len,sha_len))=row else {return Ok(None)};
@@ -112,6 +156,16 @@ fn require_metadata(tx:&Transaction<'_>,turn:&owner_turn::OwnerTurn,preparation:
     Ok(())
 }
 impl WorkflowStore {
+    /// Inspection under the actual retained original metadata turn. This mints
+    /// no ordinary writer token and cannot promote that turn to execution.
+    pub(crate) fn read_owner_publication_metadata<T>(&mut self,turn:&owner_turn::OwnerTurn,publication:&crate::self_improve::OwnerPublicationDraft<'_>,
+        native_audit:&Path,now:i64,inspect:impl FnOnce(&OwnerPublicationReadContext<'_>)->Result<T>)->Result<T> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_metadata(&tx,turn,publication.preparation(),native_audit,now)?;publication.require_metadata_record(&tx,turn)?;
+        let reader=OwnerPublicationReadContext {conn:&tx,workflow:&turn.lease.workflow,records:std::cell::RefCell::new(None)};
+        let result=inspect(&reader)?;
+        require_metadata(&tx,turn,publication.preparation(),native_audit,now)?;tx.commit()?;Ok(result)
+    }
     /// Actual native -> scope -> immediate workflow transaction -> bounded FS.
     /// This records metadata only and cannot promote the original logger/guard.
     pub(crate) fn complete_owner_publication(&mut self,turn:&owner_turn::OwnerTurn,publication:&crate::self_improve::OwnerPublicationDraft<'_>,

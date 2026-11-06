@@ -80,6 +80,8 @@ pub(crate) struct OwnerPublicationRecord {
 }
 impl OwnerPublicationRecord {
     pub(crate) fn workflow(&self)->&str {&self.input.workflow}
+    pub(crate) fn canonical_manifest(&self)->&str {&self.next_manifest}
+    pub(crate) fn canonical_contract(&self)->&str {&self.next_binding.contract}
     pub(crate) fn request(&self)->&str {&self.input.request_id}
     pub(crate) fn generation(&self)->i64 {self.activated_generation}
     pub(crate) fn validate_current_native(&self,conn:&rusqlite::Connection,expected_audit:&Path)->Result<()> {

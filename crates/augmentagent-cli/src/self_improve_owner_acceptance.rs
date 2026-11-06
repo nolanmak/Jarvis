@@ -257,6 +257,14 @@ pub(in crate::self_improve) fn test_publication_original(candidate:&Path,control
 #[cfg(test)]
 pub(in crate::self_improve) fn test_productive_canonical(control:&Path)->Result<()> {read_manifest(control,AcceptanceSource::Issue(77)).map(|_|())}
 #[cfg(test)]
+pub(in crate::self_improve) fn test_owner_descendant(control:&Path,prepared:&PreparedAcceptance,name:&str)->Result<(Vec<u8>,PreparedAcceptance)> {amendment::owner_descendant_fixture(control,prepared,name)}
+
+#[cfg(test)]
+pub(in crate::self_improve) fn test_manifest_prepared(source:AcceptanceSource)->Result<PreparedAcceptance> {
+    let mut proposal=tests::proposal();proposal.contract.issue=source.issue();proposal.contract.pull_request=source.pull_request();
+    test_publication_baseline(proposal,&"a".repeat(40))
+}
+#[cfg(test)]
 fn test_publication_baseline(proposal:ContractProposal,base:&str)->Result<PreparedAcceptance> {
     let root=tempfile::tempdir()?;install_harness(root.path(),&proposal)?;
     let registration=RegisteredContract::register(root.path(),proposal.contract.clone(),base.into(),"test".into())?;
@@ -297,10 +305,14 @@ pub(in crate::self_improve) async fn test_cached_preparation(candidate:&Path,con
     let result=prepare_at(candidate,workflow,source,&turn.binding.head,"fixture source",&required,None,control).await?;
     let canonical=control.join(format!("{}-workflow.json",source.key()));
     let claimed=serde_json::to_vec(&WorkflowManifest::from_prepared(source,result.prepared()))?;
+    // This scenario is a valid, newly present original contract, rather than
+    // a corrupt manifest without evidence that correctly fences the guard.
+    let present=evidence_path(control,source,&turn.binding.head)?;
+    std::fs::write(&present,serde_json::to_vec(result.prepared())?)?;std::fs::set_permissions(&present,std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(&canonical,&claimed)?;std::fs::set_permissions(&canonical,std::fs::Permissions::from_mode(0o600))?;
     ensure!(prepare_at(candidate,workflow,source,&turn.binding.head,"fixture source",&required,None,control).await.is_err(),"cached owner preparation ignored a newly present canonical acceptance");
     ensure!(std::fs::read(&canonical)?==claimed && std::fs::read(&path)?==bytes,"refused canonical mismatch rewrote original evidence");
-    std::fs::remove_file(&canonical)?;
+    std::fs::remove_file(&canonical)?;std::fs::remove_file(present)?;
     let orphan=evidence_path(control,source,&turn.binding.head)?;let original_evidence=serde_json::to_vec(result.prepared())?;
     std::fs::write(&orphan,&original_evidence)?;std::fs::set_permissions(&orphan,std::fs::Permissions::from_mode(0o600))?;
     ensure!(prepare_at(candidate,workflow,source,&turn.binding.head,"fixture source",&required,None,control).await.is_err(),"orphan original acceptance was treated as absent by owner preparation");
@@ -481,4 +493,13 @@ mod tests {
         assert_ne!(key,make(&first,"source",vec!["changed requirement".into()]));
         assert!(Input::new(&first,AcceptanceSource::PullRequest(42),&"a".repeat(40),"source",&[],None).is_err());
     }
+}
+
+#[cfg(test)]
+pub(in crate::self_improve) fn test_canonical_with_reader(control:&Path,reader:&crate::autoship_workflow::OwnerPublicationReadContext<'_>)->Result<String> {
+    Ok(read_manifest_with_reader(control,AcceptanceSource::Issue(77),Some(reader))?.context("canonical lineage missing")?.contract_hash)
+}
+#[cfg(test)]
+pub(in crate::self_improve) fn test_canonical_other_workflow(control:&Path)->Result<String> {
+    with_fixture_acceptance_metadata(|access|test_canonical_with_reader(control,&access.publication_reader()))
 }

@@ -23,7 +23,7 @@ mod review_epoch;
 mod conversations;
 #[path="autoship_owner_publication.rs"]
 mod owner_publication;
-pub(crate) use owner_publication::{OwnerPublicationNativeFacts,OwnerPublicationCommitMetadata};
+pub(crate) use owner_publication::{OwnerPublicationNativeFacts,OwnerPublicationCommitMetadata,OwnerPublicationReadContext};
 #[path = "autoship_owner_revision.rs"]
 mod owner_revision;
 pub(crate) use owner_revision::OwnerPreparationBinding;
@@ -149,7 +149,7 @@ pub struct Checkpoint {
 
 /// Borrowed metadata ordering token. It is not serializable, cloneable or
 /// native execution authority, and cannot outlive its store transaction.
-pub(crate) struct AcceptanceMetadata<'a> {_transaction:&'a Connection}
+pub(crate) struct AcceptanceMetadata<'a> {_transaction:&'a Connection,workflow:&'a str}
 
 #[derive(Debug, Clone)]
 pub struct Lease {
@@ -1705,7 +1705,7 @@ impl WorkflowStore {
         clock:&dyn Fn()->i64,operation:impl FnOnce(&AcceptanceMetadata<'_>)->Result<T>)->Result<T> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_native_dispatch_tx(&tx,lease,binding,clock())?;
-        let result=operation(&AcceptanceMetadata {_transaction:&tx})?;
+        let result=operation(&AcceptanceMetadata {_transaction:&tx,workflow:&lease.workflow})?;
         require_native_dispatch_tx(&tx,lease,binding,clock())?;
         tx.commit()?;Ok(result)
     }

@@ -1640,17 +1640,18 @@ fn private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     );
     Ok(serde_json::from_reader(file)?)
 }
-fn read_manifest(control:&Path,source:AcceptanceSource)->Result<Option<WorkflowManifest>> {
+fn read_manifest(control:&Path,source:AcceptanceSource)->Result<Option<WorkflowManifest>> {read_manifest_with_reader(control,source,None)}
+fn read_manifest_with_reader(control:&Path,source:AcceptanceSource,reader:Option<&crate::autoship_workflow::OwnerPublicationReadContext<'_>>)->Result<Option<WorkflowManifest>> {
     amendment::require_no_pending(control,source)?;
     let manifest=read_manifest_unsettled(control,source)?;
-    if let Some(manifest)=&manifest {amendment::require_completed_manifest(control,source,manifest)?;}
+    if let Some(manifest)=&manifest {amendment::require_completed_manifest_with_reader(control,source,manifest,reader)?;}
     Ok(manifest)
 }
 /// Metadata recovery only: this observation grants no completed-revision admission.
 fn read_manifest_unsettled(control: &Path, source: AcceptanceSource) -> Result<Option<WorkflowManifest>> {
     let index = control.join(format!("{}-workflow.json", source.key()));
     if index.try_exists()? {
-        let manifest: WorkflowManifest = private_json(&index)?;
+        let manifest=amendment::read_lineage_manifest(&index,&mut 0)?;
         ensure!(
             manifest.version == 1 && manifest.source()? == source,
             "invalid acceptance workflow manifest"
@@ -1664,7 +1665,7 @@ fn guarded_original_manifest(workflow:&workflow::WorkflowGuard,control:&Path,sou
     workflow.with_acceptance_metadata(|access| recover_original_manifest(control,source,access))
 }
 fn recover_original_manifest(control:&Path,source:AcceptanceSource,access:&crate::autoship_workflow::AcceptanceMetadata<'_>)->Result<Option<WorkflowManifest>> {
-    if let Some(manifest)=read_manifest(control,source)? {return Ok(Some(manifest));}
+    if let Some(manifest)=read_manifest_with_reader(control,source,Some(&access.publication_reader()))? {return Ok(Some(manifest));}
     // Recover the crash window between durable baseline and manifest creation.
     // Never choose a newer baseline by timestamp or silently supersede evidence.
     let prefix = format!("{}-base-", source.key());
@@ -1756,16 +1757,15 @@ mod manifest_tests {
     #[test]
     fn original_base_and_revision_survive_updated_main_and_cannot_be_overwritten() {
         let control = tempfile::tempdir().unwrap();
-        let original = WorkflowManifest {
-            version: 1,
-            issue: Some(42),
-            pull_request: None,
-            original_base: "a".repeat(40),
-            contract_revision: 1,
-            contract_hash: "pinned".into(),
-            evidence_file: None,
-        };
-        write_manifest(control.path(), &original).unwrap();
+        let prepared=owner::test_manifest_prepared(AcceptanceSource::Issue(42)).unwrap();
+        let original=WorkflowManifest::from_prepared(AcceptanceSource::Issue(42),&prepared);
+        persist_fixture_registration(control.path(),&prepared).unwrap();
+        let artifact=evidence_path(control.path(),AcceptanceSource::Issue(42),&original.original_base).unwrap();
+        let saved=std::fs::read(&artifact).unwrap();std::fs::remove_file(&artifact).unwrap();
+        assert!(original_manifest(control.path(),AcceptanceSource::Issue(42)).is_err(),"manifest without original baseline became accepted criteria");
+        assert!(!artifact.exists(),"reader recreated missing original evidence");
+        std::fs::write(&artifact,&saved).unwrap();
+        use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
         let recovered = original_manifest(control.path(), AcceptanceSource::Issue(42))
             .unwrap()
             .unwrap();
@@ -2457,23 +2457,11 @@ mod source_namespace_tests {
     fn issue_and_unlinked_pr_keep_separate_original_baseline_manifests() {
         let control = tempfile::tempdir().unwrap();
         let base = "a".repeat(40);
-        let issue = WorkflowManifest {
-            version: 1,
-            issue: Some(42),
-            pull_request: None,
-            original_base: base.clone(),
-            contract_revision: 1,
-            contract_hash: "issue-contract".into(),
-            evidence_file: None,
-        };
-        let pr = WorkflowManifest {
-            issue: None,
-            pull_request: Some(42),
-            contract_hash: "pr-contract".into(),
-            ..issue.clone()
-        };
-        write_manifest(control.path(), &issue).unwrap();
-        write_manifest(control.path(), &pr).unwrap();
+        let issue_prepared=owner::test_manifest_prepared(AcceptanceSource::Issue(42)).unwrap();
+        let pr_prepared=owner::test_manifest_prepared(AcceptanceSource::PullRequest(42)).unwrap();
+        let issue=WorkflowManifest::from_prepared(AcceptanceSource::Issue(42),&issue_prepared);
+        let pr=WorkflowManifest::from_prepared(AcceptanceSource::PullRequest(42),&pr_prepared);
+        persist_fixture_registration(control.path(),&issue_prepared).unwrap();persist_fixture_registration(control.path(),&pr_prepared).unwrap();
         assert_eq!(
             original_manifest(control.path(), AcceptanceSource::Issue(42))
                 .unwrap()
@@ -2528,7 +2516,7 @@ pub(super) async fn assert_sweep_receipt(
         "sweep candidate evidence escaped protected store"
     );
     // Sweep inspection never repairs a missing canonical index.
-    let manifest = workflow.read_acceptance_metadata(||read_manifest(&control,source))?
+    let manifest = workflow.read_publication_metadata(|reader|read_manifest_with_reader(&control,source,Some(reader)))?
         .context("sweep original acceptance manifest missing")?;
     ensure!(
         manifest.contract_hash == reference.binding.contract_hash
@@ -2542,7 +2530,7 @@ pub(super) async fn assert_sweep_receipt(
                 source.key(),
                 manifest.contract_revision,
                 manifest.contract_hash
-            ),
+            ) || name.starts_with(&format!("{}-owner-",source.key())),
             "sweep amended evidence path mismatch"
         );
         control.join(name)

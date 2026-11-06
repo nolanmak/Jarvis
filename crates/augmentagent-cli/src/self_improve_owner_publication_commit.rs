@@ -160,3 +160,48 @@ impl OwnerPublicationDraft<'_> {
             && evidence==serde_json::to_vec(self.producer.prepared())?,"owner publication immutable evidence changed at commit");Ok(())
     }
 }
+
+fn counted_bytes(path:&Path,max:usize,used:&mut usize)->Result<Vec<u8>> {
+    let raw=bytes(path,max)?;*used=used.checked_add(raw.len()).context("canonical lineage size overflow")?;
+    ensure!(*used<=128*1024*1024,"canonical lineage exceeds byte bound");Ok(raw)
+}
+impl OwnerPublicationRecord {
+    /// Historical criteria inspection only. Protected saved evidence is data,
+    /// never fresh native/resource/source proof or executable preparation.
+    pub(crate) fn read_canonical_ancestor(&self,control:&Path,source:AcceptanceSource,manifest:&str,
+        completed:&OwnerPublicationCompletion,used:&mut usize)->Result<Option<String>> {
+        ensure!(control.canonicalize()?==self.canonical.control && source==self.input.source && manifest==self.next_manifest,
+            "owner canonical lineage differs from original protected namespace");
+        let directory=ControlDirectory::open(&self.canonical.control)?;
+        let raw=counted_bytes(&self.preparation_file,4*1024*1024,used)?;
+        let stored:Stored=serde_json::from_slice(&raw)?;
+        ensure!(stored.version==3 && stored.input==self.input && stored.candidate==self.candidate && stored.canonical==self.canonical
+            && serde_json::to_vec(&stored)?==raw,"owner canonical lineage original preparation changed");
+        stored.prepared.verify_registration()?;
+        let binding=crate::autoship_workflow::OwnerPreparationBinding::from_artifact(amendment::digest(&raw),self.input.key()?,
+            &stored.prepared.baseline.registration,&stored.prepared.baseline.receipts)?;
+        ensure!(binding==self.preparation,"owner canonical lineage preparation binding changed");
+        let evidence=counted_bytes(&directory.path.join(&self.next_evidence.file),4*1024*1024,used)?;
+        ensure!(evidence.len()==self.next_evidence.bytes && amendment::digest(&evidence)==self.next_evidence.sha256
+            && evidence==serde_json::to_vec(&stored.prepared)?,"owner canonical lineage evidence changed");
+        let previous=if let Some(raw)=&self.canonical.manifest {
+            let old:WorkflowManifest=serde_json::from_str(raw)?;
+            let path=if let Some(name)=&old.evidence_file {
+                ensure!(Path::new(name).components().count()==1 && matches!(Path::new(name).components().next(),Some(std::path::Component::Normal(_))),"owner canonical ancestor evidence is not a basename");directory.path.join(name)
+            }else {evidence_path(&directory.path,source,&old.original_base)?};
+            let old_prepared:PreparedAcceptance=serde_json::from_slice(&counted_bytes(&path,4*1024*1024,used)?)?;
+            old_prepared.verify_registration()?;
+            let registration=&old_prepared.baseline.registration;
+            ensure!(registration.contract_hash()==old.contract_hash && registration.contract().revision==old.contract_revision
+                && registration.baseline_head()==old.original_base && registration.contract().source()?==source,"owner canonical ancestor registration changed");
+            Some(old_prepared)
+        }else{None};
+        self.input.validate_prepared(&stored.prepared,previous.as_ref().map(|p|&p.baseline.registration))?;
+        let native=counted_bytes(&directory.path.join(&completed.native_evidence.file),1024*1024,used)?;
+        ensure!(native.len()==completed.native_evidence.bytes && amendment::digest(&native)==completed.native_evidence.sha256,"owner canonical lineage native evidence changed");
+        let native:serde_json::Value=serde_json::from_slice(&native)?;
+        ensure!(native["version"]==1 && native["kind"]=="retained_native_metadata_quiescence" && native["namespace"]==serde_json::to_value(&completed.native_namespace)?
+            && native["original_binding_sha256"]==completed.native_binding_sha256,"owner canonical lineage native reference changed");
+        directory.validate()?;Ok(self.canonical.manifest.clone())
+    }
+}

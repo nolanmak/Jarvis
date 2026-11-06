@@ -1962,6 +1962,9 @@ impl WorkflowGuard {
     pub(super) fn read_acceptance_metadata<T>(&self,operation:impl FnOnce()->Result<T>)->Result<T> {
         self.visit_acceptance_metadata_at(&millis,false,|_access|operation())
     }
+    pub(super) fn read_publication_metadata<T>(&self,operation:impl FnOnce(&durable::OwnerPublicationReadContext<'_>)->Result<T>)->Result<T> {
+        self.visit_acceptance_metadata_at(&millis,false,|access|operation(&access.publication_reader()))
+    }
     fn visit_acceptance_metadata_at<T>(&self,clock:&dyn Fn()->i64,mutating:bool,
         operation:impl FnOnce(&durable::AcceptanceMetadata<'_>)->Result<T>)->Result<T> {
         self.healthy_lease()?;
@@ -4353,6 +4356,16 @@ mod tests {
                     let request=intent["input"]["request_id"].as_str().unwrap();
                     let next_evidence=control.join(intent["next_evidence"]["file"].as_str().unwrap());
                     let preparation=PathBuf::from(intent["preparation_file"].as_str().unwrap());
+                    let (descendant,amended)=acceptance::owner::test_owner_descendant(&control,prepared.prepared(),intent["next_evidence"]["file"].as_str().unwrap()).unwrap();
+                    let descendant_value:serde_json::Value=serde_json::from_slice(&descendant).unwrap();
+                    let (descendant_two,amended_two)=acceptance::owner::test_owner_descendant(&control,&amended,descendant_value["evidence_file"].as_str().unwrap()).unwrap();
+                    std::fs::write(&canonical,&descendant).unwrap();std::fs::set_permissions(&canonical,std::fs::Permissions::from_mode(0o600)).unwrap();
+                    assert!(acceptance::owner::test_productive_canonical(&control).is_err(),"ordinary amendment concealed uncompleted owner publication ancestry");
+                    let uncompleted_turn=pending._guard.store.lock().unwrap().owner_turn_for_lease(&pending._guard.lease,millis()).unwrap();
+                    assert!(pending._guard.store.lock().unwrap().read_owner_publication_metadata(&uncompleted_turn,&pending._publication,pending._guard.audit.path(),millis(),|reader|
+                        acceptance::owner::test_canonical_with_reader(&control,reader)).is_err(),"workflow-bound reader accepted an uncompleted owner ancestor");
+                    if let Some(raw)=&old_canonical {std::fs::write(&canonical,raw).unwrap();}else {std::fs::remove_file(&canonical).unwrap();}
+
                     let events_before=WorkflowStore::open(&state).unwrap().events(&id).unwrap();
                     if previous.is_some() {
                         let scope_state=augmentagent_channel_core::state_dir::state_dir().unwrap();
@@ -4462,6 +4475,49 @@ mod tests {
                     assert!(pending._guard.audit.dispatch_allowed().is_err());assert!(pending._guard.audit.model_call_admitted("codex").is_err());
                     assert_eq!(WorkflowStore::open(&state).unwrap().owner_control(&id).unwrap(),control_before);
                     assert!(acceptance::owner::test_productive_canonical(&control).is_err(),"ordinary reader mistook owner completion for ordinary amendment authority");
+                    let original_turn=pending._guard.store.lock().unwrap().owner_turn_for_lease(&pending._guard.lease,millis()).unwrap();
+                    let inspect=|namespace:&Path|pending._guard.store.lock().unwrap().read_owner_publication_metadata(&original_turn,&pending._publication,pending._guard.audit.path(),millis(),
+                        |reader|acceptance::owner::test_canonical_with_reader(namespace,reader));
+                    assert_eq!(inspect(&control).unwrap(),prepared.prepared().baseline.registration.contract_hash());
+                    let owner_value:serde_json::Value=serde_json::from_slice(&next_canonical).unwrap();
+                    if previous.is_none() {
+                        let mut disguised=owner_value.clone();disguised.as_object_mut().unwrap().remove("evidence_file");
+                        let original_file=control.join(format!("issue-77-base-{}.json",before.checkpoint.binding.head));
+                        std::fs::write(&original_file,serde_json::to_vec(prepared.prepared()).unwrap()).unwrap();std::fs::set_permissions(&original_file,std::fs::Permissions::from_mode(0o600)).unwrap();
+                        std::fs::write(&canonical,serde_json::to_vec(&disguised).unwrap()).unwrap();
+                        assert!(inspect(&control).is_err(),"known owner registration was relabelled as an original baseline without journal lineage");
+                        std::fs::remove_file(original_file).unwrap();std::fs::write(&canonical,&next_canonical).unwrap();
+                    }
+                    std::fs::write(&canonical,serde_json::to_vec_pretty(&owner_value).unwrap()).unwrap();assert!(inspect(&control).is_err(),"changed owner manifest bytes ignored the completion digest");std::fs::write(&canonical,&next_canonical).unwrap();
+                    assert!(acceptance::owner::test_canonical_other_workflow(&control).is_err(),"another workflow resolved private owner criteria");
+                    let other=tempfile::tempdir_in("/tmp").unwrap();let foreign=other.path().join("issue-77-workflow.json");
+                    std::fs::write(&foreign,&next_canonical).unwrap();std::fs::set_permissions(&foreign,std::fs::Permissions::from_mode(0o600)).unwrap();
+                    assert!(inspect(other.path()).is_err(),"another canonical namespace reused the owner completion");
+                    std::fs::write(&canonical,&descendant).unwrap();assert_eq!(inspect(&control).unwrap(),amended.baseline.registration.contract_hash());
+                    std::fs::write(&canonical,&descendant_two).unwrap();assert_eq!(inspect(&control).unwrap(),amended_two.baseline.registration.contract_hash());
+                    // These are criteria reads, not fresh native proof. They
+                    // must not reopen native locks while SQL is held.
+                    assert_eq!(unsafe{libc::flock(state_lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+                    assert_eq!(inspect(&control).unwrap(),amended_two.baseline.registration.contract_hash());unsafe{libc::flock(state_lock.as_raw_fd(),libc::LOCK_UN)};
+                    let ancestor_completion=control.join(format!("issue-77-amendment-complete-{}.json",amended.baseline.registration.contract_hash()));
+                    let ordinary_evidence=control.join(descendant_value["evidence_file"].as_str().unwrap());
+                    let owner_history=control.join(format!("issue-77-manifest-history-{}-{}.json",prepared.prepared().proposal.contract.revision,prepared.prepared().baseline.registration.contract_hash()));
+                    let original_history=std::fs::read(&owner_history).unwrap();
+                    let history_value:serde_json::Value=serde_json::from_slice(&original_history).unwrap();std::fs::write(&owner_history,serde_json::to_vec_pretty(&history_value).unwrap()).unwrap();
+                    assert!(inspect(&control).is_err(),"changed historical owner manifest bytes ignored the completion digest");std::fs::write(&owner_history,&original_history).unwrap();
+                    for path in [&ancestor_completion,&ordinary_evidence,&owner_history,&native_evidence,&next_evidence,&preparation] {
+                        let saved=std::fs::read(path).unwrap();std::fs::remove_file(path).unwrap();assert!(inspect(&control).is_err(),"missing lineage artifact became readable: {}",path.display());
+                        assert!(!path.exists());std::fs::write(path,&saved).unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600)).unwrap();
+                        std::fs::write(path,b"{}").unwrap();assert!(inspect(&control).is_err());assert_eq!(std::fs::read(path).unwrap(),b"{}");std::fs::write(path,saved).unwrap();
+                    }
+                    db.execute("DELETE FROM workflow_owner_publication_completion",[]).unwrap();assert!(inspect(&control).is_err(),"owner descendant concealed missing journal completion");
+                    db.execute("INSERT INTO workflow_owner_publication_completion VALUES(?1,?2,?3,?4,?5)",rusqlite::params![request,id,sequence,completion_sha,completion_raw]).unwrap();
+                    assert_eq!(inspect(&control).unwrap(),amended_two.baseline.registration.contract_hash());
+                    assert_eq!(WorkflowStore::open(&state).unwrap().events(&id).unwrap(),completed_events,"criteria inspection wrote workflow history");
+                    assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap(),before);
+                    assert!(pending._guard.validate_before_side_effect().is_err());assert!(pending._guard.audit.model_call_admitted("codex").is_err());
+                    std::fs::write(&canonical,&next_canonical).unwrap();
+
                     let mut store=WorkflowStore::open(&state).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
                     store.set_owner_pause(&id,"fixture-owner",revision,true,millis()).unwrap();drop(store);
                     assert!(pending.publish_canonical().is_err(),"completed metadata replay bypassed later owner pause");
