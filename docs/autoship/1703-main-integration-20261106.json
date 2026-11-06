@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "kind": "autoship-recovery-integration-with-current-main",
+  "delivery_parent": "49e510c62bea36423d5091c11c0a5d9ceadaca0f",
+  "main_parent": "fe2e7b1f50430af73e65bb38049097e959b7a3e3",
+  "main_verification": [
+    "Git fetch and ls-remote main",
+    "GitHub branches/main API"
+  ],
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-instagram/src/bin/autoship_case.rs",
+      "sha256": "b703460fcd45797c7522a81064e6842f743089694d373a36dc9a00528aecf6d3"
+    },
+    {
+      "path": "crates/augmentagent-channel-instagram/src/composer.rs",
+      "sha256": "e8e9a8540d2bae5edbc3cc3b6e1e6bbba2370573fc5bd42adca2902e061b3e7d"
+    },
+    {
+      "path": "crates/augmentagent-channel-instagram/src/feed.rs",
+      "sha256": "57ba188ceecada5b76556e6abef75c833c08711c2b6fb97f99dc72c30bf11222"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve.rs",
+      "sha256": "3d5c1ac475c98c5b1ede96ff7243de0bb6ab8f1bd0c8a54dc962c1bc3eafdba7"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_alignment.rs",
+      "sha256": "3894e76b86cb8df3f14fdbfd014de63c9d14740060b5dd4f974b31cb7203836c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_contract.rs",
+      "sha256": "43ba24d48cce8ddec4f19ca731f897a9ccb20a6cbaf8efddaab55ed65d0e5bf7"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_review.rs",
+      "sha256": "26cc5d649f07a5e252e5e32c271175feb3695233d127f13b4780604272155c99"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_review_symbols.rs",
+      "sha256": "33a9ccf1834067a5784295a5ae753183003954bf72b420ddc7c3de969b60c96e"
+    }
+  ],
+  "incoming_changes": [
+    "#1889 restrict crate-local Rust caller search to its crate",
+    "#1890 align candidate changes from merge-base",
+    "#1891 name unmapped hunks by path/header",
+    "#1892 bounded alignment narrowing turn",
+    "#1894 tell QA which harness files are controller-pinned",
+    "#1895 parse the controller acceptance section",
+    "#1888 preserve a close Instagram contact when first identity is blank"
+  ],
+  "integration": {
+    "merge": "automatic, no conflicts; regular two-parent merge; no force push or main mutation",
+    "local_fix": "Only the test-side Instagram mock composer harness uses a short private temporary directory in /tmp, avoiding Unix socket SUN_LEN under deep managed TMPDIR. Production composer behavior and registered Cargo target are unchanged."
+  },
+  "validation": {
+    "initial_managed_run": {
+      "original_session_id": 2269,
+      "terminal_exit": 1,
+      "log": "/tmp/autoship-main-integration-core-instagram-20261106.log",
+      "core_passed": 933,
+      "core_ignored": 15,
+      "core_seconds": 35.57,
+      "instagram_passed": 121,
+      "instagram_failed": 21,
+      "failure": "mock-sidecar socket path exceeds Unix SUN_LEN under managed deep TMPDIR; CLI not reached"
+    },
+    "final_managed_run": {
+      "original_session_id": 21899,
+      "terminal_exit": 0
+    },
+    "core": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core -p augmentagent-channel-instagram --lib --bins",
+      "passed": 933,
+      "failed": 0,
+      "ignored": 15,
+      "log": "/tmp/autoship-main-integration-core-instagram-20261106.log",
+      "core_source_unchanged_by_test_fixture_fix": true
+    },
+    "instagram": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-channel-instagram --lib --bins",
+      "passed": 142,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 4.27,
+      "log": "/tmp/autoship-main-integration-instagram-final-20261106.log"
+    },
+    "cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "passed": 1945,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 299.11,
+      "log": "/tmp/autoship-main-integration-cli-final-20261106.log"
+    },
+    "production_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "exit_code": 0,
+      "seconds": 18.0,
+      "log": "/tmp/autoship-main-integration-production-check-final-20261106.log"
+    },
+    "offline_instagram_case": {
+      "command": "scripts/cargo-managed.sh run -p augmentagent-channel-instagram --bin autoship_case",
+      "exit_code": 0,
+      "observed": [
+        "real_ig",
+        "real_ig",
+        "first_ig",
+        null
+      ],
+      "expected": [
+        "real_ig",
+        "real_ig",
+        "first_ig",
+        null
+      ],
+      "log": "/tmp/autoship-main-integration-instagram-case-20261106.log",
+      "live_workflow_submission": false
+    }
+  },
+  "limits": [
+    "This integrates and locally validates current main with the recovery branch; it does not establish deployed source/kernel/resource authority or live autoship acceptance.",
+    "The productive owner consumer remains unconnected. General retained-conversation native metadata proof, protected publication writer/completion, shared durable productive predicate and recovery/canonical lineage remain unfinished.",
+    "P2-P5, continuation, C/R, aggregate protected storage, independent exact-head review, hosted validation, normal updater rollout and complete CLI/Discord/soak/five-merge acceptance remain required."
+  ]
+}

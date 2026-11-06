@@ -450,20 +450,12 @@ async fn caller_paths(worktree: &Path, head: &str, diff: &str) -> Result<(BTreeS
 async fn caller_paths_for_symbols(worktree:&Path,head:&str,symbols:&BTreeSet<String>)->Result<BTreeSet<String>> {
     let mut paths = BTreeSet::new();
     for symbol in symbols {
-        let (ok, output, error) = git_output(
-            worktree,
-            &[
-                "grep",
-                "-l",
-                "-z",
-                "--fixed-strings",
-                "-e",
-                symbol,
-                head,
-                "--",
-            ],
-        )
-        .await?;
+        // Crate-local items (see source_items::scoped_names) are searched in
+        // their declaring crate only; everything else stays repository-wide.
+        let (pattern, scope) = source_items::split_symbol(symbol);
+        let mut args = vec!["grep", "-l", "-z", "--fixed-strings", "-e", pattern, head, "--"];
+        if let Some(dir) = scope { args.push(dir); }
+        let (ok, output, error) = git_output(worktree, &args).await?;
         anyhow::ensure!(
             ok || error.trim().is_empty(),
             "caller lookup failed: {error}"
@@ -507,7 +499,10 @@ async fn complete_caller_paths(worktree:&Path,head:&str,symbols:&BTreeSet<String
     }
     Ok(serde_json::to_string(&serde_json::json!({
         "lookup": "All lexical matches for changed and removed Rust item names; not a semantic call graph",
-        "symbols": symbols, "full_files": files
+        "symbols": symbols.iter().map(|s| match source_items::split_symbol(s) {
+            (name, Some(dir)) => format!("{name} (crate-local: {dir})"),
+            (name, None) => name.to_owned(),
+        }).collect::<Vec<_>>(), "full_files": files
     }))?)
 }
 
