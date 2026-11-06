@@ -6,6 +6,35 @@ use sha2::{Digest,Sha256};
 use super::{PreparedLaunchIntent,PreparedLaunchRecord};
 
 pub(super) const MAX_EXECUTABLE_BYTES:u64=512*1024*1024;
+/// Preserve the caller's host working-directory semantics before mapping its
+/// invocation into the guest. PATH defaults remain the restricted native policy.
+pub(super) fn resolve_executable(command:&std::process::Command)->Result<(PathBuf,PathBuf)> {
+    let cwd=match command.get_current_dir() {
+        Some(path) if path.is_absolute()=>path.to_path_buf(),
+        Some(path)=>std::env::current_dir().context("native command working directory unavailable")?.join(path),
+        None=>std::env::current_dir().context("native command working directory unavailable")?,
+    };
+    let cwd=cwd.canonicalize().context("native command working directory unavailable")?;
+    ensure!(cwd.is_dir(),"native command working directory is not a directory");
+    let raw=std::ffi::CString::new(cwd.as_os_str().as_encoded_bytes()).context("invalid native command working directory")?;
+    ensure!(unsafe{libc::access(raw.as_ptr(),libc::X_OK)}==0,"native command working directory is not searchable");
+    let program=Path::new(command.get_program());
+    ensure!(!program.as_os_str().is_empty(),"native executable unavailable");
+    if program.is_absolute() {return Ok((program.canonicalize()?,cwd));}
+    if program.as_os_str().as_encoded_bytes().contains(&b'/') {return Ok((cwd.join(program).canonicalize()?,cwd));}
+    let search=command.get_envs().find(|(key,_)|*key=="PATH").and_then(|(_,value)|value)
+        .map(std::ffi::OsString::from).unwrap_or_else(||"/usr/bin:/bin".into());
+    for directory in std::env::split_paths(&search) {
+        let directory=if directory.is_absolute() {directory}else{cwd.join(directory)};
+        let candidate=directory.join(program);
+        if !candidate.is_file() {continue;}
+        let raw=std::ffi::CString::new(candidate.as_os_str().as_encoded_bytes()).context("invalid native executable path")?;
+        if unsafe{libc::access(raw.as_ptr(),libc::X_OK)}!=0 {continue;}
+        return Ok((candidate.canonicalize()?,cwd));
+    }
+    anyhow::bail!("native executable unavailable")
+}
+
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Origin {device:u64,inode:u64,nlink:u64,mode:u32,uid:u32,gid:u32,bytes:u64,mtime:[i64;2],ctime:[i64;2]}

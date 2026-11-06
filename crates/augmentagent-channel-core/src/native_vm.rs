@@ -663,16 +663,9 @@ impl Launch {
         let directory = tempfile::Builder::new().prefix("launch-").tempdir_in(&provider_root)?;
         for (name, contents) in HELPERS { write(&directory.path().join(name), contents)?; }
         let source = original.as_std();
-        let program = PathBuf::from(source.get_program());
-        let executable = if program.is_absolute() { program.canonicalize()? } else {
-            let search = source.get_envs().find(|(key,_)|*key=="PATH").and_then(|(_,value)|value)
-                .map(std::ffi::OsString::from).unwrap_or_else(|| "/usr/bin:/bin".into());
-            std::env::split_paths(&search).map(|path|path.join(&program)).find(|path|path.is_file())
-                .context("native executable unavailable")?.canonicalize()?
-        };
+        let (executable,asset_base)=executable_input::resolve_executable(source)?;
         let executable_input=capture_executable_input(&executable)?;
         let mut assets = Vec::new();let mut asset_bytes=0u64;
-        let asset_base=match source.get_current_dir() {Some(path)=>path.to_path_buf(),None=>std::env::current_dir()?};
         let mut arguments: Vec<String> = source.get_args().map(|arg|arg.to_str().context("non-UTF8 native argument").map(str::to_owned)).collect::<Result<_>>()?;
         let mut index = 0;
         while index < arguments.len() {
@@ -948,6 +941,8 @@ mod tests {
     #[test]
     fn native_preparation_binds_original_owner_preparation_context() {launch_intent_child("preparation-context");}
     #[test]
+    fn native_preparation_resolves_original_command_working_directory() {launch_intent_child("executable-resolution");}
+    #[test]
     fn native_preparation_binds_executable_before_runtime_allocation() {launch_intent_child("executable-input");}
     #[test]
     fn native_preparation_snapshots_referenced_asset_bytes() {launch_intent_child("asset-input");}
@@ -1053,6 +1048,7 @@ mod tests {
             let test = if mode=="preparation-context" {"native_preparation_binds_original_owner_preparation_context"}
                 else if mode=="asset-input" {"native_preparation_snapshots_referenced_asset_bytes"}
                 else if mode=="executable-input" {"native_preparation_binds_executable_before_runtime_allocation"}
+                else if mode=="executable-resolution" {"native_preparation_resolves_original_command_working_directory"}
                 else if mode=="input-lock-success" {"native_input_release_holds_authority_through_blocked_stdin"}
                 else if mode=="input-lock-cancel" {"native_input_release_cancellation_releases_authority_without_replay"}
                 else if mode=="input-lock-error" {"native_input_release_write_failure_releases_authority_without_replay"}
@@ -1143,6 +1139,49 @@ mod tests {
             let mut opts=crate::reasoner::triage_opts(None);opts.audit_logger=Some(logger.clone());
             let native=crate::native_session::Launch::Create {requested_id:id.map(str::to_owned)};
             let context=OwnerPreparationContext::new(owner.clone(),"original-owner-request".into(),"c".repeat(64)).unwrap();
+            if mode=="executable-resolution" {
+                let not_directory=root.join(format!("cwd-file-{provider}"));write(&not_directory,b"not a working directory").unwrap();
+                for bad in [root.join(format!("missing-cwd-{provider}")),not_directory] {
+                    assert!(std::process::Command::new("/usr/bin/false").current_dir(&bad).output().is_err());
+                    let mut invalid=Command::new("/usr/bin/false");invalid.current_dir(&bad);
+                    let result=Launch::prepare(provider,&opts,&invalid,None,Some(&native));
+                    assert!(result.is_err(),"native preparation ignored the original invalid command working directory");
+                    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);
+                    let directory=state.join(provider);if directory.exists() {
+                        assert!(!std::fs::read_dir(directory).unwrap().any(|entry| {let name=entry.unwrap().file_name();let name=name.to_string_lossy();
+                            name.starts_with("session-") || name.starts_with("launch-")}),"invalid command cwd stranded native state");
+                    }
+                }
+                for (index,case) in ["relative-program","relative-path","empty-path","skip-nonexec"].into_iter().enumerate() {
+                    let cwd=root.join(format!("resolution-{provider}-{case}"));std::fs::create_dir(&cwd).unwrap();std::fs::create_dir(cwd.join("bin")).unwrap();
+                    let executable=if case=="empty-path" {cwd.join("provider")}else{cwd.join("bin/provider")};
+                    let expected=format!("selected-{provider}-{case}");let bytes=format!("#!/bin/sh\nprintf '{expected}'\n").into_bytes();
+                    write(&executable,&bytes).unwrap();std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o700)).unwrap();
+                    if case=="skip-nonexec" {std::fs::create_dir(cwd.join("blocked")).unwrap();write(&cwd.join("blocked/provider"),b"not executable").unwrap();}
+                    let program=if case=="relative-program" {"./bin/provider"}else{"provider"};
+                    let search=match case {"relative-program"=>"/usr/bin:/bin","relative-path"=>"bin","empty-path"=>"",_=>"blocked:bin"};
+                    let declared_cwd=if case=="relative-path" {
+                        let mut relative=PathBuf::new();for component in std::env::current_dir().unwrap().components() {
+                            if matches!(component,std::path::Component::Normal(_)) {relative.push("..");}
+                        }
+                        relative.push(cwd.strip_prefix("/").unwrap());relative
+                    }else {cwd.clone()};
+                    let output=std::process::Command::new(program).env_clear().env("PATH",search).current_dir(&declared_cwd).output().unwrap();
+                    assert!(output.status.success());assert_eq!(output.stdout,expected.as_bytes(),"actual command selected another executable");
+                    let mut command=Command::new(program);command.env_clear().env("PATH",search).current_dir(&declared_cwd);
+                    if case=="relative-path" {write(&cwd.join("instructions.txt"),b"instructions relative to original command cwd").unwrap();
+                        command.arg("-c").arg("model_instructions_file=\"instructions.txt\"");}
+                    let selected=crate::native_session::Launch::Create {requested_id:None};
+                    let launch=Launch::prepare(provider,&opts,&command,None,Some(&selected)).unwrap_or_else(|error|panic!("native preparation resolved {case} differently from actual command: {error:#}"));
+                    let spec:serde_json::Value=serde_json::from_slice(&std::fs::read(launch._directory.path().join("launch.json")).unwrap()).unwrap();
+                    assert_eq!(spec["executable"],serde_json::to_value(executable.canonicalize().unwrap()).unwrap());
+                    assert_eq!(spec["executable_input"]["sha256"],digest(&bytes));assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),index+1);
+                    if case=="relative-path" {assert_eq!(spec["assets"][0]["sha256"],digest(b"instructions relative to original command cwd"));
+                        assert_eq!(spec["assets"][0]["origin"]["path"],serde_json::to_value(cwd.canonicalize().unwrap().join("instructions.txt")).unwrap());}
+                }
+                continue;
+            }
+
             if mode=="preparation-context" {
                 let bridge_dir=root.join(format!("bridge-{provider}"));std::fs::create_dir(&bridge_dir).unwrap();
                 let bridge=crate::codex_tools::BridgeLaunch::prepare(&opts,&bridge_dir).unwrap();

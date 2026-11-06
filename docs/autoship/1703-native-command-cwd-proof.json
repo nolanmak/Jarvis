@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "kind": "original-command-working-directory-input-resolution-component",
+  "source_parent_commit": "22f8c0968e423f0319f81735b5d6ce6454156387",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_executable_input.rs",
+      "sha256": "d2d23c6543cbe9ec3c6a592c40d37746f7629f16d0d7cc955c30bfdd8b87e2e4"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "4929649c22874c917d0517089d6d146b1ab63f3854c3340f1e8671c3b7dada42"
+    }
+  ],
+  "behavioral_reds": [
+    {
+      "session": 55848,
+      "result": "terminal1",
+      "log": "/tmp/autoship-native-command-cwd-red-20261106.log",
+      "observed": "Actual std command refuses invalid cwd, native preparation ignores it and allocates session"
+    }
+  ],
+  "intermediate_validation": [
+    {
+      "session": 69242,
+      "result": "terminal1",
+      "log": "/tmp/autoship-native-command-cwd-focused-20261106.log",
+      "reason": "New fixture reused requested session alias across distinct calls; corrected fixture to independent Create without requested alias, preserving production collision guard"
+    }
+  ],
+  "verification": {
+    "focused": {
+      "session": 40866,
+      "result": "terminal0",
+      "passed": 1,
+      "seconds": 1.03,
+      "log": "/tmp/autoship-native-command-cwd-focused-final-20261106.log"
+    },
+    "full_core": {
+      "session": 11892,
+      "result": "terminal0",
+      "passed": 953,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 38.14,
+      "log": "/tmp/autoship-native-command-cwd-full-core-20261106.log"
+    },
+    "isolated_full_cli": {
+      "session": 22953,
+      "result": "terminal0",
+      "passed": 1949,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 352.68,
+      "log": "/tmp/autoship-native-command-cwd-isolated-full-cli-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    },
+    "isolated_production_check": {
+      "session": 79196,
+      "result": "terminal0",
+      "seconds": 13.31,
+      "log": "/tmp/autoship-native-command-cwd-isolated-production-check-20261106.log"
+    }
+  },
+  "implemented": [
+    "Validate/canonicalize explicit or inherited original command cwd before native allocation; reject missing/non-directory/non-searchable cwd",
+    "Resolve explicit relative executable paths from original cwd without searching PATH",
+    "Resolve relative/empty PATH components from original cwd and skip non-executable candidates",
+    "Use same resolved cwd for relative instruction/image assets; preserve existing restricted default native PATH",
+    "Captured original executable descriptor/spec/protected history continue to bind the selected canonical file and actual bytes"
+  ],
+  "test_scope": {
+    "providers": [
+      "codex",
+      "claude"
+    ],
+    "controlled_host_subprocesses": 8,
+    "actual_native_preparations": 8,
+    "cases_per_provider": [
+      "explicit relative program path",
+      "relative PATH + relative declared cwd + relative instruction asset",
+      "empty PATH component/current directory",
+      "skip earlier non-executable PATH candidate"
+    ],
+    "invalid_cwd": "Actual command and native preparation both refuse missing cwd or regular file used as cwd; no native runtime/capture/observer effects",
+    "vm_or_provider_executed": false,
+    "synthetic_scripts": "Only print fixed fixture markers; no model, remote side effect or productive owner coding"
+  },
+  "not_proven_or_implemented": [
+    "Complete trusted compiled-source/runtime/credential/kernel/allocation/writer/associated-input census and source/resource authority",
+    "Fresh original-body nonrelease or semantic actual coding-conversation continuation",
+    "Typed recovery/terminal authority, separate productive successor bridge/claim, all-consumer productive gates and connected owner worker",
+    "Aggregate protected-storage admission/retention, exact-head independent review, normal rollout, live CLI/Discord acceptance and soaks"
+  ],
+  "preserved_unpublished_work": "/tmp/autoship-productive-gate-preserved-20261106.patch"
+}
