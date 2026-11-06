@@ -45,6 +45,66 @@ pub struct OriginalInputWriterRevocationProof<'a> {metadata:&'a MetadataNativeOw
 impl OriginalInputWriterRevocationProof<'_> {
     pub fn namespace(&self)->&Authority {self.metadata.namespace()}
     pub fn evidence(&self)->&Value {self.evidence}
+    /// Native-only observation for an already-bound original model admission.
+    /// Does not grant body replay, source authority or productive setup.
+    pub fn with_bound_input_nonrelease<T>(&self, original:&super::OwnerInputReference,
+        visit:impl FnOnce(&BoundNativeInputNonreleaseProof<'_>)->Result<T>)->Result<T> {
+        self.metadata.validate_current()?;
+        ensure!(original.workflow==self.namespace().owner.workflow_id,
+            "native nonrelease reference belongs to another workflow");
+        let writers=self.evidence["writers"].as_array().context("native nonrelease writer census missing")?;
+        let associated=bound_input_launches(writers,original)?;
+        let evidence=json!({"version":1,"kind":"bound_native_input_nonrelease","namespace":self.namespace(),
+            "original_input":original,"original_binding_sha256":digest(self.metadata.binding())?,
+            "native_metadata_sha256":digest(self.metadata.evidence())?,"writer_revocation_sha256":digest(self.evidence)?,
+            "associated_launches":associated});
+        ensure!(serde_json::to_vec(&evidence)?.len()<=1024*1024,R::HistoryCapacity);
+        self.metadata.validate_current()?;
+        visit(&BoundNativeInputNonreleaseProof {revocation:self,original,evidence:&evidence})
+    }
+}
+fn bound_input_launches(writers:&[Value],original:&super::OwnerInputReference)->Result<Vec<Value>> {
+    let mut associated=Vec::new();
+    for writer in writers {
+        let prepared=super::PreparedLaunchRecord {
+            intent:serde_json::from_value(writer["launch_intent"].clone())?,
+            controller_receipt:serde_json::from_value(writer["launch_receipt"].clone())?,
+        };
+        let released=writer["release_attempted"].as_bool().context("native nonrelease release disposition missing")?;
+        let reference:Option<super::OwnerInputReference>=serde_json::from_value(writer["owner_input"].clone())?;
+        if let Some(reference)=&reference {
+            reference.validate(&prepared)?;
+            if reference.request_id==original.request_id {
+                ensure!(reference==original,"native nonrelease original model admission changed");
+                ensure!(!released,"original native body input may already have been released");
+                let resource:AppendReceipt=serde_json::from_value(writer["resource_receipt"].clone())?;
+                ensure!(resource.sequence>prepared.controller_receipt.sequence,
+                    "native nonrelease original resource admission missing");
+                associated.push(json!({"launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,
+                    "resource_receipt":resource,"closure":writer["closure"]}));
+            }
+        }else {
+            // A descriptive readonly-preparation label is not the trusted
+            // readonly/input-census proof needed to exclude released input.
+            ensure!(!released,"unclassified original native input release prevents nonrelease");
+        }
+    }
+    ensure!(!associated.is_empty(),"native nonrelease has no original bound model admission");
+    Ok(associated)
+}
+/// Borrowed original input observation, never a recovered body permission.
+/// Full source proof and original workflow/preparation joins are separate.
+pub struct BoundNativeInputNonreleaseProof<'a> {
+    revocation:&'a OriginalInputWriterRevocationProof<'a>,
+    original:&'a super::OwnerInputReference,
+    evidence:&'a Value,
+}
+impl BoundNativeInputNonreleaseProof<'_> {
+    pub fn original(&self)->&super::OwnerInputReference {self.original}
+    pub fn namespace(&self)->&Authority {self.revocation.namespace()}
+    pub fn binding(&self)->&TransferBinding {self.revocation.metadata.binding()}
+    pub fn evidence(&self)->&Value {self.evidence}
+    pub fn validate_current(&self)->Result<()> {self.revocation.metadata.validate_current()}
 }
 fn digest<T:serde::Serialize>(value:&T)->Result<String> {Ok(format!("{:x}",Sha256::digest(super::ownership::canonical_bytes(&serde_json::to_value(value)?)?)))}
 type RuntimeKey=(String,String,String);
@@ -266,4 +326,64 @@ pub fn with_metadata_native_owner(logger:&AuditLogger,runtimes:&[PreparationRunt
             visit(&MetadataNativeOwnerProof {binding:&binding,namespace:&namespace,inventory,evidence:&value,_state:&state,current:&fence})
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn reference(request:&str)->super::super::OwnerInputReference {
+        super::super::OwnerInputReference {version:1,workflow:"original-workflow".into(),request_id:request.into(),
+            dispatch_sequence:1,model_admission_sequence:2,model_receipt:format!("model-{request}"),claim_sha256:"a".repeat(64)}
+    }
+    // Classification data only: these values cannot construct a native proof.
+    // Original native locks, audit continuity, kernel observations and closure
+    // are covered by the retained-session integration fixture.
+    fn writer(original:Option<&super::super::OwnerInputReference>,released:bool)->Value {
+        json!({"launch_intent":{"version":2,"intent_id":uuid::Uuid::new_v4().to_string(),
+            "source_owner":{"workflow_id":"original-workflow","lease_generation":1},"source_audit_path":"/original/audit",
+            "provider":"codex","runtime_relative_path":"codex/session-fixture","native_session_id":uuid::Uuid::new_v4().to_string(),
+            "launch_sha256":"a".repeat(64),"creation_receipt_sha256":"b".repeat(64),"original_store_binding_sha256":"c".repeat(64)},
+            "launch_receipt":{"version":1,"sequence":1,"record_sha256":"a".repeat(64),"committed_audit_sha256":"b".repeat(64)},
+            "resource_receipt":{"version":1,"sequence":2,"record_sha256":"c".repeat(64),"committed_audit_sha256":"d".repeat(64)},
+            "owner_input":original,"release_attempted":released,"closure":{"kind":"completed_native_transfer"}})
+    }
+    #[test]
+    fn bound_nonrelease_keeps_other_requests_distinct_from_the_original() {
+        let original=reference("original-request");let previous=reference("previous-request");
+        let target=writer(Some(&original),false);let other=writer(Some(&previous),true);
+        let selected=bound_input_launches(&[other,target.clone()],&original).unwrap();
+        assert_eq!(selected.len(),1);assert_eq!(selected[0]["launch_intent"],target["launch_intent"]);
+    }
+    #[test]
+    fn bound_nonrelease_refuses_unclassified_release_even_with_a_matching_unreleased_model() {
+        let original=reference("original-request");
+        assert!(bound_input_launches(&[writer(Some(&original),false),writer(None,true)],&original).is_err());
+    }
+    #[test]
+    fn bound_nonrelease_refuses_any_matching_release_or_conflicting_admission() {
+        let original=reference("original-request");
+        assert!(bound_input_launches(&[writer(Some(&original),false),writer(Some(&original),true)],&original).is_err());
+        let mut changed=original.clone();changed.model_receipt.push('x');
+        assert!(bound_input_launches(&[writer(Some(&original),false),writer(Some(&changed),false)],&original).is_err());
+    }
+    #[test]
+    fn bound_nonrelease_cannot_be_inferred_from_empty_or_unrelated_histories() {
+        let original=reference("original-request");let other=reference("previous-request");
+        for writers in [vec![],vec![writer(None,false)],vec![writer(Some(&other),false)]] {
+            assert!(bound_input_launches(&writers,&original).is_err());
+        }
+    }
+    #[test]
+    fn bound_nonrelease_retains_unreleased_unbound_writers_in_the_outer_census() {
+        let original=reference("original-request");let target=writer(Some(&original),false);
+        let selected=bound_input_launches(&[writer(None,false),target.clone()],&original).unwrap();
+        assert_eq!(selected.len(),1);assert_eq!(selected[0]["launch_intent"],target["launch_intent"]);
+    }
+    #[test]
+    fn bound_nonrelease_requires_known_release_disposition_and_original_resources() {
+        let original=reference("original-request");let mut target=writer(Some(&original),false);
+        target["release_attempted"]=Value::Null;assert!(bound_input_launches(&[target],&original).is_err());
+        let mut target=writer(Some(&original),false);target["resource_receipt"]=Value::Null;
+        assert!(bound_input_launches(&[target],&original).is_err());
+    }
 }

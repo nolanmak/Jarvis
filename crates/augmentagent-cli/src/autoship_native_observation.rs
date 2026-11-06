@@ -853,7 +853,7 @@ pub(crate) mod tests {
     fn retained_native_metadata_proof_preserves_actual_completed_session() {
         if child("retained_native_metadata_proof_preserves_actual_completed_session") {return;}
         use std::sync::{Arc,Mutex};use std::os::fd::AsRawFd;
-        for provider in ["codex","claude"] {for input_fault in ["resource","input","preparation","readonly-transport","startup-input","startup-hash","startup-receipt","startup-version","startup-extra","startup-duplicate","startup-post-model","startup-post-input","startup-post-session","executable-foreign","executable-receipt","executable-version","executable-schema","executable-digest","executable-duplicate","executable-post-resource"] {for original_input in ["none","generic","owner","preparation","readonly-preparation"] {
+        for provider in ["codex","claude"] {for input_fault in ["resource","input","preparation","readonly-transport","startup-input","startup-hash","startup-receipt","startup-version","startup-extra","startup-duplicate","startup-post-model","startup-post-input","startup-post-session","executable-foreign","executable-receipt","executable-version","executable-schema","executable-digest","executable-duplicate","executable-post-resource"] {for original_input in ["none","generic","owner","owner-unreleased","preparation","readonly-preparation"] {
         if input_fault.starts_with("startup-") && input_fault!="startup-input" && original_input!="readonly-preparation" {continue;}
         if input_fault.starts_with("executable-") && original_input!="readonly-preparation" {continue;}
         let mut f=Fixture::with_native_provider_preparation_startup(false,false,false,provider,match original_input {"preparation"=>1,"readonly-preparation"=>2,_=>0},original_input=="readonly-preparation");
@@ -862,7 +862,7 @@ pub(crate) mod tests {
         if original_input!="none" {
             let reference=serde_json::json!({"version":1,"workflow":f.lease.workflow,"request_id":"original-request",
                 "dispatch_sequence":1,"model_admission_sequence":2,"model_receipt":"original-model","claim_sha256":"b".repeat(64)});
-            if original_input=="owner" {
+            if matches!(original_input,"owner"|"owner-unreleased") {
                 f.audit.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_owner_model_bound",
                     "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_receipt":f.resource,"owner_input":reference})).unwrap();
             }
@@ -870,7 +870,7 @@ pub(crate) mod tests {
                 "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_receipt":f.resource,
                 "prompt_sha256":"a".repeat(64),"prompt_bytes":42,"recorded_at_ms":now()});
             if original_input=="owner" {marker["version"]=2.into();marker["owner_input"]=reference;}
-            f.audit.record_controller(marker).unwrap();
+            if original_input!="owner-unreleased" {f.audit.record_controller(marker).unwrap();}
         }
         let (middle_lease,first,first_proof)=completed_native_handoff(&mut f);
         assert!(f.store.settle_native_handoff(&middle_lease,&f.binding,&first_proof,now()).unwrap().current_context);
@@ -932,7 +932,30 @@ pub(crate) mod tests {
             let mut revoked=false;
             proof.with_revoked_input_writers(|closed| {
                 assert_eq!(closed.namespace(),proof.namespace());assert_eq!(closed.evidence()["writers"].as_array().unwrap().len(),1);
-                assert_eq!(closed.evidence()["writers"][0]["release_attempted"],original_input!="none");
+                assert_eq!(closed.evidence()["writers"][0]["release_attempted"],!matches!(original_input,"none"|"owner-unreleased"));
+                let original:augmentagent_channel_core::native_vm::OwnerInputReference=serde_json::from_value(serde_json::json!({"version":1,"workflow":f.lease.workflow,"request_id":"original-request",
+                    "dispatch_sequence":1,"model_admission_sequence":2,"model_receipt":"original-model","claim_sha256":"b".repeat(64)})).unwrap();
+                let mut nonrelease_visited=false;
+                let result=closed.with_bound_input_nonrelease(&original,|unreleased| {
+                    nonrelease_visited=true;assert_eq!(unreleased.original(),&original);assert_eq!(unreleased.namespace(),proof.namespace());assert_eq!(unreleased.binding(),proof.binding());
+                    assert_eq!(unreleased.evidence()["kind"],"bound_native_input_nonrelease");assert_eq!(unreleased.evidence()["associated_launches"].as_array().unwrap().len(),1);
+                    unreleased.validate_current()?;Ok(())
+                });
+                if original_input=="owner-unreleased" {
+                    result.expect("permanently closed bound model without release could not prove native input nonrelease");assert!(nonrelease_visited);
+                    for fault in ["workflow","request","dispatch","admission","receipt","claim"] {
+                        let mut wrong=original.clone();match fault {"workflow"=>wrong.workflow.push('x'),"request"=>wrong.request_id.push('x'),
+                            "dispatch"=>wrong.dispatch_sequence+=1,"admission"=>wrong.model_admission_sequence+=1,
+                            "receipt"=>wrong.model_receipt.push('x'),"claim"=>wrong.claim_sha256="c".repeat(64),_=>unreachable!()}
+                        let mut entered=false;assert!(closed.with_bound_input_nonrelease(&wrong,|_| {entered=true;Ok(())}).is_err(),"native nonrelease accepted changed {fault}");assert!(!entered);
+                    }
+                    let policy=std::path::PathBuf::from(std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").unwrap());let saved=std::fs::read(&policy).unwrap();
+                    closed.with_bound_input_nonrelease(&original,|unreleased| {
+                        std::fs::write(&policy,b"{}")?;let current=unreleased.validate_current();std::fs::write(&policy,&saved)?;
+                        assert!(current.is_err(),"borrowed native nonrelease ignored a changed actual policy");Ok(())
+                    }).unwrap();
+                }
+                else {assert!(result.is_err());assert!(!nonrelease_visited,"unknown or possibly released body acquired native nonrelease proof");}
                 let fd=std::fs::OpenOptions::new().read(true).open(native.join("state.lock")).unwrap();
                 assert_ne!(unsafe{libc::flock(fd.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
                 revoked=true;Ok(())
