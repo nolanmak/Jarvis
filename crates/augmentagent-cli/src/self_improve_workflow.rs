@@ -5002,13 +5002,94 @@ else: raise SystemExit('unexpected authority call')
                                 rebound=true;Ok(())
                             })
                         }).unwrap();assert!(rebound);
+                        // The actual recovery writer must settle scope/canonical metadata
+                        // under the original locks, without promoting this generation.
+                        let before_publication=store.snapshot(&id).unwrap().unwrap();
+                        db.execute_batch("CREATE TRIGGER reject_recovery_publication BEFORE INSERT ON workflow_owner_publication_completion BEGIN SELECT RAISE(ABORT,'injected recovered publication failure'); END;").unwrap();
+                        let mut publish=||with_recovery_native_metadata(&state,Some(dir.path()),second.clone(),&next_auth,&mut |proof| {
+                            let recovered=store.with_owner_recovery_preparation(&second,&next_auth,proof,millis(),|access|
+                                acceptance::owner::publication::reopen_recovery_preparation(access,proof,dir.path()))?;
+                            recovered.with_scope_transition(|transition|store.complete_recovered_owner_publication(&second,&next_auth,&recovered,transition,millis()))
+                        });
+                        let failure=publish().err().expect("recovery writer escaped failed completion append");
+                        assert!(format!("{failure:#}").contains("injected recovered publication failure"),"{failure:#}");
+                        assert_eq!(std::fs::read(&canonical).unwrap(),next,"failed journal append lost exact next canonical");
+                        assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_publication_completion WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),0);
+                        assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_publication_pending WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),1);
+                        db.execute_batch("DROP TRIGGER reject_recovery_publication;").unwrap();
+                        publish().unwrap();
+                        let completion_before:String=db.query_row("SELECT record FROM workflow_owner_publication_completion WHERE workflow=?1",[&id],|r|r.get(0)).unwrap();
+                        let completed:serde_json::Value=serde_json::from_str(&completion_before).unwrap();
+                        assert_eq!(completed["authority"]["kind"],"recovery_lease");
+                        assert_eq!(completed["authority"]["claim"]["generation"],second.generation());
+                        assert_eq!(completed["activated_generation"],original_generation);
+                        assert_eq!(completed["native_namespace"]["owner"]["lease_generation"],original_generation);
+                        let event_before:i64=db.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1",[&id],|r|r.get(0)).unwrap();
+                        let scope_completed=std::fs::read(&scope_file).unwrap();publish().unwrap();drop(publish);
+                        assert_eq!(db.query_row("SELECT record FROM workflow_owner_publication_completion WHERE workflow=?1",[&id],|r|r.get::<_,String>(0)).unwrap(),completion_before);
+                        assert_eq!(db.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),event_before);
+                        assert_eq!(std::fs::read(&scope_file).unwrap(),scope_completed);
+                        assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_publication_pending WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),0);
+                        assert_eq!(db.query_row("SELECT generation FROM workflow_owner_publication_recovery_pending WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),second.generation());
+                        assert_eq!(store.snapshot(&id).unwrap().unwrap(),before_publication);assert_eq!(store.pending_owner_messages(&id).unwrap(),2);
+                        let copied_second=Lease {workflow:id.clone(),owner:"metadata-retry".into(),generation:second.generation()};
+                        assert!(store.charge(&copied_second,"published-is-not-productive",durable::ResourceCharge {model_calls:1,..Default::default()},millis()).is_err());
+                        assert!(store.begin_operation(&copied_second,OperationKind::CreatePr,&before_publication.checkpoint.binding,millis()).is_err());
+                        // Coherently replacing record, digest and event must not
+                        // credit a claim fenced before this completion event.
+                        let (first_generation,first_sequence,first_sha):(i64,i64,String)=db.query_row("SELECT generation,sequence,record_sha256 FROM workflow_owner_publication_recovery WHERE workflow=?1 ORDER BY generation LIMIT 1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                        let (completion_sequence,event_generation,event_payload):(i64,i64,String)=db.query_row("SELECT c.sequence,e.generation,e.payload FROM workflow_owner_publication_completion c JOIN workflow_event e ON e.seq=c.sequence WHERE c.workflow=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                        let mut substituted=completed.clone();substituted["authority"]["claim"]=serde_json::json!({"version":1,"generation":first_generation,"sequence":first_sequence,"record_sha256":first_sha});
+                        let substituted:super::super::OwnerPublicationCompletion=serde_json::from_value(substituted).unwrap();let substituted=serde_json::to_string(&substituted).unwrap();let substituted_sha=format!("{:x}",Sha256::digest(substituted.as_bytes()));
+                        let mut substituted_event:serde_json::Value=serde_json::from_str(&event_payload).unwrap();substituted_event["record_sha256"]=substituted_sha.clone().into();
+                        db.execute("UPDATE workflow_owner_publication_completion SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,substituted,substituted_sha]).unwrap();
+                        db.execute("UPDATE workflow_event SET generation=?2,payload=?3 WHERE seq=?1",rusqlite::params![completion_sequence,first_generation,serde_json::to_string(&substituted_event).unwrap()]).unwrap();
+                        let refused=store.validate_owner_publication_recovery(&second,&next_auth,millis()).err().expect("publication completion adopted an older recovery claim after that claim was fenced");
+                        assert!(format!("{refused:#}").contains("claim event window"),"unexpected historical-claim refusal: {refused:#}");
+                        db.execute("UPDATE workflow_owner_publication_completion SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,completion_before,format!("{:x}",Sha256::digest(completion_before.as_bytes()))]).unwrap();
+                        db.execute("UPDATE workflow_event SET generation=?2,payload=?3 WHERE seq=?1",rusqlite::params![completion_sequence,event_generation,event_payload]).unwrap();
+                        store.validate_owner_publication_recovery(&second,&next_auth,millis()).unwrap();
+                        let mut substituted=completed.clone();substituted["authority"]="live_owner_turn".into();
+                        let substituted:super::super::OwnerPublicationCompletion=serde_json::from_value(substituted).unwrap();let substituted=serde_json::to_string(&substituted).unwrap();let substituted_sha=format!("{:x}",Sha256::digest(substituted.as_bytes()));
+                        let mut substituted_event:serde_json::Value=serde_json::from_str(&event_payload).unwrap();substituted_event["record_sha256"]=substituted_sha.clone().into();
+                        db.execute("UPDATE workflow_owner_publication_completion SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,substituted,substituted_sha]).unwrap();
+                        db.execute("UPDATE workflow_event SET generation=?2,payload=?3 WHERE seq=?1",rusqlite::params![completion_sequence,original_generation,serde_json::to_string(&substituted_event).unwrap()]).unwrap();
+                        let refused=store.validate_owner_publication_recovery(&second,&next_auth,millis()).err().expect("recovery completion discarded its claim and became legacy live publication");
+                        assert!(format!("{refused:#}").contains("live owner publication completion follows a recovery claim fence"),"{refused:#}");
+                        db.execute("UPDATE workflow_owner_publication_completion SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,completion_before,format!("{:x}",Sha256::digest(completion_before.as_bytes()))]).unwrap();
+                        db.execute("UPDATE workflow_event SET generation=?2,payload=?3 WHERE seq=?1",rusqlite::params![completion_sequence,event_generation,event_payload]).unwrap();
+                        store.validate_owner_publication_recovery(&second,&next_auth,millis()).unwrap();
+                        // A later real recovery can replay the genuine earlier
+                        // completion; it cannot relabel that immutable receipt.
+                        db.execute("UPDATE workflow SET lease_until=?2 WHERE id=?1",rusqlite::params![id,millis()-1]).unwrap();
+                        let later_plan=store.owner_publication_recovery_plan(&id).unwrap().unwrap();
+                        let later_auth=super::super::targeted::authorize_owner_publication_recovery(dir.path(),&later_plan,policy).await.unwrap();
+                        let later=Arc::new(store.claim_owner_publication_recovery(&later_auth,"metadata-after-publication",millis(),60_000).unwrap().unwrap());
+                        assert_eq!(later.generation(),original_generation+3);
+                        let before_replay_events:i64=db.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1",[&id],|r|r.get(0)).unwrap();
+                        with_recovery_native_metadata(&state,Some(dir.path()),later.clone(),&later_auth,&mut |proof| {
+                            let recovered=store.with_owner_recovery_preparation(&later,&later_auth,proof,millis(),|access|
+                                acceptance::owner::publication::reopen_recovery_preparation(access,proof,dir.path()))?;
+                            assert!(recovered.require_recovery_claim(&second).is_err());
+                            recovered.with_scope_transition(|transition|store.complete_recovered_owner_publication(&later,&later_auth,&recovered,transition,millis()))
+                        }).unwrap();
+                        store.validate_owner_publication_recovery(&later,&later_auth,millis()).unwrap();
+                        assert_eq!(db.query_row("SELECT record FROM workflow_owner_publication_completion WHERE workflow=?1",[&id],|r|r.get::<_,String>(0)).unwrap(),completion_before);
+                        assert_eq!(db.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),before_replay_events);
+                        assert_eq!(std::fs::read(&scope_file).unwrap(),scope_completed);
+                        assert_eq!(store.pending_owner_messages(&id).unwrap(),2);
+                        let saved_claim:(i64,String,String)=db.query_row("SELECT sequence,record_sha256,record FROM workflow_owner_publication_recovery WHERE workflow=?1 AND generation=?2",rusqlite::params![id,second.generation()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                        db.execute("DELETE FROM workflow_owner_publication_recovery WHERE workflow=?1 AND generation=?2",rusqlite::params![id,second.generation()]).unwrap();
+                        assert!(store.validate_owner_publication_recovery(&later,&later_auth,millis()).is_err(),"completion retained authority after its referenced older claim was lost");
+                        db.execute("INSERT INTO workflow_owner_publication_recovery VALUES(?1,?2,?3,?4,?5)",rusqlite::params![id,second.generation(),saved_claim.0,saved_claim.1,saved_claim.2]).unwrap();
+                        store.validate_owner_publication_recovery(&later,&later_auth,millis()).unwrap();
                         let saved_checkpoint:String=db.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&id],|r|r.get(0)).unwrap();
                         for terminal in [Stage::Merged,Stage::Retired] {
                             let mut terminal_checkpoint:Checkpoint=serde_json::from_str(&saved_checkpoint).unwrap();terminal_checkpoint.stage=terminal;
                             db.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",rusqlite::params![id,serde_json::to_string(&terminal_checkpoint).unwrap()]).unwrap();
                             assert!(store.owner_publication_recovery_plan(&id).unwrap().is_none());
-                            assert!(store.validate_owner_publication_recovery(&second,&next_auth,millis()).is_err());
-                            assert!(store.claim_owner_publication_recovery(&next_auth,"no-terminal-resurrection",millis(),60_000).unwrap().is_none());
+                            assert!(store.validate_owner_publication_recovery(&later,&later_auth,millis()).is_err());
+                            assert!(store.claim_owner_publication_recovery(&later_auth,"no-terminal-resurrection",millis(),60_000).unwrap().is_none());
                         }
                         db.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",rusqlite::params![id,saved_checkpoint]).unwrap();
 

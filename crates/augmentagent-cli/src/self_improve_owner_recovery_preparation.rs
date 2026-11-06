@@ -13,6 +13,65 @@ pub(crate) struct RecoveredOwnerPreparation<'claim, 'a, 'native> {
     _native: &'a MetadataNativeOwnerProof<'native>,
 }
 impl RecoveredOwnerPreparation<'_, '_, '_> {
+    fn draft(&self) -> OwnerPublicationDraft<'_> {
+        OwnerPublicationDraft {
+            record: self.record.clone(),
+            producer: &self.producer,
+        }
+    }
+    pub(crate) fn validate_native_current(&self) -> Result<()> {
+        self._native.validate_current()
+    }
+    pub(crate) fn native_namespace(
+        &self,
+    ) -> &augmentagent_channel_core::native_vm::ownership::Authority {
+        self._native.namespace()
+    }
+    pub(crate) fn native_binding(
+        &self,
+    ) -> &augmentagent_channel_core::native_vm::ownership::TransferBinding {
+        self._native.binding()
+    }
+    pub(crate) fn publication_record(
+        &self,
+        conn: &rusqlite::Connection,
+    ) -> Result<(OwnerPublicationRecord, String)> {
+        let (raw,len):(String,i64)=conn.query_row("SELECT substr(record,1,4227073),length(CAST(record AS BLOB)) FROM workflow_owner_publication_intent WHERE workflow=?1 AND request_id=?2",rusqlite::params![self.record.workflow(),self.record.request()],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        ensure!(
+            (1..=MAX_INTENT as i64).contains(&len)
+                && raw.len() as i64 == len
+                && raw == serde_json::to_string(&self.record)?,
+            "recovered publication original record changed"
+        );
+        self.record.validate_history(conn)?;
+        Ok((self.record.clone(), raw))
+    }
+    pub(crate) fn with_scope_transition<T>(
+        &self,
+        visit: impl FnOnce(
+            &augmentagent_channel_core::autoship_write_scope::ScopeTransition,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        self.validate_native_current()?;
+        self.draft().with_scope_transition(visit)
+    }
+    pub(crate) fn commit_canonical(
+        &self,
+        access: &crate::autoship_workflow::OwnerPublicationCommitMetadata<'_>,
+        transition: &augmentagent_channel_core::autoship_write_scope::ScopeTransition,
+        facts_sha256: &str,
+        existing: Option<&OwnerPublicationCompletion>,
+        now: i64,
+    ) -> Result<OwnerPublicationCompletion> {
+        self.draft().commit_canonical(
+            access,
+            self._native,
+            transition,
+            facts_sha256,
+            existing,
+            now,
+        )
+    }
     /// Pins this borrowed metadata preparation to the same opaque recovery
     /// claim. Fresh store/authorization checks remain independently required.
     pub(crate) fn require_recovery_claim(

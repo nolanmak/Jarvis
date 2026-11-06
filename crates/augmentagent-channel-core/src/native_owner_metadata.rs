@@ -14,6 +14,9 @@ pub struct MetadataNativeOwnerProof<'a> {
     evidence:&'a Value,_state:&'a StateLock,current:&'a dyn Fn()->Result<()>,
 }
 impl MetadataNativeOwnerProof<'_> {
+    /// Recheck the captured metadata/current-owner fence while the original
+    /// locks remain held. Call before a caller opens a workflow transaction.
+    pub fn validate_current(&self)->Result<()> {(self.current)()}
     pub fn binding(&self)->&TransferBinding {self.binding}
     pub fn namespace(&self)->&Authority {self.namespace}
     pub fn inventory(&self)->&[RuntimeInventoryRow] {self.inventory}

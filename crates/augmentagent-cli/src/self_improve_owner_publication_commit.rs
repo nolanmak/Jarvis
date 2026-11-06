@@ -4,23 +4,57 @@ use super::*;
 use augmentagent_channel_core::{autoship_write_scope::{self,DeclaredPath,ScopeReference,ScopeTransition},native_vm::ownership::{Authority,MetadataNativeOwnerProof}};
 
 fn sha(value:&str)->bool {value.len()==64 && value.bytes().all(|b|matches!(b,b'0'..=b'9'|b'a'..=b'f'))}
+/// Strict saved authority identity, not permission to perform a new write.
+#[derive(Clone,Serialize,Deserialize)]
+#[serde(untagged)]
+pub(crate) enum OwnerPublicationAuthority {Live(LivePublicationAuthority),Recovery(RecoveryPublicationAuthority)}
+#[derive(Clone,Serialize,Deserialize)]
+pub(crate) enum LivePublicationAuthority {#[serde(rename="live_owner_turn")]Original}
+#[derive(Clone,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryPublicationAuthority {kind:RecoveryPublicationKind,claim:crate::autoship_workflow::owner_publication_recovery::PublicationRecoveryReference}
+#[derive(Clone,Serialize,Deserialize)]
+pub(crate) enum RecoveryPublicationKind {#[serde(rename="recovery_lease")]Metadata}
+impl OwnerPublicationAuthority {
+    pub(crate) fn live()->Self {Self::Live(LivePublicationAuthority::Original)}
+    pub(crate) fn recovery(claim:crate::autoship_workflow::owner_publication_recovery::PublicationRecoveryReference)->Self {
+        Self::Recovery(RecoveryPublicationAuthority {kind:RecoveryPublicationKind::Metadata,claim})
+    }
+    fn generation(&self,activated:i64)->i64 {match self {Self::Live(_)=>activated,Self::Recovery(value)=>value.claim.generation()}}
+    fn sequence(&self)->Option<i64> {match self {Self::Live(_)=>None,Self::Recovery(value)=>Some(value.claim.sequence())}}
+    fn validate_event_position(&self,conn:&rusqlite::Connection,intent:&OwnerPublicationRecord,sequence:i64)->Result<()> {
+        use crate::autoship_workflow::owner_publication_recovery as recovery;
+        match self {Self::Live(_)=>recovery::validate_live_publication_event_position(conn,intent.workflow(),intent.request(),sequence),
+            Self::Recovery(value)=>recovery::validate_publication_event_position(conn,intent.workflow(),intent.request(),&value.claim,sequence)}
+    }
+    fn validate(&self,conn:&rusqlite::Connection,intent:&OwnerPublicationRecord,raw:&str,at:i64)->Result<()> {
+        match self {Self::Live(_)=>Ok(()),Self::Recovery(value)=>{
+            ensure!(value.claim.generation()>intent.generation(),"recovery publication generation did not advance");
+            crate::autoship_workflow::owner_publication_recovery::validate_publication_reference(conn,intent.workflow(),intent.request(),raw,&value.claim,at)
+        }}
+    }
+}
 #[derive(Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OwnerPublicationCompletion {
     version:u32,workflow:String,request_id:String,intent_sha256:String,
-    original_generation:i64,activated_generation:i64,authority:String,
+    original_generation:i64,activated_generation:i64,authority:OwnerPublicationAuthority,
     native_namespace:Authority,native_binding_sha256:String,native_facts_sha256:String,native_evidence:Evidence,
     scope:ScopeReference,canonical_sha256:String,evidence:Evidence,at_ms:i64,
 }
 impl OwnerPublicationCompletion {
     pub(crate) fn workflow(&self)->&str {&self.workflow}
     pub(crate) fn request(&self)->&str {&self.request_id}
-    pub(crate) fn generation(&self)->i64 {self.activated_generation}
+    pub(crate) fn generation(&self)->i64 {self.authority.generation(self.activated_generation)}
+    pub(crate) fn recovery_sequence(&self)->Option<i64> {self.authority.sequence()}
     pub(crate) fn at_ms(&self)->i64 {self.at_ms}
     pub(crate) fn intent_sha256(&self)->&str {&self.intent_sha256}
     pub(crate) fn native_bytes(&self)->usize {self.native_evidence.bytes}
+    pub(crate) fn validate_event_position(&self,conn:&rusqlite::Connection,intent:&OwnerPublicationRecord,sequence:i64)->Result<()> {
+        self.authority.validate_event_position(conn,intent,sequence)
+    }
     pub(crate) fn validate(&self,conn:&rusqlite::Connection,intent:&OwnerPublicationRecord,raw:&str)->Result<()> {
-        ensure!(serde_json::to_vec(self)?.len()<=32*1024 && self.version==1 && self.authority=="live_owner_turn"
+        ensure!(serde_json::to_vec(self)?.len()<=32*1024 && self.version==1
             && self.workflow==intent.workflow() && self.request_id==intent.request() && self.intent_sha256==amendment::digest(raw.as_bytes())
             && self.original_generation==intent.input.generation && self.activated_generation==intent.generation()
             && self.native_namespace.owner.workflow_id==self.workflow && self.native_namespace.owner.lease_generation==self.activated_generation
@@ -28,6 +62,7 @@ impl OwnerPublicationCompletion {
             && self.scope.version==1 && self.scope.worktree==intent.candidate.root_path() && self.scope.contract_hash==intent.next_binding.contract && sha(&self.scope.record_sha256)
             && self.canonical_sha256==amendment::digest(intent.next_manifest.as_bytes()) && self.evidence==intent.next_evidence && self.at_ms>=0,
             "owner publication completion original lineage changed");
+        self.authority.validate(conn,intent,raw,self.at_ms)?;
         let (audit,audit_len):(String,i64)=conn.query_row("SELECT substr(audit_path,1,4097),length(CAST(audit_path AS BLOB)) FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![self.workflow,self.activated_generation],|r|Ok((r.get(0)?,r.get(1)?)))?;
         ensure!((1..=4096).contains(&audit_len) && audit.len() as i64==audit_len && self.native_namespace.audit_path==audit && self.native_evidence.bytes<=1024*1024 && sha(&self.native_evidence.sha256)
             && self.native_evidence.file==format!("{}-owner-{}-native-{}.json",intent.input.source.key(),amendment::digest(self.request_id.as_bytes()),self.native_evidence.sha256),
@@ -107,9 +142,10 @@ impl OwnerPublicationDraft<'_> {
                 "owner publication original native evidence lineage changed");
         }
         // Bound both descriptive records before any scope/file mutation.
-        let fresh=if existing.is_none() {Some(self.fresh_completion(proof,facts_sha256,now)?)}else{None};
+        let fresh=if existing.is_none() {Some(self.fresh_completion(access.authority(),proof,facts_sha256,now)?)}else{None};
         // All workflow/current-authority and completed-history checks precede
         // mutation. A reverted completed canonical cannot republish its scope.
+        access.require(self.record.workflow(),self.record.request(),&amendment::digest(serde_json::to_string(&self.record)?.as_bytes()))?;
         let scope=transition.register()?;
         ensure!(scope.reference()==&self.next_scope()?,"owner publication registered scope differs from original preparation");
         if let Some(existing)=existing {
@@ -118,6 +154,7 @@ impl OwnerPublicationDraft<'_> {
         }
         let (completed,evidence)=fresh.context("owner publication fresh completion missing")?;
         control.immutable(&completed.native_evidence.file,&evidence,1024*1024)?;
+        access.require(self.record.workflow(),self.record.request(),&amendment::digest(serde_json::to_string(&self.record)?.as_bytes()))?;
         if !is_next {
             let mut staged=tempfile::NamedTempFile::new_in(&control.path)?;staged.write_all(self.record.next_manifest.as_bytes())?;staged.as_file().sync_all()?;
             control.validate()?;
@@ -129,16 +166,17 @@ impl OwnerPublicationDraft<'_> {
         control.file.sync_all()?;control.validate()?;
         ensure!(self.record.canonical.publication_is_next(&self.record.next_manifest)?,"owner publication next canonical missing");
         self.verify_commit_files()?;scope.validate_current()?;
+        access.require(self.record.workflow(),self.record.request(),&amendment::digest(serde_json::to_string(&self.record)?.as_bytes()))?;
         Ok(completed)
     }
-    fn fresh_completion(&self,proof:&MetadataNativeOwnerProof<'_>,facts_sha256:&str,now:i64)->Result<(OwnerPublicationCompletion,Vec<u8>)> {
+    fn fresh_completion(&self,authority:&OwnerPublicationAuthority,proof:&MetadataNativeOwnerProof<'_>,facts_sha256:&str,now:i64)->Result<(OwnerPublicationCompletion,Vec<u8>)> {
         let evidence=augmentagent_channel_core::native_vm::ownership::canonical_bytes(proof.evidence())?;
         ensure!(evidence.len()<=1024*1024 && sha(facts_sha256) && now>=0,"owner publication native evidence or metadata exceeds bound");
         let evidence_sha=amendment::digest(&evidence);
         let native_evidence=Evidence {file:format!("{}-owner-{}-native-{}.json",self.record.input.source.key(),amendment::digest(self.record.request().as_bytes()),evidence_sha),bytes:evidence.len(),sha256:evidence_sha};
         let completed=OwnerPublicationCompletion {version:1,workflow:self.record.workflow().into(),request_id:self.record.request().into(),
             intent_sha256:amendment::digest(serde_json::to_string(&self.record)?.as_bytes()),original_generation:self.record.input.generation,
-            activated_generation:self.record.generation(),authority:"live_owner_turn".into(),native_namespace:proof.namespace().clone(),
+            activated_generation:self.record.generation(),authority:authority.clone(),native_namespace:proof.namespace().clone(),
             native_binding_sha256:self.record.original_native.binding_sha256.clone(),native_facts_sha256:facts_sha256.into(),native_evidence,
             scope:self.next_scope()?,canonical_sha256:amendment::digest(self.record.next_manifest.as_bytes()),evidence:self.record.next_evidence.clone(),at_ms:now};
         ensure!(serde_json::to_vec(&completed)?.len()<=32768,"owner publication completion exceeds bound before mutation");Ok((completed,evidence))

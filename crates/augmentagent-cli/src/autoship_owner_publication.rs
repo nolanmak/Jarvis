@@ -20,10 +20,11 @@ pub(super) fn require(conn:&Connection,request:&str,expected:&Reference,raw:&str
 }
 /// Distinct transaction-scoped owner writer capability. A generic acceptance
 /// metadata visitor cannot construct it or bypass the original intent join.
-pub(crate) struct OwnerPublicationCommitMetadata<'a> {_transaction:&'a Connection,workflow:&'a str,request:&'a str,intent_sha256:String}
+pub(crate) struct OwnerPublicationCommitMetadata<'a> {_transaction:&'a Connection,workflow:&'a str,request:&'a str,intent_sha256:String,authority:crate::self_improve::OwnerPublicationAuthority,current:&'a dyn Fn()->Result<()>}
 impl OwnerPublicationCommitMetadata<'_> {
+    pub(crate) fn authority(&self)->&crate::self_improve::OwnerPublicationAuthority {&self.authority}
     pub(crate) fn require(&self,workflow:&str,request:&str,intent_sha256:&str)->Result<()> {
-        ensure!(self.workflow==workflow && self.request==request && self.intent_sha256==intent_sha256,"owner publication commit authority differs from original intent");Ok(())
+        ensure!(self.workflow==workflow && self.request==request && self.intent_sha256==intent_sha256,"owner publication commit authority differs from original intent");(self.current)()
     }
 }
 /// Read-only transaction-bound lineage context. It never grants a model,
@@ -77,9 +78,10 @@ fn completion(conn:&Connection,workflow:&str,request:&str,intent:&crate::self_im
     let completed:crate::self_improve::OwnerPublicationCompletion=serde_json::from_str(&raw)?;
     ensure!(serde_json::to_string(&completed)?==raw && reference(&raw).record_sha256==sha,"owner publication immutable completion changed");
     completed.validate(conn,intent,raw_intent)?;
+    completed.validate_event_position(conn,intent,sequence)?;
     let (kind,generation,payload,at,payload_len):(String,i64,String,i64,i64)=conn.query_row("SELECT kind,generation,substr(payload,1,4097),at_ms,length(CAST(payload AS BLOB)) FROM workflow_event WHERE workflow=?1 AND seq=?2",params![workflow,sequence],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
     let (before,before_at):(i64,i64)=conn.query_row("SELECT i.sequence,e.at_ms FROM workflow_owner_publication_intent i JOIN workflow_event e ON e.seq=i.sequence AND e.workflow=i.workflow WHERE i.workflow=?1 AND i.request_id=?2",params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?)))?;
-    ensure!((1..=4096).contains(&payload_len) && payload.len() as i64==payload_len && sequence>before && at>=before_at && at==completed.at_ms() && kind=="owner_publication_completed" && generation==completed.generation()
+    ensure!((1..=4096).contains(&payload_len) && payload.len() as i64==payload_len && sequence>before && at>=before_at && at==completed.at_ms() && completed.recovery_sequence().is_none_or(|claim|claim<sequence) && kind=="owner_publication_completed" && generation==completed.generation()
         && serde_json::from_str::<serde_json::Value>(&payload)?==serde_json::json!({"version":1,"request_id":request,"record_sha256":sha,"intent_sha256":completed.intent_sha256()}),
         "owner publication completion event changed");Ok(Some(completed))
 }
@@ -203,7 +205,8 @@ impl WorkflowStore {
         let raw:String=tx.query_row("SELECT record FROM workflow_owner_publication_intent WHERE request_id=?1",[&turn.request_id],|r|r.get(0))?;
         let intent:crate::self_improve::OwnerPublicationRecord=serde_json::from_str(&raw)?;
         let existing=completion(&tx,&turn.lease.workflow,&turn.request_id,&intent,&raw)?;
-        let access=OwnerPublicationCommitMetadata {_transaction:&tx,workflow:&turn.lease.workflow,request:&turn.request_id,intent_sha256:reference(&raw).record_sha256};
+        let current=||require_live_metadata(&tx,metadata,Path::new(&proof.namespace().audit_path),chrono::Utc::now().timestamp_millis());
+        let access=OwnerPublicationCommitMetadata {_transaction:&tx,workflow:&turn.lease.workflow,request:&turn.request_id,intent_sha256:reference(&raw).record_sha256,authority:crate::self_improve::OwnerPublicationAuthority::live(),current:&current};
         let completed=publication.commit_canonical(&access,proof,transition,&facts.fingerprint()?,existing.as_ref(),now)?;
         completed.validate(&tx,&intent,&raw)?;
         if existing.is_none() {
@@ -238,5 +241,43 @@ impl WorkflowStore {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let actual=Self::publication_native_facts_tx(&tx,metadata,publication,native_audit,now)?;
         ensure!(actual.fingerprint()?==expected.fingerprint()?,"owner publication native metadata changed");tx.commit()?;Ok(())
+    }
+}
+
+impl WorkflowStore {
+    /// The caller holds the recovered preparation's original native proof and
+    /// scope transition. No new native lock or provider call enters this SQL TX.
+    pub(crate) fn complete_recovered_owner_publication(&mut self,lease:&super::owner_publication_recovery::RecoveryLease,
+        authorization:&crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+        prepared:&crate::self_improve::RecoveredOwnerPreparation<'_,'_,'_>,
+        transition:&augmentagent_channel_core::autoship_write_scope::ScopeTransition,now:i64,
+    )->Result<()> {
+        prepared.require_recovery_claim(lease)?;
+        // This captured fence may query policy and the controller's independent
+        // connection. It must run before this connection holds a transaction.
+        prepared.validate_native_current()?;
+        let expected=self.owner_publication_recovery_native_facts(lease,authorization,now)?;
+        ensure!(expected.namespace()==prepared.native_namespace() && expected.original_binding()==prepared.native_binding(),"recovered publication native proof differs from original claim");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let facts=super::owner_publication_recovery::recovery_native_facts_tx(&tx,lease,authorization,now)?;
+        ensure!(facts.fingerprint()?==expected.fingerprint()?,"recovered publication native facts changed before transaction");
+        let (intent,raw)=prepared.publication_record(&tx)?;
+        ensure!(intent.request()==lease.request_id(),"recovered publication request changed");
+        let existing=completion(&tx,intent.workflow(),intent.request(),&intent,&raw)?;
+        let current=||super::owner_publication_recovery::require_authorized_claim(&tx,lease,authorization,chrono::Utc::now().timestamp_millis());
+        let access=OwnerPublicationCommitMetadata {_transaction:&tx,workflow:intent.workflow(),request:intent.request(),intent_sha256:reference(&raw).record_sha256,
+            authority:crate::self_improve::OwnerPublicationAuthority::recovery(lease.publication_reference()),current:&current};
+        let completed=prepared.commit_canonical(&access,transition,&facts.fingerprint()?,existing.as_ref(),now)?;
+        completed.validate(&tx,&intent,&raw)?;
+        if existing.is_none() {
+            let completed_raw=serde_json::to_string(&completed)?;ensure!(completed_raw.len()<=32768,"recovered publication completion exceeds bound");let sha=reference(&completed_raw).record_sha256;
+            event(&tx,intent.workflow(),completed.generation(),"owner_publication_completed",&serde_json::json!({"version":1,"request_id":intent.request(),"record_sha256":sha,"intent_sha256":completed.intent_sha256()}).to_string(),now)?;
+            let sequence:i64=tx.query_row("SELECT max(seq) FROM workflow_event WHERE workflow=?1",[intent.workflow()],|r|r.get(0))?;
+            tx.execute("INSERT INTO workflow_owner_publication_completion VALUES(?1,?2,?3,?4,?5)",params![intent.request(),intent.workflow(),sequence,sha,completed_raw])?;
+            ensure!(tx.execute("DELETE FROM workflow_owner_publication_pending WHERE workflow=?1 AND request_id=?2",params![intent.workflow(),intent.request()])?==1,"recovered publication pending pointer changed");
+        }
+        current()?;
+        prepared.publication_record(&tx)?;validate_history(&tx,intent.workflow())?;
+        tx.commit()?;prepared.validate_native_current()?;Ok(())
     }
 }

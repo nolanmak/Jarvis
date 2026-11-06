@@ -6,7 +6,7 @@ use std::os::unix::fs::{MetadataExt,OpenOptionsExt,PermissionsExt};
 const MAX_INTENT:usize=4*1024*1024+32*1024;
 #[path="self_improve_owner_publication_commit.rs"]
 mod commit;
-pub(crate) use commit::OwnerPublicationCompletion;
+pub(crate) use commit::{OwnerPublicationCompletion,OwnerPublicationAuthority};
 #[path="self_improve_owner_recovery_preparation.rs"]
 mod recovery;
 pub(crate) use recovery::{reopen as reopen_recovery_preparation,RecoveredOwnerPreparation};
@@ -75,6 +75,7 @@ struct Evidence {file:String,bytes:usize,sha256:String}
 struct Native {audit:String,binding_sha256:String}
 #[derive(Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(Clone)]
 pub(crate) struct OwnerPublicationRecord {
     version:u32,repository:String,input:Input,candidate:CandidateIdentity,canonical:CanonicalSnapshot,
     preparation:crate::autoship_workflow::OwnerPreparationBinding,preparation_file:PathBuf,

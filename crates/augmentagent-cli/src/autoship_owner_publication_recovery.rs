@@ -81,6 +81,11 @@ fn digest(raw: &str) -> String {
 fn original(conn: &Connection, workflow: &str, request: &str) -> Result<Original> {
     owner_revision::validate_history(conn, workflow)?;
     owner_dispatch::validate_history(conn, workflow)?;
+    original_identity(conn, workflow, request)
+}
+// Independent immutable identity layer. Publication completion reference readers
+// must not re-enter revision/publication/body completion validation here.
+fn original_identity(conn: &Connection, workflow: &str, request: &str) -> Result<Original> {
     let (raw,len):(String,i64)=conn.query_row("SELECT substr(record,1,4227073),length(CAST(record AS BLOB)) FROM workflow_owner_publication_intent WHERE workflow=?1 AND request_id=?2",params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?)))?;
     ensure!(
         (1..=4 * 1024 * 1024 + 32 * 1024).contains(&len) && raw.len() as i64 == len,
@@ -150,13 +155,23 @@ fn table_exists(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_publication_recovery')",[],|r|r.get(0))?)
 }
 fn history(conn: &Connection, workflow: &str) -> Result<Option<(Claim, RecordRef)>> {
+    let mut claims = journal(conn, workflow)?;
+    if !claims.is_empty() {
+        owner_revision::validate_history(conn, workflow)?;
+        owner_dispatch::validate_history(conn, workflow)?;
+    }
+    Ok(claims.pop())
+}
+/// Immutable bounded claim/event/original-intent joins only. This layer grants
+/// no current authority and never calls higher-level completion validators.
+fn journal(conn: &Connection, workflow: &str) -> Result<Vec<(Claim, RecordRef)>> {
     let events:i64=conn.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1 AND kind='owner_publication_recovery_claimed'",[workflow],|r|r.get(0))?;
     if !table_exists(conn)? {
         ensure!(events == 0, "recovery history index missing");
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let mut query=conn.prepare("SELECT generation,sequence,record_sha256,substr(record,1,32769),length(CAST(record AS BLOB)) FROM workflow_owner_publication_recovery WHERE workflow=?1 ORDER BY generation LIMIT 1025")?;
-    let mut previous: Option<(Claim, RecordRef)> = None;
+    let mut claims: Vec<(Claim, RecordRef)> = Vec::new();
     let mut count = 0usize;
     for row in query.query_map([workflow], |r| {
         Ok((
@@ -184,6 +199,8 @@ fn history(conn: &Connection, workflow: &str) -> Result<Option<(Claim, RecordRef
                 && claim.generation == generation
                 && claim.predecessor.generation.checked_add(1) == Some(generation)
                 && claim.lease_until > claim.claimed_at
+                && claim.predecessor.lease_until <= claim.claimed_at
+                && !matches!(claim.checkpoint.stage, Stage::Merged | Stage::Retired)
                 && claim.owner.len() <= 256
                 && !claim.owner.is_empty()
                 && claim.owner.bytes().all(|b| b.is_ascii_graphic())
@@ -191,10 +208,10 @@ fn history(conn: &Connection, workflow: &str) -> Result<Option<(Claim, RecordRef
             "recovery claim shape changed"
         );
         ensure!(
-            claim.original == original(conn, workflow, &claim.original.request_id)?,
+            claim.original == original_identity(conn, workflow, &claim.original.request_id)?,
             "recovery original lineage changed"
         );
-        match &previous {
+        match claims.last() {
             None => ensure!(
                 claim.previous.is_none()
                     && claim.predecessor.generation == claim.original.activated_generation,
@@ -203,6 +220,7 @@ fn history(conn: &Connection, workflow: &str) -> Result<Option<(Claim, RecordRef
             Some((last, reference)) => ensure!(
                 claim.original == last.original
                     && claim.previous.as_ref() == Some(reference)
+                    && reference.sequence < sequence
                     && claim.predecessor.generation == last.generation
                     && claim
                         .predecessor
@@ -225,7 +243,7 @@ fn history(conn: &Connection, workflow: &str) -> Result<Option<(Claim, RecordRef
                     == serde_json::json!({"version":1,"request_id":claim.original.request_id,"record_sha256":sha}),
             "recovery claim event changed"
         );
-        previous = Some((
+        claims.push((
             claim,
             RecordRef {
                 sequence,
@@ -242,10 +260,10 @@ fn history(conn: &Connection, workflow: &str) -> Result<Option<(Claim, RecordRef
         )
         .optional()?;
     ensure!(
-        pending == previous.as_ref().map(|(claim, _)| claim.generation),
+        pending == claims.last().map(|(claim, _)| claim.generation),
         "recovery pending pointer changed"
     );
-    Ok(previous)
+    Ok(claims)
 }
 /// Ordinary dispatch never consumes a metadata recovery generation, including
 /// after input application or damage to the mutable pending pointer.
@@ -486,34 +504,49 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_current_claim(&tx, lease, now)?;
-        let original = &lease.claim.original;
-        let raw:String=tx.query_row("SELECT record FROM workflow_owner_publication_intent WHERE workflow=?1 AND request_id=?2",params![original.workflow,original.request_id],|r|r.get(0))?;
-        let record: crate::self_improve::OwnerPublicationRecord = serde_json::from_str(&raw)?;
-        super::owner_publication::require(&tx, &original.request_id, &original.intent, &raw)?;
-        let (audit,audit_bytes):(String,i64)=tx.query_row("SELECT substr(audit_path,1,4097),length(CAST(audit_path AS BLOB)) FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",params![original.workflow,original.activated_generation],|r|Ok((r.get(0)?,r.get(1)?)))?;
-        ensure!(
-            (1..=4096).contains(&audit_bytes) && audit.len() as i64 == audit_bytes,
-            "recovery native audit reference exceeds bound"
-        );
-        record.validate_current_native(&tx, Path::new(&audit))?;
-        let namespace = augmentagent_channel_core::native_vm::ownership::Authority {
-            owner: augmentagent_channel_core::native_vm::RuntimeOwner {
-                workflow_id: original.workflow.clone(),
-                lease_generation: original.activated_generation,
-            },
-            audit_path: audit,
-        };
-        let context = RecoveryNativeContext {
-            conn: &tx,
-            workflow: &original.workflow,
-            binding: record.recovery_binding().clone(),
-            namespace,
-        };
-        let facts = super::native_handoff::read_recovery_metadata_facts(&context)?;
-        require_current_claim(&tx, lease, now)?;
+        let result = recovery_native_facts_tx(&tx, lease, authorization, now)?;
         tx.commit()?;
-        Ok(super::owner_publication::OwnerPublicationNativeFacts::from_recovery_metadata(facts))
+        Ok(result)
     }
+}
+
+pub(super) fn recovery_native_facts_tx(
+    tx: &Transaction<'_>,
+    lease: &RecoveryLease,
+    authorization: &crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+    now: i64,
+) -> Result<super::owner_publication::OwnerPublicationNativeFacts> {
+    require_authorized_claim(tx, lease, authorization, now)?;
+    let original = &lease.claim.original;
+    let raw: String = tx.query_row(
+        "SELECT record FROM workflow_owner_publication_intent WHERE workflow=?1 AND request_id=?2",
+        params![original.workflow, original.request_id],
+        |r| r.get(0),
+    )?;
+    let record: crate::self_improve::OwnerPublicationRecord = serde_json::from_str(&raw)?;
+    super::owner_publication::require(&tx, &original.request_id, &original.intent, &raw)?;
+    let (audit,audit_bytes):(String,i64)=tx.query_row("SELECT substr(audit_path,1,4097),length(CAST(audit_path AS BLOB)) FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",params![original.workflow,original.activated_generation],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    ensure!(
+        (1..=4096).contains(&audit_bytes) && audit.len() as i64 == audit_bytes,
+        "recovery native audit reference exceeds bound"
+    );
+    record.validate_current_native(&tx, Path::new(&audit))?;
+    let namespace = augmentagent_channel_core::native_vm::ownership::Authority {
+        owner: augmentagent_channel_core::native_vm::RuntimeOwner {
+            workflow_id: original.workflow.clone(),
+            lease_generation: original.activated_generation,
+        },
+        audit_path: audit,
+    };
+    let context = RecoveryNativeContext {
+        conn: &tx,
+        workflow: &original.workflow,
+        binding: record.recovery_binding().clone(),
+        namespace,
+    };
+    let facts = super::native_handoff::read_recovery_metadata_facts(&context)?;
+    require_current_claim(&tx, lease, now)?;
+    Ok(super::owner_publication::OwnerPublicationNativeFacts::from_recovery_metadata(facts))
 }
 
 /// Transaction-borrowed permission to read the original protected preparation.
@@ -596,4 +629,124 @@ impl WorkflowStore {
         tx.commit()?;
         Ok(result)
     }
+}
+
+/// Descriptive durable join, never a lease or native/write capability.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PublicationRecoveryReference {
+    version: u32,
+    generation: i64,
+    sequence: i64,
+    record_sha256: String,
+}
+impl PublicationRecoveryReference {
+    pub(crate) fn generation(&self) -> i64 {
+        self.generation
+    }
+    pub(crate) fn sequence(&self) -> i64 {
+        self.sequence
+    }
+}
+impl RecoveryLease {
+    pub(super) fn publication_reference(&self) -> PublicationRecoveryReference {
+        PublicationRecoveryReference {
+            version: 1,
+            generation: self.claim.generation,
+            sequence: self.reference.sequence,
+            record_sha256: self.reference.sha256.clone(),
+        }
+    }
+}
+/// Validate a saved completion reference without the recursive current-authority
+/// reader. The caller's full revision/publication validation remains required.
+pub(crate) fn validate_publication_reference(
+    conn: &Connection,
+    workflow: &str,
+    request: &str,
+    raw_intent: &str,
+    reference: &PublicationRecoveryReference,
+    at: i64,
+) -> Result<()> {
+    ensure!(
+        reference.version == 1 && reference.sequence > 0 && reference.record_sha256.len() == 64,
+        "recovery publication reference shape changed"
+    );
+    let claims = journal(conn, workflow)?;
+    let (claim, record) = claims
+        .iter()
+        .find(|(claim, record)| {
+            claim.generation == reference.generation && record.sequence == reference.sequence
+        })
+        .context("recovery publication claim missing")?;
+    ensure!(
+        record.sha256 == reference.record_sha256
+            && claim.original.workflow == workflow
+            && claim.original.request_id == request
+            && claim.original.intent == super::owner_publication::reference(raw_intent)
+            && claim.claimed_at <= at,
+        "recovery publication claim differs from original intent"
+    );
+    Ok(())
+}
+pub(super) fn require_authorized_claim(
+    conn: &Connection,
+    lease: &RecoveryLease,
+    authorization: &crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+    now: i64,
+) -> Result<()> {
+    authorization.require(authorization.plan(), now)?;
+    ensure!(
+        authorization.plan().original == lease.claim.original,
+        "recovery authorization differs from original claim"
+    );
+    require_current_claim(conn, lease, now)
+}
+
+/// A saved completion must occupy the claim's actual event interval, not merely
+/// name a real claim from the same original context. This is descriptive history
+/// validation; it cannot authorize a new mutation or revive an expired lease.
+pub(crate) fn validate_publication_event_position(
+    conn: &Connection,
+    workflow: &str,
+    request: &str,
+    reference: &PublicationRecoveryReference,
+    sequence: i64,
+) -> Result<()> {
+    let claims = journal(conn, workflow)?;
+    let index = claims
+        .iter()
+        .position(|(claim, row)| {
+            claim.original.request_id == request
+                && claim.generation == reference.generation
+                && row.sequence == reference.sequence
+                && row.sha256 == reference.record_sha256
+        })
+        .context("publication claim event interval missing")?;
+    let next = claims
+        .iter()
+        .skip(index + 1)
+        .find(|(claim, _)| claim.original.request_id == request)
+        .map(|(_, row)| row.sequence);
+    ensure!(
+        reference.sequence < sequence && next.is_none_or(|next| sequence < next),
+        "owner publication completion is outside recovery claim event window"
+    );
+    Ok(())
+}
+pub(crate) fn validate_live_publication_event_position(
+    conn: &Connection,
+    workflow: &str,
+    request: &str,
+    sequence: i64,
+) -> Result<()> {
+    let first = journal(conn, workflow)?
+        .into_iter()
+        .find(|(claim, _)| claim.original.request_id == request)
+        .map(|(_, row)| row.sequence);
+    ensure!(
+        first.is_none_or(|first| sequence < first),
+        "live owner publication completion follows a recovery claim fence"
+    );
+    Ok(())
 }
