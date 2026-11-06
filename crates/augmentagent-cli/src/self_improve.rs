@@ -1433,7 +1433,16 @@ fn criteria_pr_section(criteria: &[String]) -> String {
 fn required_criteria_from_pr_body(body: &str) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut in_block = false;
-    for line in body.lines() {
+    // The controller writes its criteria section after the summary, plan and
+    // review notes, so the last heading is the authoritative one. An earlier
+    // heading is quoted text: #1893's summary echoed the issue body (and the
+    // scoper prompt after it), and the resume refused on that prose.
+    let lines: Vec<&str> = body.lines().collect();
+    let start = lines
+        .iter()
+        .rposition(|line| line.trim().starts_with("## Acceptance criteria"))
+        .unwrap_or(0);
+    for line in &lines[start..] {
         let t = line.trim();
         if t.starts_with("## Acceptance criteria") {
             in_block = true;
@@ -16439,6 +16448,10 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn resume_required_criteria_refuse_an_unparsed_section_instead_of_using_a_prefix() {
         assert!(required_criteria_from_pr_body("## Acceptance criteria\n- first required behavior\n  wrapped owner requirement\n- later required behavior").is_err());
+        let quoted = "## Summary\n## Acceptance criteria\n- quoted from the issue\n\nProduce the verdict header now.\n\n\
+                      ## Acceptance criteria (from the scoping pass)\n- controller criterion\n## Verification\n- gate: passed";
+        assert_eq!(required_criteria_from_pr_body(quoted).unwrap(), vec!["controller criterion".to_string()],
+            "the controller's own (last) criteria section is authoritative over quoted text");
     }
 
     /// Generated scope summaries retain their historical display limits. Owner
