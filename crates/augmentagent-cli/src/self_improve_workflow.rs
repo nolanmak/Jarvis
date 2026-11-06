@@ -248,6 +248,7 @@ pub(super) struct WorkflowGuard {
     capacity_exhausted: Arc<AtomicBool>,
     released: bool,
     metadata_only: bool,
+    publication_metadata: Option<Arc<durable::LiveOwnerTurn>>,
     audit: Arc<augmentagent_channel_core::AuditLogger>,
 }
 
@@ -256,6 +257,7 @@ pub(super) struct WorkflowGuard {
 /// Recovery and terminal metadata authorities need their own real producers.
 pub(super) struct OwnerPublicationGuard<'a> {
     _guard: WorkflowGuard,
+    _metadata: Arc<durable::LiveOwnerTurn>,
     // Keep the original opaque producer and exact draft alive. A future
     // publication writer must not reconstruct them from journal JSON.
     _publication: acceptance::owner::publication::OwnerPublicationDraft<'a>,
@@ -264,10 +266,10 @@ pub(super) struct OwnerPublicationGuard<'a> {
 impl OwnerPublicationGuard<'_> {
     fn publish_canonical(&self)->Result<()> {
         let guard=&self._guard;
-        let turn=self._publication.metadata_turn(&guard.repository,&guard.lease,&guard.binding,&guard.worktree)?;
+        let _turn=self._publication.metadata_turn(&guard.repository,&guard.lease,&guard.binding,&guard.worktree)?;
         self.with_native_metadata(&mut |proof|self._publication.with_scope_transition(|transition| {
             guard.store.lock().map_err(|_|anyhow::anyhow!("publication commit store poisoned"))?
-                .complete_owner_publication(&turn,&self._publication,proof,transition,millis())
+                .complete_owner_publication(&self._metadata,&self._publication,proof,transition,millis())
         }))
     }
 
@@ -282,14 +284,14 @@ impl OwnerPublicationGuard<'_> {
     fn with_native_metadata(&self,visit:&mut dyn FnMut(&augmentagent_channel_core::native_vm::ownership::MetadataNativeOwnerProof<'_>)->Result<()>)->Result<()> {
         let guard=&self._guard;guard.healthy_lease()?;
         anyhow::ensure!(guard.metadata_only,"publication metadata role missing");
-        let turn=self._publication.metadata_turn(&guard.repository,&guard.lease,&guard.binding,&guard.worktree)?;
+        let _turn=self._publication.metadata_turn(&guard.repository,&guard.lease,&guard.binding,&guard.worktree)?;
         let facts=guard.store.lock().map_err(|_|anyhow::anyhow!("publication native facts store poisoned"))?
-            .owner_publication_native_facts(&turn,&self._publication,guard.audit.path(),millis())?;
+            .owner_publication_native_facts(&self._metadata,&self._publication,guard.audit.path(),millis())?;
         let runtimes=facts.runtimes()?;
         let current=|| {
             guard.healthy_lease()?;
             guard.store.lock().map_err(|_|anyhow::anyhow!("publication native facts store poisoned"))?
-                .revalidate_owner_publication_native_facts(&turn,&self._publication,guard.audit.path(),&facts,millis())
+                .revalidate_owner_publication_native_facts(&self._metadata,&self._publication,guard.audit.path(),&facts,millis())
         };
         let mut load=|namespaces:&[augmentagent_channel_core::native_vm::ownership::Authority]| {
             let mut grouped=std::collections::BTreeMap::new();
@@ -308,9 +310,9 @@ impl OwnerPublicationGuard<'_> {
     fn native_facts(&self)->Result<durable::OwnerPublicationNativeFacts> {
         let guard=&self._guard;guard.healthy_lease()?;
         anyhow::ensure!(guard.metadata_only,"publication metadata role missing");
-        let turn=self._publication.metadata_turn(&guard.repository,&guard.lease,&guard.binding,&guard.worktree)?;
+        let _turn=self._publication.metadata_turn(&guard.repository,&guard.lease,&guard.binding,&guard.worktree)?;
         guard.store.lock().map_err(|_|anyhow::anyhow!("publication native facts store poisoned"))?
-            .owner_publication_native_facts(&turn,&self._publication,guard.audit.path(),millis())
+            .owner_publication_native_facts(&self._metadata,&self._publication,guard.audit.path(),millis())
     }
     /// Uninterrupted, originally unused namespace only. The callback performs
     /// short metadata work under original native locks; no productive API is
@@ -319,11 +321,11 @@ impl OwnerPublicationGuard<'_> {
         let guard=&self._guard;
         anyhow::ensure!(guard.metadata_only,"publication metadata role missing");
         guard.healthy_lease()?;
-        let turn=self._publication.metadata_turn(&guard.repository,&guard.lease,&guard.binding,&guard.worktree)?;
+        let _turn=self._publication.metadata_turn(&guard.repository,&guard.lease,&guard.binding,&guard.worktree)?;
         let current=|| {
             guard.healthy_lease()?;
             guard.store.lock().map_err(|_|anyhow::anyhow!("publication metadata store poisoned"))?
-                .validate_owner_publication_metadata(&turn,self._publication.preparation(),guard.audit.path(),millis())
+                .validate_owner_publication_metadata(&self._metadata,millis())
         };
         augmentagent_channel_core::native_vm::ownership::with_metadata_unused_native_owner(&guard.audit,&current,&mut |proof| {
             anyhow::ensure!(proof.namespace().owner.workflow_id==guard.lease.workflow
@@ -779,7 +781,7 @@ impl SweepGuard {
             accounted_ms: Arc::new(AtomicU64::new(0)),
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
             released: false,
-            metadata_only: false,
+            metadata_only: false,publication_metadata:None,
         };
         let setup=inner.register_native_context()
             .and_then(|_|inner.install_model_accounting())
@@ -1085,7 +1087,7 @@ impl WorkflowGuard {
             accounted_ms: Arc::new(AtomicU64::new(0)),
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
             released: false,
-            metadata_only: false,
+            metadata_only: false,publication_metadata:None,
         };
         let setup=guard.register_native_context()
             .and_then(|_|guard.install_model_accounting())
@@ -1386,7 +1388,7 @@ impl WorkflowGuard {
             workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
         })?;
         let mut guard = Self { state:state.clone(),audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),binding,
-            heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false,metadata_only:false };
+            heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false,metadata_only:false,publication_metadata:None };
         let setup=guard.register_native_context()
             .and_then(|_|guard.install_model_accounting())
             .and_then(|_|guard.validate_before_side_effect())
@@ -1468,8 +1470,9 @@ impl WorkflowGuard {
     /// consuming the old guard. Adapter files are never installed in product.
     pub(super) async fn activate_prepared_owner_acceptance<'a>(self,prepared:&'a acceptance::owner::PreparedOwnerAcceptance,
         previous:Option<&crate::autoship_contract::RegisteredContract>)->Result<OwnerPublicationGuard<'a>> {
-        let (guard,publication)=self.activate_prepared_owner_acceptance_inner(prepared,previous,OwnerActivationMode::Metadata).await?;
-        Ok(OwnerPublicationGuard {_guard:guard,_publication:publication})
+        let (mut guard,publication)=self.activate_prepared_owner_acceptance_inner(prepared,previous,OwnerActivationMode::Metadata).await?;
+        let metadata=guard.publication_metadata.take().context("original live owner metadata role missing")?;
+        Ok(OwnerPublicationGuard {_guard:guard,_metadata:metadata,_publication:publication})
     }
 
     #[cfg(test)]
@@ -1501,7 +1504,7 @@ impl WorkflowGuard {
             charge_elapsed(&mut store,&self.lease,self.started,&self.accounted_ms,now)?;
             store.activate_private_owner_acceptance_with_publication(initial.as_ref(),&turn,previous,next,&prepared.baseline.receipts,&prepared.proposal.files,&preparation,&binding,&publication,now)?
         };
-        let metadata=match mode {OwnerActivationMode::Metadata=>Some(preparation.clone()),#[cfg(test)] OwnerActivationMode::AccountingFixture=>None};
+        let metadata=match mode {OwnerActivationMode::Metadata=>Some(&publication),#[cfg(test)] OwnerActivationMode::AccountingFixture=>None};
         let guard=self.finish_owner_contract_change(revised,contract,environment,"owner_private_acceptance_metadata_ready",&old,next.contract_hash(),metadata)?;
         anyhow::ensure!(owner_prepared.activation_binding()?==preparation,"owner preparation changed during native settlement");
         #[cfg(test)]
@@ -1565,7 +1568,7 @@ impl WorkflowGuard {
 
     fn finish_owner_contract_change(mut self,revised:durable::owner_turn::OwnerTurn,
         contract:String,environment:String,kind:&str,previous_contract:&str,next_contract:&str,
-        publication:Option<durable::OwnerPreparationBinding>)->Result<Self> {
+        publication:Option<&acceptance::owner::publication::OwnerPublicationDraft<'_>>)->Result<Self> {
         let original_turn=revised.clone();
         self.metadata_only=publication.is_some();
         self.heartbeat.cancel();
@@ -1587,12 +1590,15 @@ impl WorkflowGuard {
             workflow_id:self.id().into(),lease_generation:self.lease.generation,
         })?;
         self.register_native_context()?;
-        if let Some(preparation)=publication {
-            let store=self.store.clone();let failure=self.lease_failure.clone();let native_audit=self.audit.path().to_path_buf();
+        if let Some(publication)=publication {
+            let metadata=Arc::new(self.store.lock().map_err(|_|anyhow::anyhow!("live publication store poisoned"))?
+                .bind_live_owner_publication(original_turn,publication,self.audit.path(),millis())?);
+            self.publication_metadata=Some(metadata.clone());
+            let store=self.store.clone();let failure=self.lease_failure.clone();
             self.audit.restrict_to_metadata(Arc::new(move || {
                 anyhow::ensure!(failure.lock().map_err(|_|anyhow::anyhow!("metadata failure lock poisoned"))?.is_none(),"metadata owner guard fenced");
                 store.lock().map_err(|_|anyhow::anyhow!("metadata publication store poisoned"))?
-                    .validate_owner_publication_metadata(&original_turn,&preparation,&native_audit,millis())
+                    .validate_owner_publication_metadata(&metadata,millis())
             }))?;
         }else {
             self.install_model_accounting()?;
@@ -4367,8 +4373,7 @@ mod tests {
                     let (descendant_two,amended_two)=acceptance::owner::test_owner_descendant(&control,&amended,descendant_value["evidence_file"].as_str().unwrap()).unwrap();
                     std::fs::write(&canonical,&descendant).unwrap();std::fs::set_permissions(&canonical,std::fs::Permissions::from_mode(0o600)).unwrap();
                     assert!(acceptance::owner::test_productive_canonical(&control).is_err(),"ordinary amendment concealed uncompleted owner publication ancestry");
-                    let uncompleted_turn=pending._guard.store.lock().unwrap().owner_turn_for_lease(&pending._guard.lease,millis()).unwrap();
-                    assert!(pending._guard.store.lock().unwrap().read_owner_publication_metadata(&uncompleted_turn,&pending._publication,pending._guard.audit.path(),millis(),|reader|
+                    assert!(pending._guard.store.lock().unwrap().read_owner_publication_metadata(&pending._metadata,&pending._publication,pending._guard.audit.path(),millis(),|reader|
                         acceptance::owner::test_canonical_with_reader(&control,reader)).is_err(),"workflow-bound reader accepted an uncompleted owner ancestor");
                     if let Some(raw)=&old_canonical {std::fs::write(&canonical,raw).unwrap();}else {std::fs::remove_file(&canonical).unwrap();}
 
@@ -4396,11 +4401,10 @@ mod tests {
                     assert!(pending.publish_canonical().is_err());unsafe{libc::flock(state_lock.as_raw_fd(),libc::LOCK_UN)};
                     db.execute("DELETE FROM workflow_owner_publication_pending WHERE request_id=?1",[request]).unwrap();
                     assert!(pending.publish_canonical().is_err());db.execute("INSERT INTO workflow_owner_publication_pending VALUES(?1,?2)",rusqlite::params![id,request]).unwrap();
-                    let turn=pending._guard.store.lock().unwrap().owner_turn_for_lease(&pending._guard.lease,millis()).unwrap();
                     pending.with_native_metadata(&mut |proof| {
                         db.execute("DELETE FROM workflow_owner_publication_pending WHERE request_id=?1",[request])?;
                         let result=pending._publication.with_scope_transition(|transition|pending._guard.store.lock().unwrap()
-                            .complete_owner_publication(&turn,&pending._publication,proof,transition,millis()));
+                            .complete_owner_publication(&pending._metadata,&pending._publication,proof,transition,millis()));
                         db.execute("INSERT INTO workflow_owner_publication_pending VALUES(?1,?2)",rusqlite::params![id,request])?;
                         assert!(result.is_err(),"stale workflow authority mutated scope under held native proof");Ok(())
                     }).unwrap();
@@ -4487,8 +4491,7 @@ mod tests {
                     assert!(pending._guard.audit.dispatch_allowed().is_err());assert!(pending._guard.audit.model_call_admitted("codex").is_err());
                     assert_eq!(WorkflowStore::open(&state).unwrap().owner_control(&id).unwrap(),control_before);
                     assert!(acceptance::owner::test_productive_canonical(&control).is_err(),"ordinary reader mistook owner completion for ordinary amendment authority");
-                    let original_turn=pending._guard.store.lock().unwrap().owner_turn_for_lease(&pending._guard.lease,millis()).unwrap();
-                    let inspect=|namespace:&Path|pending._guard.store.lock().unwrap().read_owner_publication_metadata(&original_turn,&pending._publication,pending._guard.audit.path(),millis(),
+                    let inspect=|namespace:&Path|pending._guard.store.lock().unwrap().read_owner_publication_metadata(&pending._metadata,&pending._publication,pending._guard.audit.path(),millis(),
                         |reader|acceptance::owner::test_canonical_with_reader(namespace,reader));
                     assert_eq!(inspect(&control).unwrap(),prepared.prepared().baseline.registration.contract_hash());
                     let owner_value:serde_json::Value=serde_json::from_slice(&next_canonical).unwrap();
@@ -4590,8 +4593,7 @@ mod tests {
                         pending.with_native_metadata(&mut |proof| {assert!(proof.inventory().is_empty());general=true;Ok(())}).unwrap();assert!(general);
                         assert_eq!(current_facts.namespace().owner.lease_generation,guard.lease.generation);
                         assert_eq!(current_facts.original_binding(),&original);assert!(current_facts.runtimes().unwrap().is_empty());
-                        let current_turn=guard.store.lock().unwrap().owner_turn_for_lease(&guard.lease,millis()).unwrap();
-                        guard.store.lock().unwrap().revalidate_owner_publication_native_facts(&current_turn,&pending._publication,guard.audit.path(),&current_facts,millis()).unwrap();
+                        guard.store.lock().unwrap().revalidate_owner_publication_native_facts(&pending._metadata,&pending._publication,guard.audit.path(),&current_facts,millis()).unwrap();
                         let epoch=std::fs::read(native.join("authority-epoch.json")).unwrap();
                         let audit_before=std::fs::read(guard.audit.path()).unwrap();
                         let (_,audit_log,audit_anchor)=audit_generation_paths(&state,&id,guard.lease.generation).unwrap();
@@ -4685,11 +4687,39 @@ mod tests {
                     assert!(!scope_file.exists(),"metadata activation registered productive scope");
                     let turn=guard.store.lock().unwrap().owner_turn_for_lease(&guard.lease,millis()).unwrap();
                     let binding=prepared.activation_binding().unwrap();
-                    guard.store.lock().unwrap().validate_owner_publication_metadata(&turn,&binding,guard.audit.path(),millis()).unwrap();
+                    guard.store.lock().unwrap().validate_owner_publication_metadata(&pending._metadata,millis()).unwrap();
                     let db=rusqlite::Connection::open(&state).unwrap();
                     let saved:String=db.query_row("SELECT record FROM workflow_owner_publication_intent WHERE request_id=?1",[&turn.request_id],|r|r.get(0)).unwrap();
+                    // A coherent journal replacement is still not the exact
+                    // original intent retained by the live activation producer.
+                    let old_sha:String=db.query_row("SELECT record_sha256 FROM workflow_owner_publication_intent WHERE request_id=?1",[&turn.request_id],|r|r.get(0)).unwrap();
+                    let mut changed:serde_json::Value=serde_json::from_str(&saved).unwrap();
+                    let other_control=control.join("another-publication-domain");
+                    changed["canonical"]["control"]=serde_json::to_value(&other_control).unwrap();
+                    changed["preparation_file"]=serde_json::to_value(other_control.join("owner-preparations").join(format!("{}.json",binding.context_sha256()))).unwrap();
+                    let changed:crate::self_improve::OwnerPublicationRecord=serde_json::from_value(changed).unwrap();let changed=serde_json::to_string(&changed).unwrap();
+                    let changed_sha=format!("{:x}",Sha256::digest(changed.as_bytes()));
+                    let events={let mut query=db.prepare("SELECT seq,payload FROM workflow_event WHERE workflow=?1 AND kind IN ('owner_publication_intended','owner_acceptance_registered','owner_contract_revised')").unwrap();
+                        query.query_map([&id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).unwrap().collect::<std::result::Result<Vec<_>,_>>().unwrap()};
+                    db.execute("UPDATE workflow_owner_publication_intent SET record=?2,record_sha256=?3 WHERE request_id=?1",rusqlite::params![turn.request_id,changed,changed_sha]).unwrap();
+                    for (sequence,payload) in &events {let mut value:serde_json::Value=serde_json::from_str(payload).unwrap();
+                        if value.get("publication").is_some() {value["publication"]["record_sha256"]=changed_sha.clone().into();}
+                        else {value["record_sha256"]=changed_sha.clone().into();}
+                        db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![sequence,serde_json::to_string(&value).unwrap()]).unwrap();}
+                    let substituted=guard.store.lock().unwrap().validate_owner_publication_metadata(&pending._metadata,millis());
+                    let reopened_substituted=WorkflowStore::open(&state).unwrap().validate_owner_publication_metadata(&pending._metadata,millis());
+                    let reminted=WorkflowStore::open(&state).unwrap().bind_live_owner_publication(turn.clone(),&pending._publication,guard.audit.path(),millis());
+                    let mut substituted_visit=false;
+                    let inspected=pending.with_unused_native_metadata(&mut |_| {substituted_visit=true;Ok(())});
+                    db.execute("UPDATE workflow_owner_publication_intent SET record=?2,record_sha256=?3 WHERE request_id=?1",rusqlite::params![turn.request_id,saved,old_sha]).unwrap();
+                    for (sequence,payload) in events {db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![sequence,payload]).unwrap();}
+                    assert!(substituted.is_err(),"live metadata callback followed a replacement intent instead of its original activation");
+                    assert!(reopened_substituted.is_err(),"reopened metadata callback followed substituted intent");
+                    assert!(reminted.is_err(),"saved turn and rewritten history reminted original live metadata role");
+                    assert!(inspected.is_err());assert!(!substituted_visit,"substituted live metadata entered native proof visitor");
+                    WorkflowStore::open(&state).unwrap().validate_owner_publication_metadata(&pending._metadata,millis()).unwrap();
                     db.execute("UPDATE workflow_owner_publication_intent SET record='{}' WHERE request_id=?1",[&turn.request_id]).unwrap();
-                    assert!(guard.store.lock().unwrap().validate_owner_publication_metadata(&turn,&binding,guard.audit.path(),millis()).is_err());
+                    assert!(guard.store.lock().unwrap().validate_owner_publication_metadata(&pending._metadata,millis()).is_err());
                     if mode.ends_with("-metadata-native-proof") {
                         let mut entered=false;
                         assert!(pending.with_unused_native_metadata(&mut |_| {entered=true;Ok(())}).is_err());assert!(!entered);
@@ -4697,17 +4727,16 @@ mod tests {
                         let mut general=false;assert!(pending.with_native_metadata(&mut |_| {general=true;Ok(())}).is_err());assert!(!general);
                     }
                     db.execute("UPDATE workflow_owner_publication_intent SET record=?2 WHERE request_id=?1",rusqlite::params![turn.request_id,saved]).unwrap();
-                    guard.store.lock().unwrap().validate_owner_publication_metadata(&turn,&binding,guard.audit.path(),millis()).unwrap();
+                    guard.store.lock().unwrap().validate_owner_publication_metadata(&pending._metadata,millis()).unwrap();
                     if mode.ends_with("-metadata-native-proof") {
                         let cached_facts=pending.native_facts().unwrap();
-                        let cached_turn=guard.store.lock().unwrap().owner_turn_for_lease(&guard.lease,millis()).unwrap();
                         let mut store=WorkflowStore::open(&state).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
                         store.set_owner_pause(&id,"fixture-owner",revision,true,millis()).unwrap();drop(store);
                         let mut entered=false;
                         assert!(pending.with_unused_native_metadata(&mut |_| {entered=true;Ok(())}).is_err());assert!(!entered,"new owner pause reached metadata visitor");
                         assert!(pending.native_facts().is_err(),"new owner pause exposed current native metadata");
                         let mut general=false;assert!(pending.with_native_metadata(&mut |_| {general=true;Ok(())}).is_err());assert!(!general);
-                        assert!(guard.store.lock().unwrap().revalidate_owner_publication_native_facts(&cached_turn,&pending._publication,guard.audit.path(),&cached_facts,millis()).is_err(),"cached native facts bypassed newer owner pause");
+                        assert!(guard.store.lock().unwrap().revalidate_owner_publication_native_facts(&pending._metadata,&pending._publication,guard.audit.path(),&cached_facts,millis()).is_err(),"cached native facts bypassed newer owner pause");
                         assert_eq!(WorkflowStore::open(&state).unwrap().pending_owner_messages(&id).unwrap(),1);
                         assert_eq!(WorkflowStore::open(&state).unwrap().merge_allowance(millis(),5).unwrap().confirmed,0);
                     }

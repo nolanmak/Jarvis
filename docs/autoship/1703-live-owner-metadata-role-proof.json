@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "kind": "exact-original-live-owner-publication-metadata-authority-component",
+  "source_parent_commit": "a2ae4928cb673e5678c7ea234cae00338a2f42db",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication.rs",
+      "sha256": "a14e0632eda150ede8f7f37b52a5c9364bf797e96db4e95ac3288b33c1592961"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "b399c40973de123d4941f7a1632088cb01f0e4420c7538020da99860a3b544aa"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "b13cae705961909efb9fd9ca0687812fe102014cbf5e2deb8b69bbe5b87ec777"
+    }
+  ],
+  "behavioral_reds": [
+    {
+      "session": 77563,
+      "result": "terminal1",
+      "log": "/tmp/autoship-live-owner-metadata-role-red-20261106.log",
+      "observed": "Live metadata callback followed coherently substituted original publication intent rather than exact original activated intent"
+    }
+  ],
+  "intermediate_validation": [
+    {
+      "session": 21546,
+      "result": "terminal1",
+      "log": "/tmp/autoship-live-owner-metadata-role-focused-20261106.log",
+      "reason": "Qualified PathBuf in new private role; compile failure is not behavioral red"
+    },
+    {
+      "session": 60164,
+      "result": "terminal0",
+      "passed": 1,
+      "seconds": 1.69,
+      "log": "/tmp/autoship-live-owner-metadata-role-focused-final-20261106.log",
+      "scope": "Before final reopened/remint/visitor assertions; superseded by full suite"
+    },
+    {
+      "session": 83172,
+      "result": "terminal0",
+      "passed": 4,
+      "seconds": 7.86,
+      "log": "/tmp/autoship-live-owner-metadata-role-publication-tests-20261106.log",
+      "scope": "Before final remint/native visitor assertions; full suite supersedes"
+    }
+  ],
+  "verification": {
+    "isolated_full_cli": {
+      "session": 87629,
+      "result": "terminal0",
+      "passed": 1949,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 342.93,
+      "log": "/tmp/autoship-live-owner-metadata-role-isolated-full-cli-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    },
+    "isolated_production_check": {
+      "session": 83079,
+      "result": "terminal0",
+      "seconds": 17.23,
+      "log": "/tmp/autoship-live-owner-metadata-role-isolated-production-check-20261106.log"
+    }
+  },
+  "implemented": [
+    "Actual consuming private activation/settled original-native handoff mints private nonserializable LiveOwnerTurn bound to original opaque draft, original intent digest, activated turn/preparation and original native audit",
+    "Logger and private publication guard share same Arc role; no raw-turn accessor, clone/serialization or execution conversion",
+    "Metadata validation, canonical reader/commit and native-facts/revalidation require actual role and recheck exact original intent/current lease/control/native context in normal transactions",
+    "Original opaque preparation/candidate/file and native/scope proofs remain independent; canonical completion never promotes metadata role",
+    "Coherent journal replacement is rejected through current/reopened connections, cannot remint using saved turn plus original opaque draft, and cannot enter native proof visitor"
+  ],
+  "test_scope": {
+    "actual_private_activation": "Existing initial/revision publication, unused/retained native proof, file/history/pause/namespace integrity fixtures retain actual producer path",
+    "coherent_replacement": "Changed canonical control/preparation path plus matching intent digest and activation/journal references; restore exact original history then legitimate role validation passes",
+    "vm_or_provider_executed": false
+  },
+  "source_dependency_audit": {
+    "head": "fdca35a09f82465c74703d0e12d4783b9a0292ac",
+    "readonly_worktree": "/home/nolan-makatche/jarvis-codex-reset-dst",
+    "observed": "SourceProjectionObservation requires incomplete-input/shipping-false observations; ci-opaque-producers.md draft explicitly leaves final shared C proof/API/audit and original regression unfinished",
+    "grants_native_execution_or_source_authority": false,
+    "modified": false
+  },
+  "not_proven_or_implemented": [
+    "RecoveryLease and TerminalCheckpoint real authenticated producers and metadata settlement under newer controls",
+    "Complete trusted original source/runtime/credential/kernel/compiled/allocation/writer/input census and source/resource authority",
+    "Fresh body nonrelease or semantic actual coding-conversation continuation",
+    "Distinct productive successor bridge/claim, shared productive gates and connected owner worker",
+    "Aggregate protected storage admission/retention, independent exact-head review, normal rollout, original live CLI/Discord acceptance and soaks"
+  ],
+  "preserved_unpublished_work": "/tmp/autoship-productive-gate-live-role-preserved-20261106.patch",
+  "original_preserved_patch": "/tmp/autoship-productive-gate-preserved-20261106.patch",
+  "preserved_patch_changes": "Only removed two context lines in one patch hunk; all +/- lines identical; original patch retained unchanged"
+}

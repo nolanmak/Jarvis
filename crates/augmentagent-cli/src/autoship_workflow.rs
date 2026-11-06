@@ -23,7 +23,7 @@ mod review_epoch;
 mod conversations;
 #[path="autoship_owner_publication.rs"]
 mod owner_publication;
-pub(crate) use owner_publication::{OwnerPublicationNativeFacts,OwnerPublicationCommitMetadata,OwnerPublicationReadContext};
+pub(crate) use owner_publication::{LiveOwnerTurn,OwnerPublicationNativeFacts,OwnerPublicationCommitMetadata,OwnerPublicationReadContext};
 #[path = "autoship_owner_revision.rs"]
 mod owner_revision;
 pub(crate) use owner_revision::OwnerPreparationBinding;
