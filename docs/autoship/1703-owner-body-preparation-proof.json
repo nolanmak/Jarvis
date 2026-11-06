@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "kind": "owner-body-original-preparation-admission-component",
+  "source_parent_commit": "69bc74b92321f3fbd75ccc95aa150299368b9322",
+  "source_inventory_is_post_run_inventory": true,
+  "source_generation_authority": false,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_revision.rs",
+      "sha256": "6b1b04a736540ab4295f0e6b2dd4841f6f3854eb1d50887aa8ba4e30d6e2865f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_dispatch.rs",
+      "sha256": "95a96e31596407ed13d7a98dbf8a855132e966f68956ddc5ca4501a7c71dcb5e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "fabe112ebde55576991d0c9d25110c479b2eb57a7c07754eef4925515dac34bd"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_acceptance.rs",
+      "sha256": "1813bf17738b123cfa109a0d41963dc6186ed3605c29840cb5f529820358cfae"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "d6866e074dd5dfa76f1c839ca46d595cd5922d1499de94b2d7bd79b84c9cac9f"
+    },
+    {
+      "path": "docs/autoship/owner-acceptance-publication.md",
+      "sha256": "3282accaa37ca1d7080e2807668b86e2c567383c27d596d52e766067561a3286"
+    }
+  ],
+  "validation": {
+    "red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent owner_coding_admission_cannot_treat_missing_preparation_as_legacy_authority",
+      "log": "/tmp/autoship-owner-body-preparation-red.log",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "observed": "revision row granted coding after both preparation projections disappeared"
+    },
+    "full_cli": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-body-preparation-full-cli.log",
+      "exit": 0,
+      "passed": 1918,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 314.19,
+      "native_guard_subprocess_modes": 67
+    },
+    "production_check": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-body-preparation-production-check.log",
+      "exit": 0,
+      "compiler_seconds": 32.79
+    },
+    "prior_narrowed_observer_suite": {
+      "log": "/tmp/autoship-owner-body-preparation-final-owner-suite.log",
+      "exit": 75,
+      "state": "terminal storage admission deferral before compilation; superseded by final full suite"
+    }
+  },
+  "coverage": [
+    "legacy-shaped missing preparation inspected but not granted coding authority",
+    "productive entry requires original opaque artifact and validates original request, single activation generation and current turn",
+    "both first-builder and continuation reservations retain preparation; first-builder tests use strict production factory and original unused-native proof",
+    "dispatch/model observers capture original artifact and reservation permanently, including across plain-thread callbacks",
+    "actual entry rejects damaged preparation before an empty scripted provider can be reached",
+    "atomic model/attribution/bounded-budget transaction refuses missing activation pair, reservation downgrade, changed artifact/provider, fenced or expired turn",
+    "audit failure rolls back model/resource/bounded-attempt changes; idempotent receipt remains single charge",
+    "pending input, pause, confirmed merge count preserved"
+  ],
+  "synthetic_controller_and_baseline_fixtures": true,
+  "model_observer_calls_are_not_provider_execution": true,
+  "live_provider_dispatch": false,
+  "actual_vm_source_execution": false,
+  "canonical_manifest_publication": false,
+  "process_loss_recovery": false,
+  "productive_owner_consumer_enabled": false,
+  "public_output_projection_complete": false,
+  "compiled_source_freshness_proved": false,
+  "shipping_authority": false,
+  "production_restored": false,
+  "handoff_ready": false,
+  "audit": {
+    "fresh_reader": "owner_body_admission_spec_audit_20261106",
+    "pass_a_complete": true,
+    "pass_b_complete": true,
+    "new_checkpoint_defects": 0,
+    "remaining_acknowledged": [
+      "P1 publication fence/order",
+      "P2 authenticated recovery/lineage/settlement",
+      "P3 all-writer public projection",
+      "P4 authorized correction context"
+    ],
+    "final_seam_pass_c": false
+  },
+  "remaining": [
+    "P1 canonical publication and all-reader/body admission",
+    "P2 authenticated native process-loss recovery with immutable original input lineage and terminal/supersession settlement",
+    "P3/P4 public output and correction contexts",
+    "productive worker ingress",
+    "full C/R proof, exact-head hosted checks and independent review, normal rollout and every epic live acceptance/soak/shipment exit"
+  ]
+}

@@ -129,6 +129,18 @@ impl PreparedOwnerAcceptance {
             "owner acceptance current request changed");
         self.input.validate_prepared(&self.prepared,previous)
     }
+    /// Reuse the original producer's artifact after its one guarded activation;
+    /// a revision row or reconstructed PreparedAcceptance is insufficient.
+    pub(in crate::self_improve) fn validate_activated(&self,workflow:&workflow::WorkflowGuard,candidate:&Path)->Result<crate::autoship_workflow::OwnerPreparationBinding> {
+        let turn=workflow.owner_acceptance_turn(candidate,self.input.source,Some(&self.prepared.baseline.registration))?;
+        self.candidate.verify(candidate)?;
+        ensure!(turn.request_id==self.input.request_id && turn.lease.owner==self.input.owner
+            && Some(turn.lease.generation)==self.input.generation.checked_add(1)
+            && turn.pause_revision==self.input.pause_revision && turn.body==self.input.body
+            && turn.binding.head==self.input.binding.head,"activated owner preparation request changed");
+        let binding=self.activation_binding()?;
+        workflow.validate_original_owner_preparation(&turn,&binding)?;Ok(binding)
+    }
     #[cfg(test)]
     pub(in crate::self_improve) async fn test_reload_cached(&self,candidate:&Path,workflow:&workflow::WorkflowGuard)->Result<()> {
         let control=self.path.parent().and_then(Path::parent).context("fixture preparation namespace missing")?;

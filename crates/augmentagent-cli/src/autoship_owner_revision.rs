@@ -5,6 +5,17 @@ use crate::autoship_contract::{RegisteredContract,VerifierReceipt,BaselineResult
 #[path="autoship_owner_revision_history.rs"]
 mod history;
 pub(super) fn validate_history(conn:&Connection,workflow:&str)->Result<()> {history::validate(conn,workflow)}
+/// Historical binding data only. Current turn/lease validation is separate;
+/// absence never grants a legacy exception to productive owner coding.
+pub(super) fn preparation_for_turn(conn:&Connection,turn:&owner_turn::OwnerTurn)->Result<Option<OwnerPreparationBinding>> {
+    validate_history(conn,&turn.lease.workflow)?;
+    let raw:Option<String>=conn.query_row("SELECT p.record FROM workflow_owner_revision r JOIN workflow_owner_preparation p ON p.request_id=r.request_id JOIN workflow_owner_turn t ON t.request_id=r.request_id WHERE r.request_id=?1 AND r.binding=?2 AND r.next_contract=?3 AND t.workflow=?4 AND t.owner=?5 AND t.lease_generation=?6 AND t.pause_revision=?7",
+        params![turn.request_id,serde_json::to_string(&turn.binding)?,turn.binding.contract,turn.lease.workflow,turn.lease.owner,turn.lease.generation,turn.pause_revision],|r|r.get(0)).optional()?;
+    raw.map(|raw|Ok(serde_json::from_str(&raw)?)).transpose()
+}
+pub(super) fn require_preparation(conn:&Connection,turn:&owner_turn::OwnerTurn,expected:&OwnerPreparationBinding)->Result<()> {
+    ensure!(preparation_for_turn(conn,turn)?.as_ref()==Some(expected),"original owner preparation missing or changed");Ok(())
+}
 fn baseline_digest(receipts:&[VerifierReceipt])->Result<String> {
     Ok(format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(receipts)?)?)))
 }
@@ -177,6 +188,69 @@ mod tests {
         let files=std::collections::BTreeMap::from([("verifier.rs".into(),"synthetic verifier fixture".into())]);
         let preparation=OwnerPreparationBinding::from_artifact("a".repeat(64),"b".repeat(64),next,&receipts).unwrap();
         (receipts,files,preparation)
+    }
+    #[test]
+    fn owner_coding_admission_cannot_treat_missing_preparation_as_legacy_authority() {
+        let dir=tempfile::tempdir().unwrap();let (mut store,turn,previous,next,binding)=setup(dir.path());
+        let (receipts,files,preparation)=private_preparation(dir.path(),&next);
+        let revised=store.activate_private_owner_acceptance(None,&turn,Some(&previous),&next,&receipts,&files,&preparation,&binding,5).unwrap();
+        assert!(store.has_owner_acceptance_for_turn(&revised).unwrap());
+        store.conn.execute("DELETE FROM workflow_owner_preparation WHERE request_id=?1",[&turn.request_id]).unwrap();
+        store.conn.execute("UPDATE workflow_event SET payload=json_remove(payload,'$.preparation') WHERE workflow=?1 AND kind='owner_contract_revised'",[&turn.lease.workflow]).unwrap();
+        drop(store);let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        // Legacy-shaped history remains inspectable, but cannot grant coding.
+        store.validate_owner_turn(&revised,6).unwrap();
+        let before=store.snapshot(&turn.lease.workflow).unwrap().unwrap();let events=store.events(&turn.lease.workflow).unwrap();
+        assert!(!store.has_owner_acceptance_for_turn(&revised).unwrap(),"revision row granted coding after both preparation projections disappeared");
+        assert_eq!(store.snapshot(&turn.lease.workflow).unwrap().unwrap(),before);assert_eq!(store.events(&turn.lease.workflow).unwrap(),events);
+        assert_eq!(store.pending_owner_messages(&turn.lease.workflow).unwrap(),1);assert_eq!(before.model_calls,0);
+    }
+    #[test]
+    fn prepared_owner_body_admission_and_charge_are_atomic_and_retain_original_binding() {
+        for fault in ["intact","activation-missing","dispatch-downgrade","artifact","provider","pause","expired","audit"] {
+            let dir=tempfile::tempdir().unwrap();let (mut store,turn,previous,next,binding)=setup(dir.path());
+            let (receipts,files,preparation)=private_preparation(dir.path(),&next);
+            let turn=store.activate_private_owner_acceptance(None,&turn,Some(&previous),&next,&receipts,&files,&preparation,&binding,5).unwrap();
+            let dispatch=store.begin_prepared_owner_body_dispatch(&turn,submission::Provider::Codex,&preparation,6).unwrap();
+            let raw:String=store.conn.query_row("SELECT record FROM workflow_owner_body_dispatch WHERE request_id=?1",[&turn.request_id],|r|r.get(0)).unwrap();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&raw).unwrap()["preparation"],serde_json::to_value(&preparation).unwrap());
+            let mut expected=preparation.clone();let mut provider=submission::Provider::Codex;let mut now=7;
+            match fault {
+                "activation-missing"=>{
+                    store.conn.execute("DELETE FROM workflow_owner_preparation WHERE request_id=?1",[&turn.request_id]).unwrap();
+                    store.conn.execute("UPDATE workflow_event SET payload=json_remove(payload,'$.preparation') WHERE workflow=?1 AND kind='owner_contract_revised'",[&turn.lease.workflow]).unwrap();
+                },
+                "dispatch-downgrade"=>{
+                    store.conn.execute("UPDATE workflow_owner_body_dispatch SET record=json_remove(record,'$.preparation') WHERE request_id=?1",[&turn.request_id]).unwrap();
+                    store.conn.execute("UPDATE workflow_event SET payload=json_remove(payload,'$.preparation') WHERE workflow=?1 AND kind='owner_body_dispatch_started'",[&turn.lease.workflow]).unwrap();
+                },
+                "artifact"=>{let mut value=serde_json::to_value(&expected).unwrap();value["artifact_sha256"]="e".repeat(64).into();expected=serde_json::from_value(value).unwrap();},
+                "provider"=>provider=submission::Provider::Claude,
+                "pause"=>{store.set_owner_pause(&turn.lease.workflow,"owner",turn.pause_revision,true,7).unwrap();},
+                "expired"=>now=1000,
+                "audit"=>store.conn.execute_batch("CREATE TRIGGER deny_owner_model_admission BEFORE INSERT ON workflow_event WHEN NEW.kind='native_model_admitted' BEGIN SELECT RAISE(ABORT,'injected owner model admission failure'); END;").unwrap(),
+                _=>{},
+            }
+            let before=store.snapshot(&turn.lease.workflow).unwrap().unwrap();let events=store.events(&turn.lease.workflow).unwrap();
+            let result=store.charge_prepared_owner_model(&turn.lease,"owner-body-call",now,Some(("owner-body-fixture",&binding,1)),provider,&dispatch,&expected);
+            if fault=="intact" {
+                result.unwrap();store.charge_prepared_owner_model(&turn.lease,"owner-body-call",8,Some(("owner-body-fixture",&binding,1)),provider,&dispatch,&expected).unwrap();
+                assert_eq!(store.snapshot(&turn.lease.workflow).unwrap().unwrap().model_calls,1);
+                assert_eq!(store.conn.query_row("SELECT attempts FROM bounded_attempt WHERE workflow=?1",[&turn.lease.workflow],|r|r.get::<_,i64>(0)).unwrap(),1);
+            }else {
+                assert!(result.is_err(),"{fault}: invalid owner body charged a model");
+                assert_eq!(store.snapshot(&turn.lease.workflow).unwrap().unwrap(),before);assert_eq!(store.events(&turn.lease.workflow).unwrap(),events);
+                assert_eq!(store.conn.query_row("SELECT count(*) FROM bounded_attempt WHERE workflow=?1",[&turn.lease.workflow],|r|r.get::<_,i64>(0)).unwrap(),0);
+                assert_eq!(store.conn.query_row("SELECT count(*) FROM resource_charge WHERE workflow=?1",[&turn.lease.workflow],|r|r.get::<_,i64>(0)).unwrap(),0);
+                if fault=="audit" {
+                    store.conn.execute_batch("DROP TRIGGER deny_owner_model_admission").unwrap();
+                    store.charge_prepared_owner_model(&turn.lease,"owner-body-call",8,Some(("owner-body-fixture",&binding,1)),provider,&dispatch,&expected).unwrap();
+                }
+            }
+            assert_eq!(store.pending_owner_messages(&turn.lease.workflow).unwrap(),1);
+            assert!(store.owner_control(&turn.lease.workflow).unwrap().unwrap().paused);
+            assert_eq!(store.merge_allowance(8,5).unwrap().confirmed,0);
+        }
     }
     #[test]
     fn private_owner_revision_retains_its_exact_preparation_and_revised_baseline_after_reopen() {

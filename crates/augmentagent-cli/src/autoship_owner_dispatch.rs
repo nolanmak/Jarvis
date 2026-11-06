@@ -17,6 +17,8 @@ struct Record {
     started_at_ms: i64,
     #[serde(default,skip_serializing_if="Option::is_none")]
     first_builder:Option<serde_json::Value>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    preparation:Option<OwnerPreparationBinding>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -170,6 +172,12 @@ fn decode(
         record.body_sha256 == format!("{:x}", Sha256::digest(input.body.as_bytes())),
         "owner dispatch input changed"
     );
+    if let Some(preparation)=&record.preparation {
+        super::owner_revision::require_preparation(conn,&owner_turn::OwnerTurn {
+            lease:Lease {workflow:record.workflow.clone(),owner:record.owner.clone(),generation:record.generation},
+            request_id:record.request_id.clone(),body:input.body.clone(),pause_revision:record.pause_revision,binding:record.binding.clone(),
+        },preparation)?;
+    }
     let turn:(String,i64,i64,String)=conn.query_row("SELECT owner,lease_generation,pause_revision,binding FROM workflow_owner_turn WHERE workflow=?1 AND request_id=?2",params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
     ensure!(
         turn == (
@@ -277,29 +285,39 @@ impl WorkflowStore {
         &self,
         turn: &owner_turn::OwnerTurn,
     ) -> Result<bool> {
-        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_revision WHERE request_id=?1 AND binding=?2 AND next_contract=?3)",
-            params![turn.request_id,serde_json::to_string(&turn.binding)?,turn.binding.contract],|r|r.get(0))?)
+        Ok(super::owner_revision::preparation_for_turn(&self.conn,turn)?.is_some())
+    }
+    pub(crate) fn validate_owner_preparation_for_turn(&mut self,turn:&owner_turn::OwnerTurn,preparation:&OwnerPreparationBinding,now:i64)->Result<()> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::owner_turn::validate_turn(&tx,turn,now)?;
+        super::owner_revision::require_preparation(&tx,turn,preparation)?;tx.commit()?;Ok(())
     }
     /// Metadata reservation only. The guard independently establishes native
     /// readiness, acceptance registration and provider/session scope before use.
+    #[cfg(test)]
     pub(crate) fn begin_owner_body_dispatch(
         &mut self,
         turn: &owner_turn::OwnerTurn,
         provider: submission::Provider,
         now: i64,
     ) -> Result<OwnerBodyDispatch> {
-        self.begin_owner_body_dispatch_inner(turn,provider,now,None)
+        self.begin_owner_body_dispatch_inner(turn,provider,now,None,None)
+    }
+    pub(crate) fn begin_prepared_owner_body_dispatch(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,
+        preparation:&OwnerPreparationBinding,now:i64)->Result<OwnerBodyDispatch> {
+        self.begin_owner_body_dispatch_inner(turn,provider,now,None,Some(preparation))
     }
     pub(crate) fn first_owner_body_turn(&mut self,lease:&Lease,provider:submission::Provider,base:&str,now:i64)->Result<owner_turn::OwnerTurn> {
         self.require_command_builder(&lease.workflow,Some(provider))?;
         let turn=self.owner_turn_for_lease(lease,now)?;first_builder_policy(&self.conn,&turn,base)?;Ok(turn)
     }
-    pub(crate) fn begin_first_owner_body(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,base:&str,canonical_main:&str,
-        proof:&augmentagent_channel_core::native_vm::ownership::UnusedNativeOwnerProof<'_>,now:i64)->Result<OwnerBodyDispatch> {
-        self.begin_owner_body_dispatch_inner(turn,provider,now,Some((base,canonical_main,proof)))
+    pub(crate) fn begin_prepared_first_owner_body(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,base:&str,canonical_main:&str,
+        proof:&augmentagent_channel_core::native_vm::ownership::UnusedNativeOwnerProof<'_>,preparation:&OwnerPreparationBinding,now:i64)->Result<OwnerBodyDispatch> {
+        self.begin_owner_body_dispatch_inner(turn,provider,now,Some((base,canonical_main,proof)),Some(preparation))
     }
     fn begin_owner_body_dispatch_inner(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,now:i64,
         first:Option<(&str,&str,&augmentagent_channel_core::native_vm::ownership::UnusedNativeOwnerProof<'_>)>,
+        preparation:Option<&OwnerPreparationBinding>,
     )->Result<OwnerBodyDispatch> {
         ensure!(now >= 0, "invalid owner dispatch time");
         self.require_command_builder(&turn.lease.workflow, Some(provider))?;
@@ -307,6 +325,7 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         super::owner_turn::validate_turn(&tx, turn, now)?;
+        if let Some(preparation)=preparation {super::owner_revision::require_preparation(&tx,turn,preparation)?;}
         let prior: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_owner_body_dispatch WHERE request_id=?1)",
             [&turn.request_id],
@@ -339,6 +358,7 @@ impl WorkflowStore {
             launch_floor,
             started_at_ms: now,
             first_builder,
+            preparation:preparation.cloned(),
         };
         let raw = serde_json::to_string(&record)?;
         event(
@@ -550,38 +570,50 @@ impl WorkflowStore {
             .context("owner body completion reference missing")?;
         Ok((prepared, reference))
     }
-    pub(crate) fn validate_owner_body_dispatch(
-        &mut self,
-        dispatch: &OwnerBodyDispatch,
-        now: i64,
-    ) -> Result<()> {
-        let record = &dispatch.record;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let input = super::owner_inbox::require_pending(&tx, &record.workflow, &record.request_id)?;
-        let turn = owner_turn::OwnerTurn {
-            lease: Lease {
-                workflow: record.workflow.clone(),
-                owner: record.owner.clone(),
-                generation: record.generation,
-            },
-            request_id: record.request_id.clone(),
-            body: input.body,
-            pause_revision: record.pause_revision,
-            binding: record.binding.clone(),
-        };
-        super::owner_turn::validate_turn(&tx, &turn, now)?;
-        let (sequence,raw):(i64,String)=tx.query_row("SELECT sequence,record FROM workflow_owner_body_dispatch WHERE request_id=?1 AND workflow=?2",params![record.request_id,record.workflow],|r|Ok((r.get(0)?,r.get(1)?)))?;
-        ensure!(
-            sequence == dispatch.sequence
-                && decode(&tx, &record.request_id, &record.workflow, sequence, &raw)? == *record,
-            "owner dispatch reservation changed"
-        );
-        tx.commit()?;
-        Ok(())
+    pub(crate) fn validate_owner_body_dispatch(&mut self,dispatch:&OwnerBodyDispatch,now:i64)->Result<()> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_dispatch_tx(&tx,dispatch,now)?;tx.commit()?;Ok(())
     }
+    pub(crate) fn validate_prepared_owner_body_dispatch(&mut self,lease:&Lease,dispatch:&OwnerBodyDispatch,
+        preparation:&OwnerPreparationBinding,provider:submission::Provider,now:i64)->Result<()> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_prepared_dispatch_tx(&tx,lease,dispatch,preparation,provider,now)?;tx.commit()?;Ok(())
+    }
+
 }
+
+fn validate_dispatch_tx(tx:&Transaction<'_>,dispatch:&OwnerBodyDispatch,now:i64)->Result<()> {
+    let record=&dispatch.record;
+    let input = super::owner_inbox::require_pending(tx, &record.workflow, &record.request_id)?;
+    let turn = owner_turn::OwnerTurn {
+        lease: Lease {
+            workflow: record.workflow.clone(),
+            owner: record.owner.clone(),
+            generation: record.generation,
+        },
+        request_id: record.request_id.clone(),
+        body: input.body,
+        pause_revision: record.pause_revision,
+        binding: record.binding.clone(),
+    };
+    super::owner_turn::validate_turn(tx, &turn, now)?;
+    let (sequence,raw):(i64,String)=tx.query_row("SELECT sequence,record FROM workflow_owner_body_dispatch WHERE request_id=?1 AND workflow=?2",params![record.request_id,record.workflow],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    ensure!(
+        sequence == dispatch.sequence
+            && decode(tx, &record.request_id, &record.workflow, sequence, &raw)? == *record,
+        "owner dispatch reservation changed"
+    );
+    Ok(())
+}
+pub(super) fn validate_prepared_dispatch_tx(tx:&Transaction<'_>,lease:&Lease,dispatch:&OwnerBodyDispatch,
+    preparation:&OwnerPreparationBinding,provider:submission::Provider,now:i64)->Result<()> {
+    let record=&dispatch.record;
+    ensure!(record.workflow==lease.workflow && record.owner==lease.owner && record.generation==lease.generation
+        && record.provider==provider && record.preparation.as_ref()==Some(preparation),
+        "owner coding reservation lacks its original preparation or provider");
+    validate_dispatch_tx(tx,dispatch,now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

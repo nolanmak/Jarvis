@@ -1315,13 +1315,13 @@ impl WorkflowStore {
         charge: ResourceCharge,
         now_ms: i64,
     ) -> Result<()> {
-        self.charge_inner(lease, receipt_id, charge, now_ms, None, None, None)
+        self.charge_inner(lease, receipt_id, charge, now_ms, None, None, None,None)
     }
 
     pub fn charge_observation(&mut self, lease: &Lease, receipt_id: &str,
         charge: ResourceCharge, now_ms: i64, daily_cap: u64) -> Result<()> {
         ensure!(lease.workflow.starts_with("autoship-observation/") || lease.workflow.starts_with("autoship-canary/"), "observation budget requires diagnostic workflow namespace");
-        self.charge_inner(lease, receipt_id, charge, now_ms, Some(daily_cap), None, None)
+        self.charge_inner(lease, receipt_id, charge, now_ms, Some(daily_cap), None, None,None)
     }
 
     /// Bound actual native dispatches in the same transaction as quota charging.
@@ -1331,7 +1331,7 @@ impl WorkflowStore {
         ensure!(observation_cap.is_none() || lease.workflow.starts_with("autoship-observation/") || lease.workflow.starts_with("autoship-canary/"),
             "observation budget requires diagnostic workflow namespace");
         self.charge_inner(lease,receipt_id,ResourceCharge{model_calls:1,..Default::default()},now_ms,observation_cap,
-            Some((purpose,binding,limit)),None)
+            Some((purpose,binding,limit)),None,None)
     }
 
     /// Called only by the controller's actual model-admission observer. Persist
@@ -1341,7 +1341,16 @@ impl WorkflowStore {
         provider:Option<submission::Provider>,reviewer:bool)->Result<()> {
         ensure!(observation_cap.is_none() || lease.workflow.starts_with("autoship-observation/") || lease.workflow.starts_with("autoship-canary/"),"observation budget requires diagnostic workflow namespace");
         self.charge_inner(lease,receipt,ResourceCharge {model_calls:1,..Default::default()},now,
-            observation_cap,bounded,Some((provider,reviewer)))
+            observation_cap,bounded,Some((provider,reviewer)),None)
+    }
+    /// Validate the captured once-only owner reservation in the same transaction
+    /// as model attribution, budget admission and charging. Legacy metadata
+    /// cannot satisfy this path by losing its preparation fields.
+    pub(crate) fn charge_prepared_owner_model(&mut self,lease:&Lease,receipt:&str,now:i64,
+        bounded:Option<(&str,&Binding,u32)>,provider:submission::Provider,
+        dispatch:&owner_dispatch::OwnerBodyDispatch,preparation:&OwnerPreparationBinding)->Result<()> {
+        self.charge_inner(lease,receipt,ResourceCharge {model_calls:1,..Default::default()},now,
+            None,bounded,Some((Some(provider),false)),Some((dispatch,preparation)))
     }
 
     pub fn observation_available(&self, now_ms: i64, required: u64, daily_cap: u64) -> Result<bool> {
@@ -1360,7 +1369,9 @@ impl WorkflowStore {
     }
 
     fn charge_inner(&mut self, lease: &Lease, receipt_id: &str,
-        charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>, bounded:Option<(&str,&Binding,u32)>, admission:Option<(Option<submission::Provider>,bool)>) -> Result<()> {
+        charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>, bounded:Option<(&str,&Binding,u32)>, admission:Option<(Option<submission::Provider>,bool)>,
+        owner_body:Option<(&owner_dispatch::OwnerBodyDispatch,&OwnerPreparationBinding)>) -> Result<()> {
+        let owner_provider=admission.as_ref().and_then(|(provider,reviewer)|if *reviewer {None}else{provider.clone()});
         let admission=admission.map(|(provider,reviewer)|serde_json::json!({"receipt":receipt_id,"provider":provider,"reviewer":reviewer}).to_string());
         ensure!(!receipt_id.is_empty(), "charge receipt required");
         let values = (
@@ -1372,6 +1383,10 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx, lease, now_ms)?;
+        if let Some((dispatch,preparation))=owner_body {
+            owner_dispatch::validate_prepared_dispatch_tx(&tx,lease,dispatch,preparation,
+                owner_provider.context("owner coding requires native builder attribution")?,now_ms)?;
+        }
         let prior: Option<(i64,i64,i64)> = tx.query_row("SELECT wall_ms,model_calls,tokens FROM resource_charge WHERE workflow=?1 AND id=?2",
             params![lease.workflow,receipt_id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         if let Some(prior) = prior {

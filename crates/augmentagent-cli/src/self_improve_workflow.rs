@@ -21,12 +21,23 @@ struct BoundedNativeCall {
 tokio::task_local! {
     static BOUNDED_NATIVE_CALL: BoundedNativeCall;
 }
+struct OwnerBodyAdmission {
+    dispatch:Arc<durable::owner_dispatch::OwnerBodyDispatch>,
+    preparation:Arc<acceptance::owner::PreparedOwnerAcceptance>,
+    provider:durable::submission::Provider,
+}
+impl OwnerBodyAdmission {
+    fn validate(&self,store:&mut WorkflowStore,lease:&Lease,now:i64)->Result<()> {
+        let preparation=self.preparation.activation_binding()?;
+        store.validate_prepared_owner_body_dispatch(lease,&self.dispatch,&preparation,self.provider,now)
+    }
+}
 
 const LEASE_MS: i64 = 10 * 60 * 1000;
 const RENEW_SECS: u64 = 60;
 
 pub(super) struct OwnerBodyResult {
-    dispatch:durable::owner_dispatch::OwnerBodyDispatch,
+    dispatch:Arc<durable::owner_dispatch::OwnerBodyDispatch>,
     response:String,
     observed:augmentagent_channel_core::native_session::ObservedConversation,
 }
@@ -1048,12 +1059,6 @@ impl WorkflowGuard {
 
     fn install_model_accounting(&self) -> Result<()> {
         self.audit.require_run_resources()?;
-        let dispatch_store=self.store.clone();let dispatch_lease=self.lease.clone();
-        self.audit.set_dispatch_observer(Arc::new(move || {
-            let mut store=dispatch_store.lock().map_err(|_|anyhow::anyhow!("workflow dispatch lock poisoned"))?;
-            let binding=store.snapshot(&dispatch_lease.workflow)?.context("workflow missing")?.checkpoint.binding;
-            store.validate_dispatch(&dispatch_lease,&binding,millis())
-        }))?;
         if self.audit.native_runtime_owner()?.is_some() {
             let original=self.store.lock().map_err(|_|anyhow::anyhow!("native original binding store poisoned"))?
                 .native_owner_binding(&self.lease.workflow,self.lease.generation)?;
@@ -1086,6 +1091,21 @@ impl WorkflowGuard {
             // capacity exhaustion is not a code defect or a convergence round.
             store.checkpoint(&capacity_lease, &checkpoint, millis())
         }))?;
+        self.install_model_observers(None)
+    }
+    /// Once a body is reserved, narrow both observers to its captured original
+    /// authority. Keep that fence after success/failure and across thread hops;
+    /// only a new guarded generation can install an ordinary observer again.
+    fn install_model_observers(&self,body:Option<Arc<OwnerBodyAdmission>>) -> Result<()> {
+        let dispatch_body=body.clone();
+        let dispatch_store=self.store.clone();let dispatch_lease=self.lease.clone();
+        self.audit.set_dispatch_observer(Arc::new(move || {
+            let mut store=dispatch_store.lock().map_err(|_|anyhow::anyhow!("workflow dispatch lock poisoned"))?;
+            let binding=store.snapshot(&dispatch_lease.workflow)?.context("workflow missing")?.checkpoint.binding;
+            store.validate_dispatch(&dispatch_lease,&binding,millis())?;
+            if let Some(body)=&dispatch_body {body.validate(&mut store,&dispatch_lease,millis())?;}
+            Ok(())
+        }))?;
         let capacity_flag = self.capacity_exhausted.clone();
         let store = self.store.clone();
         let lease = self.lease.clone();
@@ -1100,6 +1120,14 @@ impl WorkflowGuard {
                 anyhow::ensure!(bounded.workflow==lease.workflow,"bounded native call used a different workflow audit sink");
             }
             let actual=match provider {"codex"=>Some(durable::submission::Provider::Codex),"claude"=>Some(durable::submission::Provider::Claude),_=>None};
+            if let Some(body)=&body {
+                anyhow::ensure!(!augmentagent_channel_core::native_session::is_fresh_review(),"owner coding cannot use reviewer attribution");
+                let actual=actual.context("owner coding requires its native provider")?;
+                anyhow::ensure!(actual==body.provider,"owner coding provider changed");
+                let preparation=body.preparation.activation_binding()?;
+                return store.charge_prepared_owner_model(&lease,&receipt,millis(),
+                    bounded.as_ref().map(|b|(b.purpose.as_str(),&b.binding,b.limit)),actual,&body.dispatch,&preparation);
+            }
             store.charge_admitted_model(&lease,&receipt,millis(),observational.then(observation_call_cap),
                 bounded.as_ref().map(|b|(b.purpose.as_str(),&b.binding,b.limit)),actual,
                 augmentagent_channel_core::native_session::is_fresh_review())
@@ -1120,8 +1148,8 @@ impl WorkflowGuard {
     }
 
     pub(super) fn bind_reasoner(&self, reasoner: &FallbackReasoner) -> Result<()> {
-        // The guard installs exactly one observer at acquisition. Rebinding a
-        // builder or attaching a separately constructed reviewer cannot double charge.
+        // The guard owns one accounting observer. Binding a reasoner reuses
+        // it; the owner-body boundary narrows it without adding a second charge.
         reasoner.set_workflow_audit(self.audit.clone())
     }
 
@@ -1215,6 +1243,12 @@ impl WorkflowGuard {
             anyhow::ensure!(!self.contract.starts_with("registered:") && self.binding.contract==format!("{:x}",Sha256::digest(self.contract.as_bytes())),"initial owner acceptance requires unregistered intake");
         }
         self.store.lock().map_err(|_|anyhow::anyhow!("owner acceptance store poisoned"))?.owner_turn_for_lease(&self.lease,millis())
+    }
+    pub(super) fn validate_original_owner_preparation(&self,turn:&durable::owner_turn::OwnerTurn,preparation:&durable::OwnerPreparationBinding)->Result<()> {
+        anyhow::ensure!(turn.lease.workflow==self.lease.workflow && turn.lease.owner==self.lease.owner
+            && turn.lease.generation==self.lease.generation,"owner preparation workflow changed");
+        self.store.lock().map_err(|_|anyhow::anyhow!("owner preparation store poisoned"))?
+            .validate_owner_preparation_for_turn(turn,preparation,millis())
     }
 
     /// Preparation is neither installation nor activation. The current request
@@ -1338,7 +1372,9 @@ impl WorkflowGuard {
     /// guarded native builder scope. This is not input completion or permission
     /// to publish: the returned private result still needs locked completion
     /// and an atomic per-request reply/owner-turn transaction.
-    pub(super) async fn run_owner_body(&self,reasoner:&FallbackReasoner,prepared:&acceptance::PreparedAcceptance)->Result<OwnerBodyResult> {
+    pub(super) async fn run_owner_body(&self,reasoner:&FallbackReasoner,owner_prepared:&Arc<acceptance::owner::PreparedOwnerAcceptance>)->Result<OwnerBodyResult> {
+        owner_prepared.validate_activated(self,&self.worktree)?;
+        let prepared=owner_prepared.prepared();
         self.native_builder_owner()?;
         anyhow::ensure!(self.contract==format!("registered:{}",self.binding.contract),
             "owner body requires independently registered acceptance");
@@ -1356,22 +1392,26 @@ impl WorkflowGuard {
         let authors=reasoner.review_authors()?;
         let first=!origin.is_imported() && authors.as_ref().is_some_and(|authors|authors.is_empty());
         anyhow::ensure!(origin.is_imported() || authors.as_ref().is_some_and(|authors|!authors.is_empty()) || first,"owner body requires known builder provenance or authorized imported history");
+        // Revalidate after asynchronous provenance inspection and before the
+        // once-only reservation, so a known invalid artifact cannot strand it.
+        let preparation=owner_prepared.validate_activated(self,&self.worktree)?;
         let (turn,dispatch)=if first {
             anyhow::ensure!(sessions.observed().is_empty(),"first builder cannot replace an observed conversation");
             let main=remote_main_head(&self.worktree,&self.repository).await?;
-            let dispatch=self.reserve_first_owner_body(prepared,selected,&main).await?;
+            let dispatch=self.reserve_prepared_first_owner_body(owner_prepared,selected,&main).await?;
             let turn=self.store.lock().map_err(|_|anyhow::anyhow!("owner dispatch store poisoned"))?.owner_turn_for_lease(&self.lease,millis())?;
             (turn,dispatch)
         }else {
             let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("owner dispatch store poisoned"))?;
             let now=millis();let turn=store.owner_turn_for_lease(&self.lease,now)?;
-            let activated:bool=store.has_owner_acceptance_for_turn(&turn)?;
-            anyhow::ensure!(activated,"owner request acceptance has not been independently activated");
-            let dispatch=store.begin_owner_body_dispatch(&turn,selected,now)?;
+            let dispatch=store.begin_prepared_owner_body_dispatch(&turn,selected,&preparation,now)?;
             (turn,dispatch)
         };
         let mut opts=fix_opts(self.worktree.clone());opts.audit_logger=Some(self.audit.clone());
         anyhow::ensure!(turn.request_id==expected_turn.request_id && turn.body==expected_turn.body && turn.binding==expected_turn.binding,"owner prompt request changed before dispatch");
+        let dispatch=Arc::new(dispatch);
+        let admission=Arc::new(OwnerBodyAdmission {dispatch:dispatch.clone(),preparation:owner_prepared.clone(),provider:selected});
+        self.install_model_observers(Some(admission))?;
         let outcome=sessions.scope(async {
             if first {reasoner.call_with_storage(&opts,&prompt).await}
             else {adoption::revise(reasoner,self,&opts,&prompt).await}
@@ -1392,7 +1432,9 @@ impl WorkflowGuard {
     /// A first builder may start only on a real linked candidate still equal
     /// to its original main baseline, using protected private verifier bytes.
     /// Actual native absence is checked under original-store locks at reservation.
-    async fn reserve_first_owner_body(&self,prepared:&acceptance::PreparedAcceptance,provider:durable::submission::Provider,canonical_main:&str)->Result<durable::owner_dispatch::OwnerBodyDispatch> {
+    async fn reserve_prepared_first_owner_body(&self,owner_prepared:&acceptance::owner::PreparedOwnerAcceptance,provider:durable::submission::Provider,canonical_main:&str)->Result<durable::owner_dispatch::OwnerBodyDispatch> {
+        let preparation=owner_prepared.validate_activated(self,&self.worktree)?;
+        let prepared=owner_prepared.prepared();
         self.native_builder_owner()?;
         let registration=&prepared.baseline.registration;
         anyhow::ensure!(self.contract==format!("registered:{}",registration.contract_hash())
@@ -1418,7 +1460,7 @@ impl WorkflowGuard {
         augmentagent_channel_core::native_vm::ownership::with_unused_native_owner(&self.audit,&current,&mut |proof| {
             let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("first builder store poisoned"))?;
             let turn=store.first_owner_body_turn(&self.lease,provider,base,millis())?;
-            dispatch=Some(store.begin_first_owner_body(&turn,provider,base,canonical_main,proof,millis())?);Ok(())
+            dispatch=Some(store.begin_prepared_first_owner_body(&turn,provider,base,canonical_main,proof,&preparation,millis())?);Ok(())
         })?;
         dispatch.context("first builder reservation missing")
     }
@@ -3455,6 +3497,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_body_admission_rechecks_original_preparation_in_actual_callbacks() {
+        let control=control_dir();
+        let status=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
+            .env("AUTOSHIP_INITIAL_GUARD_CHILD",control.path())
+            .env("AUTOSHIP_INITIAL_GUARD_MODE","owner-early-acceptance-producer-body-admission")
+            .env("XDG_STATE_HOME",control.path().join("operator-state"))
+            .env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json"))
+            .status().unwrap();
+        assert!(status.success(),"original owner preparation admission callback fixture failed");
+    }
+    async fn check_prepared_owner_body_callbacks(guard:&WorkflowGuard,prepared:Arc<acceptance::owner::PreparedOwnerAcceptance>,artifact:&Path) {
+        let preparation=prepared.validate_activated(guard,&guard.worktree).unwrap();
+        let turn=guard.store.lock().unwrap().owner_turn_for_lease(&guard.lease,millis()).unwrap();
+        let dispatch=Arc::new(guard.store.lock().unwrap().begin_prepared_owner_body_dispatch(&turn,durable::submission::Provider::Codex,&preparation,millis()).unwrap());
+        let admission=Arc::new(OwnerBodyAdmission {dispatch:dispatch.clone(),preparation:prepared.clone(),provider:durable::submission::Provider::Codex});
+        guard.install_model_observers(Some(admission)).unwrap();
+        let db=rusqlite::Connection::open(&guard.state).unwrap();
+        let (original_preparation,original_receipts):(String,String)=db.query_row("SELECT record,receipts FROM workflow_owner_preparation WHERE request_id=?1",[&turn.request_id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        let activation:String=db.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='owner_acceptance_registered'",[guard.id()],|r|r.get(0)).unwrap();
+        let reservation:String=db.query_row("SELECT record FROM workflow_owner_body_dispatch WHERE request_id=?1",[&turn.request_id],|r|r.get(0)).unwrap();
+        let bytes=std::fs::read(artifact).unwrap();
+        for fault in ["preparation-pair","reservation-downgrade","artifact","provider","intact"] {
+            match fault {
+                "preparation-pair"=>{
+                    db.execute("DELETE FROM workflow_owner_preparation WHERE request_id=?1",[&turn.request_id]).unwrap();
+                    db.execute("UPDATE workflow_event SET payload=json_remove(payload,'$.preparation') WHERE workflow=?1 AND kind='owner_acceptance_registered'",[guard.id()]).unwrap();
+                },
+                "reservation-downgrade"=>{
+                    db.execute("UPDATE workflow_owner_body_dispatch SET record=json_remove(record,'$.preparation') WHERE request_id=?1",[&turn.request_id]).unwrap();
+                    db.execute("UPDATE workflow_event SET payload=json_remove(payload,'$.preparation') WHERE workflow=?1 AND kind='owner_body_dispatch_started'",[guard.id()]).unwrap();
+                },
+                "artifact"=>{let mut changed=bytes.clone();changed.push(b' ');std::fs::write(artifact,changed).unwrap();},
+                _=>{},
+            }
+            let before=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
+            let events=guard.store.lock().unwrap().events(guard.id()).unwrap();
+            if matches!(fault,"preparation-pair"|"artifact") {
+                let reasoner=FallbackReasoner::for_tests(vec![],augmentagent_channel_core::CooldownLatch::at(artifact.parent().unwrap().join("fixture-cooldowns.json")));
+                let error=guard.run_owner_body(&reasoner,&prepared).await.err().expect("damaged preparation reached owner body execution");
+                assert!(format!("{error:#}").contains("owner preparation"),"refusal occurred after original preparation admission: {error:#}");
+                assert_eq!(reasoner.calls(),0);
+            }
+            // A plain thread has no Tokio task-local context. Admission must
+            // still use the captured preparation and reservation, never fallback.
+            let audit=guard.audit.clone();
+            std::thread::spawn(move|| {
+                let healthy=matches!(fault,"provider"|"intact");
+                assert_eq!(audit.dispatch_allowed().is_ok(),healthy,"{fault}: actual dispatch observer");
+                let provider=if fault=="provider" {"claude"}else{"codex"};
+                assert_eq!(audit.model_call_admitted(provider).is_ok(),fault=="intact","{fault}: actual model admission observer");
+            }).join().unwrap();
+            if fault!="intact" {
+                assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap(),before);
+                assert_eq!(guard.store.lock().unwrap().events(guard.id()).unwrap(),events);
+            }
+            match fault {
+                "preparation-pair"=>{
+                    db.execute("INSERT INTO workflow_owner_preparation VALUES(?1,?2,?3)",rusqlite::params![turn.request_id,original_preparation,original_receipts]).unwrap();
+                    db.execute("UPDATE workflow_event SET payload=?2 WHERE workflow=?1 AND kind='owner_acceptance_registered'",rusqlite::params![guard.id(),activation]).unwrap();
+                },
+                "reservation-downgrade"=>{
+                    db.execute("UPDATE workflow_owner_body_dispatch SET record=?2 WHERE request_id=?1",rusqlite::params![turn.request_id,reservation]).unwrap();
+                    db.execute("UPDATE workflow_event SET payload=?2 WHERE workflow=?1 AND kind='owner_body_dispatch_started'",rusqlite::params![guard.id(),reservation]).unwrap();
+                },
+                "artifact"=>std::fs::write(artifact,&bytes).unwrap(),
+                _=>{},
+            }
+            prepared.validate_activated(guard,&guard.worktree).unwrap();
+        }
+        let mut store=guard.store.lock().unwrap();
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,1);
+        assert_eq!(store.pending_owner_messages(guard.id()).unwrap(),1);assert!(store.owner_control(guard.id()).unwrap().unwrap().paused);
+        assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+    }
+
+    #[tokio::test]
     async fn owner_preparation_refuses_replaced_checkout_with_identical_git_binding() {
         let control=control_dir();
         let status=std::process::Command::new(std::env::current_exe().unwrap())
@@ -3472,7 +3591,7 @@ mod tests {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session","owner-setup-codex-revision-unconfigured-session","owner-early-fresh","owner-early-no-input","owner-early-corrupt-input","owner-early-history","owner-early-policy-retry","owner-early-register-write-failure","owner-early-initial-acceptance","owner-early-initial-acceptance-green-baseline","owner-early-initial-acceptance-write-failure","owner-early-initial-acceptance-history-loss","owner-early-initial-acceptance-setup-failure","owner-early-initial-acceptance-baseline-tamper","owner-early-initial-acceptance-unconfigured","owner-early-initial-acceptance-repeat","owner-early-initial-acceptance-wrong-source","owner-early-initial-acceptance-first-build","owner-early-initial-acceptance-first-build-dirty","owner-early-initial-acceptance-first-build-staged","owner-early-initial-acceptance-first-build-ignored","owner-early-initial-acceptance-first-build-off-base","owner-early-initial-acceptance-first-build-orphan-main","owner-early-initial-acceptance-first-build-runtime","owner-early-initial-acceptance-first-build-legacy-call","owner-early-initial-acceptance-first-build-workflow-call","owner-early-initial-acceptance-first-build-readonly-call","owner-early-initial-acceptance-first-build-lost-call-history","owner-early-initial-acceptance-first-build-policy-lost","owner-early-initial-acceptance-first-build-leading-space","owner-early-initial-acceptance-first-build-counter-loss","owner-early-initial-acceptance-first-build-new-verifier","owner-early-initial-acceptance-first-build-retired-native","owner-early-initial-acceptance-first-build-grafted-main","owner-early-acceptance-producer","owner-early-acceptance-producer-fenced","owner-early-acceptance-producer-replaced-checkout"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session","owner-setup-codex-revision-unconfigured-session","owner-early-fresh","owner-early-no-input","owner-early-corrupt-input","owner-early-history","owner-early-policy-retry","owner-early-register-write-failure","owner-early-initial-acceptance","owner-early-initial-acceptance-green-baseline","owner-early-initial-acceptance-write-failure","owner-early-initial-acceptance-history-loss","owner-early-initial-acceptance-setup-failure","owner-early-initial-acceptance-baseline-tamper","owner-early-initial-acceptance-unconfigured","owner-early-initial-acceptance-repeat","owner-early-initial-acceptance-wrong-source","owner-early-initial-acceptance-first-build","owner-early-initial-acceptance-first-build-dirty","owner-early-initial-acceptance-first-build-staged","owner-early-initial-acceptance-first-build-ignored","owner-early-initial-acceptance-first-build-off-base","owner-early-initial-acceptance-first-build-orphan-main","owner-early-initial-acceptance-first-build-runtime","owner-early-initial-acceptance-first-build-legacy-call","owner-early-initial-acceptance-first-build-workflow-call","owner-early-initial-acceptance-first-build-readonly-call","owner-early-initial-acceptance-first-build-lost-call-history","owner-early-initial-acceptance-first-build-policy-lost","owner-early-initial-acceptance-first-build-leading-space","owner-early-initial-acceptance-first-build-counter-loss","owner-early-initial-acceptance-first-build-new-verifier","owner-early-initial-acceptance-first-build-retired-native","owner-early-initial-acceptance-first-build-grafted-main","owner-early-acceptance-producer","owner-early-acceptance-producer-fenced","owner-early-acceptance-producer-replaced-checkout","owner-early-acceptance-producer-body-admission"] {
                 if mode.ends_with("-session") && !cfg!(target_os="linux") {continue;}
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
@@ -3638,10 +3757,13 @@ mod tests {
                     let bytes=std::fs::read(artifacts[0].path()).unwrap();
                     assert_eq!(activation["preparation"]["artifact_sha256"],format!("{:x}",Sha256::digest(&bytes)),"owner activation must retain the exact protected preparation bytes");
                     drop(db);
+                    if mode.ends_with("-body-admission") {
+                        check_prepared_owner_body_callbacks(&first,Arc::new(prepared),&artifacts[0].path()).await;
+                    }
                     assert_eq!(first.audit.native_store_binding().unwrap(),Some(original));first.finish().unwrap();
                 }
                 let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(store.owner_control(&id).unwrap().unwrap().paused);
-                assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,0);return;
+                assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,if mode.ends_with("-body-admission"){1}else{0});return;
             }
             if mode.contains("-initial-acceptance") {
                 let mut registration=revision_contracts.as_ref().unwrap().0.clone();
@@ -3660,9 +3782,9 @@ mod tests {
                 if mode.ends_with("-unconfigured") {unsafe {std::env::remove_var("AUGMENTAGENT_NATIVE_VM_POLICY");}}
                 if mode.ends_with("-write-failure") {rusqlite::Connection::open(&state).unwrap().execute_batch("CREATE TRIGGER deny_initial_acceptance BEFORE INSERT ON workflow_event WHEN NEW.kind='owner_acceptance_registered' BEGIN SELECT RAISE(ABORT,'injected initial acceptance write failure'); END;").unwrap();}
                 if mode.ends_with("-setup-failure") {rusqlite::Connection::open(&state).unwrap().execute_batch("CREATE TRIGGER deny_initial_handoff BEFORE INSERT ON workflow_native_handoff_pending BEGIN SELECT RAISE(ABORT,'injected initial handoff failure'); END;").unwrap();}
-                let activated=if private_first_files.is_some() {
-                    let private=acceptance::owner::test_from_prepared(dir.path(),&first,&prepared).unwrap();
-                    first.activate_prepared_owner_acceptance(&private,None).await
+                let private=private_first_files.as_ref().map(|_|acceptance::owner::test_from_prepared(dir.path(),&first,&prepared).unwrap());
+                let activated=if let Some(private)=private.as_ref() {
+                    first.activate_prepared_owner_acceptance(private,None).await
                 }else {first.activate_initial_owner_acceptance(&prepared).await};
                 if mode.ends_with("-green-baseline") || mode.ends_with("-write-failure") || mode.ends_with("-wrong-source") || mode.ends_with("-unconfigured") {
                     assert!(activated.is_err());let mut store=WorkflowStore::open(&state).unwrap();let snapshot=store.snapshot(&id).unwrap().unwrap();
@@ -3717,10 +3839,10 @@ mod tests {
                     }
                     if mode.ends_with("-policy-lost") {unsafe {std::env::remove_var("AUGMENTAGENT_NATIVE_VM_POLICY");}}
                     let before=WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap();let original=first.audit.native_store_binding().unwrap().unwrap();
-                    let result=first.reserve_first_owner_body(&prepared,durable::submission::Provider::Codex,&canonical).await;
+                    let result=first.reserve_prepared_first_owner_body(private.as_ref().unwrap(),durable::submission::Provider::Codex,&canonical).await;
                     let allowed=mode.ends_with("-first-build") || mode.ends_with("-readonly-call") || mode.ends_with("-new-verifier");
                     assert_eq!(result.is_ok(),allowed,"first owner body decision: {mode}: {:?}",result.as_ref().err());
-                    if allowed {let dispatch=result.unwrap();first.store.lock().unwrap().validate_owner_body_dispatch(&dispatch,millis()).unwrap();assert!(first.reserve_first_owner_body(&prepared,durable::submission::Provider::Codex,&canonical).await.is_err(),"first body was reserved twice");}
+                    if allowed {let dispatch=result.unwrap();first.store.lock().unwrap().validate_owner_body_dispatch(&dispatch,millis()).unwrap();assert!(first.reserve_prepared_first_owner_body(private.as_ref().unwrap(),durable::submission::Provider::Codex,&canonical).await.is_err(),"first body was reserved twice");}
                     let mut store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(store.owner_control(&id).unwrap().unwrap().paused);
                     assert_eq!(first.audit.native_store_binding().unwrap(),Some(original));
                     let count:i64=rusqlite::Connection::open(&state).unwrap().query_row("SELECT count(*) FROM workflow_owner_body_dispatch WHERE workflow=?1",[&id],|r|r.get(0)).unwrap();assert_eq!(count,i64::from(allowed));
