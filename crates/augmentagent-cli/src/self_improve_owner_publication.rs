@@ -1,9 +1,12 @@
-//! Immutable owner publication input, not publication completion or execution.
+//! Original publication intent and proof-bound private metadata commit; never execution.
 use super::*;
 use anyhow::{bail,ensure,Context,Result};
 use std::io::{Read,Write};
 use std::os::unix::fs::{MetadataExt,OpenOptionsExt,PermissionsExt};
 const MAX_INTENT:usize=4*1024*1024+32*1024;
+#[path="self_improve_owner_publication_commit.rs"]
+mod commit;
+pub(crate) use commit::OwnerPublicationCompletion;
 fn bytes(path:&Path,max:usize)->Result<Vec<u8>> {
     let mut file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(path)?;
     let m=file.metadata()?;ensure!(m.is_file() && m.nlink()==1 && m.uid()==unsafe{libc::geteuid()} && m.mode()&0o077==0 && m.len()<=max as u64,"owner publication file is not private/bounded");
@@ -27,6 +30,27 @@ impl CanonicalSnapshot {
     }
     #[cfg(test)]
     pub(super) fn absent(control:&Path,source:AcceptanceSource)->Self {Self {version:1,control:control.canonicalize().unwrap(),source,manifest:None}}
+    fn require_no_orphan(&self)->Result<()> {
+        if self.manifest.is_none() {
+            let prefix=format!("{}-base-",self.source.key());let mut count=0;
+            for entry in std::fs::read_dir(&self.control)? {let entry=entry?;count+=1;ensure!(count<=4096,"owner canonical namespace exceeds bound");
+                let name=entry.file_name();let name=name.to_string_lossy();ensure!(!(name.starts_with(&prefix) && name.ends_with(".json")),"owner canonical absence has an orphan original baseline");}
+        }
+        Ok(())
+    }
+    /// Exact old or exact next only. Preparation/activation still use the
+    /// stricter old-only check. Initial next replay must retain orphan checks.
+    fn publication_is_next(&self,next:&str)->Result<bool> {
+        ensure!(self.version==1 && self.control.is_absolute(),"owner canonical snapshot version/path changed");
+        amendment::require_no_pending(&self.control,self.source)?;self.require_no_orphan()?;
+        let path=self.control.join(format!("{}-workflow.json",self.source.key()));
+        match std::fs::symlink_metadata(&path) {
+            Ok(_)=>{let raw=bytes(&path,4096)?;if raw==next.as_bytes() {return Ok(true);}
+                ensure!(self.manifest.as_ref().map(|m|m.as_bytes())==Some(raw.as_slice()),"owner publication canonical state is neither original nor next");Ok(false)},
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{ensure!(self.manifest.is_none(),"owner publication original canonical disappeared");Ok(false)},
+            Err(e)=>Err(e.into()),
+        }
+    }
     pub(super) fn verify_current(&self)->Result<()> {
         ensure!(self.version==1 && self.control.is_absolute(),"owner canonical snapshot version/path changed");
         amendment::require_no_pending(&self.control,self.source)?;
@@ -34,9 +58,7 @@ impl CanonicalSnapshot {
         match (&self.manifest,std::fs::symlink_metadata(&path)) {
             (Some(expected),Ok(_))=>ensure!(bytes(&path,4096)?==expected.as_bytes(),"owner preparation canonical manifest changed"),
             (None,Err(e)) if e.kind()==std::io::ErrorKind::NotFound=>{
-                let prefix=format!("{}-base-",self.source.key());let mut count=0;
-                for entry in std::fs::read_dir(&self.control)? {let entry=entry?;count+=1;ensure!(count<=4096,"owner canonical namespace exceeds bound");
-                    let name=entry.file_name();let name=name.to_string_lossy();ensure!(!(name.starts_with(&prefix) && name.ends_with(".json")),"owner canonical absence has an orphan original baseline");}
+                self.require_no_orphan()?;
             },_=>bail!("owner preparation canonical manifest appeared or disappeared"),
         }
         Ok(())
@@ -147,7 +169,7 @@ impl OwnerPublicationDraft<'_> {
             && binding==&self.record.next_binding,"owner publication live metadata context changed");
         self.producer.candidate.verify(candidate)?;
         ensure!(self.producer.activation_binding()?==self.record.preparation,"owner publication original preparation changed");
-        self.record.canonical.verify_current()?;
+        self.record.canonical.publication_is_next(&self.record.next_manifest)?;
         let evidence=bytes(&self.record.canonical.control.join(&self.record.next_evidence.file),4*1024*1024)?;
         ensure!(evidence.len()==self.record.next_evidence.bytes && amendment::digest(&evidence)==self.record.next_evidence.sha256
             && evidence==serde_json::to_vec(self.producer.prepared())?,"owner publication immutable next evidence changed");

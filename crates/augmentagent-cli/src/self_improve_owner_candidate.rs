@@ -98,6 +98,7 @@ impl CandidateIdentity {
         ensure!(*self==Self::capture(candidate)?,"owner preparation physical candidate changed");Ok(())
     }
     pub(super) fn verify_current(&self) -> Result<()> {self.verify(&self.root.path)}
+    pub(super) fn root_path(&self)->&Path {&self.root.path}
 }
 
 #[cfg(test)]

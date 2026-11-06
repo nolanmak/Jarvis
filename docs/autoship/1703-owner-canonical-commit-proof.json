@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "kind": "uninterrupted-owner-canonical-metadata-commit-component",
+  "source_parent_commit": "1dc8024f33d1fa671bfb1c575bb1244cdaa81f9e",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication.rs",
+      "sha256": "b16e7896288a7054ac399780066d6b54fc20689490eff96b830c6ee70f6f00e9"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_revision_history.rs",
+      "sha256": "85b524267dc5edbb9b66230898bba458fba76763dfab763c68e26e066f21b1a0"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "61b8721a4620ee5ce896315daf59c82f45db986f88c9c4748a45b45cd6af0d4c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve.rs",
+      "sha256": "96e0494c478b646684aa1c06f14f2bc9e58491ab8c43a28c45886f4b9e7c2113"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_acceptance.rs",
+      "sha256": "bf8b155d4434aade669ae9484aaee87e418b75f92c5816bd97f1f1c328e96fd7"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_candidate.rs",
+      "sha256": "d95f728c73660e854a6a5948d1b22cfc20d8b3f5d8cbc0b93303ee22bb39bb3d"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication.rs",
+      "sha256": "409b44028b77157917ba3437fee9d36edb5d39d87c0263a216dea15c4614ce10"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication_commit.rs",
+      "sha256": "3d39a16c53b65e7d5cc1584d690ae93d9a56416a733fcbede3b595501303481a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "ef4153976533736ae3c8b9a9dd5b44f2b5298bfc54f1e7694059ea737dcddbca"
+    },
+    {
+      "path": "docs/autoship/owner-publication-protocol.md",
+      "sha256": "d60a2fee4d734c12bc61db28f1a587f725fe96ab869aa39553e25d33ba8a5030"
+    },
+    {
+      "path": "docs/autoship/owner-acceptance-publication.md",
+      "sha256": "8524bf0da14a12cbf04b2b77259093ea3734f057623b4d8f9064182285fa6e89"
+    }
+  ],
+  "behavior": [
+    "Original metadata guard retains fresh actual native proof, then exact scope transition, then immediate workflow transaction and bounded protected file operations.",
+    "Private transaction-scoped non-cloneable metadata capability binds the exact original intent; generic acceptance metadata cannot mint it.",
+    "Initial/revision canonical publication supports only exact old or exact next; initial next replay still refuses orphan original baseline.",
+    "Exact prior permissions derive from protected original acceptance; next replay requires existing exact next scope.",
+    "Native evidence (1 MiB) and strict completion envelope (32 KiB) are bounded before scope mutation; verified owned control descriptor is secured to 0700.",
+    "Native evidence and canonical manifest are private/fsynced; immutable completion/event and pending removal commit together.",
+    "Filesystem effects survive database failure; fresh-proof retries settle the same original intent without reconstructing authority from history.",
+    "Committed replay preserves the original completion and native evidence without new events/artifacts.",
+    "Completion/event/pending joins and retained history bounds are validated bidirectionally; original guard/logger remain metadata-only."
+  ],
+  "validation": {
+    "behavioral_red": {
+      "original_session_id": 13654,
+      "terminal_exit": 1,
+      "cargo_exit": 101,
+      "log": "/tmp/autoship-owner-publication-commit-red-20261106.log",
+      "failure": "New publish entry initially inspected actual native proof only; the canonical manifest remained missing."
+    },
+    "intermediate_refusals": [
+      {
+        "session": 87343,
+        "terminal_exit": 1,
+        "log": "/tmp/autoship-owner-publication-commit-focused-20261106.log",
+        "reason": "Writer correctly refused group-writable controller namespace inherited under umask 0002; producer now secures its verified no-follow owned control descriptor."
+      },
+      {
+        "session": 76184,
+        "terminal_exit": 1,
+        "log": "/tmp/autoship-owner-publication-commit-matrix-20261106.log",
+        "reason": "Compile-only failure from sibling-private canonical reader in test; cfg(test) delegating helper preserves production visibility."
+      }
+    ],
+    "focused": [
+      {
+        "session": 22151,
+        "terminal_exit": 0,
+        "seconds": 2.57,
+        "log": "/tmp/autoship-owner-publication-commit-focused-2-20261106.log"
+      },
+      {
+        "session": 11994,
+        "terminal_exit": 0,
+        "seconds": 4.72,
+        "log": "/tmp/autoship-owner-publication-commit-matrix-2-20261106.log"
+      },
+      {
+        "session": 63493,
+        "terminal_exit": 0,
+        "seconds": 5.02,
+        "log": "/tmp/autoship-owner-publication-commit-final-focused-20261106.log"
+      }
+    ],
+    "actual_guard_cases": [
+      "Initial and revised acceptance through actual cached opaque producer and native ownership handoff.",
+      "Changed original scope permissions rejected against retained acceptance rather than current scope snapshot.",
+      "Changed preparation/evidence/canonical preserved and refused.",
+      "Native and scope lock contention; authority loss after native proof and before writer admission.",
+      "Injected completion insert failure after actual canonical publication retains canonical/scope and pending, rolls back event/completion.",
+      "Next canonical with missing scope refuses recreation; initial next with orphan original baseline refuses.",
+      "Committed replay returns exact original completion, unchanged events and no replacement proof artifacts.",
+      "Changed native evidence/preparation/canonical/completion SHA/record/event, missing completion record, orphan event and duplicate pending refuse.",
+      "Completed revision with reverted canonical/scope refuses before rewriting scope.",
+      "Later owner pause refuses replay; pending input remains; original model/dispatch APIs deny and allowance stays zero.",
+      "Ordinary canonical reader still refuses owner manifest until the actual owner lineage reader is implemented."
+    ],
+    "full_cli": {
+      "original_session_id": 11493,
+      "terminal_exit": 0,
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "passed": 1949,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 298.88,
+      "log": "/tmp/autoship-owner-publication-commit-full-cli-20261106.log"
+    },
+    "production_check": {
+      "original_session_id": 86452,
+      "terminal_exit": 0,
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "seconds": 28.22,
+      "log": "/tmp/autoship-owner-publication-commit-production-check-20261106.log"
+    },
+    "rust_sources_unchanged_during_full_cli_and_production_check": true,
+    "parent_hosted_checks": {
+      "head": "1dc8024f33d1fa671bfb1c575bb1244cdaa81f9e",
+      "successes": 24,
+      "snapshot": "/tmp/autoship-1dc8024f-hosted-latest-20261106.json",
+      "not_new_head_ci": true
+    }
+  },
+  "limits": [
+    "Uninterrupted original live-owner metadata writer/completion only; no recovery or terminal authority.",
+    "Tests use actual protected native/scope/workflow services and synthetic baseline observations; no real provider/VM/live coding/merge is executed.",
+    "Completion is descriptive metadata. Original metadata guard/logger are never promoted; no input/body/model/shipping authority is granted.",
+    "Productive owner consumption remains unconnected; canonical lineage readers and shared all-consumer productive predicate remain unfinished.",
+    "Blocked dispositions, P2 recovery/ready bridge/continuation/nonrelease/response settlement, P3-P5, complete independent C/R proof, required exact-head CI/review, normal rollout and full original live acceptance remain required.",
+    "Referenced-byte history bounds do not replace unfinished aggregate protected-artifact admission/retention.",
+    "No production database counters, holds, service configuration or protected caches were changed."
+  ]
+}

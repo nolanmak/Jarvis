@@ -252,7 +252,7 @@ pub(super) struct WorkflowGuard {
 }
 
 /// Uninterrupted publication reconciliation only. No Clone, Deref, audit
-/// accessor, builder binding, input, model, publication or merge API escapes.
+/// accessor, builder binding, input, model, GitHub publication or merge API escapes.
 /// Recovery and terminal metadata authorities need their own real producers.
 pub(super) struct OwnerPublicationGuard<'a> {
     _guard: WorkflowGuard,
@@ -262,6 +262,15 @@ pub(super) struct OwnerPublicationGuard<'a> {
 }
 
 impl OwnerPublicationGuard<'_> {
+    fn publish_canonical(&self)->Result<()> {
+        let guard=&self._guard;
+        let turn=self._publication.metadata_turn(&guard.repository,&guard.lease,&guard.binding,&guard.worktree)?;
+        self.with_native_metadata(&mut |proof|self._publication.with_scope_transition(|transition| {
+            guard.store.lock().map_err(|_|anyhow::anyhow!("publication commit store poisoned"))?
+                .complete_owner_publication(&turn,&self._publication,proof,transition,millis())
+        }))
+    }
+
     /// General retained-session metadata inspection. Actual physical/resource
     /// proof is distinct from the captured facts; no productive guard escapes.
     fn with_native_metadata(&self,visit:&mut dyn FnMut(&augmentagent_channel_core::native_vm::ownership::MetadataNativeOwnerProof<'_>)->Result<()>)->Result<()> {
@@ -3986,6 +3995,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_publication_commits_initial_and_revision_without_productive_admission() {
+        for mode in ["owner-early-acceptance-producer-publication-initial","owner-early-acceptance-producer-publication-revision"] {
+            let control=control_dir();
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--test-threads=1"])
+                .env("AUTOSHIP_INITIAL_GUARD_CHILD",control.path()).env("AUTOSHIP_INITIAL_GUARD_MODE",mode)
+                .env("XDG_STATE_HOME",control.path().join("operator-state")).env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json")).output().unwrap();
+            assert!(output.status.success(),"{mode}: {} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        }
+    }
+
+    #[tokio::test]
     async fn pending_owner_publication_returns_only_metadata_authority() {
         let control=control_dir();
         let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--test-threads=1"])
@@ -4257,7 +4277,11 @@ mod tests {
             contract.criteria.push(Criterion {id:"C2".into(),requirement:"Additional owner requirement".into(),verifier_ids:vec!["ready".into()]});
             let next=register(contract);Some((previous,next))
         }else{None};
-        let contract_label=if mode.contains("-initial-acceptance") {"C1".into()}else{revision_contracts.as_ref().map(|(previous,_)|format!("registered:{}",previous.contract_hash())).unwrap_or_else(||"C1".into())};
+        let publication_previous=if mode.ends_with("-publication-revision") {
+            let base=git_evidence(dir.path(),&["rev-parse","HEAD"]).await.unwrap();
+            Some(acceptance::owner::test_publication_original(dir.path(),&control.join("owner-producer-control"),&base).unwrap())
+        }else {None};
+        let contract_label=if let Some(old)=&publication_previous {format!("registered:{}",old.baseline.registration.contract_hash())}else if mode.contains("-initial-acceptance") {"C1".into()}else{revision_contracts.as_ref().map(|(previous,_)|format!("registered:{}",previous.contract_hash())).unwrap_or_else(||"C1".into())};
         let start=||Start{repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",
             source_issue:Some(77),pr:None,branch:"fixture",contract:&contract_label,environment:"test"};
         if mode.starts_with("owner-early-") {
@@ -4314,6 +4338,137 @@ mod tests {
             if mode.starts_with("owner-early-acceptance-producer") {
                 let before=WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap();
                 let original=first.audit.native_store_binding().unwrap().unwrap();
+                if mode.ends_with("-publication-initial") || mode.ends_with("-publication-revision") {
+                    let control=control.join("owner-producer-control");
+                    let prepared=acceptance::owner::test_publication_preparation(dir.path(),&control,&first,publication_previous.as_ref()).await.unwrap();
+                    let previous=publication_previous.as_ref().map(|p|&p.baseline.registration);
+                    let pending=first.activate_prepared_owner_acceptance(&prepared,previous).await.unwrap();
+                    let before=WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap();
+                    use std::os::fd::AsRawFd;
+                    let canonical=control.join("issue-77-workflow.json");
+                    let old_canonical=std::fs::read(&canonical).ok();
+                    let db=rusqlite::Connection::open(&state).unwrap();
+                    let intent_raw:String=db.query_row("SELECT record FROM workflow_owner_publication_intent",[],|r|r.get(0)).unwrap();
+                    let intent:serde_json::Value=serde_json::from_str(&intent_raw).unwrap();
+                    let request=intent["input"]["request_id"].as_str().unwrap();
+                    let next_evidence=control.join(intent["next_evidence"]["file"].as_str().unwrap());
+                    let preparation=PathBuf::from(intent["preparation_file"].as_str().unwrap());
+                    let events_before=WorkflowStore::open(&state).unwrap().events(&id).unwrap();
+                    if previous.is_some() {
+                        let scope_state=augmentagent_channel_core::state_dir::state_dir().unwrap();
+                        let old_scope=scope_state.join("autoship-write-admission").join(format!("{:x}.json",Sha256::digest(dir.path().canonicalize().unwrap().as_os_str().as_encoded_bytes())));
+                        let original=std::fs::read(&old_scope).unwrap();
+                        let changed=String::from_utf8(original.clone()).unwrap().replace("behavior.py","unexpected.rs");assert_ne!(changed.as_bytes(),original);
+                        std::fs::write(&old_scope,&changed).unwrap();assert!(pending.publish_canonical().is_err(),"writer trusted a fresh current scope instead of retained original permissions");
+                        assert_eq!(std::fs::read(&old_scope).unwrap(),changed.as_bytes());std::fs::write(&old_scope,original).unwrap();
+                    }
+                    let restore_canonical=|| {if let Some(raw)=&old_canonical {std::fs::write(&canonical,raw).unwrap();std::fs::set_permissions(&canonical,std::fs::Permissions::from_mode(0o600)).unwrap();}
+                        else if canonical.exists() {std::fs::remove_file(&canonical).unwrap();}};
+                    for path in [&next_evidence,&preparation] {
+                        let saved=std::fs::read(path).unwrap();std::fs::write(path,b"{}").unwrap();
+                        assert!(pending.publish_canonical().is_err());assert_eq!(std::fs::read(path).unwrap(),b"{}");std::fs::write(path,saved).unwrap();
+                    }
+                    std::fs::write(&canonical,b"{}").unwrap();std::fs::set_permissions(&canonical,std::fs::Permissions::from_mode(0o600)).unwrap();
+                    assert!(pending.publish_canonical().is_err());assert_eq!(std::fs::read(&canonical).unwrap(),b"{}");restore_canonical();
+                    // Current workflow authority is rechecked after native and
+                    // scope acquisition, before register can mutate scope.
+                    let state_lock=std::fs::OpenOptions::new().read(true).open(native.join("state.lock")).unwrap();
+                    assert_eq!(unsafe{libc::flock(state_lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+                    assert!(pending.publish_canonical().is_err());unsafe{libc::flock(state_lock.as_raw_fd(),libc::LOCK_UN)};
+                    db.execute("DELETE FROM workflow_owner_publication_pending WHERE request_id=?1",[request]).unwrap();
+                    assert!(pending.publish_canonical().is_err());db.execute("INSERT INTO workflow_owner_publication_pending VALUES(?1,?2)",rusqlite::params![id,request]).unwrap();
+                    let turn=pending._guard.store.lock().unwrap().owner_turn_for_lease(&pending._guard.lease,millis()).unwrap();
+                    pending.with_native_metadata(&mut |proof| {
+                        db.execute("DELETE FROM workflow_owner_publication_pending WHERE request_id=?1",[request])?;
+                        let result=pending._publication.with_scope_transition(|transition|pending._guard.store.lock().unwrap()
+                            .complete_owner_publication(&turn,&pending._publication,proof,transition,millis()));
+                        db.execute("INSERT INTO workflow_owner_publication_pending VALUES(?1,?2)",rusqlite::params![id,request])?;
+                        assert!(result.is_err(),"stale workflow authority mutated scope under held native proof");Ok(())
+                    }).unwrap();
+                    assert_eq!(WorkflowStore::open(&state).unwrap().events(&id).unwrap(),events_before);
+                    assert_eq!(std::fs::read(&canonical).ok(),old_canonical);
+                    db.execute_batch("CREATE TRIGGER deny_owner_completion BEFORE INSERT ON workflow_owner_publication_completion BEGIN SELECT RAISE(ABORT,'injected owner completion failure'); END;").unwrap();
+                    let error=pending.publish_canonical().unwrap_err();assert!(format!("{error:#}").contains("injected owner completion failure"),"{error:#}");
+                    let next_canonical=std::fs::read(&canonical).unwrap();assert_ne!(Some(&next_canonical),old_canonical.as_ref());
+                    assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_publication_completion",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+                    assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_publication_pending",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+                    assert_eq!(WorkflowStore::open(&state).unwrap().events(&id).unwrap(),events_before,"failed completion leaked event/outbox authority");
+                    db.execute_batch("DROP TRIGGER deny_owner_completion").unwrap();
+                    let scope_state=augmentagent_channel_core::state_dir::state_dir().unwrap();
+                    let scope=scope_state.join("autoship-write-admission").join(format!("{:x}.json",Sha256::digest(dir.path().canonicalize().unwrap().as_os_str().as_encoded_bytes())));
+                    let scope_bytes=std::fs::read(&scope).unwrap();
+                    std::fs::remove_file(&scope).unwrap();assert!(pending.publish_canonical().is_err(),"next canonical silently recreated missing scope");assert!(!scope.exists());
+                    std::fs::write(&scope,&scope_bytes).unwrap();std::fs::set_permissions(&scope,std::fs::Permissions::from_mode(0o600)).unwrap();
+                    // An initial next canonical must still reject an orphan
+                    // original baseline left in its original namespace.
+                    if previous.is_none() {
+                        let orphan=control.join(format!("issue-77-base-{}.json",before.checkpoint.binding.head));
+                        std::fs::write(&orphan,b"{}").unwrap();assert!(pending.publish_canonical().is_err());assert_eq!(std::fs::read(&orphan).unwrap(),b"{}");std::fs::remove_file(orphan).unwrap();
+                    }
+                    let scope_lock=std::fs::OpenOptions::new().read(true).open(scope.with_extension("lock")).unwrap();
+                    assert_eq!(unsafe{libc::flock(scope_lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+                    assert!(pending.publish_canonical().is_err());unsafe{libc::flock(scope_lock.as_raw_fd(),libc::LOCK_UN)};
+                    pending.publish_canonical().unwrap();
+                    let completion_raw:String=db.query_row("SELECT record FROM workflow_owner_publication_completion",[],|r|r.get(0)).unwrap();
+                    let completed_events=WorkflowStore::open(&state).unwrap().events(&id).unwrap();
+                    let artifacts=std::fs::read_dir(&control).unwrap().map(|e|e.unwrap().path()).collect::<std::collections::BTreeSet<_>>();
+                    pending.publish_canonical().unwrap();
+                    assert_eq!(db.query_row("SELECT record FROM workflow_owner_publication_completion",[],|r|r.get::<_,String>(0)).unwrap(),completion_raw);
+                    assert_eq!(WorkflowStore::open(&state).unwrap().events(&id).unwrap(),completed_events);
+                    assert_eq!(std::fs::read_dir(&control).unwrap().map(|e|e.unwrap().path()).collect::<std::collections::BTreeSet<_>>(),artifacts,"completion replay generated replacement proof artifacts");
+                    let completed:serde_json::Value=serde_json::from_str(&completion_raw).unwrap();
+                    let native_evidence=control.join(completed["native_evidence"]["file"].as_str().unwrap());
+                    for path in [&native_evidence,&next_evidence,&preparation,&canonical] {
+                        let saved=std::fs::read(path).unwrap();std::fs::write(path,b"{}").unwrap();
+                        assert!(pending.publish_canonical().is_err());assert_eq!(std::fs::read(path).unwrap(),b"{}");std::fs::write(path,saved).unwrap();
+                    }
+                    let (sequence,completion_sha):(i64,String)=db.query_row("SELECT sequence,record_sha256 FROM workflow_owner_publication_completion",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                    for column in ["record","record_sha256"] {
+                        let original=if column=="record" {&completion_raw}else{&completion_sha};
+                        db.execute(&format!("UPDATE workflow_owner_publication_completion SET {column}='{{}}'"),[]).unwrap();
+                        assert!(pending.publish_canonical().is_err());db.execute(&format!("UPDATE workflow_owner_publication_completion SET {column}=?1"),[original]).unwrap();
+                    }
+                    db.execute("DELETE FROM workflow_owner_publication_completion",[]).unwrap();assert!(pending.publish_canonical().is_err(),"completion event without record became ready");
+                    db.execute("INSERT INTO workflow_owner_publication_pending VALUES(?1,?2)",rusqlite::params![id,request]).unwrap();assert!(pending.publish_canonical().is_err(),"orphan completion event became a new pending attempt");
+                    db.execute("DELETE FROM workflow_owner_publication_pending",[]).unwrap();
+                    db.execute("INSERT INTO workflow_owner_publication_completion VALUES(?1,?2,?3,?4,?5)",rusqlite::params![request,id,sequence,completion_sha,completion_raw]).unwrap();
+                    let event:String=db.query_row("SELECT payload FROM workflow_event WHERE seq=?1",[sequence],|r|r.get(0)).unwrap();
+                    db.execute("UPDATE workflow_event SET payload='{}' WHERE seq=?1",[sequence]).unwrap();assert!(pending.publish_canonical().is_err());
+                    db.execute("UPDATE workflow_event SET payload=?1 WHERE seq=?2",rusqlite::params![event,sequence]).unwrap();
+                    db.execute("INSERT INTO workflow_owner_publication_pending VALUES(?1,?2)",rusqlite::params![id,request]).unwrap();assert!(pending.publish_canonical().is_err());
+                    db.execute("DELETE FROM workflow_owner_publication_pending WHERE request_id=?1",[request]).unwrap();
+                    // A completed revision whose canonical and scope were
+                    // reverted must refuse before changing either record.
+                    if let Some(old)=&publication_previous {
+                        let (allowed,pinned)=(old.proposal.contract.allowed_paths.iter().map(|scope|match scope {
+                            crate::autoship_contract::PathScope::File(path)=>augmentagent_channel_core::autoship_write_scope::DeclaredPath {path:path.clone(),directory:false},
+                            crate::autoship_contract::PathScope::Directory(path)=>augmentagent_channel_core::autoship_write_scope::DeclaredPath {path:path.clone(),directory:true},
+                        }).collect(),old.proposal.files.keys().cloned().collect());
+                        augmentagent_channel_core::autoship_write_scope::replace_registered(dir.path(),prepared.prepared().baseline.registration.contract_hash(),old.baseline.registration.contract_hash(),allowed,pinned).unwrap();
+                        let reverted=std::fs::read(&scope).unwrap();restore_canonical();assert!(pending.publish_canonical().is_err());
+                        assert_eq!(std::fs::read(&scope).unwrap(),reverted,"completed-history refusal rewrote a reverted scope");
+                        std::fs::write(&scope,&scope_bytes).unwrap();std::fs::write(&canonical,&next_canonical).unwrap();
+                    }
+                    pending.publish_canonical().unwrap();
+                    let raw=std::fs::read(control.join("issue-77-workflow.json")).expect("canonical owner publication missing");
+                    let manifest:serde_json::Value=serde_json::from_slice(&raw).unwrap();
+                    assert_eq!(manifest["contract_hash"],prepared.prepared().baseline.registration.contract_hash());
+                    assert_eq!(manifest["contract_revision"],if previous.is_some() {2}else{1});
+                    let db=rusqlite::Connection::open(&state).unwrap();
+                    let pending_count:i64=db.query_row("SELECT count(*) FROM workflow_owner_publication_pending",[],|r|r.get(0)).unwrap();assert_eq!(pending_count,0);
+                    let completed:i64=db.query_row("SELECT count(*) FROM workflow_owner_publication_completion",[],|r|r.get(0)).unwrap();assert_eq!(completed,1);
+                    assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap(),before);
+                    assert!(pending._guard.validate_before_side_effect().is_err());
+                    assert!(pending._guard.audit.dispatch_allowed().is_err());assert!(pending._guard.audit.model_call_admitted("codex").is_err());
+                    assert_eq!(WorkflowStore::open(&state).unwrap().owner_control(&id).unwrap(),control_before);
+                    assert!(acceptance::owner::test_productive_canonical(&control).is_err(),"ordinary reader mistook owner completion for ordinary amendment authority");
+                    let mut store=WorkflowStore::open(&state).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
+                    store.set_owner_pause(&id,"fixture-owner",revision,true,millis()).unwrap();drop(store);
+                    assert!(pending.publish_canonical().is_err(),"completed metadata replay bypassed later owner pause");
+                    assert_eq!(WorkflowStore::open(&state).unwrap().pending_owner_messages(&id).unwrap(),1);
+                    assert_eq!(WorkflowStore::open(&state).unwrap().merge_allowance(millis(),5).unwrap().confirmed,0);
+                    return;
+                }
                 let prepared=acceptance::owner::test_cached_preparation(dir.path(),&control.join("owner-producer-control"),&first).await.unwrap();
                 assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap(),before,"preparation changed workflow state");
                 if mode.ends_with("-publication-write-failure") {

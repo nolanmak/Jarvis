@@ -23,7 +23,7 @@ mod review_epoch;
 mod conversations;
 #[path="autoship_owner_publication.rs"]
 mod owner_publication;
-pub(crate) use owner_publication::OwnerPublicationNativeFacts;
+pub(crate) use owner_publication::{OwnerPublicationNativeFacts,OwnerPublicationCommitMetadata};
 #[path = "autoship_owner_revision.rs"]
 mod owner_revision;
 pub(crate) use owner_revision::OwnerPreparationBinding;
@@ -407,6 +407,9 @@ impl WorkflowStore {
                 sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq), record_sha256 TEXT NOT NULL, record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS workflow_owner_publication_pending (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id),request_id TEXT NOT NULL UNIQUE REFERENCES workflow_owner_publication_intent(request_id));
+            CREATE TABLE IF NOT EXISTS workflow_owner_publication_completion (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_publication_intent(request_id), workflow TEXT NOT NULL REFERENCES workflow(id),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq), record_sha256 TEXT NOT NULL, record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS workflow_owner_revision_fence (
                 request_id TEXT PRIMARY KEY REFERENCES workflow_owner_revision(request_id),
                 previous_generation INTEGER NOT NULL, next_generation INTEGER NOT NULL);

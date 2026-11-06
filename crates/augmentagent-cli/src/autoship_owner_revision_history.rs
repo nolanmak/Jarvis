@@ -84,6 +84,10 @@ pub(super) fn validate(conn: &Connection, workflow: &str) -> Result<()> {
             let raw:String=conn.query_row("SELECT record FROM workflow_owner_publication_intent WHERE request_id=?1",[&activation.request_id],|r|r.get(0))?;
             super::super::owner_publication::require(conn,&activation.request_id,reference,&raw)?;
             bytes=bytes.checked_add(raw.len()).context("owner publication history size overflow")?;
+            let completed:Option<(String,i64)>=conn.query_row("SELECT substr(record,1,32769),length(CAST(record AS BLOB)) FROM workflow_owner_publication_completion WHERE request_id=?1",[&activation.request_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            if let Some((raw,len))=completed {ensure!((1..=32768).contains(&len) && raw.len() as i64==len,"owner publication completion exceeds history bound");
+                let completed:crate::self_improve::OwnerPublicationCompletion=serde_json::from_str(&raw)?;
+                bytes=bytes.checked_add(raw.len()).and_then(|b|b.checked_add(completed.native_bytes())).context("owner completion aggregate history size overflow")?;}
             ensure!(bytes<=128*1024*1024,"owner revision/publication aggregate history exceeds bound");
         }
         if initial {

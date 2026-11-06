@@ -154,9 +154,16 @@ impl PreparedOwnerAcceptance {
 }
 
 fn preparation_directory(candidate:&Path,control:&Path)->Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt,MetadataExt};
+    use std::os::unix::fs::{DirBuilderExt,MetadataExt,OpenOptionsExt,PermissionsExt};
     std::fs::create_dir_all(control)?;let control=control.canonicalize()?;
     for root in worker_roots(candidate) {ensure!(!control.starts_with(root.canonicalize()?),"owner acceptance store is writable by worker");}
+    // This controller namespace must not inherit a group-writable umask.
+    // Tighten only its verified owned, no-follow directory descriptor.
+    let held=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY|libc::O_NOFOLLOW|libc::O_NONBLOCK).open(&control)?;
+    let opened=held.metadata()?;let named=std::fs::symlink_metadata(&control)?;
+    ensure!(opened.is_dir() && opened.uid()==unsafe{libc::geteuid()} && !named.file_type().is_symlink()
+        && opened.dev()==named.dev() && opened.ino()==named.ino(),"owner control directory is not owned/protected");
+    if opened.mode()&0o077!=0 {held.set_permissions(std::fs::Permissions::from_mode(0o700))?;held.sync_all()?;}
     let directory=control.join("owner-preparations");
     if !directory.try_exists()? {std::fs::DirBuilder::new().mode(0o700).create(&directory)?;}
     let meta=std::fs::symlink_metadata(&directory)?;
@@ -232,6 +239,43 @@ pub(in crate::self_improve) fn test_from_prepared(candidate:&Path,workflow:&work
     let canonical=CanonicalSnapshot::capture(workflow,&control,source,None)?;
     let path=persist_preparation(&directory,&input,&identity,&canonical,prepared)?;
     Ok(PreparedOwnerAcceptance {input,candidate:identity,canonical,prepared:prepared.clone(),path})
+}
+
+/// Synthetic baseline fixtures still pass through the actual cached producer,
+/// activation and original native ownership services. No provider/VM is run.
+#[cfg(test)]
+pub(in crate::self_improve) fn test_publication_original(candidate:&Path,control:&Path,base:&str)->Result<PreparedAcceptance> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(control)?;
+    let mut proposal=tests::proposal();proposal.contract.issue=Some(77);
+    let prepared=test_publication_baseline(proposal,base)?;
+    let evidence=evidence_path(control,AcceptanceSource::Issue(77),base)?;
+    std::fs::write(&evidence,serde_json::to_vec(&prepared)?)?;std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o600))?;
+    let path=control.join("issue-77-workflow.json");std::fs::write(&path,serde_json::to_vec(&WorkflowManifest::from_prepared(AcceptanceSource::Issue(77),&prepared))?)?;
+    std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600))?;bind_write_scope(candidate,&prepared,None)?;Ok(prepared)
+}
+#[cfg(test)]
+pub(in crate::self_improve) fn test_productive_canonical(control:&Path)->Result<()> {read_manifest(control,AcceptanceSource::Issue(77)).map(|_|())}
+#[cfg(test)]
+fn test_publication_baseline(proposal:ContractProposal,base:&str)->Result<PreparedAcceptance> {
+    let root=tempfile::tempdir()?;install_harness(root.path(),&proposal)?;
+    let registration=RegisteredContract::register(root.path(),proposal.contract.clone(),base.into(),"test".into())?;
+    let receipt=registration.observe(root.path(),"ready",registration.binding(base)?,&Observation {exit_code:Some(0),stdout:"false".into(),stderr:String::new(),interrupted:false,output_complete:true})?;
+    Ok(PreparedAcceptance {proposal,baseline:BaselineEvidence {registration,receipts:vec![receipt]}})
+}
+#[cfg(test)]
+pub(in crate::self_improve) async fn test_publication_preparation(candidate:&Path,control:&Path,workflow:&workflow::WorkflowGuard,previous:Option<&PreparedAcceptance>)->Result<PreparedOwnerAcceptance> {
+    let source=AcceptanceSource::Issue(77);let old=previous.map(|p|&p.baseline.registration);
+    let turn=workflow.owner_acceptance_turn(candidate,source,old)?;
+    let mut proposal=previous.map(|p|p.proposal.clone()).unwrap_or_else(tests::proposal);proposal.contract.issue=Some(77);
+    proposal.contract.revision=old.map(|p|p.contract().revision+1).unwrap_or(1);
+    let prepared=test_publication_baseline(proposal,&turn.binding.head)?;
+    let required=vec!["Original requirement".into()];let input=Input::new(&turn,source,&turn.binding.head,"fixture source",&required,old)?;
+    input.validate_prepared(&prepared,old)?;
+    let directory=preparation_directory(candidate,control)?;
+    let canonical=CanonicalSnapshot::capture(workflow,control,source,old)?;
+    persist_preparation(&directory,&input,&CandidateIdentity::capture(candidate)?,&canonical,&prepared)?;
+    prepare_at(candidate,workflow,source,&turn.binding.head,"fixture source",&required,old,control).await
 }
 
 /// Exercise the production cached factory with actual guarded owner metadata.

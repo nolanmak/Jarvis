@@ -84,7 +84,7 @@ mod workspace;
 pub(crate) mod targeted;
 #[path = "self_improve_contract.rs"]
 mod acceptance;
-pub(crate) use acceptance::owner::publication::{OwnerPublicationDraft,OwnerPublicationRecord};
+pub(crate) use acceptance::owner::publication::{OwnerPublicationDraft,OwnerPublicationRecord,OwnerPublicationCompletion};
 #[path = "self_improve_alignment.rs"]
 mod alignment;
 #[path = "self_improve_publication.rs"]
