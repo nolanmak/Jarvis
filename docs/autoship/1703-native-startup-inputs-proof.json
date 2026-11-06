@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "kind": "native-startup-consumed-input-admission-component",
+  "source_parent_commit": "c05fd025e74619e3dbafab0ef090203172452211",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/process_tree.rs",
+      "sha256": "f1cc3c40042f95e6405a64e644fe54838fba70c00ba962e2bb6c00183df40f3e"
+    },
+    {
+      "path": "scripts/native-provider-vm.py",
+      "sha256": "873ac28d49585d8663721c228a1479904f7f082b72594316b0742ed7b41d470c"
+    },
+    {
+      "path": "scripts/test-native-provider-vm.py",
+      "sha256": "71a8b31988af83489c37879d0a815bdd2998e049aedb25cc606b4cc2ff77abda"
+    }
+  ],
+  "behavioral_reds": [
+    {
+      "result": "terminal1",
+      "session": 40408,
+      "log": "/tmp/autoship-native-startup-inputs-rust-red-20261106.log",
+      "observed": "Mismatched consumed-launch digest reached actual owner resources_ready callback"
+    },
+    {
+      "result": "terminal1",
+      "log": "/tmp/autoship-native-startup-inputs-python-red-20261106.log",
+      "observed": "Actual main start-frame callback found no startup consumed-input observation"
+    }
+  ],
+  "verification": {
+    "focused_admission": {
+      "session": 93490,
+      "result": "terminal0",
+      "passed": 49,
+      "failed": 0,
+      "ignored": 1,
+      "log": "/tmp/autoship-native-startup-inputs-focused-20261106.log"
+    },
+    "full_core": {
+      "session": 96189,
+      "result": "terminal0",
+      "passed": 951,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 36.98,
+      "log": "/tmp/autoship-native-startup-inputs-full-core-20261106.log"
+    },
+    "python_vm": {
+      "result": "terminal0",
+      "tests": 27,
+      "seconds": 1.303,
+      "log": "/tmp/autoship-native-startup-inputs-python-final-20261106.log"
+    },
+    "python_io": {
+      "result": "terminal0",
+      "tests": 9,
+      "seconds": 0.096,
+      "log": "/tmp/autoship-native-startup-inputs-io-20261106.log"
+    },
+    "isolated_full_cli": {
+      "session": 10001,
+      "result": "terminal0",
+      "passed": 1949,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 320.53,
+      "log": "/tmp/autoship-native-startup-inputs-isolated-full-cli-final-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    },
+    "isolated_production_check": {
+      "session": 82166,
+      "result": "terminal0",
+      "seconds": 24.22,
+      "log": "/tmp/autoship-native-startup-inputs-isolated-production-check-20261106.log"
+    }
+  },
+  "invalid_validation_invocations": [
+    {
+      "session": 53133,
+      "result": "terminal1",
+      "log": "/tmp/autoship-native-startup-inputs-isolated-full-cli-20261106.log",
+      "reason": "CLI is a binary-only crate; --lib ran no tests. Corrected to --bin augmentagent."
+    }
+  ],
+  "implemented": [
+    "Runner publishes synced private consumed-spec observation after asset staging and guest ready, before VM-ready marker",
+    "Actual process admission requires strict bounded private observation matching original prepared launch before owner callbacks/model charges/execution release",
+    "Unreleased boundary rechecks startup input observation before and after owner resources_ready callback",
+    "Existing valid fixture admissions retain productive assertions with explicit scripted startup observation"
+  ],
+  "test_scope": {
+    "actual_supervisor_consumer": "Missing/mismatched/unknown-version/nonprivate/callback-replaced observations refuse; no premature owner callback, model charge or launch-continue",
+    "actual_runner_main": "Real asset file staging and strict declared hash validation with mocked hypervisor/gateway; original spec mutation/removal; before start-frame observation; invalid asset refuses before QEMU/observation/ready/start",
+    "vm_or_provider_executed": false
+  },
+  "not_proven_or_implemented": [
+    "Complete original trusted source/runtime/credential/kernel/compiled-artifact/allocation/writer/associated-input census and source/resource authority",
+    "Fresh body nonrelease or semantic coding-conversation continuation",
+    "Typed recovery/terminal producers, distinct productive successor bridge/claim and shared productive admission",
+    "Connected owner worker, aggregate protected-storage admission, exact-head independent review, rollout, live acceptance and soaks"
+  ],
+  "preserved_unpublished_work": "/tmp/autoship-productive-gate-preserved-20261106.patch"
+}

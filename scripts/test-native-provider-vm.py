@@ -52,7 +52,7 @@ class ReadonlyTransportAdmissionTests(unittest.TestCase):
 
 class LaunchInputSnapshotTests(unittest.TestCase):
     def test_completed_and_failed_receipts_bind_consumed_spec_not_later_path_contents(self):
-        for outcome in ('complete', 'disconnect', 'complete-removed', 'disconnect-removed'):
+        for outcome in ('complete', 'disconnect', 'complete-removed', 'disconnect-removed', 'asset-invalid'):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
                 state = root / 'session'
@@ -60,11 +60,18 @@ class LaunchInputSnapshotTests(unittest.TestCase):
                 executable = root / 'provider'
                 executable.write_bytes(b'synthetic provider never executed')
                 executable.chmod(0o700)
+                asset = root / 'asset-snapshot'
+                asset.write_bytes(b'original bounded instructions')
+                asset.chmod(0o400)
+                asset_manifest = {'version': 1, 'source': str(asset), 'name': 'asset-0',
+                    'bytes': asset.stat().st_size, 'sha256': hashlib.sha256(asset.read_bytes()).hexdigest()}
+                if outcome == 'asset-invalid':
+                    asset_manifest['sha256'] = 'f' * 64
                 launch = {'version': 1, 'readonly_review': True, 'resume': False, 'mcp_argv': None,
                           'guest_runtime': '/fixture/runtime', 'runtime_config': '/fixture/config',
                           'session_directory': str(state), 'memory_mb': 512, 'refresh_auth': False,
                           'executable': str(executable), 'gateway': {}, 'auth_relative': '.codex/auth.json',
-                          'argv': ['consumed-original-argument'], 'environment': {}}
+                          'argv': ['consumed-original-argument'], 'environment': {}, 'assets': [asset_manifest]}
                 path = root / 'launch.json'
                 original = json.dumps(launch).encode()
                 path.write_bytes(original)
@@ -75,7 +82,10 @@ class LaunchInputSnapshotTests(unittest.TestCase):
                 backend = mock.Mock()
                 backend.Runtime.load.return_value.config = {'library_dir': '/fixture/lib', 'module_dir': '/fixture/modules'}
                 backend.initrd.return_value = b'synthetic initrd'
-                backend.qemu_command.return_value = ['synthetic-qemu', '-serial', 'stdio']
+                def qemu_command(config, image, shares, unused):
+                    self.assertEqual((shares[1][1] / 'asset-0').read_bytes(), b'original bounded instructions')
+                    return ['synthetic-qemu', '-serial', 'stdio']
+                backend.qemu_command.side_effect = qemu_command
                 gateway_module = mock.Mock()
                 gateway_module.provision.return_value = ({}, [])
                 gateway = mock.Mock(guest_failures=0, host_failures=0)
@@ -90,6 +100,13 @@ class LaunchInputSnapshotTests(unittest.TestCase):
                     return gateway
                 gateway_module.HostGateway.side_effect = gateway_started
                 channel = mock.Mock()
+                def observe_start(frame):
+                    if frame.get('type') == 'start':
+                        observation = json.loads((root / 'vm-startup-inputs.json').read_bytes())
+                        self.assertEqual(observation, {'version': 1, 'phase': 'inputs_staged',
+                            'launch_sha256': hashlib.sha256(original).hexdigest()})
+                        self.assertEqual((root / 'ready').read_bytes(), b'ready\n')
+                channel.send.side_effect = observe_start
                 channel.receive.return_value = [{'type': 'ready'},
                     {'type': 'worker_quiescent', 'scans': 2, 'signalled': 0, 'reaped': 0,
                      'remaining_workers': 0, 'quiet_scans': 2}, {'type': 'exit', 'code': 0}]
@@ -110,6 +127,14 @@ class LaunchInputSnapshotTests(unittest.TestCase):
                         mock.patch.object(vm.threading, 'Thread'), \
                         mock.patch.dict(os.environ, {'JARVIS_NATIVE_VM_READY': str(root / 'ready'),
                                                     'JARVIS_NATIVE_VM_CONTINUE': str(proceed)}):
+                    if outcome == 'asset-invalid':
+                        with self.assertRaisesRegex(ValueError, 'asset.*digest'):
+                            vm.main(path)
+                        self.assertFalse((root / 'ready').exists())
+                        self.assertFalse((root / 'vm-startup-inputs.json').exists())
+                        backend.qemu_command.assert_not_called()
+                        channel.send.assert_not_called()
+                        continue
                     if outcome.startswith('complete'):
                         self.assertEqual(vm.main(path), 0)
                         receipt = json.loads((state / 'complete.json').read_bytes())

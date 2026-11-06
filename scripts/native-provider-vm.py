@@ -753,6 +753,12 @@ def main(spec_path):
                     proceed = os.environ.get('JARVIS_NATIVE_VM_CONTINUE')
                     if not ready or not proceed:
                         raise RuntimeError('native VM controller admission missing')
+                    # Publish the exact spec consumed by this runner only after
+                    # all declared assets were validated and staged. The controller
+                    # checks it before owner/model admission; no pathname reread.
+                    atomic(Path(ready).with_name('vm-startup-inputs.json'),
+                           json.dumps({'version': 1, 'phase': 'inputs_staged',
+                                       'launch_sha256': launch_sha256}).encode())
                     atomic(Path(ready), b'ready\n')
                     deadline = time.monotonic() + 15
                     while not Path(proceed).exists():

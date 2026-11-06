@@ -50,6 +50,7 @@ impl NativeResourceAdmission<'_> {
         absent(&self.group.receipt)?;
         absent(&self.group.receipt.with_file_name("launch-continue"))?;
         anyhow::ensure!(launch_readiness(&self.group.receipt.with_file_name("launch-ready"))?,"native resource readiness publication is pending");
+        self.group.validate_startup_inputs()?;
         let original:serde_json::Value=serde_json::from_slice(&private_read(&self.group.receipt.with_file_name("resource-admitted.json"))?)?;
         let current:serde_json::Value=serde_json::from_slice(&private_read(&self.group.receipt.with_file_name("resource-accounting.json"))?)?;
         anyhow::ensure!(original==*self.identity && current["phase"]=="admitted" && current["exhausted"]==false
@@ -61,6 +62,20 @@ impl NativeResourceAdmission<'_> {
 }
 
 impl ProcessGroup {
+    /// Check the trusted runner's observation of its consumed spec after asset
+    /// validation, before consulting any owner/body or model admission callback.
+    /// This is an input correlation check, not complete native/source authority.
+    fn validate_startup_inputs(&self)->anyhow::Result<()> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StartupInputs {version:u32,phase:String,launch_sha256:String}
+        let prepared=self.native_launch.as_ref().ok_or_else(||anyhow::anyhow!("native startup lacks original prepared launch"))?;
+        let observed:StartupInputs=serde_json::from_slice(&private_read(&self.receipt.with_file_name("vm-startup-inputs.json"))?)?;
+        anyhow::ensure!(observed.version==1 && observed.phase=="inputs_staged"
+            && observed.launch_sha256==prepared.intent.launch_sha256,
+            "native startup consumed different or unknown launch inputs");
+        Ok(())
+    }
     pub(crate) fn bind_resource_audit(&self, provider:&str, logger:Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
         if let Some(logger)=logger { *self.resource_audit.lock().map_err(|_|anyhow::anyhow!("resource audit lock poisoned"))?=Some((provider.into(),logger.clone())); }
         Ok(())
@@ -106,6 +121,7 @@ impl ProcessGroup {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+        if self.vm_preflight {self.validate_startup_inputs()?;}
         let mut resource_identity=None;
         if self.resource_required {
             let parsed=private_read(&self.receipt.with_file_name("resource-accounting.json")).ok()
@@ -1208,6 +1224,16 @@ mod tests {
     async fn initial_prepared_proof_refuses_prior_input_release() {native_release_context_fixture("owner-initial-input").await;}
     #[tokio::test]
     async fn initial_prepared_proof_refuses_unclassified_actor() {native_release_context_fixture("owner-initial-actor").await;}
+    #[tokio::test]
+    async fn native_startup_inputs_refuse_missing_observation_before_release() {native_release_context_fixture("owner-startup-missing").await;}
+    #[tokio::test]
+    async fn native_startup_inputs_refuse_mismatched_observation_before_release() {native_release_context_fixture("owner-startup-hash").await;}
+    #[tokio::test]
+    async fn native_startup_inputs_refuse_unknown_observation_before_release() {native_release_context_fixture("owner-startup-version").await;}
+    #[tokio::test]
+    async fn native_startup_inputs_refuse_public_observation_before_release() {native_release_context_fixture("owner-startup-writable").await;}
+    #[tokio::test]
+    async fn native_startup_inputs_refuse_changed_observation_before_release() {native_release_context_fixture("owner-startup-changed").await;}
     struct ReadyOwnerFixture {
         visits:Arc<std::sync::atomic::AtomicUsize>,billed:Arc<std::sync::atomic::AtomicUsize>,refuse:bool,changed:Option<PathBuf>,published:Option<Arc<AtomicBool>>,initial_audit:Option<std::sync::Weak<crate::tool_audit::AuditLogger>>,proofs:Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -1255,6 +1281,11 @@ mod tests {
                 "owner-initial-input"=>"initial_prepared_proof_refuses_prior_input_release",
                 "owner-initial-preparation"=>"initial_prepared_proof_refuses_owner_preparation_launch",
                 "owner-initial-actor"=>"initial_prepared_proof_refuses_unclassified_actor",
+                "owner-startup-missing"=>"native_startup_inputs_refuse_missing_observation_before_release",
+                "owner-startup-hash"=>"native_startup_inputs_refuse_mismatched_observation_before_release",
+                "owner-startup-version"=>"native_startup_inputs_refuse_unknown_observation_before_release",
+                "owner-startup-writable"=>"native_startup_inputs_refuse_public_observation_before_release",
+                "owner-startup-changed"=>"native_startup_inputs_refuse_changed_observation_before_release",
                 "owner-ready"=>"native_resource_ready_precedes_owner_model_charge_and_release",
                 "owner-prefix"=>"native_resource_ready_waits_for_complete_private_ready_marker",
                 "owner-permissions"=>"native_resource_ready_waits_for_private_ready_permissions",
@@ -1332,6 +1363,17 @@ mod tests {
                 original_store_binding_sha256:format!("{:x}",Sha256::digest(crate::native_vm::ownership::canonical_bytes(&serde_json::to_value(original).unwrap()).unwrap()))};
             Some(logger.native_launch_prepared(&intent).unwrap())
         } else {None};
+        // Scripted startup observations exercise the actual admission consumer;
+        // they are not proof of a real VM or a provider invocation.
+        if let Some(prepared)=&prepared {
+            if mode!="owner-startup-missing" {
+                let observation=serde_json::json!({"version":if mode=="owner-startup-version" {2}else{1},
+                    "phase":"inputs_staged","launch_sha256":if mode=="owner-startup-hash" {"f".repeat(64)}else{prepared.intent.launch_sha256.clone()}});
+                let path=group.receipt.with_file_name("vm-startup-inputs.json");
+                write_private(&path,observation.to_string().as_bytes());
+                if mode=="owner-startup-writable" {std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o644)).unwrap();}
+            }
+        }
         group.native_launch=prepared.clone();
         if mode=="changed" {group.native_launch.as_mut().unwrap().intent.launch_sha256="f".repeat(64);}
         if mode=="sealed" {
@@ -1360,7 +1402,7 @@ mod tests {
         } else {None};
         if mode.starts_with("owner-") {
             logger.set_owner_input_authorizer(Arc::new(ReadyOwnerFixture {visits:visits.clone(),billed:count.clone(),refuse:mode=="owner-refuse",
-                changed:(mode=="owner-changed").then(||group.receipt.with_file_name("resource-accounting.json")),published:matches!(mode,"owner-prefix"|"owner-permissions").then(||published.clone()),initial_audit:mode.starts_with("owner-initial").then(||Arc::downgrade(&logger)),proofs:proofs.clone()})).unwrap();
+                changed:if mode=="owner-startup-changed" {Some(group.receipt.with_file_name("vm-startup-inputs.json"))}else{(mode=="owner-changed").then(||group.receipt.with_file_name("resource-accounting.json"))},published:matches!(mode,"owner-prefix"|"owner-permissions").then(||published.clone()),initial_audit:mode.starts_with("owner-initial").then(||Arc::downgrade(&logger)),proofs:proofs.clone()})).unwrap();
             if mode=="owner-fenced" {
                 let visited=visits.clone();
                 logger.set_dispatch_observer(Arc::new(move || {
@@ -1383,7 +1425,7 @@ mod tests {
         let rows:Vec<serde_json::Value>=std::fs::read_to_string(logger.path()).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
         let binding=rows.iter().find(|row|row["kind"]=="native_launch_resource_binding");
         if mode.starts_with("owner-") {
-            assert_eq!(visits.load(Ordering::SeqCst),if matches!(mode,"owner-no-resource"|"owner-corrupt") {0}else{1},"owner resource-ready was never observed");
+            assert_eq!(visits.load(Ordering::SeqCst),if matches!(mode,"owner-no-resource"|"owner-corrupt"|"owner-startup-missing"|"owner-startup-hash"|"owner-startup-version"|"owner-startup-writable") {0}else{1},"owner resource-ready was never observed");
             if matches!(mode,"owner-ready"|"owner-prefix"|"owner-permissions"|"owner-initial") {outcome.unwrap();assert!(proceeded);assert_eq!(count.load(Ordering::SeqCst),1);}
             else {assert!(outcome.is_err());assert!(!proceeded);assert_eq!(count.load(Ordering::SeqCst),0);}
             if mode.starts_with("owner-initial") {assert_eq!(proofs.load(Ordering::SeqCst),usize::from(mode=="owner-initial"));}
