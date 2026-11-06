@@ -64,6 +64,25 @@ impl OwnerInputReference {
 mod preparation_context;
 pub use preparation_context::OwnerPreparationContext;
 pub use crate::process_tree::NativeResourceAdmission;
+
+/// Strict historical observation payload, never a live input/body capability.
+#[derive(Debug,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StartupInputRecord {
+    pub(crate) version:u32,pub(crate) actor:String,pub(crate) kind:String,
+    pub(crate) launch_intent:PreparedLaunchIntent,pub(crate) launch_receipt:crate::audit_chain::AppendReceipt,
+    pub(crate) resource_receipt:crate::audit_chain::AppendReceipt,pub(crate) inputs:crate::process_tree::StartupInputs,
+}
+impl StartupInputRecord {
+    pub(crate) fn validate(&self,prepared:&PreparedLaunchRecord,resource:&crate::audit_chain::AppendReceipt)->Result<()> {
+        ensure!(self.version==1 && self.actor=="controller" && self.kind=="native_startup_inputs_observed"
+            && self.launch_intent==prepared.intent && self.launch_receipt==prepared.controller_receipt
+            && self.resource_receipt==*resource && resource.sequence>prepared.controller_receipt.sequence,
+            "native startup observation original references changed");
+        self.inputs.validate(prepared)
+    }
+}
+
 /// Installed once by the original owner controller. Callbacks never wait for
 /// providers or perform native IO inside a workflow transaction.
 pub trait OwnerInputAuthorizer:Send+Sync {

@@ -465,6 +465,10 @@ pub(crate) mod tests {
         provider:&str,
         record:impl FnOnce(&PreparedLaunchRecord),
     )->(PreparedLaunchRecord,AppendReceipt,AppendReceipt) {
+        retained_launch_fixture_with_startup(state,audit,provider,record,false)
+    }
+    fn retained_launch_fixture_with_startup(state:&Path,audit:&AuditLogger,provider:&str,
+        record:impl FnOnce(&PreparedLaunchRecord),startup:bool)->(PreparedLaunchRecord,AppendReceipt,AppendReceipt) {
         directory(&state.join(provider));
         let runtime = state.join(format!("{provider}/session-fixture"));
         directory(&runtime);
@@ -496,6 +500,11 @@ pub(crate) mod tests {
             "resource_identity":{"host_sha256":sha(&std::fs::read("/etc/machine-id").unwrap()),
                 "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),
                 "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1}})).unwrap();
+        if startup {
+            audit.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_startup_inputs_observed",
+                "launch_intent":intent,"launch_receipt":prepared.controller_receipt,"resource_receipt":resource,
+                "inputs":{"version":1,"phase":"inputs_staged","launch_sha256":intent.launch_sha256}})).unwrap();
+        }
         let session=audit.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
             "kind":"native_session_observed","launch_intent":intent,"launch_receipt":prepared.controller_receipt,
             "native_session_id":"actual-session","observed_at_ms":now()})).unwrap();
@@ -535,6 +544,9 @@ pub(crate) mod tests {
             Self::with_native_provider_preparation(owner_bound,body_turn,late_dispatch,provider,0)
         }
         fn with_native_provider_preparation(owner_bound:bool,body_turn:bool,late_dispatch:bool,provider:&str,preparation_version:u32) -> Self {
+            Self::with_native_provider_preparation_startup(owner_bound,body_turn,late_dispatch,provider,preparation_version,false)
+        }
+        fn with_native_provider_preparation_startup(owner_bound:bool,body_turn:bool,late_dispatch:bool,provider:&str,preparation_version:u32,startup:bool) -> Self {
             let root = tempfile::tempdir().unwrap();
             let base = root.path().canonicalize().unwrap();
             let state = base.join("native");
@@ -604,7 +616,7 @@ pub(crate) mod tests {
                 audit.require_run_resources().unwrap();
             }
             let mut owner_dispatch=turn.as_ref().filter(|_|!late_dispatch).map(|t|store.begin_owner_body_dispatch(t,submission::Provider::Codex,now()).unwrap());
-            let (prepared,session,resource)=retained_launch_fixture(&state,&audit,provider,|prepared| {
+            let (prepared,session,resource)=retained_launch_fixture_with_startup(&state,&audit,provider,|prepared| {
                 store.record_verified_native_launch(&lease,&binding,&audit,prepared,now()).unwrap();
                 if preparation_version>0 {
                     let context=augmentagent_channel_core::native_vm::OwnerPreparationContext::new(prepared.intent.source_owner.clone(),"original-owner-request".into(),"c".repeat(64)).unwrap();
@@ -613,7 +625,7 @@ pub(crate) mod tests {
                     if preparation_version==2 {record["readonly_transport"]=serde_json::json!({"version":1,"launch_sha256":prepared.intent.launch_sha256,"readonly_review":true,"host_tool_channel":"absent"});}
                     audit.record_controller(record).unwrap();
                 }
-            });
+            },startup);
             if late_dispatch {owner_dispatch=turn.as_ref().map(|t|store.begin_owner_body_dispatch(t,submission::Provider::Codex,now()).unwrap());}
             Self {
                 _root: root,
@@ -833,8 +845,9 @@ pub(crate) mod tests {
     fn retained_native_metadata_proof_preserves_actual_completed_session() {
         if child("retained_native_metadata_proof_preserves_actual_completed_session") {return;}
         use std::sync::{Arc,Mutex};use std::os::fd::AsRawFd;
-        for provider in ["codex","claude"] {for input_fault in ["resource","input","preparation","readonly-transport"] {for original_input in ["none","generic","owner","preparation","readonly-preparation"] {
-        let mut f=Fixture::with_native_provider_preparation(false,false,false,provider,match original_input {"preparation"=>1,"readonly-preparation"=>2,_=>0});
+        for provider in ["codex","claude"] {for input_fault in ["resource","input","preparation","readonly-transport","startup-input","startup-hash","startup-receipt","startup-version","startup-extra","startup-duplicate","startup-post-model","startup-post-input","startup-post-session"] {for original_input in ["none","generic","owner","preparation","readonly-preparation"] {
+        if input_fault.starts_with("startup-") && input_fault!="startup-input" && original_input!="readonly-preparation" {continue;}
+        let mut f=Fixture::with_native_provider_preparation_startup(false,false,false,provider,match original_input {"preparation"=>1,"readonly-preparation"=>2,_=>0},original_input=="readonly-preparation");
         // Protected journal fixtures describe prior input uncertainty; they do
         // not invoke a model or reconstruct the original live input authorizer.
         if original_input!="none" {
@@ -887,6 +900,15 @@ pub(crate) mod tests {
             let writers=proof.evidence()["audits"].as_array().unwrap().iter().flat_map(|a|a["native_input_writers"].as_array()
                 .expect("native metadata omitted its original input-writer closure census")).collect::<Vec<_>>();
             assert_eq!(writers.len(),1);assert_eq!(writers[0]["launch_intent"],serde_json::to_value(&f.prepared.intent).unwrap());
+            assert!(writers[0].as_object().unwrap().contains_key("startup_inputs"),"retained native metadata omitted startup input certainty");
+            assert_eq!(writers[0]["startup_inputs"].is_null(),original_input!="readonly-preparation");
+            if original_input=="readonly-preparation" {
+                let startup=&writers[0]["startup_inputs"];
+                assert_eq!(startup["record"]["inputs"]["launch_sha256"],f.prepared.intent.launch_sha256);
+                assert_eq!(startup["record"]["launch_receipt"],serde_json::to_value(&f.prepared.controller_receipt).unwrap());
+                assert_eq!(startup["record"]["resource_receipt"],serde_json::to_value(&f.resource).unwrap());
+                assert!(startup["receipt"]["sequence"].as_u64().unwrap()>f.resource.sequence);
+            }
             assert_eq!(writers[0]["readonly_transport"].is_null(),original_input!="readonly-preparation");
             if original_input=="readonly-preparation" {assert_eq!(writers[0]["readonly_transport"]["launch_sha256"],f.prepared.intent.launch_sha256);}
             assert_eq!(writers[0]["closure"]["kind"],"completed_native_transfer");
@@ -959,6 +981,37 @@ pub(crate) mod tests {
             current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_input_release_attempt",
                 "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_receipt":f.resource,
                 "prompt_sha256":"a".repeat(64),"prompt_bytes":42,"recorded_at_ms":now()})).unwrap();
+        }else if input_fault.starts_with("startup-") && input_fault!="startup-input" {
+            let identity=f.audit.read_append_receipt(&f.resource).unwrap()["resource_identity"].clone();
+            let resource=current.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller","kind":"native_launch_resource_binding",
+                "launch_intent":live,"launch_receipt":live_receipt,"resource_identity":identity})).unwrap();
+            let mut record=serde_json::json!({"version":1,"actor":"controller","kind":"native_startup_inputs_observed",
+                "launch_intent":live,"launch_receipt":live_receipt,"resource_receipt":resource,
+                "inputs":{"version":1,"phase":"inputs_staged","launch_sha256":live.launch_sha256}});
+            match input_fault {
+                "startup-hash"=>record["inputs"]["launch_sha256"]="f".repeat(64).into(),
+                "startup-receipt"=>record["resource_receipt"]=serde_json::to_value(&f.resource).unwrap(),
+                "startup-version"=>record["version"]=2.into(),
+                "startup-extra"=>record["unexpected"]=true.into(),
+                "startup-duplicate"=>{current.record_controller(record.clone()).unwrap();},
+                "startup-post-model"=>{
+                    current.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":provider,
+                        "observation":{"phase":"admitted","exhausted":false,"identity":identity}})).unwrap();
+                    current.record_controller(serde_json::json!({"actor":"controller","kind":"model_call_admitted","admission_schema_version":2,
+                        "actual_provider":provider,"resource_identity":identity})).unwrap();
+                },
+                "startup-post-input"=>{current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_input_release_attempt",
+                    "launch_intent":live,"launch_receipt":live_receipt,"resource_receipt":resource,
+                    "prompt_sha256":"a".repeat(64),"prompt_bytes":42,"recorded_at_ms":now()})).unwrap();},
+                "startup-post-session"=>{current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_session_observed",
+                    "launch_intent":live,"launch_receipt":live_receipt,"native_session_id":"scripted-session","observed_at_ms":now()})).unwrap();},
+                _=>unreachable!(),
+            }
+            current.record_controller(record).unwrap();
+        }else if input_fault=="startup-input" {
+            current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_startup_inputs_observed",
+                "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_receipt":f.resource,
+                "inputs":{"version":1,"phase":"inputs_staged","launch_sha256":f.prepared.intent.launch_sha256}})).unwrap();
         }else if input_fault=="readonly-transport" {
             let context=augmentagent_channel_core::native_vm::OwnerPreparationContext::new(live.source_owner.clone(),"original-owner-request".into(),"c".repeat(64)).unwrap();
             current.record_controller(serde_json::json!({"version":2,"actor":"controller","kind":"native_owner_preparation_binding",
@@ -974,7 +1027,9 @@ pub(crate) mod tests {
         }
         let mut visited=false;
         let error=ownership::with_metadata_native_owner(&current,&runtimes,&fence,&mut load,&mut |_| {visited=true;Ok(())}).unwrap_err();
-        assert!(!visited);assert!(format!("{error:#}").contains(match input_fault {"input"=>"native metadata input has no original launch","preparation"=>"native preparation binding has no original launch","readonly-transport"=>"original readonly preparation transport changed",_=>"native metadata resource has no original launch"}),"{error:#}");
+        assert!(!visited);assert!(format!("{error:#}").contains(match input_fault {"input"=>"native metadata input has no original launch","preparation"=>"native preparation binding has no original launch","readonly-transport"=>"original readonly preparation transport changed","startup-input"=>"native startup observation has no original launch","startup-hash"=>"different or unknown launch inputs",
+            "startup-receipt"|"startup-version"=>"native startup observation original references changed","startup-extra"=>"unknown field",
+            "startup-duplicate"=>"native startup observation duplicated","startup-post-model"|"startup-post-input"|"startup-post-session"=>"follows model/input/session exposure",_=>"native metadata resource has no original launch"}),"{error:#}");
         f.store.release(&lease,now()).unwrap();refuse(&runtimes,audits.clone());
         }}}
     }

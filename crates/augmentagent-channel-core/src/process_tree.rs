@@ -25,6 +25,18 @@ pub(crate) struct ProcessGroup {
     _directory: Option<tempfile::TempDir>,
 }
 
+/// Descriptive consumed-input payload. Saved bytes never reconstruct admission.
+#[derive(Debug,serde::Serialize,serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StartupInputs {version:u32,phase:String,launch_sha256:String}
+impl StartupInputs {
+    pub(crate) fn validate(&self,prepared:&crate::native_vm::PreparedLaunchRecord)->anyhow::Result<()> {
+        anyhow::ensure!(self.version==1 && self.phase=="inputs_staged"
+            && self.launch_sha256==prepared.intent.launch_sha256,
+            "native startup consumed different or unknown launch inputs");Ok(())
+    }
+}
+
 /// Borrowed observation from this actual supervisor's closed release boundary.
 /// This is not kernel quiescence, native absence, or permission to replay input.
 /// Only this module can construct it; it cannot outlive the owning group.
@@ -39,6 +51,9 @@ impl NativeResourceAdmission<'_> {
     pub fn prepared(&self)->&crate::native_vm::PreparedLaunchRecord {self.prepared}
     pub fn resource_receipt(&self)->&crate::audit_chain::AppendReceipt {self.resource}
     pub fn identity(&self)->&serde_json::Value {self.identity}
+    pub(crate) fn startup_inputs(&self)->anyhow::Result<StartupInputs> {
+        self.validate_unreleased()?;self.group.validate_startup_inputs()
+    }
     pub fn validate_unreleased(&self)->anyhow::Result<()> {
         let absent=|path:&std::path::Path|->anyhow::Result<()> {
             match std::fs::symlink_metadata(path) {
@@ -65,16 +80,10 @@ impl ProcessGroup {
     /// Check the trusted runner's observation of its consumed spec after asset
     /// validation, before consulting any owner/body or model admission callback.
     /// This is an input correlation check, not complete native/source authority.
-    fn validate_startup_inputs(&self)->anyhow::Result<()> {
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct StartupInputs {version:u32,phase:String,launch_sha256:String}
+    fn validate_startup_inputs(&self)->anyhow::Result<StartupInputs> {
         let prepared=self.native_launch.as_ref().ok_or_else(||anyhow::anyhow!("native startup lacks original prepared launch"))?;
         let observed:StartupInputs=serde_json::from_slice(&private_read(&self.receipt.with_file_name("vm-startup-inputs.json"))?)?;
-        anyhow::ensure!(observed.version==1 && observed.phase=="inputs_staged"
-            && observed.launch_sha256==prepared.intent.launch_sha256,
-            "native startup consumed different or unknown launch inputs");
-        Ok(())
+        observed.validate(prepared)?;Ok(observed)
     }
     pub(crate) fn bind_resource_audit(&self, provider:&str, logger:Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
         if let Some(logger)=logger { *self.resource_audit.lock().map_err(|_|anyhow::anyhow!("resource audit lock poisoned"))?=Some((provider.into(),logger.clone())); }
@@ -159,6 +168,7 @@ impl ProcessGroup {
             *self.native_resource.lock().map_err(|_|anyhow::anyhow!("native resource receipt lock poisoned"))?=Some(receipt.clone());
             let admission=NativeResourceAdmission {group:self,prepared,resource:&receipt,identity};
             admission.validate_unreleased()?;
+            logger.unwrap().native_startup_inputs_observed(&admission)?;
             logger.unwrap().owner_native_resources_ready(&admission)?;
             admission.validate_unreleased()?;
             logger.unwrap().dispatch_allowed()?;
@@ -1432,13 +1442,21 @@ mod tests {
         } else if mode=="bound" {
             outcome.unwrap();assert!(proceeded);assert_eq!(count.load(Ordering::SeqCst),1);
             let binding=binding.expect("released native model has no exact launch/resource correlation");
-            assert_eq!(logger.read_append_receipt(&retained_resource.unwrap()).unwrap(),*binding,
+            assert_eq!(logger.read_append_receipt(retained_resource.as_ref().unwrap()).unwrap(),*binding,
                 "completion did not retain the exact protected supervisor receipt");
             let prepared=prepared.unwrap();
-            assert_eq!(binding["launch_intent"],serde_json::to_value(prepared.intent).unwrap());
-            assert_eq!(binding["launch_receipt"],serde_json::to_value(prepared.controller_receipt).unwrap());
+            assert_eq!(binding["launch_intent"],serde_json::to_value(&prepared.intent).unwrap());
+            assert_eq!(binding["launch_receipt"],serde_json::to_value(&prepared.controller_receipt).unwrap());
             assert_eq!(binding["resource_identity"],identity);
+            let startup=rows.iter().find(|row|row["kind"]=="native_startup_inputs_observed")
+                .expect("released native model has no durable consumed-startup observation");
+            assert_eq!(startup["launch_intent"],binding["launch_intent"]);
+            assert_eq!(startup["launch_receipt"],binding["launch_receipt"]);
+            assert_eq!(startup["resource_receipt"],serde_json::to_value(retained_resource.as_ref().unwrap()).unwrap());
+            assert_eq!(startup["inputs"],serde_json::json!({"version":1,"phase":"inputs_staged","launch_sha256":prepared.intent.launch_sha256}));
             let model=rows.iter().find(|row|row["kind"]=="model_call_admitted").unwrap();
+            assert!(binding["audit_chain"]["sequence"].as_u64().unwrap()<startup["audit_chain"]["sequence"].as_u64().unwrap());
+            assert!(startup["audit_chain"]["sequence"].as_u64().unwrap()<model["audit_chain"]["sequence"].as_u64().unwrap());
             assert_eq!(model["resource_identity"],binding["resource_identity"]);
             assert!(binding["audit_chain"]["sequence"].as_u64().unwrap()<model["audit_chain"]["sequence"].as_u64().unwrap());
         } else {

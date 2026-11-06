@@ -582,7 +582,7 @@ impl AuditLogger {
         anyhow::ensure!(admission.is_initial() && self.native_runtime_owner()?.as_ref()==Some(&namespace.owner),"initial prepared namespace owner/mode changed");
         self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("prepared namespace requires protected audit"))?.with_retained_snapshot(|rows,audit| {
             self.check_protected_continuity()?;
-            let prepared=admission.prepared();let mut launches=0usize;let mut bindings=0usize;let mut current=0usize;
+            let prepared=admission.prepared();let mut launches=0usize;let mut bindings=0usize;let mut startups=0usize;let mut current=0usize;
             let mut retained=Vec::new();
             for row in rows {
                 anyhow::ensure!(row["actor"]=="controller","initial prepared namespace has unclassified actor effects");
@@ -600,6 +600,13 @@ impl AuditLogger {
                             && row["audit_chain"]["sequence"]==admission.resource_receipt().sequence,
                             "another native resource binding in initial prepared namespace");bindings+=1;
                     }
+                    Some("native_startup_inputs_observed")=>{
+                        let mut raw=row.clone();raw.as_object_mut().ok_or_else(||anyhow::anyhow!("native startup is not object"))?.remove("audit_chain");
+                        let startup:crate::native_vm::StartupInputRecord=serde_json::from_value(raw)?;
+                        startup.validate(prepared,admission.resource_receipt())?;
+                        anyhow::ensure!(bindings==1 && row["audit_chain"]["sequence"].as_u64().is_some_and(|s|s>admission.resource_receipt().sequence),"initial startup observation reordered");
+                        startups+=1;
+                    }
                     Some("run_resource_admitted") if row["observation"]["identity"]==*admission.identity()=>{
                         anyhow::ensure!(row["actor"]=="controller" && row["provider"]==prepared.intent.provider
                             && row["observation"]["phase"]=="admitted" && row["observation"]["exhausted"]==false,
@@ -612,7 +619,7 @@ impl AuditLogger {
                 }
                 retained.push(row.clone());
             }
-            anyhow::ensure!(launches==1 && bindings==1 && current==1,"initial prepared namespace is incomplete or duplicated");
+            anyhow::ensure!(launches==1 && bindings==1 && startups==1 && current==1,"initial prepared namespace is incomplete or duplicated");
             let (generation,resources)=Self::namespace_resources(&retained,&namespace.owner.workflow_id)?;
             anyhow::ensure!(generation==namespace.owner.lease_generation,"initial prepared namespace generation changed");
             admission.validate_unreleased()?;self.check_protected_continuity()?;
@@ -1118,6 +1125,26 @@ impl AuditLogger {
             "resource_identity":identity,"recorded_at_ms":chrono::Utc::now().timestamp_millis()}))?;
         self.dispatch_allowed()?;
         Ok(receipt)
+    }
+    /// Only the actual closed supervisor admission can produce this record.
+    /// The serialized payload is historical evidence, not an admission token.
+    pub(crate) fn native_startup_inputs_observed(&self,admission:&crate::native_vm::NativeResourceAdmission<'_>)
+        ->anyhow::Result<crate::audit_chain::AppendReceipt> {
+        admission.validate_unreleased()?;
+        self.verify_native_launch_reference(admission.prepared())?;
+        let original=self.read_append_receipt(admission.resource_receipt())?;
+        anyhow::ensure!(original["version"]==1 && original["actor"]=="controller"
+            && original["kind"]=="native_launch_resource_binding"
+            && original["launch_intent"]==serde_json::to_value(&admission.prepared().intent)?
+            && original["launch_receipt"]==serde_json::to_value(&admission.prepared().controller_receipt)?
+            && original["resource_identity"]==*admission.identity(),"startup input observation resource changed");
+        let record=crate::native_vm::StartupInputRecord {version:1,actor:"controller".into(),kind:"native_startup_inputs_observed".into(),
+            launch_intent:admission.prepared().intent.clone(),launch_receipt:admission.prepared().controller_receipt.clone(),
+            resource_receipt:admission.resource_receipt().clone(),inputs:admission.startup_inputs()?};
+        record.validate(admission.prepared(),admission.resource_receipt())?;
+        self.dispatch_allowed()?;
+        let receipt=self.record_controller_receipted(serde_json::to_value(record)?)?;
+        admission.validate_unreleased()?;self.dispatch_allowed()?;Ok(receipt)
     }
     pub(crate) fn native_launch_uncertain(
         &self,

@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "kind": "protected-original-native-startup-history-component",
+  "source_parent_commit": "13ce3b4d72734f7196f086f8aea5d4a78b722642",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/process_tree.rs",
+      "sha256": "92d25d18fce7de6388cccb8cf0f9c16f4a4b200528769f6f9e12ddebc61e2316"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "5424e90a5f3209186597c21e6c4771228ea7fcb8f1ba8400d3d7003d9b13b96e"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "b8961cec1984dc527c88adb59a7a23b08bf7dd43277cf3ed8ca5d56c25e93df7"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_metadata.rs",
+      "sha256": "8e2dd7cdfe8df0ae642da86054a7ef89bc60bb38001dcb95ae0c5b4abf96d9ef"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+      "sha256": "ed3a75aae429a1442a2075a520513384f9c94dd9b0ce96343dfcf4ce898df3af"
+    }
+  ],
+  "behavioral_reds": [
+    {
+      "session": 39475,
+      "result": "terminal1",
+      "log": "/tmp/autoship-native-startup-history-core-red-final-20261106.log",
+      "observed": "Actual released model had no durable consumed-startup observation"
+    },
+    {
+      "session": 25683,
+      "result": "terminal1",
+      "log": "/tmp/autoship-native-startup-history-retained-red-20261106.log",
+      "observed": "Actual retained metadata visitor omitted startup input certainty"
+    }
+  ],
+  "invalid_validation_invocations": [
+    {
+      "session": 26112,
+      "result": "terminal1",
+      "log": "/tmp/autoship-native-startup-history-core-red-20261106.log",
+      "reason": "Regression initially borrowed moved test data; corrected before behavioral red. This compile failure is not behavioral evidence."
+    }
+  ],
+  "verification": {
+    "focused_core": {
+      "session": 40496,
+      "result": "terminal0",
+      "passed": 49,
+      "failed": 0,
+      "ignored": 1,
+      "seconds": 4.99,
+      "log": "/tmp/autoship-native-startup-history-focused-core-20261106.log",
+      "scope": "Precedes later resource-reference assertion and bounded exposure-index edits; final full-core run supersedes it"
+    },
+    "focused_retained_history": {
+      "session": 59554,
+      "result": "terminal0",
+      "passed": 1,
+      "failed": 0,
+      "cases": 66,
+      "seconds": 78.18,
+      "log": "/tmp/autoship-native-startup-history-retained-focused-20261106.log"
+    },
+    "full_core": {
+      "session": 88462,
+      "result": "terminal0",
+      "passed": 951,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 37.38,
+      "log": "/tmp/autoship-native-startup-history-full-core-20261106.log"
+    },
+    "isolated_full_cli": {
+      "session": 87250,
+      "result": "terminal0",
+      "passed": 1949,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 325.81,
+      "log": "/tmp/autoship-native-startup-history-isolated-full-cli-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    },
+    "isolated_production_check": {
+      "session": 54193,
+      "result": "terminal0",
+      "seconds": 47.93,
+      "log": "/tmp/autoship-native-startup-history-isolated-production-check-20261106.log"
+    }
+  },
+  "implemented": [
+    "Live borrowed supervisor admission emits strict protected startup observation after exact original resource binding and before owner/model admission",
+    "Producer checks actual unreleased boundary, actual private consumed-spec observation, original protected launch/resource receipts and current dispatch fence before/after append",
+    "Actual initial prepared namespace requires exactly one correctly bound/ordered startup record",
+    "Locked retained metadata reconstructs original append receipts, joins original launch/resource references, preserves startup records per original writer and leaves missing historical observations explicitly unknown",
+    "Reject mismatched/foreign/unknown/duplicate/late observations before metadata visitor; bounded startup/exposure indexes"
+  ],
+  "test_scope": {
+    "actual_supervisor": "Existing valid initial/retained admissions and startup corruption refusals; emitted record refs and before-model ordering",
+    "retained_protected_store": "Both providers, two completed transfers; recorded readonly preparation startup vs legacy unknown; hash/resource/version/field/duplicate/model/input/session/foreign-namespace faults; original locks, sealed audit continuity and retained bytes",
+    "vm_or_provider_executed": false
+  },
+  "not_proven_or_implemented": [
+    "Complete trusted-source/runtime/credential/kernel/compiled-artifact/allocation/writer/input census and source/resource authority",
+    "Fresh original-body nonrelease or semantic coding-conversation continuation",
+    "Typed recovery/terminal metadata, distinct productive successor bridge/claim, shared productive gates and connected owner consumer",
+    "Aggregate protected-storage admission/retention, independent exact-head review, normal rollout, live CLI/Discord acceptance and soaks"
+  ],
+  "preserved_unpublished_work": "/tmp/autoship-productive-gate-preserved-20261106.patch"
+}

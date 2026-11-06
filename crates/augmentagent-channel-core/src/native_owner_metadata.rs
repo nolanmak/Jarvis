@@ -69,6 +69,7 @@ fn append_receipt(row:&Value,bytes:&[u8],prefix:&Sha256)->Result<AppendReceipt> 
 fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,binding:&TransferBinding,ledger:&Ledger<'_>)->Result<(Vec<Value>,BTreeSet<RuntimeKey>,Vec<Value>,Vec<Value>,Vec<Value>)> {
     let mut prefix=Sha256::new();let mut launches=BTreeMap::new();let mut resources=Vec::new();let mut bound=BTreeSet::new();
     let mut preparation_bindings=BTreeMap::new();let mut preparations=Vec::new();let mut readonly_transports=BTreeMap::new();
+    let mut startups=BTreeMap::new();let mut model_resources=BTreeSet::new();let mut session_launches=BTreeSet::new();let mut resource_identities=BTreeMap::new();
     let mut resource_receipts=BTreeMap::new();let mut owner_inputs=BTreeMap::new();let mut attempts=BTreeSet::new();let mut inputs=Vec::new();
     for row in rows {
         let bytes=serde_json::to_vec(row)?;prefix.update(&bytes);prefix.update(b"\n");
@@ -92,9 +93,29 @@ fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,bindin
                 ensure!(original.intent==intent && original.controller_receipt==receipt
                     && !resource_receipts.contains_key(&intent.intent_id),"native metadata resource launch changed or duplicated");
                 resource_receipts.insert(intent.intent_id.clone(),append_receipt(row,&bytes,&prefix)?);
+                resource_identities.insert(intent.intent_id.clone(),digest(&row["resource_identity"])?);
                 resources.push(crate::run_resources::verify_quiescent(&row["resource_identity"])?);
                 ensure!(resources.len()<=4096,R::HistoryCapacity);
                 bound.insert((intent.runtime_relative_path,intent.launch_sha256,intent.creation_receipt_sha256));
+            }
+            Some("native_startup_inputs_observed")=>{
+                let mut raw=row.clone();raw.as_object_mut().context("native startup record is not object")?.remove("audit_chain");
+                let record:super::StartupInputRecord=serde_json::from_value(raw.clone())?;
+                let original=launches.get(&record.launch_intent.intent_id).context("native startup observation has no original launch")?;
+                let resource=resource_receipts.get(&record.launch_intent.intent_id).context("native startup observation has no original resource")?;
+                record.validate(original,resource)?;
+                ensure!(!owner_inputs.contains_key(&record.launch_intent.intent_id) && !attempts.contains(&record.launch_intent.intent_id)
+                    && !session_launches.contains(&record.launch_intent.intent_id)
+                    && !model_resources.contains(resource_identities.get(&record.launch_intent.intent_id).context("native startup resource identity missing")?),
+                    "native startup observation follows model/input/session exposure");
+                ensure!(startups.insert(record.launch_intent.intent_id,json!({"record":raw,"receipt":append_receipt(row,&bytes,&prefix)?})).is_none(),
+                    "native startup observation duplicated");
+                ensure!(startups.len()<=4096,R::HistoryCapacity);
+            }
+            Some("model_call_admitted") if row["resource_identity"].is_object()=>{model_resources.insert(digest(&row["resource_identity"])?);ensure!(model_resources.len()<=4096,R::HistoryCapacity);}
+            Some("native_session_observed")=>{
+                let intent:super::PreparedLaunchIntent=serde_json::from_value(row["launch_intent"].clone())?;
+                session_launches.insert(intent.intent_id);ensure!(session_launches.len()<=4096,R::HistoryCapacity);
             }
             Some("native_owner_preparation_binding")=>{
                 let mut raw=row.clone();raw.as_object_mut().context("native preparation record is not object")?.remove("audit_chain");
@@ -160,7 +181,7 @@ fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,bindin
         let key=(authority.owner.lease_generation,authority.audit_path.clone());
         if !closures.contains_key(&key) {closures.insert(key.clone(),ledger.input_writer_closure(&authority)?);}
         writers.push(json!({"launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"closure":closures[&key],
-            "resource_receipt":resource_receipts.get(&prepared.intent.intent_id),"release_attempted":attempts.contains(&prepared.intent.intent_id),
+            "resource_receipt":resource_receipts.get(&prepared.intent.intent_id),"startup_inputs":startups.get(&prepared.intent.intent_id),"release_attempted":attempts.contains(&prepared.intent.intent_id),
             "preparation_context":preparation_bindings.get(&prepared.intent.intent_id),"readonly_transport":readonly_transports.get(&prepared.intent.intent_id),"owner_input":owner_inputs.get(&prepared.intent.intent_id)}));
     }
     Ok((resources,bound,inputs,preparations,writers))
