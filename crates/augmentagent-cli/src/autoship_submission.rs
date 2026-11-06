@@ -116,9 +116,15 @@ const DUE_COMMAND_SQL: &str = "SELECT j.workflow FROM command_job j
 
 fn due_command_sql(conn:&Connection)->Result<String> {
     let controls:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_control')",[],|r|r.get(0))?;
-    Ok(if controls {DUE_COMMAND_SQL.replace("WHERE j.repository=?1",
-        "WHERE NOT EXISTS(SELECT 1 FROM workflow_owner_control c WHERE c.workflow=j.workflow AND c.paused=1) AND j.repository=?1")}
-        else {DUE_COMMAND_SQL.into()})
+    let inbox:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_message')",[],|r|r.get(0))?;
+    let mut query=DUE_COMMAND_SQL.to_string();
+    if controls {query=query.replace("WHERE j.repository=?1",
+        "WHERE NOT EXISTS(SELECT 1 FROM workflow_owner_control c WHERE c.workflow=j.workflow AND c.paused=1) AND j.repository=?1");}
+    // This is the ordinary worker queue. Owner input has its own exclusive
+    // admission; do not repeatedly select a job ordinary execution cannot run.
+    if inbox {query=query.replace("j.repository=?1",
+        "j.repository=?1 AND NOT EXISTS(SELECT 1 FROM workflow_owner_message m WHERE m.workflow=j.workflow AND m.state='pending')");}
+    Ok(query)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

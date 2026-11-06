@@ -23,7 +23,7 @@ impl WorkflowStore {
         let job:(String,String)=tx.query_row("SELECT repository,target FROM command_job WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?)))?;
         ensure!(job==(request.repository,serde_json::to_string(&request.target)?),"owner candidate command changed");
         let control=super::owner_control::read(&tx,workflow)?;
-        if !control.is_some_and(|c|c.paused) {tx.commit()?;return Ok(false);}
+        if !control.is_some_and(|c|!c.paused) {tx.commit()?;return Ok(false);}
         if super::owner_inbox::next_pending(&tx,workflow)?.is_none() {tx.commit()?;return Ok(false);}
         let prior:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1) OR EXISTS(SELECT 1 FROM workflow_native_registration_origin WHERE workflow=?1) OR EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1) OR EXISTS(SELECT 1 FROM workflow_native_session_owner WHERE workflow=?1) OR EXISTS(SELECT 1 FROM workflow_builder_conversation WHERE workflow=?1) OR EXISTS(SELECT 1 FROM workflow_native_launch WHERE workflow=?1) OR EXISTS(SELECT 1 FROM workflow_native_observation WHERE workflow=?1) OR EXISTS(SELECT 1 FROM workflow_native_handoff_pending WHERE workflow=?1) OR EXISTS(SELECT 1 FROM workflow_native_handoff_snapshot WHERE workflow=?1) OR EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1) OR EXISTS(SELECT 1 FROM resource_charge WHERE workflow=?1) OR EXISTS(SELECT 1 FROM operation WHERE workflow=?1)",[workflow],|r|r.get(0))?;
         ensure!(!prior,"owner candidate has prior execution history; reconciliation required");
@@ -58,7 +58,7 @@ impl WorkflowStore {
             if unbound {return Ok(None);}
         }
         let Some(control)=super::owner_control::read(&tx,workflow)? else {return Ok(None);};
-        if !control.paused {return Ok(None);}
+        if control.paused {return Ok(None);}
         let Some(message)=super::owner_inbox::next_pending(&tx,workflow)? else {return Ok(None);};
         let request_id=message.request_id;let body=message.body;
         let generation=generation.checked_add(1).context("owner lease generation overflow")?;
@@ -72,6 +72,12 @@ impl WorkflowStore {
         event(&tx,workflow,generation,"owner_turn_claimed",&serde_json::json!({"request_id":request_id,"pause_revision":control.revision,"binding":checkpoint.binding}).to_string(),now)?;
         tx.commit()?;
         Ok(Some(OwnerTurn {lease:Lease {workflow:workflow.into(),owner:owner.into(),generation},request_id,body,pause_revision:control.revision,binding:checkpoint.binding}))
+    }
+    /// Historical role inspection for run reporting only; grants no dispatch or
+    /// recovery capability, including after completion, expiry or owner fencing.
+    pub(crate) fn lease_has_owner_turn(&self,lease:&Lease)->Result<bool> {
+        validate_history(&self.conn,&lease.workflow)?;
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1 AND owner=?2 AND lease_generation=?3)",params![lease.workflow,lease.owner,lease.generation],|r|r.get(0))?)
     }
     pub fn owner_turn_for_lease(&mut self,lease:&Lease,now:i64)->Result<OwnerTurn> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -96,7 +102,7 @@ pub(super) fn validate_turn(tx:&Transaction<'_>,turn:&OwnerTurn,now:i64)->Result
         let matches:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1 AND request_id=?2 AND owner=?3 AND lease_generation=?4 AND pause_revision=?5 AND binding=?6 AND state='claimed' AND EXISTS(SELECT 1 FROM workflow_owner_message m WHERE m.request_id=?2 AND m.workflow=?1 AND m.body=?7 AND m.state='pending'))",params![turn.lease.workflow,turn.request_id,turn.lease.owner,turn.lease.generation,turn.pause_revision,serde_json::to_string(&turn.binding)?,turn.body],|r|r.get(0))?;
         ensure!(matches,"owner turn identity changed");
         let control=super::owner_control::read(tx,&turn.lease.workflow)?.context("owner control missing")?;
-        ensure!(control.paused && control.revision==turn.pause_revision,"owner intent changed during turn");
+        ensure!(!control.paused && control.revision==turn.pause_revision,"owner intent changed during turn");
         let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&turn.lease.workflow],|r|r.get(0))?;
         ensure!(!matches!(serde_json::from_str::<Checkpoint>(&raw)?.stage,Stage::Merged|Stage::Retired|Stage::Held),"owner turn checkpoint blocked");
     Ok(())
@@ -105,11 +111,12 @@ pub(super) fn validate_turn(tx:&Transaction<'_>,turn:&OwnerTurn,now:i64)->Result
 // retain the ordinary owner-pause checks even for an active owner turn.
 pub(super) fn require_native_dispatch(tx:&Transaction<'_>,lease:&Lease,now:i64)->Result<()> {
     validate_history(tx,&lease.workflow)?;
-    let turn:Option<(String,i64,String)>=tx.query_row("SELECT request_id,pause_revision,binding FROM workflow_owner_turn WHERE workflow=?1 AND owner=?2 AND lease_generation=?3 AND state='claimed'",params![lease.workflow,lease.owner,lease.generation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    let Some((request,revision,raw))=turn else {return super::owner_control::require_dispatch(tx,&lease.workflow);};
+    let turn:Option<(String,String,i64,String)>=tx.query_row("SELECT state,request_id,pause_revision,binding FROM workflow_owner_turn WHERE workflow=?1 AND owner=?2 AND lease_generation=?3",params![lease.workflow,lease.owner,lease.generation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    let Some((state,request,revision,raw))=turn else {return super::owner_control::require_dispatch(tx,&lease.workflow);};
+    ensure!(state=="claimed","owner turn no longer active");
     let binding:Binding=serde_json::from_str(&raw)?;require_binding(tx,lease,&binding,now)?;
     let control=super::owner_control::read(tx,&lease.workflow)?.context("owner control missing")?;
-    ensure!(control.paused && control.revision==revision,"owner intent changed during turn");
+    ensure!(!control.paused && control.revision==revision,"owner intent changed during turn");
     super::owner_inbox::require_pending(tx,&lease.workflow,&request)?;
     let checkpoint:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;
     ensure!(!matches!(serde_json::from_str::<Checkpoint>(&checkpoint)?.stage,Stage::Held|Stage::Merged|Stage::Retired),"owner turn checkpoint blocked");
@@ -125,6 +132,43 @@ mod tests {
         let id=store.submit_discord_authorized(&origin,&request,&"a".repeat(64),1).unwrap().admission.workflow;
         store.register(&id,"candidate",Binding {head:"head".into(),contract:"scope".into(),evidence_hash:"evidence".into()},2).unwrap();
         let origin=discord_ingress::DiscordOrigin {message:45,..origin};store.enqueue_owner_message(&origin,&id,"Fix the failing test",None,3).unwrap();(store,id)
+    }
+    #[test]
+    fn explicit_pause_blocks_new_owner_turns_while_pending_input_stays_queued() {
+        let dir=tempfile::tempdir().unwrap();let (mut store,id)=setup(&dir.path().join("state.db"));
+        let revision=store.owner_control(&id).unwrap().unwrap().revision;
+        let paused=store.set_owner_pause(&id,"owner",revision,true,4).unwrap();
+        let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
+        assert!(store.claim_owner_turn(&id,"must-not-code-through-pause",5,100).unwrap().is_none(),"explicit pause was treated as permission to start owner coding");
+        assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.events(&id).unwrap(),events);
+        assert_eq!(store.owner_control(&id).unwrap(),Some(paused));assert_eq!(store.pending_owner_messages(&id).unwrap(),1);
+    }
+    #[test]
+    fn explicit_resume_keeps_the_input_barrier_but_allows_its_owner_turn() {
+        let dir=tempfile::tempdir().unwrap();let (mut store,id)=setup(&dir.path().join("state.db"));
+        let revision=store.owner_control(&id).unwrap().unwrap().revision;
+        let paused=store.set_owner_pause(&id,"owner",revision,true,4).unwrap();
+        let resumed=store.set_owner_pause(&id,"owner",paused.revision,false,5).expect("pending input must not prevent clearing an explicit pause");
+        assert!(!resumed.paused);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);
+        assert!(store.require_owner_dispatch(&id).is_err(),"resume bypassed unapplied input");
+        assert!(store.claim_productive(&id,"ordinary-builder",6,100).unwrap().is_none());
+        let turn=store.claim_owner_turn(&id,"owner-consumer",6,100).unwrap().unwrap();
+        store.validate_owner_turn(&turn,7).unwrap();store.validate_dispatch(&turn.lease,&turn.binding,7).unwrap();
+        assert!(store.begin_operation(&turn.lease,OperationKind::Push,&turn.binding,7).is_err());
+        assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.merge_allowance(7,5).unwrap().confirmed,0);
+    }
+    #[test]
+    fn owner_progress_resume_does_not_describe_a_fenced_turn_as_processing() {
+        let dir=tempfile::tempdir().unwrap();let (mut store,id)=setup(&dir.path().join("state.db"));
+        let turn=store.claim_owner_turn(&id,"consumer",4,100).unwrap().unwrap();
+        let paused=store.set_owner_pause(&id,"owner",turn.pause_revision,true,5).unwrap();
+        store.set_owner_pause(&id,"owner",paused.revision,false,6).unwrap();
+        assert!(store.validate_dispatch(&turn.lease,&turn.binding,7).is_err());
+        let progress=store.progress_events(&id).unwrap().pop().unwrap();
+        assert_eq!(progress.reason,"owner-followup-pending","fenced owner turn was reported as processing");
+        assert_eq!(progress.next_action,"process_owner_input");
+        assert!(store.claim_owner_turn(&id,"no-replay",200,100).unwrap().is_none());
+        assert_eq!(store.pending_owner_messages(&id).unwrap(),1);
     }
     #[test]
     fn owner_turn_refuses_changed_or_unbound_authenticated_input_before_claiming() {
@@ -148,7 +192,7 @@ mod tests {
             drop(db);
             assert!(store.claim_owner_turn(&id,"consumer",4,100).is_err(),"{corruption}: damaged owner input was claimed");
             assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.events(&id).unwrap(),events);
-            assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(store.owner_control(&id).unwrap().unwrap().paused);
+            assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(!store.owner_control(&id).unwrap().unwrap().paused);
         }
     }
     #[test]
@@ -183,7 +227,7 @@ mod tests {
             let before=store.owner_control(&id).unwrap().unwrap();
             let origin=discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:46};
             assert!(store.enqueue_owner_message(&origin,&id,"Then fix the next test",None,6).unwrap().accepted);
-            let after=store.owner_control(&id).unwrap().unwrap();assert!(after.paused);assert_eq!(store.pending_owner_messages(&id).unwrap(),2);
+            let after=store.owner_control(&id).unwrap().unwrap();assert_eq!(after.paused,disposition=="explicitly-fenced");assert_eq!(store.pending_owner_messages(&id).unwrap(),2);
             if disposition=="active" {
                 assert_eq!(after,before,"queued follow-up revoked the active coding turn");
                 store.validate_owner_turn(&turn,7).unwrap();store.validate_dispatch(&turn.lease,&turn.binding,7).unwrap();

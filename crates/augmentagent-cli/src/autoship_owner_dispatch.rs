@@ -484,7 +484,7 @@ impl WorkflowStore {
             evidence: Vec::new(),
             next: NextAction {
                 reason: "owner-input-applied".into(),
-                action: "await_owner_resume".into(),
+                action: if super::owner_inbox::pending(&tx,&record.workflow)?>0 {"process_owner_input"}else{"verify_owner_changes"}.into(),
                 eligible_at_ms: 0,
             },
         };
@@ -690,7 +690,7 @@ mod tests {
             1
         );
         assert!(
-            store
+            !store
                 .owner_control(&turn.lease.workflow)
                 .unwrap()
                 .unwrap()

@@ -843,6 +843,7 @@ impl WorkflowStore {
         }
         if purpose != ClaimPurpose::General {
             if owner_control::read(&tx,workflow)?.is_some_and(|c|c.paused) {return Ok(None);}
+            if owner_inbox::pending(&tx,workflow)?>0 {return Ok(None);}
             let policy: Option<String> = tx.query_row("SELECT until_milestone FROM command_job WHERE workflow=?1", [workflow], |r| r.get(0)).optional()?;
             if let Some(policy) = policy {
                 let until: submission::Milestone = serde_json::from_str(&policy)?;

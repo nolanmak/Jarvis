@@ -248,7 +248,7 @@ mod tests {
                 }
             }
             assert_eq!(store.pending_owner_messages(&turn.lease.workflow).unwrap(),1);
-            assert!(store.owner_control(&turn.lease.workflow).unwrap().unwrap().paused);
+            assert_eq!(store.owner_control(&turn.lease.workflow).unwrap().unwrap().paused,fault=="pause");
             assert_eq!(store.merge_allowance(8,5).unwrap().confirmed,0);
         }
     }
@@ -306,7 +306,7 @@ mod tests {
             assert!(store.charge(&revised.lease,"must-not-spend",ResourceCharge {model_calls:1,..Default::default()},6).is_err(),"{corruption}");
             assert!(store.activate_private_owner_acceptance(None,&turn,Some(&previous),&next,&receipts,&files,&preparation,&binding,6).is_err(),"{corruption}");
             assert_eq!(store.snapshot(&turn.lease.workflow).unwrap().unwrap(),before);assert_eq!(store.events(&turn.lease.workflow).unwrap(),events);
-            assert_eq!(store.pending_owner_messages(&turn.lease.workflow).unwrap(),1);assert!(store.owner_control(&turn.lease.workflow).unwrap().unwrap().paused);
+            assert_eq!(store.pending_owner_messages(&turn.lease.workflow).unwrap(),1);assert!(!store.owner_control(&turn.lease.workflow).unwrap().unwrap().paused);
         }
     }
     #[test]
@@ -404,7 +404,7 @@ mod tests {
             assert!(store.validate_dispatch(&revised.lease,&binding,7).is_err(),"{corruption}: native dispatch accepted damaged activation history");
             assert!(store.charge(&revised.lease,"must-not-admit",ResourceCharge {model_calls:1,..Default::default()},7).is_err(),"{corruption}: charged a model admission");
             assert!(store.activate_owner_revision(&turn,&previous,&next,&binding,dir.path(),7).is_err(),"{corruption}: replay accepted damaged activation history");
-            assert_eq!(store.pending_owner_messages(&turn.lease.workflow).unwrap(),1);assert!(store.owner_control(&turn.lease.workflow).unwrap().unwrap().paused);
+            assert_eq!(store.pending_owner_messages(&turn.lease.workflow).unwrap(),1);assert!(!store.owner_control(&turn.lease.workflow).unwrap().unwrap().paused);
             assert_eq!(store.snapshot(&turn.lease.workflow).unwrap().unwrap(),before);assert_eq!(store.events(&turn.lease.workflow).unwrap(),events);
         }
     }

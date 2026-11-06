@@ -76,7 +76,9 @@ impl WorkflowStore {
         let reason=refusal.unwrap_or_else(||match prepared.action {Action::Pause=>"owner-pause-requested",Action::Resume=>"owner-resume-accepted",Action::Use=>"workflow-selected",Action::Status=>"status-observed"}.into());
         let content=if !accepted {format!("Autoship {}: {reason}. No control change was applied.",prepared.workflow)} else {match prepared.action {
             Action::Pause=>format!("Autoship pause recorded for {}. Live-worker enforcement and teardown are unverified.",prepared.workflow),
-            Action::Resume=>format!("Autoship resume recorded for {}. Execution and completion are not confirmed.",prepared.workflow),
+            Action::Resume=>if super::owner_inbox::pending(&tx,&prepared.workflow)?>0 {
+                format!("Explicit autoship pause cleared for {}; queued owner input still blocks ordinary automation. Coding and completion are not confirmed.",prepared.workflow)
+            }else{format!("Autoship resume recorded for {}. Execution and completion are not confirmed.",prepared.workflow)},
             Action::Use=>format!("Autoship selected: {}. PR coding follow-ups are not connected yet.",prepared.workflow),
             Action::Status=>prepared.status.clone().context("control status observation missing")?,
         }};

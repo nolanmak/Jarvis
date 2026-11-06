@@ -1343,8 +1343,8 @@ pub(crate) mod tests {
         assert!(matches!(super::super::native_prepare::run(&store,&lease,&f.binding,&sources,&destination,&now).unwrap(),super::super::native_prepare::NativePreparationRun::Registered {..}));assert_eq!(store.lock().unwrap().events(&lease.workflow).unwrap(),events);
     }
     #[test]
-    fn owner_turn_preparation_transfers_retained_runtime_under_pause_without_consuming_input() {
-        if child("owner_turn_preparation_transfers_retained_runtime_under_pause_without_consuming_input") {return;}
+    fn owner_turn_preparation_transfers_retained_runtime_under_input_barrier_without_consuming_input() {
+        if child("owner_turn_preparation_transfers_retained_runtime_under_input_barrier_without_consuming_input") {return;}
         use std::sync::{Arc,Mutex};
         let mut f=Fixture::with_owner_binding(true);let completed=f.complete();f.record(&completed).unwrap();file(&f._root.path().join("native/codex/session-fixture/lock"),b"");
         f.audit.require_run_resources().unwrap();f.audit.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":f.lease.workflow,"generation":f.lease.generation})).unwrap();
@@ -1353,7 +1353,7 @@ pub(crate) mod tests {
         let turn=f.store.claim_owner_turn_for_setup(&f.lease.workflow,"guard-constructor",now(),60_000).unwrap().unwrap();let original=f.store.native_owner_binding(&f.lease.workflow,f.lease.generation).unwrap().unwrap();let base=f._root.path().canonicalize().unwrap();let destination=Arc::new(AuditLogger::protected(base.join("logs/owner-destination.jsonl"),base.join("anchors/owner-destination.json"),&[]).unwrap());destination.set_native_runtime_owner(RuntimeOwner {workflow_id:turn.lease.workflow.clone(),lease_generation:turn.lease.generation}).unwrap();destination.set_native_store_binding(original.clone()).unwrap();destination.require_run_resources().unwrap();destination.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":turn.lease.workflow,"generation":turn.lease.generation})).unwrap();
         let before=f.store.snapshot(&turn.lease.workflow).unwrap().unwrap();let allowance=f.store.merge_allowance(now(),5).unwrap();let bytes=std::fs::read(base.join("native/codex/session-fixture/owned.json")).unwrap();let store=Arc::new(Mutex::new(WorkflowStore::open(&f.path).unwrap()));
         let result=super::super::native_prepare::run(&store,&turn.lease,&turn.binding,&[Arc::new(f.audit.clone())],&destination,&now).unwrap();assert!(matches!(result,super::super::native_prepare::NativePreparationRun::Pending {settlement:Some(ref settled),settlement_failed:false,..} if settled.current_context),"{result:?}");
-        let mut locked=store.lock().unwrap();assert_eq!(locked.snapshot(&turn.lease.workflow).unwrap().unwrap(),before);assert_eq!(locked.merge_allowance(now(),5).unwrap(),allowance);assert_eq!(locked.pending_owner_messages(&turn.lease.workflow).unwrap(),1);assert!(locked.owner_control(&turn.lease.workflow).unwrap().unwrap().paused);assert_eq!(locked.native_owner_binding(&turn.lease.workflow,turn.lease.generation).unwrap(),Some(original));assert!(locked.begin_operation(&turn.lease,OperationKind::MergePr,&turn.binding,now()).is_err());assert_eq!(std::fs::read(base.join("native/codex/session-fixture/owned.json")).unwrap(),bytes);
+        let mut locked=store.lock().unwrap();assert_eq!(locked.snapshot(&turn.lease.workflow).unwrap().unwrap(),before);assert_eq!(locked.merge_allowance(now(),5).unwrap(),allowance);assert_eq!(locked.pending_owner_messages(&turn.lease.workflow).unwrap(),1);assert!(!locked.owner_control(&turn.lease.workflow).unwrap().unwrap().paused);assert_eq!(locked.native_owner_binding(&turn.lease.workflow,turn.lease.generation).unwrap(),Some(original));assert!(locked.begin_operation(&turn.lease,OperationKind::MergePr,&turn.binding,now()).is_err());assert_eq!(std::fs::read(base.join("native/codex/session-fixture/owned.json")).unwrap(),bytes);
     }
     #[test]
     fn native_joined_preparation_rollback_schedules_free_retry_without_native_claims() {
@@ -2966,7 +2966,8 @@ pub(crate) mod tests {
             &mut |proof|store.lock().unwrap().complete_owner_body(&dispatch,proof,&next,response,now())).unwrap();
         let mut store=store.into_inner().unwrap();
         assert_eq!(store.pending_owner_messages(&f.lease.workflow).unwrap(),0);
-        assert!(store.owner_control(&f.lease.workflow).unwrap().unwrap().paused);
+        assert!(!store.owner_control(&f.lease.workflow).unwrap().unwrap().paused);
+        store.require_owner_dispatch(&f.lease.workflow).unwrap();
         assert!(store.validate_dispatch(&f.lease,&next,now()).is_err(),"old native callbacks survived owner completion");
         let after=store.snapshot(&f.lease.workflow).unwrap().unwrap();assert_eq!(after.checkpoint.binding,next);
         assert_eq!(after.model_calls,old.model_calls);assert_eq!(after.attempts,old.attempts);
@@ -2988,12 +2989,40 @@ pub(crate) mod tests {
             owner_dispatch::validate_history(&store.conn,&f.lease.workflow).unwrap();
         }
         store.release(&f.lease,now()).unwrap();
-        let revision=store.owner_control(&f.lease.workflow).unwrap().unwrap().revision;
-        store.set_owner_pause(&f.lease.workflow,"discord:22",revision,false,now()).unwrap();
+        // Proven completion released only its derived input barrier; no owner
+        // resume command or explicit-hold rewrite is needed for the next input.
         store.enqueue_owner_message(&discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:46},&f.lease.workflow,"Second private owner instruction",None,now()).unwrap();
         assert!(store.claim_owner_turn_for_setup(&f.lease.workflow,"next-consumer",now(),60_000).unwrap().is_some());
         assert_eq!(store.pending_owner_messages(&f.lease.workflow).unwrap(),1);
         assert_eq!(store.conn.query_row("SELECT count(*) FROM workflow_owner_body_result WHERE state='queued'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+    #[test]
+    fn owner_body_completion_preserves_followups_arriving_after_its_claim() {
+        if child("owner_body_completion_preserves_followups_arriving_after_its_claim") {return;}
+        let mut f=Fixture::with_owner_mode(true,true);
+        file(&f._root.path().join("native/codex/session-fixture/lock"),b"");
+        let dispatch=f.owner_dispatch.take().unwrap();
+        let original_control=f.store.owner_control(&f.lease.workflow).unwrap();
+        let followup=f.store.enqueue_owner_message(&discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:46},&f.lease.workflow,"Later private instruction the original body has not seen",None,now()).unwrap();
+        assert!(followup.accepted);assert_eq!(f.store.owner_control(&f.lease.workflow).unwrap(),original_control);
+        let fact=f.complete();f.record(&fact).unwrap();
+        let observed=augmentagent_channel_core::native_session::ObservedConversation {provider:augmentagent_channel_core::ProviderKind::Codex,id:"actual-session".into(),uncertain:false};
+        let (prepared,reference)=f.store.owner_body_completion_reference(&dispatch,&observed,now()).unwrap();
+        let store=std::sync::Mutex::new(f.store);
+        ownership::with_current_native_completion(&f.audit,&prepared,&reference,
+            &||store.lock().unwrap().validate_owner_body_dispatch(&dispatch,now()),
+            &mut |proof|store.lock().unwrap().complete_owner_body(&dispatch,proof,&f.binding,"Private first reply",now())).unwrap();
+        let mut store=store.into_inner().unwrap();
+        assert_eq!(store.pending_owner_messages(&f.lease.workflow).unwrap(),1);
+        assert_eq!(super::owner_inbox::message_evidence(&store.conn,&f.lease.workflow,dispatch.request_id()).unwrap().state,"applied");
+        assert_eq!(super::owner_inbox::message_evidence(&store.conn,&f.lease.workflow,&followup.request_id).unwrap().state,"pending");
+        assert_eq!(store.snapshot(&f.lease.workflow).unwrap().unwrap().checkpoint.next.action,"process_owner_input");
+        assert!(store.require_owner_dispatch(&f.lease.workflow).is_err());
+        assert!(store.validate_dispatch(&f.lease,&f.binding,now()).is_err());
+        store.release(&f.lease,now()).unwrap();
+        assert!(store.claim_productive(&f.lease.workflow,"ordinary-must-wait",now(),60_000).unwrap().is_none());
+        let next=store.claim_owner_turn_for_setup(&f.lease.workflow,"next-consumer",now(),60_000).unwrap().unwrap();
+        assert_eq!(next.request_id,followup.request_id);assert_eq!(store.merge_allowance(now(),5).unwrap().confirmed,0);
     }
     #[test]
     fn owner_body_completion_write_failure_preserves_pending_input_and_can_reconcile() {

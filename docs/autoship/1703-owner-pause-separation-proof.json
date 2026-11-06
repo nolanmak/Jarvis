@@ -1,0 +1,175 @@
+{
+  "schema_version": 1,
+  "kind": "explicit-owner-pause-and-pending-input-separation-component",
+  "source_parent_commit": "1c84f67d42bc68dc11028b606073fb774b5ea424",
+  "source_inventory_is_post_run_inventory": true,
+  "source_generation_authority": false,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_commands.rs",
+      "sha256": "6981cf260a930983dca74647999d9b157461a5b1274acc403f39f291b9198b7b"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_conversations.rs",
+      "sha256": "4f52749a1b7e916d27ff81cd68def776203c5ac9fa1041f8c35c0be4fcc33b54"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_controls.rs",
+      "sha256": "7c7bb998ca8392b7c5e4fec757d767bc14f917eb5d5a6ca2bd55e7bfa77555d3"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+      "sha256": "b133f1ddbeff941d43fa063ee40b586179b3667ff38fbc1db1c87d5fcec00924"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_control.rs",
+      "sha256": "dd25d63fecb7b926ff017db44ec1d9f3bf7d3e33140fee810bed2a15f92cdddc"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_dispatch.rs",
+      "sha256": "286b1a1a4300d281c395a7ad94ba003b3844e6ebc2e282e3076c93f3379beb62"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_inbox.rs",
+      "sha256": "7ef0a9d0cc39e1e27e6eea234319b1324e0235b6e8cc6a2813253ec7b3f3709f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_revision.rs",
+      "sha256": "316f0d2df64daed64f03acbcda7da3bf30118e85f0fa8a60931ec591a564436a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+      "sha256": "f087d4f54648615b1c28218b8d5b43a9e3735d8e1f8772d33e29aa7b8f54a8ec"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_progress.rs",
+      "sha256": "be1d3f7c7c5f84c85773c23c8afa0b99bd477bd16fff87de9f65cbcf3a1a6e2c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_submission.rs",
+      "sha256": "5fa7d7693402af624bc659be50260d06f9d7c89d03f98aa9366418c0acbbb498"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "66b0d1c6d52c07630f8872d3e8d3a7640911a8d265ba685b059a9a0d9748e23b"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "9e8fd1012484b35468a2dfce79fe6365a00531b4d9e5ce6bf179d9799a6f98a9"
+    },
+    {
+      "path": "docs/autoship/owner-acceptance-publication.md",
+      "sha256": "3db91011181974f731afeef4f11a46ea3093b4a1fd8c43e3fd17ba8f1cf868e4"
+    }
+  ],
+  "validation": {
+    "behavioral_red": {
+      "log": "/tmp/autoship-owner-pause-separation-behavior-red.log",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "passed": 0,
+      "failed": 2,
+      "observed": [
+        "explicit pause permitted starting an owner coding turn",
+        "explicit resume refused pending owner input"
+      ]
+    },
+    "queue_red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent pending_owner_input_skips_ordinary_queue",
+      "log": "/tmp/autoship-owner-input-queue-red.log",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "observed": "pending input selected ahead of a runnable ordinary peer"
+    },
+    "progress_red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent owner_progress_resume",
+      "log": "/tmp/autoship-owner-pause-progress-red.log",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "observed": "fenced turn reported owner-input-processing after explicit resume"
+    },
+    "accounting_red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent owner_input_defers_an_interrupted",
+      "log": "/tmp/autoship-owner-input-accounting-red.log",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "observed": "pending owner input lost its ordinary-run deferral"
+    },
+    "final_full_cli": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-pause-separation-final-full-cli.log",
+      "log_sha256": "6b595b7ab923b965373e8b7177e28202cf71f6afb23d17c3f87155116788c40f",
+      "exit": 0,
+      "passed": 1924,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 276.68,
+      "native_guard_subprocess_modes": 68
+    },
+    "production_check": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-pause-separation-production-check.log",
+      "log_sha256": "1bf6ba18289cd3a9e1f4b85a23584dad59645ec7685a00a050815d2c40cfa69c",
+      "exit": 0
+    },
+    "superseded": {
+      "intermediate_full_cli": {
+        "log": "/tmp/autoship-owner-pause-separation-full-cli.log",
+        "passed": 1921,
+        "failed": 0,
+        "ignored": 34,
+        "seconds": 280.04,
+        "exit": 0
+      },
+      "intermediate_owner_suite": {
+        "log": "/tmp/autoship-owner-pause-separation-final-owner.log",
+        "passed": 171,
+        "failed": 0,
+        "ignored": 1,
+        "seconds": 59.59,
+        "exit": 0
+      },
+      "admission_only_red_deferrals": [
+        "/tmp/autoship-owner-pause-separation-red.log",
+        "/tmp/autoship-owner-pause-separation-red-retry.log"
+      ]
+    }
+  },
+  "coverage": [
+    "explicit pause blocks metadata and actual native guard setup without consuming input",
+    "explicit resume retains pending input and independent workflow holds",
+    "queued messages do not create explicit pause or emit false resume",
+    "ordinary productive/reconciliation claims and acceptance binding respect pending input",
+    "ordinary scheduler skips blocked input and serves a runnable peer",
+    "original borrowed native completion applies only its captured request and leaves later followups pending",
+    "completed owner lease cannot regain ordinary dispatch",
+    "fenced old owner turn is not projected as processing after resume",
+    "ordinary interrupted run preserves checkpoint, evidence and actual model charges and defers even after paid work",
+    "active owner turn does not mask provider/execution errors as an ordinary input deferral",
+    "no autonomous merge count manufactured"
+  ],
+  "audit": {
+    "pass_a_agent": "owner_pause_separation_spec_audit_20261106",
+    "new_findings": 2,
+    "resolved": [
+      "exact one-request ownership of a turn",
+      "immediate transaction ordering of enqueue/control/claim/completion"
+    ],
+    "pass_b_code_contract_alignment": true,
+    "acknowledged_P1_P2_blockers": true,
+    "final_seam_pass_c": false
+  },
+  "original_native_closure_proved_for_live_work": false,
+  "canonical_manifest_publication": false,
+  "process_loss_recovery": false,
+  "productive_owner_consumer_enabled": false,
+  "shipping_authority": false,
+  "production_restored": false,
+  "goal_complete": false,
+  "limits": [
+    "Native fixture controller/session/baseline evidence is controlled; no live provider, VM code execution or Discord coding is proved.",
+    "Existing paused=true rows remain held, including legacy ambiguous input pauses; no migration clears them.",
+    "Post-run inventories are not compiled-source freshness or locked native/storage proof.",
+    "P1/P2 publication and process-loss recovery, public projection/correction contexts, productive ingress, C/R cutover and all epic live acceptance exits remain required."
+  ]
+}

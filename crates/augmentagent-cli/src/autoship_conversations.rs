@@ -84,7 +84,7 @@ mod tests {
         assert_eq!(store.owner_turn_builder(&turn,8).unwrap(),Some(submission::Provider::Claude));
         assert!(store.owner_turn_conversations(&turn,ProviderKind::Codex,8).is_err(),"global default silently replaced the observed Claude conversation");
         let restored=store.owner_turn_conversations(&turn,ProviderKind::Claude,8).unwrap();assert_eq!(restored[0].id,"original-claude-session");
-        assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(store.owner_control(&id).unwrap().unwrap().paused);
+        assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(!store.owner_control(&id).unwrap().unwrap().paused);
     }
     #[test]
     fn owner_provider_resolution_preserves_fresh_pins_and_refuses_ambiguous_history() {
@@ -101,7 +101,7 @@ mod tests {
             else {assert!(store.owner_turn_builder(&turn,9).is_err());assert!(store.owner_turn_conversations(&turn,ProviderKind::Codex,9).is_err());assert!(store.owner_turn_conversations(&turn,ProviderKind::Claude,9).is_err());}
             store.record_builder_conversations(&turn.lease,&binding,&[ObservedConversation {provider:ProviderKind::Claude,id:"claude-session".into(),uncertain:true}],10).unwrap();
             assert!(store.owner_turn_builder(&turn,11).is_err(),"uncertain history was ignored during selection");
-            assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(store.owner_control(&id).unwrap().unwrap().paused);
+            assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(!store.owner_control(&id).unwrap().unwrap().paused);
         }
     }
     #[test]

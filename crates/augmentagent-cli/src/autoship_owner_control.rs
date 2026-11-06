@@ -5,6 +5,7 @@ use super::*;
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub struct OwnerControl {
     pub revision:i64,
+    /// Explicit owner hold. Pending messages are a separate derived barrier.
     pub paused:bool,
     pub principal:String,
     pub updated_at_ms:i64,
@@ -93,6 +94,15 @@ fn retry_checkpoint(tx:&Transaction<'_>,workflow:&str,now:i64,require_retired:bo
 }
 
 pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&str,expected_revision:i64,paused:bool,now:i64)->Result<OwnerControl> {
+    apply_control(tx,workflow,principal,expected_revision,paused,now,false)
+}
+/// Ingress advances the intent fence without changing the explicit hold or
+/// interpreting input as a request to retry/retire native execution.
+pub(super) fn record_input_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&str,expected_revision:i64,now:i64)->Result<OwnerControl> {
+    let paused=read(tx,workflow)?.is_some_and(|control|control.paused);
+    apply_control(tx,workflow,principal,expected_revision,paused,now,true)
+}
+fn apply_control(tx:&Transaction<'_>,workflow:&str,principal:&str,expected_revision:i64,paused:bool,now:i64,input:bool)->Result<OwnerControl> {
         ensure!(!principal.is_empty() && principal.len()<=256 && principal.bytes().all(|b|b.is_ascii_graphic()),"invalid owner principal");
         let checkpoint:Option<String>=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[workflow],|r|r.get(0)).optional()?;
         let queued:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM command_job WHERE workflow=?1)",[workflow],|r|r.get(0))?;
@@ -100,12 +110,12 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
         if let Some(checkpoint)=checkpoint {
             ensure!(!matches!(serde_json::from_str::<Checkpoint>(&checkpoint)?.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot change owner control");
         }
-        if !paused {ensure!(super::owner_inbox::pending(tx,workflow)?==0,"owner-followup-pending");}
+        let pending_input=super::owner_inbox::pending(tx,workflow)?>0;
         let prior=read(&tx,workflow)?;
         let revision=prior.as_ref().map_or(0,|c|c.revision);
         ensure!(revision==expected_revision,"owner-control-revision-conflict");
         let revision=revision.checked_add(1).context("owner control revision overflow")?;
-        let retry=if paused {None}else{retry_checkpoint(tx,workflow,now,false)?};
+        let retry=if paused || input || pending_input {None}else{retry_checkpoint(tx,workflow,now,false)?};
         let control=OwnerControl {revision,paused,principal:principal.into(),updated_at_ms:now};
         tx.execute("INSERT INTO workflow_owner_control VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workflow) DO UPDATE SET revision=excluded.revision,paused=excluded.paused,principal=excluded.principal,updated_at=excluded.updated_at",
             params![workflow,revision,paused,principal,now])?;
@@ -123,7 +133,7 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
             tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",params![workflow,serde_json::to_string(&checkpoint)?,now])?;
             event(tx,workflow,generation,"owner_execution_retry_requested",&serde_json::json!({"principal":principal,"owner_revision":revision,"cleanup_pending":pending}).to_string(),now)?;
         }
-        super::progress::project(tx,workflow,"owner_control_changed",now)?;
+        super::progress::project(tx,workflow,if input {"owner_input_queued"}else{"owner_control_changed"},now)?;
         Ok(control)
 }
 
@@ -278,10 +288,11 @@ mod tests {
         store.checkpoint(&lease,&checkpoint,4).unwrap();
         store.register_native_owner(&lease,dir.path().join("audit").to_str().unwrap(),5).unwrap();store.release(&lease,6).unwrap();
         store.enqueue_owner_message(&super::super::discord_ingress::DiscordOrigin {message:45,..origin},&id,"Owner requirement",None,7).unwrap();
-        assert_eq!(store.set_owner_pause(&id,"github:owner",1,false,8).unwrap_err().to_string(),"owner-followup-pending");
+        let resumed=store.set_owner_pause(&id,"github:owner",1,false,8).unwrap();
+        assert!(!resumed.paused);assert!(store.require_owner_dispatch(&id).is_err());
         let retirement:Option<String>=store.conn.query_row("SELECT retirement_reason FROM workflow_native_owner",[],|r|r.get(0)).unwrap();
-        assert_eq!(retirement,None,"refused resume must not start teardown behind pending owner input");
-        assert!(store.owner_control(&id).unwrap().unwrap().paused);
+        assert_eq!(retirement,None,"resume must not start teardown behind pending owner input");
+        assert!(!store.owner_control(&id).unwrap().unwrap().paused);
     }
 
     #[test]

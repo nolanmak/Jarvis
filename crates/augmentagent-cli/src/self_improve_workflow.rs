@@ -152,7 +152,7 @@ pub(super) struct WorkflowGuard {
 pub(super) struct CapacityAccounting {
     store: Arc<Mutex<WorkflowStore>>,
     audit: Arc<augmentagent_channel_core::AuditLogger>,
-    workflow: String,
+    lease: Lease,
     calls_before: u64,
     resumed: bool,
 }
@@ -160,9 +160,9 @@ impl CapacityAccounting {
     pub(super) fn settle_ci(&self, outcome: Result<RunReport>) -> Result<RunReport> {
         let Err(error) = &outcome else { return outcome; };
         let Some(deferred) = error.downcast_ref::<CiInfrastructureDeferred>() else { return outcome; };
-        anyhow::ensure!(deferred.workflow == self.workflow, "CI deferral belongs to another workflow");
+        anyhow::ensure!(deferred.workflow == self.lease.workflow, "CI deferral belongs to another workflow");
         let checkpoint = self.store.lock().map_err(|_|anyhow::anyhow!("retry accounting store poisoned"))?
-            .snapshot(&self.workflow)?.context("retry workflow missing")?.checkpoint;
+            .snapshot(&self.lease.workflow)?.context("retry workflow missing")?.checkpoint;
         anyhow::ensure!(checkpoint.next.reason == "verification_infrastructure_retry"
             && checkpoint.next.action == "retry_verification"
             && checkpoint.next.eligible_at_ms == deferred.eligible_at_ms,
@@ -172,7 +172,7 @@ impl CapacityAccounting {
 
     pub(super) fn retry_report(&self,message:String)->Result<RunReport> {
         let calls=self.store.lock().map_err(|_|anyhow::anyhow!("retry accounting store poisoned"))?
-            .snapshot(&self.workflow)?.context("retry workflow missing")?.model_calls;
+            .snapshot(&self.lease.workflow)?.context("retry workflow missing")?.model_calls;
         let paid=calls.checked_sub(self.calls_before).context("durable admissions decreased")?;
         // Actual spend and productive progress are independent. A retry must
         // remain deferred even if a builder ran earlier in the same attempt.
@@ -180,15 +180,17 @@ impl CapacityAccounting {
     }
     pub(super) fn report(&self) -> Result<Option<RunReport>> {
         let store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
-        let paused=store.owner_control(&self.workflow)?.is_some_and(|c|c.paused);
-        if !paused && !self.audit.resource_capacity_seen() { return Ok(None); }
-        let calls_after = store.snapshot(&self.workflow)?.context("capacity workflow missing")?.model_calls;
+        let paused=store.owner_control(&self.lease.workflow)?.is_some_and(|c|c.paused);
+        let input_waiting=store.pending_owner_messages(&self.lease.workflow)?>0 && !store.lease_has_owner_turn(&self.lease)?;
+        if !paused && !input_waiting && !self.audit.resource_capacity_seen() { return Ok(None); }
+        let calls_after = store.snapshot(&self.lease.workflow)?.context("capacity workflow missing")?.model_calls;
         let paid = calls_after.checked_sub(self.calls_before).context("durable model admissions decreased")?;
         Ok(Some(RunReport {
             message: if paused {format!("Autoship owner pause requested; candidate and evidence preserved ({paid} model admissions this run)")}
+                else if input_waiting {format!("Autoship awaiting owner input; candidate and evidence preserved ({paid} model admissions this run)")}
                 else {format!("Autoship awaiting declared run capacity; candidate and evidence preserved ({paid} model admissions this run)")},
             billed: paid > 0,
-            held: paid == 0,
+            held: input_waiting || paid == 0,
             resumed: self.resumed,
         }))
     }
@@ -946,7 +948,7 @@ impl WorkflowGuard {
         let calls_before = self.store.lock().map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?
             .snapshot(self.id())?.context("capacity workflow missing")?.model_calls;
         Ok(CapacityAccounting { store:self.store.clone(), audit:self.audit.clone(),
-            workflow:self.id().into(), calls_before, resumed })
+            lease:self.lease.clone(), calls_before, resumed })
     }
     pub(super) fn audit_logger(&self) -> Arc<augmentagent_channel_core::AuditLogger> {
         self.audit.clone()
@@ -1464,8 +1466,8 @@ impl WorkflowGuard {
         })?;
         dispatch.context("first builder reservation missing")
     }
-    /// The owner pause survives completion. Resume/review/CI/publication remain
-    /// separate normal service actions; a private model reply grants none.
+    /// Completion applies only proven input. Explicit holds remain independent;
+    /// normal verification/review/CI/publication still gate any shipping.
     pub(super) async fn finish_owner_body(mut self,result:OwnerBodyResult)->Result<()> {
         self.audit_health().await?;
         let binding=git_binding(&self.worktree,&self.contract,&self.environment,&[]).await?;
@@ -1619,9 +1621,8 @@ impl WorkflowGuard {
         prepared: &acceptance::PreparedAcceptance,
     ) -> Result<()> {
         self.validate_before_side_effect()?;
-        anyhow::ensure!(!self.store.lock().map_err(|_|anyhow::anyhow!("acceptance store poisoned"))?
-            .owner_control(self.id())?.is_some_and(|control|control.paused),
-            "owner acceptance requires a guarded contract transition");
+        self.store.lock().map_err(|_|anyhow::anyhow!("acceptance store poisoned"))?
+            .require_owner_dispatch(self.id()).context("owner acceptance requires a guarded contract transition")?;
         self.contract = format!(
             "registered:{}",
             prepared.baseline.registration.contract_hash()
@@ -2542,7 +2543,10 @@ mod tests {
         let binding=git_binding(dir.path(),"C1","rust-a",&[]).await.unwrap();store.register(&id,"candidate",binding,now).unwrap();
         store.enqueue_owner_message(&durable::discord_ingress::DiscordOrigin {message:45,..origin},&id,"Fix the test",None,now).unwrap();drop(store);
         let guard=WorkflowGuard::acquire_mode_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:None,pr:Some(42),branch:"candidate",contract:"C1",environment:"rust-a"},millis(),true).await.unwrap().unwrap();
+        let accounting=guard.capacity_accounting(false).unwrap();
+        assert!(accounting.report().unwrap().is_none(),"pending input hid an active owner's provider failure");
         guard.audit_logger().dispatch_allowed().unwrap();guard.audit_logger().model_call_admitted("codex").unwrap();
+        assert!(accounting.report().unwrap().is_none(),"paid owner turn was mistaken for an interrupted ordinary run");
         assert!(guard.intent(OperationKind::Push).is_err());assert!(guard.intent(OperationKind::MergePr).is_err());
         let mut store=WorkflowStore::open(&path).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
         store.set_owner_pause(&id,"owner",revision,true,millis()).unwrap();
@@ -2644,6 +2648,31 @@ mod tests {
         guard.finish().unwrap();
     }
 
+    #[tokio::test]
+    async fn owner_input_defers_an_interrupted_ordinary_run_without_changing_its_checkpoint() {
+        for paid in [false,true] {
+            let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");
+            let origin=durable::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
+            let request=durable::submission::Request {repository:"owner/repo".into(),target:durable::submission::Target::Pr(42),provider:None,until:durable::submission::Milestone::Merged};
+            let id=WorkflowStore::open(&path).unwrap().submit_discord_authorized(&origin,&request,&"a".repeat(64),millis()).unwrap().admission.workflow;
+            let mut guard=WorkflowGuard::acquire_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:None,pr:Some(42),branch:"candidate",contract:"C1",environment:"rust-a"},millis()).await.unwrap().unwrap();
+            guard.checkpoint(Stage::Review,"verified","review",0,&["preserved-evidence".into()]).await.unwrap();
+            let accounting=guard.capacity_accounting(false).unwrap();
+            if paid {guard.audit_logger().model_call_admitted("codex").unwrap();}
+            let before=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
+            WorkflowStore::open(&path).unwrap().enqueue_owner_message(&durable::discord_ingress::DiscordOrigin {message:45,..origin},&id,"Private clarification arriving during ordinary work",None,millis()).unwrap();
+            assert!(guard.audit_logger().dispatch_allowed().is_err());
+            assert!(!guard.audit_logger().resource_capacity_seen());
+            let report=accounting.report().unwrap().expect("pending owner input lost its ordinary-run deferral");
+            assert!(report.message.contains("owner input"));assert_eq!(report.billed,paid);assert!(report.held,"pending input was reported as productive progress");
+            assert_eq!(WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap().checkpoint,before.checkpoint);
+            guard.finish().unwrap();
+            let mut store=WorkflowStore::open(&path).unwrap();assert!(!store.owner_control(&id).unwrap().unwrap().paused);
+            assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,u64::from(paid));
+            assert!(store.claim_owner_turn_for_setup(&id,"owner-consumer",millis(),60_000).unwrap().is_some(),"ordinary deferral stranded owner input in a permanent hold");
+            assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+        }
+    }
     #[tokio::test]
     async fn owner_pause_fences_live_guard_dispatch_without_losing_completion_receipts() {
         let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");
@@ -3569,7 +3598,7 @@ mod tests {
         }
         let mut store=guard.store.lock().unwrap();
         assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,1);
-        assert_eq!(store.pending_owner_messages(guard.id()).unwrap(),1);assert!(store.owner_control(guard.id()).unwrap().unwrap().paused);
+        assert_eq!(store.pending_owner_messages(guard.id()).unwrap(),1);assert!(!store.owner_control(guard.id()).unwrap().unwrap().paused);
         assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
     }
 
@@ -3591,7 +3620,7 @@ mod tests {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session","owner-setup-codex-revision-unconfigured-session","owner-early-fresh","owner-early-no-input","owner-early-corrupt-input","owner-early-history","owner-early-policy-retry","owner-early-register-write-failure","owner-early-initial-acceptance","owner-early-initial-acceptance-green-baseline","owner-early-initial-acceptance-write-failure","owner-early-initial-acceptance-history-loss","owner-early-initial-acceptance-setup-failure","owner-early-initial-acceptance-baseline-tamper","owner-early-initial-acceptance-unconfigured","owner-early-initial-acceptance-repeat","owner-early-initial-acceptance-wrong-source","owner-early-initial-acceptance-first-build","owner-early-initial-acceptance-first-build-dirty","owner-early-initial-acceptance-first-build-staged","owner-early-initial-acceptance-first-build-ignored","owner-early-initial-acceptance-first-build-off-base","owner-early-initial-acceptance-first-build-orphan-main","owner-early-initial-acceptance-first-build-runtime","owner-early-initial-acceptance-first-build-legacy-call","owner-early-initial-acceptance-first-build-workflow-call","owner-early-initial-acceptance-first-build-readonly-call","owner-early-initial-acceptance-first-build-lost-call-history","owner-early-initial-acceptance-first-build-policy-lost","owner-early-initial-acceptance-first-build-leading-space","owner-early-initial-acceptance-first-build-counter-loss","owner-early-initial-acceptance-first-build-new-verifier","owner-early-initial-acceptance-first-build-retired-native","owner-early-initial-acceptance-first-build-grafted-main","owner-early-acceptance-producer","owner-early-acceptance-producer-fenced","owner-early-acceptance-producer-replaced-checkout","owner-early-acceptance-producer-body-admission"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session","owner-setup-codex-revision-unconfigured-session","owner-early-fresh","owner-early-explicit-pause","owner-early-no-input","owner-early-corrupt-input","owner-early-history","owner-early-policy-retry","owner-early-register-write-failure","owner-early-initial-acceptance","owner-early-initial-acceptance-green-baseline","owner-early-initial-acceptance-write-failure","owner-early-initial-acceptance-history-loss","owner-early-initial-acceptance-setup-failure","owner-early-initial-acceptance-baseline-tamper","owner-early-initial-acceptance-unconfigured","owner-early-initial-acceptance-repeat","owner-early-initial-acceptance-wrong-source","owner-early-initial-acceptance-first-build","owner-early-initial-acceptance-first-build-dirty","owner-early-initial-acceptance-first-build-staged","owner-early-initial-acceptance-first-build-ignored","owner-early-initial-acceptance-first-build-off-base","owner-early-initial-acceptance-first-build-orphan-main","owner-early-initial-acceptance-first-build-runtime","owner-early-initial-acceptance-first-build-legacy-call","owner-early-initial-acceptance-first-build-workflow-call","owner-early-initial-acceptance-first-build-readonly-call","owner-early-initial-acceptance-first-build-lost-call-history","owner-early-initial-acceptance-first-build-policy-lost","owner-early-initial-acceptance-first-build-leading-space","owner-early-initial-acceptance-first-build-counter-loss","owner-early-initial-acceptance-first-build-new-verifier","owner-early-initial-acceptance-first-build-retired-native","owner-early-initial-acceptance-first-build-grafted-main","owner-early-acceptance-producer","owner-early-acceptance-producer-fenced","owner-early-acceptance-producer-replaced-checkout","owner-early-acceptance-producer-body-admission"] {
                 if mode.ends_with("-session") && !cfg!(target_os="linux") {continue;}
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
@@ -3696,6 +3725,29 @@ mod tests {
             }
             let origin=durable::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:45};
             store.enqueue_owner_message(&origin,&id,"Early synthetic clarification",None,millis()).unwrap();
+            if mode=="owner-early-explicit-pause" {
+                let revision=store.owner_control(&id).unwrap().unwrap().revision;
+                let paused=store.set_owner_pause(&id,"fixture-owner",revision,true,millis()).unwrap();
+                drop(store);
+                assert!(WorkflowGuard::acquire_mode_at(&state,start(),millis(),true).await.unwrap().is_none(),"explicit pause started owner setup");
+                let mut store=WorkflowStore::open(&state).unwrap();
+                assert!(store.snapshot(&id).unwrap().is_none(),"explicit pause created a native candidate");
+                assert_eq!(store.pending_owner_messages(&id).unwrap(),1);
+                let resumed=store.set_owner_pause(&id,"fixture-owner",paused.revision,false,millis()).unwrap();
+                assert!(store.require_owner_dispatch(&id).is_err(),"resume erased the pending-input barrier");
+                drop(store);
+                let guard=WorkflowGuard::acquire_mode_at(&state,start(),millis(),true).await.unwrap().expect("explicit resume must permit the queued owner turn");
+                guard.validate_before_side_effect().unwrap();
+                let mut store=WorkflowStore::open(&state).unwrap();
+                assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,0);
+                assert!(store.native_owner_binding(&id,guard.lease.generation).unwrap().is_some());
+                assert!(store.claim_productive(&id,"ordinary-must-wait",millis(),LEASE_MS).unwrap().is_none());
+                store.set_owner_pause(&id,"fixture-owner",resumed.revision,true,millis()).unwrap();
+                assert!(guard.validate_before_side_effect().is_err(),"new explicit pause did not fence the active owner guard");
+                assert_eq!(store.pending_owner_messages(&id).unwrap(),1);
+                assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+                return;
+            }
             let control_before=store.owner_control(&id).unwrap();drop(store);
             let policy_bytes=std::fs::read(&policy).unwrap();
             if mode=="owner-early-corrupt-input" {rusqlite::Connection::open(&state).unwrap().execute("UPDATE workflow_owner_message SET body='Different instruction' WHERE workflow=?1",[&id]).unwrap();}
@@ -3762,7 +3814,7 @@ mod tests {
                     }
                     assert_eq!(first.audit.native_store_binding().unwrap(),Some(original));first.finish().unwrap();
                 }
-                let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(store.owner_control(&id).unwrap().unwrap().paused);
+                let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.owner_control(&id).unwrap().unwrap().paused,mode.ends_with("-fenced"));
                 assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,if mode.ends_with("-body-admission"){1}else{0});return;
             }
             if mode.contains("-initial-acceptance") {
@@ -3843,7 +3895,7 @@ mod tests {
                     let allowed=mode.ends_with("-first-build") || mode.ends_with("-readonly-call") || mode.ends_with("-new-verifier");
                     assert_eq!(result.is_ok(),allowed,"first owner body decision: {mode}: {:?}",result.as_ref().err());
                     if allowed {let dispatch=result.unwrap();first.store.lock().unwrap().validate_owner_body_dispatch(&dispatch,millis()).unwrap();assert!(first.reserve_prepared_first_owner_body(private.as_ref().unwrap(),durable::submission::Provider::Codex,&canonical).await.is_err(),"first body was reserved twice");}
-                    let mut store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(store.owner_control(&id).unwrap().unwrap().paused);
+                    let mut store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(!store.owner_control(&id).unwrap().unwrap().paused);
                     assert_eq!(first.audit.native_store_binding().unwrap(),Some(original));
                     let count:i64=rusqlite::Connection::open(&state).unwrap().query_row("SELECT count(*) FROM workflow_owner_body_dispatch WHERE workflow=?1",[&id],|r|r.get(0)).unwrap();assert_eq!(count,i64::from(allowed));
                     if mode.ends_with("-staged") {assert_eq!(git_evidence(dir.path(),&["show",":code.txt"]).await.unwrap(),"owner staged change");}
@@ -3953,7 +4005,7 @@ mod tests {
                     assert!(recovered.activate_owner_revision(previous,next).await.is_err(),"owner revision returned a guard without native configuration");
                     let mut store=WorkflowStore::open(&state).unwrap();let snapshot=store.snapshot(&id).unwrap().unwrap();
                     assert_eq!(snapshot.generation,old_lease.generation);assert_eq!(snapshot.checkpoint.binding,old_binding);
-                    assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(store.owner_control(&id).unwrap().unwrap().paused);
+                    assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(!store.owner_control(&id).unwrap().unwrap().paused);
                     assert!(!store.events(&id).unwrap().iter().any(|(_,kind,_,_)|kind=="owner_contract_revised"));return;
                 }
                 if mode.contains("-setup-failure-") {
