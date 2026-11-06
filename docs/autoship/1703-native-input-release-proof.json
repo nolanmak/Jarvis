@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "kind": "native-input-release-marker-component",
+  "source_parent_commit": "b43c18630b47ff7919ae469f65eecd6dc6ceccfc",
+  "source_generation_authority": false,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "13358c0f0946457e9461e2a5269b001ec57673a91675a9c47bfeb074f8896c2e"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/codex.rs",
+      "sha256": "315265fe00fac6b091816ddf4b0dbb33185be842af0e1bd087d211faa0706b9c"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/reasoner.rs",
+      "sha256": "d53871b569c3d2ce121b329bdc16cdc88c1b5c57a8117ef354a61331334e970e"
+    }
+  ],
+  "behavior": [
+    "Claude and Codex stdin writers share submit_provider_input.",
+    "Required native input requires original protected store/runtime authority and the exact prepared launch/resource receipt.",
+    "Durable controller marker retains prompt SHA-256 and exact byte length, launch and resource references before stdin bytes; no prompt contents are recorded.",
+    "One live Launch refuses another marker attempt; this is not durable request-wide replay permission.",
+    "Sealed audit, current owner fence, missing/wrong resource receipt refuse before any byte.",
+    "Final post-marker refusal retains exposure uncertainty without sending input.",
+    "Abrupt controller exit after protected append leaves a validated original marker, no provider bytes and no fabricated completion in both provider fixtures."
+  ],
+  "validation": {
+    "initial_behavioral_red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-channel-core --lib native_input_release",
+      "log": "/tmp/autoship-native-input-release-red-20261106.log",
+      "log_sha256": "a0af2658871ff90458df9caf5cdf980d4da42871f6ac9146c974578a3ff75b53",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "passed": 0,
+      "failed": 3
+    },
+    "final_focused": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-channel-core --lib native_input_release",
+      "log": "/tmp/autoship-native-input-release-crash-20261106.log",
+      "log_sha256": "869116b5d6ddf7599d9650ec479a5b13eadda0a14788417c182978cf67ed88ca",
+      "exit": 0,
+      "passed": 7,
+      "failed": 0,
+      "seconds": 0.9
+    },
+    "full_channel_core": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-channel-core --lib",
+      "log": "/tmp/autoship-native-input-release-full-core-20261106.log",
+      "log_sha256": "17ced0e4fdb2cafdba76e2a4cfb6187a87fd65d6a27043bcfedb460a02ce3803",
+      "exit": 0,
+      "passed": 904,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 34.04
+    },
+    "full_cli": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-native-input-release-full-cli-20261106.log",
+      "log_sha256": "888126792a30c6e4c04cc190ee1ea638a14ca1342c0ddac641857d8c380764a1",
+      "exit": 0,
+      "passed": 1929,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 284.33
+    },
+    "production_cli_check": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-native-input-release-production-check-20261106.log",
+      "log_sha256": "24b48d06c550d44ca0a56454eea61dc24063eecff123258fb894fbb57ca0e05f",
+      "exit": 0,
+      "compiler_seconds": 13.25
+    }
+  },
+  "limitations": [
+    "Red run used the parent stdin behavior extracted unchanged into the shared production helper, plus three behavioral tests; it was not a pristine-parent binary and did not yet include later regressions.",
+    "Tests prepare actual native launch/audit/store metadata and use a real Python stdin recipient through the shared production helper. They do not execute the full Claude/Codex reasoner call or VM/network provider.",
+    "The fixture resource binding is synthetic metadata; no actual resource/kernel quiescence is proved by that fixture.",
+    "The state authority lock covers marker persistence, not the subsequent asynchronous transport write. No nonrelease capability or retained-writer exclusion proof is supplied.",
+    "The marker proves attempted release/exposure uncertainty, not successful provider delivery, completion, restorable conversation or permission to resend.",
+    "Owner body reservation/preparation linkage, successor authorization, native nonrelease/reconnect/result recovery and P1-P5 remain implementation work.",
+    "No productive owner worker ingress, public projection, normal rollout, live CLI/Discord coding, acceptance soaks or epic completion is established."
+  ],
+  "epic_complete": false,
+  "source_inventory_is_post_run_inventory": true
+}

@@ -13,7 +13,7 @@ use crate::cli_gate::CliGate;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, warn};
 
@@ -1413,11 +1413,9 @@ impl ClaudeCliReasoner {
         crate::phone_timing::spawned("claude");
 
         if let Some(mut stdin) = child.stdin.take() {
-            // #1626 — from the first byte on, the CLI may have the turn.
-            if let Some(lease) = native_lease.as_ref() { lease.mark_submitting(); }
-            stdin.write_all(user_message.as_bytes()).await?;
-            stdin.shutdown().await?;
-            if let Some(lease) = native_lease.as_ref() { lease.observe_native_submission(); }
+            let resource = process_group.native_resource_receipt()?;
+            crate::native_vm::submit_provider_input(&mut stdin, &user_message,
+                native_vm.as_ref(), resource.as_ref(), native_lease.as_ref()).await?;
         }
 
         let stdout = child

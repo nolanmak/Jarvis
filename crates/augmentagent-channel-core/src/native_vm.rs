@@ -455,6 +455,7 @@ struct LaunchObservation {
     prepared:PreparedLaunchRecord,
     logger:std::sync::Weak<crate::tool_audit::AuditLogger>,
     actual_session:std::sync::Mutex<Option<(String,crate::audit_chain::AppendReceipt)>>,
+    input_attempted:std::sync::atomic::AtomicBool,
     completion_verified:std::sync::atomic::AtomicBool,
     completed:std::sync::atomic::AtomicBool,
 }
@@ -472,6 +473,26 @@ pub(crate) struct Launch {
     observation:Option<LaunchObservation>,
     _directory: tempfile::TempDir,
 }
+/// Shared Claude/Codex stdin boundary. Native release evidence is deliberately
+/// separate from provider completion and from in-memory session submission.
+pub(crate) async fn submit_provider_input(
+    stdin: &mut tokio::process::ChildStdin,
+    prompt: &str,
+    native: Option<&Launch>,
+    resource: Option<&crate::audit_chain::AppendReceipt>,
+    lease: Option<&crate::native_session::Lease>,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    if let Some(native) = native {
+        native.record_input_release_attempt(prompt, resource.context("native input lacks resource receipt")?)?;
+    }
+    if let Some(lease) = lease { lease.mark_submitting(); }
+    stdin.write_all(prompt.as_bytes()).await?;
+    stdin.shutdown().await?;
+    if let Some(lease) = lease { lease.observe_native_submission(); }
+    Ok(())
+}
+
 impl Launch {
     pub(crate) fn prepared_record(&self)->Result<PreparedLaunchRecord> {
         let observation=self.observation.as_ref().context("native launch lacks prepared controller context")?;
@@ -624,12 +645,56 @@ impl Launch {
         command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
             .env("PATH","/usr/bin:/bin");
         let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), authority, store, runtime_relative_path, creation_receipt_sha256, audit_log,
-            observation:Some(LaunchObservation {prepared,logger:std::sync::Arc::downgrade(owner_logger),actual_session:std::sync::Mutex::new(None),completion_verified:std::sync::atomic::AtomicBool::new(false),completed:std::sync::atomic::AtomicBool::new(false)}),_directory:directory };
+            observation:Some(LaunchObservation {prepared,logger:std::sync::Arc::downgrade(owner_logger),actual_session:std::sync::Mutex::new(None),input_attempted:std::sync::atomic::AtomicBool::new(false),completion_verified:std::sync::atomic::AtomicBool::new(false),completed:std::sync::atomic::AtomicBool::new(false)}),_directory:directory };
         // A requested alias permits later lookup but is not a provider ID event.
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.register_alias(id)?; }
         owner_logger.validate_native_store_binding()?;
         owner_logger.dispatch_allowed()?;
         Ok(result)
+    }
+    /// Records exposure *uncertainty* before the first byte. This is not a
+    /// submission/completion receipt or a capability to recover/replay input.
+    fn record_input_release_attempt(&self, prompt: &str, resource: &crate::audit_chain::AppendReceipt) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let observed = self.observation.as_ref().context("native input lacks prepared controller context")?;
+        ensure!(!observed.input_attempted.swap(true, std::sync::atomic::Ordering::SeqCst),
+            "native launch input release already attempted; reconcile instead of replaying");
+        let logger = observed.logger.upgrade().context("native input controller expired")?;
+        logger.validate_native_store_binding()?;
+        let root = self.session.parent().and_then(Path::parent).context("native input state root missing")?;
+        owner_store::validate_bound_metadata(root, &self.store)?;
+        let lock = StateLock::existing(root)?;
+        let ledger = owner_ledger::Ledger::open_bound(root, &lock, &self.store, true)?;
+        let current = runtime_authority(root, &ledger, &self.session)?;
+        ensure_unretired(&self.session)?;
+        ensure!(current == self.authority && current.owner == observed.prepared.intent.source_owner
+            && current.audit_path == observed.prepared.intent.source_audit_path.to_str().context("non-UTF8 native input audit")?,
+            "native input runtime authority changed");
+        ensure_native_admission(&ledger, &current.owner, &logger)?;
+        ensure!(!ledger.claimed(&current.owner, relative_runtime(root, &self.session)?)?,
+            "native input runtime transfer pending");
+        ensure!(digest(private(&self.session.join("owned.json"))?) == self.creation_receipt_sha256,
+            "native input creation receipt changed");
+        logger.verify_native_launch_reference(&observed.prepared)?;
+        let admitted = logger.read_append_receipt(resource)?;
+        ensure!(resource.sequence > observed.prepared.controller_receipt.sequence
+            && admitted["kind"] == "native_launch_resource_binding"
+            && admitted["launch_intent"] == serde_json::to_value(&observed.prepared.intent)?
+            && admitted["launch_receipt"] == serde_json::to_value(&observed.prepared.controller_receipt)?
+            && admitted["resource_identity"].is_object(),
+            "native input resource receipt differs from prepared launch");
+        // Hold original state authority through the protected append. Actual
+        // transport release is later; this marker deliberately grants no
+        // quiescence/nonrelease proof across that interval.
+        logger.dispatch_allowed()?;
+        logger.record_controller_receipted(serde_json::json!({
+            "version":1,"actor":"controller","kind":"native_input_release_attempt",
+            "launch_intent":observed.prepared.intent,"launch_receipt":observed.prepared.controller_receipt,
+            "resource_receipt":resource,"prompt_sha256":format!("{:x}",Sha256::digest(prompt.as_bytes())),
+            "prompt_bytes":prompt.len(),"recorded_at_ms":chrono::Utc::now().timestamp_millis()
+        }))?;
+        logger.dispatch_allowed()?;
+        Ok(())
     }
     pub fn register_retirement(&self, lease:&crate::native_session::Lease) {
         lease.register_vm_retirement(Retirement{session:self.session.clone(),expected:self.authority.clone(),store:self.store.clone(),runtime_relative_path:self.runtime_relative_path.clone(),creation_receipt_sha256:self.creation_receipt_sha256.clone()});
@@ -766,11 +831,62 @@ mod tests {
     #[cfg(target_os="linux")]
     #[test]
     fn native_completion_requires_exact_launch_and_kernel_quiescence() {launch_intent_child("completion");}
+    #[test]
+    fn native_input_release_is_durable_before_prompt_bytes() { launch_intent_child("input-ready"); }
+    #[test]
+    fn native_input_release_refuses_sealed_audit_without_sending_bytes() { launch_intent_child("input-sealed"); }
+    #[test]
+    fn native_input_release_refuses_current_fence_without_sending_bytes() { launch_intent_child("input-fenced"); }
+    #[test]
+    fn native_input_release_refuses_wrong_resource_receipt() { launch_intent_child("input-resource"); }
+    #[test]
+    fn native_input_release_requires_resource_receipt() { launch_intent_child("input-no-resource"); }
+    #[test]
+    fn native_input_release_retains_marker_if_final_fence_refuses() { launch_intent_child("input-final-fence"); }
+    #[test]
+    fn native_input_release_survives_process_death_before_stdin() { launch_intent_child("input-crash"); }
     fn launch_intent_child(mode: &str) {
         let seal=mode=="seal";let refuse=mode=="refuse";
         const CHILD: &str = "JARVIS_TEST_NATIVE_LAUNCH_INTENT_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let test = if mode=="unbound" {"native_preparation_requires_original_store_binding"}
+            if mode=="input-crash" {
+                for provider in ["codex","claude"] {
+                    let retained=tempfile::tempdir().unwrap();
+                    let output=std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact","native_vm::tests::native_input_release_survives_process_death_before_stdin","--test-threads=1"])
+                        .env(CHILD,"1").env("JARVIS_TEST_INPUT_CRASH_ROOT",retained.path())
+                        .env("JARVIS_TEST_INPUT_CRASH_PROVIDER",provider).env("AUGMENTAGENT_RUN_RESOURCES","1")
+                        .env_remove("AUGMENTAGENT_RUN_MEMORY_BYTES").env_remove("AUGMENTAGENT_RUN_HOST_OVERHEAD_BYTES")
+                        .output().unwrap();
+                    assert_eq!(output.status.code(),Some(73),"controller did not die at the post-marker boundary: {} {}",
+                        String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+                    let sink=crate::audit_chain::AnchoredAudit::new(retained.path().join(format!("logs-{provider}/model.jsonl")),
+                        retained.path().join(format!("anchors-{provider}/model.json")),&[]).unwrap();
+                    sink.inspect_open(|rows| {
+                        let markers:Vec<_>=rows.iter().filter(|row|row["kind"]=="native_input_release_attempt").collect();
+                        ensure!(markers.len()==1 && markers[0]["launch_intent"]["provider"]==provider,
+                            "process death lost the exact committed input-release marker");
+                        ensure!(!rows.iter().any(|row|row["kind"]=="native_launch_completion_verified"),
+                            "process death fabricated completion");Ok(())
+                    }).unwrap();
+                    let received=retained.path().join("received.json");
+                    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
+                    while !received.exists() && std::time::Instant::now()<deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    let recipient:serde_json::Value=serde_json::from_slice(&std::fs::read(received).unwrap()).unwrap();
+                    assert_eq!(recipient["received"],"","controller death still released prompt bytes");
+                    assert_eq!(recipient["visible_before_input"],true,"retained marker was not remotely visible after death");
+                }
+                return;
+            }
+            let test = if mode=="input-resource" {"native_input_release_refuses_wrong_resource_receipt"}
+                else if mode=="input-no-resource" {"native_input_release_requires_resource_receipt"}
+                else if mode=="input-final-fence" {"native_input_release_retains_marker_if_final_fence_refuses"}
+                else if mode=="input-ready" {"native_input_release_is_durable_before_prompt_bytes"}
+                else if mode=="input-sealed" {"native_input_release_refuses_sealed_audit_without_sending_bytes"}
+                else if mode=="input-fenced" {"native_input_release_refuses_current_fence_without_sending_bytes"}
+                else if mode=="unbound" {"native_preparation_requires_original_store_binding"}
                 else if mode=="completion" {"native_completion_requires_exact_launch_and_kernel_quiescence"}
                 else if mode=="observe" {"native_observation_records_actual_id_with_exact_launch_receipt"}
                 else if mode=="observe-sealed" {"native_observation_refuses_sealed_audit_before_alias_publication"}
@@ -789,14 +905,16 @@ mod tests {
             return;
         }
         use sha2::{Digest,Sha256};
-        let root=tempfile::tempdir().unwrap();
-        let state=root.path().join("state"); std::fs::create_dir(&state).unwrap();
+        let owned_root=if std::env::var_os("JARVIS_TEST_INPUT_CRASH_ROOT").is_none() {Some(tempfile::tempdir().unwrap())} else {None};
+        let root=std::env::var_os("JARVIS_TEST_INPUT_CRASH_ROOT").map(PathBuf::from)
+            .unwrap_or_else(||owned_root.as_ref().unwrap().path().to_path_buf());
+        let state=root.as_path().join("state"); std::fs::create_dir(&state).unwrap();
         std::fs::set_permissions(&state,std::fs::Permissions::from_mode(0o700)).unwrap();
         initialize_native_test_store(&state);
         // macOS temporary paths may traverse /var -> /private/var; compare
         // runtime paths against the same canonical root used by preparation.
         let state=state.canonicalize().unwrap();
-        let policy=root.path().join("policy.json");
+        let policy=root.as_path().join("policy.json");
         write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,
             "runtime_config":"/declared/runtime.json","guest_runtime":"/declared/guest","state_root":state,
             "memory_mb":512,"max_state_bytes":8589934592u64,"max_sessions":8,
@@ -805,7 +923,8 @@ mod tests {
         // Isolated subprocess: never mutate another Rust test's policy selection.
         std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",&policy);
         for (provider,id) in [("codex",Some("requested-codex-id")),("claude",None)] {
-            let logs=root.path().join(format!("logs-{provider}")); let anchors=root.path().join(format!("anchors-{provider}"));
+            if mode=="input-crash" && std::env::var("JARVIS_TEST_INPUT_CRASH_PROVIDER").unwrap()!=provider {continue;}
+            let logs=root.as_path().join(format!("logs-{provider}")); let anchors=root.as_path().join(format!("anchors-{provider}"));
             std::fs::create_dir(&logs).unwrap(); std::fs::create_dir(&anchors).unwrap();
             let logger=std::sync::Arc::new(crate::tool_audit::AuditLogger::protected(logs.join("model.jsonl"),anchors.join("model.json"),&[]).unwrap());
             let owner=RuntimeOwner {workflow_id:"owner/repo/pr/7".into(),lease_generation:1};
@@ -881,6 +1000,88 @@ mod tests {
             assert_eq!(row["launch_sha256"],format!("{:x}",Sha256::digest(std::fs::read(launch._directory.path().join("launch.json")).unwrap())));
             assert_eq!(row["creation_receipt_sha256"],format!("{:x}",Sha256::digest(std::fs::read(launch.session.join("owned.json")).unwrap())));
             assert!(uuid::Uuid::parse_str(row["intent_id"].as_str().unwrap()).is_ok());
+            if mode.starts_with("input-") {
+                let resource=logger.native_launch_resource_binding(&prepared,provider,&serde_json::json!({"fixture":"input-resource"})).unwrap();
+                if mode=="input-sealed" {
+                    sink_for_observation(&logger,&anchors).seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"sealed-before-input"}))).unwrap();
+                }
+                if mode=="input-fenced" {
+                    logger.set_dispatch_observer(std::sync::Arc::new(||anyhow::bail!("fixture current owner fenced"))).unwrap();
+                }
+                if mode=="input-crash" {
+                    let log=logger.path().to_path_buf();
+                    logger.set_dispatch_observer(std::sync::Arc::new(move || {
+                        if std::fs::read_to_string(&log)?.contains("native_input_release_attempt") {std::process::exit(73);}
+                        Ok(())
+                    })).unwrap();
+                }
+                if mode=="input-final-fence" {
+                    let log=logger.path().to_path_buf();
+                    logger.set_dispatch_observer(std::sync::Arc::new(move || {
+                        ensure!(!std::fs::read_to_string(&log)?.contains("native_input_release_attempt"),"fixture final input fence");Ok(())
+                    })).unwrap();
+                }
+                let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let send = || runtime.block_on(async {
+                    use std::process::Stdio;
+                    // A real child receives stdin through the exact shared production
+                    // boundary; no VM or provider/network execution is claimed.
+                    let mut command=Command::new("/usr/bin/python3");
+                    command.arg("-c").arg(r#"
+import json,sys
+first=sys.stdin.buffer.read(1)
+rows=[json.loads(line) for line in open(sys.argv[1])]
+visible=any(row.get('kind')=='native_input_release_attempt' for row in rows)
+received=first+sys.stdin.buffer.read()
+result=json.dumps({'visible_before_input':visible,'received':received.decode()})
+if len(sys.argv)>2:
+    import os
+    temp=sys.argv[2]+'.pending'
+    with open(temp,'w') as output: output.write(result)
+    os.replace(temp,sys.argv[2])
+else: print(result)
+"#).arg(logger.path()).stdin(Stdio::piped()).stdout(Stdio::piped());
+                    if mode=="input-crash" { command.arg(root.join("received.json")).stdout(Stdio::null()); }
+                    let mut child=command.spawn().unwrap();
+                    let mut stdin=child.stdin.take().unwrap();
+                    let selected=if mode=="input-no-resource" {None}
+                        else if mode=="input-resource" {Some(&prepared.controller_receipt)} else {Some(&resource)};
+                    let result=submit_provider_input(&mut stdin,"synthetic exact private input",Some(&launch),selected,None).await;
+                    drop(stdin);
+                    let output=tokio::time::timeout(std::time::Duration::from_secs(5),child.wait_with_output()).await.unwrap().unwrap();
+                    assert!(output.status.success());
+                    (result,serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap())
+                });
+                let (result,output)=send();
+                if mode!="input-ready" {
+                    assert!(result.is_err(),"native input escaped despite failed durable admission: {mode}");
+                    assert_eq!(output["received"],"","refused native input still reached child");
+                    let raw=std::fs::read_to_string(logger.path()).unwrap();
+                    assert_eq!(raw.contains("native_input_release_attempt"),mode=="input-final-fence",
+                        "only a post-marker refusal may retain an exposure marker");
+                    continue;
+                }
+                result.unwrap();
+                assert_eq!(output["visible_before_input"],true,"recipient saw input before durable marker");
+                assert_eq!(output["received"],"synthetic exact private input");
+                let rows:Vec<serde_json::Value>=std::fs::read_to_string(logger.path()).unwrap().lines().map(|row|serde_json::from_str(row).unwrap()).collect();
+                let markers:Vec<_>=rows.iter().filter(|row|row["kind"]=="native_input_release_attempt").collect();
+                assert_eq!(markers.len(),1,"prompt bytes escaped without exactly one durable release marker");
+                let marker=markers[0];
+                assert_eq!(marker["launch_intent"],serde_json::to_value(&prepared.intent).unwrap());
+                assert_eq!(marker["launch_receipt"],serde_json::to_value(&prepared.controller_receipt).unwrap());
+                assert_eq!(marker["resource_receipt"],serde_json::to_value(&resource).unwrap());
+                assert_eq!(marker["prompt_sha256"],format!("{:x}",Sha256::digest(b"synthetic exact private input")));
+                assert_eq!(marker["prompt_bytes"],"synthetic exact private input".len());
+                assert!(marker.get("prompt").is_none(),"private prompt copied into audit");
+                assert!(marker.get("certainty").is_none(),"release intent claims completion certainty");
+                let before=std::fs::read(logger.path()).unwrap();
+                let (again,recipient)=send();
+                assert!(again.is_err(),"same live launch released input twice");
+                assert_eq!(recipient["received"],"");
+                assert_eq!(std::fs::read(logger.path()).unwrap(),before,"repeated release appended another marker");
+                continue;
+            }
             #[cfg(target_os="linux")]
             if mode=="completion" {
                 let actual_id=format!("actual-{provider}-session");
