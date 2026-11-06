@@ -1980,16 +1980,22 @@ pub(super) async fn verify_with_repair_for(
                         continue;
                     }
                 }
-                let infrastructure = detail.contains("infrastructure_failure")
-                    || detail.contains("toolchain")
-                    || detail.contains("environment changed")
-                    || detail.contains("disk")
-                    || detail.contains("admission")
-                    || detail.contains("alignment reviewer unavailable")
-                    || detail.contains("alignment transport")
-                    || detail.contains("constraint authority unavailable")
-                    || detail.contains("constraint authority invalid structured response")
-                    || detail.contains("alignment invalid structured response");
+                // Hunk locations are code, so a path like `disk.rs` must not
+                // classify a scope failure as infrastructure.
+                let classified = detail
+                    .split(crate::self_improve::alignment::UNMAPPED_LOCATIONS)
+                    .next()
+                    .unwrap_or(&detail);
+                let infrastructure = classified.contains("infrastructure_failure")
+                    || classified.contains("toolchain")
+                    || classified.contains("environment changed")
+                    || classified.contains("disk")
+                    || classified.contains("admission")
+                    || classified.contains("alignment reviewer unavailable")
+                    || classified.contains("alignment transport")
+                    || classified.contains("constraint authority unavailable")
+                    || classified.contains("constraint authority invalid structured response")
+                    || classified.contains("alignment invalid structured response");
                 if infrastructure {
                     CiGateResult(Err(error.context("acceptance infrastructure unavailable")))
                         .for_workflow(workflow).await??;
