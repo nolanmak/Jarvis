@@ -750,3 +750,95 @@ pub(crate) fn validate_live_publication_event_position(
     );
     Ok(())
 }
+
+pub(super) fn require_transfer_context(
+    conn: &Connection,
+    lease: &RecoveryLease,
+    authorization: &crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+    pending: &PendingNativeHandoff,
+    now: i64,
+) -> Result<()> {
+    require_authorized_claim(conn, lease, authorization, now)?;
+    let original = &lease.claim.original;
+    let (raw,len):(String,i64)=conn.query_row("SELECT substr(record,1,4227073),length(CAST(record AS BLOB)) FROM workflow_owner_publication_intent WHERE workflow=?1 AND request_id=?2",params![original.workflow,original.request_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    ensure!(
+        (1..=4 * 1024 * 1024 + 32 * 1024).contains(&len) && raw.len() as i64 == len,
+        "owner recovery transfer intent exceeds bound"
+    );
+    super::owner_publication::require(conn, &original.request_id, &original.intent, &raw)?;
+    let record: crate::self_improve::OwnerPublicationRecord = serde_json::from_str(&raw)?;
+    record.require_recovery_transfer(pending)?;
+    ensure!(
+        lease.generation() > pending.request().destination.owner.lease_generation,
+        "owner recovery transfer has no successor claim"
+    );
+    Ok(())
+}
+impl WorkflowStore {
+    pub(crate) fn owner_recovery_pending_transfer(
+        &mut self,
+        lease: &RecoveryLease,
+        authorization: &crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+        now: i64,
+    ) -> Result<Option<PendingNativeHandoff>> {
+        self.validate_owner_publication_recovery(lease, authorization, now)?;
+        let pending = match self.resolve_native_handoff_persistence(
+            &lease.claim.original.workflow,
+            None,
+            Err(anyhow::anyhow!(
+                augmentagent_channel_core::native_vm::ownership::TransferReason::PersistRetry
+            )),
+        ) {
+            native_pending::NativePreparationPersistence::Durable(
+                native_pending::HandoffPreparation::Prepared(p)
+                | native_pending::HandoffPreparation::ReconcileExisting(p),
+            ) => Some(p),
+            native_pending::NativePreparationPersistence::NotCommitted { .. } => None,
+            native_pending::NativePreparationPersistence::Unknown { reason, .. } => {
+                anyhow::bail!(reason)
+            }
+        };
+        if let Some(pending) = &pending {
+            require_transfer_context(&self.conn, lease, authorization, pending, now)?;
+        }
+        Ok(pending)
+    }
+    pub(crate) fn validate_owner_recovery_transfer(
+        &self,
+        lease: &RecoveryLease,
+        authorization: &crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+        pending: &PendingNativeHandoff,
+        now: i64,
+    ) -> Result<()> {
+        require_transfer_context(&self.conn, lease, authorization, pending, now)
+    }
+    pub(crate) fn owner_recovery_transfer_replay_is_current(
+        &mut self,
+        lease: &RecoveryLease,
+        authorization: &crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+        pending: &PendingNativeHandoff,
+        now: i64,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        require_transfer_context(&tx, lease, authorization, pending, now)?;
+        native_pending::require_clear_abort_barriers(&tx, &pending.request().workflow_id)?;
+        let row:(String,i64,u64,String)=tx.query_row("SELECT transfer_id,sequence,snapshot_sequence,record FROM workflow_native_handoff_pending WHERE workflow=?1",[&pending.request().workflow_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        ensure!(
+            native_pending::decode(&tx, &pending.request().workflow_id, row)? == *pending,
+            "owner recovery transfer pending identity changed"
+        );
+        let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed'))",[&pending.request().workflow_id],|r|r.get(0))?;
+        ensure!(
+            !blocked,
+            "owner recovery transfer has unsettled remote operation"
+        );
+        ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2)",params![pending.request().workflow_id,pending.request().destination.owner.lease_generation],|r|r.get::<_,bool>(0))?,"owner recovery transfer destination is already registered");
+        for source in &pending.request().source_owners {
+            ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2 AND audit_path=?3 AND retirement_reason IS NULL AND retired_at IS NULL)",params![pending.request().workflow_id,source.owner.lease_generation,source.audit_path],|r|r.get::<_,bool>(0))?,"owner recovery transfer source is no longer active");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}

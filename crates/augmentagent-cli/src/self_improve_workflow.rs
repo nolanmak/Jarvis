@@ -4057,7 +4057,7 @@ mod tests {
     #[tokio::test]
     async fn expired_owner_publication_has_authenticated_metadata_recovery() {
         use std::os::unix::fs::PermissionsExt;
-        for mode in ["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery","owner-early-acceptance-producer-recovery-revised-metadata-recovery","owner-early-acceptance-producer-claude-recovery-revised-metadata-recovery"] {
+        for mode in ["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery","owner-early-acceptance-producer-recovery-revised-metadata-recovery","owner-early-acceptance-producer-claude-recovery-revised-metadata-recovery","owner-early-acceptance-producer-transfer-recovery","owner-early-acceptance-producer-claude-transfer-recovery"] {
         let control=control_dir();let gh=control.path().join("gh-recovery");
         std::fs::write(&gh,r#"#!/usr/bin/python3
 import json,sys
@@ -4602,6 +4602,50 @@ else: raise SystemExit('unexpected authority call')
                     acceptance::owner::test_publication_preparation(dir.path(),&control.join("owner-producer-control"),&first,publication_previous.as_ref()).await.unwrap()
                 }else {acceptance::owner::test_cached_preparation(dir.path(),&control.join("owner-producer-control"),&first).await.unwrap()};
                 assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap(),before,"preparation changed workflow state");
+                if mode.ends_with("-transfer-recovery") {
+                    let db=rusqlite::Connection::open(&state).unwrap();
+                    db.execute_batch("CREATE TRIGGER deny_owner_transfer_settlement BEFORE INSERT ON workflow_native_handoff_completed BEGIN SELECT RAISE(ABORT,'injected owner transfer settlement failure'); END;").unwrap();
+                    let failure=first.activate_prepared_owner_acceptance(&prepared,None).await.err().expect("failed transfer settlement returned an owner publication guard");
+                    drop(failure);drop(prepared);
+                    let mut store=WorkflowStore::open(&state).unwrap();let activated=store.snapshot(&id).unwrap().unwrap().generation;
+                    let transfer:String=db.query_row("SELECT transfer_id FROM workflow_native_handoff_pending WHERE workflow=?1",[&id],|r|r.get(0)).unwrap();
+                    assert_eq!(db.query_row("SELECT count(*) FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,activated],|r|r.get::<_,i64>(0)).unwrap(),0);
+                    db.execute_batch("DROP TRIGGER deny_owner_transfer_settlement;").unwrap();
+                    db.execute("UPDATE workflow SET lease_until=?2 WHERE id=?1",rusqlite::params![id,millis()-1]).unwrap();
+                    let revision=store.owner_control(&id).unwrap().unwrap().revision;store.set_owner_pause(&id,"fixture-owner",revision,true,millis()).unwrap();
+                    let later=durable::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:46};store.enqueue_owner_message(&later,&id,"Retain this queued instruction",None,millis()).unwrap();
+                    let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Held;
+                    db.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",rusqlite::params![id,serde_json::to_string(&checkpoint).unwrap()]).unwrap();
+                    let plan=store.owner_publication_recovery_plan(&id).unwrap().unwrap();
+                    let authorization=super::super::targeted::authorize_owner_publication_recovery(dir.path(),&plan,crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22}).await.unwrap();
+                    let recovery=Arc::new(store.claim_owner_publication_recovery(&authorization,"owner-transfer-metadata",millis(),60_000).unwrap().unwrap());
+                    let before=store.snapshot(&id).unwrap().unwrap();let control_before=store.owner_control(&id).unwrap();
+                    assert!(store.owner_publication_recovery_native_facts(&recovery,&authorization,millis()).is_err(),"missing activated native registration was invented");
+                    let pending=store.owner_recovery_pending_transfer(&recovery,&authorization,millis()).unwrap().unwrap();assert_eq!(pending.request().transfer_id,transfer);
+                    let mut changed=serde_json::to_value(&pending).unwrap();changed["request"]["destination"]["owner"]["lease_generation"]=(activated+1).into();
+                    let changed:durable::PendingNativeHandoff=serde_json::from_value(changed).unwrap();
+                    let copied=Lease {workflow:id.clone(),owner:"owner-transfer-metadata".into(),generation:recovery.generation()};
+                    assert!(store.validate_dispatch(&copied,&before.checkpoint.binding,millis()).is_err(),"generic execution admission accepted a metadata recovery generation");
+                    store.owner_recovery_transfer_replay_is_current(&recovery,&authorization,&pending,millis()).unwrap();
+                    let shared=Arc::new(Mutex::new(WorkflowStore::open(&state).unwrap()));
+                    let mode=durable::native_reconcile::Mode::OwnerRecovery {lease:&recovery,authorization:&authorization};
+                    assert!(matches!(durable::native_reconcile::run(&shared,mode,&changed,None,&millis).unwrap(),durable::native_reconcile::ReconciliationRun::Retained {..}));
+                    assert_eq!(db.query_row("SELECT transfer_id FROM workflow_native_handoff_pending WHERE workflow=?1",[&id],|r|r.get::<_,String>(0)).unwrap(),transfer);
+                    let result=durable::native_reconcile::run(&shared,mode,&pending,None,&millis).unwrap();
+                    match result {durable::native_reconcile::ReconciliationRun::Settled(result)=>{assert!(!result.current_context);assert_eq!(result.destination.owner.lease_generation,activated);},other=>panic!("original owner transfer did not settle: {other:?}")}
+                    assert!(matches!(durable::native_reconcile::run(&shared,mode,&pending,None,&millis).unwrap(),durable::native_reconcile::ReconciliationRun::Historical));
+                    assert!(store.owner_recovery_pending_transfer(&recovery,&authorization,millis()).unwrap().is_none());
+                    assert_eq!(db.query_row("SELECT transfer_id FROM workflow_native_handoff_completed WHERE workflow=?1 AND transfer_id=?2",rusqlite::params![id,transfer],|r|r.get::<_,String>(0)).unwrap(),transfer);
+                    assert_eq!(db.query_row("SELECT count(*) FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,recovery.generation()],|r|r.get::<_,i64>(0)).unwrap(),0);
+                    with_recovery_native_metadata(&state,Some(dir.path()),recovery.clone(),&authorization,&mut |proof| {
+                        assert_eq!(proof.namespace().owner.lease_generation,activated);
+                        let recovered=store.with_owner_recovery_preparation(&recovery,&authorization,proof,millis(),|access|
+                            acceptance::owner::publication::reopen_recovery_preparation(access,proof,dir.path()))?;
+                        recovered.with_scope_transition(|transition|store.complete_recovered_owner_publication(&recovery,&authorization,&recovered,transition,millis()))
+                    }).expect("settled original transfer did not unlock original metadata publication");
+                    assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.owner_control(&id).unwrap(),control_before);assert_eq!(store.pending_owner_messages(&id).unwrap(),2);
+                    assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);return;
+                }
                 if mode.ends_with("-publication-write-failure") {
                     let db=rusqlite::Connection::open(&state).unwrap();
                     db.execute_batch("CREATE TRIGGER deny_publication_intent BEFORE INSERT ON workflow_owner_publication_intent BEGIN SELECT RAISE(ABORT,'injected publication intent failure'); END;").unwrap();

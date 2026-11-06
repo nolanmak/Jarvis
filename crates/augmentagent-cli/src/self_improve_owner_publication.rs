@@ -86,6 +86,13 @@ impl OwnerPublicationRecord {
     pub(crate) fn workflow(&self)->&str {&self.input.workflow}
     pub(crate) fn repository(&self)->&str {&self.repository}
     pub(crate) fn recovery_binding(&self)->&crate::autoship_workflow::Binding {&self.next_binding}
+    pub(crate) fn require_recovery_transfer(&self,pending:&crate::autoship_workflow::PendingNativeHandoff)->Result<()> {
+        ensure!(pending.request().workflow_id==self.workflow() && pending.request().destination.owner.lease_generation==self.activated_generation
+            && pending.workflow_binding()==&self.next_binding && pending.request().source_owners.iter().any(|source|
+                source.owner.workflow_id==self.workflow() && source.owner.lease_generation==self.input.generation && source.audit_path==self.original_native.audit),
+            "owner recovery transfer differs from original activation");
+        self.validate_native_binding(pending.original_binding())
+    }
     pub(crate) fn recovery_identity(&self)->Result<(String,i64,crate::autoship_workflow::OwnerPreparationBinding,String)> {
         Ok((self.input.key()?,self.activated_generation,self.preparation.clone(),self.input.body_sha256.clone()))
     }

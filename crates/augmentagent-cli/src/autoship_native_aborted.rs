@@ -98,6 +98,12 @@ impl WorkflowStore {
             && lease.generation>pending.request.destination.owner.lease_generation,TransferReason::AuthorityConflict);
         acknowledge(&tx,&lease.workflow,lease.generation,binding,None,pending,now)?;tx.commit()?;Ok(())
     }
+    pub(crate) fn acknowledge_owner_recovery_native_aborted(&mut self,lease:&super::super::owner_publication_recovery::RecoveryLease,
+        authorization:&crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,pending:&PendingNativeHandoff,proof:&NativeTransferInspection<'_>,now:i64)->Result<()> {
+        require_aborted(pending,proof)?;let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::super::owner_publication_recovery::require_transfer_context(&tx,lease,authorization,pending,now)?;
+        acknowledge(&tx,&pending.request().workflow_id,lease.generation(),pending.workflow_binding(),None,pending,now)?;tx.commit()?;Ok(())
+    }
     pub(crate) fn acknowledge_terminal_native_aborted(&mut self,terminal:&terminal::TerminalNativeCheckpoint,pending:&PendingNativeHandoff,proof:&NativeTransferInspection<'_>,now:i64)->Result<()> {
         require_aborted(pending,proof)?;let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure!(terminal::capture(&tx,terminal.workflow())?==*terminal && pending.request.workflow_id==terminal.workflow()
