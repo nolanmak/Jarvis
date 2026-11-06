@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "kind": "ordinary-owner-turn-claim-fence-component",
+  "source_parent_commit": "30e7bc0e687e1bb9a806373f23030f6f1644fce4",
+  "source_inventory_is_post_run_inventory": true,
+  "source_generation_authority": false,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "794727b604e88a6a4d698cf1c37587f70f996aeae1daf0eae6d6b1ff8b3ce950"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+      "sha256": "65ccfdfbe27ce7901f04cb3260d222b7fd547b6690dbdb2fd7574b0b282e29f3"
+    },
+    {
+      "path": "docs/autoship/owner-acceptance-publication.md",
+      "sha256": "72e3314666ed7021b70eb0fd2486662e6df4bd56412604fd527ee56f342e2234"
+    }
+  ],
+  "validation": {
+    "red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent ordinary_recovery_cannot_take_an_unsettled_owner_turn_after_timeout",
+      "log": "/tmp/autoship-owner-claim-fence-red.log",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "observed": "claimed: generic recovery stole owner generation"
+    },
+    "focused": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent autoship_workflow::owner_",
+      "log": "/tmp/autoship-owner-claim-fence-green.log",
+      "exit": 0,
+      "passed": 36,
+      "failed": 0
+    },
+    "full_cli": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-claim-fence-full-cli.log",
+      "exit": 0,
+      "passed": 1911,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 279.38,
+      "native_guard_subprocess_modes": 65
+    },
+    "production_check": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-claim-fence-production-check.log",
+      "exit": 0
+    }
+  },
+  "coverage": [
+    "separate database connection after owner lease timeout",
+    "claimed, uncertain and unknown owner dispositions refuse ordinary recovery",
+    "productive and merge reconciliation cannot take the same unsettled turn",
+    "checkpoint, generation, attempts, events, owner control and pending input retained",
+    "zero confirmed autonomous merges manufactured",
+    "unrelated productive peer still advances"
+  ],
+  "original_native_closure_proved": false,
+  "canonical_manifest_publication": false,
+  "process_loss_recovery": false,
+  "productive_owner_consumer_enabled": false,
+  "shipping_authority": false,
+  "production_restored": false,
+  "remaining": [
+    "P1/P2 publication and authenticated process-loss recovery protocol",
+    "public output allowlist and independently authorized correction contexts",
+    "productive owner ingress",
+    "full C/R proof and CI cutover",
+    "exact-head hosted checks/review, normal rollout, live CLI/Discord acceptance and epic soaks"
+  ]
+}

@@ -206,6 +206,35 @@ mod tests {
         assert!(WorkflowStore::open(&path).unwrap().claim_owner_turn(&id,"restart",1000,100).unwrap().is_none(),"expired owner turn is uncertain, not permission to repeat its native mutation");
     }
     #[test]
+    fn ordinary_recovery_cannot_take_an_unsettled_owner_turn_after_timeout() {
+        for state in ["claimed", "uncertain", "unrecognized"] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+            let (mut store,id)=setup(&path);
+            let turn=store.claim_owner_turn(&id,"original-owner",4,100).unwrap().unwrap();
+            if state!="claimed" {
+                store.conn.execute("UPDATE workflow_owner_turn SET state=?2 WHERE request_id=?1",params![turn.request_id,state]).unwrap();
+            }
+            let before=store.snapshot(&id).unwrap().unwrap();
+            let events=store.events(&id).unwrap();
+            let control=store.owner_control(&id).unwrap();
+            drop(store);
+            // A different controller connection and expired lease are not
+            // evidence that the original native execution has closed.
+            let mut recovery=WorkflowStore::open(&path).unwrap();
+            assert!(recovery.claim(&id,"generic-recovery",1000,100).unwrap().is_none(),"{state}: generic recovery stole owner generation");
+            assert!(recovery.claim_productive(&id,"builder",1000,100).unwrap().is_none());
+            assert!(recovery.claim_reconciliation(&id,"merge-recovery",1000,100).unwrap().is_none());
+            assert_eq!(recovery.snapshot(&id).unwrap().unwrap(),before);
+            assert_eq!(recovery.events(&id).unwrap(),events);
+            assert_eq!(recovery.owner_control(&id).unwrap(),control);
+            assert_eq!(recovery.pending_owner_messages(&id).unwrap(),1);
+            assert_eq!(recovery.merge_allowance(1000,5).unwrap().confirmed,0);
+            // The fence belongs to this workflow, not the entire queue.
+            recovery.register("owner/repo#99","peer",turn.binding.clone(),1000).unwrap();
+            assert!(recovery.claim_productive("owner/repo#99","peer-builder",1001,100).unwrap().is_some());
+        }
+    }
+    #[test]
     fn owner_turn_requires_quiescence_and_never_clears_another_hold() {
         for blocker in ["lease","native","operation","held"] {
             let dir=tempfile::tempdir().unwrap();let (mut store,id)=setup(&dir.path().join("state.db"));

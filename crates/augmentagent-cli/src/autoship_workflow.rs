@@ -826,6 +826,16 @@ impl WorkflowStore {
             bail!("unknown workflow");
         };
         let cp: Checkpoint = serde_json::from_str(&raw)?;
+        // An expired lease is not original-native closure evidence. Ordinary
+        // recovery must not advance the generation under an escaped owner
+        // turn; authenticated owner recovery must settle that turn first.
+        let unsettled_owner: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1 AND state NOT IN ('completed','setup_refused'))",
+            [workflow], |r| r.get(0),
+        )?;
+        if unsettled_owner {
+            return Ok(None);
+        }
         // Pending owner cleanup owns this generation until checked retirement
         // settles the retry. Even free recovery must not fence that intent.
         if cp.stage == Stage::Held && cp.next.reason == "owner_execution_retry_pending" {
