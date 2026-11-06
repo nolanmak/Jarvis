@@ -46,14 +46,55 @@ impl UnusedNativeOwnerProof<'_> {
     pub fn namespace(&self)->&super::ownership::Authority {self.namespace}
     pub fn evidence(&self)->&Value {self.evidence}
 }
+/// Metadata-only absence proof, deliberately distinct from the productive
+/// first-body proof. Neither history JSON nor an ordinary logger can mint it.
+/// Existing conversations require their actual completion/transfer producer.
+pub struct MetadataUnusedNativeOwnerProof<'a> {
+    binding:&'a super::ownership::TransferBinding,
+    namespace:&'a super::ownership::Authority,
+    evidence:&'a Value,
+    _state:&'a super::StateLock,
+}
+impl MetadataUnusedNativeOwnerProof<'_> {
+    pub fn binding(&self)->&super::ownership::TransferBinding {self.binding}
+    pub fn namespace(&self)->&super::ownership::Authority {self.namespace}
+    pub fn evidence(&self)->&Value {self.evidence}
+}
+
+#[derive(Clone,Copy)]
+enum UnusedAdmission {Productive,Metadata}
+impl UnusedAdmission {
+    fn selection(self,logger:&AuditLogger,binding:&super::ownership::TransferBinding)->Result<()> {
+        match self {Self::Productive=>logger.dispatch_allowed()?,Self::Metadata=>logger.metadata_reconciliation_current()?}
+        selected_binding(binding)
+    }
+    fn kind(self)->&'static str {match self {Self::Productive=>"unused_native_workflow",Self::Metadata=>"metadata_unused_native_workflow"}}
+}
+
+/// Reconcile only the original currently unused namespace, retaining original
+/// state, scanned-session and protected audit locks through a metadata visitor.
+/// This cannot be converted into UnusedNativeOwnerProof or input permission.
+pub fn with_metadata_unused_native_owner(logger:&AuditLogger,current:&dyn Fn()->Result<()>,
+    visit:&mut dyn FnMut(&MetadataUnusedNativeOwnerProof<'_>)->Result<()>)->Result<()> {
+    with_unused_native_owner_inner(logger,current,UnusedAdmission::Metadata,&mut |binding,namespace,evidence,state| {
+        visit(&MetadataUnusedNativeOwnerProof {binding,namespace,evidence,_state:state})
+    })
+}
+
 /// Recheck actual physical absence, active original ownership, protected audit
 /// and kernel closure under the shared state/session/audit locks. The visitor
 /// and current fence perform short workflow metadata operations only.
 pub fn with_unused_native_owner(logger:&AuditLogger,current:&dyn Fn()->Result<()>,visit:&mut dyn FnMut(&UnusedNativeOwnerProof<'_>)->Result<()>)->Result<()> {
+    with_unused_native_owner_inner(logger,current,UnusedAdmission::Productive,&mut |binding,namespace,evidence,_state| {
+        visit(&UnusedNativeOwnerProof {binding,namespace,evidence})
+    })
+}
+fn with_unused_native_owner_inner(logger:&AuditLogger,current:&dyn Fn()->Result<()>,admission:UnusedAdmission,
+    visit:&mut dyn FnMut(&super::ownership::TransferBinding,&super::ownership::Authority,&Value,&super::StateLock)->Result<()>)->Result<()> {
     use sha2::{Digest,Sha256};
     current()?;
     let binding=logger.native_store_binding()?.context("unused native owner requires original binding")?;
-    selection(logger,&binding)?;
+    admission.selection(logger,&binding)?;
     let owner=logger.native_runtime_owner()?.context("unused native owner missing")?;
     let audit=super::owner_handoff::actual_audit(logger.path())?;
     ensure!(logger.protected_log_path()==Some(audit.as_path()),"unused native owner audit path changed");
@@ -64,11 +105,11 @@ pub fn with_unused_native_owner(logger:&AuditLogger,current:&dyn Fn()->Result<()
     super::owner_handoff::with_empty_workflow_inventory(root,&ledger,&namespace,&mut || {
         logger.with_namespace_quiescence_rows(&namespace,namespace.owner.lease_generation,|rows,audited| {
             ensure!(!rows.iter().any(|row|row["kind"].as_str().is_some_and(|kind|kind.starts_with("native_launch_") || kind=="model_call_admitted")),"native namespace already prepared or admitted a model call");
-            selection(logger,&binding)?;current()?;
-            let evidence=json!({"version":1,"kind":"unused_native_workflow","namespace":namespace,
+            admission.selection(logger,&binding)?;current()?;
+            let evidence=json!({"version":1,"kind":admission.kind(),"namespace":namespace,
                 "original_binding_sha256":format!("{:x}",Sha256::digest(super::ownership::canonical_bytes(&serde_json::to_value(&binding)?)?)),
                 "audit":audited["audit"],"namespace_validation":audited["validation"]});
-            visit(&UnusedNativeOwnerProof {binding:&binding,namespace:&namespace,evidence:&evidence})
+            visit(&binding,&namespace,&evidence,&lock)
         })
     })
 }
@@ -245,6 +286,9 @@ fn referenced_event(
 
 fn selection(logger: &AuditLogger, binding: &super::ownership::TransferBinding) -> Result<()> {
     logger.dispatch_allowed()?;
+    selected_binding(binding)
+}
+fn selected_binding(binding: &super::ownership::TransferBinding) -> Result<()> {
     let path = std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY")
         .context("native completion selected policy missing")?;
     let bytes = super::private(Path::new(&path))?;

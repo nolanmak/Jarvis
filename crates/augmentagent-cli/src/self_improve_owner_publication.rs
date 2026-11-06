@@ -60,6 +60,20 @@ impl OwnerPublicationRecord {
     pub(crate) fn workflow(&self)->&str {&self.input.workflow}
     pub(crate) fn request(&self)->&str {&self.input.request_id}
     pub(crate) fn generation(&self)->i64 {self.activated_generation}
+    pub(crate) fn validate_current_native(&self,conn:&rusqlite::Connection,expected_audit:&Path)->Result<()> {
+        use rusqlite::{params,OptionalExtension};
+        let context:Option<(String,String,i64,i64)>=conn.query_row("SELECT substr(o.audit_path,1,4097),substr(b.binding,1,16385),length(CAST(o.audit_path AS BLOB)),length(CAST(b.binding AS BLOB)) FROM workflow_native_owner o JOIN workflow_native_owner_binding b ON b.workflow=o.workflow AND b.lease_generation=o.lease_generation WHERE o.workflow=?1 AND o.lease_generation=?2 AND o.retirement_reason IS NULL AND o.retired_at IS NULL",params![self.workflow(),self.activated_generation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let (audit,raw,audit_bytes,binding_bytes)=context.context("owner publication activated native registration missing or retiring")?;
+        ensure!((1..=4096).contains(&audit_bytes) && (1..=16384).contains(&binding_bytes),"owner publication activated native metadata exceeds bound");
+        ensure!(Path::new(&audit)==expected_audit,"owner publication activated native audit changed");
+        let binding:augmentagent_channel_core::native_vm::ownership::TransferBinding=serde_json::from_str(&raw)?;
+        self.validate_native_binding(&binding)
+    }
+    fn validate_native_binding(&self,binding:&augmentagent_channel_core::native_vm::ownership::TransferBinding)->Result<()> {
+        binding.validate()?;
+        let sha=amendment::digest(&augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(binding)?)?);
+        ensure!(sha==self.original_native.binding_sha256,"owner publication original native binding changed");Ok(())
+    }
     pub(crate) fn validate_history(&self,conn:&rusqlite::Connection)->Result<()> {
         use rusqlite::{params,OptionalExtension};
         let (registration,binding,body):(String,String,String)=conn.query_row("SELECT registration,binding,owner_message_sha256 FROM workflow_owner_revision WHERE request_id=?1",[self.request()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
@@ -114,6 +128,27 @@ impl OwnerPublicationRecord {
 /// Borrowed original producer; history JSON cannot reconstruct activation input.
 pub(crate) struct OwnerPublicationDraft<'a> {record:OwnerPublicationRecord,producer:&'a PreparedOwnerAcceptance}
 impl OwnerPublicationDraft<'_> {
+    /// Preflight against the retained original producer. These bounded file
+    /// checks precede native locks; the eventual writer must recheck its exact
+    /// canonical/evidence bytes at commit, rather than treating this as a grant.
+    pub(in crate::self_improve) fn metadata_turn(&self,repository:&str,lease:&crate::autoship_workflow::Lease,
+        binding:&crate::autoship_workflow::Binding,candidate:&Path)->Result<crate::autoship_workflow::owner_turn::OwnerTurn> {
+        ensure!(repository==self.record.repository && lease.workflow==self.record.input.workflow
+            && lease.owner==self.record.input.owner && lease.generation==self.record.activated_generation
+            && binding==&self.record.next_binding,"owner publication live metadata context changed");
+        self.producer.candidate.verify(candidate)?;
+        ensure!(self.producer.activation_binding()?==self.record.preparation,"owner publication original preparation changed");
+        self.record.canonical.verify_current()?;
+        let evidence=bytes(&self.record.canonical.control.join(&self.record.next_evidence.file),4*1024*1024)?;
+        ensure!(evidence.len()==self.record.next_evidence.bytes && amendment::digest(&evidence)==self.record.next_evidence.sha256
+            && evidence==serde_json::to_vec(self.producer.prepared())?,"owner publication immutable next evidence changed");
+        Ok(crate::autoship_workflow::owner_turn::OwnerTurn {lease:lease.clone(),request_id:self.record.input.request_id.clone(),
+            body:self.record.input.body.clone(),pause_revision:self.record.input.pause_revision,binding:binding.clone()})
+    }
+    pub(in crate::self_improve) fn preparation(&self)->&crate::autoship_workflow::OwnerPreparationBinding {&self.record.preparation}
+    pub(in crate::self_improve) fn validate_native_binding(&self,binding:&augmentagent_channel_core::native_vm::ownership::TransferBinding)->Result<()> {
+        self.record.validate_native_binding(binding)
+    }
     pub(crate) fn encode_for_activation(&self,turn:&crate::autoship_workflow::owner_turn::OwnerTurn,next:&RegisteredContract,
         preparation:&crate::autoship_workflow::OwnerPreparationBinding,binding:&crate::autoship_workflow::Binding)->Result<String> {
         self.record.validate_fields(next)?;

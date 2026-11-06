@@ -807,14 +807,19 @@ impl AuditLogger {
     /// Check only the original metadata fence and protected continuity.
     /// Callers must separately retain the native/scope proofs their write needs.
     pub(crate) fn metadata_reconciliation_allowed(&self) -> anyhow::Result<()> {
+        self.check_protected_continuity()?;
+        self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("protected metadata audit missing"))?
+            .with_retained_snapshot(|_,_|self.metadata_reconciliation_current())
+    }
+
+    /// Current role/lease only. The native metadata producer supplies its own
+    /// retained committed audit snapshot; reacquiring it there would deadlock.
+    /// This check alone is not a native or publication proof.
+    pub(crate) fn metadata_reconciliation_current(&self) -> anyhow::Result<()> {
         let current=self.metadata_only.read().map_err(|_|anyhow::anyhow!("metadata admission lock poisoned"))?
             .clone().ok_or_else(||anyhow::anyhow!("metadata reconciliation fence missing"))?;
         self.check_protected_continuity()?;
-        self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("protected metadata audit missing"))?
-            .with_retained_snapshot(|_,_| {
-                self.check_protected_continuity()?;
-                current()
-            })
+        current()
     }
 
     fn productive_admission(&self) -> anyhow::Result<std::sync::RwLockReadGuard<'_,Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>> {

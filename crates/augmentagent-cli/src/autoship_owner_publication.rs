@@ -46,13 +46,17 @@ impl WorkflowStore {
     /// Current metadata authority for an uninterrupted original activation.
     /// This deliberately does not assert publication completion or coding readiness.
     pub(crate) fn validate_owner_publication_metadata(&mut self,turn:&owner_turn::OwnerTurn,
-        preparation:&OwnerPreparationBinding,now:i64)->Result<()> {
+        preparation:&OwnerPreparationBinding,native_audit:&Path,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_native_dispatch_tx(&tx,&turn.lease,&turn.binding,now)?;
         owner_turn::validate_turn(&tx,turn,now)?;
         owner_revision::require_preparation(&tx,turn,preparation)?;
         let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_publication_pending WHERE workflow=?1 AND request_id=?2)",params![turn.lease.workflow,turn.request_id],|r|r.get(0))?;
         ensure!(pending,"original owner publication is no longer pending");
+        let raw:String=tx.query_row("SELECT record FROM workflow_owner_publication_intent WHERE request_id=?1",[&turn.request_id],|r|r.get(0))?;
+        let record:crate::self_improve::OwnerPublicationRecord=serde_json::from_str(&raw)?;
+        ensure!(record.workflow()==turn.lease.workflow && record.generation()==turn.lease.generation,"owner publication activated native generation changed");
+        record.validate_current_native(&tx,native_audit)?;
         tx.commit()?;Ok(())
     }
 }

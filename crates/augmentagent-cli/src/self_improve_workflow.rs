@@ -261,6 +261,30 @@ pub(super) struct OwnerPublicationGuard<'a> {
     _publication: acceptance::owner::publication::OwnerPublicationDraft<'a>,
 }
 
+impl OwnerPublicationGuard<'_> {
+    /// Uninterrupted, originally unused namespace only. The callback performs
+    /// short metadata work under original native locks; no productive API is
+    /// exposed and existing conversations are never relabelled as unused.
+    fn with_unused_native_metadata(&self,visit:&mut dyn FnMut(&augmentagent_channel_core::native_vm::ownership::MetadataUnusedNativeOwnerProof<'_>)->Result<()>)->Result<()> {
+        let guard=&self._guard;
+        anyhow::ensure!(guard.metadata_only,"publication metadata role missing");
+        guard.healthy_lease()?;
+        let turn=self._publication.metadata_turn(&guard.repository,&guard.lease,&guard.binding,&guard.worktree)?;
+        let current=|| {
+            guard.healthy_lease()?;
+            guard.store.lock().map_err(|_|anyhow::anyhow!("publication metadata store poisoned"))?
+                .validate_owner_publication_metadata(&turn,self._publication.preparation(),guard.audit.path(),millis())
+        };
+        augmentagent_channel_core::native_vm::ownership::with_metadata_unused_native_owner(&guard.audit,&current,&mut |proof| {
+            anyhow::ensure!(proof.namespace().owner.workflow_id==guard.lease.workflow
+                && proof.namespace().owner.lease_generation==guard.lease.generation
+                && Path::new(&proof.namespace().audit_path)==guard.audit.path(),"owner publication native metadata namespace changed");
+            self._publication.validate_native_binding(proof.binding())?;
+            visit(proof)
+        })
+    }
+}
+
 enum OwnerActivationMode {
     Metadata,
     // Accounting component fixtures are not productive publication acceptance.
@@ -1514,11 +1538,11 @@ impl WorkflowGuard {
         })?;
         self.register_native_context()?;
         if let Some(preparation)=publication {
-            let store=self.store.clone();let failure=self.lease_failure.clone();
+            let store=self.store.clone();let failure=self.lease_failure.clone();let native_audit=self.audit.path().to_path_buf();
             self.audit.restrict_to_metadata(Arc::new(move || {
                 anyhow::ensure!(failure.lock().map_err(|_|anyhow::anyhow!("metadata failure lock poisoned"))?.is_none(),"metadata owner guard fenced");
                 store.lock().map_err(|_|anyhow::anyhow!("metadata publication store poisoned"))?
-                    .validate_owner_publication_metadata(&original_turn,&preparation,millis())
+                    .validate_owner_publication_metadata(&original_turn,&preparation,&native_audit,millis())
             }))?;
         }else {
             self.install_model_accounting()?;
@@ -3918,6 +3942,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_publication_metadata_proof_uses_original_native_namespace_without_execution() {
+        let control=control_dir();
+        let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--test-threads=1"])
+            .env("AUTOSHIP_INITIAL_GUARD_CHILD",control.path()).env("AUTOSHIP_INITIAL_GUARD_MODE","owner-early-acceptance-producer-metadata-native-proof")
+            .env("XDG_STATE_HOME",control.path().join("operator-state")).env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json")).output().unwrap();
+        assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[tokio::test]
     async fn pending_owner_publication_returns_only_metadata_authority() {
         let control=control_dir();
         let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--test-threads=1"])
@@ -4284,12 +4317,98 @@ mod tests {
                         prepared.test_reload_cached(dir.path(),&first).await.unwrap();
                     }
                     first.finish().unwrap();
-                }else if mode.ends_with("-metadata-only") {
+                }else if mode.ends_with("-metadata-only") || mode.ends_with("-metadata-native-proof") {
                     let retained=first.audit.clone();
                     let pending=first.activate_prepared_owner_acceptance(&prepared,None).await.unwrap();
                     // Test module can inspect the private inner; product callers cannot.
                     let guard=&pending._guard;
                     assert!(guard.metadata_only);
+                    if mode.ends_with("-metadata-native-proof") {
+                        use std::os::fd::AsRawFd;
+                        use augmentagent_channel_core::native_vm::ownership;
+                        let before=WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap();
+                        let epoch=std::fs::read(native.join("authority-epoch.json")).unwrap();
+                        let audit_before=std::fs::read(guard.audit.path()).unwrap();
+                        let (_,audit_log,audit_anchor)=audit_generation_paths(&state,&id,guard.lease.generation).unwrap();
+                        assert_eq!(audit_log,guard.audit.path());
+                        let refuse=|pending:&OwnerPublicationGuard<'_>| {
+                            let mut entered=false;
+                            assert!(pending.with_unused_native_metadata(&mut |_| {entered=true;Ok(())}).is_err());
+                            assert!(!entered,"refused metadata context reached locked visitor");
+                        };
+                        let mut visited=false;
+                        pending.with_unused_native_metadata(&mut |proof| {
+                            assert_eq!(proof.namespace().owner.lease_generation,guard.lease.generation);
+                            assert_eq!(proof.binding(),&original);
+                            assert_eq!(proof.evidence()["kind"],"metadata_unused_native_workflow");
+                            for lock in [native.join("state.lock"),audit_anchor.with_extension("lock")] {
+                                let competing=std::fs::OpenOptions::new().read(true).open(&lock).unwrap();
+                                assert_ne!(unsafe{libc::flock(competing.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0,"original lock escaped metadata visitor: {}",lock.display());
+                            }
+                            assert!(guard.audit.dispatch_allowed().is_err());
+                            assert!(guard.audit.model_call_admitted("codex").is_err());
+                            visited=true;Ok(())
+                        }).expect("metadata publication cannot obtain native metadata proof without enabling execution");
+                        assert!(visited);
+                        let mut productive_visited=false;
+                        assert!(ownership::with_unused_native_owner(&guard.audit,&||Ok(()),&mut |_| {productive_visited=true;Ok(())}).is_err());assert!(!productive_visited);
+                        let reopened=augmentagent_channel_core::AuditLogger::protected(guard.audit.path().to_path_buf(),audit_anchor,&[]).unwrap();
+                        reopened.set_native_runtime_owner(guard.audit.native_runtime_owner().unwrap().unwrap()).unwrap();
+                        reopened.set_native_store_binding(original.clone()).unwrap();
+                        let mut reopened_visited=false;
+                        assert!(ownership::with_metadata_unused_native_owner(&reopened,&||Ok(()),&mut |_| {reopened_visited=true;Ok(())}).is_err());assert!(!reopened_visited);
+                        let policy_data=std::fs::read(&policy).unwrap();
+                        let mut changed:serde_json::Value=serde_json::from_slice(&policy_data).unwrap();changed["max_sessions"]=17.into();
+                        std::fs::write(&policy,serde_json::to_vec(&changed).unwrap()).unwrap();
+                        refuse(&pending);
+                        std::fs::write(&policy,&policy_data).unwrap();
+                        pending.with_unused_native_metadata(&mut |_|Ok(())).unwrap();
+                        let publication_control=control.join("owner-producer-control");
+                        let artifact=std::fs::read_dir(publication_control.join("owner-preparations")).unwrap().next().unwrap().unwrap().path();
+                        let next_evidence=std::fs::read_dir(&publication_control).unwrap().map(|e|e.unwrap().path()).find(|p|p.file_name().unwrap().to_string_lossy().starts_with("issue-77-owner-")).unwrap();
+                        for file in [artifact,next_evidence] {
+                            let saved=std::fs::read(&file).unwrap();std::fs::write(&file,b"{}").unwrap();
+                            refuse(&pending);assert_eq!(std::fs::read(&file).unwrap(),b"{}","proof refusal rewrote original evidence");
+                            std::fs::write(&file,&saved).unwrap();pending.with_unused_native_metadata(&mut |_|Ok(())).unwrap();
+                        }
+                        let canonical=publication_control.join("issue-77-workflow.json");assert!(!canonical.exists());
+                        std::fs::write(&canonical,b"{}").unwrap();std::fs::set_permissions(&canonical,std::fs::Permissions::from_mode(0o600)).unwrap();
+                        refuse(&pending);assert_eq!(std::fs::read(&canonical).unwrap(),b"{}");std::fs::remove_file(&canonical).unwrap();
+                        pending.with_unused_native_metadata(&mut |_|Ok(())).unwrap();
+                        for provider in ["codex","claude"] {
+                            let directory=native.join(provider);std::fs::create_dir_all(&directory).unwrap();std::fs::set_permissions(&directory,std::fs::Permissions::from_mode(0o700)).unwrap();
+                            let runtime=directory.join("session-metadata-unknown");std::fs::create_dir(&runtime).unwrap();std::fs::set_permissions(&runtime,std::fs::Permissions::from_mode(0o700)).unwrap();
+                            let owned=serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":guard.audit.path(),"owner":guard.audit.native_runtime_owner().unwrap().unwrap()})).unwrap();
+                            std::fs::write(runtime.join("owned.json"),&owned).unwrap();std::fs::set_permissions(runtime.join("owned.json"),std::fs::Permissions::from_mode(0o600)).unwrap();
+                            refuse(&pending);
+                            assert_eq!(std::fs::read(runtime.join("owned.json")).unwrap(),owned,"unknown original runtime was changed by proof refusal");
+                            // Remove only this disposable negative fixture, never an actual runtime.
+                            std::fs::remove_dir_all(&runtime).unwrap();
+                            pending.with_unused_native_metadata(&mut |_|Ok(())).unwrap();
+                        }
+                        assert!(pending.with_unused_native_metadata(&mut |_|anyhow::bail!("injected metadata visitor failure")).is_err());
+                        pending.with_unused_native_metadata(&mut |_|Ok(())).unwrap();
+                        std::fs::write(guard.audit.path(),b"damaged committed audit\n").unwrap();
+                        refuse(&pending);assert_eq!(std::fs::read(guard.audit.path()).unwrap(),b"damaged committed audit\n");
+                        std::fs::write(guard.audit.path(),&audit_before).unwrap();pending.with_unused_native_metadata(&mut |_|Ok(())).unwrap();
+                        let db=rusqlite::Connection::open(&state).unwrap();
+                        let saved_native:(String,String)=db.query_row("SELECT o.audit_path,b.binding FROM workflow_native_owner o JOIN workflow_native_owner_binding b ON b.workflow=o.workflow AND b.lease_generation=o.lease_generation WHERE o.workflow=?1 AND o.lease_generation=?2",rusqlite::params![id,guard.lease.generation],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                        db.execute("UPDATE workflow_native_owner SET audit_path='/unknown-metadata-audit' WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,guard.lease.generation]).unwrap();refuse(&pending);
+                        db.execute("UPDATE workflow_native_owner SET audit_path=?3 WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,guard.lease.generation,saved_native.0]).unwrap();
+                        pending.with_unused_native_metadata(&mut |_|Ok(())).unwrap();
+                        db.execute("UPDATE workflow_native_owner_binding SET binding='{}' WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,guard.lease.generation]).unwrap();refuse(&pending);
+                        db.execute("UPDATE workflow_native_owner_binding SET binding=?3 WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,guard.lease.generation,saved_native.1]).unwrap();
+                        pending.with_unused_native_metadata(&mut |_|Ok(())).unwrap();
+                        let retirement:(Option<String>,Option<i64>)=db.query_row("SELECT retirement_reason,retired_at FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,guard.lease.generation],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();assert_eq!(retirement,(None,None));
+                        db.execute("UPDATE workflow_native_owner SET retirement_reason='fixture-retirement' WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,guard.lease.generation]).unwrap();refuse(&pending);
+                        db.execute("UPDATE workflow_native_owner SET retirement_reason=NULL WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,guard.lease.generation]).unwrap();
+                        db.execute("UPDATE workflow_native_owner SET retired_at=1 WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,guard.lease.generation]).unwrap();refuse(&pending);
+                        db.execute("UPDATE workflow_native_owner SET retired_at=NULL WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,guard.lease.generation]).unwrap();
+                        pending.with_unused_native_metadata(&mut |_|Ok(())).unwrap();
+                        assert_eq!(std::fs::read(native.join("authority-epoch.json")).unwrap(),epoch);
+                        assert_eq!(std::fs::read(guard.audit.path()).unwrap(),audit_before,"proof-only inspection appended or replaced audit evidence");
+                        assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap(),before,"proof-only inspection charged or changed workflow state");
+                    }
                     assert!(guard.validate_before_side_effect().is_err());
                     assert!(guard.audit.dispatch_allowed().is_err(),"pending owner publication escaped as productive guard");
                     assert!(guard.audit.model_call_admitted("codex").is_err());
@@ -4299,13 +4418,25 @@ mod tests {
                     assert!(!scope_file.exists(),"metadata activation registered productive scope");
                     let turn=guard.store.lock().unwrap().owner_turn_for_lease(&guard.lease,millis()).unwrap();
                     let binding=prepared.activation_binding().unwrap();
-                    guard.store.lock().unwrap().validate_owner_publication_metadata(&turn,&binding,millis()).unwrap();
+                    guard.store.lock().unwrap().validate_owner_publication_metadata(&turn,&binding,guard.audit.path(),millis()).unwrap();
                     let db=rusqlite::Connection::open(&state).unwrap();
                     let saved:String=db.query_row("SELECT record FROM workflow_owner_publication_intent WHERE request_id=?1",[&turn.request_id],|r|r.get(0)).unwrap();
                     db.execute("UPDATE workflow_owner_publication_intent SET record='{}' WHERE request_id=?1",[&turn.request_id]).unwrap();
-                    assert!(guard.store.lock().unwrap().validate_owner_publication_metadata(&turn,&binding,millis()).is_err());
+                    assert!(guard.store.lock().unwrap().validate_owner_publication_metadata(&turn,&binding,guard.audit.path(),millis()).is_err());
+                    if mode.ends_with("-metadata-native-proof") {
+                        let mut entered=false;
+                        assert!(pending.with_unused_native_metadata(&mut |_| {entered=true;Ok(())}).is_err());assert!(!entered);
+                    }
                     db.execute("UPDATE workflow_owner_publication_intent SET record=?2 WHERE request_id=?1",rusqlite::params![turn.request_id,saved]).unwrap();
-                    guard.store.lock().unwrap().validate_owner_publication_metadata(&turn,&binding,millis()).unwrap();
+                    guard.store.lock().unwrap().validate_owner_publication_metadata(&turn,&binding,guard.audit.path(),millis()).unwrap();
+                    if mode.ends_with("-metadata-native-proof") {
+                        let mut store=WorkflowStore::open(&state).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
+                        store.set_owner_pause(&id,"fixture-owner",revision,true,millis()).unwrap();drop(store);
+                        let mut entered=false;
+                        assert!(pending.with_unused_native_metadata(&mut |_| {entered=true;Ok(())}).is_err());assert!(!entered,"new owner pause reached metadata visitor");
+                        assert_eq!(WorkflowStore::open(&state).unwrap().pending_owner_messages(&id).unwrap(),1);
+                        assert_eq!(WorkflowStore::open(&state).unwrap().merge_allowance(millis(),5).unwrap().confirmed,0);
+                    }
                     let snapshot=WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap();
                     drop(pending);
                     assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap(),snapshot,"dropping metadata authority changed execution accounting or released original work");
@@ -4355,7 +4486,7 @@ mod tests {
                     }
                     assert_eq!(first.audit.native_store_binding().unwrap(),Some(original));first.finish().unwrap();
                 }
-                let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.owner_control(&id).unwrap().unwrap().paused,mode.ends_with("-fenced"));
+                let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert_eq!(store.owner_control(&id).unwrap().unwrap().paused,mode.ends_with("-fenced") || mode.ends_with("-metadata-native-proof"));
                 assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,if mode.ends_with("-body-admission"){1}else{0});return;
             }
             if mode.contains("-initial-acceptance") {

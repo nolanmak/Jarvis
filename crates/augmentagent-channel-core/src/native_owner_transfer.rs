@@ -15,6 +15,7 @@ pub use super::owner_completion::{
     observe_native_completion, observe_native_uncertainty, VerifiedNativeObservation,
     with_current_native_completion, NativeCompletionProof, with_unused_native_owner, UnusedNativeOwnerProof,
     with_initial_prepared_native_owner, InitialPreparedNativeOwnerProof,
+    with_metadata_unused_native_owner, MetadataUnusedNativeOwnerProof,
 };
 
 pub use crate::native_owner_transfer_wire::{
