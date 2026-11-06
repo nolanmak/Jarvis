@@ -73,17 +73,8 @@ impl OwnerPublicationDraft<'_> {
         autoship_write_scope::scope_reference_for(self.record.candidate.root_path(),&self.record.next_binding.contract,allowed,pinned)
     }
     fn previous_scope(&self)->Result<Option<ScopeReference>> {
-        let Some(raw)=&self.record.canonical.manifest else {return Ok(None)};
-        let old:WorkflowManifest=serde_json::from_str(raw)?;
-        let path=if let Some(name)=&old.evidence_file {
-            ensure!(Path::new(name).components().count()==1 && matches!(Path::new(name).components().next(),Some(std::path::Component::Normal(_))),"owner publication original evidence reference is not a basename");
-            self.record.canonical.control.join(name)
-        }else {evidence_path(&self.record.canonical.control,self.record.input.source,&old.original_base)?};
-        let prepared:PreparedAcceptance=serde_json::from_slice(&bytes(&path,4*1024*1024)?)?;
+        let Some(prepared)=self.record.previous_prepared()? else {return Ok(None)};
         let registration=&prepared.baseline.registration;
-        ensure!(registration.contract_hash()==old.contract_hash && registration.contract().revision==old.contract_revision
-            && registration.baseline_head()==old.original_base && registration.contract().source()?==self.record.input.source,
-            "owner publication original evidence differs from retained canonical manifest");
         let (allowed,pinned)=permissions(&prepared)?;
         Ok(Some(autoship_write_scope::scope_reference_for(self.record.candidate.root_path(),registration.contract_hash(),allowed,pinned)?))
     }

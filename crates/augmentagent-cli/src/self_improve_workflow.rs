@@ -4057,7 +4057,7 @@ mod tests {
     #[tokio::test]
     async fn expired_owner_publication_has_authenticated_metadata_recovery() {
         use std::os::unix::fs::PermissionsExt;
-        for mode in ["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery"] {
+        for mode in ["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery","owner-early-acceptance-producer-recovery-revised-metadata-recovery","owner-early-acceptance-producer-claude-recovery-revised-metadata-recovery"] {
         let control=control_dir();let gh=control.path().join("gh-recovery");
         std::fs::write(&gh,r#"#!/usr/bin/python3
 import json,sys
@@ -4350,7 +4350,7 @@ else: raise SystemExit('unexpected authority call')
             contract.criteria.push(Criterion {id:"C2".into(),requirement:"Additional owner requirement".into(),verifier_ids:vec!["ready".into()]});
             let next=register(contract);Some((previous,next))
         }else{None};
-        let publication_previous=if mode.ends_with("-publication-revision") {
+        let publication_previous=if mode.ends_with("-publication-revision") || mode.contains("-recovery-revised-") {
             let base=git_evidence(dir.path(),&["rev-parse","HEAD"]).await.unwrap();
             Some(acceptance::owner::test_publication_original(dir.path(),&control.join("owner-producer-control"),&base).unwrap())
         }else {None};
@@ -4598,7 +4598,9 @@ else: raise SystemExit('unexpected authority call')
                     assert_eq!(WorkflowStore::open(&state).unwrap().merge_allowance(millis(),5).unwrap().confirmed,0);
                     return;
                 }
-                let prepared=acceptance::owner::test_cached_preparation(dir.path(),&control.join("owner-producer-control"),&first).await.unwrap();
+                let prepared=if publication_previous.is_some() {
+                    acceptance::owner::test_publication_preparation(dir.path(),&control.join("owner-producer-control"),&first,publication_previous.as_ref()).await.unwrap()
+                }else {acceptance::owner::test_cached_preparation(dir.path(),&control.join("owner-producer-control"),&first).await.unwrap()};
                 assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap(),before,"preparation changed workflow state");
                 if mode.ends_with("-publication-write-failure") {
                     let db=rusqlite::Connection::open(&state).unwrap();
@@ -4638,7 +4640,10 @@ else: raise SystemExit('unexpected authority call')
                     first.finish().unwrap();
                 }else if mode.ends_with("-metadata-only") || mode.ends_with("-metadata-native-proof") || mode.ends_with("-metadata-recovery") {
                     let retained=first.audit.clone();
-                    let pending=first.activate_prepared_owner_acceptance(&prepared,None).await.unwrap();
+                    let scope_state=augmentagent_channel_core::state_dir::state_dir().unwrap();
+                    let scope_file=scope_state.join("autoship-write-admission").join(format!("{:x}.json",Sha256::digest(dir.path().canonicalize().unwrap().as_os_str().as_encoded_bytes())));
+                    let scope_before=std::fs::read(&scope_file).ok();
+                    let pending=first.activate_prepared_owner_acceptance(&prepared,publication_previous.as_ref().map(|p|&p.baseline.registration)).await.unwrap();
                     // Test module can inspect the private inner; product callers cannot.
                     let guard=&pending._guard;
                     assert!(guard.metadata_only);
@@ -4740,9 +4745,7 @@ else: raise SystemExit('unexpected authority call')
                     assert!(guard.audit.dispatch_allowed().is_err(),"pending owner publication escaped as productive guard");
                     assert!(guard.audit.model_call_admitted("codex").is_err());
                     assert!(retained.dispatch_allowed().is_err(),"old audit retained productive generation authority");
-                    let scope_state=augmentagent_channel_core::state_dir::state_dir().unwrap();
-                    let scope_file=scope_state.join("autoship-write-admission").join(format!("{:x}.json",Sha256::digest(dir.path().canonicalize().unwrap().as_os_str().as_encoded_bytes())));
-                    assert!(!scope_file.exists(),"metadata activation registered productive scope");
+                    assert_eq!(std::fs::read(&scope_file).ok(),scope_before,"metadata activation changed productive scope");
                     let turn=guard.store.lock().unwrap().owner_turn_for_lease(&guard.lease,millis()).unwrap();
                     let binding=prepared.activation_binding().unwrap();
                     guard.store.lock().unwrap().validate_owner_publication_metadata(&pending._metadata,millis()).unwrap();
@@ -4793,7 +4796,8 @@ else: raise SystemExit('unexpected authority call')
                         let live_auth=super::super::targeted::authorize_owner_publication_recovery(dir.path(),&live_plan,policy).await.unwrap();
                         assert!(WorkflowStore::open(&state).unwrap().claim_owner_publication_recovery(&live_auth,"must-wait",millis(),60_000).unwrap().is_none());
                         let original_generation=guard.lease.generation;let original_request=turn.request_id.clone();
-                        drop(pending);drop(live_auth);drop(live_plan);
+                        let original_preparation=prepared.activation_binding().unwrap();
+                        drop(pending);drop(prepared);drop(live_auth);drop(live_plan);
                         // Controlled expiry projection; no native cleanup is inferred.
                         db.execute("UPDATE workflow SET lease_until=?2 WHERE id=?1",rusqlite::params![id,millis()-1]).unwrap();
                         let mut store=WorkflowStore::open(&state).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
@@ -4840,6 +4844,80 @@ else: raise SystemExit('unexpected authority call')
                             native_visited=true;Ok(())
                         }).expect("authenticated recovery could not inspect original native metadata while held and paused");
                         assert!(native_visited);assert_eq!(std::fs::read(&original_audit).unwrap(),audit_before);
+                        let original_intent:serde_json::Value=serde_json::from_str(&intent_before.0).unwrap();
+                        let canonical=control.join("owner-producer-control/issue-77-workflow.json");
+                        let next=original_intent["next_manifest"].as_str().unwrap().as_bytes();
+                        let canonical_before=std::fs::read(&canonical).ok();
+                        for already_written in [false,true] {
+                            if already_written {std::fs::write(&canonical,next).unwrap();std::fs::set_permissions(&canonical,std::fs::Permissions::from_mode(0o600)).unwrap();}
+                            let mut reopened=false;
+                            with_recovery_native_metadata(&state,Some(dir.path()),recovery.clone(),&authorization,&mut |proof| {
+                                let recovered=store.with_owner_recovery_preparation(&recovery,&authorization,proof,millis(),|access|
+                                    acceptance::owner::publication::reopen_recovery_preparation(access,proof,dir.path()))?;
+                                recovered.require_recovery_claim(&recovery)?;
+                                assert_eq!(recovered.request_id(),original_request);
+                                assert_eq!(recovered.original_generation()+1,original_generation);
+                                assert_eq!(recovered.activated_generation(),original_generation);
+                                assert_eq!(recovered.context_sha256(),original_preparation.context_sha256());
+                                assert_eq!(recovered.contract_hash(),original_intent["next_binding"]["contract"].as_str().unwrap());
+                                reopened=true;Ok(())
+                            }).unwrap_or_else(|error|panic!("original preparation recovery failed (canonical_already_written={already_written}): {error:#}"));
+                            assert!(reopened);
+                            if already_written {assert_eq!(std::fs::read(&canonical).unwrap(),next,"recovery read rewrote the exact next canonical");}
+                            assert_eq!(std::fs::read(&scope_file).ok(),scope_before,"recovery preparation read changed write scope");
+                            assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_publication_completion WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),0,"read-only recovery fabricated publication completion");
+                        }
+                        if let Some(old)=&canonical_before {std::fs::write(&canonical,old).unwrap();}else{std::fs::remove_file(&canonical).unwrap();}
+                        let mut reopen_original=|| {
+                            let mut entered=false;let mut reopened=false;
+                            let result=with_recovery_native_metadata(&state,Some(dir.path()),recovery.clone(),&authorization,&mut |proof| {
+                                entered=true;
+                                store.with_owner_recovery_preparation(&recovery,&authorization,proof,millis(),|access|
+                                    acceptance::owner::publication::reopen_recovery_preparation(access,proof,dir.path()))?;
+                                reopened=true;Ok(())
+                            });(result,entered,reopened)
+                        };
+                        let artifact=PathBuf::from(original_intent["preparation_file"].as_str().unwrap());
+                        let artifact_bytes=std::fs::read(&artifact).unwrap();
+                        for fault in ["version","unknown-field","rekeyed-input","trailing-bytes","missing","symlink","hardlink","fifo","public-mode"] {
+                            let retained_file=tempfile::tempdir_in(artifact.parent().unwrap()).unwrap();let original_file=retained_file.path().join("original");
+                            std::fs::rename(&artifact,&original_file).unwrap();
+                            match fault {
+                                "version"|"unknown-field"|"rekeyed-input"=>{
+                                    let original_text=std::str::from_utf8(&artifact_bytes).unwrap();
+                                    let changed=if fault=="version" {original_text.replacen("\"version\":3","\"version\":4",1)}else if fault=="unknown-field" {
+                                        original_text.replacen('{',"{\"untrusted_claim\":true,",1)
+                                    }else {original_text.replacen(&format!("\"generation\":{}",original_generation-1),&format!("\"generation\":{}",recovery.generation()),1)};
+                                    assert_ne!(changed,original_text);std::fs::write(&artifact,changed.as_bytes()).unwrap();
+                                    std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
+                                },
+                                "trailing-bytes"=>{let mut changed=artifact_bytes.clone();changed.push(b' ');std::fs::write(&artifact,changed).unwrap();std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();},
+                                "missing"=>{},
+                                "symlink"=>std::os::unix::fs::symlink(&original_file,&artifact).unwrap(),
+                                "hardlink"=>std::fs::hard_link(&original_file,&artifact).unwrap(),
+                                "fifo"=>{use std::os::unix::ffi::OsStrExt;let name=std::ffi::CString::new(artifact.as_os_str().as_bytes()).unwrap();assert_eq!(unsafe{libc::mkfifo(name.as_ptr(),0o600)},0);},
+                                "public-mode"=>{std::fs::write(&artifact,&artifact_bytes).unwrap();std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o644)).unwrap();},_=>unreachable!(),
+                            }
+                            let (result,entered,reopened)=reopen_original();assert!(result.is_err() && entered && !reopened,"{fault}: invalid protected preparation accepted or failed before original native visitor");
+                            assert_eq!(std::fs::read(&original_file).unwrap(),artifact_bytes,"recovery changed original retained fixture");
+                            if fault!="missing" {std::fs::remove_file(&artifact).unwrap();}std::fs::rename(&original_file,&artifact).unwrap();
+                            assert!(reopen_original().0.is_ok(),"{fault}: restoring original preparation did not recover inspection");
+                        }
+                        for path in [artifact.parent().unwrap().parent().unwrap().join(original_intent["next_evidence"]["file"].as_str().unwrap()),canonical.clone()] {
+                            let saved=std::fs::read(&path).ok();std::fs::write(&path,b"{}").unwrap();std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600)).unwrap();
+                            let (result,entered,reopened)=reopen_original();assert!(result.is_err() && entered && !reopened);assert_eq!(std::fs::read(&path).unwrap(),b"{}");
+                            if let Some(saved)=saved {std::fs::write(&path,saved).unwrap();}else{std::fs::remove_file(&path).unwrap();}
+                            assert!(reopen_original().0.is_ok());
+                        }
+                        for source in [dir.path().join(".git"),dir.path().to_path_buf()] {
+                            let retained_candidate=tempfile::tempdir_in(dir.path().parent().unwrap()).unwrap();let original_candidate=retained_candidate.path().join("original");
+                            std::fs::rename(&source,&original_candidate).unwrap();assert!(std::process::Command::new("cp").arg("-a").arg(&original_candidate).arg(&source).status().unwrap().success());
+                            assert_eq!(git_evidence(dir.path(),&["rev-parse","HEAD"]).await.unwrap(),original_intent["input"]["binding"]["head"].as_str().unwrap());
+                            let (result,entered,reopened)=reopen_original();assert!(result.is_err() && entered && !reopened,"copied physical checkout acquired original recovery preparation");
+                            std::fs::remove_dir_all(&source).unwrap();std::fs::rename(&original_candidate,&source).unwrap();assert!(reopen_original().0.is_ok());
+                        }
+                        drop(reopen_original);
+                        assert_eq!(std::fs::read(&artifact).unwrap(),artifact_bytes);
                         let refuse_native=|| {
                             let mut entered=false;
                             assert!(with_recovery_native_metadata(&state,Some(dir.path()),recovery.clone(),&authorization,&mut |_| {entered=true;Ok(())}).is_err());
@@ -4909,11 +4987,21 @@ else: raise SystemExit('unexpected authority call')
                         assert_eq!(db.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),before_events);
                         assert_eq!(db.query_row("SELECT generation FROM workflow_owner_publication_recovery_pending WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),recovery.generation());
                         db.execute_batch("DROP TRIGGER reject_recovery_insert;").unwrap();
-                        let second=store.claim_owner_publication_recovery(&next_auth,"metadata-retry",millis(),60_000).unwrap().unwrap();
+                        let second=Arc::new(store.claim_owner_publication_recovery(&next_auth,"metadata-retry",millis(),60_000).unwrap().unwrap());
                         assert_eq!(second.generation(),original_generation+2);assert_eq!(second.request_id(),original_request);
                         store.validate_owner_publication_recovery(&second,&next_auth,millis()).unwrap();
                         assert!(store.validate_owner_publication_recovery(&recovery,&next_auth,millis()).is_err());
                         let mut stale_entered=false;assert!(with_recovery_native_metadata(&state,Some(dir.path()),recovery.clone(),&next_auth,&mut |_| {stale_entered=true;Ok(())}).is_err());assert!(!stale_entered);
+                        let mut rebound=false;
+                        with_recovery_native_metadata(&state,Some(dir.path()),second.clone(),&next_auth,&mut |proof| {
+                            store.with_owner_recovery_preparation(&second,&next_auth,proof,millis(),|access| {
+                                let recovered=acceptance::owner::publication::reopen_recovery_preparation(access,proof,dir.path())?;
+                                recovered.require_recovery_claim(&second)?;
+                                assert!(recovered.require_recovery_claim(&recovery).is_err(),"original preparation implicitly adopted a different recovery claim");
+                                assert_eq!(recovered.context_sha256(),original_preparation.context_sha256());
+                                rebound=true;Ok(())
+                            })
+                        }).unwrap();assert!(rebound);
                         let saved_checkpoint:String=db.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&id],|r|r.get(0)).unwrap();
                         for terminal in [Stage::Merged,Stage::Retired] {
                             let mut terminal_checkpoint:Checkpoint=serde_json::from_str(&saved_checkpoint).unwrap();terminal_checkpoint.stage=terminal;

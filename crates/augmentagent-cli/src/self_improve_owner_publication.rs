@@ -7,6 +7,9 @@ const MAX_INTENT:usize=4*1024*1024+32*1024;
 #[path="self_improve_owner_publication_commit.rs"]
 mod commit;
 pub(crate) use commit::OwnerPublicationCompletion;
+#[path="self_improve_owner_recovery_preparation.rs"]
+mod recovery;
+pub(crate) use recovery::{reopen as reopen_recovery_preparation,RecoveredOwnerPreparation};
 fn bytes(path:&Path,max:usize)->Result<Vec<u8>> {
     let mut file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(path)?;
     let m=file.metadata()?;ensure!(m.is_file() && m.nlink()==1 && m.uid()==unsafe{libc::geteuid()} && m.mode()&0o077==0 && m.len()<=max as u64,"owner publication file is not private/bounded");
@@ -97,6 +100,21 @@ impl OwnerPublicationRecord {
         ensure!(Path::new(&audit)==expected_audit,"owner publication activated native audit changed");
         let binding:augmentagent_channel_core::native_vm::ownership::TransferBinding=serde_json::from_str(&raw)?;
         self.validate_native_binding(&binding)
+    }
+    fn previous_prepared(&self)->Result<Option<PreparedAcceptance>> {
+        let Some(raw)=&self.canonical.manifest else {return Ok(None)};
+        let old:WorkflowManifest=serde_json::from_str(raw)?;
+        let path=if let Some(name)=&old.evidence_file {
+            ensure!(Path::new(name).components().count()==1 && matches!(Path::new(name).components().next(),Some(std::path::Component::Normal(_))),"owner publication original evidence reference is not a basename");
+            self.canonical.control.join(name)
+        }else {evidence_path(&self.canonical.control,self.input.source,&old.original_base)?};
+        let prepared:PreparedAcceptance=serde_json::from_slice(&bytes(&path,4*1024*1024)?)?;
+        let registration=&prepared.baseline.registration;
+        prepared.verify_registration()?;
+        ensure!(registration.contract_hash()==old.contract_hash && registration.contract().revision==old.contract_revision
+            && registration.baseline_head()==old.original_base && registration.contract().source()?==self.input.source,
+            "owner publication original evidence differs from retained canonical manifest");
+        Ok(Some(prepared))
     }
     fn validate_native_binding(&self,binding:&augmentagent_channel_core::native_vm::ownership::TransferBinding)->Result<()> {
         binding.validate()?;

@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "kind": "original-opaque-preparation-reopen-under-authenticated-recovery-native-read",
+  "source_parent_commit": "ca1cb5dca7bcc8e02a11e158994a80b339200dc7",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs",
+      "sha256": "7b1e486bac3ac08822ecaa8b6123ffe425d8c4e44b28e7f8dff5954f89bc255f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication.rs",
+      "sha256": "a8720abf211f860fd2cfc9bbfb07943caf8369cedca734967e12556e04792c0e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication_commit.rs",
+      "sha256": "1cd17b2973e9e306dcda99735f5136effb680dfda201c86f0f6de58477453963"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_recovery_preparation.rs",
+      "sha256": "c20d5f2ed6487082ee52ad79081b1a8b152cb88dad38ae2bd8489314669d6e22"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "7aa4ee16c71d279640e65d938c060203ccce9a79bfdf0034e0d306f82e92e764"
+    }
+  ],
+  "behavioral_reds": [
+    {
+      "session": 11937,
+      "result": "terminal1",
+      "log": "/tmp/autoship-owner-recovered-preparation-red-20261106.log",
+      "observed": "New real recovery loader reused old-only canonical check and refused required exact-next-written/completion-pending crash window. The ordinary preparation old-only rule remains unchanged."
+    }
+  ],
+  "intermediate_validation": [
+    {
+      "session": 34770,
+      "result": "terminal1",
+      "log": "/tmp/autoship-owner-recovered-preparation-focused-20261106.log",
+      "scope": "Initial-provider cases passed; new revised-acceptance fixture exposed an initial-only assertion that scope must be absent. Fixed by checking exact pre-activation scope preservation for both initial/revised cases."
+    },
+    {
+      "session": 50560,
+      "result": "terminal0",
+      "passed": 1,
+      "seconds": 26.58,
+      "log": "/tmp/autoship-owner-recovered-preparation-focused-final-20261106.log",
+      "scope": "Four child cases: both provider pins and initial/revised original acceptance, canonical old/next states, actual original preparation dropped, original context/generations preserved, protected artifact/evidence/canonical and physical candidate faults; before final explicit unchanged-scope/no-completion assertions"
+    },
+    {
+      "session": 63692,
+      "result": "terminal0",
+      "passed": 1951,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 347.45,
+      "log": "/tmp/autoship-owner-recovered-preparation-full-cli-20261106.log",
+      "scope": "Before final opaque claim lifetime pin and cross-claim rejection assertions"
+    },
+    {
+      "session": 2161,
+      "result": "terminal0",
+      "passed": 1,
+      "seconds": 27.66,
+      "log": "/tmp/autoship-owner-recovered-preparation-claim-pin-focused-20261106.log",
+      "scope": "All four original acceptance/provider cases, plus a second actual recovery claim whose reopened preparation rejects the prior opaque claim"
+    }
+  ],
+  "verification": {
+    "isolated_full_cli": {
+      "session": 66676,
+      "result": "terminal0",
+      "passed": 1951,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 350.62,
+      "log": "/tmp/autoship-owner-recovered-preparation-claim-pin-full-cli-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    },
+    "isolated_production_check": {
+      "session": 4197,
+      "result": "terminal0",
+      "seconds": 25.04,
+      "log": "/tmp/autoship-owner-recovered-preparation-production-check-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    }
+  },
+  "remaining": [
+    "Recovery canonical writer, completion/disposition lineage and original pending transfer reconciliation where needed",
+    "Terminal checkpoint and productive successor bridge/claim",
+    "Full C/R source/resource/input census, original-body nonrelease and semantic conversation restoration",
+    "Shared productive gates and aggregate protected-storage admission",
+    "Connected owner worker, independent exact-head review, normal rollout, original CLI/Discord live acceptance and soaks"
+  ],
+  "live_provider_vm_discord_proof": false,
+  "deployed": false,
+  "epic_complete": false
+}

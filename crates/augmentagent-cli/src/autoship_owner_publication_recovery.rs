@@ -515,3 +515,85 @@ impl WorkflowStore {
         Ok(super::owner_publication::OwnerPublicationNativeFacts::from_recovery_metadata(facts))
     }
 }
+
+/// Transaction-borrowed permission to read the original protected preparation.
+/// It grants no activation, source, scope mutation or body permission.
+pub(crate) struct RecoveryPreparationRead<'tx, 'claim> {
+    conn: &'tx Connection,
+    lease: &'claim RecoveryLease,
+    namespace: augmentagent_channel_core::native_vm::ownership::Authority,
+    original_binding: augmentagent_channel_core::native_vm::ownership::TransferBinding,
+}
+impl<'claim> RecoveryPreparationRead<'_, 'claim> {
+    pub(crate) fn recovery_claim(&self) -> &'claim RecoveryLease {
+        self.lease
+    }
+    pub(crate) fn original_record(
+        &self,
+        proof: &augmentagent_channel_core::native_vm::ownership::MetadataNativeOwnerProof<'_>,
+    ) -> Result<crate::self_improve::OwnerPublicationRecord> {
+        ensure!(
+            proof.namespace() == &self.namespace && proof.binding() == &self.original_binding,
+            "recovery preparation native proof changed"
+        );
+        let original = &self.lease.claim.original;
+        let (raw,len):(String,i64)=self.conn.query_row("SELECT substr(record,1,4227073),length(CAST(record AS BLOB)) FROM workflow_owner_publication_intent WHERE workflow=?1 AND request_id=?2",params![original.workflow,original.request_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        ensure!(
+            (1..=4 * 1024 * 1024 + 32 * 1024).contains(&len) && raw.len() as i64 == len,
+            "recovery preparation intent exceeds bound"
+        );
+        super::owner_publication::require(self.conn, &original.request_id, &original.intent, &raw)?;
+        let record: crate::self_improve::OwnerPublicationRecord = serde_json::from_str(&raw)?;
+        ensure!(
+            serde_json::to_string(&record)? == raw,
+            "recovery preparation intent encoding changed"
+        );
+        record.validate_history(self.conn)?;
+        record.validate_current_native(self.conn, Path::new(&self.namespace.audit_path))?;
+        let (context, generation, preparation, _) = record.recovery_identity()?;
+        ensure!(
+            context == original.input_context
+                && generation == original.activated_generation
+                && preparation == original.preparation,
+            "recovery original preparation context changed"
+        );
+        Ok(record)
+    }
+}
+impl WorkflowStore {
+    /// Original native locks are already held by `proof`. All validation and
+    /// bounded protected reads run in this short SQL transaction; no native I/O
+    /// or provider/GitHub call occurs while it is held.
+    pub(crate) fn with_owner_recovery_preparation<'claim, T>(
+        &mut self,
+        lease: &'claim RecoveryLease,
+        authorization: &crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+        proof: &augmentagent_channel_core::native_vm::ownership::MetadataNativeOwnerProof<'_>,
+        now: i64,
+        read: impl FnOnce(&RecoveryPreparationRead<'_, 'claim>) -> Result<T>,
+    ) -> Result<T> {
+        let facts = self.owner_publication_recovery_native_facts(lease, authorization, now)?;
+        ensure!(
+            facts.namespace() == proof.namespace() && facts.original_binding() == proof.binding(),
+            "recovery preparation requires exact original native proof"
+        );
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_current_claim(&tx, lease, now)?;
+        let access = RecoveryPreparationRead {
+            conn: &tx,
+            lease,
+            namespace: proof.namespace().clone(),
+            original_binding: proof.binding().clone(),
+        };
+        access.original_record(proof)?;
+        let result = read(&access)?;
+        let current = chrono::Utc::now().timestamp_millis();
+        authorization.require(authorization.plan(), current)?;
+        require_current_claim(&tx, lease, current)?;
+        access.original_record(proof)?;
+        tx.commit()?;
+        Ok(result)
+    }
+}
