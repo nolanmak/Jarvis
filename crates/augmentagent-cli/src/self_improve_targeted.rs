@@ -72,6 +72,7 @@ pub(crate) struct AuthorizedOwnerRecovery<'a> {
 impl AuthorizedOwnerRecovery<'_> {
     pub(crate) fn plan(&self)->&crate::autoship_workflow::owner_publication_recovery::RecoveryPlan {self.plan}
     pub(crate) fn principal(&self)->&str {&self.principal}
+    pub(crate) fn expires_at(&self)->i64 {self.authorized_at.saturating_add(30_000)}
     pub(crate) fn require(&self,plan:&crate::autoship_workflow::owner_publication_recovery::RecoveryPlan,now:i64)->Result<()> {
         anyhow::ensure!(self.plan.same_original(plan) && now>=self.authorized_at && now-self.authorized_at<=30_000,
             "owner publication recovery authorization expired or changed");Ok(())

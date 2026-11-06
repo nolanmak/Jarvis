@@ -433,6 +433,40 @@ fn existing_native_audit(state:&Path,authority:&augmentagent_channel_core::nativ
     let audit=open_audit_generation(state,&authority.owner.workflow_id,worktree,generation)?;
     audit.set_native_runtime_owner(authority.owner.clone())?;audit.set_native_store_binding(original.clone())?;Ok(audit)
 }
+/// Authenticated, read-only original-native inspection for interrupted owner
+/// publication. No workflow mutex spans native/session/audit acquisition and no
+/// reopened logger or execution guard escapes this borrowed proof visitor.
+fn with_recovery_native_metadata(state:&Path,worktree:Option<&Path>,
+    recovery:Arc<durable::owner_publication_recovery::RecoveryLease>,
+    authorization:&super::targeted::AuthorizedOwnerRecovery<'_>,
+    visit:&mut dyn FnMut(&augmentagent_channel_core::native_vm::ownership::MetadataNativeOwnerProof<'_>)->Result<()>,
+)->Result<()> {
+    let store=Arc::new(Mutex::new(WorkflowStore::open(state)?));
+    let facts=store.lock().map_err(|_|anyhow::anyhow!("recovery native facts store poisoned"))?
+        .owner_publication_recovery_native_facts(&recovery,authorization,millis())?;
+    let audit=existing_native_audit(state,facts.namespace(),worktree,facts.original_binding())?;
+    let fence=durable::owner_publication_recovery::native_metadata_fence(store.clone(),recovery.clone(),authorization,millis())?;
+    audit.restrict_to_metadata(fence)?;
+    let runtimes=facts.runtimes()?;
+    let current=|| {
+        let fresh=store.lock().map_err(|_|anyhow::anyhow!("recovery native facts store poisoned"))?
+            .owner_publication_recovery_native_facts(&recovery,authorization,millis())?;
+        anyhow::ensure!(fresh.fingerprint()?==facts.fingerprint()?,"recovery original native inputs changed");Ok(())
+    };
+    let mut load=|namespaces:&[augmentagent_channel_core::native_vm::ownership::Authority]| {
+        let mut grouped=std::collections::BTreeMap::new();
+        for namespace in namespaces {let prior=grouped.entry(namespace.audit_path.clone()).or_insert_with(||namespace.clone());if namespace.owner.lease_generation>prior.owner.lease_generation {*prior=namespace.clone();}}
+        grouped.values().map(|namespace| {
+            if Path::new(&namespace.audit_path)==audit.path() {Ok(audit.clone())}
+            else {existing_native_audit(state,namespace,worktree,facts.original_binding())}
+        }).collect::<Result<Vec<_>>>()
+    };
+    augmentagent_channel_core::native_vm::ownership::with_metadata_native_owner(&audit,&runtimes,&current,&mut load,&mut |proof| {
+        anyhow::ensure!(proof.namespace()==facts.namespace() && proof.binding()==facts.original_binding(),"recovery native metadata differs from original namespace");
+        visit(proof)?;current()
+    })
+}
+
 fn existing_native_sources(state:&Path,authorities:&[augmentagent_channel_core::native_vm::ownership::Authority],worktree:Option<&Path>,original:&augmentagent_channel_core::native_vm::ownership::TransferBinding)->Result<Vec<Arc<augmentagent_channel_core::AuditLogger>>> {
     let mut grouped=std::collections::BTreeMap::new();
     for authority in authorities {
@@ -4788,8 +4822,47 @@ else: raise SystemExit('unexpected authority call')
                             let mut winners=jobs.into_iter().map(|job|job.join().unwrap()).filter_map(|(index,lease)|lease.map(|lease|(index,lease))).collect::<Vec<_>>();
                             assert_eq!(winners.len(),1,"competing metadata recovery claims both won");winners.pop().unwrap()
                         });
-                        let (index,recovery)=winner;assert_eq!(recovery.generation(),original_generation+1);assert_eq!(recovery.request_id(),original_request);
+                        let (index,recovery)=winner;let recovery=Arc::new(recovery);assert_eq!(recovery.generation(),original_generation+1);assert_eq!(recovery.request_id(),original_request);
                         store.validate_owner_publication_recovery(&recovery,&authorization,millis()).unwrap();
+                        let native_facts=store.owner_publication_recovery_native_facts(&recovery,&authorization,millis()).unwrap();
+                        let original_audit=PathBuf::from(&native_facts.namespace().audit_path);let audit_before=std::fs::read(&original_audit).unwrap();
+                        let mut native_visited=false;
+                        with_recovery_native_metadata(&state,Some(dir.path()),recovery.clone(),&authorization,&mut |proof| {
+                            assert_eq!(proof.namespace().owner.lease_generation,original_generation);
+                            assert_eq!(proof.binding(),&original);assert!(proof.inventory().is_empty());
+                            use std::os::fd::AsRawFd;
+                            let (_,_,anchor)= [original_generation,0].into_iter().map(|generation|audit_generation_paths(&state,&id,generation).unwrap()).find(|(_,log,_)|*log==original_audit).unwrap();
+                            for path in [native.join("state.lock"),anchor.with_extension("lock")] {
+                                let competing=std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+                                assert_ne!(unsafe{libc::flock(competing.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0,"recovery metadata visitor lost original lock: {}",path.display());
+                            }
+                            assert!(retained.dispatch_allowed().is_err());assert!(retained.model_call_admitted("codex").is_err());
+                            native_visited=true;Ok(())
+                        }).expect("authenticated recovery could not inspect original native metadata while held and paused");
+                        assert!(native_visited);assert_eq!(std::fs::read(&original_audit).unwrap(),audit_before);
+                        let refuse_native=|| {
+                            let mut entered=false;
+                            assert!(with_recovery_native_metadata(&state,Some(dir.path()),recovery.clone(),&authorization,&mut |_| {entered=true;Ok(())}).is_err());
+                            assert!(!entered,"unverified recovery reached original native visitor");
+                        };
+                        let native_policy=control.join("policy.json");let policy_bytes=std::fs::read(&native_policy).unwrap();let mut changed:serde_json::Value=serde_json::from_slice(&policy_bytes).unwrap();changed["max_sessions"]=17.into();
+                        std::fs::write(&native_policy,serde_json::to_vec(&changed).unwrap()).unwrap();refuse_native();std::fs::write(&native_policy,&policy_bytes).unwrap();
+                        let provider=native.join(if mode.contains("-claude-") {"claude"}else{"codex"});std::fs::create_dir_all(&provider).unwrap();std::fs::set_permissions(&provider,std::fs::Permissions::from_mode(0o700)).unwrap();
+                        let unknown=provider.join("session-recovery-unknown");std::fs::create_dir(&unknown).unwrap();std::fs::set_permissions(&unknown,std::fs::Permissions::from_mode(0o700)).unwrap();
+                        let owned=serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":original_audit,"owner":native_facts.namespace().owner})).unwrap();
+                        std::fs::write(unknown.join("owned.json"),&owned).unwrap();std::fs::set_permissions(unknown.join("owned.json"),std::fs::Permissions::from_mode(0o600)).unwrap();
+                        refuse_native();assert_eq!(std::fs::read(unknown.join("owned.json")).unwrap(),owned);
+                        // Remove only the disposable negative fixture, never a real runtime.
+                        std::fs::remove_dir_all(&unknown).unwrap();
+                        std::fs::write(&original_audit,b"damaged original recovery audit\n").unwrap();refuse_native();assert_eq!(std::fs::read(&original_audit).unwrap(),b"damaged original recovery audit\n");std::fs::write(&original_audit,&audit_before).unwrap();
+                        with_recovery_native_metadata(&state,Some(dir.path()),recovery.clone(),&authorization,&mut |_|Ok(())).unwrap();
+                        let mut entered=false;
+                        assert!(with_recovery_native_metadata(&state,Some(dir.path()),recovery.clone(),&authorization,&mut |_| {
+                            entered=true;db.execute("DELETE FROM workflow_owner_publication_recovery_pending WHERE workflow=?1",[&id]).unwrap();Ok(())
+                        }).is_err(),"metadata observation returned success after claim pointer changed in visitor");assert!(entered);
+                        db.execute("INSERT INTO workflow_owner_publication_recovery_pending VALUES(?1,?2)",rusqlite::params![id,recovery.generation()]).unwrap();
+                        with_recovery_native_metadata(&state,Some(dir.path()),recovery.clone(),&authorization,&mut |_|Ok(())).unwrap();
+                        assert_eq!(std::fs::read(&original_audit).unwrap(),audit_before);
                         assert!(store.claim_owner_publication_recovery(&authorization,"stale-plan",millis(),60_000).unwrap().is_none());
                         let after=store.snapshot(&id).unwrap().unwrap();assert_eq!(after.checkpoint,before.checkpoint);assert_eq!(after.progress_at_ms,before.progress_at_ms);
                         assert_eq!((after.attempts,after.wall_ms,after.model_calls,after.tokens),(before.attempts,before.wall_ms,before.model_calls,before.tokens));
@@ -4840,6 +4913,7 @@ else: raise SystemExit('unexpected authority call')
                         assert_eq!(second.generation(),original_generation+2);assert_eq!(second.request_id(),original_request);
                         store.validate_owner_publication_recovery(&second,&next_auth,millis()).unwrap();
                         assert!(store.validate_owner_publication_recovery(&recovery,&next_auth,millis()).is_err());
+                        let mut stale_entered=false;assert!(with_recovery_native_metadata(&state,Some(dir.path()),recovery.clone(),&next_auth,&mut |_| {stale_entered=true;Ok(())}).is_err());assert!(!stale_entered);
                         let saved_checkpoint:String=db.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&id],|r|r.get(0)).unwrap();
                         for terminal in [Stage::Merged,Stage::Retired] {
                             let mut terminal_checkpoint:Checkpoint=serde_json::from_str(&saved_checkpoint).unwrap();terminal_checkpoint.stage=terminal;

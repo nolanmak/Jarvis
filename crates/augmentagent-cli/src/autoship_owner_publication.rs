@@ -121,6 +121,7 @@ pub(crate) struct OwnerPublicationNativeFacts {facts:super::native_handoff::Nati
 #[cfg(test)]
 pub(super) fn current_facts_fixture(facts:super::native_handoff::NativeHandoffFacts)->OwnerPublicationNativeFacts {OwnerPublicationNativeFacts {facts}}
 impl OwnerPublicationNativeFacts {
+    pub(super) fn from_recovery_metadata(facts:super::native_handoff::NativeHandoffFacts)->Self {Self {facts}}
     pub(crate) fn namespace(&self)->&augmentagent_channel_core::native_vm::ownership::Authority {&self.facts.source_owners[0]}
     pub(crate) fn original_binding(&self)->&augmentagent_channel_core::native_vm::ownership::TransferBinding {&self.facts.original_binding}
     pub(crate) fn fingerprint(&self)->Result<String> {

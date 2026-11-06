@@ -60,7 +60,7 @@ fn digest(value: &serde_json::Value) -> Result<String> {
 }
 /// Verify both directions of the immutable event/projection join. Losing the
 /// newest uncertain row must not expose an older success as the current state.
-fn history_closed(tx: &Transaction<'_>, workflow: &str) -> Result<()> {
+fn history_closed(tx: &Connection, workflow: &str) -> Result<()> {
     for (kind, table, column, generation) in [
         (
             "native_launch_intent_recorded",
@@ -133,7 +133,6 @@ pub(super) fn read_current_metadata_facts(tx:&Transaction<'_>,lease:&Lease,bindi
     read_facts_mode(tx,lease,binding,now,FactOwners::CurrentMetadata(namespace))
 }
 fn read_facts_mode(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64,selection:FactOwners<'_>)->Result<NativeHandoffFacts> {
-    let closed=matches!(selection,FactOwners::PriorRetired);
     require_binding(&tx, lease, binding, now)?;
     let raw: String = tx.query_row(
         "SELECT checkpoint FROM workflow WHERE id=?1",
@@ -148,15 +147,26 @@ fn read_facts_mode(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64,sel
         ),
         "native handoff preparation blocked by checkpoint"
     );
-    history_closed(&tx, &lease.workflow)?;
-    native_pending::require_clear_abort_barriers(tx,&lease.workflow)?;
-    let transfers = native_pending::settlement::History::load(tx, &lease.workflow, u64::MAX)?;
+    collect_facts(tx,&lease.workflow,lease.generation,binding,selection)
+}
+/// A distinct typed, already-authenticated metadata transaction may inspect
+/// the exact original namespace while the workflow is held or paused. The
+/// context exposes no Lease and cannot enter handoff/setup/model admission.
+pub(super) fn read_recovery_metadata_facts(context:&super::owner_publication_recovery::RecoveryNativeContext<'_>)->Result<NativeHandoffFacts> {
+    collect_facts(context.conn(),context.workflow(),context.namespace().owner.lease_generation,
+        context.binding(),FactOwners::CurrentMetadata(context.namespace()))
+}
+fn collect_facts(tx:&Connection,workflow:&str,generation_limit:i64,binding:&Binding,selection:FactOwners<'_>)->Result<NativeHandoffFacts> {
+    let closed=matches!(selection,FactOwners::PriorRetired);
+    history_closed(&tx, workflow)?;
+    native_pending::require_clear_abort_barriers(tx,workflow)?;
+    let transfers = native_pending::settlement::History::load(tx, workflow, u64::MAX)?;
     let owners = {
         let predicate=if closed {"retirement_reason IS NOT NULL AND retired_at IS NOT NULL"}else{"retirement_reason IS NULL AND retired_at IS NULL"};
         let generation=if matches!(selection,FactOwners::CurrentMetadata(_)) {"lease_generation=?2"}else{"lease_generation<?2"};
         let mut query=tx.prepare(&format!("SELECT lease_generation,audit_path FROM workflow_native_owner WHERE workflow=?1 AND {generation} AND {predicate} AND NOT EXISTS(SELECT 1 FROM workflow_native_transferred_source d WHERE d.workflow=workflow_native_owner.workflow AND d.lease_generation=workflow_native_owner.lease_generation AND d.audit_path=workflow_native_owner.audit_path) ORDER BY lease_generation,audit_path LIMIT 129"))?;
         let rows = query
-            .query_map(params![lease.workflow, lease.generation], |r| {
+            .query_map(params![workflow, generation_limit], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -179,7 +189,7 @@ fn read_facts_mode(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64,sel
                 )),
             TransferReason::InventoryMissing
         );
-        let raw:Option<String>=tx.query_row("SELECT binding FROM workflow_native_owner_binding WHERE workflow=?1 AND lease_generation=?2",params![lease.workflow,generation],|r|r.get(0)).optional()?;
+        let raw:Option<String>=tx.query_row("SELECT binding FROM workflow_native_owner_binding WHERE workflow=?1 AND lease_generation=?2",params![workflow,generation],|r|r.get(0)).optional()?;
         let native: TransferBinding =
             serde_json::from_str(&raw.context(TransferReason::InventoryMissing)?)?;
         native.validate()?;
@@ -190,7 +200,7 @@ fn read_facts_mode(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64,sel
         let registered = {
             let mut q=tx.prepare("SELECT seq,payload FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='native_runtime_owner_registered' ORDER BY seq LIMIT 2")?;
             let rows = q
-                .query_map(params![lease.workflow, generation], |r| {
+                .query_map(params![workflow, generation], |r| {
                     Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -204,7 +214,7 @@ fn read_facts_mode(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64,sel
         );
         let source = Authority {
             owner: RuntimeOwner {
-                workflow_id: lease.workflow.clone(),
+                workflow_id: workflow.to_owned(),
                 lease_generation: generation,
             },
             audit_path: audit,
@@ -216,8 +226,8 @@ fn read_facts_mode(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64,sel
     if let FactOwners::CurrentMetadata(expected)=selection {
         ensure!(source_owners.as_slice()==std::slice::from_ref(expected),TransferReason::AuthorityConflict);
     }
-    let launches=native_launch::history(tx,&lease.workflow)?;
-    let observations=native_observation::history(tx,&lease.workflow)?;
+    let launches=native_launch::history(tx,workflow)?;
+    let observations=native_observation::history(tx,workflow)?;
     let mut latest_launch=BTreeMap::new();let mut latest_observation=BTreeMap::new();
     for launch in &launches {latest_launch.insert((provider_key(launch.intent.provider),launch.intent.runtime_relative_path.as_str()),launch);}
     for row in &observations {latest_observation.insert((provider_key(row.provider),row.runtime_relative_path.as_str()),row);}
@@ -240,7 +250,7 @@ fn read_facts_mode(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64,sel
         let mut query = tx.prepare(
             "SELECT provider,native_session FROM workflow_builder_conversation WHERE workflow=?1",
         )?;
-        for row in query.query_map([&lease.workflow], |r| {
+        for row in query.query_map([workflow], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })? {
             let (provider, id) = row?;
@@ -253,7 +263,7 @@ fn read_facts_mode(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64,sel
             );
         }
     }
-    Ok(NativeHandoffFacts {workflow_id:lease.workflow.clone(),workflow_binding:binding.clone(),source_owners,
+    Ok(NativeHandoffFacts {workflow_id:workflow.to_owned(),workflow_binding:binding.clone(),source_owners,
         original_binding:original_binding.context(TransferReason::InventoryMissing)?,
         source_registration_sha256:digest(&serde_json::json!(source_projection))?,latest_input_sha256,runtimes})
 }

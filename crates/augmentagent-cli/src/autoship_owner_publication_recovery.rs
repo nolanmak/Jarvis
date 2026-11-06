@@ -412,11 +412,106 @@ impl WorkflowStore {
             authorization.plan().original == lease.claim.original,
             "recovery authorization differs from original claim"
         );
-        let recorded = history(&self.conn, &lease.claim.original.workflow)?
-            .context("recovery claim missing")?;
-        ensure!(recorded.1 == lease.reference, "recovery claim superseded");
-        let valid:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow WHERE id=?1 AND owner=?2 AND generation=?3 AND lease_until>?4 AND json_extract(checkpoint,'$.stage') NOT IN ('merged','retired'))",params![lease.claim.original.workflow,lease.claim.owner,lease.claim.generation,now],|r|r.get(0))?;
-        ensure!(valid, "recovery metadata lease expired or terminal");
+        require_current_claim(&self.conn, lease, now)?;
         Ok(())
+    }
+}
+
+// No native I/O: callers may use this under the original native locks.
+fn require_current_claim(conn: &Connection, lease: &RecoveryLease, now: i64) -> Result<()> {
+    let recorded =
+        history(conn, &lease.claim.original.workflow)?.context("recovery claim missing")?;
+    ensure!(recorded.1 == lease.reference, "recovery claim superseded");
+    let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow WHERE id=?1 AND owner=?2 AND generation=?3 AND lease_until>?4 AND json_extract(checkpoint,'$.stage') NOT IN ('merged','retired'))",params![lease.claim.original.workflow,lease.claim.owner,lease.claim.generation,now],|r|r.get(0))?;
+    ensure!(valid, "recovery metadata lease expired or terminal");
+    Ok(())
+}
+/// Bounded authenticated metadata fence for a logger that never escapes its
+/// native metadata visitor. Capturing the same Arc retains, rather than remints,
+/// the claim; the fresh grant deadline remains enforced at every callback.
+pub(crate) fn native_metadata_fence(
+    store: std::sync::Arc<std::sync::Mutex<WorkflowStore>>,
+    lease: std::sync::Arc<RecoveryLease>,
+    authorization: &crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+    now: i64,
+) -> Result<std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>> {
+    store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("recovery metadata store poisoned"))?
+        .validate_owner_publication_recovery(&lease, authorization, now)?;
+    let expires = authorization.expires_at();
+    Ok(std::sync::Arc::new(move || {
+        let now = chrono::Utc::now().timestamp_millis();
+        ensure!(
+            now <= expires,
+            "recovery native metadata authorization expired"
+        );
+        let locked = store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recovery metadata store poisoned"))?;
+        require_current_claim(&locked.conn, &lease, now)
+    }))
+}
+/// Borrowed transaction context minted only after fresh authorization and the
+/// current opaque claim/original intent checks. Never execution/native proof.
+pub(super) struct RecoveryNativeContext<'a> {
+    conn: &'a Connection,
+    workflow: &'a str,
+    binding: Binding,
+    namespace: augmentagent_channel_core::native_vm::ownership::Authority,
+}
+impl RecoveryNativeContext<'_> {
+    pub(super) fn conn(&self) -> &Connection {
+        self.conn
+    }
+    pub(super) fn workflow(&self) -> &str {
+        self.workflow
+    }
+    pub(super) fn binding(&self) -> &Binding {
+        &self.binding
+    }
+    pub(super) fn namespace(&self) -> &augmentagent_channel_core::native_vm::ownership::Authority {
+        &self.namespace
+    }
+}
+impl WorkflowStore {
+    pub(crate) fn owner_publication_recovery_native_facts(
+        &mut self,
+        lease: &RecoveryLease,
+        authorization: &crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+        now: i64,
+    ) -> Result<super::owner_publication::OwnerPublicationNativeFacts> {
+        self.validate_owner_publication_recovery(lease, authorization, now)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_current_claim(&tx, lease, now)?;
+        let original = &lease.claim.original;
+        let raw:String=tx.query_row("SELECT record FROM workflow_owner_publication_intent WHERE workflow=?1 AND request_id=?2",params![original.workflow,original.request_id],|r|r.get(0))?;
+        let record: crate::self_improve::OwnerPublicationRecord = serde_json::from_str(&raw)?;
+        super::owner_publication::require(&tx, &original.request_id, &original.intent, &raw)?;
+        let (audit,audit_bytes):(String,i64)=tx.query_row("SELECT substr(audit_path,1,4097),length(CAST(audit_path AS BLOB)) FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",params![original.workflow,original.activated_generation],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        ensure!(
+            (1..=4096).contains(&audit_bytes) && audit.len() as i64 == audit_bytes,
+            "recovery native audit reference exceeds bound"
+        );
+        record.validate_current_native(&tx, Path::new(&audit))?;
+        let namespace = augmentagent_channel_core::native_vm::ownership::Authority {
+            owner: augmentagent_channel_core::native_vm::RuntimeOwner {
+                workflow_id: original.workflow.clone(),
+                lease_generation: original.activated_generation,
+            },
+            audit_path: audit,
+        };
+        let context = RecoveryNativeContext {
+            conn: &tx,
+            workflow: &original.workflow,
+            binding: record.recovery_binding().clone(),
+            namespace,
+        };
+        let facts = super::native_handoff::read_recovery_metadata_facts(&context)?;
+        require_current_claim(&tx, lease, now)?;
+        tx.commit()?;
+        Ok(super::owner_publication::OwnerPublicationNativeFacts::from_recovery_metadata(facts))
     }
 }
