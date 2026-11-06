@@ -2,6 +2,10 @@
 use super::discord_ingress::DiscordOrigin;
 use super::*;
 
+#[path = "autoship_owner_recovery_blocked.rs"]
+mod blocked;
+pub(crate) use blocked::RecoveryBlockedState;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecordRef {
@@ -366,6 +370,7 @@ impl WorkflowStore {
             return Ok(None);
         }
         authorization.require(&current, now)?;
+        if blocked::blocked_state(&tx, &current, now)?.is_some() { return Ok(None); }
         let generation = current
             .predecessor
             .generation

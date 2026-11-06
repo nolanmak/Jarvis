@@ -4664,6 +4664,23 @@ else: raise SystemExit('unexpected authority call')
                                 assert!(matches!(aborted,durable::native_reconcile::ReconciliationRun::KnownAborted {unresolved:2}),"aborted request lost namespace barriers: {aborted:?}");
                                 assert_eq!(store.native_aborted_handoff(&id,&transfer).unwrap(),Some(pending.clone()));
                                 assert_eq!(store.unresolved_native_abort_namespaces(&id).unwrap().len(),2);
+                                let blocked_at=millis();
+                                let due=store.record_owner_recovery_abort_blocked(&recovery,&authorization,&pending,blocked_at).unwrap().unwrap();
+                                let observed:i64=db.query_row("SELECT json_extract(record,'$.observed_at_ms') FROM workflow_owner_recovery_blocked WHERE workflow=?1 ORDER BY sequence DESC LIMIT 1",[&id],|r|r.get(0)).unwrap();
+                                assert_eq!(due,observed+300_000);assert!(observed<=blocked_at);
+                                let blocked_events=store.events(&id).unwrap();
+                                assert_eq!(store.record_owner_recovery_abort_blocked(&recovery,&authorization,&pending,millis()).unwrap(),Some(due));
+                                assert_eq!(store.events(&id).unwrap(),blocked_events);
+                                let live_until=store.snapshot(&id).unwrap().unwrap().lease_until_ms;
+                                db.execute("UPDATE workflow SET lease_until=0 WHERE id=?1",[&id]).unwrap();
+                                let waiting_plan=store.owner_publication_recovery_plan(&id).unwrap().unwrap();
+                                let waiting_auth=super::super::targeted::authorize_owner_publication_recovery(dir.path(),&waiting_plan,crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22}).await.unwrap();
+                                assert!(store.claim_owner_publication_recovery(&waiting_auth,"unchanged-blocker",millis(),60_000).unwrap().is_none(),"unchanged unresolved namespace debt minted another recovery generation before backoff");
+                                let mut reopened=WorkflowStore::open(&state).unwrap();
+                                assert!(reopened.claim_owner_publication_recovery(&waiting_auth,"unchanged-blocker-peer",millis(),60_000).unwrap().is_none());
+                                assert_eq!(store.events(&id).unwrap(),blocked_events);
+                                db.execute("UPDATE workflow SET lease_until=?2 WHERE id=?1",rusqlite::params![id,live_until]).unwrap();
+
                                 let current=||shared.lock().unwrap().validate_owner_recovery_transfer(&recovery,&authorization,&pending,millis()).map_err(|_|native_owner::TransferFenceError::NotCurrent);
                                 let mut unretired_visited=false;
                                 assert!(native_owner::with_retired_aborted_namespace(pending.original_binding(),pending.request(),&pending.observation(),&pending.request().source_owners[0],&sources[0],&current,&mut |_| {unretired_visited=true;Ok(())}).is_err());
@@ -4679,9 +4696,59 @@ else: raise SystemExit('unexpected authority call')
                                 assert_eq!(store.events(&id).unwrap(),events,"retired namespace acknowledgement was not idempotent");
                                 assert!(store.owner_recovery_pending_transfer(&recovery,&authorization,millis()).unwrap().is_none());
                                 assert!(store.owner_publication_recovery_native_facts(&recovery,&authorization,millis()).is_err());
-                                assert!(matches!(durable::native_reconcile::run(&shared,reconciliation,&pending,Some((&sources,&destination)),&millis).unwrap(),durable::native_reconcile::ReconciliationRun::Historical));
                                 assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.owner_control(&id).unwrap(),control_before);assert_eq!(store.pending_owner_messages(&id).unwrap(),2);
-                                assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);return;
+                                assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+                                // Proven destination settlement changes the original
+                                // obligations and wakes reconciliation before its deadline.
+                                assert_eq!(store.owner_publication_recovery_blocked_state(&id,millis()).unwrap(),None);
+                                db.execute("UPDATE workflow SET lease_until=0 WHERE id=?1",[&id]).unwrap();
+                                let next_plan=store.owner_publication_recovery_plan(&id).unwrap().unwrap();
+                                let next_auth=super::super::targeted::authorize_owner_publication_recovery(dir.path(),&next_plan,crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22}).await.unwrap();
+                                let next=store.claim_owner_publication_recovery(&next_auth,"changed-obligation",millis(),60_000).unwrap().expect("actual original namespace settlement did not wake metadata recovery");
+                                assert_eq!(next.generation(),recovery.generation()+1);
+                                let next_until=store.snapshot(&id).unwrap().unwrap().lease_until_ms;
+                                assert!(store.record_owner_recovery_abort_blocked(&recovery,&authorization,&pending,millis()).is_err(),"superseded recovery wrote another observation");
+                                let next_mode=durable::native_reconcile::Mode::OwnerRecovery {lease:&next,authorization:&next_auth};
+                                assert!(matches!(durable::native_reconcile::run(&shared,next_mode,&pending,Some((&sources,&destination)),&millis).unwrap(),durable::native_reconcile::ReconciliationRun::Historical));
+                                let latest:String=db.query_row("SELECT record FROM workflow_owner_recovery_blocked WHERE workflow=?1 ORDER BY sequence DESC LIMIT 1",[&id],|r|r.get(0)).unwrap();
+                                let latest_value:serde_json::Value=serde_json::from_str(&latest).unwrap();
+                                assert_eq!(latest_value["obligations"]["namespaces"].as_array().unwrap().len(),1);
+                                assert_eq!(latest_value["failures"],1);
+                                let source_due=latest_value["eligible_at_ms"].as_i64().unwrap();
+                                assert_eq!(store.owner_publication_recovery_blocked_state(&id,source_due-1).unwrap(),Some(durable::owner_publication_recovery::RecoveryBlockedState::NamespaceObligations {eligible_at_ms:source_due}));
+                                assert_eq!(store.owner_publication_recovery_blocked_state(&id,source_due).unwrap(),None);
+                                let events=store.events(&id).unwrap();
+                                assert!(matches!(durable::native_reconcile::run(&shared,next_mode,&pending,None,&millis).unwrap(),durable::native_reconcile::ReconciliationRun::Historical));
+                                assert_eq!(store.events(&id).unwrap(),events);
+                                db.execute("UPDATE workflow SET lease_until=0 WHERE id=?1",[&id]).unwrap();
+                                let waiting_plan=store.owner_publication_recovery_plan(&id).unwrap().unwrap();
+                                let waiting_auth=super::super::targeted::authorize_owner_publication_recovery(dir.path(),&waiting_plan,crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22}).await.unwrap();
+                                let (last_sequence,last_digest):(i64,String)=db.query_row("SELECT sequence,record_sha256 FROM workflow_owner_recovery_blocked WHERE workflow=?1 ORDER BY sequence DESC LIMIT 1",[&id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                                db.execute("DELETE FROM workflow_owner_recovery_blocked WHERE sequence=?1",[last_sequence]).unwrap();
+                                assert!(store.claim_owner_publication_recovery(&waiting_auth,"missing-blocked-index",millis(),60_000).is_err(),"missing observation projection hid its immutable event");
+                                db.execute("INSERT INTO workflow_owner_recovery_blocked VALUES(?1,?2,?3,?4)",rusqlite::params![id,last_sequence,last_digest,latest]).unwrap();
+                                assert!(store.claim_owner_publication_recovery(&waiting_auth,"still-blocked-source",millis(),60_000).unwrap().is_none());
+                                assert_eq!(store.pending_owner_messages(&id).unwrap(),2);assert_eq!(store.owner_control(&id).unwrap(),control_before);
+                                let after=store.snapshot(&id).unwrap().unwrap();assert_eq!(after.checkpoint,before.checkpoint);assert_eq!(after.attempts,before.attempts);assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.tokens,before.tokens);assert_eq!(after.wall_ms,before.wall_ms);assert_eq!(after.progress_at_ms,before.progress_at_ms);
+                                // Deliberate disposable-fixture cleanup of the last
+                                // source proves that cleanup is not publication readiness.
+                                db.execute("UPDATE workflow SET lease_until=?2 WHERE id=?1",rusqlite::params![id,next_until]).unwrap();
+                                let current=||shared.lock().unwrap().validate_owner_recovery_transfer(&next,&next_auth,&pending,millis()).map_err(|_|native_owner::TransferFenceError::NotCurrent);
+                                augmentagent_channel_core::native_vm::retire_owned_runtimes(pending.original_binding(),Path::new(&pending.request().source_owners[0].audit_path),&pending.request().source_owners[0].owner,&current).unwrap();
+                                native_owner::with_retired_aborted_namespace(pending.original_binding(),pending.request(),&pending.observation(),&pending.request().source_owners[0],&sources[0],&current,&mut |proof|
+                                    store.settle_owner_recovery_abort_namespace(&next,&next_auth,&pending,proof,millis())).unwrap();
+                                assert!(store.unresolved_native_abort_namespaces(&id).unwrap().is_empty());
+                                assert!(matches!(durable::native_reconcile::run(&shared,next_mode,&pending,None,&millis).unwrap(),durable::native_reconcile::ReconciliationRun::Historical));
+                                assert_eq!(store.owner_publication_recovery_blocked_state(&id,millis()).unwrap(),Some(durable::owner_publication_recovery::RecoveryBlockedState::OriginalPublicationUnavailable));
+                                assert_eq!(store.owner_publication_recovery_blocked_state(&id,source_due+3_600_000).unwrap(),Some(durable::owner_publication_recovery::RecoveryBlockedState::OriginalPublicationUnavailable));
+                                assert!(store.owner_publication_recovery_native_facts(&next,&next_auth,millis()).is_err());
+                                let events=store.events(&id).unwrap();assert_eq!(store.record_owner_recovery_abort_blocked(&next,&next_auth,&pending,millis()).unwrap(),None);assert_eq!(store.events(&id).unwrap(),events);
+                                db.execute("UPDATE workflow SET lease_until=0 WHERE id=?1",[&id]).unwrap();
+                                let unavailable_plan=store.owner_publication_recovery_plan(&id).unwrap().unwrap();
+                                let unavailable_auth=super::super::targeted::authorize_owner_publication_recovery(dir.path(),&unavailable_plan,crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22}).await.unwrap();
+                                assert!(store.claim_owner_publication_recovery(&unavailable_auth,"cleanup-is-not-readiness",millis(),60_000).unwrap().is_none());
+                                assert_eq!(store.events(&id).unwrap(),events);assert_eq!(store.pending_owner_messages(&id).unwrap(),2);assert_eq!(store.owner_control(&id).unwrap(),control_before);
+                                return;
                             }
                         }
                         Some((sources,destination))

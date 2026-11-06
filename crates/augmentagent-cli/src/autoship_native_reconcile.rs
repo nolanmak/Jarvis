@@ -40,6 +40,13 @@ pub(crate) fn run(store:&Arc<Mutex<WorkflowStore>>,mode:Mode<'_>,pending:&Pendin
     })();
     match metadata {
         Ok(native_pending::NativeHandoffDisposition::Active)=>{},
+        Ok(native_pending::NativeHandoffDisposition::Aborted)=>{
+            if let Mode::OwnerRecovery {lease,authorization}=mode {
+                store.lock().map_err(|_|anyhow::anyhow!(TransferReason::PersistRetry))?
+                    .record_owner_recovery_abort_blocked(lease,authorization,pending,clock())?;
+            }
+            return Ok(ReconciliationRun::Historical);
+        },
         Ok(_)=>return Ok(ReconciliationRun::Historical),
         Err(error)=>return Ok(retained(None,error.downcast_ref::<TransferReason>().copied().unwrap_or(TransferReason::PendingUnknown),None)),
     }
@@ -60,6 +67,9 @@ pub(crate) fn run(store:&Arc<Mutex<WorkflowStore>>,mode:Mode<'_>,pending:&Pendin
             }
             NativeTransferState::Aborted=>{
                 match mode {Mode::Lease {lease,binding}=>locked.acknowledge_native_aborted(lease,binding,pending,proof,clock())?,Mode::Terminal(terminal)=>locked.acknowledge_terminal_native_aborted(terminal,pending,proof,clock())?,Mode::OwnerRecovery {lease,authorization}=>locked.acknowledge_owner_recovery_native_aborted(lease,authorization,pending,proof,clock())?,}
+                if let Mode::OwnerRecovery {lease,authorization}=mode {
+                    locked.record_owner_recovery_abort_blocked(lease,authorization,pending,clock())?;
+                }
                 resolved=Some(ReconciliationRun::KnownAborted {unresolved:locked.unresolved_native_abort_namespaces(&pending.request.workflow_id)?.len()});
             }
             NativeTransferState::Completed=>{
