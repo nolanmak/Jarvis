@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "kind": "owner-preparation-physical-candidate-binding-component",
+  "source_parent_commit": "c90998f8059a86fe0bd87d9f47359ba255460cde",
+  "source_inventory_is_post_run_inventory": true,
+  "source_generation_authority": false,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_candidate.rs",
+      "sha256": "e5c95ab131d9534f01415d58254a378e928e33db73acb0f813b3ccf4959925db"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_acceptance.rs",
+      "sha256": "160010170a0d819f321ff6cc2a9159eb93132d113928c965963f9e25124da3fa"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "3ee4b6470bdf1de21e28e8d9bbc5dfbec338ecbfc54dc5627a786ed1acfbfcdd"
+    },
+    {
+      "path": "docs/autoship/owner-acceptance-publication.md",
+      "sha256": "499cf49a75d9afc5e8948ae47489deb1c64f167413a66094480c316f3ba5bafd"
+    }
+  ],
+  "envelope_version": 2,
+  "input_context_version": 1,
+  "context_key_changed": false,
+  "validation": {
+    "red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent owner_preparation_refuses_replaced_checkout_with_identical_git_binding",
+      "log": "/tmp/autoship-owner-candidate-identity-red.log",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "observed": "git-directory: owner preparation accepted a substituted physical checkout; fixture retained exact Git head/tree/product evidence"
+    },
+    "focused": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent owner",
+      "log": "/tmp/autoship-owner-candidate-identity-focused-final.log",
+      "exit": 0,
+      "passed": 163,
+      "failed": 0,
+      "ignored": 1,
+      "seconds": 56.44
+    },
+    "full_cli": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-candidate-identity-full-cli.log",
+      "exit": 0,
+      "passed": 1915,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 274.76,
+      "native_guard_subprocess_modes": 66
+    },
+    "production_check": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-candidate-identity-production-check.log",
+      "state": "terminal managed storage admission deferral; no compiler started",
+      "exit": 75,
+      "reason": "build lease is held",
+      "hosted_exact_head_validation": "pending"
+    }
+  },
+  "coverage": [
+    "actual guard refuses copied Git directory and copied worktree root with unchanged logical Git binding",
+    "activation binding and production cached factory reject the substitute; original fixture restoration permits replay",
+    "refused cached legacy/missing/unknown/changed candidate evidence is retained without regeneration",
+    "linked-worktree Git/common directory replacements and pointer copies, symlinks, hardlinks, FIFOs and changed bytes",
+    "bounded nonblocking pointer inspection",
+    "serialized physical identity survives reopen and permits ordinary product edits",
+    "private artifact digest retained by activation also binds the new candidate data"
+  ],
+  "audit": {
+    "fresh_reader": "owner_candidate_binding_spec_audit_20261106",
+    "pass_a": true,
+    "pass_b": true,
+    "final_seam_pass_c": false,
+    "findings": [
+      "legacy-shaped missing preparation is inspection metadata, never productive authority; actual admission gate remains P1 work",
+      "no regeneration guarantee applies to durable completed artifacts; prior read-only preparation uses bounded existing response journal and native admission",
+      "pointer byte framing specified exactly, hashing original bytes"
+    ]
+  },
+  "synthetic_controller_and_baseline_fixtures": true,
+  "repository_authorization_proved": false,
+  "locked_native_or_storage_closure_proved": false,
+  "compiled_source_freshness_proved": false,
+  "canonical_manifest_publication": false,
+  "process_loss_recovery": false,
+  "productive_owner_consumer_enabled": false,
+  "live_provider_dispatch": false,
+  "shipping_authority": false,
+  "production_restored": false,
+  "handoff_ready": false,
+  "remaining": [
+    "P1/P2 publication admission, original preparation/body gate and immutable recovery lineage",
+    "authenticated workspace replacement and legacy-envelope recovery",
+    "P3/P4 public projection and authorized correction contexts",
+    "actual productive owner worker ingress",
+    "full C/R proof, exact-head checks/review, normal rollout and all live CLI/Discord/soak/shipment acceptance"
+  ],
+  "all_own_build_test_handles_terminal": true
+}

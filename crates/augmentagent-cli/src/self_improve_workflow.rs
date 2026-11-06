@@ -1223,13 +1223,17 @@ impl WorkflowGuard {
     pub(super) async fn activate_prepared_owner_acceptance(self,prepared:&acceptance::owner::PreparedOwnerAcceptance,
         previous:Option<&crate::autoship_contract::RegisteredContract>)->Result<Self> {
         prepared.validate_current(&self,&self.worktree,previous)?;
-        let preparation=prepared.activation_binding()?;
+        let owner_prepared=prepared;
         let prepared=prepared.prepared();
         acceptance::validate_candidate_harness(&self.worktree,prepared).await?;
         self.audit_health().await?;self.native_builder_owner()?;
         let next=&prepared.baseline.registration;let old=self.binding.contract.clone();let contract=format!("registered:{}",next.contract_hash());
         let environment=next.binding(&self.binding.head)?.environment_id;
         let binding=git_binding(&self.worktree,&contract,&environment,&[]).await?;
+        // Recheck after all asynchronous candidate inspection, then again
+        // across native settlement before changing its registered scope.
+        owner_prepared.validate_current(&self,&self.worktree,previous)?;
+        let preparation=owner_prepared.activation_binding()?;
         let initial=previous.is_none().then(||InitialOwnerAcceptance {lease:self.lease.clone(),binding:self.binding.clone()});
         let revised={
             let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("private owner acceptance store poisoned"))?;
@@ -1238,7 +1242,9 @@ impl WorkflowGuard {
             store.activate_private_owner_acceptance(initial.as_ref(),&turn,previous,next,&prepared.baseline.receipts,&prepared.proposal.files,&preparation,&binding,now)?
         };
         let guard=self.finish_owner_contract_change(revised,contract,environment,"owner_private_acceptance_guard_ready",&old,next.contract_hash())?;
+        anyhow::ensure!(owner_prepared.activation_binding()?==preparation,"owner preparation changed during native settlement");
         acceptance::bind_write_scope(&guard.worktree,prepared,previous)?;
+        anyhow::ensure!(owner_prepared.activation_binding()?==preparation,"owner preparation changed during scope registration");
         Ok(guard)
     }
 
@@ -3449,11 +3455,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_preparation_refuses_replaced_checkout_with_identical_git_binding() {
+        let control=control_dir();
+        let status=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
+            .env("AUTOSHIP_INITIAL_GUARD_CHILD",control.path())
+            .env("AUTOSHIP_INITIAL_GUARD_MODE","owner-early-acceptance-producer-replaced-checkout")
+            .env("XDG_STATE_HOME",control.path().join("operator-state"))
+            .env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json"))
+            .status().unwrap();
+        assert!(status.success(),"owner preparation accepted a substituted checkout identity");
+    }
+
+    #[tokio::test]
     async fn workflow_guard_initial_native_owner_registers_before_returning() {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session","owner-setup-codex-revision-unconfigured-session","owner-early-fresh","owner-early-no-input","owner-early-corrupt-input","owner-early-history","owner-early-policy-retry","owner-early-register-write-failure","owner-early-initial-acceptance","owner-early-initial-acceptance-green-baseline","owner-early-initial-acceptance-write-failure","owner-early-initial-acceptance-history-loss","owner-early-initial-acceptance-setup-failure","owner-early-initial-acceptance-baseline-tamper","owner-early-initial-acceptance-unconfigured","owner-early-initial-acceptance-repeat","owner-early-initial-acceptance-wrong-source","owner-early-initial-acceptance-first-build","owner-early-initial-acceptance-first-build-dirty","owner-early-initial-acceptance-first-build-staged","owner-early-initial-acceptance-first-build-ignored","owner-early-initial-acceptance-first-build-off-base","owner-early-initial-acceptance-first-build-orphan-main","owner-early-initial-acceptance-first-build-runtime","owner-early-initial-acceptance-first-build-legacy-call","owner-early-initial-acceptance-first-build-workflow-call","owner-early-initial-acceptance-first-build-readonly-call","owner-early-initial-acceptance-first-build-lost-call-history","owner-early-initial-acceptance-first-build-policy-lost","owner-early-initial-acceptance-first-build-leading-space","owner-early-initial-acceptance-first-build-counter-loss","owner-early-initial-acceptance-first-build-new-verifier","owner-early-initial-acceptance-first-build-retired-native","owner-early-initial-acceptance-first-build-grafted-main","owner-early-acceptance-producer","owner-early-acceptance-producer-fenced"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session","owner-setup-codex-revision-unconfigured-session","owner-early-fresh","owner-early-no-input","owner-early-corrupt-input","owner-early-history","owner-early-policy-retry","owner-early-register-write-failure","owner-early-initial-acceptance","owner-early-initial-acceptance-green-baseline","owner-early-initial-acceptance-write-failure","owner-early-initial-acceptance-history-loss","owner-early-initial-acceptance-setup-failure","owner-early-initial-acceptance-baseline-tamper","owner-early-initial-acceptance-unconfigured","owner-early-initial-acceptance-repeat","owner-early-initial-acceptance-wrong-source","owner-early-initial-acceptance-first-build","owner-early-initial-acceptance-first-build-dirty","owner-early-initial-acceptance-first-build-staged","owner-early-initial-acceptance-first-build-ignored","owner-early-initial-acceptance-first-build-off-base","owner-early-initial-acceptance-first-build-orphan-main","owner-early-initial-acceptance-first-build-runtime","owner-early-initial-acceptance-first-build-legacy-call","owner-early-initial-acceptance-first-build-workflow-call","owner-early-initial-acceptance-first-build-readonly-call","owner-early-initial-acceptance-first-build-lost-call-history","owner-early-initial-acceptance-first-build-policy-lost","owner-early-initial-acceptance-first-build-leading-space","owner-early-initial-acceptance-first-build-counter-loss","owner-early-initial-acceptance-first-build-new-verifier","owner-early-initial-acceptance-first-build-retired-native","owner-early-initial-acceptance-first-build-grafted-main","owner-early-acceptance-producer","owner-early-acceptance-producer-fenced","owner-early-acceptance-producer-replaced-checkout"] {
                 if mode.ends_with("-session") && !cfg!(target_os="linux") {continue;}
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
@@ -3582,7 +3601,26 @@ mod tests {
                 let original=first.audit.native_store_binding().unwrap().unwrap();
                 let prepared=acceptance::owner::test_cached_preparation(dir.path(),&control.join("owner-producer-control"),&first).await.unwrap();
                 assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap(),before,"preparation changed workflow state");
-                if mode.ends_with("-fenced") {
+                if mode.ends_with("-replaced-checkout") {
+                    for replacement in ["git-directory","worktree-root"] {
+                        let source=if replacement=="git-directory" {dir.path().join(".git")}else{dir.path().to_path_buf()};
+                        let retained=tempfile::tempdir_in(dir.path().parent().unwrap()).unwrap();
+                        let retained_source=retained.path().join("original");
+                        std::fs::rename(&source,&retained_source).unwrap();
+                        assert!(std::process::Command::new("cp").arg("-a").arg(&retained_source).arg(&source).status().unwrap().success());
+                        assert_eq!(git_binding(dir.path(),&contract_label,"test",&[]).await.unwrap(),first.binding,
+                            "replacement fixture must retain exact head/tree/product evidence");
+                        assert!(prepared.validate_current(&first,dir.path(),None).is_err(),
+                            "{replacement}: owner preparation accepted a substituted physical checkout");
+                        assert!(prepared.activation_binding().is_err(),"{replacement}: substituted checkout acquired activation binding");
+                        assert!(prepared.test_reload_cached(dir.path(),&first).await.is_err(),"{replacement}: cached factory rebound the original request to a substitute");
+                        assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap(),before);
+                        std::fs::remove_dir_all(&source).unwrap();std::fs::rename(&retained_source,&source).unwrap();
+                        prepared.validate_current(&first,dir.path(),None).unwrap();prepared.activation_binding().unwrap();
+                        prepared.test_reload_cached(dir.path(),&first).await.unwrap();
+                    }
+                    first.finish().unwrap();
+                }else if mode.ends_with("-fenced") {
                     let mut store=WorkflowStore::open(&state).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
                     store.set_owner_pause(&id,"fixture-owner",revision,true,millis()).unwrap();drop(store);
                     assert!(prepared.validate_current(&first,dir.path(),None).is_err(),"stale prepared acceptance escaped owner fence");
