@@ -1241,7 +1241,7 @@ impl ClaudeCliReasoner {
 
         let launch_audit=opts.audit_logger.clone().or_else(default_audit_logger);
         let vm_required = crate::native_vm::required(launch_audit.as_ref());
-        let native_scope = crate::autoship_scope::NativeScope::from_opts(opts)?;
+        let native_scope = if fresh_review {None}else{crate::autoship_scope::NativeScope::from_opts(opts)?};
         let claude_bridge = if native_scope.is_some() {
             Some(crate::codex_tools::ClaudeBridgeLaunch::prepare(opts)?)
         } else { None };
@@ -5292,6 +5292,7 @@ echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"reviewed\"}
         let mut opts = dummy_opts();
         opts.cwd = Some(dir.path().to_owned());
         opts.add_dirs = vec![dir.path().to_owned()];
+        opts.env.push((crate::autoship_scope::SCOPE_ENV.into(),"1".into()));
         let (answer, native_id) = crate::native_session::CURRENT.scope(builder.clone(),
             crate::native_session::fresh_review_scope(provider, reasoner.call(&opts, "review supplied evidence"))).await.unwrap();
         assert_eq!(answer, "reviewed");

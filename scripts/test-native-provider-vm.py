@@ -22,6 +22,109 @@ vm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(vm)
 
 
+class ReadonlyTransportAdmissionTests(unittest.TestCase):
+    def test_readonly_tool_channel_is_refused_before_runtime_or_module_loading(self):
+        original = {'version': 1, 'readonly_review': True, 'resume': False, 'mcp_argv': None}
+        changes = [{'mcp_argv': ['/host/tool-bridge']}, {'mcp_argv': []}, {'resume': True},
+                   {'readonly_review': 'true'}, {'readonly_review': 1}, {'readonly_review': None}]
+        for change in changes:
+            with self.subTest(change=change), mock.patch.object(vm, 'read_launch_spec', return_value=({**original, **change}, '0' * 64)), \
+                    mock.patch.object(vm, 'module') as modules, mock.patch.object(vm, 'validate_runtime') as runtime:
+                with self.assertRaisesRegex(ValueError, 'readonly review'):
+                    vm.main('/fixture/launch.json')
+                modules.assert_not_called()
+                runtime.assert_not_called()
+        for missing in ('mcp_argv', 'resume'):
+            spec = {key: value for key, value in original.items() if key != missing}
+            with self.subTest(missing=missing), mock.patch.object(vm, 'read_launch_spec', return_value=(spec, '0' * 64)), mock.patch.object(vm, 'module') as modules:
+                with self.assertRaisesRegex(ValueError, 'readonly review'):
+                    vm.main('/fixture/launch.json')
+                modules.assert_not_called()
+
+    def test_readonly_without_channel_and_legacy_builder_continue_to_runtime_admission(self):
+        for spec in ({'version': 1, 'readonly_review': True, 'resume': False, 'mcp_argv': None},
+                     {'version': 1, 'mcp_argv': ['/declared/builder-bridge']}):
+            with self.subTest(spec=spec), mock.patch.object(vm, 'read_launch_spec', return_value=(spec, '0' * 64)), \
+                    mock.patch.object(vm, 'module', side_effect=RuntimeError('runtime admission reached')):
+                with self.assertRaisesRegex(RuntimeError, 'runtime admission reached'):
+                    vm.main('/fixture/launch.json')
+
+
+class LaunchInputSnapshotTests(unittest.TestCase):
+    def test_completed_and_failed_receipts_bind_consumed_spec_not_later_path_contents(self):
+        for outcome in ('complete', 'disconnect', 'complete-removed', 'disconnect-removed'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                state = root / 'session'
+                state.mkdir(mode=0o700)
+                executable = root / 'provider'
+                executable.write_bytes(b'synthetic provider never executed')
+                executable.chmod(0o700)
+                launch = {'version': 1, 'readonly_review': True, 'resume': False, 'mcp_argv': None,
+                          'guest_runtime': '/fixture/runtime', 'runtime_config': '/fixture/config',
+                          'session_directory': str(state), 'memory_mb': 512, 'refresh_auth': False,
+                          'executable': str(executable), 'gateway': {}, 'auth_relative': '.codex/auth.json',
+                          'argv': ['consumed-original-argument'], 'environment': {}}
+                path = root / 'launch.json'
+                original = json.dumps(launch).encode()
+                path.write_bytes(original)
+                path.chmod(0o600)
+                proceed = root / 'continue'
+                proceed.write_bytes(b'admitted\n')
+                proceed.chmod(0o600)
+                backend = mock.Mock()
+                backend.Runtime.load.return_value.config = {'library_dir': '/fixture/lib', 'module_dir': '/fixture/modules'}
+                backend.initrd.return_value = b'synthetic initrd'
+                backend.qemu_command.return_value = ['synthetic-qemu', '-serial', 'stdio']
+                gateway_module = mock.Mock()
+                gateway_module.provision.return_value = ({}, [])
+                gateway = mock.Mock(guest_failures=0, host_failures=0)
+                gateway.transport_receipt.return_value = {}
+                def gateway_started(*args, **kwargs):
+                    changed = {**launch, 'argv': ['later-substituted-argument'], 'readonly_review': False,
+                               'mcp_argv': ['/later/host/tool-channel']}
+                    if outcome.endswith('-removed'):
+                        path.unlink()
+                    else:
+                        path.write_bytes(json.dumps(changed).encode())
+                    return gateway
+                gateway_module.HostGateway.side_effect = gateway_started
+                channel = mock.Mock()
+                channel.receive.return_value = [{'type': 'ready'},
+                    {'type': 'worker_quiescent', 'scans': 2, 'signalled': 0, 'reaped': 0,
+                     'remaining_workers': 0, 'quiet_scans': 2}, {'type': 'exit', 'code': 0}]
+                if outcome.startswith('disconnect'):
+                    channel.receive.side_effect = RuntimeError('synthetic native disconnect')
+                process = mock.Mock(returncode=0)
+                process.poll.return_value = None
+                with mock.patch.object(vm, 'module', side_effect=[backend, gateway_module]), \
+                        mock.patch.object(vm, 'validate_runtime'), \
+                        mock.patch.object(vm, 'credential_use', return_value=None), \
+                        mock.patch.object(vm, 'runtime_seed', return_value=([], None)), \
+                        mock.patch.object(vm, 'stage_native_companions'), \
+                        mock.patch.object(vm, 'boot_entries', return_value=[]) as boot, \
+                        mock.patch.object(vm, 'publish_runtime_generation', return_value='generation-synthetic'), \
+                        mock.patch.object(vm.subprocess, 'Popen', return_value=process), \
+                        mock.patch.object(vm.socket, 'socket'), \
+                        mock.patch.object(vm, 'Channel', return_value=channel), \
+                        mock.patch.object(vm.threading, 'Thread'), \
+                        mock.patch.dict(os.environ, {'JARVIS_NATIVE_VM_READY': str(root / 'ready'),
+                                                    'JARVIS_NATIVE_VM_CONTINUE': str(proceed)}):
+                    if outcome.startswith('complete'):
+                        self.assertEqual(vm.main(path), 0)
+                        receipt = json.loads((state / 'complete.json').read_bytes())
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'synthetic native disconnect'):
+                            vm.main(path)
+                        self.assertFalse((state / 'complete.json').exists())
+                        receipt = json.loads((root / 'failed-gateway-observation.json').read_bytes())
+                        self.assertTrue(receipt['diagnostic_only'])
+                self.assertEqual(boot.call_args.args[1]['argv'], ['consumed-original-argument'])
+                self.assertFalse(boot.call_args.args[1]['mcp'])
+                self.assertEqual(receipt['launch_sha256'], hashlib.sha256(original).hexdigest(),
+                                 'receipt hashed replacement path bytes instead of the consumed launch input')
+
+
 class NativeVmTests(unittest.TestCase):
     def test_export_target_rejects_existing_public_or_symlink_parents(self):
         for case in ('public-root', 'public-parent', 'symlink-parent'):

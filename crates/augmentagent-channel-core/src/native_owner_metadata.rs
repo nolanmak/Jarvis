@@ -60,6 +60,7 @@ struct InputRecord {
 struct PreparationBindingRecord {
     version:u32,actor:String,kind:String,launch_intent:super::PreparedLaunchIntent,
     launch_receipt:AppendReceipt,context:super::OwnerPreparationContext,transport_role:String,
+    #[serde(default)] readonly_transport:Option<super::preparation_context::ReadonlyPreparationTransport>,
 }
 fn append_receipt(row:&Value,bytes:&[u8],prefix:&Sha256)->Result<AppendReceipt> {
     Ok(AppendReceipt {version:1,sequence:row["audit_chain"]["sequence"].as_u64().context("native record sequence missing")?,
@@ -67,7 +68,7 @@ fn append_receipt(row:&Value,bytes:&[u8],prefix:&Sha256)->Result<AppendReceipt> 
 }
 fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,binding:&TransferBinding,ledger:&Ledger<'_>)->Result<(Vec<Value>,BTreeSet<RuntimeKey>,Vec<Value>,Vec<Value>,Vec<Value>)> {
     let mut prefix=Sha256::new();let mut launches=BTreeMap::new();let mut resources=Vec::new();let mut bound=BTreeSet::new();
-    let mut preparation_bindings=BTreeMap::new();let mut preparations=Vec::new();
+    let mut preparation_bindings=BTreeMap::new();let mut preparations=Vec::new();let mut readonly_transports=BTreeMap::new();
     let mut resource_receipts=BTreeMap::new();let mut owner_inputs=BTreeMap::new();let mut attempts=BTreeSet::new();let mut inputs=Vec::new();
     for row in rows {
         let bytes=serde_json::to_vec(row)?;prefix.update(&bytes);prefix.update(b"\n");
@@ -98,10 +99,14 @@ fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,bindin
             Some("native_owner_preparation_binding")=>{
                 let mut raw=row.clone();raw.as_object_mut().context("native preparation record is not object")?.remove("audit_chain");
                 let record:PreparationBindingRecord=serde_json::from_value(raw.clone())?;
-                ensure!(record.version==1 && record.actor=="controller" && record.kind=="native_owner_preparation_binding"
+                ensure!(matches!((record.version,record.readonly_transport.is_some()),(1,false)|(2,true)) && record.actor=="controller" && record.kind=="native_owner_preparation_binding"
                     && record.transport_role=="fresh_tool_free_review","native preparation binding shape changed");
                 let original=launches.get(&record.launch_intent.intent_id).context("native preparation binding has no original launch")?;
                 record.context.validate_launch(&original.intent)?;
+                if let Some(transport)=&record.readonly_transport {
+                    transport.validate(&original.intent)?;
+                    readonly_transports.insert(record.launch_intent.intent_id.clone(),transport.clone());
+                }
                 ensure!(original.intent==record.launch_intent && original.controller_receipt==record.launch_receipt
                     && !resource_receipts.contains_key(&record.launch_intent.intent_id)
                     && preparation_bindings.insert(record.launch_intent.intent_id,record.context).is_none(),
@@ -156,7 +161,7 @@ fn native_resources(rows:&[Value],audit:&AuditLogger,namespace:&Authority,bindin
         if !closures.contains_key(&key) {closures.insert(key.clone(),ledger.input_writer_closure(&authority)?);}
         writers.push(json!({"launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"closure":closures[&key],
             "resource_receipt":resource_receipts.get(&prepared.intent.intent_id),"release_attempted":attempts.contains(&prepared.intent.intent_id),
-            "preparation_context":preparation_bindings.get(&prepared.intent.intent_id),"owner_input":owner_inputs.get(&prepared.intent.intent_id)}));
+            "preparation_context":preparation_bindings.get(&prepared.intent.intent_id),"readonly_transport":readonly_transports.get(&prepared.intent.intent_id),"owner_input":owner_inputs.get(&prepared.intent.intent_id)}));
     }
     Ok((resources,bound,inputs,preparations,writers))
 }

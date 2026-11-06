@@ -569,12 +569,29 @@ def stage_native_companions(executable, guest_runtime, destination):
         os.fchmod(stream.fileno(), 0o555)
 
 
+def read_launch_spec(spec_path):
+    # Hash the exact bounded bytes parsed for this invocation. Completion and
+    # failure receipts must never reread a potentially changed launch path.
+    raw = private_bytes(Path(spec_path), 2 * 1024 * 1024)
+    if len(raw) > 2 * 1024 * 1024:
+        raise ValueError('native VM launch input exceeds bound')
+    spec = json.loads(raw)
+    if type(spec) is not dict:
+        raise ValueError('native VM launch input is not an object')
+    return spec, hashlib.sha256(raw).hexdigest()
+
+
 def main(spec_path):
-    vm = module('native_vm_runtime', 'codex-build-vm.py')
-    gateway_module = module('native_provider_gateway', 'native-provider-gateway.py')
-    spec = private_json(spec_path)
+    spec, launch_sha256 = read_launch_spec(spec_path)
     if spec.get('version') != 1:
         raise ValueError('unsupported native VM launch version')
+    readonly = spec.get('readonly_review', False)
+    if type(readonly) is not bool:
+        raise ValueError('invalid readonly review mode')
+    if readonly and ('mcp_argv' not in spec or spec['mcp_argv'] is not None or spec.get('resume') is not False):
+        raise ValueError('readonly review requires fresh transport without host tools')
+    vm = module('native_vm_runtime', 'codex-build-vm.py')
+    gateway_module = module('native_provider_gateway', 'native-provider-gateway.py')
     validate_runtime(spec['guest_runtime'])
     runtime = vm.Runtime.load(Path(spec['runtime_config']))
     config = dict(runtime.config)
@@ -819,7 +836,7 @@ def main(spec_path):
             atomic(state / 'complete.json', json.dumps({'version': 1, 'exit_code': exit_code,
                    'generation': generation, 'export_bytes': exported,
                    'auth_generation': original_auth, 'worker_quiescence': quiescence,
-                   'launch_sha256': hashlib.sha256(private_bytes(Path(spec_path), 2 * 1024 * 1024)).hexdigest(),
+                   'launch_sha256': launch_sha256,
                    'gateway_transport': gateway.transport_receipt()}).encode())
             # Only controller-generated complete exports are retained. Keep the
             # previous generation through pointer publication for crash safety.
@@ -840,7 +857,7 @@ def main(spec_path):
                 # complete.json, or successful launch authority follows this path.
                 atomic(Path(spec_path).parent / 'failed-gateway-observation.json', json.dumps({
                     'version': 1, 'diagnostic_only': True,
-                    'launch_sha256': hashlib.sha256(private_bytes(Path(spec_path), 2 * 1024 * 1024)).hexdigest(),
+                    'launch_sha256': launch_sha256,
                     'gateway_transport': gateway.transport_receipt()}).encode())
             if gateway is not None and (gateway.guest_failures or gateway.host_failures):
                 print(json.dumps({'native_gateway_failures': gateway.guest_failures, 'native_gateway_host_failures': gateway.host_failures}), file=sys.stderr, flush=True)

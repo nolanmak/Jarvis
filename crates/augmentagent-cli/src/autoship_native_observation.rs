@@ -532,9 +532,9 @@ pub(crate) mod tests {
         fn with_owner_mode(owner_bound:bool,body_turn:bool) -> Self {Self::with_owner_timing(owner_bound,body_turn,false)}
         fn with_owner_timing(owner_bound:bool,body_turn:bool,late_dispatch:bool) -> Self {Self::with_native_provider(owner_bound,body_turn,late_dispatch,"codex")}
         fn with_native_provider(owner_bound:bool,body_turn:bool,late_dispatch:bool,provider:&str) -> Self {
-            Self::with_native_provider_preparation(owner_bound,body_turn,late_dispatch,provider,false)
+            Self::with_native_provider_preparation(owner_bound,body_turn,late_dispatch,provider,0)
         }
-        fn with_native_provider_preparation(owner_bound:bool,body_turn:bool,late_dispatch:bool,provider:&str,preparation:bool) -> Self {
+        fn with_native_provider_preparation(owner_bound:bool,body_turn:bool,late_dispatch:bool,provider:&str,preparation_version:u32) -> Self {
             let root = tempfile::tempdir().unwrap();
             let base = root.path().canonicalize().unwrap();
             let state = base.join("native");
@@ -606,10 +606,12 @@ pub(crate) mod tests {
             let mut owner_dispatch=turn.as_ref().filter(|_|!late_dispatch).map(|t|store.begin_owner_body_dispatch(t,submission::Provider::Codex,now()).unwrap());
             let (prepared,session,resource)=retained_launch_fixture(&state,&audit,provider,|prepared| {
                 store.record_verified_native_launch(&lease,&binding,&audit,prepared,now()).unwrap();
-                if preparation {
+                if preparation_version>0 {
                     let context=augmentagent_channel_core::native_vm::OwnerPreparationContext::new(prepared.intent.source_owner.clone(),"original-owner-request".into(),"c".repeat(64)).unwrap();
-                    audit.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_owner_preparation_binding",
-                        "launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"context":context,"transport_role":"fresh_tool_free_review"})).unwrap();
+                    let mut record=serde_json::json!({"version":preparation_version,"actor":"controller","kind":"native_owner_preparation_binding",
+                        "launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"context":context,"transport_role":"fresh_tool_free_review"});
+                    if preparation_version==2 {record["readonly_transport"]=serde_json::json!({"version":1,"launch_sha256":prepared.intent.launch_sha256,"readonly_review":true,"host_tool_channel":"absent"});}
+                    audit.record_controller(record).unwrap();
                 }
             });
             if late_dispatch {owner_dispatch=turn.as_ref().map(|t|store.begin_owner_body_dispatch(t,submission::Provider::Codex,now()).unwrap());}
@@ -831,8 +833,8 @@ pub(crate) mod tests {
     fn retained_native_metadata_proof_preserves_actual_completed_session() {
         if child("retained_native_metadata_proof_preserves_actual_completed_session") {return;}
         use std::sync::{Arc,Mutex};use std::os::fd::AsRawFd;
-        for provider in ["codex","claude"] {for input_fault in ["resource","input","preparation"] {for original_input in ["none","generic","owner","preparation"] {
-        let mut f=Fixture::with_native_provider_preparation(false,false,false,provider,original_input=="preparation");
+        for provider in ["codex","claude"] {for input_fault in ["resource","input","preparation","readonly-transport"] {for original_input in ["none","generic","owner","preparation","readonly-preparation"] {
+        let mut f=Fixture::with_native_provider_preparation(false,false,false,provider,match original_input {"preparation"=>1,"readonly-preparation"=>2,_=>0});
         // Protected journal fixtures describe prior input uncertainty; they do
         // not invoke a model or reconstruct the original live input authorizer.
         if original_input!="none" {
@@ -885,6 +887,8 @@ pub(crate) mod tests {
             let writers=proof.evidence()["audits"].as_array().unwrap().iter().flat_map(|a|a["native_input_writers"].as_array()
                 .expect("native metadata omitted its original input-writer closure census")).collect::<Vec<_>>();
             assert_eq!(writers.len(),1);assert_eq!(writers[0]["launch_intent"],serde_json::to_value(&f.prepared.intent).unwrap());
+            assert_eq!(writers[0]["readonly_transport"].is_null(),original_input!="readonly-preparation");
+            if original_input=="readonly-preparation" {assert_eq!(writers[0]["readonly_transport"]["launch_sha256"],f.prepared.intent.launch_sha256);}
             assert_eq!(writers[0]["closure"]["kind"],"completed_native_transfer");
             assert_eq!(writers[0]["closure"]["transfer_id"],first.request().transfer_id);
             let mut revoked=false;
@@ -903,7 +907,7 @@ pub(crate) mod tests {
             let input_count=proof.evidence()["audits"].as_array().unwrap().iter().map(|a|a["native_input_records"].as_array().unwrap().len()).sum::<usize>();
             assert_eq!(input_count,match original_input {"none"=>0,"owner"=>2,_=>1});
             let preparation_count=proof.evidence()["audits"].as_array().unwrap().iter().map(|a|a["native_preparation_bindings"].as_array().unwrap().len()).sum::<usize>();
-            assert_eq!(preparation_count,usize::from(original_input=="preparation"));
+            assert_eq!(preparation_count,usize::from(matches!(original_input,"preparation"|"readonly-preparation")));
             for path in [native.join("state.lock"),native.join(format!("{provider}/session-fixture/lock")),base.join("anchors/native.lock"),base.join("anchors/destination.lock"),base.join("anchors/metadata-final.lock")] {
                 let fd=std::fs::OpenOptions::new().read(true).open(path).unwrap();assert_ne!(unsafe{libc::flock(fd.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
             }
@@ -945,7 +949,7 @@ pub(crate) mod tests {
         // permanently revoked, even though the retained runtime's creation
         // owner is closed and general metadata inspection remains possible.
         let mut live=f.prepared.intent.clone();live.intent_id=uuid::Uuid::new_v4().to_string();live.source_owner=namespace.owner.clone();live.source_audit_path=current.path().into();
-        let mut row=serde_json::to_value(&live).unwrap();row["actor"]="controller".into();row["kind"]="native_launch_intent".into();current.record_controller(row).unwrap();
+        let mut row=serde_json::to_value(&live).unwrap();row["actor"]="controller".into();row["kind"]="native_launch_intent".into();let live_receipt=current.record_controller_receipted(row).unwrap();
         ownership::with_metadata_native_owner(&current,&runtimes,&fence,&mut load,&mut |proof| {
             let count=proof.evidence()["audits"].as_array().unwrap().iter().map(|a|a["native_input_writers"].as_array().unwrap().len()).sum::<usize>();assert_eq!(count,2);
             let mut entered=false;let error=proof.with_revoked_input_writers(|_| {entered=true;Ok(())}).unwrap_err();
@@ -955,6 +959,11 @@ pub(crate) mod tests {
             current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_input_release_attempt",
                 "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_receipt":f.resource,
                 "prompt_sha256":"a".repeat(64),"prompt_bytes":42,"recorded_at_ms":now()})).unwrap();
+        }else if input_fault=="readonly-transport" {
+            let context=augmentagent_channel_core::native_vm::OwnerPreparationContext::new(live.source_owner.clone(),"original-owner-request".into(),"c".repeat(64)).unwrap();
+            current.record_controller(serde_json::json!({"version":2,"actor":"controller","kind":"native_owner_preparation_binding",
+                "launch_intent":live,"launch_receipt":live_receipt,"context":context,"transport_role":"fresh_tool_free_review",
+                "readonly_transport":{"version":1,"launch_sha256":"f".repeat(64),"readonly_review":true,"host_tool_channel":"absent"}})).unwrap();
         }else if input_fault=="preparation" {
             let context=augmentagent_channel_core::native_vm::OwnerPreparationContext::new(f.prepared.intent.source_owner.clone(),"original-owner-request".into(),"c".repeat(64)).unwrap();
             current.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_owner_preparation_binding",
@@ -965,7 +974,7 @@ pub(crate) mod tests {
         }
         let mut visited=false;
         let error=ownership::with_metadata_native_owner(&current,&runtimes,&fence,&mut load,&mut |_| {visited=true;Ok(())}).unwrap_err();
-        assert!(!visited);assert!(format!("{error:#}").contains(match input_fault {"input"=>"native metadata input has no original launch","preparation"=>"native preparation binding has no original launch",_=>"native metadata resource has no original launch"}),"{error:#}");
+        assert!(!visited);assert!(format!("{error:#}").contains(match input_fault {"input"=>"native metadata input has no original launch","preparation"=>"native preparation binding has no original launch","readonly-transport"=>"original readonly preparation transport changed",_=>"native metadata resource has no original launch"}),"{error:#}");
         f.store.release(&lease,now()).unwrap();refuse(&runtimes,audits.clone());
         }}}
     }

@@ -33,3 +33,18 @@ impl OwnerPreparationContext {
     }
 }
 pub(super) fn current()->Option<OwnerPreparationContext> {CURRENT.try_with(Clone::clone).ok()}
+
+/// Descriptive versioned observation from the actual guarded VM launch spec.
+/// It is not a readonly kernel/source/resource proof or executable capability.
+#[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReadonlyPreparationTransport {version:u32,launch_sha256:String,readonly_review:bool,host_tool_channel:String}
+impl ReadonlyPreparationTransport {
+    pub(super) fn capture(intent:&PreparedLaunchIntent)->Self {
+        Self {version:1,launch_sha256:intent.launch_sha256.clone(),readonly_review:true,host_tool_channel:"absent".into()}
+    }
+    pub(super) fn validate(&self,intent:&PreparedLaunchIntent)->Result<()> {
+        ensure!(self.version==1 && self.launch_sha256==intent.launch_sha256 && self.readonly_review && self.host_tool_channel=="absent",
+            "original readonly preparation transport changed");Ok(())
+    }
+}

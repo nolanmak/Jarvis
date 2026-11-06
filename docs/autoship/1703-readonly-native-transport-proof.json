@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "kind": "readonly-native-review-transport-and-consumed-spec-binding-component",
+  "source_parent_commit": "b0b7fe9307a7d9974ef88bdcde46473f4de9130b",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/codex.rs",
+      "sha256": "b1e888df1e20239e8380ee57286cab3d458e4bf2c1f5bb48c914641dbcefc0d4"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/reasoner.rs",
+      "sha256": "01375cf14e99ed46b571f2944d9beca2a2dfe0c13745259cc3de19b9dc569e0e"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "b79939605aa969cddc37fcef935e560a7e68793a1aedbcaaa5cb473b2e8be3dd"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_preparation_context.rs",
+      "sha256": "7e56f058d48474c064c247648e24ccd1d7709ea9850fb76ada3e230c9749e000"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_metadata.rs",
+      "sha256": "8ba0f1f2624ac95191bcebd6c2c64b549f8a0eeb49ff9a8e95cfac81d4b626b2"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+      "sha256": "cb89325af41be843d9b1442868d4d333a7f59c66df3f16304265b50dadabf92a"
+    },
+    {
+      "path": "scripts/native-provider-vm.py",
+      "sha256": "991f2c31e41aa73f63ed4df2fdba3c7a9cfaab2b8b4d1711e632fa89f16bcaa8"
+    },
+    {
+      "path": "scripts/test-native-provider-vm.py",
+      "sha256": "eb93bcecf3c83350f116204675a0cc4a90e1a1796012c34e475c1b2d65b3bbcf"
+    },
+    {
+      "path": "scripts/native-provider-vm-guest.py",
+      "sha256": "3eb2c054440e1714c1c2a0ea50cc6e86baa7413b830deab7b37db240239e17d9"
+    },
+    {
+      "path": "scripts/test-native-provider-io.py",
+      "sha256": "eccacccb7a968d84d6b34f956d860f987ed572476789dd3e8cd8c1c732e33689"
+    }
+  ],
+  "behavioral_reds": [
+    {
+      "session": 16688,
+      "result": "terminal1;managed exit101",
+      "log": "/tmp/autoship-readonly-native-bridge-red-2-20261106.log",
+      "failure": "actual fresh Codex adapter argv still configured host MCP server"
+    },
+    {
+      "result": "terminal1",
+      "log": "/tmp/autoship-readonly-native-vm-red-20261106.log",
+      "failure": "readonly job with declared host tool channel proceeded to runtime setup instead of rejecting before helper load"
+    },
+    {
+      "result": "terminal1;2 subcase failures",
+      "log": "/tmp/autoship-native-spec-input-snapshot-red-20261106.log",
+      "failure": "actual runner main complete/disconnect paths hashed replacement spec pathname bytes instead of consumed input"
+    }
+  ],
+  "validation": {
+    "full_core": {
+      "session": 39976,
+      "result": "terminal0",
+      "passed": 945,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 36.5,
+      "log": "/tmp/autoship-readonly-native-transport-full-core-final-20261106.log"
+    },
+    "python_vm": {
+      "session": 19407,
+      "result": "terminal0",
+      "tests": 24,
+      "seconds": 1.739,
+      "log": "/tmp/autoship-readonly-native-vm-full-final-20261106.log"
+    },
+    "python_io": {
+      "result": "terminal0",
+      "tests": 9,
+      "seconds": 0.098,
+      "log": "/tmp/autoship-readonly-native-transport-io-20261106.log"
+    },
+    "isolated_full_cli": {
+      "session": 33196,
+      "log": "/tmp/autoship-readonly-native-transport-isolated-full-cli-final-20261106.log",
+      "unfinished_productive_gate_wip_included": false,
+      "result": "terminal0",
+      "passed": 1949,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 314.9
+    },
+    "isolated_production_check": {
+      "session": 92863,
+      "result": "terminal0",
+      "seconds": 39.4,
+      "log": "/tmp/autoship-readonly-native-transport-isolated-production-check-20261106.log"
+    }
+  },
+  "implemented": [
+    "Fresh Codex review omits MCP configuration and passes no host bridge to native VM; ordinary builders retain declared broker",
+    "Fresh Claude review skips inherited builder NativeScope and its filesystem/materialization/bridge setup",
+    "Native preparation rejects host bridge and tools/settings/handoff before allocation in readonly-review mode",
+    "Actual VM launch spec readonly_review flag rejects tool vectors, missing explicit no-channel state, resume and malformed modes before runtime/helper loading",
+    "Version2 original preparation binding describes enforced absent-host-channel transport and exact original launch SHA; strict retained metadata preserves it without upgrading legacy version1 labels",
+    "Runner hashes exact bounded originally parsed spec bytes once and reuses digest for completion and diagnostic-only failure records"
+  ],
+  "test_scope": {
+    "stub_cli": "actual adapter argv/new-conversation/customization path; inherited Claude builder-scope selector; no real model",
+    "core_launch": "both providers actual emitted readonly spec/version2 binding, bridge refusal before runtime allocation",
+    "retained_metadata": "40 protected-journal cases across both providers, legacy/v2 preparation and none/generic/owner input histories, mismatch against exact current launch SHA; original lock/control/accounting checks retained",
+    "runner": "actual main with mocked hypervisor/gateway and scripted frames; spec overwritten or removed after job construction for complete/disconnect; consumed original argv and absent tool channel retained, receipt hashes original bytes",
+    "vm_or_provider_executed": false
+  },
+  "not_proven_or_implemented": [
+    "Complete kernel/source/resource/associated-input-census authority; versioned transport descriptor is not such proof",
+    "Fresh body input nonrelease and semantic coding-conversation continuation",
+    "Typed recovery/terminal metadata producers and distinct productive successor bridge/claim",
+    "Shared productive gate, connected owner consumer, aggregate protected storage, independent exact-head review, rollout, original live acceptance/soaks"
+  ],
+  "preserved_unpublished_work": "/tmp/autoship-productive-gate-preserved-20261106.patch"
+}

@@ -552,6 +552,12 @@ impl Launch {
         bridge: Option<&crate::codex_tools::BridgeLaunch>, native: Option<&crate::native_session::Launch>) -> Result<Self> {
         let owner_logger=opts.audit_logger.as_ref().context("native runtime owner audit unavailable")?;
         let audit_owner=owner_logger.native_runtime_owner()?.context("native runtime fenced owner unavailable")?;
+        let readonly_review=crate::native_session::is_fresh_review();
+        if readonly_review {
+            ensure!(bridge.is_none(),"fresh review cannot expose a host tool bridge");
+            ensure!(opts.allowed_tools.is_empty() && opts.settings_json.is_none() && opts.handoff_path.is_none(),
+                "fresh review requires supplied evidence without tools, settings or handoff history");
+        }
         let preparation_context=preparation_context::current();
         if let Some(context)=&preparation_context {
             context.validate_owner(&audit_owner)?;
@@ -678,7 +684,7 @@ impl Launch {
         let mcp_argv = bridge.map(|bridge| vec!["/usr/bin/python3".to_string(), "-I".into(),
             bridge.native_cwd.parent().expect("bridge launch directory").join("tool-bridge.py").to_string_lossy().into_owned(),
             bridge.policy_path.to_string_lossy().into_owned()]);
-        let spec = serde_json::json!({"version":1,"runtime_config":policy.runtime_config,"guest_runtime":policy.guest_runtime,"memory_mb":policy.memory_mb,
+        let spec = serde_json::json!({"version":1,"readonly_review":readonly_review,"runtime_config":policy.runtime_config,"guest_runtime":policy.guest_runtime,"memory_mb":policy.memory_mb,
             "provider":provider,"refresh_auth":profile.refresh_auth,"credential_directory":root.join("credentials"),"session_directory":session,"resume":resume,"executable":executable,"argv":arguments,
             "environment":environment,"auth_file":profile.auth_file,"auth_relative":profile.auth_relative,
             "gateway":profile.gateway,"mcp_argv":mcp_argv,"assets":assets});
@@ -701,8 +707,9 @@ impl Launch {
         if let Some(context)=&preparation_context {
             context.validate_launch(&prepared.intent)?;
             owner_logger.dispatch_allowed()?;
-            owner_logger.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller","kind":"native_owner_preparation_binding",
-                "launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"context":context,"transport_role":"fresh_tool_free_review"}))?;
+            let transport=preparation_context::ReadonlyPreparationTransport::capture(&prepared.intent);
+            owner_logger.record_controller_receipted(serde_json::json!({"version":2,"actor":"controller","kind":"native_owner_preparation_binding",
+                "launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"context":context,"transport_role":"fresh_tool_free_review","readonly_transport":transport}))?;
             owner_logger.dispatch_allowed()?;
         }
         let mut command = Command::new("/usr/bin/python3");
@@ -1076,7 +1083,9 @@ mod tests {
             let native=crate::native_session::Launch::Create {requested_id:id.map(str::to_owned)};
             let context=OwnerPreparationContext::new(owner.clone(),"original-owner-request".into(),"c".repeat(64)).unwrap();
             if mode=="preparation-context" {
-                for fault in ["owner","tools","settings","handoff","resume","not-review"] {
+                let bridge_dir=root.join(format!("bridge-{provider}"));std::fs::create_dir(&bridge_dir).unwrap();
+                let bridge=crate::codex_tools::BridgeLaunch::prepare(&opts,&bridge_dir).unwrap();
+                for fault in ["owner","tools","settings","handoff","resume","not-review","bridge"] {
                     let mut invalid=opts.clone();
                     match fault {"tools"=>invalid.allowed_tools.push("Write".into()),"settings"=>invalid.settings_json=Some("{}".into()),
                         "handoff"=>invalid.handoff_path=Some(root.join("untrusted.json")),_=>()}
@@ -1086,7 +1095,7 @@ mod tests {
                     let session=if fault=="resume" {&resume}else{&native};
                     let refused=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(selected.scope(async {
                         crate::native_session::FRESH_REVIEW.scope(fault!="not-review",async {
-                            Launch::prepare(provider,&invalid,&Command::new("/usr/bin/false"),None,Some(session))
+                            Launch::prepare(provider,&invalid,&Command::new("/usr/bin/false"),if fault=="bridge" {Some(&bridge)}else{None},Some(session))
                         }).await
                     }));
                     assert!(refused.is_err(),"preparation association accepted {fault}");
@@ -1142,6 +1151,11 @@ mod tests {
             if mode=="preparation-context" {
                 let binding=rows.iter().find(|row|row["kind"]=="native_owner_preparation_binding")
                     .expect("native launch escaped without its original owner preparation association");
+                assert_eq!(binding["version"],2);
+                assert_eq!(binding["readonly_transport"]["host_tool_channel"],"absent");
+                assert_eq!(binding["readonly_transport"]["launch_sha256"],prepared.intent.launch_sha256);
+                let spec:serde_json::Value=serde_json::from_slice(&std::fs::read(launch._directory.path().join("launch.json")).unwrap()).unwrap();
+                assert_eq!(spec["readonly_review"],true);assert_eq!(spec["resume"],false);assert!(spec["mcp_argv"].is_null());
                 assert_eq!(binding["context"],serde_json::to_value(&context).unwrap());
                 assert_eq!(binding["launch_intent"],serde_json::to_value(&prepared.intent).unwrap());
                 assert_eq!(binding["launch_receipt"],serde_json::to_value(&prepared.controller_receipt).unwrap());

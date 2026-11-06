@@ -202,7 +202,8 @@ impl CodexCliReasoner {
         clean: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
-        if crate::native_session::is_fresh_review() {
+        let fresh_review=crate::native_session::is_fresh_review();
+        if fresh_review {
             anyhow::ensure!(opts.allowed_tools.is_empty() && opts.settings_json.is_none() && opts.handoff_path.is_none(),
                 "fresh review must use supplied evidence without tools, settings or handoff history");
         }
@@ -244,12 +245,14 @@ impl CodexCliReasoner {
                 message: format!("codex tool policy is not ready: {error}"),
             })
         })?;
-        let effective_system = format!("{effective_system}\n\nJarvis tool transport: use the jarvis MCP tools for the \
+        let effective_system = if fresh_review {
+            format!("{effective_system}\n\nUse only supplied evidence. No filesystem, command, web or MCP tools are available.")
+        }else {format!("{effective_system}\n\nJarvis tool transport: use the jarvis MCP tools for the \
             declared file, command and integration operations. The tool workspace is {}. \
             Relative tool paths resolve there. Commands accept one executable and its arguments; \
             split compound shell operations into separate calls. Preserve ATTACH output markers \
             verbatim when delivering original files. Use native web tools for declared web operations.",
-            opts.cwd.as_ref().or(opts.add_dirs.first()).map(|p| p.display().to_string()).unwrap_or_default());
+            opts.cwd.as_ref().or(opts.add_dirs.first()).map(|p| p.display().to_string()).unwrap_or_default())};
         let instructions = tmp.path().join("instructions.md");
         std::fs::write(&instructions, effective_system).map_err(|e| {
             anyhow::Error::new(ReasonerError::Local {
@@ -298,6 +301,7 @@ impl CodexCliReasoner {
             args.push(img.to_string_lossy().into_owned());
         }
         for config in &bridge.config_overrides {
+            if fresh_review && config.starts_with("mcp_servers.") {continue;}
             args.push("-c".into());
             args.push(config.clone());
         }
@@ -344,7 +348,7 @@ impl CodexCliReasoner {
         let launch_audit=opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger);
         crate::run_resources::check_requirement(provider,launch_audit.as_ref())?;
         let native_vm = if crate::native_vm::required(launch_audit.as_ref()) {
-            Some(crate::native_vm::Launch::prepare(provider, opts, &cmd, Some(&bridge), native_launch.as_ref())?)
+            Some(crate::native_vm::Launch::prepare(provider, opts, &cmd, if fresh_review {None}else{Some(&bridge)}, native_launch.as_ref())?)
         } else { None };
         if let (Some(vm),Some(lease))=(&native_vm,&native_lease) {vm.register_retirement(lease);}
         // #1627 — a text turn reserves the text tier, not a builder's 4 GiB.
@@ -753,6 +757,7 @@ echo '{{"type":"turn.completed"}}'
             assert!(argv.contains(required), "missing {required}: {argv}");
         }
         assert!(!argv.lines().any(|arg| arg == "resume" || arg == "builder-thread"));
+        assert!(!argv.lines().any(|arg|arg.starts_with("mcp_servers.")),"fresh review still exposes a host MCP bridge: {argv}");
     }
 
     #[tokio::test]
