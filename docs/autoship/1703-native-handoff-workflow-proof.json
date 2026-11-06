@@ -1,6 +1,6 @@
 {
   "kind": "native-handoff-workflow-component-validation",
-  "source_parent_commit": "634bac3a34f3f2d20612b55a0f839d87422eca73",
+  "source_parent_commit": "f32f43a2f1d0eae5fb54f84766fc76ea877c8036",
   "source_inventory_is_post_run_inventory": true,
   "source_generation_authority": false,
   "sources": [
@@ -110,7 +110,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "014d42e0fee80ce054638eca5b727e8d78a804c7f34fcb79bb3172d9c1977472"
+      "sha256": "da63dc9e54789c1cb55f51d113c92f2c59ee15a97bdb70292f197ae43455cef2"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_recovery.rs",
@@ -195,11 +195,27 @@
     {
       "path": "crates/augmentagent-cli/src/autoship_conversations.rs",
       "sha256": "d3799692eff450a435d39827e2096d783c324eb4a8845cf4f39574aa8ee051c4"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_contract.rs",
+      "sha256": "bfbf311fdec90c5c33a4c55e83986369b744bcec3cbc3ef80e763a16a04b4aa4"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_contract.rs",
+      "sha256": "91698b334a5bf4d8c500cfaf28c3be96e7806f23abc9faba4b7a3f2edeb2a15d"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_scope.rs",
+      "sha256": "ced3a6e8e8b8b1f8f4004d8d1f24215488a3ad1d56cb840f80038720eae92c50"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_acceptance.rs",
+      "sha256": "75213eff90b02c5a1a5d10fd49fac789035cfe2320b9d922a5da4c961468b5d6"
     }
   ],
   "results": {
-    "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
-    "passed": 1870,
+    "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent -- --test-threads=8",
+    "passed": 1875,
     "failed": 0,
     "ignored": 33,
     "handoff_snapshot_cases": 10,
@@ -359,7 +375,18 @@
       "autoship-owner-default-provider-red.log",
       "autoship-owner-default-provider-green.log",
       "autoship-owner-default-provider-full-cli.log",
-      "autoship-owner-default-provider-production-check.log"
+      "autoship-owner-default-provider-production-check.log",
+      "autoship-owner-acceptance-red.log",
+      "autoship-owner-acceptance-green.log",
+      "autoship-owner-acceptance-bytes-red.log",
+      "autoship-owner-acceptance-bytes-behavior-red.log",
+      "autoship-owner-acceptance-bytes-green.log",
+      "autoship-owner-acceptance-guard-green.log",
+      "autoship-owner-acceptance-full-cli.log",
+      "autoship-owner-acceptance-production-check.log",
+      "autoship-owner-acceptance-final-focused.log",
+      "autoship-owner-acceptance-final-cli.log",
+      "autoship-owner-acceptance-final-production-check.log"
     ],
     "settlement_cases": 7,
     "handoff_component_cases": 31,
@@ -392,11 +419,11 @@
     "production_configuration_check": {
       "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
       "passed": true,
-      "log": "autoship-owner-default-provider-production-check.log"
+      "log": "autoship-owner-acceptance-final-production-check.log"
     },
     "guard_promotion_cases": 3,
     "read_only_audit_probe_cases": 2,
-    "actual_guard_subprocess_modes": 25,
+    "actual_guard_subprocess_modes": 65,
     "sweep_related_cases": 20,
     "guard_abort_resolver_cases": 3,
     "closed_workflow_core_cases": 2,
@@ -407,7 +434,8 @@
     "phone_reliability_failed": 0,
     "owner_guard_setup_modes": 6,
     "retained_runtime_owner_pause_cases": 1,
-    "focused_owner_cases": 115
+    "focused_owner_cases": 115,
+    "owner_acceptance_preparation_cases": 5
   },
   "coverage": [
     "atomic immutable observation snapshots and exact-input sequence reuse",
@@ -551,7 +579,8 @@
     "remaining authenticated retirement intent routing and interrupted/legacy/vanished namespace recovery; remaining owner-turn and recovery consumers; actual runtime/provider continuation acceptance",
     "actual provider/VM continuation after closed-workflow recovery, remaining nonterminal owner execution-retry/owner-turn retirement routing, and missing/legacy/vanished authority recovery remain unproven",
     "real owner-message worker consumption, guarded completion/reply and Discord coding gateway activation remain unimplemented; metadata/guard readiness never substitutes for actual provider/VM/Discord acceptance",
-    "new published head hosted checks and protected main synchronization/review remain required"
+    "new published head hosted checks and protected main synchronization/review remain required",
+    "Private owner acceptance producer exists, but worker consumption, recoverable verifier application and safe projection of every public GitHub output remain required before native Discord coding activation."
   ],
   "native_transfer_scope": "isolated synthetic-controller/native-filesystem fixtures only; zero production transfers or provider/model dispatch",
   "opaque_receipt_producer": "actual original-bound ownership::transfer_receipt lookup or Completed NativeTransferInspection under the held original native lock; no wire/serialized-receipt constructor",
@@ -1119,7 +1148,7 @@
     "discord_coding_enabled": false,
     "reply_delivery_enabled": false,
     "remaining": [
-      "Authorized worker routing and owner-independent acceptance preparation",
+      "Authorized worker routing, use of independent acceptance producer and safe verifier application",
       "actual first-builder provider/VM dispatch acceptance and complete retained-history provider resolution",
       "interrupted owner execution/result recovery",
       "actual private per-request delivery acceptance and rare irrecoverable-send operator resolution",
@@ -1190,5 +1219,33 @@
     "fixtures": "Actual SQLite command admission, builder observation, restart, authenticated owner inbox and claimed turn. No actual model, VM or Discord transport.",
     "worker_consumer_enabled": false,
     "live_provider_dispatch": false
+  },
+  "owner_independent_acceptance": {
+    "scope": "Request-bound independent native proposal/baseline producer and opaque current-guard activation adapter implemented in source. Actual worker consumption remains absent.",
+    "protocol": "Keep the full private message, immutable owner request/generation/pause/binding, original source/criteria/baseline and previous registration in a bounded private request artifact. Use the existing independent native scoper and sandboxed original-baseline engine; emit the exact next revision and preserve every original criterion. Ordinary retries/questions need not become new code requirements. Cached prepared bytes must match every exact registered adapter digest and original intended-red receipts. Refuse environment transitions, protected controls, broadened directories, incomplete receipts and stale owner authority. Prompt bounds apply before paid dispatch. Preparation never installs into the retained candidate, applies input, unpauses or spends merge allowance.",
+    "behavioral_red": "The uncommitted producer accepted changed adapter contents under an original registered baseline receipt. The actual failing assertion is retained; verify_file_contents makes the same case refuse. This is not a regression demonstrated against published f32f43a2, which has no producer API.",
+    "other_reds": "Initial absent Input API and an attempted call to a private Binding validator failed compilation; corrected without expanding that validator visibility. A separate managed invocation ended with storage busy before compilation and was retried only after terminal confirmation.",
+    "focused_passed": 5,
+    "guard_modes_passed": 65,
+    "cached_factory_fixture": "Two added modes traverse the production cached factory under an actual SQLite/native-owner WorkflowGuard. Changed adapter bytes, changed authenticated input, nonprivate evidence, wrong source and explicit owner fencing refuse. Healthy preparation leaves the candidate and workflow unchanged; explicit fixture-only harness installation then activates through the normal native ownership transfer. The old producer proof refuses after activation. Pending owner input, pause, original native store and zero model calls remain intact.",
+    "fixture_scope": "Baseline observations and native controller/resource receipts are synthetic. No actual provider/model/VM/Discord dispatch. Fresh scoping/baseline source path compiles but was not executed against live transport. Fixture installation does not prove production verifier application/recovery.",
+    "full_cli": {
+      "passed": 1875,
+      "failed": 0,
+      "ignored": 33,
+      "test_threads": 8
+    },
+    "production_check": "passed",
+    "worker_consumer_enabled": false,
+    "live_provider_dispatch": false,
+    "live_discord_acceptance": false,
+    "production_verifier_application_connected": false,
+    "remaining": [
+      "Authorized worker owner-message selection, current owner/repository authorization and retained-history builder construction",
+      "Safe recoverable application of independently prepared verifier files before activation",
+      "Private projection across public PR bodies, review notes, failure comments and all other publication paths before enabling private owner coding",
+      "Interrupted owner execution/result recovery and controlled provider switching",
+      "Actual fresh native scoping, sandboxed VM baseline/body execution and Discord acceptance through normal deployment; full #1715 closure"
+    ]
   }
 }

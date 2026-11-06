@@ -178,12 +178,16 @@ pub(crate) async fn run(
     workflow: &workflow::WorkflowGuard,
     prompt: &str,
 ) -> Result<String> {
-    run_inner(root,repository,workflow,prompt,true).await
+    run_inner(root,repository,workflow,prompt,true,None).await
 }
 pub(super) async fn assess(root:&Path,repository:&str,workflow:&workflow::WorkflowGuard,prompt:&str)->Result<String> {
-    run_inner(root,repository,workflow,prompt,false).await
+    run_inner(root,repository,workflow,prompt,false,None).await
 }
-async fn run_inner(root:&Path,repository:&str,workflow:&workflow::WorkflowGuard,prompt:&str,contract:bool)->Result<String> {
+pub(super) fn contract_schema(revision:Option<u64>)->String {
+    let revision=revision.unwrap_or(1);
+    CONTRACT_PROMPT.replacen("revision=1",&format!("revision={revision}"),1).replace("\"revision\":1",&format!("\"revision\":{revision}"))
+}
+async fn run_inner(root:&Path,repository:&str,workflow:&workflow::WorkflowGuard,prompt:&str,contract:bool,revision:Option<u64>)->Result<String> {
     let control = control_directories(repository, workflow.id())?.workflow_acceptance;
     std::fs::create_dir_all(&control)?;
     let control = control.canonicalize()?;
@@ -229,7 +233,8 @@ async fn run_inner(root:&Path,repository:&str,workflow:&workflow::WorkflowGuard,
     }
     let (provider,evidence)=selected.ok_or_else(||SourceSelectionExhausted(exhausted.join("; ")))?;
     ensure!(actual_head(root).await?==head,"candidate moved during independent source selection");
-    let format_instructions=if contract {CONTRACT_PROMPT} else {"Return only the requested readiness JSON, not a specification or executable contract."};
+    let schema=contract_schema(revision);
+    let format_instructions=if contract {schema.as_str()} else {"Return only the requested readiness JSON, not a specification or executable contract."};
     let final_prompt=format!("{prompt}\n{format_instructions}\nYou have no tools. Scope against these controller-supplied original-base excerpts, not assumptions from another conversation. Unseen files are unknown, not proof of a blocker. Original HEAD: {head}\nSource excerpts: {}",serde_json::to_string(&evidence)?);
     let output = call(
         root,
@@ -320,10 +325,19 @@ pub(super) fn cached_persistent<T>(workflow:&workflow::WorkflowGuard,purpose:&st
 /// strategy slots; actual model admissions remain fully charged by the audit
 /// observer. A crash after response persistence resumes without another call.
 pub(super) async fn persistent<T>(root:&Path,workflow:&workflow::WorkflowGuard,purpose:&str,epoch:&str,prompt:&str,contract:bool,validate:impl Fn(&str)->Result<T>)->Result<T> {
+    persistent_inner(root,workflow,purpose,epoch,prompt,contract,None,validate).await
+}
+/// Owner revisions use the same independent native provider and bounded response
+/// journal, with the controller's exact revision in the emitted schema.
+pub(super) async fn persistent_revision<T>(root:&Path,workflow:&workflow::WorkflowGuard,purpose:&str,epoch:&str,prompt:&str,revision:u64,validate:impl Fn(&str)->Result<T>)->Result<T> {
+    ensure!(revision>0,"invalid owner acceptance revision");
+    persistent_inner(root,workflow,purpose,epoch,prompt,true,Some(revision),validate).await
+}
+async fn persistent_inner<T>(root:&Path,workflow:&workflow::WorkflowGuard,purpose:&str,epoch:&str,prompt:&str,contract:bool,revision:Option<u64>,validate:impl Fn(&str)->Result<T>)->Result<T> {
     let key=|correction,attempt| {
         response_key(purpose,epoch,&workflow.binding().contract,correction,attempt)
     };
-    let generate=|request:String|async move {workflow.check_resource_policy()?;let raw=run_inner(root,workflow.repository(),workflow,&request,contract).await?;workflow.audit_health().await?;Ok(raw)};
+    let generate=|request:String|async move {workflow.check_resource_policy()?;let raw=run_inner(root,workflow.repository(),workflow,&request,contract,revision).await?;workflow.audit_health().await?;Ok(raw)};
     if contract {
         let completed=recoverable_contract_generation(prompt,|correction,attempt|workflow.scope_stage_response(&key(correction,attempt)),
             |correction,attempt,raw|workflow.record_scope_stage_response(&key(correction,attempt),raw),generate,

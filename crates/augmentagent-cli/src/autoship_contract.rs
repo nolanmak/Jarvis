@@ -585,6 +585,17 @@ impl RegisteredContract {
         ensure!(valid_commit(&self.baseline_head) && !self.environment_id.is_empty(),"invalid registered baseline identity");
         Ok(())
     }
+    /// Validate controller-stored adapter bytes before applying them to any
+    /// checkout. This is a metadata check, not execution or source freshness.
+    pub(crate) fn verify_file_contents(&self,files:&BTreeMap<String,String>)->Result<()> {
+        self.verify_metadata()?;
+        ensure!(files.len()==self.file_hashes.len(),"registered verifier file inventory changed");
+        for (path,expected) in &self.file_hashes {
+            let contents=files.get(path).context("registered verifier file missing")?;
+            ensure!(contents.len() as u64<=MAX_FILE_BYTES && digest(contents.as_bytes())==*expected,"registered verifier artifact bytes changed: {path}");
+        }
+        Ok(())
+    }
     pub fn verify_integrity(&self, root: &Path) -> Result<()> {
         self.verify_metadata()?;
         for (file, expected) in &self.file_hashes {

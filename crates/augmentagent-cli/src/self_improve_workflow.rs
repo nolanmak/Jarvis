@@ -1183,6 +1183,34 @@ impl WorkflowGuard {
         augmentagent_channel_core::native_session::FreshBuilderSessions::from_observed(owner,&observed)
     }
 
+    /// Authenticated private input for the independent acceptance producer.
+    /// Reading it grants neither provider dispatch nor contract activation.
+    pub(super) fn owner_acceptance_turn(&self,candidate:&Path,source:crate::autoship_contract::AcceptanceSource,
+        previous:Option<&crate::autoship_contract::RegisteredContract>)->Result<durable::owner_turn::OwnerTurn> {
+        self.native_builder_owner()?;
+        anyhow::ensure!(candidate.canonicalize()?==self.worktree.canonicalize()?,"owner acceptance candidate changed");
+        let expected=match source {crate::autoship_contract::AcceptanceSource::Issue(n)=>durable::workflow_id(&self.repository,n)?,
+            crate::autoship_contract::AcceptanceSource::PullRequest(n)=>durable::pr_workflow_id(&self.repository,n)?};
+        anyhow::ensure!(expected==self.id(),"owner acceptance source changed");
+        if let Some(previous)=previous {
+            previous.verify_metadata()?;
+            anyhow::ensure!(self.contract==format!("registered:{}",previous.contract_hash()) && self.binding.contract==previous.contract_hash(),"owner acceptance previous contract changed");
+        }else {
+            anyhow::ensure!(!self.contract.starts_with("registered:") && self.binding.contract==format!("{:x}",Sha256::digest(self.contract.as_bytes())),"initial owner acceptance requires unregistered intake");
+        }
+        self.store.lock().map_err(|_|anyhow::anyhow!("owner acceptance store poisoned"))?.owner_turn_for_lease(&self.lease,millis())
+    }
+
+    /// Preparation is neither installation nor activation. The current request
+    /// and its independently reproduced baseline are rechecked before the old
+    /// guard is consumed; changed verifier files must already be safely applied.
+    pub(super) async fn activate_prepared_owner_acceptance(self,prepared:&acceptance::owner::PreparedOwnerAcceptance,
+        previous:Option<&crate::autoship_contract::RegisteredContract>)->Result<Self> {
+        prepared.validate_current(&self,&self.worktree,previous)?;
+        if let Some(previous)=previous {self.activate_owner_revision(previous,&prepared.prepared().baseline.registration).await}
+        else {self.activate_initial_owner_acceptance(prepared.prepared()).await}
+    }
+
     /// The independently prepared registration changes the owner turn's
     /// generation. Consume this guard so its old audit/admission callbacks can
     /// never be reused for the new contract. Native ownership must transfer
@@ -3368,7 +3396,7 @@ mod tests {
         const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
         const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
         if std::env::var_os(CHILD).is_none() {
-            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session","owner-setup-codex-revision-unconfigured-session","owner-early-fresh","owner-early-no-input","owner-early-corrupt-input","owner-early-history","owner-early-policy-retry","owner-early-register-write-failure","owner-early-initial-acceptance","owner-early-initial-acceptance-green-baseline","owner-early-initial-acceptance-write-failure","owner-early-initial-acceptance-history-loss","owner-early-initial-acceptance-setup-failure","owner-early-initial-acceptance-baseline-tamper","owner-early-initial-acceptance-unconfigured","owner-early-initial-acceptance-repeat","owner-early-initial-acceptance-wrong-source","owner-early-initial-acceptance-first-build","owner-early-initial-acceptance-first-build-dirty","owner-early-initial-acceptance-first-build-staged","owner-early-initial-acceptance-first-build-ignored","owner-early-initial-acceptance-first-build-off-base","owner-early-initial-acceptance-first-build-orphan-main","owner-early-initial-acceptance-first-build-runtime","owner-early-initial-acceptance-first-build-legacy-call","owner-early-initial-acceptance-first-build-workflow-call","owner-early-initial-acceptance-first-build-readonly-call","owner-early-initial-acceptance-first-build-lost-call-history","owner-early-initial-acceptance-first-build-policy-lost","owner-early-initial-acceptance-first-build-leading-space","owner-early-initial-acceptance-first-build-counter-loss","owner-early-initial-acceptance-first-build-new-verifier","owner-early-initial-acceptance-first-build-retired-native","owner-early-initial-acceptance-first-build-grafted-main"] {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery","healthy-handoff","lost-source-audit","pending-settlement-recovery","promotion-failure-recovery","lost-native-authority","native-sweep","native-sweep-lost-authority","resolved-abort-acquisition","closed-recovery-rollback","closed-recovery-history-loss","terminal-abort-cleanup","owner-setup-healthy","owner-setup-policy-retry","owner-setup-history-loss","owner-setup-write-failure","owner-setup-unconfigured","owner-setup-index-corruption","owner-setup-codex-session","owner-setup-claude-session","owner-setup-codex-revision-session","owner-setup-claude-revision-session","owner-setup-codex-revision-setup-failure-session","owner-setup-codex-revision-unconfigured-session","owner-early-fresh","owner-early-no-input","owner-early-corrupt-input","owner-early-history","owner-early-policy-retry","owner-early-register-write-failure","owner-early-initial-acceptance","owner-early-initial-acceptance-green-baseline","owner-early-initial-acceptance-write-failure","owner-early-initial-acceptance-history-loss","owner-early-initial-acceptance-setup-failure","owner-early-initial-acceptance-baseline-tamper","owner-early-initial-acceptance-unconfigured","owner-early-initial-acceptance-repeat","owner-early-initial-acceptance-wrong-source","owner-early-initial-acceptance-first-build","owner-early-initial-acceptance-first-build-dirty","owner-early-initial-acceptance-first-build-staged","owner-early-initial-acceptance-first-build-ignored","owner-early-initial-acceptance-first-build-off-base","owner-early-initial-acceptance-first-build-orphan-main","owner-early-initial-acceptance-first-build-runtime","owner-early-initial-acceptance-first-build-legacy-call","owner-early-initial-acceptance-first-build-workflow-call","owner-early-initial-acceptance-first-build-readonly-call","owner-early-initial-acceptance-first-build-lost-call-history","owner-early-initial-acceptance-first-build-policy-lost","owner-early-initial-acceptance-first-build-leading-space","owner-early-initial-acceptance-first-build-counter-loss","owner-early-initial-acceptance-first-build-new-verifier","owner-early-initial-acceptance-first-build-retired-native","owner-early-initial-acceptance-first-build-grafted-main","owner-early-acceptance-producer","owner-early-acceptance-producer-fenced"] {
                 if mode.ends_with("-session") && !cfg!(target_os="linux") {continue;}
                 let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
                 child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
@@ -3485,6 +3513,27 @@ mod tests {
                 std::fs::write(&policy,&policy_bytes).unwrap();std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
                 WorkflowGuard::acquire_mode_at(&state,start(),millis(),true).await.unwrap().expect("early owner turn must retry only its unstarted setup")
             }else{result.expect("early owner input must acquire its first candidate without unpausing").unwrap()};
+            if mode.starts_with("owner-early-acceptance-producer") {
+                let before=WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap();
+                let original=first.audit.native_store_binding().unwrap().unwrap();
+                let prepared=acceptance::owner::test_cached_preparation(dir.path(),&control.join("owner-producer-control"),&first).await.unwrap();
+                assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap(),before,"preparation changed workflow state");
+                if mode.ends_with("-fenced") {
+                    let mut store=WorkflowStore::open(&state).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
+                    store.set_owner_pause(&id,"fixture-owner",revision,true,millis()).unwrap();drop(store);
+                    assert!(prepared.validate_current(&first,dir.path(),None).is_err(),"stale prepared acceptance escaped owner fence");
+                    assert!(first.activate_prepared_owner_acceptance(&prepared,None).await.is_err());
+                }else {
+                    // Fixture installation is explicit controller setup, not a
+                    // claim that production recovery/application is connected.
+                    acceptance::install_harness(dir.path(),&prepared.prepared().proposal).unwrap();
+                    first=first.activate_prepared_owner_acceptance(&prepared,None).await.unwrap();first.validate_before_side_effect().unwrap();
+                    assert!(prepared.validate_current(&first,dir.path(),None).is_err(),"old producer proof survived activation");
+                    assert_eq!(first.audit.native_store_binding().unwrap(),Some(original));first.finish().unwrap();
+                }
+                let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(store.owner_control(&id).unwrap().unwrap().paused);
+                assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,0);return;
+            }
             if mode.contains("-initial-acceptance") {
                 let mut registration=revision_contracts.as_ref().unwrap().0.clone();
                 if mode.ends_with("-wrong-source") {
