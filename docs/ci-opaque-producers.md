@@ -373,7 +373,16 @@ supervision/resource joins. Before final-C or proxy runtime admission, C/R must
 complete those remaining writer/input/configuration proofs. The carrying cost
 is a stricter measured helper whose identity must travel through the existing
 activation/runtime binding, with no durable permission-schema change. The real
-V3 proxy and unchanged pinned compiler/worker regressions remain unfinished.
+V3 proxy and unchanged pinned compiler/worker regressions remain unfinished. At `bfffecd9`,
+all nine policy cases passed on the declared guest kernel in 90.19 seconds,
+including both successful pre-policy writes/attaches and their post-policy
+refusals with unchanged victim bytes and actual reap. The same stricter helper
+then passed all six native vfork/exec-boundary cases in 92.96 seconds, retaining
+original bootstrap and unfiltered controller tracing. Both original host VM
+resource subtrees were verified removed. All 708 host Python checks and 37
+focused Rust checks passed. See [bounded writer-route evidence](ci-cross-memory-writer-proof.json);
+these observations do not establish the remaining complete writer or input
+proofs.
 
 ### O3. Freeze before capturing a live parent's input
 
