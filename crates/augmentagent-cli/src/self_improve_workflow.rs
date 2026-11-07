@@ -4063,6 +4063,10 @@ mod tests {
         owner_metadata_recovery_modes(&["owner-early-acceptance-producer-snapshot-transfer-recovery","owner-early-acceptance-producer-claude-snapshot-transfer-recovery"]);
     }
 
+    #[tokio::test]
+    async fn owner_recovery_native_intent_is_atomic_and_replayable() {
+        owner_metadata_recovery_modes(&["owner-early-acceptance-producer-intent-transfer-recovery","owner-early-acceptance-producer-claude-intent-transfer-recovery"]);
+    }
     fn owner_metadata_recovery_modes(modes:&[&str]) {
         use std::os::unix::fs::PermissionsExt;
         for mode in modes {
@@ -4773,7 +4777,7 @@ else: raise SystemExit('unexpected authority call')
                             acceptance::owner::publication::reopen_recovery_preparation(access,proof,dir.path()))?;
                         recovered.with_scope_transition(|transition|store.complete_recovered_owner_publication(&recovery,&authorization,&recovered,transition,millis()))
                     }).expect("settled original transfer did not unlock original metadata publication");
-                    if mode.contains("-snapshot-") {
+                    if mode.contains("-snapshot-") || mode.contains("-intent-") {
                         use augmentagent_channel_core::native_vm::ownership as native_owner;
                         let facts=store.owner_publication_recovery_native_facts(&recovery,&authorization,millis()).unwrap();
                         let source=existing_native_audit(&state,facts.namespace(),Some(dir.path()),facts.original_binding()).unwrap();
@@ -4788,6 +4792,77 @@ else: raise SystemExit('unexpected authority call')
                             destination:native_owner::Authority {owner:destination.native_runtime_owner().unwrap().unwrap(),audit_path:destination.path().to_str().unwrap().into()},runtimes:facts.runtimes().unwrap(),
                             fingerprint_input:native_owner::PreparationFingerprintInput {workflow_id:id.clone(),workflow_binding:serde_json::to_value(pending.workflow_binding()).unwrap(),original_binding_sha256:None,source_registration_sha256:None,latest_input_sha256:Some(facts.fingerprint().unwrap()),selected_policy_sha256:None,capacity_class:Default::default()}};
                         let current=||shared.lock().unwrap().validate_owner_publication_recovery(&recovery,&authorization,millis()).map_err(|_|native_owner::TransferFenceError::NotCurrent);
+                        if mode.contains("-intent-") {
+                            let mut recorded=None;
+                            let result=native_owner::prepare_transfer(facts.original_binding(),&plan,&[source],&destination,&current,&mut |scan| {
+                                let before_events=store.events(&id).unwrap();
+                                // Recreate the genuine pre-completion SQL window:
+                                // exact canonical files exist, but publication is pending.
+                                let complete:(i64,String,String)=db.query_row("SELECT sequence,record_sha256,record FROM workflow_owner_publication_completion WHERE request_id=?1",[recovery.request_id()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                                let complete_event:(i64,String,String,i64)=db.query_row("SELECT generation,kind,payload,at_ms FROM workflow_event WHERE seq=?1",[complete.0],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+                                db.execute("DELETE FROM workflow_owner_publication_completion WHERE request_id=?1",[recovery.request_id()]).unwrap();db.execute("DELETE FROM workflow_event WHERE seq=?1",[complete.0]).unwrap();
+                                db.execute("INSERT INTO workflow_owner_publication_pending VALUES(?1,?2)",rusqlite::params![id,recovery.request_id()]).unwrap();
+                                assert!(matches!(store.prepare_owner_recovery_native_intent(&recovery,&authorization,&facts,scan,millis()),durable::owner_publication_recovery::RecoveryNativeIntentPersistence::NotCommitted {..}),"uncompleted publication admitted a forward native intent");
+                                db.execute("INSERT INTO workflow_event(seq,workflow,generation,kind,payload,at_ms) VALUES(?1,?2,?3,?4,?5,?6)",rusqlite::params![complete.0,id,complete_event.0,complete_event.1,complete_event.2,complete_event.3]).unwrap();
+                                db.execute("INSERT INTO workflow_owner_publication_completion VALUES(?1,?2,?3,?4,?5)",rusqlite::params![recovery.request_id(),id,complete.0,complete.1,complete.2]).unwrap();db.execute("DELETE FROM workflow_owner_publication_pending WHERE workflow=?1",[&id]).unwrap();
+                                assert_eq!(store.events(&id).unwrap(),before_events);
+                                db.execute_batch("CREATE TRIGGER deny_recovery_native_context BEFORE INSERT ON workflow_owner_recovery_native_intent BEGIN SELECT RAISE(ABORT,'injected recovery context failure'); END;").unwrap();
+                                assert!(matches!(store.prepare_owner_recovery_native_intent(&recovery,&authorization,&facts,scan,millis()),durable::owner_publication_recovery::RecoveryNativeIntentPersistence::NotCommitted {..}));
+                                db.execute_batch("DROP TRIGGER deny_recovery_native_context;").unwrap();
+                                assert_eq!(store.events(&id).unwrap(),before_events,"failed context projection retained a snapshot or pending event");
+                                assert_eq!(db.query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),0);
+                                assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_recovery_native_intent WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),0);
+                                store.test_lose_recovery_commit_ack();
+                                match store.prepare_owner_recovery_native_intent(&recovery,&authorization,&facts,scan,millis()) {
+                                    durable::owner_publication_recovery::RecoveryNativeIntentPersistence::Durable(receipt)=>recorded=Some(receipt.transfer_id().to_owned()),
+                                    _=>panic!("actual recovery could not atomically record native intent"),
+                                }
+                                assert_eq!(store.test_finish_recovery_commit_ack_loss(),1,"fixture did not fail the actual durable WAL commit acknowledgement");
+                                let expected=recorded.as_ref().unwrap().clone();let events=store.events(&id).unwrap();
+                                match store.prepare_owner_recovery_native_intent(&recovery,&authorization,&facts,scan,millis()) {
+                                    durable::owner_publication_recovery::RecoveryNativeIntentPersistence::Durable(receipt)=>assert_eq!(receipt.transfer_id(),expected),_=>panic!("durable recovery native intent did not replay"),
+                                }
+                                assert_eq!(store.events(&id).unwrap(),events);
+                                let context:(i64,i64,String,String)=db.query_row("SELECT pending_sequence,sequence,record_sha256,record FROM workflow_owner_recovery_native_intent WHERE workflow=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+                                db.execute("DELETE FROM workflow_owner_recovery_native_intent WHERE workflow=?1",[&id]).unwrap();
+                                assert!(store.read_owner_recovery_native_intent(&recovery,&authorization,millis()).is_err());
+                                assert!(matches!(store.prepare_owner_recovery_native_intent(&recovery,&authorization,&facts,scan,millis()),durable::owner_publication_recovery::RecoveryNativeIntentPersistence::Unknown {..}),"lost context was treated as no pending");
+                                db.execute("INSERT INTO workflow_owner_recovery_native_intent VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",rusqlite::params![id,recovery.request_id(),expected,recovery.generation(),context.0,context.1,context.2,context.3]).unwrap();
+                                let pending_row:(i64,i64,String)=db.query_row("SELECT sequence,snapshot_sequence,record FROM workflow_native_handoff_pending WHERE workflow=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                                let pending_event:(i64,String,String,i64)=db.query_row("SELECT generation,kind,payload,at_ms FROM workflow_event WHERE seq=?1",[pending_row.0],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+                                // Deliberate corruption only on this disposable
+                                // fixture connection; production constraints stay on.
+                                db.pragma_update(None,"foreign_keys",false).unwrap();
+                                db.execute("DELETE FROM workflow_native_handoff_pending WHERE workflow=?1",[&id]).unwrap();db.execute("DELETE FROM workflow_event WHERE seq=?1",[pending_row.0]).unwrap();
+                                assert!(store.read_owner_recovery_native_intent(&recovery,&authorization,millis()).is_err());
+                                assert!(matches!(store.prepare_owner_recovery_native_intent(&recovery,&authorization,&facts,scan,millis()),durable::owner_publication_recovery::RecoveryNativeIntentPersistence::Unknown {..}),"orphan context manufactured permission for a replacement UUID");
+                                db.execute("INSERT INTO workflow_event(seq,workflow,generation,kind,payload,at_ms) VALUES(?1,?2,?3,?4,?5,?6)",rusqlite::params![pending_row.0,id,pending_event.0,pending_event.1,pending_event.2,pending_event.3]).unwrap();
+                                db.execute("INSERT INTO workflow_native_handoff_pending VALUES(?1,?2,?3,?4,?5)",rusqlite::params![id,expected,pending_row.0,pending_row.1,pending_row.2]).unwrap();
+                                db.pragma_update(None,"foreign_keys",true).unwrap();
+                                assert_eq!(store.read_owner_recovery_native_intent(&recovery,&authorization,millis()).unwrap().unwrap().transfer_id(),expected);
+                                assert!(store.read_owner_recovery_native_intent(&recovery,&authorization,authorization.expires_at()+1).is_err());
+                                assert_eq!(store.events(&id).unwrap(),events);
+                                native_owner::PreparationPersistence::Unknown {reason:native_owner::TransferReason::PendingUnknown,attempted:None}
+                            }).unwrap();
+                            assert!(matches!(result,native_owner::PreparedTransferResult::PersistenceUnknown {..}));
+                            let id_recorded=recorded.expect("core did not enter recovery intent callback");
+                            let mut reopened=WorkflowStore::open(&state).unwrap();
+                            let receipt=reopened.read_owner_recovery_native_intent(&recovery,&authorization,millis()).unwrap().unwrap();
+                            assert_eq!(receipt.transfer_id(),id_recorded);assert_eq!(receipt.generation(),recovery.generation());
+                            assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.owner_control(&id).unwrap(),control_before);assert_eq!(store.pending_owner_messages(&id).unwrap(),2);
+                            assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+                            // Simulate a restarted controller after the original
+                            // metadata lease expires; mint a real new claim.
+                            db.execute("UPDATE workflow SET lease_until=0 WHERE id=?1",[&id]).unwrap();
+                            let next_plan=store.owner_publication_recovery_plan(&id).unwrap().unwrap();
+                            let next_auth=super::super::targeted::authorize_owner_publication_recovery(dir.path(),&next_plan,crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22}).await.unwrap();
+                            let next=store.claim_owner_publication_recovery(&next_auth,"reopened-native-intent",millis(),60_000).unwrap().unwrap();
+                            assert!(store.read_owner_recovery_native_intent(&recovery,&authorization,millis()).is_err());
+                            let receipt=store.read_owner_recovery_native_intent(&next,&next_auth,millis()).unwrap().unwrap();assert_eq!(receipt.transfer_id(),id_recorded);assert_eq!(receipt.generation(),recovery.generation());
+                            assert_eq!(store.pending_owner_messages(&id).unwrap(),2);assert_eq!(store.owner_control(&id).unwrap(),control_before);
+                            let after=store.snapshot(&id).unwrap().unwrap();assert_eq!(after.attempts,before.attempts);assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.tokens,before.tokens);assert_eq!(after.wall_ms,before.wall_ms);assert_eq!(after.progress_at_ms,before.progress_at_ms);
+                            return;
+                        }
                         let mut snapshot=None;
                         let result=native_owner::prepare_transfer(facts.original_binding(),&plan,&[source],&destination,&current,&mut |scan| {
                             let captured=store.capture_owner_recovery_native_snapshot(&recovery,&authorization,&facts,scan,millis()).expect("actual metadata recovery could not capture its locked original native snapshot");

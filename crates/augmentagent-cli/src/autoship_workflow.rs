@@ -419,6 +419,11 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS workflow_owner_publication_recovery_pending (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id),generation INTEGER NOT NULL,
                 FOREIGN KEY(workflow,generation) REFERENCES workflow_owner_publication_recovery(workflow,generation));
+            CREATE TABLE IF NOT EXISTS workflow_owner_recovery_native_intent (
+                workflow TEXT NOT NULL REFERENCES workflow(id),request_id TEXT NOT NULL,transfer_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,pending_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record_sha256 TEXT NOT NULL,record TEXT NOT NULL,
+                PRIMARY KEY(workflow,request_id),UNIQUE(workflow,transfer_id),UNIQUE(workflow,generation));
             CREATE TABLE IF NOT EXISTS workflow_owner_recovery_blocked (
                 workflow TEXT NOT NULL REFERENCES workflow(id),
                 sequence INTEGER PRIMARY KEY REFERENCES workflow_event(seq),

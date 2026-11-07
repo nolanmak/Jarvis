@@ -124,7 +124,7 @@ impl OwnerPublicationRecord {
             "owner publication original evidence differs from retained canonical manifest");
         Ok(Some(prepared))
     }
-    fn validate_native_binding(&self,binding:&augmentagent_channel_core::native_vm::ownership::TransferBinding)->Result<()> {
+    pub(crate) fn validate_native_binding(&self,binding:&augmentagent_channel_core::native_vm::ownership::TransferBinding)->Result<()> {
         binding.validate()?;
         let sha=amendment::digest(&augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(binding)?)?);
         ensure!(sha==self.original_native.binding_sha256,"owner publication original native binding changed");Ok(())

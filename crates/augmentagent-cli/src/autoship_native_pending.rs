@@ -375,29 +375,51 @@ impl WorkflowStore {
             observation_sha256: snapshot.observation.sha256,
             observation_certain: true,
         };
-        let value = serde_json::to_value(&pending)?;
-        let raw = serde_json::to_string(&value)?;
-        ensure!(raw.len() <= 512 * 1024, TransferReason::HistoryCapacity);
-        event(&tx,&lease.workflow,lease.generation,"native_handoff_prepared",&serde_json::json!({"transfer_id":pending.request.transfer_id,"record_sha256":digest(&value)?}).to_string(),now)?;
-        let sequence: i64 = tx.query_row(
-            "SELECT max(seq) FROM workflow_event WHERE workflow=?1",
-            [&lease.workflow],
-            |r| r.get(0),
-        )?;
-        tx.execute(
-            "INSERT INTO workflow_native_handoff_pending VALUES(?1,?2,?3,?4,?5)",
-            params![
-                lease.workflow,
-                pending.request.transfer_id,
-                sequence,
-                pending.observation_revision,
-                raw
-            ],
-        )?;
+        append_pending(&tx,&pending,now)?;
         // Capture the exact candidate immediately before attempting COMMIT.
         // Errors after this point can never infer no-pending from Result alone.
         *attempted=Some(pending.clone());
         tx.commit()?;
         Ok(HandoffPreparation::Prepared(pending))
     }
+}
+
+/// Shared pending encoder/event projection. Its callers supply their own actual
+/// execution or recovery admission in this transaction; this grants no native IO.
+pub(super) fn append_pending(tx:&Transaction<'_>,pending:&PendingNativeHandoff,now:i64)->Result<(i64,String)> {
+    let value = serde_json::to_value(pending)?;
+    let raw = serde_json::to_string(&value)?;
+    ensure!(raw.len() <= 512 * 1024, TransferReason::HistoryCapacity);
+    event(&tx,&pending.request.workflow_id,pending.request.destination.owner.lease_generation,"native_handoff_prepared",&serde_json::json!({"transfer_id":pending.request.transfer_id,"record_sha256":digest(&value)?}).to_string(),now)?;
+    let sequence: i64 = tx.query_row(
+        "SELECT max(seq) FROM workflow_event WHERE workflow=?1",
+        [&pending.request.workflow_id],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO workflow_native_handoff_pending VALUES(?1,?2,?3,?4,?5)",
+        params![
+            pending.request.workflow_id,
+            pending.request.transfer_id,
+            sequence,
+            pending.observation_revision,
+            raw
+        ],
+    )?;
+    Ok((sequence,digest(&value)?))
+}
+/// Pure durable data lookup, never a native receipt or execution capability.
+pub(super) fn recorded_pending(conn:&Connection,workflow:&str,id:&str)->Result<PendingNativeHandoff> {
+    ensure!(!orphaned(conn,workflow)?,TransferReason::PendingUnknown);
+    let history=settlement::History::load(conn,workflow,u64::MAX)?;
+    let mut found=Vec::new();
+    let active:Option<(String,i64,u64,String)>=conn.query_row("SELECT transfer_id,sequence,snapshot_sequence,substr(record,1,524289) FROM workflow_native_handoff_pending WHERE workflow=?1 AND transfer_id=?2",params![workflow,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    if let Some(row)=active {found.push(decode(conn,workflow,row)?);}
+    if let Some(pending)=history.pending_for_id(id) {found.push(pending.clone());}
+    for table in ["workflow_native_handoff_unstarted","workflow_native_handoff_aborted"] {
+        let raw:Option<(String,i64)>=conn.query_row(&format!("SELECT substr(json_extract(record,'$.pending'),1,524289),length(CAST(json_extract(record,'$.pending') AS BLOB)) FROM {table} WHERE workflow=?1 AND transfer_id=?2"),params![workflow,id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if let Some((raw,len))=raw {ensure!((1..=524288).contains(&len) && raw.len() as i64==len,TransferReason::HistoryCapacity);found.push(serde_json::from_str(&raw)?);}
+    }
+    ensure!(found.len()==1,TransferReason::PendingUnknown);let pending=found.pop().unwrap();
+    ensure!(pending.request().workflow_id==workflow && pending.request().transfer_id==id,TransferReason::InventoryMissing);Ok(pending)
 }

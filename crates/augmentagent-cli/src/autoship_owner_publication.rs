@@ -71,7 +71,7 @@ impl OwnerPublicationReadContext<'_> {
         record.read_canonical_ancestor(control,source,manifest,completed.as_ref().context("canonical owner publication is not completed")?,used)
     }
 }
-fn completion(conn:&Connection,workflow:&str,request:&str,intent:&crate::self_improve::OwnerPublicationRecord,raw_intent:&str)->Result<Option<crate::self_improve::OwnerPublicationCompletion>> {
+pub(super) fn completion(conn:&Connection,workflow:&str,request:&str,intent:&crate::self_improve::OwnerPublicationRecord,raw_intent:&str)->Result<Option<crate::self_improve::OwnerPublicationCompletion>> {
     let row:Option<(i64,String,String,i64,i64)>=conn.query_row("SELECT sequence,substr(record_sha256,1,65),substr(record,1,32769),length(CAST(record AS BLOB)),length(CAST(record_sha256 AS BLOB)) FROM workflow_owner_publication_completion WHERE workflow=?1 AND request_id=?2",params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
     let Some((sequence,sha,raw,len,sha_len))=row else {return Ok(None)};
     ensure!((1..=32768).contains(&len) && raw.len() as i64==len && sha_len==64 && sha.len()==64,"owner publication completion exceeds bound");
