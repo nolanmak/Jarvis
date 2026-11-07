@@ -226,7 +226,12 @@ fn acquire_audit_generation(
 pub(super) fn reconcile_runtime_retirements()->Result<usize> {
     let state=path();
     if !state.exists(){return Ok(0);}
-    reconcile_runtime_retirements_in(&mut WorkflowStore::open(&state)?,millis())
+    let mut store=WorkflowStore::open(&state)?;let now=millis();
+    let retired=reconcile_runtime_retirements_in(&mut store,now)?;
+    let report=augmentagent_channel_core::native_vm::state_capacity::inspect();
+    let woken=store.reconcile_native_capacity(&report,now,16)?;
+    if woken>0 {info!(woken,"native capacity wait schedules eligible; normal admission remains required");}
+    Ok(retired)
 }
 fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<usize> {
     if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_none(){store.settle_owner_execution_retries(now,16)?;return Ok(0);}
@@ -250,16 +255,28 @@ fn requires_reverification_at(path: &Path, repository: &str, pr: u64) -> Result<
     requires_reverification_at_time(path, repository, pr, millis())
 }
 fn requires_reverification_at_time(path: &Path, repository: &str, pr: u64, now: i64) -> Result<bool> {
-    let store = WorkflowStore::open(path)?;
+    let mut store = WorkflowStore::open(path)?;
     let Some(id) = store.resolve_pr(repository, pr)? else {
         return Ok(false);
     };
+    refresh_native_capacity(&mut store,&id,now)?;
     Ok(store
         .snapshot(&id)?
         .is_some_and(|snapshot| snapshot.checkpoint.next.action == "reverify_candidate"
             || (snapshot.checkpoint.next.action == "await_capacity"
                 && snapshot.checkpoint.next.eligible_at_ms <= now
                 && snapshot.lease_until_ms <= now)))
+}
+
+/// Observe native storage outside the SQL transaction. A wake changes only
+/// eligibility; the subsequent original claim/admission checks remain mandatory.
+fn refresh_native_capacity(store:&mut WorkflowStore,id:&str,now:i64)->Result<()> {
+    if store.snapshot(id)?.is_some_and(|s|s.checkpoint.next.reason=="resource_capacity" && s.checkpoint.next.action=="await_capacity"
+        && s.checkpoint.next.eligible_at_ms>now && s.lease_until_ms<=now) {
+        let report=augmentagent_channel_core::native_vm::state_capacity::inspect();
+        store.wake_native_capacity(id,&report,now)?;
+    }
+    Ok(())
 }
 
 fn structured_review_base(raw: &str, expected_head: &str) -> Option<String> {
@@ -680,6 +697,7 @@ impl WorkflowGuard {
         if owner_turn {
             anyhow::ensure!(existing.as_ref().is_some_and(|s|s.checkpoint.binding==binding),"owner turn requires the current owned candidate binding");
         } else {store.register(&id,start.branch,binding.clone(),now)?;}
+        refresh_native_capacity(&mut store,&id,now)?;
         let owner=format!("{}:{}",std::process::id(),uuid::Uuid::new_v4());
         let lease=if owner_turn {store.claim_owner_turn(&id,&owner,now,LEASE_MS)?.map(|turn|turn.lease)}
             else {store.claim_productive(&id,&owner,now,LEASE_MS)?};
@@ -800,23 +818,17 @@ impl WorkflowGuard {
         let capacity_store = self.store.clone();
         let capacity_lease = self.lease.clone();
         let capacity_flag = self.capacity_exhausted.clone();
-        self.audit.set_resource_capacity_observer(Arc::new(move |_observation| {
-            // Refuse further work even if persistence itself fails. The protected
-            // audit already contains the full independently observed resource event.
+        self.audit.set_resource_capacity_observer(Arc::new(move |observation| {
+            // Refuse further work even if persistence itself fails. This
+            // controller observation never grants permission to continue.
             capacity_flag.store(true, Ordering::SeqCst);
             let mut store = capacity_store.lock().map_err(|_| anyhow::anyhow!("workflow capacity lock poisoned"))?;
-            let mut checkpoint = store.snapshot(&capacity_lease.workflow)?
-                .context("capacity workflow missing")?.checkpoint;
-            // Resource observations live in the protected audit, not in the
-            // acceptance evidence vector whose hash binds the verified candidate.
-            checkpoint.next = NextAction {
-                reason: "resource_capacity".into(),
-                action: "await_capacity".into(),
-                eligible_at_ms: millis().saturating_add(300_000),
-            };
-            // Keep the current stage, verified binding, findings and receipts;
-            // capacity exhaustion is not a code defect or a convergence round.
-            store.checkpoint(&capacity_lease, &checkpoint, millis())
+            let fingerprint=if observation["phase"]=="native_runtime_state_capacity" && observation["exhausted"]==true
+                && observation["native_state"]["status"]=="capacity-exhausted" {
+                observation["native_state"]["capacity_fingerprint"].as_str()
+            }else{None};
+            store.defer_run_capacity(&capacity_lease,fingerprint,millis())?;
+            Ok(())
         }))?;
         let capacity_flag = self.capacity_exhausted.clone();
         let store = self.store.clone();
@@ -3030,6 +3042,30 @@ mod tests {
         let recovered=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
         assert_eq!(recovered.checkpoint.binding,before.checkpoint.binding);
         assert_eq!(recovered.checkpoint.evidence,before.checkpoint.evidence);
+    }
+
+    #[tokio::test]
+    async fn native_capacity_observer_persists_retry_without_progress_or_paid_admission() {
+        let dir=repo();let control=control_dir();let path=control.path().join("workflow.db");
+        let start=Start{repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(711),pr:None,branch:"fixture",contract:"C1",environment:"test"};
+        let guard=WorkflowGuard::acquire_at(&path,start,millis()).await.unwrap().unwrap();let id=guard.id().to_owned();
+        let before=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();let now=millis();
+        // Protected observer metadata fixture; native storage production itself
+        // is covered by channel-core's real admission/inspection regressions.
+        let observation=serde_json::json!({"phase":"native_runtime_state_capacity","exhausted":true,
+            "native_state":{"status":"capacity-exhausted","capacity_fingerprint":"a".repeat(64)}});
+        guard.audit_logger().resource_capacity_exhausted(&observation).unwrap();
+        let mut store=WorkflowStore::open(&path).unwrap();let after=store.snapshot(&id).unwrap().unwrap();
+        let retry=store.events(&id).unwrap().into_iter().find(|e|e.1=="resource_capacity_retry");
+        assert!(retry.is_some());assert_eq!(after.checkpoint.next.action,"await_capacity");
+        assert!(after.checkpoint.next.eligible_at_ms>=now+300_000 && after.checkpoint.next.eligible_at_ms<=millis()+300_000);
+        let events=store.events(&id).unwrap().len();guard.audit_logger().resource_capacity_exhausted(&observation).unwrap();
+        assert_eq!(store.events(&id).unwrap().len(),events);
+        assert_eq!(after.progress_at_ms,before.progress_at_ms);assert_eq!(after.model_calls,before.model_calls);
+        assert_eq!(after.checkpoint.binding,before.checkpoint.binding);assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+        assert!(guard.audit_logger().model_call_admitted("codex").is_err());assert!(guard.validate_before_side_effect().is_err());
+        assert!(guard.finish().is_err());
+        assert!(store.claim_productive(&id,"too-early",after.checkpoint.next.eligible_at_ms-1,60_000).unwrap().is_none());
     }
 
     #[tokio::test]
