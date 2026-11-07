@@ -1,0 +1,644 @@
+{
+  "version": 1,
+  "kind": "retained-native-audit-read-only-observation",
+  "observed_at": "2026-11-07T19:27:02.695103+00:00",
+  "retained_sessions": [
+    {
+      "provider": "claude",
+      "runtime": "session-2a5cafd3-311a-4308-8aec-0c8a362ca1de",
+      "owned_sha256": "22303305fb9209668ba8571ce581a6e51c495e15ae916ed8cb2cb5b7e54fff91",
+      "lease_generation": 1,
+      "audit_file": "073cfa8af77cc705d892d257b144fcdd35d82ccb1671509c7cb7a8186f51c03c.jsonl"
+    },
+    {
+      "provider": "claude",
+      "runtime": "session-7dbed20d-f709-4419-9757-c76303caa1c3",
+      "owned_sha256": "7fc4ef51a74b9367a6456d3eace4aefe8b55843b36dbbbd7acc60eabbf75b07c",
+      "lease_generation": 2,
+      "audit_file": "073cfa8af77cc705d892d257b144fcdd35d82ccb1671509c7cb7a8186f51c03c.jsonl"
+    },
+    {
+      "provider": "claude",
+      "runtime": "session-87940919-c039-4835-a84c-5d6d67a37e78",
+      "owned_sha256": "517a3682e53d6e4d229866790ec2c5e2550176de197576ac7881f3970b732655",
+      "lease_generation": 13,
+      "audit_file": "073cfa8af77cc705d892d257b144fcdd35d82ccb1671509c7cb7a8186f51c03c.jsonl"
+    },
+    {
+      "provider": "claude",
+      "runtime": "session-8b99f145-95fc-4cba-b413-ce6835cce24b",
+      "owned_sha256": "680e60dde8d2dd75e40f9aebdebc3cd9a2e5ca25a63a3b47075de8ab019b7b5e",
+      "lease_generation": 12,
+      "audit_file": "073cfa8af77cc705d892d257b144fcdd35d82ccb1671509c7cb7a8186f51c03c.jsonl"
+    },
+    {
+      "provider": "claude",
+      "runtime": "session-a8a8b18d-2aed-4e98-9e70-8329746342dc",
+      "owned_sha256": "18c68e2256735642baa0535564f3ab2e6889592f6f6f3743b39972b36b3fe6b2",
+      "lease_generation": 1,
+      "audit_file": "3d04500d2e0d0ac651f09e5ed166d6044196d16268ed389afec158372a2c0aa7.jsonl"
+    },
+    {
+      "provider": "claude",
+      "runtime": "session-aa0d1771-9d53-4112-b340-ba3f96f23f43",
+      "owned_sha256": "ec95f33e0ebc5da18911fe35041a62982fb57f9bdbd036adfdea549a5c4446ec",
+      "lease_generation": 2,
+      "audit_file": "3d04500d2e0d0ac651f09e5ed166d6044196d16268ed389afec158372a2c0aa7.jsonl"
+    },
+    {
+      "provider": "claude",
+      "runtime": "session-dc97a77f-fb93-49c1-9776-89e4a4b56d63",
+      "owned_sha256": "01a43304f30272f3211e7cc502a0e65183d5ab7102b0932d9d6ff975d8e61aac",
+      "lease_generation": 11,
+      "audit_file": "073cfa8af77cc705d892d257b144fcdd35d82ccb1671509c7cb7a8186f51c03c.jsonl"
+    },
+    {
+      "provider": "codex",
+      "runtime": "session-a9b53765-57ca-4d57-917e-07fe6282dff2",
+      "owned_sha256": "8be2ff051ac167b231bc0724176479a4338643abaac2159c7c60f59f61451c37",
+      "lease_generation": 1,
+      "audit_file": "0c46e6e0d4a31a92f6f512aa26a8b7c92d55e0d91ecb4d53cb6de2891ee00bfc.jsonl"
+    }
+  ],
+  "audit_summaries": [
+    {
+      "audit_file": "073cfa8af77cc705d892d257b144fcdd35d82ccb1671509c7cb7a8186f51c03c.jsonl",
+      "anchor_unchanged_during_read": true,
+      "committed_bytes": 3209069,
+      "committed_sha256": "60ef0a04839d0488503a11651fe713eb78dd962405d2e92c653b1aa5d139f213",
+      "committed_hash_matches_anchor": true,
+      "uncommitted_tail_bytes": 0,
+      "pending_append": false,
+      "sealed": false,
+      "kind_counts": {
+        "audit_integrity_check": 2135,
+        "run_resources_required": 156,
+        "workflow_claimed": 156,
+        "stage_checkpoint": 496,
+        "run_resource_admitted": 267,
+        "model_call_admitted": 103,
+        "run_resource_observation": 404,
+        "independent_readiness": 11,
+        "None": 737,
+        "hosted_ci_pending_publication": 160,
+        "verification_gate_passed": 5,
+        "review_fragment_completed": 8,
+        "adjudicator_native_conversation": 2,
+        "amendment_scope_basis": 4,
+        "scope_contract_framing_recovered": 5,
+        "episode_decision": 1,
+        "operation_intent": 2,
+        "remote_observed": 2,
+        "workflow_released": 9,
+        "verification_infrastructure_retry": 8
+      },
+      "resource_paths_read_only_observation": {
+        "path_absent": 267
+      },
+      "unique_resource_identities": 267,
+      "runtime_name_occurrences_in_committed_log": {
+        "session-2a5cafd3-311a-4308-8aec-0c8a362ca1de": 0,
+        "session-7dbed20d-f709-4419-9757-c76303caa1c3": 0,
+        "session-87940919-c039-4835-a84c-5d6d67a37e78": 0,
+        "session-8b99f145-95fc-4cba-b413-ce6835cce24b": 0,
+        "session-dc97a77f-fb93-49c1-9776-89e4a4b56d63": 0
+      },
+      "counts_by_preceding_claim_generation_observation_only": {
+        "1": {
+          "run_resource_admitted": 17,
+          "model_call_admitted": 14
+        },
+        "2": {
+          "run_resource_admitted": 18,
+          "model_call_admitted": 16
+        },
+        "3": {
+          "run_resource_admitted": 15,
+          "model_call_admitted": 11
+        },
+        "4": {
+          "run_resource_admitted": 12,
+          "model_call_admitted": 9
+        },
+        "5": {
+          "run_resource_admitted": 12,
+          "model_call_admitted": 10
+        },
+        "6": {
+          "run_resource_admitted": 9,
+          "model_call_admitted": 7
+        },
+        "7": {
+          "run_resource_admitted": 7,
+          "model_call_admitted": 5
+        },
+        "8": {
+          "run_resource_admitted": 7,
+          "model_call_admitted": 5
+        },
+        "9": {
+          "run_resource_admitted": 9,
+          "model_call_admitted": 7
+        },
+        "10": {
+          "run_resource_admitted": 11,
+          "model_call_admitted": 9
+        },
+        "11": {
+          "run_resource_admitted": 11,
+          "model_call_admitted": 8
+        },
+        "12": {
+          "run_resource_admitted": 2,
+          "model_call_admitted": 1
+        },
+        "13": {
+          "run_resource_admitted": 2,
+          "model_call_admitted": 1
+        },
+        "14": {
+          "run_resource_admitted": 1
+        },
+        "15": {
+          "run_resource_admitted": 1
+        },
+        "16": {
+          "run_resource_admitted": 1
+        },
+        "17": {
+          "run_resource_admitted": 1
+        },
+        "18": {
+          "run_resource_admitted": 1
+        },
+        "19": {
+          "run_resource_admitted": 1
+        },
+        "20": {
+          "run_resource_admitted": 1
+        },
+        "21": {
+          "run_resource_admitted": 1
+        },
+        "22": {
+          "run_resource_admitted": 1
+        },
+        "23": {
+          "run_resource_admitted": 1
+        },
+        "24": {
+          "run_resource_admitted": 1
+        },
+        "25": {
+          "run_resource_admitted": 1
+        },
+        "26": {
+          "run_resource_admitted": 1
+        },
+        "27": {
+          "run_resource_admitted": 1
+        },
+        "28": {
+          "run_resource_admitted": 1
+        },
+        "29": {
+          "run_resource_admitted": 1
+        },
+        "30": {
+          "run_resource_admitted": 1
+        },
+        "31": {
+          "run_resource_admitted": 1
+        },
+        "32": {
+          "run_resource_admitted": 1
+        },
+        "33": {
+          "run_resource_admitted": 1
+        },
+        "34": {
+          "run_resource_admitted": 1
+        },
+        "35": {
+          "run_resource_admitted": 1
+        },
+        "36": {
+          "run_resource_admitted": 1
+        },
+        "37": {
+          "run_resource_admitted": 1
+        },
+        "38": {
+          "run_resource_admitted": 1
+        },
+        "39": {
+          "run_resource_admitted": 1
+        },
+        "40": {
+          "run_resource_admitted": 1
+        },
+        "41": {
+          "run_resource_admitted": 1
+        },
+        "42": {
+          "run_resource_admitted": 1
+        },
+        "43": {
+          "run_resource_admitted": 1
+        },
+        "44": {
+          "run_resource_admitted": 1
+        },
+        "45": {
+          "run_resource_admitted": 1
+        },
+        "46": {
+          "run_resource_admitted": 1
+        },
+        "47": {
+          "run_resource_admitted": 1
+        },
+        "48": {
+          "run_resource_admitted": 1
+        },
+        "50": {
+          "run_resource_admitted": 1
+        },
+        "51": {
+          "run_resource_admitted": 1
+        },
+        "52": {
+          "run_resource_admitted": 1
+        },
+        "53": {
+          "run_resource_admitted": 1
+        },
+        "54": {
+          "run_resource_admitted": 1
+        },
+        "55": {
+          "run_resource_admitted": 1
+        },
+        "57": {
+          "run_resource_admitted": 1
+        },
+        "58": {
+          "run_resource_admitted": 1
+        },
+        "59": {
+          "run_resource_admitted": 1
+        },
+        "60": {
+          "run_resource_admitted": 1
+        },
+        "61": {
+          "run_resource_admitted": 1
+        },
+        "62": {
+          "run_resource_admitted": 1
+        },
+        "63": {
+          "run_resource_admitted": 1
+        },
+        "64": {
+          "run_resource_admitted": 1
+        },
+        "65": {
+          "run_resource_admitted": 1
+        },
+        "66": {
+          "run_resource_admitted": 1
+        },
+        "67": {
+          "run_resource_admitted": 1
+        },
+        "68": {
+          "run_resource_admitted": 1
+        },
+        "69": {
+          "run_resource_admitted": 1
+        },
+        "71": {
+          "run_resource_admitted": 1
+        },
+        "72": {
+          "run_resource_admitted": 1
+        },
+        "73": {
+          "run_resource_admitted": 1
+        },
+        "74": {
+          "run_resource_admitted": 1
+        },
+        "75": {
+          "run_resource_admitted": 1
+        },
+        "76": {
+          "run_resource_admitted": 1
+        },
+        "77": {
+          "run_resource_admitted": 1
+        },
+        "78": {
+          "run_resource_admitted": 1
+        },
+        "79": {
+          "run_resource_admitted": 1
+        },
+        "80": {
+          "run_resource_admitted": 1
+        },
+        "81": {
+          "run_resource_admitted": 1
+        },
+        "82": {
+          "run_resource_admitted": 1
+        },
+        "83": {
+          "run_resource_admitted": 1
+        },
+        "84": {
+          "run_resource_admitted": 1
+        },
+        "85": {
+          "run_resource_admitted": 1
+        },
+        "86": {
+          "run_resource_admitted": 1
+        },
+        "87": {
+          "run_resource_admitted": 1
+        },
+        "88": {
+          "run_resource_admitted": 1
+        },
+        "89": {
+          "run_resource_admitted": 1
+        },
+        "90": {
+          "run_resource_admitted": 1
+        },
+        "91": {
+          "run_resource_admitted": 1
+        },
+        "93": {
+          "run_resource_admitted": 1
+        },
+        "96": {
+          "run_resource_admitted": 1
+        },
+        "97": {
+          "run_resource_admitted": 1
+        },
+        "98": {
+          "run_resource_admitted": 1
+        },
+        "99": {
+          "run_resource_admitted": 1
+        },
+        "101": {
+          "run_resource_admitted": 1
+        },
+        "102": {
+          "run_resource_admitted": 1
+        },
+        "103": {
+          "run_resource_admitted": 1
+        },
+        "104": {
+          "run_resource_admitted": 1
+        },
+        "105": {
+          "run_resource_admitted": 1
+        },
+        "106": {
+          "run_resource_admitted": 1
+        },
+        "107": {
+          "run_resource_admitted": 1
+        },
+        "108": {
+          "run_resource_admitted": 1
+        },
+        "109": {
+          "run_resource_admitted": 1
+        },
+        "110": {
+          "run_resource_admitted": 1
+        },
+        "111": {
+          "run_resource_admitted": 1
+        },
+        "112": {
+          "run_resource_admitted": 1
+        },
+        "113": {
+          "run_resource_admitted": 1
+        },
+        "114": {
+          "run_resource_admitted": 1
+        },
+        "115": {
+          "run_resource_admitted": 1
+        },
+        "116": {
+          "run_resource_admitted": 1
+        },
+        "117": {
+          "run_resource_admitted": 1
+        },
+        "118": {
+          "run_resource_admitted": 1
+        },
+        "119": {
+          "run_resource_admitted": 1
+        },
+        "120": {
+          "run_resource_admitted": 1
+        },
+        "121": {
+          "run_resource_admitted": 1
+        },
+        "122": {
+          "run_resource_admitted": 1
+        },
+        "123": {
+          "run_resource_admitted": 1
+        },
+        "124": {
+          "run_resource_admitted": 1
+        },
+        "125": {
+          "run_resource_admitted": 1
+        },
+        "127": {
+          "run_resource_admitted": 1
+        },
+        "128": {
+          "run_resource_admitted": 1
+        },
+        "129": {
+          "run_resource_admitted": 1
+        },
+        "130": {
+          "run_resource_admitted": 1
+        },
+        "131": {
+          "run_resource_admitted": 1
+        },
+        "132": {
+          "run_resource_admitted": 1
+        },
+        "133": {
+          "run_resource_admitted": 1
+        },
+        "134": {
+          "run_resource_admitted": 1
+        },
+        "135": {
+          "run_resource_admitted": 1
+        },
+        "136": {
+          "run_resource_admitted": 1
+        },
+        "137": {
+          "run_resource_admitted": 1
+        },
+        "138": {
+          "run_resource_admitted": 1
+        },
+        "139": {
+          "run_resource_admitted": 1
+        },
+        "140": {
+          "run_resource_admitted": 1
+        },
+        "141": {
+          "run_resource_admitted": 1
+        },
+        "142": {
+          "run_resource_admitted": 1
+        },
+        "143": {
+          "run_resource_admitted": 1
+        },
+        "144": {
+          "run_resource_admitted": 1
+        },
+        "145": {
+          "run_resource_admitted": 1
+        },
+        "146": {
+          "run_resource_admitted": 1
+        },
+        "147": {
+          "run_resource_admitted": 1
+        },
+        "148": {
+          "run_resource_admitted": 1
+        },
+        "149": {
+          "run_resource_admitted": 1
+        },
+        "150": {
+          "run_resource_admitted": 1
+        },
+        "151": {
+          "run_resource_admitted": 1
+        },
+        "152": {
+          "run_resource_admitted": 1
+        },
+        "153": {
+          "run_resource_admitted": 1
+        },
+        "154": {
+          "run_resource_admitted": 1
+        },
+        "155": {
+          "run_resource_admitted": 1
+        },
+        "156": {
+          "run_resource_admitted": 1
+        }
+      }
+    },
+    {
+      "audit_file": "3d04500d2e0d0ac651f09e5ed166d6044196d16268ed389afec158372a2c0aa7.jsonl",
+      "anchor_unchanged_during_read": true,
+      "committed_bytes": 404082,
+      "committed_sha256": "2269be875f6bd0938376f550dd1dd6d17318f798eab832a298d2042568500252",
+      "committed_hash_matches_anchor": true,
+      "uncommitted_tail_bytes": 0,
+      "pending_append": false,
+      "sealed": false,
+      "kind_counts": {
+        "audit_integrity_check": 106,
+        "run_resources_required": 2,
+        "workflow_claimed": 2,
+        "stage_checkpoint": 15,
+        "run_resource_admitted": 18,
+        "model_call_admitted": 14,
+        "run_resource_observation": 19,
+        "independent_readiness": 1,
+        "scope_contract_framing_recovered": 1,
+        "None": 130,
+        "hosted_ci_pending_publication": 3,
+        "verification_gate_passed": 2,
+        "review_fragment_completed": 1,
+        "episode_decision": 1,
+        "operation_intent": 2,
+        "remote_observed": 2,
+        "workflow_released": 1
+      },
+      "resource_paths_read_only_observation": {
+        "path_absent": 18
+      },
+      "unique_resource_identities": 18,
+      "runtime_name_occurrences_in_committed_log": {
+        "session-a8a8b18d-2aed-4e98-9e70-8329746342dc": 0,
+        "session-aa0d1771-9d53-4112-b340-ba3f96f23f43": 0
+      },
+      "counts_by_preceding_claim_generation_observation_only": {
+        "1": {
+          "run_resource_admitted": 16,
+          "model_call_admitted": 13
+        },
+        "2": {
+          "run_resource_admitted": 2,
+          "model_call_admitted": 1
+        }
+      }
+    },
+    {
+      "audit_file": "0c46e6e0d4a31a92f6f512aa26a8b7c92d55e0d91ecb4d53cb6de2891ee00bfc.jsonl",
+      "anchor_unchanged_during_read": true,
+      "committed_bytes": 2867,
+      "committed_sha256": "a984f6159a875edcb69a53fa49cd7c2cbff7fb523b59f308977ed4bf521b78c4",
+      "committed_hash_matches_anchor": true,
+      "uncommitted_tail_bytes": 0,
+      "pending_append": false,
+      "sealed": false,
+      "kind_counts": {
+        "audit_integrity_check": 6,
+        "run_resources_required": 1,
+        "workflow_claimed": 1,
+        "run_resource_observation": 1
+      },
+      "resource_paths_read_only_observation": {},
+      "unique_resource_identities": 0,
+      "runtime_name_occurrences_in_committed_log": {
+        "session-a9b53765-57ca-4d57-917e-07fe6282dff2": 0
+      },
+      "counts_by_preceding_claim_generation_observation_only": {}
+    }
+  ],
+  "limitations": [
+    "No audit seal, cgroup removal, process mutation, lock acquisition, native-state mutation or accounting transition performed.",
+    "Anchor digest validates the observed committed bytes, not controller compromise or original executable/process provenance.",
+    "Generation segmentation is positional observation, not an exact native launch/runtime-to-resource binding.",
+    "Absent cgroup paths do not cover pre-admission writers, delayed ingress, original unrecorded resources or complete retained-session charged population.",
+    "A runtime name not occurring in a log means this direct correlation is absent; it is not original input nonrelease or proof no model ran."
+  ],
+  "grants_capacity": false
+}

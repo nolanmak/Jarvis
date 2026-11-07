@@ -64,6 +64,43 @@ Until this producer exists, the future-growth demand stays at its full ordinary
 value even if every visible immutable flag is set and its journal is intact.
 The original outcomes, data and aliases remain unchanged.
 
+## Original executable reproduction and remaining runtime join
+
+`1902-original-producer-reproduction.json` records a whole-file reproduction of
+the preserved original executable. An unchanged checkout of
+`fe2e7b1f50430af73e65bb38049097e959b7a3e3`, built through actual managed storage
+leases with the original logical paths and observed phone telemetry build input,
+produced SHA256
+`7bbdd56db0c4b6f926d67dad7620104b00cc373ed8cb5b51a29d051be9baad30`.
+Both complete hashes and `cmp` agree. No code, data, build ID or other section
+was excluded. The telemetry value is an existing supported build input, not a
+claim that its named Git revision supplied the compiled source.
+
+This resolves the source-label ambiguity for that saved executable. Inspection
+of its matching source shows resource admission and protected model admission
+preceding atomic publication of `launch-continue`; the Codex and Claude adapters
+await admission before writing the request to the child's stdin. This contract
+is conditional on the actual launch using that executable and protected launch
+path. It does not create a historical process binding or establish that every
+retained runtime used the same executable, policy and input path.
+
+`1902-retained-audit-correlation-observation.json` records a separate read-only
+inspection of the eight retained ownership records and their three referenced
+audit logs. Each observed committed-prefix digest matched its unchanged anchor.
+All 285 distinct recorded admitted resource paths were absent, but none of the
+eight exact runtime names occurs in its referenced committed log. The canary
+log has no admitted resource identity. Counts grouped by the preceding claim
+are positional observations, not exact native-launch/resource correlation.
+
+These observations do not close pre-admission lifetimes, delayed writer ingress,
+unrecorded resources or the complete charged population. No audit was sealed or
+cgroup removed. A producer must still recover the original runtime-to-execution
+and resource binding, with a live exclusion against later ingress, before a
+consumer can use original R closure. The source reproduction, a matching audit
+digest, absent cgroup paths and absent runtime strings cannot be combined into
+a serialized capacity permit. The alternative complete resource-bound route
+and OT1–OT5 remain unresolved.
+
 ## Controller and journal obligations
 
 The eventual mutation controller must have one root-owned, bounded registration

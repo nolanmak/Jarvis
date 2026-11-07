@@ -1,0 +1,104 @@
+{
+  "version": 1,
+  "kind": "known-source-whole-executable-reproduction-witness",
+  "observed_at": "2026-11-07T19:28:06.197358+00:00",
+  "source_commit": "fe2e7b1f50430af73e65bb38049097e959b7a3e3",
+  "tracked_source_clean": true,
+  "source_sha256": {
+    "Cargo.lock": "20f9e0734e86ed443d1810b613d465639ff325f812beb4442e4598e8e91a9810",
+    "scripts/cargo-managed.sh": "01266210882e68bbecc880020e26dc61c0ab02f963f19f3bc19e0981449e373f",
+    "scripts/native-provider-vm.py": "473b5487930745a192ca6322d258700b7b9bfec9cf969d88921467e187ff4f1f",
+    "scripts/provider-supervisor.py": "10929702ac75f16314592bd2c0ca80d12b4aa0c44ed44097b5b88f85bf09c201",
+    "scripts/run-resource-scope.py": "1868e48360f8e7452fdf252e99782f070adba5ca077bf170eba00b78295b424c",
+    "crates/augmentagent-channel-core/src/native_vm.rs": "c4259c016eb27a782188687b091a405a66acc152c2e1a3e73268c03b9a50ec9a",
+    "crates/augmentagent-channel-core/src/process_tree.rs": "a2cbfbd470b88420e4cb81402368bbe34c839f240444dcddab09316542a16460",
+    "crates/augmentagent-channel-core/src/run_resources.rs": "f82dd568a45f654dcfe20d3b514588631f73951b41d03edda82a9c928ee034a4",
+    "crates/augmentagent-channel-core/src/tool_audit.rs": "7499ef25085cd72862746ddd26d96ff435cc3cb2f2e96bd6e51e22c750b03e00",
+    "crates/augmentagent-channel-core/src/reasoner.rs": "ebcfe7a1ec2d63df8de812047346916604bfb8d06b12b4872ba243f9e6be957a",
+    "crates/augmentagent-channel-core/src/codex.rs": "c8dc6743323f335bc5b54e01220e7d858b959c6b24af8a42919020cfc3b17151",
+    "crates/augmentagent-phone/build.rs": "bb0c563b8d738d6adcba79be61f175823d7b292e357096d59729c5b37e379143",
+    "crates/augmentagent-phone/src/metrics.rs": "d6f07fff798f361337a3dc975e66e01e3d871bebd5de310c7162b37aac6baca7"
+  },
+  "original": {
+    "path": "/home/nolan-makatche/.local/share/augmentagent/deploy-snapshots/20261107T110605Z-autoship-1906-original-producer/augmentagent",
+    "sha256": "7bbdd56db0c4b6f926d67dad7620104b00cc373ed8cb5b51a29d051be9baad30",
+    "bytes": 143756808
+  },
+  "rebuilt": {
+    "path": "/mnt/store/augmentagent-session-targets/jarvis-native-producer-repro-e8127483b207b035/release/augmentagent",
+    "sha256": "7bbdd56db0c4b6f926d67dad7620104b00cc373ed8cb5b51a29d051be9baad30",
+    "bytes": 143756808
+  },
+  "comparison": {
+    "whole_sha256_equal": true,
+    "cmp_silent_exit": 0,
+    "sections_ignored": [],
+    "elf_patching": false,
+    "source_patching": false
+  },
+  "execution": {
+    "original_handle": 33523,
+    "terminal": true,
+    "exit_code": 0,
+    "release_build_seconds": 696,
+    "log": "/tmp/autoship-original-producer-observed-metadata-build-20261107.log",
+    "log_sha256": "0f4f528b598ec03bfa91c1e35b873984ee8dc88b67c56827997e649a73639463",
+    "command": "/usr/bin/python3 -I /tmp/autoship-producer-proot-tools/run-path-build.py --build",
+    "registered_physical_target": "/mnt/store/augmentagent-session-targets/jarvis-native-producer-repro-e8127483b207b035",
+    "logical_workspace": "/home/nolan-makatche/AugmentAgent",
+    "logical_target": "/home/nolan-makatche/AugmentAgent/target",
+    "management": "One actual outer managed disk build lease; nested scripts/cargo-managed.sh for Cargo metadata, CLI release package clean and locked two-package release build. Same registered physical target inode and original parent storage descriptions verified.",
+    "preflight_records": [
+      {
+        "kind": "path_preserving_build_preflight",
+        "uid": 1000,
+        "head": "fe2e7b1f50430af73e65bb38049097e959b7a3e3",
+        "cwd": "/home/nolan-makatche/AugmentAgent",
+        "target": "/home/nolan-makatche/AugmentAgent/target",
+        "same_registered_target_inode": true,
+        "actual_inherited_descriptors": 11,
+        "grants_capacity": false
+      },
+      {
+        "kind": "cargo_path_preflight",
+        "workspace": "/home/nolan-makatche/AugmentAgent",
+        "target": "/home/nolan-makatche/AugmentAgent/target",
+        "cli_manifest": "/home/nolan-makatche/AugmentAgent/crates/augmentagent-cli/Cargo.toml"
+      }
+    ],
+    "launcher_sha256": "74d26bedd56434aa5700557477df3c51c43ebe9284b2339506d880ec8aba060c",
+    "helper_sha256": "ca78a3dd603956a8610ace053975b47a8108d922a5b40f9944362391a5ca3c0e",
+    "launcher_source": "import hashlib,os,sys\nfrom pathlib import Path\nassert sys.argv[1:] in (['--probe'],['--build'])\nbase=Path('/tmp/autoship-producer-proot-tools')\nproot=base/'proot-current'\nassert hashlib.sha256(proot.read_bytes()).hexdigest()=='90375de3807212b8f948ff98ed66020f7c9cf7ea447c8734f1af02a2643c8d26'\noriginal='/home/nolan-makatche/AugmentAgent'\nsource='/home/nolan-makatche/jarvis-native-producer-repro'\ntarget='/mnt/store/augmentagent-session-targets/jarvis-native-producer-repro-e8127483b207b035'\ncli='/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c/debug/augmentagent'\ncommand=[cli,'disk','build','--target-dir',target,str(proot),'-b',source+':'+original,'-b',original+'/.git:'+original+'/.git','-b',target+':'+original+'/target','-w',original,'/usr/bin/env',\n 'GIT_DIR='+original+'/.git/worktrees/jarvis-native-producer-repro','GIT_COMMON_DIR='+original+'/.git','GIT_WORK_TREE='+original,'GIT_OPTIONAL_LOCKS=0','PWD='+original,'CARGO_TARGET_DIR='+original+'/target','TMPDIR='+original+'/target/tmp','AUGMENTAGENT_STORAGE_BIN='+cli,'CARGO_BUILD_JOBS=1','AUGMENTAGENT_PHONE_BUILD_COMMIT=3f1e003f000f3bdc4b9c02c1e145abcab70d8f58','CARGO_PROFILE_DEV_DEBUG=0','CARGO_PROFILE_TEST_DEBUG=0','/usr/bin/python3','-I',str(base/'path-build.py'),sys.argv[1]]\nos.execv(cli,command)\n",
+    "helper_source": "import hashlib, importlib.util, json, os, subprocess, sys\nfrom pathlib import Path\nassert sys.argv[1:] in (['--probe'], ['--build'])\nroot=Path('/home/nolan-makatche/AugmentAgent')\ntarget=root/'target'\nactual=Path('/mnt/store/augmentagent-session-targets/jarvis-native-producer-repro-e8127483b207b035')\nassert os.getuid()==1000 and Path.cwd()==root\nassert os.environ['AUGMENTAGENT_PHONE_BUILD_COMMIT']=='3f1e003f000f3bdc4b9c02c1e145abcab70d8f58'\nassert target.resolve()==target\nassert (target.stat().st_dev,target.stat().st_ino)==(actual.stat().st_dev,actual.stat().st_ino)\nhead=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()\nassert head=='fe2e7b1f50430af73e65bb38049097e959b7a3e3'\nassert not subprocess.check_output(['git','status','--porcelain','--untracked-files=no'],text=True).strip()\nassert hashlib.sha256((root/'Cargo.lock').read_bytes()).hexdigest()=='20f9e0734e86ed443d1810b613d465639ff325f812beb4442e4598e8e91a9810'\nassert hashlib.sha256((root/'crates/augmentagent-channel-core/src/native_vm.rs').read_bytes()).hexdigest()=='c4259c016eb27a782188687b091a405a66acc152c2e1a3e73268c03b9a50ec9a'\npath=Path('/home/nolan-makatche/jarvis-autoship-main-integration/scripts/tests/native_custody_immutable_vm_probe.py')\nspec=importlib.util.spec_from_file_location('repro_storage_validation',path)\nmodule=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)\ndescriptors,observed,scratch=module.managed_storage()\nassert observed==target and scratch==target/'tmp'\nprint(json.dumps({'kind':'path_preserving_build_preflight','uid':os.getuid(),'head':head,'cwd':str(root),'target':str(target),'same_registered_target_inode':True,'actual_inherited_descriptors':len(descriptors),'grants_capacity':False}),flush=True)\nwrapper=str(root/'scripts/cargo-managed.sh')\nmetadata=subprocess.run([wrapper,'metadata','--locked','--no-deps','--format-version','1','--manifest-path',str(root/'Cargo.toml')],capture_output=True,text=True,check=True)\nvalue=json.loads(metadata.stdout)\npackage=next(p for p in value['packages'] if p['name']=='augmentagent-cli')\nassert value['workspace_root']==str(root),value['workspace_root']\nassert value['target_directory']==str(target),value['target_directory']\nassert package['manifest_path']==str(root/'crates/augmentagent-cli/Cargo.toml'),package['manifest_path']\nprint(json.dumps({'kind':'cargo_path_preflight','workspace':value['workspace_root'],'target':value['target_directory'],'cli_manifest':package['manifest_path']}),flush=True)\nif sys.argv[1]=='--probe':\n    raise SystemExit(0)\nsubprocess.run([wrapper,'clean','--release','-p','augmentagent-cli','--manifest-path',str(root/'Cargo.toml')],check=True)\nraise SystemExit(subprocess.run([wrapper,'build','--release','--locked','--manifest-path',str(root/'Cargo.toml'),'-p','augmentagent-cli','-p','augmentagent-mcp-memory']).returncode)\n",
+    "storage_validation_source_sha256": "b8e698088ce322a9e98e078284e407c91e90837d1c093b2a5d893f11640ddc19",
+    "path_adapter": {
+      "name": "PRoot",
+      "version": "v5.4.1-32-g25dc6a3-25dc6a31",
+      "sha256": "90375de3807212b8f948ff98ed66020f7c9cf7ea447c8734f1af02a2643c8d26",
+      "official_documentation": "https://proot-me.github.io/",
+      "download": "https://proot.gitlab.io/proot/bin/proot",
+      "role": "Userspace pathname translation for this trusted reference build only; no security/isolation claim, host root or production mount mutation."
+    }
+  },
+  "phone_telemetry_input": {
+    "name": "AUGMENTAGENT_PHONE_BUILD_COMMIT",
+    "observed_original_value": "3f1e003f000f3bdc4b9c02c1e145abcab70d8f58",
+    "explicit_rebuild_value": "3f1e003f000f3bdc4b9c02c1e145abcab70d8f58",
+    "meaning": "Existing supported build-time telemetry override. Actual source remains fe2e7b1f. This value is not compiled-source provenance; its original historical cause is unknown.",
+    "preceding_path_corrected_rebuild_sha256": "12329747d1419ab8f14dc7669373ba8ced61ed821a69f59b0ec8b2aded461b44",
+    "preceding_difference": "Executable text already identical. Remaining rodata changes were 37 differing bytes within this one 40-byte telemetry field, plus ELF build ID and string table. Final comparison ignores none of these."
+  },
+  "establishes": [
+    "An unchanged checkout of the identified source, with the recorded observed build inputs and path mapping, produces exactly the preserved original executable bytes.",
+    "The recorded matching source can now be used to inspect the preserved executable admission contract; this is stronger than a source label, symbol names or embedded Python helper match."
+  ],
+  "does_not_establish": [
+    "That every retained runtime was launched by this preserved executable, or an original kernel/process-to-executable identity for any particular launch.",
+    "Original per-runtime resource/input/source correlation, original nonrelease, outcome, replay eligibility or complete charged-resource/writer closure.",
+    "Complete historical dependency/toolchain provenance merely from Cargo.lock and executable reproduction.",
+    "A production resource-bound capability, cleanup/retirement permission, capacity credit, successful deployment or autoship restoration."
+  ],
+  "production_state_changed": false,
+  "grants_capacity": false,
+  "implementation_handoff_approved": false
+}
