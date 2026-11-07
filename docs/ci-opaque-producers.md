@@ -648,8 +648,17 @@ cohort/source/resource binding remain C/R-owned prerequisites before admitting
 those routes. Root configuration tags and this diagnostic report cannot replace
 them. The returned report retains false complete-input/full-CI/shipping flags.
 The carrying cost is a shared proc mount helper and two fixed private cases;
-no runtime permission or durable grant schema is added. Actual guest validation
-is still pending for this extension. Do not rerun the unchanged compiler fixture
+no runtime permission or durable grant schema is added. At `b16780dd`, all eight expanded root-controlled cases passed on the declared
+guest kernel in 96.60 seconds, including both memory cases and the six prior
+relay-policy cases. All four writable-control aliases changed actual victim
+bytes; all four guarded writable opens returned EROFS while read controls
+succeeded and the victim retained its original bytes. Read-only FD pwrite
+returned EBADF in both cases. Actual mount flags, original exec acknowledgement
+and victim/supervisor reap were checked. Embedded helper/native artifacts
+matched, and the original host resource subtree was removed without exhaustion.
+All 735 host Python checks and 39 Rust checks passed (30 opt-ins ignored in the
+bulk Rust run). See [bounded proc-writer evidence](ci-proc-memory-writer-proof.json).
+Do not rerun the unchanged compiler fixture
 merely to restate its vfork refusal before a relevant admission change exists.
 
 ### O3. Freeze before capturing a live parent's input
