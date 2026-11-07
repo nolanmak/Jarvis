@@ -437,6 +437,8 @@ mod tests {
         if complete {write(&path.join("complete.json"),b"{\"generation\":\"generation-a\"}").unwrap();}
         path
     }
+    /// Exercise fresh construction failures in an isolated process while
+    /// preserving resumed and successfully prepared runtime ownership.
     #[test]
     fn failed_prepare_does_not_consume_native_session_capacity() {
         use std::os::unix::ffi::OsStringExt;
@@ -446,7 +448,9 @@ mod tests {
             let output=std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact","native_vm::tests::failed_prepare_does_not_consume_native_session_capacity","--nocapture"])
                 .env_clear().env("PATH","/usr/bin:/bin").env(CHILD,root.path()).env("AUGMENTAGENT_RUN_RESOURCES","1").output().unwrap();
-            assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
+            let stdout=String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(),"{} {}",stdout,String::from_utf8_lossy(&output.stderr));
+            assert!(stdout.contains("running 1 test") && stdout.contains("test result: ok. 1 passed; 0 failed;"),"child regression did not execute: {stdout}");return;
         };
         let root=PathBuf::from(root).canonicalize().unwrap();
         let state=root.join("state");
