@@ -970,3 +970,80 @@ passed (138.11s), and production compilation passed (11.56s). The full CLI suite
 was not repeated. See `1703-owner-successor-native-proof.json` for source hashes,
 commands, logs and limits. The bounded spec audit found no introduced gap; it
 is not full C/R handoff or productive recovery approval.
+
+## 52. Native transfer for live successor setup (producer implemented)
+
+Native setup uses the actual live `SuccessorSetup` and fresh exact-preview
+successor authorization. It does not reopen an expired metadata recovery claim
+or synthesize an ordinary lease. The completed original publication and
+receipt-backed original recovery frontier select the source. Actual core
+`prepare_transfer` owns original state/audit/session locks and produces a fresh
+`PreparationScan`; it runs outside a metadata-proof visitor and outside the
+workflow mutex. Source policy, inventory, input census and resource uncertainty
+retain core refusal semantics.
+
+A short callback transaction checks the same live setup, exact original intent,
+completed publication, source facts and actual scan. The scan and pending
+destination must equal this setup generation and its exact generated private
+metadata-only audit path under the original workflow database directory. A
+wrong-generation or wrong-audit scan refuses before durability, even with an
+empty inventory. Core still verifies actual destination audit authority. It atomically records the
+selected snapshot, immutable pending request and a separate successor-purpose
+context referencing the consumed setup edge. The context records the exact
+pending event/digest and original source; missing, orphaned, oversized or changed
+halves hold. The same setup can acquire one transfer UUID. A retry returns that
+exact intent and cannot retarget its source or destination. A lost commit reply
+is reread through the same typed authority: durable matching state is returned,
+known rollback is free, and uncertain persistence retains the attempted ID.
+
+The core may transfer only that durable intent. Current fences recheck setup,
+fresh authorization and pending purpose. Native inspection/replay occurs outside
+the workflow mutex; SQL acknowledgement occurs inside a short transaction while
+actual core inspection is held. Absent/prepared state retains the same UUID for
+current setup replay. Aborted or uncertain state cannot fabricate a replacement
+or release input. A genuinely verified completed receipt is settled through the
+shared SQL settlement writer with distinct successor authorization. Ordinary
+lease/native preparation/settlement APIs reject the setup generation even if a
+purpose index disappears. Terminal APIs retain cleanup-only purpose and must
+validate any recorded context; they never return coding permission.
+
+Completed SQL/native history advances only this setup's native frontier to the
+exact receipt-backed destination. The old publication/preparation and original
+turn history remain immutable; the old recovery frontier is historical source,
+not permission to reopen a transferred source. Fresh successor metadata and
+preparation reads follow the completed successor edge. A cached metadata proof
+from before the transfer cannot authorize the new namespace. Both destination
+and original metadata loggers retain permanent model fences. Transfer settlement
+is descriptive progress, not a productive coding guard or model/body allowance.
+
+D/R owns this stage. Tests extend the real original recovery/ready/setup fixture
+for both providers and initial/revised acceptance through actual core transfer
+and verified SQL settlement, including rollback, durable lost reply, replay,
+exact native-frontier advance, original preparation retention and copied-lease
+refusal after completion. Controlled synthetic preparation/empty runtime fixtures
+do not establish live provider/VM coding. Lost live setup reservations still need
+an explicit actual-native disposition before authenticated replacement; lease
+expiry alone never clears them. Multiple consumed ancestry, coding constructor,
+C/R source/resource/input proofs and body reservation lineage remain activation
+gates. Before connecting the worker, D/R must also persist the typed no-pending
+failure fingerprint and retry backoff; this setup-only producer currently
+returns the failure without scheduling another run. Unknown persistence retains
+its attempted transfer ID and must never be treated as no pending work. The carrying cost is one bounded purpose context per setup transfer plus
+existing pending/settlement history, not another shipping/model allowance.
+
+
+Checkpoint validation: the unavailable-producer regression failed as intended.
+The actual transfer path then passed for both provider pins and initial/revised
+acceptance. Expanded failure coverage passed (136.23s): wrong private audit and
+wrong generation scans reached real core preparation and refused before writes;
+a late intent trigger rolled back all workflow effects; a real durable WAL reply
+was lost; native completion plus SQL settlement rollback retained the same UUID;
+verified replay settled it without promoting metadata purpose. Corrupt/missing
+purpose history and ordinary copied-lease settlement refuse. Reopened original
+preparation follows the settled destination. The shared native-observation suite
+passed 105 tests (207.92s), owner store/turn tests passed 48 (11.16s), surrounding
+owner workflow tests passed 11 (140.36s), and production compilation passed
+(22.80s). Full CLI and live provider/VM acceptance were not rerun. See
+`1703-owner-successor-transfer-proof.json` for exact source hashes and limits.
+The bounded audit's destination-join finding was resolved in both specification
+and real scan controls; this is not full C/R handoff or activation approval.

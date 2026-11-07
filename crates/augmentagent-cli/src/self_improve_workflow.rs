@@ -405,11 +405,7 @@ pub(super) fn workflow_audit(
 }
 
 fn audit_generation_paths(state:&Path,id:&str,generation:i64)->Result<(PathBuf,PathBuf,PathBuf)> {
-    let parent=state.parent().context("workflow state has no parent")?;
-    let parent=if parent.as_os_str().is_empty(){Path::new(".")}else{parent}.canonicalize()?;
-    let root=parent.join("autoship-audit");let key=format!("{:x}",Sha256::digest(id.as_bytes()));
-    let key=if generation==0 {key}else{format!("{key}-generation-{generation}")};
-    Ok((root.clone(),root.join("logs").join(format!("{key}.jsonl")),root.join("anchors").join(format!("{key}.json"))))
+    durable::native_audit_generation_paths(state,id,generation)
 }
 /// Existing registered namespaces are never recreated or health-appended here.
 /// Only known generated paths are supported; legacy/vanished authority holds.
@@ -512,6 +508,95 @@ fn with_successor_native_metadata(state:&Path,worktree:Option<&Path>,
         anyhow::ensure!(proof.namespace()==facts.namespace() && proof.binding()==facts.original_binding(),"successor native metadata differs from original namespace");
         visit(proof)?;current()
     })
+}
+
+#[derive(Debug)]
+enum SuccessorNativeSetupRun {
+    Outcome(durable::native_prepare::NativePreparationRun),
+    PersistenceUnknown {reason:augmentagent_channel_core::native_vm::ownership::TransferReason,attempted_transfer:Option<String>},
+}
+
+/// Transfer native ownership for this live setup role, retaining metadata-only
+/// purpose. Completing this stage does not construct a coding guard.
+fn run_successor_native_setup(store:&Arc<Mutex<WorkflowStore>>,state:&Path,worktree:&Path,
+    setup:Arc<durable::owner_publication_recovery::SuccessorSetup>,
+    authorization:&super::targeted::AuthorizedOwnerSuccessor<'_>,
+)->Result<SuccessorNativeSetupRun> {
+    use augmentagent_channel_core::native_vm::ownership::*;
+    use durable::native_prepare::NativePreparationRun as Run;
+    let pending=store.lock().map_err(|_|anyhow::anyhow!("successor setup store poisoned"))?
+        .owner_successor_pending_transfer(&setup,authorization,millis())?;
+    if let Some(pending)=pending {
+        let destination=existing_native_audit(state,&pending.request().destination,Some(worktree),pending.original_binding())?;
+        destination.require_run_resources()?;
+        destination.restrict_to_metadata(durable::owner_publication_recovery::successor_native_metadata_fence(store.clone(),setup.clone(),authorization,millis())?)?;
+        let sources=existing_native_sources(state,&pending.request().source_owners,Some(worktree),pending.original_binding())?;
+        let mode=durable::native_reconcile::Mode::OwnerSuccessor {setup:&setup,authorization};
+        let result=durable::native_reconcile::run(store,mode,&pending,Some((&sources,&destination)),&millis)?;
+        return Ok(SuccessorNativeSetupRun::Outcome(Run::Reconciled {pending,result}));
+    }
+    let facts=store.lock().map_err(|_|anyhow::anyhow!("successor setup store poisoned"))?
+        .owner_successor_native_facts(&setup,authorization,millis())?;
+    if facts.namespace().owner.lease_generation==setup.generation() {
+        let audit=existing_native_audit(state,facts.namespace(),Some(worktree),facts.original_binding())?;
+        audit.restrict_to_metadata(durable::owner_publication_recovery::successor_native_metadata_fence(store.clone(),setup.clone(),authorization,millis())?)?;
+        return Ok(SuccessorNativeSetupRun::Outcome(Run::Registered {original_binding:facts.original_binding().clone()}));
+    }
+    let destination=open_audit_generation(state,setup.workflow_id(),Some(worktree),setup.generation())?;
+    destination.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:setup.workflow_id().into(),lease_generation:setup.generation()})?;
+    destination.set_native_store_binding(facts.original_binding().clone())?;
+    destination.require_run_resources()?;
+    destination.restrict_to_metadata(durable::owner_publication_recovery::successor_native_metadata_fence(store.clone(),setup.clone(),authorization,millis())?)?;
+    destination.record_controller(serde_json::json!({"actor":"controller","kind":"owner_successor_setup_native","workflow":setup.workflow_id(),"generation":setup.generation()}))?;
+    let sources=existing_native_sources(state,&[facts.namespace().clone()],Some(worktree),facts.original_binding())?;
+    let fingerprint=PreparationFingerprintInput {workflow_id:setup.workflow_id().into(),workflow_binding:serde_json::to_value(authorization.plan().checkpoint_binding())?,original_binding_sha256:None,
+        source_registration_sha256:None,latest_input_sha256:Some(facts.fingerprint()?),selected_policy_sha256:None,capacity_class:PreparationCapacity::default()};
+    let plan=PreparationPlan {workflow_id:setup.workflow_id().into(),source_owners:vec![facts.namespace().clone()],destination:Authority {owner:augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:setup.workflow_id().into(),lease_generation:setup.generation()},audit_path:destination.path().to_str().context("successor audit encoding")?.into()},runtimes:facts.runtimes()?,fingerprint_input:fingerprint};
+    let durable=std::cell::RefCell::new(None::<durable::PendingNativeHandoff>);
+    let unknown_id=std::cell::RefCell::new(None::<String>);
+    let current=||->std::result::Result<(),TransferFenceError> {
+        let saved=durable.borrow().clone();
+        let locked=store.lock().map_err(|_|TransferFenceError::Unavailable)?;
+        let result=match saved {Some(pending)=>locked.validate_owner_successor_transfer(&setup,authorization,&pending,millis()),None=>locked.validate_owner_successor_setup(&setup,authorization,millis())};
+        result.map_err(|error|if error.downcast_ref::<rusqlite::Error>().is_some(){TransferFenceError::Unavailable}else{TransferFenceError::NotCurrent})
+    };
+    let outcome=prepare_transfer(facts.original_binding(),&plan,&sources,&destination,&current,&mut |scan| {
+        let disposition=match store.lock() {
+            Ok(mut locked)=>locked.prepare_owner_successor_native_intent(&setup,authorization,&facts,scan,millis()),
+            Err(_)=>return PreparationPersistence::Unknown {reason:TransferReason::PendingUnknown,attempted:None},
+        };
+        match disposition {
+            durable::owner_publication_recovery::SuccessorNativePersistence::Durable(intent)=>{
+                let core=intent.core_intent();
+                let pending=store.lock().ok().and_then(|mut locked|locked.owner_successor_pending_transfer(&setup,authorization,millis()).ok().flatten());
+                if let Some(pending)=pending {*durable.borrow_mut()=Some(pending);PreparationPersistence::Durable(core)}
+                else {PreparationPersistence::Unknown {reason:TransferReason::PendingUnknown,attempted:Some(core)}}
+            },
+            durable::owner_publication_recovery::SuccessorNativePersistence::NotCommitted {reason}=>PreparationPersistence::NotCommitted(reason),
+            durable::owner_publication_recovery::SuccessorNativePersistence::Unknown {reason,attempted_transfer}=>{*unknown_id.borrow_mut()=attempted_transfer;PreparationPersistence::Unknown {reason,attempted:None}},
+        }
+    }).map_err(anyhow::Error::new)?;
+    match outcome {
+        PreparedTransferResult::NoPending(failure)=>Ok(SuccessorNativeSetupRun::Outcome(Run::NoPending {failure,next_eligible_ms:None})),
+        PreparedTransferResult::PersistenceUnknown {reason,attempted}=>Ok(SuccessorNativeSetupRun::PersistenceUnknown {reason,attempted_transfer:unknown_id.into_inner().or_else(||attempted.map(|intent|intent.request.transfer_id)).or_else(||durable.into_inner().map(|pending|pending.request().transfer_id.clone()))}),
+        PreparedTransferResult::Pending {outcome,..}=>{
+            let pending=durable.borrow().clone().context("successor durable native intent missing")?;
+            let mut settlement=None;let mut settlement_failed=false;let mut outcome=outcome;
+            if matches!(outcome,TransferOutcome::Completed(_)) {
+                match pending.verified_receipt(&current) {
+                    Ok(Some(proof))=>{
+                        let result=store.lock().map_err(|_|anyhow::anyhow!("successor settlement store poisoned"))?
+                            .settle_owner_successor_native_handoff(&setup,authorization,&proof,millis());
+                        match result {Ok(value)=>settlement=Some(value),Err(_)=>settlement_failed=true}
+                    },
+                    Ok(None)=>outcome=TransferOutcome::Unknown {reason:TransferReason::PendingUnknown,transfer_id:pending.request().transfer_id.clone()},
+                    Err(failure)=>outcome=failure,
+                }
+            }
+            anyhow::ensure!(destination.dispatch_allowed().is_err(),"successor metadata destination became productive");
+            Ok(SuccessorNativeSetupRun::Outcome(Run::Pending {pending,outcome,settlement,settlement_failed}))
+        }
+    }
 }
 
 fn existing_native_sources(state:&Path,authorities:&[augmentagent_channel_core::native_vm::ownership::Authority],worktree:Option<&Path>,original:&augmentagent_channel_core::native_vm::ownership::TransferBinding)->Result<Vec<Arc<augmentagent_channel_core::AuditLogger>>> {
@@ -5763,6 +5848,80 @@ else: raise SystemExit('unexpected authority call')
                             native_visited=true;Ok(())
                         }).expect("successor setup must inspect the actual retained native namespace");
                         assert!(native_visited);
+                        let setup_store=Arc::new(Mutex::new(WorkflowStore::open(&state).unwrap()));
+                        let before_native_transfer=store.snapshot(&id).unwrap().unwrap();
+                        use augmentagent_channel_core::native_vm::ownership as successor_native;
+                        let basis=store.owner_successor_native_facts(&setup,&setup_auth,millis()).unwrap();
+                        let source=existing_native_audit(&state,basis.namespace(),Some(dir.path()),basis.original_binding()).unwrap();
+                        for wrong_generation in [false,true] {
+                            let control=tempfile::tempdir().unwrap();
+                            for name in ["logs","anchors"] {let p=control.path().join(name);std::fs::create_dir(&p).unwrap();std::fs::set_permissions(&p,std::fs::Permissions::from_mode(0o700)).unwrap();}
+                            let foreign=Arc::new(augmentagent_channel_core::AuditLogger::protected(control.path().join("logs/foreign.jsonl"),control.path().join("anchors/foreign.json"),&[]).unwrap());
+                            let owner=augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:id.clone(),lease_generation:setup.generation()+i64::from(wrong_generation)};
+                            foreign.set_native_runtime_owner(owner.clone()).unwrap();foreign.set_native_store_binding(basis.original_binding().clone()).unwrap();foreign.require_run_resources().unwrap();
+                            foreign.record_controller(serde_json::json!({"actor":"controller","kind":"foreign-destination-control","workflow":id,"generation":owner.lease_generation})).unwrap();
+                            foreign.restrict_to_metadata(durable::owner_publication_recovery::successor_native_metadata_fence(setup_store.clone(),setup.clone(),&setup_auth,millis()).unwrap()).unwrap();
+                            let plan=successor_native::PreparationPlan {workflow_id:id.clone(),source_owners:vec![basis.namespace().clone()],destination:successor_native::Authority {owner,audit_path:foreign.path().to_str().unwrap().into()},runtimes:basis.runtimes().unwrap(),fingerprint_input:successor_native::PreparationFingerprintInput {workflow_id:id.clone(),workflow_binding:serde_json::to_value(&saved_cp.binding).unwrap(),original_binding_sha256:None,source_registration_sha256:None,latest_input_sha256:Some(basis.fingerprint().unwrap()),selected_policy_sha256:None,capacity_class:Default::default()}};
+                            let current=||store.validate_owner_successor_setup(&setup,&setup_auth,millis()).map_err(|_|successor_native::TransferFenceError::NotCurrent);
+                            let events=store.events(&id).unwrap();let mut visited=false;
+                            let result=successor_native::prepare_transfer(basis.original_binding(),&plan,&[source.clone()],&foreign,&current,&mut |scan| {
+                                visited=true;
+                                match setup_store.lock().unwrap().prepare_owner_successor_native_intent(&setup,&setup_auth,&basis,scan,millis()) {
+                                    durable::owner_publication_recovery::SuccessorNativePersistence::NotCommitted {reason}=>successor_native::PreparationPersistence::NotCommitted(reason),
+                                    _=>panic!("foreign destination scan acquired successor intent"),
+                                }
+                            }).unwrap();
+                            assert!(visited && matches!(result,successor_native::PreparedTransferResult::NoPending(_)),"wrong destination did not reach actual scan callback: {result:?}");
+                            assert_eq!(store.events(&id).unwrap(),events);
+                        }
+                        let before_intent_events=store.events(&id).unwrap();
+                        db.execute_batch("CREATE TRIGGER refuse_successor_native_context BEFORE INSERT ON workflow_owner_successor_native_intent BEGIN SELECT RAISE(ABORT,'injected successor native intent rollback'); END;").unwrap();
+                        let refused=run_successor_native_setup(&setup_store,&state,dir.path(),setup.clone(),&setup_auth).unwrap();
+                        assert!(matches!(refused,SuccessorNativeSetupRun::Outcome(durable::native_prepare::NativePreparationRun::NoPending {..})),"{refused:?}");
+                        assert_eq!(store.events(&id).unwrap(),before_intent_events);assert!(store.owner_successor_pending_transfer(&setup,&setup_auth,millis()).unwrap().is_none());
+                        db.execute_batch("DROP TRIGGER refuse_successor_native_context; CREATE TRIGGER refuse_successor_native_settlement BEFORE INSERT ON workflow_native_handoff_completed BEGIN SELECT RAISE(ABORT,'injected successor native settlement rollback'); END;").unwrap();
+                        setup_store.lock().unwrap().test_lose_recovery_commit_ack();
+                        let transferred=run_successor_native_setup(&setup_store,&state,dir.path(),setup.clone(),&setup_auth).unwrap();
+                        assert!(matches!(transferred,SuccessorNativeSetupRun::Outcome(durable::native_prepare::NativePreparationRun::Pending {outcome:successor_native::TransferOutcome::Completed(_),settlement:None,settlement_failed:true,..})),"{transferred:?}");
+                        assert_eq!(setup_store.lock().unwrap().test_finish_recovery_commit_ack_loss(),1,"actual durable intent reply was not lost");
+                        let pending=store.owner_successor_pending_transfer(&setup,&setup_auth,millis()).unwrap().unwrap();
+                        let transfer_id=pending.request().transfer_id.clone();
+                        let current=||store.validate_owner_successor_transfer(&setup,&setup_auth,&pending,millis()).map_err(|_|successor_native::TransferFenceError::NotCurrent);
+                        let verified=pending.verified_receipt(&current).unwrap().unwrap();
+                        let error=store.settle_native_handoff(&copied,&saved_cp.binding,&verified,millis()).unwrap_err();
+                        assert!(format!("{error:#}").contains("owner-successor-setup-only"),"ordinary settlement refused for incidental reason: {error:#}");
+                        let context:(i64,i64,String,String)=db.query_row("SELECT pending_sequence,sequence,record_sha256,record FROM workflow_owner_successor_native_intent WHERE workflow=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+                        let context_event:String=db.query_row("SELECT payload FROM workflow_event WHERE seq=?1",[context.1],|r|r.get(0)).unwrap();
+                        for fault in ["record","event","missing-context"] {
+                            match fault {
+                                "record"=>{db.execute("UPDATE workflow_owner_successor_native_intent SET record='{}' WHERE workflow=?1",[&id]).unwrap();},
+                                "event"=>{db.execute("UPDATE workflow_event SET payload='{}' WHERE seq=?1",[context.1]).unwrap();},
+                                _=>{db.execute("DELETE FROM workflow_owner_successor_native_intent WHERE workflow=?1",[&id]).unwrap();},
+                            }
+                            assert!(store.owner_successor_pending_transfer(&setup,&setup_auth,millis()).is_err(),"{fault}: damaged native purpose accepted");
+                            assert!(store.validate_owner_successor_transfer(&setup,&setup_auth,&pending,millis()).is_err());
+                            db.execute("INSERT OR REPLACE INTO workflow_owner_successor_native_intent VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",rusqlite::params![id,setup.generation(),db.query_row("SELECT sequence FROM workflow_owner_successor_claim WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),transfer_id,context.0,context.1,context.2,context.3]).unwrap();
+                            db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![context.1,context_event]).unwrap();
+                        }
+                        db.execute_batch("DROP TRIGGER refuse_successor_native_settlement;").unwrap();
+                        let reconciled=run_successor_native_setup(&setup_store,&state,dir.path(),setup.clone(),&setup_auth).unwrap();
+                        assert!(matches!(reconciled,SuccessorNativeSetupRun::Outcome(durable::native_prepare::NativePreparationRun::Reconciled {result:durable::native_reconcile::ReconciliationRun::Settled(_),..})),"{reconciled:?}");
+                        assert!(store.owner_successor_pending_transfer(&setup,&setup_auth,millis()).unwrap().is_none());
+                        let replay_events=store.events(&id).unwrap();
+                        assert!(matches!(run_successor_native_setup(&setup_store,&state,dir.path(),setup.clone(),&setup_auth).unwrap(),SuccessorNativeSetupRun::Outcome(durable::native_prepare::NativePreparationRun::Registered {..})));
+                        assert_eq!(store.events(&id).unwrap(),replay_events);
+                        assert_eq!(db.query_row("SELECT transfer_id FROM workflow_owner_successor_native_intent WHERE workflow=?1",[&id],|r|r.get::<_,String>(0)).unwrap(),transfer_id);
+                        let advanced=store.owner_successor_native_facts(&setup,&setup_auth,millis()).unwrap();
+                        assert_eq!(advanced.namespace().owner.lease_generation,setup.generation());
+                        with_successor_native_metadata(&state,Some(dir.path()),setup.clone(),&setup_auth,&mut |proof| {
+                            assert_eq!(proof.namespace(),advanced.namespace());
+                            let prepared=store.with_owner_successor_preparation(&setup,&setup_auth,proof,millis(),|access|
+                                acceptance::owner::publication::reopen_successor_preparation(access,proof,dir.path()))?;
+                            prepared.require_setup(&setup)?;assert_eq!(prepared.request_id(),original_request);Ok(())
+                        }).expect("transferred setup cannot reopen original preparation");
+                        assert!(store.owner_turn_for_lease(&copied,millis()).is_err());
+                        assert!(store.charge(&copied,"native-transfer-is-not-coding",durable::ResourceCharge {model_calls:1,..Default::default()},millis()).is_err());
+                        assert_eq!(store.snapshot(&id).unwrap().unwrap(),before_native_transfer);
                         let saved_claim:(i64,String,String)=db.query_row("SELECT sequence,record_sha256,record FROM workflow_owner_successor_claim WHERE workflow=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
                         let claim_event:String=db.query_row("SELECT payload FROM workflow_event WHERE seq=?1",[saved_claim.0],|r|r.get(0)).unwrap();
                         let lease_until:i64=db.query_row("SELECT lease_until FROM workflow WHERE id=?1",[&id],|r|r.get(0)).unwrap();

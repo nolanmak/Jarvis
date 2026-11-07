@@ -312,6 +312,10 @@ pub(super) fn capture_recovery_selected(context:&super::owner_publication_recove
     let facts=context.facts();
     write_selected_snapshot(context.transaction(),&facts.workflow_id,context.generation(),&facts.workflow_binding,facts,rows,now)
 }
+pub(super) fn capture_successor_selected(context:&super::owner_publication_recovery::SuccessorNativeSnapshotContext<'_, '_>,rows:Vec<native_observation::NativeObservation>,now:i64)->Result<NativeHandoffSnapshot> {
+    let facts=context.facts();
+    write_selected_snapshot(context.transaction(),&facts.workflow_id,context.generation(),&facts.workflow_binding,facts,rows,now)
+}
 fn write_selected_snapshot(tx:&Transaction<'_>,workflow:&str,generation:i64,binding:&Binding,facts:&NativeHandoffFacts,
     rows:Vec<native_observation::NativeObservation>,now:i64)->Result<NativeHandoffSnapshot> {
     ensure!(facts.workflow_id==workflow && facts.workflow_binding==*binding,TransferReason::AuthorityConflict);

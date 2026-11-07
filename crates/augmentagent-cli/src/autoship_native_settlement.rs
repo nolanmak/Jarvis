@@ -294,6 +294,13 @@ impl WorkflowStore {
         let result=settle(&tx,&proof.pending().request().workflow_id,lease.generation(),proof.pending().workflow_binding(),None,proof,now)?;
         tx.commit()?;Ok(result)
     }
+    pub(crate) fn settle_owner_successor_native_handoff(&mut self,setup:&super::super::owner_publication_recovery::SuccessorSetup,
+        authorization:&crate::self_improve::targeted::AuthorizedOwnerSuccessor<'_>,proof:&VerifiedHandoffReceipt,now:i64)->Result<HandoffSettlement> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::super::owner_publication_recovery::require_successor_transfer_context(&tx,setup,authorization,proof.pending(),now)?;
+        let result=settle(&tx,&proof.pending().request().workflow_id,setup.generation(),proof.pending().workflow_binding(),None,proof,now)?;
+        tx.commit()?;Ok(result)
+    }
     pub(crate) fn settle_terminal_native_handoff(&mut self,terminal:&terminal::TerminalNativeCheckpoint,proof:&VerifiedHandoffReceipt,now:i64)->Result<HandoffSettlement> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure!(terminal::capture(&tx,terminal.workflow())?==*terminal,TransferReason::AuthorityConflict);

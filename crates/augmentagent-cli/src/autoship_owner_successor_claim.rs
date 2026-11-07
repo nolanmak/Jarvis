@@ -3,12 +3,19 @@ use super::*;
 #[path="autoship_owner_successor_native.rs"]
 mod native;
 pub(crate) use native::{SuccessorPreparationRead,metadata_fence as successor_native_metadata_fence};
+#[path="autoship_owner_successor_transfer.rs"]
+mod transfer;
+pub(crate) use transfer::{SuccessorNativePersistence,SnapshotContext as SuccessorNativeSnapshotContext};
+pub(super) fn require_transfer_context(conn:&Connection,setup:&SuccessorSetup,authorization:&crate::self_improve::targeted::AuthorizedOwnerSuccessor<'_>,pending:&PendingNativeHandoff,now:i64)->Result<()> {transfer::require_context(conn,setup,authorization,pending,now)}
+pub(super) fn require_terminal_transfer(conn:&Connection,pending:&PendingNativeHandoff)->Result<()> {transfer::require_terminal(conn,pending)}
+
 #[derive(Debug,PartialEq,Eq)]
 pub(crate) struct SuccessorPlan {original:Original,ready:RecordRef,generation:i64,control:owner_control::OwnerControl,checkpoint:Checkpoint}
 impl SuccessorPlan {
     pub(crate) fn origin(&self)->&DiscordOrigin {&self.original.origin}
     pub(crate) fn command(&self)->&submission::Request {&self.original.command}
     pub(crate) fn same_ready(&self,other:&Self)->bool {self==other}
+    pub(crate) fn checkpoint_binding(&self)->&Binding {&self.checkpoint.binding}
 }
 #[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +31,7 @@ struct Record {
 /// Process loss cannot reconstruct this object from its descriptive journal.
 pub(crate) struct SuccessorSetup {record:Record,reference:RecordRef}
 impl SuccessorSetup {
+    pub(crate) fn workflow_id(&self)->&str {&self.record.workflow}
     pub(crate) fn generation(&self)->i64 {self.record.setup.generation}
     pub(crate) fn request_id(&self)->&str {&self.record.request_id}
 }

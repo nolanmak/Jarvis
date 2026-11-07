@@ -233,6 +233,16 @@ fn observation_capacity(conn: &Connection, now_ms: i64, required: u64, cap: u64,
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClaimPurpose { General, Productive, MergeReconciliation }
 
+/// Generated audit paths are descriptive only; core validates their actual
+/// protected audit authority. Native setup also binds them to this database.
+pub(crate) fn native_audit_generation_paths(state:&Path,id:&str,generation:i64)->Result<(std::path::PathBuf,std::path::PathBuf,std::path::PathBuf)> {
+    let parent=state.parent().context("workflow state has no parent")?;
+    let parent=if parent.as_os_str().is_empty(){Path::new(".")}else{parent}.canonicalize()?;
+    let root=parent.join("autoship-audit");let key=format!("{:x}",Sha256::digest(id.as_bytes()));
+    let key=if generation==0 {key}else{format!("{key}-generation-{generation}")};
+    Ok((root.clone(),root.join("logs").join(format!("{key}.jsonl")),root.join("anchors").join(format!("{key}.json"))))
+}
+
 pub struct WorkflowStore {
     conn: Connection,
 }
@@ -420,6 +430,12 @@ impl WorkflowStore {
                 workflow TEXT NOT NULL REFERENCES workflow(id),generation INTEGER NOT NULL,
                 request_id TEXT NOT NULL REFERENCES workflow_owner_turn(request_id),
                 ready_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_owner_successor_ready(sequence),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record_sha256 TEXT NOT NULL,record TEXT NOT NULL,
+                PRIMARY KEY(workflow,generation));
+            CREATE TABLE IF NOT EXISTS workflow_owner_successor_native_intent (
+                workflow TEXT NOT NULL REFERENCES workflow(id),generation INTEGER NOT NULL,
+                setup_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_owner_successor_claim(sequence),
+                transfer_id TEXT NOT NULL UNIQUE,pending_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
                 sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record_sha256 TEXT NOT NULL,record TEXT NOT NULL,
                 PRIMARY KEY(workflow,generation));
             CREATE TABLE IF NOT EXISTS workflow_owner_successor_ready (

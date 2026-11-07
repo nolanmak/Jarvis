@@ -4,7 +4,8 @@ use augmentagent_channel_core::{AuditLogger,native_vm::ownership::*};
 use std::sync::{Arc,Mutex};
 #[derive(Clone,Copy)]
 pub(crate) enum Mode<'a> {Lease {lease:&'a Lease,binding:&'a Binding},Terminal(&'a native_pending::terminal::TerminalNativeCheckpoint),
-    OwnerRecovery {lease:&'a owner_publication_recovery::RecoveryLease,authorization:&'a crate::self_improve::targeted::AuthorizedOwnerRecovery<'a>}}
+    OwnerRecovery {lease:&'a owner_publication_recovery::RecoveryLease,authorization:&'a crate::self_improve::targeted::AuthorizedOwnerRecovery<'a>},
+    OwnerSuccessor {setup:&'a owner_publication_recovery::SuccessorSetup,authorization:&'a crate::self_improve::targeted::AuthorizedOwnerSuccessor<'a>}}
 #[derive(Debug)]
 pub(crate) enum ReconciliationRun {
     KnownUnstarted,KnownAborted {unresolved:usize},Settled(HandoffSettlement),Historical,
@@ -19,6 +20,7 @@ impl Mode<'_> {
                 store.validate_lease(lease,binding,now)
             }
             Self::OwnerRecovery {lease,authorization}=>store.validate_owner_recovery_transfer(lease,authorization,pending,now),
+            Self::OwnerSuccessor {setup,authorization}=>store.validate_owner_successor_transfer(setup,authorization,pending,now),
             Self::Terminal(terminal)=>{
                 ensure!(terminal.workflow()==pending.request.workflow_id && terminal.generation()>=pending.request.destination.owner.lease_generation,TransferReason::AuthorityConflict);
                 owner_publication_recovery::require_terminal_native_transfer(&store.conn,pending)?;
@@ -63,15 +65,15 @@ pub(crate) fn run(store:&Arc<Mutex<WorkflowStore>>,mode:Mode<'_>,pending:&Pendin
         mode.current(&mut locked,pending,clock())?;
         match proof.state() {
             NativeTransferState::Absent=>{
-                if matches!(mode,Mode::OwnerRecovery {..}) || matches!(mode,Mode::Lease {lease,..} if lease.generation==pending.request.destination.owner.lease_generation) {return Ok(());}
-                match mode {Mode::Lease {lease,binding}=>locked.acknowledge_native_unstarted(lease,binding,pending,proof,clock())?,Mode::Terminal(terminal)=>locked.acknowledge_terminal_native_unstarted(terminal,pending,proof,clock())?,Mode::OwnerRecovery {..}=>unreachable!("recovery retains the original unstarted request"),}
+                if matches!(mode,Mode::OwnerRecovery {..}|Mode::OwnerSuccessor {..}) || matches!(mode,Mode::Lease {lease,..} if lease.generation==pending.request.destination.owner.lease_generation) {return Ok(());}
+                match mode {Mode::Lease {lease,binding}=>locked.acknowledge_native_unstarted(lease,binding,pending,proof,clock())?,Mode::Terminal(terminal)=>locked.acknowledge_terminal_native_unstarted(terminal,pending,proof,clock())?,Mode::OwnerRecovery {..}|Mode::OwnerSuccessor {..}=>unreachable!("recovery retains the original unstarted request"),}
                 resolved=Some(ReconciliationRun::KnownUnstarted);
             }
             NativeTransferState::Aborted=>{
                 // The actual claim that created a forward metadata intent
                 // cannot acknowledge its own abort as a successor generation.
-                if matches!(mode,Mode::OwnerRecovery {lease,..} if lease.generation()==pending.request().destination.owner.lease_generation) {return Ok(());}
-                match mode {Mode::Lease {lease,binding}=>locked.acknowledge_native_aborted(lease,binding,pending,proof,clock())?,Mode::Terminal(terminal)=>locked.acknowledge_terminal_native_aborted(terminal,pending,proof,clock())?,Mode::OwnerRecovery {lease,authorization}=>locked.acknowledge_owner_recovery_native_aborted(lease,authorization,pending,proof,clock())?,}
+                if matches!(mode,Mode::OwnerSuccessor {..}) || matches!(mode,Mode::OwnerRecovery {lease,..} if lease.generation()==pending.request().destination.owner.lease_generation) {return Ok(());}
+                match mode {Mode::Lease {lease,binding}=>locked.acknowledge_native_aborted(lease,binding,pending,proof,clock())?,Mode::Terminal(terminal)=>locked.acknowledge_terminal_native_aborted(terminal,pending,proof,clock())?,Mode::OwnerRecovery {lease,authorization}=>locked.acknowledge_owner_recovery_native_aborted(lease,authorization,pending,proof,clock())?,Mode::OwnerSuccessor {..}=>unreachable!("successor retains its aborted request"),}
                 if let Mode::OwnerRecovery {lease,authorization}=mode {
                     locked.record_owner_recovery_abort_blocked(lease,authorization,pending,clock())?;
                 }
@@ -79,7 +81,7 @@ pub(crate) fn run(store:&Arc<Mutex<WorkflowStore>>,mode:Mode<'_>,pending:&Pendin
             }
             NativeTransferState::Completed=>{
                 let verified=pending.verified_inspected_receipt(proof)?;
-                let settled=match mode {Mode::Lease {lease,binding}=>locked.settle_native_handoff(lease,binding,&verified,clock())?,Mode::Terminal(terminal)=>locked.settle_terminal_native_handoff(terminal,&verified,clock())?,Mode::OwnerRecovery {lease,authorization}=>locked.settle_owner_recovery_native_handoff(lease,authorization,&verified,clock())?,};
+                let settled=match mode {Mode::Lease {lease,binding}=>locked.settle_native_handoff(lease,binding,&verified,clock())?,Mode::Terminal(terminal)=>locked.settle_terminal_native_handoff(terminal,&verified,clock())?,Mode::OwnerRecovery {lease,authorization}=>locked.settle_owner_recovery_native_handoff(lease,authorization,&verified,clock())?,Mode::OwnerSuccessor {setup,authorization}=>locked.settle_owner_successor_native_handoff(setup,authorization,&verified,clock())?,};
                 resolved=Some(ReconciliationRun::Settled(settled));
             }
             NativeTransferState::Prepared=>{},
@@ -94,7 +96,7 @@ pub(crate) fn run(store:&Arc<Mutex<WorkflowStore>>,mode:Mode<'_>,pending:&Pendin
     let replay_current=||->std::result::Result<(),TransferFenceError> {
         let mut locked=store.lock().map_err(|_|TransferFenceError::Unavailable)?;
         (match mode {Mode::Lease {lease,binding}=>locked.native_handoff_replay_is_current(lease,binding,pending,clock()),
-            Mode::OwnerRecovery {lease,authorization}=>locked.owner_recovery_transfer_replay_is_current(lease,authorization,pending,clock()),Mode::Terminal(_)=>Err(anyhow::anyhow!(TransferReason::AuthorityConflict))}).map_err(|error|if error.downcast_ref::<rusqlite::Error>().is_some(){TransferFenceError::Unavailable}else{TransferFenceError::NotCurrent})
+            Mode::OwnerRecovery {lease,authorization}=>locked.owner_recovery_transfer_replay_is_current(lease,authorization,pending,clock()),Mode::OwnerSuccessor {setup,authorization}=>locked.owner_successor_transfer_replay_is_current(setup,authorization,pending,clock()),Mode::Terminal(_)=>Err(anyhow::anyhow!(TransferReason::AuthorityConflict))}).map_err(|error|if error.downcast_ref::<rusqlite::Error>().is_some(){TransferFenceError::Unavailable}else{TransferFenceError::NotCurrent})
     };
     // This can only replay the supplied immutable request, under current selected
     // policy fences. Changed/missing audits or selection retain that same UUID.
@@ -103,7 +105,7 @@ pub(crate) fn run(store:&Arc<Mutex<WorkflowStore>>,mode:Mode<'_>,pending:&Pendin
         match pending.verified_receipt(&current) {
             Ok(Some(proof))=>{
                 let result=(||->Result<HandoffSettlement> {let mut locked=store.lock().map_err(|_|anyhow::anyhow!(TransferReason::PersistRetry))?;match mode {Mode::Lease {lease,binding}=>locked.settle_native_handoff(lease,binding,&proof,clock()),
-                    Mode::OwnerRecovery {lease,authorization}=>locked.settle_owner_recovery_native_handoff(lease,authorization,&proof,clock()),Mode::Terminal(_)=>anyhow::bail!(TransferReason::AuthorityConflict)}})();
+                    Mode::OwnerRecovery {lease,authorization}=>locked.settle_owner_recovery_native_handoff(lease,authorization,&proof,clock()),Mode::OwnerSuccessor {setup,authorization}=>locked.settle_owner_successor_native_handoff(setup,authorization,&proof,clock()),Mode::Terminal(_)=>anyhow::bail!(TransferReason::AuthorityConflict)}})();
                 return Ok(match result {Ok(settled)=>ReconciliationRun::Settled(settled),Err(_)=>retained(Some(NativeTransferState::Completed),TransferReason::PersistRetry,Some(outcome))});
             }
             Ok(None)=>return Ok(retained(None,outcome_reason(&outcome),Some(outcome))),

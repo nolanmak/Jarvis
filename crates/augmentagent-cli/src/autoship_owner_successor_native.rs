@@ -10,12 +10,12 @@ fn original(conn:&Connection,setup:&SuccessorSetup)->Result<Original> {
     ensure!(reference==setup.record.recovery,"successor original recovery changed");
     Ok(claim.original)
 }
-fn facts(conn:&Connection,setup:&SuccessorSetup,now:i64)->Result<OwnerPublicationNativeFacts> {
+pub(super) fn facts(conn:&Connection,setup:&SuccessorSetup,now:i64)->Result<OwnerPublicationNativeFacts> {
     require_current_setup(conn,setup,now)?;
     let original=original(conn,setup)?;
     let (record,_)=native_intent::original_record(conn,&original)?;
     record.validate_completed_canonical_files(&native_intent::completed(conn,&original)?)?;
-    let namespace=native_intent::frontier(conn,&original)?;
+    let namespace=super::transfer::frontier(conn,setup)?;
     let context=RecoveryNativeContext {conn,workflow:&original.workflow,binding:record.recovery_binding().clone(),namespace};
     let facts=crate::autoship_workflow::native_handoff::read_recovery_metadata_facts(&context)?;
     require_current_setup(conn,setup,now)?;
@@ -47,7 +47,7 @@ impl<'setup> SuccessorPreparationRead<'_,'setup> {
         ensure!(proof.namespace()==&self.namespace && proof.binding()==&self.binding,"successor preparation native proof changed");
         let original=original(self.conn,self.setup)?;
         let (record,_)=native_intent::original_record(self.conn,&original)?;
-        ensure!(native_intent::frontier(self.conn,&original)?==self.namespace,"successor preparation original frontier changed");
+        ensure!(super::transfer::frontier(self.conn,self.setup)?==self.namespace,"successor preparation original frontier changed");
         record.validate_native_binding(&self.binding)?;
         record.validate_completed_canonical_files(&native_intent::completed(self.conn,&original)?)?;
         let (context,generation,preparation,_)=record.recovery_identity()?;

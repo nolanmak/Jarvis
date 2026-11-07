@@ -13,7 +13,7 @@ mod successor_ready;
 pub(crate) use successor_ready::ReadySettlement;
 #[path="autoship_owner_successor_claim.rs"]
 mod successor_claim;
-pub(crate) use successor_claim::{SuccessorPlan,SuccessorSetup,SuccessorPreparationRead,successor_native_metadata_fence};
+pub(crate) use successor_claim::{SuccessorPlan,SuccessorSetup,SuccessorPreparationRead,successor_native_metadata_fence,SuccessorNativePersistence,SuccessorNativeSnapshotContext};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -912,8 +912,14 @@ fn capture_recovery_snapshot_tx(tx:&Transaction<'_>,lease:&RecoveryLease,
     Ok(snapshot)
 }
 
-pub(super) fn require_ordinary_native_transfer(conn:&Connection,pending:&PendingNativeHandoff)->Result<()> {native_intent::require_ordinary(conn,pending)}
-pub(super) fn require_terminal_native_transfer(conn:&Connection,pending:&PendingNativeHandoff)->Result<()> {native_intent::require_terminal(conn,pending)}
+pub(super) fn require_ordinary_native_transfer(conn:&Connection,pending:&PendingNativeHandoff)->Result<()> {
+    successor_claim::require_no_setup_dispatch(conn,&pending.request().workflow_id,pending.request().destination.owner.lease_generation)?;
+    native_intent::require_ordinary(conn,pending)
+}
+pub(super) fn require_terminal_native_transfer(conn:&Connection,pending:&PendingNativeHandoff)->Result<()> {
+    successor_claim::require_terminal_transfer(conn,pending)?;native_intent::require_terminal(conn,pending)
+}
+pub(super) fn require_successor_transfer_context(conn:&Connection,setup:&SuccessorSetup,authorization:&crate::self_improve::targeted::AuthorizedOwnerSuccessor<'_>,pending:&PendingNativeHandoff,now:i64)->Result<()> {successor_claim::require_transfer_context(conn,setup,authorization,pending,now)}
 
 #[cfg(test)]
 pub(crate) fn test_ready_encoding(raw:&str)->Result<String> {successor_ready::fixture_encoding(raw)}
