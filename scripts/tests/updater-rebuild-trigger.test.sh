@@ -31,6 +31,9 @@ TEST_ONLY_EMBEDS=(
   scripts/tests/ci_cargo_namespace_sequence_test.py
   scripts/tests/ci_cargo_namespace_test.py
   scripts/tests/ci_cargo_parent_signals_test.py
+  scripts/tests/ci_cargo_status_handoff_test.py
+  scripts/tests/ci_cargo_status_prepare_test.py
+  scripts/tests/ci_cargo_status_proxy_test.py
   scripts/tests/ci_cargo_transfer_objects_test.py
   scripts/tests/ci_cargo_transfer_test.py
   docs/fixtures/whatsapp/wire-v1.ndjson
