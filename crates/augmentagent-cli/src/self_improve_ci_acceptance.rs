@@ -471,7 +471,7 @@ fn native_unit_policy_covers_real_namespace_async_io_and_thread_syscalls() {
         .env("AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY",library).output().unwrap();
     let diagnostics=String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(),"native unit policy failed: {diagnostics}");
-    assert!(diagnostics.contains("Ran 12 tests") && !diagnostics.contains("skipped"),"unit policy cases did not execute: {diagnostics}");
+    assert!(diagnostics.contains("Ran 14 tests") && !diagnostics.contains("skipped"),"unit policy cases did not execute: {diagnostics}");
     assert!(std::process::Command::new("/usr/bin/true").status().unwrap().success(),"child policy affected the Rust parent");
 }
 
@@ -882,7 +882,7 @@ async fn live_shared_ci_native_unit_policy()->Result<()> {
 import json,shutil,signal,subprocess,sys
 shutil.copyfile('/workspace/native.so','/workspace/target/native.so')
 results={}
-for mode in ('namespace','async','clone','fork','exec','threads','x32','cross-memory','cross-memory-listener'):
+for mode in ('namespace','async','clone','fork','exec','threads','x32','cross-memory','cross-memory-listener','pidfd-copy','pidfd-copy-listener'):
  result=subprocess.run([sys.executable,'-I','/workspace/cases.py','/workspace/target/native.so',mode],capture_output=True,text=True,timeout=15)
  expected=-signal.SIGSYS if mode=='x32' else 0
  results[mode]={'exit_code':result.returncode,'stdout':result.stdout,'stderr':result.stderr}
@@ -892,6 +892,11 @@ for mode in ('namespace','async','clone','fork','exec','threads','x32','cross-me
   assert row['pre_policy_remote_write_bytes']==8 and row['pre_policy_attach']
   assert row['post_policy_remote_write_errno']==1 and row['post_policy_attach_errno']==1
   assert row['post_policy_remote_read_bytes']==8 and row['victim_bytes_unchanged'] and row['victim_reaped']
+  assert row['full_ci_pass'] is False and row['shipping_authority'] is False
+ elif mode.startswith('pidfd-copy'):
+  row=json.loads(result.stdout);results[mode]['observation']=row
+  assert all(row[flag] is True for flag in ('pre_policy_fd_copy','same_socket_cookie','pre_policy_shared_flags_verified','retained_alias_usable_after_policy','post_policy_shared_flags_verified','victim_reaped'))
+  assert row['post_policy_fd_copy_errno']==1 and row['descriptor_ingress_complete'] is False
   assert row['full_ci_pass'] is False and row['shipping_authority'] is False
  elif mode!='x32':assert result.stdout=='GUARDED\n',results[mode]
 print(json.dumps(results))
@@ -903,7 +908,7 @@ PY"#;
         "version":1,"kind":"real_shared_ci_native_unit_policy","head":head,"generation":source.generation(),
         "status":result.status,"cases":cases,"actual_vm_commands":1,"input_closure_complete":false,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
-    ensure!(result.status=="passed" && cases.as_object().is_some_and(|cases|cases.len()==9),
+    ensure!(result.status=="passed" && cases.as_object().is_some_and(|cases|cases.len()==11),
         "native unit policy unavailable: {} {}",result.stdout,result.stderr);
     Ok(())
 }

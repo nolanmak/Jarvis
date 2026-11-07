@@ -126,6 +126,23 @@ class NativeUnitPolicyTests(unittest.TestCase):
     def test_original_listener_guard_blocks_real_foreign_memory_writers(self):
         self.assert_cross_memory('cross-memory-listener')
 
+    def assert_fd_copy(self,mode):
+        result=self.run_mode(mode)
+        self.assertEqual(result.returncode,0,result.stderr)
+        row=json.loads(result.stdout)
+        for flag in ('pre_policy_fd_copy','same_socket_cookie','pre_policy_shared_flags_verified',
+                     'retained_alias_usable_after_policy','post_policy_shared_flags_verified','victim_reaped'):
+            self.assertTrue(row[flag],flag)
+        self.assertEqual(row['post_policy_fd_copy_errno'],1)
+        self.assertFalse(row['descriptor_ingress_complete'])
+        self.assertFalse(row['full_ci_pass']);self.assertFalse(row['shipping_authority'])
+
+    def test_standalone_guard_blocks_foreign_fd_copy_but_does_not_revoke_existing_alias(self):
+        self.assert_fd_copy('pidfd-copy')
+
+    def test_original_listener_guard_blocks_foreign_fd_copy_but_does_not_revoke_existing_alias(self):
+        self.assert_fd_copy('pidfd-copy-listener')
+
     def test_x32_cannot_alias_native_syscall_numbers(self):
         result = self.run_mode('x32')
         self.assertEqual(result.returncode, 128 + signal.SIGSYS, result.stderr)

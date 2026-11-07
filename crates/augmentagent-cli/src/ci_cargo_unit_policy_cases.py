@@ -81,6 +81,62 @@ def cross_memory(listener):
         'full_ci_pass':False,'shipping_authority':False}))
 
 
+def pidfd_copy(listener):
+    import fcntl,socket
+    server,client=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET)
+    commands=os.pipe();responses=os.pipe();target=client.fileno()
+    child=os.fork()
+    if not child:
+        server.close();os.close(commands[1]);os.close(responses[0])
+        os.write(responses[1],client.getsockopt(socket.SOL_SOCKET,57,8))
+        assert os.read(commands[0],1)==b'1'
+        assert fcntl.fcntl(target,fcntl.F_GETFL)&os.O_NONBLOCK
+        fcntl.fcntl(target,fcntl.F_SETFL,fcntl.fcntl(target,fcntl.F_GETFL)&~os.O_NONBLOCK)
+        os.write(responses[1],b'R')
+        assert os.read(commands[0],1)==b'2'
+        assert fcntl.fcntl(target,fcntl.F_GETFL)&os.O_NONBLOCK
+        os._exit(0)
+    client.close();os.close(commands[0]);os.close(responses[1]);pidfd=os.pidfd_open(child)
+    duplicate=None;descriptor=None;reaped=False
+    try:
+        cookie=os.read(responses[0],8);assert len(cookie)==8
+        before_fd=libc.syscall(438,pidfd,target,0)
+        assert before_fd>=0,('valid pre-policy pidfd_getfd',ctypes.get_errno())
+        duplicate=socket.socket(fileno=before_fd)
+        assert duplicate.getsockopt(socket.SOL_SOCKET,57,8)==cookie
+        duplicate.sendall(b'copied-before');assert server.recv(32)==b'copied-before'
+        duplicate.setblocking(False);os.write(commands[1],b'1')
+        assert os.read(responses[0],1)==b'R'
+        assert not fcntl.fcntl(duplicate.fileno(),fcntl.F_GETFL)&os.O_NONBLOCK
+        descriptor=library.jarvis_ci_exec_listener() if listener else library.jarvis_ci_restrict_unit()
+        assert descriptor>=0 and (listener or descriptor==0)
+        ctypes.set_errno(0);new_fd=libc.syscall(438,pidfd,target,0);failure=ctypes.get_errno()
+        if new_fd>=0:os.close(new_fd)
+        assert new_fd==-1 and failure==errno.EPERM,('post-policy fd copy',new_fd,failure)
+        # A syscall guard cannot revoke an already-issued file description.
+        duplicate.setblocking(False)
+        duplicate.sendall(b'retained-after');assert server.recv(32)==b'retained-after'
+        os.write(commands[1],b'2');assert os.waitpid(child,0)==(child,0);reaped=True
+        print(json.dumps({'mode':mode,'pre_policy_fd_copy':True,'same_socket_cookie':True,
+            'pre_policy_shared_flags_verified':True,'post_policy_fd_copy_errno':failure,
+            'retained_alias_usable_after_policy':True,'post_policy_shared_flags_verified':True,
+            'victim_reaped':True,'descriptor_ingress_complete':False,
+            'full_ci_pass':False,'shipping_authority':False}))
+    finally:
+        if not reaped:
+            try:os.kill(child,signal.SIGKILL)
+            except ProcessLookupError:pass
+            os.waitpid(child,0)
+        if duplicate is not None:duplicate.close()
+        if listener and descriptor is not None and descriptor>=0:os.close(descriptor)
+        os.close(pidfd);os.close(commands[1]);os.close(responses[0]);server.close()
+
+
+if mode in ('pidfd-copy','pidfd-copy-listener'):
+    pidfd_copy(mode=='pidfd-copy-listener')
+    raise SystemExit(0)
+
+
 if mode in ('cross-memory','cross-memory-listener'):
     cross_memory(mode=='cross-memory-listener')
     raise SystemExit(0)
@@ -96,6 +152,7 @@ def existing_thread():
     release.wait()
     try:
         denied(208, 0, 0, 0, 0, 0)  # io_getevents, also checks TSYNC.
+        denied(438,-1,0,0)
         denied(311,os.getpid(),0,0,0,0,ctypes.c_ulong(0))
         denied(435, 0, 0, expected=errno.ENOSYS)
     except BaseException as error:
@@ -126,12 +183,15 @@ elif mode == 'fork':
     child = os.fork()
     if child == 0:
         denied(208, 0, 0, 0, 0, 0)
+        denied(438,-1,0,0)
         os._exit(0)
     assert os.waitpid(child, 0)[1] == 0
 elif mode == 'exec':
     # The first ordinary exec is allowed; the kernel policy survives exec.
     program = ('import ctypes,errno; l=ctypes.CDLL(None,use_errno=True); '
                'assert l.syscall(208,0,0,0,0,0)==-1; '
+               'assert ctypes.get_errno()==errno.EPERM; '
+               'assert l.syscall(438,-1,0,0)==-1; '
                'assert ctypes.get_errno()==errno.EPERM; print("GUARDED")')
     os.execve(sys.executable, [sys.executable, '-I', '-c', program], {})
 elif mode == 'threads':

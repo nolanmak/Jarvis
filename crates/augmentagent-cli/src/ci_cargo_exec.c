@@ -79,6 +79,9 @@ static int jarvis_ci_install_unit_policy(int listener) {
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
         DENY_CALL(SYS_process_vm_writev),
         DENY_CALL(SYS_process_madvise),
+        /* Prevent new foreign file-description aliases. Existing aliases must
+         * still be excluded by the controller's descriptor admission census. */
+        DENY_CALL(SYS_pidfd_getfd),
         DENY_CALL(SYS_unshare),
         DENY_CALL(SYS_setns),
         DENY_CALL(SYS_mount),

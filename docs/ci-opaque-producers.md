@@ -661,6 +661,36 @@ bulk Rust run). See [bounded proc-writer evidence](ci-proc-memory-writer-proof.j
 Do not rerun the unchanged compiler fixture
 merely to restate its vfork refusal before a relevant admission change exists.
 
+#### Foreign descriptor-copy guard (bounded prerequisite)
+
+Decision: the common native unit policy denies `pidfd_getfd` with EPERM in both
+standalone TSYNC installation and the original combined exec listener. Trusted
+root controllers remain outside that filter. The reason is concrete: copying
+another process's open file description can import a socket or writable object
+without reopening its pathname. Readonly proc mounts do not close this route.
+The policy is inherited by fork/exec and synchronizes existing threads; it is
+installed at the existing trusted bootstrap boundary before untrusted execution.
+
+The regression first creates a live child holding a seqpacket socket and closes
+the parent's inherited client endpoint. A valid pre-policy `pidfd_getfd` must
+succeed, match the child's actual socket cookie, send real bytes and demonstrate
+shared open-file-description flags by changing O_NONBLOCK across both processes.
+The same valid acquisition after policy installation must fail with EPERM. Both
+policy paths require the positive control; an unsupported or already-refused
+control fails the test, rather than skipping it. Existing/new thread, fork and
+exec cases also require syscall denial. Original child reaping remains required.
+
+This guard does not revoke earlier acquisitions. The regression intentionally
+keeps its pre-policy duplicate, sends real bytes and verifies shared flags again
+after installation. `descriptor_ingress_complete`, full-CI and shipping authority
+remain false. Inherited FDs, socket rights, alternate acquisition paths, aliases,
+shared mappings and asynchronous writers still require complete C input/writer
+proof joined to R's original cohort enrollment and retirement. C/R must establish
+that closure before any runtime vfork/status handoff is admitted; that remains a
+load-bearing open thread, not a grant supplied by this syscall guard. The carrying
+cost here is one common filter entry and mandatory host/guest cases; no new
+admission schema, budget or authority is introduced.
+
 #### Worker/planner private proc views (C/R integration in progress)
 
 Decision: protect repository workers, their admitted worker children and Cargo
