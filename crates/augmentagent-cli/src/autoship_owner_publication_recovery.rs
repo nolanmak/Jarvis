@@ -902,3 +902,6 @@ fn capture_recovery_snapshot_tx(tx:&Transaction<'_>,lease:&RecoveryLease,
 
 pub(super) fn require_ordinary_native_transfer(conn:&Connection,pending:&PendingNativeHandoff)->Result<()> {native_intent::require_ordinary(conn,pending)}
 pub(super) fn require_terminal_native_transfer(conn:&Connection,pending:&PendingNativeHandoff)->Result<()> {native_intent::require_terminal(conn,pending)}
+
+#[cfg(test)]
+pub(crate) fn test_ready_encoding(raw:&str)->Result<String> {successor_ready::fixture_encoding(raw)}

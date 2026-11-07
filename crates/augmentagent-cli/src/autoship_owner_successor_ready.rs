@@ -112,3 +112,8 @@ impl WorkflowStore {
         ensure!(valid,"owner readiness settled projection changed");Ok(())
     }
 }
+
+#[cfg(test)]
+pub(super) fn fixture_encoding(raw:&str)->Result<String> {
+    let record:Record=serde_json::from_str(raw)?;Ok(serde_json::to_string(&record)?)
+}
