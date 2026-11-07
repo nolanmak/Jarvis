@@ -25,7 +25,7 @@ class StatusHandoffTests(unittest.TestCase):
                 capture_output=True,text=True,timeout=18,
                 env={k:v for k,v in os.environ.items() if k in ('HOME','PATH','LANG','LC_ALL')})
             self.assertEqual(r.returncode,0,r.stderr)
-            lines=r.stdout.splitlines();actual=mode in ('finish','signal','cancel-after-start')
+            lines=r.stdout.splitlines();actual=mode in ('finish','fd-finish','signal','cancel-after-start')
             self.assertEqual(lines[:-1],['DELEGATED_TOOL_OUTPUT'] if actual else [])
             row=json.loads(lines[-1]);self.assertTrue(row['original_cleanup'])
             self.assertFalse(row['root_role_admission_proved']);self.assertFalse(row['production_native_handoff'])
@@ -45,6 +45,7 @@ class StatusHandoffTests(unittest.TestCase):
             self.assertEqual(receipt.read_text(),'all-descendants-reaped\n')
 
     def test_real_vfork_releases_parent_and_returns_actual_delegated_exit(self):self.run_case('finish')
+    def test_real_vfork_descriptor_exec_releases_parent_and_returns_delegated_exit(self):self.run_case('fd-finish')
     def test_proxy_signal_reaches_actual_tool_and_native_parent_wait(self):self.run_case('signal')
     def test_cancellation_after_tool_start_retains_original_cleanup(self):self.run_case('cancel-after-start')
     def test_wrong_image_never_launches_a_tool(self):self.run_case('wrong-image')

@@ -572,7 +572,7 @@ fn native_v3_status_preparation_and_handoff_preserve_cleanup_and_filter_refusal(
         let path=directory.path().join(name);std::fs::write(&path,bytes).unwrap();
         std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    for (file,count) in [("ci_cargo_status_prepare_test.py",3),("ci_cargo_status_handoff_test.py",8)] {
+    for (file,count) in [("ci_cargo_status_prepare_test.py",6),("ci_cargo_status_handoff_test.py",9)] {
         let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests").join(file);
         let output=std::process::Command::new("python3").arg("-I").arg(tests)
             .env("AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY",directory.path().join("native.so")).output().unwrap();
@@ -764,7 +764,7 @@ record={'run':result.testsRun,'failed':len(result.failures),'errors':len(result.
  'successful':result.wasSuccessful(),'client_uid':os.getuid(),'client_gid':os.getgid(),
  'asset_sha256':{name:hashlib.sha256(pathlib.Path('/workspace/target/'+name).read_bytes()).hexdigest() for name in assets},
  'root_role_admission_proved':False,'production_native_handoff':False,'full_ci_pass':False,'shipping_authority':False}
-assert record['run']==11 and record['skipped']==0 and record['successful'],diagnostics.getvalue()
+assert record['run']==15 and record['skipped']==0 and record['successful'],diagnostics.getvalue()
 print(json.dumps(record))
 PY"#;
     let result=session.run("repository",&source,root,&binding,None,&[],&[],&[],Some(command),
@@ -774,7 +774,7 @@ PY"#;
         "version":1,"kind":"real_shared_ci_v3_status_composition","head":head,"generation":source.generation(),
         "status":result.status,"cases":cases,"actual_vm_commands":1,"input_closure_complete":false,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
-    ensure!(result.status=="passed" && cases["run"]==11 && cases["successful"]==true && cases["skipped"]==0,
+    ensure!(result.status=="passed" && cases["run"]==15 && cases["successful"]==true && cases["skipped"]==0,
         "V3 status composition unavailable: {} {}",result.stdout,result.stderr);
     Ok(())
 }

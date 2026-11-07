@@ -18,4 +18,6 @@ struct jarvis_ci_status_prepared { int config_fd,connection_fd; };
 int jarvis_ci_prepare_status_continuation(int connection,int64_t deadline,struct jarvis_ci_status_prepared *result);
 void jarvis_ci_close_status_continuation(struct jarvis_ci_status_prepared *prepared);
 int jarvis_ci_exec_status_proxy(const char *image,int connection,int64_t deadline);
+/* Borrow a sealed anonymous executable FD; no pathname fallback or admission. */
+int jarvis_ci_exec_status_proxy_fd(int image,int connection,int64_t deadline);
 #endif

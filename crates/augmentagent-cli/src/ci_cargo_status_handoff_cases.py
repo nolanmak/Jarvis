@@ -70,9 +70,11 @@ def main(args):
     os.write(extra_w,b'+')
     observations={'tool_calls':0,'tool_exec_observed':False,'tool_cleanup':False,'root_role_admission_proved':False}
     process_holder=[]
+    captured_image=None
     with tempfile.TemporaryDirectory(prefix='v3-combined-tool-') as directory:
         tool_receipt=Path(directory)/'cleanup'
         def inspect(child):
+            if mode=='fd-finish':assert not Path(f'/proc/{child}/fd/{gate.proxy_fd}').exists()
             cmdline=Path(f'/proc/{child}/cmdline').read_bytes().split(b'\0')
             assert len(cmdline)==3 and cmdline[-1]==b'' and cmdline[1].isdigit()
             assert Path(f'/proc/{child}/environ').read_bytes()==b''
@@ -143,14 +145,19 @@ def main(args):
         gate=(planner.ExecMediation(time.monotonic()+12,os.getuid()) if production else
             kernel.experiment(planner,proxy,gate_mode,ready_r,hold_w,release_r,ready_w,extra_r,
                 inspect_exec=inspect,resume_exec=resume,reject_continuation=mode=='swapped-channel'))
+        if mode=='fd-finish':
+            captured_image=planner.staging.capture_executable(gate.proxy_fd)
+            os.close(gate.proxy_fd);gate.proxy_fd=os.dup(captured_image.fileno())
         def spawned(child):
             gate.spawned(child);client.close();alternate_client.close()
         try:
             target=wrong if mode=='wrong-image' else proxy
+            if mode=='fd-finish':target=str(gate.proxy_fd)
             argv=[sys.executable,'-I',kernel_path,'--launcher',library,str(gate.child_fd),producer,
                 target,str(chosen_fd),str(release_w),str(int(time.monotonic()*1000)+10000),mode,str(ready_w),str(extra_r)]
             raw=supervisor.supervise(receipt,argv,
-                forward_fds=(gate.child_fd,chosen_fd,release_w,ready_w,extra_r),on_spawn=spawned,on_exec=gate.executed,return_raw_status=True)
+                forward_fds=(gate.child_fd,chosen_fd,release_w,ready_w,extra_r)+((gate.proxy_fd,) if mode=='fd-finish' else ()),
+                on_spawn=spawned,on_exec=gate.executed,return_raw_status=True)
             gate.settle()
             assert not gate.errors,gate.errors
             assert raw==(112 if production else 0),('parent outcome',raw)
@@ -175,13 +182,14 @@ def main(args):
                 try:gate.check()
                 except planner.FreshnessHold as hold:assert hold.reason=='input_census_unknown'
                 else:raise AssertionError('test composition leaked a source verdict')
-            assert observations['tool_calls']==(1 if mode in ('finish','signal','cancel-after-start') else 0)
+            assert observations['tool_calls']==(1 if mode in ('finish','fd-finish','signal','cancel-after-start') else 0)
             assert Path(receipt).read_bytes()==b'all-descendants-reaped\n'
             print(json.dumps(dict(result,**observations,mode=mode,original_cleanup=True,conformance_only=True,
                 production_native_handoff=False,full_ci_pass=False,shipping_authority=False)))
         finally:
             gate.close()
             if not production:os.close(gate.proxy_fd)
+            if captured_image is not None:captured_image.close()
             for sock in (server,client,alternate_server,alternate_client):sock.close()
             for pair in pipes:
                 for fd in pair:os.close(fd)

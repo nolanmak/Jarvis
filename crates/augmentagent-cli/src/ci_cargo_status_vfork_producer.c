@@ -14,6 +14,8 @@ int main(int argc,char **argv) {
     if (argc!=8) return 110;
     int connection=atoi(argv[2]),release=atoi(argv[3]),cloexec=atoi(argv[6]);
     int64_t deadline=strtoll(argv[4],NULL,10);
+    int image_fd=!strcmp(argv[5],"fd-finish") ? atoi(argv[1]) : -1;
+    if (image_fd>=0 && (image_fd<3 || fcntl(image_fd,F_SETFD,FD_CLOEXEC)<0)) return 122;
     if (connection<3 || release<3 || cloexec<3 || atoi(argv[7])<3
             || fcntl(connection,F_SETFD,FD_CLOEXEC)<0 || fcntl(release,F_SETFD,FD_CLOEXEC)<0
             || fcntl(cloexec,F_SETFD,FD_CLOEXEC)<0) return 111;
@@ -25,7 +27,8 @@ int main(int argc,char **argv) {
     if (child<0) return 112;
     if (!child) {
         shared=41;
-        jarvis_ci_exec_status_proxy(argv[1],connection,deadline);
+        if (image_fd>=0) jarvis_ci_exec_status_proxy_fd(image_fd,connection,deadline);
+        else jarvis_ci_exec_status_proxy(argv[1],connection,deadline);
         _exit((errno==EPERM || errno==ENOSYS) ? 93 : 94);
     }
     int32_t entered[]={0x4a415256,parent,(int32_t)child,shared};

@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
 #include <time.h>
@@ -75,9 +76,8 @@ failed:
     jarvis_ci_close_status_continuation(result);return -1;
 }
 
-__attribute__((visibility("default"))) int jarvis_ci_exec_status_proxy(const char *image,int connection,int64_t deadline) {
+static int exec_status_proxy(const char *image,int image_fd,int connection,int64_t deadline) {
     int original_errno=errno;
-    if (!image || !*image) {errno=EINVAL;return -1;}
     sigset_t blocked,original_mask;
     sigfillset(&blocked);
     if (sigprocmask(SIG_SETMASK,&blocked,&original_mask)<0) return -1;
@@ -89,10 +89,35 @@ __attribute__((visibility("default"))) int jarvis_ci_exec_status_proxy(const cha
     number[count]=0;
     char *arguments[]={(char *)image,number,NULL};char *environment[]={NULL};
     errno=original_errno;
-    syscall(SYS_execve,image,arguments,environment);
+    if (image_fd>=0) syscall(SYS_execveat,image_fd,"",arguments,environment,AT_EMPTY_PATH);
+    else syscall(SYS_execve,image,arguments,environment);
     jarvis_ci_close_status_continuation(&prepared);
 failed:;
     int saved=errno;
     if (sigprocmask(SIG_SETMASK,&original_mask,NULL)<0) return -1;
     errno=saved;return -1;
+}
+
+__attribute__((visibility("default"))) int jarvis_ci_exec_status_proxy(const char *image,int connection,int64_t deadline) {
+    if (!image || !*image) {errno=EINVAL;return -1;}
+    return exec_status_proxy(image,-1,connection,deadline);
+}
+
+__attribute__((visibility("default"))) int jarvis_ci_exec_status_proxy_fd(int image,int connection,int64_t deadline) {
+    int original_errno=errno;
+    if (image<3 || image>65535 || image==connection) {errno=EINVAL;return -1;}
+    struct stat info;
+    int flags=fcntl(image,F_GETFD),seals=fcntl(image,F_GET_SEALS);
+    /* Shape checks only. The original root operation must still authenticate
+     * this exact image and request before allowing the kernel notification.
+     * The borrowed FD is never closed or changed, including on failed exec. */
+    if (fstat(image,&info)<0) return -1;
+    if (!S_ISREG(info.st_mode) || info.st_nlink!=0 || (info.st_mode&07777)!=0555
+            || (info.st_uid!=0 && info.st_uid!=geteuid()) || info.st_size<64
+            || info.st_size>2*1024*1024 || flags<0 || !(flags&FD_CLOEXEC)
+            || seals<0 || (seals&(JARVIS_STATUS_SEALS|0x20))!=(JARVIS_STATUS_SEALS|0x20)) {
+        errno=EPERM;return -1;
+    }
+    errno=original_errno;
+    return exec_status_proxy("ci-cargo-status-proxy",image,connection,deadline);
 }
