@@ -40,6 +40,7 @@ impl WorkflowStore {
             WHERE json_extract(checkpoint,'$.next.reason')='resource_capacity'
             AND json_extract(checkpoint,'$.next.action')='await_capacity'
             AND json_extract(checkpoint,'$.stage') NOT IN ('held','retired','merged','merge')
+            AND NOT EXISTS(SELECT 1 FROM workflow_owner_control c WHERE c.workflow=workflow.id AND c.paused=1)
             AND id NOT LIKE 'autoship-observation/%' AND id NOT LIKE 'autoship-canary/%'",
             [],|row|row.get(0))?)
     }
@@ -141,6 +142,19 @@ mod tests {
         let mut cp=before.unwrap().checkpoint;cp.stage=Stage::Held;
         store.checkpoint(&lease,&cp,32).unwrap();
         assert_eq!(reader.capacity_wait_count().unwrap(),0);
+    }
+    #[test]
+    fn capacity_health_excludes_owner_pauses_and_reappears_after_resume() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        store.defer_run_capacity(&lease,Some(&"a".repeat(64)),30).unwrap();
+        let checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        store.set_owner_pause(&lease.workflow,"github:owner",0,true,31).unwrap();
+        assert_eq!(store.capacity_wait_count().unwrap(),0,"owner pause was reported as an active capacity blocker");
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint,checkpoint);
+        store.set_owner_pause(&lease.workflow,"github:owner",1,false,32).unwrap();
+        assert_eq!(store.capacity_wait_count().unwrap(),1);
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint,checkpoint);
     }
     fn setup(path:&Path)->(WorkflowStore,Lease) {
         let mut store=WorkflowStore::open(path).unwrap();

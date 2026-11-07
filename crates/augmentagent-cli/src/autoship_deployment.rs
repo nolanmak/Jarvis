@@ -15,6 +15,32 @@ fn command() -> tokio::process::Command {
     command
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerStoreConfiguration {
+    cwd:PathBuf,workflow_db:Option<String>,state_home:Option<String>,home:Option<String>,
+}
+fn resolve_worker_store(config:WorkerStoreConfiguration)->Result<PathBuf> {
+    anyhow::ensure!(config.cwd.is_absolute(),"worker cwd unavailable");
+    let path=if let Some(path)=config.workflow_db {
+        anyhow::ensure!(!path.is_empty(),"worker workflow store override is empty");PathBuf::from(path)
+    } else {
+        augmentagent_channel_core::state_dir::resolve(config.state_home.map(Into::into),config.home.map(Into::into))
+            .unwrap_or_else(||PathBuf::from(".local/state/augmentagent")).join("autopr-workflow.sqlite3")
+    };
+    Ok(if path.is_absolute() {path}else {config.cwd.join(path)})
+}
+/// Read the actual worker's private effective-configuration receipt. No native
+/// admission, environment mutation, provider probe or workflow-store write.
+pub fn worker_workflow_store()->Result<PathBuf> {
+    if !cfg!(target_os="linux") {return Ok(crate::autoship_workflow::default_path());}
+    let output=std::process::Command::new("/usr/bin/python3")
+        .args(["-I","-c",HELPER,"--workflow-store","--receipts"]).arg(receipts()?)
+        .stdin(Stdio::null()).output()?;
+    anyhow::ensure!(output.status.success() && output.stdout.len()<=16384,"worker workflow store configuration unavailable");
+    resolve_worker_store(serde_json::from_slice(&output.stdout).context("worker workflow store configuration invalid")?)
+}
+
 pub async fn record(role: &str, dry_run: bool, external: bool) -> Result<()> {
     if !cfg!(target_os = "linux") {
         return Ok(());
@@ -134,6 +160,16 @@ pub async fn inspect(repo: &Path) -> Report {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_store_resolution_uses_worker_override_cwd_and_state_configuration() {
+        let config=|workflow_db:Option<&str>,state_home:Option<&str>|WorkerStoreConfiguration {
+            cwd:"/worker/cwd".into(),workflow_db:workflow_db.map(str::to_owned),state_home:state_home.map(str::to_owned),home:Some("/worker/home".into())};
+        assert_eq!(resolve_worker_store(config(Some("/worker/db"),None)).unwrap(),PathBuf::from("/worker/db"));
+        assert_eq!(resolve_worker_store(config(Some("relative.db"),Some("/other"))).unwrap(),PathBuf::from("/worker/cwd/relative.db"));
+        assert_eq!(resolve_worker_store(config(None,Some("/worker/state"))).unwrap(),PathBuf::from("/worker/state/augmentagent/autopr-workflow.sqlite3"));
+        assert_eq!(resolve_worker_store(config(None,Some("relative"))).unwrap(),PathBuf::from("/worker/home/.local/state/augmentagent/autopr-workflow.sqlite3"));
+        assert!(resolve_worker_store(config(Some(""),None)).is_err());
+    }
     #[tokio::test]
     async fn startup_receipt_captures_loaded_configuration_without_credentials() {
         const CHILD: &str = "AUTOSHIP_EFFECTIVE_CONFIG_FIXTURE";

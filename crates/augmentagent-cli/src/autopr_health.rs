@@ -965,7 +965,8 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         Err(error) => (None, Some(format!("{error:#}"))),
     };
     let (capacity_waiting_workflows,capacity_observation_error)=match
-        crate::autoship_workflow::WorkflowStore::open_read_only(&crate::autoship_workflow::default_path())
+        crate::autoship_deployment::worker_workflow_store()
+            .and_then(|path|crate::autoship_workflow::WorkflowStore::open_read_only(&path))
             .and_then(|store|store.map(|store|store.capacity_wait_count()).transpose()) {
         Ok(count)=>(count,None),
         Err(error)=>(None,Some(format!("{error:#}"))),
