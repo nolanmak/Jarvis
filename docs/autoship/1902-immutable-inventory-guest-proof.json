@@ -1,0 +1,180 @@
+{
+  "version": 1,
+  "kind": "disposable-ext4-multi-inode-transition-observation",
+  "source_head_before_experiment": "2959c132ef187397bee17dc83b9d16a534d9a636",
+  "source_sha256": {
+    "scripts/tests/native_custody_inventory_guest_probe.py": "643accaa18a6c47cc135d00eee263b380a123a7acda12eaf7d732486891084a3",
+    "scripts/tests/native_custody_immutable_vm_probe.py": "2f4e2647fa4f7212be4d84dbc1f4c3fd5bc6158180474ace0548bdf429a0805e",
+    "scripts/tests/native_custody_immutable_probe.py": "07a529a4ef0db0a62ddaea464040beb91d06021077b7bd49ae3ac27a88b2ffbe"
+  },
+  "managed_runner_build": {
+    "original_handle": 67502,
+    "terminal": true,
+    "exit": 0,
+    "seconds": 86,
+    "log": "/tmp/autoship-inventory-probe-cli-build-20261107.log",
+    "binary_sha256": "05bb5e70049bf31576e4ad39de49b55fe8bac40de8bd0ef54faa29355f8744db"
+  },
+  "red": {
+    "original_handle": 93204,
+    "terminal": true,
+    "manager_exit": 1,
+    "fixture_exit": 3,
+    "inventory_fixture_sha256": "bf7e50427268815cd61986373f8c913c6a75f7c4b20bbb6fb7a3dee497226c94",
+    "vm_driver_sha256": "da4acea5a492c6935c4d0d42a9c44ecb805edb773493f7a56e7680f985df7737",
+    "candidate": "Deliberately minimal experimental candidate set directory/file flags without a final identity/content recensus. This is not a reproduction of an existing production custody implementation; no such implementation exists.",
+    "inventory_transition": {
+      "errors": 0,
+      "failures": 4,
+      "grants_capacity": false,
+      "kind": "inventory_transition",
+      "production_state_changed": false,
+      "skipped": 0,
+      "success": false,
+      "tests_run": 8
+    },
+    "failure_modes": [
+      "new directory entry before fencing accepted",
+      "same bytes on replacement file inode accepted",
+      "replacement directory accepted",
+      "existing writable descriptor changed content between directory and file fences without detection"
+    ]
+  },
+  "green": {
+    "original_handle": 25519,
+    "terminal": true,
+    "manager_exit": 0,
+    "inventory_transition": {
+      "errors": 0,
+      "failures": 0,
+      "grants_capacity": false,
+      "kind": "inventory_transition",
+      "production_state_changed": false,
+      "skipped": 0,
+      "success": true,
+      "tests_run": 10
+    },
+    "observation": {
+      "grants_capacity": false,
+      "observations": [
+        {
+          "case": "directory",
+          "creation": {
+            "denied": true,
+            "errno": 1
+          },
+          "denied": true,
+          "fixture_only": true,
+          "flag_enabled": true,
+          "original_bytes_preserved": true,
+          "removal": {
+            "denied": true,
+            "errno": 1
+          },
+          "supported": true
+        },
+        {
+          "case": "new-open",
+          "denied": true,
+          "errno": 1,
+          "fixture_only": true,
+          "flag_enabled": true,
+          "original_bytes_preserved": true,
+          "supported": true
+        },
+        {
+          "case": "existing-fd",
+          "denied": true,
+          "errno": 1,
+          "fixture_only": true,
+          "flag_enabled": true,
+          "original_bytes_preserved": true,
+          "supported": true
+        },
+        {
+          "case": "existing-mapping",
+          "denied": true,
+          "fixture_only": true,
+          "flag_enabled": true,
+          "original_bytes_preserved": true,
+          "supported": true,
+          "writer_status": 7
+        },
+        {
+          "case": "pending-open",
+          "denied": true,
+          "fixture_only": true,
+          "flag_enabled": true,
+          "original_bytes_preserved": true,
+          "supported": true,
+          "writer_status": 20480
+        }
+      ],
+      "production_state_changed": false,
+      "status": "observed"
+    },
+    "prefaulted_mapping": {
+      "case": "prefaulted-shared-mapping",
+      "denied": true,
+      "fixture_only": true,
+      "flag_enabled": true,
+      "original_bytes_preserved": true,
+      "supported": true,
+      "writer_status": 7
+    },
+    "guest": {
+      "kind": "guest_kernel",
+      "release": "7.0.0-31-generic",
+      "uid": 0
+    },
+    "kernel_image_sha256": "c85962fc9bbccc7f49141800a896f72734ebe16fd175dd46d9b4206556ed0d09",
+    "all_descendants_reaped": true
+  },
+  "cases": [
+    "stable inventory fences both original inodes",
+    "new entry before directory fence refused",
+    "same bytes on replacement inode refused",
+    "replacement directory refused",
+    "existing FD content change after directory fence refused",
+    "directory fence blocks new entries",
+    "full fence blocks preexisting writer and unlink",
+    "partial transition retains flags until explicit fixture cleanup",
+    "content change after first file fence refused by final recensus",
+    "actual inode owner UID1000 without capability cannot clear immutable"
+  ],
+  "observed_algorithm": [
+    "Capture names, device/inode identity, UID/link count/size and content digest plus held original readonly descriptions.",
+    "Set immutable on the held original directory. Recheck its current named identity, exact inventory and every original file description.",
+    "Set immutable on each held original regular file description. Recheck directory identity, inventory, content, held descriptions and all file flags.",
+    "Refuse any mismatch without automatic restriction rollback. Explicit test cleanup restores only its own allocated fixture flags."
+  ],
+  "environment": {
+    "guest_kernel": "7.0.0-31-generic",
+    "guest_uid": 0,
+    "image_bytes": 67108864,
+    "memory_mb": 512,
+    "network": false,
+    "host_mounts_image": false,
+    "host_root_used": false
+  },
+  "log_files": {
+    "red": {
+      "path": "/tmp/autoship-immutable-inventory-red-20261107.log",
+      "sha256": "53c9851b747490cb415f0ed945bb22959c6089333d9d956d9b116f9ad85c5de1"
+    },
+    "green": {
+      "path": "/tmp/autoship-immutable-inventory-green-20261107.log",
+      "sha256": "695818507d3fac529d3a4791c42ad8462ab1fc8e4552e6987a9724df0b7829fd"
+    }
+  },
+  "limits": [
+    "Controlled syscall interleavings, not complete arbitrary writer closure or a privileged host helper implementation. Namespace/inode replacements are controlled between capture and fence; content and post-fence access cases use actual subprocesses and inherited FDs.",
+    "No journal, fsync/crash durability, lost-response recovery, source/input authority, actual-host kernel qualification or all-consumer reservation implementation is established.",
+    "Deliberate mutation cases change their own disposable fixture contents to require refusal; production native bytes, aliases, outcomes, policies and reservations are unchanged.",
+    "Original pending owner-host probe bytes remain unchanged. No native/provider inference or new shipping/model allowance was used."
+  ],
+  "host_kernel_verified": false,
+  "production_state_changed": false,
+  "grants_capacity": false,
+  "implementation_handoff_approved": false
+}

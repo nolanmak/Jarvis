@@ -16,7 +16,8 @@
     "The actual native helper passed a disposable delayed-lock-open test: the write open returned after mode restriction and lease release, but creation of session data failed EACCES. Positive control created its temporary directory. This is a supported helper-path observation, not proof of every writer.",
     "Complete native-provider-vm.py and provider-supervisor.py bytes were found in the saved original producer binary with SHA2567bbdd56d..., matching current helper hashes. This does not establish Rust binary source correspondence or original outcome/closure.",
     "The frozen owner-host immutable probe remains unexecuted on the actual host kernel 7.0.0-30; this session lacks CAP_LINUX_IMMUTABLE and sudo requires the owner password. The pending owner request authorizes disposable tests only, never production fencing.",
-    "A managed disposable no-NIC ext4 guest running kernel 7.0.0-31 with guest UID0 passed six immutable cases: directory create/unlink refusal, new write-open refusal, existing writable-FD refusal, existing shared mapping SIGBUS, an open already waiting on a read-lease break refused after immutable transition, and a prefaulted writable shared mapping SIGBUS. Original fixture bytes survived. Original supervisor confirmed all descendants reaped. The host mounted nothing; no production native state was changed and no reservation was reduced. This is a different kernel and serial fixture evidence, not an actual host or concurrent inventory proof."
+    "A managed disposable no-NIC ext4 guest running kernel 7.0.0-31 with guest UID0 passed six immutable cases: directory create/unlink refusal, new write-open refusal, existing writable-FD refusal, existing shared mapping SIGBUS, an open already waiting on a read-lease break refused after immutable transition, and a prefaulted writable shared mapping SIGBUS. Original fixture bytes survived. Original supervisor confirmed all descendants reaped. The host mounted nothing; no production native state was changed and no reservation was reduced. This is a different kernel and serial fixture evidence, not an actual host or concurrent inventory proof.",
+    "A subsequent disposable guest experiment exercised a multi-inode candidate under controlled mutation interleavings. Setting directory/file flags without recensus failed four of eight tests by accepting added entries, replacement file/directory inodes and changed contents. Rechecking named and held identities, full inventory and contents after directory fencing and after file fencing then passed ten tests, including a late existing-FD write, retained partial restrictions and UID1000 inode-owner flag-clearing refusal. All six earlier immutable cases remained passing; original supervisor verified descendant cleanup. No production custody producer, crash durability, exact-host support or accounting grant is established."
   ],
   "primary_sources": [
     "https://man7.org/linux/man-pages/man2/F_SETLEASE.2const.html",
@@ -307,6 +308,15 @@
       "seams_checked": 0,
       "full_seam_pass_required_before_handoff": true,
       "model_note": "Sonnet unavailable; inherited-model read-only specification auditors used. Seam mapping is not seam validation."
+    },
+    "immutable_transition_checkpoint": {
+      "status": "Bounded evidence/algorithm amendment independently reviewed: no findings. This is not full mechanism handoff or production activation.",
+      "new_transition_tests_passed": 10,
+      "original_immutable_cases_passed": 6,
+      "implementation_handoff_approved": false,
+      "OT1_OT5_remain_open": true,
+      "full_seam_pass_required_before_handoff": true,
+      "fresh_reader_findings": 0
     }
   },
   "evidence": {
@@ -325,5 +335,12 @@
     "grants_capacity": false,
     "scope": "Serialized disposable guest observations. Original d42 storage implementation was used for the probe; later reviewed export timing and validations are additive follow-up evidence, not a rewrite of that run."
   },
-  "recovery_branch_helper_evidence": "1902-recovery-helper-ingress-proof.json"
+  "recovery_branch_helper_evidence": "1902-recovery-helper-ingress-proof.json",
+  "transition_experiment_evidence": "1902-immutable-inventory-guest-proof.json",
+  "observed_transition_candidate": [
+    "Capture names, device/inode identity, UID/link count/size and content digest plus held original readonly descriptions.",
+    "Set immutable on the held original directory. Recheck its current named identity, exact inventory and every original file description.",
+    "Set immutable on each held original regular file description. Recheck directory identity, inventory, content, held descriptions and all file flags.",
+    "Refuse any mismatch without automatic restriction rollback. Explicit test cleanup restores only its own allocated fixture flags."
+  ]
 }

@@ -58,6 +58,7 @@ def main():
     config = dict(runtime.config)
     config['memory_mb'] = 512
     fixture = Path(__file__).with_name('native_custody_immutable_probe.py').read_bytes()
+    inventory_fixture = Path(__file__).with_name('native_custody_inventory_guest_probe.py').read_bytes()
     kernel_hash = hashlib.sha256(Path(config['kernel']).read_bytes()).hexdigest()
     temporary = tempfile.TemporaryDirectory(prefix='native-custody-kernel-', dir=scratch)
     retain = False
@@ -98,11 +99,12 @@ def prefaulted_mapping_case():
 atexit.register(prefaulted_mapping_case)
 """
         entries.append(('probe.py', stat.S_IFREG | 0o400, prefix + fixture, 0, 0))
+        entries.append(('inventory-probe.py', stat.S_IFREG | 0o400, inventory_fixture, 0, 0))
         boot = '#!/bootstrap/sh\nexport PATH=/bootstrap\nmount -t devtmpfs devtmpfs /dev\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\n'
         boot += '\n'.join(module_commands) + '\n'
         boot += 'mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev runtime /usr || poweroff -f\n'
         boot += 'mount -t ext4 -o nosuid,nodev /dev/vda /fixture || poweroff -f\n'
-        boot += '/usr/bin/python3 -I /probe.py\n/bootstrap/busybox sync\n/bootstrap/busybox umount /fixture\npoweroff -f\n'
+        boot += '/usr/bin/python3 -I /probe.py\nJARVIS_CUSTODY_DISPOSABLE_GUEST=1 /usr/bin/python3 -I /inventory-probe.py\n/bootstrap/busybox sync\n/bootstrap/busybox umount /fixture\npoweroff -f\n'
         entries.append(('init', stat.S_IFREG | 0o755, boot.encode(), 0, 0))
         initrd = root / 'initrd.gz'
         initrd.write_bytes(vm.initrd(entries))
@@ -155,9 +157,17 @@ atexit.register(prefaulted_mapping_case)
         guest = next((row for row in records if row.get('kind') == 'guest_kernel'), None)
         observation = next((row for row in records if row.get('status') == 'observed'), None)
         prefaulted = next((row['observation'] for row in records if row.get('kind') == 'prefaulted_mapping'), None)
-        complete = status == 0 and observation and guest and guest.get('uid') == 0 and prefaulted and prefaulted.get('supported')
+        inventory = next((row for row in records if row.get('kind') == 'inventory_transition'), None)
+        complete = (status == 0 and observation and guest and guest.get('uid') == 0
+                    and prefaulted and prefaulted.get('supported')
+                    and inventory and inventory.get('tests_run') == 10 and inventory.get('success')
+                    and inventory.get('skipped') == 0 and inventory.get('failures') == 0 and inventory.get('errors') == 0
+                    and len(observation.get('observations', [])) == 5
+                    and all(row.get('supported') for row in observation['observations']))
         result = {'status': 'observed' if complete else 'guest-probe-failed', 'guest': guest,
                   'kernel_image_sha256': kernel_hash, 'fixture_sha256': hashlib.sha256(fixture).hexdigest(),
+                  'inventory_fixture_sha256': hashlib.sha256(inventory_fixture).hexdigest(),
+                  'inventory_transition': inventory,
                   'observation': observation, 'prefaulted_mapping': prefaulted, 'supervisor_exit': status, 'all_descendants_reaped': True,
                   'host_root_used': False, 'host_kernel_verified': False, 'production_state_changed': False, 'grants_capacity': False}
         if not complete:
