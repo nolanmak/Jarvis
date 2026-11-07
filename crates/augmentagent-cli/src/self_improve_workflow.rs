@@ -5643,6 +5643,85 @@ else: raise SystemExit('unexpected authority call')
                         assert_eq!(db.query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name='one_active_owner_turn'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
                         assert!(db.execute("INSERT INTO workflow_owner_turn SELECT workflow,(SELECT request_id FROM workflow_owner_message WHERE workflow=?1 AND request_id<>?2 LIMIT 1),'legacy-overtake',100,pause_revision,binding,'claimed',started_at FROM workflow_owner_turn WHERE request_id=?2",rusqlite::params![id,original_request]).is_err(),"legacy index upgrade lost ready ownership");
                         assert_eq!(store.pending_owner_messages(&id).unwrap(),2);assert_eq!(store.snapshot(&id).unwrap().unwrap(),after_ready);
+                        let setup_plan=store.owner_successor_setup_plan(&id).unwrap().expect("ready original request must have a successor setup preview");
+                        assert_eq!(setup_plan.command().provider,later_plan.command().provider);
+                        assert!(super::super::targeted::authorize_owner_successor(dir.path(),&setup_plan,crate::autoship_discord_command::OwnerPolicy {bot:policy.bot,owner:policy.owner+1}).await.is_err());
+                        let setup_auth=super::super::targeted::authorize_owner_successor(dir.path(),&setup_plan,policy).await.unwrap();
+                        let control=store.owner_control(&id).unwrap().unwrap();store.set_owner_pause(&id,"fixture-owner",control.revision,true,millis()).unwrap();
+                        let paused_plan=store.owner_successor_setup_plan(&id).unwrap().unwrap();let paused_auth=super::super::targeted::authorize_owner_successor(dir.path(),&paused_plan,policy).await.unwrap();
+                        let paused_before=store.snapshot(&id).unwrap().unwrap();let paused_events=store.events(&id).unwrap();
+                        assert!(store.claim_recovered_owner_turn_for_setup(&paused_auth,"paused-successor",millis(),60_000).unwrap().is_none());
+                        assert_eq!(store.snapshot(&id).unwrap().unwrap(),paused_before);assert_eq!(store.events(&id).unwrap(),paused_events);
+                        let control=store.owner_control(&id).unwrap().unwrap();store.set_owner_pause(&id,"fixture-owner",control.revision,false,millis()).unwrap();
+                        assert!(store.claim_recovered_owner_turn_for_setup(&setup_auth,"stale-control-successor",millis(),60_000).unwrap().is_none());
+                        let saved_cp=store.snapshot(&id).unwrap().unwrap().checkpoint;
+                        for blocked in ["held","future","merged","retired"] {
+                            let mut cp=saved_cp.clone();
+                            if blocked=="future" {cp.next.eligible_at_ms=millis()+60_000;}else {cp.stage=match blocked {"held"=>Stage::Held,"merged"=>Stage::Merged,_=>Stage::Retired};}
+                            db.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",rusqlite::params![id,serde_json::to_string(&cp).unwrap()]).unwrap();
+                            if matches!(cp.stage,Stage::Merged|Stage::Retired) {assert!(store.owner_successor_setup_plan(&id).unwrap().is_none());}
+                            else {
+                                let blocked_plan=store.owner_successor_setup_plan(&id).unwrap().unwrap();let blocked_auth=super::super::targeted::authorize_owner_successor(dir.path(),&blocked_plan,policy).await.unwrap();
+                                let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
+                                assert!(store.claim_recovered_owner_turn_for_setup(&blocked_auth,"blocked-successor",millis(),60_000).unwrap().is_none());
+                                assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.events(&id).unwrap(),events);
+                            }
+                        }
+                        db.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",rusqlite::params![id,serde_json::to_string(&saved_cp).unwrap()]).unwrap();
+                        let setup_plan=store.owner_successor_setup_plan(&id).unwrap().unwrap();let setup_auth=super::super::targeted::authorize_owner_successor(dir.path(),&setup_plan,policy).await.unwrap();
+                        let before_claim=store.snapshot(&id).unwrap().unwrap();let events_before_claim=store.events(&id).unwrap();
+                        db.execute_batch("CREATE TRIGGER refuse_successor_claim BEFORE INSERT ON workflow_owner_successor_claim BEGIN SELECT RAISE(ABORT,'injected successor claim failure'); END;").unwrap();
+                        assert!(store.claim_recovered_owner_turn_for_setup(&setup_auth,"failed-successor",millis(),60_000).is_err());
+                        assert_eq!(store.snapshot(&id).unwrap().unwrap(),before_claim);assert_eq!(store.events(&id).unwrap(),events_before_claim);
+                        assert_eq!(db.query_row("SELECT state FROM workflow_owner_turn WHERE request_id=?1",[&original_request],|r|r.get::<_,String>(0)).unwrap(),"recovery_ready");
+                        db.execute_batch("DROP TRIGGER refuse_successor_claim;").unwrap();
+                        let setup=store.claim_recovered_owner_turn_for_setup(&setup_auth,"fresh-owner-successor",millis(),60_000).unwrap().expect("ready bridge must be consumable once");
+                        assert_eq!(setup.generation(),later.generation()+1);assert_eq!(setup.request_id(),original_request);
+                        store.validate_owner_successor_setup(&setup,&setup_auth,millis()).unwrap();
+                        WorkflowStore::open(&state).unwrap().validate_owner_successor_setup(&setup,&setup_auth,millis()).unwrap();
+                        assert!(WorkflowStore::open(&state).unwrap().claim_recovered_owner_turn_for_setup(&setup_auth,"duplicate-successor",millis(),60_000).unwrap().is_none());
+                        assert!(store.owner_successor_setup_plan(&id).unwrap().is_none());assert!(store.owner_publication_recovery_plan(&id).unwrap().is_none());
+                        assert_eq!(store.pending_owner_messages(&id).unwrap(),2);assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,before_ready.model_calls);
+                        assert_eq!(db.query_row("SELECT record FROM workflow_owner_publication_completion WHERE workflow=?1",[&id],|r|r.get::<_,String>(0)).unwrap(),completion_before);
+                        assert_eq!(db.query_row("SELECT record,record_sha256 FROM workflow_owner_publication_intent WHERE request_id=?1",[&original_request],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).unwrap(),intent_before);
+                        assert_eq!(db.query_row("SELECT record FROM workflow_owner_successor_ready WHERE workflow=?1",[&id],|r|r.get::<_,String>(0)).unwrap(),saved_ready.2);
+                        let copied=Lease {workflow:id.clone(),owner:"fresh-owner-successor".into(),generation:setup.generation()};
+                        let source_body:String=db.query_row("SELECT body FROM workflow_owner_message WHERE request_id=?1",[&original_request],|r|r.get(0)).unwrap();
+                        let copied_turn=durable::owner_turn::OwnerTurn {lease:copied.clone(),request_id:original_request.clone(),body:source_body,pause_revision:store.owner_control(&id).unwrap().unwrap().revision,binding:saved_cp.binding.clone()};
+                        let error=store.validate_owner_turn(&copied_turn,millis()).unwrap_err();assert!(format!("{error:#}").contains("owner-successor-setup-only"),"{error:#}");
+                        assert!(store.owner_turn_for_lease(&copied,millis()).is_err());
+                        assert!(store.begin_owner_body_dispatch(&copied_turn,setup_plan.command().provider.unwrap(),millis()).is_err());
+                        assert!(store.charge(&copied,"setup-is-not-model-authority",durable::ResourceCharge {model_calls:1,..Default::default()},millis()).is_err());
+                        assert!(store.begin_operation(&copied,OperationKind::CreatePr,&saved_cp.binding,millis()).is_err());
+                        assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_body_dispatch WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),0);
+                        assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,before_ready.model_calls);
+                        let saved_claim:(i64,String,String)=db.query_row("SELECT sequence,record_sha256,record FROM workflow_owner_successor_claim WHERE workflow=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                        let claim_event:String=db.query_row("SELECT payload FROM workflow_event WHERE seq=?1",[saved_claim.0],|r|r.get(0)).unwrap();
+                        let lease_until:i64=db.query_row("SELECT lease_until FROM workflow WHERE id=?1",[&id],|r|r.get(0)).unwrap();
+                        for fault in ["record","event","coherent-owner","coherent-ready","projection","lease-owner","expiry"] {
+                            match fault {
+                                "record"=>{db.execute("UPDATE workflow_owner_successor_claim SET record='{}' WHERE workflow=?1",[&id]).unwrap();},
+                                "event"=>{db.execute("UPDATE workflow_event SET payload='{}' WHERE seq=?1",[saved_claim.0]).unwrap();},
+                                "coherent-owner"|"coherent-ready"=>{
+                                    let mut raw:serde_json::Value=serde_json::from_str(&saved_claim.2).unwrap();
+                                    if fault=="coherent-owner" {raw["original_turn"]["owner"]="substituted-original-owner".into();}else {raw["ready"]["sha256"]="b".repeat(64).into();}
+                                    let raw=durable::owner_publication_recovery::test_successor_encoding(&serde_json::to_string(&raw).unwrap()).unwrap();let hash=format!("{:x}",Sha256::digest(raw.as_bytes()));
+                                    db.execute("UPDATE workflow_owner_successor_claim SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,raw,hash]).unwrap();
+                                    let mut event:serde_json::Value=serde_json::from_str(&claim_event).unwrap();event["record_sha256"]=hash.into();db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![saved_claim.0,serde_json::to_string(&event).unwrap()]).unwrap();
+                                },
+                                "projection"=>{db.execute("UPDATE workflow_owner_turn SET owner='alien-setup' WHERE request_id=?1",[&original_request]).unwrap();},
+                                "lease-owner"=>{db.execute("UPDATE workflow SET owner='alien-lease' WHERE id=?1",[&id]).unwrap();},
+                                "expiry"=>{db.execute("UPDATE workflow SET lease_until=?2 WHERE id=?1",rusqlite::params![id,millis()-1]).unwrap();},_=>unreachable!(),
+                            }
+                            assert!(store.validate_owner_successor_setup(&setup,&setup_auth,millis()).is_err(),"{fault}: changed successor retained setup claim");
+                            db.execute("UPDATE workflow_owner_successor_claim SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,saved_claim.2,saved_claim.1]).unwrap();
+                            db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![saved_claim.0,claim_event]).unwrap();
+                            db.execute("UPDATE workflow_owner_turn SET owner='fresh-owner-successor' WHERE request_id=?1",[&original_request]).unwrap();
+                            db.execute("UPDATE workflow SET owner='fresh-owner-successor',lease_until=?2 WHERE id=?1",rusqlite::params![id,lease_until]).unwrap();
+                            store.validate_owner_successor_setup(&setup,&setup_auth,millis()).unwrap();
+                        }
+                        let control=store.owner_control(&id).unwrap().unwrap();store.set_owner_pause(&id,"fixture-owner",control.revision,true,millis()).unwrap();
+                        assert!(store.validate_owner_successor_setup(&setup,&setup_auth,millis()).is_err());assert!(store.owner_successor_setup_plan(&id).unwrap().is_none());
 
                         return;
                     }

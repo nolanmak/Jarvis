@@ -109,11 +109,20 @@ impl WorkflowStore {
         ensure!(claim.original==authorization.plan().original && claim.generation==settled.generation
             && for_claim(&self.conn,&claim,&reference)?==Some(settled.reference.clone()),"owner readiness settlement changed");
         let valid:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow w JOIN workflow_owner_turn t ON t.workflow=w.id WHERE w.id=?1 AND w.generation=?2 AND w.owner IS NULL AND w.lease_until=0 AND t.request_id=?3 AND t.state='recovery_ready')",params![settled.workflow,settled.generation,claim.original.request_id],|r|r.get(0))?;
-        ensure!(valid,"owner readiness settled projection changed");Ok(())
+        ensure!(valid || super::successor_claim::consumed_ready(&self.conn,&settled.workflow,&settled.reference)?,"owner readiness settled projection changed");Ok(())
     }
 }
 
 #[cfg(test)]
 pub(super) fn fixture_encoding(raw:&str)->Result<String> {
     let record:Record=serde_json::from_str(raw)?;Ok(serde_json::to_string(&record)?)
+}
+
+/// Data only, re-read against the already validated immutable reference.
+pub(super) fn info_for_claim(conn:&Connection,claim:&Claim,reference:&RecordRef)->Result<Option<(Original,Binding,RecordRef)>> {
+    let Some(ready)=for_claim(conn,claim,reference)? else {return Ok(None);};
+    let raw:String=conn.query_row("SELECT substr(record,1,1114113) FROM workflow_owner_successor_ready WHERE workflow=?1 AND generation=?2",params![claim.original.workflow,claim.generation],|r|r.get(0))?;
+    ensure!(raw.len()<=MAX_READY && digest(&raw)==ready.sha256,"successor readiness changed during read");
+    let record:Record=serde_json::from_str(&raw)?;
+    Ok(Some((record.original,record.binding,ready)))
 }

@@ -81,10 +81,35 @@ impl AuthorizedOwnerRecovery<'_> {
 pub(crate) async fn authorize_owner_publication_recovery<'a>(repo:&Path,
     plan:&'a crate::autoship_workflow::owner_publication_recovery::RecoveryPlan,
     policy:crate::autoship_discord_command::OwnerPolicy)->Result<AuthorizedOwnerRecovery<'a>> {
-    let origin=plan.origin();anyhow::ensure!(policy.bot>0 && policy.owner>0 && policy.bot==origin.bot && policy.owner==origin.owner,
-        "owner publication recovery configured identity changed");
-    let principal=authorize_command(repo,plan.command()).await?;
+    let principal=authorize_original_owner(repo,plan.origin(),plan.command(),policy).await?;
     Ok(AuthorizedOwnerRecovery {plan,principal,authorized_at:chrono::Utc::now().timestamp_millis()})
+}
+
+/// Fresh original owner/repository authorization for one exact ready bridge.
+/// This is distinct from metadata recovery and never grants model/native input.
+pub(crate) struct AuthorizedOwnerSuccessor<'a> {
+    plan:&'a crate::autoship_workflow::owner_publication_recovery::SuccessorPlan,
+    principal:String,authorized_at:i64,
+}
+impl AuthorizedOwnerSuccessor<'_> {
+    pub(crate) fn plan(&self)->&crate::autoship_workflow::owner_publication_recovery::SuccessorPlan {self.plan}
+    pub(crate) fn principal(&self)->&str {&self.principal}
+    pub(crate) fn require(&self,plan:&crate::autoship_workflow::owner_publication_recovery::SuccessorPlan,now:i64)->Result<()> {
+        anyhow::ensure!(self.plan.same_ready(plan) && now>=self.authorized_at && now-self.authorized_at<=30_000,
+            "owner successor authorization expired or changed");Ok(())
+    }
+}
+pub(crate) async fn authorize_owner_successor<'a>(repo:&Path,
+    plan:&'a crate::autoship_workflow::owner_publication_recovery::SuccessorPlan,
+    policy:crate::autoship_discord_command::OwnerPolicy)->Result<AuthorizedOwnerSuccessor<'a>> {
+    let principal=authorize_original_owner(repo,plan.origin(),plan.command(),policy).await?;
+    Ok(AuthorizedOwnerSuccessor {plan,principal,authorized_at:chrono::Utc::now().timestamp_millis()})
+}
+async fn authorize_original_owner(repo:&Path,origin:&crate::autoship_workflow::discord_ingress::DiscordOrigin,
+    request:&Request,policy:crate::autoship_discord_command::OwnerPolicy)->Result<String> {
+    anyhow::ensure!(policy.bot>0 && policy.owner>0 && policy.bot==origin.bot && policy.owner==origin.owner,
+        "original owner configured identity changed");
+    authorize_command(repo,request).await
 }
 
 /// Authenticate before looking up a replay; closed targets may replay their

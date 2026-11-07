@@ -86,8 +86,8 @@ impl WorkflowStore {
         let turn=OwnerTurn {lease:lease.clone(),request_id,body,pause_revision,binding:serde_json::from_str(&binding)?};
         validate_turn(&tx,&turn,now)?;tx.commit()?;Ok(turn)
     }
-    /// This validates turn ownership only; native readiness, dispatch admission,
-    /// workspace provenance and scope authorization remain separate requirements.
+    /// Validates ordinary owner-turn ownership. Successor setup has a distinct
+    /// opaque role; native readiness, source and scope remain separate gates.
     pub fn validate_owner_turn(&mut self,turn:&OwnerTurn,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_turn(&tx,turn,now)?;
@@ -95,6 +95,7 @@ impl WorkflowStore {
     }
 }
 pub(super) fn validate_turn(tx:&Transaction<'_>,turn:&OwnerTurn,now:i64)->Result<()> {
+        super::owner_publication_recovery::require_no_successor_setup_dispatch(tx,&turn.lease.workflow,turn.lease.generation)?;
         validate_history(tx,&turn.lease.workflow)?;
         require_binding(tx,&turn.lease,&turn.binding,now)?;
         let message=super::owner_inbox::require_pending(tx,&turn.lease.workflow,&turn.request_id)?;
@@ -110,6 +111,7 @@ pub(super) fn validate_turn(tx:&Transaction<'_>,turn:&OwnerTurn,now:i64)->Result
 // Only model/verifier admission uses this exception. Publication and merge
 // retain the ordinary owner-pause checks even for an active owner turn.
 pub(super) fn require_native_dispatch(tx:&Transaction<'_>,lease:&Lease,now:i64)->Result<()> {
+    super::owner_publication_recovery::require_no_successor_setup_dispatch(tx,&lease.workflow,lease.generation)?;
     validate_history(tx,&lease.workflow)?;
     let turn:Option<(String,String,i64,String)>=tx.query_row("SELECT state,request_id,pause_revision,binding FROM workflow_owner_turn WHERE workflow=?1 AND owner=?2 AND lease_generation=?3",params![lease.workflow,lease.owner,lease.generation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let Some((state,request,revision,raw))=turn else {return super::owner_control::require_dispatch(tx,&lease.workflow);};

@@ -416,6 +416,12 @@ impl WorkflowStore {
                 workflow TEXT NOT NULL REFERENCES workflow(id), generation INTEGER NOT NULL,
                 sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record_sha256 TEXT NOT NULL,record TEXT NOT NULL,
                 PRIMARY KEY(workflow,generation));
+            CREATE TABLE IF NOT EXISTS workflow_owner_successor_claim (
+                workflow TEXT NOT NULL REFERENCES workflow(id),generation INTEGER NOT NULL,
+                request_id TEXT NOT NULL REFERENCES workflow_owner_turn(request_id),
+                ready_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_owner_successor_ready(sequence),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record_sha256 TEXT NOT NULL,record TEXT NOT NULL,
+                PRIMARY KEY(workflow,generation));
             CREATE TABLE IF NOT EXISTS workflow_owner_successor_ready (
                 workflow TEXT NOT NULL REFERENCES workflow(id),generation INTEGER NOT NULL,
                 request_id TEXT NOT NULL REFERENCES workflow_owner_publication_intent(request_id),

@@ -86,6 +86,10 @@ impl OwnerPublicationRecord {
     pub(crate) fn workflow(&self)->&str {&self.input.workflow}
     pub(crate) fn repository(&self)->&str {&self.repository}
     pub(crate) fn recovery_binding(&self)->&crate::autoship_workflow::Binding {&self.next_binding}
+    /// Immutable original claim metadata only, not a current owner capability.
+    pub(crate) fn original_turn_metadata(&self)->(&str,i64,i64,&crate::autoship_workflow::Binding) {
+        (&self.input.owner,self.input.generation,self.input.pause_revision,&self.input.binding)
+    }
     pub(crate) fn require_recovery_transfer(&self,pending:&crate::autoship_workflow::PendingNativeHandoff)->Result<()> {
         ensure!(pending.request().workflow_id==self.workflow() && pending.request().destination.owner.lease_generation==self.activated_generation
             && pending.workflow_binding()==&self.next_binding && pending.request().source_owners.iter().any(|source|
@@ -144,7 +148,10 @@ impl OwnerPublicationRecord {
             let rows=q.query_map(params![self.workflow(),before],|r|r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;rows};
         ensure!(claim.len()==1,"owner publication original claim missing");let claim:serde_json::Value=serde_json::from_str(&claim[0])?;
         ensure!(claim["request_id"]==self.input.request_id && claim["pause_revision"]==self.input.pause_revision && claim["binding"]==serde_json::to_value(&self.input.binding)?,"owner publication original claim changed");
-        let turn_owner:String=conn.query_row("SELECT owner FROM workflow_owner_turn WHERE workflow=?1 AND request_id=?2",params![self.workflow(),self.request()],|r|r.get(0))?;
+        let turn_owner:String=match crate::autoship_workflow::owner_publication_recovery::historical_successor_turn(conn,self.workflow(),self.request())? {
+            Some((owner,_,_,_,_))=>owner,
+            None=>conn.query_row("SELECT owner FROM workflow_owner_turn WHERE workflow=?1 AND request_id=?2",params![self.workflow(),self.request()],|r|r.get(0))?,
+        };
         ensure!(turn_owner==self.input.owner,"owner publication original owner changed");
         let context:Option<(String,String)>=conn.query_row("SELECT o.audit_path,b.binding FROM workflow_native_owner o JOIN workflow_native_owner_binding b ON b.workflow=o.workflow AND b.lease_generation=o.lease_generation WHERE o.workflow=?1 AND o.lease_generation=?2",params![self.workflow(),before],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         let (audit,binding)=context.context("owner publication original native registration missing")?;

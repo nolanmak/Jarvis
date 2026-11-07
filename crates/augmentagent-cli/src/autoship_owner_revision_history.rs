@@ -108,9 +108,11 @@ pub(super) fn validate(conn: &Connection, workflow: &str) -> Result<()> {
         ensure!(claim_sequence<sequence && claimed_at<=at && claim.request_id==activation.request_id
             && claim.binding.contract==old && claim.binding.head==binding.head,
             "owner revision differs from original claim");
-        let (turn_generation,turn_binding,revision,started_at):(i64,String,i64,i64)=conn.query_row(
-            "SELECT lease_generation,binding,pause_revision,started_at FROM workflow_owner_turn WHERE workflow=?1 AND request_id=?2",
-            params![workflow,activation.request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        let (turn_generation,turn_binding,revision,started_at):(i64,String,i64,i64)=match super::super::owner_publication_recovery::historical_successor_turn(conn,workflow,&activation.request_id)? {
+            Some((_,generation,pause,binding,started))=>(generation,serde_json::to_string(&binding)?,pause,started),
+            None=>conn.query_row("SELECT lease_generation,binding,pause_revision,started_at FROM workflow_owner_turn WHERE workflow=?1 AND request_id=?2",
+                params![workflow,activation.request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?,
+        };
         ensure!(turn_binding.len()<=16*1024 && turn_generation==after && strict::<Binding>(&turn_binding)?==binding
             && revision==claim.pause_revision && started_at==claimed_at,
             "owner revision current turn differs from activation");
@@ -146,7 +148,9 @@ pub(super) fn validate(conn: &Connection, workflow: &str) -> Result<()> {
         let request:String=row.get(0)?;let generation:i64=row.get(1)?;let raw:String=row.get(2)?;let pause:i64=row.get(3)?;
         ensure!(raw.len()<=16*1024,"owner turn binding exceeds bound");let binding:Binding=strict(&raw)?;
         if let Some((after,activated,revision))=revisions.get(&request) {
-            ensure!(generation==*after && binding==*activated && pause==*revision,"owner revision authority index changed");
+            if super::super::owner_publication_recovery::historical_successor_turn(conn,workflow,&request)?.is_none() {
+                ensure!(generation==*after && binding==*activated && pause==*revision,"owner revision authority index changed");
+            }else {ensure!(binding==*activated,"owner successor changed original activated binding");}
         } else {
             let (_,claim,_)=claimed(conn,workflow,generation)?;
             ensure!(claim.request_id==request && claim.binding==binding && claim.pause_revision==pause,

@@ -11,6 +11,9 @@ pub(crate) use blocked::RecoveryBlockedState;
 #[path="autoship_owner_successor_ready.rs"]
 mod successor_ready;
 pub(crate) use successor_ready::ReadySettlement;
+#[path="autoship_owner_successor_claim.rs"]
+mod successor_claim;
+pub(crate) use successor_claim::{SuccessorPlan,SuccessorSetup};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -325,7 +328,8 @@ fn plan(conn: &Connection, workflow: &str) -> Result<Option<RecoveryPlan>> {
         rows
     };
     if let Some((claim,reference))=&previous {
-        if successor_ready::for_claim(conn,claim,reference)?.is_some() {
+        if let Some(ready)=successor_ready::for_claim(conn,claim,reference)? {
+            if successor_claim::consumed_ready(conn,workflow,&ready)? {return Ok(None);}
             ensure!(turns.len()==1 && claim.original.request_id==turns[0].0 && turns[0].1=="recovery_ready",
                 "owner ready turn lost its immutable disposition; successor consumption required");
             return Ok(None);
@@ -913,3 +917,14 @@ pub(super) fn require_terminal_native_transfer(conn:&Connection,pending:&Pending
 
 #[cfg(test)]
 pub(crate) fn test_ready_encoding(raw:&str)->Result<String> {successor_ready::fixture_encoding(raw)}
+
+/// Historical projection data only, never a current owner-turn capability.
+pub(crate) fn historical_successor_turn(conn:&Connection,workflow:&str,request:&str)->Result<Option<(String,i64,i64,Binding,i64)>> {
+    successor_claim::original_projection(conn,workflow,request)
+}
+pub(super) fn require_no_successor_setup_dispatch(conn:&Connection,workflow:&str,generation:i64)->Result<()> {
+    successor_claim::require_no_setup_dispatch(conn,workflow,generation)
+}
+
+#[cfg(test)]
+pub(crate) fn test_successor_encoding(raw:&str)->Result<String> {successor_claim::fixture_encoding(raw)}

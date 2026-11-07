@@ -836,3 +836,77 @@ without successor consumption. Its final focused recovery suite passed in
 index migration; normal production compilation passed. The full suite was not
 repeated after that final stricter boundary. See
 [readiness component evidence](1703-owner-successor-readiness-proof.json).
+
+## 50. Consuming an unbound ready bridge for setup (setup claim implemented)
+
+A successor setup claim is separate from both the original metadata recovery
+lease and a productive coding guard. Its preview binds the immutable original
+request/provider/preparation and the exact ready reference, plus the current
+checkpoint and owner control. Fresh owner-origin/repository authorization uses
+the same shared original-owner authorization service as recovery, with a
+separate typed purpose and bounded lifetime. Saved readiness is not authority.
+
+`claim_recovered_owner_turn_for_setup` must CAS-consume exactly that ready bridge
+for the same still-pending request. Current owner pause, held/terminal checkpoint,
+retry eligibility, unsettled native transfer or remote operation refuses. Stale
+control/checkpoint previews must be refreshed, never treated as approval of a
+new intent. Queued peers remain pending and cannot overtake the captured request.
+
+One immediate transaction records the immutable consumed edge, advances the
+workflow generation exactly once from the ready generation, acquires its setup
+lease and changes the captured turn to claimed with that exact new owner,
+generation, current control revision, binding and start time. It invalidates
+current review indexes without rewriting review history. The ready record,
+original activation/input key/preparation/publication, reservation absence,
+compute spend, checkpoint and message states remain unchanged. Uniqueness and
+current projection checks prevent a second claimant; failures must roll back
+all event/index/lease/turn writes together.
+
+The edge retains the original activated turn projection separately from the new
+setup projection. Historical revision/publication readers may follow that exact
+validated edge to the immutable original input owner, claim event, generation
+fence, binding and preparation. They must not compare old facts to an overwritten
+current owner, accept arbitrary newer generations, or manufacture another
+original claim. The bounded low-level reference reader does not recurse into
+the higher-level validators that use it. Missing, altered or orphaned halves
+hold. Original reservation absence remains frozen; legitimate first-successor
+reservation lineage is a separate required join before a body can be reserved.
+
+The successful claimant receives a noncloneable, nonserializable `SuccessorSetup`
+reservation with no raw lease/turn/logger or body capability. Ordinary owner-turn
+acquisition, native/model dispatch and body reservation reject that setup-only
+generation. The old metadata logger remains permanently fenced. A fresh productive
+constructor must consume the setup reservation and establish original native
+handoff, source/scope/resource/authorization, exact original preparation and real
+input-boundary authority before installing any model observer or releasing input.
+No such execution constructor or native setup producer is enabled by this step.
+
+A recorded consumed edge is descriptive restart evidence, not a constructor for
+a lost live reservation. Lease expiry alone cannot replace it or mark setup
+unstarted. The remaining constructor/recovery join must inspect actual original
+native effects and produce its own verified unstarted disposition before any
+return to readiness, or retain uncertainty for authenticated reconciliation.
+Existing-reservation and exposed-conversation paths still require their separate
+nonrelease/semantic-frontier producers. Multiple setup/recovery cycles require
+explicit consumed ancestry; an unsupported chain refuses instead of picking a
+newest row. These remain worker-activation gates, owned by D/R with C's complete
+source/resource producers. Their trigger is before successor execution; the
+carrying cost is bounded immutable edge history and a distinct setup role, not
+another model allowance or an automatic replay.
+
+The tests use the actual original recovery/readiness fixture for both
+provider pins and initial/revised acceptance. They show single consumption,
+transaction rollback, current pause/control/hold refusal, original historical
+metadata retained after the projection moves, no queued-input/accounting changes,
+and ordinary/body/model denial even with a copied lease. These controlled tests
+use synthetic preparation and empty native runtime inventory. They cannot prove
+provider/VM execution, restorable coding continuation, live CLI/Discord owner
+coding or full #1703 acceptance. The actual coding constructor, all original
+C/R and unchanged compiler/worker/generated-publication gates remain required.
+
+Checkpoint validation: the expanded recovery test passed (97.21s), all 48 owner
+store/turn tests passed (6.90s), and all 11 surrounding owner workflow tests
+passed (139.69s). These results do not establish productive execution. The full
+CLI suite was not repeated for this setup-claim checkpoint. Exact source hashes,
+commands, compilation result and limits are recorded in
+`1703-owner-successor-claim-proof.json`.
