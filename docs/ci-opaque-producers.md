@@ -250,6 +250,71 @@ Rust checks pass. The overall worker regression remains red at
 InputCensusUnknown because compiler compatibility is still required. See
 [checkpoint evidence](ci-runtime-launch-disposition-proof.json).
 
+#### vfork proxy exec feasibility exit (not runtime admission)
+
+The next experiment separates **native vfork release** (the kernel stops sharing
+an address space and makes the calling thread runnable) from **C parent resume**
+(the existing controller permits a frozen producer to run after verified effect
+transfer). Neither establishes the other. Linux vfork shares memory and suspends
+the calling thread until child exec or exit; see [vfork(2)](https://man7.org/linux/man-pages/man2/vfork.2.html).
+The candidate is an actual exec into a separate static status-proxy image at the
+existing staging-ready boundary, preserving the original child PID and parent
+wait relationship. It does not substitute fork for vfork or run the compiler in
+the original writable producer view. The V3 tool-start acknowledgement and
+contained tool execution remain separate, later boundaries.
+
+Before choosing that candidate for production, C owns a test-only kernel exit
+with R's original descendant supervisor. A native producer issues real x86-64
+SYS_vfork; a deliberate raw-ABI shared-memory write distinguishes it from fork
+emulation. This Linux-specific observation is not portable POSIX vfork C usage.
+Its child attempts native exec of a freestanding static probe. The test listener
+may continue this one observed vfork request, then attaches PTRACE_SEIZE with
+TRACEEXEC/EXITKILL to its exact child while the child's exec notification is
+pending. Only after attachment may the fixture continue the exec syscall. The
+tracer thread consumes that child's actual PTRACE_EVENT_EXEC and verifies the
+executed inode against its held probe image before detaching. A different static
+image is killed at that stop. The kernel stop precedes new-image instructions;
+see [ptrace(2)](https://man7.org/linux/man-pages/man2/ptrace.2.html).
+
+The decisive positive observation is the original parent reporting native vfork
+return, the actual notified child PID and the shared-memory value while the child
+is still stopped at exec and has neither executed probe code nor terminated.
+Then the accepted probe verifies inherited FIFO descriptors and kernel CLOEXEC
+closure, waits on a private control pipe, and exits with a known status; a
+separate case receives a real SIGTERM. The original parent waits on the original
+PID and reports the native wait status. Keep original descendant cleanup as the
+outer requirement. Private probe pipes are not Cargo jobserver credits and
+supply no evidence for the pinned-Cargo saturation/cancellation gate.
+
+Required negative controls are a wrong image stopped before its body, exec
+cancellation before CONTINUE, listener loss while exec is pending, and the
+unchanged production ExecMediation refusing this vfork. That production control
+must remain red for unsupported execution and positively retain its typed hold;
+the fixture must not introduce a production environment switch or a permissive
+runtime policy. At the fixture boundary, require exact parent/child identities,
+single-threaded child, original namespaces/cgroup placement, checked initial
+exec acknowledgement, accepted notification responses and original cleanup.
+The host and declared VM kernel must both exercise these cases. All fixture
+records carry false full-CI/shipping authority.
+
+This is a feasibility exit, not the final C/R architecture or its handoff.
+The [seccomp documentation](https://docs.kernel.org/userspace-api/seccomp_filter.html)
+does not make continuing untrusted pointer arguments safe. Before runtime use,
+C/R must define and independently audit the immutable proxy image/configuration,
+exact live admission and notification binding, protection from all original
+shared-mm writers, signal and cancellation intervals, pending/failed exec and
+PATH-search behavior, pre-exec error reporting and FD cleanup, shared-memory-safe
+pre-exec relay code, and original resource ownership without a new grant. A
+correct native proxy must preserve V3 streams/signals/status and existing real
+spawn tests; this small static probe does not implement that proxy. It also does
+not implement captured effect transfer, C parent resume, initial-input closure,
+projection, owner productive dispatch or final C/S consumer proofs. C owns these
+remaining contracts, R owns process/resource/supervision joins, and the trigger
+is before supported-adapter/final-C authority. The carrying cost of this
+experiment is test-only native payloads and bounded observations; no durable
+permission or source grant is added. The unchanged original compiler and worker
+regressions remain mandatory after the real adapter is implemented.
+
 ### O3. Freeze before capturing a live parent's input
 
 First capture the child's original request, exact stdin to EOF and verified

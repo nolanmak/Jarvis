@@ -5,6 +5,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ci_cargo_relay.c");
     println!("cargo:rerun-if-changed=src/ci_cargo_exec_early.c");
     println!("cargo:rerun-if-changed=src/ci_cargo_exec_static.c");
+    println!("cargo:rerun-if-changed=src/ci_cargo_vfork_producer.c");
+    println!("cargo:rerun-if-changed=src/ci_cargo_vfork_proxy.c");
     println!("cargo:rerun-if-env-changed=CC");
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo output directory"))
         .join("libci_cargo_exec.so");
@@ -19,7 +21,7 @@ fn main() {
             .expect("write unsupported relay marker");
         fs::write(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("libci_cargo_planner.so"), [])
             .expect("write unsupported planner marker");
-        for name in ["libci_cargo_exec_early.so", "ci_cargo_exec_static"] {
+        for name in ["libci_cargo_exec_early.so", "ci_cargo_exec_static", "ci_cargo_vfork_producer", "ci_cargo_vfork_proxy"] {
             fs::write(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join(name), [])
                 .expect("write unsupported exec feasibility marker");
         }
@@ -52,6 +54,9 @@ fn main() {
     for (source, output, flags) in [
         ("ci_cargo_exec_early.c", "libci_cargo_exec_early.so", vec!["-shared", "-fPIC"]),
         ("ci_cargo_exec_static.c", "ci_cargo_exec_static", vec!["-nostdlib", "-static", "-fno-stack-protector",
+            "-fno-pie", "-no-pie", "-mno-sse", "-mno-mmx", "-fno-builtin"]),
+        ("ci_cargo_vfork_producer.c", "ci_cargo_vfork_producer", vec![]),
+        ("ci_cargo_vfork_proxy.c", "ci_cargo_vfork_proxy", vec!["-nostdlib", "-static", "-fno-stack-protector",
             "-fno-pie", "-no-pie", "-mno-sse", "-mno-mmx", "-fno-builtin"]),
     ] {
         let status = Command::new(env::var_os("CC").unwrap_or_else(|| "cc".into()))

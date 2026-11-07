@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "kind": "native-vfork-exec-boundary-feasibility",
+  "baseline": "46f97b5cb97a8871e5a887febf9709de34a63708",
+  "source_sha256": {
+    "crates/augmentagent-cli/build.rs": "7b1f8ffd575038b3d1d37e31467812bb516d80339d079ffbcd0916bf541e10fa",
+    "crates/augmentagent-cli/src/ci_cargo_vfork_producer.c": "aad82a7f1af92ded1a585494753248e1ed69a11460794343225c902977622d95",
+    "crates/augmentagent-cli/src/ci_cargo_vfork_proxy.c": "80fd5f0705502da7baee85d0dc18d88db9649214009d78b209db213e3dd4bb98",
+    "crates/augmentagent-cli/src/ci_cargo_vfork_exec_cases.py": "20c1e33999cb8f048f8caac21ee631ae9435251c191625f4b452ff774df2a521",
+    "crates/augmentagent-cli/src/self_improve_ci_acceptance.rs": "99b2b9af06c3a6a578d7df6ab6be6bab36dc7da6d42a0f5b807839a32483ae53",
+    "scripts/tests/ci_cargo_vfork_exec_test.py": "8c477abc78e1ecba9427b6e4cfd9b360e66ccdd80cfbfdb4d418c6d103c7ac2f",
+    "crates/augmentagent-cli/src/ci_cargo_exec.c": "b7997f2f98a54f3c42df2402e60d8ca7e2a56c8b7d26d1880978a49f3525c100",
+    "scripts/ci-cargo-planner.py": "fa07819bab1b61344a133b8d8edda82356067814e3b5e0d5c20c9cdadea1821a",
+    "scripts/provider-supervisor.py": "08eb437fe13068df5f2ee0c1b55a6e4b38c9ba3f351ff76509511ba95815b277"
+  },
+  "red": {
+    "log": "/tmp/autoship-ci-vfork-boundary-red-20261107.log",
+    "run": 6,
+    "failed": 5,
+    "production_refusal_control_passed": true,
+    "reason": "Original production ExecMediation refused the real native SYS_vfork and the producer returned 112 before proxy transition."
+  },
+  "host": {
+    "native_cases": 6,
+    "native_log": "/tmp/autoship-ci-vfork-boundary-host-20261107.log",
+    "native_seconds": 0.592,
+    "python": {
+      "log": "/tmp/autoship-ci-vfork-boundary-python-20261107.log",
+      "passed": 706,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 42.058
+    },
+    "rust": {
+      "log": "/tmp/autoship-ci-vfork-boundary-rust-20261107.log",
+      "passed": 37,
+      "failed": 0,
+      "ignored": 27,
+      "seconds": 19.98,
+      "native_cases_required": 6
+    }
+  },
+  "cases": [
+    "Actual SYS_vfork with shared-memory observation; original parent returns while exact child is still held at PTRACE_EVENT_EXEC before proxy instructions and termination.",
+    "Original child PID/native parent wait relationship retained; real exit status 23.",
+    "Native SIGTERM produces original parent wait signal status 15.",
+    "Wrong static image killed at exec stop before its body.",
+    "Exec cancellation and listener loss cannot claim native exec release.",
+    "Original production controller continues to deny unsupported vfork and retain the typed input hold."
+  ],
+  "spec_audit": {
+    "agent": "ci_vfork_boundary_spec_audit_20261107",
+    "result": "No additional substantiated findings in this feasibility exit. Full runtime mechanism remains unfinished."
+  },
+  "vm": null,
+  "production_controller_modified": false,
+  "real_v3_proxy_implemented": false,
+  "compiler_compatible": false,
+  "complete_policy_coverage": false,
+  "input_closure_complete": false,
+  "parent_resume_implemented": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "production_runtime_changed": false,
+  "autonomous_merges_claimed": 0,
+  "limitations": [
+    "TestOnlyGate has no source verdict: check always retains InputCensusUnknown.",
+    "The probe is a small static image, not the real V3 signal/status proxy.",
+    "Immutable production proxy/configuration and exact live notification binding remain required.",
+    "All original shared-mm writers and pre-exec relay safety require proof.",
+    "Native vfork release is distinct from C parent resume.",
+    "Probe FIFO descriptors are not Cargo jobserver credit evidence.",
+    "Original unchanged pinned compiler, worker, in-command generated-publication, C/R source/input/effect/resource/projection, owner productive dispatch, hosted checks, rollout and full epic acceptance remain mandatory."
+  ]
+}
