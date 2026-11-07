@@ -127,6 +127,7 @@ async fn prepare_at(
                 complete: false,
                 elapsed_ms: 0,
                 model_decisions: 0,
+                step_timings: Vec::new(),
             },
             receipt_id: String::new(),
         });
@@ -201,5 +202,7 @@ fn receipt(seed: &ContextSeed, evidence: &EvidenceOutcome) -> Value {
         "fact_sources":evidence.facts.iter().map(|f|&f.source_ids).collect::<Vec<_>>(),
         "gaps":evidence.gaps,"review_finished":evidence.complete,
         "elapsed_ms":evidence.elapsed_ms,"model_decisions":evidence.model_decisions,"source_operations":evidence.reads.len(),
+        // #1837: where the 90-second budget went, so a dominant cost can be measured.
+        "step_timings":evidence.step_timings,"budget_consumer":evidence.budget_consumer(),
     })
 }
