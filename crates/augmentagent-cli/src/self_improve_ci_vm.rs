@@ -13,7 +13,7 @@ const INPUT_MANIFEST: &[u8] = include_bytes!("../../../scripts/ci-input-manifest
 const CACHE_GENERATION: &[u8] = include_bytes!("../../../scripts/ci-cache-generation.py");
 const LEGACY_PREVIEW: &[u8] = include_bytes!("../../../scripts/ci-legacy-recovery-preview.py");
 const RUNTIME_IDENTITY:&[u8]=include_bytes!("../../../scripts/ci-runtime-identity.py");
-const PLANNER_PROGRAMS:[(&str,&[u8]);8]=[
+const PLANNER_PROGRAMS:[(&str,&[u8]);9]=[
     ("ci-cargo-planner.py",include_bytes!("../../../scripts/ci-cargo-planner.py")),
     ("ci-cargo-relay.py",include_bytes!("../../../scripts/ci-cargo-relay.py")),
     ("ci-cargo-staging.py",include_bytes!("../../../scripts/ci-cargo-staging.py")),
@@ -22,6 +22,7 @@ const PLANNER_PROGRAMS:[(&str,&[u8]);8]=[
     ("ci-lookup-inputs.py",include_bytes!("../../../scripts/ci-lookup-inputs.py")),
     ("ci-cargo-planner.so",include_bytes!(concat!(env!("OUT_DIR"),"/libci_cargo_planner.so"))),
     ("ci-cargo-unit-policy.so",include_bytes!(concat!(env!("OUT_DIR"),"/libci_cargo_exec.so"))),
+    ("ci-cargo-status-proxy",include_bytes!(concat!(env!("OUT_DIR"),"/ci_cargo_status_proxy"))),
 ];
 const DEPENDENCY_PROGRAMS:[(&str,&[u8]);7]=[
     ("ci-cargo-boundary.py",include_bytes!("../../../scripts/ci-cargo-boundary.py")),

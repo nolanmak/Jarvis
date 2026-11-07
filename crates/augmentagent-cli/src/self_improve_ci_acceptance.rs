@@ -675,7 +675,7 @@ async fn live_shared_ci_v3_relay_exec_policy()->Result<()> {
         "version":1,"kind":"real_shared_ci_v3_relay_exec_policy","head":head,"generation":source.generation(),
         "status":result.status,"probe":probe,"actual_vm_commands":1,"input_closure_complete":false,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
-    ensure!(result.status=="passed" && probe["cases"].as_object().is_some_and(|cases|cases.len()==10),
+    ensure!(result.status=="passed" && probe["cases"].as_object().is_some_and(|cases|cases.len()==14),
         "V3 relay policy probe unavailable: {} {} {probe}",result.stdout,result.stderr);
     for name in ["worker","planner","unit_first","unit_last","descendant","listener_loss"] {
         let row=&probe["cases"][name];
@@ -694,6 +694,16 @@ async fn live_shared_ci_v3_relay_exec_policy()->Result<()> {
             ensure!(memory["write_results"][alias]==if readonly {30} else {0},
                 "proc memory alias {alias} not covered: {row}");
         }
+    }
+    for (name,uid) in [("image_worker",1000),("image_planner",1001),("image_unit_first",2000),("image_unit_last",6095)] {
+        let row=&probe["cases"][name];let image=&row["root_image"]["image"];
+        ensure!(row["uid"]==uid && row["actor_uids"]==serde_json::json!([uid,uid,uid,uid])
+            && row["actor_gids"]==serde_json::json!([uid,uid,uid,uid]) && row["actor_descriptors"]==serde_json::json!([0,1,2])
+            && row["root_image"]["asset_uid"]==0 && image["uid"]==0 && image["gid"]==0 && image["mode"]==0o555
+            && image["sha256"]==format!("{:x}",Sha256::digest(CARGO_STATUS_PROXY))
+            && image["execution_authority"]==false && image["source_authority"]==false
+            && row["actual_status"]==125 && row["original_exec_ack"]==true && row["original_cleanup"]==true
+            && row["native_handoff_integrated"]==false,"root image/cross-UID initial exec unproved: {row}");
     }
     Ok(())
 }

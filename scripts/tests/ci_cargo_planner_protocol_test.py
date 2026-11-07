@@ -24,6 +24,13 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    @unittest.skipIf(os.geteuid()==0,'requires an actual nonroot caller')
+    def test_nonroot_caller_cannot_prepare_a_root_status_image(self):
+        admission=planner._Admission(planner._TOKEN,Path('/nonexistent/target'),{},str(uuid.uuid4()),Path('/nonexistent/root'))
+        descriptors=set(os.listdir('/proc/self/fd'))
+        with self.assertRaises(planner.FreshnessHold):planner.RootStatusImage(admission)
+        self.assertEqual(set(os.listdir('/proc/self/fd')),descriptors)
+
     def compiler_mounts(self,root,binding,command,entries=()):
         path=root/('mounts-'+str(uuid.uuid4())+'.json')
         planner.cache._write_record(path,{'version':1,'binding':binding,'command':command,'ordinal':0,

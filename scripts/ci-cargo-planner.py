@@ -131,6 +131,76 @@ def admit(target,binding,command,root):
     return _Admission(_TOKEN,target,binding,command,root)
 
 
+class RootStatusImage:
+    """Root-owned physical image under an original command admission.
+
+    This is not a live native-exec/source/resource permit. Only the fixed
+    measured boot asset is accepted; callers cannot select an image pathname.
+    """
+    def __init__(self,admission):
+        if (os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0)
+                or type(admission) is not _Admission or admission.token is not _TOKEN
+                or admission.owner!=os.getpid()):raise FreshnessHold('invalidation_unsafe')
+        self._owner=os.getpid();self._admission=admission;self._binding=copy.deepcopy(admission.binding)
+        self._command=admission.command;self._target=admission.target;self._root=admission.root
+        root=self._root.lstat();self._root_identity=(root.st_dev,root.st_ino)
+        self._source=None;self._image=None;self._asset=Path('/ci-tools/ci-cargo-status-proxy')
+        try:
+            self._context()
+            if self._asset.resolve()!=self._asset:raise FreshnessHold('authority_changed')
+            self._source=os.open(self._asset,os.O_RDONLY|os.O_NONBLOCK|os.O_CLOEXEC|os.O_NOFOLLOW)
+            before=os.fstat(self._source)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid!=0 or before.st_gid!=0
+                    or before.st_mode&0o022 or before.st_nlink!=1):raise FreshnessHold('authority_changed')
+            self._asset_identity=staging._executable_key(before)
+            self._image=staging.capture_executable(self._source)
+            self.fileno()
+        except BaseException:
+            self.close();raise
+
+    def _context(self):
+        admission=self._admission
+        if (os.getpid()!=self._owner or os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0)
+                or type(admission) is not _Admission or admission.token is not _TOKEN
+                or admission.owner!=self._owner or admission.binding!=self._binding
+                or admission.command!=self._command or admission.target!=self._target
+                or admission.root!=self._root):raise FreshnessHold('invalidation_unsafe')
+        info=self._root.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or stat.S_IMODE(info.st_mode)!=0o700
+                or (info.st_dev,info.st_ino)!=self._root_identity):raise FreshnessHold('authority_changed')
+        _source(self._target,self._binding,self._command)
+
+    def fileno(self):
+        self._context()
+        if self._image is None or self._source is None:raise FreshnessHold('authority_changed')
+        if (staging._executable_key(os.fstat(self._source))!=self._asset_identity
+                or staging._executable_key(self._asset.lstat())!=self._asset_identity):
+            raise FreshnessHold('authority_changed')
+        descriptor=self._image.fileno();info=os.fstat(descriptor)
+        if info.st_uid!=0 or info.st_gid!=0:raise FreshnessHold('authority_changed')
+        return descriptor
+
+    def observation(self):
+        self.fileno()
+        return {'version':1,'kind':'ci-root-status-image','binding':copy.deepcopy(self._binding),
+            'command':self._command,'asset_uid':self._asset_identity[3],'image':self._image.observation(),
+            'source_authority':False,'execution_authority':False,'input_closure_complete':False,
+            'full_ci':False,'shipping_authority':False}
+
+    def close(self):
+        if os.getpid()!=self._owner:raise FreshnessHold('invalidation_unsafe')
+        # A stale command must still release its own image/source descriptors;
+        # closing these is not native descendant or resource teardown.
+        if self._image is not None:self._image.close();self._image=None
+        if self._source is not None:os.close(self._source);self._source=None
+
+    def __enter__(self):self.fileno();return self
+    def __exit__(self,*unused):self.close()
+    def __copy__(self):raise FreshnessHold('invalidation_unsafe')
+    def __deepcopy__(self,memo):raise FreshnessHold('invalidation_unsafe')
+    def __reduce_ex__(self,protocol):raise FreshnessHold('invalidation_unsafe')
+
+
 def _sealed(value):
     body=json.dumps(value,sort_keys=True,separators=(',',':')).encode()
     if len(body)>16384:raise FreshnessHold('metadata_torn')
@@ -5289,6 +5359,67 @@ def _relay_exec_policy_client(arguments):
         {'PATH':os.defpath,'LD_PRELOAD':value['library'],'JARVIS_CARGO_RELAY_FD':str(configuration)})
 
 
+def _root_status_image_client(arguments):
+    bootstrap,descriptor=map(int,arguments)
+    value=_bootstrap(bootstrap,'root-status-image-client');_parent_guard(value['parent']);os.close(bootstrap)
+    uid=value['uid']
+    if uid not in (1000,1001,2000,6095) or descriptor<3:raise FreshnessHold('invalidation_unsafe')
+    info=os.fstat(descriptor)
+    if (info.st_uid!=0 or info.st_gid!=0 or info.st_nlink!=0 or stat.S_IMODE(info.st_mode)!=0o555
+            or fcntl.fcntl(descriptor,fcntl.F_GET_SEALS)&staging.EXECUTABLE_SEALS!=staging.EXECUTABLE_SEALS):
+        raise FreshnessHold('authority_changed')
+    os.set_inheritable(descriptor,False)
+    stage_exec_mediation(value,UnitPolicy())
+    os.setgroups([]);os.setgid(uid);os.setuid(uid);_parent_guard(value['parent'])
+    for operation in (lambda:os.pwrite(descriptor,b'changed',0),lambda:os.fchmod(descriptor,0o755)):
+        try:operation()
+        except OSError as error:
+            if error.errno!=errno.EPERM:raise
+        else:raise FreshnessHold('invalidation_unsafe')
+    arm_original_exec()
+    # This remains the still-trusted bootstrap's one initial exec. It does not
+    # authorize a post-entry native exec or resume an original model request.
+    os.execve(descriptor,['ci-cargo-status-proxy','invalid'],{})
+
+
+def _root_status_image_probe(value,supervisor):
+    root=Path(value['root'])/'status-image-owner';root.mkdir(mode=0o700)
+    admission=admit(value['target'],value['binding'],value['command'],root);results={}
+    with RootStatusImage(admission) as image:
+        for name,uid in (('image_worker',1000),('image_planner',1001),('image_unit_first',2000),('image_unit_last',6095)):
+            mediation=ExecMediation(value['deadline'],uid);bootstrap=None;observed={}
+            try:
+                bootstrap=_sealed(dict(value,kind='root-status-image-client',parent=os.getpid(),uid=uid,
+                    exec_mediation_fd=mediation.child_fd))
+                descriptor=image.fileno();receipt=root/(name+'-cleanup')
+                def executed(child):
+                    entry=staging.observe_exec_entry(child.pid)
+                    staging.require_exec_entry(entry,uid=uid,gid=uid,groups=[],descriptors=[0,1,2])
+                    expected=os.fstat(image.fileno());actual=os.stat(f'/proc/{child.pid}/exe')
+                    if (actual.st_dev,actual.st_ino)!=(expected.st_dev,expected.st_ino):
+                        raise FreshnessHold('authority_changed')
+                    observed['image']=image.observation();observed['entry']=entry
+                    mediation.executed(child)
+                code=supervisor.supervise(receipt,[sys.executable,'-I',str(Path(__file__).resolve()),
+                    '--root-status-image-client',str(bootstrap),str(descriptor)],
+                    forward_fds=(bootstrap,descriptor,mediation.child_fd),on_spawn=mediation.spawned,
+                    on_exec=executed,return_raw_status=True)
+                mediation.check()
+                if (code!=125 or not mediation.ack or set(observed)!={'image','entry'} or len(mediation.records)!=1
+                        or mediation.records[0]['disposition']!='exec' or mediation.records[0]['allowed'] is not True
+                        or mediation.records[0]['after_ack'] is not False or mediation.records[0]['pid']!=mediation.pid
+                        or receipt.read_bytes()!=b'all-descendants-reaped\n'):
+                    raise FreshnessHold('cleanup_uncertain')
+                results[name]={'uid':uid,'mode':'root-image-initial','root_image':observed['image'],
+                    'actor_uids':observed['entry']['uids'],'actor_gids':observed['entry']['gids'],
+                    'actor_descriptors':observed['entry']['descriptors'],'original_exec_ack':True,
+                    'original_cleanup':True,'actual_status':code,'native_handoff_integrated':False}
+            finally:
+                if bootstrap is not None:os.close(bootstrap)
+                mediation.close()
+    return results
+
+
 def relay_exec_policy_probe(value):
     """Fixed root-controlled conformance only; never grants runtime execution."""
     if os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0):raise FreshnessHold('invalidation_unsafe')
@@ -5358,6 +5489,7 @@ def relay_exec_policy_probe(value):
         finally:
             if bootstrap is not None:os.close(bootstrap)
             os.close(configuration);mediation.close()
+    results.update(_root_status_image_probe(value,supervisor))
     print(json.dumps({'version':1,'kind':'ci-relay-exec-policy-probe','binding':value['binding'],
         'command':value['command'],'cases':results,'input_closure_complete':False,
         'full_ci':False,'shipping_authority':False}))
@@ -5366,7 +5498,8 @@ def relay_exec_policy_probe(value):
 
 def validate_relay_exec_policy_probe(value,binding,command,workers,writer,source_projection):
     keys={'version','kind','binding','command','cases','input_closure_complete','full_ci','shipping_authority','guest_worker_quiescence'}
-    expected={'worker':1000,'planner':1001,'unit_first':2000,'unit_last':6095,'descendant':1000,'listener_loss':2000,'proc_rw_control':2000,'proc_ro_guard':2000,'worker_proc_guard':1000,'planner_proc_guard':1001}
+    expected={'worker':1000,'planner':1001,'unit_first':2000,'unit_last':6095,'descendant':1000,'listener_loss':2000,'proc_rw_control':2000,'proc_ro_guard':2000,'worker_proc_guard':1000,'planner_proc_guard':1001,
+        'image_worker':1000,'image_planner':1001,'image_unit_first':2000,'image_unit_last':6095}
     if (type(value) is not dict or set(value)!=keys or value['version']!=1
             or value['kind']!='ci-relay-exec-policy-probe' or value['binding']!=binding or value['command']!=command
             or any(value[k] is not False for k in ('input_closure_complete','full_ci','shipping_authority'))
@@ -5377,6 +5510,36 @@ def validate_relay_exec_policy_probe(value,binding,command,workers,writer,source
             or any(scope==item['scope'] for item in source_projection['access'])):raise FreshnessHold('cleanup_uncertain')
     for name,uid in expected.items():
         row=value['cases'][name];lost=name=='listener_loss'
+        if name.startswith('image_'):
+            if (type(row) is not dict or set(row)!={'uid','mode','root_image','actor_uids','actor_gids',
+                    'actor_descriptors','original_exec_ack','original_cleanup','actual_status','native_handoff_integrated'}
+                    or row['uid']!=uid or row['mode']!='root-image-initial' or row['actor_uids']!=[uid]*4
+                    or row['actor_gids']!=[uid]*4 or row['actor_descriptors']!=[0,1,2]
+                    or row['original_exec_ack'] is not True or row['original_cleanup'] is not True
+                    or row['actual_status']!=125 or row['native_handoff_integrated'] is not False):
+                raise FreshnessHold('input_census_unknown')
+            image=row['root_image']
+            image_keys={'version','kind','binding','command','asset_uid','image','source_authority','execution_authority',
+                'input_closure_complete','full_ci','shipping_authority'}
+            if type(image) is not dict or set(image)!=image_keys:raise FreshnessHold('input_census_unknown')
+            captured=image['image']
+            capture_keys={'version','kind','device','inode','uid','gid','mode','size_bytes','sha256','seals',
+                'source_authority','execution_authority','input_closure_complete','full_ci','shipping_authority'}
+            if type(captured) is not dict or set(captured)!=capture_keys:raise FreshnessHold('input_census_unknown')
+            if (type(image.get('version')) is not int or image['version']!=1 or image.get('kind')!='ci-root-status-image' or image.get('binding')!=binding
+                    or image.get('command')!=command or image.get('asset_uid')!=0
+                    or type(image['asset_uid']) is not int or type(captured['version']) is not int or captured['version']!=1
+                    or captured['kind']!='ci-captured-static-executable'
+                    or any(type(captured[k]) is not int for k in ('device','inode','uid','gid','mode','size_bytes','seals'))
+                    or captured['device']<0 or captured['inode']<=0
+                    or captured.get('uid')!=0 or captured.get('gid')!=0 or captured.get('mode')!=0o555
+                    or not cache._digest(captured.get('sha256')) or not 64<=captured.get('size_bytes',0)<=2*1024**2
+                    or type(captured.get('seals')) is not int
+                    or captured['seals']&staging.EXECUTABLE_SEALS!=staging.EXECUTABLE_SEALS
+                    or any(image.get(k) is not False for k in ('source_authority','execution_authority','input_closure_complete','full_ci','shipping_authority'))
+                    or any(captured.get(k) is not False for k in ('source_authority','execution_authority','input_closure_complete','full_ci','shipping_authority'))):
+                raise FreshnessHold('input_census_unknown')
+            continue
         if name in ('proc_rw_control','proc_ro_guard','worker_proc_guard','planner_proc_guard'):
             readonly=name!='proc_rw_control';private=name in ('worker_proc_guard','planner_proc_guard')
             mode={'proc_rw_control':'proc-rw','proc_ro_guard':'proc-ro','worker_proc_guard':'worker-proc-ro','planner_proc_guard':'planner-proc-ro'}[name]
@@ -6138,6 +6301,7 @@ if __name__=='__main__':
         elif sys.argv[1:2]==['--credential-client']:result=_credential_client(sys.argv[2:])
         elif sys.argv[1:2]==['--unit-credential-client']:result=_unit_credential_client(sys.argv[2:])
         elif sys.argv[1:2]==['--relay-exec-policy-client']:result=_relay_exec_policy_client(sys.argv[2:])
+        elif sys.argv[1:2]==['--root-status-image-client']:result=_root_status_image_client(sys.argv[2:])
         elif sys.argv[1:2]==['--probe']:result=_probe(sys.argv[2:])
         elif sys.argv[1:2]==['--probe-supervisor']:result=_probe_supervisor(sys.argv[2:])
         else:raise FreshnessHold('invalidation_unsafe')

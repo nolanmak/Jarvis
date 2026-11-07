@@ -170,7 +170,7 @@ class AdapterTests(unittest.TestCase):
      self.assertEqual(context['cargo_execution'],commands)
      self.assertEqual(json.loads(command[-1]),commands)
      self.assertEqual(set(context['planner_programs']),{'ci-cargo-planner.py','ci-cargo-relay.py','ci-cargo-staging.py',
-      'ci-cargo-views.py','ci-cargo-observer.py','ci-lookup-inputs.py','ci-cargo-planner.so','ci-cargo-unit-policy.so'})
+      'ci-cargo-views.py','ci-cargo-observer.py','ci-lookup-inputs.py','ci-cargo-planner.so','ci-cargo-unit-policy.so','ci-cargo-status-proxy'})
      result=self.prepared_result(options,exit_code=101,stdout='original failure',stderr='original Cargo stderr')
      generation=context['generation']
      result['cargo_execution']={'version':1,'kind':'ci-cargo-execution','binding':generation['binding'],
@@ -181,7 +181,7 @@ class AdapterTests(unittest.TestCase):
       'kernel_observation':kernel_observation(generation['binding'],generation['command']),'input_closure_complete':False,'full_ci':False,
       'shipping_authority':False,'guest_worker_quiescence':result['guest_worker_quiescence']['scopes'][0 if borrowed else -1]}
      return result
-    with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'private_bytes',side_effect=lambda path: b'measured program' if Path(path).name in ('ci-cargo-planner.so','ci-cargo-unit-policy.so') else Path(path).read_bytes()),patch.object(adapter,'ensure_cache',
+    with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'private_bytes',side_effect=lambda path: b'measured program' if Path(path).name in ('ci-cargo-planner.so','ci-cargo-unit-policy.so','ci-cargo-status-proxy') else Path(path).read_bytes()),patch.object(adapter,'ensure_cache',
       side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
      if borrowed:
       with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=execute)
@@ -225,7 +225,7 @@ class AdapterTests(unittest.TestCase):
       'guest_worker_quiescence':result['guest_worker_quiescence']['scopes'][0 if borrowed else -1]}
      return result
     with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'private_bytes',side_effect=lambda path:
-      b'measured program' if Path(path).name in ('ci-cargo-planner.so','ci-cargo-unit-policy.so') else Path(path).read_bytes()),patch.object(adapter,'ensure_cache',
+      b'measured program' if Path(path).name in ('ci-cargo-planner.so','ci-cargo-unit-policy.so','ci-cargo-status-proxy') else Path(path).read_bytes()),patch.object(adapter,'ensure_cache',
       side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
      if borrowed:
       with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=execute)
