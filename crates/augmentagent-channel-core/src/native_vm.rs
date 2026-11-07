@@ -413,6 +413,23 @@ fn prune_and_count(root:&Path,ledger:&owner_ledger::Ledger<'_>) -> Result<usize>
     Ok(count)
 }
 
+/// Finish already-authorized retirement in the selected established namespace.
+/// Existing original store and marker validation remain mandatory. Inspection
+/// does not initialize or migrate a namespace, and policy grants no retirement.
+pub fn reconcile_retired_runtimes()->Result<()> {
+    let Some(path)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") else{return Ok(())};
+    let policy:Policy=serde_json::from_slice(&private(Path::new(&path))?)?;
+    ensure!(policy.version==1 && policy.max_sessions>0 && policy.max_state_bytes>=SESSION_BYTES,"invalid native storage policy");
+    let root=policy.state_root.canonicalize()?;
+    let lock=StateLock::existing(&root)?;
+    // Drop the read-only SQLite connection before opening the mutation visitor;
+    // closing a second connection must not cancel a live POSIX database lock.
+    let (original,_)=owner_ledger::inspect_current(&root,&lock)?.context("original native namespace unavailable for retirement")?;
+    let ledger=owner_ledger::Ledger::open_bound(&root,&lock,&original,false)?;
+    prune_and_count(&root,&ledger)?;
+    Ok(())
+}
+
 /// Called by the workflow controller only for an exact durable terminal or
 /// verified-recovery retirement intent. `current` revalidates that intent and
 /// its saved binding; acquiring the native lock does not create authority.

@@ -467,11 +467,16 @@ fn validate_schema(db: &rusqlite::Connection) -> Result<()> {
 /// Inspect through the current original namespace and the admission history
 /// validator/reservation sum. Never initialize or migrate retained state.
 pub(super) fn inspect_reserved_bytes(root:&Path,lock:&StateLock)->Result<u64> {
+    Ok(inspect_current(root,lock)?.map(|(_,reserved)|reserved).unwrap_or(0))
+}
+/// A current, fully checked namespace observation. This cannot initialize a
+/// namespace or turn the selected policy into original execution authority.
+pub(super) fn inspect_current(root:&Path,lock:&StateLock)->Result<Option<(super::owner_store::StoreIdentity,u64)>> {
     ensure!(history_bytes(root)?<=HISTORY_LIMIT,R::HistoryCapacity);
-    let Some(db)=super::owner_store::inspect_current(root,lock)? else {return Ok(0)};
+    let Some(db)=super::owner_store::inspect_current(root,lock)? else {return Ok(None)};
     validate_schema(&db)?;
     validate_all_history(&db)?;
-    growth(&db)
+    Ok(Some((super::owner_store::current_identity(root,lock,&db)?,growth(&db)?)))
 }
 impl<'a> Ledger<'a> {
     pub fn open(root: &'a Path, lock: &'a StateLock) -> Result<Self> {

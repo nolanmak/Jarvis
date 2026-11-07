@@ -692,16 +692,29 @@ fn acquire_audit_generation_inner(
 /// Free, bounded reconciliation; durable intent survives terminal workflows and
 /// crash between audit-generation commit and filesystem retirement.
 pub(super) fn reconcile_runtime_retirements()->Result<usize> {reconcile_runtime_retirements_at(&path())}
-fn reconcile_runtime_retirements_at(state:&Path)->Result<usize> {
+fn reconcile_runtime_retirements_at(state:&Path)->Result<usize> {reconcile_runtime_retirements_at_time(state,millis())}
+fn reconcile_runtime_retirements_at_time(state:&Path,now:i64)->Result<usize> {
     if !state.exists(){return Ok(0);}
     let mut store=WorkflowStore::open(state)?;
-    let completed=reconcile_runtime_retirements_in(&mut store,millis())?;
-    // Only this free worker entry creates the shared handle. Acquisition/finish
-    // callers of the inner helper may already hold their workflow mutex.
+    let completed=reconcile_runtime_retirements_in(&mut store,now)?;
+    // Acquiring callers may already hold the workflow mutex. Only the free
+    // worker entry creates this handle, outside all native/scope locks.
     let shared=Arc::new(Mutex::new(store));
     let terminal=durable::native_terminal_cleanup::sweep(&shared,&millis,&mut |pending,namespace| {
         existing_native_audit(state,namespace,None,pending.original_binding())
     })?;
+    // No workflow mutex/transaction is held while taking original native locks.
+    if let Err(error)=augmentagent_channel_core::native_vm::reconcile_retired_runtimes() {
+        warn!("native retired runtime cleanup retained for retry: {error:#}");
+    }
+    let report=augmentagent_channel_core::native_vm::state_capacity::inspect();
+    let wake=shared.lock().map_err(|_|anyhow::anyhow!("capacity reconciliation store poisoned"))
+        .and_then(|mut store|store.reconcile_native_capacity(&report,now,16));
+    match wake {
+        Ok(woken) if woken>0=>info!(woken,"native capacity wait schedules eligible; normal admission remains required"),
+        Ok(_)=>{},
+        Err(error)=>warn!("native capacity wake reconciliation retained for retry: {error:#}"),
+    }
     Ok(completed+terminal)
 }
 fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<usize> {
@@ -736,16 +749,30 @@ fn requires_reverification_at(path: &Path, repository: &str, pr: u64) -> Result<
     requires_reverification_at_time(path, repository, pr, millis())
 }
 fn requires_reverification_at_time(path: &Path, repository: &str, pr: u64, now: i64) -> Result<bool> {
-    let store = WorkflowStore::open(path)?;
+    let mut store = WorkflowStore::open(path)?;
     let Some(id) = store.resolve_pr(repository, pr)? else {
         return Ok(false);
     };
+    refresh_native_capacity(&mut store,&id,now)?;
     Ok(store
         .snapshot(&id)?
         .is_some_and(|snapshot| snapshot.checkpoint.next.action == "reverify_candidate"
             || (snapshot.checkpoint.next.action == "await_capacity"
                 && snapshot.checkpoint.next.eligible_at_ms <= now
                 && snapshot.lease_until_ms <= now)))
+}
+
+/// Observe native storage outside the SQL transaction. A wake changes only
+/// eligibility; the subsequent original claim/admission checks remain mandatory.
+fn refresh_native_capacity(store:&mut WorkflowStore,id:&str,now:i64)->Result<()> {
+    if store.snapshot(id)?.is_some_and(|s|s.checkpoint.next.reason=="resource_capacity" && s.checkpoint.next.action=="await_capacity"
+        && s.checkpoint.next.eligible_at_ms>now && s.lease_until_ms<=now) {
+        let report=augmentagent_channel_core::native_vm::state_capacity::inspect();
+        if let Err(error)=store.wake_native_capacity(id,&report,now) {
+            warn!(workflow=%id,"native capacity early wake refused; normal eligibility applies: {error:#}");
+        }
+    }
+    Ok(())
 }
 
 fn structured_review_base(raw: &str, expected_head: &str) -> Option<String> {
@@ -1192,6 +1219,7 @@ impl WorkflowGuard {
             }
             anyhow::ensure!(existing.as_ref().is_some_and(|s|s.checkpoint.binding==binding),"owner turn requires the current owned candidate binding");
         } else {store.register(&id,start.branch,binding.clone(),now)?;}
+        refresh_native_capacity(&mut store,&id,now)?;
         let owner=format!("{}:{}",std::process::id(),uuid::Uuid::new_v4());
         let lease=if owner_turn {store.claim_owner_turn_for_setup(&id,&owner,now,LEASE_MS)?.map(|turn|turn.lease)}
             else {store.claim_productive(&id,&owner,now,LEASE_MS)?};
@@ -1442,23 +1470,17 @@ impl WorkflowGuard {
         let capacity_store = self.store.clone();
         let capacity_lease = self.lease.clone();
         let capacity_flag = self.capacity_exhausted.clone();
-        self.audit.set_resource_capacity_observer(Arc::new(move |_observation| {
-            // Refuse further work even if persistence itself fails. The protected
-            // audit already contains the full independently observed resource event.
+        self.audit.set_resource_capacity_observer(Arc::new(move |observation| {
+            // Refuse further work even if persistence itself fails. This
+            // controller observation never grants permission to continue.
             capacity_flag.store(true, Ordering::SeqCst);
             let mut store = capacity_store.lock().map_err(|_| anyhow::anyhow!("workflow capacity lock poisoned"))?;
-            let mut checkpoint = store.snapshot(&capacity_lease.workflow)?
-                .context("capacity workflow missing")?.checkpoint;
-            // Resource observations live in the protected audit, not in the
-            // acceptance evidence vector whose hash binds the verified candidate.
-            checkpoint.next = NextAction {
-                reason: "resource_capacity".into(),
-                action: "await_capacity".into(),
-                eligible_at_ms: millis().saturating_add(300_000),
-            };
-            // Keep the current stage, verified binding, findings and receipts;
-            // capacity exhaustion is not a code defect or a convergence round.
-            store.checkpoint(&capacity_lease, &checkpoint, millis())
+            let fingerprint=if observation["phase"]=="native_runtime_state_capacity" && observation["exhausted"]==true
+                && observation["native_state"]["status"]=="capacity-exhausted" {
+                observation["native_state"]["capacity_fingerprint"].as_str()
+            }else{None};
+            store.defer_run_capacity(&capacity_lease,fingerprint,millis())?;
+            Ok(())
         }))?;
         self.install_model_observers(None)
     }
@@ -6537,6 +6559,111 @@ else: raise SystemExit('unexpected authority call')
         let recovered=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
         assert_eq!(recovered.checkpoint.binding,before.checkpoint.binding);
         assert_eq!(recovered.checkpoint.evidence,before.checkpoint.evidence);
+    }
+
+    #[test]
+    fn native_capacity_reconciliation_prunes_original_retired_owner_before_wake() {
+        use std::os::unix::fs::{MetadataExt,OpenOptionsExt,PermissionsExt};
+        use std::os::fd::AsRawFd;
+        use std::io::Write;
+        const CHILD:&str="AUTOSHIP_ORIGINAL_RETIREMENT_WAKE";
+        if std::env::var_os(CHILD).is_none() {
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","self_improve::workflow::tests::native_capacity_reconciliation_prunes_original_retired_owner_before_wake","--nocapture"])
+                .env_clear().env("PATH","/usr/bin:/bin").env(CHILD,"1").output().unwrap();
+            let stdout=String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(),"{stdout} {}",String::from_utf8_lossy(&output.stderr));
+            assert!(stdout.contains("test result: ok. 1 passed; 0 failed;"),"regression child did not execute");return;
+        }
+        let root=control_dir();let state=root.path().join("native");let provider=state.join("codex");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let write=|path:&Path,bytes:&[u8]| {
+            let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).unwrap();file.write_all(bytes).unwrap();file.sync_all().unwrap();
+        };
+        let metadata=state.metadata().unwrap();
+        let identity=format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::json!({"device":metadata.dev(),"inode":metadata.ino()})).unwrap()));
+        write(&state.join("authority-bootstrap.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"epoch":uuid::Uuid::new_v4().to_string(),"root_identity_sha256":identity})).unwrap());
+        let policy=root.path().join("policy.json");
+        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime","guest_runtime":"/declared/guest","state_root":state,"memory_mb":512,"max_state_bytes":2147483648u64,"max_sessions":3,"providers":{}})).unwrap());
+        std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",&policy);
+        let native_binding=augmentagent_channel_core::native_vm::ownership::capture_owner_binding(&||Ok(())).unwrap();
+        std::fs::create_dir(&provider).unwrap();std::fs::set_permissions(&provider,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let db=root.path().join("workflow.db");let mut store=WorkflowStore::open(&db).unwrap();
+        let binding=Binding{head:"head".into(),contract:"contract".into(),evidence_hash:"receipt".into()};
+        let source="terminal-origin";store.register(source,"source",binding.clone(),10).unwrap();
+        let source_lease=store.claim(source,"source-worker",20,60_000).unwrap().unwrap();
+        let audit=root.path().join("original-audit.jsonl");
+        store.register_initial_native_owner(&source_lease,&binding,audit.to_str().unwrap(),&native_binding,21).unwrap();
+        let known=provider.join("session-original");let unknown=provider.join("session-unrelated");
+        for (session,owner) in [(&known,source),(&unknown,"unrelated-origin")] {
+            std::fs::create_dir(session).unwrap();std::fs::set_permissions(session,std::fs::Permissions::from_mode(0o700)).unwrap();
+            write(&session.join("owned.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":audit,"owner":{"workflow_id":owner,"lease_generation":source_lease.generation}})).unwrap());
+            write(&session.join("lock"),b"");
+        }
+        let unknown_owned=std::fs::read(unknown.join("owned.json")).unwrap();
+        let aliases=provider.join("aliases");std::fs::create_dir(&aliases).unwrap();
+        write(&aliases.join("original"),br#""session-original""#);write(&aliases.join("unrelated"),br#""session-unrelated""#);
+        let mut terminal=store.snapshot(source).unwrap().unwrap().checkpoint;terminal.stage=Stage::Retired;
+        store.checkpoint(&source_lease,&terminal,22).unwrap();store.release(&source_lease,23).unwrap();
+        let report=augmentagent_channel_core::native_vm::state_capacity::inspect();
+        assert!(report.available_fingerprint().is_none());
+        let fingerprint=serde_json::to_value(report).unwrap()["capacity_fingerprint"].as_str().unwrap().to_owned();
+        let id="owner/repo#914";store.register(id,"fix",binding,10).unwrap();
+        let request=durable::submission::Request{repository:"owner/repo".into(),target:durable::submission::Target::Issue(914),provider:None,until:durable::submission::Milestone::Merged};
+        store.submit_authorized("original-retirement-job","owner",&request,10).unwrap();
+        let lease=store.claim(id,"worker",20,60_000).unwrap().unwrap();
+        let due=store.defer_run_capacity(&lease,Some(&fingerprint),30).unwrap();store.release(&lease,31).unwrap();
+        let before=store.snapshot(id).unwrap().unwrap();let allowance=store.merge_allowance(32,5).unwrap();
+        let lock=std::fs::OpenOptions::new().read(true).write(true).open(known.join("lock")).unwrap();
+        assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        reconcile_runtime_retirements_at_time(&db,32).unwrap();
+        assert!(known.exists());assert!(!store.command_queue_due("owner/repo",32).unwrap());
+        assert_eq!(store.snapshot(id).unwrap().unwrap().checkpoint.next.eligible_at_ms,due);
+        assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_UN)},0);drop(lock);
+        reconcile_runtime_retirements_at_time(&db,33).unwrap();
+        assert!(store.command_queue_due("owner/repo",33).unwrap(),"original authorized retirement did not wake deferred command");
+        assert!(!known.exists() && !aliases.join("original").exists());
+        assert!(unknown.exists() && aliases.join("unrelated").exists());
+        assert_eq!(std::fs::read(unknown.join("owned.json")).unwrap(),unknown_owned);
+        assert!(!unknown.join("retired-owner.json").exists());
+        let after=store.snapshot(id).unwrap().unwrap();
+        assert_eq!(after.checkpoint.next.eligible_at_ms,33);assert_eq!(after.progress_at_ms,before.progress_at_ms);
+        assert_eq!(after.checkpoint.binding,before.checkpoint.binding);assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+        assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.generation,before.generation);
+        assert_eq!(store.merge_allowance(33,5).unwrap(),allowance);
+        let epoch=state.join("authority-epoch.json");let saved_epoch=std::fs::read(&epoch).unwrap();
+        std::fs::rename(&epoch,state.join("retained-original-epoch.json")).unwrap();
+        assert!(augmentagent_channel_core::native_vm::reconcile_retired_runtimes().is_err(),"cleanup recreated missing original authority");
+        reconcile_runtime_retirements_at_time(&db,34).unwrap();
+        assert!(!epoch.exists());
+        assert_eq!(std::fs::read(state.join("retained-original-epoch.json")).unwrap(),saved_epoch);
+        assert_eq!(std::fs::read(unknown.join("owned.json")).unwrap(),unknown_owned);
+        assert_eq!(store.snapshot(id).unwrap().unwrap(),after,"failed optional cleanup changed completed scheduling work");
+    }
+
+    #[tokio::test]
+    async fn native_capacity_observer_persists_retry_without_progress_or_paid_admission() {
+        let dir=repo();let control=control_dir();let path=control.path().join("workflow.db");
+        let start=Start{repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(711),pr:None,branch:"fixture",contract:"C1",environment:"test"};
+        let guard=WorkflowGuard::acquire_at(&path,start,millis()).await.unwrap().unwrap();let id=guard.id().to_owned();
+        let before=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();let now=millis();
+        // Protected observer metadata fixture; native storage production itself
+        // is covered by channel-core's real admission/inspection regressions.
+        let observation=serde_json::json!({"phase":"native_runtime_state_capacity","exhausted":true,
+            "native_state":{"status":"capacity-exhausted","capacity_fingerprint":"a".repeat(64)}});
+        guard.audit_logger().resource_capacity_exhausted(&observation).unwrap();
+        let mut store=WorkflowStore::open(&path).unwrap();let after=store.snapshot(&id).unwrap().unwrap();
+        let retry=store.events(&id).unwrap().into_iter().find(|e|e.1=="resource_capacity_retry");
+        assert!(retry.is_some());assert_eq!(after.checkpoint.next.action,"await_capacity");
+        assert!(after.checkpoint.next.eligible_at_ms>=now+300_000 && after.checkpoint.next.eligible_at_ms<=millis()+300_000);
+        let events=store.events(&id).unwrap().len();guard.audit_logger().resource_capacity_exhausted(&observation).unwrap();
+        assert_eq!(store.events(&id).unwrap().len(),events);
+        assert_eq!(after.progress_at_ms,before.progress_at_ms);assert_eq!(after.model_calls,before.model_calls);
+        assert_eq!(after.checkpoint.binding,before.checkpoint.binding);assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+        assert!(guard.audit_logger().model_call_admitted("codex").is_err());assert!(guard.validate_before_side_effect().is_err());
+        assert!(guard.finish().is_err());
+        assert!(store.claim_productive(&id,"too-early",after.checkpoint.next.eligible_at_ms-1,60_000).unwrap().is_none());
     }
 
     #[tokio::test]

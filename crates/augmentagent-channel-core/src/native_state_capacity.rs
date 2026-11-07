@@ -26,6 +26,11 @@ struct Measurements {
 }
 
 impl Report {
+    /// Scheduling evidence only, available after all observed storage boundaries
+    /// permit a fresh session. This is never a runtime admission capability.
+    pub fn available_fingerprint(&self)->Option<&str> {
+        self.measurements.as_ref().filter(|m|m.blockers.is_empty()).map(|m|m.capacity_fingerprint.as_str())
+    }
     pub(super) fn exhausted(&self) -> bool {
         self.status == "capacity-exhausted"
     }
@@ -68,7 +73,8 @@ pub fn inspect() -> Report {
     inspect_at(path.as_deref().map(Path::new))
 }
 
-pub(super) fn inspect_at(path: Option<&Path>) -> Report {
+/// Inspect one explicitly supplied declaration without changing its state.
+pub fn inspect_at(path: Option<&Path>) -> Report {
     let Some(path)=path else{return Report::unknown("policy-unobserved")};
     let policy=match private(path).and_then(|bytes|Ok(serde_json::from_slice::<Policy>(&bytes)?)) {
         Ok(policy) if policy.version==1 && policy.max_sessions>0 && policy.max_state_bytes>=SESSION_BYTES=>policy,
