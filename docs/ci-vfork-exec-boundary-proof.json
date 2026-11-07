@@ -52,7 +52,217 @@
     "agent": "ci_vfork_boundary_spec_audit_20261107",
     "result": "No additional substantiated findings in this feasibility exit. Full runtime mechanism remains unfinished."
   },
-  "vm": null,
+  "vm": {
+    "source_head": "3439cda78285846d6bc4ca50ddb0f26df291fa43",
+    "seconds": 95.01,
+    "exit_code": 0,
+    "result": "passed_feasibility_only",
+    "result_file": "/tmp/autoship-1703-ci-vfork-exec-boundary-result-20261107.json",
+    "log": "/tmp/autoship-ci-vfork-exec-boundary-vm-20261107.log",
+    "audit": "/tmp/autoship-ci-vfork-exec-boundary-audit-20261107.json",
+    "host_resource_removed_empty_subtree": true,
+    "receipt": {
+      "actual_vm_commands": 1,
+      "autonomous_merges_claimed": 0,
+      "cases": {
+        "cancel": {
+          "cloexec_closed_at_exec_stop": false,
+          "feasibility_only": true,
+          "full_ci_pass": false,
+          "image_accepted": false,
+          "mode": "cancel",
+          "native_exec_stop": false,
+          "notifications": [
+            {
+              "nr": 59,
+              "pid": 151,
+              "stage": "initial_exec"
+            },
+            {
+              "nr": 58,
+              "pid": 151,
+              "stage": "fixture_vfork_only"
+            },
+            {
+              "nr": 59,
+              "pid": 153,
+              "stage": "cancelled_exec"
+            }
+          ],
+          "original_cleanup": true,
+          "original_parent_wait_status": 23808,
+          "parent_released_before_proxy_termination": false,
+          "production_refusal": false,
+          "shared_memory_observed": false,
+          "shipping_authority": false
+        },
+        "finish": {
+          "cloexec_closed_at_exec_stop": true,
+          "feasibility_only": true,
+          "full_ci_pass": false,
+          "image_accepted": true,
+          "mode": "finish",
+          "native_exec_stop": true,
+          "notifications": [
+            {
+              "nr": 59,
+              "pid": 139,
+              "stage": "initial_exec"
+            },
+            {
+              "nr": 58,
+              "pid": 139,
+              "stage": "fixture_vfork_only"
+            },
+            {
+              "image_accepted": true,
+              "nr": 59,
+              "pid": 141,
+              "stage": "verified_exec_stop"
+            }
+          ],
+          "original_cleanup": true,
+          "original_parent_wait_status": 5888,
+          "parent_released_before_proxy_termination": true,
+          "production_refusal": false,
+          "shared_memory_observed": true,
+          "shipping_authority": false
+        },
+        "listener-loss": {
+          "cloexec_closed_at_exec_stop": false,
+          "feasibility_only": true,
+          "full_ci_pass": false,
+          "image_accepted": false,
+          "mode": "listener-loss",
+          "native_exec_stop": false,
+          "notifications": [
+            {
+              "nr": 59,
+              "pid": 155,
+              "stage": "initial_exec"
+            },
+            {
+              "nr": 58,
+              "pid": 155,
+              "stage": "fixture_vfork_only"
+            },
+            {
+              "nr": 59,
+              "pid": 157,
+              "stage": "lost_listener"
+            }
+          ],
+          "original_cleanup": true,
+          "original_parent_wait_status": 23808,
+          "parent_released_before_proxy_termination": false,
+          "production_refusal": false,
+          "shared_memory_observed": false,
+          "shipping_authority": false
+        },
+        "production-deny": {
+          "feasibility_only": true,
+          "full_ci_pass": false,
+          "mode": "production-deny",
+          "notifications": [
+            {
+              "after_ack": false,
+              "allowed": true,
+              "clone_flags": 0,
+              "disposition": "exec",
+              "nr": 59,
+              "pid": 159,
+              "response_errno": 0
+            },
+            {
+              "after_ack": true,
+              "allowed": false,
+              "clone_flags": 0,
+              "disposition": "unsupported_vfork",
+              "nr": 58,
+              "pid": 159,
+              "response_errno": 38
+            }
+          ],
+          "original_cleanup": true,
+          "parent_released_before_proxy_termination": false,
+          "production_refusal": true,
+          "shipping_authority": false
+        },
+        "signal": {
+          "cloexec_closed_at_exec_stop": true,
+          "feasibility_only": true,
+          "full_ci_pass": false,
+          "image_accepted": true,
+          "mode": "signal",
+          "native_exec_stop": true,
+          "notifications": [
+            {
+              "nr": 59,
+              "pid": 143,
+              "stage": "initial_exec"
+            },
+            {
+              "nr": 58,
+              "pid": 143,
+              "stage": "fixture_vfork_only"
+            },
+            {
+              "image_accepted": true,
+              "nr": 59,
+              "pid": 145,
+              "stage": "verified_exec_stop"
+            }
+          ],
+          "original_cleanup": true,
+          "original_parent_wait_status": 15,
+          "parent_released_before_proxy_termination": true,
+          "production_refusal": false,
+          "shared_memory_observed": true,
+          "shipping_authority": false
+        },
+        "wrong-image": {
+          "cloexec_closed_at_exec_stop": true,
+          "feasibility_only": true,
+          "full_ci_pass": false,
+          "image_accepted": false,
+          "mode": "wrong-image",
+          "native_exec_stop": true,
+          "notifications": [
+            {
+              "nr": 59,
+              "pid": 147,
+              "stage": "initial_exec"
+            },
+            {
+              "nr": 58,
+              "pid": 147,
+              "stage": "fixture_vfork_only"
+            },
+            {
+              "image_accepted": false,
+              "nr": 59,
+              "pid": 149,
+              "stage": "verified_exec_stop"
+            }
+          ],
+          "original_cleanup": true,
+          "original_parent_wait_status": 9,
+          "parent_released_before_proxy_termination": true,
+          "production_refusal": false,
+          "shared_memory_observed": true,
+          "shipping_authority": false
+        }
+      },
+      "full_ci_pass": false,
+      "generation": "25b63334-92ca-40d8-ae20-d6256a09933a",
+      "head": "67d35413c91f55ddd806685f4b6a1a5cc3f2ec82",
+      "input_closure_complete": false,
+      "kind": "real_shared_ci_vfork_exec_boundary",
+      "shipping_authority": false,
+      "status": "passed",
+      "version": 1
+    }
+  },
   "production_controller_modified": false,
   "real_v3_proxy_implemented": false,
   "compiler_compatible": false,

@@ -252,7 +252,7 @@ InputCensusUnknown because compiler compatibility is still required. See
 
 #### vfork proxy exec feasibility exit (not runtime admission)
 
-The next experiment separates **native vfork release** (the kernel stops sharing
+This experiment separates **native vfork release** (the kernel stops sharing
 an address space and makes the calling thread runnable) from **C parent resume**
 (the existing controller permits a frozen producer to run after verified effect
 transfer). Neither establishes the other. Linux vfork shares memory and suspends
@@ -313,7 +313,14 @@ remaining contracts, R owns process/resource/supervision joins, and the trigger
 is before supported-adapter/final-C authority. The carrying cost of this
 experiment is test-only native payloads and bounded observations; no durable
 permission or source grant is added. The unchanged original compiler and worker
-regressions remain mandatory after the real adapter is implemented.
+regressions remain mandatory after the real adapter is implemented. The probe at
+`3439cda7` passed all six cases on the declared guest kernel in 95.01 seconds,
+with the original host VM resource subtree verified removed. All 706 host
+Python checks and 37 focused Rust checks passed, with the six native probe cases
+mandatory in the Rust adapter. Production refusal remains a passing negative
+control. This settles the bounded native-exec feasibility question; it does not
+settle runtime admission, shared-mm writer protection or the real V3 proxy. See
+[host and VM evidence](ci-vfork-exec-boundary-proof.json).
 
 ### O3. Freeze before capturing a live parent's input
 
