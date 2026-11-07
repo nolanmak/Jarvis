@@ -4,7 +4,7 @@
   "component": "Recovery-aware native capacity, persisted retry and original retirement wakeup",
   "status": "tested component on draft recovery branch; not deployed; not autoship restoration",
   "source_base": "19c2b759d91a70f67e65b1035894539c5e4b4216",
-  "main_component_integrated": "675be536 diagnostics and 743942c9 retry/wakeup, with 25bcb01f retirement-before-observation behavior adapted to the existing original-ledger and terminal-cleanup authorities.",
+  "main_component_integrated": "Main 4b0b2461152bb774e50d9510fc9d3235bce2b006 merged with diagnostics, persisted backoff, retirement-before-observation, pre-intent cleanup and one-shot spawn adapted to the established original-ledger and durable-intent authorities. Post-prepare physical deletion is deliberately not adopted without original-intent settlement.",
   "problem": "A pending native transfer reserves growth in the existing ledger. Reusing main storage inspection without that reservation reports capacity available even when actual native admission refuses.",
   "behavior": [
     "Actual native admission and read-only readiness share the reservation boundary evaluator, including transfer growth in reserved, stored and filesystem ceilings.",
@@ -95,7 +95,7 @@
       "green": "Both-provider regression passed; empty, overlong and non-graphic session IDs leave no fresh runtime or launch directory.",
       "green_log": "/tmp/autoship-native-intent-constructor-green-20261107.log",
       "preservation": "A successful prepared launch and a workflow-journal acknowledgement failure retain original runtime bytes and the actual committed launch receipt.",
-      "full_cli_scope": "Full CLI suite above is the preceding composition; the constructor follow-up was verified through full core and production CLI compilation."
+      "full_cli_scope": "Covered by current_full_cli on the resolved main merge; preceding_composition_full_cli remains historical parent evidence."
     },
     "prepared_spawn_once": {
       "test": "native_vm::tests::prepared_native_launch_allows_only_one_supervisor_attempt",
@@ -105,12 +105,21 @@
       "green_log": "/tmp/autoship-native-one-shot-green-20261107.log",
       "green_seconds": 0.68,
       "limits": "Real packaged supervisor/controller fixture before guest startup; not native provider acceptance or physical runtime reclamation."
+    },
+    "current_full_cli": {
+      "passed": 1959,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 423.94,
+      "log": "/tmp/autoship-native-main-merge-cli-bin-20261107.log",
+      "command": "CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "source_scope": "Resolved main merge has exactly the production and test source of 1872a42aa207400e8c43126fb28732939b8d4e9d. Only this evidence document changes in the merge commit. Includes constructor and one-shot follow-ups."
     }
   },
   "limits": [
     "No production legacy runtime was removed or retired.",
     "No native guest or paid provider acceptance is established by these unit/controller fixtures.",
-    "This is not a full merge of #1906. Pre-intent constructor cleanup is integrated; constructor failures at/after publication and post-prepare nonrelease disposal still require an original-intent-aware join before recovery rollout.",
+    "Main 4b0b246 is integrated with the original-ledger protocol. Main FreshUnreleasedRuntime path-based disposal cannot replace durable intent settlement on this branch. Constructor failures at/after publication and post-prepare nonrelease disposal still require an original-intent-aware join before recovery rollout.",
     "Productive successor owner guard and full source/resource/input closure plus CLI/Discord/fault/soak acceptance remain open."
   ],
   "sources": [
@@ -163,5 +172,38 @@
       "sha256": "6a24fb483b43efe16383ee9ccb5b9e8a14a126a53625a250c18c4ba013065adc"
     }
   ],
-  "composition_base": "9e58bcc152f32c6db1aa40f1485f030d3e0915af"
+  "composition_base": "9e58bcc152f32c6db1aa40f1485f030d3e0915af",
+  "main_merge": {
+    "main_commit": "4b0b2461152bb774e50d9510fc9d3235bce2b006",
+    "first_parent": "1872a42aa207400e8c43126fb28732939b8d4e9d",
+    "source_equivalence": "All ten files changed by main match the already-adapted first-parent source after reviewed conflict resolution; unsafe automatically merged FreshUnreleasedRuntime fields/destructor were removed. Only evidence metadata differs from first parent.",
+    "component_resolution": [
+      {
+        "component": "capacity diagnostic/admission",
+        "resolution": "Keep original namespace validation and pending transfer growth in shared evaluator; never initialize observational state."
+      },
+      {
+        "component": "retry and wake",
+        "resolution": "Keep persisted5/10/20/40/60, bounded cursor and logged optional early-wake failures; owner controls remain authoritative."
+      },
+      {
+        "component": "retirement before observation",
+        "resolution": "Keep original-bound reconciliation, terminal cleanup sweep, original namespace pruning and optional-failure logging outside workflow locks."
+      },
+      {
+        "component": "constructor cleanup",
+        "resolution": "Keep UnpublishedSession borrowing StateLock; clean fresh allocation only through pure validation; retain before first durable intent attempt."
+      },
+      {
+        "component": "private single-use spawn",
+        "resolution": "Keep actual NativeSpawn borrowed from the prepared launch and consumed before supervisor construction; both adapters resolve declarations before allocation."
+      },
+      {
+        "component": "post-prepare physical deletion",
+        "resolution": "Not adopted: a reaped unexposed supervisor alone does not settle this branch durable launch intent. Retain context until a genuine original-intent producer and every inventory/recovery consumer support settlement."
+      }
+    ],
+    "hosted_ci": "Pending push and actual new-head Actions observation; local results are not hosted CI or exact-head review.",
+    "workflow_security_scope": "Workflow files match main; current PR validators declare read-only contents and checkout without persisted credentials. Secret references found only in issue/manual automation, not PR/push branch triggers. No credential inventory or candidate-workflow adversarial audit claimed."
+  }
 }
