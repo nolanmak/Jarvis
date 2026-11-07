@@ -561,12 +561,23 @@ class PlannerProtocolTests(unittest.TestCase):
                             try:client.sendmsg([frame],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,rights)])
                             finally:os._exit(0)
                     else:client.sendmsg([frame],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,rights)])
-                    if transferred:
-                        with self.assertRaises(planner.FreshnessHold):relay._receive(server,descriptors)
-                    else:self.assertEqual(relay._receive(server,descriptors),[0,1,2])
+                    # Credentials-only fixture: no live namespace/cgroup grant.
+                    # Actual scope admission is mandatory in the root VM tests.
+                    with patch.object(relay,'require_worker_scope') as scope:
+                        if transferred:
+                            with self.assertRaises(planner.FreshnessHold):relay._receive(server,descriptors)
+                            scope.assert_not_called()
+                        else:
+                            self.assertEqual(relay._receive(server,descriptors),[0,1,2])
+                            scope.assert_called_once_with(os.getpid())
                 finally:
                     if child is not None:os.waitpid(child,0)
                     planner.legacy._close([payload,stdin,out_r,out_w,err_r,err_w,*descriptors]);server.close();client.close()
+
+    def test_worker_scope_refuses_missing_live_freezer_without_namespace_fallback(self):
+        relay=object.__new__(planner.WorkerRelay)
+        with self.assertRaises(planner.FreshnessHold) as caught:relay.require_worker_scope(os.getpid())
+        self.assertEqual(caught.exception.reason,'input_census_unknown')
 
     def test_worker_runtime_holds_opaque_static_and_loader_redirects(self):
         request=(b'/usr/bin/python3',[b'python3',b'-I',b'driver.py'],{},b'/workspace',None,0,0)

@@ -636,7 +636,7 @@ async fn live_shared_ci_v3_relay_exec_policy()->Result<()> {
         "version":1,"kind":"real_shared_ci_v3_relay_exec_policy","head":head,"generation":source.generation(),
         "status":result.status,"probe":probe,"actual_vm_commands":1,"input_closure_complete":false,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
-    ensure!(result.status=="passed" && probe["cases"].as_object().is_some_and(|cases|cases.len()==8),
+    ensure!(result.status=="passed" && probe["cases"].as_object().is_some_and(|cases|cases.len()==10),
         "V3 relay policy probe unavailable: {} {} {probe}",result.stdout,result.stderr);
     for name in ["worker","planner","unit_first","unit_last","descendant","listener_loss"] {
         let row=&probe["cases"][name];
@@ -645,7 +645,7 @@ async fn live_shared_ci_v3_relay_exec_policy()->Result<()> {
             && row["original_exec_ack"]==true && row["original_cleanup"]==true,
             "original controller did not own {name} raw-exec refusal: {row}");
     }
-    for (name,readonly) in [("proc_rw_control",false),("proc_ro_guard",true)] {
+    for (name,readonly) in [("proc_rw_control",false),("proc_ro_guard",true),("worker_proc_guard",true),("planner_proc_guard",true)] {
         let row=&probe["cases"][name];let memory=&row["memory"];
         ensure!(row["original_exec_ack"]==true && row["original_cleanup"]==true
             && memory["mount_readonly"]==readonly && memory["read_control"]==true

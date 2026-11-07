@@ -661,6 +661,74 @@ bulk Rust run). See [bounded proc-writer evidence](ci-proc-memory-writer-proof.j
 Do not rerun the unchanged compiler fixture
 merely to restate its vfork refusal before a relevant admission change exists.
 
+#### Worker/planner private proc views (C/R integration in progress)
+
+Decision: protect repository workers, their admitted worker children and Cargo
+planners before native policy activation, credential drop and first untrusted
+instruction. `private_proc_namespace` clones the mount namespace, stops mount
+propagation and calls the production readonly proc helper. Cargo retains its
+existing toolchain/source/target mounts in that private namespace. Units retain
+their existing private view. A worker mount namespace is distinct from a declared
+generated-file namespace: the worker filesystem objects and non-proc mounts
+remain shared as before; only the kernel mount view/proc protection changes.
+
+The original exec supervisor observes each role's actual proc mounts while the
+original kernel exec-stop is held. It opens the target root/proc through the
+actual target root FD, binds the effective mount ID from fdinfo to mountinfo,
+checks actual readonly/nosuid/nodev/noexec flags and hidepid, and refuses every
+visible writable proc alias. Covered inherited mounts are identified by their
+actual opened mount IDs, not trusted merely because a pathname is repeated.
+Cargo's existing additional source/toolchain mounts remain separately scoped;
+this proc observation does not certify the full Cargo mount/input contract.
+
+For workers, the observer additionally compares the complete original controller
+and child mount tables. The child's root inode must be identical; the namespace
+must be distinct; its sole added mount must be the readonly proc mount. Normalize
+clone-generated IDs and the namespace root-parent representation, remove child
+propagation, and preserve every other mount's device/root/path/options/filesystem/
+source/super-options, multiplicity and normalized parent relationship. Unknown,
+changed, missing or extra mounts hold admission. This replaces the earlier
+literal same-mount-namespace rule with an explicit verified proc-only delta,
+not a general namespace exception. IPC/network/user/PID namespaces still match
+the original controller. Original worker controller admission independently
+repeats the live proc-view comparison before releasing its held exec-stop.
+
+The original worker freezer owns a real namespace FD for every admitted worker
+view. Enrollment rechecks the actual kernel view and namespace identity under
+the existing launch lease, then records its pin with the actual pidfd/birth and
+original cgroup membership. Fork descendants inherit their parent's verified
+view. Worker RPC reception requires a live pinned namespace and the original
+worker cgroup; matching UID, credentials, a saved namespace label or a diagnostic
+proc report alone cannot pass. Freeze checks every actual cohort PID against the
+pinned views and unchanged other namespaces, retaining the original UID/TID census,
+filter/capability checks, budget and pipe/credit ledger. Retire the controller's
+namespace FD only at the existing member-drained point after original supervisor
+cleanup of that member and descendants; closing the command scope requires no
+members or controller-owned namespace pins remain. This does not claim that
+all possible foreign descriptor aliases are retired; ingress/lifetime proofs
+remain separately required. No second scheduler, pool or resource grant exists.
+
+Private raw mount observations are retained with the existing generation-owned
+credit/control diagnostics, including before a proc proof refuses. They are
+bounded diagnostics, never admission records or reusable source proofs. Historical
+worker receipt grammar remains metadata-only; the new live factory always
+requires kernel proc observation and pinning. The credentials-only socket test
+isolates that transport guard; the actual scope guard is required in real VM
+admission/worker regressions and refuses a missing live freezer.
+
+At RED baseline `70e8befb`, the original worker admission body ran and cleaned
+up, but the strengthened regression failed after 92.71 seconds with a missing
+proc-view observation. The payload/command was unchanged. The production launch
+and original-worker/planner memory/namespace integration is now under validation;
+no passing current-build original-worker or full compiler/worker result is yet
+claimed. C/R own live admission, memory-control, full worker/Cargo pause and
+teardown exits before treating this profile as verified. Foreign/preopened FDs,
+all other writers/ABIs, immutable-image/live-operation/source/resource handoff
+and complete input closure remain required before runtime vfork admission.
+Carrying cost is one private proc view and retained namespace handle per active
+admitted worker, bounded by the original execution resource scope; no durable
+grant schema or historical preparation rewrite is added.
+
 ### O3. Freeze before capturing a live parent's input
 
 First capture the child's original request, exact stdin to EOF and verified

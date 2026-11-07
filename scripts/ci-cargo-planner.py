@@ -2330,8 +2330,9 @@ class UnitFreezer:
 class RepositoryWorkerFreezer(UnitFreezer):
     """Original UID1000 population; launch admission precedes every exec grant.
 
-    This uses the guest's shared worker mount namespace, not a unit's private
-    base. Freezing establishes a bounded writer census, never input authority.
+    Workers retain the original source mounts with private readonly proc views.
+    Every admitted view is verified at exec-stop and pinned until its original
+    supervisor reaps the member and descendants. Census is not input authority.
     """
     def __init__(self,admission,scope,lock,namespaces):
         if type(lock) is not WorkerProjectionLock:raise FreshnessHold('invalidation_unsafe')
@@ -2339,10 +2340,25 @@ class RepositoryWorkerFreezer(UnitFreezer):
         self.progress_lock=threading.Lock();self.progress_events=[]
         super().__init__(admission,scope,1000,_worker_token=_WORKER_GROUP_TOKEN)
         self.lock=lock;self.namespaces=dict(namespaces);self.members={}
+        self.proc_namespaces={};self.proc_lock=threading.Lock()
         self.membership='0::/ci-workers/'+self.path.name+'\n'
-        if (set(self.namespaces)!={'mnt','ipc','net','user','pid'} or any(
-                value!=os.readlink('/proc/self/ns/'+name) for name,value in self.namespaces.items())):
+        if (set(self.namespaces)!={'mnt','ipc','net','user','pid'}
+                or self.namespaces['mnt']==os.readlink('/proc/self/ns/mnt') or any(
+                value!=os.readlink('/proc/self/ns/'+name) for name,value in self.namespaces.items() if name!='mnt')):
             raise FreshnessHold('invalidation_unsafe')
+
+    def admitted_namespace(self,pid):
+        self._check()
+        try:
+            namespace=os.readlink(f'/proc/{pid}/ns/mnt')
+            with self.proc_lock:
+                pin=self.proc_namespaces.get(namespace)
+                if pin is None:return False
+                actual=os.fstat(pin['fd'])
+                if (actual.st_dev,actual.st_ino)!=(pin['device'],pin['inode']):return False
+            return all(os.readlink(f'/proc/{pid}/ns/'+name)==value
+                for name,value in self.namespaces.items() if name!='mnt')
+        except OSError:return False
 
     def _note(self,phase,**values):
         with self.progress_lock:
@@ -2375,15 +2391,30 @@ class RepositoryWorkerFreezer(UnitFreezer):
         status=process.joinpath('stat').read_text().rsplit(')',1)[1].split()
         if (status[0]!='t' or int(status[1])!=supervisor
                 or {task.name for task in process.joinpath('task').iterdir()}!={str(pid)}
-                or any(os.readlink(f'/proc/{pid}/ns/'+name)!=namespace for name,namespace in self.namespaces.items())
+                or any(os.readlink(f'/proc/{pid}/ns/'+name)!=namespace for name,namespace in self.namespaces.items() if name!='mnt')
+                or original and os.readlink(f'/proc/{pid}/ns/mnt')!=self.namespaces['mnt']
                 or process.joinpath('cgroup').read_text()!='0::/\n'):
             raise FreshnessHold('invalidation_unsafe')
-        self._write('cgroup.procs',str(pid).encode()+b'\n')
-        if (process.joinpath('cgroup').read_text()!=self.membership
-                or process.joinpath('stat').read_text().rsplit(')',1)[1].split()[19]!=str(entry['birth'])
-                or str(pid).encode() not in self._read('cgroup.procs').split()):
-            raise FreshnessHold('invalidation_unsafe')
-        self.members[pid]={'pidfd':os.dup(pidfd),'birth':entry['birth']}
+        namespace_fd,view=unit_views.pin_worker_proc(pid)
+        try:
+            if view!=entry.get('proc_view'):raise FreshnessHold('invalidation_unsafe')
+            namespace=view['mount_namespace'];identity=os.fstat(namespace_fd)
+            with self.proc_lock:
+                if namespace in self.proc_namespaces:raise FreshnessHold('invalidation_unsafe')
+            self._write('cgroup.procs',str(pid).encode()+b'\n')
+            if (process.joinpath('cgroup').read_text()!=self.membership
+                    or process.joinpath('stat').read_text().rsplit(')',1)[1].split()[19]!=str(entry['birth'])
+                    or str(pid).encode() not in self._read('cgroup.procs').split()):
+                raise FreshnessHold('invalidation_unsafe')
+            with self.proc_lock:
+                member={'pidfd':os.dup(pidfd),'birth':entry['birth'],'mount_namespace':namespace}
+                try:
+                    self.proc_namespaces[namespace]={'fd':namespace_fd,'device':identity.st_dev,'inode':identity.st_ino}
+                    self.members[pid]=member;namespace_fd=None
+                except BaseException:
+                    self.proc_namespaces.pop(namespace,None);os.close(member['pidfd']);raise
+        finally:
+            if namespace_fd is not None:os.close(namespace_fd)
         if original:
             self.original=pid;self.entry=copy.deepcopy(entry);self.pidfd=os.dup(pidfd)
         self._note('worker_enrolled',original_pid=self.original,enrolled_pid=pid,enrolled_birth=entry['birth'])
@@ -2405,7 +2436,9 @@ class RepositoryWorkerFreezer(UnitFreezer):
             raise FreshnessHold('cleanup_uncertain')
         # Called only after the original supervisor's full descendant cleanup
         # and exit record. pidfd readiness by itself never authorizes this.
-        os.close(member['pidfd']);del self.members[pid]
+        with self.proc_lock:
+            os.close(member['pidfd']);del self.members[pid]
+            pin=self.proc_namespaces.pop(member['mount_namespace']);os.close(pin['fd'])
 
     def freeze(self,deadline):
         self._lease('pause')
@@ -2418,8 +2451,7 @@ class RepositoryWorkerFreezer(UnitFreezer):
         if self.original not in pids or not 1<=len(pids)<=512:raise FreshnessHold('input_census_unknown')
         for pid in sorted(pids):
             process=Path('/proc')/str(pid)
-            if (process.joinpath('cgroup').read_text()!=self.membership or any(
-                    os.readlink(f'/proc/{pid}/ns/'+name)!=namespace for name,namespace in self.namespaces.items())):
+            if process.joinpath('cgroup').read_text()!=self.membership or not self.admitted_namespace(pid):
                 raise FreshnessHold('invalidation_unsafe')
             tasks=[]
             for task in process.joinpath('task').iterdir():
@@ -2453,7 +2485,7 @@ class RepositoryWorkerFreezer(UnitFreezer):
         self._note('workers_thawed')
 
     def close(self):
-        if self.members:raise FreshnessHold('cleanup_uncertain')
+        if self.members or self.proc_namespaces:raise FreshnessHold('cleanup_uncertain')
         super().close()
 
 
@@ -2897,9 +2929,14 @@ class WorkerRelay(RootRelay):
     def _receive(self,connection,descriptors):
         numbers=super()._receive(connection,descriptors)
         pid,uid,gid=struct.unpack('3i',connection.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
-        if any(os.readlink(f'/proc/{pid}/ns/'+name)!=os.readlink('/proc/self/ns/'+name)
-                for name in ('mnt','ipc','net','user','pid')):raise FreshnessHold('input_census_unknown')
+        self.require_worker_scope(pid)
         return numbers
+
+    def require_worker_scope(self,pid):
+        freezer=getattr(self,'worker_freezer',None)
+        if (freezer is None or not freezer.admitted_namespace(pid)
+                or Path(f'/proc/{pid}/cgroup').read_text()!=freezer.membership):
+            raise FreshnessHold('input_census_unknown')
 
     def _run(self,connection,ordinal,descriptors,numbers,phase):
         is_cargo=worker_cargo_request(payload(descriptors[0]));locked=False
@@ -3084,6 +3121,9 @@ def _unit(arguments):
                     or writer['flags']&os.O_ACCMODE!=os.O_WRONLY
                     or hashlib.sha256(f"{reader['device']}:{reader['inode']}".encode('ascii')).hexdigest()
                         !=stdin['jobserver']['kernel_pipe_sha256']):raise FreshnessHold('invalidation_unsafe')
+        if value.get('execution_role') in ('worker','cargo'):
+            entry['proc_view']=observe_proc_entry(child.pid,value['directory'],worker_delta=value['execution_role']=='worker',
+                retained=Path(value['target'])/('.jobserver-credit-'+value['command']))
         layout=None
         if 'view' in value:
             layout=unit_views.observe_mount_layout(child.pid);entry['mount_layout_sha256']=layout['sha256']
@@ -3140,6 +3180,19 @@ def _unit(arguments):
             except OSError as error:
                 if error.errno!=errno.EBADF:raise
         os.close(policy_receipt);endpoint.close();mediation.close()
+
+
+def observe_proc_entry(pid,directory,*,worker_delta=False,retained=None):
+    # Private diagnostic is never used as admission. Keep real layouts even if
+    # the following live proof refuses; do not lose the cause in a typed hold.
+    observation={
+        'version':1,'kind':'ci-proc-entry-observation','pid':pid,
+        'controller':unit_views.observe_mount_layout(os.getpid()),
+        'process':unit_views.observe_mount_layout(pid),
+        'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+    cache._write_record(Path(directory)/'proc-view-observation.json',observation)
+    if retained is not None:cache._write_record(Path(retained)/('proc-view-'+str(pid)+'.json'),observation)
+    return unit_views.observe_readonly_proc(pid,worker_delta=worker_delta)
 
 
 class UnitPolicy:
@@ -3383,6 +3436,7 @@ def _stage(arguments):
         environment[b'JARVIS_CARGO_RELAY_FD']=str(descriptor).encode()
         environment[b'LD_PRELOAD']=os.fsencode(value['library'])+(b' '+environment[b'LD_PRELOAD'] if b'LD_PRELOAD' in environment else b'')
         if role=='cargo':cargo_namespace(value['cargo_root'],value['source'],value.get('source_mounts'))
+        else:unit_views.private_proc_namespace()
     if 'view' in value:
         _PHASE='planner_view_enter';view=value['view']
         mounts=cache._read_record(Path(view['mounts']),max_bytes=16*1024**2)
@@ -4715,6 +4769,8 @@ def _cargo_supervisor(arguments):
     supervisor=_load('original_cargo_supervisor','provider-supervisor.py')
     def executed(child):
         staging.observe_relay_configuration(child.pid,configuration,listener_owned=True)
+        proc_view=observe_proc_entry(child.pid,directory,retained=Path(value['target'])/('.jobserver-credit-'+value['command']))
+        cache._write_record(directory/'proc-view.json',proc_view)
         mediation.executed(child)
     try:
         raw=supervisor.supervise(directory/'cleanup',
@@ -4727,9 +4783,7 @@ def _cargo_supervisor(arguments):
 
 def cargo_namespace(root,source,source_mounts=None):
     root=unit_views.literal(root);source=unit_views.literal(source)
-    libc=ctypes.CDLL(None,use_errno=True)
-    if libc.unshare(0x00020000)!=0:raise OSError(ctypes.get_errno(),'planner mount namespace unavailable')
-    unit_views._mount('--make-rprivate','/');os.chdir('/')
+    unit_views.private_proc_namespace();os.chdir('/')
     runtime=root/('toolchain-runtime-'+str(uuid.uuid4()));runtime.mkdir(mode=0o755)
     unit_views.toolchain_view('/toolchain',runtime)
     unit_views._mount('--rbind',runtime,'/toolchain')
@@ -5126,7 +5180,7 @@ os.write(1,(json.dumps({'raw_exec_errnos':errors})+'\n').encode())
 
 _RELAY_PROC_MEMORY_BODY=r'''
 import ctypes,errno,fcntl,json,os,signal,sys
-readonly=sys.argv[1]=='proc-ro'
+readonly=sys.argv[1] in ('proc-ro','worker-proc-ro','planner-proc-ro')
 assert bool(os.statvfs('/proc').f_flag&os.ST_RDONLY)==readonly
 buffer=ctypes.create_string_buffer(b'original');address=ctypes.addressof(buffer)
 ready_r,ready_w=os.pipe();go_r,go_w=os.pipe();report_r,report_w=os.pipe()
@@ -5198,9 +5252,10 @@ def _relay_exec_policy_client(arguments):
     bootstrap,configuration=map(int,arguments)
     value=_bootstrap(bootstrap,'relay-exec-policy-client');_parent_guard(value['parent']);os.close(bootstrap)
     uid=value['uid']
-    if uid not in (1000,1001,2000,6095) or value['mode'] not in ('direct','descendant','listener-loss','proc-rw','proc-ro'):
+    if uid not in (1000,1001,2000,6095) or value['mode'] not in ('direct','descendant','listener-loss','proc-rw','proc-ro','worker-proc-ro','planner-proc-ro'):
         raise FreshnessHold('invalidation_unsafe')
-    if value['mode'] in ('proc-rw','proc-ro'):
+    if value['mode'] in ('worker-proc-ro','planner-proc-ro'):unit_views.private_proc_namespace()
+    elif value['mode'] in ('proc-rw','proc-ro'):
         libc=ctypes.CDLL(None,use_errno=True)
         if libc.unshare(0x00020000)!=0:raise FreshnessHold('invalidation_unsafe')
         unit_views._mount('--make-rprivate','/')
@@ -5216,7 +5271,7 @@ def _relay_exec_policy_client(arguments):
     os.set_inheritable(configuration,True)
     arm_original_exec()
     os.execve('/usr/bin/python3',['python3','-I','-c',
-        _RELAY_PROC_MEMORY_BODY if value['mode'] in ('proc-rw','proc-ro') else _RELAY_EXEC_POLICY_BODY,value['mode']],
+        _RELAY_PROC_MEMORY_BODY if value['mode'] in ('proc-rw','proc-ro','worker-proc-ro','planner-proc-ro') else _RELAY_EXEC_POLICY_BODY,value['mode']],
         {'PATH':os.defpath,'LD_PRELOAD':value['library'],'JARVIS_CARGO_RELAY_FD':str(configuration)})
 
 
@@ -5227,7 +5282,8 @@ def relay_exec_policy_probe(value):
     cases=(('worker',1000,b'JARVWRK3',0,'direct'),('planner',1001,b'JARVCFG3',0,'direct'),
         ('unit_first',2000,b'JARVUNT3',2000,'direct'),('unit_last',6095,b'JARVUNT3',6095,'direct'),
         ('descendant',1000,b'JARVWRK3',0,'descendant'),('listener_loss',2000,b'JARVUNT3',2000,'listener-loss'),
-        ('proc_rw_control',2000,b'JARVUNT3',2000,'proc-rw'),('proc_ro_guard',2000,b'JARVUNT3',2000,'proc-ro'))
+        ('proc_rw_control',2000,b'JARVUNT3',2000,'proc-rw'),('proc_ro_guard',2000,b'JARVUNT3',2000,'proc-ro'),
+        ('worker_proc_guard',1000,b'JARVWRK3',0,'worker-proc-ro'),('planner_proc_guard',1001,b'JARVCFG3',0,'planner-proc-ro'))
     for name,uid,magic,config_uid,mode in cases:
         mediation=ExecMediation(value['deadline'],uid);bootstrap=None
         configuration=os.memfd_create('relay-policy-probe',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
@@ -5238,8 +5294,11 @@ def relay_exec_policy_probe(value):
             fcntl.fcntl(configuration,fcntl.F_ADD_SEALS,legacy.SEALS)
             bootstrap=_sealed(dict(value,kind='relay-exec-policy-client',parent=os.getpid(),
                 uid=uid,mode=mode,exec_mediation_fd=mediation.child_fd))
+            proc_views={}
             def executed(child):
                 staging.observe_relay_configuration(child.pid,configuration,listener_owned=True)
+                if mode in ('worker-proc-ro','planner-proc-ro'):
+                    proc_views['view']=observe_proc_entry(child.pid,value['root'],worker_delta=True)
                 mediation.executed(child)
                 if mode=='listener-loss':
                     mediation.settle();os.close(mediation.listener);mediation.listener=None
@@ -5259,11 +5318,12 @@ def relay_exec_policy_probe(value):
             mediation.settle()
             if code!=0 or error:raise FreshnessHold('invalidation_unsafe')
             observed=json.loads(output)
-            if mode in ('proc-rw','proc-ro'):
-                validate_proc_memory_case(observed,mode=='proc-ro')
+            if mode in ('proc-rw','proc-ro','worker-proc-ro','planner-proc-ro'):
+                validate_proc_memory_case(observed,mode!='proc-rw')
                 if mediation.errors or not mediation.ack:raise FreshnessHold('invalidation_unsafe')
                 if receipt.read_bytes()!=b'all-descendants-reaped\n':raise FreshnessHold('cleanup_uncertain')
                 results[name]={'uid':uid,'mode':mode,'memory':observed,'original_exec_ack':True,'original_cleanup':True}
+                if proc_views:results[name]['proc_view']=proc_views['view']
                 continue
             if type(observed) is not dict or set(observed)!={'raw_exec_errnos'}:raise FreshnessHold('invalidation_unsafe')
             refused=observed['raw_exec_errnos']
@@ -5292,7 +5352,7 @@ def relay_exec_policy_probe(value):
 
 def validate_relay_exec_policy_probe(value,binding,command,workers,writer,source_projection):
     keys={'version','kind','binding','command','cases','input_closure_complete','full_ci','shipping_authority','guest_worker_quiescence'}
-    expected={'worker':1000,'planner':1001,'unit_first':2000,'unit_last':6095,'descendant':1000,'listener_loss':2000,'proc_rw_control':2000,'proc_ro_guard':2000}
+    expected={'worker':1000,'planner':1001,'unit_first':2000,'unit_last':6095,'descendant':1000,'listener_loss':2000,'proc_rw_control':2000,'proc_ro_guard':2000,'worker_proc_guard':1000,'planner_proc_guard':1001}
     if (type(value) is not dict or set(value)!=keys or value['version']!=1
             or value['kind']!='ci-relay-exec-policy-probe' or value['binding']!=binding or value['command']!=command
             or any(value[k] is not False for k in ('input_closure_complete','full_ci','shipping_authority'))
@@ -5303,12 +5363,20 @@ def validate_relay_exec_policy_probe(value,binding,command,workers,writer,source
             or any(scope==item['scope'] for item in source_projection['access'])):raise FreshnessHold('cleanup_uncertain')
     for name,uid in expected.items():
         row=value['cases'][name];lost=name=='listener_loss'
-        if name in ('proc_rw_control','proc_ro_guard'):
-            readonly=name=='proc_ro_guard'
-            if (type(row) is not dict or set(row)!={'uid','mode','memory','original_exec_ack','original_cleanup'}
-                    or row['uid']!=2000 or row['mode']!=('proc-ro' if readonly else 'proc-rw')
+        if name in ('proc_rw_control','proc_ro_guard','worker_proc_guard','planner_proc_guard'):
+            readonly=name!='proc_rw_control';private=name in ('worker_proc_guard','planner_proc_guard')
+            mode={'proc_rw_control':'proc-rw','proc_ro_guard':'proc-ro','worker_proc_guard':'worker-proc-ro','planner_proc_guard':'planner-proc-ro'}[name]
+            keys={'uid','mode','memory','original_exec_ack','original_cleanup'}|({'proc_view'} if private else set())
+            if (type(row) is not dict or set(row)!=keys
+                    or row['uid']!=uid or row['mode']!=mode
                     or row['original_exec_ack'] is not True or row['original_cleanup'] is not True):
                 raise FreshnessHold('input_census_unknown')
+            if private:
+                view=row['proc_view']
+                if (type(view) is not dict or view.get('kind')!='ci-readonly-proc-view' or view.get('worker_delta') is not True
+                        or view.get('mount_namespace')==view.get('controller_mount_namespace')
+                        or any(view.get(key) is not False for key in ('input_closure_complete','full_ci','shipping_authority'))):
+                    raise FreshnessHold('input_census_unknown')
             validate_proc_memory_case(row['memory'],readonly);continue
         if (type(row) is not dict or set(row)!={'uid','mode','raw_execs_refused','raw_exec_errnos','denied_notifications','original_exec_ack','original_cleanup','listener_lost'}
                 or row['uid']!=uid or row['raw_execs_refused']!=2 or type(row['denied_notifications']) is not int
@@ -5482,7 +5550,11 @@ def admit_original_repository_worker(child,endpoint,configuration,receipt,value)
             if ((target['device'],target['inode'],target['type'])!=(actual.st_dev,actual.st_ino,stat.S_IFMT(actual.st_mode))
                     or target['flags']&os.O_ACCMODE!=os.O_WRONLY):raise FreshnessHold('invalidation_unsafe')
         namespaces={name:os.readlink(f'/proc/{pid}/ns/'+name) for name in ('mnt','ipc','net','user','pid')}
-        if any(namespace!=os.readlink('/proc/self/ns/'+name) for name,namespace in namespaces.items()):
+        if (namespaces['mnt']==os.readlink('/proc/self/ns/mnt') or any(
+                namespace!=os.readlink('/proc/self/ns/'+name) for name,namespace in namespaces.items() if name!='mnt')):
+            raise FreshnessHold('invalidation_unsafe')
+        proc_view=observe_proc_entry(pid,value['root'],worker_delta=True,retained=Path(value['target'])/('.jobserver-credit-'+value['command']))
+        if proc_view!=stored.get('proc_view') or proc_view['mount_namespace']!=namespaces['mnt']:
             raise FreshnessHold('invalidation_unsafe')
         admission={'version':1,'kind':'ci-repository-worker-admission','binding':value['binding'],
             'command':value['command'],'scope_id':expected['scope_id'],'supervisor_pid':child.pid,
@@ -5504,7 +5576,7 @@ def _repository_worker(arguments):
     worker_runtime_request((os.fsencode(value['argv'][0]),list(map(os.fsencode,value['argv'])),
         {os.fsencode(key):os.fsencode(item) for key,item in environment.items()},b'/workspace',None,0,0),value['library'])
     environment.update(LD_PRELOAD=value['library'],JARVIS_CARGO_RELAY_FD=str(configuration))
-    policy=UnitPolicy();stage_exec_mediation(value,policy)
+    policy=UnitPolicy();unit_views.private_proc_namespace();stage_exec_mediation(value,policy)
     policy.prepare_relay_configuration(configuration)
     staging.publish_policy_receipt(receipt,repository_worker_policy_context(value,policy,os.getpid()))
     libc=ctypes.CDLL(None,use_errno=True)
@@ -5525,6 +5597,7 @@ def _repository_worker_supervisor(arguments):
     def executed(child):
         observed=staging.observe_worker_entry(child.pid,int(arguments[1]),value['policy_receipt_fd'],
             repository_worker_policy_context(value,mediation.policy,child.pid),uid=1000,gid=1000,groups=[],listener_owned=True)
+        observed['proc_view']=observe_proc_entry(child.pid,value['root'],worker_delta=True,retained=Path(value['target'])/('.jobserver-credit-'+value['command']))
         cache._write_record(Path(value['root'])/'original-worker-entry.json',{
             'version':1,'binding':value['binding'],'command':value['command'],'entry':observed,
             'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
