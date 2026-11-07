@@ -1136,6 +1136,27 @@ The following load-bearing choices remain parked with C; they are not waived:
   this boundary; stricter stacked filters and the remaining runtime/input policy
   still require evidence. All real consumers must receive the final C/S mapping.
 
+The private diagnostic replay at `1bd0b1d0` now reaches the original failed child
+without consuming its output pipe: GCC 13 reports that starting
+`/usr/libexec/gcc/x86_64-linux-gnu/13/collect2` fails at `vfork` with ENOSYS.
+The original child exits 1, original cleanup is checked, its jobserver credit is
+returned, and parent resume remains held. Original host VM quiescence is verified.
+The unit policy intentionally rejects raw `vfork`, `CLONE_VFORK` and unsupported
+separate-process shared address spaces because the retained status proxy cannot
+release that shared address space at the delegated tool's exec boundary. CPython's
+ordinary fork fallback does not establish that GCC has one. This is a supported-
+adapter compatibility gate owned by C, with R owning the original process/exec
+and cleanup boundary. Before final-C authority/handoff, admit an execution path
+for the unchanged pinned compiler invocation and prove its parent release,
+shared-memory/FD/stdio, signal, exit-status, jobserver and original-scope behavior.
+Do not enable raw exec/shared-mm creation, swap the fixture compiler, alter its
+argv/environment/counters or treat a preload-only path as kernel mediation to
+make this regression pass. The compiler error is an actual private observation,
+not the trusted kernel-policy disposition proof still required above. The
+separate copy-back, closure and projection gates remain even after this runtime
+compatibility exit is implemented. No source/CI/shipping authority is established
+by these diagnostic probes.
+
 The selected implicit-credit jobserver model also remains a feasibility gate
 until its actual pinned-tool saturation/cancellation tests pass. The joint C/R
 abandonment, consumer enrollment, retirement dispositions and fingerprint replay

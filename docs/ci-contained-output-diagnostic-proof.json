@@ -64,7 +64,7 @@
   },
   "scope": "Failed contained child only, after original status/cleanup validation and while original parent frozen. Nonblocking tee copies only currently available pipe bytes into private scratch; does not consume original bytes or change original FD flags. Actual host child tests preserve bytes, flags, FD count and EOF. Regular files/sockets are not read. All extra FDs close before return.",
   "limits": [
-    "Final descriptor-lifetime guest validation is pending; earlier probe failures are explicitly retained below",
+    "Final descriptor-lifetime guest diagnostic works; original compiler invocation still fails at the explicit vfork compatibility boundary and contained copy-back remains held",
     "Sampling may return less than 32 KiB; complete_stream always false and digests cover sample only",
     "No final stdio-fidelity authority for parent-loss/external-alias races",
     "No source/resource/input, cleanup, policy-disposition, materialization, resume or reusable publication permission",
@@ -130,7 +130,28 @@
     ],
     "source_inventory_is_post_run_inventory": true,
     "source_generation_authority": false,
-    "guest_validation": "pending fresh changed-code probe",
+    "guest_validation": {
+      "session": 4395,
+      "source_commit": "1bd0b1d02dcff5c87ddca45584890fb1f280efab",
+      "result": "terminal101, original InputCensusUnknown hold retained",
+      "seconds": 115.91,
+      "log": "/tmp/autoship-ci-contained-output-descriptor-lifetime-vm-20261107.log",
+      "read_only_inspection_session": 62746,
+      "inspection": "/tmp/autoship-ci-reader-output-inspection-20261107.json",
+      "managed_cache_lease_used": true,
+      "native_child_returncode": 1,
+      "original_child_cleanup": true,
+      "jobserver_credit_state": "returned",
+      "parent_resume_held": true,
+      "stderr_sample_bytes": 137,
+      "stderr_sample_sha256": "9442eef02fd93fe5062e64846bbbfd8d73ef49b8fd53551cf4f12f8ce60b9af7",
+      "complete_stream": false,
+      "stderr_sample": "cc: fatal error: cannot execute '/usr/libexec/gcc/x86_64-linux-gnu/13/collect2': vfork: Function not implemented\ncompilation terminated.\n",
+      "host_vm_original_quiescence": "removed_empty_subtree",
+      "input_closure_complete": false,
+      "full_ci": false,
+      "shipping_authority": false
+    },
     "spec_audit": {
       "relevant_wrong_build_or_forced_guess_findings": 0,
       "scope": "new diagnostic paragraphs only; no full mechanism handoff, independent code review or activation approval"
