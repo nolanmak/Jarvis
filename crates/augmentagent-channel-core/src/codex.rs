@@ -347,14 +347,14 @@ impl CodexCliReasoner {
 
         let launch_audit=opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger);
         crate::run_resources::check_requirement(provider,launch_audit.as_ref())?;
-        let native_vm = if crate::native_vm::required(launch_audit.as_ref()) {
+        // Resolve declaration errors before allocating a native runtime or intent.
+        let run_policy = crate::run_resources::declared_policy_for(crate::run_resources::run_kind_for(opts))?;
+        let mut native_vm = if crate::native_vm::required(launch_audit.as_ref()) {
             Some(crate::native_vm::Launch::prepare(provider, opts, &cmd, if fresh_review {None}else{Some(&bridge)}, native_launch.as_ref())?)
         } else { None };
         if let (Some(vm),Some(lease))=(&native_vm,&native_lease) {vm.register_retirement(lease);}
-        // #1627 — a text turn reserves the text tier, not a builder's 4 GiB.
-        let run_policy = crate::run_resources::declared_policy_for(crate::run_resources::run_kind_for(opts))?;
-        let spawned = match &native_vm {
-            Some(vm) => crate::process_tree::spawn_admitted_vm(vm, clean, opts.handoff_path.as_deref()),
+        let spawned = match &mut native_vm {
+            Some(vm) => vm.spawn_admitted(clean, opts.handoff_path.as_deref()),
             None => crate::process_tree::spawn_admitted_with_policy(&cmd, true, clean, opts.handoff_path.as_deref(), false, run_policy.as_ref()),
         };
         let (mut child, process_group) = spawned.map_err(|e| {

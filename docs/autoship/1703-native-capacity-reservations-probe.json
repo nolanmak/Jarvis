@@ -15,7 +15,9 @@
     "The free sweep retains original-bound retirement and native terminal-cleanup reconciliation, then prunes already-authorized runtimes before read-only capacity observation. It takes native locks with no workflow mutex or transaction held.",
     "Cleanup opens only an established, validated current original namespace. Missing authority is retained, never initialized or migrated. Optional cleanup/wake errors stay logged and do not hide previously completed retirement work.",
     "Fresh unpublished session ownership borrows the held state lock through pure intent validation. Failure cleans only that newly allocated session; resume never receives this guard.",
-    "Consume the cleanup guard before the first launch-intent publication attempt and release the state lock before journal callbacks. Failed or uncertain publication retains original runtime context."
+    "Consume the cleanup guard before the first launch-intent publication attempt and release the state lock before journal callbacks. Failed or uncertain publication retains original runtime context.",
+    "Both provider adapters resolve resource declaration errors before native allocation and use one-shot prepared spawn. The command and resource policy are private.",
+    "Only the actual prepared launch can produce the non-Clone, non-serializable NativeSpawn token. Supervisor creation consumes that attempt even on construction failure. Saved launch records cannot construct a token."
   ],
   "validation": {
     "red": {
@@ -67,16 +69,16 @@
       "log": "/tmp/autoship-native-capacity-original-wake-green-20261107.log"
     },
     "current_full_core_lib": {
-      "passed": 969,
+      "passed": 970,
       "failed": 0,
       "ignored": 15,
-      "seconds": 39.24,
-      "log": "/tmp/autoship-native-intent-constructor-core-20261107.log"
+      "seconds": 39.18,
+      "log": "/tmp/autoship-native-one-shot-core-20261107.log"
     },
     "current_production_cli_check": {
       "result": "passed",
-      "seconds": 36.55,
-      "log": "/tmp/autoship-native-intent-constructor-production-20261107.log"
+      "seconds": 37.24,
+      "log": "/tmp/autoship-native-one-shot-production-20261107.log"
     },
     "preceding_composition_full_cli": {
       "passed": 1959,
@@ -94,6 +96,15 @@
       "green_log": "/tmp/autoship-native-intent-constructor-green-20261107.log",
       "preservation": "A successful prepared launch and a workflow-journal acknowledgement failure retain original runtime bytes and the actual committed launch receipt.",
       "full_cli_scope": "Full CLI suite above is the preceding composition; the constructor follow-up was verified through full core and production CLI compilation."
+    },
+    "prepared_spawn_once": {
+      "test": "native_vm::tests::prepared_native_launch_allows_only_one_supervisor_attempt",
+      "red": "Same actual prepared native launch started a second packaged supervisor after resource refusal.",
+      "red_log": "/tmp/autoship-native-one-shot-red-20261107.log",
+      "green": "Both providers reject second attempt after real supervisor resource refusal and after early journal-path construction failure; zero model calls and original owned bytes preserved.",
+      "green_log": "/tmp/autoship-native-one-shot-green-20261107.log",
+      "green_seconds": 0.68,
+      "limits": "Real packaged supervisor/controller fixture before guest startup; not native provider acceptance or physical runtime reclamation."
     }
   },
   "limits": [
@@ -105,7 +116,7 @@
   "sources": [
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
-      "sha256": "3943977da82d9854aedccbe43d1d09d63b64e3f3416ab5e6fa681f6cb08daa1f"
+      "sha256": "b89340271c5b46b6907513103d39fc5d07fdc65afafa34d32f48b7635d5bb210"
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_owner_store.rs",
@@ -117,7 +128,7 @@
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_vm.rs",
-      "sha256": "83debf4a48277f89f4a21464f0cd0bcaa3171de75fe5ba3578bf2faf4df9549e"
+      "sha256": "724283125fb371920446def125aad57480293f7c943a543f8a5e07f77a59374c"
     },
     {
       "path": "crates/augmentagent-channel-core/src/run_resources.rs",
@@ -138,6 +149,18 @@
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
       "sha256": "6116eca6457ae95e048a5047c1204b94db3c71006d78b39da624d7e9ac84ec22"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/codex.rs",
+      "sha256": "7f5f2d16db0dadfe4552045668eb30181b064fbc80ead3d4b4528f81c7c5d08c"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/process_tree.rs",
+      "sha256": "62208da0108290d804d97b0c13dfa896878632b874b8cc91d3de07426d225df6"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/reasoner.rs",
+      "sha256": "6a24fb483b43efe16383ee9ccb5b9e8a14a126a53625a250c18c4ba013065adc"
     }
   ],
   "composition_base": "9e58bcc152f32c6db1aa40f1485f030d3e0915af"

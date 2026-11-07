@@ -1938,6 +1938,7 @@ mod tests {
         let launch = super::super::Launch {
             command: tokio::process::Command::new("unused-fixture"),
             resource_policy: json!({}),
+            spawn_attempted:false,
             runtime_relative_path:super::super::relative_runtime(root.path(),&runtime).unwrap().into(),
             creation_receipt_sha256:super::super::digest(super::super::private(&runtime.join("owned.json")).unwrap()),
             store: super::super::test_store_identity(root.path()),
@@ -1972,6 +1973,7 @@ mod tests {
         let destination = super::super::Launch {
             command: tokio::process::Command::new("unused-fixture"),
             resource_policy: json!({}),
+            spawn_attempted:false,
             runtime_relative_path:super::super::relative_runtime(root.path(),&runtime).unwrap().into(),
             creation_receipt_sha256:super::super::digest(super::super::private(&runtime.join("owned.json")).unwrap()),
             store: super::super::test_store_identity(root.path()),
@@ -2011,6 +2013,7 @@ mod tests {
         let launch = super::super::Launch {
             command: tokio::process::Command::new("unused-fixture"),
             resource_policy: json!({}),
+            spawn_attempted:false,
             runtime_relative_path:super::super::relative_runtime(root.path(),&runtime).unwrap().into(),
             creation_receipt_sha256:super::super::digest(super::super::private(&runtime.join("owned.json")).unwrap()),
             store: super::super::test_store_identity(root.path()),

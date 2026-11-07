@@ -691,10 +691,10 @@ pub(crate) fn spawn_admitted_with_policy(command: &Command, clear_env: bool, cle
     spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,policy,&[],None)
 }
 /// Controller-only VM startup capability. Native code cannot run before admission.
-pub(crate) fn spawn_admitted_vm(launch: &crate::native_vm::Launch, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>)
+pub(crate) fn spawn_admitted_vm(launch: crate::native_vm::NativeSpawn<'_>, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>)
     -> std::io::Result<(Child, ProcessGroup)> {
     let prepared=launch.prepared_record().map_err(std::io::Error::other)?;
-    let (child,mut group)=spawn_supervised_inner(&launch.command,true,clean,journal,true,true,true,Some(&launch.resource_policy),&[],None)?;
+    let (child,mut group)=spawn_supervised_inner(launch.command(),true,clean,journal,true,true,true,Some(launch.resource_policy()),&[],None)?;
     group.native_initial=launch.is_initial();
     group.native_launch=Some(prepared);
     Ok((child,group))

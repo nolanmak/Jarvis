@@ -577,8 +577,9 @@ impl UnpublishedSession<'_> {
     fn retain(self) {let _=self.directory.keep();}
 }
 pub(crate) struct Launch {
-    pub command: Command,
-    pub resource_policy: serde_json::Value,
+    command: Command,
+    resource_policy: serde_json::Value,
+    spawn_attempted:bool,
     aliases: PathBuf,
     session: PathBuf,
     ephemeral: bool,
@@ -591,6 +592,16 @@ pub(crate) struct Launch {
     observation:Option<LaunchObservation>,
     _directory: tempfile::TempDir,
 }
+/// One supervisor attempt borrowed from the actual prepared launch. Only this
+/// module can construct it; saved launch records cannot mint a spawn attempt.
+pub(crate) struct NativeSpawn<'a> {launch:&'a Launch}
+impl NativeSpawn<'_> {
+    pub(crate) fn command(&self)->&Command {&self.launch.command}
+    pub(crate) fn resource_policy(&self)->&serde_json::Value {&self.launch.resource_policy}
+    pub(crate) fn prepared_record(&self)->Result<PreparedLaunchRecord> {self.launch.prepared_record()}
+    pub(crate) fn is_initial(&self)->bool {self.launch.is_initial()}
+}
+
 /// Original input authority retained from its durable marker until stdin is
 /// settled or the submission future is dropped. Never serializable/replayable.
 struct NativeInputRelease {_state:StateLock}
@@ -617,6 +628,15 @@ pub(crate) async fn submit_provider_input(
 
 impl Launch {
     pub(crate) fn is_initial(&self)->bool {self.initial}
+    /// Claim before any supervisor I/O; even failed construction consumes this
+    /// prepared launch. Durable intent/context remain protected for settlement.
+    pub(crate) fn spawn_admitted(&mut self,clean:std::sync::Arc<std::sync::atomic::AtomicBool>,journal:Option<&Path>)
+        ->std::io::Result<(tokio::process::Child,crate::process_tree::ProcessGroup)> {
+        if self.spawn_attempted {return Err(std::io::Error::other("prepared native launch already used"));}
+        self.spawn_attempted=true;
+        crate::process_tree::spawn_admitted_vm(NativeSpawn {launch:self},clean,journal)
+    }
+
     pub(crate) fn prepared_record(&self)->Result<PreparedLaunchRecord> {
         let observation=self.observation.as_ref().context("native launch lacks prepared controller context")?;
         ensure!(observation.logger.upgrade().is_some(),"native launch controller expired");
@@ -801,7 +821,7 @@ impl Launch {
         let mut command = Command::new("/usr/bin/python3");
         command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
             .env("PATH","/usr/bin:/bin");
-        let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), initial:!resume, authority, store, runtime_relative_path, creation_receipt_sha256, audit_log,
+        let result = Self { command, resource_policy,spawn_attempted:false, aliases, session, ephemeral:native.is_none(), initial:!resume, authority, store, runtime_relative_path, creation_receipt_sha256, audit_log,
             observation:Some(LaunchObservation {prepared,logger:std::sync::Arc::downgrade(owner_logger),actual_session:std::sync::Mutex::new(None),input_attempted:std::sync::atomic::AtomicBool::new(false),completion_verified:std::sync::atomic::AtomicBool::new(false),completed:std::sync::atomic::AtomicBool::new(false)}),_directory:directory };
         // A requested alias permits later lookup but is not a provider ID event.
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.register_alias(id)?; }
@@ -966,6 +986,8 @@ mod tests {
         prune_and_count(root,&ledger)
     }
     #[test]
+    fn prepared_native_launch_allows_only_one_supervisor_attempt() {launch_intent_child("spawn-once");}
+    #[test]
     fn native_preparation_reclaims_only_before_intent_publication_attempt() {launch_intent_child("constructor-reclaim");}
     #[test]
     fn native_preparation_durably_records_exact_launch_before_returning() {
@@ -1086,7 +1108,8 @@ mod tests {
                 }
                 return;
             }
-            let test = if mode=="constructor-reclaim" {"native_preparation_reclaims_only_before_intent_publication_attempt"}
+            let test = if mode=="spawn-once" {"prepared_native_launch_allows_only_one_supervisor_attempt"}
+                else if mode=="constructor-reclaim" {"native_preparation_reclaims_only_before_intent_publication_attempt"}
                 else if mode=="preparation-context" {"native_preparation_binds_original_owner_preparation_context"}
                 else if mode=="asset-input" {"native_preparation_snapshots_referenced_asset_bytes"}
                 else if mode=="executable-input" {"native_preparation_binds_executable_before_runtime_allocation"}
@@ -1181,6 +1204,42 @@ mod tests {
             let mut opts=crate::reasoner::triage_opts(None);opts.audit_logger=Some(logger.clone());
             let native=crate::native_session::Launch::Create {requested_id:id.map(str::to_owned)};
             let context=OwnerPreparationContext::new(owner.clone(),"original-owner-request".into(),"c".repeat(64)).unwrap();
+            if mode=="spawn-once" {
+                use std::sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}};
+                let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let _entered=runtime.enter();
+                let billed=Arc::new(AtomicUsize::new(0));let calls=billed.clone();
+                logger.set_model_call_observer(Arc::new(move |_| {calls.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
+                let mut vm=Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native)).unwrap();
+                let original=vm.session.clone();let owned=private(&original.join("owned.json")).unwrap();
+                // Real packaged supervisor rejects this resource declaration
+                // before native VM startup. No guest/provider inference runs.
+                vm.resource_policy=serde_json::json!({"memory_bytes":0,"pids":64,"cpu_percent":100});
+                let clean=Arc::new(AtomicBool::new(true));
+                let (mut child,group)=vm.spawn_admitted(clean.clone(),None).unwrap();
+                assert!(runtime.block_on(group.admit_model(provider,Some(&logger))).is_err());
+                let second=vm.spawn_admitted(Arc::new(AtomicBool::new(true)),None);
+                let refused=match second {
+                    Err(error)=>error.to_string().contains("already used"),
+                    Ok((mut duplicate,group))=>{drop(group);runtime.block_on(duplicate.wait()).unwrap();false},
+                };
+                drop(group);runtime.block_on(child.wait()).unwrap();
+                assert!(clean.load(Ordering::SeqCst));
+                assert!(refused,"same prepared native launch started a second supervisor");
+                assert_eq!(private(&original.join("owned.json")).unwrap(),owned);
+                let create=crate::native_session::Launch::Create {requested_id:None};
+                let mut vm=Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&create)).unwrap();
+                let original=vm.session.clone();let owned=private(&original.join("owned.json")).unwrap();
+                let file=root.join(format!("{provider}-not-a-journal-directory"));write(&file,b"fixture").unwrap();
+                let journal=file.join("journal");
+                assert!(vm.spawn_admitted(Arc::new(AtomicBool::new(true)),Some(&journal)).is_err());
+                let error=vm.spawn_admitted(Arc::new(AtomicBool::new(true)),Some(&journal))
+                    .err().expect("failed constructor was reused");
+                assert!(error.to_string().contains("already used"),"failed spawn did not consume prepared launch: {error}");
+                assert_eq!(private(&original.join("owned.json")).unwrap(),owned);
+                assert_eq!(billed.load(Ordering::SeqCst),0);
+                continue;
+            }
             if mode=="constructor-reclaim" {
                 for invalid_id in [String::new(),"x".repeat(257),"session with whitespace".into()] {
                     let invalid=crate::native_session::Launch::Create {requested_id:Some(invalid_id)};
@@ -1812,7 +1871,7 @@ else: print(result)
         std::fs::set_permissions(&aliases,std::fs::Permissions::from_mode(0o700)).unwrap();
         let expected=ownership::Authority {owner:RuntimeOwner {workflow_id:"workflow".into(),lease_generation:1},audit_path:"/audit/original".into()};
         let retirement=test_retirement(runtime.clone(),expected.clone());
-        let launch=Launch {command:Command::new("unused-fixture"),resource_policy:serde_json::json!({}),aliases,
+        let launch=Launch {command:Command::new("unused-fixture"),resource_policy:serde_json::json!({}),spawn_attempted:false,aliases,
             session:runtime,ephemeral:false,initial:true,authority:expected,store:test_store_identity(&root),runtime_relative_path:retirement.runtime_relative_path.clone(),creation_receipt_sha256:retirement.creation_receipt_sha256.clone(),audit_log:"/audit/original".into(),observation:None,_directory:tempfile::tempdir().unwrap()};
         (base,root,retirement,launch)
     }
