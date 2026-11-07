@@ -275,7 +275,13 @@ fn journal(conn: &Connection, workflow: &str) -> Result<Vec<(Claim, RecordRef)>>
     };
     let ready_events:i64=conn.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1 AND kind='owner_successor_ready'",[workflow],|r|r.get(0))?;
     let mut ready_count=0;
-    for (claim,reference) in &claims {if successor_ready::for_claim(conn,claim,reference)?.is_some() {ready_count+=1;}}
+    for (claim,reference) in &claims {
+        if successor_ready::for_claim(conn,claim,reference)?.is_some() {
+            ensure!(claims.last().is_some_and(|(last,_)|last.generation==claim.generation),
+                "owner readiness has no consumed successor edge");
+            ready_count+=1;
+        }
+    }
     let indexed_ready:i64=if conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_successor_ready')",[],|r|r.get::<_,bool>(0))? {
         let (count,bytes):(i64,i64)=conn.query_row("SELECT count(*),coalesce(sum(length(CAST(record AS BLOB))),0) FROM workflow_owner_successor_ready WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?)))?;
         ensure!(count<=1024 && bytes<=128*1024*1024,"owner readiness history exceeds aggregate bound");count
@@ -318,12 +324,14 @@ fn plan(conn: &Connection, workflow: &str) -> Result<Option<RecoveryPlan>> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
-    if turns.is_empty() {
-        return Ok(None);
+    if let Some((claim,reference))=&previous {
+        if successor_ready::for_claim(conn,claim,reference)?.is_some() {
+            ensure!(turns.len()==1 && claim.original.request_id==turns[0].0 && turns[0].1=="recovery_ready",
+                "owner ready turn lost its immutable disposition; successor consumption required");
+            return Ok(None);
+        }
     }
-    if turns.len()==1 && turns[0].1=="recovery_ready" {
-        let (claim,reference)=previous.as_ref().context("owner readiness has no recovery claim")?;
-        ensure!(claim.original.request_id==turns[0].0 && successor_ready::for_claim(conn,claim,reference)?.is_some(),"owner ready turn lost its immutable bridge");
+    if turns.is_empty() {
         return Ok(None);
     }
     ensure!(

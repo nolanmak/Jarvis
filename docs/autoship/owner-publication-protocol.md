@@ -787,7 +787,10 @@ must be revalidated by the future execution constructor.
 
 The recovery journal validates the exact ready record/event/publication joins
 before accepting removal of its pending pointer. Missing, substituted, orphaned
-or oversized history holds. A ready turn prevents routine metadata re-claim,
+or oversized history holds. An unconsumed ready record must remain the last
+recovery claim; a changed/missing turn disposition or a later recovery claim
+without a consumed-successor edge refuses rather than recreating metadata work.
+A ready turn prevents routine metadata re-claim,
 ordinary workflow acquisition and generic next-owner acquisition. The one-active
 turn index includes `recovery_ready`, with atomic idempotent migration from the
 previous index. History never treats `completed` or `setup_refused` as a shortcut
