@@ -2148,6 +2148,35 @@ class UnitFreezer:
     """
     _setup=threading.Lock()
 
+    @classmethod
+    def prepare_mount(cls,admission):
+        if (os.getresuid()!=(0,0,0) or type(admission) is not _Admission
+                or admission.token is not _TOKEN or admission.owner!=os.getpid()
+                or os.readlink('/proc/1/ns/pid')!=os.readlink('/proc/self/ns/pid')):
+            raise FreshnessHold('invalidation_unsafe')
+        _source(admission.target,admission.binding,admission.command)
+        with cls._setup:return cls._prepare_mount(lambda *args,**kwargs:None)
+
+    @staticmethod
+    def _prepare_mount(note):
+        mount=Path('/sys/fs/cgroup')
+        # This controller runs in the isolated guest's initial cgroup.
+        # Refuse a host service/delegation rather than modifying its tree.
+        membership=Path('/proc/self/cgroup').read_bytes()
+        note('before_mount',membership_root=membership==b'0::/\n',membership_empty=membership==b'',
+            mountpoint_exists=mount.is_dir(),v2_controls_present=(mount/'cgroup.controllers').exists())
+        # The unified hierarchy is omitted from proc until its first
+        # mount. Verify actual root membership after making it visible.
+        if membership not in (b'',b'0::/\n'):raise FreshnessHold('invalidation_unsafe')
+        if not (mount/'cgroup.controllers').exists():
+            unit_views._mount('-t','cgroup2','-o','nosuid,nodev,noexec','none',mount)
+        note('verify_mount')
+        if Path('/proc/self/cgroup').read_bytes()!=b'0::/\n':raise FreshnessHold('invalidation_unsafe')
+        rows=Path('/proc/self/mountinfo').read_text().splitlines()
+        if not any(line.split()[4]=='/sys/fs/cgroup' and ' - cgroup2 ' in line for line in rows):
+            raise FreshnessHold('invalidation_unsafe')
+        return mount
+
     def __init__(self,admission,scope,uid,*,_worker_token=None):
         worker=_worker_token is _WORKER_GROUP_TOKEN
         if (os.getresuid()!=(0,0,0) or type(admission) is not _Admission
@@ -2165,22 +2194,7 @@ class UnitFreezer:
         self.setup_record={'version':1,'kind':'ci-worker-freezer-setup' if worker else 'ci-unit-freezer-setup','binding':admission.binding,
             'command':admission.command,'uid':uid,'pid_namespace':self.pid_namespace,'shipping_authority':False}
         with self._setup:
-            mount=Path('/sys/fs/cgroup')
-            # This controller runs in the isolated guest's initial cgroup.
-            # Refuse a host service/delegation rather than modifying its tree.
-            membership=Path('/proc/self/cgroup').read_bytes()
-            self._note('before_mount',membership_root=membership==b'0::/\n',membership_empty=membership==b'',
-                mountpoint_exists=mount.is_dir(),v2_controls_present=(mount/'cgroup.controllers').exists())
-            # The unified hierarchy is omitted from proc until its first
-            # mount. Verify actual root membership after making it visible.
-            if membership not in (b'',b'0::/\n'):raise FreshnessHold('invalidation_unsafe')
-            if not (mount/'cgroup.controllers').exists():
-                unit_views._mount('-t','cgroup2','-o','nosuid,nodev,noexec','none',mount)
-            self._note('verify_mount')
-            if Path('/proc/self/cgroup').read_bytes()!=b'0::/\n':raise FreshnessHold('invalidation_unsafe')
-            rows=Path('/proc/self/mountinfo').read_text().splitlines()
-            if not any(line.split()[4]=='/sys/fs/cgroup' and ' - cgroup2 ' in line for line in rows):
-                raise FreshnessHold('invalidation_unsafe')
+            mount=self._prepare_mount(self._note)
             root=mount/('ci-workers' if worker else 'ci-units')
             if not root.exists():root.mkdir(mode=0o700)
             info=root.lstat()
@@ -5619,6 +5633,9 @@ def _execute_repository(arguments):
     root=Path(value['root']);worker_admission=admit(value['target'],value['binding'],value['command'],root)
     planner_root=root/'planner';planner_root.mkdir(mode=0o700)
     planner_admission=admit(value['target'],value['binding'],value['command'],planner_root)
+    # Make the controller's kernel mount table stable before any worker clones
+    # its proc-only view. Later freezer creation adds only cgroup directories.
+    UnitFreezer.prepare_mount(worker_admission)
     supervisor_receipt=root/'original-worker-cleanup';child=None;bootstrap=None;configuration=None;worker_pidfd=None;original_launch=None
     controller,worker_control=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
     policy_receipt=os.memfd_create('ci-repository-worker-policy',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)

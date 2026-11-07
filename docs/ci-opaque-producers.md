@@ -693,6 +693,15 @@ not a general namespace exception. IPC/network/user/PID namespaces still match
 the original controller. Original worker controller admission independently
 repeats the live proc-view comparison before releasing its held exec-stop.
 
+Prepare the existing controller cgroup2 mount through the admitted root context
+before any worker clones its mount table. The first integration replay exposed
+why this order is mandatory: lazy freezer initialization mounted cgroup2 only
+after the worker view was captured, invalidating the later proc-only comparison.
+Preparation retains the original initial-guest-cgroup/PID-namespace/source checks;
+it does not create a worker/credit grant or change resource budgets. Subsequent
+freezer setup rechecks the existing mount and creates only its cgroup directories.
+Keep the strict mount-table comparison rather than exempting this late change.
+
 The original worker freezer owns a real namespace FD for every admitted worker
 view. Enrollment rechecks the actual kernel view and namespace identity under
 the existing launch lease, then records its pin with the actual pidfd/birth and
