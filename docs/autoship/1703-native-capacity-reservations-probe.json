@@ -13,7 +13,9 @@
     "Reports are observations, never native execution, cleanup, original-input replay or merge capabilities.",
     "Persist native refusal backoff and rotating bounded wakeup without changing original authorization, owner controls, meaningful progress, model charges or merge allowance.",
     "The free sweep retains original-bound retirement and native terminal-cleanup reconciliation, then prunes already-authorized runtimes before read-only capacity observation. It takes native locks with no workflow mutex or transaction held.",
-    "Cleanup opens only an established, validated current original namespace. Missing authority is retained, never initialized or migrated. Optional cleanup/wake errors stay logged and do not hide previously completed retirement work."
+    "Cleanup opens only an established, validated current original namespace. Missing authority is retained, never initialized or migrated. Optional cleanup/wake errors stay logged and do not hide previously completed retirement work.",
+    "Fresh unpublished session ownership borrows the held state lock through pure intent validation. Failure cleans only that newly allocated session; resume never receives this guard.",
+    "Consume the cleanup guard before the first launch-intent publication attempt and release the state lock before journal callbacks. Failed or uncertain publication retains original runtime context."
   ],
   "validation": {
     "red": {
@@ -65,29 +67,39 @@
       "log": "/tmp/autoship-native-capacity-original-wake-green-20261107.log"
     },
     "current_full_core_lib": {
-      "passed": 968,
+      "passed": 969,
       "failed": 0,
       "ignored": 15,
-      "seconds": 38.55,
-      "log": "/tmp/autoship-native-capacity-original-wake-core-20261107.log"
+      "seconds": 39.24,
+      "log": "/tmp/autoship-native-intent-constructor-core-20261107.log"
     },
-    "current_full_cli": {
+    "current_production_cli_check": {
+      "result": "passed",
+      "seconds": 36.55,
+      "log": "/tmp/autoship-native-intent-constructor-production-20261107.log"
+    },
+    "preceding_composition_full_cli": {
       "passed": 1959,
       "failed": 0,
       "ignored": 34,
       "seconds": 420.72,
-      "log": "/tmp/autoship-native-capacity-original-wake-cli-20261107.log"
+      "log": "/tmp/autoship-native-capacity-original-wake-cli-20261107.log",
+      "source_commit": "bc880b1e29aa5451ac7fdc8debe03ca3c3156eca"
     },
-    "current_production_cli_check": {
-      "result": "passed",
-      "seconds": 25.79,
-      "log": "/tmp/autoship-native-capacity-original-wake-production-20261107.log"
+    "pre_intent_constructor": {
+      "test": "native_vm::tests::native_preparation_reclaims_only_before_intent_publication_attempt",
+      "red": "Invalid native session declaration stranded a fresh Codex runtime before a durable intent was recorded.",
+      "red_log": "/tmp/autoship-native-intent-constructor-red-20261107.log",
+      "green": "Both-provider regression passed; empty, overlong and non-graphic session IDs leave no fresh runtime or launch directory.",
+      "green_log": "/tmp/autoship-native-intent-constructor-green-20261107.log",
+      "preservation": "A successful prepared launch and a workflow-journal acknowledgement failure retain original runtime bytes and the actual committed launch receipt.",
+      "full_cli_scope": "Full CLI suite above is the preceding composition; the constructor follow-up was verified through full core and production CLI compilation."
     }
   },
   "limits": [
     "No production legacy runtime was removed or retired.",
     "No native guest or paid provider acceptance is established by these unit/controller fixtures.",
-    "This is not a full merge of #1906. Intent-aware constructor and post-prepare nonrelease cleanup still require composition before recovery rollout. All ordinary merge/review/source/input/resource gates remain required.",
+    "This is not a full merge of #1906. Pre-intent constructor cleanup is integrated; constructor failures at/after publication and post-prepare nonrelease disposal still require an original-intent-aware join before recovery rollout.",
     "Productive successor owner guard and full source/resource/input closure plus CLI/Discord/fault/soak acceptance remain open."
   ],
   "sources": [
@@ -105,7 +117,7 @@
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_vm.rs",
-      "sha256": "40e3a417f7be424aeb28606fb0bffeb488c014c2f61e089a3e36cc4d7173e489"
+      "sha256": "83debf4a48277f89f4a21464f0cd0bcaa3171de75fe5ba3578bf2faf4df9549e"
     },
     {
       "path": "crates/augmentagent-channel-core/src/run_resources.rs",

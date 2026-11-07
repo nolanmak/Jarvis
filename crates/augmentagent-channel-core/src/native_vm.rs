@@ -566,6 +566,16 @@ struct LaunchObservation {
     completion_verified:std::sync::atomic::AtomicBool,
     completed:std::sync::atomic::AtomicBool,
 }
+/// Fresh constructor ownership before any launch-intent publication attempt.
+/// Borrowing the state lock keeps cleanup serialized with native observers.
+/// Resume never creates this guard; publication consumes it conservatively.
+struct UnpublishedSession<'a> {
+    directory:tempfile::TempDir,
+    _state:&'a StateLock,
+}
+impl UnpublishedSession<'_> {
+    fn retain(self) {let _=self.directory.keep();}
+}
 pub(crate) struct Launch {
     pub command: Command,
     pub resource_policy: serde_json::Value,
@@ -721,17 +731,21 @@ impl Launch {
             }
         }
         let resume = matches!(native, Some(crate::native_session::Launch::Resume { .. }));
+        let unpublished_session;
         let session = match native {
             Some(crate::native_session::Launch::Resume { id }) => {
                 let name: String = serde_json::from_slice(&private(&aliases.join(digest(id)))?)?;
                 ensure!(name.starts_with("session-") && name.bytes().all(|c|c.is_ascii_alphanumeric() || c==b'-'), "invalid native runtime alias");
                 let session = provider_root.join(name);
                 validate_resume_owner(&root,&state_lock,&session,owner_logger.path(),&audit_owner)?;
+                unpublished_session=None;
                 session
             },
             _ => {
-                let path = provider_root.join(format!("session-{}", uuid::Uuid::new_v4()));
-                std::fs::create_dir(&path)?;
+                let directory=tempfile::Builder::new().prefix(&format!("session-{}",uuid::Uuid::new_v4()))
+                    .rand_bytes(0).tempdir_in(&provider_root)?;
+                let path=directory.path().to_path_buf();
+                unpublished_session=Some(UnpublishedSession {directory,_state:&state_lock});
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
                 write(&path.join("owned.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":owner_logger.path(),"owner":audit_owner}))?)?;
                 path
@@ -742,7 +756,7 @@ impl Launch {
         let runtime_relative_path=relative_runtime(&root,&session)?.to_owned();
         use sha2::{Digest,Sha256};
         let creation_receipt_sha256=format!("{:x}",Sha256::digest(private(&session.join("owned.json"))?));
-        drop(ledger);drop(state_lock);
+        drop(ledger);
         let mcp_argv = bridge.map(|bridge| vec!["/usr/bin/python3".to_string(), "-I".into(),
             bridge.native_cwd.parent().expect("bridge launch directory").join("tool-bridge.py").to_string_lossy().into_owned(),
             bridge.policy_path.to_string_lossy().into_owned()]);
@@ -763,6 +777,11 @@ impl Launch {
             source_owner:audit_owner,source_audit_path:owner_logger.path().into(),provider:provider.into(),
             runtime_relative_path:runtime_relative_path.clone(),native_session_id,creation_receipt_sha256:creation_receipt_sha256.clone(),
             launch_sha256:format!("{:x}",Sha256::digest(&spec_bytes))};
+        intent.validate()?;
+        // After this point a durable intent or callback may have committed even
+        // if acknowledgement fails. Preserve its exact original runtime.
+        if let Some(session)=unpublished_session {session.retain();}
+        drop(state_lock);
         // The protected append and optional workflow journal callback complete
         // before any command can escape preparation or receive prompt bytes.
         let prepared=owner_logger.native_launch_prepared(&intent)?;
@@ -947,6 +966,8 @@ mod tests {
         prune_and_count(root,&ledger)
     }
     #[test]
+    fn native_preparation_reclaims_only_before_intent_publication_attempt() {launch_intent_child("constructor-reclaim");}
+    #[test]
     fn native_preparation_durably_records_exact_launch_before_returning() {
         launch_intent_child("ready");
     }
@@ -1065,7 +1086,8 @@ mod tests {
                 }
                 return;
             }
-            let test = if mode=="preparation-context" {"native_preparation_binds_original_owner_preparation_context"}
+            let test = if mode=="constructor-reclaim" {"native_preparation_reclaims_only_before_intent_publication_attempt"}
+                else if mode=="preparation-context" {"native_preparation_binds_original_owner_preparation_context"}
                 else if mode=="asset-input" {"native_preparation_snapshots_referenced_asset_bytes"}
                 else if mode=="executable-input" {"native_preparation_binds_executable_before_runtime_allocation"}
                 else if mode=="executable-resolution" {"native_preparation_resolves_original_command_working_directory"}
@@ -1159,6 +1181,28 @@ mod tests {
             let mut opts=crate::reasoner::triage_opts(None);opts.audit_logger=Some(logger.clone());
             let native=crate::native_session::Launch::Create {requested_id:id.map(str::to_owned)};
             let context=OwnerPreparationContext::new(owner.clone(),"original-owner-request".into(),"c".repeat(64)).unwrap();
+            if mode=="constructor-reclaim" {
+                for invalid_id in [String::new(),"x".repeat(257),"session with whitespace".into()] {
+                    let invalid=crate::native_session::Launch::Create {requested_id:Some(invalid_id)};
+                    let error=Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&invalid))
+                        .err().expect("invalid native session accepted");
+                    assert!(error.to_string().contains("invalid native launch session ID"),"{error:#}");
+                    let directory=state.join(provider);
+                    assert!(!std::fs::read_dir(&directory).unwrap().any(|entry| {
+                        let name=entry.unwrap().file_name();let name=name.to_string_lossy();
+                        name.starts_with("session-") || name.starts_with("launch-")
+                    }),"{provider}: validation before durable intent stranded runtime capacity");
+                    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);
+                    assert!(saved.lock().unwrap().is_empty());
+                }
+                let valid=Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native)).unwrap();
+                let original=valid.session.clone();let owned=private(&original.join("owned.json")).unwrap();
+                assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);
+                drop(valid);
+                assert_eq!(private(&original.join("owned.json")).unwrap(),owned,"published launch lost original context");
+                continue;
+            }
+
             if mode=="executable-resolution" {
                 let not_directory=root.join(format!("cwd-file-{provider}"));write(&not_directory,b"not a working directory").unwrap();
                 for bad in [root.join(format!("missing-cwd-{provider}")),not_directory] {
@@ -1281,7 +1325,11 @@ mod tests {
             if refuse {
                 let error=launch.err().expect("workflow journal rejection returned a dispatchable command");
                 assert!(error.to_string().contains("workflow journal refused launch"),"{error:#}");
-                assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);continue;
+                assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);
+                let prepared=saved.lock().unwrap()[0].clone();
+                assert!(state.join(&prepared.intent.runtime_relative_path).join("owned.json").exists(),"uncertain workflow journal acknowledgement lost original runtime");
+                let committed=sink_for_observation(&logger,&anchors).read_receipt(&prepared.controller_receipt).unwrap();
+                assert_eq!(committed["intent_id"],prepared.intent.intent_id);continue;
             }
             let launch=launch.unwrap();
             if mode=="executable-input" {
