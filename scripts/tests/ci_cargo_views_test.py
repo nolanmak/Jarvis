@@ -1,9 +1,12 @@
 """Filesystem mechanics only; root namespace/credential evidence needs the VM."""
 import importlib.util
+import array
+import ctypes
 import os
 from pathlib import Path
 import socket
 import stat
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -249,6 +252,43 @@ class UnitViewTests(unittest.TestCase):
             views.validate_stdio([reader,writer,writer])
             with self.assertRaises(views.FreshnessHold):views.validate_stdio([reader,left.fileno(),writer])
         finally:os.close(reader);os.close(writer);left.close();right.close()
+
+    def test_regular_file_stdio_validation_preserves_original_bytes_and_offset(self):
+        with tempfile.TemporaryFile() as stream,open('/dev/null','r+b') as null:
+            stream.write(b'original input');stream.seek(3)
+            views.validate_stdio([stream.fileno(),null.fileno(),null.fileno()])
+            self.assertEqual(stream.tell(),3)
+            self.assertEqual(stream.read(),b'ginal input')
+
+    @unittest.skipUnless(sys.platform=='linux','requires Linux procfs memory descriptions')
+    def test_preopened_proc_memory_descriptions_are_refused_as_each_stdio_role(self):
+        # Only this test's allocated buffer is addressed. A real SCM_RIGHTS
+        # transfer retains the underlying memory file despite a new FD number.
+        buffer=ctypes.create_string_buffer(b'original')
+        memory=os.open('/proc/self/mem',os.O_RDWR|os.O_CLOEXEC)
+        left,right=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET)
+        transferred=[]
+        try:
+            self.assertTrue(stat.S_ISREG(os.fstat(memory).st_mode))
+            left.sendmsg([b'fd'],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',[memory]))])
+            body,control,flags,_=right.recvmsg(2,socket.CMSG_SPACE(4),socket.MSG_CMSG_CLOEXEC)
+            self.assertEqual(body,b'fd');self.assertEqual(flags&(socket.MSG_TRUNC|socket.MSG_CTRUNC),0)
+            self.assertEqual(len(control),1)
+            level,kind,data=control[0]
+            self.assertEqual((level,kind),(socket.SOL_SOCKET,socket.SCM_RIGHTS))
+            received=array.array('i');received.frombytes(data);transferred.extend(received)
+            self.assertEqual(len(transferred),1)
+            self.assertEqual(os.pwrite(transferred[0],b'changed!',ctypes.addressof(buffer)),8)
+            self.assertEqual(buffer.value,b'changed!')
+            with open('/dev/null','r+b') as null:
+                for fd in (memory,transferred[0]):
+                    for role in range(3):
+                        with self.subTest(fd=fd,role=role):
+                            descriptors=[null.fileno()]*3;descriptors[role]=fd
+                            with self.assertRaises(views.FreshnessHold):views.validate_stdio(descriptors)
+        finally:
+            for fd in transferred:os.close(fd)
+            left.close();right.close();os.close(memory)
 
     @unittest.skipIf(os.geteuid()==0,'requires a normal non-root caller')
     def test_no_host_caller_can_enter_a_privileged_namespace(self):

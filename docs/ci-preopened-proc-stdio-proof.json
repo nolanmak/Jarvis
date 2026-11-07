@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "kind": "preopened-procfs-stdio-capability-refusal",
+  "source_base": "b664f5e4149b70a16fce2cd14841d51e25a93c50",
+  "source_sha256": {
+    "scripts/ci-cargo-views.py": "988b533eba39fabcfe24d7ca89fb9133023746ee5decaf6750b26eb158640d56",
+    "scripts/tests/ci_cargo_views_test.py": "7c8da476fd836fb43793b9991212352bdc63435bc77c9b0f9a30babcbd5854a6"
+  },
+  "host": {
+    "kernel": "7.0.0-30-generic",
+    "machine": "x86_64",
+    "root_used": false
+  },
+  "red": {
+    "original_handle": 14736,
+    "terminal": true,
+    "exit": 1,
+    "tests": 20,
+    "failures": 6,
+    "log": "/tmp/autoship-ci-preopened-memory-stdio-red-20261107.log",
+    "log_sha256": "59be54d5f604c3383948c7877690e1131a4990f923c95161247153f7ebd8f122",
+    "control": "An actual preopened O_RDWR /proc/self/mem FD and its actual SCM_RIGHTS-transferred description both passed as stdin/stdout/stderr. The transferred FD wrote8bytes to a fixture-owned allocated buffer before validation. No unrelated memory was read or written."
+  },
+  "implementation": "On Linux64, fstatfs checks the filesystem behind each regular stdio description and refuses procfs or an unavailable observation. No pathname label or caller assertion supplies this check. Existing pipe/dev-null/type restrictions remain. The actual planner receive path and root unit-view entry already call the shared validator. This is not a complete descriptor or writable-mapping census.",
+  "consumers": [
+    "scripts/ci-cargo-planner.py::RootRelay._receive",
+    "scripts/ci-cargo-views.py::_enter"
+  ],
+  "host_python": {
+    "original_handle": 50792,
+    "terminal": true,
+    "exit": 0,
+    "tests": 742,
+    "failures": 0,
+    "skips": 0,
+    "seconds": 43.697,
+    "log": "/tmp/autoship-ci-preopened-memory-stdio-python-corrected-20261107.log",
+    "log_sha256": "6e68749107c79e45d833f21147aff7773fbea581a2ec53fdbcbbdaa8b21bed9a",
+    "actual_supervisor_cleanup_receipt": "/tmp/autoship-ci-preopened-memory-stdio-supervisor-20261107.receipt",
+    "cleanup_receipt_sha256": "e6dfea0d072a34bddc0ea2c3a4948d881c96c85c44d81524608a2f837c231deb",
+    "all_descendants_reaped": true,
+    "storage_broker": "Actual managed disk build plus original provider-supervisor retains original storage descriptions through full subtree reaping. /usr/bin/env removes only stale storage-FD metadata from the suite environment; the supervising broker retains the real descriptions. All native libraries and the actual Rust fixture binary were supplied."
+  },
+  "host_rust": {
+    "original_handle": 60402,
+    "terminal": true,
+    "exit": 0,
+    "tests": 39,
+    "failures": 0,
+    "ignored": 30,
+    "seconds": 11.9,
+    "compile_seconds": 111,
+    "log": "/tmp/autoship-ci-preopened-memory-stdio-rust-20261107.log",
+    "log_sha256": "0e16c1db35c80e8637610befa96203d2a12f8f28c5e4c80b04d8329d5d5b07c4"
+  },
+  "harness_failure_preserved": {
+    "log": "/tmp/autoship-ci-preopened-memory-stdio-python-20261107.log",
+    "tests": 742,
+    "failures": 16,
+    "errors": 10,
+    "reason": "Initial broad invocation omitted AUGMENTAGENT_RELAY_FIXTURE_BINARY and carried storage descriptor environment into child fixtures that close those FDs. Corrected invocation used the actual supervisor broker and complete fixture environment. No production supervisor or fixture admission check was relaxed."
+  },
+  "compatibility": "Ordinary regular-file stdin remains accepted without reading bytes or changing its offset. Actual original and transferred proc memory descriptions are refused in each stdio position. Native privileged CI execution remains Linux-only; portable non-Linux mechanics retain prior validation. Unsupported Linux32 ABI refuses.",
+  "native_vm_replayed_for_this_change": false,
+  "original_compiler_worker_regression_rerun": false,
+  "original_compiler_worker_status": "Known GCC SYS_vfork refusal retained; this guard does not admit vfork and does not justify repeating that unchanged failure.",
+  "remaining": [
+    "Complete descriptor ingress/lifetime, shared-memory mappings, aliases, writers/cohort/ABI and original source/input closure.",
+    "Real immutable-image/continuation and live root-peer/operation/resource admission for the native compiler handoff.",
+    "Original unchanged compiler, worker and generated-publication acceptance after relevant handoff changes.",
+    "Normal reviewed rollout, production native recovery, productive owner sessions, CLI/Discord shipment and full1703acceptance."
+  ],
+  "descriptor_ingress_complete": false,
+  "input_closure_complete": false,
+  "native_vfork_admission": false,
+  "production_runtime_changed": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "autonomous_merges_claimed": 0
+}

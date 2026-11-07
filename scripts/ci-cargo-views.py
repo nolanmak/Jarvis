@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 
 spec=importlib.util.spec_from_file_location('unit_view_cache',Path(__file__).with_name('ci-cache-generation.py'))
 cache=importlib.util.module_from_spec(spec);spec.loader.exec_module(cache)
@@ -1934,6 +1935,29 @@ def reject_projection_stdio(descriptors,workspace,outputs,*,owner,check):
     except OSError:raise FreshnessHold('invalidation_unsafe') from None
 
 
+class _LinuxStatfs(ctypes.Structure):
+    # Linux 64-bit statfs ABI. Read the filesystem behind the actual FD;
+    # pathname checks cannot identify duplicated or SCM_RIGHTS descriptions.
+    _fields_=[('type',ctypes.c_long),('block_size',ctypes.c_long),
+        ('blocks',ctypes.c_ulong),('blocks_free',ctypes.c_ulong),
+        ('blocks_available',ctypes.c_ulong),('files',ctypes.c_ulong),
+        ('files_free',ctypes.c_ulong),('fsid',ctypes.c_int*2),
+        ('name_length',ctypes.c_long),('fragment_size',ctypes.c_long),
+        ('flags',ctypes.c_long),('spare',ctypes.c_long*4)]
+
+
+def _reject_proc_stdio(descriptor):
+    # The privileged CI execution path is Linux-only. Other hosts retain the
+    # portable filesystem mechanics; they cannot supply native CI authority.
+    if sys.platform!='linux':return
+    if ctypes.sizeof(ctypes.c_long)!=8:raise FreshnessHold('input_census_unknown')
+    filesystem=_LinuxStatfs();native=ctypes.CDLL(None,use_errno=True)
+    native.fstatfs.argtypes=[ctypes.c_int,ctypes.POINTER(_LinuxStatfs)]
+    native.fstatfs.restype=ctypes.c_int
+    if native.fstatfs(descriptor,ctypes.byref(filesystem))!=0 or filesystem.type==0x9fa0:
+        raise FreshnessHold('input_census_unknown')
+
+
 def validate_stdio(descriptors):
     if len(descriptors)!=3:raise FreshnessHold('input_census_unknown')
     for descriptor in descriptors:
@@ -1941,6 +1965,7 @@ def validate_stdio(descriptors):
         if not (stat.S_ISREG(info.st_mode) or stat.S_ISFIFO(info.st_mode)
                 or stat.S_ISCHR(info.st_mode) and info.st_rdev==os.makedev(1,3)):
             raise FreshnessHold('input_census_unknown')
+        if stat.S_ISREG(info.st_mode):_reject_proc_stdio(descriptor)
 
 
 def _mount(*arguments):
