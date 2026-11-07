@@ -60,6 +60,13 @@
       "setup_reason": "launch omitted AUGMENTAGENT_RELAY_FIXTURE_BINARY",
       "other_failures": 1,
       "other_failure": "existing active-signal parent-resume SIGUSR2 timeout; corrected full rerun passed; cause not established"
+    },
+    "guest_adapter_rust": {
+      "passed": 39,
+      "failed": 0,
+      "ignored": 29,
+      "seconds": 21.81,
+      "log": "/tmp/autoship-ci-status-composition-guest-build-20261107.log"
     }
   },
   "spec_audit": {
@@ -68,7 +75,7 @@
     "full_mechanism_handoff_audit": false
   },
   "production_blocker": "V3 relay constructor still installs irreversible exec ERRNO filter; no runtime caller or filter relaxation added",
-  "declared_guest_composition_proved": false,
+  "declared_guest_composition_proved": true,
   "root_role_admission_proved": false,
   "complete_writer_closure": false,
   "native_handoff_integrated": false,
@@ -76,5 +83,25 @@
   "parent_effect_transfer_integrated": false,
   "full_ci_pass": false,
   "shipping_authority": false,
-  "autonomous_merges_claimed": 0
+  "autonomous_merges_claimed": 0,
+  "guest": {
+    "code_head": "c53fb8faaddb251b912d8b613373bdb44d4bf0e2",
+    "rust_acceptance_sha256": "9e6cfaab8c9f130ab6b6ca2b198d952e31733d967e9621d09e53969fb00e1725",
+    "result": "/tmp/autoship-1703-ci-v3-status-composition-result-20261107.json",
+    "receipt": "/tmp/augmentagent-ci-v3-status-composition-20261107043039/receipt.json",
+    "audit": "/tmp/autoship-ci-v3-status-composition-audit-20261107.json",
+    "log": "/tmp/autoship-ci-v3-status-composition-live-20261107.log",
+    "passed": 11,
+    "failed": 0,
+    "skipped": 0,
+    "seconds": 102.26,
+    "asset_hashes_match_embedded_build": true,
+    "client_uid": 1000,
+    "client_gid": 1000,
+    "original_host_resource_subtree_removed": true,
+    "resource_exhausted": false,
+    "same_uid_conformance_only": true,
+    "production_constructor_conflict_resolved": false,
+    "root_role_admission_proved": false
+  }
 }

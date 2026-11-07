@@ -518,7 +518,7 @@ refusal and actual root-role/live-operation binding. A sealed config, Seccomp
 status field, filter count or successful same-UID fixture cannot prove that
 policy. Do not remove the constructor denial merely to make the handoff pass.
 The carrying cost is a measured native helper and additional conformance cases;
-there is no durable grant/schema change. Declared-guest composition and the
+there is no durable grant/schema change. The
 unchanged compiler/worker/publication regressions remain required and unproved
 for this new composition. This subsection records an intermediate implementation
 checkpoint, not a mechanism handoff or a passing original compiler fixture.
@@ -526,7 +526,14 @@ Host validation passed 728 Python cases with no skips and 39 focused Rust cases
 with 28 opt-ins ignored. The eleven new preparation/composition cases execute
 through a mandatory Rust adapter. See [bounded composition evidence](ci-v3-status-composition-proof.json),
 including the initial setup errors and signal timeout before the successful
-corrected full run. No guest composition result is claimed.
+corrected full run. At `c53fb8fa`, all eleven composition/preparation cases then
+passed on the declared guest kernel in 102.26 seconds. All four actual guest
+native asset hashes matched the embedded build; the original host VM resource
+subtree was verified removed without resource exhaustion. The Rust suite with
+the new opt-in passed 39 cases, with 29 opt-ins ignored in the bulk run. Guest
+clients were UID/GID 1000; this establishes same-UID conformance, including the
+production-filter refusal, and does not resolve the constructor conflict or
+establish runtime root-role admission.
 
 ### O3. Freeze before capturing a live parent's input
 
