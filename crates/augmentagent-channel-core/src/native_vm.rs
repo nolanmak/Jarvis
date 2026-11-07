@@ -325,6 +325,10 @@ impl Launch {
         std::fs::create_dir_all(&aliases)?;
         std::fs::set_permissions(&aliases, std::fs::Permissions::from_mode(0o700))?;
         let resume = matches!(native, Some(crate::native_session::Launch::Resume { .. }));
+        // Only this constructor owns a fresh unpublished directory. Failure
+        // before returning the command must not consume a persistent slot.
+        // Existing/resumed runtimes are never owned by this cleanup guard.
+        let mut unpublished_session=None;
         let session = match native {
             Some(crate::native_session::Launch::Resume { id }) => {
                 let name: String = serde_json::from_slice(&private(&aliases.join(digest(id)))?)?;
@@ -334,8 +338,10 @@ impl Launch {
                 session
             },
             _ => {
-                let path = provider_root.join(format!("session-{}", uuid::Uuid::new_v4()));
-                std::fs::create_dir(&path)?;
+                let temporary=tempfile::Builder::new().prefix(&format!("session-{}",uuid::Uuid::new_v4()))
+                    .rand_bytes(0).tempdir_in(&provider_root)?;
+                let path=temporary.path().to_path_buf();
+                unpublished_session=Some(temporary);
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
                 write(&path.join("owned.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":owner_logger.path(),"owner":audit_owner}))?)?;
                 path
@@ -399,6 +405,7 @@ impl Launch {
             .env("PATH","/usr/bin:/bin");
         let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), _directory:directory };
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.observe_session(id)?; }
+        if let Some(session)=unpublished_session {let _=session.keep();}
         Ok(result)
     }
     pub fn register_retirement(&self, lease:&crate::native_session::Lease) {
@@ -429,6 +436,54 @@ mod tests {
         write(&path.join("owned.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":owner,"owner":{"workflow_id":"workflow","lease_generation":1}})).unwrap()).unwrap();
         if complete {write(&path.join("complete.json"),b"{\"generation\":\"generation-a\"}").unwrap();}
         path
+    }
+    #[test]
+    fn failed_prepare_does_not_consume_native_session_capacity() {
+        use std::os::unix::ffi::OsStringExt;
+        const CHILD:&str="JARVIS_TEST_NATIVE_PREPARE_CAPACITY";
+        let Some(root)=std::env::var_os(CHILD) else {
+            let root=tempfile::tempdir().unwrap();
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","native_vm::tests::failed_prepare_does_not_consume_native_session_capacity","--nocapture"])
+                .env_clear().env("PATH","/usr/bin:/bin").env(CHILD,root.path()).env("AUGMENTAGENT_RUN_RESOURCES","1").output().unwrap();
+            assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
+        };
+        let root=PathBuf::from(root).canonicalize().unwrap();
+        let state=root.join("state");
+        for path in [&state,&root.join("logs"),&root.join("anchors")] {std::fs::create_dir(path).unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();}
+        let policy=root.join("policy.json");
+        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime.json","guest_runtime":"/declared/guest","state_root":state,"memory_mb":512,"max_state_bytes":8589934592u64,"max_sessions":8,"providers":{"codex":{"gateway":{},"auth_file":null,"auth_relative":".codex/auth.json"},"claude":{"gateway":{},"auth_file":null,"auth_relative":".claude.json"}}})).unwrap()).unwrap();
+        std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",policy);
+        for provider in ["codex","claude"] {
+            let log=root.join("logs").join(format!("{provider}.jsonl"));
+            let logger=std::sync::Arc::new(crate::tool_audit::AuditLogger::protected(log.clone(),root.join("anchors").join(format!("{provider}.json")),&[]).unwrap());
+            logger.set_native_runtime_owner(RuntimeOwner {workflow_id:"workflow".into(),lease_generation:1}).unwrap();
+            let mut opts=crate::reasoner::ReasonerOpts::pinned(crate::providers::ModelTier::Fast,"");opts.audit_logger=Some(logger);
+            let native=crate::native_session::Launch::Create {requested_id:None};
+            let sessions=||->usize {std::fs::read_dir(state.join(provider)).map(|entries|entries.filter(|e|e.as_ref().unwrap().file_name().to_string_lossy().starts_with("session-")).count()).unwrap_or(0)};
+            for case in ["missing-executable","invalid-argument","invalid-instructions","invalid-environment"] {
+                let mut command=Command::new(if case=="missing-executable" {"/nonexistent-native-prepare-test"}else{"/usr/bin/true"});
+                if case=="invalid-argument" {command.arg(std::ffi::OsString::from_vec(vec![255]));}
+                if case=="invalid-instructions" {command.arg("model_instructions_file=not-json");}
+                if case=="invalid-environment" {command.env("LANG",std::ffi::OsString::from_vec(vec![255]));}
+                assert!(Launch::prepare(provider,&opts,&command,None,Some(&native)).is_err(),"{provider}/{case}");
+                assert_eq!(sessions(),0,"{provider}/{case}: failed construction consumed a persistent session slot");
+                assert!(!std::fs::read_dir(state.join(provider)).unwrap().any(|e|e.unwrap().file_name().to_string_lossy().starts_with("launch-")),"failed construction retained helper output");
+            }
+            let old=state.join(provider).join("session-retained");std::fs::create_dir(&old).unwrap();std::fs::set_permissions(&old,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let owned=serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":log,"owner":{"workflow_id":"workflow","lease_generation":1}})).unwrap();
+            write(&old.join("owned.json"),&owned).unwrap();
+            let aliases=state.join(provider).join("aliases");write(&aliases.join(digest("retained-id")),b"\"session-retained\"").unwrap();
+            let resume=crate::native_session::Launch::Resume {id:"retained-id".into()};
+            assert!(Launch::prepare(provider,&opts,&Command::new("/nonexistent-native-prepare-test"),None,Some(&resume)).is_err());
+            assert_eq!(std::fs::read(old.join("owned.json")).unwrap(),owned);assert_eq!(sessions(),1,"failed resume removed original runtime");
+            let collision=crate::native_session::Launch::Create {requested_id:Some("retained-id".into())};
+            assert!(Launch::prepare(provider,&opts,&Command::new("/usr/bin/true"),None,Some(&collision)).is_err());
+            assert_eq!(sessions(),1,"alias collision leaked a fresh runtime");assert_eq!(std::fs::read(aliases.join(digest("retained-id"))).unwrap(),b"\"session-retained\"");
+            let valid=Launch::prepare(provider,&opts,&Command::new("/usr/bin/true"),None,Some(&native)).unwrap();
+            let path=valid.session.clone();assert!(path.join("owned.json").exists());drop(valid);
+            assert!(path.exists(),"successful preparation was reclaimed after its command could escape");assert_eq!(sessions(),2);
+        }
     }
     #[test]
     fn embedded_inventory_imports_without_checkout_siblings() {
