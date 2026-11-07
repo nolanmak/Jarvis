@@ -15,11 +15,13 @@ impl Mode<'_> {
         match self {
             Self::Lease {lease,binding}=>{
                 ensure!(lease.workflow==pending.request.workflow_id && lease.generation>=pending.request.destination.owner.lease_generation,TransferReason::AuthorityConflict);
+                owner_publication_recovery::require_ordinary_native_transfer(&store.conn,pending)?;
                 store.validate_lease(lease,binding,now)
             }
             Self::OwnerRecovery {lease,authorization}=>store.validate_owner_recovery_transfer(lease,authorization,pending,now),
             Self::Terminal(terminal)=>{
                 ensure!(terminal.workflow()==pending.request.workflow_id && terminal.generation()>=pending.request.destination.owner.lease_generation,TransferReason::AuthorityConflict);
+                owner_publication_recovery::require_terminal_native_transfer(&store.conn,pending)?;
                 store.terminal_native_is_current(terminal)
             }
         }
@@ -66,6 +68,9 @@ pub(crate) fn run(store:&Arc<Mutex<WorkflowStore>>,mode:Mode<'_>,pending:&Pendin
                 resolved=Some(ReconciliationRun::KnownUnstarted);
             }
             NativeTransferState::Aborted=>{
+                // The actual claim that created a forward metadata intent
+                // cannot acknowledge its own abort as a successor generation.
+                if matches!(mode,Mode::OwnerRecovery {lease,..} if lease.generation()==pending.request().destination.owner.lease_generation) {return Ok(());}
                 match mode {Mode::Lease {lease,binding}=>locked.acknowledge_native_aborted(lease,binding,pending,proof,clock())?,Mode::Terminal(terminal)=>locked.acknowledge_terminal_native_aborted(terminal,pending,proof,clock())?,Mode::OwnerRecovery {lease,authorization}=>locked.acknowledge_owner_recovery_native_aborted(lease,authorization,pending,proof,clock())?,}
                 if let Mode::OwnerRecovery {lease,authorization}=mode {
                     locked.record_owner_recovery_abort_blocked(lease,authorization,pending,clock())?;
@@ -83,6 +88,7 @@ pub(crate) fn run(store:&Arc<Mutex<WorkflowStore>>,mode:Mode<'_>,pending:&Pendin
     });
     let state=match inspected {Ok(state)=>state,Err(outcome)=>return Ok(retained(None,outcome_reason(&outcome),Some(outcome)))};
     if let Some(result)=resolved {return Ok(result);}
+    if state==NativeTransferState::Aborted {return Ok(retained(Some(state),TransferReason::AuthorityConflict,None));}
     if matches!(mode,Mode::Terminal(_)) {return Ok(retained(Some(state),TransferReason::AuthorityConflict,None));}
     let Some((sources,destination))=audits else {return Ok(retained(Some(state),TransferReason::InventoryMissing,None));};
     let replay_current=||->std::result::Result<(),TransferFenceError> {

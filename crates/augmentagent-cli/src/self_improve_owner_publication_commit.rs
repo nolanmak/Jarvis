@@ -195,6 +195,10 @@ fn counted_bytes(path:&Path,max:usize,used:&mut usize)->Result<Vec<u8>> {
     ensure!(*used<=128*1024*1024,"canonical lineage exceeds byte bound");Ok(raw)
 }
 impl OwnerPublicationRecord {
+    pub(crate) fn validate_completed_canonical_files(&self,completed:&OwnerPublicationCompletion)->Result<()> {
+        ensure!(self.canonical.publication_is_next(&self.next_manifest)?,"recovery original completed canonical changed");
+        self.read_canonical_ancestor(&self.canonical.control,self.input.source,&self.next_manifest,completed,&mut 0)?;Ok(())
+    }
     /// Historical criteria inspection only. Protected saved evidence is data,
     /// never fresh native/resource/source proof or executable preparation.
     pub(crate) fn read_canonical_ancestor(&self,control:&Path,source:AcceptanceSource,manifest:&str,

@@ -32,7 +32,14 @@ impl WorkflowStore {
     pub(super) fn prepare_native_handoff_disposition(&mut self,lease:&Lease,binding:&Binding,audit:&str,basis:&native_handoff::NativeHandoffFacts,inventory:&[augmentagent_channel_core::native_vm::ownership::RuntimeInventoryRow],retired:&[String],now:i64)->NativePreparationPersistence {
         let mut attempted=None;
         let reported=self.prepare_native_handoff_tracked(lease,binding,audit,Some((basis,inventory,retired)),now,&mut attempted);
-        self.resolve_native_handoff_persistence(&lease.workflow,attempted,reported)
+        let resolved=self.resolve_native_handoff_persistence(&lease.workflow,attempted,reported);
+        if let NativePreparationPersistence::Durable(value)=&resolved {
+            let (HandoffPreparation::Prepared(pending)|HandoffPreparation::ReconcileExisting(pending))=value;
+            if owner_publication_recovery::require_ordinary_native_transfer(&self.conn,pending).is_err() {
+                return NativePreparationPersistence::Unknown {reason:TransferReason::AuthorityConflict,attempted:Some(pending.clone())};
+            }
+        }
+        resolved
     }
     pub(super) fn resolve_native_handoff_persistence(&mut self,workflow:&str,attempted:Option<PendingNativeHandoff>,reported:Result<HandoffPreparation>)->NativePreparationPersistence {
         let reported_value=reported.as_ref().ok().cloned();
@@ -272,6 +279,7 @@ impl WorkflowStore {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         require_binding(&tx,lease,binding,now)?;
         require_clear_abort_barriers(&tx,&lease.workflow)?;
+        owner_publication_recovery::require_ordinary_native_transfer(&tx,pending)?;
         owner_turn::require_native_dispatch(&tx,lease,now)?;
         let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;
         let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
@@ -316,6 +324,7 @@ impl WorkflowStore {
         ensure!(!orphan, TransferReason::InventoryMissing);
         if let Some(old) = old {
             let pending = decode(&tx, &lease.workflow, old)?;
+            owner_publication_recovery::require_ordinary_native_transfer(&tx,&pending)?;
             let destination = &pending.request.destination;
             ensure!(
                 destination.owner.lease_generation <= lease.generation,

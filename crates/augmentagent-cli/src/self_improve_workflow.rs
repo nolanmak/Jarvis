@@ -4067,6 +4067,14 @@ mod tests {
     async fn owner_recovery_native_intent_is_atomic_and_replayable() {
         owner_metadata_recovery_modes(&["owner-early-acceptance-producer-intent-transfer-recovery","owner-early-acceptance-producer-claude-intent-transfer-recovery"]);
     }
+    #[tokio::test]
+    async fn owner_recovery_forward_native_transfer_retains_metadata_purpose() {
+        let mut modes=Vec::new();
+        for provider in ["","claude-"] {for outcome in ["live","later","coreprepared","corecompleted","coreaborted","sqlrollback","sqlcommit","terminalabsent","terminalprepared","terminalcompleted","terminalaborted"] {
+            modes.push(format!("owner-early-acceptance-producer-{provider}intent-forward-{outcome}-transfer-recovery"));
+        }}
+        owner_metadata_recovery_modes(&modes.iter().map(String::as_str).collect::<Vec<_>>());
+    }
     fn owner_metadata_recovery_modes(modes:&[&str]) {
         use std::os::unix::fs::PermissionsExt;
         for mode in modes {
@@ -4783,9 +4791,12 @@ else: raise SystemExit('unexpected authority call')
                         let source=existing_native_audit(&state,facts.namespace(),Some(dir.path()),facts.original_binding()).unwrap();
                         let setup_control=tempfile::tempdir().unwrap();
                         for name in ["snapshot-logs","snapshot-anchors"] {let path=setup_control.path().join(name);std::fs::create_dir(&path).unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();}
-                        let destination=Arc::new(augmentagent_channel_core::AuditLogger::protected(setup_control.path().join("snapshot-logs/destination.jsonl"),setup_control.path().join("snapshot-anchors/destination.json"),&[]).unwrap());
+                        let destination=if mode.contains("-forward-") {
+                            open_audit_generation(&state,&id,Some(dir.path()),recovery.generation()).unwrap()
+                        }else {Arc::new(augmentagent_channel_core::AuditLogger::protected(setup_control.path().join("snapshot-logs/destination.jsonl"),setup_control.path().join("snapshot-anchors/destination.json"),&[]).unwrap())};
                         destination.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:id.clone(),lease_generation:recovery.generation()}).unwrap();
                         destination.set_native_store_binding(facts.original_binding().clone()).unwrap();
+                        destination.require_run_resources().unwrap();
                         destination.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":id,"generation":recovery.generation()})).unwrap();
                         destination.restrict_to_metadata(durable::owner_publication_recovery::native_metadata_fence(shared.clone(),recovery.clone(),&authorization,millis()).unwrap()).unwrap();
                         let plan=native_owner::PreparationPlan {workflow_id:id.clone(),source_owners:vec![facts.namespace().clone()],
@@ -4794,7 +4805,7 @@ else: raise SystemExit('unexpected authority call')
                         let current=||shared.lock().unwrap().validate_owner_publication_recovery(&recovery,&authorization,millis()).map_err(|_|native_owner::TransferFenceError::NotCurrent);
                         if mode.contains("-intent-") {
                             let mut recorded=None;
-                            let result=native_owner::prepare_transfer(facts.original_binding(),&plan,&[source],&destination,&current,&mut |scan| {
+                            let result=native_owner::prepare_transfer(facts.original_binding(),&plan,&[source.clone()],&destination,&current,&mut |scan| {
                                 let before_events=store.events(&id).unwrap();
                                 // Recreate the genuine pre-completion SQL window:
                                 // exact canonical files exist, but publication is pending.
@@ -4851,6 +4862,135 @@ else: raise SystemExit('unexpected authority call')
                             assert_eq!(receipt.transfer_id(),id_recorded);assert_eq!(receipt.generation(),recovery.generation());
                             assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.owner_control(&id).unwrap(),control_before);assert_eq!(store.pending_owner_messages(&id).unwrap(),2);
                             assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+                            if mode.contains("-forward-") {
+                                let forward=store.owner_recovery_pending_transfer(&recovery,&authorization,millis()).expect("durable forward intent was not admitted under its actual recovery purpose").unwrap();
+                                assert_eq!(forward.request().transfer_id,id_recorded);
+                                assert!(destination.dispatch_allowed().is_err(),"metadata destination acquired coding permission before transfer");
+                                // Adversarial raw descriptor matches current SQL identity;
+                                // it must still fail specifically on recovery purpose.
+                                let raw=durable::Lease {workflow:id.clone(),owner:"owner-transfer-metadata".into(),generation:recovery.generation()};
+                                let error=store.prepare_or_load_native_handoff(&raw,forward.workflow_binding(),&plan.destination.audit_path,millis()).unwrap_err();
+                                assert!(format!("{error:#}").contains("recovery-native intent"),"ordinary admission refused for an incidental reason: {error:#}");
+                                assert!(matches!(durable::native_prepare::run(&shared,&raw,forward.workflow_binding(),&[source.clone()],&destination,&millis).unwrap(),durable::native_prepare::NativePreparationRun::Reconciled {result:durable::native_reconcile::ReconciliationRun::Retained {..},..}),"ordinary native preparation consumed metadata intent");
+
+                                if mode.contains("coreprepared") || mode.contains("coreaborted") || mode.contains("terminalprepared") || mode.contains("terminalaborted") {
+                                    let interrupted=std::cell::Cell::new(false);
+                                    let fence=|| {
+                                        store.validate_owner_recovery_transfer(&recovery,&authorization,&forward,millis()).map_err(|_|native_owner::TransferFenceError::NotCurrent)?;
+                                        let ledger=rusqlite::Connection::open_with_flags(native.join("runtime-retirement.sqlite"),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+                                        if ledger.query_row("SELECT EXISTS(SELECT 1 FROM native_transfer WHERE id=?1 AND state='prepared')",[&id_recorded],|r|r.get::<_,bool>(0)).unwrap() {interrupted.set(true);return Err(native_owner::TransferFenceError::NotCurrent);}Ok(())
+                                    };
+                                    let outcome=native_owner::transfer(forward.original_binding(),forward.request(),&forward.observation(),&[source.clone()],&destination,&fence);
+                                    assert!(interrupted.get() && !matches!(outcome,native_owner::TransferOutcome::Completed(_)));
+                                    if mode.contains("aborted") {
+                                        augmentagent_channel_core::native_vm::retire_owned_runtimes(forward.original_binding(),destination.path(),&plan.destination.owner,&current).unwrap();
+                                        let retained=durable::native_reconcile::run(&shared,reconciliation,&forward,None,&millis).unwrap();
+                                        assert!(matches!(retained,durable::native_reconcile::ReconciliationRun::Retained {state:Some(native_owner::NativeTransferState::Aborted),..}),"same-generation abort was not retained: {retained:?}");
+                                        assert_eq!(store.owner_recovery_pending_transfer(&recovery,&authorization,millis()).unwrap().unwrap(),forward);
+                                    }
+                                }
+                                if mode.contains("corecompleted") || mode.contains("terminalcompleted") {
+                                    assert!(matches!(native_owner::transfer(forward.original_binding(),forward.request(),&forward.observation(),&[source.clone()],&destination,&current),native_owner::TransferOutcome::Completed(_)));
+                                    // Core completed, controller settlement not acknowledged.
+                                    assert_eq!(store.owner_recovery_pending_transfer(&recovery,&authorization,millis()).unwrap().unwrap(),forward);
+                                    assert_eq!(store.owner_publication_recovery_native_facts(&recovery,&authorization,millis()).unwrap().namespace().owner.lease_generation,activated,"unsettled destination advanced descriptive metadata");
+                                    let mut visited=false;
+                                    assert!(with_recovery_native_metadata(&state,Some(dir.path()),recovery.clone(),&authorization,&mut |_| {visited=true;Ok(())}).is_err());
+                                    assert!(!visited,"old namespace issued native proof after core moved without SQL settlement");
+                                }
+                                if mode.contains("terminal") {
+                                    // Deliberate terminalization of this disposable
+                                    // fixture. The actual terminal checkpoint reader
+                                    // and original core inspection still own cleanup.
+                                    let mut terminal=before.checkpoint.clone();terminal.stage=Stage::Retired;
+                                    let raw_terminal=serde_json::to_string(&terminal).unwrap();
+                                    db.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",rusqlite::params![id,raw_terminal]).unwrap();
+                                    db.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,?2,'checkpoint',?3,?4)",rusqlite::params![id,recovery.generation(),raw_terminal,millis()]).unwrap();
+                                    assert!(store.owner_recovery_pending_transfer(&recovery,&authorization,millis()).is_err());
+                                    let terminal=store.terminal_native_checkpoint(&id).unwrap();
+                                    let result=durable::native_reconcile::run(&shared,durable::native_reconcile::Mode::Terminal(&terminal),&forward,None,&millis).unwrap();
+                                    if mode.contains("terminalabsent") {assert!(matches!(result,durable::native_reconcile::ReconciliationRun::KnownUnstarted));}
+                                    else if mode.contains("terminalprepared") {assert!(matches!(result,durable::native_reconcile::ReconciliationRun::Retained {state:Some(native_owner::NativeTransferState::Prepared),..}));}
+                                    else if mode.contains("terminalcompleted") {assert!(matches!(result,durable::native_reconcile::ReconciliationRun::Settled(ref settled) if !settled.current_context));}
+                                    else {assert!(matches!(result,durable::native_reconcile::ReconciliationRun::KnownAborted {..}));}
+                                    assert!(destination.dispatch_allowed().is_err());assert_eq!(store.owner_control(&id).unwrap(),control_before);assert_eq!(store.pending_owner_messages(&id).unwrap(),2);return;
+                                }
+                                if mode.contains("coreaborted") || mode.contains("-later-") {
+                                    db.execute("UPDATE workflow SET lease_until=0 WHERE id=?1",[&id]).unwrap();
+                                }
+                                let next_plan=if mode.contains("coreaborted") || mode.contains("-later-") {Some(store.owner_publication_recovery_plan(&id).unwrap().unwrap())}else {None};
+                                let next_auth=if let Some(plan)=&next_plan {Some(super::super::targeted::authorize_owner_publication_recovery(dir.path(),plan,crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22}).await.unwrap())}else {None};
+                                let next_claim=next_auth.as_ref().map(|auth|Arc::new(store.claim_owner_publication_recovery(auth,"forward-replay-after-restart",millis(),60_000).unwrap().unwrap()));
+                                let live=next_claim.as_ref().unwrap_or(&recovery);let live_auth=next_auth.as_ref().unwrap_or(&authorization);
+                                let live_mode=durable::native_reconcile::Mode::OwnerRecovery {lease:live,authorization:live_auth};
+                                if mode.contains("coreaborted") {
+                                    let result=durable::native_reconcile::run(&shared,live_mode,&forward,None,&millis).unwrap();
+                                    assert!(matches!(result,durable::native_reconcile::ReconciliationRun::KnownAborted {unresolved:2}),"later actual claim did not acknowledge original forward abort: {result:?}");
+                                    assert!(store.owner_publication_recovery_blocked_state(&id,millis()).unwrap().is_some());
+                                    let current=||store.validate_owner_recovery_transfer(live,live_auth,&forward,millis()).map_err(|_|native_owner::TransferFenceError::NotCurrent);
+                                    native_owner::with_retired_aborted_namespace(forward.original_binding(),forward.request(),&forward.observation(),&plan.destination,&destination,&current,&mut |proof|
+                                        WorkflowStore::open(&state)?.settle_owner_recovery_abort_namespace(live,live_auth,&forward,proof,millis())).unwrap();
+                                    assert_eq!(store.unresolved_native_abort_namespaces(&id).unwrap().len(),1);
+                                    // Deliberate cleanup of the remaining disposable
+                                    // source proves that completion stays completed,
+                                    // but cleanup cannot restore a forward frontier.
+                                    augmentagent_channel_core::native_vm::retire_owned_runtimes(forward.original_binding(),source.path(),&forward.request().source_owners[0].owner,&current).unwrap();
+                                    native_owner::with_retired_aborted_namespace(forward.original_binding(),forward.request(),&forward.observation(),&forward.request().source_owners[0],&source,&current,&mut |proof|
+                                        WorkflowStore::open(&state)?.settle_owner_recovery_abort_namespace(live,live_auth,&forward,proof,millis())).unwrap();
+                                    assert_eq!(store.record_owner_recovery_abort_blocked(live,live_auth,&forward,millis()).unwrap(),None);
+                                    assert_eq!(store.owner_publication_recovery_blocked_state(&id,millis()).unwrap(),Some(durable::owner_publication_recovery::RecoveryBlockedState::ForwardNativeFrontierUnavailable));
+                                    assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_publication_completion WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),1);
+                                    assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_publication_pending WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),0);
+                                    db.execute("UPDATE workflow SET lease_until=0 WHERE id=?1",[&id]).unwrap();
+                                    let unavailable=store.owner_publication_recovery_plan(&id).unwrap().unwrap();
+                                    let unavailable_auth=super::super::targeted::authorize_owner_publication_recovery(dir.path(),&unavailable,crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22}).await.unwrap();
+                                    assert!(store.claim_owner_publication_recovery(&unavailable_auth,"cleanup-cannot-recreate-forward-frontier",millis(),60_000).unwrap().is_none());
+                                    assert_eq!(store.owner_control(&id).unwrap(),control_before);assert_eq!(store.pending_owner_messages(&id).unwrap(),2);return;
+                                }
+                                let live_destination=if next_claim.is_some() {
+                                    let audit=existing_native_audit(&state,&plan.destination,Some(dir.path()),forward.original_binding()).unwrap();
+                                    audit.restrict_to_metadata(durable::owner_publication_recovery::native_metadata_fence(shared.clone(),live.clone(),live_auth,millis()).unwrap()).unwrap();audit
+                                }else {destination.clone()};
+                                assert_eq!(store.owner_recovery_pending_transfer(live,live_auth,millis()).unwrap().unwrap(),forward);
+                                if mode.contains("sqlrollback") {db.execute_batch("CREATE TRIGGER deny_forward_settlement BEFORE INSERT ON workflow_native_handoff_completed BEGIN SELECT RAISE(ABORT,'injected forward settlement failure'); END;").unwrap();}
+                                if mode.contains("sqlcommit") {shared.lock().unwrap().test_lose_recovery_commit_ack();}
+                                let mut result=durable::native_reconcile::run(&shared,live_mode,&forward,Some((&[source.clone()],&live_destination)),&millis).unwrap();
+                                if mode.contains("sqlrollback") || mode.contains("sqlcommit") {
+                                    assert!(matches!(result,durable::native_reconcile::ReconciliationRun::Retained {state:Some(native_owner::NativeTransferState::Completed),reason:native_owner::TransferReason::PersistRetry,..}),"lost settlement did not retain original completed transfer: {result:?}");
+                                    if mode.contains("sqlcommit") {
+                                        assert_eq!(shared.lock().unwrap().test_finish_recovery_commit_ack_loss(),1);
+                                        assert!(WorkflowStore::open(&state).unwrap().owner_recovery_pending_transfer(live,live_auth,millis()).unwrap().is_none());
+                                        assert!(matches!(durable::native_reconcile::run(&shared,live_mode,&forward,None,&millis).unwrap(),durable::native_reconcile::ReconciliationRun::Historical));
+                                    }else {
+                                        db.execute_batch("DROP TRIGGER deny_forward_settlement;").unwrap();
+                                        assert_eq!(WorkflowStore::open(&state).unwrap().owner_recovery_pending_transfer(live,live_auth,millis()).unwrap().unwrap(),forward);
+                                        result=durable::native_reconcile::run(&shared,live_mode,&forward,None,&millis).unwrap();
+                                    }
+                                }
+                                match result {durable::native_reconcile::ReconciliationRun::Settled(settled)=>assert_eq!(settled.destination,plan.destination),durable::native_reconcile::ReconciliationRun::Retained {state:Some(native_owner::NativeTransferState::Completed),..} if mode.contains("sqlcommit")=>{},other=>panic!("forward recovery transfer did not settle: {other:?}")}
+                                assert!(store.owner_recovery_pending_transfer(live,live_auth,millis()).unwrap().is_none());
+                                assert!(matches!(durable::native_reconcile::run(&shared,live_mode,&forward,None,&millis).unwrap(),durable::native_reconcile::ReconciliationRun::Historical));
+                                assert!(destination.dispatch_allowed().is_err(),"settlement promoted the original metadata logger");
+                                let current=||store.validate_owner_recovery_transfer(live,live_auth,&forward,millis()).map_err(|_|native_owner::TransferFenceError::NotCurrent);
+                                let verified=forward.verified_receipt(&current).unwrap().unwrap();
+                                let raw=durable::Lease {workflow:id.clone(),owner:if next_claim.is_some(){"forward-replay-after-restart".into()}else{raw.owner},generation:live.generation()};
+                                let error=store.settle_native_handoff(&raw,forward.workflow_binding(),&verified,millis()).unwrap_err();
+                                assert!(format!("{error:#}").contains("recovery-native intent"),"ordinary settlement used metadata purpose: {error:#}");
+                                let frontier=store.owner_publication_recovery_native_facts(live,live_auth,millis()).expect("settled forward edge did not advance the metadata frontier");
+                                assert_eq!(frontier.namespace(),&plan.destination);
+                                with_recovery_native_metadata(&state,Some(dir.path()),live.clone(),live_auth,&mut |proof| {
+                                    assert_eq!(proof.namespace(),&plan.destination);
+                                    let original=store.with_owner_recovery_preparation(live,live_auth,proof,millis(),|access|
+                                        acceptance::owner::publication::reopen_recovery_preparation(access,proof,dir.path()))?;
+                                    assert_eq!(original.activated_generation(),activated);assert_eq!(original.request_id(),recovery.request_id());
+                                    let events=store.events(&id)?;
+                                    assert!(original.with_scope_transition(|transition|store.complete_recovered_owner_publication(live,live_auth,&original,transition,millis())).is_err(),"new native namespace overwrote historical publication evidence");
+                                    assert_eq!(store.events(&id)?,events);Ok(())
+                                }).expect("forward frontier could not reopen exact original preparation");
+                                assert_eq!(store.owner_control(&id).unwrap(),control_before);assert_eq!(store.pending_owner_messages(&id).unwrap(),2);
+                                let after=store.snapshot(&id).unwrap().unwrap();assert_eq!(after.checkpoint,before.checkpoint);assert_eq!(after.attempts,before.attempts);assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.tokens,before.tokens);
+                                return;
+                            }
                             // Simulate a restarted controller after the original
                             // metadata lease expires; mint a real new claim.
                             db.execute("UPDATE workflow SET lease_until=0 WHERE id=?1",[&id]).unwrap();

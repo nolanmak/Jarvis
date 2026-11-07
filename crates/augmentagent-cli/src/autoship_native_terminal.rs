@@ -48,6 +48,7 @@ impl WorkflowStore {
         ensure!(capture(&tx,&terminal.workflow)?==*terminal
             && pending.request.workflow_id==terminal.workflow
             && terminal.generation>=pending.request.destination.owner.lease_generation,TransferReason::AuthorityConflict);
+        super::super::owner_publication_recovery::require_terminal_native_transfer(&tx,pending)?;
         unstarted::acknowledge(&tx,&terminal.workflow,terminal.generation,&terminal.binding,Some(terminal),pending,now)?;
         tx.commit()?;Ok(())
     }

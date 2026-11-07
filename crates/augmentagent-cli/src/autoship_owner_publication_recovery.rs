@@ -526,26 +526,10 @@ pub(super) fn recovery_native_facts_tx(
 ) -> Result<super::owner_publication::OwnerPublicationNativeFacts> {
     require_authorized_claim(tx, lease, authorization, now)?;
     let original = &lease.claim.original;
-    let raw: String = tx.query_row(
-        "SELECT record FROM workflow_owner_publication_intent WHERE workflow=?1 AND request_id=?2",
-        params![original.workflow, original.request_id],
-        |r| r.get(0),
-    )?;
-    let record: crate::self_improve::OwnerPublicationRecord = serde_json::from_str(&raw)?;
-    super::owner_publication::require(&tx, &original.request_id, &original.intent, &raw)?;
-    let (audit,audit_bytes):(String,i64)=tx.query_row("SELECT substr(audit_path,1,4097),length(CAST(audit_path AS BLOB)) FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",params![original.workflow,original.activated_generation],|r|Ok((r.get(0)?,r.get(1)?)))?;
-    ensure!(
-        (1..=4096).contains(&audit_bytes) && audit.len() as i64 == audit_bytes,
-        "recovery native audit reference exceeds bound"
-    );
-    record.validate_current_native(&tx, Path::new(&audit))?;
-    let namespace = augmentagent_channel_core::native_vm::ownership::Authority {
-        owner: augmentagent_channel_core::native_vm::RuntimeOwner {
-            workflow_id: original.workflow.clone(),
-            lease_generation: original.activated_generation,
-        },
-        audit_path: audit,
-    };
+    // Use the shared bounded intent reader; the namespace independently follows
+    // only the validated publication/native lineage.
+    let (record,_)=native_intent::original_record(tx,original)?;
+    let namespace=native_intent::frontier(tx,original)?;
     let context = RecoveryNativeContext {
         conn: &tx,
         workflow: &original.workflow,
@@ -590,7 +574,10 @@ impl<'claim> RecoveryPreparationRead<'_, 'claim> {
             "recovery preparation intent encoding changed"
         );
         record.validate_history(self.conn)?;
-        record.validate_current_native(self.conn, Path::new(&self.namespace.audit_path))?;
+        ensure!(native_intent::frontier(self.conn,original)?==self.namespace,"recovery preparation native frontier changed");
+        if self.namespace.owner.lease_generation!=original.activated_generation {
+            record.validate_completed_canonical_files(&native_intent::completed(self.conn,original)?)?;
+        }
         let (context, generation, preparation, _) = record.recovery_identity()?;
         ensure!(
             context == original.input_context
@@ -775,11 +762,13 @@ pub(super) fn require_transfer_context(
     );
     super::owner_publication::require(conn, &original.request_id, &original.intent, &raw)?;
     let record: crate::self_improve::OwnerPublicationRecord = serde_json::from_str(&raw)?;
-    record.require_recovery_transfer(pending)?;
-    ensure!(
-        lease.generation() > pending.request().destination.owner.lease_generation,
-        "owner recovery transfer has no successor claim"
-    );
+    if pending.request().destination.owner.lease_generation==original.activated_generation {
+        record.require_recovery_transfer(pending)?;
+        ensure!(lease.generation()>original.activated_generation,"owner recovery transfer has no successor claim");
+    }else {
+        native_intent::require_forward(conn,original,pending)?;
+        ensure!(lease.generation()>=pending.request().destination.owner.lease_generation,"recovery forward transfer is newer than current claim");
+    }
     Ok(())
 }
 impl WorkflowStore {
@@ -893,3 +882,6 @@ fn capture_recovery_snapshot_tx(tx:&Transaction<'_>,lease:&RecoveryLease,
         let snapshot=super::native_handoff::capture_recovery_selected(&context,rows,now)?;
     Ok(snapshot)
 }
+
+pub(super) fn require_ordinary_native_transfer(conn:&Connection,pending:&PendingNativeHandoff)->Result<()> {native_intent::require_ordinary(conn,pending)}
+pub(super) fn require_terminal_native_transfer(conn:&Connection,pending:&PendingNativeHandoff)->Result<()> {native_intent::require_terminal(conn,pending)}

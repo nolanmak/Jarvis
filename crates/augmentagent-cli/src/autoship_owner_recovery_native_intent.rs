@@ -20,12 +20,16 @@ struct ContextRecord {
     version:u32,request_id:String,intent:super::super::owner_publication::Reference,
     claim:RecordRef,generation:i64,completion:RecordRef,pending:RecordRef,created_at:i64,
 }
-fn original_record(conn:&Connection,original:&Original)->Result<(crate::self_improve::OwnerPublicationRecord,String)> {
+pub(super) fn original_record(conn:&Connection,original:&Original)->Result<(crate::self_improve::OwnerPublicationRecord,String)> {
     let (raw,len):(String,i64)=conn.query_row("SELECT substr(record,1,4227073),length(CAST(record AS BLOB)) FROM workflow_owner_publication_intent WHERE workflow=?1 AND request_id=?2",params![original.workflow,original.request_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
     ensure!((1..=4227072).contains(&len) && raw.len() as i64==len,"recovery native intent original exceeds bound");
     super::super::owner_publication::require(conn,&original.request_id,&original.intent,&raw)?;
     let record:crate::self_improve::OwnerPublicationRecord=serde_json::from_str(&raw)?;
     record.validate_history(conn)?;Ok((record,raw))
+}
+pub(super) fn completed(conn:&Connection,original:&Original)->Result<crate::self_improve::OwnerPublicationCompletion> {
+    let (record,raw)=original_record(conn,original)?;
+    super::super::owner_publication::completion(conn,&original.workflow,&original.request_id,&record,&raw)?.context("recovery original completed publication missing")
 }
 fn completed_reference(conn:&Connection,original:&Original)->Result<RecordRef> {
     let (record,raw)=original_record(conn,original)?;
@@ -76,6 +80,47 @@ fn history(conn:&Connection,workflow:&str)->Result<Vec<(ContextRecord,PendingNat
         result.push((context,pending));
     }
     Ok(result)
+}
+/// Historical purpose/lineage only; native proof still comes from core.
+pub(super) fn forward(conn:&Connection,original:&Original)->Result<Option<PendingNativeHandoff>> {
+    let contexts=history(conn,&original.workflow)?;
+    Ok(contexts.into_iter().find(|(context,_)|context.request_id==original.request_id && context.intent==original.intent).map(|(_,pending)|pending))
+}
+pub(super) fn require_forward(conn:&Connection,original:&Original,pending:&PendingNativeHandoff)->Result<()> {
+    ensure!(forward(conn,original)?.as_ref()==Some(pending),"recovery forward transfer context missing or changed");Ok(())
+}
+pub(super) fn require_ordinary(conn:&Connection,pending:&PendingNativeHandoff)->Result<()> {
+    // Captured metadata generation remains metadata even if mutable projections
+    // disappear. Never derive a productive purpose from missing context rows.
+    let metadata:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_publication_recovery WHERE workflow=?1 AND generation=?2)",params![pending.request().workflow_id,pending.request().destination.owner.lease_generation],|r|r.get(0))?;
+    ensure!(!metadata,"recovery-native intent requires authenticated metadata authority");
+    ensure!(!history(conn,&pending.request().workflow_id)?.iter().any(|(_,saved)|saved.request().transfer_id==pending.request().transfer_id),"recovery-native intent is not an ordinary transfer");Ok(())
+}
+pub(super) fn require_terminal(conn:&Connection,pending:&PendingNativeHandoff)->Result<()> {
+    // Validate even when a captured claim projection is damaged or missing.
+    history(conn,&pending.request().workflow_id)?;
+    let claims=journal(conn,&pending.request().workflow_id)?;
+    if let Some((claim,_))=claims.iter().find(|(claim,_)|claim.generation==pending.request().destination.owner.lease_generation) {
+        require_forward(conn,&claim.original,pending)?;
+    }
+    Ok(())
+}
+/// Follow only the validated completed edge, never the greatest generation or
+/// an occupied destination row. Retained original publication remains immutable.
+pub(super) fn frontier(conn:&Connection,original:&Original)->Result<augmentagent_channel_core::native_vm::ownership::Authority> {
+    let (record,_)=original_record(conn,original)?;
+    let pending=forward(conn,original)?;
+    let completed=native_pending::settlement::History::load(conn,&original.workflow,u64::MAX)?;
+    let selected=if let Some(pending)=pending.as_ref() {
+        (completed.current_pending(pending.request().destination.owner.lease_generation,pending.workflow_binding())?.as_ref()==Some(pending)).then_some(pending)
+    }else {None};
+    let generation=selected.map_or(original.activated_generation,|pending|pending.request().destination.owner.lease_generation);
+    let (audit,binding,audit_len,binding_len):(String,String,i64,i64)=conn.query_row("SELECT substr(o.audit_path,1,4097),substr(b.binding,1,16385),length(CAST(o.audit_path AS BLOB)),length(CAST(b.binding AS BLOB)) FROM workflow_native_owner o JOIN workflow_native_owner_binding b ON b.workflow=o.workflow AND b.lease_generation=o.lease_generation WHERE o.workflow=?1 AND o.lease_generation=?2 AND o.retired_at IS NULL AND o.retirement_reason IS NULL",params![original.workflow,generation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+    ensure!((1..=4096).contains(&audit_len) && audit.len() as i64==audit_len && (1..=16384).contains(&binding_len) && binding.len() as i64==binding_len,"recovery frontier registration exceeds bound");
+    record.validate_native_binding(&serde_json::from_str(&binding)?)?;
+    let namespace=augmentagent_channel_core::native_vm::ownership::Authority {owner:augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:original.workflow.clone(),lease_generation:generation},audit_path:audit};
+    ensure!(selected.is_none_or(|pending|pending.request().destination==namespace),"recovery frontier destination registration changed");
+    Ok(namespace)
 }
 fn read(conn:&Connection,lease:&RecoveryLease,authorization:&crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,now:i64)->Result<Option<PendingNativeHandoff>> {
     require_authorized_claim(conn,lease,authorization,now)?;

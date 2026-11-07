@@ -93,6 +93,7 @@ impl WorkflowStore {
     pub(crate) fn acknowledge_native_aborted(&mut self,lease:&Lease,binding:&Binding,pending:&PendingNativeHandoff,proof:&NativeTransferInspection<'_>,now:i64)->Result<()> {
         require_aborted(pending,proof)?;let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,binding,now)?;
+        super::super::owner_publication_recovery::require_ordinary_native_transfer(&tx,pending)?;
         let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
         ensure!(!matches!(checkpoint.stage,Stage::Merged|Stage::Retired) && pending.request.workflow_id==lease.workflow
             && lease.generation>pending.request.destination.owner.lease_generation,TransferReason::AuthorityConflict);
@@ -102,12 +103,14 @@ impl WorkflowStore {
         authorization:&crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,pending:&PendingNativeHandoff,proof:&NativeTransferInspection<'_>,now:i64)->Result<()> {
         require_aborted(pending,proof)?;let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         super::super::owner_publication_recovery::require_transfer_context(&tx,lease,authorization,pending,now)?;
+        ensure!(lease.generation()>pending.request().destination.owner.lease_generation,"creating metadata claim retains its own aborted native intent");
         acknowledge(&tx,&pending.request().workflow_id,lease.generation(),pending.workflow_binding(),None,pending,now)?;tx.commit()?;Ok(())
     }
     pub(crate) fn acknowledge_terminal_native_aborted(&mut self,terminal:&terminal::TerminalNativeCheckpoint,pending:&PendingNativeHandoff,proof:&NativeTransferInspection<'_>,now:i64)->Result<()> {
         require_aborted(pending,proof)?;let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure!(terminal::capture(&tx,terminal.workflow())?==*terminal && pending.request.workflow_id==terminal.workflow()
             && terminal.generation()>=pending.request.destination.owner.lease_generation,TransferReason::AuthorityConflict);
+        super::super::owner_publication_recovery::require_terminal_native_transfer(&tx,pending)?;
         acknowledge(&tx,terminal.workflow(),terminal.generation(),terminal.binding(),Some(terminal),pending,now)?;tx.commit()?;Ok(())
     }
     /// Historical protected context only; native proof and cleanup authorization

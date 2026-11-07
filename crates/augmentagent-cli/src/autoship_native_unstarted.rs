@@ -49,6 +49,7 @@ impl WorkflowStore {
         require_absent(pending,proof)?;
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,binding,now)?;
+        super::super::owner_publication_recovery::require_ordinary_native_transfer(&tx,pending)?;
         let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;
         let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
         ensure!(!matches!(checkpoint.stage,Stage::Merged|Stage::Retired)

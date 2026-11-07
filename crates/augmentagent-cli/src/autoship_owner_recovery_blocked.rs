@@ -28,6 +28,7 @@ struct Blocked {
 pub(crate) enum RecoveryBlockedState {
     NamespaceObligations { eligible_at_ms: i64 },
     OriginalPublicationUnavailable,
+    ForwardNativeFrontierUnavailable,
     HistoryCapacity,
 }
 fn deadline(observed_at: i64, failures: u32, obligations: &Obligations) -> Result<Option<i64>> {
@@ -75,11 +76,11 @@ fn load(conn: &Connection, workflow: &str) -> Result<Vec<(Blocked, RecordRef)>> 
             && record.previous == result.last().map(|(_, reference)| reference.clone()),
             "recovery blocked lineage changed");
         ensure!(record.obligations == obligations(conn, workflow, &record.obligations.transfer_id, sequence)?, "recovery blocked obligations changed");
-        // The aborted transfer must be the original activated destination, not
-        // some other legitimate historical transfer in the same workflow.
-        let destination: i64 = conn.query_row("SELECT json_extract(record,'$.pending.request.destination.owner.lease_generation') FROM workflow_native_handoff_aborted WHERE workflow=?1 AND transfer_id=?2",
-            params![workflow, record.obligations.transfer_id], |r| r.get(0))?;
-        ensure!(destination == claim.original.activated_generation, "blocked recovery original transfer changed");
+        let pending=native_pending::recorded_pending(conn,workflow,&record.obligations.transfer_id)?;
+        if pending.request().destination.owner.lease_generation==claim.original.activated_generation {
+            let (original,_) = super::native_intent::original_record(conn,&claim.original)?;
+            original.require_recovery_transfer(&pending)?;
+        }else {super::native_intent::require_forward(conn,&claim.original,&pending)?;}
         let expected_failures = result.iter().rev().find(|(prior,_)| prior.request_id == record.request_id && prior.obligations == record.obligations)
             .map_or(1, |(prior,_)| prior.failures.saturating_add(1));
         ensure!(record.failures == expected_failures, "blocked recovery debt changed");
@@ -106,7 +107,15 @@ pub(super) fn blocked_state(conn: &Connection, plan: &RecoveryPlan, now: i64) ->
     let current = obligations(conn, &plan.original.workflow, &record.obligations.transfer_id, i64::MAX)?;
     if current != record.obligations { return Ok(None); }
     match record.eligible_at_ms {
-        None => Ok(Some(RecoveryBlockedState::OriginalPublicationUnavailable)),
+        None => {
+            let pending=native_pending::recorded_pending(conn,&plan.original.workflow,&record.obligations.transfer_id)?;
+            Ok(Some(if pending.request().destination.owner.lease_generation==plan.original.activated_generation {
+                RecoveryBlockedState::OriginalPublicationUnavailable
+            }else {
+                super::native_intent::require_forward(conn,&plan.original,&pending)?;
+                RecoveryBlockedState::ForwardNativeFrontierUnavailable
+            }))
+        },
         Some(eligible_at_ms) => Ok((now < eligible_at_ms).then_some(RecoveryBlockedState::NamespaceObligations { eligible_at_ms })),
     }
 }

@@ -279,7 +279,9 @@ impl History {
 impl WorkflowStore {
     pub fn settle_native_handoff(&mut self,lease:&Lease,binding:&Binding,proof:&VerifiedHandoffReceipt,now:i64)->Result<HandoffSettlement> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_binding(&tx,lease,binding,now)?;require_clear_abort_barriers(&tx,&lease.workflow)?;
+        require_binding(&tx,lease,binding,now)?;
+        super::super::owner_publication_recovery::require_ordinary_native_transfer(&tx,proof.pending())?;
+        require_clear_abort_barriers(&tx,&lease.workflow)?;
         let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
         ensure!(!matches!(checkpoint.stage,Stage::Merged|Stage::Retired),"terminal handoff needs cleanup-only settlement");
         let result=settle(&tx,&lease.workflow,lease.generation,binding,None,proof,now)?;tx.commit()?;Ok(result)
@@ -294,7 +296,9 @@ impl WorkflowStore {
     }
     pub(crate) fn settle_terminal_native_handoff(&mut self,terminal:&terminal::TerminalNativeCheckpoint,proof:&VerifiedHandoffReceipt,now:i64)->Result<HandoffSettlement> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure!(terminal::capture(&tx,terminal.workflow())?==*terminal,TransferReason::AuthorityConflict);require_clear_abort_barriers(&tx,terminal.workflow())?;
+        ensure!(terminal::capture(&tx,terminal.workflow())?==*terminal,TransferReason::AuthorityConflict);
+        super::super::owner_publication_recovery::require_terminal_native_transfer(&tx,proof.pending())?;
+        require_clear_abort_barriers(&tx,terminal.workflow())?;
         let result=settle(&tx,terminal.workflow(),terminal.generation(),terminal.binding(),Some(terminal),proof,now)?;tx.commit()?;Ok(result)
     }
 }
