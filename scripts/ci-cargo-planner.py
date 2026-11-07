@@ -5124,12 +5124,88 @@ os.write(1,(json.dumps({'raw_exec_errnos':errors})+'\n').encode())
 '''
 
 
+_RELAY_PROC_MEMORY_BODY=r'''
+import ctypes,errno,fcntl,json,os,signal,sys
+readonly=sys.argv[1]=='proc-ro'
+assert bool(os.statvfs('/proc').f_flag&os.ST_RDONLY)==readonly
+buffer=ctypes.create_string_buffer(b'original');address=ctypes.addressof(buffer)
+ready_r,ready_w=os.pipe();go_r,go_w=os.pipe();report_r,report_w=os.pipe()
+child=os.fork()
+if not child:
+ os.close(ready_r);os.close(go_w);os.close(report_r)
+ os.write(ready_w,b'R');assert os.read(go_r,1)==b'G'
+ os.write(report_w,buffer.raw[:8]);os._exit(0)
+reaped=False;reader=None
+try:
+ os.close(ready_w);os.close(go_r);os.close(report_w)
+ assert os.read(ready_r,1)==b'R' and os.waitpid(child,os.WNOHANG)==(0,0)
+ reader=os.open('/proc/'+str(child)+'/mem',os.O_RDONLY|os.O_CLOEXEC)
+ assert os.pread(reader,8,address)==b'original'
+ paths={'direct':'/proc/'+str(child)+'/mem',
+  'self_root':'/proc/self/root/proc/'+str(child)+'/mem',
+  'victim_root':'/proc/'+str(child)+'/root/proc/'+str(child)+'/mem',
+  'fd_alias':'/proc/self/fd/'+str(reader)}
+ results={}
+ for index,(name,path) in enumerate(paths.items()):
+  writer=None
+  try:
+   writer=os.open(path,os.O_RDWR|os.O_CLOEXEC)
+   assert not readonly,'read-only proc allowed a writable memory FD'
+   data=('writer-'+str(index)).encode();assert os.pwrite(writer,data,address)==8
+   assert os.pread(reader,8,address)==data
+   results[name]=0
+  except OSError as error:
+   assert readonly and error.errno==errno.EROFS,(name,error.errno)
+   results[name]=error.errno
+  finally:
+   if writer is not None:os.close(writer)
+ flags=fcntl.fcntl(reader,fcntl.F_GETFL);fcntl.fcntl(reader,fcntl.F_SETFL,flags|os.O_RDWR)
+ assert fcntl.fcntl(reader,fcntl.F_GETFL)&os.O_ACCMODE==os.O_RDONLY
+ try:os.pwrite(reader,b'forged!!',address)
+ except OSError as error:assert error.errno==errno.EBADF
+ else:raise AssertionError('read-only memory FD gained write access')
+ expected=b'original' if readonly else b'writer-3'
+ assert os.pread(reader,8,address)==expected
+ os.write(go_w,b'G');actual=os.read(report_r,8);assert actual==expected
+ assert os.waitpid(child,0)==(child,0);reaped=True
+ print(json.dumps({'mount_readonly':readonly,'read_control':True,'write_results':results,
+  'readonly_fd_write_errno':errno.EBADF,'victim_final_hex':actual.hex(),'victim_reaped':True}),flush=True)
+finally:
+ if not reaped:
+  try:os.kill(child,signal.SIGKILL)
+  except ProcessLookupError:pass
+  os.waitpid(child,0)
+ if reader is not None:os.close(reader)
+ for fd in (ready_r,go_w,report_r):os.close(fd)
+'''
+
+
+def validate_proc_memory_case(row,readonly):
+    keys={'mount_readonly','read_control','write_results','readonly_fd_write_errno','victim_final_hex','victim_reaped'}
+    aliases={'direct','self_root','victim_root','fd_alias'}
+    if (type(row) is not dict or set(row)!=keys or row['mount_readonly'] is not readonly
+            or row['read_control'] is not True or row['victim_reaped'] is not True
+            or type(row['readonly_fd_write_errno']) is not int or row['readonly_fd_write_errno']!=errno.EBADF
+            or row['victim_final_hex']!=(b'original' if readonly else b'writer-3').hex()
+            or type(row['write_results']) is not dict or set(row['write_results'])!=aliases
+            or any(type(value) is not int or value!=(errno.EROFS if readonly else 0)
+                for value in row['write_results'].values())):
+        raise FreshnessHold('input_census_unknown')
+    return row
+
+
 def _relay_exec_policy_client(arguments):
     bootstrap,configuration=map(int,arguments)
     value=_bootstrap(bootstrap,'relay-exec-policy-client');_parent_guard(value['parent']);os.close(bootstrap)
     uid=value['uid']
-    if uid not in (1000,1001,2000,6095) or value['mode'] not in ('direct','descendant','listener-loss'):
+    if uid not in (1000,1001,2000,6095) or value['mode'] not in ('direct','descendant','listener-loss','proc-rw','proc-ro'):
         raise FreshnessHold('invalidation_unsafe')
+    if value['mode'] in ('proc-rw','proc-ro'):
+        libc=ctypes.CDLL(None,use_errno=True)
+        if libc.unshare(0x00020000)!=0:raise FreshnessHold('invalidation_unsafe')
+        unit_views._mount('--make-rprivate','/')
+        if value['mode']=='proc-ro':unit_views.mount_unit_proc('/proc')
+        else:unit_views._mount('-t','proc','-o','rw,nosuid,nodev,noexec,hidepid=2','proc','/proc')
     policy=UnitPolicy()
     try:policy.prepare_relay_configuration(configuration)
     except FreshnessHold as error:
@@ -5139,7 +5215,8 @@ def _relay_exec_policy_client(arguments):
     os.setgroups([]);os.setgid(uid);os.setuid(uid);_parent_guard(value['parent'])
     os.set_inheritable(configuration,True)
     arm_original_exec()
-    os.execve('/usr/bin/python3',['python3','-I','-c',_RELAY_EXEC_POLICY_BODY,value['mode']],
+    os.execve('/usr/bin/python3',['python3','-I','-c',
+        _RELAY_PROC_MEMORY_BODY if value['mode'] in ('proc-rw','proc-ro') else _RELAY_EXEC_POLICY_BODY,value['mode']],
         {'PATH':os.defpath,'LD_PRELOAD':value['library'],'JARVIS_CARGO_RELAY_FD':str(configuration)})
 
 
@@ -5149,7 +5226,8 @@ def relay_exec_policy_probe(value):
     supervisor=_load('relay_policy_original_supervisor','provider-supervisor.py');results={}
     cases=(('worker',1000,b'JARVWRK3',0,'direct'),('planner',1001,b'JARVCFG3',0,'direct'),
         ('unit_first',2000,b'JARVUNT3',2000,'direct'),('unit_last',6095,b'JARVUNT3',6095,'direct'),
-        ('descendant',1000,b'JARVWRK3',0,'descendant'),('listener_loss',2000,b'JARVUNT3',2000,'listener-loss'))
+        ('descendant',1000,b'JARVWRK3',0,'descendant'),('listener_loss',2000,b'JARVUNT3',2000,'listener-loss'),
+        ('proc_rw_control',2000,b'JARVUNT3',2000,'proc-rw'),('proc_ro_guard',2000,b'JARVUNT3',2000,'proc-ro'))
     for name,uid,magic,config_uid,mode in cases:
         mediation=ExecMediation(value['deadline'],uid);bootstrap=None
         configuration=os.memfd_create('relay-policy-probe',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
@@ -5181,6 +5259,12 @@ def relay_exec_policy_probe(value):
             mediation.settle()
             if code!=0 or error:raise FreshnessHold('invalidation_unsafe')
             observed=json.loads(output)
+            if mode in ('proc-rw','proc-ro'):
+                validate_proc_memory_case(observed,mode=='proc-ro')
+                if mediation.errors or not mediation.ack:raise FreshnessHold('invalidation_unsafe')
+                if receipt.read_bytes()!=b'all-descendants-reaped\n':raise FreshnessHold('cleanup_uncertain')
+                results[name]={'uid':uid,'mode':mode,'memory':observed,'original_exec_ack':True,'original_cleanup':True}
+                continue
             if type(observed) is not dict or set(observed)!={'raw_exec_errnos'}:raise FreshnessHold('invalidation_unsafe')
             refused=observed['raw_exec_errnos']
             if refused not in ([errno.EPERM,errno.EPERM],[errno.ENOSYS,errno.ENOSYS]) or mode!='listener-loss' and refused!=[errno.EPERM,errno.EPERM]:
@@ -5208,7 +5292,7 @@ def relay_exec_policy_probe(value):
 
 def validate_relay_exec_policy_probe(value,binding,command,workers,writer,source_projection):
     keys={'version','kind','binding','command','cases','input_closure_complete','full_ci','shipping_authority','guest_worker_quiescence'}
-    expected={'worker':1000,'planner':1001,'unit_first':2000,'unit_last':6095,'descendant':1000,'listener_loss':2000}
+    expected={'worker':1000,'planner':1001,'unit_first':2000,'unit_last':6095,'descendant':1000,'listener_loss':2000,'proc_rw_control':2000,'proc_ro_guard':2000}
     if (type(value) is not dict or set(value)!=keys or value['version']!=1
             or value['kind']!='ci-relay-exec-policy-probe' or value['binding']!=binding or value['command']!=command
             or any(value[k] is not False for k in ('input_closure_complete','full_ci','shipping_authority'))
@@ -5219,6 +5303,13 @@ def validate_relay_exec_policy_probe(value,binding,command,workers,writer,source
             or any(scope==item['scope'] for item in source_projection['access'])):raise FreshnessHold('cleanup_uncertain')
     for name,uid in expected.items():
         row=value['cases'][name];lost=name=='listener_loss'
+        if name in ('proc_rw_control','proc_ro_guard'):
+            readonly=name=='proc_ro_guard'
+            if (type(row) is not dict or set(row)!={'uid','mode','memory','original_exec_ack','original_cleanup'}
+                    or row['uid']!=2000 or row['mode']!=('proc-ro' if readonly else 'proc-rw')
+                    or row['original_exec_ack'] is not True or row['original_cleanup'] is not True):
+                raise FreshnessHold('input_census_unknown')
+            validate_proc_memory_case(row['memory'],readonly);continue
         if (type(row) is not dict or set(row)!={'uid','mode','raw_execs_refused','raw_exec_errnos','denied_notifications','original_exec_ack','original_cleanup','listener_lost'}
                 or row['uid']!=uid or row['raw_execs_refused']!=2 or type(row['denied_notifications']) is not int
                 or row['denied_notifications'] not in ((0,) if lost else (0,2))

@@ -607,6 +607,51 @@ C and R own those testable exits before runtime native-handoff activation.
 Carrying cost is three fixed config tags and exact canonical-byte observation;
 there is no durable grant schema or historical owner-preparation rewrite.
 
+#### Proc-memory writer boundary (C/R validation in progress)
+
+The unit view already mounts procfs with `ro,nosuid,nodev,noexec,hidepid=2`.
+Use one `mount_unit_proc` helper for that exact production mount and for the
+fixed root-controlled conformance probe. Do not infer from the process-vm-write
+or ptrace syscall refusals that proc memory writes are covered: they are a
+separate filesystem route. Before native proxy exec, C/R must establish that
+all relevant untrusted writers have the required proc view and cannot reach a
+writable alternate proc mount or already-open writable memory descriptor.
+
+Extend the existing private relay-policy probe with a writable-proc control
+and a read-only-proc guard case, both under the actual inherited native policy,
+actual V3 unit credentials/configuration and original exec supervisor. Each
+client creates its own private mount namespace before native policy activation;
+the guard calls the same production `mount_unit_proc`. The control alone creates
+a private writable proc mount. After native exec/acknowledgement and dropping
+to the assigned UID, the client forks a cooperative same-UID victim with a real
+buffer. The parent must read the victim's original bytes through a read-only
+memory FD, so DAC/Yama refusal cannot masquerade as a successful filesystem
+guard. It then tries direct `/proc/PID/mem`, self-root and victim-root links,
+and reopening the read-only memory FD through `/proc/self/fd` for writing.
+
+The writable control must actually write through every alias and observe each
+new value in the victim's memory. The read-only case must get EROFS from every
+writable open; EACCES/EPERM is not the expected positive control. Attempting to
+change the read-only FD's access mode must not grant write access, and pwrite
+on that FD must return EBADF. The live victim reports its own final bytes,
+which must be changed in the writable control and original in the guard case,
+and is then reaped under the original supervisor. Observe the actual mount's
+read-only flag rather than deriving it from the requested mode. Report each
+alias separately; missing aliases, boolean errnos, changed guarded bytes,
+missing read-control/reap or added authority flags reject the report.
+
+This is a bounded filesystem-writer proof under the unit proc view, not a
+complete writer closure or runtime vfork admission. Worker/planner views,
+foreign writable memory FDs, descriptor ingress/lifetime, mappings, cross-scope
+aliases, asynchronous writers, all relevant ABI paths and the original live
+cohort/source/resource binding remain C/R-owned prerequisites before admitting
+those routes. Root configuration tags and this diagnostic report cannot replace
+them. The returned report retains false complete-input/full-CI/shipping flags.
+The carrying cost is a shared proc mount helper and two fixed private cases;
+no runtime permission or durable grant schema is added. Actual guest validation
+is still pending for this extension. Do not rerun the unchanged compiler fixture
+merely to restate its vfork refusal before a relevant admission change exists.
+
 ### O3. Freeze before capturing a live parent's input
 
 First capture the child's original request, exact stdin to EOF and verified

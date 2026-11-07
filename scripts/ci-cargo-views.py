@@ -1948,6 +1948,11 @@ def _mount(*arguments):
         stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10)
 
 
+def mount_unit_proc(destination):
+    """Private unit procfs: memory writes must not bypass the syscall policy."""
+    _mount('-t','proc','-o','ro,nosuid,nodev,noexec,hidepid=2','proc',destination)
+
+
 def _readonly(source,destination):
     _mount('--bind',source,destination)
     _mount('-o','remount,bind,ro,nosuid,nodev,noatime',destination)
@@ -2071,7 +2076,7 @@ def _enter(root,unit,source,artifacts,bindings,phase,source_bindings=None,declar
                 raise FreshnessHold('invalidation_unsafe')
             _mount('--bind',original,root/name);_mount('-o','remount,bind,rw,nosuid,nodev,noatime',root/name)
     phase[0]='planner_view_proc'
-    _mount('-t','proc','-o','ro,nosuid,nodev,noexec,hidepid=2','proc',root/'proc')
+    mount_unit_proc(root/'proc')
     phase[0]='planner_view_devices'
     for name in ('null','zero','random','urandom'):
         (root/'dev'/name).touch(mode=0o600);_mount('--bind','/dev/'+name,root/'dev'/name)
