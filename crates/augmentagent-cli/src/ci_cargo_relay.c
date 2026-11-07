@@ -137,12 +137,17 @@ __attribute__((constructor)) static void initialize_relay(void) {
 #ifdef JARVIS_CARGO_PROTOCOL_V3
     /* The unit role uses the existing uid field for the assigned client UID.
      * Worker/planner layouts retain uid=0; every V3 server peer stays root. */
-    int worker = memcmp(config.magic, "JARVWRK3", 8) == 0;
-    int unit = memcmp(config.magic, "JARVUNT3", 8) == 0;
+    /* Listener-owned forms are prepared only by the trusted root bootstrap
+     * after native policy installation. The original supervisor verifies their
+     * exact bytes at exec-stop. The tag alone is never an exec permission. */
+    int listener_owned = !memcmp(config.magic,"JARVWRL3",8)
+        || !memcmp(config.magic,"JARVCFL3",8) || !memcmp(config.magic,"JARVUNL3",8);
+    int worker = !memcmp(config.magic,"JARVWRK3",8) || !memcmp(config.magic,"JARVWRL3",8);
+    int unit = !memcmp(config.magic,"JARVUNT3",8) || !memcmp(config.magic,"JARVUNL3",8);
     uid_t expected = unit ? config.uid : worker ? 1000 : 1001;
     uid_t real_uid,effective_uid,saved_uid;
     gid_t real_gid,effective_gid,saved_gid;
-    if ((!worker && !unit && memcmp(config.magic, CONFIG_MAGIC, 8))
+    if ((!worker && !unit && memcmp(config.magic, CONFIG_MAGIC, 8) && memcmp(config.magic,"JARVCFL3",8))
         || (unit ? config.uid<2000 || config.uid>=6096 : config.uid!=0) || info.st_uid!=0
         || getresuid(&real_uid,&effective_uid,&saved_uid) || getresgid(&real_gid,&effective_gid,&saved_gid)
         || real_uid!=expected || effective_uid!=expected || saved_uid!=expected
@@ -155,7 +160,11 @@ __attribute__((constructor)) static void initialize_relay(void) {
     if (config.pid == 0 || config.pid > INT_MAX || config.timeout_ms < 1000
         || config.timeout_ms > MAX_TIMEOUT_MS || config.path[0] != '/'
         || !memchr(config.path, 0, sizeof(config.path))) _exit(125);
+#ifdef JARVIS_CARGO_PROTOCOL_V3
+    if (!listener_owned && jarvis_ci_deny_exec() != 0) _exit(125);
+#else
     if (jarvis_ci_deny_exec() != 0) _exit(125);
+#endif
 #ifdef JARVIS_CARGO_PROTOCOL_V3
     if (unit && strip_unit_transport_environment()!=0) _exit(125);
 #endif

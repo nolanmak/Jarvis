@@ -385,6 +385,42 @@ def observe_sealed_descriptor(pid,number):
         if descriptor is not None:os.close(descriptor)
 
 
+def listener_relay_body(body):
+    """Data-only canonical form for an already listener-protected bootstrap.
+
+    This tag does not establish policy installation or authorize any exec.
+    Ordinary V3/V2 callers keep the constructor's duplicate exec denial.
+    """
+    tags={b'JARVWRK3':b'JARVWRL3',b'JARVCFG3':b'JARVCFL3',b'JARVUNT3':b'JARVUNL3'}
+    if type(body) is not bytes or len(body)!=160 or body[:8] not in tags:
+        raise StagingUnavailable('worker_entry_configuration')
+    return tags[body[:8]]+body[8:]
+
+
+def observe_relay_configuration(pid,number,*,listener_owned=False):
+    """Verify exact original or canonical bootstrap bytes at original exec-stop.
+
+    Only the original supervisor may select listener_owned after its own kernel
+    listener transfer/exec observation. Matching bytes alone are not that proof.
+    """
+    original=observe_sealed_descriptor(os.getpid(),number)
+    actual=observe_sealed_descriptor(pid,number)
+    if not listener_owned:
+        if actual!=original or actual['uid']!=os.geteuid() or actual['gid']!=os.getegid():
+            raise StagingUnavailable('worker_entry_configuration')
+    else:
+        if os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0):
+            raise StagingUnavailable('worker_entry_configuration')
+        body=os.pread(number,161,0)
+        expected=listener_relay_body(body)
+        if (original['uid']!=0 or original['gid']!=0 or original['size_bytes']!=160
+                or original['sha256']!=hashlib.sha256(body).hexdigest()
+                or actual['uid']!=0 or actual['gid']!=0 or actual['size_bytes']!=160
+                or actual['sha256']!=hashlib.sha256(expected).hexdigest()):
+            raise StagingUnavailable('worker_entry_configuration')
+    return actual
+
+
 def publish_policy_receipt(descriptor,value):
     """Seal a bootstrap observation in the original supervisor's empty memfd.
 
@@ -404,16 +440,12 @@ def publish_policy_receipt(descriptor,value):
     except OSError:raise StagingUnavailable('policy_receipt') from None
 
 
-def observe_worker_entry(pid,configuration,receipt,expected_policy,*,uid,gid,groups,tracer=None):
+def observe_worker_entry(pid,configuration,receipt,expected_policy,*,uid,gid,groups,tracer=None,listener_owned=False):
     """Original supervisor observation, without a runnable or cleanup grant."""
     entry=observe_exec_entry(pid,tracer=tracer)
     require_exec_entry(entry,uid=uid,gid=gid,groups=groups,descriptors=[0,1,2,configuration])
     entry['policy_activation']=read_policy_receipt(receipt,expected_policy)
-    original=observe_sealed_descriptor(os.getpid(),configuration)
-    actual=observe_sealed_descriptor(pid,configuration)
-    if actual!=original or actual['uid']!=os.geteuid() or actual['gid']!=os.getegid():
-        raise StagingUnavailable('worker_entry_configuration')
-    entry['sealed_relay']=actual
+    entry['sealed_relay']=observe_relay_configuration(pid,configuration,listener_owned=listener_owned)
     table={row['number']:row for row in entry['fd_table']}
     for number in (0,1,2):
         info=os.fstat(number);row=table[number]

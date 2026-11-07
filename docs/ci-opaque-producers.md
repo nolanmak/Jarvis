@@ -501,7 +501,7 @@ refusal must launch no tool. Same-UID host composition does not establish root
 role admission, complete writer closure, jobserver accounting, source closure,
 parent effect transfer or production activation.
 
-**Load-bearing constructor conflict, unresolved:** the original V3 relay still
+**Original load-bearing constructor conflict:** the ordinary V3 relay
 calls `jarvis_ci_deny_exec`, an inherited irreversible ERRNO filter for execve
 and execveat. Its refusal precedes USER_NOTIF, so the original controller cannot
 approve a status-image exec through that filter. The combined positive fixture
@@ -511,7 +511,9 @@ vfork: no child exec notification or exec-stop occurs, no tool starts, and the
 original parent reaps exit 93 only after the child dies. Keep this regression;
 positive composition cannot stand in for this production path.
 
-C and R own resolution before any production native-handoff admission. Trace
+C and R own resolution before any production native-handoff admission. The
+listener-owned bootstrap path below addresses duplicate-filter ownership; the
+remaining native-handoff admission requirements still apply. Trace
 all worker, planner and unit bootstraps and their mandatory original listener
 installation/exec acknowledgement; preserve early-constructor/static/raw-exec
 refusal and actual root-role/live-operation binding. A sealed config, Seccomp
@@ -534,6 +536,66 @@ the new opt-in passed 39 cases, with 29 opt-ins ignored in the bulk run. Guest
 clients were UID/GID 1000; this establishes same-UID conformance, including the
 production-filter refusal, and does not resolve the constructor conflict or
 establish runtime root-role admission.
+
+#### Listener-owned relay bootstrap (C/R policy ownership)
+
+Decision: preserve ordinary V3/V2 constructor exec denial, and use a distinct
+canonical configuration only in the trusted root bootstrap after actual native
+listener installation. This avoids both an unconditional V3 relaxation and the
+irreversible ERRNO filter that masks the original listener. The 160-byte root
+configuration keeps all existing fields; only its magic changes: worker
+`JARVWRK3` to `JARVWRL3`, planner `JARVCFG3` to `JARVCFL3`, and unit `JARVUNT3`
+to `JARVUNL3`. These forms select which layer owns exec refusal; they are not
+execution, root-peer, staging, source or resource authorization.
+
+`UnitPolicy.prepare_relay_configuration` is root-bootstrap-only. It requires
+actual successful native listener activation in that same process, and runs
+after `stage_exec_mediation` transfers the actual kernel listener to the original
+supervisor. It creates a new root-owned fully sealed memfd containing the exact
+canonical bytes, replacing only the bootstrap's original FD number while
+preserving its FD flags and offset. The original server/supervisor copy and its
+historical bytes remain unchanged. Worker, Cargo and unit bootstraps perform
+this step before dropping credentials and before their initial untrusted exec.
+No environment flag, claimed Seccomp state, filter count or model request can
+substitute for that bootstrap execution sequence.
+
+The original supervisor receives/authenticates the actual listener and observes
+its original child at the kernel exec-stop. Before acknowledgement/release it
+independently compares the child's fully sealed root-owned configuration against
+the exact canonical form of its own original configuration. Original worker
+controller admission independently repeats that comparison while the original
+supervisor still holds the stop. Ordinary constructor probes keep their original
+configuration and denial behavior. Both old and canonical V3 forms retain exact
+role UID/GID/saved-identity/group/owner/seal checks. V2 is unchanged. The new tag
+alone does not prove policy installation; the trusted bootstrap, original kernel
+listener custody and original exec-stop checks establish this narrower boundary.
+Runtime native proxy exec remains denied until its separate live admission and
+writer/input/source/resource requirements are implemented.
+
+The private test-only session marker may select a fixed root-controlled
+`relay-exec-policy` probe under the existing measured planner probe bundle.
+Only repository probe mode accepts it; unknown kinds and cross-operation
+selection fail before VM launch. It cannot select source-controlled root code.
+The probe loads the actual relay with root-owned sealed role configurations for
+worker, planner, first/last unit UID and a descendant. It attempts real execve
+and execveat, requires original exec acknowledgement/reap, and records actual
+controller denial notifications. Listener-loss must refuse both calls with
+ENOSYS. A pre-activation canonicalization attempt must refuse before preparing
+the real listener-backed configuration. The returned report remains data with
+all complete-input/full-CI/shipping flags false; a diagnostic report with zero
+notifications may be retained to explain the RED baseline, but cannot satisfy
+the ownership regression. The Rust regression requires two actual controller
+denials for every connected case and the expected listener-loss errno.
+
+At baseline `eaeabe91`, the root-controlled guest regression failed after 92.59
+seconds: actual worker raw exec calls returned EPERM, original exec/reap
+succeeded, but the controller observed zero denial notifications. This is a
+real constructor/listener composition failure, independent of the earlier
+same-UID vfork fixture. The listener-owned change is under validation; no
+passing root probe or restored compiler/worker/publication result is yet claimed.
+C and R own those testable exits before runtime native-handoff activation.
+Carrying cost is three fixed config tags and exact canonical-byte observation;
+there is no durable grant schema or historical owner-preparation rewrite.
 
 ### O3. Freeze before capturing a live parent's input
 

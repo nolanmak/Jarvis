@@ -3069,11 +3069,7 @@ def _unit(arguments):
         entry['sealed_stdin']=sealed
         if relay_enabled:
             descriptor=value['relay_fd']
-            original=staging.observe_sealed_descriptor(os.getpid(),descriptor)
-            actual=staging.observe_sealed_descriptor(child.pid,descriptor)
-            if original!=actual or actual['uid']!=0 or actual['gid']!=0:
-                raise FreshnessHold('invalidation_unsafe')
-            entry['sealed_relay']=actual
+            entry['sealed_relay']=staging.observe_relay_configuration(child.pid,descriptor,listener_owned=True)
         for number in (1,2):
             info=os.fstat(number);actual=table[number]
             if ((actual['device'],actual['inode'],actual['type'],actual['flags']&os.O_ACCMODE)
@@ -3181,13 +3177,39 @@ class UnitPolicy:
             if descriptor is not None:os.close(descriptor)
 
     def activate(self,*,listener=False):
-        self._activated=False
+        self._activated=False;self._listener_pid=None
         function=self.library.jarvis_ci_exec_listener if listener else self.restrict
         function.argtypes=[];function.restype=ctypes.c_int
         result=function()
         if result<0 or not listener and result!=0:raise FreshnessHold('invalidation_unsafe')
         self._activated=True
+        if listener:self._listener_pid=os.getpid()
         return result if listener else None
+
+    def prepare_relay_configuration(self,descriptor):
+        """Trusted root bootstrap only, after actual native listener installation.
+
+        Keep the original descriptor number/flags/offset, replacing only this
+        process's copy. The original supervisor independently verifies the exact
+        canonical bytes before acknowledging the kernel exec stop. No native
+        exec is permitted by this data transformation.
+        """
+        if (os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0)
+                or type(descriptor) is not int or not 3<=descriptor<=65535
+                or not self._activated or getattr(self,'_listener_pid',None)!=os.getpid()):
+            raise FreshnessHold('invalidation_unsafe')
+        original=staging.observe_sealed_descriptor(os.getpid(),descriptor)
+        if original['uid']!=0 or original['gid']!=0:raise FreshnessHold('invalidation_unsafe')
+        body=staging.listener_relay_body(os.pread(descriptor,161,0))
+        flags=fcntl.fcntl(descriptor,fcntl.F_GETFD)
+        offset=os.lseek(descriptor,0,os.SEEK_CUR)
+        replacement=os.memfd_create('ci-listener-relay',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
+        try:
+            if os.write(replacement,body)!=len(body):raise FreshnessHold('metadata_torn')
+            fcntl.fcntl(replacement,fcntl.F_ADD_SEALS,legacy.SEALS)
+            os.lseek(replacement,offset,os.SEEK_SET)
+            os.dup2(replacement,descriptor,inheritable=not bool(flags&fcntl.FD_CLOEXEC))
+        finally:os.close(replacement)
 
     def activation_observation(self):
         if not self._activated:raise FreshnessHold('invalidation_unsafe')
@@ -3375,6 +3397,8 @@ def _stage(arguments):
             environment[b'JARVIS_CARGO_RELAY_FD']=str(descriptor).encode()
             environment[b'LD_PRELOAD']=b'/run/ci-cargo-relay.so'+(b' '+environment[b'LD_PRELOAD'] if b'LD_PRELOAD' in environment else b'')
     stage_exec_mediation(value,policy)
+    if role in ('worker','cargo') or 'transport' in value.get('view',{}):
+        policy.prepare_relay_configuration(value['relay_fd'])
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     staging.publish_policy_receipt(receipt,{'version':1,'kind':'ci-unit-policy-receipt',
@@ -4689,11 +4713,14 @@ def _cargo_supervisor(arguments):
     mediation=ExecMediation(value['deadline'],1001)
     child_bootstrap=_sealed(dict(value,kind='cargo',parent=os.getpid(),exec_mediation_fd=mediation.child_fd))
     supervisor=_load('original_cargo_supervisor','provider-supervisor.py')
+    def executed(child):
+        staging.observe_relay_configuration(child.pid,configuration,listener_owned=True)
+        mediation.executed(child)
     try:
         raw=supervisor.supervise(directory/'cleanup',
             [sys.executable,'-I',str(Path(__file__).resolve()),'--cargo',str(child_bootstrap),str(configuration)],
             forward_fds=(child_bootstrap,configuration,mediation.child_fd),close_after_spawn=(child_bootstrap,),
-            on_spawn=mediation.spawned,on_exec=mediation.executed)
+            on_spawn=mediation.spawned,on_exec=executed)
         mediation.check();return raw
     finally:mediation.close()
 
@@ -4744,6 +4771,7 @@ def _cargo(arguments):
         validate_invocation(**invocation)
         environment=dict(invocation['environment'],LD_PRELOAD=value['library'],JARVIS_CARGO_RELAY_FD=str(configuration))
     stage_exec_mediation(value,policy)
+    policy.prepare_relay_configuration(configuration)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     os.setgroups([]);os.setgid(1001);os.setuid(1001);os.umask(0o077);_parent_guard(value['parent'])
     os.set_inheritable(configuration,True);os.chdir('/workspace');_PHASE='planner_cargo_execute'
@@ -5102,7 +5130,12 @@ def _relay_exec_policy_client(arguments):
     uid=value['uid']
     if uid not in (1000,1001,2000,6095) or value['mode'] not in ('direct','descendant','listener-loss'):
         raise FreshnessHold('invalidation_unsafe')
-    policy=UnitPolicy();stage_exec_mediation(value,policy)
+    policy=UnitPolicy()
+    try:policy.prepare_relay_configuration(configuration)
+    except FreshnessHold as error:
+        if error.reason!='invalidation_unsafe':raise
+    else:raise FreshnessHold('invalidation_unsafe')
+    stage_exec_mediation(value,policy);policy.prepare_relay_configuration(configuration)
     os.setgroups([]);os.setgid(uid);os.setuid(uid);_parent_guard(value['parent'])
     os.set_inheritable(configuration,True)
     arm_original_exec()
@@ -5128,6 +5161,7 @@ def relay_exec_policy_probe(value):
             bootstrap=_sealed(dict(value,kind='relay-exec-policy-client',parent=os.getpid(),
                 uid=uid,mode=mode,exec_mediation_fd=mediation.child_fd))
             def executed(child):
+                staging.observe_relay_configuration(child.pid,configuration,listener_owned=True)
                 mediation.executed(child)
                 if mode=='listener-loss':
                     mediation.settle();os.close(mediation.listener);mediation.listener=None
@@ -5348,9 +5382,8 @@ def admit_original_repository_worker(child,endpoint,configuration,receipt,value)
         expected=repository_worker_policy_context(value,UnitPolicy(),pid)
         if stored['policy_activation']!=staging.read_policy_receipt(receipt,expected):
             raise FreshnessHold('authority_changed')
-        configuration_identity=staging.observe_sealed_descriptor(os.getpid(),configuration)
-        if (stored['sealed_relay']!=configuration_identity
-                or staging.observe_sealed_descriptor(pid,configuration)!=configuration_identity):
+        configuration_identity=staging.observe_relay_configuration(pid,configuration,listener_owned=True)
+        if stored['sealed_relay']!=configuration_identity:
             raise FreshnessHold('invalidation_unsafe')
         table={row['number']:row for row in observed['fd_table']}
         for number,stream in ((1,child.stdout),(2,child.stderr)):
@@ -5381,6 +5414,7 @@ def _repository_worker(arguments):
         {os.fsencode(key):os.fsencode(item) for key,item in environment.items()},b'/workspace',None,0,0),value['library'])
     environment.update(LD_PRELOAD=value['library'],JARVIS_CARGO_RELAY_FD=str(configuration))
     policy=UnitPolicy();stage_exec_mediation(value,policy)
+    policy.prepare_relay_configuration(configuration)
     staging.publish_policy_receipt(receipt,repository_worker_policy_context(value,policy,os.getpid()))
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
@@ -5399,7 +5433,7 @@ def _repository_worker_supervisor(arguments):
     endpoint=socket.socket(fileno=int(arguments[2]));os.set_inheritable(endpoint.fileno(),False)
     def executed(child):
         observed=staging.observe_worker_entry(child.pid,int(arguments[1]),value['policy_receipt_fd'],
-            repository_worker_policy_context(value,mediation.policy,child.pid),uid=1000,gid=1000,groups=[])
+            repository_worker_policy_context(value,mediation.policy,child.pid),uid=1000,gid=1000,groups=[],listener_owned=True)
         cache._write_record(Path(value['root'])/'original-worker-entry.json',{
             'version':1,'binding':value['binding'],'command':value['command'],'entry':observed,
             'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
