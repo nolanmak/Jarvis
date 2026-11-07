@@ -40,6 +40,8 @@ struct Provider {
 
 #[path = "native_readiness.rs"]
 pub mod readiness;
+#[path = "native_state_capacity.rs"]
+pub mod state_capacity;
 
 /// Declaration-only native authentication readiness. This performs no inference
 /// and never treats a router credential as native provider authentication.
@@ -313,10 +315,11 @@ impl Launch {
         ensure!(policy.max_state_bytes>=SESSION_BYTES && policy.max_sessions>0,"native state budget is not declared");
         let count=prune_and_count(&root)?;
         let additional=usize::from(!matches!(native,Some(crate::native_session::Launch::Resume{..})));
-        if count.saturating_add(additional)>policy.max_sessions
-            || (count.saturating_add(additional) as u64).saturating_mul(SESSION_BYTES)>policy.max_state_bytes
-            || tree_bytes(&root)?>policy.max_state_bytes || available_bytes(&root)?<SESSION_BYTES {
-            crate::run_resources::admission_failed(provider,opts.audit_logger.as_ref(),"native_runtime_state_capacity")?;
+        let capacity=state_capacity::observed(count,additional,policy.max_sessions,policy.max_state_bytes,
+            tree_bytes(&root)?,available_bytes(&root)?);
+        if capacity.exhausted() {
+            crate::run_resources::admission_failed_observation(provider,opts.audit_logger.as_ref(),
+                serde_json::json!({"phase":"native_runtime_state_capacity","exhausted":true,"native_state":capacity}))?;
         }
         let provider_root = root.join(provider);
         std::fs::create_dir_all(&provider_root)?;
@@ -429,6 +432,78 @@ mod tests {
         write(&path.join("owned.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":owner,"owner":{"workflow_id":"workflow","lease_generation":1}})).unwrap()).unwrap();
         if complete {write(&path.join("complete.json"),b"{\"generation\":\"generation-a\"}").unwrap();}
         path
+    }
+    /// A full retained-state reservation must be distinguishable from RAM or
+    /// physical disk exhaustion, and inspection must not retire any session.
+    #[test]
+    fn native_state_capacity_reports_reservations_without_reclaiming() {
+        let temp=tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root=temp.path().join("state");std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let lock=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(root.join("state.lock")).unwrap();
+        let original=session(&root,"session-retained","/private/credential/path",false);
+        let policy=temp.path().join("policy.json");
+        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/runtime","guest_runtime":"/guest","state_root":root,"memory_mb":512,"max_state_bytes":SESSION_BYTES,"max_sessions":16,"providers":{}})).unwrap()).unwrap();
+        let before=std::fs::read(original.join("owned.json")).unwrap();
+        let report=serde_json::to_value(state_capacity::inspect_at(Some(&policy))).unwrap();
+        assert_eq!(report["status"],"capacity-exhausted");
+        assert_eq!(report["retained_sessions"],1);
+        assert_eq!(report["required_reserved_bytes"],2*SESSION_BYTES);
+        assert_eq!(report["blockers"],serde_json::json!(["reserved-bytes"]));
+        assert_eq!(report["live_verified"],false);
+        assert!(!report.to_string().contains("/private/credential/path"));
+        assert_eq!(std::fs::read(original.join("owned.json")).unwrap(),before);
+        assert!(!original.join("retired-owner.json").exists());
+        assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        let busy=serde_json::to_value(state_capacity::inspect_at(Some(&policy))).unwrap();
+        assert_eq!(busy["status"],"observation-unavailable");
+        assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_UN)},0);
+        let missing=serde_json::to_value(state_capacity::inspect_at(None)).unwrap();
+        assert_eq!(missing["status"],"policy-unobserved");
+    }
+    /// Real native admission must retain the precise storage observation and
+    /// return a resource hold before executable preparation or model dispatch.
+    #[test]
+    fn native_state_capacity_admission_audits_exact_storage_blocker() {
+        const CHILD:&str="JARVIS_TEST_NATIVE_STATE_OBSERVATION";
+        let Some(root)=std::env::var_os(CHILD) else {
+            let root=tempfile::tempdir().unwrap();
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","native_vm::tests::native_state_capacity_admission_audits_exact_storage_blocker","--nocapture"])
+                .env_clear().env("PATH","/usr/bin:/bin").env(CHILD,root.path()).env("AUGMENTAGENT_RUN_RESOURCES","1").output().unwrap();
+            let stdout=String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(),"{stdout} {}",String::from_utf8_lossy(&output.stderr));
+            assert!(stdout.contains("test result: ok. 1 passed; 0 failed;"),"child regression did not execute: {stdout}");return;
+        };
+        let root=PathBuf::from(root).canonicalize().unwrap();
+        let state=root.join("state");
+        for path in [&state,&root.join("logs"),&root.join("anchors")] {std::fs::create_dir(path).unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();}
+        let original=session(&state,"session-retained","/original/audit",false);
+        let before=std::fs::read(original.join("owned.json")).unwrap();
+        let policy=root.join("policy.json");
+        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/runtime","guest_runtime":"/guest","state_root":state,"memory_mb":512,"max_state_bytes":SESSION_BYTES,"max_sessions":16,"providers":{"codex":{"gateway":{},"auth_file":null,"auth_relative":".codex/auth.json"},"claude":{"gateway":{},"auth_file":null,"auth_relative":".claude.json"}}})).unwrap()).unwrap();
+        std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",policy);
+        for provider in ["codex","claude"] {
+            let log=root.join("logs").join(format!("{provider}.jsonl"));
+            let logger=std::sync::Arc::new(crate::tool_audit::AuditLogger::protected(log.clone(),root.join("anchors").join(format!("{provider}.json")),&[]).unwrap());
+            logger.set_native_runtime_owner(RuntimeOwner {workflow_id:"capacity-test".into(),lease_generation:2}).unwrap();
+            let mut opts=crate::reasoner::ReasonerOpts::pinned(crate::providers::ModelTier::Fast,"");opts.audit_logger=Some(logger.clone());
+            let result=Launch::prepare(provider,&opts,&Command::new("/nonexistent-must-not-reach-executable-validation"),None,None);
+            let error=match result {Err(error)=>error,Ok(_)=>panic!("full native state admitted")};
+            assert!(matches!(error.downcast_ref::<crate::reasoner::ReasonerError>(),Some(crate::reasoner::ReasonerError::ResourceCapacity{..})),"{error:#}");
+            assert!(logger.resource_capacity_seen());
+            let rows=std::fs::read_to_string(&log).unwrap().lines().map(|line|serde_json::from_str::<serde_json::Value>(line).unwrap()).collect::<Vec<_>>();
+            let observation=&rows.iter().find(|row|row["kind"]=="run_resource_observation").unwrap()["observation"];
+            assert_eq!(observation["phase"],"native_runtime_state_capacity");
+            assert_eq!(observation["native_state"]["blockers"],serde_json::json!(["reserved-bytes"]));
+            assert_eq!(observation["native_state"]["retained_sessions"],1);
+            assert_eq!(observation["native_state"]["required_reserved_bytes"],2*SESSION_BYTES);
+            assert_eq!(observation["native_state"]["live_verified"],false);
+            assert!(!rows.iter().any(|row|row["kind"]=="model_call_admitted"));
+        }
+        assert_eq!(std::fs::read(original.join("owned.json")).unwrap(),before);
+        assert!(!original.join("retired-owner.json").exists());
     }
     #[test]
     fn embedded_inventory_imports_without_checkout_siblings() {
