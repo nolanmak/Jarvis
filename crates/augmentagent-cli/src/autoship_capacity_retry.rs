@@ -34,6 +34,15 @@ fn previous(tx:&Transaction<'_>,workflow:&str,generation:i64,now:i64)->Result<Op
     Ok(Some(prior))
 }
 impl WorkflowStore {
+    /// Observe durable waits only; never reconcile, prune, claim or wake work.
+    pub fn capacity_wait_count(&self)->Result<u64> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM workflow
+            WHERE json_extract(checkpoint,'$.next.reason')='resource_capacity'
+            AND json_extract(checkpoint,'$.next.action')='await_capacity'
+            AND json_extract(checkpoint,'$.stage') NOT IN ('held','retired','merged','merge')
+            AND id NOT LIKE 'autoship-observation/%' AND id NOT LIKE 'autoship-canary/%'",
+            [],|row|row.get(0))?)
+    }
     /// Actual protected capacity observer only. No failure changes shipping
     /// allowance, paid accounting, evidence, owner intent or the progress clock.
     pub fn defer_run_capacity(&mut self,lease:&Lease,native_fingerprint:Option<&str>,now:i64)->Result<i64> {
@@ -115,6 +124,24 @@ impl WorkflowStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capacity_health_reads_persisted_waits_without_recovery_or_charges() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        assert_eq!(store.capacity_wait_count().unwrap(),0);
+        store.defer_run_capacity(&lease,Some(&"a".repeat(64)),30).unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap();
+        let events=store.events(&lease.workflow).unwrap();
+        let allowance=store.merge_allowance(31,5).unwrap();
+        let reader=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+        assert_eq!(reader.capacity_wait_count().unwrap(),1);
+        assert_eq!(reader.snapshot(&lease.workflow).unwrap(),before);
+        assert_eq!(store.events(&lease.workflow).unwrap(),events);
+        assert_eq!(store.merge_allowance(31,5).unwrap(),allowance);
+        let mut cp=before.unwrap().checkpoint;cp.stage=Stage::Held;
+        store.checkpoint(&lease,&cp,32).unwrap();
+        assert_eq!(reader.capacity_wait_count().unwrap(),0);
+    }
     fn setup(path:&Path)->(WorkflowStore,Lease) {
         let mut store=WorkflowStore::open(path).unwrap();
         let binding=Binding{head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};

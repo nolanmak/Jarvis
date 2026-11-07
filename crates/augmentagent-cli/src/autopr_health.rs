@@ -128,6 +128,9 @@ pub struct HealthInputs {
     /// Confirmed autonomous merges and separately held dispatch capacity.
     pub merge_allowance: Option<crate::autoship_workflow::MergeAllowance>,
     pub merge_allowance_error: Option<String>,
+    /// Durable active workflows whose next action is still await_capacity.
+    pub capacity_waiting_workflows: Option<u64>,
+    pub capacity_observation_error: Option<String>,
     /// #1214 — open `agent-gave-up` issues grouped by reason code.
     pub gave_up_by_reason: Option<Vec<(String, u32)>>,
 }
@@ -409,6 +412,16 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         out.push(Finding { severity: Severity::Alert, code: "merge-accounting-unavailable",
             detail: format!("Cannot read authoritative merge allowance: {error}"),
             fix: "Inspect the workflow store and restore access; never reset the ledger to regain capacity.".into() });
+    }
+    if let Some(error) = &i.capacity_observation_error {
+        out.push(Finding { severity: Severity::Alert, code: "workflow-capacity-unavailable",
+            detail: format!("Cannot read durable workflow capacity waits: {error}"),
+            fix: "Inspect the protected workflow store; do not reset the ledger or discard retained sessions.".into() });
+    }
+    if let Some(count) = i.capacity_waiting_workflows.filter(|count| *count>0) {
+        out.push(Finding { severity: Severity::Alert, code: "workflow-capacity-blocked",
+            detail: format!("{count} active autoship workflow(s) have a durable resource-capacity wait. A running worker or recent manual merge does not clear this blocker."),
+            fix: "Inspect `augmentagent autopr readiness --json` using the worker's selected policy and delegated resource context. Restore supported capacity or complete verified ownership recovery; never delete unknown sessions or reset reservations.".into() });
     }
     if let Some(a) = i.merge_allowance {
         if a.last_merged_at_ms.is_none() {
@@ -951,6 +964,12 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         Ok(status) => (Some(status), None),
         Err(error) => (None, Some(format!("{error:#}"))),
     };
+    let (capacity_waiting_workflows,capacity_observation_error)=match
+        crate::autoship_workflow::WorkflowStore::open_read_only(&crate::autoship_workflow::default_path())
+            .and_then(|store|store.map(|store|store.capacity_wait_count()).transpose()) {
+        Ok(count)=>(count,None),
+        Err(error)=>(None,Some(format!("{error:#}"))),
+    };
     HealthInputs {
         now_or_epoch: Some(now),
         daemon_active: daemon_active(),
@@ -984,6 +1003,8 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         policy_held_drafts: crate::self_improve::policy_held_drafts(),
         merge_allowance,
         merge_allowance_error,
+        capacity_waiting_workflows,
+        capacity_observation_error,
         gave_up_by_reason: crate::self_improve::gave_up_breakdown_live(repo_root),
     }
 }
@@ -1169,6 +1190,8 @@ mod tests {
             policy_held_drafts: vec![],
             merge_allowance: None,
             merge_allowance_error: None,
+            capacity_waiting_workflows: None,
+            capacity_observation_error: None,
             gave_up_by_reason: None,
         }
     }
@@ -1182,6 +1205,26 @@ mod tests {
         let f = analyze(&healthy(), &Thresholds::default());
         assert!(f.is_empty(), "{f:?}");
         assert_eq!(report(&f), None, "a clean run must not ping Discord");
+    }
+
+    #[test]
+    fn durable_capacity_wait_alerts_even_with_recent_progress_and_provider_hold() {
+        let mut i=healthy();i.capacity_waiting_workflows=Some(2);
+        i.last_provider_hold=Some(t0());i.last_loop_line=Some(t0());i.last_merge=Some(t0());
+        let findings=analyze(&i,&Thresholds::default());
+        let capacity=findings.iter().find(|f|f.code=="workflow-capacity-blocked").unwrap();
+        assert_eq!(capacity.severity,Severity::Alert);
+        assert!(capacity.detail.contains("2 active"));
+        i.capacity_waiting_workflows=Some(0);
+        assert!(!codes(&analyze(&i,&Thresholds::default())).contains(&"workflow-capacity-blocked"));
+    }
+
+    #[test]
+    fn unreadable_capacity_state_is_unknown_and_alerts() {
+        let mut i=healthy();i.capacity_observation_error=Some("state unavailable".into());
+        let findings=analyze(&i,&Thresholds::default());
+        assert!(findings.iter().any(|f|f.code=="workflow-capacity-unavailable" && f.severity==Severity::Alert));
+        assert!(!codes(&findings).contains(&"workflow-capacity-blocked"));
     }
 
     /// 2026-09-04: the CLI-gate permit leak. The process stayed active and
