@@ -1694,6 +1694,7 @@ class RootRelay:
         if started and transport is not None:self.ordinals.credits.finish_root(value['ordinal'])
 
     def unit_signal_drained(self,value,transport,started):pass
+    def unit_failed_output(self,value,directory,raw,descriptors):pass
 
     def unit_started(self,value,directory):pass
     def unit_finished(self,value,record):pass
@@ -1831,6 +1832,9 @@ class RootRelay:
                     or not -64<=record['returncode']<=255):raise FreshnessHold('cleanup_uncertain')
             raw=record['returncode']
             if status!=(raw if raw>=0 else 128-raw):raise FreshnessHold('cleanup_uncertain')
+            # Snapshot failed contained output only after these original cleanup
+            # and status checks. The paused parent cannot drain its pipes yet.
+            if started and raw!=0:self.unit_failed_output(value,directory,raw,descriptors)
             # The original cleanup marker and raw status must be validated
             # before removing a signal target or closing its owned pidfd.
             self.unit_credit_drained(value,transport,started)
@@ -2562,6 +2566,17 @@ class UnitPeerRelay(RootRelay):
         if type(transport) is not UnitPeerRelay or transport.staged_signals is None:
             raise FreshnessHold('cleanup_uncertain')
         self.staged_signals.child_drained(value['ordinal'],transport.staged_signals)
+
+    def unit_failed_output(self,value,directory,raw,descriptors):
+        record=self.active_record
+        if record is None or record['last_request_ordinal']!=value['ordinal']:raise FreshnessHold('generation_mismatch')
+        self.freezer.check_frozen_cohort()
+        retain_private_diagnostic(self.admission.target/('.jobserver-credit-'+self.admission.command)/('contained-output-'+str(value['ordinal'])+'.json'),{
+            'version':1,'kind':'ci-contained-output-pipe-diagnostic','binding':self.admission.binding,'command':self.admission.command,
+            'parent_scope':self.scope.name,'child_scope':directory.name,'ordinal':value['ordinal'],'returncode':raw,
+            'stdout':nonconsuming_pipe_diagnostic(descriptors[2]),'stderr':nonconsuming_pipe_diagnostic(descriptors[3]),
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
+        self.freezer.check_frozen_cohort()
 
     def unit_started(self,value,directory):
         record=self.active_record
@@ -3578,6 +3593,41 @@ def validate_invocation(argv,environment,cwd):
     return {'argv':list(argv),'environment':dict(environment),'cwd':cwd}
 
 
+def nonconsuming_pipe_diagnostic(descriptor):
+    """Instant unread-pipe sample only. Never a complete stream/input proof.
+
+    Caller observes original child cleanup and keeps its parent frozen. A
+    temporary reader plus tee duplicates queued bytes without advancing the
+    original pipe or changing its file-description flags. All new FDs close
+    before the caller can resume; regular files and sockets are not read.
+    """
+    unavailable={'status':'unavailable','complete_stream':False}
+    handles=[]
+    try:
+        original=os.fstat(descriptor)
+        if not stat.S_ISFIFO(original.st_mode):return {'status':'not_a_pipe','complete_stream':False}
+        source=os.open(f'/proc/self/fd/{descriptor}',os.O_RDONLY|os.O_NONBLOCK|os.O_CLOEXEC);handles.append(source)
+        observed=os.fstat(source)
+        if (observed.st_dev,observed.st_ino,stat.S_IFMT(observed.st_mode))!=(original.st_dev,original.st_ino,stat.S_IFIFO):return unavailable
+        reader,writer=os.pipe2(os.O_NONBLOCK|os.O_CLOEXEC);handles.extend([reader,writer])
+        libc=ctypes.CDLL(None,use_errno=True)
+        if not hasattr(libc,'tee'):return unavailable
+        tee=libc.tee;tee.argtypes=[ctypes.c_int,ctypes.c_int,ctypes.c_size_t,ctypes.c_uint];tee.restype=ctypes.c_ssize_t
+        count=tee(source,writer,32768,os.SPLICE_F_NONBLOCK)
+        if count<0:
+            number=ctypes.get_errno()
+            if number==errno.EAGAIN:return {'status':'empty','complete_stream':False}
+            return dict(unavailable,errno=number)
+        data=os.read(reader,count) if count else b''
+        if len(data)!=count:return unavailable
+        return {'status':'sampled' if count else 'empty','source_device':original.st_dev,'source_inode':original.st_ino,
+            'sample_bytes':len(data),'sample_hex':data.hex(),'sample_sha256':hashlib.sha256(data).hexdigest(),
+            'complete_stream':False}
+    except OSError as error:return dict(unavailable,errno=error.errno)
+    finally:
+        for handle in handles:os.close(handle)
+
+
 def retain_repository_result(path,binding,command,returncode,output,error):
     """Private bounded diagnostics only; never input/cleanup/publication proof.
 
@@ -3596,6 +3646,10 @@ def retain_repository_result(path,binding,command,returncode,output,error):
     value={'version':1,'kind':'ci-repository-result-diagnostic','binding':binding,'command':command,
         'returncode':returncode,'stdout':stream(output),'stderr':stream(error),
         'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+    return retain_private_diagnostic(path,value)
+
+
+def retain_private_diagnostic(path,value):
     encoded=json.dumps(value,sort_keys=True,separators=(',',':')).encode()
     if len(encoded)>512*1024:raise FreshnessHold('metadata_torn')
     path=Path(path);parent=path.parent.lstat()

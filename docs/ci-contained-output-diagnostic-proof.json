@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "kind": "failed-contained-child-private-nonconsuming-pipe-diagnostic",
+  "source_parent_commit": "f1d950a8cef2e20c3fa346cef23e0e3080722c4c",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "docs/ci-opaque-producers.md",
+      "sha256": "43c6f88bd15b2d7c5153846f21ba772c06a0171a4163da2ecd78ab9e24070741"
+    },
+    {
+      "path": "scripts/ci-cargo-planner.py",
+      "sha256": "a85805d213f2b5c65a891d73b6243a668c299706ad77c6dced9f6ebd677cedd5"
+    },
+    {
+      "path": "scripts/tests/ci_repository_result_test.py",
+      "sha256": "8b0cb430bffce8aaabf15680334aaa6215ef8dccd8cec9b57bd01ec8683c2a02"
+    }
+  ],
+  "previous_changed_code_replay": {
+    "session": 79247,
+    "source_commit": "f1d950a8cef2e20c3fa346cef23e0e3080722c4c",
+    "seconds": 116.05,
+    "result": "InputCensusUnknown, deliberate contained-transfer hold retained",
+    "vm_original_quiescence_verified": true,
+    "read_only_inspection_session": 47238,
+    "private_root_result_retained": true,
+    "repository_returncode": 125,
+    "stderr_bytes": 52,
+    "observation": "Outer stderr contains only Compiling line because failed nested child output is still behind its frozen parent",
+    "log": "/tmp/autoship-ci-repository-result-vm-replay-20261107.log",
+    "inspection": "/tmp/autoship-ci-repository-result-inspection-20261107.json"
+  },
+  "tdd_red": {
+    "log": "/tmp/autoship-ci-contained-pipe-diagnostic-red-20261107.log",
+    "scope": "3 new actual pipe/file tests require the missing nonconsuming diagnostic API"
+  },
+  "verification": {
+    "focused": {
+      "tests_run": 8,
+      "failed": 0,
+      "log": "/tmp/autoship-ci-contained-pipe-diagnostic-focused-20261107.log",
+      "seconds": 0.04
+    },
+    "ci_python_suite": {
+      "session": 81776,
+      "tests_run": 695,
+      "passed": 652,
+      "skipped": 43,
+      "failed": 0,
+      "seconds": 35.273,
+      "managed_storage_lease": true,
+      "log": "/tmp/autoship-ci-contained-pipe-diagnostic-python-suite-20261107.log"
+    },
+    "embedded_build_and_shared_ci_rust": {
+      "session": 78360,
+      "passed": 36,
+      "failed": 0,
+      "ignored": 26,
+      "seconds": 19.1,
+      "log": "/tmp/autoship-ci-contained-pipe-diagnostic-rust-20261107.log"
+    }
+  },
+  "scope": "Failed contained child only, after original status/cleanup validation and while original parent frozen. Nonblocking tee copies only currently available pipe bytes into private scratch; does not consume original bytes or change original FD flags. Actual host child tests preserve bytes, flags, FD count and EOF. Regular files/sockets are not read. All extra FDs close before return.",
+  "limits": [
+    "Fresh changed-code guest pipe snapshot replay not yet recorded",
+    "Sampling may return less than 32 KiB; complete_stream always false and digests cover sample only",
+    "No final stdio-fidelity authority for parent-loss/external-alias races",
+    "No source/resource/input, cleanup, policy-disposition, materialization, resume or reusable publication permission",
+    "Original deliberate contained-effect-transfer hold remains; no full-CI, deployment or autonomous shipping claim"
+  ],
+  "input_closure_complete": false,
+  "full_ci": false,
+  "shipping_authority": false,
+  "full_goal_complete": false
+}

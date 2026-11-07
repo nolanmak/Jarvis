@@ -650,6 +650,23 @@ policy disposition. Inspect it only under the existing managed cache lease. This
 closes the missing failure-output observation before the next original worker replay;
 the deliberate contained-effect-transfer hold and every O1–O6/final-C gate remain.
 
+A failed contained child can leave its error bytes in a pipe whose reader is the
+frozen parent, so the outer repository record alone cannot recover that failure.
+After checking that child's original cleanup marker/raw status, the unit relay
+rechecks its actual parent's frozen cohort and records a non-consuming snapshot
+of available stdout/stderr pipe bytes in the same private command directory.
+It temporarily opens a reader for the exact FIFO identity and uses nonblocking
+`tee` into a bounded private pipe, closing every new descriptor before returning.
+It never consumes the original pipe, changes its flags, reads regular files/sockets,
+thaws a parent or acknowledges a child result. The sample is at most 32 KiB (the
+kernel may return less); it is always marked `complete_stream:false`, including
+empty or unavailable observations. Sample digests cover sampled bytes only.
+The record keeps all input-closure/full-CI/shipping flags false and is diagnostic
+data, never an input census, nonrelease, policy classification or cleanup grant.
+This observation is not final stdio-fidelity evidence for parent-loss or external-alias
+races; those O4 cases still gate activation. Actual child/parent authority and every
+deliberate copy-back gate remain unchanged.
+
 ### O4. Preserve bounded execution and cancellation
 
 Use one controller-owned ordinal/request budget across all relays, preserving

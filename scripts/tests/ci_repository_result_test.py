@@ -69,4 +69,40 @@ class RepositoryResultTests(unittest.TestCase):
             self.assertFalse(value['shipping_authority']);self.assertFalse(value['full_ci'])
             self.assertEqual(bytes.fromhex(value['stderr']['prefix_hex']),b'{"shipping_authority":true,"full_ci":true}')
 
+class ContainedPipeDiagnosticTests(unittest.TestCase):
+    def test_reaped_child_snapshot_does_not_consume_pipe_bytes_flags_or_fds(self):
+        import fcntl
+        reader,writer=os.pipe2(os.O_CLOEXEC)
+        try:
+            child=subprocess.Popen([sys.executable,'-c',"import os;os.write(2,b'actual nested failure\\xff');raise SystemExit(17)"],stderr=writer,stdout=subprocess.DEVNULL)
+            self.assertEqual(child.wait(timeout=5),17)
+            flags=fcntl.fcntl(writer,fcntl.F_GETFL);descriptors=set(os.listdir('/proc/self/fd'))
+            value=planner.nonconsuming_pipe_diagnostic(writer)
+            self.assertEqual(value['status'],'sampled');self.assertFalse(value['complete_stream'])
+            self.assertEqual(bytes.fromhex(value['sample_hex']),b'actual nested failure\xff')
+            self.assertEqual(value['sample_sha256'],hashlib.sha256(b'actual nested failure\xff').hexdigest())
+            self.assertEqual(fcntl.fcntl(writer,fcntl.F_GETFL),flags)
+            self.assertEqual(set(os.listdir('/proc/self/fd')),descriptors)
+            self.assertEqual(os.read(reader,4096),b'actual nested failure\xff')
+            os.close(writer);writer=None
+            self.assertEqual(os.read(reader,4096),b'')
+        finally:
+            os.close(reader)
+            if writer is not None:os.close(writer)
+
+    def test_empty_pipe_does_not_claim_a_complete_or_unreleased_stream(self):
+        reader,writer=os.pipe2(os.O_CLOEXEC)
+        try:
+            value=planner.nonconsuming_pipe_diagnostic(writer)
+            self.assertEqual(value['status'],'empty');self.assertFalse(value['complete_stream'])
+            os.write(writer,b'later');self.assertEqual(os.read(reader,5),b'later')
+        finally:os.close(reader);os.close(writer)
+
+    def test_regular_file_is_not_read_or_repositioned(self):
+        with tempfile.TemporaryFile() as stream:
+            stream.write(b'private file');stream.flush();stream.seek(3)
+            value=planner.nonconsuming_pipe_diagnostic(stream.fileno())
+            self.assertEqual(value['status'],'not_a_pipe');self.assertFalse(value['complete_stream'])
+            self.assertEqual(stream.tell(),3)
+
 if __name__=='__main__':unittest.main()
