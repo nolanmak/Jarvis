@@ -1,0 +1,362 @@
+{
+  "version": 1,
+  "kind": "v3-listener-owned-relay-bootstrap",
+  "baseline": "eaeabe91",
+  "code_head": "19a8ffc3",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/ci_cargo_relay.c": "66d1fac1930cd7fc6e320a0bfd234de99d4f06393151c9e6e5b697499168919e",
+    "crates/augmentagent-cli/src/self_improve_ci_vm.rs": "bb7d5e701640da55bdf94b09d67d046d950c016e0e9178622185a8381eb03424",
+    "crates/augmentagent-cli/src/self_improve_ci_acceptance.rs": "3b699cb440a9b619a5569abb4171de2cbb5052510fd9cd35c6de6a74aa234cf4",
+    "scripts/ci-cargo-planner.py": "df1a0deb6507efde8f77e7733908a4d861326c0a5e1b8180b04107b616050b62",
+    "scripts/ci-cargo-staging.py": "3ef2314f77515eb4654a3fc73e94079f6b0f358cc8a9af0c23f7e32e3a994c92",
+    "scripts/ci-build-vm.py": "1782d0f5c571371f5f0d99e994bd696e1ab646012b2ea51ecf3431da4aba4faa",
+    "scripts/codex-build-vm.py": "a7f3b7afebb5c5a610af20e238f500abfc2093c7861a2ba8a2908c6f3d049620",
+    "scripts/tests/ci_build_vm_test.py": "1de9ddba73c854ee6f4f6eb9cf14e2cbb32294cd89a4e01cf6e5f2f179a5d46d",
+    "scripts/tests/ci_listener_relay_test.py": "bfec1f3f8bd66db5c773579f1072aa672ea140b0e8e71b4b1f0656ea307531c1"
+  },
+  "implementation": "Root bootstrap transforms only its own descriptor after actual listener activation/transfer; original supervisors compare exact canonical root-sealed bytes at kernel exec-stop. Only canonical forms omit the duplicate constructor ERRNO filter. Ordinary V3 and V2 denial remain unchanged; no production vfork/native-exec permission added.",
+  "native_assets": {
+    "binary_sha256": "39d8b5ab15648f857fe08a70995c420d8eb23c6c6bcaf9a19f939a53551da68e",
+    "embedded_native_sha256": {
+      "libci_cargo_planner.so": "fd272729eacdbdbd14ed9dbf7432047f6a33520538ba27393792b62e58ba1ac8",
+      "libci_cargo_exec.so": "ebc8c59914672371b9053da399e5b2d0c5ef8d4bebc89b425a48fc2294fab843",
+      "libci_cargo_relay.so": "e7371d559cce1d51ebff69106211e72f8171b885d99f24120c1575e93cdd84d6"
+    }
+  },
+  "host": {
+    "python": {
+      "passed": 733,
+      "skipped": 0,
+      "failed": 0,
+      "seconds": 43.557,
+      "log": "/tmp/autoship-ci-relay-policy-green-python-20261107.log"
+    },
+    "rust": {
+      "passed": 39,
+      "failed": 0,
+      "ignored": 30,
+      "seconds": 22.33,
+      "log": "/tmp/autoship-ci-relay-policy-green-build-20261107.log"
+    }
+  },
+  "red": {
+    "regression_exit": 101,
+    "seconds": 92.59,
+    "receipt": "/tmp/augmentagent-ci-v3-relay-exec-policy-red-20261107044319/receipt.json",
+    "audit": "/tmp/autoship-ci-v3-relay-exec-policy-red-audit-20261107.json",
+    "cases": {
+      "descendant": {
+        "denied_notifications": 0,
+        "listener_lost": false,
+        "mode": "descendant",
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "raw_exec_errnos": [
+          1,
+          1
+        ],
+        "raw_execs_refused": 2,
+        "uid": 1000
+      },
+      "listener_loss": {
+        "denied_notifications": 0,
+        "listener_lost": true,
+        "mode": "listener-loss",
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "raw_exec_errnos": [
+          1,
+          1
+        ],
+        "raw_execs_refused": 2,
+        "uid": 2000
+      },
+      "planner": {
+        "denied_notifications": 0,
+        "listener_lost": false,
+        "mode": "direct",
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "raw_exec_errnos": [
+          1,
+          1
+        ],
+        "raw_execs_refused": 2,
+        "uid": 1001
+      },
+      "unit_first": {
+        "denied_notifications": 0,
+        "listener_lost": false,
+        "mode": "direct",
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "raw_exec_errnos": [
+          1,
+          1
+        ],
+        "raw_execs_refused": 2,
+        "uid": 2000
+      },
+      "unit_last": {
+        "denied_notifications": 0,
+        "listener_lost": false,
+        "mode": "direct",
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "raw_exec_errnos": [
+          1,
+          1
+        ],
+        "raw_execs_refused": 2,
+        "uid": 6095
+      },
+      "worker": {
+        "denied_notifications": 0,
+        "listener_lost": false,
+        "mode": "direct",
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "raw_exec_errnos": [
+          1,
+          1
+        ],
+        "raw_execs_refused": 2,
+        "uid": 1000
+      }
+    },
+    "reason": "actual loaded relay refuses execve/execveat but original listener observes zero denials",
+    "original_resource_subtree_removed": true,
+    "resource_exhausted": false
+  },
+  "green": {
+    "regression_exit": 0,
+    "cases": {
+      "descendant": {
+        "denied_notifications": 2,
+        "listener_lost": false,
+        "mode": "descendant",
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "raw_exec_errnos": [
+          1,
+          1
+        ],
+        "raw_execs_refused": 2,
+        "uid": 1000
+      },
+      "listener_loss": {
+        "denied_notifications": 0,
+        "listener_lost": true,
+        "mode": "listener-loss",
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "raw_exec_errnos": [
+          38,
+          38
+        ],
+        "raw_execs_refused": 2,
+        "uid": 2000
+      },
+      "planner": {
+        "denied_notifications": 2,
+        "listener_lost": false,
+        "mode": "direct",
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "raw_exec_errnos": [
+          1,
+          1
+        ],
+        "raw_execs_refused": 2,
+        "uid": 1001
+      },
+      "unit_first": {
+        "denied_notifications": 2,
+        "listener_lost": false,
+        "mode": "direct",
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "raw_exec_errnos": [
+          1,
+          1
+        ],
+        "raw_execs_refused": 2,
+        "uid": 2000
+      },
+      "unit_last": {
+        "denied_notifications": 2,
+        "listener_lost": false,
+        "mode": "direct",
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "raw_exec_errnos": [
+          1,
+          1
+        ],
+        "raw_execs_refused": 2,
+        "uid": 6095
+      },
+      "worker": {
+        "denied_notifications": 2,
+        "listener_lost": false,
+        "mode": "direct",
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "raw_exec_errnos": [
+          1,
+          1
+        ],
+        "raw_execs_refused": 2,
+        "uid": 1000
+      }
+    },
+    "seconds": 91.64,
+    "receipt": "/tmp/augmentagent-ci-v3-relay-exec-policy-green-20261107044839/receipt.json",
+    "audit": "/tmp/autoship-ci-v3-relay-exec-policy-green-audit-20261107.json",
+    "original_resource_subtree_removed": true,
+    "resource_exhausted": false,
+    "role_constructor_and_listener_ownership_proved": true,
+    "full_native_proxy_root_role_admission_proved": false
+  },
+  "unchanged_original_worker_regression": {
+    "passed": false,
+    "exit": 101,
+    "seconds": 115.84,
+    "result": "/tmp/autoship-1703-ci-worker-listener-owned-result-20261107.json",
+    "audit": "/tmp/autoship-ci-worker-listener-owned-audit-20261107.json",
+    "inspection": "/tmp/autoship-ci-worker-listener-owned-inspection-20261107.json",
+    "log": "/tmp/autoship-ci-worker-listener-owned-live-20261107.log",
+    "evidence_sha256": "f1d4906e257a4cee946fbbaad3999068e8622b061ee0780ca8869936dee420ab",
+    "actual_gcc_error": "collect2: vfork: Function not implemented",
+    "gcc_exit": 1,
+    "unsupported_vfork_refusals": 4,
+    "policy_observation": {
+      "binding": {
+        "authority_sha256": "ab9336f362fede23e92c73f354110573ac0ec37e1e4c06d2885540adf0970e5b",
+        "cache_identity_sha256": "668230d6c5d4988e24dc47fe407f0ce4a0a8b905a5780ae75750cc8be2223784",
+        "contract_sha256": "b4c27b5ad65ae13a64a2d657b0fc16f254d42d275655b551b999d4512ba4c189",
+        "generation": "637773fb-6c27-436a-b651-aaab60589c86",
+        "head": "006a32e40cd261cfa7ae2337a8c44df7305ad1f5",
+        "source_inputs_sha256": "fc40d1c5ae47fb57d319cce40d5de5b72f02762013879e69f88cbb7e0020daa3",
+        "tree": "9ec0e6e478a7569affa5ea10f8fae8af1a62a720"
+      },
+      "command": "6d33accd-d334-4036-be83-4337e5cb8a1c",
+      "denied_execs": 0,
+      "exec_observed": true,
+      "initial_attempts": 4,
+      "kind": "ci-exec-mediation-observation",
+      "notification_errors": 0,
+      "ordinal": 7,
+      "policy_dispositions": [
+        {
+          "after_ack": false,
+          "allowed": true,
+          "clone_flags": 0,
+          "disposition": "exec",
+          "nr": 59,
+          "pid": 360,
+          "response_errno": 0
+        },
+        {
+          "after_ack": false,
+          "allowed": true,
+          "clone_flags": 0,
+          "disposition": "exec",
+          "nr": 59,
+          "pid": 360,
+          "response_errno": 0
+        },
+        {
+          "after_ack": false,
+          "allowed": true,
+          "clone_flags": 0,
+          "disposition": "exec",
+          "nr": 59,
+          "pid": 360,
+          "response_errno": 0
+        },
+        {
+          "after_ack": false,
+          "allowed": true,
+          "clone_flags": 0,
+          "disposition": "exec",
+          "nr": 59,
+          "pid": 360,
+          "response_errno": 0
+        },
+        {
+          "after_ack": true,
+          "allowed": false,
+          "clone_flags": 0,
+          "disposition": "unsupported_vfork",
+          "nr": 58,
+          "pid": 360,
+          "response_errno": 38
+        },
+        {
+          "after_ack": true,
+          "allowed": false,
+          "clone_flags": 0,
+          "disposition": "unsupported_vfork",
+          "nr": 58,
+          "pid": 360,
+          "response_errno": 38
+        },
+        {
+          "after_ack": true,
+          "allowed": false,
+          "clone_flags": 0,
+          "disposition": "unsupported_vfork",
+          "nr": 58,
+          "pid": 360,
+          "response_errno": 38
+        },
+        {
+          "after_ack": true,
+          "allowed": false,
+          "clone_flags": 0,
+          "disposition": "unsupported_vfork",
+          "nr": 58,
+          "pid": 360,
+          "response_errno": 38
+        }
+      ],
+      "returncode": 1,
+      "shipping_authority": false,
+      "version": 1
+    },
+    "original_jobserver_loan_returned": true,
+    "held_exit_status": {
+      "binding": {
+        "authority_sha256": "ab9336f362fede23e92c73f354110573ac0ec37e1e4c06d2885540adf0970e5b",
+        "cache_identity_sha256": "668230d6c5d4988e24dc47fe407f0ce4a0a8b905a5780ae75750cc8be2223784",
+        "contract_sha256": "b4c27b5ad65ae13a64a2d657b0fc16f254d42d275655b551b999d4512ba4c189",
+        "generation": "637773fb-6c27-436a-b651-aaab60589c86",
+        "head": "006a32e40cd261cfa7ae2337a8c44df7305ad1f5",
+        "source_inputs_sha256": "fc40d1c5ae47fb57d319cce40d5de5b72f02762013879e69f88cbb7e0020daa3",
+        "tree": "9ec0e6e478a7569affa5ea10f8fae8af1a62a720"
+      },
+      "command": "6d33accd-d334-4036-be83-4337e5cb8a1c",
+      "exec_observed": true,
+      "ordinal": 7,
+      "policy_hold": "input_census_unknown",
+      "returncode": 1,
+      "version": 4
+    },
+    "original_vm_resource_subtree_removed": true,
+    "full_fixture_pass": false
+  },
+  "spec_audit": {
+    "scope": "listener-owned relay bootstrap plus adjacent component/composition sections",
+    "findings": 0,
+    "full_mechanism_handoff_audit": false
+  },
+  "production_native_handoff_integrated": false,
+  "runtime_vfork_admission": false,
+  "complete_writer_closure": false,
+  "input_closure_complete": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "deployed": false,
+  "autonomous_merges_claimed": 0
+}

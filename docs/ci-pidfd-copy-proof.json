@@ -1,0 +1,555 @@
+{
+  "version": 1,
+  "kind": "bounded-foreign-descriptor-copy-guard",
+  "source_head": "ddfccb86c393668f16349bdbe046b8f1e31ca162",
+  "host_red": {
+    "log": "/tmp/autoship-ci-pidfd-copy-red-20261107.log",
+    "tests": 14,
+    "failures": 5,
+    "valid_post_policy_fd_copy_succeeded": true
+  },
+  "host_green": {
+    "python_tests": 740,
+    "python_skips": 0,
+    "python_log": "/tmp/autoship-ci-pidfd-copy-python-green-20261107.log",
+    "rust_tests": 39,
+    "rust_bulk_ignored": 30,
+    "rust_log": "/tmp/autoship-ci-pidfd-copy-rust-20261107.log",
+    "native_policy_cases_required": 14
+  },
+  "vm": {
+    "result_file": "/tmp/autoship-1703-ci-pidfd-policy-result-20261107.json",
+    "log": "/tmp/autoship-ci-pidfd-policy-vm-20261107.log",
+    "audit": "/tmp/autoship-ci-pidfd-policy-audit-20261107.json",
+    "host_resource_removed_empty_subtree": true,
+    "resource_exhausted": false,
+    "receipt": {
+      "actual_vm_commands": 1,
+      "autonomous_merges_claimed": 0,
+      "cases": {
+        "async": {
+          "exit_code": 0,
+          "stderr": "",
+          "stdout": "GUARDED\n"
+        },
+        "clone": {
+          "exit_code": 0,
+          "stderr": "",
+          "stdout": "GUARDED\n"
+        },
+        "cross-memory": {
+          "exit_code": 0,
+          "observation": {
+            "full_ci_pass": false,
+            "mode": "cross-memory",
+            "post_policy_attach_errno": 1,
+            "post_policy_remote_read_bytes": 8,
+            "post_policy_remote_write_errno": 1,
+            "pre_policy_attach": true,
+            "pre_policy_remote_write_bytes": 8,
+            "shipping_authority": false,
+            "victim_bytes_unchanged": true,
+            "victim_reaped": true
+          },
+          "stderr": "",
+          "stdout": "{\"mode\": \"cross-memory\", \"pre_policy_remote_write_bytes\": 8, \"pre_policy_attach\": true, \"post_policy_remote_write_errno\": 1, \"post_policy_attach_errno\": 1, \"post_policy_remote_read_bytes\": 8, \"victim_bytes_unchanged\": true, \"victim_reaped\": true, \"full_ci_pass\": false, \"shipping_authority\": false}\n"
+        },
+        "cross-memory-listener": {
+          "exit_code": 0,
+          "observation": {
+            "full_ci_pass": false,
+            "mode": "cross-memory-listener",
+            "post_policy_attach_errno": 1,
+            "post_policy_remote_read_bytes": 8,
+            "post_policy_remote_write_errno": 1,
+            "pre_policy_attach": true,
+            "pre_policy_remote_write_bytes": 8,
+            "shipping_authority": false,
+            "victim_bytes_unchanged": true,
+            "victim_reaped": true
+          },
+          "stderr": "",
+          "stdout": "{\"mode\": \"cross-memory-listener\", \"pre_policy_remote_write_bytes\": 8, \"pre_policy_attach\": true, \"post_policy_remote_write_errno\": 1, \"post_policy_attach_errno\": 1, \"post_policy_remote_read_bytes\": 8, \"victim_bytes_unchanged\": true, \"victim_reaped\": true, \"full_ci_pass\": false, \"shipping_authority\": false}\n"
+        },
+        "exec": {
+          "exit_code": 0,
+          "stderr": "",
+          "stdout": "GUARDED\n"
+        },
+        "fork": {
+          "exit_code": 0,
+          "stderr": "",
+          "stdout": "GUARDED\n"
+        },
+        "namespace": {
+          "exit_code": 0,
+          "stderr": "",
+          "stdout": "GUARDED\n"
+        },
+        "pidfd-copy": {
+          "exit_code": 0,
+          "observation": {
+            "descriptor_ingress_complete": false,
+            "full_ci_pass": false,
+            "mode": "pidfd-copy",
+            "post_policy_fd_copy_errno": 1,
+            "post_policy_shared_flags_verified": true,
+            "pre_policy_fd_copy": true,
+            "pre_policy_shared_flags_verified": true,
+            "retained_alias_usable_after_policy": true,
+            "same_socket_cookie": true,
+            "shipping_authority": false,
+            "victim_reaped": true
+          },
+          "stderr": "",
+          "stdout": "{\"mode\": \"pidfd-copy\", \"pre_policy_fd_copy\": true, \"same_socket_cookie\": true, \"pre_policy_shared_flags_verified\": true, \"post_policy_fd_copy_errno\": 1, \"retained_alias_usable_after_policy\": true, \"post_policy_shared_flags_verified\": true, \"victim_reaped\": true, \"descriptor_ingress_complete\": false, \"full_ci_pass\": false, \"shipping_authority\": false}\n"
+        },
+        "pidfd-copy-listener": {
+          "exit_code": 0,
+          "observation": {
+            "descriptor_ingress_complete": false,
+            "full_ci_pass": false,
+            "mode": "pidfd-copy-listener",
+            "post_policy_fd_copy_errno": 1,
+            "post_policy_shared_flags_verified": true,
+            "pre_policy_fd_copy": true,
+            "pre_policy_shared_flags_verified": true,
+            "retained_alias_usable_after_policy": true,
+            "same_socket_cookie": true,
+            "shipping_authority": false,
+            "victim_reaped": true
+          },
+          "stderr": "",
+          "stdout": "{\"mode\": \"pidfd-copy-listener\", \"pre_policy_fd_copy\": true, \"same_socket_cookie\": true, \"pre_policy_shared_flags_verified\": true, \"post_policy_fd_copy_errno\": 1, \"retained_alias_usable_after_policy\": true, \"post_policy_shared_flags_verified\": true, \"victim_reaped\": true, \"descriptor_ingress_complete\": false, \"full_ci_pass\": false, \"shipping_authority\": false}\n"
+        },
+        "threads": {
+          "exit_code": 0,
+          "stderr": "",
+          "stdout": "GUARDED\n"
+        },
+        "x32": {
+          "exit_code": -31,
+          "stderr": "",
+          "stdout": ""
+        }
+      },
+      "full_ci_pass": false,
+      "generation": "3152ce4d-13ba-4f09-a0ce-eff705f54080",
+      "head": "b06fe239e89c259444cbe414678a3012f41027e1",
+      "input_closure_complete": false,
+      "kind": "real_shared_ci_native_unit_policy",
+      "shipping_authority": false,
+      "status": "passed",
+      "version": 1
+    }
+  },
+  "source_sha256": [
+    {
+      "path": "scripts/tests/ci_cargo_inode_alias_test.py",
+      "sha256": "d9810b9b7569844f37a64a5782a65de39ba7d984c9fcb41fdaea56ed8ee5568f"
+    },
+    {
+      "path": "scripts/tests/ci_worker_projection_lock_test.py",
+      "sha256": "0a5e1ed9c853fa4cbbf16c155690c788aa26b2006501ced8651add5af74e94cf"
+    },
+    {
+      "path": "scripts/tests/ci_repository_worker_entry_test.py",
+      "sha256": "28f8700b1f9982e3ed739e8fede0c95b7ebc6cbb7b2da5986847d55222675675"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_projection_stdio_test.py",
+      "sha256": "7d22771a1d6b9d977de4fe6d4c126e87d840471edc1b6bd75d88ca4ca100d8ec"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_uid_cohort_test.py",
+      "sha256": "474c8c8d19c0079074106a9deced26f0a9c1f414c02aa74c1065756578b7b3e9"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_private_base_test.py",
+      "sha256": "edbf3107a505b1672925aadbdeaf23ddad298a4fa88cd6c08b6840eca9af6783"
+    },
+    {
+      "path": "scripts/tests/ci_execution_abandonment_test.py",
+      "sha256": "c2ee234d471f03bba270a58816c02003e2ef5ae9b3f93c52ae7a9770de20bad2"
+    },
+    {
+      "path": "scripts/tests/ci_execution_failure_paths_test.py",
+      "sha256": "e30f24257904a6701e810a3ccf73a1ea5dda2126faafa350a2caf93ec30cef30"
+    },
+    {
+      "path": "scripts/tests/ci_execution_retirement_test.py",
+      "sha256": "566c0cd2cafb85553db006f582e2cc910f41af702843ea525f53970a82c7df0b"
+    },
+    {
+      "path": "scripts/tests/ci_cache_capacity_test.py",
+      "sha256": "e44d595293591533994a6b0b64d5e516c33531ce3b65ee01ac408815ac6fcdf1"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_mount_layout_test.py",
+      "sha256": "320131cc60930e72f37ee399ed8335bff7fb03d5e4ceb9c354b872ffd71df11b"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_policy_identity_test.py",
+      "sha256": "796670d16adce9bdc0629feb3f05b0776b8aab4b11d3b5c75c24078b68119b9d"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_unit_policy_test.py",
+      "sha256": "e7c16c73847c73c58b63c6fdf1a2f55fb1906c77efa5e9f374bdbb04b0f9bee7"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_entry_test.py",
+      "sha256": "17eb28f629d62a22611a3d2ec4063e1bebda0d412a6b7ed07c3922e8b32b7d24"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_stdio_closure_test.py",
+      "sha256": "6352ca1fa6e8487b7810c1f59d600c3360ea38c45fe708dde28b2371f1dbf992"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_jobserver_observation_test.py",
+      "sha256": "7e049ec4d619b0277277d6490e350eb936c1f2f3db60defc5ec70d4c3f280994"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_credits_test.py",
+      "sha256": "ca02c72ae04ae7569daab3f3c804c7fdc9e55f5d23a45bed95f081703acf2308"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_active_signals_test.py",
+      "sha256": "8de8b8bfa7bec1b1b25990fe9f2e5d7d549a5e9191b157e99b990a22334f781b"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_transfer_test.py",
+      "sha256": "211259d1e675ff17dac47e05216904c9fe03c09aae28e582b7c4e002dd83deee"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_transfer_objects_test.py",
+      "sha256": "86df7ee0434ae287ab01e9880bd8c62e9ca1d16958b08795cf47b65c488a1b3d"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_namespace_sequence_test.py",
+      "sha256": "85b8d8989531ff569dc7f52225d6eecbf13d1026ac893c7e8b1ee9330b908be4"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_namespace_apply_test.py",
+      "sha256": "83d3adaa2020be1b40a73da7311ecee98b2e9bf814faead8e799d916c4cb78be"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_namespace_test.py",
+      "sha256": "2e3b00dfac867ca9e6e9c11e0456daa1fe592ca769260fbcbc207684fae2f444"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_inode_apply_test.py",
+      "sha256": "aab49f5dc4ced19088c0b8f6635c443dd62502c3e172029e68ffe3d36195e4da"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_parent_signals_test.py",
+      "sha256": "f339b8b957f866b6fb38e530d3c747c838f51795074e0f800597dfc5178e2819"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_capture_test.py",
+      "sha256": "1d49ea02a4a9009a2b1188b0c11714cd731491d9344c0ecc920625a4851e7061"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_dispatch_test.py",
+      "sha256": "f56adddb9a61d9e70719cb0f9b33a6479eff3804d24d52a285ad5dc134d8d151"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_exec_controller_test.py",
+      "sha256": "57e01b9e38cd39f9deb1f8a151cbe35119b0093f9564ea48741b531b52c2b1ee"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_exec_mediation_cases.py",
+      "sha256": "37c49cb8ab28da8056548e014a50bb77de11bb2b4c19d317e242b190ae17d49b"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_exec_early.c",
+      "sha256": "fe1d23841e9d872bcc91ed984a8c039bcaaefcbaac72d561bf91f8ccd09bb71c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_exec_static.c",
+      "sha256": "7ca53808de7fe6e123a7af00b850b3834690c02f164bee3cd6c95150f314fc91"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_exec_mediation_test.py",
+      "sha256": "a0f7871ef8db6740c77ec0d6b83e3d032c8d4b0b94eff40967044581572b5521"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_unit_policy_cases.py",
+      "sha256": "263c38619e4b2253650d63e65dfbfe0d96ed86b9bc3d5941fbf2820e1781d0fa"
+    },
+    {
+      "path": "scripts/tests/ci_legacy_incremental_test.py",
+      "sha256": "9bb1f3613a12091c159e4fbb8dcb46e034ac7416e270d512bdf19e675f8a6b38"
+    },
+    {
+      "path": "scripts/ci-cargo-observer.py",
+      "sha256": "118d49eb844437eb0f18d2f89d641ea7b0f2c9139ed9b06353022e787a5d755e"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_observer_test.py",
+      "sha256": "df0cbdc4a43c810a5fac0133242f6273f12b9d0d6ed2103ecc8e01dedb190ba2"
+    },
+    {
+      "path": "scripts/ci-cargo-views.py",
+      "sha256": "60bd6da9ee51bf506c2f096fd9afc62151c0357351e46a16da81f2327194653d"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_views_test.py",
+      "sha256": "199efc38cfde19dacdaa43fdea0b10ed79c1d6a8f8cd4e08e935ace29be40684"
+    },
+    {
+      "path": "scripts/ci-cargo-planner.py",
+      "sha256": "d86f19cba4522974e60b70b50d42a99d70e65e4cad3092d201440279f577ae33"
+    },
+    {
+      "path": "scripts/ci-cargo-staging.py",
+      "sha256": "3ef2314f77515eb4654a3fc73e94079f6b0f358cc8a9af0c23f7e32e3a994c92"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_planner_protocol_test.py",
+      "sha256": "bb93ae154443f3ec2e19a8c8dcae05e5df2bf5000fcad5b0ae19f3c807904771"
+    },
+    {
+      "path": "scripts/check-for-updates.sh",
+      "sha256": "7b53a26c9184a12d243dfe6c8770a5f0be7ab9956f04bc4bcfe65cbb4d83e563"
+    },
+    {
+      "path": "scripts/tests/updater-rebuild-trigger.test.sh",
+      "sha256": "e824cf86de5b5eeed4a30b4b810189f1e0da235d1fae0c86747025102a52cd24"
+    },
+    {
+      "path": "scripts/tests/ci_source_projection_test.py",
+      "sha256": "b40b9f923e4fcdc2be10cc7d5a42183eb4dbe747ba12b92366b4db6665086797"
+    },
+    {
+      "path": "scripts/tests/ci_build_vm_test.py",
+      "sha256": "1de9ddba73c854ee6f4f6eb9cf14e2cbb32294cd89a4e01cf6e5f2f179a5d46d"
+    },
+    {
+      "path": "scripts/ci-lookup-inputs.py",
+      "sha256": "0f4a81af6c251788585bf91f3b93ded3d7d0503640cbfb114cec19c226b9bb81"
+    },
+    {
+      "path": "scripts/tests/ci_lookup_inputs_test.py",
+      "sha256": "a8fff738c49ecf3df7ed5ce6c950ad94fc6de59662acc2c1c1ed95df44a78e2f"
+    },
+    {
+      "path": "docs/ci-cargo-planner.md",
+      "sha256": "9f3ff722f491fe62336da06c205a6a62afbdcc357f467d74d1986520f785afd6"
+    },
+    {
+      "path": "scripts/ci-input-lookups.py",
+      "sha256": "9478ad836a019787e306167d355a2310f2ccbf33281db225e21c3a05141a7c62"
+    },
+    {
+      "path": "scripts/tests/ci_input_lookups_test.py",
+      "sha256": "aa5db039d2dac0c54b50fd71de723a7ab03384e44621491c0f6eec3e4b570bf2"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_signal_probe.c",
+      "sha256": "e87a0d2ff2d43a9649a900789fd1f6553c7ecb182b151b407642b0274b55a2ee"
+    },
+    {
+      "path": "scripts/ci-cargo-relay.py",
+      "sha256": "5028e6c34c42e2f5996a648501bf3ee2f8c5155e66a031c762d6d621495cf712"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_relay_test.py",
+      "sha256": "533dab2ff026773c4896bf9760148c95fc2120b5c18aaa540921023769fd4ca1"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_relay_native_test.py",
+      "sha256": "23d51faae3f5e5a589c6fac61a758a8c105d98af8e2a2068ad62c748bdb59c52"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_relay.c",
+      "sha256": "66d1fac1930cd7fc6e320a0bfd234de99d4f06393151c9e6e5b697499168919e"
+    },
+    {
+      "path": "crates/augmentagent-cli/build.rs",
+      "sha256": "129f1034b680e83e83c7982ef0c73542bd1eb03e235426831e93538d894f0aa5"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_exec.c",
+      "sha256": "007645b905e479b684bdd93495038de301bc5482a8eef2b14bba98bd5521d5bf"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_exec_cases.py",
+      "sha256": "bb0d836a516ee869bde9206bb74809787a57c704c0dab4a23257fa82cbdadc66"
+    },
+    {
+      "path": "scripts/ci-cargo-boundary.py",
+      "sha256": "39ef16544ea33609184513929110e43a127c98f9f5a8d0a6cbe7f7e7364504f5"
+    },
+    {
+      "path": "scripts/ci-worker-scope.py",
+      "sha256": "68fae2bd655d48182d48f6dd455800e725e29318bfea0dead5c0c7b5d17270b8"
+    },
+    {
+      "path": "scripts/ci-input-manifest.py",
+      "sha256": "622dc0a18b259719012aa48bcf0aacf369e1e32c86ec59798de6ab7be9e1f865"
+    },
+    {
+      "path": "scripts/provider-supervisor.py",
+      "sha256": "08eb437fe13068df5f2ee0c1b55a6e4b38c9ba3f351ff76509511ba95815b277"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_ci_proof.rs",
+      "sha256": "7230342b080341ce47e4f96dc01831232b0f4d2811d3d8fa1e5f0d5e4b5aa10e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_ci_acceptance.rs",
+      "sha256": "430ffcfad43a373018c6d8d2192098b328d0b7c01d28cb33e2e3658777e3778a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_ci_vm.rs",
+      "sha256": "bb7d5e701640da55bdf94b09d67d046d950c016e0e9178622185a8381eb03424"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_verifier_checkout.rs",
+      "sha256": "5f93f367fca6fadaa2fd0518ebf6613b455f82da8e3566765ee60ca7fc519931"
+    },
+    {
+      "path": "scripts/ci-cache-generation.py",
+      "sha256": "d5513679d766b418a2e1706f3fb9e8ecce0eb50820077d5335159db572cf0fee"
+    },
+    {
+      "path": "scripts/ci-build-vm.py",
+      "sha256": "1782d0f5c571371f5f0d99e994bd696e1ab646012b2ea51ecf3431da4aba4faa"
+    },
+    {
+      "path": "scripts/codex-build-vm.py",
+      "sha256": "a7f3b7afebb5c5a610af20e238f500abfc2093c7861a2ba8a2908c6f3d049620"
+    },
+    {
+      "path": "scripts/ci-contract.json",
+      "sha256": "b4c27b5ad65ae13a64a2d657b0fc16f254d42d275655b551b999d4512ba4c189"
+    },
+    {
+      "path": "scripts/build-dependency-proxy.py",
+      "sha256": "e9b03f2dc888743a07c5dab380a444febcac93d6f4bf8d73056070458eb50b5a"
+    },
+    {
+      "path": "scripts/tests/codex_build_vm_test.py",
+      "sha256": "f8629c726fe4cba5ec62ae414a4c1938ba66b01222a3a6f3cacdc35e8a9ebc2a"
+    },
+    {
+      "path": "docs/BUILD-VM.md",
+      "sha256": "f15351cef952e408776995cda579646823d671154729e021fc66cfd29ce5e61a"
+    },
+    {
+      "path": "scripts/ci-dependency-workspace.py",
+      "sha256": "8e8a7b3f547db87203edb1977f88e7162d2d0754e43327185b2ad12ed70810d5"
+    },
+    {
+      "path": "scripts/ci-dependency-seed.py",
+      "sha256": "d5ff2372ba318cb0581bc333392c4794c6909fa050add0582c81cebadbb32077"
+    },
+    {
+      "path": "scripts/ci-dependency-artifacts.py",
+      "sha256": "b6b6476889a059dae27ef2ff3735b5fab98c496d1b6baae76b5e2f1d7d754080"
+    },
+    {
+      "path": "scripts/ci-dependency-store.py",
+      "sha256": "4230cb659547d702574d01f3a3f3df6dc287ae3713e5943a6edc3e3b0e67012a"
+    },
+    {
+      "path": "scripts/ci-dependency-driver.py",
+      "sha256": "c126028fbbda3fd69fe021ab43a0b38c8c164f829990d93b8e3d2857cc0afa9c"
+    },
+    {
+      "path": "scripts/ci-dependency-guest.py",
+      "sha256": "15a423c1c68bcb978a40aed70a0795a6110a45a371eeb1afcde103dba3624f0d"
+    },
+    {
+      "path": "scripts/ci-runtime-identity.py",
+      "sha256": "4688575b0f9bcfccca1c55d4fee506c5abae86b1be77034cf599814299f105ef"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_ci.rs",
+      "sha256": "91ec40d5dbd7b4ea446cc2ea12348bd5483da63cceb8d8f835879b3cf658d8fc"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_ci_coverage.rs",
+      "sha256": "881e91598c2c54bf9c5f292b595433a04f27f9b3caba7aec8f4b4f733d3795a4"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve.rs",
+      "sha256": "463a43575d7295e35d60bf7bfe0fd51b5ee223fa0bbecb780ca439a0fac0cbd6"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_vfork_exec_cases.py",
+      "sha256": "f0a6d287f4cba920509f727a76a411d52b14f1b743f6d05b4704df399b406035"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_vfork_producer.c",
+      "sha256": "aad82a7f1af92ded1a585494753248e1ed69a11460794343225c902977622d95"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_vfork_proxy.c",
+      "sha256": "80fd5f0705502da7baee85d0dc18d88db9649214009d78b209db213e3dd4bb98"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_vfork_exec_test.py",
+      "sha256": "8c477abc78e1ecba9427b6e4cfd9b360e66ccdd80cfbfdb4d418c6d103c7ac2f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_status_proxy.c",
+      "sha256": "b17de6b14999e7d7f4f8176ec4d7e9209e8495c6089fbd3ea30c8e3351fe8ea7"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_status_wire.h",
+      "sha256": "8aaa08e261006a0402726780477d225b678831e379a1b7685d05d3cc2f9e4ef0"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_status_proxy_test.py",
+      "sha256": "aeee92cfeed62c22670f8c3fa0a13086167c67bdc2ad25db910b6af1ecab2ea3"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_status_continuation.c",
+      "sha256": "1b95f7ff051150c276e7e9a6fc4ae91fee17d660d78a4a8a971eb56df0a4aeca"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_status_continuation.h",
+      "sha256": "12ace9f30600b74e37ec4cda710a1af974f4ceea4ce2d6c8a00faf2116caccf6"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_status_vfork_producer.c",
+      "sha256": "1034a374097fcec07e4a69c5bfd291b2aeb27c478906eea2692b8509e449384c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/ci_cargo_status_handoff_cases.py",
+      "sha256": "d3c71de24f1e91c8f0ca8a4e55067c8b98dc0e284b1bacc170505499a7e48086"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_status_prepare_test.py",
+      "sha256": "666cae9380a8accc39e0f7b370187afb749830dce4499ad6b951190cf2c0a9fb"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_status_handoff_test.py",
+      "sha256": "e8ee8344163c6a1a61986ce1fbe6b71c6e25c2625f3ee12786b288213180c399"
+    },
+    {
+      "path": "scripts/tests/ci_listener_relay_test.py",
+      "sha256": "028254d27b13fed9b0b393a4a8e1fb6a00e2584fddcca9b1592fcf8955871e13"
+    }
+  ],
+  "spec_audit": {
+    "agent": "ci_relay_policy_ownership_spec_audit_20261107",
+    "result": "No substantiated findings in bounded subsection; not full-mechanism handoff approval."
+  },
+  "existing_aliases_revoked": false,
+  "descriptor_ingress_complete": false,
+  "complete_writer_coverage": false,
+  "runtime_vfork_handoff_admitted": false,
+  "compiler_compatible": false,
+  "input_closure_complete": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "production_runtime_changed": false,
+  "autonomous_merges_claimed": 0,
+  "remaining": [
+    "Complete C/R descriptor ingress, alias lifetime, mappings, async writers and ABI/input closure before runtime handoff.",
+    "Immutable proxy/configuration, original live operation/source/resource authority, original unchanged GCC/Cargo/worker/generated-publication success.",
+    "Owner productive recovery, hosted checks, normal rollout and full epic 1703 CLI/Discord/soak acceptance."
+  ]
+}

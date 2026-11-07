@@ -131,6 +131,30 @@ impl AnchoredAudit {
         );
         self.append_locked(record)
     }
+    /// Read only the fully committed protected prefix. A caller cannot turn a
+    /// pending intent or a log suffix into a durable authorization receipt.
+    pub(crate) fn committed_records(&self) -> Result<Vec<serde_json::Value>> {
+        let lock_path=self.anchor.with_extension("lock");
+        ensure!(lock_path!=self.anchor && lock_path!=self.log,"audit lock path collision");
+        let lock=private_open(&lock_path,false)?;
+        #[cfg(unix)]
+        ensure!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX)}==0,"audit lock failed");
+        ensure!(self.anchor.exists() && self.log.exists(),"protected receipt requires existing audit evidence");
+        let file=private_open(&self.anchor,false)?;
+        ensure!(file.metadata()?.len()<=LIMIT,"anchor exceeds budget");
+        let anchor:Anchor=serde_json::from_reader(file)?;
+        ensure!(anchor.version==1 && anchor.pending.is_none(),"audit publication is not settled");
+        let mut file=private_open(&self.log,false)?;
+        ensure!(file.metadata()?.len()<=LIMIT,"audit exceeds budget");
+        let mut bytes=Vec::new();file.read_to_end(&mut bytes)?;
+        ensure!(bytes.len()==anchor.bytes,"audit has missing or uncommitted bytes");
+        let actual=if bytes.is_empty(){String::new()} else {digest(&bytes)};
+        ensure!(actual==anchor.hash,"committed audit modified");
+        let rows=bytes.split(|byte|*byte==b'\n').filter(|line|!line.is_empty())
+            .map(serde_json::from_slice).collect::<std::result::Result<Vec<serde_json::Value>,_>>()?;
+        ensure!(rows.len() as u64==anchor.sequence,"audit sequence differs from committed records");
+        Ok(rows)
+    }
     /// Validate without replaying uncertain records, then atomically prevent all
     /// future appends. The caller validates kernel quiescence while holding the
     /// same lock as writers. A retry returns the identical immutable proof.
@@ -252,6 +276,31 @@ impl AnchoredAudit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn receipt_read_requires_the_committed_anchored_prefix() {
+        let (_dir,sink)=setup();
+        sink.append(serde_json::json!({"actor":"controller","kind":"ci-proof","value":1})).unwrap();
+        let rows=sink.committed_records().unwrap();
+        assert_eq!(rows.len(),1);assert_eq!(rows[0]["kind"],"ci-proof");
+        let mut log=OpenOptions::new().append(true).open(&sink.log).unwrap();
+        log.write_all(b"{\"actor\":\"controller\",\"kind\":\"uncommitted-proof\"}\n").unwrap();
+        assert!(sink.committed_records().is_err(),"an unanchored proof became readable");
+    }
+
+    #[test]
+    fn receipt_read_rejects_corruption_and_pending_publication() {
+        let (_dir,sink)=setup();
+        sink.append(serde_json::json!({"actor":"controller","kind":"ci-proof"})).unwrap();
+        let original=fs::read(&sink.log).unwrap();
+        let mut changed=original.clone();changed[0]=b' ';
+        fs::write(&sink.log,changed).unwrap();
+        assert!(sink.committed_records().is_err());
+        fs::write(&sink.log,original).unwrap();
+        let mut anchor:Anchor=serde_json::from_slice(&fs::read(&sink.anchor).unwrap()).unwrap();
+        anchor.pending=Some("pending proof\n".into());sink.save(&anchor).unwrap();
+        assert!(sink.committed_records().is_err(),"an unsettled publication was treated as committed");
+    }
+
     fn setup() -> (tempfile::TempDir, AnchoredAudit) {
         let dir = tempfile::tempdir().unwrap();
         for name in ["logs", "anchors", "work"] {

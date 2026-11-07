@@ -6,6 +6,53 @@ from pathlib import Path
 BASE=Path(__file__).resolve().parent
 spec=importlib.util.spec_from_file_location('ci_build_runtime',BASE/'codex-build-vm.py')
 vm=importlib.util.module_from_spec(spec);spec.loader.exec_module(vm)
+cache_spec=importlib.util.spec_from_file_location('ci_cache_generation',BASE/'ci-cache-generation.py')
+cache_generation=importlib.util.module_from_spec(cache_spec);cache_spec.loader.exec_module(cache_generation)
+CACHE_PROGRAM=(BASE/'ci-cache-generation.py').read_bytes()
+WORKER_PROGRAMS={name:(BASE/name).read_bytes() for name in ('provider-supervisor.py','ci-worker-scope.py','ci-input-manifest.py')}
+worker_spec=importlib.util.spec_from_file_location('ci_worker_boundary',BASE/'ci-worker-scope.py')
+worker_boundary=importlib.util.module_from_spec(worker_spec);worker_spec.loader.exec_module(worker_boundary)
+input_spec=importlib.util.spec_from_file_location('ci_input_boundary',BASE/'ci-input-manifest.py')
+input_boundary=importlib.util.module_from_spec(input_spec);input_spec.loader.exec_module(input_boundary)
+dependency_spec=importlib.util.spec_from_file_location('ci_dependency_workspace',BASE/'ci-dependency-workspace.py')
+dependency_workspace=importlib.util.module_from_spec(dependency_spec);dependency_spec.loader.exec_module(dependency_workspace)
+DEPENDENCY_PROGRAMS={name:(BASE/name).read_bytes() for name in (
+ 'ci-cargo-boundary.py',
+ 'ci-cache-generation.py','ci-dependency-seed.py','ci-dependency-artifacts.py','ci-dependency-workspace.py',
+ 'ci-dependency-store.py','ci-dependency-driver.py','ci-dependency-guest.py')}
+
+
+def dependency_action(request):
+    value=request.get('dependency')
+    if value is None:
+        if request['operation']=='dependency':raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+        return None
+    if not isinstance(value,dict):raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+    kind=value.get('kind')
+    fields={'kind','dependency_inputs_sha256'}
+    if kind in ('produce','publish'):
+        fields|={'producer','source_sha256'}
+        if kind=='publish':fields.add('ack')
+        if request['operation']!='dependency' or not cache_generation._uuid(value.get('producer')) or not cache_generation._digest(value.get('source_sha256')):
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+    elif kind=='install':
+        fields.add('seed')
+        if request['operation'] not in ('step','targeted','baseline','repository') or not cache_generation._digest(value.get('seed')):
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+    elif kind=='lookup':
+        fields.add('source_sha256')
+        if request['operation']!='dependency' or not cache_generation._digest(value.get('source_sha256')):
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+    else:raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+    if set(value)!=fields or not cache_generation._digest(value.get('dependency_inputs_sha256')):
+        raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+    if kind=='publish':
+        ack=value['ack']
+        if (not isinstance(ack,dict) or set(ack)!={'command','authority_sha256','cache_identity_sha256','quiescence_sha256'}
+                or not cache_generation._uuid(ack.get('command'))
+                or any(not cache_generation._digest(ack.get(key)) for key in ('authority_sha256','cache_identity_sha256','quiescence_sha256'))):
+            raise cache_generation.FreshnessHold('cleanup_uncertain')
+    return dict(value)
 
 
 def private_bytes(path,limit=2*1024*1024):
@@ -20,6 +67,22 @@ def private_bytes(path,limit=2*1024*1024):
 
 class InheritedStorage:
     """Keep the actual inherited open-file description; opening /proc/.../fd is NOT a dup."""
+    @staticmethod
+    def held_flock(descriptor,info):
+        """Kernel fdinfo attributes flock ownership to this open description."""
+        try:
+            with open('/proc/self/fdinfo/'+str(descriptor),'rb') as stream:data=stream.read(65537)
+            if len(data)>65536:return False
+            for line in data.decode('ascii').splitlines():
+                fields=line.split()
+                if (len(fields)!=9 or fields[0]!='lock:' or fields[2:5]!=['FLOCK','ADVISORY','WRITE']
+                        or fields[7:]!=['0','EOF']):continue
+                major,minor,inode=fields[6].split(':')
+                if (int(major,16),int(minor,16),int(inode))==(os.major(info.st_dev),os.minor(info.st_dev),info.st_ino):
+                    return True
+        except (OSError,ValueError,UnicodeError):pass
+        return False
+
     def __init__(self,policy,scratch):
         if set(policy)!={'fd','fds','path','device','inode','floor_bytes'}:raise vm.Unavailable('invalid inherited storage policy')
         if any(type(policy[key]) is not int or policy[key]<0 for key in ('fd','device','inode','floor_bytes')):raise vm.Unavailable('invalid inherited storage values')
@@ -40,6 +103,38 @@ class InheritedStorage:
             except BlockingIOError:pass
             else:raise vm.Unavailable('storage admission lock is not held')
         finally:os.close(probe)
+    def verify_cache_target(self,path):
+        """Bind the image's physical target to an actually held target lease."""
+        self.check()
+        refusal='managed CI cache target ownership unavailable'
+        path=Path(path);target=path.parent.parent
+        if path.name!='cache.img' or path.parent.name!='ci-vm' or target.resolve()!=target:
+            raise vm.Unavailable(refusal)
+        info=target.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o002:
+            raise vm.Unavailable(refusal)
+        uid=os.getuid();runtime=Path('/run/user')/str(uid)
+        base=runtime if runtime.is_dir() and runtime.stat().st_uid==uid else Path('/tmp')
+        directory=base/('augmentagent-storage-locks-'+str(uid))
+        try:
+            parent=directory.lstat()
+            if (directory.resolve()!=directory or not stat.S_ISDIR(parent.st_mode)
+                    or parent.st_uid!=uid or parent.st_mode&0o077):raise vm.Unavailable(refusal)
+            lock=directory/('inode-'+str(info.st_dev)+'-'+str(info.st_ino)+'.lock')
+            current=lock.lstat();identity=(current.st_dev,current.st_ino)
+            if (not stat.S_ISREG(current.st_mode) or current.st_uid!=uid or current.st_mode&0o077
+                    or current.st_nlink!=1 or not any(expected==identity and self.held_flock(fd,os.fstat(fd))
+                        for fd,expected in self.identities.items())):raise vm.Unavailable(refusal)
+            probe=os.open(lock,os.O_RDWR|os.O_NOFOLLOW|os.O_CLOEXEC)
+            try:
+                if (os.fstat(probe).st_dev,os.fstat(probe).st_ino)!=identity:raise vm.Unavailable(refusal)
+                try:fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                except BlockingIOError:return
+                fcntl.flock(probe,fcntl.LOCK_UN)
+            finally:os.close(probe)
+        except OSError as error:raise vm.Unavailable(refusal) from error
+        raise vm.Unavailable(refusal)
+
     def check(self):
         for fd,expected in self.identities.items():
             current=os.fstat(fd)
@@ -47,47 +142,21 @@ class InheritedStorage:
         info=os.fstat(self.fd);current=self.path.lstat()
         if (not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o022 or info.st_nlink!=1
                 or (info.st_dev,info.st_ino)!=self.identity or (current.st_dev,current.st_ino)!=self.identity):raise vm.Unavailable('inherited storage identity changed')
+        if not self.held_flock(self.fd,info):raise vm.Unavailable('original inherited storage lease unavailable')
         space=os.statvfs(self.scratch)
         if space.f_bavail*space.f_frsize<self.floor:raise vm.Unavailable('managed storage floor unavailable')
 
 
-# A cargo cache that outlives every run only ever grows. Below this fraction
-# of free space the next build fails with ENOSPC inside the guest — which the
-# gate classifies as infra and retries hourly, forever (main never green).
-# Start such a run on a fresh cache instead; it is only a cache.
-CACHE_MIN_FREE_FRACTION = 0.25
+def ensure_cache(path, capacity, lease, *, allow_create=True):
+    """Provision only inside the controller's registered, already leased target.
 
-
-def cache_free_bytes(header):
-    """Free bytes recorded in an ext4 superblock (1024 bytes at offset 1024)."""
-    block = 1024 << struct.unpack_from('<I', header, 24)[0]
-    free = struct.unpack_from('<I', header, 12)[0]
-    if struct.unpack_from('<I', header, 96)[0] & 0x80:
-        free |= struct.unpack_from('<I', header, 0x158)[0] << 32
-    return free * block
-
-
-def cache_full(outcome):
-    """The guest ran out of space in the build cache (not a real failure)."""
-    if outcome.get('exit_code') == 0:
-        return False
-    text = (outcome.get('stdout') or '') + (outcome.get('stderr') or '')
-    return 'No space left on device' in text or 'VM build cache is full' in text
-
-
-def discard_cache(path, lease):
-    """Drop a full cache image; ensure_cache recreates it empty."""
-    lease.check()
-    try:
-        Path(path).unlink()
-    except FileNotFoundError:
-        pass
-
-
-def ensure_cache(path, capacity, lease):
-    """Provision only inside the controller's registered, already leased target."""
+    Unlike the former disposable cache, this image retains original producer,
+    consumer and recovery ownership. Neither a free-space percentage nor an
+    ENOSPC-looking build message authorizes unlink/reformat or a fresh retry.
+    Original generation retirement and checked cleanup own reclamation.
+    """
     path=Path(path)
-    if type(capacity) is not int or capacity<64*1024*1024 or capacity%4096:
+    if type(allow_create) is not bool or type(capacity) is not int or capacity<64*1024*1024 or capacity%4096:
         raise vm.Unavailable('invalid managed CI cache capacity')
     parent=path.parent
     if not path.is_absolute() or parent.resolve()!=parent:
@@ -99,6 +168,7 @@ def ensure_cache(path, capacity, lease):
     # Target/path locks must accompany the global lease; controller owns their
     # registration. A global-only fixture cannot provision an arbitrary cache.
     if len(lease.fds)<2:raise vm.Unavailable('managed CI cache target lease missing')
+    lease.verify_cache_target(path)
     available=os.statvfs(parent);free=available.f_bavail*available.f_frsize
     if path.exists() or path.is_symlink():
         fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC)
@@ -113,12 +183,9 @@ def ensure_cache(path, capacity, lease):
             if blocks*(1024<<struct.unpack_from('<I',header,24)[0])!=capacity:
                 raise vm.Unavailable('managed CI filesystem capacity changed')
             growth=max(0,capacity-info.st_blocks*512)
-            exhausted=cache_free_bytes(header)<capacity*CACHE_MIN_FREE_FRACTION
-        if not exhausted:
-            if free<lease.floor+growth:raise vm.Unavailable('managed CI cache growth reserve unavailable')
-            return
-        discard_cache(path,lease)
-        available=os.statvfs(parent);free=available.f_bavail*available.f_frsize
+        if free<lease.floor+growth:raise vm.Unavailable('managed CI cache growth reserve unavailable')
+        return
+    if not allow_create:raise vm.Unavailable('existing managed CI cache required')
     if free<lease.floor+capacity:raise vm.Unavailable('managed CI cache growth reserve unavailable')
     fd,name=tempfile.mkstemp(prefix='.ci-cache-',dir=parent)
     try:
@@ -136,16 +203,20 @@ def ensure_cache(path, capacity, lease):
         except FileNotFoundError:pass
 
 
+def cargo_commands(request):
+    selection=[arg for package in request['packages'] for arg in ('-p',package)] or ['--workspace']
+    commands=[]
+    if request['operation']=='targeted':commands.append(['/toolchain/bin/cargo','build',*selection])
+    commands.append(['/toolchain/bin/cargo','test',*selection,'--no-fail-fast','--','--test-threads=1',*request['filters']])
+    return commands
+
+
 CARGO_OPERATIONS = """import json,subprocess,sys
-request=json.loads(sys.argv[1])
-selection=[arg for package in request['packages'] for arg in ('-p',package)] or ['--workspace']
-commands=[]
-if request['operation']=='targeted':commands.append(['/toolchain/bin/cargo','build',*selection])
-commands.append(['/toolchain/bin/cargo','test',*selection,'--no-fail-fast','--','--test-threads=1',*request['filters']])
-for command in commands:
+for command in json.loads(sys.argv[1]):
     result=subprocess.run(command)
     if result.returncode:sys.exit(result.returncode if result.returncode>0 else 1)
 """
+
 
 def cargo_request(request):
     packages=request.get('packages',[]);filters=request.get('filters',[])
@@ -153,7 +224,7 @@ def cargo_request(request):
         if not isinstance(values,list) or len(values)>128 or any(not isinstance(value,str) or len(value)>256 or not re.fullmatch(pattern,value) for value in values):
             raise vm.Unavailable('invalid CI '+label)
     operation=request['operation']
-    if operation in ('plan','step','repository') and (packages or filters):raise vm.Unavailable('irrelevant CI cargo arguments')
+    if operation in ('plan','step','repository','dependency') and (packages or filters):raise vm.Unavailable('irrelevant CI cargo arguments')
     if operation=='targeted' and (not packages or filters):raise vm.Unavailable('targeted CI requires packages and no filters')
     if operation=='repository':
         command=request.get('command')
@@ -165,9 +236,51 @@ def cargo_request(request):
 def execute(request,run=vm.run,progress=None):
     progress={} if progress is None else progress
     progress["stage"]="request_schema"
-    required={'version','operation','runtime_config','workspace','state','git_objects','runner','contract','head','base','storage','scratch','build_cache'}
-    optional={'id','changed_files','cache_bytes','packages','filters','command'}
-    if set(request)-required-optional or not required<=set(request) or request['version']!=1 or request['operation'] not in ('plan','step','targeted','baseline','repository'):raise vm.Unavailable('invalid CI VM request')
+    required={'version','operation','runtime_config','workspace','state','git_objects','runner','contract','head','base','storage','scratch','build_cache',
+              'source_generation','command_id','predecessor','tree','controller_authority_sha256','retained_generations','retained_producers','producer_retirements'}
+    optional={'id','changed_files','cache_bytes','packages','filters','command','dependency','planner_protocol_probe','planner_probe_kind','protected_cargo','protected_repository'}
+    if set(request)-required-optional or not required<=set(request) or request['version']!=2 or request['operation'] not in ('plan','step','targeted','baseline','repository','dependency'):raise vm.Unavailable('invalid CI VM request')
+    if (type(request.get('planner_protocol_probe',False)) is not bool
+            or request.get('planner_protocol_probe') and request['operation']!='repository'):
+        raise cache_generation.FreshnessHold('invalidation_unsafe')
+    probe_kind=request.get('planner_probe_kind','full')
+    if probe_kind not in ('full','relay-exec-policy') or probe_kind!='full' and not request.get('planner_protocol_probe'):
+        raise cache_generation.FreshnessHold('invalidation_unsafe')
+    protected=request.get('protected_cargo',False)
+    if (type(protected) is not bool or protected and (request['operation'] not in ('targeted','baseline')
+            or request.get('planner_protocol_probe'))):
+        # Existing executor state must be recovered/revalidated, never silently
+        # replaced with another cold target to bypass missing reuse evidence.
+        raise cache_generation.FreshnessHold('input_census_unknown')
+    repository=request.get('protected_repository',False)
+    if (type(repository) is not bool or repository and (request['operation']!='repository'
+            or request.get('planner_protocol_probe') or protected)):
+        raise cache_generation.FreshnessHold('input_census_unknown')
+    dependency=dependency_action(request)
+    if not cache_generation._uuid(request['source_generation']) or not cache_generation._uuid(request['command_id']) or (request['predecessor'] is not None and not cache_generation._uuid(request['predecessor'])):raise cache_generation.FreshnessHold('generation_mismatch')
+    retained=request['retained_generations']
+    if (not isinstance(retained,list) or not 1<=len(retained)<=4096
+            or any(not cache_generation._uuid(value) for value in retained) or len(set(retained))!=len(retained)
+            or request['source_generation'] not in retained):raise cache_generation.FreshnessHold('cleanup_uncertain')
+    producers=request['retained_producers']
+    if (not isinstance(producers,list) or len(producers)>4096
+            or any(not cache_generation._uuid(value) for value in producers)
+            or len(set(producers))!=len(producers)):raise cache_generation.FreshnessHold('cleanup_uncertain')
+    if dependency and dependency.get('kind') in ('produce','publish') and dependency['producer'] not in producers:
+        raise cache_generation.FreshnessHold('cleanup_uncertain')
+    retirements=request['producer_retirements']
+    if not isinstance(retirements,list) or len(retirements)>4096:raise cache_generation.FreshnessHold('cleanup_uncertain')
+    retired_ids=set()
+    for item in retirements:
+        if (not isinstance(item,dict) or set(item)!={'producer','ack'} or not cache_generation._uuid(item['producer'])
+                or item['producer'] in retired_ids or item['producer'] in producers):raise cache_generation.FreshnessHold('cleanup_uncertain')
+        ack=item['ack']
+        if (not isinstance(ack,dict) or set(ack)!={'command','authority_sha256','cache_identity_sha256','quiescence_sha256'}
+                or not cache_generation._uuid(ack['command']) or not all(cache_generation._digest(ack[key]) for key in
+                    ('authority_sha256','cache_identity_sha256','quiescence_sha256'))
+                or ack['authority_sha256']!=request['controller_authority_sha256']):raise cache_generation.FreshnessHold('cleanup_uncertain')
+        retired_ids.add(item['producer'])
+    if not cache_generation._digest(request['controller_authority_sha256']):raise cache_generation.FreshnessHold('authority_changed')
     if not all(isinstance(request[key],str) and re.fullmatch(r'[a-f0-9]{40,64}',request[key]) for key in ('head','base')):raise vm.Unavailable('CI candidate binding invalid')
     cargo=cargo_request(request)
     progress['stage']='controller_bundle'
@@ -179,6 +292,34 @@ def execute(request,run=vm.run,progress=None):
     for path in (workspace,state,scratch):
         info=path.lstat()
         if path.resolve()!=path or not path.is_absolute() or not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:raise vm.Unavailable('CI snapshot/state/scratch is not private')
+    generation=None
+    if request['operation']!='plan':
+        progress['stage']='source_census'
+        outputs={} if request['operation']=='dependency' else cache_generation.declared_outputs(workspace)
+        directories=['target',*[name for name,kind in outputs.items() if kind=='directory']]
+        files=[name for name,kind in outputs.items() if kind=='file']
+        if request['operation']=='dependency':
+            try:source_inputs=dependency_workspace.verify_source(workspace,dependency['source_sha256'])
+            except dependency_workspace.InputsUnknown:raise cache_generation.FreshnessHold('input_census_unknown') from None
+            policy_sha=hashlib.sha256((workspace/'seed-inputs.json').read_bytes()).hexdigest()
+            if policy_sha!=dependency['dependency_inputs_sha256']:raise cache_generation.FreshnessHold('input_census_unknown')
+        else:
+            source_inputs=cache_generation.source_census(workspace,Path(request['git_objects']),request['head'],
+                generated_directories=directories,generated_files=files)
+        target=workspace/'target'
+        if request['operation']!='dependency':target.mkdir(mode=0o700,exist_ok=True)
+        for name,kind in outputs.items():
+            path=workspace/name
+            if kind=='directory':path.mkdir(mode=0o700,exist_ok=True)
+            else:
+                try:
+                    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+                    os.close(fd)
+                except FileExistsError:pass
+        generation={'binding':{'generation':request['source_generation'],'head':request['head'],'tree':request['tree'],
+            'contract_sha256':hashlib.sha256(contract).hexdigest(),'authority_sha256':request['controller_authority_sha256'],
+            'source_inputs_sha256':source_inputs},'command':request['command_id'],'predecessor':request['predecessor'],
+            'outputs':outputs,'retained_generations':retained,'retained_producers':producers,'producer_retirements':retirements}
     # The supplied snapshot has controller-generated Git metadata, never the
     # source worktree's config/hooks. Rebind only its private alternate file.
     progress['stage']='git_alternate'
@@ -205,39 +346,120 @@ def execute(request,run=vm.run,progress=None):
         if not isinstance(request['build_cache'],str):raise vm.Unavailable('managed CI cache image is required')
         progress['stage']='cache_prepare'
         ensure_cache(request['build_cache'],request.get('cache_bytes'),lease)
-        if request['operation']=='step':
+        info=Path(request['build_cache']).stat()
+        generation['binding']['cache_identity_sha256']=hashlib.sha256(json.dumps([info.st_dev,info.st_ino,info.st_size],separators=(',',':')).encode()).hexdigest()
+        if any(item['ack']['cache_identity_sha256']!=generation['binding']['cache_identity_sha256'] for item in retirements):
+            raise cache_generation.FreshnessHold('cleanup_uncertain')
+        cache_generation.validate_binding(generation['binding'])
+        if request['operation']=='dependency':command=['/usr/bin/true']
+        elif request['operation']=='step':
             identifier=request.get('id')
             if not isinstance(identifier,str) or len(identifier)>4096 or '\0' in identifier:raise vm.Unavailable('invalid CI command identity')
             command+=['step','--vm-runtime','--id',identifier,'--input-head',request['head'],'--input-base',request['base'],'--state-dir','/ci-runtime']
         elif request['operation']=='repository':
             command=['/bin/bash','--noprofile','--norc','-o','pipefail','-c',request['command']]
         else:
-            command=['/usr/bin/python3','-I','-c',CARGO_OPERATIONS,json.dumps(cargo,separators=(',',':'))]
+            command=['/usr/bin/python3','-I','-c',CARGO_OPERATIONS,json.dumps(cargo_commands(cargo),separators=(',',':'))]
     progress['stage']='vm_launch'
-    def launch():
-        try:
-            return run(runtime,workspace,command,{},timeout=None,scratch_dir=str(scratch),build_cache=request['build_cache'],storage_lease=lease,
-                       ci_context={'state':state,'git_objects':Path(request['git_objects']),'runner':runner,'contract':contract})
-        except vm.Unavailable as error:
-            if 'VM build cache is full' not in str(error):raise
-            return {'exit_code':1,'stdout':'','stderr':str(error)}
-    outcome=launch();cache_reset=None
-    if request['operation']!='plan' and cache_full(outcome):
-        # Retry once on a fresh cache: a second ENOSPC is a real report, not a loop.
-        progress['stage']='cache_reset'
-        discard_cache(request['build_cache'],lease)
-        ensure_cache(request['build_cache'],request.get('cache_bytes'),lease)
-        cache_reset='full';progress['stage']='vm_launch'
-        outcome=launch()
+    context={'state':state,'git_objects':Path(request['git_objects']),'runner':runner,'contract':contract,
+                            'cache_program':CACHE_PROGRAM,'generation':generation,'worker_programs':WORKER_PROGRAMS,
+                            'dependency_programs':DEPENDENCY_PROGRAMS,'dependency_action':dependency}
+    probe=request.get('planner_protocol_probe',False)
+    if type(probe) is not bool or probe and request['operation']!='repository':raise cache_generation.FreshnessHold('invalidation_unsafe')
+    if probe or protected or repository:
+        context.update(planner_programs={name:private_bytes(BASE/name) for name in (
+            'ci-cargo-planner.py','ci-cargo-relay.py','ci-cargo-staging.py','ci-cargo-views.py','ci-cargo-observer.py','ci-lookup-inputs.py','ci-cargo-planner.so','ci-cargo-unit-policy.so')})
+    if probe:context.update(planner_protocol_probe=True,planner_probe_kind=probe_kind)
+    if protected:context['cargo_execution']=cargo_commands(cargo)
+    if repository:context['repository_execution']=True
+    outcome=run(runtime,workspace,command,{},timeout=None,scratch_dir=str(scratch),build_cache=request['build_cache'],storage_lease=lease,
+                ci_context=context)
     progress['stage']='receipt_validate'
+    reclaimed_legacy=outcome.get('legacy_incremental_reclaimed')
+    if (type(reclaimed_legacy) is not list or len(reclaimed_legacy)>32
+            or any(not cache_generation._uuid(value) for value in reclaimed_legacy)
+            or len(set(reclaimed_legacy))!=len(reclaimed_legacy)):
+        raise cache_generation.FreshnessHold('cleanup_uncertain')
+    legacy_diagnostic=outcome.get('legacy_incremental_diagnostic')
+    if generation is None:
+        if 'legacy_incremental_diagnostic' not in outcome or legacy_diagnostic is not None:
+            raise cache_generation.FreshnessHold('cleanup_uncertain')
+    else:
+        cache_generation.validate_legacy_diagnostic(legacy_diagnostic,generation['binding'],generation['command'],reclaimed_legacy)
+        if legacy_diagnostic['policy']!='closed-links':raise cache_generation.FreshnessHold('cleanup_uncertain')
+    reclaimed_seeds=outcome.get('seed_reclaimed')
+    protected_seed=dependency.get('seed') if dependency and dependency.get('kind')=='install' else None
+    if (not isinstance(reclaimed_seeds,list) or len(reclaimed_seeds)>2
+            or any(not cache_generation._digest(value) or value==protected_seed for value in reclaimed_seeds)
+            or len(set(reclaimed_seeds))!=len(reclaimed_seeds)):
+        raise cache_generation.FreshnessHold('cleanup_uncertain')
+    reclaimed_producers=outcome.get('producer_reclaimed',[])
+    if (not isinstance(reclaimed_producers,list) or len(reclaimed_producers)>2
+            or any(not cache_generation._uuid(value) or value in producers for value in reclaimed_producers)
+            or len(set(reclaimed_producers))!=len(reclaimed_producers)):
+        raise cache_generation.FreshnessHold('cleanup_uncertain')
+    try:guest_workers=worker_boundary.validate_quiescence(outcome.get('guest_worker_quiescence'),
+            require_worker=request['operation']!='dependency' or dependency['kind']=='produce')
+    except worker_boundary.FreshnessHold:raise cache_generation.FreshnessHold('cleanup_uncertain') from None
     result={'version':1,'head':request['head'],'base':request['base'],'contract_sha256':hashlib.sha256(contract).hexdigest(),
-            'boundary':'existing-build-vm','exit_code':outcome['exit_code'],'stdout':outcome['stdout'],'stderr':outcome['stderr']}
-    if cache_reset:result['cache_reset']=cache_reset
+            'guest_worker_quiescence':guest_workers,
+            'boundary':'existing-build-vm','exit_code':outcome['exit_code'],'stdout':outcome['stdout'],'stderr':outcome['stderr'],
+            'cache_reclaimed':outcome.get('cache_reclaimed',[]),
+            'producer_reclaimed':reclaimed_producers,
+            'seed_reclaimed':reclaimed_seeds,
+            'legacy_incremental_reclaimed':reclaimed_legacy,
+            'legacy_incremental_diagnostic':legacy_diagnostic,
+            'source_kind':'dependency_inputs' if request['operation']=='dependency' else 'git'}
+    if request['operation'] not in ('plan','dependency'):
+        try:observed_inputs=input_boundary.validate_observation(outcome.get('input_write_observation'),guest_workers,len(outputs))
+        except input_boundary.FreshnessHold as error:raise cache_generation.FreshnessHold(error.reason) from None
+        result['input_write_observation']=observed_inputs
+        prepared=cache_generation.validate_preparation(outcome.get('cache_preparation'),generation['binding'],generation['command'],generation['outputs'])
+        if dependency is not None and prepared['dependency_seed']!=dependency['seed']:
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+        result['cache_preparation']=prepared
+        result['source_projection']=cache_generation.validate_source_projection_observation(
+            outcome.get('source_projection'),generation['binding'],generation['command'],guest_workers,observed_inputs)
+        if probe:
+            probe_spec=importlib.util.spec_from_file_location('observed_planner_probe',BASE/'ci-cargo-planner.py')
+            planner=importlib.util.module_from_spec(probe_spec);probe_spec.loader.exec_module(planner)
+            try:result['planner_protocol_probe']=(planner.validate_relay_exec_policy_probe if probe_kind=='relay-exec-policy' else planner.validate_probe)(outcome.get('planner_protocol_probe'),
+                generation['binding'],generation['command'],guest_workers,observed_inputs,result['source_projection'])
+            except planner.FreshnessHold as error:raise cache_generation.FreshnessHold(error.reason) from None
+    if protected:
+        spec=importlib.util.spec_from_file_location('observed_cargo_execution',BASE/'ci-cargo-planner.py')
+        planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
+        try:result['cargo_execution']=planner.validate_execution(outcome.get('cargo_execution'),
+            generation['binding'],generation['command'],cargo_commands(cargo),guest_workers,
+            observed_inputs['guest_worker_quiescence'],result['exit_code'],generation['predecessor'])
+        except planner.FreshnessHold as error:raise cache_generation.FreshnessHold(error.reason) from None
+    if repository:
+        spec=importlib.util.spec_from_file_location('observed_repository_execution',BASE/'ci-cargo-planner.py')
+        planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
+        try:result['repository_execution']=planner.validate_repository_execution(outcome.get('repository_execution'),
+            generation['binding'],generation['command'],guest_workers,observed_inputs['guest_worker_quiescence'],generation['predecessor'],progress)
+        except planner.FreshnessHold as error:raise cache_generation.FreshnessHold.from_diagnostic(error.diagnostic()) from None
+    if dependency is not None:
+        observed=outcome.get('dependency_result')
+        if (not isinstance(observed,dict) or observed.get('version')!=1 or observed.get('shipping_authority') is not False
+                or observed.get('dependency_inputs_sha256')!=dependency['dependency_inputs_sha256']
+                or observed.get('kind')!={'produce':'produced','publish':'published','install':'installed','lookup':'lookup'}[dependency['kind']]):
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+        if dependency['kind'] in ('produce','publish') and observed.get('producer')!=dependency['producer']:
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+        if dependency['kind']=='produce' and observed.get('command')!=request['command_id']:
+            raise cache_generation.FreshnessHold('cleanup_uncertain')
+        if dependency['kind'] in ('publish','install') and not cache_generation._digest(observed.get('seed')):
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+        if dependency['kind']=='lookup' and observed.get('seed') is not None and not cache_generation._digest(observed['seed']):
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+        result['dependency_result']=observed
     if outcome['exit_code']==0:
         if request['operation']=='plan':
             plan=json.loads(outcome['stdout'])
             if plan.get('head')!=request['head'] or plan.get('base')!=request['base'] or plan.get('contract_sha256')!=result['contract_sha256']:raise vm.Unavailable('guest CI plan binding mismatch')
             result.update(status='planned',plan=plan)
+        elif request['operation']=='dependency':result['status']='seed_'+result['dependency_result']['kind']
         else:result['status']='passed'
     elif 'shared CI prerequisite unavailable' in outcome['stderr']:result['status']='prerequisite_hold'
     else:result['status']='failed'
@@ -248,9 +470,18 @@ def main():
     parser=argparse.ArgumentParser();parser.add_argument('--spec',type=Path,required=True);args=parser.parse_args()
     progress={'stage':'request_read'}
     try:result=execute(json.loads(private_bytes(args.spec)),progress=progress)
+    except vm.GuestUnavailable as error:
+        result={'version':1,'status':'prerequisite_hold','boundary':'existing-build-vm',
+                'stage':progress['stage'],'category':'Unavailable','guest_diagnostic':error.diagnostic}
+    except vm.FreshnessUnavailable as error:
+        result={'version':1,'status':'prerequisite_hold','boundary':'existing-build-vm',
+                'freshness_hold':cache_generation.validate_hold(error.diagnostic),'stage':progress['stage'],'category':'FreshnessHold'}
+    except cache_generation.FreshnessHold as error:
+        result={'version':1,'status':'prerequisite_hold','boundary':'existing-build-vm','freshness_hold':error.diagnostic(),
+                'stage':progress['stage'],'category':'FreshnessHold'}
     except (OSError,ValueError,KeyError,subprocess.SubprocessError) as error:
         # Local diagnostics deliberately omit raw paths, requests and exception text.
         result={'version':1,'status':'prerequisite_hold','boundary':'existing-build-vm','reason':'CI VM setup unavailable','category':type(error).__name__ if type(error).__name__ in ('Unavailable','OSError','PermissionError','FileNotFoundError','ValueError','KeyError','JSONDecodeError','CalledProcessError') else 'SetupError','stage':progress['stage'],'errno':error.errno if isinstance(error,OSError) and type(error.errno) is int and 0<=error.errno<=4096 else None}
     print(json.dumps(result,sort_keys=True))
-    return 0 if result['status'] in ('passed','planned') else 2
+    return 0 if result['status'] in ('passed','planned','seed_produced','seed_published','seed_lookup') else 2
 if __name__=='__main__':raise SystemExit(main())

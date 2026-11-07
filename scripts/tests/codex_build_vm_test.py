@@ -14,6 +14,35 @@ SPEC.loader.exec_module(vm)
 
 
 class SnapshotValidationTests(unittest.TestCase):
+    def test_source_projection_survives_transport_only_for_ci_and_unknown_fields_still_fail(self):
+        ordinary={'exit_code':0,'stdout':'','stderr':''}
+        projection={'version':1,'kind':'ci-git-source-projection'}
+        result={**ordinary,'cache_reclaimed':[],'producer_reclaimed':[],'seed_reclaimed':[],'legacy_incremental_reclaimed':[],
+            'legacy_incremental_diagnostic':{},
+            'guest_worker_quiescence':{},'cache_preparation':{},'input_write_observation':{},
+            'source_projection':projection}
+        vm.validate_result_shape(result,{})
+        self.assertIs(result['source_projection'],projection)
+        with self.assertRaises(vm.Unavailable):vm.validate_result_shape({**ordinary,'source_projection':projection},None)
+        with self.assertRaises(vm.Unavailable):vm.validate_result_shape({**result,'unknown':True},{})
+        with self.assertRaises(vm.Unavailable):vm.validate_result_shape({**result,'exit_code':False},{})
+
+    def test_guest_failure_diagnostic_keeps_only_protocol_enums_and_errno(self):
+        self.assertEqual(vm.guest_diagnostic({'stage':'hide_producer_cache','category':'CalledProcessError','errno':22,
+                                              'message':'private source or credential contents'}),
+                         {'stage':'hide_producer_cache','category':'CalledProcessError','errno':22})
+        self.assertEqual(vm.guest_diagnostic({'stage':'private path','category':'private contents','errno':True}),
+                         {'stage':'unknown','category':'unknown','errno':None})
+    def test_fixed_planner_failure_phases_survive_guest_transport_without_private_fields(self):
+        for phase in ('planner_probe_credentials','planner_probe_filter','planner_probe_exec_start',
+                'planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive',
+                'planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket',
+                'planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin',
+                'planner_cargo_supervisor','planner_cargo_retire','planner_cargo_retry'):
+            with self.subTest(phase=phase):
+                self.assertEqual(vm.guest_diagnostic({'stage':phase,'category':'OSError','errno':71,'private':'secret'}),
+                    {'stage':phase,'category':'OSError','errno':71})
+
     def test_internal_build_hard_links_can_reach_the_vm_boundary_unchanged(self):
         class BoundaryReached(Exception): pass
         with tempfile.TemporaryDirectory() as temporary:

@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "kind": "unit-proc-memory-writer-conformance",
+  "baseline": "4ad4d794",
+  "code_head": "b16780dd",
+  "source_sha256": {
+    "scripts/ci-cargo-views.py": "d2e1cd114e2d3843f40ac61c9f15ee7889984199a37550e51a5a1355b6d9588b",
+    "scripts/ci-cargo-planner.py": "fb8a0e82f8dccb925478c87b9029cfb2e3c9dc8dfedc5df545729a4a62454b8a",
+    "scripts/tests/ci_listener_relay_test.py": "028254d27b13fed9b0b393a4a8e1fb6a00e2584fddcca9b1592fcf8955871e13",
+    "crates/augmentagent-cli/src/self_improve_ci_acceptance.rs": "610d8627757c1a7a978e880025e8fad0059389307d725fe9eb64877aa595e801"
+  },
+  "implementation": "The existing readonly unit proc mount is shared through mount_unit_proc. Fixed root-controlled probe adds actual memory writes and four pathname/FD aliases with positive writable controls. No proc mount option or runtime permission changed.",
+  "host": {
+    "python": {
+      "passed": 735,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 43.682,
+      "log": "/tmp/autoship-ci-proc-memory-python-20261107.log"
+    },
+    "rust": {
+      "passed": 39,
+      "failed": 0,
+      "ignored": 30,
+      "seconds": 22.12,
+      "log": "/tmp/autoship-ci-proc-memory-build-20261107.log"
+    }
+  },
+  "guest": {
+    "passed": 8,
+    "failed": 0,
+    "seconds": 96.6,
+    "receipt": "/tmp/augmentagent-ci-unit-proc-memory-20261107050701/receipt.json",
+    "result": "/tmp/autoship-1703-ci-unit-proc-memory-result-20261107.json",
+    "audit": "/tmp/autoship-ci-unit-proc-memory-audit-20261107.json",
+    "log": "/tmp/autoship-ci-unit-proc-memory-live-20261107.log",
+    "memory_cases": {
+      "proc_ro_guard": {
+        "memory": {
+          "mount_readonly": true,
+          "read_control": true,
+          "readonly_fd_write_errno": 9,
+          "victim_final_hex": "6f726967696e616c",
+          "victim_reaped": true,
+          "write_results": {
+            "direct": 30,
+            "fd_alias": 30,
+            "self_root": 30,
+            "victim_root": 30
+          }
+        },
+        "mode": "proc-ro",
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "uid": 2000
+      },
+      "proc_rw_control": {
+        "memory": {
+          "mount_readonly": false,
+          "read_control": true,
+          "readonly_fd_write_errno": 9,
+          "victim_final_hex": "7772697465722d33",
+          "victim_reaped": true,
+          "write_results": {
+            "direct": 0,
+            "fd_alias": 0,
+            "self_root": 0,
+            "victim_root": 0
+          }
+        },
+        "mode": "proc-rw",
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "uid": 2000
+      }
+    },
+    "original_exec_ack_and_cleanup": true,
+    "original_resource_subtree_removed": true,
+    "resource_exhausted": false,
+    "embedded_native_sha256": {
+      "libci_cargo_planner.so": "fd272729eacdbdbd14ed9dbf7432047f6a33520538ba27393792b62e58ba1ac8",
+      "libci_cargo_exec.so": "ebc8c59914672371b9053da399e5b2d0c5ef8d4bebc89b425a48fc2294fab843",
+      "libci_cargo_relay.so": "e7371d559cce1d51ebff69106211e72f8171b885d99f24120c1575e93cdd84d6"
+    },
+    "six_prior_relay_policy_cases_repeated": true
+  },
+  "spec_audit": {
+    "scope": "proc-memory subsection and adjacent listener bootstrap",
+    "findings": 0,
+    "full_mechanism_handoff_audit": false
+  },
+  "interpretation": "Under the actual native unit policy, writable proc permits real same-UID victim memory mutation through all four tested aliases. The existing production readonly proc mount refuses writable opens with EROFS, retains successful read controls, prevents RO FD write-upgrade and preserves victim bytes. This is a bounded mount/writer-route result, not complete closure.",
+  "not_proved": [
+    "worker/planner proc-view closure",
+    "foreign preopened writable memory descriptors and ingress/lifetime",
+    "all mapped/external/asynchronous writers and ABI routes",
+    "complete live cohort/source/resource binding",
+    "runtime vfork/status-image admission",
+    "original compiler/worker/generated-publication success"
+  ],
+  "full_writer_closure": false,
+  "input_closure_complete": false,
+  "production_native_handoff_integrated": false,
+  "runtime_vfork_admission": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "deployed": false,
+  "autonomous_merges_claimed": 0
+}

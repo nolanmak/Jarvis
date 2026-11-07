@@ -41,7 +41,7 @@ use tracing::{info, warn};
 use augmentagent_channel_core::{build_workflow_reasoner as build_reasoner, FallbackReasoner, Reasoner};
 
 #[path = "self_improve_ci.rs"]
-mod shared_ci;
+pub(crate) mod shared_ci;
 #[path = "self_improve_hosted_ci.rs"]
 mod hosted_ci;
 #[path = "self_improve_baseline_priority.rs"]
@@ -4647,7 +4647,7 @@ async fn verification_gate(worktree: &Path, audit: &Arc<augmentagent_channel_cor
         #[cfg(test)]
         if shared_ci::fixture::selected(worktree)?.is_some() {
             gate_disk_guard()?;
-            return shared_ci::verify(worktree, audit).await;
+            return shared_ci::verify(worktree, audit).await.map(|_|());
         }
         hosted_ci::preflight(worktree, audit).await
     }.await)

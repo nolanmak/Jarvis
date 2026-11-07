@@ -295,6 +295,23 @@ pub fn default_audit_log_path() -> PathBuf {
     crate::state_dir::state_dir_or("/tmp").join("tool-audit.log")
 }
 
+/// An authenticated controller record, obtained only from the protected audit
+/// writer or its committed-prefix reader. Raw JSON and hashes are not receipts.
+#[derive(Clone)]
+pub struct ProtectedControllerReceipt {
+    payload_sha256:String,
+    value:serde_json::Value,
+}
+impl std::fmt::Debug for ProtectedControllerReceipt {
+    fn fmt(&self,formatter:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        formatter.debug_struct("ProtectedControllerReceipt").field("payload_sha256",&self.payload_sha256).finish_non_exhaustive()
+    }
+}
+impl ProtectedControllerReceipt {
+    pub fn payload_sha256(&self)->&str {&self.payload_sha256}
+    pub fn value(&self)->&serde_json::Value {&self.value}
+}
+
 /// Append-only NDJSON writer. Cheap to clone (`Arc<Mutex<…>>` inside) so
 /// the caller can hand it to spawned tasks.
 #[derive(Clone)]
@@ -569,6 +586,57 @@ impl AuditLogger {
         }
         ticket.complete();
         result
+    }
+
+    /// The returned identity becomes usable only after both the log record and
+    /// its external anchor commit. No caller can construct the receipt from a
+    /// model response or a file in a worker namespace.
+    pub fn record_controller_receipt(&self,mut value:serde_json::Value)->anyhow::Result<ProtectedControllerReceipt> {
+        use sha2::{Digest,Sha256};
+        let object=value.as_object_mut().ok_or_else(||anyhow::anyhow!("controller receipt must be an object"))?;
+        anyhow::ensure!(!object.contains_key("audit_chain"),"reserved audit metadata");
+        object.insert("actor".into(),"controller".into());
+        let hash=format!("{:x}",Sha256::digest(serde_json::to_vec(&value)?));
+        self.record_controller(value)?;
+        self.controller_receipt(&hash)
+    }
+
+    pub fn controller_receipt(&self,payload_sha256:&str)->anyhow::Result<ProtectedControllerReceipt> {
+        anyhow::ensure!(payload_sha256.len()==64 && payload_sha256.bytes().all(|byte|matches!(byte,b'0'..=b'9'|b'a'..=b'f')),
+            "invalid protected receipt identity");
+        self.protected_health()?;
+        let sink=self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("protected audit required"))?;
+        for mut row in sink.committed_records()? {
+            if row["audit_chain"]["payload_sha256"].as_str()!=Some(payload_sha256) {continue;}
+            anyhow::ensure!(row["actor"]=="controller","receipt is not a controller record");
+            // The external anchor authenticates both the payload and its
+            // original writer's payload identity. Do not reserialize to derive
+            // a different identity under another serde map-order feature set.
+            row.as_object_mut().ok_or_else(||anyhow::anyhow!("invalid controller receipt"))?.remove("audit_chain");
+            return Ok(ProtectedControllerReceipt {payload_sha256:payload_sha256.into(),value:row});
+        }
+        anyhow::bail!("protected controller receipt missing")
+    }
+
+    /// Return the newest committed controller record of this kind. This is a
+    /// freshness fence, so a newer unfinished attempt supersedes an older pass.
+    /// Model records and uncommitted or corrupted suffixes cannot supply it.
+    pub fn latest_controller_receipt(&self,kind:&str)->anyhow::Result<Option<ProtectedControllerReceipt>> {
+        anyhow::ensure!(!kind.is_empty() && kind.len()<=128
+            && kind.bytes().all(|byte|byte.is_ascii_alphanumeric() || matches!(byte,b'_'|b'-')),
+            "invalid protected receipt kind");
+        self.protected_health()?;
+        let sink=self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("protected audit required"))?;
+        for mut row in sink.committed_records()?.into_iter().rev() {
+            if row["actor"]!="controller" || row["kind"]!=kind {continue;}
+            let payload_sha256=row["audit_chain"]["payload_sha256"].as_str()
+                .ok_or_else(||anyhow::anyhow!("protected receipt identity missing"))?.to_owned();
+            anyhow::ensure!(payload_sha256.len()==64 && payload_sha256.bytes()
+                .all(|byte|matches!(byte,b'0'..=b'9'|b'a'..=b'f')),"invalid protected receipt identity");
+            row.as_object_mut().ok_or_else(||anyhow::anyhow!("invalid controller receipt"))?.remove("audit_chain");
+            return Ok(Some(ProtectedControllerReceipt {payload_sha256,value:row}));
+        }
+        Ok(None)
     }
 
     async fn record_value_checked(&self, value: serde_json::Value) -> anyhow::Result<()> {
@@ -1384,6 +1452,50 @@ mod tests {
         let anchor = dir.path().join("anchors/workflow.json");
         let logger = AuditLogger::protected(log.clone(), anchor.clone(), &[]).unwrap();
         (dir, logger, log, anchor)
+    }
+
+    #[test]
+    fn controller_receipt_requires_protected_committed_publication() {
+        let (_dir,logger,log,_anchor)=protected_fixture();
+        let receipt=logger.record_controller_receipt(serde_json::json!({"kind":"ci-proof","value":42})).unwrap();
+        assert_eq!(receipt.value()["actor"],"controller");
+        let reopened=logger.controller_receipt(receipt.payload_sha256()).unwrap();
+        assert_eq!(reopened.value(),receipt.value());
+        assert!(logger.controller_receipt(&"0".repeat(64)).is_err());
+        let mut file=std::fs::OpenOptions::new().append(true).open(log).unwrap();
+        use std::io::Write;
+        file.write_all(b"{\"actor\":\"controller\",\"kind\":\"fake-ci-proof\"}\n").unwrap();
+        assert!(logger.controller_receipt(receipt.payload_sha256()).is_err());
+    }
+
+    #[test]
+    fn latest_controller_receipt_ignores_spoofs_and_refuses_uncommitted_suffixes() {
+        let (dir,logger,log,_anchor)=protected_fixture();
+        assert!(AuditLogger::new(dir.path().join("plain.log")).latest_controller_receipt("ci-start").is_err());
+        assert!(logger.latest_controller_receipt("").is_err());
+        assert!(logger.latest_controller_receipt("ci-start").unwrap().is_none());
+        let first=logger.record_controller_receipt(serde_json::json!({"kind":"ci-start","attempt":1})).unwrap();
+        logger.record_controller(serde_json::json!({"actor":"model","kind":"ci-start","attempt":99})).unwrap();
+        assert_eq!(logger.latest_controller_receipt("ci-start").unwrap().unwrap().payload_sha256(),first.payload_sha256());
+        let second=logger.record_controller_receipt(serde_json::json!({"kind":"ci-start","attempt":2})).unwrap();
+        logger.record_controller_receipt(serde_json::json!({"kind":"ci-complete","attempt":1})).unwrap();
+        let latest=logger.latest_controller_receipt("ci-start").unwrap().unwrap();
+        assert_eq!(latest.payload_sha256(),second.payload_sha256());
+        assert_eq!(latest.value(),second.value());
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(log).unwrap()
+            .write_all(b"{\"actor\":\"controller\",\"kind\":\"ci-start\",\"attempt\":3}\n").unwrap();
+        assert!(logger.latest_controller_receipt("ci-start").is_err());
+    }
+
+    #[test]
+    fn plain_or_non_controller_records_cannot_be_authorization_receipts() {
+        let (dir,logger,log,_anchor)=protected_fixture();
+        let plain=AuditLogger::new(dir.path().join("plain.log"));
+        assert!(plain.controller_receipt(&"a".repeat(64)).is_err());
+        logger.record_controller(serde_json::json!({"actor":"model","kind":"model-output"})).unwrap();
+        let row:serde_json::Value=serde_json::from_str(std::fs::read_to_string(log).unwrap().trim()).unwrap();
+        assert!(logger.controller_receipt(row["audit_chain"]["payload_sha256"].as_str().unwrap()).is_err());
     }
 
     #[tokio::test]

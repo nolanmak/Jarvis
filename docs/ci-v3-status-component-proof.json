@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "kind": "v3-post-ready-status-signal-component",
+  "baseline": "3db416ffe44248d5c59f5ed67180dbfb4311c0f7",
+  "source_sha256": {
+    "crates/augmentagent-cli/build.rs": "b6fd69f4f80b565556e0a7f771e0e134d6a07b0abb1ae354a1015aec2eab1cbd",
+    "crates/augmentagent-cli/src/ci_cargo_status_proxy.c": "4abed1f0fc5de14bb55ef69de4184ec15fd00961af5e819a31b175cd6480374c",
+    "crates/augmentagent-cli/src/ci_cargo_status_wire.h": "8aaa08e261006a0402726780477d225b678831e379a1b7685d05d3cc2f9e4ef0",
+    "crates/augmentagent-cli/src/ci_cargo_relay.c": "3704f74ed044f6df693a6835b6a2176d88b3107598e75958b316a249de06ed6b",
+    "crates/augmentagent-cli/src/ci_cargo_exec.c": "c9564ede10d4ec5f1b34eef5c5d0b8bba2b49e487da6cf5a496bc4cacb3bb727",
+    "crates/augmentagent-cli/src/self_improve_ci_acceptance.rs": "2aa821683a08234f8797a681ee00ccc52acc9c7a999b3e4685409d1855108768",
+    "scripts/tests/ci_cargo_status_proxy_test.py": "aeee92cfeed62c22670f8c3fa0a13086167c67bdc2ad25db910b6af1ecab2ea3"
+  },
+  "implementation": "Static post-ready V3 component shares exact response/signal/terminal code with the original V2/V3 relay. No caller switched to native proxy exec.",
+  "red": {
+    "log": "/tmp/autoship-ci-status-proxy-red-20261107.log",
+    "test_methods": 8,
+    "result": "nonzero: static component did not exist",
+    "subtest_failures": 19,
+    "errors": 3
+  },
+  "host": {
+    "component_cases": 9,
+    "component_log": "/tmp/autoship-ci-status-proxy-fds-20261107.log",
+    "component_seconds": 0.538,
+    "python": {
+      "log": "/tmp/autoship-ci-status-proxy-python-20261107.log",
+      "passed": 717,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 42.97
+    },
+    "rust": {
+      "log": "/tmp/autoship-ci-status-proxy-rust-portable-20261107.log",
+      "passed": 38,
+      "failed": 0,
+      "ignored": 28,
+      "seconds": 20.8,
+      "component_cases_required": 9
+    }
+  },
+  "verified_behavior": [
+    "Static ELF has no PT_INTERP.",
+    "Actual inherited socket is matched to sealed 64-byte continuation, exact PID/UID/GID, peer credentials and cookie, connected AF_UNIX seqpacket type and bounded absolute monotonic deadline.",
+    "V3 requires tool-start before native terminal status; bad sequencing, malformed frames and received rights are refused.",
+    "Pending signals are forwarded before tool-start and formerly ignored signals after handler ownership; native parent observes actual fatal signal status.",
+    "Binary stdout/stderr bytes, non-CLOEXEC inherited FIFO lifetime and exec CLOEXEC closure are preserved.",
+    "Wrong/unsealed/extended continuation, identity/cookie mismatch, stream transport, disconnect and deadline fail with infrastructure status 125.",
+    "Original relay code and real Rust spawn/async-Popen/closefrom/stdio/signal tests remain passing."
+  ],
+  "authority_boundary": "Continuation consistency and component exit are not execution admission. Runtime must bind immutable image/configuration, actual root peer, live staging operation, original owner/model/source/resource context and kernel notification before exec. Same-UID conformance does not prove runtime root-role admission.",
+  "spec_audit": {
+    "agent": "ci_status_component_spec_audit_20261107",
+    "result": "No substantiated findings in this bounded component contract; full mechanism remains unfinished."
+  },
+  "vm": {
+    "source_head": "4c437b276998178462072a57f6281a7b8aa10b2d",
+    "exit_code": 0,
+    "seconds": 90.67,
+    "result": "passed_component_conformance_only",
+    "result_file": "/tmp/autoship-1703-ci-v3-status-component-result-20261107.json",
+    "log": "/tmp/autoship-ci-v3-status-component-vm-20261107.log",
+    "audit": "/tmp/autoship-ci-v3-status-component-audit-20261107.json",
+    "host_resource_removed_empty_subtree": true,
+    "receipt": {
+      "actual_vm_commands": 1,
+      "autonomous_merges_claimed": 0,
+      "cases": {
+        "client_gid": 1000,
+        "client_uid": 1000,
+        "component_sha256": "7263938a2a65e48e3832cf52928f6ac300f6613c73278101b80a6a5a7ac6b951",
+        "errors": 0,
+        "failed": 0,
+        "full_ci_pass": false,
+        "native_handoff_integrated": false,
+        "root_role_admission_proved": false,
+        "run": 9,
+        "shipping_authority": false,
+        "skipped": 0,
+        "successful": true
+      },
+      "full_ci_pass": false,
+      "generation": "60115bb1-3a91-4cfc-9453-d0796d7ac3a8",
+      "head": "8ca115d364fcd19e44779a17b41a1faa30699dc9",
+      "input_closure_complete": false,
+      "kind": "real_shared_ci_v3_status_component",
+      "shipping_authority": false,
+      "status": "passed",
+      "version": 1
+    }
+  },
+  "component_implemented": true,
+  "runtime_root_role_policy_changed": false,
+  "root_role_admission_proved": false,
+  "native_handoff_integrated": false,
+  "real_v3_proxy_complete": false,
+  "compiler_compatible": false,
+  "complete_writer_coverage": false,
+  "input_closure_complete": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "production_runtime_changed": false,
+  "autonomous_merges_claimed": 0,
+  "remaining": [
+    "Shared-mm-safe original client hook and synchronous errno/PATH/FD semantics before successful exec.",
+    "Exact immutable image/configuration and live root-admission factory; all original writers, mutable pointers, signal/cancellation intervals and resource/supervision joins.",
+    "Actual kernel-observed native handoff with this component and unchanged compiler/worker/generated-publication regressions.",
+    "Full C/R source/input/effect/projection and owner productive bridge, hosted checks, managed rollout and full epic acceptance."
+  ]
+}

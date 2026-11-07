@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import shutil
 import shlex
@@ -28,6 +29,34 @@ MAX_OUTPUT = 8 * 1024 * 1024
 
 class Unavailable(ValueError):
     pass
+
+
+class FreshnessUnavailable(Unavailable):
+    def __init__(self, diagnostic):
+        self.diagnostic = diagnostic
+        super().__init__('shared CI prerequisite unavailable: source/cache freshness')
+
+
+def guest_diagnostic(value):
+    value=value if isinstance(value,dict) else {}
+    stages={'planner_original_worker_entry','planner_original_worker_supervisor','load_dependency_controller','reclaim_legacy_incremental','reclaim_producers','reclaim_seeds','prepare_producer','bind_producer_cache','hide_producer_cache',
+            'resolve_dependencies','freeze_resolution','compile_dependencies','record_producer',
+            'publish_dependencies','prepare_generation','execute_command','planner_protocol_probe',
+            'planner_startup','planner_unit','planner_capture','planner_authorize','planner_drop',
+            'planner_arm_exec','planner_unit_exec','planner_client_start','planner_client_exec',
+            'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_signal','planner_probe_supervisor',
+        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin','planner_probe_view','planner_tool_view','planner_view_prepare','planner_view_enter','planner_view_namespace','planner_view_runtime','planner_view_source','planner_view_inputs','planner_view_proc','planner_view_devices','planner_view_root','planner_view_publish','planner_cargo_request','planner_cargo_artifact','planner_cargo_runtime','planner_cargo_execute','planner_cargo_compile','planner_cargo_build_script','planner_cargo_application','planner_cargo_supervisor','planner_cargo_retire','planner_cargo_retry','planner_kernel_observer'}
+    categories={'OSError','PermissionError','FileNotFoundError','FileExistsError','NotADirectoryError',
+                'IsADirectoryError','CalledProcessError','RuntimeError','TimeoutExpired','FreshnessHold','Unavailable','ValueError','KeyError','ModuleNotFoundError','ImportError'}
+    return {'stage':value.get('stage') if value.get('stage') in stages else 'unknown',
+            'category':value.get('category') if value.get('category') in categories else 'unknown',
+            'errno':value.get('errno') if type(value.get('errno')) is int and 0<=value['errno']<=4096 else None}
+
+
+class GuestUnavailable(Unavailable):
+    def __init__(self,value):
+        self.diagnostic=guest_diagnostic(value)
+        super().__init__('VM controller phase unavailable')
 
 
 def private_json(path):
@@ -90,6 +119,31 @@ GUEST_RUNNER = dependency_proxy.GUEST_PROXY + r'''
 import ctypes,json,os,re,selectors,signal,subprocess
 from pathlib import Path
 job=json.loads(Path('/job.json').read_text())
+ci_cache={}
+ci_dependency=None
+ci_workers=None
+ci_inputs=None
+guest_worker_receipts=[]
+worker_control=Path('/root/ci-worker-control')
+guest_stage='load_dependency_controller'
+if job.get('ci_context'):
+    exec(compile(Path('/ci-tools/cache-generation.py').read_bytes(),'/ci-tools/cache-generation.py','exec'),ci_cache)
+    import importlib.util
+    scope_spec=importlib.util.spec_from_file_location('ci_worker_scope','/ci-tools/ci-worker-scope.py')
+    ci_workers=importlib.util.module_from_spec(scope_spec);scope_spec.loader.exec_module(ci_workers)
+    input_spec=importlib.util.spec_from_file_location('ci_input_manifest','/ci-tools/ci-input-manifest.py')
+    ci_inputs=importlib.util.module_from_spec(input_spec);input_spec.loader.exec_module(ci_inputs)
+    worker_control.mkdir(mode=0o700,exist_ok=True)
+    if job.get('ci_dependency') or (job.get('build_cache') and job.get('ci_generation')):
+        try:
+            import importlib.util
+            spec=importlib.util.spec_from_file_location('ci_dependency_guest','/ci-tools/ci-dependency-guest.py')
+            ci_dependency=importlib.util.module_from_spec(spec);spec.loader.exec_module(ci_dependency)
+        except Exception as error:
+            Path('/root/control/outcome.json').write_text(json.dumps({'error':'VM controller initialization unavailable',
+                'guest_diagnostic':{'stage':guest_stage,'category':getattr(error,'planner_category',type(error).__name__),'errno':getattr(error,'errno',None)}}))
+            Path('/root/control/outcome.json').chmod(0o600)
+            raise SystemExit(0)
 uid=job['uid'];gid=job['gid']
 os.makedirs('/home/worker',mode=0o700,exist_ok=True)
 os.chown('/home/worker',uid,gid)
@@ -99,22 +153,36 @@ Path('/etc/group').write_text(f'root:x:0:\nworker:x:{gid}:\n')
 Path('/etc/hosts').write_text('127.0.0.1 localhost registry.npmjs.org index.crates.io static.crates.io\n::1 localhost\n')
 environment={'PATH':'/toolchain/bin:/usr/bin:/bin','HOME':'/home/worker','USER':'worker','LOGNAME':'worker',
     'LANG':'C.UTF-8','TMPDIR':'/tmp','CARGO_HOME':'/cargo','CARGO_NET_OFFLINE':'true','CARGO_TARGET_DIR':'/workspace/target'}
-def seed_build_cache():
+def seed_build_cache(ci_target=None):
     # Session build cache (#1036): persistent target and Cargo home. Seed the
     # Cargo home once per image from the read-only operator caches.
     import shutil
     cache=Path('/build-cache')
-    for name in ('target','cargo-home'):
-        (cache/name).mkdir(exist_ok=True); os.chown(cache/name,uid,gid)
-    home=cache/'cargo-home'
-    if not (home/'.jarvis-seeded').exists():
+    if ci_target is None:
+        for name in ('target','cargo-home'):
+            (cache/name).mkdir(exist_ok=True); os.chown(cache/name,uid,gid)
+        home=cache/'cargo-home'
+    else:
+        home=ci_target.parent/'cargo-home'
+        if not home.exists():home.mkdir();os.chown(home,uid,gid)
+        Path('/ci-cargo-home').mkdir(mode=0o755,exist_ok=True)
+        subprocess.run(['/usr/bin/mount','--bind',str(home),'/ci-cargo-home'],check=True)
+        environment.update({'CARGO_HOME':'/ci-cargo-home','CARGO_TARGET_DIR':'/workspace/target'})
+    seeded=(home/'.jarvis-seeded') if ci_target is None else home.parent/'cargo-home-seeded.json'
+    if ci_target is not None and (seeded.exists() or seeded.is_symlink()):
+        if ci_cache['_read_record'](seeded)!={'version':1,'kind':'ci-downloads-seeded'}:
+            raise ci_cache['FreshnessHold']('metadata_torn')
+    if not seeded.exists():
         for source,destination in (('/cargo/registry/cache','registry/cache'),('/cargo/registry/index','registry/index'),('/cargo/git','git')):
             if Path(source).is_dir() and any(Path(source).iterdir()):
                 shutil.copytree(source,home/destination,symlinks=True,dirs_exist_ok=True)
         for base,dirs,files in os.walk(home):
             for name in [*dirs,*files]:
                 os.lchown(os.path.join(base,name),uid,gid)
-        (home/'.jarvis-seeded').touch(); os.chown(home/'.jarvis-seeded',uid,gid)
+        if ci_target is None:
+            seeded.touch();os.chown(seeded,uid,gid)
+        else:
+            ci_cache['_write_record'](seeded,{'version':1,'kind':'ci-downloads-seeded'})
 if job.get('build_cache'):
     environment.update({'CARGO_HOME':'/build-cache/cargo-home','CARGO_TARGET_DIR':'/build-cache/target'})
 environment.update(job['environment'])
@@ -148,13 +216,27 @@ def worker():
     if libc.prctl(38,1,0,0,0)!=0: raise OSError('cannot enforce no-new-privileges')
     os.setgroups([]); os.setgid(gid); os.setuid(uid)
     os.umask(0o022)
-try:
-    if job.get('build_cache'):
-        seed_build_cache()
-    process=subprocess.Popen(job['argv'],cwd='/workspace',env=environment,
+def bind_ci_cache(target):
+    subprocess.run(['/usr/bin/mount','--bind',str(target),'/workspace/target'],check=True)
+    seed_build_cache(target)
+def hide_ci_cache():
+    private=Path('/root/managed-ci-cache');private.mkdir(mode=0o700,exist_ok=True)
+    # The runtime's mount topology does not support moving this mount. Keep a
+    # controller-only bind, then cover the original path with a read-only empty
+    # directory. The worker has neither /root traversal nor raw device access.
+    subprocess.run(['/usr/bin/mount','--bind','/build-cache',str(private)],check=True)
+    hidden=Path('/root/hidden-build-cache');hidden.mkdir(mode=0o700,exist_ok=True)
+    subprocess.run(['/usr/bin/mount','--bind',str(hidden),'/build-cache'],check=True)
+    subprocess.run(['/usr/bin/mount','-o','remount,bind,ro,nosuid,nodev,noexec','/build-cache'],check=True)
+    os.chmod('/dev/vda',0o600)
+    return private
+def _run_worker(argv,scope=None):
+    controller_environment=scope.controller_environment() if scope is not None else None
+    process=subprocess.Popen(argv,cwd='/workspace',env=environment if controller_environment is None else controller_environment,
         stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-        start_new_session=True,preexec_fn=worker)
-    threading.Thread(target=registry.serve_forever,daemon=True).start()
+        start_new_session=True,preexec_fn=worker if scope is None else None,
+        pass_fds=() if scope is None else scope.inherited_fds())
+    if scope is not None:scope.attach(process)
     outputs={'stdout':bytearray(),'stderr':bytearray()}
     size=0; exceeded=False
     with selectors.DefaultSelector() as streams:
@@ -172,7 +254,7 @@ try:
     if exceeded:
         # The entire guest is shut down after this receipt, including detached
         # descendants. Kill the foreground group promptly to stop its output.
-        try: os.killpg(process.pid,signal.SIGKILL)
+        try: os.killpg(process.pid,signal.SIGTERM if scope is not None else signal.SIGKILL)
         except ProcessLookupError: pass
         process.wait()
         result={'error':'VM command exceeded output limit'}
@@ -180,11 +262,266 @@ try:
         result={'exit_code':process.wait(),**{key:value.decode('utf-8','replace') for key,value in outputs.items()}}
         if len(result['stdout'].encode())+len(result['stderr'].encode())>8*1024*1024:
             result={'error':'VM command exceeded output limit'}
-except OSError as error:
+    return result
+
+def run_worker(argv,input_roots=None):
+    if not job.get('ci_context'):return _run_worker(argv)
+    scope=ci_workers.WorkerScope(worker_control,uid,gid,argv)
+    journal=ci_inputs.ChangeJournal(input_roots,scope=scope) if input_roots is not None else None
+    try:
+        result=_run_worker(scope.argv,scope)
+        stopped=scope.verify()
+        if journal is not None:result['input_write_observation']=journal.finish(stopped)
+    finally:
+        if journal is not None:journal.close()
+    guest_worker_receipts.append(stopped.observation())
+    return result
+
+ci_planner=None
+def execution_lease():
+    global ci_planner
+    if ci_planner is None:
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('guest_execution_lease','/ci-tools/ci-cargo-planner.py')
+        ci_planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(ci_planner)
+    return ci_planner.ExecutionLease(
+        private_cache/'ci-source-generations'/generation['binding']['generation']/'target',
+        generation['binding'],generation['command'],generation['predecessor'])
+
+
+def _run_execution(scope,lease,journal,field):
+    stopped=None;verification_attempted=False
+    try:
+        observed=_run_worker(scope.argv,scope)
+        verification_attempted=True;stopped=scope.verify()
+        writes=journal.finish(stopped)
+        guest_worker_receipts.append(stopped.observation())
+        if observed.get('exit_code')!=0:
+            raise ci_cache['FreshnessHold']('input_census_unknown',observed.get('stderr','').encode()[:8192])
+        try:
+            result=json.loads(observed['stdout'])
+            if (type(result) is not dict or set(result)!={'exit_code','stdout','stderr',field}
+                    or type(result['exit_code']) is not int or not 0<=result['exit_code']<=255
+                    or any(type(result[key]) is not str for key in ('stdout','stderr'))
+                    or type(result[field]) is not dict):raise ValueError()
+            result[field]['guest_worker_quiescence']=stopped.observation()
+        except (ValueError,KeyError,TypeError):raise ci_cache['FreshnessHold']('input_census_unknown') from None
+        invoked=field=='cargo_execution' or bool(result[field]['cargo_commands'])
+        result[field]['checkpoint']=lease.finish(scope,stopped,outputs=generation['outputs'],
+            invoked_cargo=invoked,producer_succeeded=result['exit_code']==0)
+        result['input_write_observation']=writes
+        return result
+    except BaseException:
+        if stopped is None and not verification_attempted:
+            # A failed transport/read still needs this same original scope's
+            # positive cleanup. Missing proof leaves the active claim held.
+            try:stopped=scope.verify()
+            except Exception:pass
+        if stopped is not None:lease.abandon_nonreusable(scope,stopped)
+        raise
+    finally:journal.close()
+
+
+def run_cargo_commands(commands,input_roots):
+    # This replaces the normal structured Cargo driver, not an extra replay.
+    # All candidate code still starts after planner/unit credential drops.
+    import tempfile,time
+    root=Path(tempfile.mkdtemp(prefix='ci-run-',dir='/tmp'));lease=execution_lease()
+    scope=ci_workers.controller_execution_scope(worker_control,{
+        'target':str(private_cache/'ci-source-generations'/generation['binding']['generation']/'target'),
+        'binding':generation['binding'],'command':generation['command'],'root':str(root),
+        'library':'/ci-tools/ci-cargo-planner.so','deadline':time.monotonic()+900,
+        'commands':commands,'environment':dict(environment),'cwd':'/workspace','execution_lease':lease.handle(),'generated_outputs':generation['outputs']})
+    lease.bind_scope(scope)
+    journal=ci_inputs.ChangeJournal(input_roots,scope=scope)
+    return _run_execution(scope,lease,journal,'cargo_execution')
+
+
+def run_repository_command(argv,input_roots):
+    import tempfile,time
+    root=Path(tempfile.mkdtemp(prefix='ci-repo-',dir='/tmp'));lease=execution_lease()
+    scope=ci_workers.controller_repository_scope(worker_control,{
+        'target':str(private_cache/'ci-source-generations'/generation['binding']['generation']/'target'),
+        'binding':generation['binding'],'command':generation['command'],'root':str(root),
+        'library':'/ci-tools/ci-cargo-planner.so','deadline':time.monotonic()+900,
+        'argv':argv,'environment':dict(environment),'cwd':'/workspace','execution_lease':lease.handle(),'generated_outputs':generation['outputs']})
+    lease.bind_scope(scope)
+    journal=ci_inputs.ChangeJournal(input_roots,scope=scope)
+    return _run_execution(scope,lease,journal,'repository_execution')
+
+
+SOURCE_ACCESS_PROBE=r"""
+import errno,json,os,stat,subprocess,sys
+head,role=sys.argv[1],int(sys.argv[2])
+assert os.geteuid()==role and os.getegid()==role
+environment={'PATH':'/usr/bin:/bin','GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null','GIT_OPTIONAL_LOCKS':'0'}
+def git(arguments):
+ result=subprocess.run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false',
+  '-c','safe.directory=/workspace','-C','/workspace',*arguments],env=environment,
+  stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=10)
+ assert result.returncode==0 and len(result.stdout)<=16*1024**2
+ return result.stdout
+assert git(['rev-parse','HEAD']).decode().strip()==head
+rows=git(['ls-tree','-rz','--full-tree',head]).split(b'\0')
+row=next(row for row in rows if row);metadata,name=row.split(b'\t',1)
+assert metadata.split()[0] in (b'100644',b'100755')
+path=b'/workspace/'+name
+descriptor=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+assert os.fstat(descriptor).st_uid==0;os.read(descriptor,1);os.close(descriptor)
+for destination,flags in [(path,os.O_WRONLY|os.O_NOFOLLOW|os.O_NONBLOCK),
+ (b'/workspace/.ci-source-write-probe',os.O_WRONLY|os.O_CREAT|os.O_EXCL)]:
+ try:descriptor=os.open(destination,flags,0o600)
+ except OSError as error:assert error.errno in (errno.EACCES,errno.EPERM,errno.EROFS)
+ else:os.close(descriptor);raise RuntimeError('immutable source is writable')
+print(json.dumps({'uid':role,'git_head':head,'read_only':True}))
+"""
+
+def verify_source_access(generation):
+    access=[]
+    for role in (1001,2000):
+        scope=ci_workers.WorkerScope(worker_control,role,role,
+            ['/usr/bin/python3','-I','-c',SOURCE_ACCESS_PROBE,generation['binding']['head'],str(role)])
+        result=_run_worker(scope.argv,scope)
+        stopped=scope.verify();observation=stopped.observation();guest_worker_receipts.append(observation)
+        try:value=json.loads(result.get('stdout',''))
+        except (ValueError,TypeError):value=None
+        if result.get('exit_code')!=0 or value!={'uid':role,'git_head':generation['binding']['head'],'read_only':True}:
+            raise ci_cache['FreshnessHold']('invalidation_unsafe')
+        access.append({'uid':role,'scope':observation})
+    return access
+
+def observe_phase(value):
+    global guest_stage
+    guest_stage=value
+
+try:
+    cache_reclaimed=[]
+    producer_reclaimed=[]
+    seed_reclaimed=[]
+    legacy_incremental_reclaimed=[]
+    legacy_incremental_diagnostic=(ci_cache['legacy_diagnostic'](job['ci_generation']['binding'],
+        job['ci_generation']['command'],allow_closed_links=True) if job.get('ci_generation') else None)
+    dependency_result=None
+    cache_preparation=None
+    source_projection=None
+    planner_protocol_probe=None
+    action=job.get('ci_dependency')
+    if job.get('ci_context') and job.get('build_cache'):
+        guest_stage='reclaim_legacy_incremental'
+        if os.geteuid()!=0 or guest_worker_receipts:raise ci_cache['FreshnessHold']('cleanup_uncertain')
+        legacy_incremental_reclaimed=ci_cache['reclaim_legacy_incremental']('/build-cache',
+            job['ci_generation']['binding'],job['ci_generation']['command'],uid,gid,
+            allow_closed_links=True,diagnostic=legacy_incremental_diagnostic)
+        guest_stage='reclaim_producers'
+        producer_reclaimed=ci_dependency.store.reclaim_producers('/build-cache',job['ci_generation']['retained_producers'],
+            cache_identity=job['ci_generation']['binding']['cache_identity_sha256'],eligible=job['ci_generation']['producer_retirements'])
+        guest_stage='reclaim_seeds'
+        seed_reclaimed=ci_dependency.store.reclaim_seeds('/build-cache',
+            cache_identity=job['ci_generation']['binding']['cache_identity_sha256'],
+            protected_seeds=[action['seed']] if action and action['kind']=='install' else [])
+    if action:
+        original=job['ci_generation']['binding']
+        seed_binding={key:original[key] for key in ('authority_sha256','cache_identity_sha256','contract_sha256','source_inputs_sha256')}
+        seed_binding.update(source_head=original['head'],dependency_inputs_sha256=action['dependency_inputs_sha256'])
+    threading.Thread(target=registry.serve_forever,daemon=True).start()
+    if action and action['kind']=='produce':
+        environment.pop('GIT_ALTERNATE_OBJECT_DIRECTORIES',None)
+        dependency_result=ci_dependency.produce(action,seed_binding,job['ci_generation']['command'],uid,gid,run_worker,bind_ci_cache,hide_ci_cache,observe_phase)
+        result={'exit_code':0,'stdout':'','stderr':''}
+    elif action and action['kind']=='publish':
+        guest_stage='publish_dependencies'
+        dependency_result=ci_dependency.publish(action,seed_binding)
+        result={'exit_code':0,'stdout':'','stderr':''}
+    elif action and action['kind']=='lookup':
+        dependency_result=ci_dependency.lookup(action,seed_binding)
+        result={'exit_code':0,'stdout':'','stderr':''}
+    else:
+      if job.get('build_cache'):
+        if job.get('ci_context'):
+            guest_stage='prepare_generation'
+            if os.geteuid()!=0:raise OSError('CI cache preparation requires the guest controller')
+            generation=job['ci_generation']
+            cache_reclaimed=ci_cache['reclaim']('/build-cache',generation['retained_generations'],uid,gid)
+            ci_cache['require_cache_capacity']('/build-cache')
+            ci_target=ci_cache['prepare']('/build-cache',generation['binding'],generation['command'],uid,gid,
+                predecessor=generation['predecessor'])
+            source_view=ci_cache['prepare_source_projection'](ci_target,Path('/workspace'),Path('/ci-git-objects'),
+                generation['binding'],generation['command'],generation['outputs'])
+            subprocess.run(['/usr/bin/mount','--bind',str(source_view),'/workspace'],check=True)
+            subprocess.run(['/usr/bin/mount','-o','remount,bind,ro,nosuid,nodev,noatime','/workspace'],check=True)
+            environment.pop('GIT_ALTERNATE_OBJECT_DIRECTORIES',None)
+            access=verify_source_access(generation)
+            source_projection=ci_cache['source_projection_observation'](ci_target,generation['binding'],generation['command'],access)
+            subprocess.run(['/usr/bin/mount','--bind',str(ci_target),'/workspace/target'],check=True)
+            output_mounts=ci_cache['prepare_outputs'](ci_target,generation['outputs'],uid,gid)
+            for relative,source in output_mounts.items():
+                subprocess.run(['/usr/bin/mount','--bind',str(source),str(Path('/workspace')/relative)],check=True)
+            seed_build_cache(ci_target)
+            ci_cache['require_cache_capacity'](ci_target)
+            if action and action['kind']=='install':
+                ci_cache['begin_seed_install'](ci_target,generation['binding'],action['seed'])
+                dependency_result=ci_dependency.install(action,seed_binding,ci_target,ci_target.parent/'cargo-home')
+                ci_cache['finish_seed_install'](ci_target,generation['binding'],action['seed'])
+            cache_preparation=ci_cache['preparation_receipt'](ci_target,generation['binding'],generation['command'],generation['outputs'])
+            private_cache=hide_ci_cache()
+            if job.get('planner_protocol_probe'):
+                guest_stage='planner_protocol_probe'
+                if uid!=1000 or gid!=1000:raise ci_cache['FreshnessHold']('invalidation_unsafe')
+                import tempfile,time,shutil
+                probe_root=Path(tempfile.mkdtemp(prefix='ci-plan-',dir='/tmp'))
+                scope=ci_workers.controller_probe_scope(worker_control,{
+                    'target':str(private_cache/'ci-source-generations'/generation['binding']['generation']/'target'),
+                    'binding':generation['binding'],'command':generation['command'],'root':str(probe_root),
+                    'library':'/ci-tools/ci-cargo-planner.so','deadline':time.monotonic()+120,
+                    'probe_kind':job.get('planner_probe_kind','full')})
+                observed=_run_worker(scope.argv,scope);stopped=scope.verify()
+                guest_worker_receipts.append(stopped.observation())
+                if observed.get('exit_code')!=0:
+                    probe_errno=71;probe_category='Unavailable'
+                    for line in observed.get('stderr','').splitlines():
+                        try:failure=json.loads(line)
+                        except ValueError:continue
+                        if type(failure) is dict and type(failure.get('planner_diagnostic')) is dict:
+                            guest_stage=failure['planner_diagnostic'].get('stage','planner_protocol_probe')
+                            probe_category=failure['planner_diagnostic'].get('category','Unavailable')
+                            number=failure['planner_diagnostic'].get('errno')
+                            probe_errno=number if type(number) is int and 1<=number<=4095 else 71
+                    failure=OSError(probe_errno,'private planner probe unavailable');failure.planner_category=probe_category
+                    raise failure
+                try:planner_protocol_probe=json.loads(observed['stdout'])
+                except (ValueError,KeyError):raise ci_cache['FreshnessHold']('input_census_unknown') from None
+                planner_protocol_probe['guest_worker_quiescence']=stopped.observation()
+                shutil.rmtree(probe_root)
+        else:
+            seed_build_cache()
+      guest_stage='execute_command'
+      roots=None
+      if job.get('ci_context') and job.get('ci_generation'):
+          roots={'output_'+str(index):Path('/workspace')/name for index,name in enumerate(sorted(job['ci_generation']['outputs']))}
+      if job.get('repository_execution'):result=run_repository_command(job['argv'],roots)
+      else:result=run_cargo_commands(job['cargo_execution'],roots) if job.get('cargo_execution') else run_worker(job['argv'],roots)
+    if job.get('ci_context'):
+        result['cache_reclaimed']=cache_reclaimed
+        result['producer_reclaimed']=producer_reclaimed
+        result['seed_reclaimed']=seed_reclaimed
+        result['legacy_incremental_reclaimed']=legacy_incremental_reclaimed
+        result['legacy_incremental_diagnostic']=legacy_incremental_diagnostic
+        result['guest_worker_quiescence']={'version':1,'kind':'ci-guest-command-quiescence',
+            'worker_free':True,'scopes':guest_worker_receipts,'shipping_authority':False}
+    if dependency_result is not None:result['dependency_result']=dependency_result
+    if cache_preparation is not None:result['cache_preparation']=cache_preparation
+    if source_projection is not None:result['source_projection']=source_projection
+    if planner_protocol_probe is not None:result['planner_protocol_probe']=planner_protocol_probe
+except Exception as error:
     import errno
     # copytree aggregates per-file failures into shutil.Error without an errno.
-    full=error.errno in (errno.ENOSPC,errno.EDQUOT) or 'No space left on device' in str(error)
-    result={'error':'VM build cache is full' if full else 'VM command could not start'}
+    hold_types=(ci_cache.get('FreshnessHold'),)+( (ci_planner.FreshnessHold,) if ci_planner is not None else () )+( (ci_dependency.FreshnessHold,) if ci_dependency is not None else () )+( (ci_workers.FreshnessHold,) if ci_workers is not None else () )+( (ci_inputs.FreshnessHold,) if ci_inputs is not None else () )
+    if job.get('ci_context') and isinstance(error,tuple(kind for kind in hold_types if kind is not None)):
+        result={'error':'CI source/cache freshness unavailable','freshness_hold':error.diagnostic()}
+    else:
+        full=getattr(error,'errno',None) in (errno.ENOSPC,errno.EDQUOT) or 'No space left on device' in str(error)
+        result={'error':'VM build cache is full' if full else 'VM command could not start',
+                'guest_diagnostic':{'stage':guest_stage,'category':getattr(error,'planner_category',type(error).__name__),'errno':getattr(error,'errno',None)}}
 path=Path('/root/control/outcome.json')
 with path.open('w') as receipt:
     os.chmod(path,0o600);json.dump(result,receipt);receipt.flush();os.fsync(receipt.fileno())
@@ -197,6 +534,19 @@ with path.open('w') as receipt:
 # not a 9p share: the guest's 9p client stores timestamps to the second, which
 # makes Cargo rebuild every dependency. The host never mounts the image.
 BUILD_CACHE_MOUNT = '/build-cache'
+
+
+def validate_result_shape(result,ci_context):
+    expected={'exit_code','stdout','stderr'}|({'cache_reclaimed','producer_reclaimed','seed_reclaimed','legacy_incremental_reclaimed','legacy_incremental_diagnostic','guest_worker_quiescence'} if ci_context is not None else set())
+    if ci_context is not None and ci_context.get('dependency_action') is not None:expected.add('dependency_result')
+    if ci_context is not None:
+        for field in ('cache_preparation','input_write_observation','source_projection'):
+            if field in result:expected.add(field)
+        if ci_context.get('planner_protocol_probe') is True and 'planner_protocol_probe' in result:expected.add('planner_protocol_probe')
+        if ci_context.get('cargo_execution') is not None:expected.add('cargo_execution')
+        if ci_context.get('repository_execution') is True:expected.add('repository_execution')
+    if set(result)!=expected or type(result['exit_code']) is not int:
+        raise Unavailable('invalid VM result')
 
 
 def qemu_command(config, image, shares, build_cache):
@@ -298,9 +648,49 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
                 raise Unavailable('npm dependency mount traverses a non-directory or symlink')
         if not source.is_absolute() or source.resolve() != source or not source.is_dir():
             raise Unavailable('invalid read-only npm dependency directory')
+    auxiliary_dependency=False
     if ci_context is not None:
-        if set(ci_context)!={'state','git_objects','runner','contract'}:
+        base_keys={'state','git_objects','runner','contract','cache_program','generation','worker_programs'}
+        probe=ci_context.get('planner_protocol_probe',False)
+        execution=ci_context.get('cargo_execution');repository=ci_context.get('repository_execution',False)
+        if type(repository) is not bool or repository and (probe or execution is not None):raise Unavailable('invalid internal repository mode')
+        if type(probe) is not bool or probe and execution is not None:raise Unavailable('invalid internal planner mode')
+        planner_keys={'planner_programs'} if probe or execution is not None or repository else set()
+        if probe:
+            planner_keys.add('planner_protocol_probe')
+            if 'planner_probe_kind' in ci_context:planner_keys.add('planner_probe_kind')
+        probe_kind=ci_context.get('planner_probe_kind','full')
+        if probe_kind not in ('full','relay-exec-policy') or probe_kind!='full' and not probe:
+            raise Unavailable('invalid internal planner probe kind')
+        if repository:
+            planner_keys.add('repository_execution')
+        if execution is not None:
+            planner_keys.add('cargo_execution')
+            if (type(execution) is not list or not 1<=len(execution)<=2
+                    or any(type(argv) is not list or not 2<=len(argv)<=4096 or argv[0]!='/toolchain/bin/cargo'
+                        or any(type(arg) is not str or not arg or '\0' in arg or len(arg)>65536 for arg in argv) for argv in execution)
+                    ):raise Unavailable('invalid structured Cargo execution')
+        if set(ci_context) not in (base_keys|planner_keys,base_keys|planner_keys|{'dependency_programs','dependency_action'}):
             raise Unavailable('invalid controller CI context')
+        if probe or execution is not None or repository:
+            programs=ci_context['planner_programs']
+            if (not isinstance(programs,dict) or set(programs)!={'ci-cargo-planner.py','ci-cargo-relay.py',
+                    'ci-cargo-staging.py','ci-cargo-views.py','ci-cargo-observer.py','ci-lookup-inputs.py','ci-cargo-planner.so','ci-cargo-unit-policy.so'}
+                    or any(not isinstance(data,bytes) or not 0<len(data)<=2*1024*1024 for data in programs.values())):
+                raise Unavailable('invalid measured planner probe bundle')
+        dependency=ci_context.get('dependency_action')
+        programs=ci_context['worker_programs']
+        if (not isinstance(programs,dict) or set(programs)!={'provider-supervisor.py','ci-worker-scope.py','ci-input-manifest.py'}
+                or any(not isinstance(data,bytes) or not 0<len(data)<=2*1024*1024 for data in programs.values())):
+            raise Unavailable('invalid worker controller bundle')
+        if dependency is not None and not isinstance(dependency,dict):raise Unavailable('invalid dependency action')
+        auxiliary_dependency=dependency is not None and dependency.get('kind') in ('produce','publish','lookup')
+        if 'dependency_programs' in ci_context:
+            programs=ci_context.get('dependency_programs')
+            expected={'ci-cache-generation.py','ci-cargo-boundary.py','ci-dependency-seed.py','ci-dependency-artifacts.py','ci-dependency-workspace.py',
+                      'ci-dependency-store.py','ci-dependency-driver.py','ci-dependency-guest.py'}
+            if not isinstance(programs,dict) or set(programs)!=expected or any(not isinstance(data,bytes) or not 0<len(data)<=2*1024*1024 for data in programs.values()):
+                raise Unavailable('invalid dependency controller bundle')
         for key in ('state','git_objects'):
             path=Path(ci_context[key]);info=path.lstat()
             if (not path.is_absolute() or path.resolve()!=path or not stat.S_ISDIR(info.st_mode)
@@ -308,7 +698,7 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
                     or workspace.is_relative_to(path)):
                 raise Unavailable('CI state and Git objects require separate owned directories')
             if key=='state' and info.st_mode&0o077:raise Unavailable('CI state is not private')
-        for key in ('runner','contract'):
+        for key in ('runner','contract','cache_program'):
             if not isinstance(ci_context[key],bytes) or not 0<len(ci_context[key])<=2*1024*1024:
                 raise Unavailable('invalid controller CI bundle')
     config = runtime.config
@@ -352,19 +742,32 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
             entries.append((name, stat.S_IFREG | 0o600, Path(path).read_bytes(), 0, 0))
             module_commands.append(f'insmod /{name} || poweroff -f')
         dependency_mounts = []
-        shares = [('runtime', Path('/usr'), True), ('workspace', workspace, False), ('control', control, False)]
+        shares = [('runtime', Path('/usr'), True), ('workspace', workspace, ci_context is not None), ('control', control, False)]
         if ci_context is not None:
             entries.extend((name,stat.S_IFDIR|0o755,b'',0,0) for name in ('ci-runtime','ci-git-objects','ci-tools'))
             entries.extend([('ci-tools/runner.py',stat.S_IFREG|0o444,ci_context['runner'],0,0),
-                            ('ci-tools/contract.json',stat.S_IFREG|0o444,ci_context['contract'],0,0)])
-            shares.extend([('ci_runtime',Path(ci_context['state']),False),('ci_objects',Path(ci_context['git_objects']),True)])
-            dependency_mounts.extend([
-                'mount -t 9p -o trans=virtio,version=9p2000.L,nosuid,nodev ci_runtime /ci-runtime || poweroff -f',
-                'mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev ci_objects /ci-git-objects || poweroff -f'])
+                            ('ci-tools/contract.json',stat.S_IFREG|0o444,ci_context['contract'],0,0),
+                            ('ci-tools/cache-generation.py',stat.S_IFREG|0o444,ci_context['cache_program'],0,0),
+                            ('ci-tools/ci-cache-generation.py',stat.S_IFREG|0o444,ci_context['cache_program'],0,0)])
+            for name,data in ci_context['worker_programs'].items():
+                entries.append(('ci-tools/'+name,stat.S_IFREG|0o444,data,0,0))
+            for name,data in ci_context.get('planner_programs',{}).items():
+                entries.append(('ci-tools/'+name,stat.S_IFREG|0o444,data,0,0))
+            for name,data in ci_context.get('dependency_programs',{}).items():
+                if name=='ci-cache-generation.py':
+                    if data!=ci_context['cache_program']:raise Unavailable('contradictory cache controller bundle')
+                    continue
+                entries.append(('ci-tools/'+name,stat.S_IFREG|0o444,data,0,0))
+            if not auxiliary_dependency:
+                shares.extend([('ci_runtime',Path(ci_context['state']),False),('ci_objects',Path(ci_context['git_objects']),True)])
+                dependency_mounts.extend([
+                    'mount -t 9p -o trans=virtio,version=9p2000.L,nosuid,nodev ci_runtime /ci-runtime || poweroff -f',
+                    'mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev ci_objects /ci-git-objects || poweroff -f'])
         if build_cache is not None:
             dependency_mounts.append(f'/bootstrap/busybox mkdir -p {BUILD_CACHE_MOUNT} || poweroff -f')
             dependency_mounts.append(f'mount -t ext4 -o nosuid,nodev,discard /dev/vda {BUILD_CACHE_MOUNT} || poweroff -f')
         for key, destination in [('toolchain', '/toolchain'), ('registry', '/cargo/registry'), ('cargo_git', '/cargo/git'), ('ort_cache', '/ort-cache')]:
+            if auxiliary_dependency and key=='cargo_git':continue
             if key in config:
                 shares.append((key, Path(config[key]), True))
                 dependency_mounts.append(f'mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev {key} {destination} || poweroff -f')
@@ -382,18 +785,25 @@ mount -t sysfs sysfs /sys
 ip link set lo up
 ''' + '\n'.join(module_commands) + '''
 mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev runtime /usr || poweroff -f
-mount -t 9p -o trans=virtio,version=9p2000.L,nosuid,nodev workspace /workspace || poweroff -f
+mount -t 9p -o trans=virtio,version=9p2000.L,''' + ('ro,' if ci_context is not None else '') + '''nosuid,nodev workspace /workspace || poweroff -f
 mount -t 9p -o trans=virtio,version=9p2000.L,nosuid,nodev,noexec control /root/control || poweroff -f
 ''' + '\n'.join(dependency_mounts) + '''
 /usr/bin/python3 -I /guest.py
 /bootstrap/busybox sync
 /bootstrap/busybox umount /build-cache 2>/dev/null
+/bootstrap/busybox umount /root/managed-ci-cache 2>/dev/null
 poweroff -f
 '''
         entries.extend([('init', stat.S_IFREG | 0o755, boot.encode(), 0, 0),
             ('guest.py', stat.S_IFREG | 0o400, GUEST_RUNNER.encode(), 0, 0),
             ('job.json', stat.S_IFREG | 0o400, json.dumps({'argv': argv, 'environment': environment,
                 'uid': os.getuid(), 'gid': os.getgid(), 'build_cache': build_cache is not None,'ci_context':ci_context is not None,
+                'ci_generation':ci_context['generation'] if ci_context is not None else None,
+                'ci_dependency':ci_context.get('dependency_action') if ci_context is not None else None,
+                'planner_protocol_probe':ci_context.get('planner_protocol_probe',False) if ci_context is not None else False,
+                'planner_probe_kind':ci_context.get('planner_probe_kind','full') if ci_context is not None else 'full',
+                'cargo_execution':ci_context.get('cargo_execution') if ci_context is not None else None,
+                'repository_execution':ci_context.get('repository_execution',False) if ci_context is not None else False,
                 'ort_cache':'ort_cache' in config}).encode(), 0, 0)])
         image = private / 'initrd.gz'; image.write_bytes(initrd(entries))
         command = qemu_command(config, image, shares, build_cache)
@@ -430,11 +840,40 @@ poweroff -f
                 except (OSError, ValueError) as exc:
                     raise Unavailable('VM did not produce a trusted command result') from exc
                 if 'error' in result:
+                    if ci_context is not None and set(result)=={'error','freshness_hold'}:
+                        # The CI adapter validates this bounded diagnostic.
+                        # Controller bundle programs execute only in the guest.
+                        raise FreshnessUnavailable(result['freshness_hold'])
+                    if ci_context is not None and set(result)=={'error','guest_diagnostic'}:
+                        raise GuestUnavailable(result['guest_diagnostic'])
                     raise Unavailable(result['error'])
                 if download_info is not None:
                     download_info.update(requests=broker.requests, bytes=broker.bytes)
-                if set(result) != {'exit_code', 'stdout', 'stderr'} or type(result['exit_code']) is not int:
-                    raise Unavailable('invalid VM result')
+                validate_result_shape(result,ci_context)
+                if ci_context is not None:
+                    legacy=result['legacy_incremental_reclaimed']
+                    if (not isinstance(legacy,list) or len(legacy)>32
+                            or any(not isinstance(value,str) or re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',value) is None for value in legacy)
+                            or len(set(legacy))!=len(legacy)):
+                        raise Unavailable('invalid CI legacy incremental cleanup receipt')
+                    seeds=result['seed_reclaimed']
+                    action=ci_context.get('dependency_action')
+                    protected_seed=action.get('seed') if action and action.get('kind')=='install' else None
+                    if (not isinstance(seeds,list) or len(seeds)>2
+                            or any(not isinstance(value,str) or re.fullmatch(r'[0-9a-f]{64}',value) is None
+                                or value==protected_seed for value in seeds) or len(set(seeds))!=len(seeds)):
+                        raise Unavailable('invalid CI seed cleanup receipt')
+                    producer_reclaimed=result['producer_reclaimed']
+                    protected=(ci_context.get('generation') or {}).get('retained_producers',[])
+                    if (not isinstance(producer_reclaimed,list) or len(producer_reclaimed)>2
+                            or any(not isinstance(value,str) or re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',value) is None or value in protected for value in producer_reclaimed)
+                            or len(set(producer_reclaimed))!=len(producer_reclaimed)):
+                        raise Unavailable('invalid CI producer cleanup receipt')
+                    reclaimed=result['cache_reclaimed']
+                    if (not isinstance(reclaimed,list) or len(reclaimed)>2
+                            or any(not isinstance(value,str) or re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',value) is None for value in reclaimed)
+                            or len(set(reclaimed))!=len(reclaimed)):
+                        raise Unavailable('invalid CI cache cleanup receipt')
                 return result
             finally:
                 if process.poll() is None:

@@ -157,6 +157,213 @@ A `cargo`, `npm` or `npx` command with no explicit `timeout` gets
 call runs), passed as `build_timeout_secs` and capped at the tool maximum of
 900 s. Other commands default to 120 s. An explicit timeout is honoured.
 
+### Shared CI input capture (#1807)
+
+Inactive external dependency producer payloads have a separate retirement path
+inside the admitted cache image. The original host session must release its
+source lifetime and supply its original verified producer acknowledgement.
+Another session's unprotected producer is not eligible merely because its ID is
+absent from the current session. Cleanup removes at most two eligible producers
+per command. It records original control/publication metadata and retirement
+authorization durably before deletion, and can resume a committed interrupted
+retirement under normal storage admission. The physical cache must still match.
+Published seeds and installed hard links remain intact during producer cleanup.
+Unknown ownership is preserved; recovery of unreleased producers across process
+death remains unfinished.
+
+Before workers start, the same admitted controller can reclaim at most two
+orphaned published seeds. It inventories all current indexes, allocated source
+generations and producer controls, and protects the current installation request.
+An absent producer alone is insufficient: reclamation requires its original
+completed retirement and matching publication/host acknowledgement. The existing
+storage lease remains held across seed lookup and consumption. Current indexed
+seeds and installed generations stay warm. Unknown references, extra files,
+symlinks, foreign cache identities and incomplete inventories retain the payload.
+An original manifest is committed before unlinking; interrupted deletion resumes
+only from that matching private intent. Host audit records the reclaimed seed
+identities after original VM quiescence. This bounds orphan cleanup per command;
+global retention across distinct current dependency indexes and bounded history
+retention remain unfinished. This is not recovery of the full legacy image.
+
+Shared CI runs each worker command through the existing descendant supervisor
+inside the guest. The controller retains its cleanup receipt under the guest's
+private `/root/ci-worker-control`, outside the worker's writable mounts. It
+requires a stopped supervisor and a valid receipt before capturing generated
+inputs. Detached children are stopped and reaped before capture. The host still
+requires its separate whole-VM quiescence and storage-settlement evidence.
+
+The controller starts a bounded write journal before launching that worker and
+records content/mode snapshots of declared generated directories and files.
+Restoring earlier bytes or timestamps does not hide an observed write. A bound
+journal cannot finish with another worker scope's cleanup receipt. Internal
+aliases may resolve only through declared namespaces; escaped, cyclic, special,
+lost-watch and overflowed observations remain typed prerequisites. Reads alone
+do not invalidate the observation.
+
+These observations are partial evidence. They do not establish complete compiler
+inputs inside build outputs, artifact provenance or compatible-unit invalidation.
+The current local-completion producer remains `preparation_only`, with
+`reusable_passing_proof: false`. A passing local command or input observation
+does not authorize merge; final proof publication and merge enforcement remain
+separate required work.
+
+### Candidate protected Cargo planner (#1807, not enabled)
+
+The [planner proposal](ci-cargo-planner.md) records the actual guest request and
+fingerprint observations, proposed unit identity/cleanup rules and the remaining
+blocking questions. It does not enable the mode or hand off a final C contract.
+
+This is a candidate mechanism under interrogation. The capability probe and an unprivileged native exec-denial primitive are
+implemented; protected Cargo execution, artifact invalidation and the final
+passing-proof producer are not. This section does not authorize a rollout or a
+consumer handoff. All #1807 D1–D8 requirements, including compatible-unit reuse,
+remain binding. C owns resolving the open threads below before implementation
+acceptance. An unsupported premise rejects the candidate; it is not permission
+to change the operator's toolchain channel, provider grant or VM restrictions.
+
+1. **Protect the planner's metadata.** The pinned Cargo executable would run under
+   a dedicated non-root planner credential inside the existing VM, distinct from
+   both the controller and application credentials, with its fingerprint metadata
+   inaccessible to application workers. Build scripts, procedural macros,
+   wrappers, linkers, plugins and tests must execute without that privilege.
+   An application-written Cargo fingerprint or dep-info file is not a reuse
+   authority. Only independently protected producer records may support reuse.
+2. **Prevent application execution under the planner credential.** The current
+   prototype direction is a controller-embedded native gate denying the planner's
+   direct exec calls, with tool execution delegated to a controller relay under a
+   separate unprivileged credential. A preload adapter may translate the pinned
+   Cargo/std-library spawn interfaces to that relay; the kernel denial remains
+   mandatory if interposition misses a call. A same-UID interface experiment now
+   exercises that delegation; the protected relay, credential transition and
+   production loader protocol remain unimplemented and unaccepted. Unsupported ABI,
+   missing listener, ambiguous caller identity or unknown executable must refuse.
+   A capability observation establishes none of this enforcement. Application
+   environment/arguments cannot select the launcher, credentials or gate policy.
+3. **Close each producer's inputs and outputs.** Before compilation, expose the
+   original read-only Git source, frozen declared generated inputs, trusted
+   dependency artifacts and the pinned runtime. Separate producer credentials
+   and private output paths must prevent other workers from modifying an active
+   producer or its result. Capture build-script outputs before dependent rustc
+   invocations. Publish and seal a unit only after its descendants are stopped
+   through the existing guest supervisor. Whole-VM host quiescence and managed
+   storage admission remain independently required; this is not a second host
+   storage fence.
+4. **Invalidate from protected content identities.** Bind a unit to package,
+   Rust target/build-script, target triple, profile, feature/cfg/test mode, flags,
+   runtime/toolchain and its complete input closure. Use protected Cargo graph
+   data and producer records to invalidate changed units and transitive outputs,
+   including build-script execution state. Pure compiler units need precise
+   inputs so unrelated generated files do not force recompilation. Native or
+   otherwise opaque producers need an explicit complete visible-input closure;
+   a candidate-supplied dependency hint cannot make it smaller. Unknown formats
+   or incomplete closure must return a typed prerequisite. Every unchanged
+   compatible unit must remain reusable, and cross-generation external reuse
+   still requires the existing independently produced, sealed seed.
+5. **Keep one evidence chain.** Private planner/unit records belong to the owned
+   source generation and physical managed image. They are inputs to C's existing
+   proof contract, not another workflow binding or CI verdict. Crashes cannot
+   promote incomplete records. Source-generation reconstruction, changed
+   authority and unknown ownership retain the existing refusal/recovery rules.
+   Final proof publication still requires complete local coverage, original
+   bindings, input provenance and guest/host cleanup evidence. V/M/baseline
+   integration and the D7 rollout/storage-enforcement requirements remain open.
+
+Load-bearing open threads (owner C; each blocks production privilege activation and final
+proof publication): the precise launcher/listener credential and loader protocol;
+the protected graph/unit record schema and opaque-input closure rule that meets
+D8; frozen generated-input and build-output provenance; and bounded/crash-safe
+artifact retention using R's existing admission/quiescence. None is an accepted
+weaker alternative or a new product requirement.
+
+The first fresh-reader audit identified six unresolved implementation choices:
+the trusted graph/input interface, execution/loader protocol, unit-scoped cleanup
+bindings, generated-output publication, unreleased-owner recovery, and exact
+unit-to-suite proof/API mapping. All remain blockers, not accepted guesses.
+Unit cleanup must have its own producer identity and evidence before dependent
+compilation; command cleanup and whole-VM cleanup cannot substitute for it.
+C must define those bindings using the existing supervisor, and coordinate
+durable owner recovery with R/#1676/#1803. The next safely admitted attempt must
+recover known interrupted state without manual fence deletion. C must also
+publish the exact unit-to-suite mapping with the single D7 schema/API before
+consumer handoff. This audit does not establish implementation readiness.
+
+The existing descendant supervisor now accepts explicit internal `forward_fds`
+and `close_after_spawn` tuples for a relay experiment. It forwards jobserver
+pipes and releases its copy of an exec-start pipe immediately after dispatch,
+so Rust can drain captured output before the tool exits. Post-spawn errors stay
+inside the original descendant cleanup guard. Storage lease descriptors cannot
+be released through this interface. Real subprocess regressions cover large
+captured output, exit status, invalid descriptors, storage retention and an
+injected post-spawn failure with a detached child. The ordinary Linux CLI suite
+runs these cases. No command-line/environment switch enables this interface,
+and it establishes no planner credential or artifact isolation.
+
+The interface experiment in `ci-cargo-relay.py` refuses root and uses a private
+0700 Unix socket directory, same-UID peer credentials and an immutable nonce-bearing
+configuration memfd. Its separate preload library installs the existing
+deny-exec filter before main. Hooks translate `execv`/`execve`/`execvp`/`execvpe`
+and supported `posix_spawn` calls into bounded requests. The Rust fixture proved
+that returning ENOSYS from `posix_spawn` does not establish an `execvp` fallback;
+the adapter therefore implements the observed spawn path. It records supported
+close/dup/chdir/fchdir actions through their public APIs and forks a proxy that
+releases its exec-start pipe only after the delegated tool's launch handshake.
+Other actions and non-default process-group/scheduling/credential attributes
+refuse. There is no unchecked native execution fallback.
+
+Prototype wire format (little-endian, not C's passing-proof schema): the sealed
+160-byte configuration contains `JARVCFG2`, UID/PID/timeout, a 32-byte nonce and
+a 108-byte socket path. A 300-byte `JARVREQ2` frame carries the nonce and at most
+64 original descriptor numbers; SCM_RIGHTS carries a sealed argument memfd,
+stdio and inheritable FIFO descriptors. The `JARVARG2` memfd's 36-byte header contains flags,
+argument/environment counts and the original ignored-signal/blocked-mask bits,
+followed by length-prefixed file/cwd/search-path/argv/env
+bytes, bounded to 8 MiB, 4096 entries and 1 MiB per string. Unknown inheritable
+regular/socket descriptors refuse. `JARVRSP2` start/finish/error/signaled frames are
+16 bytes. Each tool runs through the original supervisor. The endpoint bounds
+concurrency to four, requests to 4096 and each declared tool deadline to at most
+60 seconds; uncertain cleanup retains a failing state and never publishes a
+passing receipt. Tool environment bytes are applied only by the unprivileged
+exec bootstrap, after removing this experiment's preload/control selector.
+
+The original supervisor supplies a pidfd for its actual child through a private
+control socket, before the exec-start acknowledgement can complete. That socket
+is never inherited by the tool. Asynchronous `JARVSIG2` frames route signal
+numbers to that pidfd, with a 4096-message bound and strict descriptor refusal.
+The tool receives its requested initial mask and ignored dispositions. The proxy
+catches signals even when initially blocked or ignored, so a tool can later
+install a handler or change its own mask. Synchronous proxy faults fail rather
+than masquerading as tool signals. The supervisor's internal raw-status option
+returns the actual wait status only after descendant cleanup; ordinary provider
+callers retain their shell-style codes. A private status carrier checked against
+the supervisor exit distinguishes signal termination from ordinary exit 143.
+The native proxy reproduces a terminating signal after the original cleanup.
+Disconnect/timeout cancellation sends TERM once and waits, avoiding a second
+signal racing the supervisor's committed status during interpreter teardown.
+
+This is not the accepted planner execution protocol. In particular, queued
+signal-info payloads, complete job-control/process-group behavior and other
+semantics beyond the tested cases, complete ABI/loader
+coverage, separate credentials, immutable per-unit inputs/output publication,
+graph-based invalidation and final suite-proof binding remain open. The endpoint
+reports metadata isolation and shipping authority as false. No production
+launcher, merge consumer or final C schema uses it.
+
+Disposable boundary tests may exercise a specified gate under the existing VM
+admission before production activation. They must never fall back to unchecked
+privileged execution or create a reusable CI/merge proof. Unsupported capability
+observations remain observations; they cannot authorize those tests' privileged
+transitions. The credential/loader protocol and fail-closed gate must be resolved
+and verified before any experimental privileged Cargo invocation.
+
+Testable build order: query the real guest's kernel ABI and Cargo loader without
+granting execution authority; prove denial of direct/bypassed privileged exec,
+listener loss, loader/environment substitution and credential recovery; then
+prove metadata/artifact isolation against real build scripts/macros/tests. Run
+the existing generated-input `OLD`→`NEW`, compile-error/assertion, mutation/revert,
+feature/configuration and exact compiler-call reuse cases through the actual VM.
+Only then finalize and freshly audit the C mechanism/schema before consumer
+handoff. No step here is a passing CI or autonomous-merge claim.
+
 ### Host provisioning: KVM access that survives logout (operator step)
 
 On desktop hosts `/dev/kvm` is usually `root:kvm 0660` plus a logind `uaccess`
@@ -282,7 +489,7 @@ export JARVIS_TEST_VM_CONFIG="$HOME/.local/share/augmentagent/build-vm/runtime.j
 export JARVIS_TEST_BUILD_SCRATCH=/mnt/build/codex-vm   # an existing 0700 directory
 python3 scripts/tests/codex_build_vm_test.py
 python3 scripts/tests/codex_tool_bridge_test.py
-cargo test -p augmentagent-channel-core live_codex_builds_and_tests_with_the_vm_bridge --lib -- --ignored
+./scripts/cargo-managed.sh test -p augmentagent-channel-core live_codex_builds_and_tests_with_the_vm_bridge --lib -- --ignored
 ```
 
 The last command needs working Codex authentication and uses the daemon's default
