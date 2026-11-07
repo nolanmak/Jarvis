@@ -466,7 +466,14 @@ proofs and parent resume. Trigger is before any production vfork continuation or
 final-C grant; carrying cost is a new measured native asset and fixed input ABI,
 with no execution permission or durable grant added here. Root-role integration
 and the unchanged compiler/worker/generated-publication regressions remain
-mandatory. Do not turn component conformance into an original fixture pass.
+mandatory. Do not turn component conformance into an original fixture pass. At `4c437b27`,
+all nine component cases passed on the declared guest kernel in 90.67 seconds,
+with the exact embedded static image hash matched and the original host VM
+resource subtree verified removed. All 717 host Python checks and 38 focused
+Rust checks passed, including the nine mandatory component cases and original
+relay regressions. These are same-UID wire/descriptor/signal conformance results;
+root-role admission and native handoff remain unproved. See
+[component evidence](ci-v3-status-component-proof.json).
 
 ### O3. Freeze before capturing a live parent's input
 

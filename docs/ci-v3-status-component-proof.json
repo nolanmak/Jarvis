@@ -53,7 +53,42 @@
     "agent": "ci_status_component_spec_audit_20261107",
     "result": "No substantiated findings in this bounded component contract; full mechanism remains unfinished."
   },
-  "vm": null,
+  "vm": {
+    "source_head": "4c437b276998178462072a57f6281a7b8aa10b2d",
+    "exit_code": 0,
+    "seconds": 90.67,
+    "result": "passed_component_conformance_only",
+    "result_file": "/tmp/autoship-1703-ci-v3-status-component-result-20261107.json",
+    "log": "/tmp/autoship-ci-v3-status-component-vm-20261107.log",
+    "audit": "/tmp/autoship-ci-v3-status-component-audit-20261107.json",
+    "host_resource_removed_empty_subtree": true,
+    "receipt": {
+      "actual_vm_commands": 1,
+      "autonomous_merges_claimed": 0,
+      "cases": {
+        "client_gid": 1000,
+        "client_uid": 1000,
+        "component_sha256": "7263938a2a65e48e3832cf52928f6ac300f6613c73278101b80a6a5a7ac6b951",
+        "errors": 0,
+        "failed": 0,
+        "full_ci_pass": false,
+        "native_handoff_integrated": false,
+        "root_role_admission_proved": false,
+        "run": 9,
+        "shipping_authority": false,
+        "skipped": 0,
+        "successful": true
+      },
+      "full_ci_pass": false,
+      "generation": "60115bb1-3a91-4cfc-9453-d0796d7ac3a8",
+      "head": "8ca115d364fcd19e44779a17b41a1faa30699dc9",
+      "input_closure_complete": false,
+      "kind": "real_shared_ci_v3_status_component",
+      "shipping_authority": false,
+      "status": "passed",
+      "version": 1
+    }
+  },
   "component_implemented": true,
   "runtime_root_role_policy_changed": false,
   "root_role_admission_proved": false,
