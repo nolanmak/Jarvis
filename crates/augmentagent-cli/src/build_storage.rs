@@ -698,8 +698,25 @@ pub async fn run_command(target: &Path, command: &[String], lease: Option<&Lease
         .env("CARGO_PROFILE_TEST_DEBUG", "0")
         .kill_on_drop(true)
         .process_group(0);
+    // These are real dup/fork-inherited open descriptions, never path reopens.
+    // Keep them alive until wait/cancellation has dropped this command. Trusted
+    // VM brokers can pass this same set through their supervisor to QEMU.
+    let inherited_files=lease.map(Lease::inherited_files).transpose()?.unwrap_or_default();
     if let Some(lease) = lease {
         process.env(PARENT_LEASE_ENV, lease.parent_proof(target)?);
+        let descriptors:Vec<_>=inherited_files.iter().map(AsRawFd::as_raw_fd).collect();
+        let first=descriptors.first().context("managed command storage descriptor missing")?;
+        process.env("JARVIS_STORAGE_LEASE_FD",first.to_string())
+            .env("JARVIS_STORAGE_LEASE_FDS",descriptors.iter().map(ToString::to_string).collect::<Vec<_>>().join(","));
+        unsafe {process.pre_exec(move || {
+            for fd in &descriptors {
+                let flags=libc::fcntl(*fd,libc::F_GETFD);
+                if flags<0 || libc::fcntl(*fd,libc::F_SETFD,flags & !libc::FD_CLOEXEC)<0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });}
     }
     let mut child = process.spawn()?;
     struct Group(u32);
@@ -1891,6 +1908,72 @@ mod inherited_ci_storage_tests {
         std::os::unix::fs::symlink(&target, state.path().join("disk-update.lock")).unwrap();
         assert!(ci_update_exclusion(state.path()).is_err());
         assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");
+    }
+
+    #[tokio::test]
+    async fn failed_managed_spawn_releases_exported_storage_descriptions() {
+        let state=tempfile::tempdir().unwrap();let cache=tempfile::tempdir().unwrap();
+        let mut lease=Lease::try_at(state.path()).unwrap().unwrap();
+        lease.ci_update_exclusion=Some(ci_update_exclusion(state.path()).unwrap());
+        lease.protect_targets(&[cache.path().to_owned()]).await.unwrap();
+        let missing=cache.path().join("missing-command").to_str().unwrap().to_owned();
+        assert!(run_command(cache.path(),&[missing],Some(&lease),false).await.is_err());
+        drop(lease);
+        assert!(Lease::try_at(state.path()).unwrap().is_some(),"failed spawn leaked global exclusion");
+        assert!(ci_update_exclusion(state.path()).is_ok(),"failed spawn leaked updater exclusion");
+        assert!(crate::storage_leases::TargetLeases::try_directory(cache.path()).unwrap().is_some(),"failed spawn leaked target exclusion");
+    }
+
+    #[tokio::test]
+    async fn managed_command_exports_leases_before_manager_cancellation() {
+        let state=tempfile::tempdir().unwrap();let cache=tempfile::tempdir().unwrap();
+        let mut lease=Lease::try_at(state.path()).unwrap().unwrap();
+        lease.ci_update_exclusion=Some(ci_update_exclusion(state.path()).unwrap());
+        lease.protect_targets(&[cache.path().to_owned()]).await.unwrap();
+        let ready=cache.path().join("descendant-ready");let stop=cache.path().join("stop-descendant");
+        struct Stop(PathBuf);
+        impl Drop for Stop {fn drop(&mut self) {let _=std::fs::write(&self.0,b"stop");}}
+        let _stop=Stop(stop.clone());
+        let code=r#"
+import os,sys,time
+from pathlib import Path
+ready,stop=map(Path,sys.argv[1:])
+fds=[int(value) for value in os.environ.get('JARVIS_STORAGE_LEASE_FDS','').split(',') if value]
+if len(fds)<4:
+    ready.write_text('missing exported storage descriptors')
+    raise SystemExit(86)
+assert os.environ.get('JARVIS_STORAGE_LEASE_FD')==str(fds[0])
+for fd in fds: os.fstat(fd)
+if os.fork()==0:
+    os.setsid()
+    ready.write_text(str(os.getpid()))
+    deadline=time.monotonic()+15
+    while not stop.exists() and time.monotonic()<deadline: time.sleep(0.005)
+    os._exit(0)
+while True: time.sleep(1)
+"#;
+        let command=vec!["/usr/bin/python3".into(),"-I".into(),"-c".into(),code.into(),ready.to_str().unwrap().into(),stop.to_str().unwrap().into()];
+        let target=cache.path().to_path_buf();
+        let task=tokio::spawn(async move {run_command(&target,&command,Some(&lease),false).await});
+        let deadline=std::time::Instant::now()+Duration::from_secs(5);
+        while !ready.exists() && !task.is_finished() && std::time::Instant::now()<deadline {tokio::time::sleep(Duration::from_millis(5)).await;}
+        let actual=std::fs::read_to_string(&ready).unwrap_or_else(|_|"no ready child".into());
+        task.abort();let _=task.await;
+        assert!(actual.parse::<u32>().is_ok(),"actual managed command did not receive its storage descriptors: {actual}");
+        assert!(Lease::try_at(state.path()).unwrap().is_none(),"manager cancellation released the descendant's global exclusion");
+        assert!(ci_update_exclusion(state.path()).is_err(),"manager cancellation released the descendant's updater exclusion");
+        assert!(crate::storage_leases::TargetLeases::try_directory(cache.path()).unwrap().is_none(),"manager cancellation released the descendant's physical target");
+        std::fs::write(&stop,b"stop").unwrap();
+        let deadline=std::time::Instant::now()+Duration::from_secs(5);
+        loop {
+            if let Some(lease)=Lease::try_at(state.path()).unwrap() {
+                assert!(ci_update_exclusion(state.path()).is_ok());
+                assert!(crate::storage_leases::TargetLeases::try_directory(cache.path()).unwrap().is_some());
+                drop(lease);break;
+            }
+            assert!(std::time::Instant::now()<deadline,"original descendant did not release storage after stopping");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     #[tokio::test]

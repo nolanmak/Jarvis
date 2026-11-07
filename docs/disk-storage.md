@@ -50,6 +50,13 @@ their private scratch-image ownership and aggregate growth reservations; they
 check the configured admission/free-space floor before and during execution.
 The bridge, descendant supervisor, and QEMU share the locked descriptor, so
 canceling a model cannot unlock storage before its build descendants exit.
+Managed `disk build` commands also inherit the actual global, target and
+reservation lock descriptions through `JARVIS_STORAGE_LEASE_FD` and
+`JARVIS_STORAGE_LEASE_FDS`. Trusted brokers must forward that exact descriptor
+set to their supervisor and VM, rather than reopening lock paths. Canceling the
+manager cannot release a surviving descendant's inherited exclusions; failed
+spawn closes the exported duplicates without retaining a nonexistent worker.
+
 Repository `cargo-managed.sh` tool requests map to managed Cargo inside the VM;
 they never execute a candidate-controlled host wrapper. Deterministic host gates
 and explicit host/legacy builders retain verified target leases and parent-proof
