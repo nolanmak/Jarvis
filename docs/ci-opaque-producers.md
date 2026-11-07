@@ -691,6 +691,17 @@ load-bearing open thread, not a grant supplied by this syscall guard. The carryi
 cost here is one common filter entry and mandatory host/guest cases; no new
 admission schema, budget or authority is introduced.
 
+At `ddfccb86`, all eleven native-policy cases passed on the pinned guest kernel
+in 88.79 seconds, including real pre-policy descriptor acquisition and shared
+flags in both guard variants. The same acquisitions returned EPERM after policy;
+the deliberately retained aliases remained usable. The original host resource
+subtree was removed without exhaustion. All 740 host Python checks passed with
+no skips, and 39 Rust shared-CI checks passed (30 bulk opt-ins ignored). The
+14-case host regression first failed five cases against the previous policy,
+including successful foreign FD acquisition after installation. See
+[bounded descriptor-copy evidence](ci-pidfd-copy-proof.json). These results do
+not establish a passing compiler workflow or admit a native vfork handoff.
+
 #### Worker/planner private proc views (C/R integration in progress)
 
 Decision: protect repository workers, their admitted worker children and Cargo
