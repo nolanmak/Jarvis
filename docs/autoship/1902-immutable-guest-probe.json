@@ -142,5 +142,43 @@
       "log": "/tmp/autoship-managed-command-inherited-storage-production-20261107.log",
       "result": "passed;10.05s"
     }
+  },
+  "storage_export_review_followup": {
+    "main_pr": "https://github.com/nolanmak/Jarvis/pull/1907",
+    "main_code_head": "0afd1e591e1d753524099b8666ec3776787037c7",
+    "recovery_code_head": "91ce672517a3d59b5a362da1cf7e36f4c0014048",
+    "finding": "Failed command setup marked descriptions exported before a worker existed, so incidental fork/dup descriptions could retain exclusions.",
+    "red_log": "/tmp/autoship-managed-command-spawn-rollback-red-20261107.log",
+    "red_result": "Deterministic failed exec with real incidental duplicate descriptions retained global exclusion.",
+    "fix": "Prepare descriptions without changing export state; monotonically commit target/reservation/global ownership only after successful OS spawn, before any await. Preserve earlier and concurrent exports. Use the owned std child plus blocking-pool wait to avoid treating later async-wrapper failure as unstarted.",
+    "tests": [
+      "failed exec with incidental global/update/target descriptors",
+      "parent-proof refusal before spawn",
+      "previous explicit export retained",
+      "actual detached child retains exclusions after manager cancellation"
+    ],
+    "main_validation": {
+      "cli": "1739 passed,0 failed,33 ignored;187.27s",
+      "cli_log": "/tmp/autoship-managed-command-main-reviewed-cli-20261107.log",
+      "production": "passed;9.08s",
+      "production_log": "/tmp/autoship-managed-command-main-reviewed-production-20261107.log"
+    },
+    "recovery_validation": {
+      "cli": "1965 passed,0 failed,34 ignored;439.72s",
+      "cli_log": "/tmp/autoship-recovery-reviewed-clean-cli-20261107.log",
+      "production_log": "/tmp/autoship-recovery-reviewed-clean-production-20261107.log",
+      "production": "passed"
+    },
+    "cache_invalidation": {
+      "observation": "Explicitly sharing one target across divergent worktrees reused main dependency metadata while compiling recovery CLI; ownership/scope APIs present in recovery sources were missing from reused libraries. No compatibility aliases or weakened source gates were added.",
+      "action": "Invalidated only the four changed workspace packages through cargo-managed clean under actual global/target leases, retaining registry dependencies, then reran full recovery validation. Keep future divergent worktrees on distinct registered per-worktree caches.",
+      "log": "/tmp/autoship-recovery-managed-package-invalidation-20261107.log"
+    },
+    "scope": "Original guest observation above retains its exact prior d42 source context; this follow-up changes storage-export commit timing, not immutable-file or native-capacity authority.",
+    "source_sha256": {
+      "crates/augmentagent-cli/src/build_storage.rs": "6af001f36aef5720e36a931ad0285ac43f31c32fd4bce878cf7ca86342dfb6ae",
+      "crates/augmentagent-cli/src/storage_leases.rs": "54f8e9c6d28db641c28f05b57014100f67bccd3ad327d120ffa7dfd268e15459",
+      "crates/augmentagent-cli/src/storage_reservations.rs": "aa3aa203bf38074a5b0b88284897a34cfa784471942c8f2e3826ac306ea1a767"
+    }
   }
 }
