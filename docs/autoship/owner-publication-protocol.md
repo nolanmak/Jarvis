@@ -910,3 +910,63 @@ passed (139.69s). These results do not establish productive execution. The full
 CLI suite was not repeated for this setup-claim checkpoint. Exact source hashes,
 commands, compilation result and limits are recorded in
 `1703-owner-successor-claim-proof.json`.
+
+
+## 51. Successor original-native and preparation join (borrowed producer implemented)
+
+The next setup stage inspects the retained original native namespace under the
+same live `SuccessorSetup`, fresh successor authorization and exact consumed
+ready edge. It must not reopen the metadata recovery lease, use an ordinary
+execution lease, remint a setup reservation from JSON, select the greatest native
+generation, or install a productive logger. The validated original publication
+and completed forward-native ancestry select the namespace. Current bounded
+workflow/native facts are descriptive inputs to the actual core metadata scan.
+
+The workflow composition opens the existing sealed original audit, installs a
+metadata-only fence capturing the same Arc reservation and authorization expiry,
+and acquires actual original state/session/audit locks through the core metadata
+producer. The current claim, owner control, checkpoint, original namespace and
+facts fingerprint are rechecked before and after the visitor. The successor
+authorization must match the exact consumed preview: ready generation/reference,
+original request, checkpoint and owner-control revision. A prior paused preview
+cannot authorize a later resumed setup, even within its grant lifetime. No workflow
+mutex is held while acquiring native locks. Auth expiry, pause, lease loss, changed
+projection, mismatched original binding and source/census uncertainty refuse.
+The metadata logger retains its permanent model fence after the visitor.
+
+Under that borrowed native proof, a short workflow transaction can expose a
+distinct `SuccessorPreparationRead`. Its bounded original record reader checks
+exact original intent, original input/preparation identity, completed publication
+and canonical files, and original native frontier/binding. The private envelope,
+physical candidate and protected evidence are reopened with the same parser as
+metadata recovery. A noncloneable `SuccessorOwnerPreparation` borrows both the
+live setup reservation and actual native proof. It exposes only original facts
+and a borrowed registered-scope transition. It cannot activate acceptance,
+construct an execution guard, release provider input or recreate a lost token.
+Native revalidation brackets the transaction, while transaction-local checks
+validate the live role and original record inside it. The artifact is reopened
+again before and after scope use. Native fence callbacks never reenter a held
+workflow transaction. Lock order is native locks, then scope lock, then short workflow transaction when needed.
+
+Tests extend the existing original recovery/readiness/claim fixture for both
+providers and initial/revised acceptance. A stub native producer must fail the
+positive case. The real producer must reach the original namespace and original
+private preparation under actual metadata locks, retain scope identity, and
+refuse corruption, changed intent/control and stale authorization without model
+or allowance spend. These fixtures still have synthetic preparation and empty
+runtime inventory. D/R owns this join. Its exit is a real borrowed producer;
+actual successor native transfer, C/R source/resource closure, coding constructor,
+first-body lineage and lost-reservation/multiple-cycle recovery remain required
+before worker activation. The carrying cost is distinct typed borrowed contexts,
+not a new persisted authority or an extra model allowance.
+
+
+Checkpoint validation: the stub-producer regression failed as intended, and a
+second regression demonstrated stale paused-preview authorization of a later
+resumed setup. After correcting transaction reentry and exact-preview matching,
+the combined recovery/native/preparation regression passed (111.39s), all 48
+owner store/turn tests passed (6.97s), all 11 surrounding owner workflow tests
+passed (138.11s), and production compilation passed (11.56s). The full CLI suite
+was not repeated. See `1703-owner-successor-native-proof.json` for source hashes,
+commands, logs and limits. The bounded spec audit found no introduced gap; it
+is not full C/R handoff or productive recovery approval.

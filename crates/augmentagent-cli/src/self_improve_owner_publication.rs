@@ -10,6 +10,9 @@ pub(crate) use commit::{OwnerPublicationCompletion,OwnerPublicationAuthority};
 #[path="self_improve_owner_recovery_preparation.rs"]
 mod recovery;
 pub(crate) use recovery::{reopen as reopen_recovery_preparation,RecoveredOwnerPreparation};
+#[path="self_improve_owner_successor_preparation.rs"]
+mod successor;
+pub(crate) use successor::{reopen as reopen_successor_preparation,SuccessorOwnerPreparation};
 fn bytes(path:&Path,max:usize)->Result<Vec<u8>> {
     let mut file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(path)?;
     let m=file.metadata()?;ensure!(m.is_file() && m.nlink()==1 && m.uid()==unsafe{libc::geteuid()} && m.mode()&0o077==0 && m.len()<=max as u64,"owner publication file is not private/bounded");

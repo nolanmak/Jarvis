@@ -92,6 +92,7 @@ pub(crate) struct AuthorizedOwnerSuccessor<'a> {
     principal:String,authorized_at:i64,
 }
 impl AuthorizedOwnerSuccessor<'_> {
+    pub(crate) fn expires_at(&self)->i64 {self.authorized_at.saturating_add(30_000)}
     pub(crate) fn plan(&self)->&crate::autoship_workflow::owner_publication_recovery::SuccessorPlan {self.plan}
     pub(crate) fn principal(&self)->&str {&self.principal}
     pub(crate) fn require(&self,plan:&crate::autoship_workflow::owner_publication_recovery::SuccessorPlan,now:i64)->Result<()> {

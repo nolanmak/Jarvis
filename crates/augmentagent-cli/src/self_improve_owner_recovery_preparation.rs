@@ -110,6 +110,21 @@ pub(crate) fn reopen<'claim, 'a, 'native>(
     candidate: &Path,
 ) -> Result<RecoveredOwnerPreparation<'claim, 'a, 'native>> {
     let record = access.original_record(proof)?;
+    let producer=reopen_producer(&record,candidate)?;
+    // All saved values remain descriptive; only the actual read authority and
+    // still-held original native proof permit returning this metadata role.
+    access.original_record(proof)?;
+    Ok(RecoveredOwnerPreparation {
+        record,
+        producer,
+        claim: access.recovery_claim(),
+        _native: proof,
+    })
+}
+
+/// Shared strict envelope/artifact parser. Callers must separately hold their
+/// actual typed live claim and original native proof before and after reading.
+pub(super) fn reopen_producer(record:&OwnerPublicationRecord,candidate:&Path)->Result<PreparedOwnerAcceptance> {
     record.candidate.verify(candidate)?;
     let raw = bytes(&record.preparation_file, 4 * 1024 * 1024)?;
     let stored: Stored = serde_json::from_slice(&raw)?;
@@ -150,13 +165,5 @@ pub(crate) fn reopen<'claim, 'a, 'native>(
             && evidence == serde_json::to_vec(producer.prepared())?,
         "recovery original next evidence changed"
     );
-    // All saved values remain descriptive; only the actual read authority and
-    // still-held original native proof permit returning this metadata role.
-    access.original_record(proof)?;
-    Ok(RecoveredOwnerPreparation {
-        record,
-        producer,
-        claim: access.recovery_claim(),
-        _native: proof,
-    })
+    Ok(producer)
 }

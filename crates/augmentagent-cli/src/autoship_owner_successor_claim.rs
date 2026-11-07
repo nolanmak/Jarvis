@@ -1,5 +1,8 @@
 //! Single-use successor setup claim. Never a coding/body/native release grant.
 use super::*;
+#[path="autoship_owner_successor_native.rs"]
+mod native;
+pub(crate) use native::{SuccessorPreparationRead,metadata_fence as successor_native_metadata_fence};
 #[derive(Debug,PartialEq,Eq)]
 pub(crate) struct SuccessorPlan {original:Original,ready:RecordRef,generation:i64,control:owner_control::OwnerControl,checkpoint:Checkpoint}
 impl SuccessorPlan {
@@ -138,12 +141,24 @@ impl WorkflowStore {
         tx.commit()?;Ok(Some(SuccessorSetup {record,reference}))
     }
     pub(crate) fn validate_owner_successor_setup(&self,setup:&SuccessorSetup,authorization:&crate::self_improve::targeted::AuthorizedOwnerSuccessor<'_>,now:i64)->Result<()> {
-        authorization.require(authorization.plan(),now)?;
-        let (actual,reference)=read(&self.conn,&setup.record.workflow)?.context("successor setup claim missing")?;
-        ensure!(reference==setup.reference && actual.ready==authorization.plan().ready && actual.request_id==authorization.plan().original.request_id,"successor setup claim changed");
-        let valid:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow WHERE id=?1 AND owner=?2 AND generation=?3 AND lease_until>?4 AND checkpoint=?5)",params![actual.workflow,actual.setup.owner,actual.setup.generation,now,serde_json::to_string(&actual.checkpoint)?],|r|r.get(0))?;
-        ensure!(valid && owner_control::read(&self.conn,&actual.workflow)?.as_ref()==Some(&actual.control),"successor setup lease or intent changed");Ok(())
+        require_authorized_setup(&self.conn,setup,authorization,now)
     }
+}
+fn require_authorized_setup(conn:&Connection,setup:&SuccessorSetup,
+    authorization:&crate::self_improve::targeted::AuthorizedOwnerSuccessor<'_>,now:i64)->Result<()> {
+    authorization.require(authorization.plan(),now)?;
+    let plan=authorization.plan();
+    ensure!(setup.record.ready==plan.ready && setup.record.ready_generation==plan.generation
+        && setup.record.request_id==plan.original.request_id && setup.record.workflow==plan.original.workflow
+        && setup.record.control==plan.control && setup.record.checkpoint==plan.checkpoint,
+        "successor setup authorization preview changed");
+    require_current_setup(conn,setup,now)
+}
+fn require_current_setup(conn:&Connection,setup:&SuccessorSetup,now:i64)->Result<()> {
+    let (actual,reference)=read(conn,&setup.record.workflow)?.context("successor setup claim missing")?;
+    ensure!(reference==setup.reference,"successor setup claim changed");
+    let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow WHERE id=?1 AND owner=?2 AND generation=?3 AND lease_until>?4 AND checkpoint=?5)",params![actual.workflow,actual.setup.owner,actual.setup.generation,now,serde_json::to_string(&actual.checkpoint)?],|r|r.get(0))?;
+    ensure!(valid && owner_control::read(conn,&actual.workflow)?.as_ref()==Some(&actual.control),"successor setup lease or intent changed");Ok(())
 }
 
 #[cfg(test)]

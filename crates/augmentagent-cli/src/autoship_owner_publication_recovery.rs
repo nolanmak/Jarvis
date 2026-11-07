@@ -13,7 +13,7 @@ mod successor_ready;
 pub(crate) use successor_ready::ReadySettlement;
 #[path="autoship_owner_successor_claim.rs"]
 mod successor_claim;
-pub(crate) use successor_claim::{SuccessorPlan,SuccessorSetup};
+pub(crate) use successor_claim::{SuccessorPlan,SuccessorSetup,SuccessorPreparationRead,successor_native_metadata_fence};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

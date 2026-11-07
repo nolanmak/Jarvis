@@ -481,6 +481,39 @@ fn with_recovery_native_metadata_outcome(state:&Path,worktree:Option<&Path>,
     })
 }
 
+/// Retained native metadata for the distinct live successor setup reservation.
+/// Never returns an execution logger or releases input.
+fn with_successor_native_metadata(state:&Path,worktree:Option<&Path>,
+    setup:Arc<durable::owner_publication_recovery::SuccessorSetup>,
+    authorization:&super::targeted::AuthorizedOwnerSuccessor<'_>,
+    visit:&mut dyn FnMut(&augmentagent_channel_core::native_vm::ownership::MetadataNativeOwnerProof<'_>)->Result<()>,
+)->Result<()> {
+    let store=Arc::new(Mutex::new(WorkflowStore::open(state)?));
+    let facts=store.lock().map_err(|_|anyhow::anyhow!("successor native facts store poisoned"))?
+        .owner_successor_native_facts(&setup,authorization,millis())?;
+    let audit=existing_native_audit(state,facts.namespace(),worktree,facts.original_binding())?;
+    let fence=durable::owner_publication_recovery::successor_native_metadata_fence(store.clone(),setup.clone(),authorization,millis())?;
+    audit.restrict_to_metadata(fence)?;
+    let runtimes=facts.runtimes()?;
+    let current=|| {
+        let fresh=store.lock().map_err(|_|anyhow::anyhow!("successor native facts store poisoned"))?
+            .owner_successor_native_facts(&setup,authorization,millis())?;
+        anyhow::ensure!(fresh.fingerprint()?==facts.fingerprint()?,"successor original native inputs changed");Ok(())
+    };
+    let mut load=|namespaces:&[augmentagent_channel_core::native_vm::ownership::Authority]| {
+        let mut grouped=std::collections::BTreeMap::new();
+        for namespace in namespaces {let prior=grouped.entry(namespace.audit_path.clone()).or_insert_with(||namespace.clone());if namespace.owner.lease_generation>prior.owner.lease_generation {*prior=namespace.clone();}}
+        grouped.values().map(|namespace| {
+            if Path::new(&namespace.audit_path)==audit.path() {Ok(audit.clone())}
+            else {existing_native_audit(state,namespace,worktree,facts.original_binding())}
+        }).collect::<Result<Vec<_>>>()
+    };
+    augmentagent_channel_core::native_vm::ownership::with_metadata_native_owner(&audit,&runtimes,&current,&mut load,&mut |proof| {
+        anyhow::ensure!(proof.namespace()==facts.namespace() && proof.binding()==facts.original_binding(),"successor native metadata differs from original namespace");
+        visit(proof)?;current()
+    })
+}
+
 fn existing_native_sources(state:&Path,authorities:&[augmentagent_channel_core::native_vm::ownership::Authority],worktree:Option<&Path>,original:&augmentagent_channel_core::native_vm::ownership::TransferBinding)->Result<Vec<Arc<augmentagent_channel_core::AuditLogger>>> {
     let mut grouped=std::collections::BTreeMap::new();
     for authority in authorities {
@@ -5675,8 +5708,10 @@ else: raise SystemExit('unexpected authority call')
                         assert_eq!(store.snapshot(&id).unwrap().unwrap(),before_claim);assert_eq!(store.events(&id).unwrap(),events_before_claim);
                         assert_eq!(db.query_row("SELECT state FROM workflow_owner_turn WHERE request_id=?1",[&original_request],|r|r.get::<_,String>(0)).unwrap(),"recovery_ready");
                         db.execute_batch("DROP TRIGGER refuse_successor_claim;").unwrap();
-                        let setup=store.claim_recovered_owner_turn_for_setup(&setup_auth,"fresh-owner-successor",millis(),60_000).unwrap().expect("ready bridge must be consumable once");
+                        let setup=Arc::new(store.claim_recovered_owner_turn_for_setup(&setup_auth,"fresh-owner-successor",millis(),60_000).unwrap().expect("ready bridge must be consumable once"));
                         assert_eq!(setup.generation(),later.generation()+1);assert_eq!(setup.request_id(),original_request);
+                        assert!(store.validate_owner_successor_setup(&setup,&paused_auth,millis()).is_err(),"stale paused preview authorized a later resumed setup");
+                        assert!(store.owner_successor_native_facts(&setup,&paused_auth,millis()).is_err(),"stale paused preview exposed successor native facts");
                         store.validate_owner_successor_setup(&setup,&setup_auth,millis()).unwrap();
                         WorkflowStore::open(&state).unwrap().validate_owner_successor_setup(&setup,&setup_auth,millis()).unwrap();
                         assert!(WorkflowStore::open(&state).unwrap().claim_recovered_owner_turn_for_setup(&setup_auth,"duplicate-successor",millis(),60_000).unwrap().is_none());
@@ -5695,6 +5730,39 @@ else: raise SystemExit('unexpected authority call')
                         assert!(store.begin_operation(&copied,OperationKind::CreatePr,&saved_cp.binding,millis()).is_err());
                         assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_body_dispatch WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),0);
                         assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,before_ready.model_calls);
+                        let mut native_visited=false;
+                        with_successor_native_metadata(&state,Some(dir.path()),setup.clone(),&setup_auth,&mut |proof| {
+                            proof.validate_current()?;
+                            assert!(proof.namespace().owner.lease_generation<setup.generation());
+                            proof.with_revoked_input_writers(|closed|closed.with_unbound_input_nonrelease(&original_request,|unreleased|unreleased.validate_current()))?;
+                            let prepared=store.with_owner_successor_preparation(&setup,&setup_auth,proof,millis(),|access|
+                                acceptance::owner::publication::reopen_successor_preparation(access,proof,dir.path()))?;
+                            prepared.require_setup(&setup)?;assert_eq!(prepared.request_id(),original_request);
+                            assert_eq!(prepared.contract_hash(),saved_cp.binding.contract);
+                            prepared.with_scope_transition(|transition| {
+                                let scope=transition.register()?;scope.validate_current()?;
+                                let completed:serde_json::Value=serde_json::from_str(&completion_before)?;
+                                assert_eq!(serde_json::to_value(scope.reference())?,completed["scope"]);Ok(())
+                            })?;
+                            let original:serde_json::Value=serde_json::from_str(&intent_before.0)?;
+                            let preparation_path=Path::new(original["preparation_file"].as_str().unwrap());
+                            let original_bytes=std::fs::read(preparation_path)?;
+                            std::fs::write(preparation_path,b"{}")?;
+                            assert!(prepared.require_setup(&setup).is_err(),"retained preparation ignored changed artifact");
+                            let mut damaged_scope_visited=false;
+                            assert!(prepared.with_scope_transition(|_| {damaged_scope_visited=true;Ok(())}).is_err());
+                            assert!(!damaged_scope_visited,"changed preparation reached scope transition");
+                            assert!(store.with_owner_successor_preparation(&setup,&setup_auth,proof,millis(),|access|
+                                acceptance::owner::publication::reopen_successor_preparation(access,proof,dir.path())).is_err());
+                            std::fs::write(preparation_path,&original_bytes)?;
+                            let other=tempfile::tempdir()?;
+                            assert!(store.with_owner_successor_preparation(&setup,&setup_auth,proof,millis(),|access|
+                                acceptance::owner::publication::reopen_successor_preparation(access,proof,other.path())).is_err());
+                            store.with_owner_successor_preparation(&setup,&setup_auth,proof,millis(),|access|
+                                acceptance::owner::publication::reopen_successor_preparation(access,proof,dir.path()))?.require_setup(&setup)?;
+                            native_visited=true;Ok(())
+                        }).expect("successor setup must inspect the actual retained native namespace");
+                        assert!(native_visited);
                         let saved_claim:(i64,String,String)=db.query_row("SELECT sequence,record_sha256,record FROM workflow_owner_successor_claim WHERE workflow=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
                         let claim_event:String=db.query_row("SELECT payload FROM workflow_event WHERE seq=?1",[saved_claim.0],|r|r.get(0)).unwrap();
                         let lease_until:i64=db.query_row("SELECT lease_until FROM workflow WHERE id=?1",[&id],|r|r.get(0)).unwrap();
@@ -5722,6 +5790,11 @@ else: raise SystemExit('unexpected authority call')
                         }
                         let control=store.owner_control(&id).unwrap().unwrap();store.set_owner_pause(&id,"fixture-owner",control.revision,true,millis()).unwrap();
                         assert!(store.validate_owner_successor_setup(&setup,&setup_auth,millis()).is_err());assert!(store.owner_successor_setup_plan(&id).unwrap().is_none());
+                        let mut paused_native_visited=false;
+                        assert!(with_successor_native_metadata(&state,Some(dir.path()),setup.clone(),&setup_auth,&mut |_| {paused_native_visited=true;Ok(())}).is_err());
+                        assert!(!paused_native_visited,"paused successor reached original native metadata");
+                        assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,before_ready.model_calls);
+                        assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
 
                         return;
                     }
