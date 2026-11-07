@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "kind": "original-unused-native-namespace-metadata-proof-component",
+  "source_parent_commit": "f9ca0ba160bffaca7a2d302d2ed665863e86faf2",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_completion.rs",
+      "sha256": "545c98b1512a5afbbc3216f35a4ed754b6e7521e518895a1052b97f4bc843ba9"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_transfer.rs",
+      "sha256": "319faf629044f852b272c3d890ddaaec91002a538a2fa1db263451a3a21b762f"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "a6a385662de9a16bbbbd8fd113de5ea7d9bdffc68c5d28eea7c95800c6770b78"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication.rs",
+      "sha256": "ade9834468ccf7746f53c5e7e8c011a8f73f7b1dc80f54233b0994dd0fd5a07e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication.rs",
+      "sha256": "559c52ab8407ddd97d02927d3f86b3418adc6a545a75e07a920689b6a4ae67ae"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "86aafa3fa82048113fd18c02ff52470104b44406596327fc2c8f554cf747b4c7"
+    },
+    {
+      "path": "docs/autoship/owner-publication-protocol.md",
+      "sha256": "e1899bd11d03135ac3464ffada9aabda2a6f9ad7ed0fd852dfdd587dd8c98c1b"
+    },
+    {
+      "path": "docs/autoship/owner-acceptance-publication.md",
+      "sha256": "e620f318cc0b5a363341a8061b529d58926e4d4a5677a9ed2ec57b05c25d091e"
+    }
+  ],
+  "behavior": [
+    "Distinct borrowed MetadataUnusedNativeOwnerProof supports only a currently unused original namespace and grants no productive or input capability.",
+    "Actual native state/session/audit producers retain their locks through the metadata visitor, checking original selected policy/store/epoch, active native authority, actual physical absence, protected launch/model history and recorded resource quiescence.",
+    "The original metadata guard preflights retained candidate/preparation/canonical/evidence bytes, then uses short exact workflow metadata callbacks under native locks; the proof namespace and binding must match the current lease/audit and original draft.",
+    "Current workflow native audit/binding rows must match the original intent and remain active; requested or completed retirement refuses uninterrupted metadata work. Native metadata SQL reads retain existing 4096/16384-byte bounds.",
+    "Current metadata-role fencing is separated internally from held audit snapshot acquisition, preserving strong public metadata health checks without recursively reacquiring the native visitor audit lock.",
+    "No manifest, completion, disposition, ready bridge, body grant or model charge is created by this component."
+  ],
+  "validation": {
+    "actual_guard_behavioral_red": {
+      "original_session_id": 31385,
+      "terminal_exit": 1,
+      "cargo_exit": 101,
+      "log": "/tmp/autoship-native-metadata-proof-red-20261106.log",
+      "failure": "ordinary productive unused-native proof correctly refused metadata-only execution; no safe metadata native proof existed"
+    },
+    "active_retirement_behavioral_red": {
+      "original_session_id": 55196,
+      "terminal_exit": 1,
+      "cargo_exit": 101,
+      "log": "/tmp/autoship-native-metadata-retirement-red-20261106.log",
+      "failure": "uninterrupted native metadata visitor was admitted after current workflow native registration was marked for retirement"
+    },
+    "focused_actual_guard": {
+      "original_session_id": 83633,
+      "terminal_exit": 0,
+      "log": "/tmp/autoship-native-metadata-proof-matrix-3-20261106.log"
+    },
+    "final_core": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib",
+      "original_session_id": 93067,
+      "terminal_exit": 0,
+      "log": "/tmp/autoship-native-metadata-proof-full-core-20261106.log",
+      "passed": 933,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 36.74,
+      "core_source_unchanged_by_later_cli_retirement_fix": true
+    },
+    "final_cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "original_session_id": 68110,
+      "terminal_exit": 0,
+      "log": "/tmp/autoship-native-metadata-proof-full-cli-final-20261106.log",
+      "passed": 1941,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 295.25
+    },
+    "final_production_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "original_session_id": 68110,
+      "terminal_exit": 0,
+      "log": "/tmp/autoship-native-metadata-proof-production-check-final-20261106.log",
+      "seconds": 8.82
+    },
+    "cases": [
+      "real state and audit lock contention inside actual metadata proof visitor",
+      "productive unused proof still refuses metadata-only logger",
+      "reopened logger without live metadata fence refuses",
+      "changed selected policy refuses before visitor",
+      "changed original preparation/staged evidence or unexpected canonical manifest refuses and preserves bytes",
+      "unknown/incomplete Codex and Claude runtime metadata refuses without removal or rewriting by producer",
+      "damaged committed audit refuses before visitor",
+      "changed current native audit/binding or pending intent refuses before visitor",
+      "requested and completed workflow-native retirement refuse before visitor",
+      "new owner pause refuses without applying original input or spending merge allowance",
+      "visitor failure releases native/audit locks and preserves original state; subsequent valid inspection succeeds",
+      "proof-only inspection preserves exact workflow snapshot, epoch and audit bytes; zero model charges; no scope or canonical publication"
+    ],
+    "intermediate_notes": [
+      "An intermediate fixture tried a core-private anchor accessor and failed to compile; it was corrected to the actual fixture audit_generation_paths without broadening visibility.",
+      "Negative visitors record whether they were entered and return success; an error returned by a visitor is not misreported as pre-admission refusal.",
+      "The earlier complete CLI run passed 1941 tests and production check passed before the retirement regression was added. Final CLI and production checks above include its fix."
+    ]
+  },
+  "limits": [
+    "This absence producer refuses retained acceptance-scoper/builder conversations. General publication still needs separate fresh actual completion/transfer/resource proof; no preparation skip, session retirement, input replay or relabelling as unused is authorized.",
+    "Artifact/candidate/canonical/evidence checks here are preflight, not commit-time source or filesystem authority. The eventual protected writer needs original native plus scope admission and exact commit-time checks.",
+    "The shared durable completed-publication productive predicate, recovery/terminal metadata authorities, protected writer/completion/disposition, canonical lineage readers and ready bridge remain unfinished.",
+    "Component fixtures use synthetic private baseline observations and actual native registration/census plumbing, not actual provider inference or real VM execution. No live owner workflow, autonomous merge or deployment is established.",
+    "Productive owner consumer remains unconnected. P2-P5, continuation, C/R source/resource proof, aggregate protected-artifact admission, independent exact-head review, hosted checks, normal rollout and full live acceptance remain required."
+  ]
+}

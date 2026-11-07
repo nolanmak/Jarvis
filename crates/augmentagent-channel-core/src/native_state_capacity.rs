@@ -17,6 +17,7 @@ struct Measurements {
     max_sessions: usize,
     session_reserved_bytes: u64,
     required_reserved_bytes: u64,
+    transfer_reserved_bytes: u64,
     max_state_bytes: u64,
     stored_bytes: u64,
     filesystem_available_bytes: u64,
@@ -38,23 +39,30 @@ impl Report {
     }
 }
 
+#[cfg(test)]
 pub(super) fn observed(count: usize, additional: usize, max_sessions: usize,
     max_state_bytes: u64, stored_bytes: u64, free_bytes: u64) -> Report {
+    observed_with_transfer_reservations(count,additional,max_sessions,max_state_bytes,stored_bytes,free_bytes,0)
+}
+
+/// Include the same pending-transfer growth reservation as native admission.
+pub(super) fn observed_with_transfer_reservations(count:usize,additional:usize,max_sessions:usize,
+    max_state_bytes:u64,stored_bytes:u64,free_bytes:u64,transfer_reserved_bytes:u64)->Report {
     let required_sessions=count.saturating_add(additional);
-    let reserved=(required_sessions as u64).saturating_mul(SESSION_BYTES);
+    let reserved=(required_sessions as u64).saturating_mul(SESSION_BYTES).saturating_add(transfer_reserved_bytes);
     let mut blockers=Vec::new();
     if required_sessions>max_sessions {blockers.push("session-count");}
     if reserved>max_state_bytes {blockers.push("reserved-bytes");}
-    if stored_bytes>max_state_bytes {blockers.push("stored-bytes");}
-    if free_bytes<SESSION_BYTES {blockers.push("filesystem-free-bytes");}
+    if stored_bytes.saturating_add(transfer_reserved_bytes)>max_state_bytes {blockers.push("stored-bytes");}
+    if free_bytes<SESSION_BYTES.saturating_add(transfer_reserved_bytes) {blockers.push("filesystem-free-bytes");}
     // Free space and small file writes fluctuate. Fingerprint the admission
     // boundaries rather than making every audit append look like recovery.
-    let capacity_fingerprint=digest(&serde_json::json!({"version":1,"retained_sessions":count,
+    let capacity_fingerprint=digest(&serde_json::json!({"version":2,"retained_sessions":count,"transfer_reserved_bytes":transfer_reserved_bytes,
         "additional_sessions":additional,"max_sessions":max_sessions,"max_state_bytes":max_state_bytes,
         "session_reserved_bytes":SESSION_BYTES,"blockers":blockers}).to_string());
     Report { status:if blockers.is_empty(){"capacity-observed"}else{"capacity-exhausted"},live_verified:false,
         measurements:Some(Measurements {retained_sessions:count,additional_sessions:additional,max_sessions,
-            session_reserved_bytes:SESSION_BYTES,required_reserved_bytes:reserved,max_state_bytes,
+            session_reserved_bytes:SESSION_BYTES,required_reserved_bytes:reserved,transfer_reserved_bytes,max_state_bytes,
             stored_bytes,filesystem_available_bytes:free_bytes,blockers,capacity_fingerprint}) }
 }
 
@@ -88,7 +96,8 @@ fn inspect_locked(policy:&Policy)->Result<Report> {
     let info=file.metadata()?;
     ensure!(info.is_file() && info.uid()==unsafe{libc::geteuid()} && info.nlink()==1 && info.mode() & 0o077==0,"unsafe native lock");
     ensure!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_SH|libc::LOCK_NB)}==0,"native state busy");
-    let _guard=StateLock(file);
+    let guard=StateLock(file);
+    let transfer_reserved_bytes=owner_ledger::inspect_reserved_bytes(&root,&guard)?;
     let mut count=0usize;
     for provider in std::fs::read_dir(&root)? {
         let provider=provider?.path();
@@ -103,7 +112,7 @@ fn inspect_locked(policy:&Policy)->Result<Report> {
     }
     // Count all retained sessions, including potentially reclaimable state.
     // Only the admission/retirement service may perform actual reclamation.
-    Ok(observed(count,1,policy.max_sessions,policy.max_state_bytes,tree_bytes(&root)?,available_bytes(&root)?))
+    Ok(observed_with_transfer_reservations(count,1,policy.max_sessions,policy.max_state_bytes,tree_bytes(&root)?,available_bytes(&root)?,transfer_reserved_bytes))
 }
 
 #[cfg(test)]
@@ -123,5 +132,10 @@ mod tests {
         assert_eq!(value(observed(1,1,1,8*SESSION_BYTES,8*SESSION_BYTES+1,SESSION_BYTES-1))["blockers"],
             serde_json::json!(["session-count","stored-bytes","filesystem-free-bytes"]));
         assert!(observed(usize::MAX,1,16,8*SESSION_BYTES,0,SESSION_BYTES).exhausted());
+        let transfer=value(observed_with_transfer_reservations(0,1,16,SESSION_BYTES,100,SESSION_BYTES,1));
+        assert_eq!(transfer["blockers"],serde_json::json!(["reserved-bytes","filesystem-free-bytes"]));
+        assert_eq!(transfer["required_reserved_bytes"],SESSION_BYTES+1);
+        assert_eq!(value(observed_with_transfer_reservations(0,1,16,8*SESSION_BYTES,8*SESSION_BYTES,100*SESSION_BYTES,1))["blockers"],serde_json::json!(["stored-bytes"]));
+
     }
 }

@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "kind": "borrowed-native-supervisor-resource-ready-boundary-component",
+  "source_parent_commit": "cf0580291d0fb42d26b18181dc7477710fc0fdbd",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "317fef3341b038a5a6c42e6691df74816bdae2b455f79f782d4adbfb9f6e0c57"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/process_tree.rs",
+      "sha256": "6411bb0109ed0f917f3d0e4f31f9c11d3731abf4158f7b47ccdd472cb3db6e24"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "97e01c30dc5729f95c7458266719f9671bd8ba5603c398fa379fc6209571b9db"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "b9171dc7fd739c74f9017362b0cc2aa2cf6fa5905e4f15c616782b76b20c797f"
+    }
+  ],
+  "behavior": [
+    "Actual native supervisor resource admission constructs a borrowed nonserializable group/prepared/receipt/identity view, with release and cleanup boundaries closed.",
+    "Owner resource-ready callback runs before model charging, model binding and launch-continue; refusal, changed accounting or a new owner fence keep model calls zero and release absent.",
+    "Missing required resource admission never invokes the callback. Original protected launch/resource identity is checked around the callback.",
+    "Actual complete/private ready bytes are required. Valid partial bytes and unfinished private permissions remain pending; malformed readiness refuses before callback/charge/release.",
+    "Existing controller revalidates its original prepared body at this stage; no body-reservation migration or new execution authority is supplied by the observation."
+  ],
+  "validation": {
+    "callback_order_red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-channel-core --lib native_resource_ready_",
+      "log": "/tmp/autoship-native-resource-ready-red-2-20261106.log",
+      "log_sha256": "6a68e5bca5b2b2fa064d007e3d1466d4b47960f93dcb73f585a0d686e39a920f",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "passed": 1,
+      "failed": 3
+    },
+    "partial_ready_red": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-channel-core --lib native_resource_ready_waits_for_complete_private_ready_marker",
+      "log": "/tmp/autoship-native-resource-ready-prefix-red-20261106.log",
+      "log_sha256": "779ba835a0bd64a82d5e67a401eee63717ffff35a1d776f179e44b4281729207",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "passed": 0,
+      "failed": 1
+    },
+    "final_focused": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-channel-core --lib native_resource_ready_",
+      "log": "/tmp/autoship-native-resource-ready-final-focused-2-20261106.log",
+      "log_sha256": "5458896e5f8f747ef80c9bb1af8d277232a7bbebdc2f7d03deeb600989a6a261",
+      "exit": 0,
+      "passed": 8,
+      "failed": 0,
+      "seconds": 0.63
+    },
+    "final_full_core": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-channel-core --lib",
+      "log": "/tmp/autoship-native-resource-ready-final-full-core-20261106.log",
+      "log_sha256": "01f64e46256c2b1f97e24141f674b46d978ea70251bcf6aecceb76555bb93147",
+      "exit": 0,
+      "passed": 916,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 34.97
+    },
+    "superseded_full_cli": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-native-resource-ready-full-cli-20261106.log",
+      "log_sha256": "d5aa0f3d05cdfcf96c4b4ad4cbc90fe161b25349bd91ec17a272a90b08653cf4",
+      "exit": 0,
+      "passed": 1933,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 282.41,
+      "superseded_by_readiness_publication_fix": true
+    },
+    "fixture_corrections": [
+      "Initial red compile failed on an escaped JSON byte literal; fixed before the recorded behavioral red.",
+      "Initial green fault fixture used create_new on an existing accounting file; fixed the controlled fixture overwrite before final green."
+    ],
+    "final_full_cli": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-native-resource-ready-final-full-cli-20261106.log",
+      "log_sha256": "5520ab1c074fba9eb5ae8554790d8f2474cd0891bfed5f5af1076c26bfaf3f97",
+      "exit": 0,
+      "passed": 1933,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 283.13
+    },
+    "final_production_check": {
+      "command": "env CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-native-resource-ready-final-production-check-20261106.log",
+      "log_sha256": "87a1eef0dc7efc45235aeb7cee31d0c6989e73c2e03bb1088ec87bc432d15ebd",
+      "exit": 0,
+      "compiler_seconds": 12.66
+    }
+  },
+  "limits": [
+    "The callback red run introduced the borrowed-view/required trait declarations and fixtures before wiring the producer callback; it is not a pristine-parent binary.",
+    "The later readiness red run reproduced a visible partial marker reaching the callback in the intermediate implementation.",
+    "The transport regressions use a real supervisor/child and synthetic native intent/resource metadata. They do not establish actual VM/provider execution or kernel resource readback/quiescence.",
+    "NativeResourceAdmission borrows a retained supervisor group and reports checked setup metadata. It is not native-unused, nonrelease, cleanup, source freshness or retained-writer exclusion proof.",
+    "The outer owner body reservation is still created before resource setup. The next factory migration needs fresh prepared-native proof and versioned dispatch-to-prepared-launch ordering; old UnusedNativeOwnerProof cannot authorize an existing prepared namespace.",
+    "No automatic successor/body replay, slot reset, productive owner ingress, canonical publication, rollout, live owner coding, fault/unattended soak or epic completion is established."
+  ],
+  "epic_complete": false
+}

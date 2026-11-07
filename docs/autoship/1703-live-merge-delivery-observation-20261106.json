@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "kind": "partial-production-autonomous-merge-and-private-delivery-observation",
+  "observed_at_utc": "2026-11-06T06:01:07.872648+00:00",
+  "epic": "https://github.com/nolanmak/Jarvis/issues/1703",
+  "acceptance_issue": "https://github.com/nolanmak/Jarvis/issues/1715",
+  "workflow": "nolanmak/jarvis#1887",
+  "autonomous_merge": {
+    "pr_url": "https://github.com/nolanmak/Jarvis/pull/1888",
+    "head": "f2bf84bb846c28924c0b4a6f864c1407d08a630a",
+    "merge_commit": "fe2e7b1f50430af73e65bb38049097e959b7a3e3",
+    "merged_at_utc": "2026-11-06T05:02:33Z",
+    "attribution_source": "durable controller mutation receipt and matching remote GitHub facts; account identity not used for attribution",
+    "checks": {
+      "operation_matches_mutation_id": true,
+      "expected_head_matches_dispatch_and_remote": true,
+      "pr_number_matches": true,
+      "merge_commit_matches": true,
+      "merged_at_matches": true,
+      "remote_state_merged": true
+    }
+  },
+  "private_delivery": {
+    "progress_sequence": 46,
+    "remote_message_timestamp_utc": "2026-11-06T05:02:36.824000+00:00",
+    "checks": {
+      "remote_message_exists": true,
+      "actual_bot_matches": true,
+      "private_owner_dm_verified": true,
+      "content_matches_durable_intent": true
+    },
+    "verification": "Read-only remote Discord channel/message retrieval compared against durable private outbox intent and configured immutable owner/bot. No message was sent by the verifier.",
+    "private_identifiers_and_message_content_omitted": true
+  },
+  "allowance_observation": {
+    "utc_day": "2026-11-06",
+    "confirmed_autonomous_merges": 1,
+    "cap": 5,
+    "pending": 0,
+    "remaining": 4,
+    "authority": "Deployed production allowance projection at observation time; this is not a current-day forecast or an independent accounting implementation."
+  },
+  "rollout_observation": {
+    "built_commit_stamp": "fe2e7b1f50430af73e65bb38049097e959b7a3e3",
+    "canonical_head": "fe2e7b1f50430af73e65bb38049097e959b7a3e3",
+    "compiled_source_freshness_proved": false
+  },
+  "local_verification_artifact_sha256": {
+    "merge": "48fcd2a0123aeed09dce39c4e4bc7f812ef78c9c210d722ea9326e3bd00457f6",
+    "private_delivery": "9e4c2523fa02ae37444471845eb5d67f941a59e61a256383f9f6634e7cbdf875"
+  },
+  "limitations": [
+    "Observation of the deployed production build; draft PR #1758 is not deployed by this receipt.",
+    "Matching canonical checkout and built-commit stamp do not prove complete compiled-source freshness.",
+    "No terminal CLI invocation-to-merge chain was verified by this observation.",
+    "Discord merge notification delivery does not prove owner-initiated Discord coding or follow-up execution.",
+    "One merge does not meet the five-merge acceptance-day requirement.",
+    "No 72-hour fault-injection or 24-hour unattended acceptance soak is established.",
+    "No seed-defect rejection, all-child closure or epic completion is established.",
+    "No benchmark, model call, workflow submission/resume, service restart, route reconfiguration, accounting reset or hold clearing was performed by this verification."
+  ],
+  "epic_complete": false
+}

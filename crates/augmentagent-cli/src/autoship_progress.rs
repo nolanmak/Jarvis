@@ -112,7 +112,7 @@ fn code(value:&str,fallback:&str)->String {
 }
 
 pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Result<()> {
-    if !matches!(source,"registered"|"checkpoint"|"autonomous_merge_confirmed"|"command_queued"|"command_attempt_finished"|"owner_control_changed"|"native_model_admitted") {return Ok(());}
+    if !matches!(source,"registered"|"checkpoint"|"autonomous_merge_confirmed"|"command_queued"|"command_attempt_finished"|"owner_control_changed"|"owner_input_queued"|"native_model_admitted") {return Ok(());}
     let previous:Option<(i64,String,bool)>=tx.query_row("SELECT sequence,fingerprint,terminal FROM workflow_progress_state WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     if previous.as_ref().is_some_and(|p|p.2) {return Ok(());}
     super::delivery::apply_default(tx,workflow,now)?;
@@ -135,6 +135,14 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     }
     let control:Option<bool>=tx.query_row("SELECT paused FROM workflow_owner_control WHERE workflow=?1",[workflow],|r|r.get(0)).optional()?;
     if control==Some(true) {kind="blocked".into();reason="owner-pause-requested".into();action="await_owner_resume".into();}
+    else if super::owner_inbox::pending(tx,workflow)?>0 {
+        if stage!=Some(Stage::Held) {
+            let processing:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_turn t JOIN workflow w ON w.id=t.workflow JOIN workflow_owner_control c ON c.workflow=t.workflow WHERE t.workflow=?1 AND t.state='claimed' AND t.owner=w.owner AND t.lease_generation=w.generation AND t.pause_revision=c.revision AND w.lease_until>?2)",params![workflow,now],|r|r.get(0))?;
+            kind=if processing {"owner-input"}else{"waiting"}.into();
+            reason=if processing {"owner-input-processing"}else{"owner-followup-pending"}.into();
+            action=if processing {"continue_owner_turn"}else{"process_owner_input"}.into();
+        }
+    }
     else if source=="owner_control_changed" {kind="resume-requested".into();reason="owner-resume-accepted".into();action="await_worker".into();}
     let external_merge=checkpoint.as_ref().is_some_and(|c|c.stage==Stage::Merged && c.next.reason=="external_merge_reconciled");
     let terminal=confirmed || external_merge || stage==Some(Stage::Retired);

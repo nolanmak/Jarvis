@@ -119,6 +119,24 @@ class ProvisionTests(unittest.TestCase):
             provider=provider, native_executable=Path(provider), auth_file=None, allow_auth_refresh=False,
             gateway_policy=gateway, environment_key=[], memory_mb=None, max_state_bytes=None, max_sessions=None)
 
+    def test_new_provisioning_records_fresh_native_store_origin_once(self):
+        with tempfile.TemporaryDirectory() as name, patch.object(p, 'stage_runtime', fake_stage):
+            root = Path(name)
+            path = p.provision(self.args(root, 'codex'))
+            state = Path(json.loads(path.read_text())['state_root'])
+            bootstrap = state / 'authority-bootstrap.json'
+            before = bootstrap.read_bytes()
+            value = json.loads(before)
+            self.assertEqual(set(value), {'version', 'epoch', 'root_identity_sha256'})
+            self.assertEqual(value['version'], 1)
+            self.assertEqual(str(p.uuid.UUID(value['epoch'])), value['epoch'])
+            info = state.stat()
+            expected = p.hashlib.sha256(json.dumps({'device': info.st_dev, 'inode': info.st_ino}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            self.assertEqual(value['root_identity_sha256'], expected)
+            self.assertEqual(bootstrap.stat().st_mode & 0o777, 0o600)
+            p.provision(self.args(root, 'claude', path))
+            self.assertEqual(bootstrap.read_bytes(), before, 'provider extension replaced fresh-root provenance')
+
     def test_extension_preserves_existing_grants_state_and_runtime_dependencies(self):
         with tempfile.TemporaryDirectory() as name, patch.object(p, 'stage_runtime', fake_stage):
             root = Path(name)

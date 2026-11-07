@@ -230,7 +230,9 @@ mod tests {
         }
     }
     fn directory() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+        // Only these socket fixtures need a path shorter than managed TMPDIR.
+        let dir = tempfile::Builder::new().prefix("phone-")
+            .tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         dir
     }

@@ -55,12 +55,24 @@ async fn contribution_diff(
 fn pending_path(control: &Path, source: AcceptanceSource) -> PathBuf {
     control.join(format!("{}-pending-amendment.json", source.key()))
 }
-fn immutable(control: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
-    use std::io::Write;
+fn immutable_with_metadata(control: &Path, name: &str, bytes: &[u8],
+    _access:&crate::autoship_workflow::AcceptanceMetadata<'_>) -> Result<PathBuf> {
+    use std::io::{Read,Write};
+    use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
+    const LIMIT:usize=4*1024*1024;
+    ensure!(bytes.len()<=LIMIT,"amendment artifact exceeds private file bound");
     let path = control.join(name);
-    if path.exists() {
-        ensure!(std::fs::read(&path)? == bytes, "amendment artifact changed");
-        return Ok(path);
+    match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(&path) {
+        Ok(mut file)=>{
+            let metadata=file.metadata()?;
+            ensure!(metadata.is_file() && metadata.nlink()==1 && metadata.uid()==unsafe{libc::geteuid()}
+                && metadata.mode()&0o077==0 && metadata.len()<=LIMIT as u64,"amendment artifact is not a bounded private regular file");
+            let mut saved=Vec::new();(&mut file).take(LIMIT as u64+1).read_to_end(&mut saved)?;
+            ensure!(saved.len()<=LIMIT && saved.len() as u64==metadata.len() && saved==bytes,"amendment artifact changed");
+            return Ok(path);
+        },
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},
+        Err(error)=>return Err(error.into()),
     }
     let mut file = tempfile::NamedTempFile::new_in(control)?;
     file.write_all(bytes)?;
@@ -68,6 +80,13 @@ fn immutable(control: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
     file.persist_noclobber(&path).map_err(|e| e.error)?;
     std::fs::File::open(control)?.sync_all()?;
     Ok(path)
+}
+fn immutable_for(workflow:&workflow::WorkflowGuard,control:&Path,name:&str,bytes:&[u8])->Result<PathBuf> {
+    workflow.with_acceptance_metadata(|access|immutable_with_metadata(control,name,bytes,access))
+}
+#[cfg(test)]
+fn immutable(control:&Path,name:&str,bytes:&[u8])->Result<PathBuf> {
+    with_fixture_acceptance_metadata(|access|immutable_with_metadata(control,name,bytes,access))
 }
 fn validate_bound_scope_files(adjudication:Option<&str>,additional:&[String])->Result<()> {
     let Some(raw)=adjudication else {return Ok(());};
@@ -134,7 +153,7 @@ fn validate_correction_with_files(
     next.contract.validate()?;
     ensure!(
         next.contract.source()? == old.proposal.contract.source()?
-            && next.contract.revision == old.proposal.contract.revision + 1,
+            && Some(next.contract.revision) == old.proposal.contract.revision.checked_add(1),
         "amendment source/revision mismatch"
     );
     for prior in &old.proposal.contract.criteria {
@@ -351,7 +370,7 @@ pub(super) async fn try_amend(
     // This is the paid amendment ingress, including repair-exhausted and
     // resumed callers. Missing infrastructure cannot authorize a correction.
     acceptance::defer_transient_verifier_infrastructure(failure,workflow).await?;
-    if let Some(prepared) = resume_pending(root, control, source).await? {
+    if let Some(prepared) = resume_pending(root, control, source, workflow).await? {
         return Ok(Some(prepared));
     }
     // Ordinary red assertions mean implementation repair, not permission to
@@ -363,7 +382,7 @@ pub(super) async fn try_amend(
     {
         return Ok(None);
     }
-    old.baseline.registration.verify_integrity(root)?;
+    old.verify_registration()?;
     let head = actual_head(root).await?;
     let tree = trusted_git(root, &["--no-replace-objects", "rev-parse", &format!("{head}^{{tree}}")]).await?;
     // GitHub supplies the canonical main identity; a candidate can mutate its
@@ -444,7 +463,7 @@ pub(super) async fn try_amend(
     }))?;
     let (decision, native_provider, native_session) =
         authority(builder, workflow, root, &prompt,old.baseline.registration.contract_hash(),&input_hash,&epoch).await?;
-    immutable(
+    immutable_for(workflow,
         control,
         &format!(
             "{}-amendment-decision-{input_hash}-{}.json",
@@ -508,26 +527,25 @@ pub(super) async fn try_amend(
     let base = old.baseline.registration.baseline_head();
     trusted_git(root, &["worktree", "add", "--detach", checkout, base]).await?;
     let reproduce = async {
-        install_harness(&baseline_root, &proposal)?;
         let baseline_environment = environment_id(&baseline_root)?;
         ensure!(baseline_environment == environments.current_original_baseline, "runner environment changed during independent amendment");
         let registration = if decision.approve_environment_transition {
-            RegisteredContract::register_transition(
-                &baseline_root,
+            RegisteredContract::register_transition_from_files(
                 proposal.contract.clone(),
                 base.into(),
                 baseline_environment,
                 candidate_environment,
+                &proposal.files,
             )?
         } else {
-            RegisteredContract::register(
-                &baseline_root,
+            RegisteredContract::register_from_files(
                 proposal.contract.clone(),
                 base.into(),
                 baseline_environment,
+                &proposal.files,
             )?
         };
-        let receipts = execute_registered(&baseline_root, &registration, &workflow.audit_logger()).await?;
+        let receipts = execute_registered(&baseline_root, &registration, &proposal.files, &workflow.audit_logger()).await?;
         ensure!(
             registration.baseline_result(&receipts)? == BaselineResult::Reproduced,
             "amended verifier failed intended-red baseline: {}",
@@ -547,7 +565,7 @@ pub(super) async fn try_amend(
         Ok(next) => next,
         Err(error) => {
             if workflow.audit_logger().resource_capacity_seen() { return Err(error); }
-            immutable(
+            immutable_for(workflow,
                 control,
                 &format!(
                     "{}-amendment-rejected-{input_hash}-{}.json",
@@ -569,7 +587,7 @@ pub(super) async fn try_amend(
     };
     cleanup?;
     let pending = Pending {
-        version: 1,
+        version: 2,
         source,
         original_head: head,
         input_hash,
@@ -585,7 +603,7 @@ pub(super) async fn try_amend(
         bytes.len() <= 4 * 1024 * 1024,
         "amendment transaction exceeds artifact budget"
     );
-    immutable(
+    immutable_for(workflow,
         control,
         pending_path(control, source)
             .file_name()
@@ -594,7 +612,7 @@ pub(super) async fn try_amend(
             .unwrap(),
         &bytes,
     )?;
-    resume_pending(root, control, source).await
+    resume_pending(root, control, source, workflow).await
 }
 
 fn staging_path(relative: &str, contract: &str) -> Result<PathBuf> {
@@ -667,16 +685,94 @@ pub(super) async fn resume_pending(
     root: &Path,
     control: &Path,
     source: AcceptanceSource,
+    workflow: &workflow::WorkflowGuard,
 ) -> Result<Option<PreparedAcceptance>> {
     use std::io::Write;
-    use std::os::unix::fs::MetadataExt;
     let path = pending_path(control, source);
     if !path.exists() {
         return Ok(None);
     }
+    workflow.validate_before_side_effect()?;
     let pending: Pending = private_json(&path)?;
+    validate_private_pending(&pending,source)?;
+    let current =
+        workflow.read_acceptance_metadata(||read_manifest_unsettled(control,source))?.context("amendment original manifest missing")?;
+    let already_active =
+        current.contract_hash == pending.next.baseline.registration.contract_hash();
     ensure!(
-        pending.version == 1
+        already_active
+            || current.contract_hash == pending.old.baseline.registration.contract_hash(),
+        "amendment was superseded"
+    );
+    // This protocol changes protected controller metadata only. Validate the
+    // original head and clean product even after the manifest became active;
+    // no candidate files or Git commit may be manufactured during replay.
+    validate_private_pending_product(root,&pending).await?;
+    workflow.validate_before_side_effect()?;
+    let mut manifest = WorkflowManifest::from_prepared(source, &pending.next);
+    let evidence = format!(
+        "{}-revision-{}-{}.json",
+        source.key(),
+        manifest.contract_revision,
+        manifest.contract_hash
+    );
+    workflow.validate_before_side_effect()?;
+    immutable_for(workflow,control, &evidence, &serde_json::to_vec(&pending.next)?)?;
+    manifest.evidence_file = Some(evidence);
+    workflow.validate_before_side_effect()?;
+    immutable_for(workflow,
+        control,
+        &format!(
+            "{}-manifest-history-{}-{}.json",
+            source.key(),
+            current.contract_revision,
+            current.contract_hash
+        ),
+        &serde_json::to_vec(&current)?,
+    )?;
+    workflow.read_publication_metadata(|reader|require_original_manifest_history(control,&pending,reader))?;
+    workflow.validate_before_side_effect()?;
+    // Every replay, including an already-published manifest, must retain the
+    // exact registered scope while canonical metadata and completion settle.
+    // Scope precedes the short workflow transaction; no subprocess enters it.
+    with_bound_write_scope(root,&pending.next,Some(&pending.old.baseline.registration),|scope| {
+        scope.validate_current()?;
+        if !already_active {
+            let mut file=tempfile::NamedTempFile::new_in(control)?;
+            file.write_all(&serde_json::to_vec(&manifest)?)?;file.as_file().sync_all()?;
+            workflow.with_acceptance_metadata(|access| {
+                scope.validate_current()?;
+                require_original_manifest_history(control,&pending,&access.publication_reader())?;
+                let latest=read_manifest_unsettled(control,source)?.context("amendment original manifest disappeared")?;
+                ensure!(latest==current || latest==manifest,"amendment manifest changed before replacement");
+                if latest!=manifest {
+                    file.persist(control.join(format!("{}-workflow.json",source.key()))).map_err(|e|e.error)?;
+                    std::fs::File::open(control)?.sync_all()?;
+                }
+                Ok(())
+            })?;
+        }
+        workflow.with_acceptance_metadata(|access| {
+            scope.validate_current()?;
+            require_original_manifest_history(control,&pending,&access.publication_reader())?;
+            ensure!(read_manifest_unsettled(control,source)?.as_ref()==Some(&manifest),"amendment canonical manifest changed before completion");
+            let saved:Pending=private_json(&path)?;
+            ensure!(serde_json::to_value(&saved)?==serde_json::to_value(&pending)?,"amendment pending transaction changed before completion");
+            immutable_with_metadata(control,&format!("{}-amendment-complete-{}.json",source.key(),pending.next.baseline.registration.contract_hash()),&serde_json::to_vec(&pending)?,access)?;
+            std::fs::remove_file(&path)?;
+            std::fs::File::open(control)?.sync_all()?;Ok(())
+        })
+    })?;
+    Ok(Some(pending.next))
+}
+fn validate_private_pending(pending:&Pending,source:AcceptanceSource)->Result<()> {
+    pending.old.verify_registration()?;
+    ensure!(pending.version != 1,
+        "legacy pending amendment requires authenticated original transaction recovery; record retained");
+    ensure!(pending.version == 2,
+        "unsupported pending amendment protocol; await a compatible controller; record retained");
+    ensure!(
+        pending.version == 2
             && pending.source == source
             && pending.next.proposal.contract.source()? == source
             && pending.authority.approved
@@ -686,26 +782,9 @@ pub(super) async fn resume_pending(
             && pending.prompt_hash.len() == 64,
         "invalid pending verifier authority"
     );
-    if pending
-        .next
-        .proposal
-        .contract
-        .verifiers
-        .iter()
-        .all(|verifier| verifier.command.controller_asserted())
-    {
-        ensure!(
-            pending
-                .next
-                .baseline
-                .registration
-                .baseline_result(&pending.next.baseline.receipts)?
-                == BaselineResult::Reproduced,
-            "pending amendment lacks red baseline"
-        );
-    }
-    // Finish an interrupted legacy file transaction as recovery metadata only;
-    // the migration gate rejects its old proof before any shipping/review.
+    validate_private_amendment_baseline(&pending.next)?;
+    // Only independently approved private-source transactions activate here.
+    // Historical file-writing protocols remain retained for explicit recovery.
     let approved_proposal = parse_proposal_data(
         &format!(
             "```autoship-contract\n{}\n```",
@@ -746,172 +825,96 @@ pub(super) async fn resume_pending(
             == pending.old.baseline.registration.baseline_head(),
         "amendment changed original baseline"
     );
-    let current =
-        original_manifest(control, source)?.context("amendment original manifest missing")?;
-    let already_active =
-        current.contract_hash == pending.next.baseline.registration.contract_hash();
-    ensure!(
-        already_active
-            || current.contract_hash == pending.old.baseline.registration.contract_hash(),
-        "amendment was superseded"
-    );
-    let paths: std::collections::BTreeSet<_> = pending
-        .old
-        .proposal
-        .files
-        .keys()
-        .chain(pending.next.proposal.files.keys())
-        .cloned()
-        .collect();
-    let staging: std::collections::BTreeSet<String> = pending
-        .next
-        .proposal
-        .files
-        .keys()
-        .map(|relative| {
-            Ok(
-                staging_path(relative, pending.next.baseline.registration.contract_hash())?
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-        })
-        .collect::<Result<_>>()?;
-    let tracked = trusted_git(root, &["ls-files", "-z"]).await?;
-    ensure!(
-        !tracked.split('\0').any(|path| staging.contains(path)),
-        "amendment staging name collides with tracked source"
-    );
-    if !already_active {
-        let changed = trusted_git(
-            root,
-            &["diff", "--name-only", "-z", &pending.original_head, "--"],
-        )
-        .await?;
-        let untracked =
-            trusted_git(root, &["ls-files", "--others", "--exclude-standard", "-z"]).await?;
-        ensure!(
-            changed
-                .split('\0')
-                .chain(untracked.split('\0'))
-                .filter(|p| !p.is_empty())
-                .all(|p| paths.contains(p) || staging.contains(p)),
-            "candidate implementation changed during verifier amendment; new authority required"
-        );
+    Ok(())
+}
+pub(super) fn require_no_pending(control:&Path,source:AcceptanceSource)->Result<()> {
+    match std::fs::symlink_metadata(pending_path(control,source)) {
+        Ok(_)=>bail!("pending amendment requires guarded metadata replay"),
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>Ok(()),
+        Err(error)=>Err(error.into()),
     }
-    for relative in &paths {
-        let target = root.join(relative);
-        if target.exists() {
-            let meta = std::fs::symlink_metadata(&target)?;
-            ensure!(
-                meta.is_file()
-                    && !meta.file_type().is_symlink()
-                    && meta.nlink() == 1
-                    && target.canonicalize()?.starts_with(root.canonicalize()?),
-                "amended harness is not a regular file"
-            );
-            let actual = std::fs::read(&target)?;
-            ensure!(
-                pending
-                    .old
-                    .proposal
-                    .files
-                    .get(relative)
-                    .is_some_and(|s| s.as_bytes() == actual)
-                    || pending
-                        .next
-                        .proposal
-                        .files
-                        .get(relative)
-                        .is_some_and(|s| s.as_bytes() == actual),
-                "harness changed outside approved amendment"
-            );
+}
+fn original_manifest_history(control:&Path,pending:&Pending,used:&mut usize)->Result<WorkflowManifest> {
+    let old=&pending.old.baseline.registration;
+    let history=control.join(format!("{}-manifest-history-{}-{}.json",pending.source.key(),old.contract().revision,old.contract_hash()));
+    let original:WorkflowManifest=read_lineage_manifest(&history,used).context("original amendment manifest history missing or invalid")?;
+    let mut expected=WorkflowManifest::from_prepared(pending.source,&pending.old);expected.evidence_file=original.evidence_file.clone();
+    ensure!(original==expected,"original amendment manifest history changed");Ok(original)
+}
+fn lineage_bytes(path:&Path,max:usize,used:&mut usize)->Result<Vec<u8>> {
+    use std::io::Read;use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
+    let mut file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(path)?;let meta=file.metadata()?;
+    ensure!(meta.is_file() && meta.nlink()==1 && meta.uid()==unsafe{libc::geteuid()} && meta.mode()&0o077==0 && meta.len()<=max as u64,"canonical lineage artifact is not private/bounded");
+    let mut raw=Vec::new();(&mut file).take(max as u64+1).read_to_end(&mut raw)?;
+    ensure!(raw.len()<=max && raw.len() as u64==meta.len(),"canonical lineage artifact changed while reading");
+    *used=used.checked_add(raw.len()).context("canonical lineage size overflow")?;ensure!(*used<=128*1024*1024,"canonical lineage exceeds byte bound");Ok(raw)
+}
+fn lineage_json<T:serde::de::DeserializeOwned>(path:&Path,max:usize,used:&mut usize)->Result<T> {Ok(serde_json::from_slice(&lineage_bytes(path,max,used)?)?)}
+pub(super) fn read_lineage_manifest(path:&Path,used:&mut usize)->Result<WorkflowManifest> {
+    let raw=lineage_bytes(path,4096,used)?;let manifest:WorkflowManifest=serde_json::from_slice(&raw)?;
+    let source=manifest.source()?;
+    if manifest.evidence_file.as_ref().is_some_and(|name|name.starts_with(&format!("{}-owner-",source.key()))) {
+        ensure!(serde_json::to_vec(&manifest)?==raw,"canonical owner manifest encoding differs from completed publication");
+    }
+    Ok(manifest)
+}
+pub(super) fn require_completed_manifest(control:&Path,source:AcceptanceSource,manifest:&WorkflowManifest)->Result<()> {
+    require_completed_manifest_with_reader(control,source,manifest,None)
+}
+pub(super) fn require_completed_manifest_with_reader(control:&Path,source:AcceptanceSource,manifest:&WorkflowManifest,
+    reader:Option<&crate::autoship_workflow::OwnerPublicationReadContext<'_>>)->Result<()> {
+    let mut current=manifest.clone();let mut seen=std::collections::BTreeSet::new();let mut used=0usize;
+    for _ in 0..1024 {
+        ensure!(current.version==1 && current.source()?==source && seen.insert((current.contract_revision,current.contract_hash.clone())),"canonical lineage repeats or changes source/version");
+        evidence_path(control,source,&current.original_base)?;
+        if let Some(reader)=reader {reader.require_manifest_identity(&current.contract_hash,&serde_json::to_string(&current)?)?;}
+        let Some(name)=current.evidence_file.as_ref() else {
+            ensure!(current.contract_revision==1,"canonical revised acceptance lost its completion reference");
+            let original:PreparedAcceptance=lineage_json(&evidence_path(control,source,&current.original_base)?,4*1024*1024,&mut used)?;
+            original.verify_registration()?;ensure!(WorkflowManifest::from_prepared(source,&original)==current,"canonical original baseline evidence changed");return Ok(())
+        };
+        if name.starts_with(&format!("{}-owner-",source.key())) {
+            let raw=serde_json::to_string(&current)?;
+            let ancestor=reader.context("canonical owner lineage requires the original workflow journal")?.ancestor(control,source,&raw,&mut used)?;
+            let Some(raw)=ancestor else {ensure!(current.contract_revision==1,"canonical owner lineage lost its original ancestor");return Ok(())};
+            let old:WorkflowManifest=serde_json::from_str(&raw)?;
+            ensure!(old.contract_revision.checked_add(1)==Some(current.contract_revision) && old.original_base==current.original_base,"owner canonical lineage revision/base changed");current=old;continue;
         }
-        if let Some(contents) = pending.next.proposal.files.get(relative) {
-            install_amended_atomic(
-                root,
-                relative,
-                contents,
-                pending.next.baseline.registration.contract_hash(),
-            )?;
-        } else if target.exists() {
-            std::fs::remove_file(target)?;
-        }
+        ensure!(name==&format!("{}-revision-{}-{}.json",source.key(),current.contract_revision,current.contract_hash),"canonical amendment evidence reference changed");
+        let completion=control.join(format!("{}-amendment-complete-{}.json",source.key(),current.contract_hash));
+        let pending:Pending=lineage_json(&completion,4*1024*1024,&mut used).context("canonical amended acceptance completion missing or invalid")?;
+        validate_private_pending(&pending,source)?;
+        let mut expected=WorkflowManifest::from_prepared(source,&pending.next);expected.evidence_file=Some(name.clone());
+        ensure!(expected==current,"canonical amendment completion differs from manifest");
+        ensure!(lineage_bytes(&control.join(name),4*1024*1024,&mut used)?==serde_json::to_vec(&pending.next)?,"canonical amendment evidence differs from completed registration");
+        current=original_manifest_history(control,&pending,&mut used)?;
     }
-    pending.next.baseline.registration.verify_integrity(root)?;
-    recovery::commit_candidate_named(
-        root,
-        &format!(
-            "test: amend {source} acceptance revision {}",
-            pending.next.proposal.contract.revision
-        ),
-    )
-    .await?;
-    let mut manifest = WorkflowManifest::from_prepared(source, &pending.next);
-    let evidence = format!(
-        "{}-revision-{}-{}.json",
-        source.key(),
-        manifest.contract_revision,
-        manifest.contract_hash
-    );
-    immutable(control, &evidence, &serde_json::to_vec(&pending.next)?)?;
-    manifest.evidence_file = Some(evidence);
-    immutable(
-        control,
-        &format!(
-            "{}-manifest-history-{}-{}.json",
-            source.key(),
-            current.contract_revision,
-            current.contract_hash
-        ),
-        &serde_json::to_vec(&current)?,
-    )?;
-    if !already_active {
-        augmentagent_channel_core::autoship_write_scope::replace_registered(
-            root,
-            pending.old.baseline.registration.contract_hash(),
-            pending.next.baseline.registration.contract_hash(),
-            pending
-                .next
-                .proposal
-                .contract
-                .allowed_paths
-                .iter()
-                .map(|scope| match scope {
-                    crate::autoship_contract::PathScope::File(path) => {
-                        augmentagent_channel_core::autoship_write_scope::DeclaredPath {
-                            path: path.clone(),
-                            directory: false,
-                        }
-                    }
-                    crate::autoship_contract::PathScope::Directory(path) => {
-                        augmentagent_channel_core::autoship_write_scope::DeclaredPath {
-                            path: path.clone(),
-                            directory: true,
-                        }
-                    }
-                })
-                .collect(),
-            pending.next.proposal.files.keys().cloned().collect(),
-        )?;
-        let mut file = tempfile::NamedTempFile::new_in(control)?;
-        file.write_all(&serde_json::to_vec(&manifest)?)?;
-        file.as_file().sync_all()?;
-        file.persist(control.join(format!("{}-workflow.json", source.key())))
-            .map_err(|e| e.error)?;
-        std::fs::File::open(control)?.sync_all()?;
-    }
-    immutable(
-        control,
-        &format!(
-            "{}-amendment-complete-{}.json",
-            source.key(),
-            pending.next.baseline.registration.contract_hash()
-        ),
-        &serde_json::to_vec(&pending)?,
-    )?;
-    std::fs::remove_file(path)?;
-    std::fs::File::open(control)?.sync_all()?;
-    Ok(Some(pending.next))
+    anyhow::bail!("canonical lineage exceeds revision bound")
+}
+fn require_original_manifest_history(control:&Path,pending:&Pending,reader:&crate::autoship_workflow::OwnerPublicationReadContext<'_>)->Result<()> {
+    let original=original_manifest_history(control,pending,&mut 0)?;
+    require_completed_manifest_with_reader(control,pending.source,&original,Some(reader))
+}
+fn validate_private_amendment_baseline(prepared:&PreparedAcceptance)->Result<()> {
+    prepared.verify_registration()?;
+    ensure!(prepared.proposal.contract.verifiers.iter().all(|verifier|verifier.command.controller_asserted()),
+        "private amendment requires current independent behavioral oracles");
+    ensure!(prepared.baseline.registration.baseline_result(&prepared.baseline.receipts)?==BaselineResult::Reproduced,
+        "pending amendment lacks red baseline");
+    Ok(())
+}
+async fn validate_private_pending_product(root:&Path,pending:&Pending)->Result<()> {
+    pending.old.verify_registration()?;
+    pending.next.verify_registration()?;
+    ensure!(actual_head(root).await?==pending.original_head,
+        "candidate head changed during private verifier amendment");
+    ensure!(trusted_git(root,&["status","--porcelain","--untracked-files=all"]).await?.is_empty(),
+        "candidate files changed during private verifier amendment");
+    assert_no_registered_adapters(root,&pending.original_head,&pending.old.baseline.registration,&pending.old.proposal.files).await?;
+    assert_no_registered_adapters(root,&pending.original_head,&pending.next.baseline.registration,&pending.next.proposal.files).await?;
+    ensure!(actual_head(root).await?==pending.original_head,
+        "candidate head changed while validating private verifier amendment");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -983,6 +986,79 @@ mod tests {
                 .args(args).current_dir(root.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();assert!(out.status.success());
         }
         let head=actual_head(root.path()).await.unwrap();(root,old,head)
+    }
+    #[test]
+    fn acceptance_metadata_existing_fifo_is_refused_without_blocking_the_store() {
+        const CHILD:&str="AUTOSHIP_ACCEPTANCE_METADATA_FIFO_CHILD";
+        if let Some(root)=std::env::var_os(CHILD) {
+            assert!(immutable(Path::new(&root),"immutable.json",b"expected").is_err());return;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let root=tempfile::Builder::new().prefix("acceptance-metadata-fifo-").tempdir_in("/tmp").unwrap();
+        let fifo=std::ffi::CString::new(root.path().join("immutable.json").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe {libc::mkfifo(fifo.as_ptr(),0o600)},0);
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::acceptance::amendment::tests::acceptance_metadata_existing_fifo_is_refused_without_blocking_the_store","--nocapture"]).env(CHILD,root.path()).spawn().unwrap();
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(2);
+        loop {
+            if let Some(status)=child.try_wait().unwrap() {assert!(status.success());break;}
+            if std::time::Instant::now()>=deadline {child.kill().unwrap();child.wait().unwrap();panic!("immutable FIFO blocked acceptance metadata admission");}
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    #[tokio::test]
+    async fn acceptance_metadata_commit_retains_registered_scope_lock() {
+        let (root,prepared)=fixture();
+        trusted_git(root.path(),&["init","--initial-branch=main"]).await.unwrap();
+        trusted_git(root.path(),&["add","."]).await.unwrap();
+        trusted_git(root.path(),&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-m","scope metadata fixture"]).await.unwrap();
+        let head=actual_head(root.path()).await.unwrap();trusted_git(root.path(),&["update-ref","refs/remotes/origin/main",&head]).await.unwrap();
+        let control=tempfile::tempdir_in("/tmp").unwrap();let state=tempfile::tempdir_in("/tmp").unwrap();
+        let database=state.path().join("workflow.db");
+        let guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:Some(42),pr:None,branch:"fixture",contract:"C1",environment:"fixture"}).await.unwrap().unwrap();
+        // Real metadata guard and write-scope service; no native/provider or
+        // completed publication authority is inferred from this fixture.
+        with_bound_write_scope(root.path(),&prepared,None,|scope| {
+            guard.with_acceptance_metadata(|access| {
+                let error=bind_write_scope(root.path(),&prepared,None).unwrap_err();
+                assert!(format!("{error:#}").contains("write scope busy"),"scope writer refused for a different reason: {error:#}");
+                immutable_with_metadata(control.path(),"scope-metadata.json",&serde_json::to_vec(scope.reference())?,access)?;
+                scope.validate_current()
+            })
+        }).unwrap();
+        let saved:augmentagent_channel_core::autoship_write_scope::ScopeReference=private_json(&control.path().join("scope-metadata.json")).unwrap();
+        assert_eq!(saved.contract_hash,prepared.baseline.registration.contract_hash());
+        bind_write_scope(root.path(),&prepared,None).unwrap();guard.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn acceptance_metadata_sweep_refuses_orphan_repair_and_owner_pause_fences_real_writers() {
+        let (root,old,head)=authority_fixture().await;
+        trusted_git(root.path(),&["update-ref","refs/remotes/origin/main",&head]).await.unwrap();
+        let control=tempfile::Builder::new().prefix("acceptance-metadata-control-").tempdir_in("/tmp").unwrap();
+        let state=tempfile::Builder::new().prefix("acceptance-metadata-state-").tempdir_in("/tmp").unwrap();
+        let database=state.path().join("workflow.db");
+        let guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:Some(42),pr:None,branch:"fixture",contract:"C1",environment:"fixture"}).await.unwrap().unwrap();
+        persist_fixture_registration(control.path(),&old).unwrap();
+        let index=control.path().join("issue-42-workflow.json");
+        let original=std::fs::read(&index).unwrap();std::fs::remove_file(&index).unwrap();
+        let artifact_sha256="f".repeat(64);
+        let reference=CandidateReceiptReference {schema_version:1,binding:old.baseline.registration.binding(&head).unwrap(),artifact:control.path().join(format!("candidate-{artifact_sha256}.json")),artifact_sha256,receipt_ids:vec![],alignment:None};
+        let error=assert_sweep_receipt(root.path(),control.path(),AcceptanceSource::Issue(42),&reference,&head,&guard).await.unwrap_err();
+        assert!(error.to_string().contains("sweep original acceptance manifest missing"),"unexpected sweep refusal: {error:#}");
+        assert!(!index.exists(),"read-only sweep repaired the canonical acceptance namespace");
+        let mut store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+        let paused=store.set_owner_pause(guard.id(),"github:owner",0,true,chrono::Utc::now().timestamp_millis()).unwrap();
+        assert!(guarded_original_manifest(&guard,control.path(),AcceptanceSource::Issue(42)).is_err());
+        assert!(!index.exists(),"paused old guard recreated a canonical manifest");
+        assert!(immutable_for(&guard,control.path(),"refused-amendment.json",b"stale metadata").is_err());
+        assert!(!control.path().join("refused-amendment.json").exists());
+        store.set_owner_pause(guard.id(),"github:owner",paused.revision,false,chrono::Utc::now().timestamp_millis()).unwrap();
+        let recovered=guarded_original_manifest(&guard,control.path(),AcceptanceSource::Issue(42)).unwrap().unwrap();
+        assert_eq!(recovered.contract_hash,old.baseline.registration.contract_hash());
+        assert_eq!(std::fs::read(&index).unwrap(),original,"guarded recovery changed original manifest evidence");
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        assert_eq!(store.merge_allowance(chrono::Utc::now().timestamp_millis(),5).unwrap().confirmed,0);
+        guard.finish().unwrap();
     }
     fn authority_json(old:&PreparedAcceptance,approved:bool,proposal:Option<ContractProposal>)->String {
         serde_json::to_string(&Decision {approved,previous_contract_hash:old.baseline.registration.contract_hash().into(),approve_environment_transition:false,approve_additional_files:vec![],reason:"Independent authority preserves every owner requirement".into(),proposal}).unwrap()
@@ -1141,6 +1217,55 @@ mod tests {
                 },
             },
         )
+    }
+    #[test]
+    fn private_amendment_requires_current_oracles_and_independent_red_evidence() {
+        let (_root,legacy)=fixture();
+        assert!(validate_private_amendment_baseline(&legacy).is_err(),
+            "private activation accepted a legacy claimed-test oracle without independent red");
+        let mut current=legacy.clone();
+        current.proposal.contract.verifiers[0].command=crate::autoship_contract::VerifierCommand::BlackBox {
+            invocation:crate::autoship_contract::BehaviorInvocation::PythonScript {file:"regression.py".into(),args:vec![]},
+            oracle:crate::autoship_contract::OutputOracle::Json {value:serde_json::json!(true)}};
+        current.baseline.registration=RegisteredContract::register_from_files(current.proposal.contract.clone(),
+            "a".repeat(40),"environment-a".into(),&current.proposal.files).unwrap();
+        assert!(validate_private_amendment_baseline(&current).is_err(),
+            "private activation accepted a current oracle with no independently red receipts");
+    }
+    #[tokio::test]
+    async fn private_amendment_replay_refuses_changed_product_and_never_repairs_it() {
+        let (root,old)=fixture();
+        std::fs::remove_file(root.path().join("regression.py")).unwrap();
+        trusted_git(root.path(),&["init","--initial-branch=main"]).await.unwrap();
+        std::fs::write(root.path().join("behavior.py"),"original product\n").unwrap();
+        trusted_git(root.path(),&["add","behavior.py"]).await.unwrap();
+        trusted_git(root.path(),&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+            "commit","-m","synthetic original product"]).await.unwrap();
+        // This tests the product precondition only, not approval or red proof.
+        // The outer resume path independently rejects this unapproved record.
+        let pending=Pending {version:2,source:AcceptanceSource::Issue(42),
+            original_head:actual_head(root.path()).await.unwrap(),input_hash:digest(b"unit input"),
+            old:old.clone(),next:old.clone(),authority:Decision {approved:false,
+                previous_contract_hash:old.baseline.registration.contract_hash().into(),
+                approve_environment_transition:false,reason:"unapproved product-precondition fixture".into(),
+                proposal:None,approve_additional_files:vec![]},native_provider:String::new(),
+            native_session:String::new(),prompt_hash:String::new()};
+        validate_private_pending_product(root.path(),&pending).await.unwrap();
+        std::fs::write(root.path().join("unrelated"),"preserve owner edit").unwrap();
+        assert!(validate_private_pending_product(root.path(),&pending).await.is_err());
+        assert_eq!(std::fs::read_to_string(root.path().join("unrelated")).unwrap(),"preserve owner edit");
+        std::fs::remove_file(root.path().join("unrelated")).unwrap();
+        std::fs::write(root.path().join("behavior.py"),"changed staged product\n").unwrap();
+        trusted_git(root.path(),&["add","behavior.py"]).await.unwrap();
+        assert!(validate_private_pending_product(root.path(),&pending).await.is_err());
+        assert!(!trusted_git(root.path(),&["diff","--cached"]).await.unwrap().is_empty());
+        trusted_git(root.path(),&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+            "commit","-m","synthetic changed product"]).await.unwrap();
+        let changed=actual_head(root.path()).await.unwrap();
+        assert!(validate_private_pending_product(root.path(),&pending).await.unwrap_err().to_string().contains("candidate head changed"));
+        assert_eq!(actual_head(root.path()).await.unwrap(),changed);
+        assert_eq!(std::fs::read_to_string(root.path().join("behavior.py")).unwrap(),"changed staged product\n");
+        assert!(!root.path().join("regression.py").exists());
     }
     #[test]
     fn ordinary_noop_approval_is_declined_while_the_validator_and_final_ruling_stay_strict() {
@@ -1385,7 +1510,7 @@ mod tests {
 /// Scripted independent scope authority for the end-to-end migration fixture.
 /// New baseline and candidate observations still use real isolated subprocesses.
 #[cfg(test)]
-pub(crate) async fn migrate_fixture(root:&Path, control:&Path, old:&PreparedAcceptance, mut proposal:ContractProposal)->Result<PreparedAcceptance> {
+pub(crate) async fn migrate_fixture(root:&Path, control:&Path, old:&PreparedAcceptance, mut proposal:ContractProposal, workflow:&workflow::WorkflowGuard)->Result<PreparedAcceptance> {
     proposal.contract.revision=old.proposal.contract.revision+1;
     let environments = environment_evidence(root, control, old).await?;
     ensure!(environments.legacy_proof_migration, "fixture must exercise actual legacy migration");
@@ -1404,10 +1529,68 @@ pub(crate) async fn migrate_fixture(root:&Path, control:&Path, old:&PreparedAcce
         let (path,directory)=match scope {crate::autoship_contract::PathScope::File(path)=>(path,false),crate::autoship_contract::PathScope::Directory(path)=>(path,true)};
         augmentagent_channel_core::autoship_write_scope::DeclaredPath{path:path.clone(),directory}
     }).collect(),old.proposal.files.keys().cloned().collect())?;
-    let pending=Pending{version:1,source:old.proposal.contract.source()?,original_head:actual_head(root).await?,input_hash:digest(b"scripted migration input"),
+    let pending=Pending{version:2,source:old.proposal.contract.source()?,original_head:actual_head(root).await?,input_hash:digest(b"scripted migration input"),
         old:old.clone(),next,authority:Decision{approved:true,previous_contract_hash:old.baseline.registration.contract_hash().into(),approve_environment_transition:true,approve_additional_files:vec![],reason:"Replace legacy claimed test status with independently measured arithmetic behavior".into(),proposal:Some(proposal)},
         native_provider:"scripted-test-authority".into(),native_session:"scripted-distinct-test-session".into(),prompt_hash:digest(prompt.as_bytes())};
     let path=pending_path(control,pending.source);
     immutable(control,path.file_name().unwrap().to_str().unwrap(),&serde_json::to_vec(&pending)?)?;
-    resume_pending(root,control,pending.source).await?.context("migration fixture did not activate")
+    let before=actual_head(root).await?;
+    let activated=resume_pending(root,control,pending.source,workflow).await?.context("migration fixture did not activate")?;
+    ensure!(actual_head(root).await?==before,"private migration changed product head");
+    // Recreate exactly the durable state after completion was synced but the
+    // final pending-file deletion acknowledgement was lost. No authority call.
+    immutable(control,path.file_name().unwrap().to_str().unwrap(),&serde_json::to_vec(&pending)?)?;
+    ensure!(read_manifest(control,pending.source).is_err(),"ordinary reader accepted a canonical manifest while its amendment remained pending");
+    let replay=resume_pending(root,control,pending.source,workflow).await?.context("private migration replay missing")?;
+    ensure!(replay.baseline.registration==activated.baseline.registration && actual_head(root).await?==before,
+        "private activation replay changed registration or product head");
+    ensure!(read_manifest(control,pending.source)?.is_some(),"completed amendment did not become readable");
+    let complete=control.join(format!("{}-amendment-complete-{}.json",pending.source.key(),pending.next.baseline.registration.contract_hash()));
+    let completed_bytes=std::fs::read(&complete)?;
+    // Durable next manifest, pending retained, completion not yet written.
+    immutable(control,path.file_name().unwrap().to_str().unwrap(),&serde_json::to_vec(&pending)?)?;
+    std::fs::remove_file(&complete)?;
+    ensure!(read_manifest(control,pending.source).is_err(),"ordinary reader accepted interrupted publication");
+    let resumed=resume_pending(root,control,pending.source,workflow).await?.context("post-manifest replay missing")?;
+    ensure!(resumed.baseline.registration==replay.baseline.registration && std::fs::read(&complete)?==completed_bytes,"post-manifest replay changed authority or completion");
+    // Missing both transaction and completion is unproven; never regenerate it.
+    std::fs::remove_file(&complete)?;
+    ensure!(read_manifest(control,pending.source).is_err(),"manifest alone granted completed amendment authority");
+    ensure!(!complete.exists() && !path.exists(),"refused inspection recreated missing authority");
+    immutable(control,complete.file_name().unwrap().to_str().unwrap(),&completed_bytes)?;
+    ensure!(read_manifest(control,pending.source)?.is_some(),"original completion restore was not recognized");
+    let mut changed=serde_json::to_value(&pending)?;changed["authority"]["approved"]=false.into();
+    let changed_bytes=serde_json::to_vec(&changed)?;std::fs::write(&complete,&changed_bytes)?;
+    ensure!(read_manifest(control,pending.source).is_err(),"conflicting completion granted ordinary revision authority");
+    ensure!(std::fs::read(&complete)?==changed_bytes,"refused reader rewrote conflicting completion");
+    std::fs::write(&complete,&completed_bytes)?;
+    let history=control.join(format!("{}-manifest-history-{}-{}.json",pending.source.key(),pending.old.proposal.contract.revision,pending.old.baseline.registration.contract_hash()));
+    let history_bytes=std::fs::read(&history)?;std::fs::remove_file(&history)?;
+    ensure!(read_manifest(control,pending.source).is_err(),"completion without original manifest history granted authority");
+    immutable(control,history.file_name().unwrap().to_str().unwrap(),&history_bytes)?;
+    ensure!(read_manifest(control,pending.source)?.is_some(),"exact original history restore was not recognized");
+    Ok(replay)
+}
+
+/// Descriptive synthetic amendment files for real owner-lineage reader tests.
+/// No provider approval or productive admission is claimed by this fixture.
+#[cfg(test)]
+pub(in crate::self_improve) fn owner_descendant_fixture(control:&Path,old:&PreparedAcceptance,owner_file:&str)->Result<(Vec<u8>,PreparedAcceptance)> {
+    let source=old.proposal.contract.source()?;let mut proposal=old.proposal.clone();proposal.contract.revision+=1;
+    for contents in proposal.files.values_mut() {contents.push_str("\n# independently amended fixture\n");}
+    let root=tempfile::tempdir()?;install_harness(root.path(),&proposal)?;
+    let registration=RegisteredContract::register(root.path(),proposal.contract.clone(),old.baseline.registration.baseline_head().into(),old.baseline.registration.binding(old.baseline.registration.baseline_head())?.environment_id)?;
+    let receipt=registration.observe(root.path(),"ready",registration.binding(registration.baseline_head())?,&Observation {exit_code:Some(0),stdout:"false".into(),stderr:String::new(),interrupted:false,output_complete:true})?;
+    let next=PreparedAcceptance {proposal:proposal.clone(),baseline:BaselineEvidence {registration,receipts:vec![receipt]}};
+    let pending=Pending {version:2,source,original_head:old.baseline.registration.baseline_head().into(),input_hash:digest(b"synthetic owner descendant"),old:old.clone(),next,
+        authority:Decision {approved:true,previous_contract_hash:old.baseline.registration.contract_hash().into(),approve_environment_transition:false,approve_additional_files:vec![],reason:"Synthetic independent amendment preserves original criteria".into(),proposal:Some(proposal)},
+        native_provider:"synthetic-authority".into(),native_session:"synthetic-independent-lineage-session".into(),prompt_hash:digest(b"synthetic lineage prompt")};
+    validate_private_pending(&pending,source)?;
+    let mut old_manifest=WorkflowManifest::from_prepared(source,old);old_manifest.evidence_file=Some(owner_file.into());
+    immutable(control,&format!("{}-manifest-history-{}-{}.json",source.key(),old_manifest.contract_revision,old_manifest.contract_hash),&serde_json::to_vec(&old_manifest)?)?;
+    let mut next_manifest=WorkflowManifest::from_prepared(source,&pending.next);
+    let name=format!("{}-revision-{}-{}.json",source.key(),next_manifest.contract_revision,next_manifest.contract_hash);
+    immutable(control,&name,&serde_json::to_vec(&pending.next)?)?;next_manifest.evidence_file=Some(name);
+    immutable(control,&format!("{}-amendment-complete-{}.json",source.key(),next_manifest.contract_hash),&serde_json::to_vec(&pending)?)?;
+    Ok((serde_json::to_vec(&next_manifest)?,pending.next))
 }

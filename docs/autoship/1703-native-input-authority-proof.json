@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "kind": "native-input-authority-retained-through-stdin-component",
+  "source_parent_commit": "9000736a581a10630af6f3ea49c0889322ca05cf",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "8e88889ec6a0dec8e44fca242b6d47251d557c10bbf5ef5b4e9906f9207eb14d"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_handoff.rs",
+      "sha256": "97b920f99469db6328add3dd0dc4dfec3420bea58d48e84bb5fe0951cf6cd82f"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_outcome.rs",
+      "sha256": "2cc478e42a4442fa4b394843870f32398e5925a4ab871352be9e3b5ff06ed851"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_metadata.rs",
+      "sha256": "db4c0dc5785015e168dfdce835920da548df5d46f018263994092fdb6e37a964"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_session.rs",
+      "sha256": "4137049620d75f1c086077fa8bcddf161ba5c4fe20f7b092526347a14640c216"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/reasoner.rs",
+      "sha256": "d53871b569c3d2ce121b329bdc16cdc88c1b5c57a8117ef354a61331334e970e"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/codex.rs",
+      "sha256": "bf6abd339e8b41e465295890fa8b0a0285df2c9626d47028d950f93c984dda44"
+    }
+  ],
+  "behavioral_reds": [
+    {
+      "session": 38842,
+      "result": "terminal1; managed exit101",
+      "log": "/tmp/autoship-native-input-authority-red-20261106.log",
+      "failure": "native state lock could be reacquired while an original marked stdin write was still pending"
+    },
+    {
+      "session": 37262,
+      "result": "terminal1; managed exit101",
+      "log": "/tmp/autoship-native-input-handoff-busy-red-20261106.log",
+      "failure": "handoff lock-acquisition subprocess blocked instead of promptly classifying active input authority as LockBusy"
+    }
+  ],
+  "validation": {
+    "full_core": {
+      "session": 89046,
+      "result": "terminal0",
+      "passed": 944,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 36.61,
+      "log": "/tmp/autoship-native-input-authority-full-core-final-20261106.log"
+    },
+    "isolated_full_cli": {
+      "session": 88018,
+      "log": "/tmp/autoship-native-input-authority-isolated-full-cli-20261106.log",
+      "unfinished_productive_gate_wip_included": false,
+      "result": "terminal0",
+      "passed": 1949,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 312.33
+    },
+    "isolated_production_check": {
+      "session": 19896,
+      "result": "terminal0",
+      "seconds": 13.98,
+      "log": "/tmp/autoship-native-input-authority-isolated-production-check-20261106.log"
+    }
+  },
+  "boundary_cases": {
+    "providers": [
+      "codex",
+      "claude"
+    ],
+    "outcomes": [
+      "successful full write",
+      "future cancellation",
+      "broken pipe"
+    ],
+    "receiver": "real local scripted subprocess with a blocked stdin pipe and 2 MiB prompt; no provider or VM",
+    "assertions": [
+      "actual StateLock::existing refuses while original input future is pending",
+      "actual handoff StateLock::acquire reports LockBusy in a bounded subprocess rather than blocking",
+      "state authority becomes available after success/cancellation/error",
+      "successful receiver gets exactly the full prompt; canceled/error receivers get less",
+      "one durable input-attempt marker remains and the same launch refuses another attempt"
+    ],
+    "original_crash_and_binding_fence_tests_retained": true
+  },
+  "implemented": [
+    "Private NativeInputRelease RAII guard retains actual original state lock from durable marker through asynchronous stdin write/shutdown/submission observation",
+    "No workflow mutex or SQLite connection retained across asynchronous input IO",
+    "Nonblocking handoff/initialization lock acquisition preserves WouldBlock for existing LockBusy classification",
+    "Cancellation/failure retains exposure uncertainty and once-only launch admission"
+  ],
+  "not_proven_or_implemented": [
+    "Original writer closure/revocation proof",
+    "Complete associated launch/input census, kernel/source/resource authority and body nonrelease",
+    "Semantic coding-conversation continuation and separate productive successor bridge/claim",
+    "Typed recovery/terminal producers, shared productive admission and connected owner consumer",
+    "Protected aggregate storage, independent exact-head review, rollout and original live acceptance/soaks"
+  ],
+  "preserved_unpublished_work": "/tmp/autoship-productive-gate-preserved-20261106.patch"
+}

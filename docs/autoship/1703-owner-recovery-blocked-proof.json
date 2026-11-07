@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "kind": "owner-recovery-original-abort-observations-and-claim-backoff",
+  "source_parent_commit": "2054e4a3dc3efeeae3055c2564b8eff12f4ba63b",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_recovery_blocked.rs",
+      "sha256": "975ab9da29cf5ecb80eb94d8fb6637f291996f6a16eb64af012bf8ff62616edd"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs",
+      "sha256": "2ff47e95ea1be5080ced7c150450b8a42482731dceb02e98d9d85963e8cf048a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_reconcile.rs",
+      "sha256": "cebf8e16016fa63a2fd4589903a7ed9ff753a986db733c2776832986c111eaf0"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "aab35c02b144cde37c43f8f22e31744c092910b787abb13e28a11c6a8e9515e8"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "d121e10d19ee02caef0f7c6c7c108548053c2b2ffbe848bed2952873dfb4e1dd"
+    },
+    {
+      "path": "docs/autoship/owner-publication-protocol.md",
+      "sha256": "d4b628d4f74141a5c787f069c07e2a2f52adf9e1f9eedf316c824fb4370a0615"
+    }
+  ],
+  "behavioral_reds": [
+    {
+      "session": 4705,
+      "result": "terminal1",
+      "log": "/tmp/autoship-owner-recovery-blocked-red-20261106.log",
+      "failure": "Expired metadata lease with unchanged original namespace obligations minted another generation before the five-minute deadline"
+    }
+  ],
+  "intermediate_validation": [
+    {
+      "session": 94450,
+      "result": "terminal0",
+      "passed": 1,
+      "seconds": 63.17,
+      "log": "/tmp/autoship-owner-recovery-blocked-focused-20261106.log",
+      "scope": "Twelve original transfer/publication cases with idempotent debt, reopened store, early wake, stale claim and missing-index refusal, before permanent unavailable/capacity hold classification"
+    },
+    {
+      "session": 4714,
+      "result": "terminal0",
+      "passed_cli_unit": 1951,
+      "failed": 0,
+      "ignored": 34,
+      "unit_seconds": 360.15,
+      "log": "/tmp/autoship-owner-recovery-blocked-full-cli-20261106.log",
+      "scope": "Full CLI command including integration binaries, before final unavailable/capacity classification"
+    }
+  ],
+  "verification": {
+    "final_focused": {
+      "session": 22265,
+      "result": "terminal0",
+      "passed": 1,
+      "seconds": 65.27,
+      "log": "/tmp/autoship-owner-recovery-blocked-final-focused-20261106.log",
+      "scope": "All twelve child cases; both providers deliberately clean disposable remaining original source and prove that zero namespace obligations retain unavailable-publication hold, pending input and denial of coding/claims"
+    },
+    "final_cli_unit": {
+      "session": 62299,
+      "result": "terminal0",
+      "passed": 1951,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 360.03,
+      "log": "/tmp/autoship-owner-recovery-blocked-final-cli-unit-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    },
+    "production_check": {
+      "session": 40124,
+      "result": "terminal0",
+      "seconds": 28.34,
+      "log": "/tmp/autoship-owner-recovery-blocked-production-check-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    }
+  },
+  "spec_audit": {
+    "scope": "Publication protocol and new section 43",
+    "findings": 5,
+    "resolved_or_explicitly_parked": 5,
+    "remaining_reported_contradictions": 0,
+    "is_independent_exact_head_code_review": false
+  },
+  "scope": "Existing opaque authenticated metadata recovery claim and original aborted request only; no new native retirement permission, productive guard, original input replacement or accounting mutation",
+  "limits": [
+    "Unused-native and synthetic-baseline fixtures; no live model, VM, Discord or autonomous merge acceptance",
+    "The 1024-entry capacity admission is implemented and audited, without a positive 1024-entry fixture",
+    "Unavailable original publication requires separately authorized correction or actual terminal transition; that implementation remains open",
+    "Evidence-preserving versioned archival remains open; capacity holds do not permit history deletion or storage-floor overrides",
+    "Other blocked causes, productive successors, terminal authority, full C/R source/resource/input census, body nonrelease/semantic continuation, shared productive gates and protected aggregate storage remain",
+    "Connected worker, exact-head independent review, normal rollout, original live CLI/Discord acceptance and all required soaks remain"
+  ],
+  "live_provider_vm_discord_proof": false,
+  "deployed": false,
+  "epic_complete": false
+}

@@ -5,6 +5,7 @@ use super::*;
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub struct OwnerControl {
     pub revision:i64,
+    /// Explicit owner hold. Pending messages are a separate derived barrier.
     pub paused:bool,
     pub principal:String,
     pub updated_at_ms:i64,
@@ -45,7 +46,10 @@ impl WorkflowStore {
             let candidate=match retry_checkpoint(&tx,&workflow,now,true) {
                 Ok(candidate)=>candidate,
                 Err(error) if error.to_string()=="execution-retry-not-quiescent"=>continue,
-                Err(error)=>return Err(error),
+                Err(error)=>{
+                    tracing::warn!(workflow,error=%error,"owner retry held: reconciliation evidence unavailable; intent retained");
+                    continue;
+                },
             };
             let Some((mut checkpoint,current_generation))=candidate else {
                 tx.execute("UPDATE owner_execution_retry SET state='superseded' WHERE workflow=?1",[&workflow])?;
@@ -84,12 +88,21 @@ fn retry_checkpoint(tx:&Transaction<'_>,workflow:&str,now:i64,require_retired:bo
     let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed'))",[workflow],|r|r.get(0))?;
     ensure!(!blocked,"execution-retry-not-quiescent");
     if require_retired {
-        ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND retired_at IS NULL)",[workflow],|r|r.get::<_,bool>(0))?,"execution-retry-not-quiescent");
+        ensure!(!super::native_owner_binding::unretired_owners(tx,workflow)?,"execution-retry-not-quiescent");
     }
     Ok(Some((checkpoint,generation)))
 }
 
 pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&str,expected_revision:i64,paused:bool,now:i64)->Result<OwnerControl> {
+    apply_control(tx,workflow,principal,expected_revision,paused,now,false)
+}
+/// Ingress advances the intent fence without changing the explicit hold or
+/// interpreting input as a request to retry/retire native execution.
+pub(super) fn record_input_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&str,expected_revision:i64,now:i64)->Result<OwnerControl> {
+    let paused=read(tx,workflow)?.is_some_and(|control|control.paused);
+    apply_control(tx,workflow,principal,expected_revision,paused,now,true)
+}
+fn apply_control(tx:&Transaction<'_>,workflow:&str,principal:&str,expected_revision:i64,paused:bool,now:i64,input:bool)->Result<OwnerControl> {
         ensure!(!principal.is_empty() && principal.len()<=256 && principal.bytes().all(|b|b.is_ascii_graphic()),"invalid owner principal");
         let checkpoint:Option<String>=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[workflow],|r|r.get(0)).optional()?;
         let queued:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM command_job WHERE workflow=?1)",[workflow],|r|r.get(0))?;
@@ -97,18 +110,18 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
         if let Some(checkpoint)=checkpoint {
             ensure!(!matches!(serde_json::from_str::<Checkpoint>(&checkpoint)?.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot change owner control");
         }
-        if !paused {ensure!(super::owner_inbox::pending(tx,workflow)?==0,"owner-followup-pending");}
+        let pending_input=super::owner_inbox::pending(tx,workflow)?>0;
         let prior=read(&tx,workflow)?;
         let revision=prior.as_ref().map_or(0,|c|c.revision);
         ensure!(revision==expected_revision,"owner-control-revision-conflict");
         let revision=revision.checked_add(1).context("owner control revision overflow")?;
-        let retry=if paused {None}else{retry_checkpoint(tx,workflow,now,false)?};
+        let retry=if paused || input || pending_input {None}else{retry_checkpoint(tx,workflow,now,false)?};
         let control=OwnerControl {revision,paused,principal:principal.into(),updated_at_ms:now};
         tx.execute("INSERT INTO workflow_owner_control VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workflow) DO UPDATE SET revision=excluded.revision,paused=excluded.paused,principal=excluded.principal,updated_at=excluded.updated_at",
             params![workflow,revision,paused,principal,now])?;
         tx.execute("INSERT INTO workflow_owner_control_event VALUES(?1,?2,?3,?4,?5)",params![workflow,revision,paused,principal,now])?;
         if let Some((mut checkpoint,generation))=retry {
-            let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND retired_at IS NULL)",[workflow],|r|r.get(0))?;
+            let pending=super::native_owner_binding::unretired_owners(tx,workflow)?;
             tx.execute("UPDATE workflow_native_owner SET retirement_reason='owner_execution_retry' WHERE workflow=?1 AND retired_at IS NULL AND retirement_reason IS NULL",[workflow])?;
             tx.execute("INSERT INTO owner_execution_retry(workflow,owner_revision,generation,binding,state,requested_at,attempted_at) VALUES(?1,?2,?3,?4,?5,?6,0) ON CONFLICT(workflow) DO UPDATE SET owner_revision=excluded.owner_revision,generation=excluded.generation,binding=excluded.binding,state=excluded.state,requested_at=excluded.requested_at,attempted_at=0",
                 params![workflow,revision,generation,serde_json::to_string(&checkpoint.binding)?,if pending {"pending"}else{"completed"},now])?;
@@ -120,7 +133,7 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
             tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",params![workflow,serde_json::to_string(&checkpoint)?,now])?;
             event(tx,workflow,generation,"owner_execution_retry_requested",&serde_json::json!({"principal":principal,"owner_revision":revision,"cleanup_pending":pending}).to_string(),now)?;
         }
-        super::progress::project(tx,workflow,"owner_control_changed",now)?;
+        super::progress::project(tx,workflow,if input {"owner_input_queued"}else{"owner_control_changed"},now)?;
         Ok(control)
 }
 
@@ -133,6 +146,10 @@ pub(super) fn read(conn:&Connection,workflow:&str)->Result<Option<OwnerControl>>
 }
 
 pub(super) fn require_dispatch(conn:&Connection,workflow:&str)->Result<()> {
+    super::owner_publication_recovery::require_no_recovery_dispatch(conn,workflow)?;
+    let turns:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_turn')",[],|r|r.get(0))?;
+    if turns {ensure!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1 AND state NOT IN ('completed','setup_refused'))",[workflow],|r|r.get::<_,bool>(0))?,"owner-turn-unsettled");}
+
     ensure!(!read(conn,workflow)?.is_some_and(|c|c.paused),"owner-paused");
     ensure!(super::owner_inbox::pending(conn,workflow)?==0,"owner-followup-pending");
     Ok(())
@@ -275,10 +292,11 @@ mod tests {
         store.checkpoint(&lease,&checkpoint,4).unwrap();
         store.register_native_owner(&lease,dir.path().join("audit").to_str().unwrap(),5).unwrap();store.release(&lease,6).unwrap();
         store.enqueue_owner_message(&super::super::discord_ingress::DiscordOrigin {message:45,..origin},&id,"Owner requirement",None,7).unwrap();
-        assert_eq!(store.set_owner_pause(&id,"github:owner",1,false,8).unwrap_err().to_string(),"owner-followup-pending");
+        let resumed=store.set_owner_pause(&id,"github:owner",1,false,8).unwrap();
+        assert!(!resumed.paused);assert!(store.require_owner_dispatch(&id).is_err());
         let retirement:Option<String>=store.conn.query_row("SELECT retirement_reason FROM workflow_native_owner",[],|r|r.get(0)).unwrap();
-        assert_eq!(retirement,None,"refused resume must not start teardown behind pending owner input");
-        assert!(store.owner_control(&id).unwrap().unwrap().paused);
+        assert_eq!(retirement,None,"resume must not start teardown behind pending owner input");
+        assert!(!store.owner_control(&id).unwrap().unwrap().paused);
     }
 
     #[test]

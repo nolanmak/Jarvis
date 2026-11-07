@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "kind": "authenticated-original-native-recovery-metadata-inspection-component",
+  "source_parent_commit": "e1dc1f054242c971fa58abb74ad339aa45c8a839",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_handoff.rs",
+      "sha256": "813c95376b4580e0bfc9bcf9a8f1ec4a0a1b065e9be466ff627dee08cf2d4024"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication.rs",
+      "sha256": "702f47315c0db5a10425840bee6b9e019b28445cc2c572a0d179b3e1ecbaa82f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs",
+      "sha256": "498d09685beee2967ac5ff28b45c058b7254fef191e8304d8ff36bc295d75cb9"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication.rs",
+      "sha256": "2652aff4b60bbff46add314370b29ee592e3166cf6d8a9abd3bcceedf736810c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_targeted.rs",
+      "sha256": "004669414a6786e9be1d3b2849a5651b0de510353ccaf63033678a9718c862c1"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "778822524511b1f6f61c09e47a64a405b6e11887d66605d266d50e6a17300dfe"
+    }
+  ],
+  "behavioral_reds": [
+    {
+      "session": 91536,
+      "result": "terminal1",
+      "log": "/tmp/autoship-owner-recovery-native-red-20261106.log",
+      "observed": "Initial real recovery observer adapter using execution-only namespace facts refused held/paused original-native inspection with native-transfer-authority-conflict; the adapter and test were newly introduced, not a live incident reproduction"
+    }
+  ],
+  "intermediate_validation": [
+    {
+      "session": 30349,
+      "result": "terminal0",
+      "passed": 1,
+      "seconds": 4.8,
+      "log": "/tmp/autoship-owner-recovery-native-green-20261106.log",
+      "scope": "Initial both-provider controlled original-native proof, before expanded fault assertions"
+    },
+    {
+      "session": 53379,
+      "result": "terminal1",
+      "log": "/tmp/autoship-owner-recovery-native-expanded-20261106.log",
+      "scope": "Test fixture used owner policy value as native policy filename; compile failure, not behavioral red"
+    },
+    {
+      "session": 68141,
+      "result": "terminal0",
+      "passed": 1,
+      "seconds": 5.97,
+      "log": "/tmp/autoship-owner-recovery-native-expanded-final-20261106.log",
+      "scope": "Both provider pins, actual private activation, production authorizer with scripted GH, original state/audit locks, policy/runtime/audit faults, in-visitor claim damage and superseded claim refusal; no actual provider/VM/Discord"
+    }
+  ],
+  "verification": {
+    "isolated_full_cli": {
+      "session": 88880,
+      "result": "terminal0",
+      "passed": 1951,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 344.72,
+      "log": "/tmp/autoship-owner-recovery-native-full-cli-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    },
+    "isolated_production_check": {
+      "session": 45598,
+      "result": "terminal0",
+      "seconds": 25.44,
+      "log": "/tmp/autoship-owner-recovery-native-production-check-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    }
+  },
+  "remaining": [
+    "Original opaque preparation reconstruction and recovery canonical writer/settlement",
+    "Original pending transfer reconciliation where needed; this observer never substitutes a new UUID or proves takeover",
+    "Terminal checkpoint and productive successor bridge/claim",
+    "Full C/R source/resource/input census, original-body nonrelease or semantic original-conversation continuation",
+    "Shared productive gates and aggregate protected-storage admission",
+    "Connected owner worker, independent exact-head review, normal rollout, original live CLI/Discord acceptance and soaks"
+  ],
+  "productive_gate_wip_included": false,
+  "live_provider_vm_discord_proof": false,
+  "deployed": false,
+  "epic_complete": false
+}

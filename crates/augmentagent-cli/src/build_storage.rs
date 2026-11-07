@@ -168,7 +168,8 @@ pub struct Target {
     pub shared: bool,
 }
 
-fn repo_id(repo: &Path) -> Result<PathBuf> {
+/// Existing storage-owner identity, shared across linked worktrees.
+pub(crate) fn repo_id(repo: &Path) -> Result<PathBuf> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)

@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "kind": "delayed-initial-owner-body-reservation-component",
+  "source_parent_commit": "3d66615e2fc2124a2aa597cccdfe5ead9e78a18d",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_dispatch.rs",
+      "sha256": "62516e9d5b566b6f4448240573a93817fac389ee3553f1a0e7dee98217faa97e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "463e316251aede0bcb1479e8171175de9660ba6994fe98f34daef53157866afb"
+    }
+  ],
+  "behavior": [
+    "Empty shared reservation slot allows controlled setup but refuses model admission; both callbacks retain it across thread hops.",
+    "Fresh first builder reserves only in actual resource-ready callback under original prepared native proof, with final original candidate/baseline and request revalidation.",
+    "Version 2 captures exact original prepared intent/launch receipt/resource receipt and launch-before-dispatch ordering; legacy version 1 remains launch-after-dispatch.",
+    "Model/native binding and completion consumers use the same versioned ordering. Missing reservation does not grant owner-turn replay after expiry."
+  ],
+  "validation": {
+    "pending_model_behavioral_red": {
+      "log": "/tmp/autoship-delayed-owner-pending-red-2-20261106.log",
+      "log_sha256": "f17e9c61cc6062383110d3820c42f4bad51a677a3fe24dc0eea6d1b8d5cb4a3a",
+      "managed_exit": 1,
+      "cargo_exit": 101,
+      "passed": 0,
+      "failed": 1,
+      "reason": "Actual original owner preparation fixture, model admission invoked from a plain thread; pending body admitted a model before resource-ready reservation."
+    },
+    "intermediate_callback_green": {
+      "log": "/tmp/autoship-delayed-owner-pending-green-20261106.log",
+      "log_sha256": "6aa12a82eb03f8c01586dfee5b9b77b6628c117f2f7526091b55ed590c5c96a4",
+      "exit": 0,
+      "passed": 1,
+      "failed": 0
+    },
+    "ordering_focused": {
+      "log": "/tmp/autoship-delayed-owner-order-focused-20261106.log",
+      "log_sha256": "bb04f8205660f475b8c7595eddb7ea2c567cddb052f9d70b1b771adf3c071e60",
+      "exit": 0,
+      "passed": 1,
+      "failed": 0
+    },
+    "source_focused": {
+      "log": "/tmp/autoship-delayed-owner-source-focused-20261106.log",
+      "log_sha256": "9f2f43393c90eda8c8c6a4a232382657d69635833e8e7bba9bff8e712efea290",
+      "exit": 0,
+      "passed": 1,
+      "failed": 0
+    },
+    "fixture_corrections": [
+      "Initial compile attempt inserted native-order checks into the model-history validator and tried serializing PreparedLaunchRecord. Corrected before behavioral red; descriptive stored setup uses strict intent and receipt fields instead."
+    ],
+    "final_full_cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-delayed-owner-full-cli-20261106.log",
+      "log_sha256": "de9f029d7289f8541ae7c96d75ebc3f0f38cb63f292e3a94f3caca58290d6733",
+      "exit": 0,
+      "passed": 1935,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 279.94
+    },
+    "build_environment": {
+      "CARGO_TARGET_DIR": "/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_TEST_DEBUG": "0"
+    },
+    "final_production_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-delayed-owner-production-check-20261106.log",
+      "log_sha256": "73ba976103028ba81bbd132b40c6add97039c50244f17c47716794d5b5ea3f50",
+      "exit": 0,
+      "compiler_seconds": 31.04
+    }
+  },
+  "limits": [
+    "The behavioral red includes new schema and test plumbing; it is not a pristine-parent binary.",
+    "Ordering unit fixture is descriptive synthetic data and grants no native proof, model admission or executable dispatch.",
+    "Actual core prepared-native producer was tested in the parent checkpoint; successful real VM/provider execution through the composed CLI factory remains unverified.",
+    "Only first fresh builders move reservation after resource readiness. Existing conversation/imported continuation paths retain the earlier reservation and still require their own proof/factory migration.",
+    "No interruption replay permission, successor publication reconciliation, current-source build authority, all-writer exclusion, rollout, live owner coding, soak or epic completion is established."
+  ],
+  "epic_complete": false
+}

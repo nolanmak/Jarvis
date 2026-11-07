@@ -120,6 +120,22 @@ def safe_relative(raw):
     return path
 
 
+def export_target(staging, raw):
+    relative = safe_relative(raw)
+    # mkdir(parents=True) applies mode only to the final directory. Create
+    # every component separately so service umasks cannot expose new parents.
+    parent = staging
+    for component in (None, *relative.parts[:-1]):
+        if component is not None:
+            parent = parent / component
+            parent.mkdir(mode=0o700, exist_ok=True)
+        info = parent.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077):
+            raise ValueError('invalid native export directory')
+    return staging / relative
+
+
 @contextlib.contextmanager
 def short_channel_endpoint():
     """Socket only: AF_UNIX names cannot inherit arbitrarily long state roots.
@@ -528,11 +544,12 @@ def validate_runtime(path):
 
 def stage_native_companions(executable, guest_runtime, destination):
     executable = Path(executable)
-    if executable.resolve().name != 'codex':
+    if executable.name != 'codex':
         return
     runtime = Path(guest_runtime)
     manifest = json.loads((runtime / 'manifest.json').read_text())
-    digest = hashlib.sha256((Path(destination) / 'cli').read_bytes()).hexdigest()
+    with open(Path(destination) / 'cli', 'rb') as stream:
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
     entries = manifest.get('native_companions', {}).get(digest)
     if not isinstance(entries, list) or len(entries) != 1:
         raise ValueError('Codex runtime companion missing for executable digest; reprovision runtime')
@@ -553,12 +570,128 @@ def stage_native_companions(executable, guest_runtime, destination):
         os.fchmod(stream.fileno(), 0o555)
 
 
+def executable_origin(info):
+    return {'device': info.st_dev, 'inode': info.st_ino, 'nlink': info.st_nlink,
+            'mode': info.st_mode, 'uid': info.st_uid, 'gid': info.st_gid, 'bytes': info.st_size,
+            'mtime': [info.st_mtime_ns // 10**9, info.st_mtime_ns % 10**9],
+            'ctime': [info.st_ctime_ns // 10**9, info.st_ctime_ns % 10**9]}
+
+
+def stage_executable_input(manifest, executable, binary):
+    executable = Path(executable)
+    if (type(manifest) is not dict or set(manifest) != {'version', 'source', 'bytes', 'sha256', 'origin'}
+            or type(manifest['version']) is not int or manifest['version'] != 1
+            or type(manifest['source']) is not str or manifest['source'] != str(executable)
+            or not executable.is_absolute() or type(manifest['bytes']) is not int
+            or not 0 < manifest['bytes'] <= 512 * 1024 * 1024
+            or type(manifest['sha256']) is not str or len(manifest['sha256']) != 64
+            or any(c not in '0123456789abcdef' for c in manifest['sha256'])):
+        raise ValueError('native executable input manifest invalid')
+    origin = manifest['origin']
+    fields = {'device', 'inode', 'nlink', 'mode', 'uid', 'gid', 'bytes', 'mtime', 'ctime'}
+    if (type(origin) is not dict or set(origin) != fields
+            or any(type(origin[key]) is not int for key in fields - {'mtime', 'ctime'})
+            or any(type(origin[key]) is not list or len(origin[key]) != 2
+                   or any(type(value) is not int for value in origin[key]) for key in ('mtime', 'ctime'))):
+        raise ValueError('native executable origin invalid')
+    target = Path(binary) / 'cli'
+    created = False
+    fd = os.open(executable, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        with os.fdopen(fd, 'rb') as source:
+            before = os.fstat(source.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid not in (0, os.getuid())
+                    or before.st_mode & 0o022 or not before.st_mode & 0o111
+                    or before.st_size != manifest['bytes'] or executable_origin(before) != origin):
+                raise ValueError('native executable identity or size changed')
+            digest = hashlib.sha256()
+            total = 0
+            with open(target, 'xb') as destination:
+                created = True
+                while True:
+                    data = source.read(min(1024 * 1024, manifest['bytes'] - total + 1))
+                    if not data:
+                        break
+                    total += len(data)
+                    if total > manifest['bytes']:
+                        raise ValueError('native executable grew during staging')
+                    digest.update(data)
+                    destination.write(data)
+                if (total != manifest['bytes'] or digest.hexdigest() != manifest['sha256']
+                        or executable_origin(os.fstat(source.fileno())) != origin):
+                    raise ValueError('native executable bytes or identity changed')
+                destination.flush()
+                os.fchmod(destination.fileno(), 0o555)
+                os.fsync(destination.fileno())
+    except BaseException:
+        if created:
+            target.unlink()
+        raise
+
+
+def stage_input_assets(assets, binary):
+    if type(assets) is not list or len(assets) > 32:
+        raise ValueError('native asset count exceeds budget')
+    loaded = []
+    asset_bytes = 0
+    for index, asset in enumerate(assets):
+        if (type(asset) is not dict or set(asset) - {'version', 'source', 'name', 'bytes', 'sha256', 'origin'}
+                or type(asset.get('version')) is not int or asset['version'] != 1
+                or type(asset.get('source')) is not str or type(asset.get('name')) is not str
+                or type(asset.get('bytes')) is not int or not 0 <= asset['bytes'] <= 16 * 1024 * 1024
+                or type(asset.get('sha256')) is not str or len(asset['sha256']) != 64
+                or any(c not in '0123456789abcdef' for c in asset['sha256'])):
+            raise ValueError('native input asset manifest invalid')
+        name = safe_relative(asset['name'])
+        if str(name) != f'asset-{index}' or len(name.parts) != 1:
+            raise ValueError('invalid native input asset name')
+        source = Path(asset['source'])
+        if not source.is_absolute():
+            raise ValueError('native input asset snapshot is not absolute')
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid()
+                    or info.st_mode & 0o377 or info.st_size != asset['bytes']):
+                raise ValueError('native input asset snapshot size or identity invalid')
+            asset_bytes += asset['bytes']
+            if asset_bytes > 16 * 1024 * 1024:
+                raise ValueError('native total asset budget exceeded')
+            data = stream.read(asset['bytes'] + 1)
+            if len(data) != asset['bytes'] or hashlib.sha256(data).hexdigest() != asset['sha256']:
+                raise ValueError('native input asset digest or bytes changed')
+            loaded.append((name, data))
+    # Verify the entire bounded batch before creating any guest asset file.
+    for name, data in loaded:
+        with open(binary / name, 'xb') as stream:
+            os.fchmod(stream.fileno(), 0o444)
+            stream.write(data)
+
+
+
+def read_launch_spec(spec_path):
+    # Hash the exact bounded bytes parsed for this invocation. Completion and
+    # failure receipts must never reread a potentially changed launch path.
+    raw = private_bytes(Path(spec_path), 2 * 1024 * 1024)
+    if len(raw) > 2 * 1024 * 1024:
+        raise ValueError('native VM launch input exceeds bound')
+    spec = json.loads(raw)
+    if type(spec) is not dict:
+        raise ValueError('native VM launch input is not an object')
+    return spec, hashlib.sha256(raw).hexdigest()
+
+
 def main(spec_path):
-    vm = module('native_vm_runtime', 'codex-build-vm.py')
-    gateway_module = module('native_provider_gateway', 'native-provider-gateway.py')
-    spec = private_json(spec_path)
+    spec, launch_sha256 = read_launch_spec(spec_path)
     if spec.get('version') != 1:
         raise ValueError('unsupported native VM launch version')
+    readonly = spec.get('readonly_review', False)
+    if type(readonly) is not bool:
+        raise ValueError('invalid readonly review mode')
+    if readonly and ('mcp_argv' not in spec or spec['mcp_argv'] is not None or spec.get('resume') is not False):
+        raise ValueError('readonly review requires fresh transport without host tools')
+    vm = module('native_vm_runtime', 'codex-build-vm.py')
+    gateway_module = module('native_provider_gateway', 'native-provider-gateway.py')
     validate_runtime(spec['guest_runtime'])
     runtime = vm.Runtime.load(Path(spec['runtime_config']))
     config = dict(runtime.config)
@@ -586,32 +719,9 @@ def main(spec_path):
         binary = private / 'provider'
         binary.mkdir()
         executable = Path(spec['executable'])
-        info = executable.stat()
-        if not executable.is_absolute() or info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022 or info.st_size > 512 * 1024 * 1024:
-            raise ValueError('native executable is not trusted or exceeds budget')
-        shutil.copyfile(executable, binary / 'cli')
-        (binary / 'cli').chmod(0o555)
+        stage_executable_input(spec.get('executable_input'), executable, binary)
         stage_native_companions(executable, spec['guest_runtime'], binary)
-        assets = spec.get('assets', [])
-        if len(assets) > 32:
-            raise ValueError('native asset count exceeds budget')
-        asset_bytes = 0
-        for asset in assets:
-            name = safe_relative(asset['name'])
-            if len(name.parts) != 1 or not str(name).startswith('asset-'):
-                raise ValueError('invalid native input asset')
-            source = Path(asset['source'])
-            fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-            with os.fdopen(fd, 'rb') as stream:
-                info = os.fstat(stream.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_size > 16 * 1024 * 1024:
-                    raise ValueError('native input asset exceeds policy')
-                data = stream.read(16 * 1024 * 1024 + 1)
-                asset_bytes += len(data)
-                if asset_bytes > 16 * 1024 * 1024:
-                    raise ValueError('native total asset budget exceeded')
-                (binary / name).write_bytes(data)
-                (binary / name).chmod(0o444)
+        stage_input_assets(spec.get('assets', []), binary)
         # The guest receives only a relay executable, never the host bridge
         # policy, settings, hooks, source checkout or daemon credential store.
         shutil.copyfile(Path(__file__).with_name('native-provider-mcp-relay.py'), binary / 'mcp-relay.py')
@@ -699,6 +809,12 @@ def main(spec_path):
                     proceed = os.environ.get('JARVIS_NATIVE_VM_CONTINUE')
                     if not ready or not proceed:
                         raise RuntimeError('native VM controller admission missing')
+                    # Publish the exact spec consumed by this runner only after
+                    # all declared assets were validated and staged. The controller
+                    # checks it before owner/model admission; no pathname reread.
+                    atomic(Path(ready).with_name('vm-startup-inputs.json'),
+                           json.dumps({'version': 1, 'phase': 'inputs_staged',
+                                       'launch_sha256': launch_sha256}).encode())
                     atomic(Path(ready), b'ready\n')
                     deadline = time.monotonic() + 15
                     while not Path(proceed).exists():
@@ -741,11 +857,10 @@ def main(spec_path):
                     if exported > MAX_HOME or str(relative) in received or len(received) >= 4096:
                         raise ValueError('native runtime export exceeds budget or duplicates file')
                     received.add(str(relative))
-                    target = staging / relative
                     export_directories.update(str(parent) for parent in relative.parents if str(parent) != '.')
                     if len(export_directories) > 2048:
                         raise ValueError('native runtime directory budget exceeded')
-                    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    target = export_target(staging, str(relative))
                     stream = open(target, 'xb')
                     os.fchmod(stream.fileno(), 0o600)
                     active_export = [stream, size, 0]
@@ -804,7 +919,7 @@ def main(spec_path):
             atomic(state / 'complete.json', json.dumps({'version': 1, 'exit_code': exit_code,
                    'generation': generation, 'export_bytes': exported,
                    'auth_generation': original_auth, 'worker_quiescence': quiescence,
-                   'launch_sha256': hashlib.sha256(private_bytes(Path(spec_path), 2 * 1024 * 1024)).hexdigest(),
+                   'launch_sha256': launch_sha256,
                    'gateway_transport': gateway.transport_receipt()}).encode())
             # Only controller-generated complete exports are retained. Keep the
             # previous generation through pointer publication for crash safety.
@@ -825,7 +940,7 @@ def main(spec_path):
                 # complete.json, or successful launch authority follows this path.
                 atomic(Path(spec_path).parent / 'failed-gateway-observation.json', json.dumps({
                     'version': 1, 'diagnostic_only': True,
-                    'launch_sha256': hashlib.sha256(private_bytes(Path(spec_path), 2 * 1024 * 1024)).hexdigest(),
+                    'launch_sha256': launch_sha256,
                     'gateway_transport': gateway.transport_receipt()}).encode())
             if gateway is not None and (gateway.guest_failures or gateway.host_failures):
                 print(json.dumps({'native_gateway_failures': gateway.guest_failures, 'native_gateway_host_failures': gateway.host_failures}), file=sys.stderr, flush=True)

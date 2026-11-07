@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "kind": "deferred-exact-permission-publication-scope-transition-component",
+  "source_parent_commit": "21fbeb2d25316e28285c025369a4a7b8e02a288e",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/autoship_write_scope.rs",
+      "sha256": "de6270a06ec7491c2409572e34d093f6b103d20e1475f8476e72972396c9b3ba"
+    },
+    {
+      "path": "docs/autoship/owner-publication-protocol.md",
+      "sha256": "710f1b3ca25aeba2f46a1f9ae9ef4eb7f71298f67673d22d8a56107b6c6585e5"
+    },
+    {
+      "path": "docs/autoship/owner-acceptance-publication.md",
+      "sha256": "f0bf2a23a2165ad307312dce84a2e86617bf191f45c64defca0b3085f20f391e"
+    }
+  ],
+  "behavior": [
+    "Acquire the ordinary scope lock without changing registered permissions, so workflow transaction admission can precede mutation.",
+    "Compare the complete previous reference derived from independently retained permission bytes, or allow exact next replay.",
+    "Register only inside the visitor; retain real filesystem effects after a later transaction failure and require existing next scope when canonical next is already published.",
+    "Recheck source before mutation and scope bytes after registration/successful visitor return; preserve immutable history and ordinary writer exclusion.",
+    "Existing ordinary register/replace APIs reuse the same implementation while preserving their contract-hash transition admission."
+  ],
+  "validation": {
+    "behavioral_red": {
+      "original_session_id": 70469,
+      "terminal_exit": 1,
+      "cargo_exit": 101,
+      "passed": 0,
+      "failed": 2,
+      "log": "/tmp/autoship-publication-scope-red-20261106.log",
+      "baseline_api": "with_registered_scope_at",
+      "failures": [
+        "Altered previous allowed paths accepted under unchanged contract hash.",
+        "Scope mutated before workflow transaction visitor refused admission."
+      ]
+    },
+    "tests": [
+      "publication_scope_rejects_changed_previous_permissions_before_mutation",
+      "publication_scope_transaction_refusal_preserves_previous_scope",
+      "publication_scope_effect_survives_transaction_loss_and_replays_exactly",
+      "publication_scope_rechecks_source_after_entering_workflow_transaction",
+      "publication_scope_refuses_mutation_after_registration_even_if_visitor_returns_success"
+    ],
+    "actual_component_fixture": "Initial and revision cases use the real scope store/lock and a SQLite immediate transaction, roll back after the filesystem effect, replay exact next, and refuse missing scope when next is required. Synthetic completion table is not the production owner-publication journal.",
+    "full_core": {
+      "original_session_id": 67880,
+      "terminal_exit": 0,
+      "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib",
+      "passed": 939,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 36.05,
+      "log": "/tmp/autoship-publication-scope-full-core-20261106.log"
+    },
+    "full_cli": {
+      "original_session_id": 83137,
+      "terminal_exit": 0,
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "passed": 1948,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 300.32,
+      "log": "/tmp/autoship-publication-scope-full-cli-20261106.log"
+    },
+    "production_check": {
+      "original_session_id": 74026,
+      "terminal_exit": 0,
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-publication-scope-production-check-20261106.log"
+    },
+    "rust_source_unchanged_during_validation": true
+  },
+  "limits": [
+    "The scope transition API is not native/source/resource/model/input authority.",
+    "The actual private writer/completion must still derive expected permissions from original acceptance, retain original native proof, and recheck current workflow/canonical/evidence admission under its transaction.",
+    "No canonical owner publication/completion, shared productive predicate, recovery bridge, productive owner consumption, rollout or live merge is established by these tests.",
+    "P2\u2013P5, independent complete C/R proof, required hosted checks/review, normal updater rollout and the original full live acceptance remain required."
+  ]
+}

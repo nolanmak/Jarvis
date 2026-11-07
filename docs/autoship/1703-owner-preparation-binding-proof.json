@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "kind": "owner-preparation-binding-component",
+  "source_parent_commit": "ff4c8053c5d724d2d7478422b265841f0da895bb",
+  "source_inventory_is_post_run_inventory": true,
+  "source_generation_authority": false,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_revision.rs",
+      "sha256": "1c2a021f59b070b1ad5387adee59961fd3598d1321a402a756891ec1d2d0a95f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_revision_history.rs",
+      "sha256": "5ae7e80b4e61485a2ffcd13a2ce0e8a7b360141cc7bac7ed202fcc03b41718b8"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "28fc3f927dec02833c4b862f173918554ffd1bccafea77dd3083cb7518a3ecfd"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_acceptance.rs",
+      "sha256": "e828d279c72de4a86a724295d31c4fb8bc5119da2ddd1842dfd6edf84c2546af"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "b7c435139b7ca5a4f3eee4ca6ba95e23b14ee65f38b88d253d7bcddd92d5da6e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_contract.rs",
+      "sha256": "bc1a53f0b0b0e82acb6c5b90d09d966c51444745e6020e6d2d8b69201593a1a5"
+    },
+    {
+      "path": "docs/autoship/owner-acceptance-publication.md",
+      "sha256": "171b2d8574453eecdc63d74340778e48d013112645a972843cb78cb4a33066e9"
+    }
+  ],
+  "validation": {
+    "cli_passed": 1910,
+    "cli_failed": 0,
+    "cli_ignored": 34,
+    "native_guard_subprocess_modes": 65,
+    "cli_log": "/tmp/autoship-owner-preparation-binding-final-full-cli.log",
+    "red_log": "/tmp/autoship-owner-preparation-binding-red.log",
+    "red_observed": "actual owner guard activation omitted the protected artifact digest",
+    "cli_seconds": 347.71,
+    "fifo_red_log": "/tmp/autoship-owner-preparation-binding-final-owner.log",
+    "fifo_red_observed": "bounded real FIFO regression caught shared reader waiting on a non-regular artifact; both protected readers now refuse without waiting",
+    "intermediate_production_check_exit": 0,
+    "intermediate_production_check_log": "/tmp/autoship-owner-preparation-binding-production-check.log",
+    "final_production_check_log": "/tmp/autoship-owner-preparation-binding-final-production-check.log",
+    "final_production_check": "terminal admission deferral; no compiler started; final hosted check pending"
+  },
+  "coverage": [
+    "exact private artifact bytes/context and immutable same-context persistence",
+    "revised intended-red baseline retained with activation across database reopen",
+    "changed artifact/context or independently valid baseline cannot replace the activation",
+    "activation/projection/event/baseline corruption refuses owner dispatch without repairing state",
+    "audit failure rolls back preparation projection and activation together",
+    "original owner pause, pending input, generations, native store, review invalidation and model accounting retained",
+    "bounded real FIFO refusal in artifact and shared protected JSON readers"
+  ],
+  "synthetic_controller_and_baseline_fixtures": true,
+  "live_provider_dispatch": false,
+  "canonical_manifest_publication": false,
+  "process_loss_recovery": false,
+  "productive_owner_consumer_enabled": false,
+  "shipping_authority": false,
+  "handoff_ready": false,
+  "remaining": [
+    "protected publication admission and all-reader fencing",
+    "invalidated-intent settlement and authenticated native handoff/recovery",
+    "public output allowlist and independently authorized correction context",
+    "productive worker ingress and full C/R proof/cutover",
+    "live CLI/Discord acceptance and epic soaks/confirmed autonomous merges"
+  ]
+}

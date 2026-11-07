@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1713,
+  "scope": "Shared typed native handoff request, strict schema, deterministic request/inventory digests. Filesystem and current authority validation remain the unimplemented ledger responsibility.",
+  "source_sha256": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_transfer.rs",
+      "sha256": "3817df4ed3b90d27adb0ab97c0a0cfe811389d75aa406570df6ff6284c0879b7"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "4a750391c3024248db80c81ece75544cedc890fa3beb1a56c401bd4a15a8b6ad"
+    },
+    {
+      "path": "docs/autoship/1713-native-owner-transfer-design.json",
+      "sha256": "db622cdc0c3cd4b6f2425d4b3b21edc82980c8e52b0d1bdff0dba8ad0e0c12fe"
+    }
+  ],
+  "red": {
+    "commit": "9962df93",
+    "tests_passed": 3,
+    "tests_failed": 2,
+    "failures": [
+      "unsupported request version accepted",
+      "unknown nested source owner field accepted"
+    ],
+    "log_sha256": "52d893a2ed1e8ca2a82fa5eceaaa0e315b0c016d8f91e19c75e542a0f6b83d96"
+  },
+  "green": {
+    "implementation_commit": "ea1f4a75",
+    "native_suite": {
+      "passed": 19,
+      "failed": 0,
+      "log_sha256": "8f926744eb0de326227563af722062ef04e216bdcbeec5915855336caf4bc62e"
+    },
+    "full_core": {
+      "passed": 688,
+      "failed": 0,
+      "ignored": 14,
+      "log_sha256": "af5659722f72c2a25c2aedf08c651c8872f02a396f5d4fccd792f6168ec1edd1"
+    },
+    "wrapper": "scripts/cargo-managed.sh"
+  },
+  "verified": [
+    "literal request and inventory SHA-256 vectors",
+    "digest binding includes native session and transfer UUID; inventory projection excludes UUID",
+    "reject unknown fields at every nested object",
+    "strict version, canonical UUID, same workflow and newer destination",
+    "unique source authorities and runtime/provider-session identities",
+    "native ID, relative runtime path and lowercase digest validation",
+    "multiple Codex/Claude rows and source owners share deterministic order",
+    "64-source boundary accepts exactly 64 and refuses overflow without truncation"
+  ],
+  "not_proved": [
+    "filesystem/runtime inventory completeness",
+    "immutable export manifest hashing",
+    "prepared endpoint claims, reservation accounting, commit/replay and retirement authority",
+    "current controller lease or kernel quiescence",
+    "native continuation, real GitHub merge or Discord acceptance"
+  ]
+}

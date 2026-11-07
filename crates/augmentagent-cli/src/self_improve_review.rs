@@ -355,9 +355,9 @@ async fn caller_discovery_symbols(
         .filter(|path| !controller_sources.is_some_and(|sources| sources.contains_key(*path)))
         .collect();
     if implementation.is_empty() { return Ok(BTreeSet::new()); }
-    // Dedicated pinned harnesses are still delivered in the complete diff,
-    // full files, and controller_source evidence. Their main/test entrypoints
-    // do not define product APIs whose callers should be scanned repo-wide.
+    // Private adapters are supplied separately as controller_source evidence.
+    // Any historical adapter in Git evidence needs the exact-byte check above
+    // before its entrypoints can be excluded from product API caller discovery.
     // Syntax spans identify the enclosing edited item, without treating every
     // unchanged function in a module or a quoted fixture string as an API edit.
     source_items::collect(root,&snapshot.base,&snapshot.head,&implementation).await

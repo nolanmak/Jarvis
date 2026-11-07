@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "kind": "authenticated-recovery-forward-native-replay-and-historical-preparation-frontier",
+  "source_parent_commit": "41b18581ef559c6505473b6e68b19cb706e0e2f9",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "behavioral_reds": [
+    {
+      "session": 61519,
+      "result": "terminal1",
+      "log": "/tmp/autoship-owner-recovery-forward-red-20261107.log",
+      "failure": "Actual opaque recovery claim could not reopen its durable forward UUID because the reconciler accepted only original activation transfers"
+    }
+  ],
+  "verification": {
+    "intermediate_matrix": {
+      "session": 34514,
+      "result": "terminal0",
+      "parent_passed": 1,
+      "cases": 22,
+      "seconds": 97.38,
+      "log": "/tmp/autoship-owner-recovery-forward-matrix3-20261107.log",
+      "scope": "Before explicit exhausted-forward disposition and final ordinary-resolver guard"
+    },
+    "focused": {
+      "session": 88967,
+      "result": "terminal0",
+      "parent_passed": 1,
+      "cases": 22,
+      "seconds": 100.84,
+      "log": "/tmp/autoship-owner-recovery-forward-final-focused-20261107.log",
+      "scope": "Both provider pins; all outcomes plus zero-obligation forward hold. Final bounded-reader/terminal-history cleanup is covered by the subsequent full CLI suite."
+    },
+    "full_cli_unit": {
+      "session": 69550,
+      "result": "terminal0",
+      "passed": 1954,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 413.42,
+      "log": "/tmp/autoship-owner-recovery-forward-final-full-cli-20261107.log",
+      "includes_final_bounded_reader_and_terminal_history_cleanup": true
+    },
+    "production_check": {
+      "session": 32607,
+      "result": "terminal0",
+      "seconds": 10.64,
+      "log": "/tmp/autoship-owner-recovery-forward-production-check-20261107.log"
+    }
+  },
+  "cases": [
+    "Authorized same-UUID absent and prepared replay",
+    "Reopen under genuine later metadata claim with fresh authorization and reopened private audit",
+    "Core completion retained before SQL settlement; no new destination proof from stale source",
+    "SQL settlement projection rollback then same-UUID verified completion",
+    "Actual WAL post-commit IOERR then reopened completed history without a replacement",
+    "Creating claim retains same-generation aborted forward request",
+    "Later actual claim acknowledges exact forward abort, records namespace debt and proven cleanup",
+    "Exhausted forward cleanup preserves completed publication and stops automatic claims with ForwardNativeFrontierUnavailable",
+    "Terminal absence, prepared retention, completed cleanup-only settlement and aborted cleanup",
+    "Ordinary pending prepare/native reconcile/receipt settlement reject metadata purpose",
+    "Metadata logger still refuses dispatch after successful transfer",
+    "Fresh actual current native proof reopens original input/preparation/activation and validates historical canonical evidence",
+    "New native namespace cannot overwrite original publication completion",
+    "Pause/hold, queued instructions, checkpoint/accounting and allowance preserved"
+  ],
+  "spec_audit": {
+    "section": 47,
+    "findings": 1,
+    "resolved": 1,
+    "finding": "Forward abort exhausted-obligation semantics must differ from initial publication unavailable while preserving completion",
+    "rechecked_wrong_build_or_forced_guess_findings": 0,
+    "is_independent_exact_head_code_review": false,
+    "is_activation_or_handoff_approval": false
+  },
+  "limits": [
+    "Metadata-native replay/inspection only; productive owner worker remains unconnected",
+    "Actual private audit/native ledger and lock fixtures, empty runtime inventory, synthetic acceptance and scripted authorization endpoint; no live provider or VM",
+    "Prepared interruption is a controlled actual fence loss, not process-kill acceptance",
+    "Full C/R source/resource/trusted readonly-input proofs, body nonrelease/semantic continuation and reservation/successor/coding release constructors remain gates",
+    "Exhausted-forward correction/terminal resolution, other blocked/storage paths, productive gates and worker, independent exact-head review, normal rollout and original CLI/Discord/merge/soak acceptance remain incomplete",
+    "Draft and undeployed; no autonomous shipping restoration claim",
+    "Terminal rows/events are deliberately initialized in disposable fixtures; original checkpoint readers and actual core inspection/cleanup are used. This is not live owner-command terminal acceptance."
+  ],
+  "unfinished_productive_gate_wip_included": false,
+  "full_goal_complete": false,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_aborted.rs",
+      "sha256": "82fe683163cd1d64649e59b8f8c764d5faa8b19a3ae7f8ece3b6599c0eb13935"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
+      "sha256": "579fe6ebb81b23cf2d4260a78a29567b69b8bd11f6c0888f655cf0f8f6f85567"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_reconcile.rs",
+      "sha256": "a200364e71173bf273e2d60060cb88e5b676ce860c6127ed994a1058e691b18d"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_settlement.rs",
+      "sha256": "c99f732a66e2f5c56868476c1ab3940b57ceebf729bc399fa449b83af5e8e71e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_terminal.rs",
+      "sha256": "a83116c01293a2d7dfece66c2cefd7c5aa9bc876f731aadcc131f751d22952f4"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_unstarted.rs",
+      "sha256": "d1446154b5b9299a1451c6fed3515deadbf4e9818ec0d5620384af57a4301c50"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs",
+      "sha256": "93bc87ac34142088f028d9dfad488686473e8d7cb4616076e4380b9cd71a8a66"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_recovery_blocked.rs",
+      "sha256": "16d6cd363b043e99490782b3a688418ccfb894a45c9ec2931eca6d170085cecf"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_recovery_native_intent.rs",
+      "sha256": "d0de8677bbd2c4b14af87c2871819451ae1d09ec889806d1ffa1218509af9840"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication_commit.rs",
+      "sha256": "a49d7999416232b4c3f1f41f71e279f0972ddffefa8545d07a510ea892fa1374"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "b0fc841c604362fb021b4e1a54053887baf23514cdd937ee58a0192f0756b2c4"
+    },
+    {
+      "path": "docs/autoship/owner-publication-protocol.md",
+      "sha256": "cbe4c9a8e57df3aa33194a27a36c240c1ba0d2b9694e765ef1454c3b5e1fe142"
+    }
+  ],
+  "core_source_changed_from_parent": false
+}

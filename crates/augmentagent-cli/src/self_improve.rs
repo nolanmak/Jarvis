@@ -75,6 +75,7 @@ pub(crate) fn policy_held_drafts() -> Vec<(u64, String)> {
 mod source_reconcile;
 #[path = "self_improve_workflow.rs"]
 mod workflow;
+pub(crate) use workflow::{UnstartedOwnerTurnSetup,InitialOwnerAcceptance};
 #[path = "self_improve_recovery.rs"]
 mod recovery;
 #[path = "self_improve_workspace.rs"]
@@ -83,6 +84,7 @@ mod workspace;
 pub(crate) mod targeted;
 #[path = "self_improve_contract.rs"]
 mod acceptance;
+pub(crate) use acceptance::owner::publication::{OwnerPublicationDraft,OwnerPublicationRecord,OwnerPublicationCompletion,OwnerPublicationAuthority,RecoveredOwnerPreparation};
 #[path = "self_improve_alignment.rs"]
 mod alignment;
 #[path = "self_improve_publication.rs"]
@@ -7339,7 +7341,7 @@ async fn resume_draft_pr(
             kind,
             "resume: revising against findings"
         );
-        if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(augmentagent_channel_core::native_session::FreshBuilderSessions::new()); }
+        if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(workflow.fresh_native_builder_sessions()?); }
         let episode_dispatch = episode_session.as_ref().map(|s|(s.epoch.clone(),s.action.clone()));
         let (repair_opts,repair_prompt) = match episode_session {
             Some(session) => (session.opts,session.prompt),
@@ -8141,7 +8143,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
 
     // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
     let opts = fix_opts(worktree.clone());
-    let prompt = format!("{}\nThe controller installed independently registered immutable regression harnesses. Do not edit/remove them; implement against this exact contract: {}",
+    let prompt = format!("{}\nThe controller keeps independently registered immutable verifier adapters outside this product checkout. Do not create, copy or change those adapter paths in product commits; implement against this exact contract: {}",
         build_fix_prompt_with_criteria(&issue, plan.as_deref(), prior_attempts.as_deref(), &criteria),
         serde_json::to_string(prepared_acceptance.baseline.registration.contract())?);
     let mut summary = match reasoner.call_with_storage(&opts, &prompt).await {
@@ -8671,7 +8673,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             };
             info!(issue = issue.number, round, max_rounds, ?source, "revising against the findings");
             let snapshot = snapshot_tree(&worktree).await?;
-            if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(augmentagent_channel_core::native_session::FreshBuilderSessions::new()); }
+            if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(workflow_guard.fresh_native_builder_sessions()?); }
             let episode_dispatch = episode_session.as_ref().map(|s|(s.epoch.clone(),s.action.clone()));
             let (repair_opts,repair_prompt) = match episode_session {
                 Some(session) => (session.opts,session.prompt),

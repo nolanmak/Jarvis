@@ -1,0 +1,265 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "component": "Recovery-aware native capacity and original prepared-lifetime observations",
+  "status": "tested component on draft recovery branch; not deployed; not autoship restoration",
+  "source_base": "19c2b759d91a70f67e65b1035894539c5e4b4216",
+  "main_component_integrated": "Main 4b0b2461152bb774e50d9510fc9d3235bce2b006 merged with diagnostics, persisted backoff, retirement-before-observation, pre-intent cleanup and one-shot spawn adapted to the established original-ledger and durable-intent authorities. Post-prepare physical deletion is deliberately not adopted without original-intent settlement.",
+  "problem": "A pending native transfer reserves growth in the existing ledger. Reusing main storage inspection without that reservation reports capacity available even when actual native admission refuses.",
+  "behavior": [
+    "Actual native admission and read-only readiness share the reservation boundary evaluator, including transfer growth in reserved, stored and filesystem ceilings.",
+    "The observer validates the exact current original store and complete bounded transfer history and uses the same growth sum as admission. It does not initialize or migrate a namespace.",
+    "Missing, corrupt, busy or incompatible evidence remains unavailable without a usable capacity fingerprint.",
+    "Reports are observations, never native execution, cleanup, original-input replay or merge capabilities.",
+    "Persist native refusal backoff and rotating bounded wakeup without changing original authorization, owner controls, meaningful progress, model charges or merge allowance.",
+    "The free sweep retains original-bound retirement and native terminal-cleanup reconciliation, then prunes already-authorized runtimes before read-only capacity observation. It takes native locks with no workflow mutex or transaction held.",
+    "Cleanup opens only an established, validated current original namespace. Missing authority is retained, never initialized or migrated. Optional cleanup/wake errors stay logged and do not hide previously completed retirement work.",
+    "Fresh unpublished session ownership borrows the held state lock through pure intent validation. Failure cleans only that newly allocated session; resume never receives this guard.",
+    "Consume the cleanup guard before the first launch-intent publication attempt and release the state lock before journal callbacks. Failed or uncertain publication retains original runtime context.",
+    "Both provider adapters resolve resource declaration errors before native allocation and use one-shot prepared spawn. The command and resource policy are private.",
+    "Only the actual prepared launch can produce the non-Clone, non-serializable NativeSpawn token. Supervisor creation consumes that attempt even on construction failure. Saved launch records cannot construct a token.",
+    "Every actual ProcessGroup claims one admission attempt before its first await, callback or model charge. Failure, cancellation and prior successful release cannot reactivate that same supervisor; a fresh guarded invocation needs a new supervisor.",
+    "A returned fresh launch dropped without any supervisor attempt records native_launch_abandoned_before_spawn through its actual original object. It retains runtime data, aliases and existing uncertainty behavior.",
+    "Fresh preparation captures its actual directory descriptor before durable intent publication. The observation validates that original inode, selected policy/store, effective owner, creation bytes and metadata-only inventory under native locks. Copied ownership bytes in a replacement directory refuse.",
+    "Historical launch-reference verification grants no authority and can record teardown under owner pause. Productive launch-reference verification retains its two live dispatch checks. Pauses, model spend and merge allowance remain unchanged."
+  ],
+  "validation": {
+    "red": {
+      "test": "native_vm::owner_ledger::tests::capacity_inspection_includes_original_pending_transfer_reservations",
+      "result": "Failed with actual pending original reservation: capacity-observed instead of capacity-exhausted.",
+      "log": "/tmp/autoship-native-capacity-transfer-red-20261107.log"
+    },
+    "green": {
+      "same_test": "passed",
+      "log": "/tmp/autoship-native-capacity-transfer-green-20261107.log"
+    },
+    "native_suite": {
+      "passed": 197,
+      "failed": 0,
+      "seconds": 25.62,
+      "log": "/tmp/autoship-native-capacity-transfer-native-20261107.log"
+    },
+    "full_core_lib": {
+      "passed": 968,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 38.2,
+      "log": "/tmp/autoship-native-capacity-transfer-core-20261107.log"
+    },
+    "production_cli_check": {
+      "result": "passed",
+      "seconds": 66,
+      "log": "/tmp/autoship-native-capacity-transfer-production-20261107.log"
+    },
+    "additional_cases": [
+      "Actual transfer commit frees reservation and changes fingerprint.",
+      "Observation preserves ledger bytes.",
+      "Corrupt original request hash refuses observation without mutation.",
+      "Missing original ledger with retained epoch remains missing; no new database is created.",
+      "Both provider admission audits report actual storage blocker before executable setup.",
+      "A genuine original-store initial registration and terminal retirement authorize only the fixture owner.",
+      "Held original session lock prevents pruning and command wakeup; unlock permits actual removal and shared command queue wake.",
+      "An unrelated incomplete runtime and alias retain their exact ownership bytes.",
+      "Wake preserves binding, evidence, generation, progress clock, model accounting and merge allowance.",
+      "Removing the original namespace epoch refuses cleanup without reinitialization or mutation of retained data; optional failure preserves already completed scheduling work."
+    ],
+    "retirement_wake_red": {
+      "test": "self_improve::workflow::tests::native_capacity_reconciliation_prunes_original_retired_owner_before_wake",
+      "result": "Original authorized retirement did not wake deferred command after its session lock was released.",
+      "log": "/tmp/autoship-native-capacity-original-wake-red-20261107.log"
+    },
+    "retirement_wake_green": {
+      "same_test": "passed in 0.25s",
+      "log": "/tmp/autoship-native-capacity-original-wake-green-20261107.log"
+    },
+    "current_full_core_lib": {
+      "passed": 974,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 39.4,
+      "log": "/tmp/autoship-native-unspawned-abandonment-core-20261107.log"
+    },
+    "current_production_cli_check": {
+      "result": "passed",
+      "seconds": 20.04,
+      "log": "/tmp/autoship-native-unspawned-abandonment-production-20261107.log"
+    },
+    "preceding_composition_full_cli": {
+      "passed": 1959,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 420.72,
+      "log": "/tmp/autoship-native-capacity-original-wake-cli-20261107.log",
+      "source_commit": "bc880b1e29aa5451ac7fdc8debe03ca3c3156eca"
+    },
+    "pre_intent_constructor": {
+      "test": "native_vm::tests::native_preparation_reclaims_only_before_intent_publication_attempt",
+      "red": "Invalid native session declaration stranded a fresh Codex runtime before a durable intent was recorded.",
+      "red_log": "/tmp/autoship-native-intent-constructor-red-20261107.log",
+      "green": "Both-provider regression passed; empty, overlong and non-graphic session IDs leave no fresh runtime or launch directory.",
+      "green_log": "/tmp/autoship-native-intent-constructor-green-20261107.log",
+      "preservation": "A successful prepared launch and a workflow-journal acknowledgement failure retain original runtime bytes and the actual committed launch receipt.",
+      "full_cli_scope": "Covered by preceding_main_merge_full_cli at a860527a. Not a claim that the new core admission change reran the full CLI suite."
+    },
+    "prepared_spawn_once": {
+      "test": "native_vm::tests::prepared_native_launch_allows_only_one_supervisor_attempt",
+      "red": "Same actual prepared native launch started a second packaged supervisor after resource refusal.",
+      "red_log": "/tmp/autoship-native-one-shot-red-20261107.log",
+      "green": "Both providers reject second attempt after real supervisor resource refusal and after early journal-path construction failure; zero model calls and original owned bytes preserved.",
+      "green_log": "/tmp/autoship-native-one-shot-green-20261107.log",
+      "green_seconds": 0.68,
+      "limits": "Real packaged supervisor/controller fixture before guest startup; not native provider acceptance or physical runtime reclamation."
+    },
+    "preceding_main_merge_full_cli": {
+      "passed": 1959,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 423.94,
+      "log": "/tmp/autoship-native-main-merge-cli-bin-20261107.log",
+      "command": "CARGO_TARGET_DIR=/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "source_scope": "Resolved main merge has exactly the production and test source of 1872a42aa207400e8c43126fb28732939b8d4e9d. Only this evidence document changes in the merge commit. Includes constructor and one-shot follow-ups.",
+      "source_commit": "a860527a54aa75e73d30f1380319b50075cb09a1"
+    },
+    "single_use_supervisor_admission": {
+      "test": "process_tree::tests::supervisor_admission_is_consumed_before_repeat_model_charge",
+      "red": "Real disposable supervisor executed once; a repeated admission reached the model-charge observer twice before failing to publish the already-existing release marker. Assertion observed2 instead of1.",
+      "red_log": "/tmp/autoship-native-admission-once-red-20261107.log",
+      "green_log": "/tmp/autoship-native-admission-once-green-20261107.log",
+      "green_result": "3 passed0failed0.08s",
+      "other_tests": [
+        "process_tree::tests::supervisor_admission_denial_cannot_retry_its_callback",
+        "process_tree::tests::supervisor_admission_cancellation_consumes_the_actual_attempt"
+      ],
+      "scope": "Actual packaged supervisor and disposable Python effect, synthetic observer charges and no provider inference. Duplicate-charge RED uses the non-required-resource path; protected native resource-admitted publication already rejects some repeats earlier. No claim this caused the current production capacity stall.",
+      "mechanics": "Private atomic flag is claimed before first await, resource audit binding, observer and model charge. It is never cleared after errors, denial, cancellation or successful release. All callers continue to use fresh supervisors for new work.",
+      "limits": "No original source/input/nonrelease capability or physical runtime retirement is minted. Full CLI result is historical a860527a; full core and production compilation cover this follow-up."
+    },
+    "current_full_cli": {
+      "passed": 1959,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 430.18,
+      "log": "/tmp/autoship-native-unspawned-abandonment-cli-20261107.log",
+      "scope": "Current unspawned-lifetime follow-up; includes both earlier constructor/supervisor changes and new historical verification/held directory descriptor."
+    },
+    "original_unspawned_lifetime": {
+      "test": "native_vm::tests::original_unspawned_launch_abandonment_is_recorded_without_disposal",
+      "missing_fact_red_log": "/tmp/autoship-native-unspawned-abandonment-behavior-red-20261107.log",
+      "missing_fact_red": "Actual fresh Codex launch dropped before spawning had no durable unspawned observation (0 instead of1). Initial anchor-location harness error was corrected before this behavioral RED.",
+      "paused_red_log": "/tmp/autoship-native-unspawned-birth-red-20261107.log",
+      "paused_red": "Productive reference verification refused to record factual teardown under owner pause. Separate history verification preserves the original productive checks.",
+      "replacement_red_log": "/tmp/autoship-native-unspawned-birth-behavior-red-20261107.log",
+      "replacement_red": "Replacing the directory with exact copied ownership bytes incorrectly produced a lifetime fact (1 instead of0). Retaining the original directory descriptor now refuses replacement.",
+      "green_log": "/tmp/autoship-native-unspawned-birth-green-20261107.log",
+      "green": "1 test passed2.26s; both providers,16 cases; paused fresh positive and seven conservative refusal cases per provider.",
+      "cases": [
+        "fresh original object with owner pause retained",
+        "supervisor attempt already consumed, including actual early construction refusal",
+        "input attempt already consumed",
+        "actual session-ID observation",
+        "changed creation owner",
+        "retained unexpected data",
+        "selected policy changed",
+        "same path and exact ownership bytes at a replacement inode"
+      ],
+      "preservation": "Original runtime and requested aliases remain. Exact creation JSON text is retained in the protected observation. All fixtures have zero model admissions.",
+      "authority_limit": "Observation only; no runtime retirement, byte/count credit, original-input nonrelease/replay or coding capability. Does not cover constructor errors before returning Launch, uncertain publication replies or already-attempted supervisors. Those still require genuine producer/consumer settlement."
+    }
+  },
+  "limits": [
+    "No production legacy runtime was removed or retired.",
+    "No native guest or paid provider acceptance is established by these unit/controller fixtures.",
+    "Main 4b0b246 is integrated with the original-ledger protocol. Main FreshUnreleasedRuntime path-based disposal cannot replace durable intent settlement on this branch. Constructor failures at/after publication and post-prepare nonrelease disposal still require an original-intent-aware join before recovery rollout.",
+    "Productive successor owner guard and full source/resource/input closure plus CLI/Discord/fault/soak acceptance remain open.",
+    "Single-use supervisor admission does not settle durable native intent or prove safe physical disposal; original-intent-aware post-prepare nonrelease remains unfinished.",
+    "Original unspawned-lifetime observation is not disposition settlement. Existing uncertainty and conservative census gates remain; interrupted constructor publication, late supervisor nonrelease and all recovery consumers must be joined before physical cleanup."
+  ],
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
+      "sha256": "8988db57cd73193b089f7e606ccd444b24d91006a9aa7b7f8df02a9547983903"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_store.rs",
+      "sha256": "21d4bacaddcd72ce6d98d955ad777ed067c49a574ce46cfa5f43c950a4f64eec"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_state_capacity.rs",
+      "sha256": "78bfd8d1ce17e650c60e921a9f264baa64e7f72581db93879e1c30996e963bb2"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "f588aa33aa8a473c5b39188ebbadb9a72aa1eb7d3eba1c2c8b95ec8a77ae3876"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/run_resources.rs",
+      "sha256": "d577620c7f7ce37f5c13392cac6a1ffe808b79635a33550c5a3503322f423ce9"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_commands.rs",
+      "sha256": "6164d1920aaf66cd8ee7a1373f7954615f15e5b01a125ef66be0acf40bd90b9a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_capacity_retry.rs",
+      "sha256": "91dbcd5af712d7d15b4f40f09545dca0825942516e320135d74662a2a3212341"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "10872230a4b97672c85b19a0037e43d503d863c22aeee05954fc4ad3813abf88"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "6116eca6457ae95e048a5047c1204b94db3c71006d78b39da624d7e9ac84ec22"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/codex.rs",
+      "sha256": "7f5f2d16db0dadfe4552045668eb30181b064fbc80ead3d4b4528f81c7c5d08c"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/process_tree.rs",
+      "sha256": "40443be1bdc23fb973e94832acb4ac6dd7637153cd5c652b7cf3cb62b0be8286"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/reasoner.rs",
+      "sha256": "6a24fb483b43efe16383ee9ccb5b9e8a14a126a53625a250c18c4ba013065adc"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "8b1dbfb76a0f9a3abce7b0cb246d6e7621eceea6d9ab83f39f096a6f2a1624cc"
+    }
+  ],
+  "composition_base": "9e58bcc152f32c6db1aa40f1485f030d3e0915af",
+  "main_merge": {
+    "main_commit": "4b0b2461152bb774e50d9510fc9d3235bce2b006",
+    "first_parent": "1872a42aa207400e8c43126fb28732939b8d4e9d",
+    "source_equivalence": "All ten files changed by main match the already-adapted first-parent source after reviewed conflict resolution; unsafe automatically merged FreshUnreleasedRuntime fields/destructor were removed. Only evidence metadata differs from first parent.",
+    "component_resolution": [
+      {
+        "component": "capacity diagnostic/admission",
+        "resolution": "Keep original namespace validation and pending transfer growth in shared evaluator; never initialize observational state."
+      },
+      {
+        "component": "retry and wake",
+        "resolution": "Keep persisted5/10/20/40/60, bounded cursor and logged optional early-wake failures; owner controls remain authoritative."
+      },
+      {
+        "component": "retirement before observation",
+        "resolution": "Keep original-bound reconciliation, terminal cleanup sweep, original namespace pruning and optional-failure logging outside workflow locks."
+      },
+      {
+        "component": "constructor cleanup",
+        "resolution": "Keep UnpublishedSession borrowing StateLock; clean fresh allocation only through pure validation; retain before first durable intent attempt."
+      },
+      {
+        "component": "private single-use spawn",
+        "resolution": "Keep actual NativeSpawn borrowed from the prepared launch and consumed before supervisor construction; both adapters resolve declarations before allocation."
+      },
+      {
+        "component": "post-prepare physical deletion",
+        "resolution": "Not adopted: a reaped unexposed supervisor alone does not settle this branch durable launch intent. Retain context until a genuine original-intent producer and every inventory/recovery consumer support settlement."
+      }
+    ],
+    "hosted_ci": "All23CheckRuns passed at531929fd before this unspawned-lifetime follow-up. Those ancestor results do not prove hosted validation or exact-head review of the new source.",
+    "workflow_security_scope": "Workflow files match main; current PR validators declare read-only contents and checkout without persisted credentials. Secret references found only in issue/manual automation, not PR/push branch triggers. No credential inventory or candidate-workflow adversarial audit claimed."
+  }
+}

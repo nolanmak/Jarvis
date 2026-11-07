@@ -132,7 +132,7 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     guard.bind_acceptance(&prepared)?;
     let mut opts = fix_opts(root.clone());
     opts.audit_logger = Some(guard.audit_logger());
-    let session = augmentagent_channel_core::native_session::FreshBuilderSessions::new();
+    let session = guard.fresh_native_builder_sessions()?;
     let builder_response = session.scope(builder.call(&opts,"Fix arithmetic.py so add(a,b) returns the arithmetic sum. Use the guarded file tools to edit the actual file. Do not modify verifier files, rules.rs, shipping.rs, or Git metadata. Do not invoke cargo/npm or install anything; controller runs the Python verifier and commits. Return a concise summary after editing.")).await?;
     // Private synthetic diagnostic evidence, outside candidate write admission.
     // Retain an honest tool-startup refusal instead of discarding it as success.

@@ -214,6 +214,28 @@ pub(crate) fn progress_confirm(path:&Path,delivery:&augmentagent_approval_discor
     WorkflowStore::open(path)?.confirm_progress(&origin,&delivery.workflow,delivery.sequence,message,chrono::Utc::now().timestamp_millis())
 }
 
+fn owner_reply_delivery(delivery:&augmentagent_approval_discord::autoship::OwnerReplyDelivery)->Result<crate::autoship_workflow::owner_reply::Delivery> {
+    Ok(crate::autoship_workflow::owner_reply::Delivery {origin:gateway_origin(&delivery.context)?,workflow:delivery.workflow.clone(),request_id:delivery.request_id.clone(),part:delivery.part})
+}
+fn owner_reply_gateway(delivery:crate::autoship_workflow::owner_reply::Delivery)->augmentagent_approval_discord::autoship::OwnerReplyDelivery {
+    let origin=delivery.origin;
+    augmentagent_approval_discord::autoship::OwnerReplyDelivery {context:GatewayContext {bot:origin.bot,owner:Some(origin.owner),author:origin.owner,channel:origin.channel,message:origin.message,guild:None},workflow:delivery.workflow,request_id:delivery.request_id,part:delivery.part}
+}
+pub(crate) fn owner_reply_pending(path:&Path,bot:u64,owner:u64)->Result<Vec<augmentagent_approval_discord::autoship::OwnerReplyDelivery>> {
+    let Some(store)=WorkflowStore::open_read_only(path)? else {return Ok(Vec::new());};
+    Ok(store.pending_owner_replies(bot,owner)?.into_iter().map(owner_reply_gateway).collect())
+}
+pub(crate) fn owner_reply_uncertain(path:&Path,bot:u64,owner:u64)->Result<Vec<augmentagent_approval_discord::autoship::UncertainOwnerReply>> {
+    let Some(store)=WorkflowStore::open_read_only(path)? else {return Ok(Vec::new());};
+    Ok(store.uncertain_owner_replies(bot,owner)?.into_iter().map(|reply|augmentagent_approval_discord::autoship::UncertainOwnerReply {delivery:owner_reply_gateway(reply.delivery),nonce:reply.nonce,content:reply.content}).collect())
+}
+pub(crate) fn owner_reply_claim(path:&Path,delivery:&augmentagent_approval_discord::autoship::OwnerReplyDelivery)->Result<Option<GatewayReply>> {
+    Ok(WorkflowStore::open(path)?.claim_owner_reply(&owner_reply_delivery(delivery)?,chrono::Utc::now().timestamp_millis())?.map(|(nonce,content)|GatewayReply {content,nonce:Some(nonce)}))
+}
+pub(crate) fn owner_reply_confirm(path:&Path,delivery:&augmentagent_approval_discord::autoship::OwnerReplyDelivery,message:u64)->Result<()> {
+    WorkflowStore::open(path)?.confirm_owner_reply(&owner_reply_delivery(delivery)?,message,chrono::Utc::now().timestamp_millis())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

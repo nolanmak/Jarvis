@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "kind": "retained-native-input-record-validation-component",
+  "source_parent_commit": "92f2c37363e38e815922eca817a81fa5969f21da",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_metadata.rs",
+      "sha256": "9577cfa3aac9dcdf3753c70eaf3509444add4ad0f9ff43a74c4a72f2ce284e5e"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "27eb4707d87d7ef151d9e1b3bdd3b7083ba896d4d7f7f8961214dc27062322ba"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "9ac174d3d5ee5c47becf52d090a374aee9e420477d02f25abc88e2bc7caf7c50"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/audit_chain.rs",
+      "sha256": "201a6fa6e1c444d48ca543af545fcc27ea627d8e51f7adecc29784308af760fb"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+      "sha256": "99e358a14749e0c442181aad3cab736f9bfc25509881d24797d6c5ac11328619"
+    }
+  ],
+  "behavioral_red": {
+    "log": "/tmp/autoship-native-input-ledger-red-20261106.log",
+    "result": "terminal101",
+    "failure": "foreign original-launch release marker ignored; metadata visitor entered"
+  },
+  "validation": {
+    "focused": {
+      "session": 44940,
+      "passed": 1,
+      "failed": 0,
+      "seconds": 4.15
+    },
+    "provider_input_matrix": {
+      "session": 25964,
+      "passed": 1,
+      "failed": 0,
+      "seconds": 12.78,
+      "cases": 12,
+      "providers": [
+        "codex",
+        "claude"
+      ],
+      "original_input": [
+        "none",
+        "generic-release-attempt",
+        "owner-binding-and-release-attempt"
+      ],
+      "foreign_current_audit_fault": [
+        "resource-binding",
+        "input-release-attempt"
+      ],
+      "actual_provider_or_model_invoked": false
+    },
+    "core_library": {
+      "session": 17009,
+      "passed": 939,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 35.99,
+      "core_sources_identical_to_isolated_patch": true
+    },
+    "isolated_full_cli": {
+      "session": 35195,
+      "passed": 1949,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 305.15,
+      "log": "/tmp/autoship-native-input-ledger-isolated-full-cli-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    },
+    "isolated_production_check": {
+      "session": 76981,
+      "result": "terminal0",
+      "seconds": 31.15,
+      "log": "/tmp/autoship-native-input-ledger-isolated-production-check-20261106.log"
+    }
+  },
+  "implemented": [
+    "Validate exact prior launch and resource append receipts under original audit/state/session locks",
+    "Validate owner-model binding and matching owner input reference; refuse duplicate/reordered binding and duplicate release attempt",
+    "Validate known input versions and strict fields; refuse downgrade from owner-bound input",
+    "Retain descriptive input records and original append receipts within private bounded metadata evidence"
+  ],
+  "not_proven_or_implemented": [
+    "Native body nonrelease or revocation of original input writer",
+    "Trusted readonly preparer/scoper association",
+    "Actual successor ready bridge or executable recovery/continuation capability",
+    "Shared productive publication admission and typed metadata recovery/terminal producers",
+    "Complete source/resource/input census and protected-storage admission",
+    "Independent exact-head review, rollout, full original live acceptance and soaks"
+  ],
+  "remaining_work_preservation": {
+    "patch": "/tmp/autoship-productive-gate-preserved-20261106.patch",
+    "unfinished_gate_not_part_of_this_checkpoint": true
+  }
+}

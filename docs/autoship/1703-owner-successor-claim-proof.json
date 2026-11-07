@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "kind": "owner-successor-setup-claim",
+  "code_head": "dec1e151e3aaf57437b638ea63e88a7db900de18",
+  "initial_red": {
+    "log": "/tmp/autoship-owner-successor-claim-red-20261107.log",
+    "observation": "The actual original recovery/readiness fixture had no successor setup preview."
+  },
+  "verification": [
+    {
+      "kind": "expanded-recovery",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 97.21,
+      "log": "/tmp/autoship-owner-successor-claim-guards-20261107.log",
+      "filter": "expired_owner_publication_has_authenticated_metadata_recovery"
+    },
+    {
+      "kind": "owner-store-turn",
+      "passed": 48,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 6.9,
+      "log": "/tmp/autoship-owner-successor-claim-owner-tests-20261107.log",
+      "filter": "autoship_workflow::owner_"
+    },
+    {
+      "kind": "surrounding-owner-workflow",
+      "passed": 11,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 139.69,
+      "log": "/tmp/autoship-owner-successor-claim-workflow-tests-20261107.log",
+      "filter": "self_improve::workflow::tests::owner_"
+    },
+    {
+      "kind": "production-check",
+      "result": "passed",
+      "seconds": 34.2,
+      "log": "/tmp/autoship-owner-successor-claim-production-20261107.log"
+    }
+  ],
+  "managed_target": "/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c",
+  "commands": {
+    "tests": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent FILTER -- --test-threads=1",
+    "production": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent"
+  },
+  "coverage": [
+    "Both provider pins and initial/revised acceptance through actual original recovery and readiness fixtures.",
+    "Fresh distinct original owner authorization; current pause, held/terminal stage, future eligibility and stale intent refusal.",
+    "Single ready-to-setup CAS; replay from another connection refuses. Late SQL failure rolls back event, turn and workflow projection.",
+    "Original publication and preparation history remains readable after current owner/generation projection advances.",
+    "Queued input, immutable records, model spend and merge allowance remain unchanged.",
+    "Copied leases and owner turns cannot gain ordinary/native/model/body/publication dispatch.",
+    "Malformed and coherently substituted consumed history, original owner, ready reference, current projection, lease owner and expiry refuse."
+  ],
+  "source_sha256": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs",
+      "sha256": "a14fef7913efc48d56206c495d3798a76dbfdf70d0b8c6c259b60f199d8c633c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_revision_history.rs",
+      "sha256": "1c260bcb03485ab6281a902d7ac7308e085e19cdeaf2f0b643277c98d0c73ea2"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_successor_claim.rs",
+      "sha256": "9211149c26763078d6d4ded364089a8986ea36160e52e2c5282231bc7682f39e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_successor_ready.rs",
+      "sha256": "e4b101009c36d8a7c832ddabbd128f7a2c6edb4f5f9454d1beec4dabaa51d89f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+      "sha256": "f73fdef0c7388bbbe8c97151e5788351b75534877c08a515b537ac82bc533cf9"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "ed4cc42f222290ee9dfdba73b708ca224581546c871e8b1a08fa0fefd2342c5c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication.rs",
+      "sha256": "b1d64992909831cfe46e65a757dbe7982a0f1ed6667c39a2a9bbcc5107c52598"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_targeted.rs",
+      "sha256": "8427809f02e28994d74bff1b41dccd4d0705901677cdc9c929d5fa635786dcd2"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "cae19476159c54f200521e8ed6783cf059fd42a23b0d0b2ce67d8836ea41f85b"
+    }
+  ],
+  "limits": [
+    "Controlled synthetic preparation and empty native runtime inventory; no actual provider or VM execution is established.",
+    "Full CLI suite not repeated for this checkpoint. Earlier readiness full-suite evidence is scoped to its recorded commit.",
+    "Setup token is not productive authority and cannot be reopened from saved JSON after process loss.",
+    "Multiple successor cycles need explicit consumed ancestry; unsupported chains refuse.",
+    "Fresh native/source/scope/resource/preparation/input joins and actual coding constructor remain unfinished.",
+    "Existing body reservation and exposed coding-conversation continuation need their distinct real producers.",
+    "Complete C/R execution and unchanged compiler/worker/generated-publication proofs remain required."
+  ],
+  "productive_execution_verified": false,
+  "deployed": false,
+  "live_cli_discord_acceptance": false,
+  "epic_1703_complete": false
+}

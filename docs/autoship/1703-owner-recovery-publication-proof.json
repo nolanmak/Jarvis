@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "kind": "authenticated-recovery-original-canonical-publication-component",
+  "source_parent_commit": "9f4507b337f102f2ae1575e4cb48c064f5f26226",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_metadata.rs",
+      "sha256": "013c99dc325fd2949558be682a86c05948d505cf4de80079dddbee16b9ee1ccd"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication.rs",
+      "sha256": "e60d7a8d0b243d27dd42ebdeea620a5e67c42a1873af0c6c78f7832e3e85645c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs",
+      "sha256": "1d0e9876b00f72fe9f64d2129d7e36327cbee7a43302269be484c36f6d999d4c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve.rs",
+      "sha256": "b7ea3640363d974bc957f6ab9a996e1f3083f1004d0e0dbf7bb6e2f8d3ce8ac3"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication.rs",
+      "sha256": "34169762a362aaff260a6f30860e0afbc05ff624395e817d7d48c01132625371"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication_commit.rs",
+      "sha256": "d38a195701402e6c7002dc85cab7865ba7808e04b174dcd427a7c705791aaf2c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_recovery_preparation.rs",
+      "sha256": "d59b204f02616f26bc7c06d7b1c66809d7ef9a0c12675d2c205b56be3aabb6bb"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "6e3c5a35bed60615499bb7ab3c382d4a5e53af1dc0eaaeb996e2b970c6d12108"
+    }
+  ],
+  "behavioral_reds": [
+    {
+      "session": 84105,
+      "result": "terminal1",
+      "log": "/tmp/autoship-owner-recovery-publication-lineage-red-20261106.log",
+      "observed": "New real recovery completion reader accepted a coherent record/digest/event substitution naming an older already-fenced actual metadata claim"
+    }
+  ],
+  "intermediate_validation": [
+    {
+      "session": 45056,
+      "result": "terminal1",
+      "log": "/tmp/autoship-owner-recovery-publication-test-first-20261106.log",
+      "scope": "Test-first compile failure: recovery writer/scope APIs did not exist yet; not a behavioral red"
+    },
+    {
+      "session": 94385,
+      "result": "terminal0",
+      "passed": 1,
+      "seconds": 36.36,
+      "log": "/tmp/autoship-owner-recovery-publication-focused-20261106.log",
+      "scope": "Initial four provider/acceptance cases, real scope/filesystem publication, insert failure/retry and idempotency before historical event-window regression"
+    },
+    {
+      "session": 92109,
+      "result": "terminal0",
+      "passed": 1,
+      "seconds": 44.32,
+      "log": "/tmp/autoship-owner-recovery-publication-lineage-green-20261106.log",
+      "scope": "Event-window fix and third-claim replay before final legacy-provenance/lost-prior-claim assertions"
+    },
+    {
+      "session": 54236,
+      "result": "terminal0",
+      "passed": 1,
+      "seconds": 45.66,
+      "log": "/tmp/autoship-owner-recovery-publication-final-focused-20261106.log",
+      "scope": "Both provider pins and initial/revised acceptance; actual native/scope/SQL publication; failed append/retry; coherent older-claim and legacy-live substitutions; third actual recovery replay; missing referenced older claim; current terminal claim refusal"
+    }
+  ],
+  "verification": {
+    "isolated_full_cli": {
+      "session": 61986,
+      "result": "terminal0",
+      "passed": 1951,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 346.02,
+      "log": "/tmp/autoship-owner-recovery-publication-full-cli-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    },
+    "full_core": {
+      "session": 8731,
+      "result": "terminal0",
+      "passed": 953,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 38.49,
+      "log": "/tmp/autoship-owner-recovery-publication-full-core-20261106.log"
+    },
+    "isolated_production_check": {
+      "session": 91516,
+      "result": "terminal0",
+      "seconds": 32.48,
+      "log": "/tmp/autoship-owner-recovery-publication-production-check-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    }
+  },
+  "remaining": [
+    "Original pending native transfer UUID reconciliation where needed",
+    "Recovery disposition/readiness and distinct productive successor bridge/claim",
+    "Terminal checkpoint authority",
+    "Full C/R source/resource/input census, original-body nonrelease and semantic conversation restoration",
+    "Shared productive gates and aggregate protected-storage admission",
+    "Connected productive owner worker, independent exact-head review, normal updater rollout, original live CLI/Discord acceptance and all required soaks"
+  ],
+  "live_provider_vm_discord_proof": false,
+  "deployed": false,
+  "epic_complete": false
+}

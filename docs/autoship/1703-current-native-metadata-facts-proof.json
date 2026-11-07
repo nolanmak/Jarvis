@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "kind": "current-owner-native-metadata-facts-component",
+  "source_parent_commit": "176e3ae81a276a1c5d08fe43a981e149ac5df6b8",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_handoff.rs",
+      "sha256": "69de13c1d67ab0017adfe3a2f222af7849404099e95f6751e211f0e36533e302"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+      "sha256": "059cf3239337aff153bf0d6e54060776f800779776221921521efaf7108efced"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication.rs",
+      "sha256": "1924c30ca4b7a438a03367d22271e289ca375dbbb9b54cd484da18d2925185f4"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "537e81ad63894efaae46e12319ecb8a4c39a9d785c9600486ca9ef0225ea3bf9"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication.rs",
+      "sha256": "2baccad86b7a402cdfde202d1d07e005f6f3d0d199d34678c245d1bd2e8a569d"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "a925c3d57e57827443a7438ec17bb6a42611de630ffab865352764f61fc0cf00"
+    },
+    {
+      "path": "docs/autoship/owner-publication-protocol.md",
+      "sha256": "c0ecd765a25c364f082069f80d28359a1c95fa0ec5b86482e933159062f52eee"
+    },
+    {
+      "path": "docs/autoship/owner-acceptance-publication.md",
+      "sha256": "2f062de5329544d0913fbab4e2b49b68302cf2a903e3a807abed8dd340c31769"
+    }
+  ],
+  "behavior": [
+    "Explicit exact-current namespace selection uses the actual current lease. Earlier active/retired handoff readers retain their existing older-generation selection.",
+    "Immutable latest launch/observation history and completed-transfer resolution preserve original authorship while reporting current effective ownership. Complete unfiltered latest-input digest remains intact.",
+    "Production facts and revalidation APIs require the original opaque draft and exact current metadata admission/intent/preparation/native registration in one short database transaction. No filesystem/native/provider IO occurs under the store mutex.",
+    "Unknown outcomes and newer launches without their own certain observation yield no usable completion inventory; no fallback to older successful rows.",
+    "Semantic fingerprints revalidate source and latest history. Cached data cannot bypass changed current authority. These objects are descriptive data, not native proof or execution grants."
+  ],
+  "validation": {
+    "behavioral_red": {
+      "original_session_id": 1791,
+      "terminal_exit": 1,
+      "cargo_exit": 101,
+      "log": "/tmp/autoship-current-native-facts-red-20261106.log",
+      "failure": "ordinary older-generation reader returns native-transfer-inventory-missing for the actual active owner"
+    },
+    "focused": {
+      "original_session_id": 87151,
+      "terminal_exit": 0,
+      "logs": [
+        "/tmp/autoship-current-native-facts-retained-focused-20261106.log",
+        "/tmp/autoship-current-native-facts-guard-focused-20261106.log"
+      ]
+    },
+    "final": {
+      "original_session_id": 13924,
+      "terminal_exit": 0,
+      "core": {
+        "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib",
+        "passed": 934,
+        "failed": 0,
+        "ignored": 15,
+        "seconds": 35.98,
+        "log": "/tmp/autoship-current-facts-scope-release-full-core-20261106.log"
+      },
+      "cli": {
+        "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+        "passed": 1947,
+        "failed": 0,
+        "ignored": 34,
+        "seconds": 299.6,
+        "log": "/tmp/autoship-current-facts-scope-release-full-cli-20261106.log"
+      },
+      "production_check": {
+        "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+        "seconds": 35.62,
+        "log": "/tmp/autoship-current-facts-scope-release-production-check-20261106.log"
+      }
+    },
+    "cases": [
+      "current completed session then latest uncertainty; descriptor retains runtime and drops usable inventory rather than exposing older success",
+      "newer protected launch without matching certain outcome yields no old inventory and changes fingerprint",
+      "missing latest uncertainty projection with retained event refuses",
+      "actual core completed handoff and database reopen resolve effective current ownership while retaining original launch/observation/creation ownership",
+      "wrong next-generation namespace refuses without changing workflow/events/allowance",
+      "actual private publication guard reads via original draft and validates a stable fingerprint",
+      "damaged pending intent and a newer owner pause refuse reads; cached facts cannot bypass that pause"
+    ],
+    "fixture_limits": [
+      "Native fixtures use actual protected append/registration/transfer/ledger plumbing plus synthetic private provider/export and resource observations. They do not execute a real VM or provider model.",
+      "Test-only descriptive DTO construction exercises mapping without fabricating production owner-publication authority."
+    ]
+  },
+  "limits": [
+    "This is a current metadata view, not fresh physical retained-session/provider inventory or kernel/resource quiescence. No restoration or coding authority comes from a saved view/fingerprint.",
+    "Fresh general retained-conversation metadata proof, protected writer/completion/disposition, shared productive predicate, authenticated recovery/terminal authority, canonical lineage and ready bridge remain unfinished.",
+    "Productive owner consumer remains unconnected; no new live workflow, model call, autonomous merge, deployment or acceptance is established. P2-P5, continuation, C/R, aggregate storage, independent exact-head review, hosted checks, rollout and complete live acceptance remain required."
+  ]
+}

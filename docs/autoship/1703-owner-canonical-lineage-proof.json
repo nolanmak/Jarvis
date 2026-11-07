@@ -1,0 +1,163 @@
+{
+  "schema_version": 1,
+  "kind": "workflow-bound-owner-and-ordinary-descendant-canonical-lineage-reader-component",
+  "source_parent_commit": "17542645f0677f43ea2300a51745c818a087b04b",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication.rs",
+      "sha256": "2a893da08ed271dc4feaae27c1cf1f8bc2737d1ba7e19f72454a5c867e10f66b"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "7dc870023bf15e6411e56b32b93d19bba01c5257aee85140010869bf79e20800"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_amendment.rs",
+      "sha256": "5194acb61fc666e3ab671422727636e774c31db7060aed26fabcac4e9e49b45d"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_contract.rs",
+      "sha256": "89bd32b65cf5a3149963d7e7cca4626dd22ddf5f328f6ca4b7b4db67d5d413a8"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_acceptance.rs",
+      "sha256": "adfead5f51850a51de6f818c104a18e24b04aea76faf80dd2139b3db7086e8cb"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication.rs",
+      "sha256": "4b744925d9cd52e8f54fc13a04b83760921364e50ccbeff873db870890777ef2"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication_commit.rs",
+      "sha256": "e2f7e93400a518ca483802c71b6d44b541263b88fc8aee1d7f893ff5f0eb7fe9"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "42ecb1c741b9445381fd4e9fdf011216d686674e9e88ed713b77033416b59b4b"
+    },
+    {
+      "path": "docs/autoship/owner-publication-protocol.md",
+      "sha256": "49235673a05595a0a77061b943ebc0cfe80a432f3a5f79fbb89a44c7c2e86cc6"
+    },
+    {
+      "path": "docs/autoship/owner-acceptance-publication.md",
+      "sha256": "3b0d80f9e5d3951ec31df6238e00deb302ef0be4dbc62423d5fa332f9add7717"
+    }
+  ],
+  "behavior": [
+    "Walk complete original/ordinary/owner predecessor ancestry with bounded private file reads, exact ordinary evidence and owner manifest encoding.",
+    "Workflow-bound transaction-scoped read-only context requires original journal/completion/preparation/evidence/native reference and matching canonical namespace.",
+    "All known owner registrations, including pending ones, are cached once per transaction keyed by contract identity; relabelling their evidence filename refuses.",
+    "Ordinary recovery/sweep readers use the context, and ordinary resume validates old ancestry before scope mutation and inside scope-held canonical/completion transactions.",
+    "Original baseline nodes require actual protected registered baseline artifacts; revised nodes cannot become originals by dropping completion references.",
+    "Saved metadata remains data only; no executable preparation, native/resource/source proof, body/model/merge authority is minted."
+  ],
+  "validation": {
+    "ancestry_red": {
+      "original_session_id": 62968,
+      "terminal_exit": 1,
+      "cargo_exit": 101,
+      "log": "/tmp/autoship-owner-canonical-lineage-red-20261106.log",
+      "failure": "ordinary amendment concealed uncompleted owner publication ancestry"
+    },
+    "identity_red": {
+      "original_session_id": 50809,
+      "terminal_exit": 1,
+      "cargo_exit": 101,
+      "log": "/tmp/autoship-owner-canonical-lineage-identity-red-20261106.log",
+      "failure": "known owner registration became an original baseline by removing evidence_file and supplying matching baseline data"
+    },
+    "focused": [
+      {
+        "session": 95734,
+        "terminal_exit": 0,
+        "seconds": 5.29,
+        "log": "/tmp/autoship-owner-canonical-lineage-focused-20261106.log"
+      },
+      {
+        "session": 65443,
+        "terminal_exit": 0,
+        "seconds": 6.32,
+        "log": "/tmp/autoship-owner-canonical-lineage-matrix-20261106.log"
+      },
+      {
+        "session": 27222,
+        "terminal_exit": 0,
+        "seconds": 6.68,
+        "log": "/tmp/autoship-owner-canonical-lineage-matrix-2-20261106.log"
+      },
+      {
+        "session": 8815,
+        "terminal_exit": 0,
+        "seconds": 6.81,
+        "log": "/tmp/autoship-owner-canonical-lineage-final-focused-20261106.log"
+      }
+    ],
+    "first_full_cli": {
+      "session": 22912,
+      "terminal_exit": 1,
+      "passed": 1941,
+      "failed": 8,
+      "ignored": 34,
+      "seconds": 280.34,
+      "log": "/tmp/autoship-owner-canonical-lineage-full-cli-20261106.log",
+      "resolution": "Positive manifest storage fixtures now carry valid registered baseline artifacts, retaining explicit missing-evidence/no-repair assertions. The cached preparation newly-present-contract case now supplies valid original evidence, avoiding an entered corrupt-metadata error that correctly fences the guard. No production gate was weakened."
+    },
+    "final_full_cli": {
+      "original_session_id": 95755,
+      "terminal_exit": 0,
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "passed": 1949,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 297.85,
+      "log": "/tmp/autoship-owner-canonical-lineage-full-cli-2-20261106.log"
+    },
+    "production_check": {
+      "original_session_id": 9410,
+      "terminal_exit": 0,
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "seconds": 26.02,
+      "log": "/tmp/autoship-owner-canonical-lineage-production-check-20261106.log"
+    },
+    "rust_sources_unchanged_during_final_full_cli_and_production_check": true,
+    "parent_hosted_checks": {
+      "head": "17542645f0677f43ea2300a51745c818a087b04b",
+      "counts": {
+        "SUCCESS": 24
+      },
+      "snapshot": "/tmp/autoship-17542645-hosted-final-parent-20261106.json",
+      "not_new_head_ci": true
+    },
+    "cases": [
+      "actual initial/revised owner publication followed by two ordinary descendants",
+      "workflow-bound completed-owner and nested-descendant positive reads",
+      "uncompleted-owner refusal even through ordinary descendant",
+      "known owner registration relabelled as an original baseline refuses",
+      "wrong workflow and canonical namespace refuse",
+      "changed current/historical owner manifest byte encoding refuses",
+      "missing/corrupt ordinary completion/evidence/history and owner preparation/evidence/native reference refuse",
+      "missing owner journal completion through nested descendants refuses",
+      "successful reads while actual native state lock held, proving no native lock reopening inside SQL",
+      "unchanged events/pending input/model accounting/allowance; metadata guard remains nonproductive",
+      "valid issue and unlinked-PR original namespaces remain distinct; missing original evidence is not recreated"
+    ]
+  },
+  "bounds": {
+    "ancestry_nodes": 1024,
+    "protected_file_bytes_per_walk": 134217728,
+    "manifest_bytes": 4096,
+    "preparation_amendment_evidence_bytes": 4194304,
+    "native_evidence_bytes": 1048576,
+    "journal_limits_separately_enforced": true
+  },
+  "limits": [
+    "This implements lineage reading, not the shared all-consumer productive publication predicate. Cached dispatch/model/body/publication/merge callers still need that gate and typed metadata/setup admission.",
+    "Saved preparation/native/scope evidence is inspected as metadata; no fresh native/resource/source/input proof or opaque executable preparation is reconstructed.",
+    "Blocked dispositions, authenticated metadata recovery/terminal authority, successor bridge/body continuation/nonrelease/response settlement, P3-P5, complete C/R, required exact-head review/CI, normal rollout and full original live acceptance remain unfinished.",
+    "Guard fixtures use synthetic baseline/authority observations with real workflow/native/scope machinery; no real provider/VM/live coding/merge is run.",
+    "Productive owner consumption remains unconnected; branch draft and undeployed."
+  ]
+}

@@ -1,0 +1,1343 @@
+{
+  "kind": "native-handoff-workflow-component-validation",
+  "source_parent_commit": "021142d6f714db094f011a09fec73f72e687a84c",
+  "source_inventory_is_post_run_inventory": true,
+  "source_generation_authority": false,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "75e9dec5623ef72b73cb6b78a22e9e72dd825ef8a834ff3dbc9472b034e8434a"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_handoff.rs",
+      "sha256": "688e53da4e3962fcfbfb65e1ef884483d0f5c298c8dcfd5a02fbddb2fd9338a9"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
+      "sha256": "7f75fc09d9f63216f2903eb65c1be3612fb0fe6e55269b2f1a92e68cd469f722"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_handoff.rs",
+      "sha256": "9bdbb8972a87002419db22873afca0cbd69eebebc07c94d2ca3478595b4ba6a9"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_launch.rs",
+      "sha256": "3d67f43b12a78e9e24d145438314f5bac4cddca43058d96b1b0cf92ee7db0e9d"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+      "sha256": "d259fb08fd72bd4aa49e79c414fc66fba3793fcd94c2dea22920ab76ef774783"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_owner_binding.rs",
+      "sha256": "00e70f67c0bd924a3c3e99cf7846351845c770f10348411dc825098c7bf27364"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
+      "sha256": "9d0b07ba773364a582d6462b8b64b120f3802812ffc963f5f9f233fc34dde73f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_settlement.rs",
+      "sha256": "663f819138ae3ca80bf9a5247437116f05ee9f8c464ce50952ead0982139a2a1"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_control.rs",
+      "sha256": "504a72a8c244abf35fbd64ce6e1bc5177e88ae3927a2957e21307976bae3d94a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+      "sha256": "a3f3d11fddf6f42810a209f163dfa8dcacdb337683c3334497bd7306bbc14d27"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "e8fb7fc42ea1c12c10ae232c58886038513f3fb8914c756b7645a3aa091a86a1"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_preparation.rs",
+      "sha256": "465228dfef0a8946157918e913b528b73d8b62fab8eebd8bc6cf679fda2c5a19"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_transfer.rs",
+      "sha256": "f11f7e0abe564f0e7ecd583bec0e1a7d10e4ee105483e70811c89130ee774ad1"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_verification_retry.rs",
+      "sha256": "34298d94f767ac27ec9cf885144f2fffea712d93e7b691afea198fb834159005"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_outcome.rs",
+      "sha256": "2cc478e42a4442fa4b394843870f32398e5925a4ab871352be9e3b5ff06ed851"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_prepare.rs",
+      "sha256": "11f7cd3a464aba9d6e2674b27b71873bcae2d6972ec6af821762499fe94de2f4"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_reconciliation.rs",
+      "sha256": "132fcb145c299e6c43cc322b6e8a8441a9c3e559a346fca2937a8be551c13c0d"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_unstarted.rs",
+      "sha256": "70544b9f926f5c89a59f5cedcb191d35ce6887ed4573d9325aa802b320b0553f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_terminal.rs",
+      "sha256": "9484bcea9848b682ec29bda84c30cd68ea5c6fa9abfc3b3da893f802cd567d60"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_aborted.rs",
+      "sha256": "e4b313a76cd4956ff2fed76ab69b35bb23c9087425463318692320f13b118e97"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/audit_chain.rs",
+      "sha256": "e599e259562d33af95a6891db078b52b36518c29da4437a16911a78612dd2496"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "537cf1a288b57301439b34dc36e2ba5fcc1eeaa49ee3e59ca84d41af4096c909"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_abort_resolution.rs",
+      "sha256": "7b109c410c9ea015fe8a8515bfd9a16649cbfe9d9bfb9975fe06b70ba90a4347"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_reconcile.rs",
+      "sha256": "5291d2576bcf681aab3052191f05562541f4a102d9e3c9a0ddf08d0d034b7697"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_callbacks.rs",
+      "sha256": "358f9ad80bad931ac23d8a1ba3db2c028aa7cb1585936dd22dd878f4903027c3"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "b8dc1b87537d14b491e6b8eb32665aa7d8f78766508e9bfc9c0b314931c61206"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_recovery.rs",
+      "sha256": "0af24b652148387aea3e8c4fa528e74edd91335a70e9907c080b788339ba6d05"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_recovery.rs",
+      "sha256": "f177ce47b4d0e783d5a01db74eb7b8568c3db92a482d99f32c1f00cfc5cc586d"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_terminal_cleanup.rs",
+      "sha256": "b62d1cfc40fd24ed17f8eab201ea90ddeb04ec200d192eb3070b0ae1404b541b"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/tests/phone_call_reliability.rs",
+      "sha256": "2843f25472d30fa28e1f5ef4899457c20de5816885b3fccdbd6f08de2456302a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_setup_refusal.rs",
+      "sha256": "68ca8db8cf07aa5270aa9fb3fba28cd00c3f4a0fde225e9edb9951ec1977c6cd"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve.rs",
+      "sha256": "7c78d0bac78a5925dd1966e00fec9e5b903c23d0ed71996d8a0f1ca000677d4b"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_revision_history.rs",
+      "sha256": "ca747bd294917fa0f97e455c8bb76c950c7fbd2826bcf9ac4bfa38d80e425f3b"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_revision.rs",
+      "sha256": "75a203c30ee58700ce563f1ae5bc98c7adb214df15aa87bcc2702326b39021f6"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_inbox.rs",
+      "sha256": "534b225890e6571989f14c931ca415fdbf564342c37bc49e1084da8657d2a0ec"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_review_epoch.rs",
+      "sha256": "f283cba8cfc19de7d343b3ff78e97ca78503c168ea555e5ffb9396c973aae922"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_completion.rs",
+      "sha256": "ec292b71d9ae9d4015bd4b9290c36a79ae11fd64ecbb907285cb3f695c1dc911"
+    },
+    {
+      "path": "scripts/provider-supervisor.py",
+      "sha256": "10929702ac75f16314592bd2c0ca80d12b4aa0c44ed44097b5b88f85bf09c201"
+    },
+    {
+      "path": "scripts/test-native-provider-vm.py",
+      "sha256": "a44a895a7a66e9fbde95ea58543d1e7c23b4e9dc581c2e7b0b6a733605d8b95a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_dispatch.rs",
+      "sha256": "a664c1d63ee92b1c669766080d722ed2d751222d139be450d23bd317ca43ffc0"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_reply.rs",
+      "sha256": "c618e7201d0b573a08e88001ab41131b3ddcf7d0a9bcd7f6979df01256e1373e"
+    },
+    {
+      "path": "crates/augmentagent-approval-discord/src/autoship.rs",
+      "sha256": "614c15c11d364ecadb70ac171d5207cd0c383a5de60c091754e2f936267e08e6"
+    },
+    {
+      "path": "crates/augmentagent-approval-discord/src/lib.rs",
+      "sha256": "88b8cf8199479bb46bb6cbe2e4ba72699fcf737e6e56f1d3dbbe7d647bbbb5f0"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_command.rs",
+      "sha256": "07fe7c256a6651d4c8fdf2f443d6ebb602a2bdcc8440af7cf00b999f8107e06f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/main.rs",
+      "sha256": "f5610b5dc7ba1a4fbb650a1b783f4f3bdc2c40bd27897527217e105391ea4699"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_delivery.rs",
+      "sha256": "acc2146ac1146b41c0efcee87bbb18fa6990510badb667f165145da299370860"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_conversations.rs",
+      "sha256": "d3799692eff450a435d39827e2096d783c324eb4a8845cf4f39574aa8ee051c4"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_contract.rs",
+      "sha256": "15133a09895615795438bc28b8be3faf9eebde98daa1e9a3f0c75d44d9288fea"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_contract.rs",
+      "sha256": "678b63b23e1689cd448651ca067f48344679fc3afa708111b50766f8d85b7802"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_scope.rs",
+      "sha256": "ced3a6e8e8b8b1f8f4004d8d1f24215488a3ad1d56cb840f80038720eae92c50"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_acceptance.rs",
+      "sha256": "5d3aa9936fb46fd126bdc23d24e8b5fad784cb07eed5893766a11df324fc50c9"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/autoship_write_scope.rs",
+      "sha256": "78319e32495111c6c54241f06084b043f9294810ba80489484afde49ebaa499f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_contract_tests.rs",
+      "sha256": "ffb5d9776b3ba9f22e2705943ac968c4f1d2586c3c993c04d7846cc37329bd6a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/build_storage.rs",
+      "sha256": "1b1dd81bf404877ed1226cfb634706c459e9e19fb726eaa54337b40a01cef046"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_amendment.rs",
+      "sha256": "bb596260ec1c036bf4f86bd795555583a084c4b033adc665ab4d8015804c6327"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_candidate_source_tests.rs",
+      "sha256": "86460041fcca6751b6229397ddbef98cdaf587a288472c55e36fe73e44b7b663"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_episode.rs",
+      "sha256": "eb09c2b801afc7bb518f5d24fc2dd50ff15abb15a0d000915b5e162ee9d770b0"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_legacy_verifier.rs",
+      "sha256": "5b697d5a7a36d3d518b1b82fc058b0df56270fc89d505b2f9f48dd27a1def86f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_progress_tests.rs",
+      "sha256": "6c3af65efa19f121cfeb6f09ed85706588881b16a325e873108e1c68a463ad35"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_review.rs",
+      "sha256": "ef977b8e9c6ed1621081dc03a3ee6cb796fbae5a72d1ecd5f80e096fa0e2a781"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_verifier_checkout.rs",
+      "sha256": "a2444cf1bfd6039750a7d76878ec75db3f0725ad68841093e369a5fa9f8e86b2"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/whatsapp_phone.rs",
+      "sha256": "ddccb3358620088e0089a9bf29232d48d9f641b292d5c1ebc7b19aa7ee6cd89d"
+    }
+  ],
+  "results": {
+    "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent -- --test-threads=8",
+    "passed": 1904,
+    "failed": 0,
+    "ignored": 34,
+    "handoff_snapshot_cases": 10,
+    "pending_handoff_cases": 8,
+    "retained_logs": [
+      "autoship-native-transfer-inspection-red.log",
+      "autoship-native-transfer-inspection-green.log",
+      "autoship-native-unstarted-red.log",
+      "autoship-native-unstarted-green.log",
+      "autoship-native-unstarted-race-fixture-failure.log",
+      "autoship-native-transfer-inspection-full-core.log",
+      "autoship-native-unstarted-full-cli.log",
+      "autoship-native-terminal-unstarted-red.log",
+      "autoship-native-terminal-unstarted-green.log",
+      "autoship-native-terminal-unstarted-full-cli.log",
+      "autoship-native-aborted-initial-compile-failure.log",
+      "autoship-native-aborted-red.log",
+      "autoship-native-aborted-green.log",
+      "autoship-native-aborted-full-cli.log",
+      "autoship-native-retired-namespace-initial-fixture-failure.log",
+      "autoship-native-retired-namespace-red.log",
+      "autoship-native-retired-namespace-green.log",
+      "autoship-native-abort-resolution-red.log",
+      "autoship-native-abort-resolution-green.log",
+      "autoship-native-abort-resolution-full-core.log",
+      "autoship-native-abort-resolution-full-cli.log",
+      "autoship-native-pending-reconcile-red.log",
+      "autoship-native-pending-reconcile-green.log",
+      "autoship-native-reconcile-adapter-red.log",
+      "autoship-native-pending-reconcile-full-cli.log",
+      "autoship-native-callback-journal-initial-compile-failure.log",
+      "autoship-native-callback-journal-red.log",
+      "autoship-native-callback-journal-green.log",
+      "autoship-native-callback-journal-production-check.log",
+      "autoship-native-callback-journal-full-cli.log",
+      "autoship-native-guard-promotion-red.log",
+      "autoship-native-guard-promotion-green.log",
+      "autoship-native-guard-factory-red.log",
+      "autoship-native-guard-factory-green.log",
+      "autoship-native-guard-factory-fault-green.log",
+      "autoship-native-guard-audit-probe-red.log",
+      "autoship-native-guard-factory-full-core.log",
+      "autoship-native-guard-factory-production-check.log",
+      "autoship-native-guard-factory-full-cli.log",
+      "autoship-native-sweep-red.log",
+      "autoship-native-sweep-green.log",
+      "autoship-native-sweep-review-red.log",
+      "autoship-native-sweep-review-green.log",
+      "autoship-native-sweep-full-cli.log",
+      "autoship-native-sweep-production-check.log",
+      "autoship-native-guard-abort-resolver-red.log",
+      "autoship-native-guard-abort-resolver-green.log",
+      "autoship-native-guard-abort-acquisition-red.log",
+      "autoship-native-guard-abort-acquisition-green.log",
+      "autoship-native-guard-abort-acquisition-green-retry.log",
+      "autoship-native-guard-abort-full-cli.log",
+      "autoship-native-guard-abort-production-check.log",
+      "autoship-native-guard-abort-fairness-red.log",
+      "autoship-native-guard-abort-fairness-green.log",
+      "autoship-native-guard-abort-fair-full-cli.log",
+      "autoship-native-guard-abort-fair-production-check.log",
+      "autoship-native-closed-workflow-core-red.log",
+      "autoship-native-closed-workflow-core-behavior-red.log",
+      "autoship-native-closed-workflow-core-green.log",
+      "autoship-native-closed-workflow-core-green-retry.log",
+      "autoship-native-closed-workflow-core-green-admission-retry.log",
+      "autoship-native-closed-workflow-guard-red.log",
+      "autoship-native-closed-workflow-guard-green.log",
+      "autoship-native-closed-workflow-publication-red.log",
+      "autoship-native-closed-workflow-publication-behavior-red.log",
+      "autoship-native-closed-workflow-full-core.log",
+      "autoship-native-closed-workflow-full-cli.log",
+      "autoship-native-closed-workflow-production-check.log",
+      "autoship-native-terminal-cleanup-red.log",
+      "autoship-native-terminal-cleanup-red-retry.log",
+      "autoship-native-terminal-cleanup-behavior-red.log",
+      "autoship-native-terminal-cleanup-green.log",
+      "autoship-native-terminal-cleanup-worker-red.log",
+      "autoship-native-terminal-cleanup-worker-red-retry.log",
+      "autoship-native-terminal-cleanup-worker-green.log",
+      "autoship-native-terminal-cleanup-full-cli.log",
+      "autoship-native-terminal-cleanup-production-check.log",
+      "autoship-native-terminal-phone-clock-check.log",
+      "autoship-7409527e-hosted-targeted-failed.log",
+      "autoship-7409527e-hosted-phone-failed.log",
+      "autoship-owner-guard-setup-red.log",
+      "autoship-owner-guard-setup-green.log",
+      "autoship-owner-guard-setup-full-cli.log",
+      "autoship-owner-guard-setup-owner-green.log",
+      "autoship-owner-guard-setup-owner-green-retry.log",
+      "autoship-owner-guard-setup-owner-final-green.log",
+      "autoship-owner-guard-setup-final-cli.log",
+      "autoship-owner-guard-index-corruption-red.log",
+      "autoship-owner-guard-index-corruption-green.log",
+      "autoship-owner-guard-setup-validated-cli.log",
+      "autoship-owner-guard-setup-validated-production-check.log",
+      "autoship-owner-session-restore-validated-guard.log",
+      "autoship-owner-session-restore-full-cli.log",
+      "autoship-owner-session-restore-production-check.log",
+      "autoship-owner-revision-history-red.log",
+      "autoship-owner-revision-history-behavior-red.log",
+      "autoship-owner-revision-history-green.log",
+      "autoship-owner-revision-history-owner-green.log",
+      "autoship-owner-revision-guard-red.log",
+      "autoship-owner-revision-guard-green.log",
+      "autoship-owner-revision-validated-full-cli.log",
+      "autoship-owner-revision-merged-full-cli.log",
+      "autoship-owner-revision-merged-production-check.log",
+      "autoship-owner-revision-native-configuration-red.log",
+      "autoship-owner-revision-native-configuration-full-cli.log",
+      "autoship-owner-revision-native-configuration-production-check.log",
+      "autoship-owner-input-auth-red.log",
+      "autoship-owner-input-auth-green.log",
+      "autoship-owner-early-candidate-red.log",
+      "autoship-owner-early-candidate-green.log",
+      "autoship-owner-early-candidate-full-cli.log",
+      "autoship-owner-early-candidate-production-check.log",
+      "autoship-owner-initial-acceptance-red.log",
+      "autoship-owner-initial-acceptance-green.log",
+      "autoship-owner-initial-acceptance-full-cli.log",
+      "autoship-owner-initial-acceptance-production-check.log",
+      "autoship-owner-followup-serialization-red.log",
+      "autoship-owner-followup-serialization-green.log",
+      "autoship-owner-initial-acceptance-validated-full-cli.log",
+      "autoship-owner-initial-acceptance-validated-production-check.log",
+      "autoship-owner-current-completion-red.log",
+      "autoship-owner-current-completion-green-retry.log",
+      "autoship-owner-current-completion-locks-green.log",
+      "autoship-owner-current-completion-final-green.log",
+      "autoship-owner-current-completion-full-core.log",
+      "autoship-owner-current-completion-full-cli.log",
+      "autoship-owner-current-completion-production-check.log",
+      "autoship-owner-body-dispatch-red.log",
+      "autoship-owner-body-dispatch-final-green.log",
+      "autoship-owner-body-completion-red.log",
+      "autoship-owner-body-completion-green.log",
+      "autoship-owner-body-joined-green.log",
+      "autoship-owner-body-validated-green.log",
+      "autoship-owner-body-full-cli.log",
+      "autoship-owner-body-production-check.log",
+      "autoship-owner-reply-gateway-red.log",
+      "autoship-owner-reply-gateway-green.log",
+      "autoship-owner-reply-completion-green.log",
+      "autoship-owner-reply-stored-green.log",
+      "autoship-owner-reply-full-discord.log",
+      "autoship-owner-reply-atomic-queue-green.log",
+      "autoship-owner-reply-full-cli.log",
+      "autoship-owner-reply-production-check.log",
+      "autoship-owner-first-builder-red.log",
+      "autoship-owner-first-builder-validated-green.log",
+      "autoship-owner-first-builder-full-core.log",
+      "autoship-owner-first-builder-graft-fixture-failure.log",
+      "autoship-owner-first-builder-graft-red.log",
+      "autoship-owner-first-builder-graft-green.log",
+      "autoship-owner-first-builder-final-cli.log",
+      "autoship-owner-first-builder-final-production-check.log",
+      "autoship-owner-default-provider-red.log",
+      "autoship-owner-default-provider-green.log",
+      "autoship-owner-default-provider-full-cli.log",
+      "autoship-owner-default-provider-production-check.log",
+      "autoship-owner-acceptance-red.log",
+      "autoship-owner-acceptance-green.log",
+      "autoship-owner-acceptance-bytes-red.log",
+      "autoship-owner-acceptance-bytes-behavior-red.log",
+      "autoship-owner-acceptance-bytes-green.log",
+      "autoship-owner-acceptance-guard-green.log",
+      "autoship-owner-acceptance-full-cli.log",
+      "autoship-owner-acceptance-production-check.log",
+      "autoship-owner-acceptance-final-focused.log",
+      "autoship-owner-acceptance-final-cli.log",
+      "autoship-owner-acceptance-final-production-check.log",
+      "autoship-owner-private-source-activation-red.log",
+      "autoship-owner-private-source-guard-green.log",
+      "autoship-owner-write-scope-replay-red.log",
+      "autoship-owner-write-scope-replay-green.log",
+      "autoship-owner-private-source-full-core.log",
+      "autoship-owner-private-source-full-cli.log",
+      "autoship-owner-private-source-production-check.log",
+      "autoship-owner-private-body-context-red.log",
+      "autoship-owner-private-body-context-green.log",
+      "autoship-owner-private-source-final-cli.log",
+      "autoship-owner-private-source-final-production-check.log",
+      "autoship-owner-private-source-final-production-check-retry.log"
+    ],
+    "settlement_cases": 7,
+    "handoff_component_cases": 31,
+    "owner_eligibility_cases": 6,
+    "focused_native_observation_cases": 33,
+    "core_passed": 897,
+    "core_failed": 0,
+    "core_ignored": 15,
+    "owner_retirement_marker_cases": 3,
+    "scope_retirement_marker_cases": 6,
+    "physical_inventory_scan_cases": 7,
+    "locked_preparation_cases": 7,
+    "workflow_filtered_preparation_cases": 7,
+    "preparation_fingerprint_cases": 4,
+    "preparation_retry_cases": 5,
+    "persistence_disposition_cases": 8,
+    "guarded_preparation_adapter_cases": 4,
+    "joined_preparation_cases": 4,
+    "exact_transfer_inspection_cases": 3,
+    "unstarted_acknowledgement_cases": 4,
+    "terminal_unstarted_acknowledgement_cases": 4,
+    "aborted_acknowledgement_cases": 4,
+    "retired_namespace_proof_cases": 3,
+    "abort_namespace_resolution_cases": 3,
+    "core_validation_scope": "full managed core library suite; source inventory is post-run and grants no compiled-source freshness authority",
+    "pending_reconciliation_cases": 9,
+    "joined_reconciliation_adapter_cases": 1,
+    "core_validation_source_commit": "021142d6 plus PR1872 merge and private-owner integration source (post-run inventory only)",
+    "callback_journal_cases": 4,
+    "production_configuration_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "passed": true,
+      "log": "autoship-owner-private-source-final-production-check-retry.log"
+    },
+    "guard_promotion_cases": 3,
+    "read_only_audit_probe_cases": 2,
+    "actual_guard_subprocess_modes": 65,
+    "sweep_related_cases": 20,
+    "guard_abort_resolver_cases": 3,
+    "closed_workflow_core_cases": 2,
+    "closed_workflow_core_refusal_faults": 11,
+    "closed_workflow_guard_modes": 3,
+    "terminal_namespace_cleanup_cases": 4,
+    "phone_reliability_passed": 6,
+    "phone_reliability_failed": 0,
+    "owner_guard_setup_modes": 6,
+    "retained_runtime_owner_pause_cases": 1,
+    "focused_owner_cases": 115,
+    "owner_acceptance_preparation_cases": 5
+  },
+  "coverage": [
+    "atomic immutable observation snapshots and exact-input sequence reuse",
+    "latest per-runtime history, multiple sessions per provider and preserved uncertainty",
+    "immutable original native-store binding independent of current policy selection",
+    "durable pending request and original observation, request ID and destination",
+    "restart/new-lease or changed-candidate reconciliation without replacement request",
+    "unknown remote operations and same-generation retarget refusal",
+    "lost/corrupt projection refusal and transactional failure rollback",
+    "opaque original-ledger receipt capability required for metadata settlement",
+    "atomic transferred-source disposition, destination registration, completed history and pending acknowledgement",
+    "historical settlement under a newer reconciliation lease grants no current-context promotion",
+    "repeated handoffs resolve effective ownership without rewriting original observations or creation/export bytes",
+    "changed policy can reconcile original receipts but cannot grant changed-selection native admission",
+    "corrupt completion and missing original store remain held/unknown",
+    "transferred registrations remain history without blocking active-owner or retirement selection",
+    "bound retry cleanup requires matching durable owner resume event and original native binding",
+    "plain-text/malformed event payloads cannot create cleanup authority or break JSON parsing",
+    "unavailable transfer history retains cleanup/retry intents while eligible peers advance",
+    "unrelated owner-retirement markers cannot omit a live runtime before source sealing",
+    "a matching owner marker also requires an exact retired_owner entry; transfer closure is insufficient",
+    "strict scope-retirement v2 binds captured authority, runtime path, creation bytes and original store epoch",
+    "classification and root-wide pruning share marker provenance validation; malformed and legacy markers retain runtimes and aliases while valid peers advance",
+    "scope completion does not override an active session lock; delayed retirement refuses changed creation bytes",
+    "bounded physical namespace scan filters authenticated retirement from latest metadata without rewriting uncertain observations",
+    "retained missing/unknown-ID/uncertain, creation/authority/launch/alias/export substitutions, busy locks and malformed foreign authorities hold the scan",
+    "session locks remain held in the scan result and are released on partial failure; zero retained sessions never creates source closure",
+    "4096-entry enumeration and 64-MiB metadata read budget include unrelated provider entries and foreign creation receipts",
+    "private core orchestration holds original state and session locks across filtered-intent callback, native prepare, protected audit seals and commit",
+    "persistence callback failure, changed returned request and stale post-persistence fence produce no native claims or audit seals",
+    "persisted synthetic intent survives stale fencing and retries the same request ID through actual core transfer",
+    "changed creation/export bytes and replaced original store after the callback are rechecked before claims; lost store is never bootstrapped",
+    "real concurrent late scope retirement returns without blocking and cannot retire a runtime during preparation or after transfer",
+    "read-only census preserves complete latest launch/optional observation inputs without inventing snapshot sequence, transfer ID or completion",
+    "complete unfiltered latest-input array has canonical digest while every eligible original source registration remains in the separate source digest",
+    "one immediate workflow transaction revalidates the complete census and atomically records a filtered snapshot and exact pending request; failed insert rolls back both and their events",
+    "proposed retired uncertainty is omitted only from the selected metadata snapshot, preserving original uncertainty/history and zero-runtime source registrations; no native retirement authority is created",
+    "metadata-only active-pending fence requires exact decoded request, original observation, current lease/candidate/destination, dispatch/remote guards and unretired source namespaces; cleared intent, hold and newer lease refuse",
+    "no-pending preparation diagnostic uses the exact canonical input/reason/class/capacity fingerprint with explicit null unknowns, no fabricated request ID or observation sequence",
+    "preparation status defers transient contention/capacity/persistence and holds provenance uncertainty; clock, lease generation and provisional audit are excluded from typed inputs",
+    "finite native_handoff_preparation domain uses the existing durable retry service with 5/10/20/40/60-minute capped backoff and independent CI/acceptance epochs",
+    "same-generation replay is idempotent, changed fingerprint resets its epoch, unrelated success cannot clear native debt, and unknown domains/cross-domain overwrites are refused",
+    "native no-pending retry write independently refuses active or orphaned native intent and unresolved remote/merge mutations without changing progress, binding, attempts, model charges or allowance",
+    "tracked persistence captures the exact pending request immediately before COMMIT and verifies workflow state after the reported result",
+    "lost commit response recovers original active intent after restart; rollback before commit attempt can be distinguished without inventing an identity",
+    "missing/unreadable/erased evidence after a commit attempt stays Unknown with the saved request, even if the local result claimed success",
+    "readback validates completed history and every orphan in the affected workflow before accepting an active row; unrelated workflows do not block it",
+    "settled intent is returned only for reconciliation and cannot pass the active-pending fence or construct a verified native receipt",
+    "public guarded preparation API validates original selected policy and immutable callback frame without inventing pre-intent UUIDs",
+    "fresh native owner/runtime/audit/log/anchor claims are checked before invoking workflow persistence; an older prepared native request cannot be bypassed by a fresh workflow UUID",
+    "durable and uncertain callback decisions preserve original intent phase; invalid callback frames cannot redirect native receipt readback to another binding",
+    "joined Arc<Mutex<WorkflowStore>> orchestrator runs actual filtered transaction, core transfer, independent original-ledger verified receipt lookup and atomic settlement with no model dispatch",
+    "joined callback rollback schedules existing-service free retry without native claims; uncertain commit cannot create native claims or a no-pending retry",
+    "native completion plus metadata settlement failure preserves the original pending request for verified reconciliation without replaying native work",
+    "original-store read-only inspection distinguishes Absent/Prepared/Completed/Aborted and retains StateLock across a nonserializable borrowed proof callback",
+    "missing lock/epoch/ledger and corrupt orphan authority cannot issue an absence proof or initialize replacement state; historical inspection does not depend on selected policy",
+    "newer-lease known-Absent acknowledgement atomically preserves exact original pending/snapshot history before clearing active pending; source registrations, checkpoint, paid accounting and owner input are unchanged",
+    "shared validated known-unstarted history gates orphan classification, preparation/readback and retry; corrupted records remain held and idempotent acknowledgement never clears a different request",
+    "real old-controller thread paused after its first fence check cannot create a native request after newer-lease acknowledgement and original-lock release",
+    "terminal merged/retired checkpoint acknowledgement under the original native absence lock preserves checkpoint, cleanup intents, counters and allowance without a new productive lease",
+    "exact terminal checkpoint event, generation and canonical hash fence changes to stage, head and next action; missing checkpoint events hold acknowledgement",
+    "terminal acknowledgement transaction rollback retains the pending intent; retained v2 terminal history survives database reopen and rejects checkpoint/projection corruption; legacy v1 serialization remains unchanged",
+    "exact original-native Aborted proof atomically retains immutable abort history and every source/unpromoted destination namespace before acknowledging the pending row, without ownership promotion or accounting changes",
+    "Absent, Prepared and Completed proofs and same-generation nonterminal reconciliation cannot acknowledge an abort; exact terminal checkpoint authority is required for terminal acknowledgement",
+    "namespace insertion failure rolls back history/events/pending acknowledgement; missing retained namespace rows hold readers and guards after database reopen",
+    "unresolved abort namespaces refuse preparation, exact active-pending fences, initial/existing registration metadata checks, handoff settlement and dispatch; native retired_owner alone does not resolve them",
+    "pending orphan checks recognize validated known-aborted dispositions; contradictory active/completed/unstarted/aborted dispositions are refused",
+    "borrowed original-store retired-namespace capability requires exact Aborted request, authentic native retirement/markers, unchanged recorded creation bytes, protected bound audit, complete resource correlation and fresh kernel quiescence checks",
+    "state lock, exact namespace session locks and protected audit ingress gate remain held across metadata acknowledgement; unrelated peer locks remain available and peers are never implicitly retired",
+    "retirement inspection requires an existing audit lock and verifies retained file identities; missing locks are not recreated, missing recorded runtimes and bad kernel identities remain held",
+    "open or retained sealed audit inspection rechecks kernel resources without changing audit bytes or inventing transfer/recovery receipts",
+    "immutable per-namespace resolution events/projections consume the borrowed capability; source retirement is acknowledged without creating an unpromoted destination registration, altering checkpoint/budgets/owner input or spending merge allowance",
+    "one resolved namespace leaves its peers blocked; metadata barriers clear only after every namespace has validated retained resolution history, which survives database reopen",
+    "namespace resolution insertion failure rolls back source disposition/events and retains barriers; corrupted resolution history holds readers/preparation/dispatch after reopen; exact terminal identity fences cleanup",
+    "original known-aborted pending context remains available as protected historical metadata after active acknowledgement and resolution; it never grants a native proof or new origin",
+    "shared reconciliation classifies the exact saved request in the original store; known Absent/Aborted acknowledgement, actual Completed settlement and Prepared replay retain UUID/observation/binding and perform no replacement allocation",
+    "same-generation known-Absent work replays the original request rather than acknowledging it as unstarted; newer leases acknowledge absence before later re-preparation",
+    "Prepared replay under a newer current lease revalidates exact active pending identity, owner/operation/source fences and current selected native policy, settles the historical destination without current-context promotion",
+    "Completed inspection supplies the opaque verified receipt under the native lock, allowing metadata settlement without audit handles or recursive native IO under the workflow mutex",
+    "terminal completion uses immutable v2 checkpoint-bound history, preserves source cleanup intents/terminal checkpoint/allowance, records transferred-source dispositions and registers only destination cleanup without acquiring a productive lease",
+    "terminal completion handles sources whose earlier terminal cleanup was already acknowledged, excludes transferred source intents and exposes the actual destination to existing cleanup selection",
+    "terminal Prepared remains pending for authorized retirement; terminal Absent and Aborted use exact checkpoint acknowledgements; changed terminal identity and missing original authority remain held without initialization",
+    "terminal completed-record insertion failure rolls back destination registration/source dispositions/events and retains pending; corrupted terminal history is refused after database reopen",
+    "the preparation adapter releases its mutex before invoking shared recovery; a failed settlement reuses the original actual native completion and succeeds on a later call after the injected failure is removed",
+    "validated historical dispositions support controller database reopen/replay without synthesizing native receipts, owner input completion or productive authority",
+    "actual guard observer installation shares a two-phase journal: resolve current binding under metadata lock, capture private verified append capabilities outside the workflow mutex, then persist with fresh dispatch validation in one transaction",
+    "private nonserializable launch/observation append capabilities bind exact protected receipt bytes, original native binding and controller identity; forged receipt/intent/owner/binding input is refused without poisoning audit health",
+    "launch and observation commits recheck lease/candidate, checkpoint holds/terminal state, owner-turn/pause authority and original registered context in the publication transaction; lease/head/held/retired changes after capture publish no event",
+    "actual core launch-prepared and uncertainty publication invoke the same installed callback implementation used by WorkflowGuard, journaling nullable identity and uncertainty without model dispatch",
+    "deterministic concurrent late launch and observation callbacks read real receipts while another thread owns the workflow mutex, then attempt metadata publication while real native transfer holds state/session/audit locks; both stale commits refuse and the original transfer settles successfully",
+    "legacy receipt-reading store wrappers and raw launch-journal entry are test-only; a successful non-test production configuration check proves real guard callers use the new receipt-capability ingress",
+    "ordinary and observational guard source paths use distinct namespaces and shared original-pending reconciliation/preparation; healthy repeated acquisition preserves original binding, checkpoint and accounting",
+    "actual guard subprocesses recover original completed settlement and audit promotion after injected database write failures; missing original audit/native authority refuses and releases the unstarted lease without recreating authority",
+    "audit pointer promotion requires opaque actual current receipt and matching settled history; historical, changed-head and held contexts refuse; replay is idempotent and projection failure retains settlement",
+    "read-only healthy audit inspection never recreates missing lock authority and reports a busy lock without waiting or mutating log/anchor",
+    "merge-sweep uses shared audit acquisition/native recovery, preserves stored review and original native binding, and releases an unstarted lease on missing native authority",
+    "audit recovery that changes the reviewed binding returns no merge-sweep guard, releases its lease and requires candidate verification/review again",
+    "controller-local pre-guard acquisition invokes original-bound retired-aborted namespace proofs without a shared workflow mutex; exact metadata settlement occurs under original native/session/audit locks",
+    "unavailable audit/native authority or failed projection retains the affected barrier; verified peers resolve independently without model/allowance changes; stale lease fences further work",
+    "bounded namespace windows rotate with durable lease generations so an unavailable prefix cannot starve a later verified peer; a reduced-budget integration fixture exercises actual native proofs across two genuine workflow leases",
+    "actual guard acquisition resolves verified source and unpromoted-destination abort barriers, then refuses all-closed source reuse without creating a fresh owner or binding",
+    "opaque borrowed closed-workflow proof verifies complete original native namespace frontier, no prepared requests, actual retired physical inventory and fresh correlated audit/kernel closure under original native/session/audit locks; no fresh binding/store/epoch, native mutation or synthetic transfer receipt",
+    "all-closed registration atomically rechecks complete latest protected runtime and source census, preserves original binding and history, records immutable recovery evidence and advances the audit pointer without resetting accounting, completing owner input or granting review/CI/merge authority",
+    "actual guard recovery preserves original epoch, binding and model count; an injected recovery-record failure rolls back registration/promotion and a later lease retries safely",
+    "recovery history survives database reopen; missing recovery projection blocks native dispatch, publication intent and guard side-effect admission even with a valid current lease",
+    "core refusals cover missing runtime/store epoch/audit lock, omitted or unretired namespace, substituted creation, busy runtime, invalid kernel identity, changed policy, stale fence and callback failure/replay",
+    "free worker reconciliation routes terminal pending requests through shared original-store reconciliation, then records exact terminal/request/namespace retirement authorization under actual Aborted inspection before native effects",
+    "unpromoted aborted destinations are retired under the original binding without registration, a productive lease, checkpoint/accounting changes or owner-input completion; barriers resolve only through fresh original-bound audit/kernel proofs",
+    "retirement intents replay idempotently after reopen; failed intent writes prevent effects; audit/projection failure retains affected barriers while verified peers advance; stale terminal/store authority refuses",
+    "bounded terminal namespace scheduling uses a durable logical ordinal that grants no authority; the real worker entry holds no workflow mutex across native inspection, retirement or audit/kernel IO",
+    "phone integration fixture observes actual fake-source sleep completion after virtual time advance and before real-clock resume, retaining the original three-second deadline assertions; all six integration cases pass locally",
+    "guard-only owner-turn metadata acquisition can reach actual shared handoff for bound retained native owners; ordinary metadata claims keep their retained-owner block and publication/merge remains owner-paused",
+    "only a private nonserializable capability constructed before guard publication can persist an unstarted owner setup disposition; failed setup atomically preserves refusal history and releases its own lease without consuming input, unpausing, clearing native intent or resetting accounting",
+    "same owner request can be reclaimed only after validated setup_refused history; escaped/expired claimed turns remain blocked, refusal write failure stays conservative, and lost/corrupt authority history holds future claims",
+    "owner-turn acquisition requires selected native configuration before claiming; configured counter-admission fixture preserves its pause/publication assertions and performs no provider transport dispatch",
+    "actual joined preparation transfers a retained physical runtime under the guarded owner pause exception while preserving creation bytes, checkpoint, pending input and allowance",
+    "unrecognized binding fields in the current owner-turn authority index are refused rather than normalized and overwritten; the actual guard corruption regression failed before the fix",
+    "guarded owner continuation factory restores the exact saved Codex/Claude conversation after physical runtime completion and original-store handoff; mismatched provider and uncertain conversation refuse; no worker/gateway/provider-transport acceptance",
+    "owner revision dispatch/replay refuses ten damaged-history cases, including total revision-history loss; original claim, accepted owner input, activation, registration and generation fence must agree",
+    "consuming owner contract revision returns a new native guard only after original-store handoff; Codex/Claude retain their exact session; failed setup stays claimed with pending input and no timeout replay",
+    "owner revision checks selected native configuration and original binding before metadata activation, then revalidates the native owner/binding before returning; disappearance regression preserves old contract/generation and pending input",
+    "owner turn claim and dispatch authenticate exact pending input against immutable accepted ingress; ten corruption/routing cases refuse, and active selector changes never retarget accepted input",
+    "owner input arriving before candidate registration can enter the first native guard while preserving the owner pause; registration event failure rolls back origin and candidate together; surviving history never becomes a fresh origin",
+    "raw owner intake can register its first pinned acceptance contract through a private guard capability, atomic baseline history and a new native guard; old callbacks are fenced and input remains pending",
+    "a queued plain follow-up preserves only a matching unexpired owner turn; expired/superseded leases and explicit pause retain their fences"
+  ],
+  "synthetic_controller_fixtures": true,
+  "live_provider_dispatch": false,
+  "native_transfer_executed": true,
+  "physical_runtime_inventory_closure": false,
+  "production_quiescence_acceptance": false,
+  "productive_caller_enabled": false,
+  "shipping_authority": false,
+  "hosted_ci": "pending current published head",
+  "remaining": [
+    "production preparation/promotion caller integration across remaining owner-turn and recovery leases",
+    "remaining nonterminal owner execution-retry/owner-turn retirement routing and interrupted namespace recovery and authenticated legacy/uncertainty/corrupt-state recovery",
+    "normal protected rollout and actual Codex/Claude Discord continuation acceptance",
+    "C actual-backend freshness/storage/quiescence cutover, private verifier recovery/application and full epic soak",
+    "persist post-intent transient-I/O S backoff, actual input-change early wake before activation",
+    "remaining authenticated retirement intent routing and interrupted/legacy/vanished namespace recovery; remaining owner-turn and recovery consumers; actual runtime/provider continuation acceptance",
+    "actual provider/VM continuation after closed-workflow recovery, remaining nonterminal owner execution-retry/owner-turn retirement routing, and missing/legacy/vanished authority recovery remain unproven",
+    "real owner-message worker consumption, guarded completion/reply and Discord coding gateway activation remain unimplemented; metadata/guard readiness never substitutes for actual provider/VM/Discord acceptance",
+    "new published head hosted checks and protected main synchronization/review remain required",
+    "Private owner acceptance producer exists, but worker consumption, recoverable verifier application and safe projection of every public GitHub output remain required before native Discord coding activation.",
+    "Private verifier map integration removes candidate installation for new owner contracts; canonical protected manifest activation/recovery, complete backend C proof, legacy removal and worker/private-output continuation remain required."
+  ],
+  "native_transfer_scope": "isolated synthetic-controller/native-filesystem fixtures only; zero production transfers or provider/model dispatch",
+  "opaque_receipt_producer": "actual original-bound ownership::transfer_receipt lookup or Completed NativeTransferInspection under the held original native lock; no wire/serialized-receipt constructor",
+  "fixture_core_protocol": {
+    "completed": true,
+    "consecutive_transfers": 2,
+    "creation_and_export_bytes_preserved": true,
+    "metadata_failure_replays_same_original_receipt": true,
+    "lost_original_store_refuses_new_verified_receipt": true
+  },
+  "physical_runtime_inventory_closure_scope": "established in isolated joined core/WorkflowStore fixtures only; production callers, recovery barriers and live acceptance remain unproven",
+  "inventory_preparation_audit": {
+    "spec": "docs/autoship/native-inventory-preparation.md",
+    "canonical_seams_checked": 18,
+    "mapped_occurrences": 160,
+    "fresh_reader_checked": true,
+    "implementation_complete": false,
+    "production_ready": false
+  },
+  "scope_marker_red_evidence": "Initial red run: two behavioral failures; third foreign-workflow fixture failed create_new before assertion. Fixture corrected; all six cases pass in full core suite.",
+  "physical_scan_component_executed": true,
+  "physical_scan_scope": "internal component under an existing ledger/state lock; synthetic native filesystem fixtures only; no workflow callback or productive consumer enabled",
+  "physical_scan_red_evidence": "Corrected initial scan red: three behavioral failures and one hold test passed. Initial hold fixture used the wrong provider alias directory; retained initial log. Separate malformed-foreign-authority test failed behaviorally before the validation fix.",
+  "locked_preparation_component_executed": true,
+  "locked_preparation_scope": "private core callback with durable-file intent fixtures and actual native ledger/audit transfer; real workflow SQLite snapshot/pending transaction and typed preparation outcomes are not connected",
+  "locked_preparation_red_evidence": "Initial four callback/locking tests failed behaviorally against the placeholder. Expanded red: one precondition test passed and five failed. Final full core suite includes seven cases, including real concurrent retirement.",
+  "workflow_filtered_transaction_component_executed": true,
+  "workflow_filtered_transaction_scope": "actual WorkflowStore SQLite transactions with synthetic proposed retained/retired selections; no core callback adapter, native transfer or model dispatch in these new cases",
+  "workflow_filtered_red_evidence": "Five census/filtered transaction tests failed against placeholders, then passed; two exact pending-fence tests separately failed before implementation. Final focused and full CLI runs include all seven.",
+  "preparation_diagnostic_retry_component_executed": true,
+  "preparation_diagnostic_retry_scope": "typed diagnostic plus actual WorkflowStore retry/event scheduling fixtures; no guarded core preparation adapter or productive caller enabled",
+  "early_input_wake_integrated": false,
+  "pending_commit_uncertainty_disposition_integrated": true,
+  "preparation_diagnostic_retry_red_evidence": "Four fingerprint tests failed against the placeholder, and native retry initially had three behavioral failures/one refusal passing. Separate domain-overwrite test reproduced its behavioral failure. Initial retry implementation had one fixture failure from claiming before scheduled eligibility; corrected test uses normal admission and proves changed-input epoch reset, not early wake.",
+  "workflow_commit_readback_component_executed": true,
+  "workflow_commit_readback_scope": "actual WorkflowStore transaction/readback fixtures, including historical metadata from an actual isolated core transfer and settlement; no guarded core callback adapter or productive consumer enabled",
+  "persistence_disposition_red_evidence": "Initial five tests: four behavioral failures and one refusal passed against the placeholder. Separate same-workflow orphan test reproduced accepting an active row despite another orphan; fixed readback now checks all affected-workflow orphans. Final focused and full CLI runs contain eight cases.",
+  "joined_preparation_component_executed": true,
+  "joined_preparation_scope": "isolated actual core/WorkflowStore orchestration fixtures; synthetic protected controller resource evidence, zero provider/model dispatch, zero production transfers",
+  "core_callback_connected": true,
+  "worker_guard_callers_enabled": false,
+  "guarded_joined_red_evidence": "Three public core adapter cases failed against the placeholder, then passed. Three actual WorkflowStore/core orchestration cases separately failed before composition. Final full suites include four cases in each group, including invalid callback frames and recovery from settlement failure.",
+  "exact_transfer_inspection_component_executed": true,
+  "newer_lease_unstarted_ack_component_executed": true,
+  "terminal_unstarted_acknowledgement_implemented": true,
+  "aborted_namespace_barriers_implemented": true,
+  "pending_recovery_routed": false,
+  "unstarted_scope": "isolated actual core inspection and WorkflowStore acknowledgement fixtures, including a fenced old-controller transfer thread, newer-lease nonterminal and terminal-checkpoint acknowledgements; zero provider/model dispatch",
+  "unstarted_red_evidence": "Core inspection placeholder: two behavioral failures/one refusal passed. Workflow acknowledgement placeholder: two behavioral failures/one refusal passed. Final suites include three inspection cases and four acknowledgement cases. Initial race fixture incorrectly expected transfer error readback to finish under the held native lock; corrected test observes completion after release and verifies zero native requests.",
+  "terminal_unstarted_scope": "isolated actual original-native absence inspection and WorkflowStore transactions; no productive lease acquisition or provider/model dispatch, no production caller routing",
+  "terminal_unstarted_red_evidence": "Three tests failed behaviorally against terminal capture/acknowledgement placeholders; all three passed after implementation. Full CLI suite includes a fourth database-reopen/corrupted-history case.",
+  "aborted_acknowledgement_component_executed": true,
+  "aborted_namespace_barriers_persisted": true,
+  "authenticated_aborted_namespace_resolution_implemented": true,
+  "aborted_acknowledgement_scope": "isolated actual core Prepared->Aborted transition, locked native inspection and WorkflowStore transactions; synthetic controller/resource evidence, zero productive dispatch; authenticated namespace resolution and automatic recovery routing remain unfinished",
+  "aborted_acknowledgement_red_evidence": "Initial test compile failed due to an unqualified Arc/Mutex fixture return type; corrected compile evidence retained separately. Against method placeholders, three behavioral failures and one refusal case passed. Final focused run and full suite contain four cases.",
+  "retired_namespace_proof_component_executed": true,
+  "namespace_resolution_production_routed": false,
+  "all_retired_namespace_repreparation_integrated": false,
+  "authenticated_interrupted_namespace_recovery_implemented": false,
+  "retired_namespace_scope": "isolated actual original-native ledger/retirement inspection, held state/session/audit locks and WorkflowStore resolution transactions. Synthetic protected controller/admission evidence; fresh kernel host/boot/missing-cgroup checks, zero actual admitted workers, zero provider/model dispatch, no production acceptance.",
+  "namespace_resolution_red_evidence": "Initial core red had two behavioral failures and one fixture failure from create_new on an existing test creation file. Corrected core red had two behavioral failures and one refusal case passing. Final full core run contains all three cases with added missing-audit-lock and vanished-runtime assertions. Workflow resolution separately had three behavioral failures against method placeholders; all three pass in focused and full CLI runs.",
+  "pending_reconciliation_service_connected": true,
+  "preparation_adapter_pending_recovery_connected": true,
+  "terminal_completed_settlement_implemented": true,
+  "pending_reconciliation_scope": "actual isolated core/WorkflowStore recovery through the preparation adapter; synthetic protected controller/resources, zero provider/model dispatch. Real WorkflowGuard/worker callers remain disabled; no production recovery or continuation acceptance.",
+  "pending_reconciliation_red_evidence": "Initial six routing tests: five behavioral failures and one refusal passed against the service placeholder. After implementation all six passed. The existing joined settlement-failure case then failed behaviorally because the preparation adapter still returned ReconcileExisting; it now invokes recovery and retries the original verified settlement. Final full CLI suite contains nine routing cases plus that adapter regression.",
+  "workflow_guard_observer_code_connected": true,
+  "callback_capture_outside_workflow_mutex": true,
+  "callback_metadata_rechecks_dispatch_in_transaction": true,
+  "legacy_receipt_io_helpers_test_only": true,
+  "callback_lock_order_component_proved": true,
+  "callback_journal_scope": "isolated actual protected append/core uncertainty ingress, WorkflowStore transactions and native transfer with concurrent late launch/observation callbacks. Synthetic controller/resource evidence, zero provider/model dispatch; production guard observer installation code compiles, but no deployed provider continuation or VM quiescence acceptance is claimed.",
+  "callback_journal_red_evidence": "Initial compile used a core-private intent validation method; corrected workflow validation and retained the initial log separately. Corrected red: two behavioral failures (observer persistence placeholder and workflow mutex retained across capture), two refusal cases passing. Final full CLI suite includes all four cases. The actual concurrent race runs both launch and observation callbacks under real state/session/audit locks and rejects their stale metadata commits while transfer and verified settlement complete.",
+  "source_caller_integration": {
+    "ordinary_and_observational_guard_acquisition": true,
+    "merge_sweep": true,
+    "runtime_deployed": false,
+    "guard_fixture_scope": "46 actual guard subprocess modes in the full CLI: 37 earlier modes plus nine initial-acceptance success/refusal/history/setup modes. Real protected native-store operations and disposable Git, scripted Discord ingress and synthetic baseline receipts; no provider/model/VM dispatch or deployed acceptance.",
+    "pre_guard_retired_aborted_namespace_resolution": true,
+    "all_closed_original_binding_recovery": true,
+    "all_closed_original_binding_recovery_scope": "complete intact original history, registered retired namespaces and resolved aborted destinations, original selected policy and existing audit authority; vanished/legacy/corrupt authority remains held",
+    "terminal_worker_cleanup": true,
+    "terminal_worker_cleanup_scope": "exact terminal checkpoints and original Aborted namespace intents; shared Absent/Completed metadata reconciliation; Prepared remains pending until authorized retirement succeeds; no provider/model dispatch or production activation",
+    "owner_turn_guard_acquisition": true,
+    "owner_turn_setup_refusal_recovery": true,
+    "owner_coding_consumer": false,
+    "discord_coding_gateway_activation": false,
+    "owner_session_restoration_factory": true,
+    "owner_contract_revision_guard_handoff": true,
+    "owner_revision_history_validated": true,
+    "owner_first_candidate_registration": true,
+    "owner_inbox_payload_authentication": true,
+    "owner_initial_acceptance_registration": true,
+    "owner_followup_serialization": true
+  },
+  "productive_caller_enabled_scope": "deployment activation remains unproven; supported guard source paths are connected as described in source_caller_integration",
+  "closed_workflow_recovery_limits": {
+    "namespaces": 128,
+    "physical_entries": 4096,
+    "physical_metadata_bytes": 67108864,
+    "correlated_audit_bytes": 134217728,
+    "workflow_recovery_records": 1024,
+    "record_bytes": 1048576
+  },
+  "closed_workflow_recovery_native_mutations": false,
+  "hosted_phone_fix_previous_head": {
+    "head": "22498a8bc820f86fd674611607d2f9bb7247137a",
+    "phone": "SUCCESS",
+    "targeted_linux_aggregate": "SUCCESS",
+    "scope": "previous published head only; new-head checks pending"
+  },
+  "owner_session_restoration": {
+    "source_parent_commit": "95e541f3d00b5e02f6880c9f35ae51b944a82dc0",
+    "source_generation_authority": false,
+    "guard_factory_implemented": true,
+    "owner_worker_connected": false,
+    "discord_coding_gateway_enabled": false,
+    "deployed": false,
+    "provider_transport_dispatch": false,
+    "guard_subprocess_modes": 27,
+    "new_retained_runtime_provider_cases": [
+      "codex",
+      "claude"
+    ],
+    "checks": [
+      "exact observed ID resumes after real guard re-acquisition and native handoff",
+      "wrong requested provider refused",
+      "uncertain saved conversation refused",
+      "pending owner input, pause and model/merge accounting preserved; publication denied"
+    ],
+    "fixture_scope": "Scripted protected launch/resource/session receipts with real private runtime files, completion/kernel checks, workflow transactions and original-store ownership transfer. No VM/provider/model dispatch; no live Discord or process-restart acceptance.",
+    "initial_red": "Compilation failed because the owner-session factory did not exist; this is an API red, not a behavioral parent-revision failure.",
+    "fixture_corrections": [
+      "metadata-only conversation correctly failed inventory handoff",
+      "runtime lock must remain private",
+      "Claude requested creation IDs cannot be replaced by a scripted arbitrary ID; seed saved parser projection from protected fixture completion instead"
+    ],
+    "targeted_guard_result": {
+      "passed": 1,
+      "failed": 0,
+      "subprocess_modes": 27,
+      "log": "autoship-owner-session-restore-validated-guard.log"
+    },
+    "full_cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "passed": 1846,
+      "failed": 0,
+      "ignored": 33,
+      "log": "autoship-owner-session-restore-full-cli.log"
+    },
+    "production_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "exit_code": 0,
+      "log": "autoship-owner-session-restore-production-check.log"
+    },
+    "optional_fresh_factory_mutation": "not executed: managed admission returned storage busy; source was restored byte-for-byte",
+    "retained_logs": [
+      "autoship-owner-session-restore-red.log",
+      "autoship-owner-session-restore-green.log",
+      "autoship-owner-session-restore-runtime-green.log",
+      "autoship-owner-session-restore-private-runtime-green.log",
+      "autoship-owner-session-restore-validated-guard.log",
+      "autoship-owner-session-restore-fresh-factory-mutation.log"
+    ],
+    "sources": [
+      {
+        "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+        "sha256": "887a303e0bd18b1dc68d526aa0948bc689b67d37fa0907a33b05b935d104a69e"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+        "sha256": "68323556db5b216745cf22528eddaf404147efcde6b41d956816a83d7ecf6448"
+      }
+    ],
+    "remaining": [
+      "actual owner worker execution and authorization/workspace recovery",
+      "contract revision through guarded generation/audit/native handoff",
+      "guarded completion and durable private reply",
+      "Discord gateway activation after the complete consumer works",
+      "normal rollout and full #1715 live acceptance"
+    ]
+  },
+  "owner_revision_guard_transition": {
+    "source_parent_commit": "96098da416a79005247caf2aff29bdadfc7abbdf",
+    "implementation_commit": "ab0d5ee4",
+    "main_integrated": "1362ee73b465b8892139b6706d59633f8f8913a9",
+    "source_generation_authority": false,
+    "metadata_history_validated": true,
+    "guard_native_handoff_connected": true,
+    "worker_consumer_connected": false,
+    "discord_coding_gateway_enabled": false,
+    "deployed": false,
+    "provider_transport_dispatch": false,
+    "behavior_red": {
+      "log": "autoship-owner-revision-history-behavior-red.log",
+      "passed": 5,
+      "failed": 1,
+      "assertion": "projection: owner turn accepted damaged activation history"
+    },
+    "initial_fixture_failure": "The first corruption fixture hit SQLite foreign-key enforcement; only the disposable corruption connection now disables it. Production enforcement is unchanged.",
+    "metadata_refusal_cases": [
+      "missing projection",
+      "missing generation fence",
+      "missing activation event",
+      "tampered registration",
+      "unknown binding field",
+      "changed fence generation",
+      "orphan activation event",
+      "missing original claim",
+      "missing authenticated origin",
+      "all revision history removed"
+    ],
+    "owner_tests": {
+      "passed": 23,
+      "failed": 0,
+      "log": "autoship-owner-revision-history-owner-green.log",
+      "scope": "standalone before main synchronization, repeated by merged-source full CLI"
+    },
+    "guard_tests": {
+      "passed": 1,
+      "failed": 0,
+      "subprocess_modes": 31,
+      "log": "autoship-owner-revision-guard-green.log",
+      "scope": "31 scenarios repeated in the merged-source full CLI, including refusal before contract/generation change when native configuration disappears; scripted protected controller evidence and real native inventory/transfer, no provider/model/VM dispatch"
+    },
+    "guard_api_red": {
+      "log": "autoship-owner-revision-guard-red.log",
+      "scope": "compile/API red: guard transition method did not exist, not a behavioral parent failure"
+    },
+    "checks": [
+      "revision history joins original owner claim, accepted private message, activation event, generation fence, exact registration and current turn",
+      "consuming guard transition fences old callbacks and re-registers/transfers native ownership before exposing the new guard",
+      "Codex and Claude retain the exact observed builder ID across revision handoff",
+      "failed native setup preserves revised claim and pending input; never records an unstarted refusal or permits timeout replay",
+      "pause, review invalidation, model/merge accounting and shipping denial remain intact"
+    ],
+    "full_cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "passed": 1851,
+      "failed": 0,
+      "ignored": 33,
+      "log": "autoship-owner-revision-native-configuration-full-cli.log",
+      "source_parent": "67a6f1b0264275394bafa9ed38159daa246f490f"
+    },
+    "production_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "exit_code": 0,
+      "log": "autoship-owner-revision-native-configuration-production-check.log"
+    },
+    "remaining": [
+      "actual worker authorization/workspace recovery and owner-message execution",
+      "independently prepared owner contracts and harness/control persistence",
+      "interrupted revision-transition recovery without replaying uncertain owner work",
+      "guarded owner-input completion and durable private replies",
+      "Discord gateway activation and full #1715 deployed acceptance/soak"
+    ],
+    "sources": [
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_revision_history.rs",
+        "sha256": "e4e43c4414c55209defebf61c81006f36de5d0a0bab6e8db0d8213be1d1cbaf7"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_revision.rs",
+        "sha256": "a9fc4ac0bfc7e52d9d53077f86f620ad2d764e5d943a55ecc990833a272a350e"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+        "sha256": "e8b13fd6606d906cf963c102853d3cc39a00f6059eafb8dc30f26d2dc025d67f"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
+        "sha256": "9d0b07ba773364a582d6462b8b64b120f3802812ffc963f5f9f233fc34dde73f"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+        "sha256": "d2c677737de5e5de1873a2e677c5c0293a55d4a14c2bfb9ff4dfbbdcaedc91ec"
+      }
+    ],
+    "native_configuration_preflight": true,
+    "native_binding_revalidated_before_guard_return": true,
+    "configuration_behavior_red": {
+      "log": "autoship-owner-revision-native-configuration-red.log",
+      "assertion": "owner revision returned a guard without native configuration",
+      "scope": "actual guard regression against the initial revision-transition implementation; no VM/model/provider dispatch"
+    }
+  },
+  "owner_early_candidate": {
+    "source_parent_commit": "af881938532ac593d13a0253133625875d36af64",
+    "source_generation_authority": false,
+    "authenticated_payload_checks_connected": true,
+    "first_candidate_guard_registration_connected": true,
+    "worker_consumer_connected": false,
+    "discord_coding_gateway_enabled": false,
+    "deployed": false,
+    "provider_transport_dispatch": false,
+    "behavior_red": [
+      {
+        "log": "autoship-owner-input-auth-red.log",
+        "passed": 6,
+        "failed": 2,
+        "assertions": [
+          "body: damaged owner input was claimed",
+          "changed persisted body became authorized by reconstructing the turn"
+        ]
+      },
+      {
+        "log": "autoship-owner-early-candidate-red.log",
+        "assertion": "early owner input must acquire its first candidate without unpausing: owner turn requires the current owned candidate binding"
+      }
+    ],
+    "targeted_green": [
+      {
+        "log": "autoship-owner-input-auth-green.log",
+        "passed": 25,
+        "failed": 0,
+        "scope": "before adding the positive selector-change regression"
+      },
+      {
+        "log": "autoship-owner-early-candidate-green.log",
+        "guard_subprocess_modes": 36,
+        "failed": 0,
+        "scope": "before adding registration-write rollback case; all final cases repeated by full CLI"
+      }
+    ],
+    "guard_subprocess_modes": 37,
+    "new_early_modes": [
+      "fresh admitted command with input before candidate registration",
+      "no input creates no candidate",
+      "corrupt input creates no candidate",
+      "surviving execution history refuses fresh registration",
+      "native policy repair retries only unstarted setup",
+      "failed registration event rolls back candidate and origin, then retries"
+    ],
+    "input_refusal_cases": [
+      "changed persisted body",
+      "changed origin",
+      "changed principal",
+      "refused acknowledgement",
+      "wrong request kind",
+      "missing acknowledgement",
+      "removed private route",
+      "unknown origin fields",
+      "unknown reply fields",
+      "changed nonce"
+    ],
+    "checks": [
+      "claim and native dispatch rejoin exact body with accepted immutable ingress, principal, origin, workflow and acknowledgement",
+      "active selector changes preserve the original queued workflow; removed destinations cannot dispatch old input",
+      "first candidate registration shares the ordinary atomic registered event/origin transaction and refuses surviving execution history",
+      "pause, pending input, publication denial and model/merge counters remain unchanged; native setup still uses original-store registration/handoff"
+    ],
+    "fixture_scope": "Scripted Discord ingress metadata with real disposable Git candidate and guard/native-store registration. No live Discord, provider/model/VM execution or input completion.",
+    "full_cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "passed": 1854,
+      "failed": 0,
+      "ignored": 33,
+      "log": "autoship-owner-early-candidate-full-cli.log"
+    },
+    "production_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "exit_code": 0,
+      "log": "autoship-owner-early-candidate-production-check.log"
+    },
+    "remaining": [
+      "actual owner worker scheduling and execution",
+      "initial registered acceptance binding for pre-candidate input, and independent owner contract/harness preparation",
+      "guarded owner-input completion and durable private replies",
+      "fenced/uncertain input and interrupted revision recovery",
+      "Discord gateway activation, normal rollout and full #1715 live acceptance/soak"
+    ],
+    "sources": [
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_inbox.rs",
+        "sha256": "7391154ae0e9fcfabe941e47f81ee4e4c83384b037cf0237b126ae16ecf38f1c"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+        "sha256": "4d1ac5211f1bc9013f53e1244a04b593d6b686171665509541b2a6de83dee044"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+        "sha256": "5f68dec3ae81d7ca94a64129cd2c669391666e4861855d26cb3493294ef10db9"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+        "sha256": "02eba342552eab6510711e8552fc9a438424b643bcfbf49bae86d240973f8a57"
+      }
+    ]
+  },
+  "owner_initial_acceptance": {
+    "source_parent_commit": "29b94a650da1883dfc293d6f6973c75fdb7c470d",
+    "source_generation_authority": false,
+    "guard_transition_connected": true,
+    "initial_kind_distinct_from_registered_revision": true,
+    "private_unregistered_intake_capability": true,
+    "baseline_receipts_durable_and_hashed": true,
+    "worker_consumer_connected": false,
+    "discord_coding_gateway_enabled": false,
+    "deployed": false,
+    "provider_transport_dispatch": false,
+    "behavior_red": [
+      {
+        "log": "autoship-owner-initial-acceptance-red.log",
+        "assertion": "initial acceptance must rebind its owner turn before dispatch: head or contract changed"
+      },
+      {
+        "log": "autoship-owner-followup-serialization-red.log",
+        "assertion": "queued follow-up revoked the active coding turn"
+      }
+    ],
+    "targeted_owner_tests": {
+      "log": "autoship-owner-followup-serialization-green.log",
+      "passed": 27,
+      "failed": 0
+    },
+    "guard_subprocess_modes": 46,
+    "initial_modes": [
+      "registered first contract advances generation/native guard",
+      "green baseline refuses",
+      "activation event failure rolls back",
+      "missing baseline history blocks dispatch",
+      "native setup failure preserves claimed input",
+      "tampered baseline blocks dispatch",
+      "missing native configuration refuses before activation",
+      "registered contract cannot be reinterpreted as raw intake",
+      "wrong source refuses"
+    ],
+    "serialization_cases": [
+      "unexpired current owner turn keeps its control revision when plain follow-up queues",
+      "expired owner turn remains fenced",
+      "explicitly fenced turn is not revived",
+      "explicit pause still fences an active owner turn after a follow-up queued"
+    ],
+    "checks": [
+      "nonserializable guard-only capability permits raw intake to register revision one without inventing a prior RegisteredContract",
+      "canonical source, unchanged head, pinned registration integrity and intended-red baseline classification are required",
+      "initial activation, baseline receipt digest, generation fence and current turn join atomically; corrupt or missing history refuses dispatch",
+      "the shared original-store native handoff completes before a new guard escapes; failed setup never becomes an unstarted replay",
+      "ordinary acceptance binding refuses paused owner turns before changing local binding state",
+      "pending input, pause, review invalidation and shipping denial remain; owner input is not marked applied"
+    ],
+    "fixture_scope": "Real disposable Git and original native-store guard/handoff operations; scripted private Discord ingress and synthetic baseline observations/receipts. No executable-baseline, model/provider/VM/Discord live acceptance is claimed by these guard fixtures.",
+    "full_cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "passed": 1855,
+      "failed": 0,
+      "ignored": 33,
+      "log": "autoship-owner-initial-acceptance-validated-full-cli.log"
+    },
+    "production_check": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "exit_code": 0,
+      "log": "autoship-owner-initial-acceptance-validated-production-check.log"
+    },
+    "remaining": [
+      "actual owner worker scheduling and execution",
+      "independent owner contract/harness preparation and private verifier/control-root integration",
+      "current native proof tied to real owner dispatch before input completion, plus durable private reply",
+      "interrupted initial/revision transition and fenced/uncertain input recovery",
+      "Discord gateway activation, required hosted CI/exact-head review and normal rollout",
+      "full #1715 CLI/Discord acceptance and unattended soak"
+    ],
+    "sources": [
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_revision.rs",
+        "sha256": "5091aa71a9a3d7f461605e46cc7bdb7072d0ccb4032022f85bca46dbf14c95b7"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_revision_history.rs",
+        "sha256": "ca747bd294917fa0f97e455c8bb76c950c7fbd2826bcf9ac4bfa38d80e425f3b"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_inbox.rs",
+        "sha256": "534b225890e6571989f14c931ca415fdbf564342c37bc49e1084da8657d2a0ec"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+        "sha256": "0daea20dd5acc60969a2d1d001bb2d1081755bd5bd87d2124061591f20c2c5eb"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_review_epoch.rs",
+        "sha256": "f283cba8cfc19de7d343b3ff78e97ca78503c168ea555e5ffb9396c973aae922"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+        "sha256": "706b6a7847f0ffec7663d20e57ca5593a103bcd01ef1f2a271f7c9bef01350be"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/self_improve.rs",
+        "sha256": "6c896dfa7063003d74683da2471d072ce692be64ea1cc785351d7ef6c2d45440"
+      },
+      {
+        "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+        "sha256": "55549550568d0b87bd45be4c581e2d2a21277827ad38a9a536b2d3a47a6bf81b"
+      }
+    ]
+  },
+  "owner_current_completion": {
+    "scope": "Borrowed fresh original-store completion capability retained under state, runtime session and protected audit locks through a short metadata visitor. Connected to the new guard execution/completion APIs; actual worker consumer and Discord ingress remain disabled.",
+    "focused_passed": 5,
+    "core_passed": 895,
+    "cli_passed": 1860,
+    "production_check": "passed",
+    "refusals": [
+      "changed runtime bytes",
+      "uncertain namespace even after later observation",
+      "superseded completion reference",
+      "later unfinished launch",
+      "stale owner fence",
+      "retired original native owner"
+    ],
+    "fixtures": "Physical private runtime with synthetic protected controller/resource receipts. No live provider, VM or Discord execution.",
+    "red_evidence": "Initial API red is compilation failure, not behavioral parent regression. A fixture compile failure used the wrong retirement namespace; corrected separately.",
+    "worker_consumer_enabled": false,
+    "input_completion_enabled": false
+  },
+  "native_readiness_publication": {
+    "standalone_pr": "https://github.com/nolanmak/Jarvis/pull/1886",
+    "standalone_head": "23081a0f",
+    "recovery_cherry_pick": "b3bb3aba",
+    "hosted_failure_observed": "42109585408, bridge-suites, empty readiness publication exits 1 before launch-ready",
+    "behavioral_red_log": "autoship-native-readiness-partial-red.log",
+    "local_green_logs": [
+      "autoship-native-readiness-validated-green.log",
+      "autoship-native-readiness-local-contract-tests.log",
+      "autoship-native-readiness-main-green.log",
+      "autoship-native-readiness-main-contract-tests.log"
+    ],
+    "recovery_launcher_tests": 21,
+    "main_based_launcher_tests": 20,
+    "scope": "Actual local supervisor subprocess, deterministic paused empty/prefix readiness writer, explicit controller admission, malformed and cancellation refusal with cleanup. No VM/provider dispatch.",
+    "local_bridge_step": "All commands passed directly; 9 delegated cgroup cases skip outside isolated service. --hosted wrapper refuses without real runner temporary directory; not represented as hosted verification.",
+    "hosted_ci": "All standalone PR checks passed on 23081a0f, including Linux platform/bridge/targeted, privacy and node-release.",
+    "status": "MERGED",
+    "merge_commit": "023cb4fb0a1255b96709bb3affa5e6fea233f577",
+    "merged_at": "2026-11-05T22:06:40Z",
+    "independent_review": "CodeRabbit COMMENTED review on exact 23081a0f head, both changed files; no functional inline findings. No-op Claude check is not review.",
+    "deployment": "Normal updater built and stamped 023cb4fb and restarted the daemon at 2026-11-05T22:10:50Z. Auto-ship worker still observed on the previous executable at 22:24Z; deployment readiness remains unverified. No manual restart or autonomous shipment claimed.",
+    "shipment_attribution": "manual repair merge; not an autonomous shipment"
+  },
+  "owner_body_execution": {
+    "scope": "Guarded execution/completion APIs and private reply transport connected in source. Actual command-worker selection, independent owner acceptance orchestration and coding gateway activation remain absent.",
+    "dispatch": "Nonclone private per-request reservation, body digest/provider/current turn binding, native launch floor and immutable joined event/index history; second reservation refuses after restart, never releases pending input based on TTL.",
+    "completion": "Fresh borrowed core proof required inside atomic metadata visitor; rejects pre-reservation launch even with current physical completion. Applies input, completes turn, saves private per-request reply, changes candidate binding and invalidates old review evidence atomically. Owner pause, accounting and merge allowance remain unchanged.",
+    "focused_passed": 7,
+    "cli_passed": 1867,
+    "cli_ignored": 33,
+    "production_check": "passed",
+    "red_scope": "Missing dispatch/completion APIs failed compilation. Joined fixture initially lacked namespace resource policy/generation; fixture corrected without weakening production proof. No behavioral parent regression is claimed for the absent APIs.",
+    "faults": [
+      "restart and duplicate reservation",
+      "changed authenticated body or pinned provider",
+      "reservation insert rollback",
+      "missing/corrupt reservation index and event",
+      "reported session ID without native observation",
+      "completed native launch prepared before dispatch",
+      "completion result insert rollback and metadata reconciliation without model replay",
+      "missing/corrupt reply/event/applied-input/completed-turn history",
+      "resume/new owner input preserves queued prior private reply"
+    ],
+    "fixtures": "Temporary actual private native ledger/runtime and current byte/kernel closure, synthetic protected controller/resource receipts and absent-cgroup scope. Zero real provider/model/VM/Discord dispatch. Guard model wrapper compiled, not exercised against real transport.",
+    "worker_consumer_enabled": false,
+    "discord_coding_enabled": false,
+    "reply_delivery_enabled": false,
+    "remaining": [
+      "Authorized worker routing and canonical protected acceptance journal activation/recovery",
+      "actual first-builder provider/VM dispatch acceptance and complete retained-history provider resolution",
+      "interrupted owner execution/result recovery",
+      "actual private per-request delivery acceptance and rare irrecoverable-send operator resolution",
+      "normal hosted CI/review/deployment and full #1715 acceptance"
+    ],
+    "reply_delivery_source_connected": true
+  },
+  "owner_reply_delivery": {
+    "scope": "Private per-request reply delivery wired in the source through WikiQuerier, the CLI gateway bridge, QueryHandler and the existing gateway recovery loop. Actual owner coding consumer/gateway and real Discord/provider acceptance remain unavailable.",
+    "protocol": "Reply chunks commit atomically with input/turn completion. Each part retains original authenticated inbound DM, deterministic nonce, UTF16 message bound and exact stored content. Ordered parts and requests are not coalesced with progress. Claims persist uncertainty before sending. Unknown sends reconcile only an exact remote bot-authored receipt; they are never resent on timeout. Inbound route replacement refuses unconfirmed private replies; changing the progress default does not retarget private model content.",
+    "gateway_behavioral_red": "Three new actual drain-loop tests failed behaviorally before private reply dispatch was connected: zero replies, no timeout claim and no destination-loss claim. All three now pass.",
+    "full_discord": {
+      "passed": 297,
+      "failed": 0,
+      "ignored": 0
+    },
+    "full_cli": {
+      "passed": 1868,
+      "failed": 0,
+      "ignored": 33
+    },
+    "production_check": "passed",
+    "stored_gateway_fixture": "One actual SQLite/native completion/gateway bridge fixture verifies multi-part Unicode response reconstruction, wrong identity, out-of-order/unstarted receipt refusal, altered/missing parts, progress-default isolation, route replacement refusal and restart recovery from remotely accepted/response-lost send. Transport is simulated; no live Discord, model or VM dispatch.",
+    "atomicity": "Existing result-write rollback fixture now also refuses a late chunk-insert failure without applying input, changing the candidate or retaining partial reply rows.",
+    "reference_lookup": "Completed reply history uses one exact original audit path/protected receipt sequence indexed lookup, full immutable decoding and exact receipt equality. It no longer scans all native observation history once per completed owner request. Persisted references grant no current native authority.",
+    "limits": "At most eight pending parts per workflow and 128 total per pass; malformed/removed-route private records retain their state and emit generic diagnostics while other deliveries continue. Irrecoverably unknown send operator resolution and end-to-end health reporting still require closure.",
+    "source_connected": true,
+    "live_provider_dispatch": false,
+    "live_discord_acceptance": false,
+    "worker_owner_consumer_enabled": false
+  },
+  "owner_first_builder": {
+    "scope": "Guarded first-builder reservation and model-wrapper source path implemented. Worker consumer and live model/Discord acceptance remain absent.",
+    "authority": "Original native store binding, active owner, actual empty physical inventory, protected launch audit and kernel closure retained under state/session/audit locks through atomic dispatch reservation.",
+    "provenance": "Original initial acceptance revision and baseline; no prior body/conversation or unknown/mutating model history. Classified readonly calls require exact original charge/event attribution and unchanged counters. Real linked candidate at original baseline, ancestor of canonical main, no staged/tracked owner changes and no unregistered untracked/ignored paths.",
+    "history": "Existing conversation/imported paths still revise retained history; only proven never-started native builders use the normal first call. No accounting reset, refund, allowance debit, fabricated session or automatic input completion.",
+    "guard_subprocess_modes": 63,
+    "first_builder_modes": 17,
+    "behavioral_red": "The real Git graft fixture caused the source guard to accept unrelated canonical main. Ignoring local grafts makes the same fixture refuse. Initial missing API/fixture compile failures and omitted-policy fixture failure are separate and are not behavioral parent regressions.",
+    "full_core": {
+      "passed": 895,
+      "failed": 0,
+      "ignored": 15,
+      "scope": "Full core suite before final CLI-only Git graft correction; core source unchanged since that validation."
+    },
+    "full_cli": {
+      "passed": 1868,
+      "failed": 0,
+      "ignored": 33
+    },
+    "production_check": "passed",
+    "fixtures": "Real linked Git candidates and temporary native ledger/runtime/audit fixtures; synthetic acceptance observations/controller/resource receipts. No actual model/provider/VM/Discord dispatch.",
+    "worker_consumer_enabled": false,
+    "live_provider_dispatch": false,
+    "live_discord_acceptance": false
+  },
+  "owner_continuation_provider": {
+    "scope": "Provider resolution used by the existing guard session-restoration path. Actual worker consumer remains absent.",
+    "behavioral_red": "On the parent source, a real stored owner workflow with an observed Claude session and no explicit pin accepted Codex and returned an empty session list. The new regression failed before the resolution check and passes with it.",
+    "policy": "Use an explicit persisted pin or the sole observed native provider; ambiguous, unknown or uncertain provider history refuses. A pin cannot replace a sole different observed provider. Never-started workflows retain their pin or unresolved default, subject independently to first-builder original-store proof. No history reset, model call or owner input completion occurs during selection.",
+    "focused_cases": 3,
+    "full_cli": {
+      "passed": 1870,
+      "failed": 0,
+      "ignored": 33
+    },
+    "production_check": "passed",
+    "fixtures": "Actual SQLite command admission, builder observation, restart, authenticated owner inbox and claimed turn. No actual model, VM or Discord transport.",
+    "worker_consumer_enabled": false,
+    "live_provider_dispatch": false
+  },
+  "owner_independent_acceptance": {
+    "scope": "Request-bound independent native proposal/baseline producer and opaque current-guard activation adapter implemented in source. Actual worker consumption remains absent.",
+    "protocol": "Keep the full private message, immutable owner request/generation/pause/binding, original source/criteria/baseline and previous registration in a bounded private request artifact. Use the existing independent native scoper and sandboxed original-baseline engine; emit the exact next revision and preserve every original criterion. Ordinary retries/questions need not become new code requirements. Cached prepared bytes must match every exact registered adapter digest and original intended-red receipts. Refuse environment transitions, protected controls, broadened directories, incomplete receipts and stale owner authority. Prompt bounds apply before paid dispatch. Preparation never installs into the retained candidate, applies input, unpauses or spends merge allowance.",
+    "behavioral_red": "The uncommitted producer accepted changed adapter contents under an original registered baseline receipt. The actual failing assertion is retained; verify_file_contents makes the same case refuse. This is not a regression demonstrated against published f32f43a2, which has no producer API.",
+    "other_reds": "Initial absent Input API and an attempted call to a private Binding validator failed compilation; corrected without expanding that validator visibility. A separate managed invocation ended with storage busy before compilation and was retried only after terminal confirmation.",
+    "focused_passed": 5,
+    "guard_modes_passed": 65,
+    "cached_factory_fixture": "Two added modes traverse the production cached factory under an actual SQLite/native-owner WorkflowGuard. Changed adapter bytes, changed authenticated input, nonprivate evidence, wrong source and explicit owner fencing refuse. Healthy preparation leaves the candidate and workflow unchanged; explicit fixture-only harness installation then activates through the normal native ownership transfer. The old producer proof refuses after activation. Pending owner input, pause, original native store and zero model calls remain intact.",
+    "fixture_scope": "Baseline observations and native controller/resource receipts are synthetic. No actual provider/model/VM/Discord dispatch. Fresh scoping/baseline source path compiles but was not executed against live transport. Fixture installation does not prove production verifier application/recovery.",
+    "full_cli": {
+      "passed": 1875,
+      "failed": 0,
+      "ignored": 33,
+      "test_threads": 8
+    },
+    "production_check": "passed",
+    "worker_consumer_enabled": false,
+    "live_provider_dispatch": false,
+    "live_discord_acceptance": false,
+    "production_verifier_application_connected": false,
+    "remaining": [
+      "Authorized worker owner-message selection, current owner/repository authorization and retained-history builder construction",
+      "Safe recoverable application of independently prepared verifier files before activation",
+      "Private projection across public PR bodies, review notes, failure comments and all other publication paths before enabling private owner coding",
+      "Interrupted owner execution/result recovery and controlled provider switching",
+      "Actual fresh native scoping, sandboxed VM baseline/body execution and Discord acceptance through normal deployment; full #1715 closure"
+    ]
+  },
+  "integration_merge_parent": "b26f9f85182754550b9bb2d020667f4f2e449578",
+  "owner_private_source_integration": {
+    "scope": "PR1872 private-verifier source integrated into native-owner recovery. Protected maps now supply productive owner activation and first-builder preparation; candidate adapter installation is unnecessary. Worker owner-message consumer remains disconnected.",
+    "activation": "Current opaque owner preparation, exact registered map and intended-red baseline validate before metadata activation. Literal committed adapter collisions refuse. Native authority transfers through the original store; the registered write policy binds before the guard escapes. Old physical-file metadata activation helpers compile only in tests. Canonical protected manifest publication and interrupted activation recovery remain incomplete.",
+    "first_builder": "Exact protected maps and committed source validation replace worker-file authority. All untracked/ignored owner files refuse first-builder dispatch; private maps need no worker copies. Fixtures use dedicated private maps and private observation roots; no production integrity check is skipped.",
+    "write_scope": "The production replacement API now checks source identity and exact complete permission equality on active-contract replay. A changed allowed or pinned map refuses without silently rewriting it. Final source read compares the complete previous record. This is not a proof of full old-writer/kernel quiescence cutover.",
+    "builder_context": "Registered map/hash and bounded context validate before body reservation. The production prompt includes every registered criterion ID/requirement and product scopes, omitting private adapter bytes, oracle values and explicit adapter edit paths. Actual provider transport remains unexercised.",
+    "behavioral_reds": [
+      "Production cached owner factory/guard activation failed with missing verifier file when the fixture stopped installing it into product. The same path now activates while product remains adapter-free.",
+      "Actual public write-scope replacement accepted mismatched saved permissions under an active contract name; it now refuses both allowed/pinned mismatches. Exact replay and stale replacement controls pass.",
+      "The extracted unchanged owner prompt omitted registered requirements. Its production helper now supplies registered context and refuses wrong/corrupt metadata without exposing private verifier/oracle literals."
+    ],
+    "validation": {
+      "core_passed": 897,
+      "core_failed": 0,
+      "core_ignored": 15,
+      "cli_passed": 1904,
+      "cli_failed": 0,
+      "cli_ignored": 34,
+      "cli_test_threads": 8,
+      "guard_modes_passed": 65,
+      "production_check": "passed on retry after terminal storage-admission deferral"
+    },
+    "fixture_scope": "Private cached factory, real temporary Git/SQLite/native metadata and original-store transfer fixtures. Baseline observations/controller/resource receipts are synthetic. Prompt test exercises the production formatter. No live model/provider/VM/Discord dispatch, compiled-freshness authority, complete kernel cleanup, autonomous merge or deployment acceptance is claimed.",
+    "production_changed": false,
+    "worker_owner_consumer_enabled": false,
+    "live_discord_acceptance": false,
+    "remaining": [
+      "Canonical protected acceptance manifest/journal activation and interrupted owner-turn recovery",
+      "Actual verifier backend freshness/storage descriptor/reservation/kernel-quiescence and old-writer cutover proof (#1807/#1811)",
+      "Authenticated protocol-1 recovery and guarded application of legacy adapter removal plan",
+      "Private projection across every public GitHub output",
+      "Authorized worker/provider/authorship wiring, owner continuation, actual native/Discord acceptance, protected rollout and full #1715 soak"
+    ]
+  }
+}

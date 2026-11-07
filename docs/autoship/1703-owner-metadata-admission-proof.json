@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "kind": "uninterrupted-owner-publication-metadata-only-admission-component",
+  "source_parent_commit": "eefd271430422ea8671b0d79046cfbd3dbac6a42",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "144e43c5876d4434c0c6665d8f03390c901a933f91ac400879151caa8e5ec35e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication.rs",
+      "sha256": "18f5a8c33c29151a1bc66201d476e3165267f512a4b54eda73ebe0b5602ae43b"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "20eb954027dadc45ef0c89fe6c16fe92c801e8d0592d278b7603e77cd24cd1a6"
+    },
+    {
+      "path": "docs/autoship/owner-publication-protocol.md",
+      "sha256": "a3351a76e3f9ed3ae475b42a2126bf132735b3dfc06cda04a198ac3eaf4d434c"
+    },
+    {
+      "path": "docs/autoship/owner-acceptance-publication.md",
+      "sha256": "e6b397d1a34a919ea5acf0d8ba8a819a48a619876099bae942c1befbdabd0e19"
+    }
+  ],
+  "behavior": [
+    "Production private activation returns a private non-cloneable OwnerPublicationGuard retaining the original borrowed draft and opaque preparation; no productive guard API escapes.",
+    "Original logger and retained clones irreversibly refuse dispatch and scoped/unscoped model admission before charging, independently of replaceable observers.",
+    "Admission lock settles an already-admitted charging/append interval before restriction; it does not prove native execution quiescence.",
+    "Metadata check validates exact turn, lease, binding, original preparation and pending request/history while retaining a healthy committed protected audit snapshot.",
+    "Production activation does not register the productive scope or publish the canonical next manifest.",
+    "Metadata renewal and drop retain the claimed work without adding execution usage charges or releasing it.",
+    "Older preparation/body accounting fixtures use an explicit cfg(test) component entry absent from production."
+  ],
+  "validation": {
+    "core_dispatch_behavioral_red": {
+      "log": "/tmp/autoship-metadata-admission-red-20261106.log",
+      "original_session_id": 86844,
+      "terminal_exit": 1,
+      "cargo_exit": 101,
+      "failure": "metadata-only logger authorized dispatch"
+    },
+    "actual_activation_behavioral_red": {
+      "log": "/tmp/autoship-metadata-admission-cli-red-2-20261106.log",
+      "original_session_id": 97275,
+      "terminal_exit": 1,
+      "cargo_exit": 101,
+      "failure": "pending owner publication escaped as productive guard"
+    },
+    "committed_audit_tampering_red": {
+      "log": "/tmp/autoship-metadata-admission-full-core-20261106.log",
+      "original_session_id": 85025,
+      "terminal_exit": 1,
+      "passed": 932,
+      "failed": 1,
+      "ignored": 15,
+      "failure": "metadata reconciliation accepted changed committed audit bytes; replaced continuity-only check with retained committed snapshot"
+    },
+    "final_core": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib",
+      "log": "/tmp/autoship-metadata-admission-full-core-2-20261106.log",
+      "original_session_id": 11319,
+      "terminal_exit": 0,
+      "passed": 933,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 35.48
+    },
+    "final_cli": {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-metadata-admission-full-cli-final-20261106.log",
+      "original_session_id": 30987,
+      "terminal_exit": 0,
+      "passed": 1940,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 296.17
+    },
+    "final_production_compile": {
+      "command": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-metadata-admission-production-check-final-20261106.log",
+      "original_session_id": 89999,
+      "terminal_exit": 0,
+      "seconds": 9.54
+    },
+    "intermediate_limits": [
+      "The first core green attempt used an absent empty log in its test assertion; a real controller fixture marker corrected that fixture. This was not another dispatch behavioral red.",
+      "The first CLI invocation incorrectly selected a nonexistent library target; the actual behavioral red used the augmentagent binary target.",
+      "An intermediate full CLI run passed 1940 tests and production compile passed before the original borrowed draft was retained. The final CLI run and production check above include that lifetime change; core source remained unchanged."
+    ],
+    "focused_cases": [
+      "retained logger clones and callback replacement cannot admit models/dispatch",
+      "refused scoped/unscoped models do not invoke charging observers or append model admission receipts",
+      "stale current fence remains restrictive; invalid/unowned/unprotected logger cannot obtain metadata role",
+      "committed audit tampering refuses metadata admission",
+      "concurrent admitted model finishes its accounting/append before mode transition; later calls refuse",
+      "production private activation returns metadata-only type and leaves no productive scope or canonical next manifest",
+      "old generation callback refuses; damaged pending intent refuses; restored exact fixture history validates",
+      "dropping metadata guard preserves exact workflow snapshot and accounting"
+    ]
+  },
+  "limits": [
+    "This is a live uninterrupted constructor restriction, not a durable all-reader completed-publication predicate. Reopened loggers do not reconstruct this live authority.",
+    "Recovery and terminal metadata producers, fresh original native publication proof, protected writer/completion, canonical lineage readers and ready bridge remain unfinished.",
+    "Existing body/accounting tests are component fixtures with synthetic baseline observations; no actual provider inference, real VM execution or productive publication is established.",
+    "The productive owner consumer remains unconnected. No new live owner work, deployment, autonomous merge or full acceptance is established by this component.",
+    "P2-P5, continuation, C/R source/resource proofs, aggregate protected-artifact storage admission, independent exact-head review, hosted checks, normal rollout and full live acceptance remain required."
+  ]
+}

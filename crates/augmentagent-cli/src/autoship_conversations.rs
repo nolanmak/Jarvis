@@ -21,13 +21,39 @@ impl WorkflowStore {
         }
         tx.commit()?;Ok(())
     }
+    /// Resolve owner continuation before constructing its reasoner. A global
+    /// default must never silently replace an observed native conversation.
+    /// None means no provider has been observed or explicitly requested; the
+    /// first-builder path must still prove actual original-store absence.
+    pub(crate) fn owner_turn_builder(&mut self,turn:&owner_turn::OwnerTurn,now:i64)->Result<Option<submission::Provider>> {
+        self.validate_owner_turn(turn,now)?;
+        let requested=self.command_builder(&turn.lease.workflow)?;
+        let mut query=self.conn.prepare("SELECT provider,uncertain FROM workflow_builder_conversation WHERE workflow=?1 ORDER BY provider LIMIT 3")?;
+        let rows=query.query_map([&turn.lease.workflow],|r|Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?)))?;
+        let mut observed=Vec::new();
+        for row in rows {
+            let (name,uncertain)=row?;
+            ensure!(!uncertain,"uncertain builder conversation requires reconciliation");
+            let provider=match name.as_str() {"codex"=>submission::Provider::Codex,"claude"=>submission::Provider::Claude,_=>bail!("unknown observed native builder provider")};
+            ensure!(!observed.contains(&provider) && observed.len()<2,"invalid builder provider inventory");observed.push(provider);
+        }
+        if let Some(requested)=requested {
+            ensure!(observed.is_empty() || observed.contains(&requested),"requested builder would replace the observed provider");
+            Ok(Some(requested))
+        } else {
+            ensure!(observed.len()<=1,"multiple observed builder providers require an explicit selection");
+            Ok(observed.first().copied())
+        }
+    }
     /// Reading an ID does not admit model dispatch. The owner turn, requested
     /// provider, workspace and native runtime must still pass their own gates.
     pub fn owner_turn_conversations(&mut self,turn:&owner_turn::OwnerTurn,provider:ProviderKind,now:i64)->Result<Vec<ObservedConversation>> {
         self.validate_owner_turn(turn,now)?;
         let name=provider_name(provider)?;
         let requested=match provider {ProviderKind::Codex=>submission::Provider::Codex,_=>submission::Provider::Claude};
-        self.require_command_builder(&turn.lease.workflow,Some(requested))?;
+        if let Some(expected)=self.owner_turn_builder(turn,now)? {
+            ensure!(expected==requested,"owner continuation differs from observed builder provider");
+        }
         let record:Option<(String,bool)>=self.conn.query_row("SELECT native_session,uncertain FROM workflow_builder_conversation WHERE workflow=?1 AND provider=?2",params![turn.lease.workflow,name],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         record.map(|(id,uncertain)| {ensure!(!uncertain,"uncertain builder conversation requires reconciliation");Ok(vec![ObservedConversation {provider,id,uncertain}])}).unwrap_or_else(||Ok(Vec::new()))
     }
@@ -36,11 +62,47 @@ impl WorkflowStore {
 mod tests {
     use super::*;
     fn setup(store:&mut WorkflowStore,n:u64)->(String,Lease) {
+        setup_provider(store,n,Some(submission::Provider::Codex))
+    }
+    fn setup_provider(store:&mut WorkflowStore,n:u64,provider:Option<submission::Provider>)->(String,Lease) {
         let origin=discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:n};
-        let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Pr(n),provider:Some(submission::Provider::Codex),until:submission::Milestone::Merged};
+        let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Pr(n),provider,until:submission::Milestone::Merged};
         let id=store.submit_discord_authorized(&origin,&request,&"a".repeat(64),1).unwrap().admission.workflow;
         store.register(&id,"candidate",Binding {head:"head".into(),contract:"scope".into(),evidence_hash:"evidence".into()},2).unwrap();
         let lease=store.claim(&id,"builder",3,100).unwrap().unwrap();(id,lease)
+    }
+    #[test]
+    fn default_owner_followup_cannot_silently_replace_observed_provider() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let mut store=WorkflowStore::open(&path).unwrap();
+        let (id,lease)=setup_provider(&mut store,42,None);let binding=store.snapshot(&id).unwrap().unwrap().checkpoint.binding;
+        store.record_builder_conversations(&lease,&binding,&[ObservedConversation {provider:ProviderKind::Claude,id:"original-claude-session".into(),uncertain:false}],4).unwrap();
+        store.release(&lease,5).unwrap();
+        let origin=discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:45};
+        store.enqueue_owner_message(&origin,&id,"Continue the current conversation",None,6).unwrap();drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();let turn=store.claim_owner_turn(&id,"consumer",7,100).unwrap().unwrap();
+        let before=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(store.owner_turn_builder(&turn,8).unwrap(),Some(submission::Provider::Claude));
+        assert!(store.owner_turn_conversations(&turn,ProviderKind::Codex,8).is_err(),"global default silently replaced the observed Claude conversation");
+        let restored=store.owner_turn_conversations(&turn,ProviderKind::Claude,8).unwrap();assert_eq!(restored[0].id,"original-claude-session");
+        assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(!store.owner_control(&id).unwrap().unwrap().paused);
+    }
+    #[test]
+    fn owner_provider_resolution_preserves_fresh_pins_and_refuses_ambiguous_history() {
+        for pinned in [None,Some(submission::Provider::Codex)] {
+            let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();let (id,lease)=setup_provider(&mut store,42,pinned);
+            let binding=store.snapshot(&id).unwrap().unwrap().checkpoint.binding;store.release(&lease,5).unwrap();
+            store.enqueue_owner_message(&discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:45},&id,"Continue",None,6).unwrap();
+            let turn=store.claim_owner_turn(&id,"consumer",7,100).unwrap().unwrap();
+            assert_eq!(store.owner_turn_builder(&turn,8).unwrap(),pinned);
+            store.record_builder_conversations(&turn.lease,&binding,&[
+                ObservedConversation {provider:ProviderKind::Codex,id:"codex-session".into(),uncertain:false},
+                ObservedConversation {provider:ProviderKind::Claude,id:"claude-session".into(),uncertain:false}],8).unwrap();
+            if pinned.is_some() {assert_eq!(store.owner_turn_builder(&turn,9).unwrap(),pinned);assert_eq!(store.owner_turn_conversations(&turn,ProviderKind::Codex,9).unwrap()[0].id,"codex-session");}
+            else {assert!(store.owner_turn_builder(&turn,9).is_err());assert!(store.owner_turn_conversations(&turn,ProviderKind::Codex,9).is_err());assert!(store.owner_turn_conversations(&turn,ProviderKind::Claude,9).is_err());}
+            store.record_builder_conversations(&turn.lease,&binding,&[ObservedConversation {provider:ProviderKind::Claude,id:"claude-session".into(),uncertain:true}],10).unwrap();
+            assert!(store.owner_turn_builder(&turn,11).is_err(),"uncertain history was ignored during selection");
+            assert_eq!(store.pending_owner_messages(&id).unwrap(),1);assert!(!store.owner_control(&id).unwrap().unwrap().paused);
+        }
     }
     #[test]
     fn observed_builder_identity_survives_restart_and_cannot_leak_to_another_workflow() {

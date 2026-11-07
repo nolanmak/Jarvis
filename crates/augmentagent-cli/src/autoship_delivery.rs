@@ -60,6 +60,7 @@ impl WorkflowStore {
         // A dispatched send cannot be moved or replayed based on a timeout.
         let uncertain:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_progress_delivery WHERE workflow=?1 AND state='uncertain') OR EXISTS(SELECT 1 FROM discord_control_request WHERE workflow=?1 AND state='uncertain') OR EXISTS(SELECT 1 FROM discord_command_ingress i JOIN command_request r ON r.request_id=i.request_id WHERE json_extract(r.admission,'$.workflow')=?1 AND i.state='uncertain')",[workflow],|r|r.get(0))?;
         ensure!(!uncertain,"delivery-uncertain-reconcile-before-rebind");
+        super::owner_reply::require_settled(&tx,workflow)?;
         ensure!(super::owner_inbox::pending(&tx,workflow)?==0,"owner-followup-pending");
         let discord_principal=format!("discord:{bot}:{owner}");
         tx.execute("UPDATE discord_control_request SET state='routing-replaced' WHERE workflow=?1 AND principal=?2 AND state='queued'",params![workflow,discord_principal])?;

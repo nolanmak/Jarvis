@@ -84,7 +84,7 @@ impl WorkflowStore {
         for id in ids {
             match self.wake_native_capacity(&id,report,now) {
                 Ok(true)=>count+=1,Ok(false)=>{},
-                Err(_)=>tracing::warn!(workflow=%id,"native capacity retry evidence retained; early wake refused"),
+                Err(error)=>tracing::warn!(workflow=%id,"native capacity retry evidence retained; early wake refused: {error:#}"),
             }
         }
         Ok(count)

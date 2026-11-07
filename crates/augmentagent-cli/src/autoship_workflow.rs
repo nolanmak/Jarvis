@@ -21,10 +21,41 @@ pub(crate) mod discord_ingress;
 mod review_epoch;
 #[path = "autoship_conversations.rs"]
 mod conversations;
+#[path="autoship_owner_publication.rs"]
+mod owner_publication;
+#[path="autoship_owner_publication_recovery.rs"]
+pub(crate) mod owner_publication_recovery;
+pub(crate) use owner_publication::{LiveOwnerTurn,OwnerPublicationNativeFacts,OwnerPublicationCommitMetadata,OwnerPublicationReadContext};
 #[path = "autoship_owner_revision.rs"]
 mod owner_revision;
+pub(crate) use owner_revision::OwnerPreparationBinding;
+#[path = "autoship_owner_reply.rs"]
+pub(crate) mod owner_reply;
+#[path = "autoship_owner_dispatch.rs"]
+pub(crate) mod owner_dispatch;
 #[path = "autoship_owner_turn.rs"]
 pub(crate) mod owner_turn;
+#[path = "autoship_native_owner_binding.rs"]
+mod native_owner_binding;
+#[path = "autoship_native_handoff.rs"]
+mod native_handoff;
+#[path = "autoship_native_terminal_cleanup.rs"]
+pub(crate) mod native_terminal_cleanup;
+#[path = "autoship_native_recovery.rs"]
+pub(crate) mod native_recovery;
+#[path = "autoship_native_reconcile.rs"]
+pub(crate) mod native_reconcile;
+#[path = "autoship_native_prepare.rs"]
+pub(crate) mod native_prepare;
+#[path = "autoship_native_pending.rs"]
+mod native_pending;
+pub(crate) use native_pending::{HandoffPreparation, HandoffSettlement, PendingNativeHandoff, VerifiedHandoffReceipt};
+#[path = "autoship_native_observation.rs"]
+pub(crate) mod native_observation;
+#[path = "autoship_native_callbacks.rs"]
+pub(crate) mod native_callbacks;
+#[path = "autoship_native_launch.rs"]
+pub(crate) mod native_launch;
 #[path = "autoship_owner_inbox.rs"]
 pub(crate) mod owner_inbox;
 #[path = "autoship_discord_controls.rs"]
@@ -120,6 +151,10 @@ pub struct Checkpoint {
     pub next: NextAction,
 }
 
+/// Borrowed metadata ordering token. It is not serializable, cloneable or
+/// native execution authority, and cannot outlive its store transaction.
+pub(crate) struct AcceptanceMetadata<'a> {_transaction:&'a Connection,workflow:&'a str}
+
 #[derive(Debug, Clone)]
 pub struct Lease {
     pub workflow: String,
@@ -199,6 +234,16 @@ fn observation_capacity(conn: &Connection, now_ms: i64, required: u64, cap: u64,
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClaimPurpose { General, Productive, MergeReconciliation }
+
+/// Generated audit paths are descriptive only; core validates their actual
+/// protected audit authority. Native setup also binds them to this database.
+pub(crate) fn native_audit_generation_paths(state:&Path,id:&str,generation:i64)->Result<(std::path::PathBuf,std::path::PathBuf,std::path::PathBuf)> {
+    let parent=state.parent().context("workflow state has no parent")?;
+    let parent=if parent.as_os_str().is_empty(){Path::new(".")}else{parent}.canonicalize()?;
+    let root=parent.join("autoship-audit");let key=format!("{:x}",Sha256::digest(id.as_bytes()));
+    let key=if generation==0 {key}else{format!("{key}-generation-{generation}")};
+    Ok((root.clone(),root.join("logs").join(format!("{key}.jsonl")),root.join("anchors").join(format!("{key}.json"))))
+}
 
 pub struct WorkflowStore {
     conn: Connection,
@@ -368,6 +413,52 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS workflow_review_floor (
                 workflow TEXT PRIMARY KEY REFERENCES command_job(workflow), after_seq INTEGER NOT NULL,
                 request_id TEXT NOT NULL REFERENCES discord_control_request(request_id));
+            CREATE TABLE IF NOT EXISTS workflow_owner_initial_acceptance (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_revision(request_id), receipts TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_preparation (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_revision(request_id),
+                record TEXT NOT NULL, receipts TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_publication_intent (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_revision(request_id), workflow TEXT NOT NULL REFERENCES workflow(id),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq), record_sha256 TEXT NOT NULL, record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_publication_pending (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id),request_id TEXT NOT NULL UNIQUE REFERENCES workflow_owner_publication_intent(request_id));
+            CREATE TABLE IF NOT EXISTS workflow_owner_publication_completion (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_publication_intent(request_id), workflow TEXT NOT NULL REFERENCES workflow(id),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq), record_sha256 TEXT NOT NULL, record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_publication_recovery (
+                workflow TEXT NOT NULL REFERENCES workflow(id), generation INTEGER NOT NULL,
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record_sha256 TEXT NOT NULL,record TEXT NOT NULL,
+                PRIMARY KEY(workflow,generation));
+            CREATE TABLE IF NOT EXISTS workflow_owner_successor_claim (
+                workflow TEXT NOT NULL REFERENCES workflow(id),generation INTEGER NOT NULL,
+                request_id TEXT NOT NULL REFERENCES workflow_owner_turn(request_id),
+                ready_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_owner_successor_ready(sequence),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record_sha256 TEXT NOT NULL,record TEXT NOT NULL,
+                PRIMARY KEY(workflow,generation));
+            CREATE TABLE IF NOT EXISTS workflow_owner_successor_native_intent (
+                workflow TEXT NOT NULL REFERENCES workflow(id),generation INTEGER NOT NULL,
+                setup_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_owner_successor_claim(sequence),
+                transfer_id TEXT NOT NULL UNIQUE,pending_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record_sha256 TEXT NOT NULL,record TEXT NOT NULL,
+                PRIMARY KEY(workflow,generation));
+            CREATE TABLE IF NOT EXISTS workflow_owner_successor_ready (
+                workflow TEXT NOT NULL REFERENCES workflow(id),generation INTEGER NOT NULL,
+                request_id TEXT NOT NULL REFERENCES workflow_owner_publication_intent(request_id),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record_sha256 TEXT NOT NULL,record TEXT NOT NULL,
+                PRIMARY KEY(workflow,generation));
+            CREATE TABLE IF NOT EXISTS workflow_owner_publication_recovery_pending (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id),generation INTEGER NOT NULL,
+                FOREIGN KEY(workflow,generation) REFERENCES workflow_owner_publication_recovery(workflow,generation));
+            CREATE TABLE IF NOT EXISTS workflow_owner_recovery_native_intent (
+                workflow TEXT NOT NULL REFERENCES workflow(id),request_id TEXT NOT NULL,transfer_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,pending_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record_sha256 TEXT NOT NULL,record TEXT NOT NULL,
+                PRIMARY KEY(workflow,request_id),UNIQUE(workflow,transfer_id),UNIQUE(workflow,generation));
+            CREATE TABLE IF NOT EXISTS workflow_owner_recovery_blocked (
+                workflow TEXT NOT NULL REFERENCES workflow(id),
+                sequence INTEGER PRIMARY KEY REFERENCES workflow_event(seq),
+                record_sha256 TEXT NOT NULL,record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS workflow_owner_revision_fence (
                 request_id TEXT PRIMARY KEY REFERENCES workflow_owner_revision(request_id),
                 previous_generation INTEGER NOT NULL, next_generation INTEGER NOT NULL);
@@ -375,11 +466,43 @@ impl WorkflowStore {
                 request_id TEXT PRIMARY KEY REFERENCES workflow_owner_turn(request_id), previous_contract TEXT NOT NULL,
                 next_contract TEXT NOT NULL, binding TEXT NOT NULL, owner_message_sha256 TEXT NOT NULL,
                 registration TEXT NOT NULL, activated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_turn_setup_refusal (
+                workflow TEXT NOT NULL REFERENCES workflow(id),request_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                record TEXT NOT NULL,PRIMARY KEY(workflow,request_id,generation));
+            CREATE TABLE IF NOT EXISTS workflow_owner_reply_delivery (
+                request_id TEXT NOT NULL REFERENCES workflow_owner_body_result(request_id),
+                workflow TEXT NOT NULL REFERENCES workflow(id),part INTEGER NOT NULL,total INTEGER NOT NULL,
+                bot TEXT NOT NULL,owner TEXT NOT NULL,channel TEXT NOT NULL,nonce TEXT NOT NULL UNIQUE,
+                content TEXT NOT NULL,state TEXT NOT NULL,dispatched_at INTEGER,message TEXT,confirmed_at INTEGER,
+                PRIMARY KEY(request_id,part));
+            CREATE INDEX IF NOT EXISTS owner_reply_due ON workflow_owner_reply_delivery(bot,owner,state,workflow,request_id,part);
+            CREATE TABLE IF NOT EXISTS workflow_owner_body_result (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_body_dispatch(request_id),
+                workflow TEXT NOT NULL REFERENCES workflow(id),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                record TEXT NOT NULL, response TEXT NOT NULL, state TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_body_native_admission (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_body_model_admission(request_id),
+                workflow TEXT NOT NULL REFERENCES workflow(id),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                intent_id TEXT NOT NULL UNIQUE REFERENCES workflow_native_launch(intent_id),record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_body_model_admission (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_body_dispatch(request_id),
+                workflow TEXT NOT NULL REFERENCES workflow(id),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                receipt TEXT NOT NULL, record TEXT NOT NULL,
+                FOREIGN KEY(workflow,receipt) REFERENCES resource_charge(workflow,id));
+            CREATE TABLE IF NOT EXISTS workflow_owner_body_dispatch (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_turn(request_id),
+                workflow TEXT NOT NULL REFERENCES workflow(id),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq), record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS workflow_owner_turn (
                 workflow TEXT NOT NULL REFERENCES workflow(id), request_id TEXT PRIMARY KEY REFERENCES workflow_owner_message(request_id),
                 owner TEXT NOT NULL, lease_generation INTEGER NOT NULL, pause_revision INTEGER NOT NULL,
                 binding TEXT NOT NULL, state TEXT NOT NULL, started_at INTEGER NOT NULL);
-            CREATE UNIQUE INDEX IF NOT EXISTS one_active_owner_turn ON workflow_owner_turn(workflow) WHERE state IN ('claimed','uncertain');
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_owner_turn_v2 ON workflow_owner_turn(workflow) WHERE state IN ('claimed','uncertain','recovery_ready');
+            DROP INDEX IF EXISTS one_active_owner_turn;
             CREATE TABLE IF NOT EXISTS workflow_owner_message (
                 request_id TEXT PRIMARY KEY REFERENCES discord_control_request(request_id),
                 workflow TEXT NOT NULL REFERENCES command_job(workflow), body TEXT NOT NULL,
@@ -406,6 +529,10 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS scope_stage_response(workflow TEXT NOT NULL REFERENCES workflow(id),key TEXT NOT NULL,response TEXT NOT NULL,PRIMARY KEY(workflow,key));
             CREATE TABLE IF NOT EXISTS pr_readiness_dependencies(workflow TEXT PRIMARY KEY REFERENCES workflow(id),request_hash TEXT NOT NULL,base TEXT NOT NULL,evidence TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS issue_readiness_dependencies(repository TEXT NOT NULL,issue INTEGER NOT NULL,request_hash TEXT NOT NULL,base TEXT NOT NULL,kind TEXT NOT NULL,evidence TEXT NOT NULL,PRIMARY KEY(repository,issue));
+            CREATE TABLE IF NOT EXISTS workflow_native_registration_origin (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id),
+                version INTEGER NOT NULL CHECK(version=1),
+                registration_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq));
             CREATE TABLE IF NOT EXISTS workflow_native_owner (
                 workflow TEXT NOT NULL REFERENCES workflow(id), lease_generation INTEGER NOT NULL,
                 audit_path TEXT NOT NULL, retirement_reason TEXT, retired_at INTEGER,
@@ -414,6 +541,77 @@ impl WorkflowStore {
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), owner_revision INTEGER NOT NULL,
                 generation INTEGER NOT NULL, binding TEXT NOT NULL, state TEXT NOT NULL,
                 requested_at INTEGER NOT NULL, attempted_at INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS workflow_native_owner_binding (
+                workflow TEXT NOT NULL, lease_generation INTEGER NOT NULL,
+                binding TEXT NOT NULL, registered_at INTEGER NOT NULL,
+                PRIMARY KEY(workflow,lease_generation),
+                FOREIGN KEY(workflow,lease_generation) REFERENCES workflow_native_owner(workflow,lease_generation));
+            CREATE TABLE IF NOT EXISTS workflow_native_terminal_attempt (
+                workflow TEXT NOT NULL REFERENCES workflow(id),transfer_id TEXT NOT NULL,
+                namespace_sha256 TEXT NOT NULL,ordinal INTEGER NOT NULL,
+                PRIMARY KEY(workflow,transfer_id,namespace_sha256));
+            CREATE TABLE IF NOT EXISTS workflow_native_recovery (
+                workflow TEXT NOT NULL REFERENCES workflow(id),generation INTEGER NOT NULL,
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record TEXT NOT NULL,
+                PRIMARY KEY(workflow,generation));
+            CREATE TABLE IF NOT EXISTS workflow_native_handoff_completed (
+                transfer_id TEXT PRIMARY KEY, workflow TEXT NOT NULL REFERENCES workflow(id),
+                pending_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                snapshot_sequence INTEGER NOT NULL REFERENCES workflow_native_handoff_snapshot(sequence),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_native_handoff_unstarted (
+                transfer_id TEXT PRIMARY KEY,workflow TEXT NOT NULL REFERENCES workflow(id),
+                pending_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                snapshot_sequence INTEGER NOT NULL REFERENCES workflow_native_handoff_snapshot(sequence),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_native_handoff_aborted (
+                transfer_id TEXT PRIMARY KEY,workflow TEXT NOT NULL REFERENCES workflow(id),
+                pending_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                snapshot_sequence INTEGER NOT NULL REFERENCES workflow_native_handoff_snapshot(sequence),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_native_abort_namespace (
+                workflow TEXT NOT NULL REFERENCES workflow(id),transfer_id TEXT NOT NULL REFERENCES workflow_native_handoff_aborted(transfer_id),
+                namespace_sha256 TEXT NOT NULL,namespace TEXT NOT NULL,
+                PRIMARY KEY(transfer_id,namespace_sha256));
+            CREATE TABLE IF NOT EXISTS workflow_native_abort_resolution (
+                workflow TEXT NOT NULL REFERENCES workflow(id),transfer_id TEXT NOT NULL,
+                namespace_sha256 TEXT NOT NULL,sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record TEXT NOT NULL,
+                PRIMARY KEY(transfer_id,namespace_sha256),
+                FOREIGN KEY(transfer_id,namespace_sha256) REFERENCES workflow_native_abort_namespace(transfer_id,namespace_sha256));
+            CREATE TABLE IF NOT EXISTS workflow_native_transferred_source (
+                workflow TEXT NOT NULL,lease_generation INTEGER NOT NULL,audit_path TEXT NOT NULL,
+                transfer_id TEXT NOT NULL REFERENCES workflow_native_handoff_completed(transfer_id) DEFERRABLE INITIALLY DEFERRED,
+                receipt_sha256 TEXT NOT NULL,destination_generation INTEGER NOT NULL,destination_audit TEXT NOT NULL,
+                PRIMARY KEY(workflow,lease_generation,audit_path),
+                FOREIGN KEY(workflow,lease_generation) REFERENCES workflow_native_owner(workflow,lease_generation));
+            CREATE TABLE IF NOT EXISTS workflow_native_handoff_pending (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id),
+                transfer_id TEXT NOT NULL UNIQUE,
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                snapshot_sequence INTEGER NOT NULL REFERENCES workflow_native_handoff_snapshot(sequence),
+                record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_native_handoff_snapshot (
+                workflow TEXT NOT NULL REFERENCES workflow(id),
+                sequence INTEGER PRIMARY KEY REFERENCES workflow_event(seq),
+                inputs_sha256 TEXT NOT NULL, record TEXT NOT NULL,
+                UNIQUE(workflow,inputs_sha256));
+            CREATE TABLE IF NOT EXISTS workflow_native_launch (
+                intent_id TEXT PRIMARY KEY, workflow TEXT NOT NULL REFERENCES workflow(id),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                lease_generation INTEGER NOT NULL, provider TEXT NOT NULL,
+                runtime_relative_path TEXT NOT NULL, native_session TEXT, record TEXT NOT NULL,
+                FOREIGN KEY(workflow,lease_generation) REFERENCES workflow_native_owner_binding(workflow,lease_generation));
+            CREATE TABLE IF NOT EXISTS workflow_native_observation (
+                sequence INTEGER PRIMARY KEY REFERENCES workflow_event(seq), workflow TEXT NOT NULL REFERENCES workflow(id),
+                provider TEXT NOT NULL,runtime_relative_path TEXT NOT NULL,lease_generation INTEGER NOT NULL,
+                intent_id TEXT NOT NULL REFERENCES workflow_native_launch(intent_id),native_session TEXT,
+                source_audit_path TEXT NOT NULL,receipt_sequence INTEGER NOT NULL,record TEXT NOT NULL,
+                UNIQUE(source_audit_path,receipt_sequence),
+                FOREIGN KEY(workflow,lease_generation) REFERENCES workflow_native_owner_binding(workflow,lease_generation));
+            CREATE INDEX IF NOT EXISTS workflow_native_observation_runtime ON workflow_native_observation(workflow,provider,runtime_relative_path,sequence);
+            CREATE INDEX IF NOT EXISTS workflow_native_observation_session ON workflow_native_observation(provider,native_session);
+            CREATE INDEX IF NOT EXISTS workflow_native_launch_history ON workflow_native_launch(workflow,sequence);
+            CREATE INDEX IF NOT EXISTS workflow_native_launch_session ON workflow_native_launch(provider,native_session);
             CREATE TABLE IF NOT EXISTS workflow_audit_generation (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), generation INTEGER NOT NULL,
                 lease_generation INTEGER NOT NULL, recovery TEXT NOT NULL);
@@ -655,45 +853,11 @@ impl WorkflowStore {
     /// Register authorized ownership only. Existing registration is not reset
     /// by restart/adoption and never manufactures an approval.
     pub fn register(
-        &mut self,
-        workflow: &str,
-        branch: &str,
-        binding: Binding,
-        now_ms: i64,
-    ) -> Result<bool> {
-        binding.validate()?;
-        ensure!(
-            !workflow.is_empty() && !branch.is_empty(),
-            "identity and branch required"
-        );
-        let checkpoint = Checkpoint {
-            stage: Stage::Intake,
-            binding,
-            evidence: vec![],
-            next: NextAction {
-                reason: "registered".into(),
-                action: "scope".into(),
-                eligible_at_ms: now_ms,
-            },
-        };
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let inserted = tx.execute(
-            "INSERT INTO workflow(id, branch, checkpoint, heartbeat_at, progress_at)
-            VALUES (?1,?2,?3,?4,?4) ON CONFLICT(id) DO NOTHING",
-            params![
-                workflow,
-                branch,
-                serde_json::to_string(&checkpoint)?,
-                now_ms
-            ],
-        )? == 1;
-        if inserted {
-            event(&tx, workflow, 0, "registered", branch, now_ms)?;
-        }
-        tx.commit()?;
-        Ok(inserted)
+        &mut self,workflow:&str,branch:&str,binding:Binding,now_ms:i64,
+    )->Result<bool> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted=register_workflow_in_transaction(&tx,workflow,branch,binding,now_ms)?;
+        tx.commit()?;Ok(inserted)
     }
 
     /// Free merge reconciliation preserves command holds and merge ceilings.
@@ -738,6 +902,16 @@ impl WorkflowStore {
             bail!("unknown workflow");
         };
         let cp: Checkpoint = serde_json::from_str(&raw)?;
+        // An expired lease is not original-native closure evidence. Ordinary
+        // recovery must not advance the generation under an escaped owner
+        // turn; authenticated owner recovery must settle that turn first.
+        let unsettled_owner: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1 AND state NOT IN ('completed','setup_refused'))",
+            [workflow], |r| r.get(0),
+        )?;
+        if unsettled_owner {
+            return Ok(None);
+        }
         // Pending owner cleanup owns this generation until checked retirement
         // settles the retry. Even free recovery must not fence that intent.
         if cp.stage == Stage::Held && cp.next.reason == "owner_execution_retry_pending" {
@@ -745,6 +919,7 @@ impl WorkflowStore {
         }
         if purpose != ClaimPurpose::General {
             if owner_control::read(&tx,workflow)?.is_some_and(|c|c.paused) {return Ok(None);}
+            if owner_inbox::pending(&tx,workflow)?>0 {return Ok(None);}
             let policy: Option<String> = tx.query_row("SELECT until_milestone FROM command_job WHERE workflow=?1", [workflow], |r| r.get(0)).optional()?;
             if let Some(policy) = policy {
                 let until: submission::Milestone = serde_json::from_str(&policy)?;
@@ -893,6 +1068,7 @@ impl WorkflowStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx, lease, binding, now_ms)?;
         owner_control::require_dispatch(&tx,&lease.workflow)?;
+        native_pending::require_clear_abort_barriers(&tx,&lease.workflow)?;
         tx.execute("INSERT INTO operation(id,workflow,kind,binding,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING",
             params![id,lease.workflow,kind_json,binding_json,now_ms])?;
         let (receipt, recorded_binding): (Option<String>, String) = tx.query_row(
@@ -1216,13 +1392,13 @@ impl WorkflowStore {
         charge: ResourceCharge,
         now_ms: i64,
     ) -> Result<()> {
-        self.charge_inner(lease, receipt_id, charge, now_ms, None, None, None)
+        self.charge_inner(lease, receipt_id, charge, now_ms, None, None, None,None)
     }
 
     pub fn charge_observation(&mut self, lease: &Lease, receipt_id: &str,
         charge: ResourceCharge, now_ms: i64, daily_cap: u64) -> Result<()> {
         ensure!(lease.workflow.starts_with("autoship-observation/") || lease.workflow.starts_with("autoship-canary/"), "observation budget requires diagnostic workflow namespace");
-        self.charge_inner(lease, receipt_id, charge, now_ms, Some(daily_cap), None, None)
+        self.charge_inner(lease, receipt_id, charge, now_ms, Some(daily_cap), None, None,None)
     }
 
     /// Bound actual native dispatches in the same transaction as quota charging.
@@ -1232,7 +1408,7 @@ impl WorkflowStore {
         ensure!(observation_cap.is_none() || lease.workflow.starts_with("autoship-observation/") || lease.workflow.starts_with("autoship-canary/"),
             "observation budget requires diagnostic workflow namespace");
         self.charge_inner(lease,receipt_id,ResourceCharge{model_calls:1,..Default::default()},now_ms,observation_cap,
-            Some((purpose,binding,limit)),None)
+            Some((purpose,binding,limit)),None,None)
     }
 
     /// Called only by the controller's actual model-admission observer. Persist
@@ -1242,7 +1418,16 @@ impl WorkflowStore {
         provider:Option<submission::Provider>,reviewer:bool)->Result<()> {
         ensure!(observation_cap.is_none() || lease.workflow.starts_with("autoship-observation/") || lease.workflow.starts_with("autoship-canary/"),"observation budget requires diagnostic workflow namespace");
         self.charge_inner(lease,receipt,ResourceCharge {model_calls:1,..Default::default()},now,
-            observation_cap,bounded,Some((provider,reviewer)))
+            observation_cap,bounded,Some((provider,reviewer)),None)
+    }
+    /// Validate the captured once-only owner reservation in the same transaction
+    /// as model attribution, budget admission and charging. Legacy metadata
+    /// cannot satisfy this path by losing its preparation fields.
+    pub(crate) fn charge_prepared_owner_model(&mut self,lease:&Lease,receipt:&str,now:i64,
+        bounded:Option<(&str,&Binding,u32)>,provider:submission::Provider,
+        dispatch:&owner_dispatch::OwnerBodyDispatch,preparation:&OwnerPreparationBinding)->Result<()> {
+        self.charge_inner(lease,receipt,ResourceCharge {model_calls:1,..Default::default()},now,
+            None,bounded,Some((Some(provider),false)),Some((dispatch,preparation)))
     }
 
     pub fn observation_available(&self, now_ms: i64, required: u64, daily_cap: u64) -> Result<bool> {
@@ -1261,8 +1446,14 @@ impl WorkflowStore {
     }
 
     fn charge_inner(&mut self, lease: &Lease, receipt_id: &str,
-        charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>, bounded:Option<(&str,&Binding,u32)>, admission:Option<(Option<submission::Provider>,bool)>) -> Result<()> {
-        let admission=admission.map(|(provider,reviewer)|serde_json::json!({"receipt":receipt_id,"provider":provider,"reviewer":reviewer}).to_string());
+        charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>, bounded:Option<(&str,&Binding,u32)>, admission:Option<(Option<submission::Provider>,bool)>,
+        owner_body:Option<(&owner_dispatch::OwnerBodyDispatch,&OwnerPreparationBinding)>) -> Result<()> {
+        let owner_provider=admission.as_ref().and_then(|(provider,reviewer)|if *reviewer {None}else{provider.clone()});
+        let admission=admission.map(|(provider,reviewer)| {
+            let mut value=serde_json::json!({"receipt":receipt_id,"provider":provider,"reviewer":reviewer});
+            if let Some((dispatch,preparation))=owner_body {value["owner_body"]=owner_dispatch::model_admission_binding(dispatch,preparation);}
+            value.to_string()
+        });
         ensure!(!receipt_id.is_empty(), "charge receipt required");
         let values = (
             i64::try_from(charge.wall_ms)?,
@@ -1273,8 +1464,18 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx, lease, now_ms)?;
+        if let Some((dispatch,preparation))=owner_body {
+            owner_dispatch::validate_prepared_dispatch_tx(&tx,lease,dispatch,preparation,
+                owner_provider.context("owner coding requires native builder attribution")?,now_ms)?;
+        }
         let prior: Option<(i64,i64,i64)> = tx.query_row("SELECT wall_ms,model_calls,tokens FROM resource_charge WHERE workflow=?1 AND id=?2",
             params![lease.workflow,receipt_id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        if let Some((dispatch,_))=owner_body {
+            owner_dispatch::require_model_admission_slot(&tx,dispatch,receipt_id,
+                admission.as_deref().context("owner model admission missing attribution")?,prior.is_some())?;
+        } else if charge.model_calls>0 {
+            owner_dispatch::require_no_body_reservation(&tx,lease)?;
+        }
         if let Some(prior) = prior {
             ensure!(prior == values, "charge receipt conflict");
             if let Some(expected)=&admission {
@@ -1352,9 +1553,15 @@ impl WorkflowStore {
             )?;
             if let Some(admission)=admission {
                 event(&tx,&lease.workflow,lease.generation,"native_model_admitted",&admission,now_ms)?;
+                if let Some((dispatch,_))=owner_body {
+                    owner_dispatch::index_model_admission(&tx,dispatch,receipt_id,&admission)?;
+                }
             }
         }
         tx.commit()?;
+        if let Some((dispatch,_))=owner_body {
+            owner_dispatch::capture_model_admission(dispatch,receipt_id)?;
+        }
         Ok(())
     }
 
@@ -1491,6 +1698,7 @@ impl WorkflowStore {
         ensure!(std::path::Path::new(audit_path).is_absolute() && audit_path.len()<=4096,"invalid native owner audit path");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx,lease,now)?;
+        native_pending::require_clear_abort_barriers(&tx,&lease.workflow)?;
         let old:Option<String>=tx.query_row("SELECT audit_path FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",params![lease.workflow,lease.generation],|row|row.get(0)).optional()?;
         if let Some(old)=old {ensure!(old==audit_path,"native owner audit path is immutable");}
         else {
@@ -1510,14 +1718,28 @@ impl WorkflowStore {
             let rows=statement.query_map([limit as i64],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
+        let mut eligible=std::collections::BTreeSet::new();
+        let workflows:std::collections::BTreeSet<_>=rows.iter().map(|r|r.0.as_str()).collect();
+        for workflow in workflows {
+            match native_pending::settlement::History::load(&tx,workflow,u64::MAX) {
+                Ok(history)=>for row in rows.iter().filter(|r|r.0==workflow) {
+                    if !history.transferred_source(row.1,&row.2) {eligible.insert(row.clone());}
+                },
+                Err(_)=>tracing::warn!(workflow,"native retirement held: handoff history unavailable; original intents retained"),
+            }
+        }
+        // Rotate even held/transferred rows so one namespace cannot monopolize
+        // the bounded cleanup window and starve eligible peers.
         for (workflow,generation,_) in &rows {
             tx.execute("UPDATE workflow_native_owner SET attempted_at=?3 WHERE workflow=?1 AND lease_generation=?2",params![workflow,generation,now])?;
         }
+        let rows=rows.into_iter().filter(|r|eligible.contains(r)).collect();
         tx.commit()?;
         Ok(rows)
     }
 
     /// Acknowledgement is idempotent and only settles the exact authorized intent.
+    #[cfg(test)]
     pub fn complete_native_retirement(&mut self,workflow:&str,generation:i64,audit_path:&str,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed=tx.execute("UPDATE workflow_native_owner SET retired_at=?4 WHERE workflow=?1 AND lease_generation=?2 AND audit_path=?3 AND retirement_reason IS NOT NULL AND retired_at IS NULL",
@@ -1527,11 +1749,20 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// Synchronous protected acceptance files only. Native/audit lock I/O,
+    /// subprocesses and awaits must stay outside this store critical section.
+    pub(crate) fn with_acceptance_metadata<T>(&mut self,lease:&Lease,binding:&Binding,
+        clock:&dyn Fn()->i64,operation:impl FnOnce(&AcceptanceMetadata<'_>)->Result<T>)->Result<T> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_native_dispatch_tx(&tx,lease,binding,clock())?;
+        let result=operation(&AcceptanceMetadata {_transaction:&tx,workflow:&lease.workflow})?;
+        require_native_dispatch_tx(&tx,lease,binding,clock())?;
+        tx.commit()?;Ok(result)
+    }
+
     pub fn validate_dispatch(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_binding(&tx,lease,binding,now)?;
-        owner_turn::require_native_dispatch(&tx,lease,now)?;
-        tx.commit()?;Ok(())
+        require_native_dispatch_tx(&tx,lease,binding,now)?;tx.commit()?;Ok(())
     }
 
     pub fn validate_lease(&mut self, lease: &Lease, binding: &Binding, now_ms: i64) -> Result<()> {
@@ -1883,6 +2114,44 @@ impl WorkflowStore {
         )
         .transpose()
     }
+}
+
+fn register_workflow_in_transaction(
+    tx:&Transaction<'_>,workflow:&str,branch:&str,binding:Binding,now_ms:i64,
+)->Result<bool> {
+        binding.validate()?;
+        ensure!(
+            !workflow.is_empty() && !branch.is_empty(),
+            "identity and branch required"
+        );
+        let checkpoint = Checkpoint {
+            stage: Stage::Intake,
+            binding,
+            evidence: vec![],
+            next: NextAction {
+                reason: "registered".into(),
+                action: "scope".into(),
+                eligible_at_ms: now_ms,
+            },
+        };
+        let inserted = tx.execute(
+            "INSERT INTO workflow(id, branch, checkpoint, heartbeat_at, progress_at)
+            VALUES (?1,?2,?3,?4,?4) ON CONFLICT(id) DO NOTHING",
+            params![
+                workflow,
+                branch,
+                serde_json::to_string(&checkpoint)?,
+                now_ms
+            ],
+        )? == 1;
+        if inserted {
+            event(tx, workflow, 0, "registered", branch, now_ms)?;
+            let sequence:i64=tx.query_row("SELECT seq FROM workflow_event WHERE workflow=?1 AND generation=0 AND kind='registered' ORDER BY seq DESC LIMIT 1",
+                [workflow],|row|row.get(0))?;
+            tx.execute("INSERT INTO workflow_native_registration_origin VALUES(?1,1,?2)",params![workflow,sequence])?;
+        }
+        Ok(inserted)
+
 }
 
 fn require_lease(tx: &Transaction<'_>, lease: &Lease, now_ms: i64) -> Result<()> {
@@ -3191,4 +3460,14 @@ mod observation_accounting_tests {
         assert!(store.observation_available(86_400_006,11,12).unwrap());
     }
 
+}
+
+fn require_native_dispatch_tx(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,now:i64)->Result<()> {
+        require_binding(tx,lease,binding,now)?;
+        native_pending::require_clear_abort_barriers(tx,&lease.workflow)?;
+        let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|row|row.get(0))?;
+        let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
+        ensure!(!matches!(checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired),"workflow checkpoint blocks native dispatch");
+        owner_turn::require_native_dispatch(tx,lease,now)?;
+    Ok(())
 }

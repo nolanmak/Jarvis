@@ -81,12 +81,12 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
             // execution/head/worker-liveness evidence at this point.
             // A failed attempt is still retryable. Only authoritative workflow
             // state may turn it into a terminal workflow failure.
-            let code=if paused || attempt.is_some() {3} else {0};
+            let code=if paused || owner_messages_pending>0 || attempt.is_some() {3} else {0};
             return Ok(Some((code, json!({"schema_version":1,"workflow":workflow,
                 "repository":command.repository,"target":command.target,
                 "accepted":true,"complete":false,"stage":"queued",
-                "reason":if paused {"owner-pause-requested"} else {attempt.as_ref().map_or("awaiting-worker-claim",|a|a.reason.as_str())},
-                "next_action":if paused {"await_owner_resume"} else if attempt.is_some() {"retry_worker_attempt"} else {"claim_workflow"},
+                "reason":if paused {"owner-pause-requested"} else if owner_messages_pending>0 {"owner-followup-pending"} else {attempt.as_ref().map_or("awaiting-worker-claim",|a|a.reason.as_str())},
+                "next_action":if paused {"await_owner_resume"} else if owner_messages_pending>0 {"process_owner_input"} else if attempt.is_some() {"retry_worker_attempt"} else {"claim_workflow"},
                 "owner_messages_pending":owner_messages_pending,"owner_control":owner_control,"delivery":delivery,
                 "eligible_at_ms":attempt.as_ref().map(|a|a.eligible_at_ms),"head":null,"last_attempt":attempt,
                 "provider":command.provider,"workflow_until":command.until,"pr_url":null,
@@ -127,7 +127,9 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
             crate::autoship_workflow::submission::Milestone::Merged=>merged,
             crate::autoship_workflow::submission::Milestone::Pr=>pr_ready.is_some() && !recovery_needed && snapshot.checkpoint.stage != Stage::Retired,
         };
-        let code = if complete {0} else if paused || recovery_needed || matches!(snapshot.checkpoint.stage, Stage::Held | Stage::AwaitChecks | Stage::Merged) {
+        let input_waiting=owner_messages_pending>0 && !complete && !recovery_needed
+            && !matches!(snapshot.checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired);
+        let code = if complete {0} else if paused || input_waiting || recovery_needed || matches!(snapshot.checkpoint.stage, Stage::Held | Stage::AwaitChecks | Stage::Merged) {
             3
         } else {
             0
@@ -139,8 +141,8 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
             code,
             json!({"schema_version":1,"workflow":workflow,"repository":repository,"target":target,
             "accepted":true,"complete":complete,"head":snapshot.checkpoint.binding.head,
-            "stage":snapshot.checkpoint.stage,"reason":if paused && !complete && !recovery_needed {"owner-pause-requested"} else {&snapshot.checkpoint.next.reason},
-            "next_action":if paused && !complete && !recovery_needed {"await_quiescence_or_owner_resume"} else {&snapshot.checkpoint.next.action},"eligible_at_ms":snapshot.checkpoint.next.eligible_at_ms,
+            "stage":snapshot.checkpoint.stage,"reason":if paused && !complete && !recovery_needed {"owner-pause-requested"} else if input_waiting {"owner-followup-pending"} else {&snapshot.checkpoint.next.reason},
+            "next_action":if paused && !complete && !recovery_needed {"await_quiescence_or_owner_resume"} else if input_waiting {"process_owner_input"} else {&snapshot.checkpoint.next.action},"eligible_at_ms":snapshot.checkpoint.next.eligible_at_ms,
             "owner_messages_pending":owner_messages_pending,"owner_control":owner_control,"delivery":delivery,
             "provider":command.as_ref().and_then(|c| c.provider),"workflow_until":command.as_ref().map(|c| c.until),"pr_url":pr_url,
             "requested_until":milestone,"milestones":{"pr":pr_ready,"merged":merged},

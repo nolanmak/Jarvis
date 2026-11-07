@@ -23,7 +23,7 @@
 use std::process::Stdio;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, warn};
 
@@ -202,7 +202,8 @@ impl CodexCliReasoner {
         clean: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
-        if crate::native_session::is_fresh_review() {
+        let fresh_review=crate::native_session::is_fresh_review();
+        if fresh_review {
             anyhow::ensure!(opts.allowed_tools.is_empty() && opts.settings_json.is_none() && opts.handoff_path.is_none(),
                 "fresh review must use supplied evidence without tools, settings or handoff history");
         }
@@ -224,19 +225,7 @@ impl CodexCliReasoner {
         // The marker lines are stripped from the stdin prompt; codex embeds
         // the images in the request itself, so an image turn survives a
         // claude→codex failover instead of arriving as a dead file path.
-        let extracted = crate::images::extract_image_markers(user_message);
-        let (user_message, image_paths) = if extracted.images.is_empty() {
-            (user_message.to_string(), Vec::new())
-        } else {
-            (
-                format!(
-                    "{}\n\n[{} image attachment(s) are embedded in this prompt]",
-                    extracted.text,
-                    extracted.images.len()
-                ),
-                extracted.images,
-            )
-        };
+        let (user_message, image_paths) = crate::images::codex_input(user_message);
         let user_message = user_message.as_str();
 
         // System prompt travels via a temp file (`model_instructions_file`
@@ -256,12 +245,14 @@ impl CodexCliReasoner {
                 message: format!("codex tool policy is not ready: {error}"),
             })
         })?;
-        let effective_system = format!("{effective_system}\n\nJarvis tool transport: use the jarvis MCP tools for the \
+        let effective_system = if fresh_review {
+            format!("{effective_system}\n\nUse only supplied evidence. No filesystem, command, web or MCP tools are available.")
+        }else {format!("{effective_system}\n\nJarvis tool transport: use the jarvis MCP tools for the \
             declared file, command and integration operations. The tool workspace is {}. \
             Relative tool paths resolve there. Commands accept one executable and its arguments; \
             split compound shell operations into separate calls. Preserve ATTACH output markers \
             verbatim when delivering original files. Use native web tools for declared web operations.",
-            opts.cwd.as_ref().or(opts.add_dirs.first()).map(|p| p.display().to_string()).unwrap_or_default());
+            opts.cwd.as_ref().or(opts.add_dirs.first()).map(|p| p.display().to_string()).unwrap_or_default())};
         let instructions = tmp.path().join("instructions.md");
         std::fs::write(&instructions, effective_system).map_err(|e| {
             anyhow::Error::new(ReasonerError::Local {
@@ -310,6 +301,7 @@ impl CodexCliReasoner {
             args.push(img.to_string_lossy().into_owned());
         }
         for config in &bridge.config_overrides {
+            if fresh_review && config.starts_with("mcp_servers.") {continue;}
             args.push("-c".into());
             args.push(config.clone());
         }
@@ -355,10 +347,10 @@ impl CodexCliReasoner {
 
         let launch_audit=opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger);
         crate::run_resources::check_requirement(provider,launch_audit.as_ref())?;
-        // #1627 — a text turn reserves the text tier, not a builder's 4 GiB.
+        // Resolve declaration errors before allocating a native runtime or intent.
         let run_policy = crate::run_resources::declared_policy_for(crate::run_resources::run_kind_for(opts))?;
         let mut native_vm = if crate::native_vm::required(launch_audit.as_ref()) {
-            Some(crate::native_vm::Launch::prepare(provider, opts, &cmd, Some(&bridge), native_launch.as_ref())?)
+            Some(crate::native_vm::Launch::prepare(provider, opts, &cmd, if fresh_review {None}else{Some(&bridge)}, native_launch.as_ref())?)
         } else { None };
         if let (Some(vm),Some(lease))=(&native_vm,&native_lease) {vm.register_retirement(lease);}
         let spawned = match &mut native_vm {
@@ -384,11 +376,9 @@ impl CodexCliReasoner {
         crate::phone_timing::spawned(provider);
 
         if let Some(mut stdin) = child.stdin.take() {
-            // #1626 — from the first byte on, the CLI may have the turn.
-            if let Some(lease) = native_lease.as_ref() { lease.mark_submitting(); }
-            stdin.write_all(user_message.as_bytes()).await?;
-            stdin.shutdown().await?;
-            if let Some(lease) = native_lease.as_ref() { lease.observe_native_submission(); }
+            let resource = process_group.native_resource_receipt()?;
+            crate::native_vm::submit_provider_input(&mut stdin, &user_message,
+                native_vm.as_ref(), resource.as_ref(), native_lease.as_ref()).await?;
         }
 
         // Drain stderr CONCURRENTLY (#655 review): a child writing >64KB of
@@ -506,6 +496,7 @@ impl CodexCliReasoner {
         let status = child.wait().await?;
         let logger=opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger);
         let resources=process_group.resource_outcome(provider, logger.as_ref());
+        let native_resource=process_group.native_resource_receipt()?;
         drop(process_group);
         resources?;
         let stderr_buf = match stderr_task {
@@ -525,9 +516,11 @@ impl CodexCliReasoner {
             if crate::reasoner::is_rate_limited(&final_text) {
                 return Err(turn_error(provider, FailureClass::Quota, capability, final_text));
             }
+            if let Some(vm)=&native_vm {vm.record_completion(native_resource.as_ref())?;}
             if let Some(lease) = native_lease {
                 lease.finish()?;
             }
+            if let Some(vm)=&native_vm {vm.acknowledge_completion()?;}
             return Ok(final_text);
         }
 
@@ -764,6 +757,7 @@ echo '{{"type":"turn.completed"}}'
             assert!(argv.contains(required), "missing {required}: {argv}");
         }
         assert!(!argv.lines().any(|arg| arg == "resume" || arg == "builder-thread"));
+        assert!(!argv.lines().any(|arg|arg.starts_with("mcp_servers.")),"fresh review still exposes a host MCP bridge: {argv}");
     }
 
     #[tokio::test]

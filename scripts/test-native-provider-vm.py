@@ -22,7 +22,324 @@ vm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(vm)
 
 
+class ReadonlyTransportAdmissionTests(unittest.TestCase):
+    def test_readonly_tool_channel_is_refused_before_runtime_or_module_loading(self):
+        original = {'version': 1, 'readonly_review': True, 'resume': False, 'mcp_argv': None}
+        changes = [{'mcp_argv': ['/host/tool-bridge']}, {'mcp_argv': []}, {'resume': True},
+                   {'readonly_review': 'true'}, {'readonly_review': 1}, {'readonly_review': None}]
+        for change in changes:
+            with self.subTest(change=change), mock.patch.object(vm, 'read_launch_spec', return_value=({**original, **change}, '0' * 64)), \
+                    mock.patch.object(vm, 'module') as modules, mock.patch.object(vm, 'validate_runtime') as runtime:
+                with self.assertRaisesRegex(ValueError, 'readonly review'):
+                    vm.main('/fixture/launch.json')
+                modules.assert_not_called()
+                runtime.assert_not_called()
+        for missing in ('mcp_argv', 'resume'):
+            spec = {key: value for key, value in original.items() if key != missing}
+            with self.subTest(missing=missing), mock.patch.object(vm, 'read_launch_spec', return_value=(spec, '0' * 64)), mock.patch.object(vm, 'module') as modules:
+                with self.assertRaisesRegex(ValueError, 'readonly review'):
+                    vm.main('/fixture/launch.json')
+                modules.assert_not_called()
+
+    def test_readonly_without_channel_and_legacy_builder_continue_to_runtime_admission(self):
+        for spec in ({'version': 1, 'readonly_review': True, 'resume': False, 'mcp_argv': None},
+                     {'version': 1, 'mcp_argv': ['/declared/builder-bridge']}):
+            with self.subTest(spec=spec), mock.patch.object(vm, 'read_launch_spec', return_value=(spec, '0' * 64)), \
+                    mock.patch.object(vm, 'module', side_effect=RuntimeError('runtime admission reached')):
+                with self.assertRaisesRegex(RuntimeError, 'runtime admission reached'):
+                    vm.main('/fixture/launch.json')
+
+
+class LaunchInputSnapshotTests(unittest.TestCase):
+    def test_completed_and_failed_receipts_bind_consumed_spec_not_later_path_contents(self):
+        for outcome in ('complete', 'disconnect', 'complete-removed', 'disconnect-removed', 'asset-invalid', 'executable-changed', 'executable-unbound', 'executable-digest'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                state = root / 'session'
+                state.mkdir(mode=0o700)
+                executable = root / 'provider'
+                executable.write_bytes(b'synthetic provider never executed')
+                executable.chmod(0o700)
+                info = executable.stat()
+                executable_input = {'version': 1, 'source': str(executable), 'bytes': info.st_size,
+                    'sha256': hashlib.sha256(executable.read_bytes()).hexdigest(), 'origin': {
+                        'device': info.st_dev, 'inode': info.st_ino, 'nlink': info.st_nlink, 'mode': info.st_mode,
+                        'uid': info.st_uid, 'gid': info.st_gid, 'bytes': info.st_size,
+                        'mtime': [info.st_mtime_ns // 10**9, info.st_mtime_ns % 10**9],
+                        'ctime': [info.st_ctime_ns // 10**9, info.st_ctime_ns % 10**9]}}
+                asset = root / 'asset-snapshot'
+                asset.write_bytes(b'original bounded instructions')
+                asset.chmod(0o400)
+                asset_manifest = {'version': 1, 'source': str(asset), 'name': 'asset-0',
+                    'bytes': asset.stat().st_size, 'sha256': hashlib.sha256(asset.read_bytes()).hexdigest()}
+                if outcome == 'asset-invalid':
+                    asset_manifest['sha256'] = 'f' * 64
+                launch = {'version': 1, 'readonly_review': True, 'resume': False, 'mcp_argv': None,
+                          'guest_runtime': '/fixture/runtime', 'runtime_config': '/fixture/config',
+                          'session_directory': str(state), 'memory_mb': 512, 'refresh_auth': False,
+                          'executable': str(executable), 'gateway': {}, 'auth_relative': '.codex/auth.json',
+                          'argv': ['consumed-original-argument'], 'environment': {}, 'assets': [asset_manifest]}
+                if outcome != 'executable-unbound':
+                    launch['executable_input'] = executable_input
+                if outcome == 'executable-changed':
+                    executable.write_bytes(b'substituted provider executable!')
+                if outcome == 'executable-digest':
+                    executable_input['sha256'] = 'f' * 64
+                path = root / 'launch.json'
+                original = json.dumps(launch).encode()
+                path.write_bytes(original)
+                path.chmod(0o600)
+                proceed = root / 'continue'
+                proceed.write_bytes(b'admitted\n')
+                proceed.chmod(0o600)
+                backend = mock.Mock()
+                backend.Runtime.load.return_value.config = {'library_dir': '/fixture/lib', 'module_dir': '/fixture/modules'}
+                backend.initrd.return_value = b'synthetic initrd'
+                def qemu_command(config, image, shares, unused):
+                    self.assertEqual((shares[1][1] / 'asset-0').read_bytes(), b'original bounded instructions')
+                    return ['synthetic-qemu', '-serial', 'stdio']
+                backend.qemu_command.side_effect = qemu_command
+                gateway_module = mock.Mock()
+                gateway_module.provision.return_value = ({}, [])
+                gateway = mock.Mock(guest_failures=0, host_failures=0)
+                gateway.transport_receipt.return_value = {}
+                def gateway_started(*args, **kwargs):
+                    changed = {**launch, 'argv': ['later-substituted-argument'], 'readonly_review': False,
+                               'mcp_argv': ['/later/host/tool-channel']}
+                    if outcome.endswith('-removed'):
+                        path.unlink()
+                    else:
+                        path.write_bytes(json.dumps(changed).encode())
+                    return gateway
+                gateway_module.HostGateway.side_effect = gateway_started
+                channel = mock.Mock()
+                def observe_start(frame):
+                    if frame.get('type') == 'start':
+                        observation = json.loads((root / 'vm-startup-inputs.json').read_bytes())
+                        self.assertEqual(observation, {'version': 1, 'phase': 'inputs_staged',
+                            'launch_sha256': hashlib.sha256(original).hexdigest()})
+                        self.assertEqual((root / 'ready').read_bytes(), b'ready\n')
+                channel.send.side_effect = observe_start
+                channel.receive.return_value = [{'type': 'ready'},
+                    {'type': 'worker_quiescent', 'scans': 2, 'signalled': 0, 'reaped': 0,
+                     'remaining_workers': 0, 'quiet_scans': 2}, {'type': 'exit', 'code': 0}]
+                if outcome.startswith('disconnect'):
+                    channel.receive.side_effect = RuntimeError('synthetic native disconnect')
+                process = mock.Mock(returncode=0)
+                process.poll.return_value = None
+                with mock.patch.object(vm, 'module', side_effect=[backend, gateway_module]), \
+                        mock.patch.object(vm, 'validate_runtime'), \
+                        mock.patch.object(vm, 'credential_use', return_value=None), \
+                        mock.patch.object(vm, 'runtime_seed', return_value=([], None)), \
+                        mock.patch.object(vm, 'stage_native_companions'), \
+                        mock.patch.object(vm, 'boot_entries', return_value=[]) as boot, \
+                        mock.patch.object(vm, 'publish_runtime_generation', return_value='generation-synthetic'), \
+                        mock.patch.object(vm.subprocess, 'Popen', return_value=process), \
+                        mock.patch.object(vm.socket, 'socket'), \
+                        mock.patch.object(vm, 'Channel', return_value=channel), \
+                        mock.patch.object(vm.threading, 'Thread'), \
+                        mock.patch.dict(os.environ, {'JARVIS_NATIVE_VM_READY': str(root / 'ready'),
+                                                    'JARVIS_NATIVE_VM_CONTINUE': str(proceed)}):
+                    if outcome in ('asset-invalid', 'executable-changed', 'executable-unbound', 'executable-digest'):
+                        with self.assertRaisesRegex(ValueError, 'asset.*digest|executable'):
+                            vm.main(path)
+                        self.assertFalse((root / 'ready').exists())
+                        self.assertFalse((root / 'vm-startup-inputs.json').exists())
+                        backend.qemu_command.assert_not_called()
+                        channel.send.assert_not_called()
+                        continue
+                    if outcome.startswith('complete'):
+                        self.assertEqual(vm.main(path), 0)
+                        receipt = json.loads((state / 'complete.json').read_bytes())
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'synthetic native disconnect'):
+                            vm.main(path)
+                        self.assertFalse((state / 'complete.json').exists())
+                        receipt = json.loads((root / 'failed-gateway-observation.json').read_bytes())
+                        self.assertTrue(receipt['diagnostic_only'])
+                self.assertEqual(boot.call_args.args[1]['argv'], ['consumed-original-argument'])
+                self.assertFalse(boot.call_args.args[1]['mcp'])
+                self.assertEqual(receipt['launch_sha256'], hashlib.sha256(original).hexdigest(),
+                                 'receipt hashed replacement path bytes instead of the consumed launch input')
+
+
+class ExecutableInputBindingTests(unittest.TestCase):
+    def manifest(self, source):
+        info = source.stat()
+        return {'version': 1, 'source': str(source), 'bytes': info.st_size,
+                'sha256': hashlib.sha256(source.read_bytes()).hexdigest(), 'origin': {
+                    'device': info.st_dev, 'inode': info.st_ino, 'nlink': info.st_nlink,
+                    'mode': info.st_mode, 'uid': info.st_uid, 'gid': info.st_gid, 'bytes': info.st_size,
+                    'mtime': [info.st_mtime_ns // 10**9, info.st_mtime_ns % 10**9],
+                    'ctime': [info.st_ctime_ns // 10**9, info.st_ctime_ns % 10**9]}}
+
+    def test_exact_executable_is_copied_readonly_without_clobbering_existing_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / 'executable'
+            source.write_bytes(b'original provider bytes')
+            source.chmod(0o700)
+            manifest = self.manifest(source)
+            vm.stage_executable_input(manifest, source, root)
+            self.assertEqual((root / 'cli').read_bytes(), b'original provider bytes')
+            self.assertEqual((root / 'cli').stat().st_mode & 0o777, 0o555)
+            with self.assertRaises(FileExistsError):
+                vm.stage_executable_input(manifest, source, root)
+            self.assertEqual((root / 'cli').read_bytes(), b'original provider bytes')
+            self.assertEqual(source.read_bytes(), b'original provider bytes')
+
+    def test_same_size_substitution_and_changed_source_inode_are_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / 'executable'
+            source.write_bytes(b'original provider bytes')
+            source.chmod(0o700)
+            original = self.manifest(source)
+            source.write_bytes(b'changed! provider bytes')
+            changed = {**self.manifest(source), 'sha256': original['sha256']}
+            with self.assertRaisesRegex(ValueError, 'executable bytes'):
+                vm.stage_executable_input(changed, source, root)
+            self.assertFalse((root / 'cli').exists(), 'failed copy retained executable output')
+            replacement = root / 'replacement'
+            replacement.write_bytes(b'original provider bytes')
+            replacement.chmod(0o700)
+            os.replace(replacement, source)
+            with self.assertRaisesRegex(ValueError, 'executable identity'):
+                vm.stage_executable_input(original, source, root)
+            self.assertFalse((root / 'cli').exists())
+
+    def test_missing_unknown_manifest_and_unsafe_source_refuse_without_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / 'executable'
+            source.write_bytes(b'original provider bytes')
+            source.chmod(0o700)
+            original = self.manifest(source)
+            changes = ({'version': True}, {'version': 2}, {'bytes': True}, {'bytes': 0},
+                       {'bytes': 512 * 1024**2 + 1}, {'sha256': 'F' * 64}, {'source': 'relative'},
+                       {'extra': 1}, {'origin': {**original['origin'], 'uid': False}})
+            invalid = [None] + [{**original, **change} for change in changes]
+            invalid += [{key: value for key, value in original.items() if key != missing} for missing in original]
+            for manifest in invalid:
+                with self.subTest(manifest=manifest), self.assertRaises(ValueError):
+                    vm.stage_executable_input(manifest, source, root)
+                self.assertFalse((root / 'cli').exists())
+            for unsafe in ('symlink', 'fifo', 'writable', 'directory'):
+                path = root / unsafe
+                if unsafe == 'symlink':
+                    path.symlink_to(source)
+                    manifest = {**original, 'source': str(path)}
+                elif unsafe == 'fifo':
+                    os.mkfifo(path, 0o700)
+                    manifest = {**original, 'source': str(path)}
+                elif unsafe == 'directory':
+                    path.mkdir(mode=0o700)
+                    manifest = {**original, 'source': str(path)}
+                else:
+                    path.write_bytes(b'original provider bytes')
+                    path.chmod(0o720)
+                    manifest = self.manifest(path)
+                with self.subTest(unsafe=unsafe), self.assertRaises((ValueError, OSError)):
+                    vm.stage_executable_input(manifest, path, root)
+                self.assertFalse((root / 'cli').exists())
+
+
+class AssetInputBindingTests(unittest.TestCase):
+    def manifest(self, source, name='asset-0', data=b'original instructions'):
+        return {'version': 1, 'source': str(source), 'name': name, 'bytes': len(data),
+                'sha256': hashlib.sha256(data).hexdigest()}
+
+    def test_changed_asset_digest_is_refused_before_guest_materialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'snapshot'
+            source.write_bytes(b'changed! instructions')
+            source.chmod(0o400)
+            binary = root / 'provider'
+            binary.mkdir(mode=0o700)
+            with self.assertRaisesRegex(ValueError, 'asset.*(digest|bytes|size)'):
+                vm.stage_input_assets([self.manifest(source)], binary)
+            self.assertEqual(list(binary.iterdir()), [])
+
+    def test_entire_batch_is_checked_before_writing_guest_assets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'snapshot'
+            source.write_bytes(b'original instructions')
+            source.chmod(0o400)
+            binary = root / 'provider'
+            binary.mkdir(mode=0o700)
+            first = self.manifest(source)
+            second = {**self.manifest(source, 'asset-1'), 'sha256': 'f' * 64}
+            with self.assertRaisesRegex(ValueError, 'asset.*digest'):
+                vm.stage_input_assets([first, second], binary)
+            self.assertEqual(list(binary.iterdir()), [])
+            vm.stage_input_assets([first, self.manifest(source, 'asset-1')], binary)
+            for name in ('asset-0', 'asset-1'):
+                self.assertEqual((binary / name).read_bytes(), b'original instructions')
+                self.assertEqual((binary / name).stat().st_mode & 0o777, 0o444)
+
+    def test_manifest_and_snapshot_identity_refuse_unknown_or_mutable_inputs(self):
+        changes = ({'version': True}, {'version': 2}, {'bytes': True}, {'bytes': -1},
+                   {'bytes': 16 * 1024 * 1024 + 1}, {'sha256': 'A' * 64}, {'extra': 1},
+                   {'name': 'asset-other'}, {'name': '../asset-0'}, {'source': 'relative'})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'snapshot'
+            source.write_bytes(b'original instructions')
+            source.chmod(0o400)
+            binary = root / 'provider'
+            binary.mkdir(mode=0o700)
+            for change in changes:
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    vm.stage_input_assets([{**self.manifest(source), **change}], binary)
+                self.assertEqual(list(binary.iterdir()), [])
+            for field in ('version', 'bytes', 'sha256'):
+                unknown = {k: v for k, v in self.manifest(source).items() if k != field}
+                with self.subTest(missing=field), self.assertRaises(ValueError):
+                    vm.stage_input_assets([unknown], binary)
+            source.chmod(0o600)
+            with self.assertRaises(ValueError):
+                vm.stage_input_assets([self.manifest(source)], binary)
+            source.chmod(0o400)
+            link = root / 'hardlink'
+            os.link(source, link)
+            with self.assertRaises(ValueError):
+                vm.stage_input_assets([self.manifest(source)], binary)
+            link.unlink()
+            symlink = root / 'symlink'
+            symlink.symlink_to(source)
+            with self.assertRaises(OSError):
+                vm.stage_input_assets([self.manifest(symlink)], binary)
+            fifo = root / 'fifo'
+            os.mkfifo(fifo, 0o400)
+            with self.assertRaises(ValueError):
+                vm.stage_input_assets([self.manifest(fifo)], binary)
+            self.assertEqual(list(binary.iterdir()), [])
+
+
+
 class NativeVmTests(unittest.TestCase):
+    def test_export_target_rejects_existing_public_or_symlink_parents(self):
+        for case in ('public-root', 'public-parent', 'symlink-parent'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                staging = root / 'generation'
+                staging.mkdir(mode=0o700)
+                if case == 'public-root':
+                    staging.chmod(0o775)
+                elif case == 'public-parent':
+                    (staging / 'nested').mkdir(mode=0o700)
+                    (staging / 'nested').chmod(0o775)
+                else:
+                    outside = root / 'outside'
+                    outside.mkdir(mode=0o700)
+                    (staging / 'nested').symlink_to(outside, target_is_directory=True)
+                before = {path: path.lstat().st_mode for path in root.rglob('*')}
+                with self.assertRaises(ValueError):
+                    vm.export_target(staging, 'nested/file')
+                self.assertEqual(before, {path: path.lstat().st_mode for path in root.rglob('*')})
+
     def wait_file(self, path, process):
         deadline = time.monotonic() + 5
         while not path.exists():

@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "kind": "content-bound-and-retained-original-native-executable-input-component",
+  "source_parent_commit": "bbd7dd271425853f5905d0989d45c3e9bb47bb8b",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_executable_input.rs",
+      "sha256": "de63d3d6c1fe6c00839af9e172d69d6b9c7f16fb685804d22d4b757c18cef856"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "58bb3ee40747e9d7c4723d2b4b5aa408a767f2e56c625979fb0fd098b0407366"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_metadata.rs",
+      "sha256": "183b35824f6d33b09fc887e1771eab5c81b55b6ba5a8fe98d7773605b78c649e"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "896b1248c80d9900be85793d4a05573803fdf225ed937ece1a56941a9eae004f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+      "sha256": "dc181e78906a0461eee6cdaf6693da07ff86031ab61bcad0a3bcd9d025197d26"
+    },
+    {
+      "path": "scripts/native-provider-vm.py",
+      "sha256": "ab06f9cc8c72478ba793b3694a08a31886836ba9b42538425c08c2e3ec93ab1c"
+    },
+    {
+      "path": "scripts/test-native-provider-vm.py",
+      "sha256": "66bb0d0077a8a078b90e5b1b38a4c958b84ec490ca58db1e645d03f6ba6413a1"
+    }
+  ],
+  "behavioral_reds": [
+    {
+      "session": 25831,
+      "result": "terminal1",
+      "log": "/tmp/autoship-native-executable-preparation-red-20261106.log",
+      "observed": "Prepared executable remained bound only by mutable pathname"
+    },
+    {
+      "result": "terminal1",
+      "log": "/tmp/autoship-native-executable-main-red-20261106.log",
+      "observed": "Actual runner-main accepted both changed and unbound executable without refusal"
+    },
+    {
+      "session": 19098,
+      "result": "terminal1",
+      "log": "/tmp/autoship-native-executable-history-red-20261106.log",
+      "observed": "Original executable descriptor vanished with temporary spec instead of protected launch history"
+    }
+  ],
+  "intermediate_validation": [
+    {
+      "session": 74449,
+      "result": "terminal1",
+      "log": "/tmp/autoship-native-executable-focused-20261106.log",
+      "reason": "New fixture reused filenames for the second provider; corrected to provider-qualified fixture inputs, keeping both provider checks"
+    },
+    {
+      "session": 47457,
+      "result": "terminal0",
+      "passed": 1,
+      "log": "/tmp/autoship-native-executable-focused-final-20261106.log",
+      "scope": "Before later protected descriptor/history joins; superseded by full core"
+    }
+  ],
+  "verification": {
+    "full_core": {
+      "session": 79582,
+      "result": "terminal0",
+      "passed": 952,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 37.88,
+      "log": "/tmp/autoship-native-executable-full-core-20261106.log"
+    },
+    "focused_retained": {
+      "session": 69685,
+      "result": "terminal0",
+      "passed": 1,
+      "cases": 80,
+      "seconds": 95.57,
+      "log": "/tmp/autoship-native-executable-retained-focused-20261106.log"
+    },
+    "python_vm": {
+      "result": "terminal0",
+      "tests": 30,
+      "seconds": 1.297,
+      "log": "/tmp/autoship-native-executable-python-20261106.log"
+    },
+    "python_io": {
+      "result": "terminal0",
+      "tests": 9,
+      "seconds": 0.099,
+      "log": "/tmp/autoship-native-executable-io-20261106.log"
+    },
+    "isolated_full_cli": {
+      "session": 33825,
+      "result": "terminal0",
+      "passed": 1949,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 341.44,
+      "log": "/tmp/autoship-native-executable-isolated-full-cli-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    },
+    "isolated_production_check": {
+      "session": 58237,
+      "result": "terminal0",
+      "seconds": 39.07,
+      "log": "/tmp/autoship-native-executable-isolated-production-check-20261106.log"
+    }
+  },
+  "implemented": [
+    "Capture bounded executable SHA/size and stable original descriptor identity from no-follow/nonblocking file descriptor before native allocation",
+    "Bind original executable descriptor into exact launch spec and protected original prepared-launch history",
+    "Runner requires strict executable manifest, validates original open descriptor identity, streams/checks actual guest copy bytes and stable identity, closes readonly copy writer",
+    "Unknown/missing/changed executable refuses before VM readiness/model admission; failed owned copy removed, existing outputs retained",
+    "Initial namespace requires one bound/ordered executable descriptor; locked retained metadata validates and retains exact original descriptor/append receipt and leaves historical absence unknown",
+    "No extra executable snapshot/cache or session-size/free-floor override; existing guest copy remains within existing512MiB executable cap"
+  ],
+  "test_scope": {
+    "actual_preparation": "Both providers; original executable binding, canonical alias, invalid/empty/writable/oversized/FIFO/directory/missing preflight with no runtime/capture/observer, durable protected descriptor",
+    "actual_runner_main": "Captured asset/executable bytes with scripted hypervisor/gateway; mutated/deleted spec retains original consumed hash; changed/unbound/digest-mismatched executable refuses before QEMU/readiness/start",
+    "staging": "Exact readonly copy; same-size digest substitution; changed inode; strict manifests/origin; symlink/FIFO/directory/writable; exclusive output/no clobber",
+    "retained_history": "Two providers/two completed transfers; recorded descriptor vs unknown legacy; foreign/receipt/version/field/digest/duplicate/resource-order faults plus previous startup/input/source/resource cases",
+    "vm_or_provider_executed": false
+  },
+  "not_proven_or_implemented": [
+    "Complete trusted compiled-source/runtime/credential/kernel/allocation/writer/associated-input census and source/resource authority",
+    "Fresh original-body nonrelease and semantic actual coding-conversation continuation",
+    "Typed recovery/terminal authorities, real productive successor bridge/claim and shared productive gates",
+    "Connected owner worker, aggregate protected storage admission/retention, independent exact-head review, normal rollout, live acceptance and soaks"
+  ],
+  "preserved_unpublished_work": "/tmp/autoship-productive-gate-preserved-20261106.patch"
+}

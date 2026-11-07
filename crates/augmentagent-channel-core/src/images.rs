@@ -76,6 +76,13 @@ pub fn extract_image_markers(user_msg: &str) -> ExtractedImages {
     }
 }
 
+/// Exact Codex stdin/attachment transformation, shared with owner sealing.
+pub fn codex_input(user_msg:&str)->(String,Vec<PathBuf>) {
+    let extracted=extract_image_markers(user_msg);
+    if extracted.images.is_empty() {(user_msg.to_owned(),Vec::new())}
+    else {(format!("{}\n\n[{} image attachment(s) are embedded in this prompt]",extracted.text,extracted.images.len()),extracted.images)}
+}
+
 /// Replace every valid marker with a visible degradation note — used by
 /// providers that cannot view images at all (gemini json mode, cerebras).
 /// Returns the original string unchanged (no allocation churn beyond the

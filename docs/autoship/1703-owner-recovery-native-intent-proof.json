@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "kind": "atomic-authenticated-recovery-native-intent-durability",
+  "source_parent_commit": "f6562afb4e11122f0ff011c25a69de946bddd0f7",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_pending.rs",
+      "sha256": "689f58b407ff58aea763d21bd3b9485f95e115be50d6d4bd9137d80026990de8"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication.rs",
+      "sha256": "e745d6f5cbebd8d32f663469b6c3873b3c0b2194c452b36a9a3ac1720f77ad73"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs",
+      "sha256": "4bdc13a72990fdc6bfdeffaf78dd84fd6c50dc9d86a9532f0e4373a7d2a3965b"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "892489b9052fe90eaeecdbeb0f8c5c88bdca46cfae79adfd6c5342b089968ff0"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication.rs",
+      "sha256": "4d54e9afcc90304a2066f55bb72f7305271645568863f5dfb36b5305f0e7680e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "6016268f517fb58388f2ace97e0d05d8fb31ecad3c0097b93c06710a41824aaf"
+    },
+    {
+      "path": "docs/autoship/owner-publication-protocol.md",
+      "sha256": "9b480ba6e9ddb83557ab1293c12f4859bf486f402ff8d8e6190b47ce39a55e8e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_recovery_native_intent.rs",
+      "sha256": "7c5cc351098f675df8703aa3154a8735f0ca68d7529e5c53998d8385913b119e"
+    }
+  ],
+  "behavioral_reds": [
+    {
+      "session": 27863,
+      "result": "terminal1",
+      "log": "/tmp/autoship-owner-recovery-native-intent-red-20261106.log",
+      "failure": "Real protected recovery/core scan reached the stub producer, which refused the required atomic intent"
+    }
+  ],
+  "verification": {
+    "focused": {
+      "session": 73219,
+      "result": "terminal0",
+      "passed": 1,
+      "failed": 0,
+      "seconds": 6.12,
+      "log": "/tmp/autoship-owner-recovery-native-intent-wal-focused-20261106.log",
+      "cases": [
+        "Both provider pins with actual original protected core scan and authenticated recovery metadata claim",
+        "Publication SQL completion required even when canonical files exist",
+        "Projection insertion failure rolls back snapshot, pending and context together",
+        "Actual WAL commit returns IOERR after persistence; authoritative read recovers original UUID",
+        "Idempotent replay and store reopen",
+        "Missing context or pending/event returns unknown; no replacement UUID",
+        "Expired authority and superseded claim refused",
+        "Genuine later metadata claim reopens same recorded UUID",
+        "Held/paused controls, queued input, accounting and merge allowance preserved"
+      ]
+    },
+    "full_cli_unit": {
+      "session": 48081,
+      "result": "terminal0",
+      "passed": 1953,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 377.6,
+      "log": "/tmp/autoship-owner-recovery-native-intent-full-cli-20261106.log"
+    },
+    "production_check": {
+      "session": 56982,
+      "result": "terminal0",
+      "seconds": 20.85,
+      "log": "/tmp/autoship-owner-recovery-native-intent-production-check-20261106.log"
+    }
+  },
+  "scope": "SQL durability stage only. Opaque current-authority receipt has no lease/request getter or core execution conversion. Controlled caller stops before native movement. Shared ordinary pending encoding remains version 1.",
+  "limits": [
+    "No native forward transfer executed by this component",
+    "Actual purpose-aware recovery replay, verified settlement, frontier/preparation readers and absent/prepared/completed/aborted/terminal/process-loss handling remain required before execution is exposed",
+    "Full source/resource/input proofs, reservation lineage, readiness, productive successor/body constructors and worker remain incomplete",
+    "Fixtures use synthetic acceptance and empty runtime inventory; no live provider/VM/Discord acceptance",
+    "Draft and undeployed; no restoration, merge or rollout claim"
+  ],
+  "spec_audit": {
+    "section": 46,
+    "reported_wrong_build_or_forced_guess_findings": 0,
+    "is_activation_or_mechanism_handoff_approval": false,
+    "is_independent_exact_head_code_review": false
+  },
+  "unfinished_productive_gate_wip_included": false,
+  "full_goal_complete": false
+}

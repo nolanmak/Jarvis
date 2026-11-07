@@ -18,6 +18,9 @@ pub struct UncertainProgress {pub delivery:ProgressDelivery,pub nonce:String,pub
 
 pub struct ProgressDelivery {pub context:Context,pub workflow:String,pub sequence:i64}
 
+pub struct OwnerReplyDelivery {pub context:Context,pub workflow:String,pub request_id:String,pub part:u32}
+pub struct UncertainOwnerReply {pub delivery:OwnerReplyDelivery,pub nonce:String,pub content:String}
+
 pub struct Reply {
     pub content: String,
     /// Present only after a durable, single-use acknowledgement claim.
@@ -81,6 +84,17 @@ pub async fn drain_queued(handler: &dyn QueryHandler, transport: &dyn Transport,
         }.await;
         match attempt {Ok(true)=>delivered+=1,Ok(false)=>{},Err(_)=>tracing::warn!("autoship acknowledgement reconciliation unavailable; delivery remains uncertain")}
     }
+    for uncertain in handler.autoship_owner_reply_uncertain(bot,owner)? {
+        let delivery=&uncertain.delivery;let context=&delivery.context;
+        if context.bot!=bot || context.owner!=Some(owner) || context.author!=owner || context.guild.is_some() || context.channel==0 || context.message==0 {continue;}
+        let attempt=async {
+            if !transport.verify_owner_dm(context).await? {return Ok(false);}
+            let Some(message)=transport.find_progress(context,&uncertain.nonce,&uncertain.content).await? else {return Ok(false);};
+            if !transport.verify_owner_dm(context).await? {return Ok(false);}
+            handler.autoship_owner_reply_confirm(delivery,message)?;Ok::<_,anyhow::Error>(true)
+        }.await;
+        match attempt {Ok(true)=>delivered+=1,Ok(false)=>{},Err(_)=>tracing::warn!("autoship private reply reconciliation unavailable; delivery remains uncertain")}
+    }
     for uncertain in handler.autoship_progress_uncertain(bot,owner)? {
         let delivery=&uncertain.delivery;let context=&delivery.context;
         if context.bot!=bot || context.owner!=Some(owner) || context.author!=owner || context.guild.is_some() || context.channel==0 {continue;}
@@ -110,6 +124,19 @@ pub async fn drain_queued(handler: &dyn QueryHandler, transport: &dyn Transport,
             Ok(false) => {},
             Err(_) => tracing::warn!("autoship acknowledgement recovery failed; uncertain sends remain parked"),
         }
+    }
+    for delivery in handler.autoship_owner_reply_pending(bot,owner)? {
+        let context=&delivery.context;
+        if context.bot!=bot || context.owner!=Some(owner) || context.author!=owner || context.guild.is_some() || context.channel==0 || context.message==0 {continue;}
+        let attempt=async {
+            if !transport.verify_owner_dm(context).await? {return Ok(false);}
+            let Some(reply)=handler.autoship_owner_reply_claim(&delivery)? else {return Ok(false);};
+            anyhow::ensure!(reply.nonce.is_some(),"private owner reply requires durable dispatch claim");
+            if !transport.verify_owner_dm(context).await? {return Ok(false);}
+            let message=transport.send(context,&reply).await?;
+            handler.autoship_owner_reply_confirm(&delivery,message)?;Ok::<_,anyhow::Error>(true)
+        }.await;
+        match attempt {Ok(true)=>delivered+=1,Ok(false)=>{},Err(_)=>tracing::warn!("autoship private reply delivery failed; uncertain sends remain parked")}
     }
     for delivery in handler.autoship_progress_pending(bot,owner)? {
         let context=&delivery.context;
@@ -302,5 +329,63 @@ mod tests {
             assert!(dispatch(&h, &wire(true, false), &c, "!autoship PR").await.unwrap());
         }
         assert_eq!(h.calls.load(SeqCst), 0); assert_eq!(w.sends.load(SeqCst), 0);
+    }
+    struct OwnerReplyHandler { state:std::sync::Mutex<Vec<u8>>, invalid:bool }
+    impl OwnerReplyHandler {
+        fn delivery(&self,index:usize)->OwnerReplyDelivery {OwnerReplyDelivery {context:if self.invalid {Context {author:99,..context()}}else{context()},workflow:"owner/repo/pr/42".into(),request_id:format!("fixture-request-{index}"),part:0}}
+        fn index(delivery:&OwnerReplyDelivery)->usize {delivery.request_id.rsplit('-').next().unwrap().parse().unwrap()}
+        fn content(index:usize)->String {format!("Private agent reply {index} [autoship:owner-reply-{index}]")}
+    }
+    #[async_trait::async_trait]
+    impl QueryHandler for OwnerReplyHandler {
+        async fn answer(&self,_:&crate::AuditCtx,_:&str)->Result<String> {panic!("delivery cannot start a model turn")}
+        fn autoship_owner_reply_pending(&self,_:u64,_:u64)->Result<Vec<OwnerReplyDelivery>> {
+            Ok(self.state.lock().unwrap().iter().enumerate().filter(|(_,s)|**s==0).map(|(i,_)|self.delivery(i)).collect())
+        }
+        fn autoship_owner_reply_uncertain(&self,_:u64,_:u64)->Result<Vec<UncertainOwnerReply>> {
+            Ok(self.state.lock().unwrap().iter().enumerate().filter(|(_,s)|**s==1).map(|(i,_)|UncertainOwnerReply {delivery:self.delivery(i),nonce:format!("owner-reply-{i}"),content:Self::content(i)}).collect())
+        }
+        fn autoship_owner_reply_claim(&self,d:&OwnerReplyDelivery)->Result<Option<Reply>> {
+            let i=Self::index(d);let mut states=self.state.lock().unwrap();if states[i]!=0 {return Ok(None);}
+            states[i]=1;Ok(Some(Reply {content:Self::content(i),nonce:Some(format!("owner-reply-{i}"))}))
+        }
+        fn autoship_owner_reply_confirm(&self,d:&OwnerReplyDelivery,message:u64)->Result<()> {
+            assert_eq!(message,55);let mut states=self.state.lock().unwrap();let i=Self::index(d);assert_eq!(states[i],1);states[i]=2;Ok(())
+        }
+    }
+    struct OwnerReplyWire {sent:AtomicUsize,lookups:AtomicUsize,fail:bool,found:bool,checks:AtomicUsize,lose_destination:bool}
+    impl OwnerReplyWire {fn new(fail:bool,found:bool)->Self {Self {sent:AtomicUsize::new(0),lookups:AtomicUsize::new(0),checks:AtomicUsize::new(0),fail,found,lose_destination:false}}}
+    #[async_trait::async_trait]
+    impl Transport for OwnerReplyWire {
+        async fn verify_owner_dm(&self,_:&Context)->Result<bool> {Ok(!self.lose_destination || self.checks.fetch_add(1,SeqCst)==0)}
+        async fn send(&self,_:&Context,reply:&Reply)->Result<u64> {
+            self.sent.fetch_add(1,SeqCst);assert!(reply.content.contains("[autoship:owner-reply-"));assert!(reply.nonce.is_some());
+            anyhow::ensure!(!self.fail,"remote outcome unknown");Ok(55)
+        }
+        async fn find_progress(&self,_:&Context,nonce:&str,content:&str)->Result<Option<u64>> {
+            self.lookups.fetch_add(1,SeqCst);assert!(content.contains(&format!("[autoship:{nonce}]")));Ok(self.found.then_some(55))
+        }
+    }
+    #[tokio::test]
+    async fn private_owner_reply_recovery_delivers_each_request_without_coalescing() {
+        let h=OwnerReplyHandler {state:std::sync::Mutex::new(vec![0,0]),invalid:false};let w=OwnerReplyWire::new(false,false);
+        assert_eq!(drain_queued(&h,&w,11,22).await.unwrap(),2);assert_eq!(w.sent.load(SeqCst),2);
+        assert_eq!(*h.state.lock().unwrap(),vec![2,2]);assert_eq!(drain_queued(&h,&w,11,22).await.unwrap(),0);
+    }
+    #[tokio::test]
+    async fn private_owner_reply_timeout_reconciles_receipt_without_resending() {
+        let h=OwnerReplyHandler {state:std::sync::Mutex::new(vec![0]),invalid:false};let w=OwnerReplyWire::new(true,false);
+        assert_eq!(drain_queued(&h,&w,11,22).await.unwrap(),0);assert_eq!(w.sent.load(SeqCst),1);
+        assert_eq!(drain_queued(&h,&w,11,22).await.unwrap(),0);assert_eq!(w.sent.load(SeqCst),1);assert_eq!(w.lookups.load(SeqCst),1);
+        let recovered=OwnerReplyWire::new(false,true);assert_eq!(drain_queued(&h,&recovered,11,22).await.unwrap(),1);
+        assert_eq!(recovered.sent.load(SeqCst),0);assert_eq!(*h.state.lock().unwrap(),vec![2]);
+    }
+    #[tokio::test]
+    async fn private_owner_reply_rechecks_destination_and_rejects_foreign_owner() {
+        let foreign=OwnerReplyHandler {state:std::sync::Mutex::new(vec![0]),invalid:true};let w=OwnerReplyWire::new(false,false);
+        assert_eq!(drain_queued(&foreign,&w,11,22).await.unwrap(),0);assert_eq!(w.sent.load(SeqCst),0);
+        let h=OwnerReplyHandler {state:std::sync::Mutex::new(vec![0]),invalid:false};let mut lost=OwnerReplyWire::new(false,false);lost.lose_destination=true;
+        assert_eq!(drain_queued(&h,&lost,11,22).await.unwrap(),0);assert_eq!(lost.sent.load(SeqCst),0);assert_eq!(*h.state.lock().unwrap(),vec![1]);
+        assert_eq!(drain_queued(&h,&w,11,22).await.unwrap(),0);assert_eq!(w.sent.load(SeqCst),0);
     }
 }

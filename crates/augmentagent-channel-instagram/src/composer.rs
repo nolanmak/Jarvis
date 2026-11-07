@@ -1194,7 +1194,12 @@ mod mock_sidecar_tests {
     async fn harness(
         handlers: HashMap<&'static str, OpHandler>,
     ) -> (Composer, OpLog, Arc<TestGov>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
+        // Managed builds deliberately use a deep TMPDIR. Unix socket paths
+        // have a small fixed limit, so keep this tiny private mock fixture short.
+        let dir = tempfile::Builder::new()
+            .prefix("jarvis-ig-compose-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let sock = dir.path().join("browser.sock");
         let log = OpLog::default();
         mock_sidecar(sock.clone(), log.clone(), handlers).await;
