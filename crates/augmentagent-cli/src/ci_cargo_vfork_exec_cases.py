@@ -56,7 +56,7 @@ def frame(fd,size,deadline):
     return data
 
 
-def experiment(planner,proxy,mode,ready,hold,release,cloexec,extra,*,inspect_exec=None,resume_exec=None,reject_continuation=False):
+def experiment(planner,proxy,mode,ready,hold,release,cloexec,extra,*,inspect_exec=None,resume_exec=None,reject_continuation=False,inspect_pending_exec=None):
     class TestOnlyGate(planner.ExecMediation):
         """Never used by the runtime; check() cannot issue a source verdict."""
         def __init__(self):
@@ -119,6 +119,7 @@ def experiment(planner,proxy,mode,ready,hold,release,cloexec,extra,*,inspect_exe
                         assert Path(f'/proc/{self.child}/cgroup').read_bytes()==Path(f'/proc/{self.pid}/cgroup').read_bytes()
                         for name in ('pid','mnt','ipc','net','user'):
                             assert os.readlink(f'/proc/{self.child}/ns/{name}')==os.readlink(f'/proc/{self.pid}/ns/{name}')
+                        if inspect_pending_exec is not None:inspect_pending_exec(self.pid,self.child)
                         if mode=='cancel':
                             respond(identity.value,False)
                             self.records.append({'pid':self.child,'nr':number.value,'stage':'cancelled_exec'})

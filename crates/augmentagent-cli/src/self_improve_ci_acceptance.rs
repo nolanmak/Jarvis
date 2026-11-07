@@ -515,6 +515,23 @@ fn native_vfork_exec_boundary_preserves_real_parent_release_and_refuses_wrong_im
 
 #[cfg(all(target_os="linux",target_arch="x86_64"))]
 #[test]
+fn native_preopened_memory_fd_retains_original_vfork_mm_after_exec() {
+    let directory=tempfile::tempdir().unwrap();
+    for (name,bytes) in [("native.so",CARGO_EXEC_DENIAL_LIBRARY),("ci_cargo_vfork_producer",CARGO_VFORK_PRODUCER),
+        ("ci_cargo_vfork_proxy",CARGO_VFORK_PROXY),("ci_cargo_exec_static",CARGO_EXEC_STATIC)] {
+        let path=directory.path().join(name);std::fs::write(&path,bytes).unwrap();
+        std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests/ci_cargo_exec_memory_test.py");
+    let output=std::process::Command::new("python3").arg("-I").arg(tests)
+        .env("AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY",directory.path().join("native.so")).output().unwrap();
+    let diagnostics=String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(),"native memory lifetime failed: {diagnostics}");
+    assert!(diagnostics.contains("Ran 1 test") && !diagnostics.contains("skipped"),"memory case did not execute: {diagnostics}");
+}
+
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[test]
 fn native_v3_status_component_preserves_protocol_signals_and_inherited_descriptors() {
     let directory=tempfile::tempdir().unwrap();
     for (name,bytes) in [("native.so",CARGO_EXEC_DENIAL_LIBRARY),("ci_cargo_status_proxy",CARGO_STATUS_PROXY)] {
@@ -747,6 +764,8 @@ async fn live_shared_ci_vfork_exec_boundary()->Result<()> {
     let root=fixture.path();
     for (name,bytes) in [("native.so",CARGO_EXEC_DENIAL_LIBRARY),("producer",CARGO_VFORK_PRODUCER),
         ("proxy",CARGO_VFORK_PROXY),("wrong",CARGO_EXEC_STATIC),("cases.py",CARGO_VFORK_CASES),
+        ("ci_cargo_vfork_exec_cases.py",CARGO_VFORK_CASES),
+        ("memory-cases.py",include_bytes!("ci_cargo_exec_memory_cases.py").as_slice()),
         ("provider-supervisor.py",include_bytes!("../../../scripts/provider-supervisor.py").as_slice()),
         ("ci-cargo-planner.py",include_bytes!("../../../scripts/ci-cargo-planner.py").as_slice()),
         ("ci-cargo-relay.py",include_bytes!("../../../scripts/ci-cargo-relay.py").as_slice()),
@@ -786,6 +805,21 @@ for mode in ('finish','signal','wrong-image','cancel','listener-loss','productio
   assert row['cloexec_closed_at_exec_stop'] and row['image_accepted']==(mode!='wrong-image')
  else:assert row['parent_released_before_proxy_termination'] is False
  results[mode]=row
+receipt='/workspace/target/memory-lifetime-cleanup'
+result=subprocess.run([sys.executable,'-I','/workspace/memory-cases.py','/workspace/ci-cargo-planner.py',
+ '/workspace/provider-supervisor.py','/workspace/target/native.so','/workspace/target/producer',
+ '/workspace/target/proxy','/workspace/target/wrong',receipt],capture_output=True,text=True,timeout=15)
+assert result.returncode==0,(result.stdout,result.stderr)
+lines=result.stdout.splitlines();assert lines[:-1]==['PROXY_OUTPUT']
+assert result.stderr=='PROXY_ERROR\n'
+row=json.loads(lines[-1])
+for field in ('pre_exec_fd_mutated_shared_parent','post_exec_old_fd_mutated_original_parent',
+ 'old_parent_value_restored','original_cleanup','native_exec_stop','parent_released_before_proxy_termination'):
+ assert row[field] is True,(field,row)
+assert row['post_exec_reopened_child_fd_old_address_errno']==5
+assert row['complete_writer_closure'] is False and row['full_ci_pass'] is False and row['shipping_authority'] is False
+assert pathlib.Path(receipt).read_bytes()==b'all-descendants-reaped\n'
+results['memory-lifetime']=row
 print(json.dumps(results))
 PY"#;
     let result=session.run("repository",&source,root,&binding,None,&[],&[],&[],Some(command),
@@ -795,7 +829,7 @@ PY"#;
         "version":1,"kind":"real_shared_ci_vfork_exec_boundary","head":head,"generation":source.generation(),
         "status":result.status,"cases":cases,"actual_vm_commands":1,"input_closure_complete":false,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
-    ensure!(result.status=="passed" && cases.as_object().is_some_and(|cases|cases.len()==6),
+    ensure!(result.status=="passed" && cases.as_object().is_some_and(|cases|cases.len()==7),
         "vfork boundary unavailable: {} {}",result.stdout,result.stderr);
     Ok(())
 }
