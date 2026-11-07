@@ -98,6 +98,29 @@ class ContainedPipeDiagnosticTests(unittest.TestCase):
             os.write(writer,b'later');self.assertEqual(os.read(reader,5),b'later')
         finally:os.close(reader);os.close(writer)
 
+    def test_frozen_reader_is_found_after_forwarded_descriptors_close(self):
+        import signal
+        reader,writer=os.pipe2(os.O_CLOEXEC);child=None
+        try:
+            data=b'failure behind stopped parent\xff';identity=os.fstat(writer)
+            child=subprocess.Popen([sys.executable,'-c',"import os,signal,time;os.kill(os.getpid(),signal.SIGSTOP);time.sleep(30)"],
+                pass_fds=(reader,),stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            _,status=os.waitpid(child.pid,os.WUNTRACED);self.assertTrue(os.WIFSTOPPED(status))
+            fields=Path(f'/proc/{child.pid}/stat').read_text().rsplit(')',1)[1].split()
+            cohort={'tasks':[{'pid':child.pid,'tid':child.pid,'birth':int(fields[19])}]}
+            os.write(writer,data);os.close(writer);writer=None
+            def stopped():
+                current=Path(f'/proc/{child.pid}/stat').read_text().rsplit(')',1)[1].split()
+                self.assertEqual(current[0],'T');self.assertEqual(current[19],fields[19])
+            value=planner.frozen_reader_pipe_diagnostic({'type':stat.S_IFIFO,'device':identity.st_dev,'inode':identity.st_ino},cohort,stopped)
+            self.assertEqual(value['status'],'sampled');self.assertFalse(value['complete_stream'])
+            self.assertEqual(bytes.fromhex(value['sample_hex']),data)
+            self.assertEqual(os.read(reader,4096),data);self.assertEqual(os.read(reader,4096),b'')
+        finally:
+            os.close(reader)
+            if writer is not None:os.close(writer)
+            if child is not None:child.kill();child.wait(timeout=5)
+
     def test_regular_file_is_not_read_or_repositioned(self):
         with tempfile.TemporaryFile() as stream:
             stream.write(b'private file');stream.flush();stream.seek(3)

@@ -655,12 +655,19 @@ frozen parent, so the outer repository record alone cannot recover that failure.
 After checking that child's original cleanup marker/raw status and settling its
 existing credit/signal cleanup gates, the unit relay rechecks its actual parent's frozen cohort and records a non-consuming snapshot
 of available stdout/stderr pipe bytes in the same private command directory.
-It temporarily opens a reader for the exact FIFO identity and uses nonblocking
-`tee` into a bounded private pipe, closing every new descriptor before returning.
+It saves only FIFO identities before the launcher closes forwarded descriptors.
+After cleanup it finds an exact matching reader in the actual frozen task cohort,
+checks the original task birth and FIFO identity, then uses nonblocking `tee` into
+a bounded private pipe. It retains no extra writer descriptor during execution
+and closes every newly opened reader/scratch descriptor before returning.
 It never consumes the original pipe, changes its flags, reads regular files/sockets,
 thaws a parent or acknowledges a child result. The sample is at most 32 KiB (the
 kernel may return less); it is always marked `complete_stream:false`, including
 empty or unavailable observations. Sample digests cover sampled bytes only.
+The original command/global request ordinal keys `contained-output-<ordinal>.json`;
+it binds the original Binding, parent/child scope IDs and verified raw return code.
+It uses the repository diagnostic's same first-record/identical-replay rule; a
+collision or changed record is refused rather than replacing an earlier child.
 The record keeps all input-closure/full-CI/shipping flags false and is diagnostic
 data, never an input census, nonrelease, policy classification or cleanup grant.
 If this observation refuses, its original private scope retains only a bounded

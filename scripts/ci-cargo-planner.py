@@ -1694,7 +1694,8 @@ class RootRelay:
         if started and transport is not None:self.ordinals.credits.finish_root(value['ordinal'])
 
     def unit_signal_drained(self,value,transport,started):pass
-    def unit_failed_output(self,value,directory,raw,descriptors):pass
+    def unit_output_context(self,descriptors):pass
+    def unit_failed_output(self,value,directory,raw,context):pass
 
     def unit_started(self,value,directory):pass
     def unit_finished(self,value,record):pass
@@ -1709,7 +1710,7 @@ class RootRelay:
             'ordinal':ordinal,'deadline':deadline,'library':str(self.library),'numbers':numbers,
             'extras':descriptors[4:]}
         view=None;bootstrap=None;child=None;pidfd=None;relay_fd=None;transport=None;launch=None;cancelled=False;ready=False;sealed=False;authorized=False;started=False
-        signal_count=0;cancelled_at=None;control_eof=False;original_pid=None
+        signal_count=0;cancelled_at=None;control_eof=False;original_pid=None;output_context=None
         try:
             request=payload(descriptors[0]);context,relay_fd=self.request_context(ordinal,request)
             if relay_fd is not None:
@@ -1753,6 +1754,7 @@ class RootRelay:
             bootstrap=_sealed(value)
             argv=[sys.executable,'-I',str(Path(__file__).resolve()),'--unit',
                 *map(str,(bootstrap,descriptors[0],cancel,release,exec_release,child_control.fileno()))]
+            output_context=self.unit_output_context(descriptors[2:4])
             child=subprocess.Popen(argv,stdin=descriptors[1],stdout=descriptors[2],stderr=descriptors[3],
                 pass_fds=tuple([bootstrap,*descriptors,cancel,release,exec_release,child_control.fileno(),*(() if relay_fd is None else (relay_fd,))]),
                 env={'PATH':os.defpath,'JARVIS_SUPERVISOR_PARENT_PID':str(os.getpid())})
@@ -1839,7 +1841,7 @@ class RootRelay:
             if transport is not None:transport.check()
             # Use the same fully drained boundary as effect inspection. Credit
             # and signal cleanup are settled; the parent is still frozen.
-            if started and raw!=0:self.unit_failed_output(value,directory,raw,descriptors)
+            if started and raw!=0:self.unit_failed_output(value,directory,raw,output_context)
             if view is not None:
                 phase[0]='planner_view_publish';self.views.finish(view,directory,raw)
             self.completed.append({'ordinal':ordinal,'uid':execution_identity(value),'started':started,
@@ -2567,13 +2569,20 @@ class UnitPeerRelay(RootRelay):
             raise FreshnessHold('cleanup_uncertain')
         self.staged_signals.child_drained(value['ordinal'],transport.staged_signals)
 
-    def unit_failed_output(self,value,directory,raw,descriptors):
+    def unit_output_context(self,descriptors):
+        self.freezer.check_frozen_cohort()
+        return [{'type':stat.S_IFMT(info.st_mode),'device':info.st_dev,'inode':info.st_ino}
+            for info in map(os.fstat,descriptors)]
+
+    def unit_failed_output(self,value,directory,raw,context):
         phase='frozen_before'
         try:
             record=self.active_record
             if record is None or record['last_request_ordinal']!=value['ordinal']:raise FreshnessHold('generation_mismatch')
             self.freezer.check_frozen_cohort();phase='sample'
-            output=nonconsuming_pipe_diagnostic(descriptors[2]);error=nonconsuming_pipe_diagnostic(descriptors[3])
+            if type(context) is not list or len(context)!=2:raise FreshnessHold('metadata_torn')
+            output=frozen_reader_pipe_diagnostic(context[0],self.freezer.paused_cohort,self.freezer.check_frozen_cohort)
+            error=frozen_reader_pipe_diagnostic(context[1],self.freezer.paused_cohort,self.freezer.check_frozen_cohort)
             phase='persist'
             retain_private_diagnostic(self.admission.target/('.jobserver-credit-'+self.admission.command)/('contained-output-'+str(value['ordinal'])+'.json'),{
                 'version':1,'kind':'ci-contained-output-pipe-diagnostic','binding':self.admission.binding,'command':self.admission.command,
@@ -3603,6 +3612,39 @@ def validate_invocation(argv,environment,cwd):
             or environment.get('CARGO_HOME')!='/ci-cargo-home'):
         raise cargo_hold('planner_cargo_request')
     return {'argv':list(argv),'environment':dict(environment),'cwd':cwd}
+
+
+def frozen_reader_pipe_diagnostic(identity,cohort,check):
+    """Use an existing stopped reader after forwarded launcher FDs are closed.
+
+    No original writer FD is retained across child execution. The caller owns
+    the actual frozen-parent fence; identities/records alone grant nothing.
+    """
+    check()
+    unavailable={'status':'reader_unavailable','complete_stream':False}
+    if identity['type']!=stat.S_IFIFO:return {'status':'not_a_pipe','complete_stream':False}
+    visited=0
+    for task in cohort['tasks']:
+        process=Path('/proc')/str(task['pid'])/'task'/str(task['tid'])
+        try:
+            fields=(process/'stat').read_text().rsplit(')',1)[1].split()
+            if int(fields[19])!=task['birth']:return unavailable
+            for path in (process/'fd').iterdir():
+                visited+=1
+                if visited>4096:return unavailable
+                info=path.stat()
+                if (info.st_dev,info.st_ino,stat.S_IFMT(info.st_mode))!=(identity['device'],identity['inode'],stat.S_IFIFO):continue
+                metadata=(process/'fdinfo'/path.name).read_text().splitlines()
+                flags=int(next(line.split()[1] for line in metadata if line.startswith('flags:')),8)
+                if flags&os.O_ACCMODE not in (os.O_RDONLY,os.O_RDWR):continue
+                descriptor=os.open(path,os.O_RDONLY|os.O_NONBLOCK|os.O_CLOEXEC)
+                try:
+                    actual=os.fstat(descriptor)
+                    if (actual.st_dev,actual.st_ino,stat.S_IFMT(actual.st_mode))!=(identity['device'],identity['inode'],stat.S_IFIFO):return unavailable
+                    check();value=nonconsuming_pipe_diagnostic(descriptor);check();return value
+                finally:os.close(descriptor)
+        except OSError:return unavailable
+    check();return unavailable
 
 
 def nonconsuming_pipe_diagnostic(descriptor):

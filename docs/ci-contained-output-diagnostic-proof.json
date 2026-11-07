@@ -64,7 +64,7 @@
   },
   "scope": "Failed contained child only, after original status/cleanup validation and while original parent frozen. Nonblocking tee copies only currently available pipe bytes into private scratch; does not consume original bytes or change original FD flags. Actual host child tests preserve bytes, flags, FD count and EOF. Regular files/sockets are not read. All extra FDs close before return.",
   "limits": [
-    "Fresh changed-code guest pipe snapshot replay not yet recorded",
+    "Final descriptor-lifetime guest validation is pending; earlier probe failures are explicitly retained below",
     "Sampling may return less than 32 KiB; complete_stream always false and digests cover sample only",
     "No final stdio-fidelity authority for parent-loss/external-alias races",
     "No source/resource/input, cleanup, policy-disposition, materialization, resume or reusable publication permission",
@@ -73,5 +73,67 @@
   "input_closure_complete": false,
   "full_ci": false,
   "shipping_authority": false,
-  "full_goal_complete": false
+  "full_goal_complete": false,
+  "descriptor_lifetime_fix": {
+    "source_parent_commit": "1bae97c6b196d56f6c093f13d7c0786175f8b4ab",
+    "observed_failure": {
+      "probe_session": 34958,
+      "source_commit": "1bae97c6b196d56f6c093f13d7c0786175f8b4ab",
+      "seconds": 116.74,
+      "inspection_session": 34910,
+      "inspection": "/tmp/autoship-ci-drained-output-inspection-20261107.json",
+      "private_error_stage": "sample",
+      "private_error_category": "IndexError",
+      "child_verified_returncode": 1,
+      "credit_returned": true,
+      "parent_resume_held": true,
+      "root_cause": "Launcher closes and clears received descriptors immediately after Popen; cleanup callback cannot index them later"
+    },
+    "fix": "Capture only pipe identities before launcher closes forwarded FDs; locate matching reader in actual frozen task cohort after cleanup and check original task birth/pipe identity. No extra writer is retained during child execution.",
+    "tdd_red": "/tmp/autoship-ci-contained-output-descriptor-lifetime-red-20261107.log",
+    "focused": {
+      "tests_run": 9,
+      "failed": 0,
+      "log": "/tmp/autoship-ci-contained-output-descriptor-lifetime-focused-20261107.log",
+      "actual_stopped_process_and_closed_writer": true
+    },
+    "python_suite": {
+      "session": 43096,
+      "tests_run": 696,
+      "passed": 653,
+      "skipped": 43,
+      "failed": 0,
+      "seconds": 35.449,
+      "log": "/tmp/autoship-ci-contained-output-descriptor-lifetime-python-20261107.log"
+    },
+    "rust_shared_ci": {
+      "session": 83111,
+      "passed": 36,
+      "ignored": 26,
+      "failed": 0,
+      "seconds": 18.86,
+      "log": "/tmp/autoship-ci-contained-output-descriptor-lifetime-rust-20261107.log"
+    },
+    "sources": [
+      {
+        "path": "docs/ci-opaque-producers.md",
+        "sha256": "ad24985061ebc7d1c8d1593764858d9774f17f6c7d1775f1add7f9fb404196e1"
+      },
+      {
+        "path": "scripts/ci-cargo-planner.py",
+        "sha256": "cc8d36092168b8e731a83b73ffa86c16cda162dbfd69c4cd23433304998a7c36"
+      },
+      {
+        "path": "scripts/tests/ci_repository_result_test.py",
+        "sha256": "f2cec7960feb56fa8b6bade25af8efcd090244f0a6469505d682ef697c1c0ebb"
+      }
+    ],
+    "source_inventory_is_post_run_inventory": true,
+    "source_generation_authority": false,
+    "guest_validation": "pending fresh changed-code probe",
+    "spec_audit": {
+      "relevant_wrong_build_or_forced_guess_findings": 0,
+      "scope": "new diagnostic paragraphs only; no full mechanism handoff, independent code review or activation approval"
+    }
+  }
 }
