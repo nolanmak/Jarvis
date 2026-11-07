@@ -3578,6 +3578,41 @@ def validate_invocation(argv,environment,cwd):
     return {'argv':list(argv),'environment':dict(environment),'cwd':cwd}
 
 
+def retain_repository_result(path,binding,command,returncode,output,error):
+    """Private bounded diagnostics only; never input/cleanup/publication proof.
+
+    Original pipes are already drained by capture_command. Snapshot their bytes
+    without decoding or changing the command's streams/status. Preserve the
+    first observation even if reporting/reconciliation is interrupted.
+    """
+    if (type(returncode) is not int or not -64<=returncode<=255
+            or type(output) is not bytes or type(error) is not bytes
+            or len(output)+len(error)>8*1024**2):raise FreshnessHold('input_census_unknown')
+    def stream(data):
+        split=min(len(data),32768)
+        return {'size_bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),
+            'prefix_hex':data[:split].hex(),'suffix_hex':data[max(split,len(data)-32768):].hex(),
+            'truncated':len(data)>65536}
+    value={'version':1,'kind':'ci-repository-result-diagnostic','binding':binding,'command':command,
+        'returncode':returncode,'stdout':stream(output),'stderr':stream(error),
+        'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+    encoded=json.dumps(value,sort_keys=True,separators=(',',':')).encode()
+    if len(encoded)>512*1024:raise FreshnessHold('metadata_torn')
+    path=Path(path);parent=path.parent.lstat()
+    if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid!=os.geteuid()
+            or stat.S_IMODE(parent.st_mode)!=0o700):raise FreshnessHold('metadata_torn')
+    try:fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
+    except FileExistsError:
+        if cache._read_record(path,max_bytes=512*1024)!=value:raise FreshnessHold('metadata_torn')
+        return value
+    with os.fdopen(fd,'wb') as target:
+        target.write(encoded);target.flush();os.fsync(target.fileno())
+    directory=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:os.fsync(directory)
+    finally:os.close(directory)
+    return value
+
+
 def capture_command(child,deadline,*,limit=8*1024**2):
     """Bound original Cargo streams while they are produced, not after EOF."""
     output={'stdout':bytearray(),'stderr':bytearray()};size=0
@@ -5156,6 +5191,10 @@ def _execute_repository(arguments):
             original_launch.close();original_launch=None
             worker.worker_freezer._note('original_worker_granted')
             output,error=capture_command(child,value['deadline']);original_cargo_cleanup(supervisor_receipt)
+            # Keep the original failure before a typed planner hold suppresses
+            # the public result. This private snapshot grants no CI authority.
+            retain_repository_result(worker_admission.target/('.jobserver-credit-'+value['command'])/'repository-command-result.json',
+                value['binding'],value['command'],child.returncode,output,error)
             worker.drain();planner.drain()
             if worker.errors or planner.errors:raise FreshnessHold('input_census_unknown')
             worker.worker_freezer.drained(worker.original_worker_entry['entry']['pid']);worker.worker_freezer.close()

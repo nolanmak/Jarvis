@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "kind": "private-repository-command-result-diagnostic",
+  "source_parent_commit": "fdca35a09f82465c74703d0e12d4783b9a0292ac",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "docs/ci-opaque-producers.md",
+      "sha256": "411fa199cc3e8ad47043ddbb2d5162bcf98987717fbf694c8e020172d4e2b97b"
+    },
+    {
+      "path": "scripts/ci-cargo-planner.py",
+      "sha256": "b872701b1e132ac7b78b8252aaf45db0b1d9832ddbbc227aeb91469d721bfef6"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_dispatch_test.py",
+      "sha256": "f56adddb9a61d9e70719cb0f9b33a6479eff3804d24d52a285ad5dc134d8d151"
+    },
+    {
+      "path": "scripts/tests/ci_cargo_views_test.py",
+      "sha256": "199efc38cfde19dacdaa43fdea0b10ed79c1d6a8f8cd4e08e935ace29be40684"
+    },
+    {
+      "path": "scripts/tests/ci_repository_result_test.py",
+      "sha256": "41a66ebb6a17041e821a1dc2568f1609856d2adec1a02f3b83265303b50f7617"
+    }
+  ],
+  "initial_retained_failure": {
+    "source_commit": "fdca35a09f82465c74703d0e12d4783b9a0292ac",
+    "fixture": "live_shared_ci_repository_worker_pause",
+    "result": "input_census_unknown",
+    "worker_freeze_verified": true,
+    "nested_child_ordinal": 7,
+    "nested_child_returncode": 1,
+    "parent_resume_held": true,
+    "effects_materialized": false,
+    "read_only_extraction_session": 69256,
+    "managed_cache_lease_used": true,
+    "extracted_record": "/tmp/autoship-1703-retained-worker-failure-20261107.json"
+  },
+  "tdd_red": {
+    "log": "/tmp/autoship-ci-repository-result-red-20261107.log",
+    "result": "missing retention API; 5 tests, 8 errors including parameter subcases"
+  },
+  "verification": {
+    "focused": {
+      "log": "/tmp/autoship-ci-repository-result-focused-20261107.log",
+      "tests_run": 5,
+      "failed": 0,
+      "seconds": 0.026
+    },
+    "ci_python_suite": {
+      "session": 45824,
+      "log": "/tmp/autoship-ci-repository-result-final-python-suite-20261107.log",
+      "tests_run": 692,
+      "passed": 649,
+      "skipped": 43,
+      "failed": 0,
+      "seconds": 35.178,
+      "managed_build_lease": true
+    },
+    "embedded_test_binary_build": {
+      "session": 86554,
+      "result": "terminal0",
+      "log": "/tmp/autoship-ci-repository-result-build-20261107.log",
+      "seconds": 73,
+      "compiler_artifacts": "/tmp/autoship-ci-repository-result-artifacts-20261107.jsonl"
+    },
+    "rust_shared_ci": {
+      "session": 62115,
+      "log": "/tmp/autoship-ci-repository-result-shared-ci-rust-20261107.log",
+      "passed": 36,
+      "failed": 0,
+      "ignored": 26,
+      "seconds": 19.18
+    }
+  },
+  "scope": "Retain unchanged captured binary stdout/stderr as bounded private diagnostics before public typed holds, without modifying stream descriptors/status or authority. Original contained-transfer hold remains. Two socket fixtures preserve their actual checks under managed long scratch paths via directory descriptors.",
+  "limits": [
+    "Fresh changed-code guest replay not yet recorded in this artifact",
+    "No effect copy-back or parent resume enabled",
+    "No full source/resource/trusted input proof or CI publication/reuse authority",
+    "No deployment, daemon reset, new hosted merge signal or autonomous merge claim"
+  ],
+  "input_closure_complete": false,
+  "full_ci": false,
+  "shipping_authority": false,
+  "full_goal_complete": false
+}

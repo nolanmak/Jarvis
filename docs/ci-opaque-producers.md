@@ -633,6 +633,23 @@ epochs, original identities and origin in the intent; validate both after pause.
 Replay accepts its own committed next epoch, while an unrelated later epoch or
 changed affected destination holds without overwrite.
 
+The original repository command now retains a private `repository-command-result.json`
+in its existing command-owned jobserver-credit directory after its original supervisor
+cleanup check and before planner holds suppress the public result. It records the
+unchanged supervisor return code and each already-captured stdout/stderr stream's full
+byte count and SHA-256, with at most 32 KiB at each edge encoded as hex. Binary bytes
+are not decoded into controller fields; omitted middle bytes are explicit. The
+existing combined 8 MiB capture ceiling is unchanged, and the record is bounded to
+512 KiB. No pipe, descriptor, stream ordering or caller output is replaced.
+
+The first diagnostic is created privately and never overwritten. An identical retry
+reuses it; changed, linked, incomplete or foreign data refuses replacement. It is
+inspection data only, retaining false input-closure/full-CI/shipping flags. It grants
+no cleanup receipt, effect materialization, parent resume, artifact reuse or kernel
+policy disposition. Inspect it only under the existing managed cache lease. This
+closes the missing failure-output observation before the next original worker replay;
+the deliberate contained-effect-transfer hold and every O1–O6/final-C gate remain.
+
 ### O4. Preserve bounded execution and cancellation
 
 Use one controller-owned ordinal/request budget across all relays, preserving

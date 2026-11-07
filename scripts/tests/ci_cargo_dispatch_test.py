@@ -91,7 +91,12 @@ class PathnameSocketTests(unittest.TestCase):
                 # A short alias exercises the same inode via a different name.
                 alias=Path(directory)/'alias';alias.symlink_to(root,target_is_directory=True)
                 with socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET) as client:
-                    client.connect(str(alias/'relay.sock'))
+                    # Managed build scratch may itself exceed sun_path. Keep
+                    # the real pathname socket and alias, with a short dirfd
+                    # spelling independent of the cache parent's path length.
+                    directory_fd=os.open(alias,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+                    try:client.connect(f'/proc/self/fd/{directory_fd}/relay.sock')
+                    finally:os.close(directory_fd)
                     connection,_=server.accept()
                     with connection:connection.sendall(b'bound')
                     self.assertEqual(client.recv(16),b'bound')

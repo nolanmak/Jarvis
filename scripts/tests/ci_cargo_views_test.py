@@ -177,7 +177,10 @@ class UnitViewTests(unittest.TestCase):
             source.chmod(0o700);raw.unlink()
             endpoint=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
             try:
-                endpoint.bind(str(raw));source.chmod(0o555)
+                directory_fd=os.open(source,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+                try:endpoint.bind(os.fsencode(f'/proc/self/fd/{directory_fd}/')+os.fsencode(raw.name))
+                finally:os.close(directory_fd)
+                source.chmod(0o555)
                 with self.assertRaises(views.FreshnessHold):views.inventory(source,owner=os.getuid(),sealed=True)
             finally:endpoint.close()
             source.chmod(0o700);raw.unlink();(source/'deps/input').chmod(0o4444);source.chmod(0o555)
