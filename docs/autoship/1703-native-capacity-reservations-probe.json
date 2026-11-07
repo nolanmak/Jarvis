@@ -21,7 +21,8 @@
     "Every actual ProcessGroup claims one admission attempt before its first await, callback or model charge. Failure, cancellation and prior successful release cannot reactivate that same supervisor; a fresh guarded invocation needs a new supervisor.",
     "A returned fresh launch dropped without any supervisor attempt records native_launch_abandoned_before_spawn through its actual original object. It retains runtime data, aliases and existing uncertainty behavior.",
     "Fresh preparation captures its actual directory descriptor before durable intent publication. The observation validates that original inode, selected policy/store, effective owner, creation bytes and metadata-only inventory under native locks. Copied ownership bytes in a replacement directory refuse.",
-    "Historical launch-reference verification grants no authority and can record teardown under owner pause. Productive launch-reference verification retains its two live dispatch checks. Pauses, model spend and merge allowance remain unchanged."
+    "Historical launch-reference verification grants no authority and can record teardown under owner pause. Productive launch-reference verification retains its two live dispatch checks. Pauses, model spend and merge allowance remain unchanged.",
+    "A real successor setup NoPending refusal persists a setup-bound retry deadline in the workflow event journal. Reopening the database preserves it; immediate duplicates do not extend it. Existing pending transfers reconcile before retry scheduling and completed transfers return before backoff."
   ],
   "validation": {
     "red": {
@@ -164,6 +165,27 @@
       ],
       "preservation": "Original runtime and requested aliases remain. Exact creation JSON text is retained in the protected observation. All fixtures have zero model admissions.",
       "authority_limit": "Observation only; no runtime retirement, byte/count credit, original-input nonrelease/replay or coding capability. Does not cover constructor errors before returning Launch, uncertain publication replies or already-attempted supervisors. Those still require genuine producer/consumer settlement."
+    },
+    "successor_setup_retry": {
+      "test": "self_improve::workflow::tests::owner_successor_native_no_pending_refusal_persists_retry",
+      "red": "Actual Codex setup reached NoPending with next_eligible_ms None; assertion failed.",
+      "red_log": "/tmp/autoship-owner-successor-retry-original-red-20261107.log",
+      "green": "Both actual Codex and Claude metadata-recovery/setup fixtures passed. Covers failed journal insertion rollback, durable reopen, duplicate refusal idempotence, deferred controller entry, unchanged checkpoint/accounting, malformed history, expired authorization/lease and owner pause.",
+      "green_log": "/tmp/autoship-owner-successor-retry-green-20261107.log",
+      "result": "1 passed; 0 failed; both provider fixture markers required; 50.94s",
+      "scheduling": "Shares existing native 5/10/20/40/60 minute delay. Journal is canonical, bounded, predecessor-linked and bound to the live setup reference, current native facts and original failure fingerprint.",
+      "full_cli": {
+        "result": "1960 passed; 0 failed; 34 ignored; 421.86s",
+        "log": "/tmp/autoship-owner-successor-retry-cli-20261107.log"
+      },
+      "production_check": {
+        "result": "passed; 20.83s",
+        "log": "/tmp/autoship-owner-successor-retry-production-20261107.log"
+      },
+      "live_readiness": {
+        "log": "/tmp/autoship-owner-successor-retry-live-readiness-20261107.json",
+        "result": "Still capacity-exhausted: eight retained sessions; required reserved bytes 9663676416 exceeds maximum 8589934592; live_verified false. No rollout or retirement performed."
+      }
     }
   },
   "limits": [
@@ -172,7 +194,8 @@
     "Main 4b0b246 is integrated with the original-ledger protocol. Main FreshUnreleasedRuntime path-based disposal cannot replace durable intent settlement on this branch. Constructor failures at/after publication and post-prepare nonrelease disposal still require an original-intent-aware join before recovery rollout.",
     "Productive successor owner guard and full source/resource/input closure plus CLI/Discord/fault/soak acceptance remain open.",
     "Single-use supervisor admission does not settle durable native intent or prove safe physical disposal; original-intent-aware post-prepare nonrelease remains unfinished.",
-    "Original unspawned-lifetime observation is not disposition settlement. Existing uncertainty and conservative census gates remain; interrupted constructor publication, late supervisor nonrelease and all recovery consumers must be joined before physical cleanup."
+    "Original unspawned-lifetime observation is not disposition settlement. Existing uncertainty and conservative census gates remain; interrupted constructor publication, late supervisor nonrelease and all recovery consumers must be joined before physical cleanup.",
+    "Successor retry scheduling neither renews a claim nor reconstructs its opaque setup authority after process loss. If authorization or setup lease expires before the deadline, authenticated setup recovery is still required. This does not implement productive successor construction or prove live automatic recovery; no production capacity was credited."
   ],
   "sources": [
     {
@@ -201,7 +224,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_capacity_retry.rs",
-      "sha256": "91dbcd5af712d7d15b4f40f09545dca0825942516e320135d74662a2a3212341"
+      "sha256": "8d4d6e48f7d989cd3077540a5db6c4cda53262cae464f6819afbda1d4651f658"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
@@ -209,7 +232,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "6116eca6457ae95e048a5047c1204b94db3c71006d78b39da624d7e9ac84ec22"
+      "sha256": "96c120461cf8e35d77606525e971bbbbaf9c00080d7149dfa29e692df7262e27"
     },
     {
       "path": "crates/augmentagent-channel-core/src/codex.rs",
@@ -226,6 +249,18 @@
     {
       "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
       "sha256": "8b1dbfb76a0f9a3abce7b0cb246d6e7621eceea6d9ab83f39f096a6f2a1624cc"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_successor_retry.rs",
+      "sha256": "8a33eaa0a8b6d5998a45d942a216d23261db180faba9fde0d6b72a5f1322f101"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_successor_claim.rs",
+      "sha256": "17daa6cb59f46bc0414b552c8ef80f44c8f851c489c0189019298ae9d621e611"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_successor_transfer.rs",
+      "sha256": "9418749e1bfadb65857540b497a1af9850f3691339649a35e845005b047b5142"
     }
   ],
   "composition_base": "9e58bcc152f32c6db1aa40f1485f030d3e0915af",

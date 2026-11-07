@@ -12,7 +12,7 @@ struct Retry {
     failed_at_ms:i64,
     eligible_at_ms:i64,
 }
-fn delay(failures:u32,native:bool)->i64 {
+pub(super) fn delay(failures:u32,native:bool)->i64 {
     if native {300_000_i64.saturating_mul(1_i64 << failures.saturating_sub(1).min(4)).min(3_600_000)}else{300_000}
 }
 fn fingerprint_valid(value:&str)->bool {

@@ -91,7 +91,7 @@ pub(super) fn require_terminal(conn:&Connection,pending:&PendingNativeHandoff)->
     }
     Ok(())
 }
-fn selected(conn:&Connection,setup:&SuccessorSetup,authorization:&crate::self_improve::targeted::AuthorizedOwnerSuccessor<'_>,now:i64)->Result<Option<PendingNativeHandoff>> {
+pub(super) fn selected(conn:&Connection,setup:&SuccessorSetup,authorization:&crate::self_improve::targeted::AuthorizedOwnerSuccessor<'_>,now:i64)->Result<Option<PendingNativeHandoff>> {
     require_authorized_setup(conn,setup,authorization,now)?;
     let context=history(conn,&setup.record.workflow)?;
     let active:Option<String>=conn.query_row("SELECT transfer_id FROM workflow_native_handoff_pending WHERE workflow=?1",[&setup.record.workflow],|r|r.get(0)).optional()?;

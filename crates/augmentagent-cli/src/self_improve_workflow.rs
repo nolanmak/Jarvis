@@ -512,6 +512,7 @@ fn with_successor_native_metadata(state:&Path,worktree:Option<&Path>,
 
 #[derive(Debug)]
 enum SuccessorNativeSetupRun {
+    Deferred {next_eligible_ms:i64},
     Outcome(durable::native_prepare::NativePreparationRun),
     PersistenceUnknown {reason:augmentagent_channel_core::native_vm::ownership::TransferReason,attempted_transfer:Option<String>},
 }
@@ -541,6 +542,10 @@ fn run_successor_native_setup(store:&Arc<Mutex<WorkflowStore>>,state:&Path,workt
         let audit=existing_native_audit(state,facts.namespace(),Some(worktree),facts.original_binding())?;
         audit.restrict_to_metadata(durable::owner_publication_recovery::successor_native_metadata_fence(store.clone(),setup.clone(),authorization,millis())?)?;
         return Ok(SuccessorNativeSetupRun::Outcome(Run::Registered {original_binding:facts.original_binding().clone()}));
+    }
+    if let Some(next_eligible_ms)=store.lock().map_err(|_|anyhow::anyhow!("successor setup store poisoned"))?
+        .owner_successor_native_retry_due(&setup,authorization,&facts,millis())? {
+        return Ok(SuccessorNativeSetupRun::Deferred {next_eligible_ms});
     }
     let destination=open_audit_generation(state,setup.workflow_id(),Some(worktree),setup.generation())?;
     destination.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:setup.workflow_id().into(),lease_generation:setup.generation()})?;
@@ -577,7 +582,11 @@ fn run_successor_native_setup(store:&Arc<Mutex<WorkflowStore>>,state:&Path,workt
         }
     }).map_err(anyhow::Error::new)?;
     match outcome {
-        PreparedTransferResult::NoPending(failure)=>Ok(SuccessorNativeSetupRun::Outcome(Run::NoPending {failure,next_eligible_ms:None})),
+        PreparedTransferResult::NoPending(failure)=>{
+            let due=store.lock().map_err(|_|anyhow::anyhow!("successor retry store poisoned"))?
+                .defer_owner_successor_native_preparation(&setup,authorization,&facts,&failure,millis())?;
+            Ok(SuccessorNativeSetupRun::Outcome(Run::NoPending {failure,next_eligible_ms:Some(due)}))
+        },
         PreparedTransferResult::PersistenceUnknown {reason,attempted}=>Ok(SuccessorNativeSetupRun::PersistenceUnknown {reason,attempted_transfer:unknown_id.into_inner().or_else(||attempted.map(|intent|intent.request.transfer_id)).or_else(||durable.into_inner().map(|pending|pending.request().transfer_id.clone()))}),
         PreparedTransferResult::Pending {outcome,..}=>{
             let pending=durable.borrow().clone().context("successor durable native intent missing")?;
@@ -4229,7 +4238,15 @@ mod tests {
         }}
         owner_metadata_recovery_modes(&modes.iter().map(String::as_str).collect::<Vec<_>>());
     }
-    fn owner_metadata_recovery_modes(modes:&[&str]) {
+    #[tokio::test]
+    async fn owner_successor_native_no_pending_refusal_persists_retry() {
+        owner_metadata_recovery_modes_with_retry(&[
+            "owner-early-acceptance-producer-metadata-recovery",
+            "owner-early-acceptance-producer-claude-metadata-recovery",
+        ],true);
+    }
+    fn owner_metadata_recovery_modes(modes:&[&str]) {owner_metadata_recovery_modes_with_retry(modes,false)}
+    fn owner_metadata_recovery_modes_with_retry(modes:&[&str],retry:bool) {
         use std::os::unix::fs::PermissionsExt;
         for mode in modes {
         let control=control_dir();let gh=control.path().join("gh-recovery");
@@ -4245,10 +4262,11 @@ elif a[:2]==['api','user']: print(s['actor'])
 else: raise SystemExit('unexpected authority call')
 "#).unwrap();std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(control.path().join("recovery-authority.json"),br#"{"repository":"owner/repo","permission":"WRITE","actor":"owner"}"#).unwrap();
-        let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--test-threads=1"])
+        let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--test-threads=1","--nocapture"])
             .env("AUTOSHIP_INITIAL_GUARD_CHILD",control.path()).env("AUTOSHIP_INITIAL_GUARD_MODE",mode)
-            .env("GH_BIN",&gh).env("XDG_STATE_HOME",control.path().join("operator-state")).env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json")).output().unwrap();
+            .env("JARVIS_TEST_SUCCESSOR_RETRY",if retry {"1"}else{"0"}).env("GH_BIN",&gh).env("XDG_STATE_HOME",control.path().join("operator-state")).env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json")).output().unwrap();
         assert!(output.status.success(),"{mode}: {} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        if retry {assert!(String::from_utf8_lossy(&output.stdout).contains("successor native retry fixture passed"),"actual successor retry fixture did not execute");}
         }
     }
 
@@ -5896,12 +5914,47 @@ else: raise SystemExit('unexpected authority call')
                             assert!(visited && matches!(result,successor_native::PreparedTransferResult::NoPending(_)),"wrong destination did not reach actual scan callback: {result:?}");
                             assert_eq!(store.events(&id).unwrap(),events);
                         }
-                        let before_intent_events=store.events(&id).unwrap();
-                        db.execute_batch("CREATE TRIGGER refuse_successor_native_context BEFORE INSERT ON workflow_owner_successor_native_intent BEGIN SELECT RAISE(ABORT,'injected successor native intent rollback'); END;").unwrap();
-                        let refused=run_successor_native_setup(&setup_store,&state,dir.path(),setup.clone(),&setup_auth).unwrap();
-                        assert!(matches!(refused,SuccessorNativeSetupRun::Outcome(durable::native_prepare::NativePreparationRun::NoPending {..})),"{refused:?}");
-                        assert_eq!(store.events(&id).unwrap(),before_intent_events);assert!(store.owner_successor_pending_transfer(&setup,&setup_auth,millis()).unwrap().is_none());
-                        db.execute_batch("DROP TRIGGER refuse_successor_native_context; CREATE TRIGGER refuse_successor_native_settlement BEFORE INSERT ON workflow_native_handoff_completed BEGIN SELECT RAISE(ABORT,'injected successor native settlement rollback'); END;").unwrap();
+                        if std::env::var("JARVIS_TEST_SUCCESSOR_RETRY").as_deref()==Ok("1") {
+                            let before_intent_events=store.events(&id).unwrap();
+                            let before_retry=millis();
+                            db.execute_batch("CREATE TRIGGER refuse_successor_native_context BEFORE INSERT ON workflow_owner_successor_native_intent BEGIN SELECT RAISE(ABORT,'injected successor native intent rollback'); END;").unwrap();
+                            db.execute_batch("CREATE TRIGGER refuse_successor_retry BEFORE INSERT ON workflow_event WHEN NEW.kind='owner_successor_native_preparation_retry' BEGIN SELECT RAISE(ABORT,'injected retry rollback'); END;").unwrap();
+                            assert!(run_successor_native_setup(&setup_store,&state,dir.path(),setup.clone(),&setup_auth).is_err());
+                            assert_eq!(store.events(&id).unwrap(),before_intent_events,"failed retry persistence must roll back");
+                            db.execute_batch("DROP TRIGGER refuse_successor_retry;").unwrap();
+                            let refused=run_successor_native_setup(&setup_store,&state,dir.path(),setup.clone(),&setup_auth).unwrap();
+                            let (due,failure)=match refused {
+                                SuccessorNativeSetupRun::Outcome(durable::native_prepare::NativePreparationRun::NoPending {next_eligible_ms,failure})=>(next_eligible_ms.expect("real no-pending successor refusal must persist retry eligibility"),failure),
+                                other=>panic!("unexpected successor refusal: {other:?}"),
+                            };
+                            assert!(due>=before_retry+300_000 && due<=millis()+300_000);
+                            assert!(store.events(&id).unwrap().len()>before_intent_events.len());
+                            assert_eq!(store.snapshot(&id).unwrap().unwrap(),before_native_transfer,"retry changed workflow, accounting or progress");
+                            assert!(store.owner_successor_pending_transfer(&setup,&setup_auth,millis()).unwrap().is_none());
+                            store.validate_owner_successor_setup(&setup,&setup_auth,millis()).unwrap();
+                            let after_retry=store.events(&id).unwrap();
+                            let basis=store.owner_successor_native_facts(&setup,&setup_auth,millis()).unwrap();
+                            assert_eq!(store.defer_owner_successor_native_preparation(&setup,&setup_auth,&basis,&failure,millis()).unwrap(),due);
+                            assert_eq!(store.events(&id).unwrap(),after_retry,"repeated refusal extended backoff");
+                            let mut reopened=WorkflowStore::open(&state).unwrap();
+                            assert_eq!(reopened.owner_successor_native_retry_due(&setup,&setup_auth,&basis,millis()).unwrap(),Some(due));
+                            assert!(matches!(run_successor_native_setup(&setup_store,&state,dir.path(),setup.clone(),&setup_auth).unwrap(),SuccessorNativeSetupRun::Deferred {next_eligible_ms} if next_eligible_ms==due));
+                            assert_eq!(store.events(&id).unwrap(),after_retry,"deferred setup repeated native preparation");
+                            assert!(reopened.owner_successor_native_retry_due(&setup,&setup_auth,&basis,due).is_err(),"timer revived expired authorization or setup lease");
+                            let (seq,raw):(i64,String)=db.query_row("SELECT seq,payload FROM workflow_event WHERE workflow=?1 AND kind='owner_successor_native_preparation_retry'",[&id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                            db.execute("UPDATE workflow_event SET payload='{}' WHERE workflow=?1 AND seq=?2",rusqlite::params![id,seq]).unwrap();
+                            assert!(reopened.owner_successor_native_retry_due(&setup,&setup_auth,&basis,millis()).is_err(),"malformed retry journal was accepted");
+                            db.execute("UPDATE workflow_event SET payload=?3 WHERE workflow=?1 AND seq=?2",rusqlite::params![id,seq,raw]).unwrap();
+                            assert_eq!(store.events(&id).unwrap(),after_retry);
+                            let control=store.owner_control(&id).unwrap().unwrap();
+                            store.set_owner_pause(&id,"fixture-owner",control.revision,true,millis()).unwrap();
+                            let paused_events=store.events(&id).unwrap();
+                            assert!(reopened.owner_successor_native_retry_due(&setup,&setup_auth,&basis,millis()).is_err());
+                            assert!(reopened.defer_owner_successor_native_preparation(&setup,&setup_auth,&basis,&failure,millis()).is_err());
+                            assert_eq!(store.events(&id).unwrap(),paused_events,"retry changed owner pause");
+                            println!("successor native retry fixture passed: {mode}");return;
+                        }
+                        db.execute_batch("CREATE TRIGGER refuse_successor_native_settlement BEFORE INSERT ON workflow_native_handoff_completed BEGIN SELECT RAISE(ABORT,'injected successor native settlement rollback'); END;").unwrap();
                         setup_store.lock().unwrap().test_lose_recovery_commit_ack();
                         let transferred=run_successor_native_setup(&setup_store,&state,dir.path(),setup.clone(),&setup_auth).unwrap();
                         assert!(matches!(transferred,SuccessorNativeSetupRun::Outcome(durable::native_prepare::NativePreparationRun::Pending {outcome:successor_native::TransferOutcome::Completed(_),settlement:None,settlement_failed:true,..})),"{transferred:?}");

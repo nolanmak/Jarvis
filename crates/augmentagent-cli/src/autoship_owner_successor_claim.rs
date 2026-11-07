@@ -5,6 +5,8 @@ mod native;
 pub(crate) use native::{SuccessorPreparationRead,metadata_fence as successor_native_metadata_fence};
 #[path="autoship_owner_successor_transfer.rs"]
 mod transfer;
+#[path="autoship_owner_successor_retry.rs"]
+mod retry;
 pub(crate) use transfer::{SuccessorNativePersistence,SnapshotContext as SuccessorNativeSnapshotContext};
 pub(super) fn require_transfer_context(conn:&Connection,setup:&SuccessorSetup,authorization:&crate::self_improve::targeted::AuthorizedOwnerSuccessor<'_>,pending:&PendingNativeHandoff,now:i64)->Result<()> {transfer::require_context(conn,setup,authorization,pending,now)}
 pub(super) fn require_terminal_transfer(conn:&Connection,pending:&PendingNativeHandoff)->Result<()> {transfer::require_terminal(conn,pending)}
