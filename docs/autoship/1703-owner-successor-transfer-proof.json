@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "kind": "live-successor-native-transfer",
+  "code_head": "bbe1a4aa2007cc1d8c4f4db44f4ac3cd6561ade7",
+  "initial_red": {
+    "log": "/tmp/autoship-owner-successor-transfer-red-20261107.log",
+    "seconds": 22.38,
+    "observation": "Actual original recovery/readiness/setup fixture reached the missing native transfer producer and failed."
+  },
+  "initial_integration_failure": {
+    "log": "/tmp/autoship-owner-successor-transfer-green-20261107.log",
+    "seconds": 22.89,
+    "observation": "Fresh destination audit lacked its initial protected controller record. Fixed by initializing only the new destination; retries and registered namespaces require existing sealed audit authority."
+  },
+  "verification": [
+    {
+      "kind": "expanded-recovery-transfer-guards",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 136.23,
+      "log": "/tmp/autoship-owner-successor-transfer-guards-20261107.log",
+      "filter": "expired_owner_publication_has_authenticated_metadata_recovery"
+    },
+    {
+      "kind": "shared-native-observation",
+      "passed": 105,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 207.92,
+      "log": "/tmp/autoship-owner-successor-transfer-native-observation-20261107.log",
+      "filter": "autoship_workflow::native_observation::tests::"
+    },
+    {
+      "kind": "owner-store-turn",
+      "passed": 48,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 11.16,
+      "log": "/tmp/autoship-owner-successor-transfer-owner-tests-20261107.log",
+      "filter": "autoship_workflow::owner_"
+    },
+    {
+      "kind": "surrounding-owner-workflow",
+      "passed": 11,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 140.36,
+      "log": "/tmp/autoship-owner-successor-transfer-workflow-tests-20261107.log",
+      "filter": "self_improve::workflow::tests::owner_"
+    },
+    {
+      "kind": "production-check",
+      "result": "passed",
+      "seconds": 22.8,
+      "log": "/tmp/autoship-owner-successor-transfer-production-20261107.log"
+    }
+  ],
+  "managed_target": "/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c",
+  "commands": {
+    "tests": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent FILTER -- --test-threads=1",
+    "production": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent"
+  },
+  "coverage": [
+    "Both provider pins and initial/revised acceptance through actual original recovery/ready/setup and core prepare_transfer, native receipt inspection and SQL settlement.",
+    "Distinct typed successor purpose atomically joins selected snapshot, immutable pending request and exact consumed setup reference. Wrong same-generation audit and wrong generation controls reach real PreparationScan and refuse before writes.",
+    "Late context insertion refusal rolls back snapshot, pending and context events without changing workflow snapshot or accounting.",
+    "Actual WAL commit acknowledgement failure is reread as the same durable intent; native transfer completes while an injected SQL settlement trigger rolls metadata writes back.",
+    "Reconciliation inspects actual completed native state and settles the same UUID after removing the trigger. Repeated setup recognizes existing registered destination without creating a new transfer.",
+    "Malformed or missing purpose records/events refuse. A copied ordinary lease cannot settle a verified successor receipt; ordinary owner/model APIs remain fenced after native completion.",
+    "Fresh native metadata and original private preparation follow only exact settled destination ancestry. Original publication, queued inputs and model/merge accounting remain unchanged.",
+    "Shared native suite validates existing ordinary/terminal reconciliation, retained native metadata/session behavior, owner body completion and private reply recovery; it is separate from live successor provider execution."
+  ],
+  "source_sha256": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_handoff.rs",
+      "sha256": "0d89d7a725fee6c658806c7cf290b1eb78ca471f893e338eb6c24ea9a9e00d17"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_reconcile.rs",
+      "sha256": "e722274f4eb82e3877164e00ff3a4eb8ffc64c8197922ef35ec395c6a20173aa"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_settlement.rs",
+      "sha256": "0bf60afd0e641562e03f42f0ba41d8fcb981f16929ac86710be61b254ab4e4f5"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs",
+      "sha256": "230ca3f1220d5190e9181acfcf495a83e343c13bbddd93310ed26957e088641b"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_successor_claim.rs",
+      "sha256": "9f46830939b3636f4f7cc4116cac2c97061c65b2360e4695ceffe049bbd467a7"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_successor_native.rs",
+      "sha256": "b386deba7a45e6eb734c83c8b39f880b030eefa18f33a56e088f8bcd84004103"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_successor_transfer.rs",
+      "sha256": "9af926e99168e163e76358bd3b97055cf6a5373edc0c058a71a45aea1c61651d"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "f9e651ed2bcc42e6282291f744679a7d4f19cde5d09a333ff2915f4693a993b6"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "ccb43b18788bbc1b71e7ad0eef833ceff875522434db524ae5cfa675ad691038"
+    }
+  ],
+  "spec_audit": {
+    "scope": "bounded section 52 against 50\u201351 and original native-purpose contracts",
+    "introduced_findings": 1,
+    "resolved_findings": 1,
+    "resolution": "Bind initial scan, pending request and context to this setup generation and exact generated protected destination audit; actual wrong-path and wrong-generation scan controls verify refusal.",
+    "full_handoff_approved": false
+  },
+  "limits": [
+    "Successor fixture uses synthetic preparation and empty native runtime inventory. It does not establish a live provider, VM coding session, or retained productive successor conversation.",
+    "Native transfer and registered destination retain metadata/setup-only purpose. No productive coding guard, body slot or model input is granted.",
+    "Full CLI suite not repeated at this checkpoint. New successor absent/prepared/aborted interruption and lost live reservation acceptance still need dedicated evidence; shared state-matrix tests retain their own scope.",
+    "Typed no-pending failure is returned but durable setup retry/fingerprint backoff must be connected before worker activation.",
+    "Lost reservation and multiple consumed ancestry, first-body/retained-reservation lineage, actual coding constructor and complete C/R source/resource/input proofs remain unfinished.",
+    "No deployment, live CLI/Discord coding acceptance, fault soak, unattended acceptance or new autonomous merge is established by this component proof."
+  ],
+  "productive_execution_verified": false,
+  "deployed": false,
+  "live_cli_discord_acceptance": false,
+  "epic_1703_complete": false
+}
