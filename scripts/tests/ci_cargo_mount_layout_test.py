@@ -57,6 +57,39 @@ class MountLayoutTests(unittest.TestCase):
         self.assertEqual(bytes.fromhex(rows[0]['root']),b'mnt:[123]')
         self.assertEqual(bytes.fromhex(rows[1]['mountpoint']),b'/tmp/vertical\x0btab')
 
+    def proc_delta(self):
+        reference={'root_identity':[1,2],'mount_namespace':'mnt:[10]','mounts':views.parse_mount_layout(
+            b'1 9 8:1 / / rw - ext4 /dev/vda rw\n'
+            b'2 1 0:5 / /proc rw,nosuid,nodev,noexec - proc proc rw\n'
+            b'3 1 8:1 /source /workspace ro,nosuid,nodev - ext4 /dev/vda rw\n')}
+        actual={'root_identity':[1,2],'mount_namespace':'mnt:[11]','mounts':views.parse_mount_layout(
+            b'11 11 8:1 / / rw - ext4 /dev/vda rw\n'
+            b'12 11 0:5 / /proc rw,nosuid,nodev,noexec - proc proc rw\n'
+            b'13 11 8:1 /source /workspace ro,nosuid,nodev - ext4 /dev/vda rw\n'
+            b'14 12 0:7 / /proc ro,nosuid,nodev,noexec - proc proc rw,hidepid=2\n')}
+        return reference,actual
+
+    def test_worker_proc_delta_preserves_root_source_mounts_and_parent_graph(self):
+        # Shape-only fixtures; they are not live namespace/source admission.
+        reference,actual=self.proc_delta()
+        views.require_worker_proc_delta(reference,actual,14)
+
+    def test_worker_proc_delta_refuses_wider_namespace_or_mount_changes(self):
+        for fault in ('same-namespace','root','source','source-options','parent','extra-proc','shared','writable','hidepid','missing-inherited'):
+            reference,actual=self.proc_delta();proc=actual['mounts'][-1]
+            if fault=='same-namespace':actual['mount_namespace']=reference['mount_namespace']
+            elif fault=='root':actual['root_identity']=[1,3]
+            elif fault=='source':actual['mounts'][2]['root']=b'/foreign'.hex()
+            elif fault=='source-options':actual['mounts'][2]['options']=['rw','nosuid','nodev']
+            elif fault=='parent':actual['mounts'][2]['parent']=12
+            elif fault=='extra-proc':actual['mounts'].append(dict(proc,id=15,mountpoint=b'/elsewhere'.hex()))
+            elif fault=='shared':actual['mounts'][0]['optional']=['shared:7']
+            elif fault=='writable':proc['options']=['rw','nosuid','nodev','noexec']
+            elif fault=='hidepid':proc['super_options']=['rw']
+            else:actual['mounts'].pop(1)
+            with self.subTest(fault=fault),self.assertRaises(views.FreshnessHold):
+                views.require_worker_proc_delta(reference,actual,14)
+
     def test_actual_proc_observation_binds_namespace_root_and_current_layout(self):
         result=views.observe_mount_layout(os.getpid())
         info=os.stat('/');self.assertEqual(result['root_identity'],[info.st_dev,info.st_ino])

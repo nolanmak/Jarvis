@@ -1953,6 +1953,96 @@ def mount_unit_proc(destination):
     _mount('-t','proc','-o','ro,nosuid,nodev,noexec,hidepid=2','proc',destination)
 
 
+def private_proc_namespace():
+    """Trusted bootstrap: clone mounts, stop propagation, protect proc writes."""
+    if os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0):raise FreshnessHold('invalidation_unsafe')
+    if ctypes.CDLL(None,use_errno=True).unshare(0x00020000)!=0:raise FreshnessHold('invalidation_unsafe')
+    _mount('--make-rprivate','/')
+    mount_unit_proc('/proc')
+
+
+def require_worker_proc_delta(reference,actual,proc_id):
+    """Mount-table shape only; actual observations and namespace FD are separate."""
+    from collections import Counter
+    try:
+        if (reference['mount_namespace']==actual['mount_namespace']
+                or reference['root_identity']!=actual['root_identity']
+                or any(row['optional'] for row in actual['mounts'])):raise ValueError()
+        def content(row):
+            return {key:row[key] for key in ('device','root','mountpoint','options','filesystem','source','super_options')}
+        def key(row):return json.dumps(content(row),sort_keys=True,separators=(',',':'))
+        def census(layout,exclude=None):
+            table={row['id']:row for row in layout['mounts']}
+            return Counter((key(row),'namespace-root' if bytes.fromhex(row['mountpoint'])==b'/' else
+                key(table[row['parent']]) if row['parent'] in table else 'external-parent')
+                for row in layout['mounts'] if row['id']!=exclude)
+        proc=next(row for row in actual['mounts'] if row['id']==proc_id)
+        if (bytes.fromhex(proc['mountpoint'])!=b'/proc' or bytes.fromhex(proc['root'])!=b'/'
+                or proc['filesystem']!='proc' or not {'ro','nosuid','nodev','noexec'}<=set(proc['options'])
+                or 'rw' in proc['options'] or not {'hidepid=2','hidepid=invisible'}&set(proc['super_options'])):
+            raise ValueError()
+        table={row['id']:row for row in actual['mounts']}
+        parent=table.get(proc['parent'])
+        if parent is None or bytes.fromhex(parent['mountpoint']) not in (b'/',b'/proc'):raise ValueError()
+        if len(actual['mounts'])!=len(reference['mounts'])+1 or census(reference)!=census(actual,proc_id):raise ValueError()
+    except (ValueError,KeyError,TypeError,StopIteration):raise FreshnessHold('invalidation_unsafe') from None
+
+
+def observe_readonly_proc(pid,*,worker_delta=False):
+    """Original exec-stop observer; matching metadata is never live admission."""
+    descriptors=[]
+    try:
+        reference=observe_mount_layout(os.getpid());actual=observe_mount_layout(pid)
+        if actual['mount_namespace']==reference['mount_namespace'] or actual['root_identity']!=reference['root_identity']:
+            raise FreshnessHold('invalidation_unsafe')
+        root=os.open(f'/proc/{pid}/root',os.O_PATH|os.O_DIRECTORY|os.O_CLOEXEC);descriptors.append(root)
+        proc=os.open('proc',os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=root);descriptors.append(proc)
+        proc_id=_descriptor_mount_id(proc)
+        required={'ro','nosuid','nodev','noexec'};visible=[]
+        for row in actual['mounts']:
+            if row['filesystem']!='proc':continue
+            path=bytes.fromhex(row['mountpoint']).lstrip(b'/')
+            fd=os.open(path or b'.',os.O_PATH|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=root)
+            try:
+                if _descriptor_mount_id(fd)!=row['id']:continue # Covered inherited mount.
+                flags=os.fstatvfs(fd).f_flag
+                if (not required<=set(row['options']) or 'rw' in row['options']
+                        or flags&(os.ST_RDONLY|os.ST_NOSUID|os.ST_NODEV|os.ST_NOEXEC)
+                            !=(os.ST_RDONLY|os.ST_NOSUID|os.ST_NODEV|os.ST_NOEXEC)):
+                    raise FreshnessHold('invalidation_unsafe')
+                visible.append(row['id'])
+            finally:os.close(fd)
+        selected=next((row for row in actual['mounts'] if row['id']==proc_id),None)
+        if (selected is None or proc_id not in visible or bytes.fromhex(selected['mountpoint'])!=b'/proc'
+                or bytes.fromhex(selected['root'])!=b'/' or selected['filesystem']!='proc'
+                or not {'hidepid=2','hidepid=invisible'}&set(selected['super_options'])):
+            raise FreshnessHold('invalidation_unsafe')
+        if worker_delta:require_worker_proc_delta(reference,actual,proc_id)
+        if observe_mount_layout(pid)!=actual or observe_mount_layout(os.getpid())!=reference:
+            raise FreshnessHold('invalidation_unsafe')
+        return {'version':1,'kind':'ci-readonly-proc-view','pid':pid,'mount_namespace':actual['mount_namespace'],
+            'controller_mount_namespace':reference['mount_namespace'],'root_identity':actual['root_identity'],
+            'mount_layout_sha256':actual['sha256'],'controller_layout_sha256':reference['sha256'],
+            'proc_mount_id':proc_id,'visible_proc_mounts':sorted(visible),'worker_delta':worker_delta,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+    except (OSError,ValueError,KeyError,TypeError):raise FreshnessHold('invalidation_unsafe') from None
+    finally:
+        for fd in descriptors:os.close(fd)
+
+
+def pin_worker_proc(pid):
+    """Return the actual namespace FD plus a stable observed worker proc view."""
+    fd=os.open(f'/proc/{pid}/ns/mnt',os.O_RDONLY|os.O_CLOEXEC)
+    try:
+        view=observe_readonly_proc(pid,worker_delta=True);info=os.fstat(fd)
+        if (os.readlink(f'/proc/{pid}/ns/mnt')!=view['mount_namespace']
+                or os.readlink(f'/proc/self/fd/{fd}')!=view['mount_namespace']
+                or view['mount_namespace']!=f'mnt:[{info.st_ino}]'):
+            raise FreshnessHold('invalidation_unsafe')
+        return fd,view
+    except BaseException:os.close(fd);raise
+
+
 def _readonly(source,destination):
     _mount('--bind',source,destination)
     _mount('-o','remount,bind,ro,nosuid,nodev,noatime',destination)

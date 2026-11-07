@@ -2010,6 +2010,11 @@ async fn live_shared_ci_original_worker_admission() -> Result<()> {
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
     audit.record_controller(receipt.clone())?;audit.protected_health()?;
     std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&receipt)?)?;
+    let proc_view=&receipt["execution"]["worker_entry"]["entry"]["proc_view"];
+    ensure!(proc_view["kind"]=="ci-readonly-proc-view" && proc_view["worker_delta"]==true
+        && proc_view["mount_namespace"]==receipt["execution"]["worker_entry"]["namespaces"]["mnt"]
+        && proc_view["mount_namespace"]!=proc_view["controller_mount_namespace"],
+        "original worker lacks verified private readonly proc: {proc_view}");
     Ok(())
 }
 
