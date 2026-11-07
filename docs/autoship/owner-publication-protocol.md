@@ -753,3 +753,10 @@ crash/reconnect recovery. The classifier tests separately check absent/unknown
 fields, exact request separation and complete launch-free observations; those
 values alone mint no capability. Full productive recovery, C/R and #1715 live
 CLI/Discord/merge/soak acceptance remain required.
+
+The test-first baseline refused both required positive classifications (two failed,
+three passed). At `8b024669`, all 964 core tests passed (15 opt-ins ignored),
+and the expanded retained-session integration passed in 110.96 seconds across
+both provider pins. No full CLI-suite rerun, provider/VM execution, productive
+successor, rollout or autonomous merge is claimed by this checkpoint. See
+[bounded unbound-input evidence](1703-unbound-native-nonrelease-proof.json).

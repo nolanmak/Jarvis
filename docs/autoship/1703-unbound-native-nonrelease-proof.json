@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "kind": "closed-unbound-native-input-nonrelease-component",
+  "code_head": "8b024669fbb2f96e1677a1f98b997433df3e63c8",
+  "test_first": {
+    "log": "/tmp/autoship-owner-unbound-nonrelease-red-20261107.log",
+    "cases": 5,
+    "failed": 2,
+    "passed": 3,
+    "observation": "The new classifier initially refused every observation; the required closed-setup and separate-prior-request positives failed."
+  },
+  "validation": {
+    "core": {
+      "passed": 964,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 202.44,
+      "log": "/tmp/autoship-owner-unbound-nonrelease-core-green-20261107.log"
+    },
+    "retained_session_integration": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 110.96,
+      "log": "/tmp/autoship-owner-unbound-nonrelease-integration-20261107.log",
+      "providers": [
+        "codex",
+        "claude"
+      ],
+      "original_ledger_state_session_audit_locks": true,
+      "actual_provider_or_vm_invocation": false,
+      "synthetic_protected_launch_resource_input_fixtures": true
+    }
+  },
+  "behavior": [
+    "Separate borrowed producer for a named request with no original owner-model binding.",
+    "Requires original fresh metadata proof, complete namespace census and permanent original input-writer closure under retained native locks.",
+    "Retains exact unbound setup launch/resource/closure references; full launch-free census is distinct from caller-supplied empty data.",
+    "Any existing target binding requires the distinct bound-input producer, even before a release attempt.",
+    "Released unclassified input, including described preparation/readonly transport, refuses.",
+    "Other validated bound requests retain their original identity; missing binding census/release state refuses.",
+    "Original locks remain held and changed selected policy invalidates the borrowed proof."
+  ],
+  "source_sha256": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_metadata.rs",
+      "sha256": "ef853976e7cb7a943266a223640e6f10a676cdefacced845c3db576616a8346b"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_transfer.rs",
+      "sha256": "8d9387883fb818eb019a15eb2f112e918ad6300948fa46b128b1838dc307ccb0"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+      "sha256": "c8f02e4c7e8460293e2c62c7ba0987586ce8f0b9f2bc83e1569970cf539b9cff"
+    },
+    {
+      "path": "docs/autoship/owner-publication-protocol.md",
+      "sha256": "522d0e372360096c6fb2f29d30e80f3e9000cbd6074dc78e395b1a32491f4cc4"
+    }
+  ],
+  "spec_audit": {
+    "agent": "ci_relay_policy_ownership_spec_audit_20261107",
+    "result": "No substantiated introduced findings in section 48 and its adjacent contracts; not full recovery handoff approval."
+  },
+  "sql_reservation_absence_proven": false,
+  "original_preparation_source_join_complete": false,
+  "trusted_released_preparation_exclusion_complete": false,
+  "owner_successor_ready_consumed_bridge_implemented": false,
+  "productive_owner_worker_connected": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "deployed": false,
+  "autonomous_merges_claimed": 0,
+  "remaining": [
+    "Join original reservation-absence/retained-reservation lineage to immutable ready/consumed successor and exact original preparation.",
+    "Provide trusted C/R exclusion for released preparation; descriptions alone cannot prove coding-body nonrelease.",
+    "Fresh real input constructors must join actual scope/source/resource/owner authorization and unexposed/continuation provider paths.",
+    "Finish full C/R and original unchanged compiler/worker/generated-publication tests, main integration, independent exact-head review, hosted checks, normal rollout and all epic 1703 live CLI/Discord/fault/soak/confirmed-merge acceptance."
+  ]
+}
