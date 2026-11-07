@@ -170,6 +170,19 @@ fn prune_and_count(root:&Path) -> Result<usize> {
     Ok(count)
 }
 
+/// Finish already-authorized retirement through the same locked pruning path
+/// used by native admission. Unknown/interrupted state is never inferred closed.
+/// Read-only capacity inspection remains separate and observes actual bytes.
+pub fn reconcile_retired_runtimes()->Result<()> {
+    let Some(path)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") else{return Ok(())};
+    let policy:Policy=serde_json::from_slice(&private(Path::new(&path))?)?;
+    ensure!(policy.version==1 && policy.max_sessions>0 && policy.max_state_bytes>=SESSION_BYTES,"invalid native state policy");
+    let root=policy.state_root.canonicalize()?;
+    let _lock=StateLock::acquire(&root)?;
+    let _retained=prune_and_count(&root)?;
+    Ok(())
+}
+
 /// Called by the workflow controller only after fenced recovery or completion.
 /// It authorizes retirement of owned runtime data, including interrupted exports;
 /// active session locks still prevent reclamation. Approval/audit history is not

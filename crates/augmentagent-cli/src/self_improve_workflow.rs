@@ -224,10 +224,13 @@ fn acquire_audit_generation(
 /// Free, bounded reconciliation; durable intent survives terminal workflows and
 /// crash between audit-generation commit and filesystem retirement.
 pub(super) fn reconcile_runtime_retirements()->Result<usize> {
-    let state=path();
+    reconcile_runtime_retirements_at(&path(),millis())
+}
+fn reconcile_runtime_retirements_at(state:&Path,now:i64)->Result<usize> {
     if !state.exists(){return Ok(0);}
-    let mut store=WorkflowStore::open(&state)?;let now=millis();
+    let mut store=WorkflowStore::open(state)?;
     let retired=reconcile_runtime_retirements_in(&mut store,now)?;
+    augmentagent_channel_core::native_vm::reconcile_retired_runtimes()?;
     let report=augmentagent_channel_core::native_vm::state_capacity::inspect();
     let woken=store.reconcile_native_capacity(&report,now,16)?;
     if woken>0 {info!(woken,"native capacity wait schedules eligible; normal admission remains required");}
@@ -3042,6 +3045,71 @@ mod tests {
         let recovered=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
         assert_eq!(recovered.checkpoint.binding,before.checkpoint.binding);
         assert_eq!(recovered.checkpoint.evidence,before.checkpoint.evidence);
+    }
+
+    #[test]
+    fn native_capacity_reconciliation_prunes_only_completed_retired_sessions_before_wake() {
+        use std::os::unix::fs::{OpenOptionsExt,PermissionsExt};
+        use std::os::fd::AsRawFd;
+        const CHILD:&str="JARVIS_TEST_NATIVE_RETIREMENT_WAKE";
+        if std::env::var_os(CHILD).is_none() {
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","self_improve::workflow::tests::native_capacity_reconciliation_prunes_only_completed_retired_sessions_before_wake","--nocapture"])
+                .env_clear().env("PATH","/usr/bin:/bin").env(CHILD,"1").output().unwrap();
+            let stdout=String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(),"{stdout} {}",String::from_utf8_lossy(&output.stderr));
+            assert!(stdout.contains("test result: ok. 1 passed; 0 failed;"),"child regression did not run: {stdout}");return;
+        }
+        let root=control_dir();let state=root.path().join("native");let provider=state.join("codex");
+        std::fs::create_dir_all(&provider).unwrap();
+        for path in [&state,&provider] {std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();}
+        let write=|path:&Path,bytes:&[u8]| {
+            use std::io::Write;
+            let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).unwrap();file.write_all(bytes).unwrap();file.sync_all().unwrap();
+        };
+        write(&state.join("state.lock"),b"");
+        let known=provider.join("session-completed");let unknown=provider.join("session-interrupted");
+        for session in [&known,&unknown] {
+            std::fs::create_dir(session).unwrap();std::fs::set_permissions(session,std::fs::Permissions::from_mode(0o700)).unwrap();
+            write(&session.join("owned.json"),br#"{"version":1,"audit_path":"/original/audit","owner":{"workflow_id":"original","lease_generation":1}}"#);
+            write(&session.join("retired.json"),br#"{"version":1,"reason":"native_scope_retired"}"#);
+            write(&session.join("lock"),b"");
+        }
+        write(&known.join("complete.json"),br#"{"version":1,"generation":"generation-a"}"#);
+        let unknown_owned=std::fs::read(unknown.join("owned.json")).unwrap();
+        let aliases=provider.join("aliases");std::fs::create_dir(&aliases).unwrap();
+        write(&aliases.join("completed-fixture"),br#""session-completed""#);
+        write(&aliases.join("interrupted-fixture"),br#""session-interrupted""#);
+        let policy=root.path().join("policy.json");
+        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime","guest_runtime":"/declared/guest","state_root":state,"memory_mb":512,"max_state_bytes":2147483648u64,"max_sessions":3,"providers":{}})).unwrap());
+        std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",&policy);
+        let full=augmentagent_channel_core::native_vm::state_capacity::inspect();
+        assert!(full.available_fingerprint().is_none());assert!(known.exists(),"read-only inspection deleted runtime state");
+        let fingerprint=serde_json::to_value(full).unwrap()["capacity_fingerprint"].as_str().unwrap().to_owned();
+        let db=root.path().join("workflow.db");let mut store=WorkflowStore::open(&db).unwrap();let id="owner/repo#914";
+        let binding=Binding{head:"head".into(),contract:"contract".into(),evidence_hash:"receipt".into()};
+        store.register(id,"fix",binding,10).unwrap();
+        let request=durable::submission::Request{repository:"owner/repo".into(),target:durable::submission::Target::Issue(914),provider:None,until:durable::submission::Milestone::Merged};
+        store.submit_authorized("native-retirement-job","owner",&request,10).unwrap();
+        let lease=store.claim(id,"worker",20,60_000).unwrap().unwrap();
+        let due=store.defer_run_capacity(&lease,Some(&fingerprint),30).unwrap();store.release(&lease,31).unwrap();
+        let before=store.snapshot(id).unwrap().unwrap();
+        let lock=std::fs::OpenOptions::new().read(true).write(true).open(known.join("lock")).unwrap();
+        assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        reconcile_runtime_retirements_at(&db,32).unwrap();
+        assert!(known.exists());assert!(!store.command_queue_due("owner/repo",32).unwrap());
+        assert_eq!(store.snapshot(id).unwrap().unwrap().checkpoint.next.eligible_at_ms,due);
+        assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_UN)},0);drop(lock);
+        reconcile_runtime_retirements_at(&db,33).unwrap();
+        assert!(store.command_queue_due("owner/repo",33).unwrap(),"retired completed capacity did not wake the deferred command job");
+        assert!(!known.exists());assert!(!aliases.join("completed-fixture").exists());
+        assert!(unknown.exists());assert!(aliases.join("interrupted-fixture").exists());
+        assert_eq!(std::fs::read(unknown.join("owned.json")).unwrap(),unknown_owned);
+        assert!(!unknown.join("retired-owner.json").exists());
+        let after=store.snapshot(id).unwrap().unwrap();
+        assert_eq!(after.checkpoint.next.eligible_at_ms,33);assert_eq!(after.progress_at_ms,before.progress_at_ms);
+        assert_eq!(after.checkpoint.binding,before.checkpoint.binding);assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+        assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.generation,before.generation);
     }
 
     #[tokio::test]
