@@ -254,7 +254,9 @@ mod tests {
     }
     #[tokio::test]
     async fn private_daemon_commands_and_text_persist_without_number_history_or_redial() {
-        let dir = tempfile::tempdir().unwrap();
+        // AF_UNIX paths must remain short under a managed build TMPDIR.
+        let dir = tempfile::Builder::new().prefix("sock-")
+            .tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
         let origin = origin().unwrap();

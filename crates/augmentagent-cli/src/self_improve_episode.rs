@@ -275,7 +275,7 @@ pub(super) async fn session_for(
     restore_best(root, workflow.id(), best).await?;
     // Reset is never a verifier waiver. Verify the exact restored commit again.
     verification_gate(root, &workflow.audit_logger()).await.for_workflow(workflow).await??;
-    acceptance::verify_candidate(root, &prepared.baseline, &workflow.audit_logger()).await?;
+    acceptance::verify_candidate(root, &prepared.baseline, &prepared.proposal.files, &workflow.audit_logger()).await?;
     workflow
         .transition(
             crate::autoship_workflow::Stage::Build,
