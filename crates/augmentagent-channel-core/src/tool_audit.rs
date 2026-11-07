@@ -1204,8 +1204,23 @@ impl AuditLogger {
             .map(|fact| fact.receipt().clone())
     }
     pub(crate) fn verify_native_launch_reference(
+        &self, prepared: &crate::native_vm::PreparedLaunchRecord,
+    ) -> anyhow::Result<()> {
+        self.verify_native_launch_history_with(prepared,||self.dispatch_allowed())
+    }
+
+    /// Verify original protected history only. This returns no dispatch, input,
+    /// recovery or cleanup authority and deliberately cannot clear owner holds.
+    pub(crate) fn verify_native_launch_history(
+        &self, prepared: &crate::native_vm::PreparedLaunchRecord,
+    ) -> anyhow::Result<()> {
+        self.verify_native_launch_history_with(prepared,||Ok(()))
+    }
+
+    fn verify_native_launch_history_with(
         &self,
         prepared: &crate::native_vm::PreparedLaunchRecord,
+        current: impl Fn() -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         prepared.intent.validate()?;
         anyhow::ensure!(
@@ -1227,7 +1242,7 @@ impl AuditLogger {
             prepared.intent.original_store_binding_sha256 == original_hash,
             "native observation original store digest mismatch"
         );
-        self.dispatch_allowed()?;
+        current()?;
         let mut actual = self.read_append_receipt(&prepared.controller_receipt)?;
         actual
             .as_object_mut()
@@ -1240,7 +1255,7 @@ impl AuditLogger {
             actual == expected,
             "native observation references another prepared launch"
         );
-        self.dispatch_allowed()?;
+        current()?;
         Ok(())
     }
 

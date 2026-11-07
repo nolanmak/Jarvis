@@ -580,6 +580,7 @@ pub(crate) struct Launch {
     command: Command,
     resource_policy: serde_json::Value,
     spawn_attempted:bool,
+    runtime_birth:Option<std::fs::File>,
     aliases: PathBuf,
     session: PathBuf,
     ephemeral: bool,
@@ -635,6 +636,69 @@ impl Launch {
         if self.spawn_attempted {return Err(std::io::Error::other("prepared native launch already used"));}
         self.spawn_attempted=true;
         crate::process_tree::spawn_admitted_vm(NativeSpawn {launch:self},clean,journal)
+    }
+
+    /// Historical observation from this actual object's consumed lifetime.
+    /// This neither retires its runtime nor grants original-input replay.
+    /// Saved launch records cannot call this private producer.
+    fn record_unspawned_abandonment(&self,logger:&crate::tool_audit::AuditLogger)->Result<crate::audit_chain::AppendReceipt> {
+        use std::sync::atomic::Ordering;
+        let observed=self.observation.as_ref().context("unspawned launch lacks original preparation")?;
+        ensure!(self.initial && !self.spawn_attempted && !observed.input_attempted.load(Ordering::SeqCst)
+            && !observed.completed.load(Ordering::SeqCst)
+            && observed.actual_session.lock().map_err(|_|anyhow::anyhow!("native ID receipt lock poisoned"))?.is_none(),
+            "native launch is not an original unspawned preparation");
+        logger.validate_native_store_binding()?;
+        logger.verify_native_launch_history(&observed.prepared)?;
+        let binding=logger.native_store_binding()?.context("unspawned original native binding missing")?;
+        let (root,store)=binding.retirement_store()?;
+        ensure!(store==&self.store && root.join(&self.runtime_relative_path)==self.session
+            && observed.prepared.intent.runtime_relative_path==self.runtime_relative_path
+            && observed.prepared.intent.creation_receipt_sha256==self.creation_receipt_sha256
+            && digest(ownership::canonical_bytes(&serde_json::to_value(&binding)?)?)==observed.prepared.intent.original_store_binding_sha256,
+            "unspawned original preparation binding changed");
+        let lock=StateLock::existing(root)?;
+        let ledger=owner_ledger::Ledger::open_bound(root,&lock,store,true)?;
+        ensure_unretired(&self.session)?;
+        ensure!(runtime_authority(root,&ledger,&self.session)?==self.authority
+            && self.authority.owner==observed.prepared.intent.source_owner
+            && Path::new(&self.authority.audit_path)==observed.prepared.intent.source_audit_path,
+            "unspawned original runtime authority changed");
+        ensure_native_admission(&ledger,&self.authority.owner,logger)?;
+        let directory=self.session.symlink_metadata()?;
+        let birth=self.runtime_birth.as_ref().context("unspawned original directory handle missing")?.metadata()?;
+        ensure!(birth.is_dir() && birth.dev()==directory.dev() && birth.ino()==directory.ino(),
+            "unspawned original runtime directory was replaced");
+        ensure!(directory.is_dir() && !directory.file_type().is_symlink()
+            && directory.uid()==unsafe{libc::geteuid()} && directory.mode() & 0o077==0,
+            "unspawned runtime directory changed");
+        let mut session_lock=None;
+        for entry in std::fs::read_dir(&self.session)? {
+            let path=entry?.path();
+            ensure!(matches!(path.file_name().and_then(|name|name.to_str()),Some("owned.json"|"lock")),
+                "unspawned runtime has retained data");
+            if path.file_name().is_some_and(|name|name=="lock") {
+                let file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(&path)?;
+                let info=file.metadata()?;
+                ensure!(info.is_file() && info.uid()==unsafe{libc::geteuid()} && info.nlink()==1
+                    && info.mode() & 0o077==0 && info.len()==0,"unspawned runtime lock changed");
+                ensure!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0,"unspawned runtime is in use");
+                session_lock=Some(StateLock(file));
+            }
+        }
+        let owned=private(&self.session.join("owned.json"))?;
+        ensure!(digest(&owned)==self.creation_receipt_sha256,"unspawned creation receipt changed");
+        // Keep the original state/session locks through the protected append.
+        // No workflow observer callback or native disposal occurs here.
+        let receipt=logger.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
+            "kind":"native_launch_abandoned_before_spawn","producer":"original-unspawned-launch",
+            "launch_intent":observed.prepared.intent,"launch_receipt":observed.prepared.controller_receipt,
+            "runtime_identity":{"device":directory.dev(),"inode":directory.ino()},
+            "creation_receipt":serde_json::from_slice::<serde_json::Value>(&owned)?,
+            "creation_receipt_utf8":std::str::from_utf8(&owned)?,"runtime_retired":false,
+            "original_input_replay_authorized":false,"observed_at_ms":chrono::Utc::now().timestamp_millis()}))?;
+        drop(session_lock);
+        Ok(receipt)
     }
 
     pub(crate) fn prepared_record(&self)->Result<PreparedLaunchRecord> {
@@ -798,6 +862,10 @@ impl Launch {
             runtime_relative_path:runtime_relative_path.clone(),native_session_id,creation_receipt_sha256:creation_receipt_sha256.clone(),
             launch_sha256:format!("{:x}",Sha256::digest(&spec_bytes))};
         intent.validate()?;
+        // Retain the actual fresh directory inode before intent publication;
+        // a copied receipt at a replacement path cannot become this lifetime.
+        let runtime_birth=if resume {None}else{Some(std::fs::OpenOptions::new().read(true)
+            .custom_flags(libc::O_NOFOLLOW|libc::O_DIRECTORY|libc::O_CLOEXEC).open(&session)?)};
         // After this point a durable intent or callback may have committed even
         // if acknowledgement fails. Preserve its exact original runtime.
         if let Some(session)=unpublished_session {session.retain();}
@@ -821,7 +889,7 @@ impl Launch {
         let mut command = Command::new("/usr/bin/python3");
         command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
             .env("PATH","/usr/bin:/bin");
-        let result = Self { command, resource_policy,spawn_attempted:false, aliases, session, ephemeral:native.is_none(), initial:!resume, authority, store, runtime_relative_path, creation_receipt_sha256, audit_log,
+        let result = Self { command, resource_policy,spawn_attempted:false,runtime_birth, aliases, session, ephemeral:native.is_none(), initial:!resume, authority, store, runtime_relative_path, creation_receipt_sha256, audit_log,
             observation:Some(LaunchObservation {prepared,logger:std::sync::Arc::downgrade(owner_logger),actual_session:std::sync::Mutex::new(None),input_attempted:std::sync::atomic::AtomicBool::new(false),completion_verified:std::sync::atomic::AtomicBool::new(false),completed:std::sync::atomic::AtomicBool::new(false)}),_directory:directory };
         // A requested alias permits later lookup but is not a provider ID event.
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.register_alias(id)?; }
@@ -960,6 +1028,11 @@ impl Drop for Launch {
         if let Some(observed)=&self.observation {
             if !observed.completed.load(std::sync::atomic::Ordering::SeqCst) {
                 if let Some(logger)=observed.logger.upgrade() {
+                    if self.initial && !self.spawn_attempted {
+                        if let Err(error)=self.record_unspawned_abandonment(&logger) {
+                            tracing::warn!(error=%error,"unspawned native launch observation unavailable; original context retained");
+                        }
+                    }
                     let actual=observed.actual_session.lock().ok().and_then(|value|value.clone());
                     let _=logger.native_launch_uncertain(&observed.prepared,actual.as_ref().map(|(_,receipt)|receipt));
                 }
@@ -997,6 +1070,90 @@ mod tests {
     fn native_preparation_refuses_when_launch_intent_cannot_be_committed() {
         launch_intent_child("seal");
     }
+    #[test]
+    fn original_unspawned_launch_abandonment_is_recorded_without_disposal() {
+        const CHILD:&str="JARVIS_TEST_ORIGINAL_UNSPAWNED_ABANDONMENT";
+        if std::env::var_os(CHILD).is_none() {
+            let root=tempfile::tempdir().unwrap();
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","native_vm::tests::original_unspawned_launch_abandonment_is_recorded_without_disposal","--nocapture"])
+                .env_clear().env("PATH","/usr/bin:/bin").env(CHILD,root.path())
+                .env("AUGMENTAGENT_RUN_RESOURCES","1").output().unwrap();
+            let stdout=String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(),"{stdout} {}",String::from_utf8_lossy(&output.stderr));
+            assert!(stdout.contains("test result: ok. 1 passed; 0 failed;"),"child did not run: {stdout}");return;
+        }
+        let root=PathBuf::from(std::env::var_os(CHILD).unwrap()).canonicalize().unwrap();
+        let state=root.join("state");std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state,std::fs::Permissions::from_mode(0o700)).unwrap();
+        initialize_native_test_store(&state);
+        let policy=root.join("policy.json");
+        let policy_bytes=serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/fixture/runtime", "guest_runtime":"/fixture/guest",
+            "state_root":state,"memory_mb":512,"max_state_bytes":17179869184u64,"max_sessions":16,
+            "providers":{"codex":{"gateway":{},"auth_file":null,"auth_relative":".codex/auth.json"},"claude":{"gateway":{},"auth_file":null,"auth_relative":".claude.json"}}})).unwrap();
+        write(&policy,&policy_bytes).unwrap();std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",&policy);
+        let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();let _entered=runtime.enter();
+        for provider in ["codex","claude"] {
+            for case in ["fresh","spawn-attempted","input-attempted","observed-id","owner-changed","unexpected-data","policy-changed","directory-replaced"] {
+                let directory=root.join(format!("{provider}-{case}"));std::fs::create_dir(&directory).unwrap();
+                std::fs::create_dir(directory.join("logs")).unwrap();
+                let log=directory.join("logs/audit.jsonl");
+                let logger=std::sync::Arc::new(crate::tool_audit::AuditLogger::protected(log.clone(),directory.join("anchor.json"),&[]).unwrap());
+                logger.set_native_runtime_owner(RuntimeOwner{workflow_id:format!("{provider}-{case}"),lease_generation:1}).unwrap();
+                logger.set_native_store_binding(ownership::capture_owner_binding(&||Ok(())).unwrap()).unwrap();
+                let mut opts=crate::reasoner::triage_opts(None);opts.audit_logger=Some(logger.clone());
+                let id=format!("requested-{provider}-{case}");
+                let native=crate::native_session::Launch::Create{requested_id:Some(id.clone())};
+                let mut launch=Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native)).unwrap();
+                let prepared=launch.prepared_record().unwrap();let session=launch.session.clone();
+                let owned=private(&session.join("owned.json")).unwrap();
+                match case {
+                    "spawn-attempted"=>{
+                        let journal=directory.join("journal-directory");std::fs::create_dir(&journal).unwrap();
+                        assert!(launch.spawn_admitted(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),Some(&journal)).is_err());
+                    },
+                    "input-attempted"=>{assert!(launch.record_input_release_attempt("fixture",&prepared.controller_receipt).is_err());},
+                    "observed-id"=>launch.observe_session(&id).unwrap(),
+                    "owner-changed"=>std::fs::write(session.join("owned.json"),b"{\"foreign\":true}").unwrap(),
+                    "unexpected-data"=>write(&session.join("unsettled-export"),b"preserve").unwrap(),
+                    "policy-changed"=>{
+                        let mut changed:serde_json::Value=serde_json::from_slice(&policy_bytes).unwrap();changed["memory_mb"]=1024.into();
+                        std::fs::write(&policy,serde_json::to_vec(&changed).unwrap()).unwrap();
+                    },
+                    "directory-replaced"=>{
+                        std::fs::rename(&session,directory.join("original-session")).unwrap();
+                        std::fs::create_dir(&session).unwrap();
+                        std::fs::set_permissions(&session,std::fs::Permissions::from_mode(0o700)).unwrap();
+                        write(&session.join("owned.json"),&owned).unwrap();
+                    },
+                    "fresh"=>{
+                        logger.set_dispatch_observer(std::sync::Arc::new(||anyhow::bail!("owner paused"))).unwrap();
+                        assert!(logger.dispatch_allowed().is_err());
+                    },_=>unreachable!(),
+                }
+                drop(launch);
+                if case=="policy-changed" {std::fs::write(&policy,&policy_bytes).unwrap();}
+                let rows=std::fs::read_to_string(&log).unwrap().lines().map(|line|serde_json::from_str::<serde_json::Value>(line).unwrap()).collect::<Vec<_>>();
+                let facts=rows.iter().filter(|row|row["kind"]=="native_launch_abandoned_before_spawn").collect::<Vec<_>>();
+                assert_eq!(facts.len(),usize::from(case=="fresh"),"{provider}/{case}: actual unspawned lifetime fact missing or overclaimed");
+                assert!(session.exists(),"{provider}/{case}: durable intent runtime was disposed");
+                assert!(session.parent().unwrap().join("aliases").join(digest(&id)).exists(),"requested alias was removed");
+                if case!="owner-changed" {assert_eq!(private(&session.join("owned.json")).unwrap(),owned);}
+                if case=="fresh" {
+                    let fact=facts[0];assert_eq!(fact["launch_intent"],serde_json::to_value(&prepared.intent).unwrap());
+                    assert_eq!(fact["launch_receipt"],serde_json::to_value(&prepared.controller_receipt).unwrap());
+                    assert_eq!(fact["runtime_retired"],false);assert_eq!(fact["original_input_replay_authorized"],false);
+                    assert_eq!(fact["creation_receipt"],serde_json::from_slice::<serde_json::Value>(&owned).unwrap());
+                    assert_eq!(fact["creation_receipt_utf8"].as_str().unwrap().as_bytes(),owned);
+                }
+                assert!(!rows.iter().any(|row|row["kind"]=="model_call_admitted"));
+                if case=="directory-replaced" {assert_eq!(private(&directory.join("original-session/owned.json")).unwrap(),owned);}
+                if case=="fresh" {assert!(logger.dispatch_allowed().is_err(),"observation cleared owner pause");}
+                logger.protected_health().unwrap();
+            }
+        }
+    }
+
     #[test]
     fn native_preparation_propagates_workflow_journal_refusal() {
         launch_intent_child("refuse");
@@ -1871,7 +2028,7 @@ else: print(result)
         std::fs::set_permissions(&aliases,std::fs::Permissions::from_mode(0o700)).unwrap();
         let expected=ownership::Authority {owner:RuntimeOwner {workflow_id:"workflow".into(),lease_generation:1},audit_path:"/audit/original".into()};
         let retirement=test_retirement(runtime.clone(),expected.clone());
-        let launch=Launch {command:Command::new("unused-fixture"),resource_policy:serde_json::json!({}),spawn_attempted:false,aliases,
+        let launch=Launch {command:Command::new("unused-fixture"),resource_policy:serde_json::json!({}),spawn_attempted:false,runtime_birth:None,aliases,
             session:runtime,ephemeral:false,initial:true,authority:expected,store:test_store_identity(&root),runtime_relative_path:retirement.runtime_relative_path.clone(),creation_receipt_sha256:retirement.creation_receipt_sha256.clone(),audit_log:"/audit/original".into(),observation:None,_directory:tempfile::tempdir().unwrap()};
         (base,root,retirement,launch)
     }
