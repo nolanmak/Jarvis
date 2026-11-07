@@ -826,3 +826,13 @@ old metadata fencing, damaged/coherently substituted history and takeover refusa
 with unrelated pause/checkpoint barriers removed. It uses synthetic preparation
 and empty native runtime inventory; no real provider/VM, process-crash reconnect,
 ready-to-coding dispatch or full epic closure follows from it.
+
+At `f2498fc4`, the full CLI suite passed 1,954 tests with 34 opt-ins ignored.
+The additional canonicalized-history regression at `d49abf4a` then reproduced a
+ready turn reset to claimed being offered for metadata recovery. The stricter
+reader at `711f41c5` refuses that missing disposition and any later recovery claim
+without successor consumption. Its final focused recovery suite passed in
+90.18 seconds, including both provider pins, initial/revised readiness and legacy
+index migration; normal production compilation passed. The full suite was not
+repeated after that final stricter boundary. See
+[readiness component evidence](1703-owner-successor-readiness-proof.json).

@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "kind": "unbound-owner-successor-readiness-metadata",
+  "code_head": "711f41c5c634506b0cc923367c6c2b2d866e8bc7",
+  "initial_red": {
+    "log": "/tmp/autoship-owner-successor-ready-red-20261107.log",
+    "observation": "Actual original native/preparation/scope fixture failed because the new readiness factory was unavailable."
+  },
+  "full_before_final_hardening": {
+    "source_head": "f2498fc47148eea03ca8c0096935bc8ab411dc11",
+    "passed": 1954,
+    "failed": 0,
+    "ignored": 34,
+    "seconds": 1484.13,
+    "log": "/tmp/autoship-owner-successor-ready-cli-20261107.log"
+  },
+  "final_regression_red": {
+    "source_head": "d49abf4aa104048068e262f9c5839d4b3049cc43",
+    "failed": 1,
+    "seconds": 16.96,
+    "log": "/tmp/autoship-owner-ready-lineage-red-20261107.log",
+    "observation": "A retained immutable ready record with turn state reset to claimed was offered as a valid metadata recovery plan."
+  },
+  "final_focused": {
+    "passed": 1,
+    "failed": 0,
+    "ignored": 0,
+    "seconds": 90.18,
+    "log": "/tmp/autoship-owner-ready-lineage-green-20261107.log",
+    "scope": "Both provider pins and initial/revised acceptance readiness, plus original transfer-recovery modes. Full suite was not repeated after the stricter ready-disposition guard."
+  },
+  "production_check": {
+    "result": "passed",
+    "log": "/tmp/autoship-owner-successor-ready-production-20261107.log"
+  },
+  "managed_target": "/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c",
+  "commands": {
+    "full": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent -- --test-threads=1",
+    "focused": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent expired_owner_publication_has_authenticated_metadata_recovery -- --test-threads=1",
+    "production": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent"
+  },
+  "coverage": [
+    "Actual original native metadata locks, reopened original preparation, canonical completion and registered scope with synthetic preparation/empty runtime fixtures.",
+    "One transaction appends exact readiness history, changes only original turn to recovery_ready, removes metadata pointer and releases metadata lease.",
+    "Late SQL refusal rolls back event, row, turn and pointer effects; no model/merge spend or pending message changes.",
+    "Wrong request and old claim refuse borrowed readiness proof.",
+    "Malformed, oversized, orphaned and coherently canonicalized substituted history refuses, including extra claimed authority fields.",
+    "Changed ready-turn disposition refuses; unconsumed readiness cannot be followed by another ordinary recovery claim.",
+    "Ordinary and generic owner takeover refuse with unrelated pause/checkpoint barriers removed.",
+    "Legacy one-active-turn index migration preserves ready ownership.",
+    "Old native metadata visitors are fenced after settlement; only transaction-minted opaque acknowledgement validates the consuming metadata outcome."
+  ],
+  "source_sha256": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_successor_ready.rs",
+      "sha256": "b47f565cf17a9288093f18b7c4e36ebf822b679490bf225be9496a7e53ffae73"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs",
+      "sha256": "2b9a0abe37ec6f4e722ffea3450d2c67015118fcc9cd6585d5bf4d8b9eae846c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+      "sha256": "38b540fb2f4f5a4edc4905a113099ebfab13b8bd7d397d312683055a61377287"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_dispatch.rs",
+      "sha256": "2c6ea0532e63207aacd2d06f1a31900b7595d28d75ab3e3696c8a4dfe56be711"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "0eb2f77da0af9ccdf7c824ebcee08e281ccd9837c82547cdb29c2a660fc55b7a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication_commit.rs",
+      "sha256": "0ca46ffd41f6e9ce57fd796969de76e99c081988bd87409ad810afbaf9aa7f40"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "7ed3cb1176a1494ece1ea789099537599998414fc719d2d309c53e879acd8fbf"
+    },
+    {
+      "path": "docs/autoship/owner-publication-protocol.md",
+      "sha256": "6c30df73470ff46fc67f225bbd35048df678e5c5b3ac4a9a4ac8b044de608d89"
+    }
+  ],
+  "spec_audit": {
+    "agent": "ci_relay_policy_ownership_spec_audit_20261107",
+    "result": "No introduced material finding in section 49 and adjacent contracts; this is not successor execution or full recovery handoff approval."
+  },
+  "original_reservation_absence_preserved": true,
+  "ready_consumption_implemented": false,
+  "bound_or_continuation_ready_producers_implemented": false,
+  "trusted_released_preparation_exclusion_complete": false,
+  "productive_owner_worker_connected": false,
+  "actual_provider_or_vm_invoked": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "deployed": false,
+  "autonomous_merges_claimed": 0,
+  "remaining": [
+    "Fresh authenticated CAS consumption for the same original pending request; immutable successor edge and historical turn/activation/preparation validation.",
+    "Preserve original reservation absence versus legitimate first-successor/retained reservation without rewriting original history; actual unexposed/continuation constructors.",
+    "Original native/source/scope/resource admission and trusted released-preparation exclusion before any coding input/model permit.",
+    "Full C/R, unchanged compiler/worker/generated-publication gates, worker integration, independent exact-head review, hosted checks, normal rollout and all epic 1703 live CLI/Discord/fault/soak/confirmed-merge acceptance."
+  ]
+}
