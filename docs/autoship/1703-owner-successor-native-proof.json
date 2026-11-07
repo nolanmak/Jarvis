@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "kind": "successor-original-native-preparation-join",
+  "code_head": "babad1bc9149d678451274a30fc35b77e1cd5668",
+  "regressions": [
+    {
+      "kind": "missing-native-producer",
+      "result": "expected failure",
+      "seconds": 19.65,
+      "log": "/tmp/autoship-owner-successor-native-red-20261107.log",
+      "observation": "Actual original recovery/readiness/claim fixture could not enter the unavailable successor native producer."
+    },
+    {
+      "kind": "transaction-reentry",
+      "result": "implementation failure corrected",
+      "seconds": 24.98,
+      "log": "/tmp/autoship-owner-successor-native-green-20261107.log",
+      "observation": "Native current-fence reentry from the preparation transaction attempted another write transaction and failed database-is-locked. Native fences now bracket the transaction; typed transaction-local checks run inside."
+    },
+    {
+      "kind": "stale-authorization-preview",
+      "result": "expected failure",
+      "seconds": 18.97,
+      "log": "/tmp/autoship-owner-successor-auth-preview-red-20261107.log",
+      "observation": "A prior paused preview incorrectly validated a later resumed setup. Validation now joins the exact consumed checkpoint/control/ready generation."
+    }
+  ],
+  "verification": [
+    {
+      "kind": "combined-recovery-native-preparation",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 111.39,
+      "log": "/tmp/autoship-owner-successor-native-final-20261107.log",
+      "filter": "expired_owner_publication_has_authenticated_metadata_recovery"
+    },
+    {
+      "kind": "owner-store-turn",
+      "passed": 48,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 6.97,
+      "log": "/tmp/autoship-owner-successor-native-owner-tests-20261107.log",
+      "filter": "autoship_workflow::owner_"
+    },
+    {
+      "kind": "surrounding-owner-workflow",
+      "passed": 11,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 138.11,
+      "log": "/tmp/autoship-owner-successor-native-workflow-tests-20261107.log",
+      "filter": "self_improve::workflow::tests::owner_"
+    },
+    {
+      "kind": "production-check",
+      "result": "passed",
+      "seconds": 11.56,
+      "log": "/tmp/autoship-owner-successor-native-production-20261107.log"
+    }
+  ],
+  "managed_target": "/mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c",
+  "commands": {
+    "tests": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent FILTER -- --test-threads=1",
+    "production": "scripts/cargo-managed.sh check -p augmentagent-cli --bin augmentagent"
+  },
+  "coverage": [
+    "Both provider pins and initial/revised acceptance run through original recovery, readiness, single setup claim and actual retained-native metadata lock/proof visitor.",
+    "Namespace follows completed original publication/native ancestry, never the greatest generation or an ordinary copied execution lease.",
+    "Fresh borrowed native writer-closure/unbound nonrelease observation remains valid for the exact original request.",
+    "Distinct successor preparation reader reopens the exact physical candidate, original private envelope and protected evidence with the shared strict recovery parser.",
+    "Registered scope matches original completed publication; modified retained preparation is refused before a scope visitor.",
+    "Damaged original preparation and another checkout refuse; restored original succeeds.",
+    "A paused successor refuses before the native visitor; stale paused authorization cannot validate or expose native facts for a later resumed setup.",
+    "Original immutable history, queued input, model spend and merge allowance are preserved; copied leases still cannot dispatch."
+  ],
+  "source_sha256": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs",
+      "sha256": "dda5bb96840b597b2cd3d2a2b12b9814282e7dd703c539c7ab2dcb795b4d1cc1"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_successor_claim.rs",
+      "sha256": "502a83fc96038b6b7a631f66584dc017a6804c01522ab8189a5c926d001780fe"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_successor_native.rs",
+      "sha256": "52850890f6de83d99feb19d22a4e8dc9e02982f03d894c2f8180dd12e8d1502e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_publication.rs",
+      "sha256": "e331e42f681fdc54bc9d7c7af482131487bff85ee8f1f0ea35aaf33467871c84"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_recovery_preparation.rs",
+      "sha256": "252cd678ffdaa868bc970c836e34d3dda4e15cdad9c16622d8b49d2ad5cc9149"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_owner_successor_preparation.rs",
+      "sha256": "cdeab10ea9c21194677f1713f07bc480b7743ede635117e7d110ebf4dfb82f31"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_targeted.rs",
+      "sha256": "6e3de72f8586499d471ef598ee992b0c235bc532db50f226e4c8415990c6d6b8"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "6b7a476583b9d146762277c075664e240c7ba6faea539cc2d69fa521d3e65219"
+    }
+  ],
+  "spec_audit": {
+    "scope": "bounded sections 50\u201351 against original recovery/native metadata contracts",
+    "introduced_findings": 0,
+    "full_handoff_approved": false
+  },
+  "limits": [
+    "Controlled fixture uses synthetic preparation and empty native runtime inventory. This does not establish provider/VM execution or a live coding session.",
+    "Full CLI suite not repeated at this checkpoint; earlier full-suite evidence retains its recorded source scope.",
+    "The borrowed metadata/preparation producer cannot acquire an ordinary lease, install a productive observer, transfer native ownership, or release model input.",
+    "Actual successor native transfer, C/R source/resource/input closure, first-body lineage and coding constructor remain unfinished.",
+    "Process-loss/multiple-cycle recovery and existing-reservation/exposed-conversation producers remain required before worker activation."
+  ],
+  "productive_execution_verified": false,
+  "deployed": false,
+  "live_cli_discord_acceptance": false,
+  "epic_1703_complete": false
+}
