@@ -108,11 +108,31 @@ class ExecutableCaptureTests(unittest.TestCase):
             def drifting(fd,size,offset):
                 data=original(fd,size,offset)
                 if fd==self.source and not changed:
-                    changed.append(True);os.pwrite(writer.fileno(),b'X',0)
+                    changed.append(True);self.assertEqual(os.pwrite(writer.fileno(),b'X',0),1)
+                    self.assertEqual(original(self.source,1,0),b'X')
                 return data
             with patch.object(os,'pread',side_effect=drifting),self.assertRaises(staging.StagingUnavailable):self.capture()
         self.assertTrue(changed);self.assertEqual(set(os.listdir('/proc/self/fd')),before)
         self.assertEqual(os.pread(self.source,1,0),b'X')
+
+    def test_preseal_descriptor_alias_tamper_cannot_return_mislabeled_bytes(self):
+        original=fcntl.fcntl;tampered=[];unexpected=None;before=set(os.listdir('/proc/self/fd'))
+        def interfere(fd,command,*arguments):
+            if command==fcntl.F_ADD_SEALS:
+                alias=os.dup(fd)
+                try:
+                    value=bytes([self.body[-1]^1])
+                    self.assertEqual(os.pwrite(alias,value,len(self.body)-1),1)
+                    self.assertEqual(os.pread(fd,1,len(self.body)-1),value)
+                    tampered.append(True)
+                finally:os.close(alias)
+            return original(fd,command,*arguments)
+        try:
+            with patch.object(fcntl,'fcntl',side_effect=interfere),self.assertRaises(staging.StagingUnavailable):
+                unexpected=self.capture()
+        finally:
+            if unexpected is not None:unexpected.close()
+        self.assertTrue(tampered);self.assertEqual(set(os.listdir('/proc/self/fd')),before)
 
     def test_capture_cannot_be_copied_pickled_or_used_after_close(self):
         image=self.capture()

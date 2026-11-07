@@ -557,7 +557,7 @@ fn native_executable_capture_preserves_bytes_and_refuses_mutable_aliases() {
         .env("AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY",directory.path().join("native.so")).output().unwrap();
     let diagnostics=String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(),"executable capture failed: {diagnostics}");
-    assert!(diagnostics.contains("Ran 11 tests") && !diagnostics.contains("skipped"),"image cases did not execute: {diagnostics}");
+    assert!(diagnostics.contains("Ran 12 tests") && !diagnostics.contains("skipped"),"image cases did not execute: {diagnostics}");
 }
 
 /// Real kernel composition only; no runtime admission or publication grant.
@@ -628,9 +628,9 @@ result=unittest.TextTestRunner(stream=diagnostics).run(suite)
 record={'run':result.testsRun,'failed':len(result.failures),'errors':len(result.errors),'skipped':len(result.skipped),
  'successful':result.wasSuccessful(),'client_uid':os.getuid(),'client_gid':os.getgid(),
  'component_sha256':hashlib.sha256(pathlib.Path('/workspace/target/ci_cargo_status_proxy').read_bytes()).hexdigest(),
- 'status_component_cases':9,'executable_capture_cases':11,
+ 'status_component_cases':9,'executable_capture_cases':12,
  'root_role_admission_proved':False,'native_handoff_integrated':False,'full_ci_pass':False,'shipping_authority':False}
-assert record['run']==20 and record['skipped']==0 and record['successful'],diagnostics.getvalue()
+assert record['run']==21 and record['skipped']==0 and record['successful'],diagnostics.getvalue()
 print(json.dumps(record))
 PY"#;
     let result=session.run("repository",&source,root,&binding,None,&[],&[],&[],Some(command),
@@ -640,8 +640,8 @@ PY"#;
         "version":1,"kind":"real_shared_ci_v3_status_component","head":head,"generation":source.generation(),
         "status":result.status,"cases":cases,"actual_vm_commands":1,"input_closure_complete":false,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
-    ensure!(result.status=="passed" && cases["run"]==20 && cases["status_component_cases"]==9
-        && cases["executable_capture_cases"]==11 && cases["successful"]==true && cases["skipped"]==0,
+    ensure!(result.status=="passed" && cases["run"]==21 && cases["status_component_cases"]==9
+        && cases["executable_capture_cases"]==12 && cases["successful"]==true && cases["skipped"]==0,
         "V3 status component unavailable: {} {}",result.stdout,result.stderr);
     Ok(())
 }

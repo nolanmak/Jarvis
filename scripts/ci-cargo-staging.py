@@ -487,6 +487,17 @@ def _executable_key(info):
         info.st_nlink,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
 
 
+def _executable_digest(descriptor,size):
+    digest=hashlib.sha256();offset=0
+    while offset<size:
+        block=os.pread(descriptor,min(65536,size-offset),offset)
+        if not block:raise StagingUnavailable('executable_changed')
+        digest.update(block);offset+=len(block)
+    if os.pread(descriptor,1,size) or os.fstat(descriptor).st_size!=size:
+        raise StagingUnavailable('executable_changed')
+    return digest.digest()
+
+
 def _static_executable(descriptor,size):
     header=os.pread(descriptor,64,0)
     if (len(header)!=64 or header[:7]!=b'\x7fELF\x02\x01\x01'
@@ -597,6 +608,14 @@ def capture_executable(source):
         # a non-root worker. Execute bits do not grant runtime authorization.
         os.fchmod(descriptor,0o555)
         fcntl.fcntl(descriptor,fcntl.F_ADD_SEALS,EXECUTABLE_SEALS)
+        # Hash the actual immutable object, not merely the bytes supplied to
+        # write(). A pre-seal alias could have changed them. Resample source
+        # bytes too: timestamps alone missed a real write in the guest probe.
+        if (_executable_digest(descriptor,before.st_size)!=digest.digest()
+                or _executable_digest(source,before.st_size)!=digest.digest()
+                or _executable_key(os.fstat(source))!=_executable_key(before)
+                or fcntl.fcntl(source,fcntl.F_GETFL)!=flags):
+            raise StagingUnavailable('executable_changed')
         _static_executable(descriptor,before.st_size)
         result=CapturedExecutable(_TOKEN,descriptor,before.st_size,digest.hexdigest())
         descriptor=None
