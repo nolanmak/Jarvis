@@ -546,6 +546,20 @@ fn native_v3_status_component_preserves_protocol_signals_and_inherited_descripto
     assert!(diagnostics.contains("Ran 9 tests") && !diagnostics.contains("skipped"),"component cases did not execute: {diagnostics}");
 }
 
+/// Physical image capture only; no source or runtime admission grant.
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[test]
+fn native_executable_capture_preserves_bytes_and_refuses_mutable_aliases() {
+    let directory=tempfile::tempdir().unwrap();
+    let image=directory.path().join("ci_cargo_status_proxy");std::fs::write(&image,CARGO_STATUS_PROXY).unwrap();
+    let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests/ci_cargo_executable_test.py");
+    let output=std::process::Command::new("python3").arg("-I").arg(tests)
+        .env("AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY",directory.path().join("native.so")).output().unwrap();
+    let diagnostics=String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(),"executable capture failed: {diagnostics}");
+    assert!(diagnostics.contains("Ran 11 tests") && !diagnostics.contains("skipped"),"image cases did not execute: {diagnostics}");
+}
+
 /// Real kernel composition only; no runtime admission or publication grant.
 #[cfg(all(target_os="linux",target_arch="x86_64"))]
 #[test]
@@ -585,8 +599,11 @@ async fn live_shared_ci_v3_status_component()->Result<()> {
     let fixture=tempfile::Builder::new().prefix("status-component-fixture-").tempdir_in(&target)?;
     let root=fixture.path();
     for (name,bytes) in [("native.so",CARGO_EXEC_DENIAL_LIBRARY),("ci_cargo_status_proxy",CARGO_STATUS_PROXY),
-        ("cases.py",CARGO_STATUS_PROXY_CASES)] {
-        let path=root.join(name);std::fs::write(&path,bytes)?;
+        ("cases.py",CARGO_STATUS_PROXY_CASES),
+        ("scripts/ci-cargo-staging.py",include_bytes!("../../../scripts/ci-cargo-staging.py").as_slice()),
+        ("scripts/ci-cache-generation.py",include_bytes!("../../../scripts/ci-cache-generation.py").as_slice()),
+        ("scripts/tests/ci_cargo_executable_test.py",include_bytes!("../../../scripts/tests/ci_cargo_executable_test.py").as_slice())] {
+        let path=root.join(name);std::fs::create_dir_all(path.parent().unwrap())?;std::fs::write(&path,bytes)?;
         std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700))?;
     }
     git(root,&["init","-q"]).await?;git(root,&["add","."]).await?;
@@ -603,13 +620,17 @@ for name in ('native.so','ci_cargo_status_proxy'):
 os.environ['AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY']='/workspace/target/native.so'
 spec=importlib.util.spec_from_file_location('status_component_cases','/workspace/cases.py')
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
-suite=unittest.defaultTestLoader.loadTestsFromModule(module);diagnostics=io.StringIO()
+suite=unittest.defaultTestLoader.loadTestsFromModule(module)
+spec=importlib.util.spec_from_file_location('executable_capture_cases','/workspace/scripts/tests/ci_cargo_executable_test.py')
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+suite.addTests(unittest.defaultTestLoader.loadTestsFromModule(module));diagnostics=io.StringIO()
 result=unittest.TextTestRunner(stream=diagnostics).run(suite)
 record={'run':result.testsRun,'failed':len(result.failures),'errors':len(result.errors),'skipped':len(result.skipped),
  'successful':result.wasSuccessful(),'client_uid':os.getuid(),'client_gid':os.getgid(),
  'component_sha256':hashlib.sha256(pathlib.Path('/workspace/target/ci_cargo_status_proxy').read_bytes()).hexdigest(),
+ 'status_component_cases':9,'executable_capture_cases':11,
  'root_role_admission_proved':False,'native_handoff_integrated':False,'full_ci_pass':False,'shipping_authority':False}
-assert record['run']==9 and record['skipped']==0 and record['successful'],diagnostics.getvalue()
+assert record['run']==20 and record['skipped']==0 and record['successful'],diagnostics.getvalue()
 print(json.dumps(record))
 PY"#;
     let result=session.run("repository",&source,root,&binding,None,&[],&[],&[],Some(command),
@@ -619,7 +640,8 @@ PY"#;
         "version":1,"kind":"real_shared_ci_v3_status_component","head":head,"generation":source.generation(),
         "status":result.status,"cases":cases,"actual_vm_commands":1,"input_closure_complete":false,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
-    ensure!(result.status=="passed" && cases["run"]==9 && cases["successful"]==true && cases["skipped"]==0,
+    ensure!(result.status=="passed" && cases["run"]==20 && cases["status_component_cases"]==9
+        && cases["executable_capture_cases"]==11 && cases["successful"]==true && cases["skipped"]==0,
         "V3 status component unavailable: {} {}",result.stdout,result.stderr);
     Ok(())
 }

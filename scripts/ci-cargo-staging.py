@@ -18,6 +18,8 @@ from pathlib import Path
 import re
 import select
 import stat
+import struct
+import sys
 import termios
 import time
 
@@ -474,6 +476,136 @@ def read_policy_receipt(descriptor,expected):
 
 def _seal(descriptor):
     fcntl.fcntl(descriptor,fcntl.F_ADD_SEALS,SEALS)
+
+
+EXECUTABLE_MAX_BYTES=2*1024**2
+EXECUTABLE_SEALS=SEALS|0x20 # Linux F_SEAL_EXEC; unsupported kernels must refuse.
+
+
+def _executable_key(info):
+    return (info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid,
+        info.st_nlink,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+
+
+def _static_executable(descriptor,size):
+    header=os.pread(descriptor,64,0)
+    if (len(header)!=64 or header[:7]!=b'\x7fELF\x02\x01\x01'
+            or header[7] not in (0,3) or header[8]!=0):raise StagingUnavailable('executable_format')
+    kind,machine,version,entry,offset,_,_,header_size,step,count,_,_,_=struct.unpack_from('<HHIQQQIHHHHHH',header,16)
+    if (kind!=2 or machine!=62 or version!=1 or header_size!=64 or step!=56
+            or not 0<count<=128 or offset<64 or offset+count*step>size):
+        raise StagingUnavailable('executable_format')
+    table=os.pread(descriptor,count*step,offset)
+    if len(table)!=count*step:raise StagingUnavailable('executable_format')
+    executable_entry=False
+    for at in range(0,len(table),step):
+        program,flags,start,address,_,file_size,memory_size,alignment=struct.unpack_from('<IIQQQQQQ',table,at)
+        if program in (2,3) or program==0x6474e551 and flags&1:
+            raise StagingUnavailable('executable_format') # No dynamic loader or executable stack.
+        if program!=1:continue
+        if (file_size>memory_size or start+file_size>size or address+memory_size>=2**64
+                or flags&3==3 or alignment>1 and (alignment&(alignment-1) or address%alignment!=start%alignment)):
+            raise StagingUnavailable('executable_format')
+        if flags&1 and address<=entry<address+memory_size:executable_entry=True
+    if not executable_entry:raise StagingUnavailable('executable_format')
+
+
+class CapturedExecutable:
+    """Locally owned immutable bytes/execute bits, not trusted-source admission.
+
+    The future runtime consumer must separately bind the original trusted asset,
+    request, root peer, notification, writer closure and live resource ownership.
+    Neither this object nor its descriptive observation authorizes an exec.
+    """
+    def __init__(self,token,descriptor,size,digest):
+        if token is not _TOKEN:raise StagingUnavailable('executable_descriptor')
+        self._fd=descriptor;self._pid=os.getpid();self._pin=os.dup(descriptor)
+        try:self._identity=os.fstat(self._pin)
+        except BaseException:os.close(self._pin);raise
+        self._size=size;self._digest=digest
+
+    def fileno(self):
+        if self._pid!=os.getpid() or self._fd is None:raise StagingUnavailable('executable_descriptor')
+        try:
+            info=os.fstat(self._fd);pin=os.fstat(self._pin)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink!=0 or stat.S_IMODE(info.st_mode)!=0o555
+                    or (pin.st_dev,pin.st_ino)!=(self._identity.st_dev,self._identity.st_ino)
+                    or not fcntl.fcntl(self._pin,fcntl.F_GETFD)&fcntl.FD_CLOEXEC
+                    or (info.st_dev,info.st_ino,info.st_uid,info.st_gid,info.st_size)
+                        !=(self._identity.st_dev,self._identity.st_ino,self._identity.st_uid,self._identity.st_gid,self._size)
+                    or fcntl.fcntl(self._fd,fcntl.F_GET_SEALS)&EXECUTABLE_SEALS!=EXECUTABLE_SEALS):
+                raise StagingUnavailable('executable_descriptor')
+        except OSError:raise StagingUnavailable('executable_descriptor') from None
+        return self._fd
+
+    def observation(self):
+        descriptor=self.fileno();info=os.fstat(descriptor)
+        return {'version':1,'kind':'ci-captured-static-executable','device':info.st_dev,'inode':info.st_ino,
+            'uid':info.st_uid,'gid':info.st_gid,'mode':stat.S_IMODE(info.st_mode),'size_bytes':self._size,
+            'sha256':self._digest,'seals':fcntl.fcntl(descriptor,fcntl.F_GET_SEALS),'source_authority':False,
+            'execution_authority':False,'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+
+    def close(self):
+        if self._fd is not None:
+            if self._pid!=os.getpid():raise StagingUnavailable('executable_descriptor')
+            try:info=os.fstat(self._fd);pin=os.fstat(self._pin)
+            except OSError:raise StagingUnavailable('executable_descriptor') from None
+            # Pin the actual inode until cleanup. Validation failure must not
+            # strand an owned FD, and FD-slot substitution must not close a
+            # foreign object. This close is not descendant/resource teardown.
+            if ((info.st_dev,info.st_ino)!=(self._identity.st_dev,self._identity.st_ino)
+                    or (pin.st_dev,pin.st_ino)!=(self._identity.st_dev,self._identity.st_ino)):
+                raise StagingUnavailable('executable_descriptor')
+            descriptor=self._fd;pin_descriptor=self._pin;self._fd=self._pin=None
+            try:os.close(descriptor)
+            finally:os.close(pin_descriptor)
+
+    def __enter__(self):self.fileno();return self
+    def __exit__(self,*unused):self.close()
+    def __copy__(self):raise StagingUnavailable('executable_descriptor')
+    def __deepcopy__(self,memo):raise StagingUnavailable('executable_descriptor')
+    def __reduce_ex__(self,protocol):raise StagingUnavailable('executable_descriptor')
+
+
+def capture_executable(source):
+    """Copy a borrowed readonly static ELF FD into a sealed executable memfd.
+
+    Size and observed drift are bounded here. Original source provenance,
+    controller deadline/cancellation and resource lifetime remain caller-owned.
+    There is no production caller or environment-selected executable route.
+    """
+    if (sys.platform!='linux' or os.uname().machine!='x86_64' or type(source) is not int
+            or not 0<=source<=65535):raise StagingUnavailable('executable_descriptor')
+    descriptor=None
+    try:
+        before=os.fstat(source);flags=fcntl.fcntl(source,fcntl.F_GETFL)
+        if (not stat.S_ISREG(before.st_mode) or not 64<=before.st_size<=EXECUTABLE_MAX_BYTES
+                or flags&os.O_ACCMODE!=os.O_RDONLY):raise StagingUnavailable('executable_descriptor')
+        descriptor=os.memfd_create('ci-static-executable',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING|0x10) # MFD_EXEC
+        offset=0;digest=hashlib.sha256()
+        while offset<before.st_size:
+            block=os.pread(source,min(65536,before.st_size-offset),offset)
+            if not block:raise StagingUnavailable('executable_changed')
+            digest.update(block);offset+=len(block);written=0
+            while written<len(block):
+                count=os.write(descriptor,block[written:])
+                if count<=0:raise StagingUnavailable('executable_descriptor')
+                written+=count
+        if (os.pread(source,1,before.st_size) or _executable_key(os.fstat(source))!=_executable_key(before)
+                or fcntl.fcntl(source,fcntl.F_GETFL)!=flags):raise StagingUnavailable('executable_changed')
+        # The eventual root owner must be able to hand this anonymous image to
+        # a non-root worker. Execute bits do not grant runtime authorization.
+        os.fchmod(descriptor,0o555)
+        fcntl.fcntl(descriptor,fcntl.F_ADD_SEALS,EXECUTABLE_SEALS)
+        _static_executable(descriptor,before.st_size)
+        result=CapturedExecutable(_TOKEN,descriptor,before.st_size,digest.hexdigest())
+        descriptor=None
+        try:result.fileno()
+        except BaseException:result.close();raise
+        return result
+    except (OSError,AttributeError,struct.error):raise StagingUnavailable('executable_descriptor') from None
+    finally:
+        if descriptor is not None:os.close(descriptor)
 
 
 class CapturedStdin:

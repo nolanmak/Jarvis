@@ -26,6 +26,7 @@ TEST_ONLY_EMBEDS=(
   scripts/tests/ci_cargo_active_signals_test.py
   scripts/tests/ci_cargo_capture_test.py
   scripts/tests/ci_cargo_credits_test.py
+  scripts/tests/ci_cargo_executable_test.py
   scripts/tests/ci_cargo_jobserver_observation_test.py
   scripts/tests/ci_cargo_namespace_apply_test.py
   scripts/tests/ci_cargo_namespace_sequence_test.py
