@@ -971,6 +971,41 @@ pub(crate) mod tests {
                     }).unwrap();
                 }
                 else {assert!(result.is_err());assert!(!nonrelease_visited,"unknown or possibly released body acquired native nonrelease proof");}
+                if input_fault=="resource" {
+                    let expected=ownership::ExpectedBodyInputAttempt {prepared:f.prepared.clone(),resource_receipt:Some(f.resource.clone()),
+                        owner_input:if matches!(original_input,"owner"|"owner-unreleased") {Some(original.clone())}else {None}};
+                    let mut visited=false;
+                    let result=closed.with_body_input_nonrelease("original-request",std::slice::from_ref(&expected),|body| {
+                        assert_eq!(body.request_id(),"original-request");assert_eq!(body.namespace(),&namespace);
+                        assert_eq!(body.binding(),first.original_binding());assert_eq!(body.expected_attempts(),std::slice::from_ref(&expected));
+                        assert_eq!(body.evidence()["attempts"].as_array().unwrap().len(),1);
+                        assert_eq!(body.evidence()["attempts"][0]["kind"],if original_input=="owner-unreleased" {"bound"}else {"unbound"});
+                        body.validate_current()?;
+                        let policy=std::path::PathBuf::from(std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").unwrap());let saved=std::fs::read(&policy)?;
+                        std::fs::write(&policy,b"{}")?;let stale=body.validate_current();std::fs::write(&policy,saved)?;
+                        assert!(stale.is_err(),"whole-body proof ignored changed actual policy");
+                        visited=true;Ok(())
+                    });
+                    assert_eq!(result.is_ok(),matches!(original_input,"none"|"owner-unreleased"),"{provider}/{original_input}: whole-body observation: {result:?}");
+                    assert_eq!(visited,result.is_ok());
+                    if original_input=="none" {
+                        let sql_bound=ownership::ExpectedBodyInputAttempt {owner_input:Some(original.clone()),..expected.clone()};
+                        closed.with_body_input_nonrelease("original-request",std::slice::from_ref(&sql_bound),|body| {
+                            assert_eq!(body.evidence()["attempts"][0]["kind"],"closed_before_binding");body.validate_current()
+                        }).unwrap();
+                        for fault in ["launch","resource","missing-writer"] {
+                            let mut wrong=expected.clone();
+                            match fault {
+                                "launch"=>wrong.prepared.intent.launch_sha256="f".repeat(64),
+                                "resource"=>wrong.resource_receipt.as_mut().unwrap().record_sha256="f".repeat(64),
+                                _=>wrong.prepared.intent.intent_id=uuid::Uuid::new_v4().to_string(),
+                            }
+                            let mut entered=false;
+                            assert!(closed.with_body_input_nonrelease("original-request",&[wrong],|_| {entered=true;Ok(())}).is_err(),"whole-body accepted changed {fault}");
+                            assert!(!entered);
+                        }
+                    }
+                }
                 let fd=std::fs::OpenOptions::new().read(true).open(native.join("state.lock")).unwrap();
                 assert_ne!(unsafe{libc::flock(fd.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
                 revoked=true;Ok(())

@@ -1632,18 +1632,38 @@ mod tests {
         let journal = directory.path().join("operations.json");
         let receipt = directory.path().join("cleanup-complete");
         let unexpected = directory.path().join("unexpected-detached-effect");
+        use std::os::fd::AsRawFd;
         let helper = directory.path().join("supervisor.py");
+        let lease_path=directory.path().join("fixture-build-lease.lock");
+        let lease=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&lease_path).unwrap();
+        assert_eq!(unsafe{libc::flock(lease.as_raw_fd(),libc::LOCK_SH)},0);
+        let fixture_fd=lease.as_raw_fd();
+        let exported=std::env::var("JARVIS_STORAGE_LEASE_FDS").ok().or_else(||std::env::var("JARVIS_STORAGE_LEASE_FD").ok()).unwrap_or_default();
+        let mut descriptors=exported.split(',').filter(|v|!v.is_empty()).map(|v|v.parse::<i32>().unwrap()).collect::<Vec<_>>();
+        descriptors.push(fixture_fd);
         std::fs::write(&helper, include_bytes!("../../../scripts/provider-supervisor.py")).unwrap();
         begin_request(Some(&journal), &receipt).unwrap();
         let mut controller = Command::new("python3");
-        controller.args(["-I", "-c", "import subprocess,sys,time; subprocess.Popen(sys.argv[1:]); time.sleep(30)",
+        controller.args(["-I", "-c", "import os,subprocess,sys,time; raw=os.environ.get('JARVIS_STORAGE_LEASE_FDS') or os.environ.get('JARVIS_STORAGE_LEASE_FD',''); fds=tuple(int(v) for v in raw.split(',') if v); subprocess.Popen(sys.argv[1:],pass_fds=fds); time.sleep(30)",
             "python3", "-I"]).arg(&helper).arg(&receipt)
             .args(["sh", "-c", "setsid sh -c 'printf \"ready\\n\"; sleep 0.5; printf escaped > \"$1\"' sh \"$1\" & wait", "sh"])
             .arg(&unexpected).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        controller.env("JARVIS_STORAGE_LEASE_FD",descriptors[0].to_string())
+            .env("JARVIS_STORAGE_LEASE_FDS",descriptors.iter().map(ToString::to_string).collect::<Vec<_>>().join(","));
+        // Only the forked fixture controller inherits this synthetic lease;
+        // retain all real managed-build leases in the exported set as well.
+        unsafe {controller.pre_exec(move || {
+            let flags=libc::fcntl(fixture_fd,libc::F_GETFD);
+            if flags<0 || libc::fcntl(fixture_fd,libc::F_SETFD,flags & !libc::FD_CLOEXEC)<0 {return Err(std::io::Error::last_os_error());}
+            Ok(())
+        });}
         let mut controller = controller.spawn().unwrap();
         let mut output = BufReader::new(controller.stdout.take().unwrap()).lines();
         let ready = tokio::time::timeout(std::time::Duration::from_secs(3), output.next_line()).await.unwrap().unwrap();
         assert_eq!(ready.as_deref(), Some("ready"));
+        drop(lease);
+        let competitor=std::fs::OpenOptions::new().read(true).write(true).open(&lease_path).unwrap();
+        assert_ne!(unsafe{libc::flock(competitor.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0,"fixture descendants lost the original shared storage lease");
         controller.start_kill().unwrap();
         controller.wait().await.unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -1653,6 +1673,8 @@ mod tests {
         assert_eq!(crate::handoff::resume_message(&journal, "synthetic request").unwrap(), "synthetic request");
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         assert!(!unexpected.exists(), "detached tool survived the daemon crash");
+        assert_eq!(unsafe{libc::flock(competitor.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0,"cleanup retained a descendant storage lease");
+        assert_eq!(unsafe{libc::flock(competitor.as_raw_fd(),libc::LOCK_UN)},0);
     }
 
     /// #1779 D2 — the supervisor forwards how the provider ended. A child

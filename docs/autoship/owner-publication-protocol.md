@@ -1248,3 +1248,54 @@ updater rollout and all original #1715 CLI/Discord/merge/soak acceptance remain.
 Deferred provider-nonproductive support is owned by P/D/R, triggered before that
 exception is admitted, and carries retained per-attempt/frontier/release history
 and protected result storage; it cannot be reconstructed later from response text.
+
+
+## 54. Native body input-lineage observation (native component implemented)
+
+The native half of D53.2 now has a distinct borrowed observation:
+`OriginalInputWriterRevocationProof::with_body_input_nonrelease`. Its
+`ExpectedBodyInputAttempt` values are descriptive expectations, not source or SQL
+authority. Under the original metadata/state/session/audit and permanently revoked
+writer locks, the producer checks every declared prepared intent, controller
+receipt, original resource receipt and input reference against the actual complete
+native writer census. The resulting `NativeBodyNonreleaseProof` is noncloneable,
+nonserializable and has no public constructor or execution/input conversion.
+
+Each declared attempt retains a distinct `bound`, `unbound` or
+`closed_before_binding` disposition. The latter requires the exact existing closed,
+unreleased prepared writer and resource; missing native history is not treated as
+an interrupted binding. Distinct known input references for one request are
+supported without relaxing the existing single-reference bound/unbound APIs.
+Undeclared matching bindings, duplicated writers/references, changed original
+launch/resource/model data, missing release/closure facts and any relevant possible
+release refuse. Unassociated unreleased setup remains in the complete observation;
+a readonly/preparation label never excludes unclassified released input. The
+consumer must still join the exact expectation/attempt set and retained setup
+census to immutable SQL history while the original native locks remain held.
+
+A regression reproduced the old single-reference refusal before implementation.
+Seventeen targeted metadata tests passed. The first full core run exposed an
+existing managed-test fixture issue: its Python controller forwarded lease metadata
+but `subprocess.Popen` closed the actual descriptors, so the unchanged production
+supervisor refused before readiness. An isolated managed probe reproduced EBADF
+without descriptor forwarding and success with it. The fixture now forwards all
+original leases plus a synthetic shared flock, asserting retention through daemon
+crash and release after descendant cleanup. Its original readiness/cleanup deadlines
+and detached-effect assertions remain unchanged. The corrected full core suite
+passed 982 tests with 15 ignored; the expanded retained-session/protected-journal
+fixture passed for both providers in 107.28 seconds, and production compilation
+passed. Exact commands, source hashes, the initial failure and limits are in
+[the native-lineage evidence](1703-native-body-lineage-proof.json).
+
+This is a native observation component, not the full recovered-body constructor.
+The multi-attempt classifier uses controlled records; retained-session fixtures use
+original core locks/ownership machinery and protected synthetic history, not live
+multi-attempt provider/VM calls. D still owns the immutable SQL reservation/model/
+native joins, versioned per-cycle migration, consuming ready/release/result slots
+and productive ingress from §53. R/C still own complete source/resource/input
+admission; their proof cannot be inferred from this observation. No old runtime
+reservation, native budget, owner hold or allowance was changed. Independent
+exact-head review, normal updater rollout and every original CLI/Discord/merge/
+soak requirement remain gates. The next trigger is the reservation-preserving
+SQL/history consumer and actual positive repeated-cycle fixtures; saved evidence
+must never be promoted directly into an `OwnerBodyDispatch`.

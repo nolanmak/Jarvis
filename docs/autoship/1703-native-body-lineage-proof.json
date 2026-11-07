@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "component": "native body input-lineage observation",
+  "status": "native-component-tested-no-productive-consumer",
+  "base_commit": "dffb40655ec4cf8f6404553abfcf1ac2d3048a78",
+  "source_sha256": {
+    "crates/augmentagent-channel-core/src/native_owner_body_nonrelease.rs": "97714ee0f55e55a5b208d373943858b38035d842efabf0b3250c6d03f0b87e89",
+    "crates/augmentagent-channel-core/src/native_owner_metadata.rs": "407af3022e41d961b8eedd98068f94169fd2ff8e01336cbcf140f4b6402ab14b",
+    "crates/augmentagent-channel-core/src/native_owner_transfer.rs": "c7b7c6f1578ca9eea30c37f023affccfb3fefacbbb9826f053965c4d501e686b",
+    "crates/augmentagent-channel-core/src/process_tree.rs": "9b9ed00e5ff312b2ca62373c588e763917cf3ec77f787f38d523f4e545b68f53",
+    "crates/augmentagent-cli/src/autoship_native_observation.rs": "48d0a36ee10a5f143052588b0762ed0e05c2e1d03c8a0aad69616f3c3e91a6a5"
+  },
+  "implemented": [
+    "ExpectedBodyInputAttempt is descriptive controller data; the native observation joins each declared intent/receipt/resource and input reference to the actual original closed-writer census.",
+    "The borrowed NativeBodyNonreleaseProof retains original metadata/state/session/audit and revoked-writer locks; no public constructor, Clone, serde or input/model/replay conversion exists.",
+    "Distinct bound attempts, unbound setup and exact closed-before-binding observations retain separate dispositions. Missing/duplicate/undeclared matching writers and original launch/resource/model substitutions refuse.",
+    "Unassociated unreleased setup remains in the observation. Readonly labels do not exclude unclassified released input. Original bound/unbound single-reference APIs remain unchanged."
+  ],
+  "validation": [
+    {
+      "log": "/tmp/autoship-body-lineage-red-20261107.log",
+      "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib body_nonrelease_lineage_retains_distinct_pre_input_attempts -- --nocapture",
+      "result": "RED: existing single-reference producer refused the second distinct unreleased input reference."
+    },
+    {
+      "log": "/tmp/autoship-body-lineage-green-20261107.log",
+      "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib native_vm::owner_metadata::tests -- --nocapture",
+      "passed": 17,
+      "failed": 0
+    },
+    {
+      "log": "/tmp/autoship-body-lineage-core-suite-20261107.log",
+      "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib",
+      "passed": 981,
+      "failed": 1,
+      "ignored": 15,
+      "result": "Failed at daemon-crash fixture readiness; isolated replay reproduced the same failure. Not counted as green."
+    },
+    {
+      "log": "/tmp/autoship-body-lineage-crash-replay-20261107.log",
+      "result": "The unchanged daemon-crash fixture reproduced its readiness timeout in isolation."
+    },
+    {
+      "log": "/tmp/autoship-body-lineage-crash-fixed-20261107.log",
+      "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib process_tree::tests::daemon_crash_triggers_cleanup_and_receipt_based_restart -- --exact --nocapture",
+      "passed": 1,
+      "failed": 0
+    },
+    {
+      "log": "/tmp/autoship-body-lineage-core-suite-fixed-20261107.log",
+      "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib",
+      "passed": 982,
+      "failed": 0,
+      "ignored": 15,
+      "seconds": 39.59
+    },
+    {
+      "log": "/tmp/autoship-body-lineage-retained-20261107.log",
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent retained_native_metadata_proof_preserves_actual_completed_session -- --nocapture",
+      "passed": 1,
+      "failed": 0,
+      "seconds": 107.28,
+      "scope": "Controlled retained-session/protected-journal fixture for both provider pins, original native/audit/session locks, unchanged state and changed-policy refusal; not live provider or VM execution."
+    },
+    {
+      "log": "/tmp/autoship-body-lineage-production-20261107.log",
+      "command": "scripts/cargo-managed.sh build -p augmentagent-cli --bin augmentagent",
+      "result": "passed",
+      "seconds": 98
+    }
+  ],
+  "managed_fixture_fix": {
+    "cause": "Direct Python fixture controller inherited storage descriptor metadata but subprocess.Popen closed actual FDs before supervisor launch.",
+    "diagnostic": "Registered managed-build Python probe: default subprocess descriptor handling produced EBADF at supervisor os.fstat; explicit pass_fds succeeded.",
+    "change": "Fixture forwards every real inherited build lease and a synthetic flock lease. It asserts the shared lease survives until controller/descendant cleanup and is released afterward.",
+    "timeouts_or_cleanup_assertions_weakened": false,
+    "production_supervisor_changed": false
+  },
+  "limits": [
+    "Multi-attempt ordering/classification is positively tested with controlled records; the retained-session integration exercises bound, unbound and closed-before-binding native observations through actual locked metadata machinery. These do not prove live multi-attempt VM/model recovery.",
+    "Immutable SQL reservation/model/native lineage, consuming readiness/release/result constructors and repeated-cycle migration remain unimplemented. Supplied expectations alone are not SQL authority.",
+    "Complete C/R source/resource/input proof, productive worker integration, independent exact-head review, normal rollout and all original CLI/Discord/autonomous-merge/soak requirements remain gates."
+  ],
+  "native_state_budget_changed": false,
+  "production_reservations_or_owner_holds_changed": false,
+  "all_original_local_validation_handles_terminal": true
+}

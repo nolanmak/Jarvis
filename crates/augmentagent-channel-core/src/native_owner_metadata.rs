@@ -7,6 +7,10 @@ use serde_json::{json,Value};
 use sha2::{Digest,Sha256};
 use std::{collections::{BTreeMap,BTreeSet},path::Path,sync::Arc};
 
+#[path="native_owner_body_nonrelease.rs"]
+mod body_nonrelease;
+pub use body_nonrelease::{ExpectedBodyInputAttempt,NativeBodyNonreleaseProof};
+
 /// Borrowed under original state/session/audit locks. No constructor, clone,
 /// serialization, or conversion into a productive/input capability.
 pub struct MetadataNativeOwnerProof<'a> {
@@ -469,6 +473,92 @@ mod tests {
         let original=reference("original-request");let target=writer(Some(&original),false);
         let selected=bound_input_launches(&[writer(None,false),target.clone()],&original).unwrap();
         assert_eq!(selected.len(),1);assert_eq!(selected[0]["launch_intent"],target["launch_intent"]);
+    }
+    fn body_attempt(writer:&Value,owner_input:Option<super::super::OwnerInputReference>)->ExpectedBodyInputAttempt {
+        ExpectedBodyInputAttempt {prepared:super::super::PreparedLaunchRecord {
+            intent:serde_json::from_value(writer["launch_intent"].clone()).unwrap(),
+            controller_receipt:serde_json::from_value(writer["launch_receipt"].clone()).unwrap()},
+            resource_receipt:serde_json::from_value(writer["resource_receipt"].clone()).unwrap(),owner_input}
+    }
+    #[test]
+    fn body_nonrelease_lineage_retains_distinct_pre_input_attempts() {
+        let first=reference("original-request");let mut second=first.clone();
+        second.model_admission_sequence=3;second.model_receipt="second-model".into();second.claim_sha256="e".repeat(64);
+        let first_writer=writer(Some(&first),false);let mut second_writer=writer(Some(&second),false);
+        second_writer["launch_intent"]["source_owner"]["lease_generation"]=2.into();
+        second_writer["launch_intent"]["source_audit_path"]="/successor/audit".into();
+        // Classification fixture only. The production observation additionally
+        // requires the original locked, resource-checked native writer census.
+        let expected=[body_attempt(&first_writer,Some(first)),body_attempt(&second_writer,Some(second))];
+        assert!(bound_input_launches(&[first_writer.clone(),second_writer.clone()],&reference("original-request")).is_err(),"legacy single-reference contract was broadened");
+        let selected=body_nonrelease::classify(&[second_writer.clone(),first_writer.clone()],"original-workflow","original-request",&expected)
+            .expect("two permanently closed unreleased attempts must retain their distinct input lineage");
+        assert_eq!(selected.attempts.len(),2);
+        assert_eq!(selected.attempts[0]["launch_intent"],first_writer["launch_intent"]);
+        assert_eq!(selected.attempts[1]["launch_intent"],second_writer["launch_intent"]);
+    }
+    #[test]
+    fn body_nonrelease_distinguishes_unbound_closed_before_binding_and_bound() {
+        let original=reference("original-request");let mut next=original.clone();next.model_receipt="next-model".into();next.model_admission_sequence=3;
+        let bound=writer(Some(&original),false);let before_binding=writer(None,false);let unbound=writer(None,false);
+        let expected=[body_attempt(&bound,Some(original)),body_attempt(&before_binding,Some(next)),body_attempt(&unbound,None)];
+        let value=body_nonrelease::classify(&[bound,before_binding,unbound],"original-workflow","original-request",&expected).unwrap();
+        assert_eq!(value.attempts.iter().map(|v|v["kind"].as_str().unwrap()).collect::<Vec<_>>(),vec!["bound","closed_before_binding","unbound"]);
+        assert!(value.attempts[1]["observed_owner_input"].is_null());assert!(value.attempts[1]["expected_owner_input"].is_object());
+    }
+    #[test]
+    fn body_nonrelease_refuses_missing_duplicate_and_undeclared_attempts() {
+        let original=reference("original-request");let target=writer(Some(&original),false);
+        let expected=body_attempt(&target,Some(original.clone()));
+        let classify=|writers:&[Value],expected:&[ExpectedBodyInputAttempt]|body_nonrelease::classify(writers,"original-workflow","original-request",expected);
+        assert!(classify(&[],std::slice::from_ref(&expected)).is_err(),"SQL expectation replaced an absent original writer");
+        assert!(classify(std::slice::from_ref(&target),&[]).is_err(),"undeclared matching input was excluded");
+        assert!(classify(std::slice::from_ref(&target),&[expected.clone(),expected.clone()]).is_err());
+        assert!(classify(&[target.clone(),target.clone()],std::slice::from_ref(&expected)).is_err());
+        let second=writer(Some(&original),false);let second_expected=body_attempt(&second,Some(original));
+        assert!(classify(&[target,second],&[expected,second_expected]).is_err(),"one model reference authorized two attempts");
+    }
+    #[test]
+    fn body_nonrelease_keeps_original_launch_resource_and_binding_exact() {
+        let original=reference("original-request");let target=writer(Some(&original),false);let expected=body_attempt(&target,Some(original));
+        for fault in ["audit","generation","creation","session","launch-receipt","resource","missing-resource","missing-resource-field","missing-binding","binding","release","unknown-release","closure","receipt-version"] {
+            let mut changed=target.clone();
+            match fault {
+                "audit"=>changed["launch_intent"]["source_audit_path"]="/substituted/audit".into(),
+                "generation"=>changed["launch_intent"]["source_owner"]["lease_generation"]=2.into(),
+                "creation"=>changed["launch_intent"]["creation_receipt_sha256"]="f".repeat(64).into(),
+                "session"=>changed["launch_intent"]["native_session_id"]="substituted-session".into(),
+                "launch-receipt"=>changed["launch_receipt"]["record_sha256"]="f".repeat(64).into(),
+                "resource"=>changed["resource_receipt"]["record_sha256"]="f".repeat(64).into(),
+                "missing-resource"=>changed["resource_receipt"]=Value::Null,
+                "missing-resource-field"=>{changed.as_object_mut().unwrap().remove("resource_receipt");},
+                "missing-binding"=>{changed.as_object_mut().unwrap().remove("owner_input");},
+                "binding"=>changed["owner_input"]["model_receipt"]="substituted-model".into(),
+                "release"=>changed["release_attempted"]=true.into(),
+                "unknown-release"=>changed["release_attempted"]=Value::Null,
+                "closure"=>changed["closure"]["kind"]="unknown".into(),
+                "receipt-version"=>changed["resource_receipt"]["version"]=2.into(),_=>unreachable!(),
+            }
+            assert!(body_nonrelease::classify(&[changed],"original-workflow","original-request",std::slice::from_ref(&expected)).is_err(),"{fault}: original evidence substituted");
+        }
+    }
+    #[test]
+    fn body_nonrelease_never_excludes_unclassified_release_by_a_readonly_label() {
+        let original=reference("original-request");let target=writer(Some(&original),false);let expected=body_attempt(&target,Some(original));
+        let other=reference("other-request");let unrelated=writer(Some(&other),true);let setup=writer(None,false);
+        let value=body_nonrelease::classify(&[unrelated.clone(),setup.clone(),target.clone()],"original-workflow","original-request",std::slice::from_ref(&expected)).unwrap();
+        assert_eq!(value.attempts.len(),1);assert_eq!(value.unassociated,vec![setup.clone()]);
+        let mut released=setup;released["release_attempted"]=true.into();released["readonly_transport"]=json!({"readonly_review":true});
+        assert!(body_nonrelease::classify(&[unrelated,released,target],"original-workflow","original-request",&[expected]).is_err());
+    }
+    #[test]
+    fn body_nonrelease_rejects_foreign_expectations_and_missing_closed_before_binding_resources() {
+        let original=reference("original-request");let target=writer(None,false);let expected=body_attempt(&target,Some(original));
+        let classify=|expected:&ExpectedBodyInputAttempt|body_nonrelease::classify(std::slice::from_ref(&target),"original-workflow","original-request",std::slice::from_ref(expected));
+        let mut wrong=expected.clone();wrong.owner_input.as_mut().unwrap().request_id="other-request".into();assert!(classify(&wrong).is_err());
+        let mut wrong=expected.clone();wrong.prepared.intent.source_owner.workflow_id="other-workflow".into();assert!(classify(&wrong).is_err());
+        let mut wrong=expected;wrong.resource_receipt=None;assert!(classify(&wrong).is_err());
+        for request in ["",&"x".repeat(1025)] {assert!(body_nonrelease::classify(&[],"original-workflow",request,&[]).is_err());}
     }
     #[test]
     fn bound_nonrelease_requires_known_release_disposition_and_original_resources() {
