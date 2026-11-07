@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "kind": "visible-immutable-fence-insufficient-resource-bound-counterexample",
+  "source_head_before_experiment": "3a30bdcc53732dc32e7af6710c7a5e9d37b5cef6",
+  "source_sha256": {
+    "scripts/tests/native_custody_inventory_guest_probe.py": "0b2ac130358a75082270920d4805da67fca48b5ddf8de5dd0b85ed0024ba89a8",
+    "scripts/tests/native_custody_immutable_vm_probe.py": "b8e698088ce322a9e98e078284e407c91e90837d1c093b2a5d893f11640ddc19",
+    "scripts/tests/native_custody_immutable_probe.py": "07a529a4ef0db0a62ddaea464040beb91d06021077b7bd49ae3ac27a88b2ffbe"
+  },
+  "original_handle": 85028,
+  "original_handle_terminal": true,
+  "manager_exit": 0,
+  "log": "/tmp/autoship-immutable-unlinked-leased-writer-20261107.log",
+  "log_sha256": "4358ab9e3e85cd7f9cbb9f573b8a9b6b3de3986e8f621f4dcef3c0711b43b9ca",
+  "guest": {
+    "kind": "guest_kernel",
+    "release": "7.0.0-31-generic",
+    "uid": 0
+  },
+  "kernel_image_sha256": "c85962fc9bbccc7f49141800a896f72734ebe16fd175dd46d9b4206556ed0d09",
+  "negative_control": {
+    "all_visible_file_flags_still_set": true,
+    "all_visible_read_leases_still_held": true,
+    "allocated_growth_bytes": 4096,
+    "case": "unlinked-open-inode",
+    "grants_capacity": false,
+    "grown_bytes": 4096,
+    "link_count": 0,
+    "visible_inventory_unchanged": true
+  },
+  "inventory_tests_passed": 11,
+  "original_immutable_tests_passed": 6,
+  "all_descendants_reaped": true,
+  "meaning": "Passing negative control demonstrates an unlinked writable inode can allocate 4096 bytes while every visible file retains its read lease and immutable flag and its exact original inventory remains unchanged. Visible-only flags/leases are insufficient for reduced resource-growth demand.",
+  "production_claim": "No assertion that production sessions possess this FD; the controlled case falsifies a proposed general grant rule, not the original unknown outcomes.",
+  "limits": [
+    "No original resource-cohort, producer Rust source, unseen descriptor closure or execution/input nonrelease authority is established.",
+    "Earlier capture and flushed-restart evidence remains scoped to its exact recorded source and visible inodes.",
+    "No production native data, paths, aliases, policy, reservations, holds, allowances, services or deployment changed."
+  ],
+  "host_root_used": false,
+  "host_kernel_verified": false,
+  "production_state_changed": false,
+  "grants_capacity": false,
+  "implementation_handoff_approved": false,
+  "consumer_inventory_source_sha256": {
+    "crates/augmentagent-channel-core/src/native_vm.rs": "730d5868759a830bdaa80eb677e3b35bbb90f8537593d7f3d912b20ac89bf28a",
+    "crates/augmentagent-channel-core/src/native_state_capacity.rs": "78bfd8d1ce17e650c60e921a9f264baa64e7f72581db93879e1c30996e963bb2",
+    "crates/augmentagent-channel-core/src/native_owner_handoff.rs": "97b920f99469db6328add3dd0dc4dfec3420bea58d48e84bb5fe0951cf6cd82f",
+    "crates/augmentagent-channel-core/src/native_owner_outcome.rs": "2cc478e42a4442fa4b394843870f32398e5925a4ab871352be9e3b5ff06ed851"
+  },
+  "consumer_inventory_source_scope": "Current recovery-branch source at pre-experiment head3a30bdcc, not original producer Rust correspondence or proof of future compatibility."
+}

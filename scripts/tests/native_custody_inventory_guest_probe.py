@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import subprocess
 import sys
@@ -108,6 +109,7 @@ class Experiment:
 
 
 class InventoryCases(unittest.TestCase):
+    negative_controls = []
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='inventory-probe-', dir='/fixture')
         self.addCleanup(self.temporary.cleanup)
@@ -203,6 +205,49 @@ except OSError as error:
                 self.assertTrue(flags(fd) & IMMUTABLE)
         self.assertTrue(self.probe.capture(race)['consistent'])
 
+    def test_unlinked_writable_inode_is_outside_the_visible_fence(self):
+        hidden = self.state / 'unlinked-payload'
+        writable = os.open(hidden, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        self.addCleanup(os.close, writable)
+        os.unlink(hidden)
+        self.assertEqual(os.fstat(writable).st_nlink, 0)
+        self.assertEqual(set(os.listdir(self.state)), {'owned.json', 'lock'})
+        leased, breaks = [], []
+        previous = signal.signal(signal.SIGIO, lambda *_: breaks.append(True))
+        def lease_visible(phase):
+            if phase == 'captured':
+                for fd, _ in self.probe.files.values():
+                    fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_RDLCK)
+                    leased.append(fd)
+        try:
+            result = self.probe.capture(lease_visible)
+            self.assertTrue(result['consistent'])
+            self.assertFalse(result['grants_capacity'])
+            before = os.fstat(writable).st_blocks * 512
+            # Negative control, not a production allegation or grant. Real
+            # read leases and immutable flags on the complete visible census
+            # do not cover a different inode that was already unlinked.
+            self.assertEqual(self.writer(f'os.write({writable},b"x"*4096);os.fsync({writable})', writable), 0)
+            after = os.fstat(writable)
+            self.assertEqual(after.st_size, 4096)
+            self.assertGreater(after.st_blocks * 512, before)
+            self.probe.require_original_inventory()
+            self.assertTrue(all(flags(fd) & IMMUTABLE for fd, _ in self.probe.files.values()))
+            self.assertTrue(all(fcntl.fcntl(fd, fcntl.F_GETLEASE) == fcntl.F_RDLCK for fd in leased))
+            self.assertEqual(breaks, [])
+            self.negative_controls.append({'case': 'unlinked-open-inode',
+                                           'link_count': after.st_nlink,
+                                           'grown_bytes': after.st_size,
+                                           'allocated_growth_bytes': after.st_blocks * 512 - before,
+                                           'visible_inventory_unchanged': True,
+                                           'all_visible_file_flags_still_set': True,
+                                           'all_visible_read_leases_still_held': True,
+                                           'grants_capacity': False})
+        finally:
+            for fd in leased:
+                fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+            signal.signal(signal.SIGIO, previous)
+
     def test_full_fence_denies_preexisting_writer_and_unlink(self):
         writable = os.open(self.state / 'owned.json', os.O_WRONLY)
         self.addCleanup(os.close, writable)
@@ -232,6 +277,7 @@ def main():
     print(json.dumps({'kind': 'inventory_transition', 'tests_run': result.testsRun,
                       'failures': len(result.failures), 'errors': len(result.errors),
                       'skipped': len(result.skipped), 'success': result.wasSuccessful(),
+                      'negative_controls': InventoryCases.negative_controls,
                       'production_state_changed': False, 'grants_capacity': False}), flush=True)
     return 0 if result.wasSuccessful() else 3
 

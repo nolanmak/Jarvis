@@ -166,8 +166,17 @@ atexit.register(prefaulted_mapping_case)
         inventory = next((row for row in records if row.get('kind') == 'inventory_transition'), None)
         complete = (status == 0 and observation and guest and guest.get('uid') == 0
                     and prefaulted and prefaulted.get('supported')
-                    and inventory and inventory.get('tests_run') == 10 and inventory.get('success')
+                    and inventory and inventory.get('tests_run') == 11 and inventory.get('success')
                     and inventory.get('skipped') == 0 and inventory.get('failures') == 0 and inventory.get('errors') == 0
+                    and len(inventory.get('negative_controls', [])) == 1
+                    and inventory['negative_controls'][0].get('case') == 'unlinked-open-inode'
+                    and inventory['negative_controls'][0].get('link_count') == 0
+                    and inventory['negative_controls'][0].get('grown_bytes') == 4096
+                    and inventory['negative_controls'][0].get('allocated_growth_bytes', 0) > 0
+                    and inventory['negative_controls'][0].get('visible_inventory_unchanged') is True
+                    and inventory['negative_controls'][0].get('all_visible_file_flags_still_set') is True
+                    and inventory['negative_controls'][0].get('all_visible_read_leases_still_held') is True
+                    and inventory['negative_controls'][0].get('grants_capacity') is False
                     and len(observation.get('observations', [])) == 5
                     and all(row.get('supported') for row in observation['observations']))
         result = {'status': 'observed' if complete else 'guest-probe-failed', 'guest': guest,

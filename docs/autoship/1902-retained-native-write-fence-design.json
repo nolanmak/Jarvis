@@ -4,7 +4,7 @@
   "epic": 1703,
   "status": "investigation only; no implementation handoff or production fencing authorized by this document",
   "problem": "Eight incomplete native sessions reserve 8 GiB although their retained files total about 59 KiB. Unknown outcomes must stay protected. Proving that a model never started is a different question from making retained storage incapable of future growth.",
-  "proposal": "Retain exact session paths, contents, aliases and unknown outcomes. Investigate a controller-produced write fence and kernel writer check that permits a small bounded retained-data reservation instead of a 1 GiB future-growth reservation. Keep the configured 8 GiB byte budget, 16-session ceiling, filesystem floors, workflow budgets and controls unchanged.",
+  "proposal": "Retain exact session paths, contents, aliases and unknown outcomes. Investigate an actual complete charged-resource bound joined to a controller-produced visible-inode write fence before replacing the 1 GiB ordinary future-growth reservation with a bounded retained-data demand. A visible inventory and kernel leases/flags alone are insufficient (D14). Keep the configured 8 GiB byte budget, 16-session ceiling, filesystem floors, workflow budgets and controls unchanged.",
   "observations": [
     "The deployed store has seven Claude and one Codex retained session; observed layouts contain only owned.json and lock, with one retired.json. No production changes were made for this investigation.",
     "A disposable probe on this host acquired a read file lease with no writer, received EAGAIN with an open writable descriptor and with a writable mapping after its descriptor closed, and succeeded after the mapping closed. This is an observation, not proof of every syscall race or a permanent fence.",
@@ -18,7 +18,8 @@
     "The frozen owner-host immutable probe remains unexecuted on the actual host kernel 7.0.0-30; this session lacks CAP_LINUX_IMMUTABLE and sudo requires the owner password. The pending owner request authorizes disposable tests only, never production fencing.",
     "A managed disposable no-NIC ext4 guest running kernel 7.0.0-31 with guest UID0 passed six immutable cases: directory create/unlink refusal, new write-open refusal, existing writable-FD refusal, existing shared mapping SIGBUS, an open already waiting on a read-lease break refused after immutable transition, and a prefaulted writable shared mapping SIGBUS. Original fixture bytes survived. Original supervisor confirmed all descendants reaped. The host mounted nothing; no production native state was changed and no reservation was reduced. This is a different kernel and serial fixture evidence, not an actual host or concurrent inventory proof.",
     "A subsequent disposable guest experiment exercised a multi-inode candidate under controlled mutation interleavings. Setting directory/file flags without recensus failed four of eight tests by accepting added entries, replacement file/directory inodes and changed contents. Rechecking named and held identities, full inventory and contents after directory fencing and after file fencing then passed ten tests, including a late existing-FD write, retained partial restrictions and UID1000 inode-owner flag-clearing refusal. All six earlier immutable cases remained passing; original supervisor verified descendant cleanup. No production custody producer, crash durability, exact-host support or accounting grant is established.",
-    "A further four-boundary disposable ext4 experiment fsynced the original fixture/oracle and selected flag subset, then syncfs, before its original supervisor SIGKILLed QEMU without a guest unmount. A fresh boot of the same verified image inode independently recovered the original directory/file identities and contents. Captured-only, directory-only and one-file states remained partial; the fully flushed flags survived. All eight original boot supervisors verified descendant cleanup, and each killed QEMU had an observed live/then-exited pidfd. This is guest termination after explicit filesystem flush, not host power-loss testing, an actual-host result or a production custody/accounting proof."
+    "A further four-boundary disposable ext4 experiment fsynced the original fixture/oracle and selected flag subset, then syncfs, before its original supervisor SIGKILLed QEMU without a guest unmount. A fresh boot of the same verified image inode independently recovered the original directory/file identities and contents. Captured-only, directory-only and one-file states remained partial; the fully flushed flags survived. All eight original boot supervisors verified descendant cleanup, and each killed QEMU had an observed live/then-exited pidfd. This is guest termination after explicit filesystem flush, not host power-loss testing, an actual-host result or a production custody/accounting proof.",
+    "A real guest negative control kept an already-open unlinked writable inode outside the complete visible inventory. After every visible file and directory was immutable and every visible file retained an actual read lease, a subprocess grew the unlinked inode by 4096 logical and allocated bytes. Visible identities/content, immutable flags and read leases remained unchanged. This demonstrates that visible-only fencing is insufficient for reduced growth demand; it does not assert such a descriptor exists in production."
   ],
   "primary_sources": [
     "https://man7.org/linux/man-pages/man2/F_SETLEASE.2const.html",
@@ -26,8 +27,8 @@
   ],
   "glossary": {
     "retained_unknown": "Original outcome remains unresolved. Fencing does not establish nonrelease, settlement, safe replay, review approval, merge or native conversation restoration.",
-    "resource_custody": "Proposed resource-only disposition retaining original bytes and names under a verified write fence. It is not original execution provenance or native ownership transfer.",
-    "growth_reservation": "Budget for possible future writes. Retained data and bounded control metadata still need a measured/conservative byte reservation.",
+    "resource_custody": "Proposed resource-only disposition retaining original bytes and names under both a verified write fence and a complete verified charged-resource bound. It is not original execution provenance or native ownership transfer.",
+    "growth_reservation": "Budget for all possible future writes charged to the retained runtime, including hidden/unlinked resources and any shared/control costs not covered by separate conservative demand. Visible retained data and bounded control metadata remain reserved even after genuine closure.",
     "file_lease": "Short-lived Linux kernel coordination against conflicting file opens/truncation. It does not replace directory permissions, all-writer ingress exclusion or a durable custody record."
   },
   "decisions": [
@@ -95,6 +96,11 @@
       "id": "D13",
       "decision": "Invalid custody restores full ordinary future-growth demand in the single shared accounting evaluator immediately; it never preserves an earlier credit to keep reported totals within the configured ceiling. Revalidate all credited sessions at controller startup/restart, host or policy compatibility change, every readiness/admission decision and before any custody/resume/retirement operation. If recomputed demand exceeds a ceiling, report an explicit overcommitted capacity hold, refuse all new model/build/native growth admissions and fence affected running workflows at their next original execution boundary. Existing resources retain their original ownership until checked teardown; a restored reservation is not proof that a process stopped. Allow only the existing bounded reconciliation/cleanup authority, preserving retained data and original outcomes. No counter reset, eviction, automatic un-fence or termination of unrelated processes.",
       "why": "Checking only the next proposed credit does not account for capacity already allocated using an invalid earlier credit. Conservative accounting must expose the resulting deficit and stop additional growth rather than hide it."
+    },
+    {
+      "id": "D14",
+      "decision": "Reject a visible-inventory immutable fence plus read leases as a complete resource-growth bound. Before reducing any original reservation, actual R authority must cover or independently bound unlinked inodes, mappings/descriptors, external scratch/copies, descendants and shared mutable controller metadata as well as named files. A privileged setter or intact journal cannot create this missing resource proof. Missing coverage retains full ordinary demand.",
+      "why": "The real unlinked-inode control allocated 4096 bytes despite a fully verified visible fence and all visible read leases. The counted namespace is not the complete possible charged-resource population."
     }
   ],
   "protocol_hypothesis": [
@@ -104,23 +110,23 @@
     },
     {
       "step": 2,
-      "action": "Prove writer ingress exclusion for this supported runtime class, including old constructors, host VM helpers, delayed starts, chmod paths, descriptor duplication, writable mappings and opens already past a permission check. Root StateLock/session flock and current creator PID absence are inputs, not complete proof. OT1 and OT2 block this step."
+      "action": "Prove or conservatively bound the complete original charged-resource population and every future growth route: visible/unlinked inodes, inherited/duplicated FDs, writable mappings, external scratch/copies, shared controller metadata, original/current helpers and descendants and delayed starts. Join actual original resource ownership/correlation to R proof. The D14 unlinked-writer counterexample rejects visible-only fencing even with leases; native locks, metadata-only names and creator PID absence are not closure. OT1/OT2 and the resource-boundary amendment block this step."
     },
     {
       "step": 3,
-      "action": "Obtain real read leases on read-only descriptors for every retained regular file, with isolated signal handling and bounded child lifetime. Refuse conflicting writers/mappings, lease-break requests and unsupported filesystems. A short-lived helper must retain original lock/descriptor custody and close on parent death; caller timeout is not proof it stopped. OT2 defines the exact guarantee and IPC protocol."
+      "action": "Obtain real read leases on read-only descriptors for every retained regular file, with isolated signal handling and bounded child lifetime. Refuse conflicting writers/mappings, lease-break requests and unsupported filesystems. A short-lived helper must retain original lock/descriptor custody and close on parent death; caller timeout is not proof it stopped. OT2 defines the exact guarantee and IPC protocol. These leases cover their exact visible inodes only. They cannot establish absence of unlinked or external resources and do not replace the D14 R producer."
     },
     {
       "step": 4,
-      "action": "Persist a bounded custody intent before the first restrictive transition, preserving original identity, content and flags for every selected inode. Provisional or partially fenced state still reserves full ordinary growth. Under the proposed D10 mechanism, fence the original directory against namespace mutation and every selected regular file against content mutation, without renaming paths or clearing preexisting flags. Exact ordering must cover writers racing directory fencing, file creation/unlink and preauthorized opens: recensus the same held directory, reject any new/replaced/unsupported entry, verify every selected inode/flag/content and retain uncertainty on a partial transition. Chmod alone is insufficient. OT1-OT3 must establish the actual atomicity, fsync and restart contract before this is implementation-ready."
+      "action": "Persist a bounded custody intent before the first restrictive transition, preserving original identity, content and flags for every selected inode. Provisional or partially fenced state still reserves full ordinary growth. Under the proposed D10 mechanism, fence the original directory against namespace mutation and every selected regular file against content mutation, without renaming paths or clearing preexisting flags. Exact ordering must cover writers racing directory fencing, file creation/unlink and preauthorized opens: recensus the same held directory, reject any new/replaced/unsupported entry, verify every selected inode/flag/content and retain uncertainty on a partial transition. Chmod alone is insufficient. OT1-OT3 must establish the actual atomicity, fsync and restart contract before this is implementation-ready. Bind and preserve the separate original R resource-bound context; completing these visible-inode operations alone cannot reduce demand (D14)."
     },
     {
       "step": 5,
-      "action": "Commit a resource-only receipt only after actual durable fence verification. Bind native root and directory/file identities, exact original ownership bytes/hash, original modes, supported writer contract and operation ID. A copied row/report is not a capability. Lost reply retries the same operation; pending/incompatible state cannot lower the reservation. OT3 supplies storage, bounds, integrity and recovery semantics."
+      "action": "Commit a resource-only receipt only after actual durable fence verification AND complete live R resource-bound verification. Bind native root and directory/file identities, exact original ownership bytes/hash, original modes, supported writer/resource contract and operation ID. A copied row/report or intact receipt is not a capability and cannot reconstruct a lost original live proof. Lost reply retries the same operation; pending/incompatible or incomplete-resource state cannot lower demand. OT2/OT3/OT4 define actual capability lifetime, storage, integrity and fresh reconciliation before any credit."
     },
     {
       "step": 6,
-      "action": "Readiness and actual native admission use one evaluator. Before any reduced future-growth reservation, freshly validate the complete durable custody receipt and live original directory/file identities, inventory and immutable flags under the defined original native locks. A receipt, cached report or earlier syscall success alone cannot grant capacity. Retained bytes and bounded custody metadata remain reserved; provisional, missing, unsupported or invalid proof stays conservative/unknown. All retained sessions still count against 16. Include pending transfer reservations. OT4 defines exact units/formula, atomic proof-to-admission join and cross-version readers. Revalidate all previously credited sessions on the D13 triggers, not only the proposed next session. Report restored conservative demand even if it exceeds the existing ceiling; block new growth and retain original active-resource ownership through verified cleanup."
+      "action": "Readiness and actual native admission use one evaluator. Before any reduced future-growth reservation, freshly validate the complete durable custody receipt and live original directory/file identities, inventory and immutable flags under the defined original native locks. A receipt, cached report or earlier syscall success alone cannot grant capacity. Retained bytes and bounded custody metadata remain reserved; provisional, missing, unsupported or invalid proof stays conservative/unknown. All retained sessions still count against 16. Include pending transfer reservations. OT4 defines exact units/formula, atomic proof-to-admission join and cross-version readers. Revalidate all previously credited sessions on the D13 triggers, not only the proposed next session. Report restored conservative demand even if it exceeds the existing ceiling; block new growth and retain original active-resource ownership through verified cleanup. Revalidate the D14 original charged-resource bound as well as named inode flags. Any uncovered hidden/external/shared cost retains separate conservative demand; a valid visible receipt cannot silently erase it."
     },
     {
       "step": 7,
@@ -135,7 +141,7 @@
     {
       "id": "OT1",
       "load_bearing": true,
-      "question": "Enumerate supported original/current native writers and privileged flag-clearing authorities. Establish the D12 kernel/user-namespace/capability boundary for all supported actors, the exact root-owned helper policy and authenticated request/descriptor protocol, including path/inode replacement and unsupported old helpers/controllers. Show how the immutable directory plus all-file transition excludes namespace and content growth after preparation locks/leases close. Same-UID permissions, a current PID capability sample and the serial guest observations are insufficient. Define the supported host kernel/filesystem gate.",
+      "question": "Enumerate supported original/current native writers and privileged flag-clearing authorities. Establish the D12 kernel/user-namespace/capability boundary for all supported actors, the exact root-owned helper policy and authenticated request/descriptor protocol, including path/inode replacement and unsupported old helpers/controllers. Show how the immutable directory plus all-file transition excludes namespace and content growth after preparation locks/leases close. Same-UID permissions, a current PID capability sample and the serial guest observations are insufficient. Define the supported host kernel/filesystem gate. The actual unlinked-inode control in D14 defeats visible-only fencing even with read leases. Supply the original resource-ownership/correlation and complete charged-population bound before designing a credit-producing helper; do not infer hidden-resource absence from metadata-only names.",
       "owner": "#1902 implementation agent",
       "trigger": "Before implementation or any production fence",
       "blocks": "Fence validity, reservation reduction and rollout."
@@ -159,7 +165,7 @@
     {
       "id": "OT4",
       "load_bearing": true,
-      "question": "Specify eligibility bounds and a conservative reservation formula covering retained allocated/logical data, bounded custody metadata, active/new session growth and pending transfers; all retained sessions count toward max_sessions. Supply the concrete shared evaluator and atomic proof-to-admission join for every growth consumer, including restart and host/policy compatibility changes. Implement D13 invalidation: any unverifiable custody restores full ordinary demand, reports overcommit if necessary, blocks further growth, and uses original execution/teardown authority for affected active work. Test an invalidated credit after a later session has actually consumed the recovered capacity. No missing row or failed probe defaults to zero.",
+      "question": "Specify eligibility bounds and a conservative reservation formula covering retained allocated/logical data, bounded custody metadata, active/new session growth and pending transfers; all retained sessions count toward max_sessions. Supply the concrete shared evaluator and atomic proof-to-admission join for every growth consumer, including restart and host/policy compatibility changes. Implement D13 invalidation: any unverifiable custody restores full ordinary demand, reports overcommit if necessary, blocks further growth, and uses original execution/teardown authority for affected active work. Test an invalidated credit after a later session has actually consumed the recovered capacity. No missing row or failed probe defaults to zero. Apply D14: hidden/unlinked resources, external scratch and shared controller metadata must have verified bounds or retain their conservative charge; visible retained bytes alone cannot replace full demand.",
       "owner": "#1902 implementation agent",
       "trigger": "Before modifying admission/counting",
       "blocks": "Capacity availability/wakeup and budget preservation."
@@ -198,6 +204,7 @@
     }
   ],
   "tests_required": [
+    "The actual open-unlinked writer control must prevent the real R resource-bound factory/accounting consumer from granting a small reservation, unless that resource is covered by a separately verified kernel bound whose demand remains reserved. Visible flags, read leases, metadata-only names and a journal alone must not pass.",
     "Real file writer and writable mapping (including mapping after closing its FD) prevent a custody grant; unsupported leases and break signals refuse.",
     "Deterministic delayed opens before/after permission checks, old constructor/host helper starts, FD duplication, chmod paths, partial permission changes, inode/path replacement and symlink/hardlink attacks cannot produce an unsound zero/small-growth grant.",
     "For the immutable candidate, test real exact-host and declared-guest behavior plus concurrent multi-file directory/file transitions, preexisting writable FDs and prefaulted mappings, directory-entry races, flag/inode substitution, nonprivileged flag-clearing refusal, privileged helper authentication and crash durability. Serial guest success cannot satisfy this combined producer/consumer gate.",
@@ -328,6 +335,42 @@
       "full_seam_pass_required_before_handoff": true,
       "implementation_handoff_approved": false,
       "fresh_reader_findings": 0
+    },
+    "unlinked_writer_checkpoint": {
+      "status": "Real counterexample, consumer boundary and synchronized D14 protocol independently reviewed. Five substantive implementation contracts remain parked; bounded synchronization recheck found no new contradiction. No handoff or production activation.",
+      "unlinked_growth_bytes": 4096,
+      "full_ordinary_growth_demand_preserved": true,
+      "OT1_OT5_remain_open": true,
+      "implementation_handoff_approved": false,
+      "production_activation_authorized": false,
+      "full_seam_pass_required_before_handoff": true,
+      "fresh_reader_findings": 5,
+      "triage": [
+        {
+          "finding": "Complete original resource-bound producer/selected mechanism undefined",
+          "resolution": "Park OT1/OT4; blocks a credit-producing controller. D14 rejects visible-only substitute."
+        },
+        {
+          "finding": "Borrowed resource proof/native-lock/IPC lifetime undefined",
+          "resolution": "Park OT2/OT4; no copied receipt or response constructs lost live authority."
+        },
+        {
+          "finding": "Durable schema/state/idempotency and restart authority undefined",
+          "resolution": "Park OT3; no schema/mutation implementation handoff."
+        },
+        {
+          "finding": "Actual-host/privilege/supported old actor boundary unestablished",
+          "resolution": "Park OT1/OT2; no root helper installation or production mutation."
+        },
+        {
+          "finding": "Reservation arithmetic/all-consumer/version and rollback integration undefined",
+          "resolution": "Park OT4/OT5; concrete consumer inventory identifies the write-open blocker but does not implement a solution."
+        }
+      ],
+      "seams_mapped": 52,
+      "seams_checked": 0,
+      "model_note": "Sonnet unavailable; inherited-model read-only specification reviewers used. Map is not a completed seam audit.",
+      "synchronization_recheck_findings": 0
     }
   },
   "evidence": {
@@ -361,5 +404,7 @@
     "Observe matching nonce/boundary from the still-running guest. Observe the original live QEMU through its original supervisor and pidfd, then TERM that supervisor. Its existing cleanup path SIGKILLs its owned QEMU tree without guest unmount.",
     "Await that same original supervisor to exit143, QEMU pidfd exit and exact all-descendants-reaped marker before booting again. Verify the same raw image device/inode.",
     "Boot a fresh VM with fresh descriptors and independently compare the persisted original inventory, content hashes, device/inode identities and expected flag subset. Close observation FDs without clearing recovered flags. Delete only owned test images after both original cleanups are verified."
-  ]
+  ],
+  "controller_resource_boundary": "1902-custody-resource-closure-boundary.md",
+  "unlinked_writer_evidence": "1902-unlinked-writer-counterexample.json"
 }
