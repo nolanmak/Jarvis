@@ -741,6 +741,11 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
     }
 
     #[cfg(test)]
+    pub(super) fn enable_relay_exec_policy_probe(&self)->Result<()> {
+        private_write(&self.directory.as_ref().context("owned probe session missing")?.path().join("planner-probe-enabled"),b"V3-relay-exec-policy\n")
+    }
+
+    #[cfg(test)]
     pub(super) fn enable_protected_cargo(&self)->Result<()> {
         private_write(&self.directory.as_ref().context("owned CI session missing")?.path().join("protected-cargo-enabled"),b"execution-only\n")
     }
@@ -812,7 +817,8 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             && self.directory.as_ref().expect("owned CI session").path().join("protected-cargo-enabled").is_file();
         let protected_repository=cfg!(test) && operation=="repository"
             && self.directory.as_ref().expect("owned CI session").path().join("protected-repository-enabled").is_file();
-        let request = serde_json::json!({"version":2,"operation":operation,"planner_protocol_probe":planner_protocol_probe,"protected_cargo":protected_cargo,"protected_repository":protected_repository,
+        let planner_probe_kind=if planner_protocol_probe && std::fs::read(self.directory.as_ref().expect("owned CI session").path().join("planner-probe-enabled"))?==b"V3-relay-exec-policy\n" {"relay-exec-policy"} else {"full"};
+        let request = serde_json::json!({"version":2,"operation":operation,"planner_protocol_probe":planner_protocol_probe,"planner_probe_kind":planner_probe_kind,"protected_cargo":protected_cargo,"protected_repository":protected_repository,
             "source_generation":generation,"command_id":command_id,"predecessor":predecessor,
             "retained_generations":retained_generations,
             "retained_producers":retained_producers,

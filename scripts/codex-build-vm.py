@@ -472,7 +472,8 @@ try:
                 scope=ci_workers.controller_probe_scope(worker_control,{
                     'target':str(private_cache/'ci-source-generations'/generation['binding']['generation']/'target'),
                     'binding':generation['binding'],'command':generation['command'],'root':str(probe_root),
-                    'library':'/ci-tools/ci-cargo-planner.so','deadline':time.monotonic()+120})
+                    'library':'/ci-tools/ci-cargo-planner.so','deadline':time.monotonic()+120,
+                    'probe_kind':job.get('planner_probe_kind','full')})
                 observed=_run_worker(scope.argv,scope);stopped=scope.verify()
                 guest_worker_receipts.append(stopped.observation())
                 if observed.get('exit_code')!=0:
@@ -655,7 +656,12 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
         if type(repository) is not bool or repository and (probe or execution is not None):raise Unavailable('invalid internal repository mode')
         if type(probe) is not bool or probe and execution is not None:raise Unavailable('invalid internal planner mode')
         planner_keys={'planner_programs'} if probe or execution is not None or repository else set()
-        if probe:planner_keys.add('planner_protocol_probe')
+        if probe:
+            planner_keys.add('planner_protocol_probe')
+            if 'planner_probe_kind' in ci_context:planner_keys.add('planner_probe_kind')
+        probe_kind=ci_context.get('planner_probe_kind','full')
+        if probe_kind not in ('full','relay-exec-policy') or probe_kind!='full' and not probe:
+            raise Unavailable('invalid internal planner probe kind')
         if repository:
             planner_keys.add('repository_execution')
         if execution is not None:
@@ -795,6 +801,7 @@ poweroff -f
                 'ci_generation':ci_context['generation'] if ci_context is not None else None,
                 'ci_dependency':ci_context.get('dependency_action') if ci_context is not None else None,
                 'planner_protocol_probe':ci_context.get('planner_protocol_probe',False) if ci_context is not None else False,
+                'planner_probe_kind':ci_context.get('planner_probe_kind','full') if ci_context is not None else 'full',
                 'cargo_execution':ci_context.get('cargo_execution') if ci_context is not None else None,
                 'repository_execution':ci_context.get('repository_execution',False) if ci_context is not None else False,
                 'ort_cache':'ort_cache' in config}).encode(), 0, 0)])

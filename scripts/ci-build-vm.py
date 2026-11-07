@@ -238,10 +238,13 @@ def execute(request,run=vm.run,progress=None):
     progress["stage"]="request_schema"
     required={'version','operation','runtime_config','workspace','state','git_objects','runner','contract','head','base','storage','scratch','build_cache',
               'source_generation','command_id','predecessor','tree','controller_authority_sha256','retained_generations','retained_producers','producer_retirements'}
-    optional={'id','changed_files','cache_bytes','packages','filters','command','dependency','planner_protocol_probe','protected_cargo','protected_repository'}
+    optional={'id','changed_files','cache_bytes','packages','filters','command','dependency','planner_protocol_probe','planner_probe_kind','protected_cargo','protected_repository'}
     if set(request)-required-optional or not required<=set(request) or request['version']!=2 or request['operation'] not in ('plan','step','targeted','baseline','repository','dependency'):raise vm.Unavailable('invalid CI VM request')
     if (type(request.get('planner_protocol_probe',False)) is not bool
             or request.get('planner_protocol_probe') and request['operation']!='repository'):
+        raise cache_generation.FreshnessHold('invalidation_unsafe')
+    probe_kind=request.get('planner_probe_kind','full')
+    if probe_kind not in ('full','relay-exec-policy') or probe_kind!='full' and not request.get('planner_protocol_probe'):
         raise cache_generation.FreshnessHold('invalidation_unsafe')
     protected=request.get('protected_cargo',False)
     if (type(protected) is not bool or protected and (request['operation'] not in ('targeted','baseline')
@@ -366,7 +369,7 @@ def execute(request,run=vm.run,progress=None):
     if probe or protected or repository:
         context.update(planner_programs={name:private_bytes(BASE/name) for name in (
             'ci-cargo-planner.py','ci-cargo-relay.py','ci-cargo-staging.py','ci-cargo-views.py','ci-cargo-observer.py','ci-lookup-inputs.py','ci-cargo-planner.so','ci-cargo-unit-policy.so')})
-    if probe:context['planner_protocol_probe']=True
+    if probe:context.update(planner_protocol_probe=True,planner_probe_kind=probe_kind)
     if protected:context['cargo_execution']=cargo_commands(cargo)
     if repository:context['repository_execution']=True
     outcome=run(runtime,workspace,command,{},timeout=None,scratch_dir=str(scratch),build_cache=request['build_cache'],storage_lease=lease,
@@ -420,7 +423,7 @@ def execute(request,run=vm.run,progress=None):
         if probe:
             probe_spec=importlib.util.spec_from_file_location('observed_planner_probe',BASE/'ci-cargo-planner.py')
             planner=importlib.util.module_from_spec(probe_spec);probe_spec.loader.exec_module(planner)
-            try:result['planner_protocol_probe']=planner.validate_probe(outcome.get('planner_protocol_probe'),
+            try:result['planner_protocol_probe']=(planner.validate_relay_exec_policy_probe if probe_kind=='relay-exec-policy' else planner.validate_probe)(outcome.get('planner_protocol_probe'),
                 generation['binding'],generation['command'],guest_workers,observed_inputs,result['source_projection'])
             except planner.FreshnessHold as error:raise cache_generation.FreshnessHold(error.reason) from None
     if protected:

@@ -5076,9 +5076,130 @@ def unit_credential_role_probe(value,relay):
         raise FreshnessHold('invalidation_unsafe')
 
 
+_RELAY_EXEC_POLICY_BODY=r'''
+import ctypes,errno,json,os,sys
+mode=sys.argv[1];libc=ctypes.CDLL(None,use_errno=True);libc.syscall.restype=ctypes.c_long
+assert ctypes.CDLL(None).jarvis_ci_prepare_status_continuation
+if mode=='descendant':
+ child=os.fork()
+ if child:
+  assert os.waitpid(child,0)==(child,0)
+  os._exit(0)
+expected=(errno.ENOSYS,errno.EPERM) if mode=='listener-loss' else (errno.EPERM,)
+errors=[]
+argv=(ctypes.c_char_p*2)(b'true',None);env=(ctypes.c_char_p*1)(None)
+assert libc.syscall(ctypes.c_long(59),ctypes.c_char_p(b'/usr/bin/true'),argv,env)==-1
+errors.append(ctypes.get_errno());assert errors[-1] in expected
+assert libc.syscall(ctypes.c_long(322),ctypes.c_int(-100),ctypes.c_char_p(b'/usr/bin/true'),argv,env,ctypes.c_int(0))==-1
+errors.append(ctypes.get_errno());assert errors[-1] in expected
+os.write(1,(json.dumps({'raw_exec_errnos':errors})+'\n').encode())
+'''
+
+
+def _relay_exec_policy_client(arguments):
+    bootstrap,configuration=map(int,arguments)
+    value=_bootstrap(bootstrap,'relay-exec-policy-client');_parent_guard(value['parent']);os.close(bootstrap)
+    uid=value['uid']
+    if uid not in (1000,1001,2000,6095) or value['mode'] not in ('direct','descendant','listener-loss'):
+        raise FreshnessHold('invalidation_unsafe')
+    policy=UnitPolicy();stage_exec_mediation(value,policy)
+    os.setgroups([]);os.setgid(uid);os.setuid(uid);_parent_guard(value['parent'])
+    os.set_inheritable(configuration,True)
+    arm_original_exec()
+    os.execve('/usr/bin/python3',['python3','-I','-c',_RELAY_EXEC_POLICY_BODY,value['mode']],
+        {'PATH':os.defpath,'LD_PRELOAD':value['library'],'JARVIS_CARGO_RELAY_FD':str(configuration)})
+
+
+def relay_exec_policy_probe(value):
+    """Fixed root-controlled conformance only; never grants runtime execution."""
+    if os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0):raise FreshnessHold('invalidation_unsafe')
+    supervisor=_load('relay_policy_original_supervisor','provider-supervisor.py');results={}
+    cases=(('worker',1000,b'JARVWRK3',0,'direct'),('planner',1001,b'JARVCFG3',0,'direct'),
+        ('unit_first',2000,b'JARVUNT3',2000,'direct'),('unit_last',6095,b'JARVUNT3',6095,'direct'),
+        ('descendant',1000,b'JARVWRK3',0,'descendant'),('listener_loss',2000,b'JARVUNT3',2000,'listener-loss'))
+    for name,uid,magic,config_uid,mode in cases:
+        mediation=ExecMediation(value['deadline'],uid);bootstrap=None
+        configuration=os.memfd_create('relay-policy-probe',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
+        receipt=Path(value['root'])/(name+'-cleanup')
+        try:
+            data=legacy.CONFIG.pack(magic,config_uid,os.getpid(),30000,b'p'*32,b'/tmp/unused-policy-probe.sock')
+            if os.write(configuration,data)!=len(data):raise FreshnessHold('metadata_torn')
+            fcntl.fcntl(configuration,fcntl.F_ADD_SEALS,legacy.SEALS)
+            bootstrap=_sealed(dict(value,kind='relay-exec-policy-client',parent=os.getpid(),
+                uid=uid,mode=mode,exec_mediation_fd=mediation.child_fd))
+            def executed(child):
+                mediation.executed(child)
+                if mode=='listener-loss':
+                    mediation.settle();os.close(mediation.listener);mediation.listener=None
+            import tempfile
+            with tempfile.TemporaryFile() as captured_out, tempfile.TemporaryFile() as captured_err:
+                saved_out,saved_err=os.dup(1),os.dup(2)
+                try:
+                    os.dup2(captured_out.fileno(),1);os.dup2(captured_err.fileno(),2)
+                    code=supervisor.supervise(receipt,[sys.executable,'-I',str(Path(__file__).resolve()),
+                        '--relay-exec-policy-client',str(bootstrap),str(configuration)],
+                        forward_fds=(bootstrap,configuration,mediation.child_fd),
+                        on_spawn=mediation.spawned,on_exec=executed,return_raw_status=True)
+                finally:
+                    os.dup2(saved_out,1);os.dup2(saved_err,2);os.close(saved_out);os.close(saved_err)
+                captured_out.seek(0);captured_err.seek(0)
+                output,error=captured_out.read(4096),captured_err.read(4096)
+            mediation.settle()
+            if code!=0 or error:raise FreshnessHold('invalidation_unsafe')
+            observed=json.loads(output)
+            if type(observed) is not dict or set(observed)!={'raw_exec_errnos'}:raise FreshnessHold('invalidation_unsafe')
+            refused=observed['raw_exec_errnos']
+            if refused not in ([errno.EPERM,errno.EPERM],[errno.ENOSYS,errno.ENOSYS]) or mode!='listener-loss' and refused!=[errno.EPERM,errno.EPERM]:
+                raise FreshnessHold('invalidation_unsafe')
+            denied=[row for row in mediation.records if not row['allowed']]
+            expected=0 if mode=='listener-loss' else 2
+            if (mediation.errors or not mediation.ack or len(denied) not in (0,expected)
+                    or any(row['disposition']!='exec' or row['nr'] not in (59,322)
+                        or row['response_errno']!=errno.EPERM or not row['after_ack'] for row in denied)
+                    or denied and [row['nr'] for row in denied]!=[59,322]):
+                raise FreshnessHold('invalidation_unsafe')
+            if mode=='descendant' and any(row['pid']==mediation.pid for row in denied):raise FreshnessHold('invalidation_unsafe')
+            if mode=='direct' and any(row['pid']!=mediation.pid for row in denied):raise FreshnessHold('invalidation_unsafe')
+            if receipt.read_bytes()!=b'all-descendants-reaped\n':raise FreshnessHold('cleanup_uncertain')
+            results[name]={'uid':uid,'mode':mode,'raw_execs_refused':2,'denied_notifications':len(denied),
+                'raw_exec_errnos':refused,'original_exec_ack':True,'original_cleanup':True,'listener_lost':mode=='listener-loss'}
+        finally:
+            if bootstrap is not None:os.close(bootstrap)
+            os.close(configuration);mediation.close()
+    print(json.dumps({'version':1,'kind':'ci-relay-exec-policy-probe','binding':value['binding'],
+        'command':value['command'],'cases':results,'input_closure_complete':False,
+        'full_ci':False,'shipping_authority':False}))
+    return 0
+
+
+def validate_relay_exec_policy_probe(value,binding,command,workers,writer,source_projection):
+    keys={'version','kind','binding','command','cases','input_closure_complete','full_ci','shipping_authority','guest_worker_quiescence'}
+    expected={'worker':1000,'planner':1001,'unit_first':2000,'unit_last':6095,'descendant':1000,'listener_loss':2000}
+    if (type(value) is not dict or set(value)!=keys or value['version']!=1
+            or value['kind']!='ci-relay-exec-policy-probe' or value['binding']!=binding or value['command']!=command
+            or any(value[k] is not False for k in ('input_closure_complete','full_ci','shipping_authority'))
+            or type(value['cases']) is not dict or set(value['cases'])!=set(expected)):
+        raise FreshnessHold('input_census_unknown')
+    scope=value['guest_worker_quiescence']
+    if (scope not in workers['scopes'] or scope==writer['guest_worker_quiescence']
+            or any(scope==item['scope'] for item in source_projection['access'])):raise FreshnessHold('cleanup_uncertain')
+    for name,uid in expected.items():
+        row=value['cases'][name];lost=name=='listener_loss'
+        if (type(row) is not dict or set(row)!={'uid','mode','raw_execs_refused','raw_exec_errnos','denied_notifications','original_exec_ack','original_cleanup','listener_lost'}
+                or row['uid']!=uid or row['raw_execs_refused']!=2 or type(row['denied_notifications']) is not int
+                or row['denied_notifications'] not in ((0,) if lost else (0,2))
+                or row['mode']!=('listener-loss' if lost else 'descendant' if name=='descendant' else 'direct')
+                or row['raw_exec_errnos'] not in (([errno.EPERM,errno.EPERM],[errno.ENOSYS,errno.ENOSYS]) if lost else ([errno.EPERM,errno.EPERM],))
+                or row['original_exec_ack'] is not True or row['original_cleanup'] is not True or row['listener_lost'] is not lost):
+            raise FreshnessHold('input_census_unknown')
+    return value
+
+
 def _probe(arguments):
     global _PHASE,_CHILD_DIAGNOSTIC
     value=_bootstrap(int(arguments[0]),'probe');_parent_guard(value['parent'])
+    if value.get('probe_kind','full')=='relay-exec-policy':return relay_exec_policy_probe(value)
+    if value.get('probe_kind','full')!='full':raise FreshnessHold('invalidation_unsafe')
     root=Path(value['root']);admission=admit(value['target'],value['binding'],value['command'],root)
     results=[];view_probe=None;cargo_probe=None
     _PHASE='planner_kernel_observer'
@@ -5801,6 +5922,7 @@ if __name__=='__main__':
         elif sys.argv[1:2]==['--repository-execution-supervisor']:result=_repository_execution_supervisor(sys.argv[2:])
         elif sys.argv[1:2]==['--credential-client']:result=_credential_client(sys.argv[2:])
         elif sys.argv[1:2]==['--unit-credential-client']:result=_unit_credential_client(sys.argv[2:])
+        elif sys.argv[1:2]==['--relay-exec-policy-client']:result=_relay_exec_policy_client(sys.argv[2:])
         elif sys.argv[1:2]==['--probe']:result=_probe(sys.argv[2:])
         elif sys.argv[1:2]==['--probe-supervisor']:result=_probe_supervisor(sys.argv[2:])
         else:raise FreshnessHold('invalidation_unsafe')

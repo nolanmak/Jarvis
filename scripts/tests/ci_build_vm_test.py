@@ -126,6 +126,23 @@ class AdapterTests(unittest.TestCase):
      with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request|{'planner_protocol_probe':value})
      load.assert_not_called()
 
+ def test_root_policy_probe_kind_is_fixed_and_requires_internal_probe_mode(self):
+  with tempfile.TemporaryDirectory() as directory:
+   request=self.fixture(Path(directory))
+   for kind in (None,False,1,[],{},'arbitrary-root-command','relay-exec-policy'):
+    with self.subTest(kind=kind),patch.object(vm.Runtime,'load') as load:
+     with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request|{'planner_probe_kind':kind})
+     load.assert_not_called()
+
+ def test_root_policy_probe_cannot_be_selected_for_non_repository_operations(self):
+  with tempfile.TemporaryDirectory() as directory:
+   request=self.fixture(Path(directory))
+   for operation in ('plan','step','targeted','baseline','dependency'):
+    with self.subTest(operation=operation),patch.object(vm.Runtime,'load') as load:
+     with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request|{
+      'operation':operation,'planner_protocol_probe':True,'planner_probe_kind':'relay-exec-policy'})
+     load.assert_not_called()
+
  def test_structured_cargo_commands_preserve_original_selection_flags_and_filters(self):
   self.assertEqual(adapter.cargo_commands({'operation':'targeted','packages':['alpha','beta'],'filters':[]}),[
    ['/toolchain/bin/cargo','build','-p','alpha','-p','beta'],
