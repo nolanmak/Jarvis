@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "component": "reservation-preserving recovery contract checkpoint",
+  "status": "contract-revised-implementation-incomplete",
+  "base_commit": "07919f1800c5e4fda4807241b910ca02b5e2455c",
+  "spec": "docs/autoship/owner-publication-protocol.md",
+  "spec_sha256": "d1257d8ee52a93bad7b2a0bcd5a49c44cfbffe1c31fd872577ed5009e9ffffb5",
+  "skill": "/home/nolan-makatche/.codex/plugins/cache/spec-interrogation/spec-interrogation/1.0.0/skills/spec-interrogation/SKILL.md",
+  "audit": {
+    "fresh_reader": "reserved_body_handoff_fresh_20261107; whole original spec, followed by bounded revision verification",
+    "conversation_and_source_pass": "performed by primary agent",
+    "complete_sonnet_seam_audit": false,
+    "seams_claimed_fully_checked": 0,
+    "handoff_readiness_claimed": false
+  },
+  "resolved_in_contract_not_implemented": [
+    {
+      "finding": "Request-lifetime uniqueness conflicts with repeated recovery",
+      "resolution": "D53.3: one immutable transfer per authenticated cycle/purpose, versioned indexes, exact predecessor settlement and original UUID replay."
+    },
+    {
+      "finding": "Reservation absence and native binding absence use the same unbound term",
+      "resolution": "D53.1/D53.2: explicit case matrix and five tagged held-attempt shapes, retaining each SQL/native publication half."
+    },
+    {
+      "finding": "Existing single-input-reference native proof cannot cover repeated attempts",
+      "resolution": "D53.2: fresh complete input-reference lineage, exact prepared/resource joins, closed-before-binding proof, no latest-row selection."
+    },
+    {
+      "finding": "Known-unstarted continuation exception lacks a producer/disposition/CAS",
+      "resolution": "D53.5: exact continuation-attempt proof, permanent writer revocation, actual resources, immutable single-consumption retry disposition."
+    },
+    {
+      "finding": "Continuation retry incorrectly depends on unexposed-original-body release authority",
+      "resolution": "D53.4/D53.5: continuation_retry has its own attempt/frontier/disposition authorization while sharing the common charge ledger."
+    },
+    {
+      "finding": "SQL-admission/native-unbound shape lacks an explicit discriminant",
+      "resolution": "D53.2: reserved_sql_bound_native_unbound requires SQL/input references and actual closed-before-binding writer/resource disposition."
+    },
+    {
+      "finding": "Normal new-frontier continuation is absent from accounting union",
+      "resolution": "D53.4/D53.5: continuation purpose binds exact CAS-consumed frontier admission and authorized attempt."
+    }
+  ],
+  "validation": {
+    "diff_check": "passed",
+    "builds_or_runtime_tests_for_document_change": "not run; document-only change",
+    "all_previous_local_build_test_handles_terminal": true
+  },
+  "remaining": [
+    "Implement versioned immutable reservation/cycle history and migration.",
+    "Produce and consume actual native/input/resource lineage for each positive case.",
+    "Implement recovered release/model/result and continuation admission constructors with positive/fault regressions.",
+    "Complete C/R source/resource/input authority, productive worker integration, independent exact-head review, normal rollout and all original CLI/Discord/merge/soak acceptance."
+  ],
+  "production_native_policy_changed": false,
+  "original_goal_scope_reduced": false
+}

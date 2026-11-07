@@ -677,7 +677,7 @@ The recovery/handoff component owns the pending/context writer, same-request rec
 
 The durability stage now uses `prepare_owner_recovery_native_intent` under the actual opaque current claim, fresh original authorization and exactly scoped original core scan. It requires the existing validated original publication completion, refuses an occupied native destination or unsettled remote mutation, then writes the shared native snapshot, ordinary version-1 `PendingNativeHandoff` and recovery context in one immediate transaction. The pending encoder/event projection is shared with ordinary native preparation. Current authorization, claim and source facts are checked again before commit. Neither the original activation/preparation nor checkpoint/control/accounting/input is rewritten.
 
-`workflow_owner_recovery_native_intent` is an immutable context projection, not a separate native verdict. Its strict canonical version-1 record is at most 16 KiB and references the original intent, actual captured claim, completed publication and exact ordinary pending event/digest. Unique workflow/request, workflow/transfer and workflow/generation keys prevent competing replacement intents. History remains bounded to 1,024 contexts per workflow. The reader validates bidirectional event/index joins, exact pending data through the shared active/completed/unstarted/aborted history, original source registration/binding and the captured claim's event/time interval. A completed-publication row is validated by its existing reader, not a new completion policy.
+`workflow_owner_recovery_native_intent` is an immutable context projection, not a separate native verdict. Its strict canonical version-1 record is at most 16 KiB and references the original intent, actual captured claim, completed publication and exact ordinary pending event/digest. Unique workflow/request, workflow/transfer and workflow/generation keys prevent competing replacement intents. These describe the implemented single-cycle projection, not a request-lifetime restriction on the repeated recovery required by §5.1. The versioned per-cycle keys and migration needed before repeated-cycle activation are specified in §53; the current projection still refuses an unsupported chain. History remains bounded to 1,024 contexts per workflow. The reader validates bidirectional event/index joins, exact pending data through the shared active/completed/unstarted/aborted history, original source registration/binding and the captured claim's event/time interval. A completed-publication row is validated by its existing reader, not a new completion policy.
 
 The public result within this private workflow subsystem is a non-cloneable/nonserializable durability receipt borrowing the actual current claim. It exposes only descriptive transfer ID/generation. It has no raw lease/request getter, core-intent conversion, executable logger or body permission. This checkpoint's controlled caller deliberately returns core `PersistenceUnknown` after SQL durability, before any native transfer effect. Saved ordinary pending data and auxiliary references cannot substitute for the future actual recovery reconciler. Opening a new store or minting a genuine later metadata claim reopens the same recorded UUID rather than allocating a replacement.
 
@@ -773,7 +773,7 @@ transaction and bounded canonical-file checks. It rechecks the current native
 frontier/facts, exact request/store binding, original reservation absence,
 completed original publication, canonical evidence and exact registered scope.
 A bound reservation cannot enter this producer; the distinct bound-input and
-semantic-continuation ready producers are still required.
+semantic-continuation ready producers are still required. Here readiness “unbound” means reservation absent; native “unbound” in §48 means no observed owner-input binding. The reserved/no-binding cases and distinct proof joins are specified in §53 and are not implemented by this checkpoint.
 
 One transaction appends the immutable `owner_successor_ready` event and record,
 changes only the captured turn to `recovery_ready`, removes its metadata recovery
@@ -1047,3 +1047,204 @@ owner workflow tests passed 11 (140.36s), and production compilation passed
 `1703-owner-successor-transfer-proof.json` for exact source hashes and limits.
 The bounded audit's destination-join finding was resolved in both specification
 and real scan controls; this is not full C/R handoff or activation approval.
+
+
+## 53. Reservation-preserving recovery case and cycle contract
+
+Status: required next implementation contract, not an implemented producer,
+productive grant, completed seam audit or rollout approval. This section resolves
+ambiguities between §§5.1, 44, 46, 48 and 49. Existing component checkpoints remain
+historical evidence of their stated narrower implementations. D owns workflow,
+model/result and continuation joins; R owns original native writer/resource and
+handoff proof. C's complete source/input proof and every original activation and
+live-acceptance gate remain required.
+
+**D53.1 — Keep reservation, model admission and input binding separate.** A body
+reservation is the immutable `owner_body_dispatch_started` record/event. A model
+admission is an actual committed owner-body model slot with its existing
+`resource_charge` ledger entry; generic preparation/reviewer charges are not that
+slot. SQL native admission describes the controller's selected
+`OwnerInputReference`, prepared launch and original resource receipt. Observed
+native binding is the corresponding protected original input-writer record.
+Those last two publications can be interrupted between stores. None, individually,
+proves input release, nonrelease, quiescence or another executable capability.
+This distinction is necessary because the resource-ready callback can commit the
+reservation before model admission or native input binding completes.
+
+| Retained reservation and selected held-attempt state | Required original native observation | Recovery disposition |
+| --- | --- | --- |
+| No reservation and no owner-body model/native-admission rows | Fresh unbound nonrelease plus the original full closed-writer/resource census | The existing reservation-absent readiness case; the later first-reservation factory still waits for native resource readiness. |
+| Version-2/3 reservation; no owner-body model or SQL native-admission row | Fresh whole-lineage nonrelease with an unbound held attempt, including the reservation's exact prepared launch and original resource receipt among the permanently closed unreleased writers | Reserved/model-unadmitted readiness; preserve the original reservation. |
+| Version-2/3 reservation and exact model slot; no SQL native-admission row | The same whole-lineage writer proof plus the captured held-attempt model-slot/charge reference | Reserved/model-admitted readiness; retain the spent model charge and reservation. |
+| Version-2/3 reservation, exact model slot and SQL native admission; native writer not yet bound | Fresh closed-before-binding proof for that exact prepared launch/resource; no release by any original relevant writer | Retain all three SQL records. A missing native reference alone is insufficient; without the actual closed writer, hold as uncertain. |
+| Version-2/3 reservation, exact model slot and matching observed native input binding | Fresh bound nonrelease for the exact immutable input-reference lineage and original resources | Reserved/native-bound readiness; retain every original model/input attempt. |
+| Native binding without its exact SQL model/reservation lineage, conflicting halves, unavailable original writer/resource history, or legacy version-1 reservation lacking the input-boundary evidence | No substituting observation is admitted | Integrity or outcome-uncertain hold; no automatic body replay or replacement reservation. |
+| Any relevant writer may have released the body | Nonrelease is unavailable | The original-conversation continuation/result path needs its own actual frontier/outcome proof; otherwise retain uncertainty and the authenticated correction path. |
+
+For every reserved row, the request/body digest, provider, original preparation,
+activated turn, publication and exact reservation/event digest must agree. Its
+prepared intent, controller receipt and resource receipt must join the same
+original native registration and the permanently closed writer census. Current
+policy, an empty transcript, a readonly label or SQL absence cannot replace this
+join. The same rule applies to every later input-boundary attempt associated with
+that reservation. An unrelated request is not relabelled as this body. Existing
+unclassified released preparation continues to hold unless C/R provides the
+separate trusted exclusion required elsewhere in this protocol.
+
+**D53.2 — Version the readiness plan and retain the complete input lineage.**
+Keep version-1 reservation-absent readiness history readable under its original
+rules. A version-2 `unexposed_body` plan has a strict tagged `body_state` union:
+`reservation_absent`, `reserved_model_unadmitted`,
+`reserved_model_admitted_native_absent`, `reserved_sql_bound_native_unbound`, or
+`reserved_native_bound`. These tags classify the retained original reservation
+and the explicitly selected held attempt, not the greatest model sequence. Every
+reserved variant carries the same original reservation/event reference and an
+immutable ordered attempt lineage. The original first model slot is separately
+retained as present or absent; a later attempt never rewrites that fact. Each
+attempt records its original/predecessor/setup/release references and its own
+model and native-admission state. Earlier model slots remain charged regardless
+of the selected attempt's current tag.
+
+For `reserved_model_unadmitted`, the held attempt has no model or SQL native slot.
+For `reserved_model_admitted_native_absent`, its exact model-slot/charge reference
+is mandatory and its SQL native-admission reference is absent. For
+`reserved_sql_bound_native_unbound`, its model slot, SQL native-admission reference,
+selected `OwnerInputReference` and exact closed-before-binding writer/resource
+disposition are all mandatory. For `reserved_native_bound`, those model/SQL/input
+references and the matching observed native binding are mandatory. The last case
+uses a bound disposition, not closed-before-binding. `reservation_absent` cannot
+contain any owner-body reservation/model/native slot. All variants retain each
+associated prepared-launch/resource pair, including setup that stopped before
+model binding. Unknown fields, missing halves and a shape inconsistent with D53.1
+refuse. These are immutable references, never reconstructed executable dispatch
+objects.
+
+The current single-reference `BoundNativeInputNonreleaseProof` is insufficient
+for repeated attempts with distinct input references for one request. Likewise,
+the current unbound producer refuses an earlier bound writer for that request;
+it cannot be reused directly just because the newest attempt is unbound. The full
+`NativeBodyNonreleaseProof` must be a fresh borrowed composition under the original
+metadata/state/session/audit and writer-revocation locks. The controller first
+reads the exact immutable reservation/attempt lineage; the native producer checks
+that every observed writer for the request belongs to that declared lineage and
+has never released input. Every declared native admission must have its exact
+observed binding, or its exact permanently closed, unreleased prepared writer
+proven to have stopped before binding. An absent writer/resource is not the latter
+proof. Each declared prepared/resource pair is checked once; duplicates,
+conflicting references and undeclared matching writers refuse. The consuming
+workflow transaction rechecks that this native-validated lineage equals its
+unchanged SQL history while those original locks are still held. A caller-supplied
+reference set is only an expectation; it grants no native or workflow authority.
+
+After a successor moves `workflow_owner_turn`, historical reservation/model/input
+readers validate the original immutable publication, claim/activation and explicit
+consumed-successor edges. They do not compare the old reservation to the rewritten
+current-turn row. Current executable admission still separately requires the live
+current lease, controls and fresh native/source/resource/scope proof. Supporting a
+historical read never revives an old `OwnerBodyDispatch` or its old audit observer.
+
+**D53.3 — One native handoff per cycle, not per request lifetime.** Preserve the
+original request, publication, preparation and reservation across every cycle.
+Each new forward native context is keyed by workflow, original request, purpose
+and its actual recovery-claim or consumed-setup reference. The destination
+generation and transfer UUID are also unique. There remains one current pending
+native transfer per workflow. A cycle may obtain exactly one UUID; absent/prepared
+replay and unknown commit replies retain it. A later cycle is admitted only by an
+immutable predecessor disposition with actual original native settlement or
+constructor-owned unstarted-setup proof. Expiry, pointer absence, a newest-row
+query and a changed UUID are not that disposition.
+
+Before enabling a second cycle, migrate the single-cycle context/claim indexes to
+bounded append-only per-cycle indexes. Keep existing record bytes, digests,
+events, UUIDs and original references unchanged as version-1 history; add an
+explicit versioned cycle/purpose link for new records. Do not backfill a missing
+native disposition or select a source by greatest generation. A read must follow
+and validate every predecessor through the exact completed native frontier.
+Unresolved abort/unknown effects keep their existing obligations and prevent a
+replacement. The existing 1,024-context/history bounds, byte bounds and aggregate
+protected-storage admission still apply; exhaustion holds without deleting old
+edges, changing budgets or hiding demand. Current single-cycle code remains
+ineligible for repeated-cycle activation until migration and positive tests exist.
+
+**D53.4 — Separate body reservation from model-call admission on recovery.**
+`with_recovered_unexposed_owner_body` retains the sole original body reservation
+and requires the exact current successor/release-authorization slot from §5.1.
+Each admitted new native model call uses the existing resource-charge authority
+and effective workflow/family budget. Earlier charges remain spent even when
+input was never released; no retry resets model, wall, token or shipping state.
+Shipping allowance changes only at a confirmed autonomous merge.
+
+Keep the original model-admission index row immutable. Add a bounded append-only
+recovered-model-slot projection with a strict three-purpose union.
+`body_recovery` is keyed by the original reservation and exact §5.1
+release-authorization edge. `continuation` is keyed by that reservation and the
+exact CAS-consumed semantic-frontier admission plus its separately authorized
+continuation attempt from §5.2. `continuation_retry` is keyed by the reservation
+and the exact continuation attempt/frontier/disposition retry-authorization slot
+from D53.5. A continuation or retry slot does not require or impersonate an
+unexposed-original-body release edge. All three purpose variants reference the
+existing common charge ledger and their current native attempt. They are accounting projections, not new accounting
+authorities. Repeated observation of the same slot/receipt is idempotent; a
+distinct slot needs its purpose's fresh verified predecessor disposition and
+current authorization. Original and recovered projections must have bidirectional
+event/charge joins; missing or orphaned halves hold. No projection can mint a
+dispatch object from saved JSON.
+
+Each new slot's actual model-admission payload binds its original reservation,
+purpose and exact owning authorization slot. Its `OwnerInputReference` may retain
+the existing descriptive wire shape: the new model sequence/receipt and claim
+digest bind that complete payload. The live installed purpose-specific authorizer,
+exact prepared launch and revoked old writer capabilities remain input-release
+authority. Recovered result/completion readers join the original reservation to
+that exact current attempt and purpose-specific authorization rather than
+equating its old generation to the new native owner. Result storage, unknown
+commit/outcome handling and atomic captured-message reply settlement remain
+required before productive ingress.
+
+**D53.5 — Define the continuation retry exception.** A consumed semantic coding
+frontier is never consumed twice. A new proven provider frontier uses normal
+continuation admission and the `continuation` model-slot purpose in D53.4, binding
+its exact consumed-frontier admission and current continuation attempt. To retry without new provider progress, require a distinct
+fresh `KnownUnstartedContinuationProof`: the original native producer permanently
+revokes every writer for that exact continuation attempt, proves its complete
+original resource quiescence and proves the continuation input never crossed the
+trusted writer boundary. Its immutable disposition binds the consumed frontier,
+exact attempt/input/model/release references and the proof source. It concerns
+that internal continuation input; it cannot resend the owner's original body.
+The distinct continuation producer selects writers by the exact authenticated
+attempt/input-purpose and consumed-frontier lineage, not by request ID alone.
+Earlier proven body input release remains in that lineage as exposed history; it
+is never relabelled as body nonrelease. An unrelated or unclassified writer is
+not excluded by a continuation label. The complete original writer/resource
+census must prove that no old capability can still release this continuation
+input. The whole-body nonrelease producer is not a substitute for this proof.
+
+A short CAS transaction admits one successor retry slot referencing that
+unconsumed disposition and the same already-consumed frontier. Commit/reply loss
+reconciles that exact slot; another timer/worker cannot consume the disposition
+again. Current owner authorization, readiness, provider cooldown transition and
+normal persisted 5/10/20/40/60-minute retry policy still apply. Each actual new
+model admission uses D53.4's `continuation_retry` purpose and common charge/budget
+rules; it does not use the §5.1 body-recovery constructor or increase the finite
+budget.
+Transport timeout, zero stdout, absent response, PID exit or provider refusal text
+alone is never known-unstarted/nonproductive proof. The broader authenticated
+provider-nonproductive outcome remains an explicit P/D/R producer obligation:
+until its protocol/version-specific effect and resource proof is implemented and
+positively tested, it cannot enable the exception. No-progress plus an expired
+backoff alone retains the existing frontier/outcome hold.
+
+Build order and exits: (1) immutable original-reservation and per-cycle historical
+readers, versioned journal/index migration, with coherent-substitution, missing-half
+and repeated-cycle tests; (2) actual original bound/unbound and closed-before-binding
+native lineage producer/SQL joins for every D53.1 recoverable row, with real original
+writer/resource proof and rollback/lost-reply cases; (3) consuming ready/setup and
+recovered release/model/result constructors, proving one original body across two
+pre-input failures and fresh owner pause/provider/budget/source refusal at every
+boundary; (4) continuation retry disposition with duplicate-worker/process-loss
+and unchanged-frontier refusal tests. Only after complete C/R and shared productive
+gates pass may D/R connect worker ingress. Independent exact-head review, normal
+updater rollout and all original #1715 CLI/Discord/merge/soak acceptance remain.
+Deferred provider-nonproductive support is owned by P/D/R, triggered before that
+exception is admitted, and carries retained per-attempt/frontier/release history
+and protected result storage; it cannot be reconstructed later from response text.
