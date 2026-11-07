@@ -1345,15 +1345,15 @@ impl ClaudeCliReasoner {
         if !vm_required { if let Some(scope) = &native_scope { scope.configure(&mut cmd); } }
         crate::run_resources::check_requirement("claude",launch_audit.as_ref())?;
         let native_launch = native_lease.as_ref().map(|lease|lease.launch());
-        let native_vm = if vm_required {
+        // #1627 — a text turn reserves the text tier, not a builder's 4 GiB.
+        let run_policy = crate::run_resources::declared_policy_for(crate::run_resources::run_kind_for(opts))?;
+        let mut native_vm = if vm_required {
             Some(crate::native_vm::Launch::prepare("claude", opts, &cmd,
                 claude_bridge.as_ref().map(|bridge|&bridge.bridge), native_launch.as_ref())?)
         } else { None };
         if let (Some(vm),Some(lease))=(&native_vm,&native_lease) {vm.register_retirement(lease);}
-        // #1627 — a text turn reserves the text tier, not a builder's 4 GiB.
-        let run_policy = crate::run_resources::declared_policy_for(crate::run_resources::run_kind_for(opts))?;
-        let spawned = match &native_vm {
-            Some(vm) => crate::process_tree::spawn_admitted_vm(&vm.command, clean, opts.handoff_path.as_deref(), &vm.resource_policy),
+        let spawned = match &mut native_vm {
+            Some(vm) => vm.spawn_admitted(clean, opts.handoff_path.as_deref()),
             None => crate::process_tree::spawn_admitted_with_policy(&cmd, clear_environment, clean, opts.handoff_path.as_deref(), false, run_policy.as_ref()),
         };
         let (mut child, process_group) = spawned
