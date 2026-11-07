@@ -235,6 +235,7 @@ pub async fn run_readiness(repo:Option<&Path>,json_output:bool) -> i32 {
     let mut unverified=vec!["live-guarded-probe"];
     if !deployment.matches { unverified.push("deployed-policy-equality"); }
     let body=json!({"schema_version":1,"ready":false,"reason":"workflow-readiness-unverified","runtime":runtime,
+        "native_state":augmentagent_channel_core::native_vm::state_capacity::inspect(),
         "credentials":{"claude":claude,"codex":codex},
         "roles":crate::self_improve::provider_readiness::inspect(),
         "resources":augmentagent_channel_core::run_resources::readiness().await,
@@ -250,6 +251,7 @@ pub async fn run_readiness(repo:Option<&Path>,json_output:bool) -> i32 {
             println!("{role}: {}",body["roles"][role]["status"]);
         }
         println!("Resources: {}",body["resources"]["status"]);
+        println!("Native state: {}; blockers: {}",body["native_state"]["status"],body["native_state"]["blockers"]);
         println!("Deployment: {}",body["deployment"]["status"]);
         println!("Live-probe evidence remains unverified.");
     }

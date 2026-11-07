@@ -33,6 +33,8 @@ pub(crate) mod discord_controls;
 pub(crate) mod owner_control;
 #[path = "autoship_verification_retry.rs"]
 mod verification_retry;
+#[path = "autoship_capacity_retry.rs"]
+mod capacity_retry;
 pub use verification_retry::VerificationDomain;
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
@@ -351,6 +353,8 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS discord_control_frontier (
                 bot TEXT NOT NULL, owner TEXT NOT NULL, workflow TEXT NOT NULL REFERENCES command_job(workflow),
                 message TEXT NOT NULL, PRIMARY KEY(bot,owner,workflow));
+            CREATE TABLE IF NOT EXISTS native_capacity_probe_cursor (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1), last_workflow TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS command_schedule (
                 workflow TEXT PRIMARY KEY REFERENCES command_job(workflow),
                 attempted_at INTEGER NOT NULL, eligible_at INTEGER NOT NULL);
