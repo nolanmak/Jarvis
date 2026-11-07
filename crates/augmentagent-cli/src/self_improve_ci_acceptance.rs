@@ -529,6 +529,29 @@ fn native_v3_status_component_preserves_protocol_signals_and_inherited_descripto
     assert!(diagnostics.contains("Ran 9 tests") && !diagnostics.contains("skipped"),"component cases did not execute: {diagnostics}");
 }
 
+/// Real kernel composition only; no runtime admission or publication grant.
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[test]
+fn native_v3_status_preparation_and_handoff_preserve_cleanup_and_filter_refusal() {
+    let directory=tempfile::tempdir().unwrap();
+    for (name,bytes) in [("native.so",CARGO_EXEC_DENIAL_LIBRARY),
+        ("ci_cargo_status_proxy",CARGO_STATUS_PROXY),
+        ("ci_cargo_status_vfork_producer",include_bytes!(concat!(env!("OUT_DIR"),"/ci_cargo_status_vfork_producer")).as_slice()),
+        ("ci_cargo_exec_static",CARGO_EXEC_STATIC)] {
+        let path=directory.path().join(name);std::fs::write(&path,bytes).unwrap();
+        std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    for (file,count) in [("ci_cargo_status_prepare_test.py",3),("ci_cargo_status_handoff_test.py",8)] {
+        let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests").join(file);
+        let output=std::process::Command::new("python3").arg("-I").arg(tests)
+            .env("AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY",directory.path().join("native.so")).output().unwrap();
+        let diagnostics=String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(),"V3 status composition {file} failed: {diagnostics}");
+        assert!(diagnostics.contains(&format!("Ran {count} tests")) && !diagnostics.contains("skipped"),
+            "composition cases did not execute: {diagnostics}");
+    }
+}
+
 /// Protocol conformance only; root-role admission and native handoff remain separate.
 #[cfg(all(target_os="linux",target_arch="x86_64"))]
 #[tokio::test]

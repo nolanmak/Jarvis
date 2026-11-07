@@ -475,6 +475,59 @@ relay regressions. These are same-UID wire/descriptor/signal conformance results
 root-role admission and native handoff remain unproved. See
 [component evidence](ci-v3-status-component-proof.json).
 
+#### Pre-exec preparation and combined host conformance
+
+C owns `jarvis_ci_prepare_status_continuation`, its close operation and the raw
+`jarvis_ci_exec_status_proxy` wrapper. Preparation allocates only two temporary
+FDs: a duplicate of the original connected socket and a sealed 64-byte memfd.
+It reads actual client/peer credentials and socket cookie, retains the original
+absolute deadline and leaves the original descriptor and flags intact. The raw
+exec wrapper blocks signals before preparation, passes an empty environment and
+only the numeric config FD, and restores the original signal mask and actual
+exec errno on refusal. Close both temporary FDs on failure; no fork, fallback
+exec or replacement resource grant is permitted. This primitive is data/setup,
+not admission, and has no production caller yet. Shared-mm writer/alias safety
+and synchronous caller errno/PATH semantics remain integration requirements.
+
+The separate combined fixture uses actual native vfork, the actual static V3
+component and a separately supervised native-exec'd tool. Its test-only observer
+checks the exact image at kernel exec-stop, validates the continuation against
+the original channel, observes the original parent released while the proxy is
+still alive, and retains the original parent's native wait status. The tool's
+own original supervisor observes exec, reaps it, and supplies actual terminal
+status; proxy signals are routed to that tool through its live pidfd. Swapped
+channels, wrong images, pre-exec cancellation and the production listener's
+refusal must launch no tool. Same-UID host composition does not establish root
+role admission, complete writer closure, jobserver accounting, source closure,
+parent effect transfer or production activation.
+
+**Load-bearing constructor conflict, unresolved:** the original V3 relay still
+calls `jarvis_ci_deny_exec`, an inherited irreversible ERRNO filter for execve
+and execveat. Its refusal precedes USER_NOTIF, so the original controller cannot
+approve a status-image exec through that filter. The combined positive fixture
+does not load that constructor. An additional combined negative installs the
+exact native denial primitive after the fixture's original exec and before
+vfork: no child exec notification or exec-stop occurs, no tool starts, and the
+original parent reaps exit 93 only after the child dies. Keep this regression;
+positive composition cannot stand in for this production path.
+
+C and R own resolution before any production native-handoff admission. Trace
+all worker, planner and unit bootstraps and their mandatory original listener
+installation/exec acknowledgement; preserve early-constructor/static/raw-exec
+refusal and actual root-role/live-operation binding. A sealed config, Seccomp
+status field, filter count or successful same-UID fixture cannot prove that
+policy. Do not remove the constructor denial merely to make the handoff pass.
+The carrying cost is a measured native helper and additional conformance cases;
+there is no durable grant/schema change. Declared-guest composition and the
+unchanged compiler/worker/publication regressions remain required and unproved
+for this new composition. This subsection records an intermediate implementation
+checkpoint, not a mechanism handoff or a passing original compiler fixture.
+Host validation passed 728 Python cases with no skips and 39 focused Rust cases
+with 28 opt-ins ignored. The eleven new preparation/composition cases execute
+through a mandatory Rust adapter. See [bounded composition evidence](ci-v3-status-composition-proof.json),
+including the initial setup errors and signal timeout before the successful
+corrected full run. No guest composition result is claimed.
+
 ### O3. Freeze before capturing a live parent's input
 
 First capture the child's original request, exact stdin to EOF and verified

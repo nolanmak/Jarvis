@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "kind": "native-v3-preparation-and-host-composition",
+  "baseline": "492d213fc43d28f4832bee654e68208dd77b57b6",
+  "source_sha256": {
+    "crates/augmentagent-cli/build.rs": "129f1034b680e83e83c7982ef0c73542bd1eb03e235426831e93538d894f0aa5",
+    "crates/augmentagent-cli/src/ci_cargo_status_proxy.c": "b17de6b14999e7d7f4f8176ec4d7e9209e8495c6089fbd3ea30c8e3351fe8ea7",
+    "crates/augmentagent-cli/src/ci_cargo_status_continuation.c": "1b95f7ff051150c276e7e9a6fc4ae91fee17d660d78a4a8a971eb56df0a4aeca",
+    "crates/augmentagent-cli/src/ci_cargo_status_continuation.h": "12ace9f30600b74e37ec4cda710a1af974f4ceea4ce2d6c8a00faf2116caccf6",
+    "crates/augmentagent-cli/src/ci_cargo_status_vfork_producer.c": "1034a374097fcec07e4a69c5bfd291b2aeb27c478906eea2692b8509e449384c",
+    "crates/augmentagent-cli/src/ci_cargo_status_handoff_cases.py": "d3c71de24f1e91c8f0ca8a4e55067c8b98dc0e284b1bacc170505499a7e48086",
+    "crates/augmentagent-cli/src/ci_cargo_vfork_exec_cases.py": "f0a6d287f4cba920509f727a76a411d52b14f1b743f6d05b4704df399b406035",
+    "crates/augmentagent-cli/src/self_improve_ci_acceptance.rs": "ea62fc60178ba04c80fe360a0831d5bfc3728fad9b802a81e387b7d630e3057b",
+    "scripts/tests/ci_cargo_status_prepare_test.py": "666cae9380a8accc39e0f7b370187afb749830dce4499ad6b951190cf2c0a9fb",
+    "scripts/tests/ci_cargo_status_handoff_test.py": "e8ee8344163c6a1a61986ce1fbe6b71c6e25c2625f3ee12786b288213180c399"
+  },
+  "preparation": {
+    "cases": 3,
+    "red_log": "/tmp/autoship-ci-status-prepare-red-20261107.log",
+    "red_result": "missing native preparation symbols"
+  },
+  "composition": {
+    "cases": 8,
+    "actual_tool_cases": [
+      "finish",
+      "signal",
+      "cancel-after-start"
+    ],
+    "negative_cases": [
+      "wrong-image",
+      "swapped-channel",
+      "cancel-before-exec",
+      "production-deny",
+      "inherited-exec-deny"
+    ],
+    "inherited_denial_red_log": "/tmp/autoship-ci-status-inherited-deny-red-20261107.log",
+    "inherited_denial_red_result": "fixture omitted inherited constructor denial; exec reached observer",
+    "focused_log": "/tmp/autoship-ci-status-inherited-deny-green-20261107.log",
+    "focused_passed": 20,
+    "focused_seconds": 1.642
+  },
+  "host": {
+    "python": {
+      "passed": 728,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 43.369,
+      "log": "/tmp/autoship-ci-status-composition-python-corrected-20261107.log"
+    },
+    "rust": {
+      "passed": 39,
+      "failed": 0,
+      "ignored": 28,
+      "seconds": 22.13,
+      "log": "/tmp/autoship-ci-status-composition-rust-20261107.log"
+    },
+    "initial_broad_run": {
+      "log": "/tmp/autoship-ci-status-composition-python-20261107.log",
+      "setup_errors": 10,
+      "setup_reason": "launch omitted AUGMENTAGENT_RELAY_FIXTURE_BINARY",
+      "other_failures": 1,
+      "other_failure": "existing active-signal parent-resume SIGUSR2 timeout; corrected full rerun passed; cause not established"
+    }
+  },
+  "spec_audit": {
+    "scope": "pre-exec preparation and combined host conformance plus adjacent component subsection",
+    "findings": 0,
+    "full_mechanism_handoff_audit": false
+  },
+  "production_blocker": "V3 relay constructor still installs irreversible exec ERRNO filter; no runtime caller or filter relaxation added",
+  "declared_guest_composition_proved": false,
+  "root_role_admission_proved": false,
+  "complete_writer_closure": false,
+  "native_handoff_integrated": false,
+  "input_closure_complete": false,
+  "parent_effect_transfer_integrated": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "autonomous_merges_claimed": 0
+}

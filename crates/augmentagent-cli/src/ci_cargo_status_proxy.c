@@ -12,19 +12,9 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include "ci_cargo_status_wire.h"
+#include "ci_cargo_status_continuation.h"
 
 extern int jarvis_ci_deny_exec(void);
-#define REQUIRED_SEALS (F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL)
-struct continuation {
-    char magic[8];
-    uint32_t version;
-    int32_t connection;
-    uint32_t client_pid,client_uid,client_gid,server_pid,server_uid,server_gid;
-    uint64_t cookie;
-    int64_t deadline;
-    uint64_t reserved;
-};
-_Static_assert(sizeof(struct continuation)==64,"continuation ABI");
 
 int main(int argc,char **argv,char **environment) {
     if (argc!=2 || *environment || getuid()==0 || getuid()!=geteuid()) return 125;
@@ -44,11 +34,11 @@ int main(int argc,char **argv,char **environment) {
     if (number<3 || number>65535) return 125;
     int descriptor=(int)number;
     struct stat info;
-    struct continuation value;
+    struct jarvis_ci_status_continuation value;
     int seals=fcntl(descriptor,F_GET_SEALS);
     if (fstat(descriptor,&info)!=0 || !S_ISREG(info.st_mode) || info.st_nlink!=0
             || (info.st_uid!=0 && info.st_uid!=geteuid()) || info.st_size!=sizeof(value)
-            || seals<0 || (seals&REQUIRED_SEALS)!=REQUIRED_SEALS
+            || seals<0 || (seals&JARVIS_STATUS_SEALS)!=JARVIS_STATUS_SEALS
             || pread(descriptor,&value,sizeof(value),0)!=sizeof(value)) return 125;
     if (memcmp(value.magic,"JARVPXY3",8) || value.version!=1 || value.reserved
             || value.connection<3 || value.connection>65535 || value.connection==descriptor

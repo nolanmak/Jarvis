@@ -56,7 +56,7 @@ def frame(fd,size,deadline):
     return data
 
 
-def experiment(planner,proxy,mode,ready,hold,release,cloexec,extra):
+def experiment(planner,proxy,mode,ready,hold,release,cloexec,extra,*,inspect_exec=None,resume_exec=None,reject_continuation=False):
     class TestOnlyGate(planner.ExecMediation):
         """Never used by the runtime; check() cannot issue a source verdict."""
         def __init__(self):
@@ -139,6 +139,11 @@ def experiment(planner,proxy,mode,ready,hold,release,cloexec,extra):
                             actual=os.fstat(image.fileno());expected=os.fstat(self.proxy_fd)
                             accepted=(actual.st_dev,actual.st_ino)==(expected.st_dev,expected.st_ino)
                         assert accepted==(mode!='wrong-image')
+                        continuation=accepted
+                        if accepted and inspect_exec is not None:continuation=inspect_exec(self.child)
+                        if accepted and inspect_exec is not None:
+                            assert continuation==(not reject_continuation)
+                            self.proof['continuation_accepted']=continuation
                         assert not Path(f'/proc/{self.child}/fd/{cloexec}').exists()
                         actual=os.stat(f'/proc/{self.child}/fd/{extra}');expected=os.fstat(extra)
                         assert (actual.st_dev,actual.st_ino)==(expected.st_dev,expected.st_ino)
@@ -149,15 +154,18 @@ def experiment(planner,proxy,mode,ready,hold,release,cloexec,extra):
                         self.proof.update(parent_released_before_proxy_termination=True,shared_memory_observed=True,
                             cloexec_closed_at_exec_stop=True,image_accepted=accepted,native_exec_stop=True)
                         self.records.append({'pid':self.child,'nr':number.value,'stage':'verified_exec_stop','image_accepted':accepted})
-                        if not accepted:
+                        if not accepted or not continuation:
                             signal.pidfd_send_signal(childfd,signal.SIGKILL)
                             terminal=wait(self.child)
                             assert os.WIFSIGNALED(terminal) and os.WTERMSIG(terminal)==signal.SIGKILL
                         else:
-                            trace(17,self.child) # DETACH only after the original exec-stop checks.
-                            assert frame(ready,12,self.deadline)==b'PROXY_READY\n'
-                            if mode=='signal':signal.pidfd_send_signal(childfd,signal.SIGTERM)
-                            else:os.write(hold,b'x')
+                            if resume_exec is not None:
+                                resume_exec(self.child,childfd,lambda:trace(17,self.child),self.deadline)
+                            else:
+                                trace(17,self.child) # DETACH only after the original exec-stop checks.
+                                assert frame(ready,12,self.deadline)==b'PROXY_READY\n'
+                                if mode=='signal':signal.pidfd_send_signal(childfd,signal.SIGTERM)
+                                else:os.write(hold,b'x')
             except BaseException as error:
                 self.errors.append(type(error).__name__+': '+str(error))
                 for descriptor in (childfd,self.pidfd):
