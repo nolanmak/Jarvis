@@ -1,0 +1,179 @@
+{
+  "version": 1,
+  "kind": "sealed-static-executable-capture-component",
+  "source_head": "b35d97ebd9f3b5b517eb75865e8562bf1fa5cfeb",
+  "source_sha256": {
+    "scripts/ci-cargo-staging.py": "f6cb16b1a48ade13edeb741538b86aabdcd5e4ea540d7b085af929f74b451c09",
+    "scripts/tests/ci_cargo_executable_test.py": "602f6ef4a0c9a7441076b30e9b7b280ea3abffca4875b05b69ec0f997c4f2590",
+    "scripts/tests/updater-rebuild-trigger.test.sh": "89ffeef54974c330a428b8486420e25ecbd0e69a6492d8b955ce2e3b28a32583",
+    "crates/augmentagent-cli/src/self_improve_ci_acceptance.rs": "403ef823b5f7d05913d7a1e9c5f79b213b2ef6f7e6b66565162f56261cc82132"
+  },
+  "mechanism": [
+    "Borrow a readonly regular FD, bound the input to2MiB, preserve its offset/flags and copy the bytes into a fresh MFD_EXEC memfd.",
+    "Set0555 for eventual nonroot execution of a root-owned anonymous image, then require kernel WRITE/GROW/SHRINK/SEAL/EXEC seals; unsupported kernels refuse without fallback.",
+    "After sealing, independently hash the actual snapshot and resample source bytes, compare both to the copied-byte digest, and recheck exact size/tail and observed source identity/flags.",
+    "Accept only bounded static ELF64/x86-64 format with no interpreter/dynamic-loader segment, executable stack or writable/executable LOAD segment. These format checks are not source provenance.",
+    "Retain a private CLOEXEC inode pin alongside the exposed local FD; revalidate actual identity, mode and seals on use; refuse copy/pickle/foreign-process use. Cleanup closes owned image FDs even after mode invalidation and refuses foreign descriptor substitution.",
+    "All source/execution/input/full-CI/shipping authorization fields remain false. There is no production caller or executable route selected by environment."
+  ],
+  "tests": [
+    "Exact bytes/hash, kernel seals, anonymous identity, execute mode and unchanged borrowed source offset/flags.",
+    "Real duplicated FD cannot write, grow, shrink, change execute bits or create a writable shared mapping.",
+    "Actual descriptor exec runs the captured static proxy after replacement of the source pathname; deliberately invalid continuation exits125.",
+    "Nonregular, oversize, dynamic/invalid ELF and invalid descriptor inputs refuse.",
+    "A real existing writable mapping prevents capture; no temporary descriptor escapes.",
+    "Actual source mutation during copy refuses; actual pre-seal destination alias mutation refuses.",
+    "Copy/deepcopy/pickle and use after close/fork refuse.",
+    "Invalid-mode cleanup releases its actual owned inode; substituted foreign pipe remains open and usable.",
+    "Unsupported memfd execution/sealing refuses without fallback."
+  ],
+  "host": {
+    "python_tests": 755,
+    "python_failed": 0,
+    "python_skipped": 0,
+    "python_seconds": 44.149,
+    "updater_tests": 116,
+    "updater_failed": 0,
+    "original_handle": 49992,
+    "terminal": true,
+    "exit": 0,
+    "log": "/tmp/autoship-ci-executable-checked-host-20261107.log",
+    "log_sha256": "b1b417cfdbbc6522f50334918ce08dfad8281ea8389ed174eaac75d54d1da256",
+    "supervisor_receipt": "/tmp/autoship-ci-executable-checked-host-supervisor-20261107.receipt",
+    "all_descendants_reaped": true,
+    "rust_tests": 41,
+    "rust_failed": 0,
+    "rust_ignored": 30,
+    "rust_seconds": 11.72,
+    "rust_handle": 93937,
+    "rust_terminal": true,
+    "rust_exit": 0,
+    "rust_log": "/tmp/autoship-ci-executable-checked-rust-20261107.log",
+    "rust_log_sha256": "997cb1560a2757617c2641fc6bef12b4398c4c326914e57924343b95eab5284d"
+  },
+  "vm": {
+    "original_handle": 59793,
+    "terminal": true,
+    "exit": 0,
+    "seconds": 89.36,
+    "result": "/tmp/autoship-1703-ci-executable-capture-checked-result-20261107.json",
+    "result_sha256": "b397beaf9258f86732e50e9bd6d7b4b1b6adf1c7cf64cfa29eaea7a3508099e6",
+    "receipt": "/tmp/augmentagent-ci-executable-checked-20261107204058/receipt.json",
+    "receipt_sha256": "378d6ea98941f0df9c7c3731597112f671a972325cd5c3e335ae51ad5bf66f38",
+    "log": "/tmp/autoship-ci-executable-capture-checked-vm-20261107.log",
+    "log_sha256": "4ef8e48105fde4688e7746b700a61ba699032d995c20bc3e2ae3b23093351f07",
+    "cases": {
+      "client_gid": 1000,
+      "client_uid": 1000,
+      "component_sha256": "e98c9b0f084d4135faa9a848d942be7bfa214ebcf4a271ba034feba237d3fcaf",
+      "errors": 0,
+      "executable_capture_cases": 12,
+      "failed": 0,
+      "full_ci_pass": false,
+      "native_handoff_integrated": false,
+      "root_role_admission_proved": false,
+      "run": 21,
+      "shipping_authority": false,
+      "skipped": 0,
+      "status_component_cases": 9,
+      "successful": true
+    },
+    "component_hash_matches_current_native_asset": true,
+    "audit_committed_hash_matches_stable_anchor": true,
+    "audit_log_sha256": "b6640c667a353ada98c4016e19d0eda002fd065bd963a4e41b2f541a257292b9",
+    "resource_admission": {
+      "phase": "admitted",
+      "exhausted": false,
+      "original_identity_sha256": "97fd00760780e9983a095710463bfa23a1ed261d84fca6e5a1c745b98bafb130",
+      "limits": {
+        "cpu.max": "200000 100000",
+        "memory.max": "5368709120",
+        "memory.oom.group": "1",
+        "memory.swap.max": "0",
+        "pids.max": "512"
+      },
+      "aggregate_limits": {
+        "cpu_max": "400000 100000",
+        "memory_bytes": 10737418240,
+        "pids": 2048
+      }
+    },
+    "resource_completion": {
+      "phase": "completed",
+      "exhausted": false,
+      "original_identity_sha256": "97fd00760780e9983a095710463bfa23a1ed261d84fca6e5a1c745b98bafb130",
+      "limits": {
+        "cpu.max": "200000 100000",
+        "memory.max": "5368709120",
+        "memory.oom.group": "1",
+        "memory.swap.max": "0",
+        "pids.max": "512"
+      },
+      "aggregate_limits": {
+        "cpu_max": "400000 100000",
+        "memory_bytes": 10737418240,
+        "pids": 2048
+      }
+    },
+    "original_resource_scope_absent": true,
+    "resource_report_is_public_projection_not_reusable_identity": true
+  },
+  "behavioral_reds": [
+    {
+      "handle": 94076,
+      "terminal": true,
+      "exit": 1,
+      "tests": 11,
+      "errors": 1,
+      "log": "/tmp/autoship-ci-executable-cleanup-red-20261107.log",
+      "finding": "Positive-validation-dependent cleanup stranded its owned FD after an actual permitted non-execute mode change."
+    },
+    {
+      "handle": 36172,
+      "terminal": true,
+      "exit": 101,
+      "tests": 20,
+      "failed": 1,
+      "seconds": 147.58,
+      "result": "/tmp/autoship-1703-ci-executable-capture-result-20261107.json",
+      "log": "/tmp/autoship-ci-executable-capture-vm-20261107.log",
+      "finding": "Actual guest source mutation escaped the metadata-only source check. Exact underlying timestamp/filesystem cause is not established. Original failed VM scope completed without exhaustion and was observed absent."
+    },
+    {
+      "handle": 81553,
+      "terminal": true,
+      "exit": 1,
+      "tests": 12,
+      "failed": 1,
+      "log": "/tmp/autoship-ci-executable-byte-red-20261107.log",
+      "finding": "An actual duplicated destination FD changed the last byte before sealing; prototype returned immutable bytes labeled with the wrong copied-source hash."
+    }
+  ],
+  "initial_missing_feature_red": {
+    "handle": 21916,
+    "terminal": true,
+    "exit": 1,
+    "tests": 8,
+    "errors": 8,
+    "reason": "capture_executable did not exist; this is missing-feature coverage, not8independent security findings."
+  },
+  "primary_source_context": "https://github.com/torvalds/linux/blob/v6.18/mm/memfd.c",
+  "limits": [
+    "The actual VM client UID/GID is1000. A root-owned image passed to a distinct nonroot actor and live root-role admission have not been proved.",
+    "Physical kernel-executable bytes are distinct from Jarvis workflow execution authorization. A snapshot and its JSON observation grant neither source provenance nor an original operation/resource permission.",
+    "Repeated source reads and metadata checks detect observed drift; they are not atomic original-source/writer closure against every concurrent actor.",
+    "Original root asset binding, authenticated continuation/request/notification, complete writer/descriptor/cohort/input/effect proof, live resource ownership and actual compiler handoff remain required before native CONTINUE.",
+    "Closing this component releases its owned image FDs, not original descendants, retained native runtimes or their capacity reservations.",
+    "Original unchanged GCC/worker/generated-publication regressions remain unresolved and were not rerun merely to restate their known refusal.",
+    "No production runtime, policy, native reservation, owner hold, allowance, compiler filter or workflow authority changed."
+  ],
+  "root_role_admission_proved": false,
+  "native_handoff_integrated": false,
+  "source_authority": false,
+  "execution_authority": false,
+  "input_closure_complete": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "production_runtime_changed": false,
+  "autonomous_merges_claimed": 0
+}

@@ -417,6 +417,50 @@ is explanatory context for the saved address-space reference, not a claim that
 the tested kernel equals that upstream revision. These remain controlled
 fixture observations, not complete writer closure or an implementation handoff.
 
+#### Physical executable capture before live image admission
+
+`ci-cargo-staging.py::capture_executable` now captures at most 2 MiB from a
+borrowed readonly regular FD into a fresh executable memfd. It preserves source
+offset/flags, fixes mode to 0555, and requires WRITE/GROW/SHRINK/SEAL/EXEC seals.
+Unsupported kernels refuse; there is no pathname-exec fallback. The captured
+format is static ELF64/x86-64 without an interpreter/dynamic-loader segment,
+executable stack or writable/executable LOAD segment. Format is not provenance.
+
+The byte check must occur **after sealing**. A real pre-seal duplicated-FD write
+reproduced immutable output mislabeled with the copied source hash. The actual
+sealed object is now hashed independently. The source is resampled by bytes,
+with size/tail, identity and flag rechecks. This also fixes an actual guest
+failure where a source mutation escaped metadata-only checking; the exact
+underlying timestamp/filesystem cause was not established. These checks detect
+observed drift, not atomic original-source closure against every writer.
+
+The local object holds a private CLOEXEC inode pin as well as its exposed FD.
+Use revalidates actual inode, mode and seals. Cleanup releases its own inode even
+after a permitted non-execute mode change, but refuses a substituted foreign FD
+without closing it. Copy, pickle, forked-process use and use after close refuse.
+Closing the image is not original descendant teardown or native-capacity credit.
+
+The actual captured FD executes the original static proxy after replacement of
+the source pathname. Deliberately invalid continuation exits 125; this confirms
+physical execution, not workflow permission. All source/execution/input/full-CI/
+shipping authority fields remain false. The component has no production caller
+and supplies no environment-selected execution route. Mode 0555 supports the
+intended root-owner/nonroot-worker arrangement, but that cross-identity case and
+live root-role admission still require their actual producer/consumer proof.
+
+Validation passed 755 Python checks, 41 focused Rust checks and 116 updater
+checks. The declared VM passed 21 cases in 89.36 seconds: nine original status
+cases plus twelve capture cases. Client UID/GID was 1000, the exact native image
+hash matched, and the original non-exhausted resource scope was verified absent.
+See [exact evidence and retained reds](ci-executable-capture-proof.json).
+
+C/R still own the original trusted-asset binding, authenticated live operation/
+continuation/notification, complete writer/input/effect proof and resource
+lifetime. Those are load-bearing prerequisites before any production CONTINUE;
+the carrying cost is that runtime vfork and compiler restoration remain held.
+An observation cannot reconstruct those permissions or authorize original-parent
+resume. This component is not the final C proof/API or its handoff approval.
+
 #### Post-ready V3 status/signal component
 
 Implement a separate static `ci_cargo_status_proxy` image for the part of
