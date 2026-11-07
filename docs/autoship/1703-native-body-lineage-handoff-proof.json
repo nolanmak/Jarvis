@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "component": "native body lineage across completed ownership handoffs",
+  "status": "controlled-integration-verification-no-production-change",
+  "base_commit": "7aef550aa7675a377891da5eff13a00da6a3a168",
+  "source": "crates/augmentagent-cli/src/autoship_native_observation.rs",
+  "source_sha256": "5039c5f19ec7fc3d3932697a7c848511050276b072ae9875c666f5a5f8f83d2f",
+  "initial_observation": {
+    "log": "/tmp/autoship-body-lineage-multi-handoff-20261107.log",
+    "result": "The initially proposed positive fixture lacked a verified latest outcome. Handoff correctly refused ConversationUncertain. This precondition was retained as negative coverage, not relaxed."
+  },
+  "validation": {
+    "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent body_input_lineage_requires_current_completion_across_handoffs -- --nocapture",
+    "log": "/tmp/autoship-body-lineage-multi-outcome-20261107.log",
+    "passed": 1,
+    "failed": 0,
+    "seconds": 4.56,
+    "controlled_cases": 6,
+    "providers": [
+      "codex",
+      "claude"
+    ],
+    "positive_cases": 2,
+    "uncertain_outcome_refusal_cases": 4
+  },
+  "positive_evidence": [
+    "Two distinct original input/model references and independent scripted original resource identities are recorded in separate protected audits.",
+    "The actual completion producer verifies the latest private runtime/export and kernel resource observation before SQL records that completion under its live originating lease.",
+    "Two actual core ownership transfers and SQL settlements complete; final metadata inspection follows all three audit namespaces and retains both input attempts in immutable expected order.",
+    "The native body observer retains the original state lock; changed launch/resource data, duplicate declarations and omitted bound input refuse before entering the visitor.",
+    "Inspection preserves workflow snapshot, events, protected audit bytes and confirmed-merge allowance. The metadata logger remains unable to dispatch/admit a model."
+  ],
+  "negative_evidence": [
+    "A newest bound attempt with no verified outcome remains ConversationUncertain.",
+    "A setup stopped before native binding with no verified latest outcome remains ConversationUncertain.",
+    "Both refusal paths preserve snapshots, events and allowance, without manufacturing completion or pending replacement handoff."
+  ],
+  "limits": [
+    "All private runtime/export, protected resource/session/model rows are controlled fixture data; no live VM/provider, model call, native capacity credit or owner-message execution is claimed.",
+    "The source completion/history contract is preserved. A distinct proven-unstarted disposition is still required to recover interrupted setup; this test does not implement it.",
+    "Immutable owner-body SQL/readiness/release/model/result integration, per-cycle migration, complete C/R source/resource/input proofs, independent review, normal rollout and full original CLI/Discord/merge/soak acceptance remain required."
+  ],
+  "production_code_changed": false,
+  "production_policy_or_reservations_changed": false,
+  "all_original_local_handles_terminal": true
+}

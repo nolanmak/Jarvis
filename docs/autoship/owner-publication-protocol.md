@@ -1299,3 +1299,34 @@ exact-head review, normal updater rollout and every original CLI/Discord/merge/
 soak requirement remain gates. The next trigger is the reservation-preserving
 SQL/history consumer and actual positive repeated-cycle fixtures; saved evidence
 must never be promoted directly into an `OwnerBodyDispatch`.
+
+
+## 55. Two completed handoffs retain distinct body input attempts
+
+A controlled integration fixture now records two distinct input references and
+independent protected resource identities in separate original native audits.
+For both provider pins, the positive case obtains the actual completion producer's
+verified latest observation from private runtime/export bytes before SQL records
+it under the originating live lease. Two real core ownership transfers and their
+SQL settlements then complete. The final metadata owner follows all three audit
+namespaces and observes both original input attempts under the retained state/
+session/audit locks, without enabling its execution logger or mutating workflow,
+protected audit, accounting or allowance state. Changed launch/resource records,
+duplicate declarations and an omitted bound attempt refuse before the visitor.
+
+The first proposed fixture correctly exposed an outcome precondition: a new
+prepared attempt is not a verified conversation outcome. Both a bound attempt
+with no latest observation and setup stopped before native binding remain
+`ConversationUncertain`, with unchanged workflow/events/allowance and no replacement
+handoff. Those four provider/case combinations remain explicit negative coverage;
+no guard was weakened or missing completion invented. The distinct proven-unstarted
+disposition required by §§5.1/53 is still an implementation gate.
+
+All six controlled cases passed in 4.56 seconds. These use protected scripted
+resource/session/model rows and physical retained-runtime fixtures with actual
+core completion, locking, transfer and kernel-absence checks. They are not live
+VM/provider execution, proof of complete C/R authority, SQL body-recovery admission
+or permission to reclaim retained production state. This test-only addition changes
+no production behavior. The remaining reservation/cycle/release/result constructors,
+full original rollout and CLI/Discord/merge/soak acceptance remain required. See
+[the multi-handoff evidence](1703-native-body-lineage-handoff-proof.json).

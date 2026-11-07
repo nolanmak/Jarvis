@@ -850,6 +850,114 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn body_input_lineage_requires_current_completion_across_handoffs() {
+        if child("body_input_lineage_requires_current_completion_across_handoffs") {return;}
+        use std::sync::{Arc,Mutex};use std::os::fd::AsRawFd;
+        for provider in ["codex","claude"] {for phase in ["completed-bound","unobserved-bound","closed-before-binding"] {
+            let mut f=Fixture::with_native_provider_preparation_startup(false,false,false,provider,0,false);
+            let original=augmentagent_channel_core::native_vm::OwnerInputReference {version:1,workflow:f.lease.workflow.clone(),
+                request_id:"retained-original-body".into(),dispatch_sequence:1,model_admission_sequence:2,
+                model_receipt:"first-model".into(),claim_sha256:"b".repeat(64)};
+            f.audit.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_owner_model_bound",
+                "launch_intent":f.prepared.intent,"launch_receipt":f.prepared.controller_receipt,"resource_receipt":f.resource,"owner_input":original})).unwrap();
+            let (middle_lease,first,first_proof)=completed_native_handoff(&mut f);
+            assert!(f.store.settle_native_handoff(&middle_lease,&f.binding,&first_proof,now()).unwrap().current_context);
+            let base=f._root.path().canonicalize().unwrap();
+            let middle=Arc::new(AuditLogger::protected(PathBuf::from(&first.request().destination.audit_path),base.join("anchors/destination.json"),&[]).unwrap());
+            middle.set_native_runtime_owner(first.request().destination.owner.clone()).unwrap();middle.set_native_store_binding(first.original_binding().clone()).unwrap();
+            let mut intent=f.prepared.intent.clone();intent.intent_id=uuid::Uuid::new_v4().to_string();
+            intent.source_owner=first.request().destination.owner.clone();intent.source_audit_path=middle.path().into();
+            intent.launch_sha256="e".repeat(64);intent.native_session_id=Some("actual-session".into());
+            let second_launch=middle.native_launch_prepared(&intent).unwrap();
+            f.store.record_verified_native_launch(&middle_lease,&f.binding,&middle,&second_launch,now()).unwrap();
+            // Independent protected scripted resource receipt, not a reused
+            // first-attempt identity. No VM/model or live resource credit.
+            let second_resource=middle.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller","kind":"native_launch_resource_binding",
+                "launch_intent":intent,"launch_receipt":second_launch.controller_receipt,"resource_identity":{
+                    "host_sha256":sha(&std::fs::read("/etc/machine-id").unwrap()),"boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),
+                    "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1}})).unwrap();
+            let next=augmentagent_channel_core::native_vm::OwnerInputReference {model_admission_sequence:3,model_receipt:"second-model".into(),claim_sha256:"c".repeat(64),..original.clone()};
+            if phase!="closed-before-binding" {
+                middle.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_owner_model_bound",
+                    "launch_intent":intent,"launch_receipt":second_launch.controller_receipt,"resource_receipt":second_resource,"owner_input":next})).unwrap();
+            }
+            if phase=="completed-bound" {
+                // Controlled normal completion of an unreleased attempt. The
+                // actual producer must verify the private runtime/export and
+                // original kernel/resource identity before SQL records it.
+                let runtime=base.join(format!("native/{provider}/session-fixture"));
+                let complete=runtime.join("complete.json");
+                let mut outcome:serde_json::Value=serde_json::from_slice(&std::fs::read(&complete).unwrap()).unwrap();
+                outcome["launch_sha256"]=intent.launch_sha256.clone().into();file(&complete,&serde_json::to_vec(&outcome).unwrap());
+                let session=middle.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller","kind":"native_session_observed",
+                    "launch_intent":intent,"launch_receipt":second_launch.controller_receipt,"native_session_id":"actual-session","observed_at_ms":now()})).unwrap();
+                let outcome=ownership::observe_native_completion(&middle,&second_launch,&session,&second_resource).unwrap();
+                f.store.record_verified_native_observation(&middle_lease,&f.binding,&middle,&outcome,now()).unwrap();
+            }
+            f.store.release(&middle_lease,now()).unwrap();
+            let lease=f.store.claim(&middle_lease.workflow,"lineage-final-owner",now(),60_000).unwrap().unwrap();
+            let current=Arc::new(AuditLogger::protected(base.join("logs/lineage-final.jsonl"),base.join("anchors/lineage-final.json"),&[]).unwrap());
+            current.set_native_runtime_owner(RuntimeOwner {workflow_id:lease.workflow.clone(),lease_generation:lease.generation}).unwrap();
+            current.set_native_store_binding(first.original_binding().clone()).unwrap();current.require_run_resources().unwrap();
+            current.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":lease.workflow,"generation":lease.generation})).unwrap();
+            if phase!="completed-bound" {
+                let before=f.store.snapshot(&lease.workflow).unwrap().unwrap();let events=f.store.events(&lease.workflow).unwrap();
+                let error=f.store.prepare_or_load_native_handoff(&lease,&f.binding,current.path().to_str().unwrap(),now()).err().expect("unobserved latest setup bypassed required outcome proof");
+                assert_eq!(error.downcast_ref::<ownership::TransferReason>(),Some(&ownership::TransferReason::ConversationUncertain));
+                assert_eq!(f.store.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(f.store.events(&lease.workflow).unwrap(),events);
+                assert_eq!(f.store.merge_allowance(now(),5).unwrap().confirmed,0);
+                continue;
+            }
+            let second=pending_record(f.store.prepare_or_load_native_handoff(&lease,&f.binding,current.path().to_str().unwrap(),now()).unwrap());
+            assert!(matches!(ownership::transfer(second.original_binding(),second.request(),&second.observation(),&[middle.clone()],&current,&||Ok(())),ownership::TransferOutcome::Completed(_)));
+            let completion=second.verified_receipt(&||Ok(())).unwrap().unwrap();
+            assert!(f.store.settle_native_handoff(&lease,&f.binding,&completion,now()).unwrap().current_context);
+            let namespace=second.request().destination.clone();
+            let store=Arc::new(Mutex::new(WorkflowStore::open(&f.path).unwrap()));let checked=store.clone();let owned=lease.clone();let binding=f.binding.clone();
+            current.restrict_to_metadata(Arc::new(move||checked.lock().unwrap().validate_lease(&owned,&binding,now()))).unwrap();
+            let tx=f.store.conn.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+            let facts=super::super::native_handoff::read_current_metadata_facts(&tx,&lease,&f.binding,&namespace,now()).unwrap();tx.commit().unwrap();
+            let facts=super::super::owner_publication::current_facts_fixture(facts);let runtimes=facts.runtimes().unwrap();
+            let audits=vec![Arc::new(f.audit.clone()),middle,current.clone()];let audit_bytes=audits.iter().map(|a|std::fs::read(a.path()).unwrap()).collect::<Vec<_>>();
+            let expected=[ownership::ExpectedBodyInputAttempt {prepared:f.prepared.clone(),resource_receipt:Some(f.resource.clone()),owner_input:Some(original)},
+                ownership::ExpectedBodyInputAttempt {prepared:second_launch,resource_receipt:Some(second_resource),owner_input:Some(next)}];
+            let before=f.store.snapshot(&lease.workflow).unwrap().unwrap();let events=f.store.events(&lease.workflow).unwrap();
+            let fence=||store.lock().unwrap().validate_lease(&lease,&f.binding,now());let mut visited=false;
+            ownership::with_metadata_native_owner(&current,&runtimes,&fence,&mut |namespaces| {assert_eq!(namespaces.len(),3);Ok(audits.clone())},&mut |proof| {
+                assert_eq!(proof.inventory().len(),1);assert_eq!(proof.namespace(),&namespace);
+                proof.with_revoked_input_writers(|closed| {
+                    assert_eq!(closed.evidence()["writers"].as_array().unwrap().len(),2);
+                    closed.with_body_input_nonrelease("retained-original-body",&expected,|body| {
+                        assert_eq!(body.expected_attempts(),&expected);assert_eq!(body.evidence()["attempts"].as_array().unwrap().len(),2);
+                        assert_eq!(body.evidence()["attempts"][0]["kind"],"bound");
+                        assert_eq!(body.evidence()["attempts"][1]["kind"],"bound");
+                        for (index,attempt) in expected.iter().enumerate() {
+                            assert_eq!(body.evidence()["attempts"][index]["launch_intent"],serde_json::to_value(&attempt.prepared.intent)?);
+                            assert_eq!(body.evidence()["attempts"][index]["resource_receipt"],serde_json::to_value(&attempt.resource_receipt)?);
+                        }
+                        let state=std::fs::OpenOptions::new().read(true).open(base.join("native/state.lock"))?;
+                        assert_ne!(unsafe{libc::flock(state.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+                        body.validate_current()?;visited=true;Ok(())
+                    })?;
+                    for fault in ["resource","launch","duplicate","omitted"] {
+                        let mut wrong=expected.to_vec();
+                        match fault {"resource"=>wrong[1].resource_receipt.as_mut().unwrap().record_sha256="f".repeat(64),
+                            "launch"=>wrong[1].prepared.intent.launch_sha256="f".repeat(64),"duplicate"=>wrong.push(wrong[0].clone()),_=>{wrong.pop();}}
+                        let mut entered=false;
+                        let result=closed.with_body_input_nonrelease("retained-original-body",&wrong,|_| {entered=true;Ok(())});
+                        assert!(result.is_err(),"{provider}/{phase}/{fault}: {result:?}");assert!(!entered);
+                    }
+                    Ok(())
+                })?;
+                assert!(current.dispatch_allowed().is_err());assert!(current.model_call_admitted(provider).is_err());Ok(())
+            }).unwrap_or_else(|e|panic!("{provider}/{phase}: actual native lineage observation failed: {e:#}"));
+            assert!(visited);assert_eq!(f.store.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(f.store.events(&lease.workflow).unwrap(),events);
+            for (audit,bytes) in audits.iter().zip(audit_bytes) {assert_eq!(std::fs::read(audit.path()).unwrap(),bytes);}
+            assert_eq!(f.store.merge_allowance(now(),5).unwrap().confirmed,0);
+        }}
+    }
+
+    #[test]
     fn retained_native_metadata_proof_preserves_actual_completed_session() {
         if child("retained_native_metadata_proof_preserves_actual_completed_session") {return;}
         use std::sync::{Arc,Mutex};use std::os::fd::AsRawFd;
