@@ -95,14 +95,16 @@ fn digest(value: &str) -> String {
 const SESSION_BYTES: u64 = 1024 * 1024 * 1024;
 struct StateLock(std::fs::File);
 impl StateLock {
-    fn acquire(root:&Path) -> Result<Self> {
+    fn acquire(root:&Path) -> Result<Self> {Self::acquire_mode(root,false)}
+    fn try_acquire(root:&Path) -> Result<Self> {Self::acquire_mode(root,true)}
+    fn acquire_mode(root:&Path, nonblocking:bool) -> Result<Self> {
         let directory=root.symlink_metadata()?;
         ensure!(directory.is_dir() && !directory.file_type().is_symlink() && directory.uid()==unsafe{libc::geteuid()} && directory.mode() & 0o077==0,"native state root is not private");
-        let file=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
+        let file=std::fs::OpenOptions::new().read(true).write(true).create(!nonblocking).mode(0o600)
             .custom_flags(libc::O_NOFOLLOW).open(root.join("state.lock"))?;
         let info=file.metadata()?;
         ensure!(info.is_file() && info.uid()==unsafe{libc::geteuid()} && info.nlink()==1 && info.mode() & 0o077==0,"unsafe native state lock");
-        ensure!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX)}==0,"native state lock unavailable");
+        ensure!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|if nonblocking {libc::LOCK_NB}else{0})}==0,"native state lock unavailable");
         Ok(Self(file))
     }
 }
@@ -273,8 +275,10 @@ const HELPERS: &[(&str, &[u8])] = &[
     ];
 
 pub(crate) struct Launch {
-    pub command: Command,
-    pub resource_policy: serde_json::Value,
+    command: Command,
+    resource_policy: serde_json::Value,
+    spawn_attempted: bool,
+    fresh_runtime: Option<FreshUnreleasedRuntime>,
     aliases: PathBuf,
     session: PathBuf,
     ephemeral: bool,
@@ -403,10 +407,27 @@ impl Launch {
         let mut command = Command::new("/usr/bin/python3");
         command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
             .env("PATH","/usr/bin:/bin");
-        let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), _directory:directory };
+        let fresh_runtime=if resume {None}else{Some(FreshUnreleasedRuntime::capture(&session,&aliases)?)};
+        let result = Self { command, resource_policy, spawn_attempted:false,fresh_runtime,aliases,session, ephemeral:native.is_none(), _directory:directory };
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.observe_session(id)?; }
         if let Some(session)=unpublished_session {let _=session.keep();}
         Ok(result)
+    }
+    /// Consume this prepared launch's only spawn attempt. Fresh-session
+    /// ownership follows its actual supervisor, never a reconstructed path.
+    pub(crate) fn spawn_admitted(&mut self,clean:std::sync::Arc<std::sync::atomic::AtomicBool>,journal:Option<&Path>)
+        -> std::io::Result<(tokio::process::Child,crate::process_tree::ProcessGroup)> {
+        if self.spawn_attempted {return Err(std::io::Error::other("prepared native launch already used"));}
+        self.spawn_attempted=true;
+        match crate::process_tree::spawn_admitted_vm(&self.command,clean,journal,&self.resource_policy) {
+            Ok((child,group))=>Ok((child,group.with_fresh_native_session(self.fresh_runtime.take()))),
+            Err(error)=>{
+                // spawn_admitted_vm returns Err only before a supervisor is
+                // created. No command handle can escape this private launch.
+                if let Some(fresh)=self.fresh_runtime.take() {let _=fresh.reclaim();}
+                Err(error)
+            }
+        }
     }
     pub fn register_retirement(&self, lease:&crate::native_session::Lease) {
         lease.register_vm_retirement(self.session.clone());
@@ -421,6 +442,60 @@ impl Launch {
         let value = serde_json::to_vec(name.as_ref())?;
         if alias.exists() { ensure!(private(&alias)? == value, "native session alias collision"); }
         else { write(&alias,&value)?; }
+        Ok(())
+    }
+}
+
+/// A constructor-owned capability for one fresh session. No Clone, serde or
+/// path-based factory: resumed/legacy runtimes cannot acquire this authority.
+pub(crate) struct FreshUnreleasedRuntime {
+    session:PathBuf,
+    aliases:PathBuf,
+    device:u64,
+    inode:u64,
+    owned:Vec<u8>,
+}
+impl FreshUnreleasedRuntime {
+    fn capture(session:&Path,aliases:&Path)->Result<Self> {
+        let metadata=session.symlink_metadata()?;
+        ensure!(metadata.is_dir() && !metadata.file_type().is_symlink(),"unsafe fresh runtime");
+        Ok(Self{session:session.into(),aliases:aliases.into(),device:metadata.dev(),inode:metadata.ino(),owned:private(&session.join("owned.json"))?})
+    }
+    /// Called only by the original failed spawn or its unreleased, reaped
+    /// supervisor. Unexpected data retains the entire runtime for recovery.
+    pub(crate) fn reclaim(self)->Result<()> {
+        let root=self.session.parent().and_then(Path::parent).context("native root missing")?;
+        let _state=StateLock::try_acquire(root)?;
+        let provider=self.session.parent().context("native provider missing")?;
+        ensure!(provider.is_dir() && !provider.is_symlink(),"unsafe provider state");
+        let metadata=self.session.symlink_metadata()?;
+        ensure!(metadata.is_dir() && !metadata.file_type().is_symlink() && metadata.dev()==self.device && metadata.ino()==self.inode
+            && metadata.uid()==unsafe{libc::geteuid()} && metadata.mode() & 0o077==0,"fresh runtime identity changed");
+        let file=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(self.session.join("lock"))?;
+        let info=file.metadata()?;
+        ensure!(info.is_file() && info.uid()==unsafe{libc::geteuid()} && info.nlink()==1 && info.mode() & 0o077==0,"unsafe fresh runtime lock");
+        ensure!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0,"fresh runtime is in use");
+        let _session=StateLock(file);
+        ensure!(private(&self.session.join("owned.json"))?==self.owned,"fresh runtime owner changed");
+        for entry in std::fs::read_dir(&self.session)? {
+            let path=entry?.path();
+            ensure!(matches!(path.file_name().and_then(|name|name.to_str()),Some("owned.json"|"lock"|"retired.json")),"fresh runtime has retained data");
+            let _=private(&path)?;
+            if path.file_name().is_some_and(|name|name=="retired.json") {
+                let value:serde_json::Value=serde_json::from_slice(&private(&path)?)?;
+                ensure!(value["version"]==1 && value["reason"]=="native_scope_retired","unexpected runtime disposition");
+            }
+        }
+        ensure!(self.aliases.is_dir() && !self.aliases.is_symlink(),"unsafe runtime aliases");
+        let mut aliases=Vec::new();
+        for entry in std::fs::read_dir(&self.aliases)? {
+            let path=entry?.path();let target:String=serde_json::from_slice(&private(&path)?)?;
+            if self.session.file_name().is_some_and(|name|name==target.as_str()) {aliases.push(path);}
+        }
+        for alias in aliases {std::fs::remove_file(alias)?;}
+        std::fs::remove_dir_all(&self.session)?;
+        std::fs::File::open(provider)?.sync_all()?;
+        std::fs::File::open(&self.aliases)?.sync_all()?;
         Ok(())
     }
 }
@@ -487,6 +562,137 @@ mod tests {
             let valid=Launch::prepare(provider,&opts,&Command::new("/usr/bin/true"),None,Some(&native)).unwrap();
             let path=valid.session.clone();assert!(path.join("owned.json").exists());drop(valid);
             assert!(path.exists(),"successful preparation was reclaimed after its command could escape");assert_eq!(sessions(),2);
+        }
+    }
+    /// Real supervisor resource refusal happens after successful native
+    /// preparation and must return the constructor's fresh reservation.
+    #[tokio::test]
+    async fn pre_model_resource_refusal_reclaims_only_fresh_native_session() {
+        use std::sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}};
+        const CHILD:&str="JARVIS_TEST_NATIVE_UNRELEASED_CAPACITY";
+        let Some(root)=std::env::var_os(CHILD) else {
+            let root=tempfile::tempdir().unwrap();
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","native_vm::tests::pre_model_resource_refusal_reclaims_only_fresh_native_session","--nocapture"])
+                .env_clear().env("PATH","/usr/bin:/bin").env(CHILD,root.path()).env("AUGMENTAGENT_RUN_RESOURCES","1").output().unwrap();
+            let stdout=String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(),"{stdout} {}",String::from_utf8_lossy(&output.stderr));
+            assert!(stdout.contains("test result: ok. 1 passed; 0 failed;"),"child regression did not execute: {stdout}");return;
+        };
+        let root=PathBuf::from(root).canonicalize().unwrap();std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap();let state=root.join("state");
+        for path in [&state,&root.join("logs"),&root.join("anchors")] {std::fs::create_dir(path).unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();}
+        let policy=root.join("policy.json");
+        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/unavailable/runtime","guest_runtime":"/unavailable/guest","state_root":state,"memory_mb":512,"max_state_bytes":34359738368u64,"max_sessions":32,"providers":{"codex":{"gateway":{},"auth_file":null,"auth_relative":".codex/auth.json"},"claude":{"gateway":{},"auth_file":null,"auth_relative":".claude.json"}}})).unwrap()).unwrap();
+        std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",policy);
+        for provider in ["codex","claude"] {
+            let logger=Arc::new(crate::tool_audit::AuditLogger::protected(root.join("logs").join(format!("{provider}.jsonl")),root.join("anchors").join(format!("{provider}.json")),&[]).unwrap());
+            logger.set_native_runtime_owner(RuntimeOwner{workflow_id:"unreleased-test".into(),lease_generation:1}).unwrap();
+            let billed=Arc::new(AtomicUsize::new(0));let observed=billed.clone();
+            logger.set_model_call_observer(Arc::new(move |_|{observed.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
+            let mut opts=crate::reasoner::ReasonerOpts::pinned(crate::providers::ModelTier::Fast,"");opts.audit_logger=Some(logger.clone());
+            let native=crate::native_session::Launch::Create{requested_id:Some(format!("fresh-{provider}"))};
+            let mut vm=Launch::prepare(provider,&opts,&Command::new("/usr/bin/true"),None,Some(&native)).unwrap();
+            let session=vm.session.clone();let alias=vm.aliases.join(digest(&format!("fresh-{provider}")));
+            assert!(session.exists() && alias.exists());
+            // Deterministic real refusal in the packaged resource helper,
+            // before any VM/provider can start; no delegated cgroup needed.
+            vm.resource_policy=serde_json::json!({"memory_bytes":0,"pids":64,"cpu_percent":100});
+            let clean=Arc::new(AtomicBool::new(true));
+            let (mut child,group)=vm.spawn_admitted(clean.clone(),None).unwrap();
+            assert!(vm.spawn_admitted(clean.clone(),None).is_err(),"prepared launch spawned twice");
+            let error=group.admit_model(provider,Some(&logger)).await.unwrap_err();
+            assert!(matches!(crate::reasoner::ReasonerError::find_in(&error),Some(crate::reasoner::ReasonerError::ResourceCapacity{..})),"{error:#}");
+            drop(group);child.wait().await.unwrap();drop(vm);
+            assert!(clean.load(Ordering::SeqCst),"supervisor teardown was not verified");
+            assert_eq!(billed.load(Ordering::SeqCst),0);
+            assert!(!session.exists(),"{provider}: resource refusal stranded a fresh native slot");
+            assert!(!alias.exists(),"unreleased fresh alias remained published");
+            assert!(std::fs::read_to_string(logger.path()).unwrap().lines().any(|line|serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"]=="native_unreleased_session_reclaimed"));
+            for case in ["complete","pending-export","owner-changed","session-locked","state-locked","resume"] {
+                let id=format!("{provider}-{case}");
+                let create=crate::native_session::Launch::Create{requested_id:Some(id.clone())};
+                let mut vm=Launch::prepare(provider,&opts,&Command::new("/usr/bin/true"),None,Some(&create)).unwrap();
+                let original=vm.session.clone();let original_alias=vm.aliases.join(digest(&id));
+                if case=="complete" || case=="resume" {write(&original.join("complete.json"),b"{}").unwrap();}
+                if case=="pending-export" {write(&original.join("upstream-export"),b"unsettled provider output").unwrap();}
+                if case=="owner-changed" {std::fs::write(original.join("owned.json"),b"{\"foreign\":true}").unwrap();}
+                if case=="resume" {
+                    drop(vm);
+                    vm=Launch::prepare(provider,&opts,&Command::new("/usr/bin/true"),None,Some(&crate::native_session::Launch::Resume{id})).unwrap();
+                    assert!(vm.fresh_runtime.is_none());
+                }
+                let before=std::fs::read(original.join("owned.json")).unwrap();
+                let held=if case=="session-locked" || case=="state-locked" {
+                    let path=if case=="session-locked" {original.join("lock")}else{state.join("state.lock")};
+                    let file=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(path).unwrap();
+                    assert_eq!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);Some(file)
+                }else{None};
+                vm.resource_policy=serde_json::json!({"memory_bytes":0,"pids":64,"cpu_percent":100});
+                let clean=Arc::new(AtomicBool::new(true));let (mut child,group)=vm.spawn_admitted(clean.clone(),None).unwrap();
+                assert!(group.admit_model(provider,Some(&logger)).await.is_err());
+                drop(group);child.wait().await.unwrap();drop(vm);
+                if let Some(file)=held {assert_eq!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_UN)},0);}
+                assert!(clean.load(Ordering::SeqCst));
+                assert_eq!(std::fs::read(original.join("owned.json")).unwrap(),before,"{provider}/{case}");
+                assert!(original_alias.exists(),"{provider}/{case}: protected alias removed");
+                if case=="pending-export" {assert_eq!(std::fs::read(original.join("upstream-export")).unwrap(),b"unsettled provider output");}
+            }
+            assert_eq!(billed.load(Ordering::SeqCst),0);
+            let create=crate::native_session::Launch::Create{requested_id:Some(format!("{provider}-failed-spawn"))};
+            let mut vm=Launch::prepare(provider,&opts,&Command::new("/usr/bin/true"),None,Some(&create)).unwrap();
+            let original=vm.session.clone();let alias=vm.aliases.join(digest(&format!("{provider}-failed-spawn")));
+            vm.command=Command::new("/nonexistent-native-supervisor-construction-fixture");
+            assert!(vm.spawn_admitted(Arc::new(AtomicBool::new(true)),None).is_err());
+            assert!(!original.exists() && !alias.exists(),"failed supervisor construction leaked fresh state");
+            assert!(vm.spawn_admitted(Arc::new(AtomicBool::new(true)),None).is_err());
+            drop(vm);
+            // Exercise release/cancellation with the real host supervisor and a
+            // disposable marker-writing command. This is a controller-boundary
+            // fixture, not native guest or provider acceptance.
+            for case in ["cancel-before-release","owner-refused","released","release-ack-error","foreign-release-before-refusal","teardown-proof-missing"] {
+                let create=crate::native_session::Launch::Create{requested_id:None};
+                let mut vm=Launch::prepare(provider,&opts,&Command::new("/usr/bin/true"),None,Some(&create)).unwrap();
+                let original=vm.session.clone();let effect=root.join(format!("{provider}-{case}-effect"));
+                let journal=root.join(format!("{provider}-{case}-journal"));
+                let mut command=Command::new("/usr/bin/python3");
+                command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran')"]).arg(&effect);
+                std::env::remove_var("AUGMENTAGENT_RUN_RESOURCES");
+                let clean=Arc::new(AtomicBool::new(true));
+                let (mut child,group)=crate::process_tree::spawn_admitted(&command,true,clean.clone(),Some(&journal),false).unwrap();
+                std::env::set_var("AUGMENTAGENT_RUN_RESOURCES","1");
+                vm.spawn_attempted=true;
+                let group=group.with_fresh_native_session(vm.fresh_runtime.take());
+                let marker:serde_json::Value=serde_json::from_slice(&std::fs::read(journal.with_extension("active")).unwrap()).unwrap();
+                let receipt=PathBuf::from(marker["receipt"].as_str().unwrap());
+                let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(3);
+                while !receipt.with_file_name("launch-ready").exists() {
+                    assert!(tokio::time::Instant::now()<deadline,"host supervisor not ready");
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                let denied=crate::tool_audit::AuditLogger::new(root.join(format!("{provider}-{case}-audit")));
+                denied.set_dispatch_observer(Arc::new(||anyhow::bail!("owner-paused"))).unwrap();
+                let denied=Arc::new(denied);
+                if case=="teardown-proof-missing" {std::fs::create_dir(&receipt).unwrap();}
+                if case=="release-ack-error" || case=="foreign-release-before-refusal" {write(&receipt.with_file_name("launch-continue"),b"admitted\n").unwrap();}
+                if case=="owner-refused" || case=="foreign-release-before-refusal" {
+                    assert!(group.admit_model(provider,Some(&denied)).await.is_err());
+                }else if case!="cancel-before-release" && case!="teardown-proof-missing" {
+                    let result=group.admit_model(provider,None).await;
+                    assert_eq!(result.is_err(),case=="release-ack-error");
+                }
+                let released=matches!(case,"released"|"release-ack-error"|"foreign-release-before-refusal");
+                if released {assert!(child.wait().await.unwrap().success());}
+                drop(group);child.wait().await.unwrap();drop(vm);
+                assert_eq!(clean.load(Ordering::SeqCst),case!="teardown-proof-missing");
+                assert_eq!(effect.exists(),released,"{provider}/{case}: release fixture did not exercise expected dispatch");
+                assert_eq!(original.exists(),released || case=="teardown-proof-missing","{provider}/{case}: uncertain/released runtime disposition incorrect");
+                if case=="teardown-proof-missing" {
+                    // The fixture provider was never released and the original
+                    // supervisor has now been waited/reaped. Remove only this
+                    // test's preserved private supervisor directory.
+                    std::fs::remove_dir_all(receipt.parent().unwrap()).unwrap();
+                }
+            }
         }
     }
     #[test]
