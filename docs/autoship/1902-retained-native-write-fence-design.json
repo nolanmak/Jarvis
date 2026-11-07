@@ -1,0 +1,329 @@
+{
+  "version": 1,
+  "issue": 1902,
+  "epic": 1703,
+  "status": "investigation only; no implementation handoff or production fencing authorized by this document",
+  "problem": "Eight incomplete native sessions reserve 8 GiB although their retained files total about 59 KiB. Unknown outcomes must stay protected. Proving that a model never started is a different question from making retained storage incapable of future growth.",
+  "proposal": "Retain exact session paths, contents, aliases and unknown outcomes. Investigate a controller-produced write fence and kernel writer check that permits a small bounded retained-data reservation instead of a 1 GiB future-growth reservation. Keep the configured 8 GiB byte budget, 16-session ceiling, filesystem floors, workflow budgets and controls unchanged.",
+  "observations": [
+    "The deployed store has seven Claude and one Codex retained session; observed layouts contain only owned.json and lock, with one retired.json. No production changes were made for this investigation.",
+    "A disposable probe on this host acquired a read file lease with no writer, received EAGAIN with an open writable descriptor and with a writable mapping after its descriptor closed, and succeeded after the mapping closed. This is an observation, not proof of every syscall race or a permanent fence.",
+    "Linux file leases may be broken after notification/timeout. F_GETLEASE changes when a break is initiated. A lease alone is not durable write revocation.",
+    "A second disposable probe held an exclusive flock and a read lease on the same O_RDONLY empty lock after fchmod(0400). This resolves descriptor compatibility for the observed local Linux filesystem only.",
+    "A deterministic real lease-break probe let a child pass the write-open permission check, observed SIGIO, then changed the file to 0400. After releasing the lease the child appended successfully. F_GETLEASE had changed to F_UNLCK. Any proposal treating a finite lease plus mode changes as permanent writer revocation is rejected.",
+    "A disposable FS_IOC_ENABLE_VERITY attempt returned errno95/EOPNOTSUPP on this filesystem despite CONFIG_FS_VERITY=y. No superblock features or production files were changed.",
+    "Main helper finally closes the session lock before waiting for bridge/QEMU shutdown; its outer TemporaryDirectory cleanup follows later. Flock availability alone therefore cannot establish full helper/process settlement.",
+    "The actual native helper passed a disposable delayed-lock-open test: the write open returned after mode restriction and lease release, but creation of session data failed EACCES. Positive control created its temporary directory. This is a supported helper-path observation, not proof of every writer.",
+    "Complete native-provider-vm.py and provider-supervisor.py bytes were found in the saved original producer binary with SHA2567bbdd56d..., matching current helper hashes. This does not establish Rust binary source correspondence or original outcome/closure.",
+    "The frozen owner-host immutable probe remains unexecuted on the actual host kernel 7.0.0-30; this session lacks CAP_LINUX_IMMUTABLE and sudo requires the owner password. The pending owner request authorizes disposable tests only, never production fencing.",
+    "A managed disposable no-NIC ext4 guest running kernel 7.0.0-31 with guest UID0 passed six immutable cases: directory create/unlink refusal, new write-open refusal, existing writable-FD refusal, existing shared mapping SIGBUS, an open already waiting on a read-lease break refused after immutable transition, and a prefaulted writable shared mapping SIGBUS. Original fixture bytes survived. Original supervisor confirmed all descendants reaped. The host mounted nothing; no production native state was changed and no reservation was reduced. This is a different kernel and serial fixture evidence, not an actual host or concurrent inventory proof."
+  ],
+  "primary_sources": [
+    "https://man7.org/linux/man-pages/man2/F_SETLEASE.2const.html",
+    "https://docs.kernel.org/filesystems/vfs.html"
+  ],
+  "glossary": {
+    "retained_unknown": "Original outcome remains unresolved. Fencing does not establish nonrelease, settlement, safe replay, review approval, merge or native conversation restoration.",
+    "resource_custody": "Proposed resource-only disposition retaining original bytes and names under a verified write fence. It is not original execution provenance or native ownership transfer.",
+    "growth_reservation": "Budget for possible future writes. Retained data and bounded control metadata still need a measured/conservative byte reservation.",
+    "file_lease": "Short-lived Linux kernel coordination against conflicting file opens/truncation. It does not replace directory permissions, all-writer ingress exclusion or a durable custody record."
+  },
+  "decisions": [
+    {
+      "id": "D1",
+      "decision": "Preserve the original files and unknown outcome; introduce no original execution binding or body nonrelease claim.",
+      "why": "Storage growth can be controlled without inventing historical execution certainty."
+    },
+    {
+      "id": "D2",
+      "decision": "Keep byte/count/resource ceilings and owner controls. Count every retained session toward max_sessions.",
+      "why": "Changing growth demand must be backed by an actual fence, not a quota increase or a counter reset."
+    },
+    {
+      "id": "D3",
+      "decision": "Use a separate typed resource-only capability and record. It cannot convert into native/input/source/recovery or merge authority.",
+      "why": "A smaller storage reservation must not enable replay of an uncertain request."
+    },
+    {
+      "id": "D4",
+      "decision": "Initial eligibility is metadata-only local Linux state: exact supported owned.json schema, empty lock, optional supported scope-retirement metadata, no exports/completion/cache/temp/result files, private directories, regular singly-linked owner files, bounded sizes and stable identities.",
+      "why": "Existing variable data or unsettled result material requires its original recovery path. Unsupported state retains full conservative growth demand."
+    },
+    {
+      "id": "D5",
+      "decision": "Inspect by default. Apply only through an authenticated controller operation after reviewed implementation and normal deployment. Never let candidate code or model output request a zero-growth grant.",
+      "why": "Filesystem custody is an administrative resource transition, not a model tool or ordinary workflow instruction."
+    },
+    {
+      "id": "D6",
+      "decision": "No zero-growth/small-retained reservation until every load-bearing thread below is resolved and actual producer/consumer fault tests pass.",
+      "why": "File modes, PID absence, a free flock or a serialized report alone do not exclude existing or delayed writers."
+    },
+    {
+      "id": "D7",
+      "decision": "If this investigation continues, acquire the session flock through an O_RDONLY descriptor and reuse or duplicate that same open-file description for the regular-file lease. Never open an additional writable session lock as part of the proof. Exact IPC ownership and lifetime remain OT2.",
+      "why": "A proof helper must not create the writable descriptor that its own writer census is intended to exclude."
+    },
+    {
+      "id": "D8",
+      "decision": "There is no executable un-fencing path in the initial proposed custody feature. Preserve original modes/history for a separately designed future recovery. No failure, timeout, restart, rollback or missing acknowledgement restores write access automatically.",
+      "why": "The earlier OT5 wording could imply implementing recovery before the necessary original outcome/source/input authority exists."
+    },
+    {
+      "id": "D9",
+      "decision": "Reject chmod plus temporary file leases as a standalone permanent write fence. Supported historical writer-ingress exclusion is still a prerequisite and remains unproved. Do not hand this document off for implementation or reduce production reservations.",
+      "why": "A real delayed open remained writable after chmod and lease release; permissions do not revoke already authorized opens."
+    },
+    {
+      "id": "D10",
+      "decision": "Investigate FS_IMMUTABLE_FL on the original session directory and every eligible regular file as the durable fence candidate. Chmod remains supplemental. D9 continues to reject leases plus permissions alone. Retain real read leases as a conservative preparation check; never infer a grant from lease expiry or from the six guest cases.",
+      "why": "The disposable ext4 guest refused existing-FD, delayed-open and writable-mapping writes after the immutable transition; the same pending-open race defeated chmod alone. Directory and file immutability answer separate namespace and content-growth obligations."
+    },
+    {
+      "id": "D11",
+      "decision": "Require evidence for the exact deployed host kernel/filesystem and the final multi-file transition, not merely the declared guest kernel. Until the controller can establish the complete live fence and revalidate it at admission, preserve full ordinary growth reservation. Neither the owner disposable probe nor guest success authorizes production mutation.",
+      "why": "The tested guest kernel is 7.0.0-31 while the observed host runs 7.0.0-30; serial syscall tests do not certify concurrent inventory stability, helper privilege boundaries or crash persistence."
+    },
+    {
+      "id": "D12",
+      "decision": "The proposed immutable transition must be performed by a narrowly scoped privileged controller outside candidate/model execution. Native workers and all supported older helpers must lack authority to clear the original filesystem immutable flags. No arbitrary path, shell, flag-clearing command or capability is exposed to the daemon/model. Exact installation, request authentication, kernel/user-namespace scope, root-owned policy, descriptor provenance and lost-controller lifetime remain OT1/OT2; no helper is installed by this investigation.",
+      "why": "An ordinary same-UID chmod can undo a permission fence. The immutable candidate instead depends on a real kernel capability boundary, which must be established for the supported actors and cannot be inferred from one current process capability sample."
+    },
+    {
+      "id": "D13",
+      "decision": "Invalid custody restores full ordinary future-growth demand in the single shared accounting evaluator immediately; it never preserves an earlier credit to keep reported totals within the configured ceiling. Revalidate all credited sessions at controller startup/restart, host or policy compatibility change, every readiness/admission decision and before any custody/resume/retirement operation. If recomputed demand exceeds a ceiling, report an explicit overcommitted capacity hold, refuse all new model/build/native growth admissions and fence affected running workflows at their next original execution boundary. Existing resources retain their original ownership until checked teardown; a restored reservation is not proof that a process stopped. Allow only the existing bounded reconciliation/cleanup authority, preserving retained data and original outcomes. No counter reset, eviction, automatic un-fence or termination of unrelated processes.",
+      "why": "Checking only the next proposed credit does not account for capacity already allocated using an invalid earlier credit. Conservative accounting must expose the resulting deficit and stop additional growth rather than hide it."
+    }
+  ],
+  "protocol_hypothesis": [
+    {
+      "step": 1,
+      "action": "Under original native StateLock and the selected session lock, read exact runtime and alias inventory, original ownership bytes, file/directory device/inode/UID/modes/link counts/allocated bytes and supported controller registration. The selection is observational until all gates pass. Do not hold a workflow mutex/transaction while acquiring native locks. The selected session lock must be opened O_RDONLY for the exclusive flock, as specified in D7; a writable lock descriptor would conflict with its own read lease."
+    },
+    {
+      "step": 2,
+      "action": "Prove writer ingress exclusion for this supported runtime class, including old constructors, host VM helpers, delayed starts, chmod paths, descriptor duplication, writable mappings and opens already past a permission check. Root StateLock/session flock and current creator PID absence are inputs, not complete proof. OT1 and OT2 block this step."
+    },
+    {
+      "step": 3,
+      "action": "Obtain real read leases on read-only descriptors for every retained regular file, with isolated signal handling and bounded child lifetime. Refuse conflicting writers/mappings, lease-break requests and unsupported filesystems. A short-lived helper must retain original lock/descriptor custody and close on parent death; caller timeout is not proof it stopped. OT2 defines the exact guarantee and IPC protocol."
+    },
+    {
+      "step": 4,
+      "action": "Persist a bounded custody intent before the first restrictive transition, preserving original identity, content and flags for every selected inode. Provisional or partially fenced state still reserves full ordinary growth. Under the proposed D10 mechanism, fence the original directory against namespace mutation and every selected regular file against content mutation, without renaming paths or clearing preexisting flags. Exact ordering must cover writers racing directory fencing, file creation/unlink and preauthorized opens: recensus the same held directory, reject any new/replaced/unsupported entry, verify every selected inode/flag/content and retain uncertainty on a partial transition. Chmod alone is insufficient. OT1-OT3 must establish the actual atomicity, fsync and restart contract before this is implementation-ready."
+    },
+    {
+      "step": 5,
+      "action": "Commit a resource-only receipt only after actual durable fence verification. Bind native root and directory/file identities, exact original ownership bytes/hash, original modes, supported writer contract and operation ID. A copied row/report is not a capability. Lost reply retries the same operation; pending/incompatible state cannot lower the reservation. OT3 supplies storage, bounds, integrity and recovery semantics."
+    },
+    {
+      "step": 6,
+      "action": "Readiness and actual native admission use one evaluator. Before any reduced future-growth reservation, freshly validate the complete durable custody receipt and live original directory/file identities, inventory and immutable flags under the defined original native locks. A receipt, cached report or earlier syscall success alone cannot grant capacity. Retained bytes and bounded custody metadata remain reserved; provisional, missing, unsupported or invalid proof stays conservative/unknown. All retained sessions still count against 16. Include pending transfer reservations. OT4 defines exact units/formula, atomic proof-to-admission join and cross-version readers. Revalidate all previously credited sessions on the D13 triggers, not only the proposed next session. Report restored conservative demand even if it exceeds the existing ceiling; block new growth and retain original active-resource ownership through verified cleanup."
+    },
+    {
+      "step": 7,
+      "action": "All current constructors, resume, alias observation, host helpers, scope retirement, terminal retirement and pruning must recognize custody. Refuse resuming or mutating a held runtime. Preserve legacy data when ordinary terminal cleanup cannot settle it; no chmod-back shortcut or fake completion. Fresh unrelated runtimes may use genuinely available capacity through normal admission. OT1 and OT5 block this join."
+    },
+    {
+      "step": 8,
+      "action": "Only after actual verified fence/accounting use normal persisted capacity wakeup. Do not change workflow stages, source evidence, ownership, instructions, progress clock, spent budgets or merge allowance. Report retained-unknown separately from model readiness and restored autoship. Subsequent guarded native progress is live acceptance, not something a fixture proves."
+    }
+  ],
+  "open_threads": [
+    {
+      "id": "OT1",
+      "load_bearing": true,
+      "question": "Enumerate supported original/current native writers and privileged flag-clearing authorities. Establish the D12 kernel/user-namespace/capability boundary for all supported actors, the exact root-owned helper policy and authenticated request/descriptor protocol, including path/inode replacement and unsupported old helpers/controllers. Show how the immutable directory plus all-file transition excludes namespace and content growth after preparation locks/leases close. Same-UID permissions, a current PID capability sample and the serial guest observations are insufficient. Define the supported host kernel/filesystem gate.",
+      "owner": "#1902 implementation agent",
+      "trigger": "Before implementation or any production fence",
+      "blocks": "Fence validity, reservation reduction and rollout."
+    },
+    {
+      "id": "OT2",
+      "load_bearing": true,
+      "question": "Define the actual descriptor and signal/helper lifetime protocol and multi-file transition: existing/inherited writers, dirty/prefaulted mappings, pending opens, directory mutation during fencing, inventory recensus, break handling, parent death, bounded wait and original cleanup ownership. Preserve full reservation through every partial transition; no automatic flag clearing. The six serial guest cases narrow the syscall question but do not settle concurrent capture or exact-host support.",
+      "owner": "#1902 implementation agent",
+      "trigger": "Before a kernel proof factory or positive fence test is accepted",
+      "blocks": "Steps2-6."
+    },
+    {
+      "id": "OT3",
+      "load_bearing": true,
+      "question": "Define private custody record/ledger schemas, authority producer, immutable bidirectional receipt/event validation, storage admission/retention, prepare/fence/commit states and restart reconciliation. Do not mutate the original native authority epoch or fabricate an original execution binding. Preserve exact prior modes for a supported future recovery; no automatic un-fence.",
+      "owner": "#1902 implementation agent",
+      "trigger": "Before schema or mutation implementation",
+      "blocks": "Crash safety and resource-only custody capability."
+    },
+    {
+      "id": "OT4",
+      "load_bearing": true,
+      "question": "Specify eligibility bounds and a conservative reservation formula covering retained allocated/logical data, bounded custody metadata, active/new session growth and pending transfers; all retained sessions count toward max_sessions. Supply the concrete shared evaluator and atomic proof-to-admission join for every growth consumer, including restart and host/policy compatibility changes. Implement D13 invalidation: any unverifiable custody restores full ordinary demand, reports overcommit if necessary, blocks further growth, and uses original execution/teardown authority for affected active work. Test an invalidated credit after a later session has actually consumed the recovered capacity. No missing row or failed probe defaults to zero.",
+      "owner": "#1902 implementation agent",
+      "trigger": "Before modifying admission/counting",
+      "blocks": "Capacity availability/wakeup and budget preservation."
+    },
+    {
+      "id": "OT5",
+      "load_bearing": true,
+      "question": "Inventory and gate every reader/writer/retirement/resume path, including older helpers and rollback builds. Initial custody has no executable un-fence or original outcome recovery command (D8). Define conservative unsupported legacy/malformed custody behavior now and preserve modes/history for a separately verified future exit. A terminal workflow alone cannot discard held unknown state.",
+      "owner": "#1902 implementation agent",
+      "trigger": "Before public command enablement or accounting cutover",
+      "blocks": "Compatibility, protection of unknown outcomes and eventual recovery."
+    }
+  ],
+  "non_goals": [
+    "No deletion, raw backup/copy/archive, byte loss, original-path rename or source outcome relabeling.",
+    "No conversion to original execution provenance, no body replay permission, no owner pause/hold removal, quota increase, free-space floor override or accounting reset.",
+    "No claim to protect against a malicious owner/root administrator; explicitly bound supported trusted controllers before accepting their protocol behavior.",
+    "No replacement for #1758 productive owner ingress, #1811 source/resource/input proof or full #1703 CLI/Discord/fault/soak acceptance."
+  ],
+  "build_order": [
+    {
+      "stage": "A",
+      "exit": "Resolve or reject all load-bearing threads using primary kernel documentation, actual disposable races and source writer inventory. Independent fresh-eyes and seam audits triaged; no handoff until then."
+    },
+    {
+      "stage": "B",
+      "exit": "Test-first real producer/consumer implementation with fault injection at every durable and permission boundary; no caller-controlled permission bits or reports mint authority."
+    },
+    {
+      "stage": "C",
+      "exit": "Exact-head review and hosted CI, normal protected merge, managed snapshot and updater deployment. No production quota/floor change."
+    },
+    {
+      "stage": "D",
+      "exit": "Apply through authenticated command to an actually eligible retained session, verify bytes/aliases/controls intact, actual bounded capacity recovered and one normal guarded native call advances. Continue broader epic acceptance."
+    }
+  ],
+  "tests_required": [
+    "Real file writer and writable mapping (including mapping after closing its FD) prevent a custody grant; unsupported leases and break signals refuse.",
+    "Deterministic delayed opens before/after permission checks, old constructor/host helper starts, FD duplication, chmod paths, partial permission changes, inode/path replacement and symlink/hardlink attacks cannot produce an unsound zero/small-growth grant.",
+    "For the immutable candidate, test real exact-host and declared-guest behavior plus concurrent multi-file directory/file transitions, preexisting writable FDs and prefaulted mappings, directory-entry races, flag/inode substitution, nonprivileged flag-clearing refusal, privileged helper authentication and crash durability. Serial guest success cannot satisfy this combined producer/consumer gate.",
+    "After a genuine credit permits a second real admission, invalidate the first receipt/fence or compatibility support and verify full demand is restored, the overcommit is reported, all new growth gates refuse, original active resources remain owned through checked teardown, and no data, hold, allowance or outcome is reset. Repeat across controller restart and lost replies.",
+    "Crash/lost reply before/after intent, each mode change, fsync, receipt commit and helper death preserves exact content and conservative accounting until proof is re-established.",
+    "A genuine metadata-only fixture can enter custody and reduce only future growth after all live proof gates, while an active session, exported/completed/unsettled result or unsupported file layout is retained conservatively.",
+    "Resume, cleanup, alias observation, old helpers and ordinary terminal retirement cannot undo custody or delete unknown data. Actual current admission revalidates the fence even if scheduling used an earlier report.",
+    "All budget/count/floor/owner/merge/source/input invariants remain unchanged; no provider/model call in resource-custody handling.",
+    "Live acceptance verifies the deployed current implementation and actual retained-state disposition; disposable syscall success alone is not restoration."
+  ],
+  "accepted_risks": [
+    {
+      "risk": "Unknown legacy outcomes remain unresolved and retained.",
+      "controls": "Exact bytes/paths/aliases preserved; explicit unknown disposition and execution hold; data/control storage still budgeted.",
+      "ends_when": "Separately supported original-outcome recovery authorizes a verified disposition."
+    },
+    {
+      "risk": "This investigation may fail to establish a durable fence for old writers.",
+      "controls": "No implementation activation, production permission change or reservation reduction before OT1-OT5 are resolved.",
+      "ends_when": "Reject this hypothesis explicitly or prove its actual producer/consumer contract."
+    }
+  ],
+  "rejection_exit": "If any writer or kernel race cannot be excluded, retain existing conservative accounting and all data, document the failed obligation, keep #1902/#1703 open and pursue supported original-evidence recovery. Rejection completes only this investigation.",
+  "deferrals": [
+    {
+      "item": "Un-fencing and original outcome recovery",
+      "owner": "#1902 / original native recovery implementation",
+      "trigger": "A separately verified original outcome/input/source proof and authenticated operator request exist",
+      "carrying_cost": "Preserve original contents, paths, aliases, original modes and custody history now; restoring writable growth also requires fresh capacity admission. No implicit resume."
+    }
+  ],
+  "audit": {
+    "status": "Investigation checkpoint: six-case guest evidence reconciled, fresh-reader findings triaged and D13 amendment rechecked with no new findings. OT1-OT5 still block implementation/handoff and production activation.",
+    "model_note": "Sonnet unavailable; inherited-model spec-only auditors were used.",
+    "fresh_eyes_findings": 6,
+    "triage": [
+      {
+        "finding": "permanent fence / same-UID trusted-controller boundary unspecified",
+        "resolution": "Park OT1 and OT2; D9 rejects the insufficient standalone mechanism."
+      },
+      {
+        "finding": "session lock descriptor conflicts with read lease",
+        "resolution": "Resolve descriptor compatibility in D7 using actual disposable RO-fd flock/lease probe; helper custody remains OT2."
+      },
+      {
+        "finding": "durable prepare/fence/commit schema and lost-response authority unspecified",
+        "resolution": "Park OT3; no schema implementation approved."
+      },
+      {
+        "finding": "atomic proof/reservation/admission and post-credit invalidation unspecified",
+        "resolution": "Park OT4; no reservation reduction approved."
+      },
+      {
+        "finding": "older helpers/controllers/rollback enforcement unspecified",
+        "resolution": "Park OT1 and OT5; main source inventory alone is not original-binary compatibility proof."
+      },
+      {
+        "finding": "initial required recovery exit conflicts with deferred un-fencing",
+        "resolution": "Resolve D8 and OT5: no initial executable release path; preserve future recovery inputs."
+      }
+    ],
+    "seams_mapped": 32,
+    "seams_checked": 0,
+    "full_seam_pass_required_before_handoff": true,
+    "immutable_checkpoint": {
+      "fresh_reader_findings": 6,
+      "triage": [
+        {
+          "finding": "Privileged supported-actor/helper boundary unspecified",
+          "resolution": "Park in expanded OT1/OT2; blocks implementation, not waived by guest tests."
+        },
+        {
+          "finding": "Exact-host concurrent multi-file durable transition unspecified",
+          "resolution": "Park in OT1-OT3; D11 keeps full reservation until complete live proof."
+        },
+        {
+          "finding": "Post-credit invalidation lifecycle unspecified",
+          "resolution": "Define required conservative invalidation and overcommit response in D13 and step6; concrete all-consumer evaluator/teardown integration and tests remain OT4."
+        },
+        {
+          "finding": "Custody schema/state machine and lost-reply authority unspecified",
+          "resolution": "Park in OT3; blocks schema/mutation implementation."
+        },
+        {
+          "finding": "Eligibility limits and reservation arithmetic unspecified",
+          "resolution": "Park in OT4; blocks admission/counting changes."
+        },
+        {
+          "finding": "Versioned schema and consumer compatibility matrix unspecified",
+          "resolution": "Park in OT5; blocks enablement/rollback cutover."
+        }
+      ],
+      "implementation_ready": false,
+      "production_activation_authorized": false,
+      "fresh_reader_amendment_findings": 0,
+      "seams_mapped_before_D13": 44,
+      "parent_added_seams": [
+        {
+          "A": "D13 conservative post-credit invalidation",
+          "B": [
+            "step6 all-session revalidation",
+            "OT4 shared evaluator and original teardown",
+            "test: invalidate after second real admission",
+            "D2 fixed byte/count/floor ceilings"
+          ],
+          "crosses": "Restore full demand, expose overcommit, stop new growth, preserve original cleanup ownership."
+        }
+      ],
+      "seams_checked": 0,
+      "full_seam_pass_required_before_handoff": true,
+      "model_note": "Sonnet unavailable; inherited-model read-only specification auditors used. Seam mapping is not seam validation."
+    }
+  },
+  "evidence": {
+    "artifact": "1902-retained-native-write-fence-kernel-observation.json",
+    "sha256": "0a6b1a6bf85046ad261022576426c0cd373a4f88c5bf0e14d728bfdb9df83b24",
+    "scope": "Disposable kernel observations and main source writer inventory; no production mutation, original writer closure or storage capability."
+  },
+  "additional_evidence": "1902-retained-native-writer-ingress-probe.json",
+  "guest_immutable_evidence": {
+    "artifact_url": "https://github.com/nolanmak/Jarvis/blob/894ed0fedae391dffb233db2f51af36ab081a6cf/docs/autoship/1902-immutable-guest-probe.json",
+    "sha256": "9e8d154b4a0a9a35c0a9727ac3ad147b4fff30524db1427698f146d4acbef246",
+    "kernel": "7.0.0-31-generic",
+    "actual_host_kernel_verified": false,
+    "cases_passed": 6,
+    "production_state_changed": false,
+    "grants_capacity": false,
+    "scope": "Serialized disposable guest observations. Original d42 storage implementation was used for the probe; later reviewed export timing and validations are additive follow-up evidence, not a rewrite of that run."
+  },
+  "recovery_branch_helper_evidence": "1902-recovery-helper-ingress-proof.json"
+}

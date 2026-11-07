@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "issue": 1902,
+  "epic": 1703,
+  "status": "investigation evidence only; no implementation handoff, custody capability or production change",
+  "real_helper_probe": {
+    "script": "scripts/tests/native_custody_writer_probe.py",
+    "source_helper": "scripts/native-provider-vm.py",
+    "passed": 3,
+    "failed": 0,
+    "log": "/tmp/autoship-native-custody-real-helper-probe-final-20261107.log",
+    "log_sha256": "24471de27e3724e62864e18030eeba0f40c0f69fca680f75438241b8f31154d4",
+    "observations": [
+      "Positive control reaches real temporary-directory creation without permission restrictions, then stops at deliberately missing executable before VM startup.",
+      "Read-only metadata and non-writable session directory refuse real helper lock opening on a fresh start.",
+      "Actual helper write-open already past permission checks waits on real read lease; after restriction and lease release the lock open succeeds, but actual TemporaryDirectory creation fails EACCES. Exact original owned bytes and names remain."
+    ],
+    "limits": "Runtime/dependency validation is bypassed to enter actual main lock/mkdir path; no actual VM/runtime validation or provider inference. No claim about all Rust constructors, writable export descriptors, unlinked files, helper descendants, every old interpreter or permanent fence.",
+    "script_sha256": "a423f944dffb272187d3d8de090370d969f2d67dd14c71690b439187da52b6a5"
+  },
+  "original_helper_correspondence": {
+    "scope": "exact embedded helper bytes only; not Rust producer source correspondence or original closure",
+    "original_binary_sha256": "7bbdd56db0c4b6f926d67dad7620104b00cc373ed8cb5b51a29d051be9baad30",
+    "helpers": [
+      {
+        "source": "scripts/native-provider-vm.py",
+        "sha256": "473b5487930745a192ca6322d258700b7b9bfec9cf969d88921467e187ff4f1f",
+        "complete_source_present_in_original_binary": true
+      },
+      {
+        "source": "scripts/provider-supervisor.py",
+        "sha256": "10929702ac75f16314592bd2c0ca80d12b4aa0c44ed44097b5b88f85bf09c201",
+        "complete_source_present_in_original_binary": true
+      }
+    ],
+    "grants_capacity": false
+  },
+  "immutable_probe": {
+    "script": "scripts/tests/native_custody_immutable_probe.py",
+    "status": "Not executed with required privilege. Local run refuses before filesystem fixtures because CAP_LINUX_IMMUTABLE is absent; sudo -n requires owner password.",
+    "owner_request": "Owner asked to run disposable probe and return JSON; no production apply requested.",
+    "cases": [
+      "immutable directory refuses create/unlink",
+      "new write open",
+      "existing writable descriptor",
+      "existing writable mapping after descriptor closed",
+      "write-open already past permission check and blocked on real lease"
+    ],
+    "scope": "Internally allocated temporary fixtures only, no path arguments, no production read/mutation, no service or budget changes. Flag removal is restricted to fixture descriptors. Positive behavior and privileged cleanup are unverified.",
+    "script_sha256": "07a529a4ef0db0a62ddaea464040beb91d06021077b7bd49ae3ac27a88b2ffbe"
+  },
+  "live_observation": {
+    "all_eight_retained_layouts": "Observed unchanged metadata-only names, owner modes0700/0600, regular files singly linked; no capacity released.",
+    "process_census": "Observational only. Three unreadable owner-UID entries; substring match included observer shell. Not usable writer-exclusion proof. Do not convert absence or PID checks into closure."
+  },
+  "grants_capacity": false,
+  "remaining": [
+    "OT1 supported Rust/writer ingress and complete descriptor/unlinked-writer closure",
+    "OT2 permanent-fence and helper lifetime/IPC guarantees",
+    "OT3 durable bounded custody prepare/fence/commit and lost acknowledgement",
+    "OT4 atomic accounting/admission/invalidations and exact conservative formula",
+    "OT5 every lifecycle/rollback consumer plus protected unknown outcome handling",
+    "All independent seams before any implementation handoff; current32 mapped0 checked"
+  ]
+}

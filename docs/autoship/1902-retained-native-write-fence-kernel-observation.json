@@ -1,0 +1,52 @@
+{
+  "scope": "disposable fixture only; no production permissions or state changed",
+  "kernel": "7.0.0-30-generic",
+  "claims": [],
+  "pending_write_open": {
+    "sigio_observed": true,
+    "lease_target_after_break": "F_UNLCK",
+    "file_mode_at_write": "0400",
+    "write_completed_after_lease_release": true,
+    "conclusion": "chmod does not revoke a write-open that already passed permission checks; a break must refuse custody. No permanent fence proved."
+  },
+  "fsverity_probe": {
+    "scope": "separate disposable file on root filesystem",
+    "enable_succeeded": false,
+    "errno": 95,
+    "conclusion": "current filesystem does not support this ioctl; kernel CONFIG_FS_VERITY=y alone is insufficient"
+  },
+  "readonly_lock_probe": {
+    "scope": "separate disposable empty lock on root filesystem",
+    "exclusive_flock_on_readonly_fd": true,
+    "read_lease_after_fchmod_0400": true,
+    "conclusion": "descriptor compatibility only; no historical writer closure proof"
+  },
+  "source_inventory": [
+    {
+      "file": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "revision": "4b0b2461152bb774e50d9510fc9d3235bce2b006",
+      "paths": [
+        "StateLock/acquire",
+        "write/create_new",
+        "Launch::prepare/fresh chmod and owned.json",
+        "prune_and_count/RW open on EVERY retained lock",
+        "retire/write new marker",
+        "retire_owned_at/write new marker",
+        "FreshUnreleasedRuntime::reclaim/RW lock then remove_dir_all"
+      ],
+      "limit": "Original producer binary-to-source contract not established by this inventory."
+    },
+    {
+      "file": "scripts/native-provider-vm.py",
+      "revision": "4b0b2461152bb774e50d9510fc9d3235bce2b006",
+      "paths": [
+        "main/session lock RW before exclusive flock",
+        "runtime_seed/read-only session contents",
+        "TemporaryDirectory inside session before VM launch",
+        "generation and complete publication",
+        "finally closes lock before bridge/QEMU wait; TemporaryDirectory context exits later"
+      ],
+      "limit": "Metadata-only layout and flock availability do not alone prove descendant closure or all delayed-start exclusion."
+    }
+  ]
+}

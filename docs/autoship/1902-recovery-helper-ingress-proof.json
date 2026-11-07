@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "kind": "recovery-branch-native-helper-ingress-observation",
+  "source_head_before_evidence": "894ed0fedae391dffb233db2f51af36ab081a6cf",
+  "source_sha256": {
+    "scripts/native-provider-vm.py": "ab06f9cc8c72478ba793b3694a08a31886836ba9b42538425c08c2e3ec93ab1c",
+    "scripts/provider-supervisor.py": "10929702ac75f16314592bd2c0ca80d12b4aa0c44ed44097b5b88f85bf09c201",
+    "scripts/tests/native_custody_writer_probe.py": "a423f944dffb272187d3d8de090370d969f2d67dd14c71690b439187da52b6a5"
+  },
+  "command": "/home/nolan-makatche/AugmentAgent/target/release/augmentagent disk build --target-dir /mnt/store/augmentagent-session-targets/jarvis-autoship-delivery-f112689868e2807c /usr/bin/python3 -I /home/nolan-makatche/jarvis-autoship-main-integration/scripts/tests/native_custody_writer_probe.py /home/nolan-makatche/jarvis-autoship-main-integration/scripts/native-provider-vm.py",
+  "original_handle": 11464,
+  "original_handle_terminal": true,
+  "exit_code": 0,
+  "tests_passed": 3,
+  "seconds": 0.183,
+  "log": "/tmp/autoship-custody-recovery-helper-ingress-20261107.log",
+  "log_sha256": "9ce77a5ca8e59dae92e5e0f496ca0ae25aa9405e4fd68fde3653a49772e622b2",
+  "observations": [
+    {
+      "lock_open_returned": true,
+      "temporary_directory_created": false,
+      "exception": "PermissionError",
+      "errno": 13,
+      "refused_session_creation": true,
+      "mode": "pending-before-fence",
+      "original_bytes_preserved": true,
+      "grants_capacity": false,
+      "guest_or_provider_started": false
+    },
+    {
+      "lock_open_returned": true,
+      "temporary_directory_created": true,
+      "exception": "KeyError",
+      "errno": null,
+      "refused_session_creation": false,
+      "mode": "normal",
+      "original_bytes_preserved": true,
+      "grants_capacity": false,
+      "guest_or_provider_started": false
+    },
+    {
+      "lock_open_returned": false,
+      "temporary_directory_created": false,
+      "exception": "PermissionError",
+      "errno": 13,
+      "refused_session_creation": false,
+      "mode": "fenced-before-start",
+      "original_bytes_preserved": true,
+      "grants_capacity": false,
+      "guest_or_provider_started": false
+    }
+  ],
+  "production_native_state_changed": false,
+  "grants_capacity": false,
+  "scope": "Real helper main() lock-open and temporary-directory operations with real file modes, flock, file lease, delayed conflicting open and checked child wait. Runtime loading/validation is stubbed; positive control deliberately stops before VM start. Actual recovery helper differs from the historical helper embedded in the saved original ELF. These three passing cases neither establish original Rust source correspondence nor complete historical writer closure, permanent immutability, privileged controller safety or capacity recovery."
+}
