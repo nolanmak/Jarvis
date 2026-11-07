@@ -17,7 +17,8 @@
     "Complete native-provider-vm.py and provider-supervisor.py bytes were found in the saved original producer binary with SHA2567bbdd56d..., matching current helper hashes. This does not establish Rust binary source correspondence or original outcome/closure.",
     "The frozen owner-host immutable probe remains unexecuted on the actual host kernel 7.0.0-30; this session lacks CAP_LINUX_IMMUTABLE and sudo requires the owner password. The pending owner request authorizes disposable tests only, never production fencing.",
     "A managed disposable no-NIC ext4 guest running kernel 7.0.0-31 with guest UID0 passed six immutable cases: directory create/unlink refusal, new write-open refusal, existing writable-FD refusal, existing shared mapping SIGBUS, an open already waiting on a read-lease break refused after immutable transition, and a prefaulted writable shared mapping SIGBUS. Original fixture bytes survived. Original supervisor confirmed all descendants reaped. The host mounted nothing; no production native state was changed and no reservation was reduced. This is a different kernel and serial fixture evidence, not an actual host or concurrent inventory proof.",
-    "A subsequent disposable guest experiment exercised a multi-inode candidate under controlled mutation interleavings. Setting directory/file flags without recensus failed four of eight tests by accepting added entries, replacement file/directory inodes and changed contents. Rechecking named and held identities, full inventory and contents after directory fencing and after file fencing then passed ten tests, including a late existing-FD write, retained partial restrictions and UID1000 inode-owner flag-clearing refusal. All six earlier immutable cases remained passing; original supervisor verified descendant cleanup. No production custody producer, crash durability, exact-host support or accounting grant is established."
+    "A subsequent disposable guest experiment exercised a multi-inode candidate under controlled mutation interleavings. Setting directory/file flags without recensus failed four of eight tests by accepting added entries, replacement file/directory inodes and changed contents. Rechecking named and held identities, full inventory and contents after directory fencing and after file fencing then passed ten tests, including a late existing-FD write, retained partial restrictions and UID1000 inode-owner flag-clearing refusal. All six earlier immutable cases remained passing; original supervisor verified descendant cleanup. No production custody producer, crash durability, exact-host support or accounting grant is established.",
+    "A further four-boundary disposable ext4 experiment fsynced the original fixture/oracle and selected flag subset, then syncfs, before its original supervisor SIGKILLed QEMU without a guest unmount. A fresh boot of the same verified image inode independently recovered the original directory/file identities and contents. Captured-only, directory-only and one-file states remained partial; the fully flushed flags survived. All eight original boot supervisors verified descendant cleanup, and each killed QEMU had an observed live/then-exited pidfd. This is guest termination after explicit filesystem flush, not host power-loss testing, an actual-host result or a production custody/accounting proof."
   ],
   "primary_sources": [
     "https://man7.org/linux/man-pages/man2/F_SETLEASE.2const.html",
@@ -317,6 +318,16 @@
       "OT1_OT5_remain_open": true,
       "full_seam_pass_required_before_handoff": true,
       "fresh_reader_findings": 0
+    },
+    "immutable_persistence_checkpoint": {
+      "status": "Bounded flushed-flag restart amendment independently reviewed: no findings. No implementation handoff or production activation.",
+      "boundaries_passed": 4,
+      "boots_verified_reaped": 8,
+      "earlier_16_cases_still_pass": true,
+      "OT1_OT5_remain_open": true,
+      "full_seam_pass_required_before_handoff": true,
+      "implementation_handoff_approved": false,
+      "fresh_reader_findings": 0
     }
   },
   "evidence": {
@@ -342,5 +353,13 @@
     "Set immutable on the held original directory. Recheck its current named identity, exact inventory and every original file description.",
     "Set immutable on each held original regular file description. Recheck directory identity, inventory, content, held descriptions and all file flags.",
     "Refuse any mismatch without automatic restriction rollback. Explicit test cleanup restores only its own allocated fixture flags."
+  ],
+  "persistence_experiment_evidence": "1902-immutable-persistence-guest-proof.json",
+  "observed_persistence_candidate": [
+    "Write and fsync the original fixture files and test oracle, plus containing directories, before any restrictive transition. The oracle is not a production custody intent or receipt.",
+    "At each selected boundary fsync held original regular files and directory, then call syncfs on that ext4 filesystem.",
+    "Observe matching nonce/boundary from the still-running guest. Observe the original live QEMU through its original supervisor and pidfd, then TERM that supervisor. Its existing cleanup path SIGKILLs its owned QEMU tree without guest unmount.",
+    "Await that same original supervisor to exit143, QEMU pidfd exit and exact all-descendants-reaped marker before booting again. Verify the same raw image device/inode.",
+    "Boot a fresh VM with fresh descriptors and independently compare the persisted original inventory, content hashes, device/inode identities and expected flag subset. Close observation FDs without clearing recovered flags. Delete only owned test images after both original cleanups are verified."
   ]
 }

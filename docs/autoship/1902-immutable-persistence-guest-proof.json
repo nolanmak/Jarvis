@@ -1,0 +1,282 @@
+{
+  "version": 1,
+  "kind": "disposable-ext4-flushed-flag-restart-observation",
+  "source_head_before_experiment": "d8b4f2a2c3c918aed9dfb2a65668081ff2906f44",
+  "source_sha256": {
+    "scripts/tests/native_custody_persistence_guest_probe.py": "3f826b90ce421377a28c61e7c91b11a487dcdeace45000de50e022396e55ac78",
+    "scripts/tests/native_custody_persistence_vm_probe.py": "4b344fbfef16823835b7f10e166c307027d849bb58195c51e2a523b3f699307d",
+    "scripts/tests/native_custody_inventory_guest_probe.py": "643accaa18a6c47cc135d00eee263b380a123a7acda12eaf7d732486891084a3",
+    "scripts/tests/native_custody_immutable_vm_probe.py": "8d1e2bfa55fdb9d2869e136ea76ed9f609523cea3bee39d33ab7a201ed824a39",
+    "scripts/provider-supervisor.py": "10929702ac75f16314592bd2c0ca80d12b4aa0c44ed44097b5b88f85bf09c201",
+    "scripts/codex-build-vm.py": "a77ff21b703423ab7654528e1846b9a8d5439a2e4e4813c9c68044692feac711"
+  },
+  "original_handle": 22394,
+  "original_handle_terminal": true,
+  "manager_exit": 0,
+  "command": "<existing recovery managed target>/debug/augmentagent disk build --target-dir <same target> /usr/bin/python3 -I scripts/tests/native_custody_persistence_vm_probe.py",
+  "log": "/tmp/autoship-immutable-persistence-verified-20261107.log",
+  "log_sha256": "1c1acce12c0c353d7c2bcd9c9132ad822599f222ec51d5082453e3f46b1ecc21",
+  "observations": {
+    "cases": [
+      {
+        "boots": [
+          {
+            "all_descendants_reaped": true,
+            "crash_requested_after_ready": true,
+            "qemu_pidfd_observed_exit": true,
+            "records": [
+              {
+                "boundary": "captured",
+                "directory_flag": false,
+                "file_flags": {
+                  "lock": false,
+                  "owned.json": false
+                },
+                "fsync_complete": true,
+                "grants_capacity": false,
+                "kind": "persistence_ready",
+                "nonce": "48c7176e34aeda57cf041b105e0d4dd5"
+              }
+            ],
+            "supervisor_exit": 143
+          },
+          {
+            "all_descendants_reaped": true,
+            "crash_requested_after_ready": false,
+            "qemu_pidfd_observed_exit": false,
+            "records": [
+              {
+                "all_fixture_flags_set": false,
+                "boundary": "captured",
+                "directory_flag": false,
+                "file_flags": {
+                  "lock": false,
+                  "owned.json": false
+                },
+                "grants_capacity": false,
+                "kernel": "7.0.0-31-generic",
+                "kind": "persistence_recovered",
+                "nonce": "48c7176e34aeda57cf041b105e0d4dd5",
+                "original_identity_content_preserved": true,
+                "partial_or_unfenced": true,
+                "production_state_changed": false,
+                "uid": 0
+              }
+            ],
+            "supervisor_exit": 0
+          }
+        ],
+        "boundary": "captured",
+        "same_image_inode_verified": true,
+        "success": true
+      },
+      {
+        "boots": [
+          {
+            "all_descendants_reaped": true,
+            "crash_requested_after_ready": true,
+            "qemu_pidfd_observed_exit": true,
+            "records": [
+              {
+                "boundary": "directory-fenced",
+                "directory_flag": true,
+                "file_flags": {
+                  "lock": false,
+                  "owned.json": false
+                },
+                "fsync_complete": true,
+                "grants_capacity": false,
+                "kind": "persistence_ready",
+                "nonce": "5aba1d3757d32d2c7f0268514dc2062e"
+              }
+            ],
+            "supervisor_exit": 143
+          },
+          {
+            "all_descendants_reaped": true,
+            "crash_requested_after_ready": false,
+            "qemu_pidfd_observed_exit": false,
+            "records": [
+              {
+                "all_fixture_flags_set": false,
+                "boundary": "directory-fenced",
+                "directory_flag": true,
+                "file_flags": {
+                  "lock": false,
+                  "owned.json": false
+                },
+                "grants_capacity": false,
+                "kernel": "7.0.0-31-generic",
+                "kind": "persistence_recovered",
+                "nonce": "5aba1d3757d32d2c7f0268514dc2062e",
+                "original_identity_content_preserved": true,
+                "partial_or_unfenced": true,
+                "production_state_changed": false,
+                "uid": 0
+              }
+            ],
+            "supervisor_exit": 0
+          }
+        ],
+        "boundary": "directory-fenced",
+        "same_image_inode_verified": true,
+        "success": true
+      },
+      {
+        "boots": [
+          {
+            "all_descendants_reaped": true,
+            "crash_requested_after_ready": true,
+            "qemu_pidfd_observed_exit": true,
+            "records": [
+              {
+                "boundary": "file-fenced:lock",
+                "directory_flag": true,
+                "file_flags": {
+                  "lock": true,
+                  "owned.json": false
+                },
+                "fsync_complete": true,
+                "grants_capacity": false,
+                "kind": "persistence_ready",
+                "nonce": "2770380382afa4a07997eeff152c54ed"
+              }
+            ],
+            "supervisor_exit": 143
+          },
+          {
+            "all_descendants_reaped": true,
+            "crash_requested_after_ready": false,
+            "qemu_pidfd_observed_exit": false,
+            "records": [
+              {
+                "all_fixture_flags_set": false,
+                "boundary": "file-fenced:lock",
+                "directory_flag": true,
+                "file_flags": {
+                  "lock": true,
+                  "owned.json": false
+                },
+                "grants_capacity": false,
+                "kernel": "7.0.0-31-generic",
+                "kind": "persistence_recovered",
+                "nonce": "2770380382afa4a07997eeff152c54ed",
+                "original_identity_content_preserved": true,
+                "partial_or_unfenced": true,
+                "production_state_changed": false,
+                "uid": 0
+              }
+            ],
+            "supervisor_exit": 0
+          }
+        ],
+        "boundary": "file-fenced:lock",
+        "same_image_inode_verified": true,
+        "success": true
+      },
+      {
+        "boots": [
+          {
+            "all_descendants_reaped": true,
+            "crash_requested_after_ready": true,
+            "qemu_pidfd_observed_exit": true,
+            "records": [
+              {
+                "boundary": "complete",
+                "directory_flag": true,
+                "file_flags": {
+                  "lock": true,
+                  "owned.json": true
+                },
+                "fsync_complete": true,
+                "grants_capacity": false,
+                "kind": "persistence_ready",
+                "nonce": "196691ae55c9471d1503a3ebe6fc7214"
+              }
+            ],
+            "supervisor_exit": 143
+          },
+          {
+            "all_descendants_reaped": true,
+            "crash_requested_after_ready": false,
+            "qemu_pidfd_observed_exit": false,
+            "records": [
+              {
+                "all_fixture_flags_set": true,
+                "boundary": "complete",
+                "directory_flag": true,
+                "file_flags": {
+                  "lock": true,
+                  "owned.json": true
+                },
+                "grants_capacity": false,
+                "kernel": "7.0.0-31-generic",
+                "kind": "persistence_recovered",
+                "nonce": "196691ae55c9471d1503a3ebe6fc7214",
+                "original_identity_content_preserved": true,
+                "partial_or_unfenced": false,
+                "production_state_changed": false,
+                "uid": 0
+              }
+            ],
+            "supervisor_exit": 0
+          }
+        ],
+        "boundary": "complete",
+        "same_image_inode_verified": true,
+        "success": true
+      }
+    ],
+    "fixture_sha256": "3f826b90ce421377a28c61e7c91b11a487dcdeace45000de50e022396e55ac78",
+    "grants_capacity": false,
+    "host_kernel_verified": false,
+    "host_root_used": false,
+    "inventory_fixture_sha256": "643accaa18a6c47cc135d00eee263b380a123a7acda12eaf7d732486891084a3",
+    "kernel_image_sha256": "c85962fc9bbccc7f49141800a896f72734ebe16fd175dd46d9b4206556ed0d09",
+    "production_state_changed": false,
+    "scope": "Fsync+syncfs then supervisor SIGKILL of QEMU; fresh boot of same test image. Not host power-loss testing or a production journal/accounting proof.",
+    "status": "observed"
+  },
+  "regression": {
+    "original_handle": 24357,
+    "terminal": true,
+    "exit": 0,
+    "original_immutable_cases": 6,
+    "inventory_transition_tests": 10,
+    "all_descendants_reaped": true,
+    "log": "/tmp/autoship-immutable-persistence-storage-refactor-regression-20261107.log",
+    "log_sha256": "5769d42657cb7b54a7ab6b92aac058f4b0826ac72cd79b5ef0f052d221023e05"
+  },
+  "earlier_terminal_runs": [
+    {
+      "handle": 84296,
+      "exit": 0,
+      "log": "/tmp/autoship-immutable-persistence-first-20261107.log",
+      "scope": "Initial four-boundary pass; descriptive field names later narrowed to observable flags, not a conservative-capacity disposition."
+    },
+    {
+      "handle": 17507,
+      "exit": 0,
+      "log": "/tmp/autoship-immutable-persistence-final-20261107.log",
+      "scope": "Four-boundary pass after descriptive rename and same-image check; final source additionally retains scratch if image identity changes."
+    }
+  ],
+  "mechanism": [
+    "Write and fsync the original fixture files and test oracle, plus containing directories, before any restrictive transition. The oracle is not a production custody intent or receipt.",
+    "At each selected boundary fsync held original regular files and directory, then call syncfs on that ext4 filesystem.",
+    "Observe matching nonce/boundary from the still-running guest. Observe the original live QEMU through its original supervisor and pidfd, then TERM that supervisor. Its existing cleanup path SIGKILLs its owned QEMU tree without guest unmount.",
+    "Await that same original supervisor to exit143, QEMU pidfd exit and exact all-descendants-reaped marker before booting again. Verify the same raw image device/inode.",
+    "Boot a fresh VM with fresh descriptors and independently compare the persisted original inventory, content hashes, device/inode identities and expected flag subset. Close observation FDs without clearing recovered flags. Delete only owned test images after both original cleanups are verified."
+  ],
+  "limits": [
+    "Four selected boundaries with explicit fsync/syncfs; not every syscall, failed fsync, torn write, host kernel, storage hardware power-loss or arbitrary concurrent-writer path.",
+    "Partial and complete flag subsets remain descriptive observations. No resource credit, original-outcome settlement, production custody ledger/authority, helper privilege policy or all-consumer admission path is implemented.",
+    "Guest root capability exists only in no-NIC disposable VMs. Host runs unprivileged, mounts no image and changes no production native state, alias, data, policy, control, outcome or reservation.",
+    "Exact-host support, authenticated narrow privileged helper, durable intent/receipt/retry semantics, supported writer closure, conservative shared reservation arithmetic/compatibility and full epic acceptance remain open."
+  ],
+  "host_kernel_verified": false,
+  "host_root_used": false,
+  "production_state_changed": false,
+  "grants_capacity": false,
+  "implementation_handoff_approved": false
+}

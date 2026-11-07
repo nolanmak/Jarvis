@@ -15,9 +15,8 @@ import sys
 import tempfile
 
 
-def main():
-    if len(sys.argv) != 1 or os.getuid() == 0:
-        raise RuntimeError('Use an unprivileged host and no paths/options')
+def managed_storage():
+    """Inspect actual inherited exclusions; never create or replace leases."""
     descriptors = tuple(int(value) for value in os.environ.get('JARVIS_STORAGE_LEASE_FDS', '').split(',') if value)
     if not descriptors or len(descriptors) > 64 or str(descriptors[0]) != os.environ.get('JARVIS_STORAGE_LEASE_FD') or any(fd < 3 for fd in descriptors):
         raise RuntimeError('Actual inherited managed storage descriptors required')
@@ -50,6 +49,13 @@ def main():
     scratch = Path(os.environ['TMPDIR']).resolve(strict=True)
     if scratch.parent != target or scratch.name != 'tmp':
         raise RuntimeError('Managed target scratch required')
+    return descriptors, target, scratch
+
+
+def main():
+    if len(sys.argv) != 1 or os.getuid() == 0:
+        raise RuntimeError('Use an unprivileged host and no paths/options')
+    descriptors, target, scratch = managed_storage()
     scripts = Path(__file__).resolve().parents[1]
     spec = importlib.util.spec_from_file_location('custody_probe_vm', scripts / 'codex-build-vm.py')
     vm = importlib.util.module_from_spec(spec)
