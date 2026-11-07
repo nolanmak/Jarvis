@@ -92,11 +92,18 @@ def main(arguments):
                 post_exec_reopened_child_fd_old_address_errno=errno.EIO,
                 old_parent_value_restored=True,complete_writer_closure=False)
         finally:os.close(current)
-        return True
 
     def construct(*args,**kwargs):
         assert not kwargs
-        value=original(*args,inspect_pending_exec=pending,inspect_exec=executed)
+        def resume(child,childfd,detach,deadline):
+            # The original experiment has consumed the parent's return frame
+            # before this callback. Keep the child at its actual exec stop so
+            # the parent cannot finish waitpid while its value is changed.
+            executed(child)
+            detach()
+            assert cases.frame(args[3],12,deadline)==b'PROXY_READY\n'
+            os.write(args[4],b'x')
+        value=original(*args,inspect_pending_exec=pending,resume_exec=resume)
         gate.append(value);return value
     cases.experiment=construct
     try:cases.main([planner,supervisor,library,producer,proxy,wrong,'finish',receipt])
