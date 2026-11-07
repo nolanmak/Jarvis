@@ -3115,7 +3115,8 @@ def _unit(arguments):
                 'version':1,'kind':'ci-exec-mediation-observation','binding':value['binding'],
                 'command':value['command'],'ordinal':value['ordinal'],'returncode':raw,
                 'exec_observed':observed,'initial_attempts':sum(row['allowed'] for row in mediation.records),
-                'denied_execs':sum(not row['allowed'] for row in mediation.records),
+                'denied_execs':sum(not row['allowed'] and row['disposition']=='exec' for row in mediation.records),
+                'policy_dispositions':mediation.records,
                 'notification_errors':len(mediation.errors),'shipping_authority':False})
         mediation.check()
         cache._write_record(Path(value['directory'])/'exit-status.json',{'version':3,'binding':value['binding'],
@@ -3165,10 +3166,14 @@ class UnitPolicy:
         finally:
             if descriptor is not None:os.close(descriptor)
 
-    def activate(self):
+    def activate(self,*,listener=False):
         self._activated=False
-        if self.restrict()!=0:raise FreshnessHold('invalidation_unsafe')
+        function=self.library.jarvis_ci_exec_listener if listener else self.restrict
+        function.argtypes=[];function.restype=ctypes.c_int
+        result=function()
+        if result<0 or not listener and result!=0:raise FreshnessHold('invalidation_unsafe')
         self._activated=True
+        return result if listener else None
 
     def activation_observation(self):
         if not self._activated:raise FreshnessHold('invalidation_unsafe')
@@ -3191,8 +3196,10 @@ class ExecMediation:
                 or type(minimum) is not int or not 3<=minimum<=65535):raise FreshnessHold('invalidation_unsafe')
         self.deadline=deadline;self.uid=uid;self.cancel=cancel;self.setup_uid=os.geteuid()
         self.policy=UnitPolicy();self.native=self.policy.library
-        self.native.jarvis_ci_exec_receive.argtypes=[ctypes.c_int,ctypes.POINTER(ctypes.c_uint64),
-            ctypes.POINTER(ctypes.c_uint32),ctypes.POINTER(ctypes.c_int32)]
+        self.native.jarvis_ci_policy_receive.argtypes=[ctypes.c_int,ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint32),ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_uint64),ctypes.POINTER(ctypes.c_int32)]
+        self.native.jarvis_ci_policy_deny.argtypes=[ctypes.c_int,ctypes.c_uint64]
         self.native.jarvis_ci_exec_respond.argtypes=[ctypes.c_int,ctypes.c_uint64,ctypes.c_int]
         self.endpoint,child=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
         try:self.child_fd=fcntl.fcntl(child.fileno(),fcntl.F_DUPFD_CLOEXEC,minimum)
@@ -3238,18 +3245,25 @@ class ExecMediation:
                 if flags&(select.POLLERR|select.POLLNVAL):raise FreshnessHold('cleanup_uncertain')
                 if flags&select.POLLHUP and not flags&select.POLLIN:return
                 identity,pid,number=ctypes.c_uint64(),ctypes.c_uint32(),ctypes.c_int32()
-                if self.native.jarvis_ci_exec_receive(self.listener,ctypes.byref(identity),ctypes.byref(pid),ctypes.byref(number))!=0:
+                clone_flags,kind=ctypes.c_uint64(),ctypes.c_int32()
+                if self.native.jarvis_ci_policy_receive(self.listener,ctypes.byref(identity),ctypes.byref(pid),
+                        ctypes.byref(number),ctypes.byref(clone_flags),ctypes.byref(kind))!=0:
                     if ctypes.get_errno() in (errno.ENOENT,errno.EINTR):continue
                     raise FreshnessHold('cleanup_uncertain')
                 with self._lock:
                     if len(self.records)>=4096:raise FreshnessHold('input_census_unknown')
                     cancelled=self.cancel is not None and bool(select.select([self.cancel],[],[],0)[0])
-                    allow=self.initial and pid.value==self.pid and not cancelled
-                    if number.value not in (59,322):raise FreshnessHold('invalidation_unsafe')
-                    if self.native.jarvis_ci_exec_respond(self.listener,identity.value,int(allow))!=0:
+                    dispositions={1:'exec',2:'clone3_fallback',3:'unsupported_vfork',4:'unsupported_shared_mm'}
+                    if kind.value not in dispositions:raise FreshnessHold('invalidation_unsafe')
+                    allow=kind.value==1 and self.initial and pid.value==self.pid and not cancelled
+                    response=(self.native.jarvis_ci_exec_respond(self.listener,identity.value,int(allow)) if kind.value==1
+                        else self.native.jarvis_ci_policy_deny(self.listener,identity.value))
+                    if response!=0:
                         if ctypes.get_errno()==errno.ENOENT:continue  # Withdrawn; no decision committed.
                         raise FreshnessHold('cleanup_uncertain')
-                    self.records.append({'pid':pid.value,'nr':number.value,'allowed':allow,'after_ack':self.ack})
+                    self.records.append({'pid':pid.value,'nr':number.value,'allowed':allow,'after_ack':self.ack,
+                        'clone_flags':clone_flags.value,'disposition':dispositions[kind.value],
+                        'response_errno':0 if allow else errno.EPERM if kind.value==1 else errno.ENOSYS})
         except BaseException:
             self.errors.append('exec_mediation_unavailable')
             try:signal.pidfd_send_signal(self.pidfd,signal.SIGKILL)
@@ -3274,7 +3288,8 @@ class ExecMediation:
     def check(self):
         self.settle()
         if self.errors:raise FreshnessHold('cleanup_uncertain')
-        if any(not record['allowed'] for record in self.records):raise FreshnessHold('input_census_unknown')
+        if any(not record['allowed'] and record['disposition']!='clone3_fallback'
+                for record in self.records):raise FreshnessHold('input_census_unknown')
 
     def close(self):
         self._stop.set()
@@ -3288,9 +3303,7 @@ class ExecMediation:
 def stage_exec_mediation(value,policy):
     descriptor=value.get('exec_mediation_fd')
     if type(descriptor) is not int or not 3<=descriptor<=65535:raise FreshnessHold('invalidation_unsafe')
-    function=policy.library.jarvis_ci_exec_listener;function.argtypes=[];function.restype=ctypes.c_int
-    listener=function()
-    if listener<0:raise FreshnessHold('invalidation_unsafe')
+    listener=policy.activate(listener=True)
     try:
         with socket.socket(fileno=descriptor) as channel:
             peer=struct.unpack('3i',channel.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
@@ -3347,7 +3360,7 @@ def _stage(arguments):
             os.set_inheritable(descriptor,True)
             environment[b'JARVIS_CARGO_RELAY_FD']=str(descriptor).encode()
             environment[b'LD_PRELOAD']=b'/run/ci-cargo-relay.so'+(b' '+environment[b'LD_PRELOAD'] if b'LD_PRELOAD' in environment else b'')
-    stage_exec_mediation(value,policy);policy.activate()
+    stage_exec_mediation(value,policy)
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     staging.publish_policy_receipt(receipt,{'version':1,'kind':'ci-unit-policy-receipt',
@@ -4716,7 +4729,7 @@ def _cargo(arguments):
     else:
         validate_invocation(**invocation)
         environment=dict(invocation['environment'],LD_PRELOAD=value['library'],JARVIS_CARGO_RELAY_FD=str(configuration))
-    stage_exec_mediation(value,policy);policy.activate()
+    stage_exec_mediation(value,policy)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     os.setgroups([]);os.setgid(1001);os.setuid(1001);os.umask(0o077);_parent_guard(value['parent'])
     os.set_inheritable(configuration,True);os.chdir('/workspace');_PHASE='planner_cargo_execute'
@@ -5232,7 +5245,7 @@ def _repository_worker(arguments):
     worker_runtime_request((os.fsencode(value['argv'][0]),list(map(os.fsencode,value['argv'])),
         {os.fsencode(key):os.fsencode(item) for key,item in environment.items()},b'/workspace',None,0,0),value['library'])
     environment.update(LD_PRELOAD=value['library'],JARVIS_CARGO_RELAY_FD=str(configuration))
-    policy=UnitPolicy();stage_exec_mediation(value,policy);policy.activate()
+    policy=UnitPolicy();stage_exec_mediation(value,policy)
     staging.publish_policy_receipt(receipt,repository_worker_policy_context(value,policy,os.getpid()))
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')

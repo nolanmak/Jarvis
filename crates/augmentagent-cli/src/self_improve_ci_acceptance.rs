@@ -473,7 +473,7 @@ fn native_exec_mediation_covers_early_static_and_original_exec_ack() {
         let path=directory.path().join(name);std::fs::write(&path,bytes).unwrap();
         std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    for (file,count) in [("ci_cargo_exec_mediation_test.py",6),("ci_cargo_exec_controller_test.py",5)] {
+    for (file,count) in [("ci_cargo_exec_mediation_test.py",6),("ci_cargo_exec_controller_test.py",9)] {
         let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests").join(file);
         let output=std::process::Command::new("python3").arg("-I").arg(tests)
             .env("AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY",directory.path().join("native.so"))

@@ -31,9 +31,8 @@ def launcher(arguments):
     listener = library.jarvis_ci_exec_listener()
     if listener < 0:
         raise OSError(ctypes.get_errno(), 'exec notification unavailable')
-    # The trusted listener exists before this guard forbids replacements.
-    if library.jarvis_ci_restrict_unit() != 0:
-        raise OSError(ctypes.get_errno(), 'unit guard unavailable')
+    # The one listener installs the complete unit guard too. Stacking the
+    # standalone ERRNO filter here would hide these policy notifications.
     with socket.socket(fileno=int(transport)) as channel:
         channel.sendmsg([b'listener'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [listener]))])
     os.close(listener)
@@ -60,6 +59,31 @@ print('BODY_DENIED')
 if child:
  assert os.waitpid(child,0)[1]==0
 for number,args in''').replace("print('BODY_DENIED')", "if not child:os._exit(0)\nprint('BODY_DENIED')")
+    if mode in ('vfork-policy','vfork-descendant','clone-policy','clone3-fallback'):
+        routes={'vfork-policy':((58,0),),'vfork-descendant':((58,0),),'clone-policy':((56,0x4111),(56,0x111)),
+            'clone3-fallback':((435,0),)}[mode]
+        body='''import ctypes,errno
+l=ctypes.CDLL(None,use_errno=True);l.syscall.restype=ctypes.c_long
+for number,flags in %r:
+ assert l.syscall(number,ctypes.c_ulong(flags),0,0,0,0)==-1
+ assert ctypes.get_errno()==errno.ENOSYS,(number,ctypes.get_errno())
+print('POLICY_DENIED')
+''' % (routes,)
+        if mode=='clone3-fallback':
+            body=body.replace("print('POLICY_DENIED')",'''import threading
+seen=[]
+t=threading.Thread(target=lambda:seen.append('actual-thread'))
+t.start();t.join(2)
+assert not t.is_alive() and seen==['actual-thread']
+print('POLICY_DENIED')''')
+        if mode=='vfork-descendant':
+            body=body.replace('for number,flags in', '''import os
+child=os.fork()
+if child:
+ assert os.waitpid(child,0)[1]==0
+else:
+ for number,flags in''').replace(" assert l.syscall", "  assert l.syscall").replace(" assert ctypes.get_errno()", "  assert ctypes.get_errno()")
+            body=body.replace("print('POLICY_DENIED')", " if not child:os._exit(0)\nprint('POLICY_DENIED')")
     if mode == 'search':
         try:
             os.execve('/does-not-exist/ci-first-exec-candidate', ['missing'], environment)
@@ -206,16 +230,24 @@ def integrated(arguments):
         try:
             gate.check()
         except planner.FreshnessHold as hold:
+            assert mode!='clone3-fallback'
             assert hold.reason == 'input_census_unknown'
         else:
-            raise AssertionError('unsupported raw exec was accepted as a source verdict')
+            if mode!='clone3-fallback':
+                raise AssertionError('unsupported route was accepted as a source verdict')
         assert not gate.errors
         assert len([r for r in gate.records if r['allowed']]) == (2 if mode == 'search' else 1)
         denied = [r for r in gate.records if not r['allowed']]
-        assert len(denied) == (4 if mode in ('early','fork') else 2)
+        if mode=='clone3-fallback':
+            assert denied and all(r['disposition']=='clone3_fallback' for r in denied)
+        else:
+            assert len(denied) == (4 if mode in ('early','fork') else 1 if mode in ('vfork-policy','vfork-descendant') else 2)
+        if mode=='vfork-descendant':assert denied[0]['pid']!=gate.pid
         assert all(r['after_ack'] for r in denied)
         assert Path(receipt).read_text() == 'all-descendants-reaped\n'
-        print(json.dumps({'controller_hold':'input_census_unknown','original_cleanup':True,'shipping_authority':False}))
+        print(json.dumps({'controller_hold':None if mode=='clone3-fallback' else 'input_census_unknown',
+            'policy_records':[r for r in denied if r['nr'] not in (59,322)],
+            'original_cleanup':True,'shipping_authority':False}))
     finally:
         gate.close()
         if cancellation is not None:

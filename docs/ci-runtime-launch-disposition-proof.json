@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "kind": "ci-runtime-launch-disposition-checkpoint",
+  "baseline": "e25d2d2af3ecd42b0f25d25c0ec496d333af5d7c",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/ci_cargo_exec.c": "b7997f2f98a54f3c42df2402e60d8ca7e2a56c8b7d26d1880978a49f3525c100",
+    "crates/augmentagent-cli/src/ci_cargo_exec_mediation_cases.py": "37c49cb8ab28da8056548e014a50bb77de11bb2b4c19d317e242b190ae17d49b",
+    "crates/augmentagent-cli/src/self_improve_ci_acceptance.rs": "2db40fe0cac0c74a5e125ca605e871ef51e6fdbad79753dbac46815fda392c55",
+    "scripts/ci-cargo-planner.py": "cddf4208ba2fa2ae5e451e3eed7e6ba7e8339318ca9ff448b2409711f8224c4d",
+    "scripts/tests/ci_cargo_exec_controller_test.py": "57e01b9e38cd39f9deb1f8a151cbe35119b0093f9564ea48741b531b52c2b1ee"
+  },
+  "red": {
+    "log": "/tmp/autoship-ci-policy-disposition-red-20261107.log",
+    "controller_cases": 8,
+    "failed": 3,
+    "meaning": "Unsupported process refusals were absent from the original controller records even when the application exited zero; clone3 fallback was unobserved."
+  },
+  "green": {
+    "python": {
+      "log": "/tmp/autoship-ci-policy-disposition-python-20261107.log",
+      "run": 700,
+      "passed": 700,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 41.52,
+      "native_helpers_enabled": true
+    },
+    "rust": {
+      "log": "/tmp/autoship-ci-policy-disposition-rust-final-20261107.log",
+      "passed": 36,
+      "failed": 0,
+      "ignored": 26,
+      "seconds": 19.18,
+      "controller_native_cases_required": 9
+    }
+  },
+  "actual_kernel_cases": [
+    "vfork refused ENOSYS and causes input_census_unknown after original cleanup despite application exit zero",
+    "clone CLONE_VFORK and separate-process CLONE_VM refused ENOSYS and observed with exact value flags",
+    "forked descendant vfork refusal observed by the original listener and both processes reaped",
+    "clone3 ENOSYS classified as intentional fallback, with actual successful thread creation",
+    "existing early-constructor/static/raw-exec/path-search/listener-loss/cancellation/descendant cases retained"
+  ],
+  "spec_audit": {
+    "agent": "ci_runtime_disposition_spec_audit_20261107",
+    "result": "No additional substantiated findings in the bounded checkpoint; full mechanism handoff remains incomplete."
+  },
+  "vm_replay": null,
+  "limitations": [
+    "Compiler vfork compatibility is unfinished.",
+    "Stricter stacked filters can mask notifications.",
+    "Empty records are not complete policy coverage.",
+    "No copyback, parent resume, complete input closure or final C/S grant is established.",
+    "All original epic acceptance requirements remain."
+  ],
+  "complete_policy_coverage": false,
+  "compiler_compatible": false,
+  "input_closure_complete": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "production_runtime_changed": false,
+  "autonomous_merges_claimed": 0
+}

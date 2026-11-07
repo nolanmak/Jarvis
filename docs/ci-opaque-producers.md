@@ -169,6 +169,56 @@ mappings have no running userspace writer; flush writeback before inventory.
 Test an asynchronous submission outstanding at capture explicitly; namespace
 restrictions do not substitute for that gate.
 
+#### Runtime-launch disposition observation
+
+The next controller checkpoint records kernel-observed launch refusals rather
+than guessing from a compiler's errno. C owns classification and the original
+scope's record; R's unchanged supervisor owns exec acknowledgement and descendant
+cleanup. The constructor-free native helper installs one filter/listener in the
+still-single-threaded trusted bootstrap. That filter includes both the existing
+unit restrictions and exec notifications. Do not subsequently stack the
+standalone unit filter: its stronger ERRNO action would hide the process-launch
+notifications. Successful installation is the unit-policy activation recorded
+in the original policy receipt. Failure to install or transfer the authenticated
+listener prevents original untrusted entry.
+
+Only the original bootstrap's initial exec may receive CONTINUE, before the
+original exec stop closes that permission. The listener additionally receives
+`clone3`, `vfork`, `clone` with CLONE_VFORK, and separate-process CLONE_VM. The
+native receiver classifies the kernel's syscall number and value-valued clone
+flags; it never reads `clone_args` or another untrusted pointer. Namespace clone
+flags and high flag bits remain EPERM restrictions. The response to every
+notified process-creation request is ENOSYS, without CONTINUE, preserving the
+existing refusal. With no listener, those requests still fail closed. The
+standalone TSYNC guard used outside this original-listener path retains its
+existing ERRNO behavior.
+
+A record is appended only after the kernel accepts the response for that live
+notification ID. Withdrawn requests are not committed dispositions. Each row
+contains the notifying PID, syscall number, clone flags where applicable,
+classification, response errno, initial-exec permission and whether the original
+exec acknowledgement has happened. Limit the original controller to 4096 rows;
+overflow or listener errors retain the existing cleanup/input hold rather than
+discarding observations. After the original supervisor returns, the existing
+private per-unit `exec-mediation.json` binds the rows to the original
+binding/command/ordinal and raw return status. Its exec-denial count counts only
+exec rows. This record precedes the typed check, so an unsupported route remains
+inspectable even when the application handles ENOSYS and exits zero.
+
+Expected `clone3` fallback alone does not add an unsupported-route hold. A denied
+exec, `vfork`, CLONE_VFORK or separate-process shared-mm request does add that
+hold, independently of the application's exit status. This distinction supplies
+positive evidence about these observed responses, not complete policy coverage.
+A stricter stacked ERRNO/KILL filter can mask notifications, and the runtime's
+actual supported fallback, unknown ABI, inherited capabilities and input closure
+still need their existing gates. Empty notification records are never coverage
+proof. Compiler compatibility remains a separate required exit: this observer
+does not allow GCC's `vfork`, detach its shared address space, resume the held
+parent, materialize outputs or grant C/CI/shipping authority. Before activating
+supported-adapter/final-C authority, C must complete the remaining disposition
+coverage and bind it through the final C/S consumers; the carrying cost of this
+checkpoint is a bounded private observation, with no new durable grant schema.
+
 ### O3. Freeze before capturing a live parent's input
 
 First capture the child's original request, exact stdin to EOF and verified
