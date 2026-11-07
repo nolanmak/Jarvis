@@ -48,7 +48,7 @@ fn require_dispatch_launch(record:&Record,sequence:i64,launch:&super::native_lau
         && launch.workflow_binding==record.binding && launch.intent.provider==record.provider,"owner dispatch launch context changed");
     match (record.version,&record.prepared_setup) {
         (1,None)=>ensure!(launch.sequence>sequence && launch.sequence>record.launch_floor,"owner launch predates legacy reservation"),
-        (2,Some(setup))=>{
+        (2|3,Some(setup))=>{
             require_same_prepared(launch,&augmentagent_channel_core::native_vm::PreparedLaunchRecord {intent:setup.intent.clone(),controller_receipt:setup.launch_receipt.clone()})?;
             ensure!(launch.sequence==record.launch_floor && launch.sequence<sequence
                 && setup.resource_receipt.version==1 && setup.resource_receipt.sequence>setup.launch_receipt.sequence,
@@ -155,8 +155,9 @@ fn decode(
         "owner dispatch has unknown nested fields"
     );
     ensure!(
-        matches!((record.version,record.prepared_setup.is_some()),(1,false)|(2,true))
-            && (record.version==1 || (record.preparation.is_some() && record.first_builder.is_some()))
+        matches!((record.version,record.prepared_setup.is_some(),record.first_builder.is_some()),
+            (1,false,_)|(2,true,true)|(3,true,false))
+            && (record.version==1 || record.preparation.is_some())
             && record.request_id == request
             && record.workflow == workflow
             && record.generation > 0
@@ -193,10 +194,11 @@ fn decode(
     if let Some(setup)=&record.prepared_setup {
         let launch=super::native_launch::recorded_launch(conn,&setup.intent.intent_id)?;
         require_dispatch_launch(&record,sequence,&launch)?;
-        let first=record.first_builder.as_ref().context("prepared first builder evidence missing")?;
-        ensure!(first["native"]["prepared_intent"]==serde_json::to_value(&setup.intent)?
-            && first["native"]["launch_receipt"]==serde_json::to_value(&setup.launch_receipt)?
-            && first["native"]["resource_receipt"]==serde_json::to_value(&setup.resource_receipt)?,"prepared first builder evidence changed");
+        if let Some(first)=&record.first_builder {
+            ensure!(first["native"]["prepared_intent"]==serde_json::to_value(&setup.intent)?
+                && first["native"]["launch_receipt"]==serde_json::to_value(&setup.launch_receipt)?
+                && first["native"]["resource_receipt"]==serde_json::to_value(&setup.resource_receipt)?,"prepared first builder evidence changed");
+        }
     }
     let input = super::owner_inbox::message_evidence(conn, workflow, request)?;
     ensure!(
@@ -502,11 +504,12 @@ impl WorkflowStore {
         provider: submission::Provider,
         now: i64,
     ) -> Result<OwnerBodyDispatch> {
-        self.begin_owner_body_dispatch_inner(turn,provider,now,None,None,None)
+        self.begin_owner_body_dispatch_inner(turn,provider,now,None,None,None,None)
     }
+    #[cfg(test)]
     pub(crate) fn begin_prepared_owner_body_dispatch(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,
         preparation:&OwnerPreparationBinding,now:i64)->Result<OwnerBodyDispatch> {
-        self.begin_owner_body_dispatch_inner(turn,provider,now,None,Some(preparation),None)
+        self.begin_owner_body_dispatch_inner(turn,provider,now,None,Some(preparation),None,None)
     }
     pub(crate) fn first_owner_body_turn(&mut self,lease:&Lease,provider:submission::Provider,base:&str,now:i64)->Result<owner_turn::OwnerTurn> {
         self.require_command_builder(&lease.workflow,Some(provider))?;
@@ -515,16 +518,35 @@ impl WorkflowStore {
     #[cfg(test)]
     pub(crate) fn begin_prepared_first_owner_body(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,base:&str,canonical_main:&str,
         proof:&augmentagent_channel_core::native_vm::ownership::UnusedNativeOwnerProof<'_>,preparation:&OwnerPreparationBinding,now:i64)->Result<OwnerBodyDispatch> {
-        self.begin_owner_body_dispatch_inner(turn,provider,now,Some((base,canonical_main,proof)),Some(preparation),None)
+        self.begin_owner_body_dispatch_inner(turn,provider,now,Some((base,canonical_main,proof)),Some(preparation),None,None)
     }
     pub(crate) fn begin_initial_prepared_owner_body(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,base:&str,main:&str,
         proof:&augmentagent_channel_core::native_vm::ownership::InitialPreparedNativeOwnerProof<'_>,preparation:&OwnerPreparationBinding,now:i64)->Result<OwnerBodyDispatch> {
-        self.begin_owner_body_dispatch_inner(turn,provider,now,None,Some(preparation),Some((base,main,proof)))
+        self.begin_owner_body_dispatch_inner(turn,provider,now,None,Some(preparation),Some((base,main,proof)),None)
+    }
+    /// Called by the original resource-ready controller with a live borrowed
+    /// resource admission. Saved receipts cannot construct this admission.
+    /// The controller validates native IO before acquiring the store mutex.
+    pub(crate) fn begin_resource_ready_owner_body_dispatch(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,
+        preparation:&OwnerPreparationBinding,admission:&augmentagent_channel_core::native_vm::NativeResourceAdmission<'_>,now:i64)->Result<OwnerBodyDispatch> {
+        let prepared=admission.prepared();
+        self.begin_owner_body_dispatch_inner(turn,provider,now,None,Some(preparation),None,
+            Some(PreparedSetup {intent:prepared.intent.clone(),launch_receipt:prepared.controller_receipt.clone(),resource_receipt:admission.resource_receipt().clone()}))
+    }
+    /// Synthetic persisted-record fixture only. Unlike the production entry,
+    /// this test helper does not establish a live native resource admission.
+    #[cfg(test)]
+    pub(crate) fn test_begin_resource_ready_owner_body(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,
+        preparation:&OwnerPreparationBinding,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,
+        resource:&augmentagent_channel_core::audit_chain::AppendReceipt,now:i64)->Result<OwnerBodyDispatch> {
+        self.begin_owner_body_dispatch_inner(turn,provider,now,None,Some(preparation),None,
+            Some(PreparedSetup {intent:prepared.intent.clone(),launch_receipt:prepared.controller_receipt.clone(),resource_receipt:resource.clone()}))
     }
     fn begin_owner_body_dispatch_inner(&mut self,turn:&owner_turn::OwnerTurn,provider:submission::Provider,now:i64,
         first:Option<(&str,&str,&augmentagent_channel_core::native_vm::ownership::UnusedNativeOwnerProof<'_>)>,
         preparation:Option<&OwnerPreparationBinding>,
         initial:Option<(&str,&str,&augmentagent_channel_core::native_vm::ownership::InitialPreparedNativeOwnerProof<'_>)>,
+        resumed:Option<PreparedSetup>,
     )->Result<OwnerBodyDispatch> {
         ensure!(now >= 0, "invalid owner dispatch time");
         self.require_command_builder(&turn.lease.workflow, Some(provider))?;
@@ -555,12 +577,14 @@ impl WorkflowStore {
             ensure!(audit==proof.namespace().audit_path && original==super::native_launch::binding_digest(proof.binding())?,"prepared first builder original binding changed");
             Some(serde_json::json!({"baseline":base,"canonical_main":main,"native":proof.evidence()}))
         }else{None};
-        let prepared_setup=initial.map(|(_,_,proof)|PreparedSetup {intent:proof.prepared().intent.clone(),launch_receipt:proof.prepared().controller_receipt.clone(),resource_receipt:proof.resource_receipt().clone()});
+        ensure!(initial.is_none() || resumed.is_none(),"owner dispatch setup roles overlap");
+        let resumed_setup=resumed.is_some();
+        let prepared_setup=initial.map(|(_,_,proof)|PreparedSetup {intent:proof.prepared().intent.clone(),launch_receipt:proof.prepared().controller_receipt.clone(),resource_receipt:proof.resource_receipt().clone()}).or(resumed);
         let launch_floor = super::native_launch::history(&tx, &turn.lease.workflow)?
             .last()
             .map_or(0, |r| r.sequence);
         let record = Record {
-            version: if prepared_setup.is_some() {2}else{1},
+            version: if resumed_setup {3}else if prepared_setup.is_some() {2}else{1},
             workflow: turn.lease.workflow.clone(),
             request_id: turn.request_id.clone(),
             owner: turn.lease.owner.clone(),
@@ -974,7 +998,12 @@ mod tests {
         launch.sequence=sequence-1;record.version=2;record.launch_floor=launch.sequence;
         record.prepared_setup=Some(PreparedSetup {intent,launch_receipt:receipt.clone(),resource_receipt:augmentagent_channel_core::audit_chain::AppendReceipt {sequence:11,..receipt}});
         require_dispatch_launch(&record,sequence,&launch).unwrap();
-        for fault in ["later","intent","launch-receipt","creation","owner","binding","version","missing-setup","resource-order"] {
+        // A resumed turn also reserves only after this exact launch is ready.
+        // It carries no first-builder or unused-conversation claim.
+        record.version=3;
+        assert!(record.first_builder.is_none());
+        require_dispatch_launch(&record,sequence,&launch).expect("resource-ready resumed dispatch must bind the existing launch");
+        for fault in ["later","intent","launch-receipt","creation","owner","binding","provider","session","audit","original-store","floor","version","missing-setup","resource-order","resource-version"] {
             let mut changed=launch.clone();let mut claim=record.clone();
             match fault {
                 "later"=>changed.sequence=sequence+1,
@@ -983,9 +1012,15 @@ mod tests {
                 "creation"=>changed.intent.creation_receipt_sha256="f".repeat(64),
                 "owner"=>changed.source_owner.lease_generation+=1,
                 "binding"=>changed.workflow_binding.head="another-head".into(),
+                "provider"=>changed.intent.provider=submission::Provider::Claude,
+                "session"=>changed.intent.native_session_id=Some("another-session".into()),
+                "audit"=>changed.source_audit_path="/other/audit.jsonl".into(),
+                "original-store"=>changed.original_native_binding_sha256="f".repeat(64),
+                "floor"=>claim.launch_floor+=1,
                 "version"=>claim.version=1,
                 "missing-setup"=>claim.prepared_setup=None,
-                "resource-order"=>claim.prepared_setup.as_mut().unwrap().resource_receipt.sequence=10,_=>unreachable!(),
+                "resource-order"=>claim.prepared_setup.as_mut().unwrap().resource_receipt.sequence=10,
+                "resource-version"=>claim.prepared_setup.as_mut().unwrap().resource_receipt.version=2,_=>unreachable!(),
             }
             assert!(require_dispatch_launch(&claim,sequence,&changed).is_err(),"{fault}: prepared launch substituted");
         }

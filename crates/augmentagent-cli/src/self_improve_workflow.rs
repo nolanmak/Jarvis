@@ -40,6 +40,11 @@ struct InitialOwnerBodyFactory {
     expected:durable::owner_turn::OwnerTurn,
     source:FirstOwnerBodySetup,
 }
+struct ResumedOwnerBodyFactory {
+    preparation:Arc<acceptance::owner::PreparedOwnerAcceptance>,
+    provider:durable::submission::Provider,
+    expected:durable::owner_turn::OwnerTurn,
+}
 struct FirstOwnerBodySetup {worktree:PathBuf,baseline:String,canonical_main:String}
 impl FirstOwnerBodySetup {
     fn validate_current_with_setup(&self,audit:&augmentagent_channel_core::AuditLogger,contract:&str)->Result<()> {self.validate_source(Some((audit,contract)))}
@@ -69,6 +74,7 @@ struct OwnerInputController {
     lease:Lease,
     body:Arc<std::sync::OnceLock<Arc<OwnerBodyAdmission>>>,
     initial:Option<InitialOwnerBodyFactory>,
+    resumed:Option<ResumedOwnerBodyFactory>,
     audit:std::sync::Weak<augmentagent_channel_core::AuditLogger>,
     prompt_sha256:String,
     prompt_bytes:usize,
@@ -98,6 +104,19 @@ impl OwnerInputController {
                 .map_err(|_|anyhow::anyhow!("owner factory reservation raced; reconcile original outcome"))?;Ok(())
         })
     }
+    fn reserve_resumed(&self,admission:&augmentagent_channel_core::native_vm::NativeResourceAdmission<'_>)->Result<()> {
+        let factory=self.resumed.as_ref().context("owner body has no resumed factory")?;
+        anyhow::ensure!(self.initial.is_none() && self.body.get().is_none(),"owner resumed body already reserved or has overlapping factory");
+        let preparation=factory.preparation.activation_binding()?;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("owner resumed factory store poisoned"))?;
+        let now=millis();let turn=store.owner_turn_for_lease(&self.lease,now)?;
+        anyhow::ensure!(turn.request_id==factory.expected.request_id && turn.body==factory.expected.body
+            && turn.binding==factory.expected.binding && turn.pause_revision==factory.expected.pause_revision,
+            "owner resumed request changed during native setup");
+        let dispatch=store.begin_resource_ready_owner_body_dispatch(&turn,factory.provider,&preparation,admission,now)?;
+        self.body.set(Arc::new(OwnerBodyAdmission {dispatch:Arc::new(dispatch),preparation:factory.preparation.clone(),provider:factory.provider}))
+            .map_err(|_|anyhow::anyhow!("owner resumed reservation raced; reconcile original outcome"))?;Ok(())
+    }
     fn check_native(&self,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,resource:&augmentagent_channel_core::audit_chain::AppendReceipt)->Result<()> {
         let audit=self.audit.upgrade().context("owner input controller expired")?;
         // Protected native IO must finish before the workflow mutex is acquired.
@@ -114,6 +133,7 @@ impl augmentagent_channel_core::native_vm::OwnerInputAuthorizer for OwnerInputCo
         admission.validate_unreleased()?;
         self.check_native(admission.prepared(),admission.resource_receipt())?;
         if self.initial.is_some() {self.reserve_initial(admission)?;}
+        else if self.resumed.is_some() {self.reserve_resumed(admission)?;}
         let body=self.reserved()?;
         let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("owner resource-ready store poisoned"))?;
         body.validate(&mut store,&self.lease,millis())
@@ -1844,26 +1864,22 @@ impl WorkflowGuard {
         anyhow::ensure!(origin.is_imported() || authors.as_ref().is_some_and(|authors|!authors.is_empty()) || first,"owner body requires known builder provenance or authorized imported history");
         // Revalidate after asynchronous provenance inspection and before the
         // once-only reservation, so a known invalid artifact cannot strand it.
-        let preparation=owner_prepared.validate_activated(self,&self.worktree)?;
+        owner_prepared.validate_activated(self,&self.worktree)?;
         let initial=if first {
             anyhow::ensure!(sessions.observed().is_empty(),"first builder cannot replace an observed conversation");
             let main=remote_main_head(&self.worktree,&self.repository).await?;
             let source=self.prepare_first_owner_body(owner_prepared,selected,&main).await?;
             Some(InitialOwnerBodyFactory {preparation:owner_prepared.clone(),provider:selected,expected:expected_turn.clone(),source})
-        }else {
-            let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("owner dispatch store poisoned"))?;
-            let now=millis();let turn=store.owner_turn_for_lease(&self.lease,now)?;
-            anyhow::ensure!(turn.request_id==expected_turn.request_id && turn.body==expected_turn.body && turn.binding==expected_turn.binding,"owner prompt request changed before dispatch");
-            let dispatch=store.begin_prepared_owner_body_dispatch(&turn,selected,&preparation,now)?;
-            body.set(Arc::new(OwnerBodyAdmission {dispatch:Arc::new(dispatch),preparation:owner_prepared.clone(),provider:selected})).map_err(|_|anyhow::anyhow!("owner body reservation already captured"))?;
-            None
-        };
+        }else {None};
+        let resumed=if first {None}else {Some(ResumedOwnerBodyFactory {
+            preparation:owner_prepared.clone(),provider:selected,expected:expected_turn,
+        })};
         let mut opts=fix_opts(self.worktree.clone());opts.audit_logger=Some(self.audit.clone());
         let wire_prompt=if selected==durable::submission::Provider::Codex {
             augmentagent_channel_core::images::codex_input(&prompt).0
         } else {prompt.clone()};
         self.audit.set_owner_input_authorizer(Arc::new(OwnerInputController {
-            store:self.store.clone(),lease:self.lease.clone(),body:body.clone(),initial,audit:Arc::downgrade(&self.audit),
+            store:self.store.clone(),lease:self.lease.clone(),body:body.clone(),initial,resumed,audit:Arc::downgrade(&self.audit),
             prompt_sha256:format!("{:x}",Sha256::digest(wire_prompt.as_bytes())),prompt_bytes:wire_prompt.len(),
         }))?;
         let outcome=sessions.scope(async {
@@ -4312,6 +4328,20 @@ else: raise SystemExit('unexpected authority call')
             .status().unwrap();
         assert!(status.success(),"original owner preparation admission callback fixture failed");
     }
+    #[tokio::test]
+    async fn resumed_owner_body_callbacks_bind_the_prepared_launch_after_reservation() {
+        let control=control_dir();
+        let output=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
+            .env("AUTOSHIP_INITIAL_GUARD_CHILD",control.path())
+            .env("AUTOSHIP_INITIAL_GUARD_MODE","owner-early-acceptance-producer-body-admission")
+            .env("AUTOSHIP_RESUMED_READY_DISPATCH_FIXTURE","1")
+            .env("XDG_STATE_HOME",control.path().join("operator-state"))
+            .env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json"))
+            .output().unwrap();
+        assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("resumed prepared callbacks passed"),"resumed fixture did not execute");
+    }
     async fn check_prepared_owner_body_callbacks(guard:&WorkflowGuard,prepared:Arc<acceptance::owner::PreparedOwnerAcceptance>,artifact:&Path) {
         let preparation=prepared.validate_activated(guard,&guard.worktree).unwrap();
         let turn=guard.store.lock().unwrap().owner_turn_for_lease(&guard.lease,millis()).unwrap();
@@ -4325,20 +4355,28 @@ else: raise SystemExit('unexpected authority call')
         std::thread::spawn(move||assert!(audit.model_call_admitted("codex").is_err(),"pending owner body admitted a model before resource-ready reservation")).join().unwrap();
         assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap(),before_pending);
         assert_eq!(guard.store.lock().unwrap().events(guard.id()).unwrap(),history_pending);
-        let dispatch=Arc::new(guard.store.lock().unwrap().begin_prepared_owner_body_dispatch(&turn,durable::submission::Provider::Codex,&preparation,millis()).unwrap());
+        let prepare_native=|| {
+            let original=guard.audit.native_store_binding().unwrap().unwrap();
+            let native=guard.audit.native_launch_prepared(&augmentagent_channel_core::native_vm::PreparedLaunchIntent {
+                version:2,intent_id:uuid::Uuid::new_v4().to_string(),source_owner:augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:guard.id().into(),lease_generation:guard.lease.generation},
+                source_audit_path:guard.audit.path().into(),provider:"codex".into(),runtime_relative_path:"codex/session-owner-input-fixture".into(),native_session_id:None,
+                launch_sha256:"d".repeat(64),creation_receipt_sha256:"e".repeat(64),original_store_binding_sha256:format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(&original).unwrap()).unwrap())),
+            }).unwrap();
+            let resource=guard.audit.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller","kind":"native_launch_resource_binding",
+                "launch_intent":native.intent,"launch_receipt":native.controller_receipt,"resource_identity":{"fixture":"synthetic-input-scope"}})).unwrap();
+            (native,resource)
+        };
+        let resumed=std::env::var_os("AUTOSHIP_RESUMED_READY_DISPATCH_FIXTURE").is_some();
+        let ready=if resumed {Some(prepare_native())}else {None};
+        let dispatch=Arc::new(if let Some((native,resource))=&ready {
+            guard.store.lock().unwrap().test_begin_resource_ready_owner_body(&turn,durable::submission::Provider::Codex,&preparation,native,resource,millis()).unwrap()
+        }else {guard.store.lock().unwrap().begin_prepared_owner_body_dispatch(&turn,durable::submission::Provider::Codex,&preparation,millis()).unwrap()});
         let admission=Arc::new(OwnerBodyAdmission {dispatch:dispatch.clone(),preparation:prepared.clone(),provider:durable::submission::Provider::Codex});
         guard.install_model_observers(Some(admission.clone())).unwrap();
-        let controller=OwnerInputController {store:guard.store.clone(),lease:guard.lease.clone(),body:Arc::new(std::sync::OnceLock::from(admission)),initial:None,
+        let controller=OwnerInputController {store:guard.store.clone(),lease:guard.lease.clone(),body:Arc::new(std::sync::OnceLock::from(admission)),initial:None,resumed:None,
             audit:Arc::downgrade(&guard.audit),prompt_sha256:format!("{:x}",Sha256::digest(b"synthetic exact private input")),prompt_bytes:"synthetic exact private input".len()};
         use augmentagent_channel_core::native_vm::OwnerInputAuthorizer;
-        let original=guard.audit.native_store_binding().unwrap().unwrap();
-        let native=guard.audit.native_launch_prepared(&augmentagent_channel_core::native_vm::PreparedLaunchIntent {
-            version:2,intent_id:uuid::Uuid::new_v4().to_string(),source_owner:augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:guard.id().into(),lease_generation:guard.lease.generation},
-            source_audit_path:guard.audit.path().into(),provider:"codex".into(),runtime_relative_path:"codex/session-owner-input-fixture".into(),native_session_id:None,
-            launch_sha256:"d".repeat(64),creation_receipt_sha256:"e".repeat(64),original_store_binding_sha256:format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(&original).unwrap()).unwrap())),
-        }).unwrap();
-        let resource=guard.audit.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller","kind":"native_launch_resource_binding",
-            "launch_intent":native.intent,"launch_receipt":native.controller_receipt,"resource_identity":{"fixture":"synthetic-input-scope"}})).unwrap();
+        let (native,resource)=ready.unwrap_or_else(prepare_native);
         assert!(controller.bind_model(&native,&resource).is_err(),"unadmitted native model received an owner input binding");
         let mut early=native.intent.clone();early.intent_id=uuid::Uuid::new_v4().to_string();early.runtime_relative_path="codex/session-concurrent-input-fixture".into();
         let early=guard.audit.native_launch_prepared(&early).unwrap();
@@ -4441,6 +4479,7 @@ else: raise SystemExit('unexpected authority call')
         assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,1);
         assert_eq!(store.pending_owner_messages(guard.id()).unwrap(),1);assert!(!store.owner_control(guard.id()).unwrap().unwrap().paused);
         assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+        if resumed {println!("resumed prepared callbacks passed");}
     }
 
     #[tokio::test]

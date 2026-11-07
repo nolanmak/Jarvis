@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "component": "resumed owner body reservation at native resource readiness",
+  "base_commit": "bc2324a2a71075631ee239036f23d57d8aea61c8",
+  "status": "component-tested-not-deployed",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_dispatch.rs": "f62fecc887a7c6e0a1d9fba0f1ea028755a1ec1d0838599a5264c69d9a4e8cfe",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "36975ce6e096076a7e685c738a1eeb38ead29487187dee0b49eaa8343683dcad"
+  },
+  "behavior": [
+    "Production subsequent-owner turns retain an empty body slot through native setup.",
+    "Only the original resource-ready controller supplies a live borrowed native admission for reservation.",
+    "Version 3 binds the resumed reservation to the exact prepared launch and resource receipt; version 1 historical ordering and version 2 first-builder semantics remain distinct.",
+    "Saved records do not reconstruct executable dispatch authority. Claimed setup and uncertain outcomes are not automatically replayable."
+  ],
+  "validation": [
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli initial_prepared_dispatch_binds_exact_launch_and_preserves_legacy_ordering -- --nocapture",
+      "result": "RED: resource-ready resumed dispatch must bind the existing launch: owner dispatch preparation version changed",
+      "log": "/tmp/autoship-resumed-ready-red-20261107.log"
+    },
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent autoship_workflow::owner_dispatch::tests -- --nocapture",
+      "passed": 5,
+      "failed": 0,
+      "log": "/tmp/autoship-resumed-ready-green-20261107.log"
+    },
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "passed": 1965,
+      "ignored": 34,
+      "failed": 0,
+      "seconds": 437.07,
+      "scope": "Production change before subsequent test-only callback expansion; production behavior unchanged by that expansion.",
+      "log": "/tmp/autoship-resumed-ready-suite-20261107.log"
+    },
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent owner_body_callbacks -- --nocapture",
+      "passed": 1,
+      "failed": 0,
+      "scope": "New persisted resumed-record fixture through actual controller/model/input callbacks with synthetic native inputs.",
+      "log": "/tmp/autoship-resumed-ready-callbacks-20261107.log"
+    },
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent owner_body_admission -- --nocapture",
+      "passed": 2,
+      "failed": 0,
+      "log": "/tmp/autoship-resumed-ready-legacy-callbacks-20261107.log"
+    },
+    {
+      "command": "scripts/cargo-managed.sh build -p augmentagent-cli --bin augmentagent",
+      "result": "passed",
+      "log": "/tmp/autoship-resumed-ready-production-20261107.log"
+    }
+  ],
+  "limits": [
+    "The callback fixture uses synthetic native inputs, not a real provider/VM resource scope. It does not establish complete C/R source/resource/input authority.",
+    "No claim of productive successor recovery, process-loss recovery, independent exact-head review, main rollout, Discord acceptance or unattended soak.",
+    "No production native-state budget, retained reservation, owner hold, provider limit or merge allowance was changed.",
+    "All original epic 1703 and owner-publication activation requirements remain."
+  ]
+}
