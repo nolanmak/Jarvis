@@ -171,7 +171,7 @@ restrictions do not substitute for that gate.
 
 #### Runtime-launch disposition observation
 
-The next controller checkpoint records kernel-observed launch refusals rather
+The controller checkpoint records kernel-observed launch refusals rather
 than guessing from a compiler's errno. C owns classification and the original
 scope's record; R's unchanged supervisor owns exec acknowledgement and descendant
 cleanup. The constructor-free native helper installs one filter/listener in the
@@ -241,7 +241,14 @@ deliberately outside the old version-3 publication contract; cleanup bookkeeping
 does not become source or execution authority. C owns this propagation, R owns
 the unchanged original cleanup checks. Its testable exit is the unchanged VM
 workload retaining raw GCC failure, the observed refusal and returned child
-credit while the parent and all effects remain held.
+credit while the parent and all effects remain held. The unchanged replay at
+`039fd50e` now proves this bounded exit: raw status 1, four kernel-observed vfork
+refusals, a version-4 held result, returned child credit, retained parent hold,
+private failed-output observation and removal of the original host VM resource
+subtree. All 700 Python checks pass with native helpers enabled; all 36 focused
+Rust checks pass. The overall worker regression remains red at
+InputCensusUnknown because compiler compatibility is still required. See
+[checkpoint evidence](ci-runtime-launch-disposition-proof.json).
 
 ### O3. Freeze before capturing a live parent's input
 

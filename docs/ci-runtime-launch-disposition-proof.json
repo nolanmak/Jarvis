@@ -196,7 +196,140 @@
       "ignored": 26,
       "seconds": 19.33
     },
-    "vm_replay": null,
+    "vm_replay": {
+      "source_head": "039fd50e68abfe639d22c9b9d0caa1f412f95168",
+      "result": "InputCensusUnknown",
+      "evidence_fingerprint": "f1d4906e257a4cee946fbbaad3999068e8622b061ee0780ca8869936dee420ab",
+      "exit_code": 101,
+      "seconds": 112.12,
+      "generation": "5d567bb8-2a94-458d-8920-1e871589b089",
+      "command": "67b7da90-3caf-4990-a812-3ec9c20b4f12",
+      "ordinal": 7,
+      "actual_policy_record": {
+        "binding": {
+          "authority_sha256": "767bbe447576a2eabc6538118a4f35e431989bb67c7ed5fa9db5e1690162cbe7",
+          "cache_identity_sha256": "668230d6c5d4988e24dc47fe407f0ce4a0a8b905a5780ae75750cc8be2223784",
+          "contract_sha256": "b4c27b5ad65ae13a64a2d657b0fc16f254d42d275655b551b999d4512ba4c189",
+          "generation": "5d567bb8-2a94-458d-8920-1e871589b089",
+          "head": "396b68dc8e0d32407c0057c9d6d4267b448805cc",
+          "source_inputs_sha256": "fc40d1c5ae47fb57d319cce40d5de5b72f02762013879e69f88cbb7e0020daa3",
+          "tree": "9ec0e6e478a7569affa5ea10f8fae8af1a62a720"
+        },
+        "command": "67b7da90-3caf-4990-a812-3ec9c20b4f12",
+        "denied_execs": 0,
+        "exec_observed": true,
+        "initial_attempts": 4,
+        "kind": "ci-exec-mediation-observation",
+        "notification_errors": 0,
+        "ordinal": 7,
+        "policy_dispositions": [
+          {
+            "after_ack": false,
+            "allowed": true,
+            "clone_flags": 0,
+            "disposition": "exec",
+            "nr": 59,
+            "pid": 360,
+            "response_errno": 0
+          },
+          {
+            "after_ack": false,
+            "allowed": true,
+            "clone_flags": 0,
+            "disposition": "exec",
+            "nr": 59,
+            "pid": 360,
+            "response_errno": 0
+          },
+          {
+            "after_ack": false,
+            "allowed": true,
+            "clone_flags": 0,
+            "disposition": "exec",
+            "nr": 59,
+            "pid": 360,
+            "response_errno": 0
+          },
+          {
+            "after_ack": false,
+            "allowed": true,
+            "clone_flags": 0,
+            "disposition": "exec",
+            "nr": 59,
+            "pid": 360,
+            "response_errno": 0
+          },
+          {
+            "after_ack": true,
+            "allowed": false,
+            "clone_flags": 0,
+            "disposition": "unsupported_vfork",
+            "nr": 58,
+            "pid": 360,
+            "response_errno": 38
+          },
+          {
+            "after_ack": true,
+            "allowed": false,
+            "clone_flags": 0,
+            "disposition": "unsupported_vfork",
+            "nr": 58,
+            "pid": 360,
+            "response_errno": 38
+          },
+          {
+            "after_ack": true,
+            "allowed": false,
+            "clone_flags": 0,
+            "disposition": "unsupported_vfork",
+            "nr": 58,
+            "pid": 360,
+            "response_errno": 38
+          },
+          {
+            "after_ack": true,
+            "allowed": false,
+            "clone_flags": 0,
+            "disposition": "unsupported_vfork",
+            "nr": 58,
+            "pid": 360,
+            "response_errno": 38
+          }
+        ],
+        "returncode": 1,
+        "shipping_authority": false,
+        "version": 1
+      },
+      "actual_held_result": {
+        "binding": {
+          "authority_sha256": "767bbe447576a2eabc6538118a4f35e431989bb67c7ed5fa9db5e1690162cbe7",
+          "cache_identity_sha256": "668230d6c5d4988e24dc47fe407f0ce4a0a8b905a5780ae75750cc8be2223784",
+          "contract_sha256": "b4c27b5ad65ae13a64a2d657b0fc16f254d42d275655b551b999d4512ba4c189",
+          "generation": "5d567bb8-2a94-458d-8920-1e871589b089",
+          "head": "396b68dc8e0d32407c0057c9d6d4267b448805cc",
+          "source_inputs_sha256": "fc40d1c5ae47fb57d319cce40d5de5b72f02762013879e69f88cbb7e0020daa3",
+          "tree": "9ec0e6e478a7569affa5ea10f8fae8af1a62a720"
+        },
+        "command": "67b7da90-3caf-4990-a812-3ec9c20b4f12",
+        "exec_observed": true,
+        "ordinal": 7,
+        "policy_hold": "input_census_unknown",
+        "returncode": 1,
+        "version": 4
+      },
+      "original_cleanup_checked": true,
+      "child_jobserver_credit_returned": true,
+      "parent_resume_held": true,
+      "child_terminal_result_published": false,
+      "host_resource_removed_empty_subtree": true,
+      "stderr_sample_bytes": 137,
+      "stderr_complete_stream": false,
+      "inspection": "/tmp/autoship-ci-policy-cleanup-inspection-20261107.json",
+      "audit": "/tmp/autoship-ci-policy-cleanup-audit-20261107.json",
+      "log": "/tmp/autoship-ci-policy-cleanup-vm-20261107.log",
+      "full_ci_pass": false,
+      "shipping_authority": false
+    },
     "spec_audit": "Same independent auditor found no additional substantiated contradiction in cleanup/policy separation; full mechanism remains incomplete."
   }
 }
