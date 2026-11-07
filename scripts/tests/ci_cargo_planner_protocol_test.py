@@ -724,6 +724,11 @@ class PlannerProtocolTests(unittest.TestCase):
             record={'version':3,'binding':binding,'command':'original','ordinal':7,'returncode':1,'exec_observed':True}
             planner.cache._write_record(scope/'exit-status.json',record)
             with self.assertRaises(planner.FreshnessHold):store.publish(identity,publication,scope=scope,ordinal=7)
+            for refused in (record|{'version':4,'returncode':0,'policy_hold':'input_census_unknown'},
+                    record|{'returncode':0,'policy_hold':'input_census_unknown'}):
+                planner.cache._write_record(scope/'exit-status.json',refused)
+                with self.assertRaises(planner.FreshnessHold):store.publish(identity,publication,scope=scope,ordinal=7)
+                self.assertEqual(store.state()['history'],[])
             planner.cache._write_record(scope/'exit-status.json',record|{'returncode':0})
             store.publish(identity,publication,scope=scope,ordinal=7)
             saved=planner.cache._read_record(root/'store/records'/(identity+'.json'))

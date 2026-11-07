@@ -219,6 +219,30 @@ supported-adapter/final-C authority, C must complete the remaining disposition
 coverage and bind it through the final C/S consumers; the carrying cost of this
 checkpoint is a bounded private observation, with no new durable grant schema.
 
+Keep original child cleanup distinct from the policy verdict. The first real
+observer replay confirmed GCC's refused `vfork`, but exposed that throwing the
+typed hold before writing `exit-status.json` left the original child loan lent.
+After the original supervisor has returned and notification handling has settled
+without a listener error, a known unsupported-route hold must retain the actual
+raw exit status in a **version 4 held-result** record with
+`policy_hold:input_census_unknown`. A normal result remains version 3 with no
+policy-hold field. Listener/settlement errors retain their existing cleanup hold;
+they cannot create this known-outcome record.
+
+The original relay accepts version 4 only for this exact hold, verifies the
+same raw status against its supervised process status and original descendant
+cleanup receipt, and performs its existing credit/signal drainage. It may retain
+the failed child's diagnostic output, then raises the policy hold before any
+effect transfer, publication, terminal child result or parent resume. Successful
+unit evidence and both normal/contained effect handlers must require version 3
+and reject a policy-hold field even if attached to version 3. An application
+exiting zero cannot launder the held result into reusable outputs. Version 4 is
+deliberately outside the old version-3 publication contract; cleanup bookkeeping
+does not become source or execution authority. C owns this propagation, R owns
+the unchanged original cleanup checks. Its testable exit is the unchanged VM
+workload retaining raw GCC failure, the observed refusal and returned child
+credit while the parent and all effects remain held.
+
 ### O3. Freeze before capturing a live parent's input
 
 First capture the child's original request, exact stdin to EOF and verified

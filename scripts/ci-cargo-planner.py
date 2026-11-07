@@ -616,7 +616,7 @@ class PublicationStore:
         if (type(status.get('version')) is not int or status['version']!=3 or status.get('binding')!=self.binding
                 or status.get('command')!=self.command or status.get('ordinal')!=ordinal
                 or type(status.get('returncode')) is not int or status['returncode']!=0
-                or status.get('exec_observed') is not True):raise FreshnessHold('artifact_provenance_unknown')
+                or status.get('exec_observed') is not True or 'policy_hold' in status):raise FreshnessHold('artifact_provenance_unknown')
         return {'kind':'unit','status':status,'original_cleanup':True,
             'cleanup_sha256':hashlib.sha256(b'all-descendants-reaped\n').hexdigest()}
 
@@ -1832,6 +1832,10 @@ class RootRelay:
                     or record.get('command')!=self.admission.command or record.get('binding')!=self.admission.binding
                     or record.get('ordinal')!=ordinal or type(record.get('returncode')) is not int
                     or not -64<=record['returncode']<=255):raise FreshnessHold('cleanup_uncertain')
+            if not (type(record.get('version')) is int and (
+                    record['version']==3 and 'policy_hold' not in record
+                    or record['version']==4 and record.get('policy_hold')=='input_census_unknown')):
+                raise FreshnessHold('cleanup_uncertain')
             raw=record['returncode']
             if status!=(raw if raw>=0 else 128-raw):raise FreshnessHold('cleanup_uncertain')
             # The original cleanup marker and raw status must be validated
@@ -1842,6 +1846,9 @@ class RootRelay:
             # Use the same fully drained boundary as effect inspection. Credit
             # and signal cleanup are settled; the parent is still frozen.
             if started and raw!=0:self.unit_failed_output(value,directory,raw,output_context)
+            # A known policy refusal does not erase a verified raw outcome or
+            # strand its loan. It still forbids effects and parent completion.
+            if record['version']==4:raise FreshnessHold('input_census_unknown')
             if view is not None:
                 phase[0]='planner_view_publish';self.views.finish(view,directory,raw)
             self.completed.append({'ordinal':ordinal,'uid':execution_identity(value),'started':started,
@@ -2839,7 +2846,8 @@ class _ContainedViews:
     def finish(self,view,directory,raw):
         relay=self.relay
         record=cache._read_record(directory/'exit-status.json')
-        if (record.get('binding')!=relay.admission.binding or record.get('command')!=relay.admission.command
+        if (type(record.get('version')) is not int or record['version']!=3 or 'policy_hold' in record
+                or record.get('binding')!=relay.admission.binding or record.get('command')!=relay.admission.command
                 or record.get('ordinal')!=view['ordinal'] or record.get('returncode')!=raw
                 or record.get('exec_observed') is not True):raise FreshnessHold('cleanup_uncertain')
         self.check();slot=Path(view['root']).parent
@@ -3118,9 +3126,15 @@ def _unit(arguments):
                 'denied_execs':sum(not row['allowed'] and row['disposition']=='exec' for row in mediation.records),
                 'policy_dispositions':mediation.records,
                 'notification_errors':len(mediation.errors),'shipping_authority':False})
-        mediation.check()
-        cache._write_record(Path(value['directory'])/'exit-status.json',{'version':3,'binding':value['binding'],
-            'command':value['command'],'ordinal':value['ordinal'],'returncode':raw,'exec_observed':observed})
+        policy_hold=None
+        try:mediation.check()
+        except FreshnessHold as hold:
+            if hold.reason!='input_census_unknown':raise
+            policy_hold=hold.reason
+        status={'version':3,'binding':value['binding'],'command':value['command'],
+            'ordinal':value['ordinal'],'returncode':raw,'exec_observed':observed}
+        if policy_hold is not None:status.update(version=4,policy_hold=policy_hold)
+        cache._write_record(Path(value['directory'])/'exit-status.json',status)
         return raw if raw>=0 else 128-raw
     finally:
         if stage_bootstrap is not None:
