@@ -847,3 +847,38 @@ impl WorkflowStore {
         Ok(())
     }
 }
+
+/// Transaction-scoped actual recovery admission, never an execution/native
+/// capability. Fields are private so a saved descriptor cannot construct it.
+pub(super) struct RecoveryNativeSnapshotContext<'tx,'db,'claim> {
+    tx:&'tx Transaction<'db>, lease:&'claim RecoveryLease,
+    facts:&'tx super::native_handoff::NativeHandoffFacts,
+}
+impl<'db> RecoveryNativeSnapshotContext<'_,'db,'_> {
+    pub(super) fn transaction(&self)->&Transaction<'db> {self.tx}
+    pub(super) fn generation(&self)->i64 {self.lease.generation()}
+    pub(super) fn facts(&self)->&super::native_handoff::NativeHandoffFacts {self.facts}
+}
+impl WorkflowStore {
+    /// Core already holds the original preparation scan. No native IO, model
+    /// admission, replacement lease or transfer request is created here.
+    pub(crate) fn capture_owner_recovery_native_snapshot(&mut self, lease:&RecoveryLease,
+        authorization:&crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+        basis:&super::owner_publication::OwnerPublicationNativeFacts,
+        scan:&augmentagent_channel_core::native_vm::ownership::PreparationScan<'_>,now:i64)->Result<super::native_handoff::NativeHandoffSnapshot> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let fresh=recovery_native_facts_tx(&tx,lease,authorization,now)?;
+        ensure!(fresh.fingerprint()?==basis.fingerprint()?,"recovery native snapshot basis changed");
+        ensure!(scan.binding()==fresh.original_binding() && scan.source_owners()==fresh.snapshot_facts().source_owners
+            && scan.destination().owner.workflow_id==fresh.snapshot_facts().workflow_id
+            && scan.destination().owner.lease_generation==lease.generation(),"recovery native snapshot scan scope differs from original claim");
+        let rows=super::native_handoff::selected_rows(&tx,fresh.snapshot_facts(),scan.inventory(),scan.retired())?;
+        let context=RecoveryNativeSnapshotContext {tx:&tx,lease,facts:fresh.snapshot_facts()};
+        let snapshot=super::native_handoff::capture_recovery_selected(&context,rows,now)?;
+        let current=chrono::Utc::now().timestamp_millis();
+        require_authorized_claim(&tx,lease,authorization,current)?;
+        let checked=recovery_native_facts_tx(&tx,lease,authorization,current)?;
+        ensure!(checked.fingerprint()?==basis.fingerprint()?,"recovery native snapshot facts changed before commit");
+        tx.commit()?;Ok(snapshot)
+    }
+}

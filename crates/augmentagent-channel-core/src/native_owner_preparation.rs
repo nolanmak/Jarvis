@@ -71,10 +71,16 @@ pub enum PreparationPersistence {
 }
 /// Borrowed only during the original-lock callback. No public constructor,
 /// serialization or ownership/dispatch authority.
+/// Original locked scan and its exact validated store/source/destination scope.
+/// Inventory alone cannot identify the scope, including when it is empty.
 pub struct PreparationScan<'a> {
+    binding:&'a super::ownership::TransferBinding,plan:&'a PreparationPlan,
     inventory:&'a [super::ownership::RuntimeInventoryRow],retired:&'a [String],
 }
 impl PreparationScan<'_> {
+    pub fn binding(&self)->&super::ownership::TransferBinding {self.binding}
+    pub fn source_owners(&self)->&[super::ownership::Authority] {&self.plan.source_owners}
+    pub fn destination(&self)->&super::ownership::Authority {&self.plan.destination}
     pub fn inventory(&self)->&[super::ownership::RuntimeInventoryRow] {self.inventory}
     pub fn retired(&self)->&[String] {self.retired}
 }
@@ -116,7 +122,7 @@ pub(super) fn prepare_with_policy(policy:Option<&std::path::Path>,binding:&super
     let fence=||super::owner_outcome::selected_fence(policy,selected_sha,root,current);
     let phase=RefCell::new(None);let validated=Cell::new(false);
     let result=super::owner_handoff::prepare_handoff_bound_at(root,max_state_bytes,store,&plan.workflow_id,&plan.source_owners,&plan.destination,&plan.runtimes,sources,destination,&fence,&mut |inventory,retired| {
-        let decision=persist(&PreparationScan {inventory,retired});
+        let decision=persist(&PreparationScan {binding,plan,inventory,retired});
         *phase.borrow_mut()=Some(decision.clone());
         match decision {
             PreparationPersistence::Durable(intent)=>{

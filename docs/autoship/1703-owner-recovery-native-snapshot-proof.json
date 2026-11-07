@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "kind": "authenticated-recovery-native-snapshot-with-exact-core-scan-scope",
+  "source_parent_commit": "7a791eb6e8ee1f58ff485771ab0a7a0c709ef4d4",
+  "source_generation_authority": false,
+  "source_inventory_is_post_run_inventory": true,
+  "sources": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_preparation.rs",
+      "sha256": "84058495792be6f33283069b2f8a3511a143a668e68fc322a656a7ca4edb0745"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_native_handoff.rs",
+      "sha256": "456a228c67a25ea0f0662b4b1756f541abd0f77c4aea2c4bf2a0df3ac8a9acd6"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication.rs",
+      "sha256": "a4d531d91a2ed41b77ba85cec2ecb47293dbad4b4a5cd37c2685b198194092a8"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs",
+      "sha256": "7392a8025bfaec7e9bbe81e8cf66cea434a2a49c860c3489c373a44a68cc35bf"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "2b2f35a96ccd71d313fcbff45c67f3850fb73957b7de92af06dcc6afd7ee0602"
+    },
+    {
+      "path": "docs/autoship/owner-publication-protocol.md",
+      "sha256": "2d50613c078052094277dde69b05b2f5ddd270a1e9912f8d35984d50acc86e2c"
+    }
+  ],
+  "behavioral_reds": [
+    {
+      "session": 35563,
+      "result": "terminal1",
+      "log": "/tmp/autoship-owner-recovery-native-snapshot-contract-red-20261106.log",
+      "failure": "Actual held metadata recovery reached the original core scan but its snapshot producer was not implemented"
+    },
+    {
+      "session": 60973,
+      "result": "terminal1",
+      "log": "/tmp/autoship-owner-recovery-native-snapshot-foreign-scan-red-20261106.log",
+      "failure": "Genuine foreign-workflow scan in the same bound store with matching empty inventory crossed snapshot admission before explicit scan-scope validation"
+    }
+  ],
+  "intermediate_validation": [
+    {
+      "session": 42460,
+      "result": "terminal0",
+      "passed": 1,
+      "seconds": 5.08,
+      "log": "/tmp/autoship-owner-recovery-native-snapshot-focused-20261106.log",
+      "scope": "Both providers before final expired-lease and foreign-scan checks"
+    },
+    {
+      "session": 87469,
+      "result": "terminal0",
+      "passed": 1952,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 375.72,
+      "log": "/tmp/autoship-owner-recovery-native-snapshot-full-cli-unit-20261106.log",
+      "scope": "Before final explicit scan identity and foreign-scope regression"
+    }
+  ],
+  "verification": {
+    "final_focused": {
+      "session": 6101,
+      "result": "terminal0",
+      "passed": 1,
+      "seconds": 5.41,
+      "log": "/tmp/autoship-owner-recovery-native-snapshot-scoped-focused-20261106.log",
+      "scope": "Both provider pins: real metadata claim and core locked scan, held/paused and queued input preserved, snapshot replay, expired grant/lease, stale source binding, lost event payload, actual foreign workflow scan refused specifically for scope mismatch; no pending transfer/native owner created"
+    },
+    "full_core": {
+      "session": 89225,
+      "result": "terminal0",
+      "unit_passed": 959,
+      "unit_failed": 0,
+      "unit_ignored": 15,
+      "unit_seconds": 39.02,
+      "integration_binaries_completed": true,
+      "log": "/tmp/autoship-owner-recovery-native-snapshot-full-core-20261106.log"
+    },
+    "final_cli_unit": {
+      "session": 26965,
+      "result": "terminal0",
+      "passed": 1952,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 373.81,
+      "log": "/tmp/autoship-owner-recovery-native-snapshot-final-cli-unit-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    },
+    "production_check": {
+      "session": 45828,
+      "result": "terminal0",
+      "seconds": 14.38,
+      "log": "/tmp/autoship-owner-recovery-native-snapshot-final-production-check-20261106.log",
+      "unfinished_productive_gate_wip_included": false
+    }
+  },
+  "spec_audit": {
+    "scope": "Section 45 with original recovery/native/body contracts, including reservation absence-to-first-successor lineage",
+    "reported_wrong_build_or_forced_guess_findings": 0,
+    "is_activation_or_mechanism_handoff_approval": false,
+    "is_independent_exact_head_code_review": false
+  },
+  "scope": "Actual opaque recovery authority and an exactly scoped borrowed original core scan feed the existing bounded immutable snapshot encoder. No execution lease is fabricated; snapshot is data, not a transfer, body grant or setup authority.",
+  "limits": [
+    "Native snapshot fixtures use real protected/native ledger and file-lock machinery with empty runtime inventory and synthetic acceptance; retained-runtime recovery-forward integration and live provider/VM/Discord acceptance remain unproved",
+    "Foreign-workflow scan in the same store is directly tested; separate cross-store and wrong-destination fixtures are not claimed",
+    "This standalone snapshot is not the future atomic snapshot/pending/recovery-context transaction",
+    "No exact destination audit path is admitted; the future pending context must bind the actual private metadata-only destination",
+    "Forward transfer intent, same-request replay/settlement, receipt-backed native-frontier readers and abort/terminal/disposition integration remain unfinished",
+    "Original reservation absence-to-first-successor body lineage must be implemented without changing old claim identity",
+    "Full C/R source/resource/input census, full body nonrelease or semantic continuation, ready/successor/body constructors, shared productive gates, aggregate protected storage and connected worker remain",
+    "Independent exact-head review, normal rollout and original live CLI/Discord acceptance, verified autonomous merges and all required soaks remain"
+  ],
+  "live_provider_vm_discord_proof": false,
+  "deployed": false,
+  "epic_complete": false
+}

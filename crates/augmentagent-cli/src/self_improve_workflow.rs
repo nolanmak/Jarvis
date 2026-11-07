@@ -4056,8 +4056,16 @@ mod tests {
 
     #[tokio::test]
     async fn expired_owner_publication_has_authenticated_metadata_recovery() {
+        owner_metadata_recovery_modes(&["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery","owner-early-acceptance-producer-recovery-revised-metadata-recovery","owner-early-acceptance-producer-claude-recovery-revised-metadata-recovery","owner-early-acceptance-producer-transfer-recovery","owner-early-acceptance-producer-claude-transfer-recovery","owner-early-acceptance-producer-absent-transfer-recovery","owner-early-acceptance-producer-claude-absent-transfer-recovery","owner-early-acceptance-producer-prepared-transfer-recovery","owner-early-acceptance-producer-claude-prepared-transfer-recovery","owner-early-acceptance-producer-aborted-transfer-recovery","owner-early-acceptance-producer-claude-aborted-transfer-recovery"]);
+    }
+    #[tokio::test]
+    async fn owner_recovery_native_snapshot_requires_actual_metadata_claim() {
+        owner_metadata_recovery_modes(&["owner-early-acceptance-producer-snapshot-transfer-recovery","owner-early-acceptance-producer-claude-snapshot-transfer-recovery"]);
+    }
+
+    fn owner_metadata_recovery_modes(modes:&[&str]) {
         use std::os::unix::fs::PermissionsExt;
-        for mode in ["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery","owner-early-acceptance-producer-recovery-revised-metadata-recovery","owner-early-acceptance-producer-claude-recovery-revised-metadata-recovery","owner-early-acceptance-producer-transfer-recovery","owner-early-acceptance-producer-claude-transfer-recovery","owner-early-acceptance-producer-absent-transfer-recovery","owner-early-acceptance-producer-claude-absent-transfer-recovery","owner-early-acceptance-producer-prepared-transfer-recovery","owner-early-acceptance-producer-claude-prepared-transfer-recovery","owner-early-acceptance-producer-aborted-transfer-recovery","owner-early-acceptance-producer-claude-aborted-transfer-recovery"] {
+        for mode in modes {
         let control=control_dir();let gh=control.path().join("gh-recovery");
         std::fs::write(&gh,r#"#!/usr/bin/python3
 import json,sys
@@ -4765,6 +4773,70 @@ else: raise SystemExit('unexpected authority call')
                             acceptance::owner::publication::reopen_recovery_preparation(access,proof,dir.path()))?;
                         recovered.with_scope_transition(|transition|store.complete_recovered_owner_publication(&recovery,&authorization,&recovered,transition,millis()))
                     }).expect("settled original transfer did not unlock original metadata publication");
+                    if mode.contains("-snapshot-") {
+                        use augmentagent_channel_core::native_vm::ownership as native_owner;
+                        let facts=store.owner_publication_recovery_native_facts(&recovery,&authorization,millis()).unwrap();
+                        let source=existing_native_audit(&state,facts.namespace(),Some(dir.path()),facts.original_binding()).unwrap();
+                        let setup_control=tempfile::tempdir().unwrap();
+                        for name in ["snapshot-logs","snapshot-anchors"] {let path=setup_control.path().join(name);std::fs::create_dir(&path).unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();}
+                        let destination=Arc::new(augmentagent_channel_core::AuditLogger::protected(setup_control.path().join("snapshot-logs/destination.jsonl"),setup_control.path().join("snapshot-anchors/destination.json"),&[]).unwrap());
+                        destination.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:id.clone(),lease_generation:recovery.generation()}).unwrap();
+                        destination.set_native_store_binding(facts.original_binding().clone()).unwrap();
+                        destination.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":id,"generation":recovery.generation()})).unwrap();
+                        destination.restrict_to_metadata(durable::owner_publication_recovery::native_metadata_fence(shared.clone(),recovery.clone(),&authorization,millis()).unwrap()).unwrap();
+                        let plan=native_owner::PreparationPlan {workflow_id:id.clone(),source_owners:vec![facts.namespace().clone()],
+                            destination:native_owner::Authority {owner:destination.native_runtime_owner().unwrap().unwrap(),audit_path:destination.path().to_str().unwrap().into()},runtimes:facts.runtimes().unwrap(),
+                            fingerprint_input:native_owner::PreparationFingerprintInput {workflow_id:id.clone(),workflow_binding:serde_json::to_value(pending.workflow_binding()).unwrap(),original_binding_sha256:None,source_registration_sha256:None,latest_input_sha256:Some(facts.fingerprint().unwrap()),selected_policy_sha256:None,capacity_class:Default::default()}};
+                        let current=||shared.lock().unwrap().validate_owner_publication_recovery(&recovery,&authorization,millis()).map_err(|_|native_owner::TransferFenceError::NotCurrent);
+                        let mut snapshot=None;
+                        let result=native_owner::prepare_transfer(facts.original_binding(),&plan,&[source],&destination,&current,&mut |scan| {
+                            let captured=store.capture_owner_recovery_native_snapshot(&recovery,&authorization,&facts,scan,millis()).expect("actual metadata recovery could not capture its locked original native snapshot");
+                            let events=store.events(&id).unwrap();
+                            assert_eq!(store.capture_owner_recovery_native_snapshot(&recovery,&authorization,&facts,scan,millis()).unwrap(),captured);
+                            assert_eq!(store.events(&id).unwrap(),events,"identical native snapshot allocated another event");
+                            assert!(store.capture_owner_recovery_native_snapshot(&recovery,&authorization,&facts,scan,authorization.expires_at()+1).is_err());
+                            let live_until:i64=db.query_row("SELECT lease_until FROM workflow WHERE id=?1",[&id],|r|r.get(0)).unwrap();
+                            db.execute("UPDATE workflow SET lease_until=0 WHERE id=?1",[&id]).unwrap();
+                            let expired=store.capture_owner_recovery_native_snapshot(&recovery,&authorization,&facts,scan,millis());
+                            db.execute("UPDATE workflow SET lease_until=?2 WHERE id=?1",rusqlite::params![id,live_until]).unwrap();assert!(expired.is_err(),"expired actual metadata claim captured a native snapshot");
+                            let binding:String=db.query_row("SELECT binding FROM workflow_native_owner_binding WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,activated],|r|r.get(0)).unwrap();
+                            db.execute("UPDATE workflow_native_owner_binding SET binding='{}' WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,activated]).unwrap();
+                            let damaged=store.capture_owner_recovery_native_snapshot(&recovery,&authorization,&facts,scan,millis());
+                            db.execute("UPDATE workflow_native_owner_binding SET binding=?3 WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,activated,binding]).unwrap();assert!(damaged.is_err());
+                            let (sequence,payload):(i64,String)=db.query_row("SELECT e.seq,e.payload FROM workflow_native_handoff_snapshot s JOIN workflow_event e ON e.seq=s.sequence WHERE s.workflow=?1 ORDER BY s.sequence DESC LIMIT 1",[&id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                            db.execute("UPDATE workflow_event SET payload='{}' WHERE seq=?1",[sequence]).unwrap();let damaged=store.capture_owner_recovery_native_snapshot(&recovery,&authorization,&facts,scan,millis());
+                            db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![sequence,payload]).unwrap();assert!(damaged.is_err());
+                            assert_eq!(store.events(&id).unwrap(),events);snapshot=Some(captured);
+                            native_owner::PreparationPersistence::NotCommitted(native_owner::TransferReason::PersistRetry)
+                        }).unwrap();
+                        assert!(matches!(result,native_owner::PreparedTransferResult::NoPending(_)));
+                        let _snapshot=snapshot.expect("core did not enter original locked scan callback");
+                        let generation:i64=db.query_row("SELECT e.generation FROM workflow_native_handoff_snapshot s JOIN workflow_event e ON e.seq=s.sequence WHERE s.workflow=?1 ORDER BY s.sequence DESC LIMIT 1",[&id],|r|r.get(0)).unwrap();
+                        assert_eq!(generation,recovery.generation());
+                        // Obtain another genuine core scan in the same bound
+                        // store, for a different workflow's empty namespace.
+                        // Inventory equality cannot substitute for its scope.
+                        let foreign="foreign-snapshot-workflow";
+                        let mut foreign_audits=Vec::new();
+                        for (name,generation) in [("foreign-source",1),("foreign-destination",2)] {
+                            let audit=Arc::new(augmentagent_channel_core::AuditLogger::protected(setup_control.path().join(format!("snapshot-logs/{name}.jsonl")),setup_control.path().join(format!("snapshot-anchors/{name}.json")),&[]).unwrap());
+                            audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:foreign.into(),lease_generation:generation}).unwrap();audit.set_native_store_binding(facts.original_binding().clone()).unwrap();
+                            audit.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":foreign,"generation":generation})).unwrap();foreign_audits.push(audit);
+                        }
+                        let authority=|audit:&Arc<augmentagent_channel_core::AuditLogger>|native_owner::Authority {owner:audit.native_runtime_owner().unwrap().unwrap(),audit_path:audit.path().to_str().unwrap().into()};
+                        let mut foreign_plan=plan.clone();foreign_plan.workflow_id=foreign.into();foreign_plan.source_owners=vec![authority(&foreign_audits[0])];foreign_plan.destination=authority(&foreign_audits[1]);foreign_plan.fingerprint_input.workflow_id=foreign.into();
+                        let mut refused=false;let events=store.events(&id).unwrap();
+                        let result=native_owner::prepare_transfer(facts.original_binding(),&foreign_plan,&[foreign_audits[0].clone()],&foreign_audits[1],&current,&mut |scan| {
+                            let result=store.capture_owner_recovery_native_snapshot(&recovery,&authorization,&facts,scan,millis());
+                            let error=result.err().expect("foreign core scan with matching empty inventory crossed recovery snapshot admission");
+                            assert!(format!("{error:#}").contains("scan scope differs"),"foreign scan refused for another reason: {error:#}");refused=true;
+                            native_owner::PreparationPersistence::NotCommitted(native_owner::TransferReason::PersistRetry)
+                        }).unwrap();
+                        assert!(refused && matches!(result,native_owner::PreparedTransferResult::NoPending(_)));assert_eq!(store.events(&id).unwrap(),events);
+
+                        assert_eq!(db.query_row("SELECT count(*) FROM workflow_native_handoff_pending WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),0);
+                        assert_eq!(db.query_row("SELECT count(*) FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",rusqlite::params![id,recovery.generation()],|r|r.get::<_,i64>(0)).unwrap(),0);
+                    }
                     assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);assert_eq!(store.owner_control(&id).unwrap(),control_before);assert_eq!(store.pending_owner_messages(&id).unwrap(),2);
                     assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);return;
                 }

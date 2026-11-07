@@ -303,13 +303,24 @@ pub(super) fn selected_rows(tx:&Transaction<'_>,facts:&NativeHandoffFacts,invent
     Ok(rows)
 }
 pub(super) fn capture_selected(tx:&Transaction<'_>,lease:&Lease,binding:&Binding,facts:&NativeHandoffFacts,rows:Vec<native_observation::NativeObservation>,now:i64)->Result<NativeHandoffSnapshot> {
-    ensure!(facts.workflow_id==lease.workflow && facts.workflow_binding==*binding,TransferReason::AuthorityConflict);
+    write_selected_snapshot(tx,&lease.workflow,lease.generation,binding,facts,rows,now)
+}
+/// The private context is minted only inside actual recovery admission. It
+/// exposes no execution lease; this shared writer records descriptive facts.
+pub(super) fn capture_recovery_selected(context:&super::owner_publication_recovery::RecoveryNativeSnapshotContext<'_, '_, '_>,
+    rows:Vec<native_observation::NativeObservation>,now:i64)->Result<NativeHandoffSnapshot> {
+    let facts=context.facts();
+    write_selected_snapshot(context.transaction(),&facts.workflow_id,context.generation(),&facts.workflow_binding,facts,rows,now)
+}
+fn write_selected_snapshot(tx:&Transaction<'_>,workflow:&str,generation:i64,binding:&Binding,facts:&NativeHandoffFacts,
+    rows:Vec<native_observation::NativeObservation>,now:i64)->Result<NativeHandoffSnapshot> {
+    ensure!(facts.workflow_id==workflow && facts.workflow_binding==*binding,TransferReason::AuthorityConflict);
     ensure!(rows.len()<=64,TransferReason::HistoryCapacity);
-    let transfers=native_pending::settlement::History::load(tx,&lease.workflow,u64::MAX)?;
+    let transfers=native_pending::settlement::History::load(tx,workflow,u64::MAX)?;
     let registrations_sha = &facts.source_registration_sha256;
-    let inputs = serde_json::json!({"version":1,"workflow_id":lease.workflow,"workflow_binding":binding,"source_registration_sha256":registrations_sha,"observations":rows});
+    let inputs = serde_json::json!({"version":1,"workflow_id":workflow,"workflow_binding":binding,"source_registration_sha256":registrations_sha,"observations":rows});
     let inputs_sha = digest(&inputs)?;
-    let existing:Option<(i64,String)>=tx.query_row("SELECT sequence,record FROM workflow_native_handoff_snapshot WHERE workflow=?1 AND inputs_sha256=?2",params![lease.workflow,inputs_sha],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let existing:Option<(i64,String)>=tx.query_row("SELECT sequence,record FROM workflow_native_handoff_snapshot WHERE workflow=?1 AND inputs_sha256=?2",params![workflow,inputs_sha],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let projection = if let Some((sequence, raw)) = existing {
         ensure!(
             raw.len() <= 4 * 1024 * 1024,
@@ -329,7 +340,7 @@ pub(super) fn capture_selected(tx:&Transaction<'_>,lease:&Lease,binding:&Binding
         let event: Option<(String, i64, String)> = tx
             .query_row(
                 "SELECT kind,generation,payload FROM workflow_event WHERE workflow=?1 AND seq=?2",
-                params![lease.workflow, sequence],
+                params![workflow, sequence],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
@@ -337,7 +348,7 @@ pub(super) fn capture_selected(tx:&Transaction<'_>,lease:&Lease,binding:&Binding
         ensure!(
             event.0 == "native_handoff_snapshot_recorded"
                 && event.1 > 0
-                && event.1 <= lease.generation
+                && event.1 <= generation
                 && serde_json::from_str::<serde_json::Value>(&event.2)?
                     == serde_json::json!({"inputs_sha256":inputs_sha}),
             TransferReason::InventoryMissing
@@ -346,27 +357,27 @@ pub(super) fn capture_selected(tx:&Transaction<'_>,lease:&Lease,binding:&Binding
     } else {
         let (count, bytes):(i64,i64)=tx.query_row(
                 "SELECT count(*),coalesce(sum(length(CAST(record AS BLOB))),0) FROM workflow_native_handoff_snapshot WHERE workflow=?1",
-                [&lease.workflow],|r|Ok((r.get(0)?,r.get(1)?)))?;
+                [workflow],|r|Ok((r.get(0)?,r.get(1)?)))?;
         ensure!(
             count < 1024 && bytes >= 0 && bytes <= 124 * 1024 * 1024,
             TransferReason::HistoryCapacity
         );
         event(
             &tx,
-            &lease.workflow,
-            lease.generation,
+            workflow,
+            generation,
             "native_handoff_snapshot_recorded",
             &serde_json::json!({"inputs_sha256":inputs_sha}).to_string(),
             now,
         )?;
         let revision: i64 = tx.query_row(
             "SELECT max(seq) FROM workflow_event WHERE workflow=?1",
-            [&lease.workflow],
+            [workflow],
             |r| r.get(0),
         )?;
         let projection = Projection {
             version: 1,
-            workflow_id: lease.workflow.clone(),
+            workflow_id: workflow.to_owned(),
             revision: u64::try_from(revision)?,
             workflow_binding: binding.clone(),
             source_registration_sha256: registrations_sha.clone(),
@@ -379,7 +390,7 @@ pub(super) fn capture_selected(tx:&Transaction<'_>,lease:&Lease,binding:&Binding
         );
         tx.execute(
             "INSERT INTO workflow_native_handoff_snapshot VALUES(?1,?2,?3,?4)",
-            params![lease.workflow, revision, inputs_sha, raw],
+            params![workflow, revision, inputs_sha, raw],
         )?;
         projection
     };
