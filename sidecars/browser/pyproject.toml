@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "Playwright + browser-use sidecar for the AugmentAgent Rust daemon."
 requires-python = ">=3.11"
 dependencies = [
-    "playwright==1.49.1",
-    "browser-use==0.12.6",
+    "playwright==1.64.1",
+    "browser-use==0.13.11",
 ]
 
 [project.scripts]
