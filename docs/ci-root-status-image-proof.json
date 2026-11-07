@@ -1,0 +1,314 @@
+{
+  "version": 1,
+  "kind": "root-owned-status-image-startup-observation",
+  "source_head": "2a362d37ad9804d36d4b35a13c56581b348105a2",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/self_improve_ci_acceptance.rs": "eb6beb1f9b3a88411cf5fea694e0669db6115be2216e735cc3bbc536b089bb84",
+    "crates/augmentagent-cli/src/self_improve_ci_vm.rs": "5ba1eacdb87c18c9d706630d6fe171a1001e6a6550eb1ceef3c976bba04253f1",
+    "scripts/ci-build-vm.py": "dac5dfb1c803c1de6ae8af5c5effb676eeba3ff22693004a542e8e2b85f242e6",
+    "scripts/ci-cargo-planner.py": "8f8c29eaf2bb612afe895b2c4a7607719acf073057ef454d10f0b0d427893f69",
+    "scripts/codex-build-vm.py": "a25db307765756fc9b5649948ae99eccbeae85ab3577c0d5fc0c3dcef5b22a37",
+    "scripts/tests/ci_build_vm_test.py": "7bb1bc3c6056daecc26fcb8e527dcec015ef24ad670d64a0d44683a19b0c3e50",
+    "scripts/tests/ci_cargo_planner_protocol_test.py": "f706e7605644c0c8fed4dfebdf72da7ac5d0303b8ffd5a971204de3ec66dff4d"
+  },
+  "host": {
+    "python_passed": 756,
+    "updater_passed": 116,
+    "rust_passed": 41,
+    "rust_ignored": 30,
+    "failed": 0,
+    "rust_original_session": 15404,
+    "host_original_session": 54361,
+    "terminal": true,
+    "all_descendants_reaped": true
+  },
+  "vm": {
+    "original_session": 32790,
+    "terminal": true,
+    "exit": 0,
+    "seconds": 94.58,
+    "cases": 14,
+    "receipt": "/tmp/augmentagent-ci-root-status-image-20261107210810/receipt.json",
+    "receipt_sha256": "7527eb11719a6fbe5f5990f48609626a4c9098b5e0d6bc7f47cc0618a8ec0de3",
+    "result": "/tmp/autoship-1703-ci-root-status-image-result-20261107.json",
+    "root_image_cases": {
+      "image_planner": {
+        "actor_descriptors": [
+          0,
+          1,
+          2
+        ],
+        "actor_gids": [
+          1001,
+          1001,
+          1001,
+          1001
+        ],
+        "actor_uids": [
+          1001,
+          1001,
+          1001,
+          1001
+        ],
+        "actual_status": 125,
+        "mode": "root-image-initial",
+        "native_handoff_integrated": false,
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "root_image": {
+          "asset_uid": 0,
+          "binding": {
+            "authority_sha256": "e67107355ffa69ee3dea71b15913d7326ee4f7203be656691a34891e6dd9dcde",
+            "cache_identity_sha256": "668230d6c5d4988e24dc47fe407f0ce4a0a8b905a5780ae75750cc8be2223784",
+            "contract_sha256": "b4c27b5ad65ae13a64a2d657b0fc16f254d42d275655b551b999d4512ba4c189",
+            "generation": "3417ba18-643d-4cc1-8cbb-b5f55cc4b1fd",
+            "head": "4fb7b9881e41d28bd4cbcc56512b875a383b7af5",
+            "source_inputs_sha256": "e9623a09c223c0eac3b1fa1b5e80477b25279a5c4d50734d715d757ef5366721",
+            "tree": "ed11fed1c86addf45abdeccfe87237f8b1110a8e"
+          },
+          "command": "c9743634-0760-4760-8f80-432d7d047984",
+          "execution_authority": false,
+          "full_ci": false,
+          "image": {
+            "device": 1,
+            "execution_authority": false,
+            "full_ci": false,
+            "gid": 0,
+            "inode": 1040,
+            "input_closure_complete": false,
+            "kind": "ci-captured-static-executable",
+            "mode": 365,
+            "seals": 63,
+            "sha256": "e98c9b0f084d4135faa9a848d942be7bfa214ebcf4a271ba034feba237d3fcaf",
+            "shipping_authority": false,
+            "size_bytes": 795528,
+            "source_authority": false,
+            "uid": 0,
+            "version": 1
+          },
+          "input_closure_complete": false,
+          "kind": "ci-root-status-image",
+          "shipping_authority": false,
+          "source_authority": false,
+          "version": 1
+        },
+        "uid": 1001
+      },
+      "image_unit_first": {
+        "actor_descriptors": [
+          0,
+          1,
+          2
+        ],
+        "actor_gids": [
+          2000,
+          2000,
+          2000,
+          2000
+        ],
+        "actor_uids": [
+          2000,
+          2000,
+          2000,
+          2000
+        ],
+        "actual_status": 125,
+        "mode": "root-image-initial",
+        "native_handoff_integrated": false,
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "root_image": {
+          "asset_uid": 0,
+          "binding": {
+            "authority_sha256": "e67107355ffa69ee3dea71b15913d7326ee4f7203be656691a34891e6dd9dcde",
+            "cache_identity_sha256": "668230d6c5d4988e24dc47fe407f0ce4a0a8b905a5780ae75750cc8be2223784",
+            "contract_sha256": "b4c27b5ad65ae13a64a2d657b0fc16f254d42d275655b551b999d4512ba4c189",
+            "generation": "3417ba18-643d-4cc1-8cbb-b5f55cc4b1fd",
+            "head": "4fb7b9881e41d28bd4cbcc56512b875a383b7af5",
+            "source_inputs_sha256": "e9623a09c223c0eac3b1fa1b5e80477b25279a5c4d50734d715d757ef5366721",
+            "tree": "ed11fed1c86addf45abdeccfe87237f8b1110a8e"
+          },
+          "command": "c9743634-0760-4760-8f80-432d7d047984",
+          "execution_authority": false,
+          "full_ci": false,
+          "image": {
+            "device": 1,
+            "execution_authority": false,
+            "full_ci": false,
+            "gid": 0,
+            "inode": 1040,
+            "input_closure_complete": false,
+            "kind": "ci-captured-static-executable",
+            "mode": 365,
+            "seals": 63,
+            "sha256": "e98c9b0f084d4135faa9a848d942be7bfa214ebcf4a271ba034feba237d3fcaf",
+            "shipping_authority": false,
+            "size_bytes": 795528,
+            "source_authority": false,
+            "uid": 0,
+            "version": 1
+          },
+          "input_closure_complete": false,
+          "kind": "ci-root-status-image",
+          "shipping_authority": false,
+          "source_authority": false,
+          "version": 1
+        },
+        "uid": 2000
+      },
+      "image_unit_last": {
+        "actor_descriptors": [
+          0,
+          1,
+          2
+        ],
+        "actor_gids": [
+          6095,
+          6095,
+          6095,
+          6095
+        ],
+        "actor_uids": [
+          6095,
+          6095,
+          6095,
+          6095
+        ],
+        "actual_status": 125,
+        "mode": "root-image-initial",
+        "native_handoff_integrated": false,
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "root_image": {
+          "asset_uid": 0,
+          "binding": {
+            "authority_sha256": "e67107355ffa69ee3dea71b15913d7326ee4f7203be656691a34891e6dd9dcde",
+            "cache_identity_sha256": "668230d6c5d4988e24dc47fe407f0ce4a0a8b905a5780ae75750cc8be2223784",
+            "contract_sha256": "b4c27b5ad65ae13a64a2d657b0fc16f254d42d275655b551b999d4512ba4c189",
+            "generation": "3417ba18-643d-4cc1-8cbb-b5f55cc4b1fd",
+            "head": "4fb7b9881e41d28bd4cbcc56512b875a383b7af5",
+            "source_inputs_sha256": "e9623a09c223c0eac3b1fa1b5e80477b25279a5c4d50734d715d757ef5366721",
+            "tree": "ed11fed1c86addf45abdeccfe87237f8b1110a8e"
+          },
+          "command": "c9743634-0760-4760-8f80-432d7d047984",
+          "execution_authority": false,
+          "full_ci": false,
+          "image": {
+            "device": 1,
+            "execution_authority": false,
+            "full_ci": false,
+            "gid": 0,
+            "inode": 1040,
+            "input_closure_complete": false,
+            "kind": "ci-captured-static-executable",
+            "mode": 365,
+            "seals": 63,
+            "sha256": "e98c9b0f084d4135faa9a848d942be7bfa214ebcf4a271ba034feba237d3fcaf",
+            "shipping_authority": false,
+            "size_bytes": 795528,
+            "source_authority": false,
+            "uid": 0,
+            "version": 1
+          },
+          "input_closure_complete": false,
+          "kind": "ci-root-status-image",
+          "shipping_authority": false,
+          "source_authority": false,
+          "version": 1
+        },
+        "uid": 6095
+      },
+      "image_worker": {
+        "actor_descriptors": [
+          0,
+          1,
+          2
+        ],
+        "actor_gids": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "actor_uids": [
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "actual_status": 125,
+        "mode": "root-image-initial",
+        "native_handoff_integrated": false,
+        "original_cleanup": true,
+        "original_exec_ack": true,
+        "root_image": {
+          "asset_uid": 0,
+          "binding": {
+            "authority_sha256": "e67107355ffa69ee3dea71b15913d7326ee4f7203be656691a34891e6dd9dcde",
+            "cache_identity_sha256": "668230d6c5d4988e24dc47fe407f0ce4a0a8b905a5780ae75750cc8be2223784",
+            "contract_sha256": "b4c27b5ad65ae13a64a2d657b0fc16f254d42d275655b551b999d4512ba4c189",
+            "generation": "3417ba18-643d-4cc1-8cbb-b5f55cc4b1fd",
+            "head": "4fb7b9881e41d28bd4cbcc56512b875a383b7af5",
+            "source_inputs_sha256": "e9623a09c223c0eac3b1fa1b5e80477b25279a5c4d50734d715d757ef5366721",
+            "tree": "ed11fed1c86addf45abdeccfe87237f8b1110a8e"
+          },
+          "command": "c9743634-0760-4760-8f80-432d7d047984",
+          "execution_authority": false,
+          "full_ci": false,
+          "image": {
+            "device": 1,
+            "execution_authority": false,
+            "full_ci": false,
+            "gid": 0,
+            "inode": 1040,
+            "input_closure_complete": false,
+            "kind": "ci-captured-static-executable",
+            "mode": 365,
+            "seals": 63,
+            "sha256": "e98c9b0f084d4135faa9a848d942be7bfa214ebcf4a271ba034feba237d3fcaf",
+            "shipping_authority": false,
+            "size_bytes": 795528,
+            "source_authority": false,
+            "uid": 0,
+            "version": 1
+          },
+          "input_closure_complete": false,
+          "kind": "ci-root-status-image",
+          "shipping_authority": false,
+          "source_authority": false,
+          "version": 1
+        },
+        "uid": 1000
+      }
+    },
+    "audit_anchor_matches": true,
+    "audit_sha256": "afeb2cf98b8cfbfddca5017a9b28b4c1a731c20f0051fc29edfaee16a0b5aea8",
+    "resource_completed": true,
+    "resource_exhausted": false,
+    "resource_path_absent": true,
+    "original_resource_identity_sha256": "db3db9778a634ff5dbd4f65d3ef1fda072ab3436467d00b2bfaccd95715a3c13",
+    "resource_limits": {
+      "cpu.max": "200000 100000",
+      "memory.max": "5368709120",
+      "memory.oom.group": "1",
+      "memory.swap.max": "0",
+      "pids.max": "512"
+    },
+    "resource_aggregate_limits": {
+      "cpu_max": "400000 100000",
+      "memory_bytes": 10737418240,
+      "pids": 2048
+    }
+  },
+  "limitations": [
+    "Only the trusted initial bootstrap exec was exercised.",
+    "The deliberately invalid proxy continuation exits125; this is not a compiler execution.",
+    "Native per-operation handoff, original writer/input/resource/source closure and full compiler acceptance remain incomplete.",
+    "Retained-session capacity recovery remains separate and unresolved."
+  ],
+  "native_handoff_integrated": false,
+  "input_closure_complete": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "autonomous_merges_claimed": 0
+}

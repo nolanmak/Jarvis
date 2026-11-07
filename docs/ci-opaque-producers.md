@@ -1860,3 +1860,20 @@ until its actual pinned-tool saturation/cancellation tests pass. The joint C/R
 abandonment, consumer enrollment, retirement dispositions and fingerprint replay
 above are work to implement, not claims about today's code. These gates block
 mechanism handoff and activation; experiments in steps 1–3 remain unauthoritative.
+
+### Root-owned status image startup observation (2026-11-07)
+
+`ci-root-status-image-proof.json` records the actual root-owned fixed boot asset
+capture and original supervised initial descriptor exec under UIDs1000,1001,2000
+and6095. The measured VM bundle now includes the static status proxy. Root
+preparation binds the original command admission, fixed asset identity and sealed
+image; nonroot construction refuses. Each actual role cannot write or chmod the
+image, reaches the original kernel exec stop with only descriptors0/1/2, and has
+its startup acknowledged before the invalid proxy continuation exits125. All14
+root policy cases passed, including the existing exec and proc-view guards.
+Host validation passed756 Python tests,116 updater checks and41 Rust tests.
+
+This proves physical asset delivery through the trusted startup bootstrap. It
+does not authorize post-entry native execution or establish a live per-operation
+resource/source/writer/input proof. The original compiler vfork blocker remains;
+full CI and shipping authority remain false.
