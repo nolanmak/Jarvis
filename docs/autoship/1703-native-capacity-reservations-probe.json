@@ -22,7 +22,8 @@
     "A returned fresh launch dropped without any supervisor attempt records native_launch_abandoned_before_spawn through its actual original object. It retains runtime data, aliases and existing uncertainty behavior.",
     "Fresh preparation captures its actual directory descriptor before durable intent publication. The observation validates that original inode, selected policy/store, effective owner, creation bytes and metadata-only inventory under native locks. Copied ownership bytes in a replacement directory refuse.",
     "Historical launch-reference verification grants no authority and can record teardown under owner pause. Productive launch-reference verification retains its two live dispatch checks. Pauses, model spend and merge allowance remain unchanged.",
-    "A real successor setup NoPending refusal persists a setup-bound retry deadline in the workflow event journal. Reopening the database preserves it; immediate duplicates do not extend it. Existing pending transfers reconcile before retry scheduling and completed transfers return before backoff."
+    "A real successor setup NoPending refusal persists a setup-bound retry deadline in the workflow event journal. Reopening the database preserves it; immediate duplicates do not extend it. Existing pending transfers reconcile before retry scheduling and completed transfers return before backoff.",
+    "Actual launch construction retains its protected receipt immediately after a known successful append, before the fallible workflow callback or final dispatch fence. Failed construction can therefore record its original unspawned lifetime under the same inode/store/creation checks. An append without a known receipt produces no such observation. Ephemeral disposal stays disabled until the existing successful-construction boundary."
   ],
   "validation": {
     "red": {
@@ -186,6 +187,34 @@
         "log": "/tmp/autoship-owner-successor-retry-live-readiness-20261107.json",
         "result": "Still capacity-exhausted: eight retained sessions; required reserved bytes 9663676416 exceeds maximum 8589934592; live_verified false. No rollout or retirement performed."
       }
+    },
+    "known_committed_constructor_lifetime": {
+      "source_base": "f22be6956994683ed83cab06c3d7e8b4a151e340",
+      "red": {
+        "log": "/tmp/autoship-native-constructor-committed-lifetime-red-20261107.log",
+        "result": "Actual protected intent committed and workflow observer refused; Codex produced zero original-unspawned records instead of one."
+      },
+      "green": {
+        "log": "/tmp/autoship-native-constructor-committed-lifetime-green-20261107.log",
+        "result": "Both providers passed actual workflow-refusal regression; 0.40s."
+      },
+      "native_suite": {
+        "log": "/tmp/autoship-native-constructor-committed-lifetime-native-20261107.log",
+        "result": "58 passed, 0 failed; 22.93s; includes failed ephemeral constructor retention, owner pause during callback, sealed append without a fabricated receipt, original inode/policy/input/spawn tests."
+      },
+      "full_core": {
+        "log": "/tmp/autoship-native-constructor-committed-lifetime-core-20261107.log",
+        "result": "976 passed, 0 failed, 15 ignored; 40.42s"
+      },
+      "full_cli": {
+        "log": "/tmp/autoship-native-constructor-committed-lifetime-cli-20261107.log",
+        "result": "1961 passed, 0 failed, 34 ignored; 437.46s"
+      },
+      "production_check": {
+        "log": "/tmp/autoship-native-constructor-committed-lifetime-production-20261107.log",
+        "result": "passed"
+      },
+      "scope": "Known protected receipt is retained by the actual original launch object before callback. Runtime bytes remain and owner pause remains effective. No model admission, deletion, reservation credit, body replay, productive guard or rollout is established."
     }
   },
   "limits": [
@@ -195,7 +224,8 @@
     "Productive successor owner guard and full source/resource/input closure plus CLI/Discord/fault/soak acceptance remain open.",
     "Single-use supervisor admission does not settle durable native intent or prove safe physical disposal; original-intent-aware post-prepare nonrelease remains unfinished.",
     "Original unspawned-lifetime observation is not disposition settlement. Existing uncertainty and conservative census gates remain; interrupted constructor publication, late supervisor nonrelease and all recovery consumers must be joined before physical cleanup.",
-    "Successor retry scheduling neither renews a claim nor reconstructs its opaque setup authority after process loss. If authorization or setup lease expires before the deadline, authenticated setup recovery is still required. This does not implement productive successor construction or prove live automatic recovery; no production capacity was credited."
+    "Successor retry scheduling neither renews a claim nor reconstructs its opaque setup authority after process loss. If authorization or setup lease expires before the deadline, authenticated setup recovery is still required. This does not implement productive successor construction or prove live automatic recovery; no production capacity was credited.",
+    "Known committed-receipt constructor failures now have original unspawned observations. Unknown protected append outcomes, actual supervisor attempts and crash/lost-reservation recovery are not settled by this producer. All disposition consumers and original writer closure remain required before physical cleanup."
   ],
   "sources": [
     {
@@ -212,7 +242,7 @@
     },
     {
       "path": "crates/augmentagent-channel-core/src/native_vm.rs",
-      "sha256": "f588aa33aa8a473c5b39188ebbadb9a72aa1eb7d3eba1c2c8b95ec8a77ae3876"
+      "sha256": "730d5868759a830bdaa80eb677e3b35bbb90f8537593d7f3d912b20ac89bf28a"
     },
     {
       "path": "crates/augmentagent-channel-core/src/run_resources.rs",
@@ -232,7 +262,7 @@
     },
     {
       "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
-      "sha256": "96c120461cf8e35d77606525e971bbbbaf9c00080d7149dfa29e692df7262e27"
+      "sha256": "0c5eed4891a5ea07f816404e3eb3100b60bb1d6d5cc5c2d5d837f03a0a52a15c"
     },
     {
       "path": "crates/augmentagent-channel-core/src/codex.rs",
@@ -248,7 +278,7 @@
     },
     {
       "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
-      "sha256": "8b1dbfb76a0f9a3abce7b0cb246d6e7621eceea6d9ab83f39f096a6f2a1624cc"
+      "sha256": "c7449a5e9dd772ee4c46bfeda5cc182c8a97b9e125d67513867f7fea720d906a"
     },
     {
       "path": "crates/augmentagent-cli/src/autoship_owner_successor_retry.rs",

@@ -4245,8 +4245,18 @@ mod tests {
             "owner-early-acceptance-producer-claude-metadata-recovery",
         ],true);
     }
+    #[tokio::test]
+    async fn owner_successor_native_interruption_retains_original_purpose_and_uuid() {
+        for interruption in ["absent","prepared","aborted"] {
+            owner_metadata_recovery_modes_inner(&[
+                "owner-early-acceptance-producer-metadata-recovery",
+                "owner-early-acceptance-producer-claude-metadata-recovery",
+            ],false,Some(interruption));
+        }
+    }
     fn owner_metadata_recovery_modes(modes:&[&str]) {owner_metadata_recovery_modes_with_retry(modes,false)}
-    fn owner_metadata_recovery_modes_with_retry(modes:&[&str],retry:bool) {
+    fn owner_metadata_recovery_modes_with_retry(modes:&[&str],retry:bool) {owner_metadata_recovery_modes_inner(modes,retry,None)}
+    fn owner_metadata_recovery_modes_inner(modes:&[&str],retry:bool,interruption:Option<&str>) {
         use std::os::unix::fs::PermissionsExt;
         for mode in modes {
         let control=control_dir();let gh=control.path().join("gh-recovery");
@@ -4264,9 +4274,11 @@ else: raise SystemExit('unexpected authority call')
         std::fs::write(control.path().join("recovery-authority.json"),br#"{"repository":"owner/repo","permission":"WRITE","actor":"owner"}"#).unwrap();
         let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--test-threads=1","--nocapture"])
             .env("AUTOSHIP_INITIAL_GUARD_CHILD",control.path()).env("AUTOSHIP_INITIAL_GUARD_MODE",mode)
-            .env("JARVIS_TEST_SUCCESSOR_RETRY",if retry {"1"}else{"0"}).env("GH_BIN",&gh).env("XDG_STATE_HOME",control.path().join("operator-state")).env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json")).output().unwrap();
+            .env("JARVIS_TEST_SUCCESSOR_RETRY",if retry {"1"}else{"0"})
+            .env("JARVIS_TEST_SUCCESSOR_INTERRUPTION",interruption.unwrap_or("")).env("GH_BIN",&gh).env("XDG_STATE_HOME",control.path().join("operator-state")).env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json")).output().unwrap();
         assert!(output.status.success(),"{mode}: {} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
         if retry {assert!(String::from_utf8_lossy(&output.stdout).contains("successor native retry fixture passed"),"actual successor retry fixture did not execute");}
+        if let Some(case)=interruption {assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("successor interruption fixture passed: {case}")),"actual successor interruption fixture did not execute");}
         }
     }
 
@@ -5913,6 +5925,79 @@ else: raise SystemExit('unexpected authority call')
                             }).unwrap();
                             assert!(visited && matches!(result,successor_native::PreparedTransferResult::NoPending(_)),"wrong destination did not reach actual scan callback: {result:?}");
                             assert_eq!(store.events(&id).unwrap(),events);
+                        }
+                        if let Ok(interruption)=std::env::var("JARVIS_TEST_SUCCESSOR_INTERRUPTION") {
+                            if !interruption.is_empty() {
+                                assert!(matches!(interruption.as_str(),"absent"|"prepared"|"aborted"));
+                                // Persist a real setup intent through the core scan,
+                                // but simulate losing its callback acknowledgement.
+                                // No core transfer has happened at this boundary.
+                                let destination=open_audit_generation(&state,&id,Some(dir.path()),setup.generation()).unwrap();
+                                destination.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:id.clone(),lease_generation:setup.generation()}).unwrap();
+                                destination.set_native_store_binding(basis.original_binding().clone()).unwrap();
+                                destination.require_run_resources().unwrap();
+                                destination.restrict_to_metadata(durable::owner_publication_recovery::successor_native_metadata_fence(setup_store.clone(),setup.clone(),&setup_auth,millis()).unwrap()).unwrap();
+                                destination.record_controller(serde_json::json!({"actor":"controller","kind":"owner_successor_setup_native","workflow":id,"generation":setup.generation()})).unwrap();
+                                let plan=successor_native::PreparationPlan {workflow_id:id.clone(),source_owners:vec![basis.namespace().clone()],
+                                    destination:successor_native::Authority {owner:augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:id.clone(),lease_generation:setup.generation()},audit_path:destination.path().to_str().unwrap().into()},
+                                    runtimes:basis.runtimes().unwrap(),fingerprint_input:successor_native::PreparationFingerprintInput {workflow_id:id.clone(),workflow_binding:serde_json::to_value(&saved_cp.binding).unwrap(),original_binding_sha256:None,source_registration_sha256:None,latest_input_sha256:Some(basis.fingerprint().unwrap()),selected_policy_sha256:None,capacity_class:Default::default()}};
+                                let current=||store.validate_owner_successor_setup(&setup,&setup_auth,millis()).map_err(|_|successor_native::TransferFenceError::NotCurrent);
+                                let result=successor_native::prepare_transfer(basis.original_binding(),&plan,&[source.clone()],&destination,&current,&mut |scan| {
+                                    match setup_store.lock().unwrap().prepare_owner_successor_native_intent(&setup,&setup_auth,&basis,scan,millis()) {
+                                        durable::owner_publication_recovery::SuccessorNativePersistence::Durable(intent)=>successor_native::PreparationPersistence::Unknown {reason:successor_native::TransferReason::PendingUnknown,attempted:Some(intent.core_intent())},
+                                        _=>panic!("actual successor interruption intent failed"),
+                                    }
+                                }).unwrap();
+                                assert!(matches!(result,successor_native::PreparedTransferResult::PersistenceUnknown {attempted:Some(_),..}));
+                                let pending=WorkflowStore::open(&state).unwrap().owner_successor_pending_transfer(&setup,&setup_auth,millis()).unwrap().unwrap();
+                                let transfer_id=pending.request().transfer_id.clone();
+                                let native_state=|expected| {
+                                    let mut visited=false;
+                                    let state=successor_native::with_transfer_inspection(pending.original_binding(),pending.request(),&pending.observation(),&current,&mut |proof| {
+                                        assert_eq!(proof.state(),expected);visited=true;Ok(())
+                                    }).unwrap();assert!(visited);assert_eq!(state,expected);
+                                };
+                                native_state(successor_native::NativeTransferState::Absent);
+                                if interruption!="absent" {
+                                    let stopped=std::cell::Cell::new(false);
+                                    let interrupt_after_prepare=|| {
+                                        current()?;
+                                        let ledger=rusqlite::Connection::open_with_flags(native.join("runtime-retirement.sqlite"),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+                                        if ledger.query_row("SELECT EXISTS(SELECT 1 FROM native_transfer WHERE id=?1 AND state='prepared')",[&transfer_id],|r|r.get::<_,bool>(0)).unwrap() {
+                                            stopped.set(true);return Err(successor_native::TransferFenceError::NotCurrent);
+                                        }Ok(())
+                                    };
+                                    assert!(!matches!(successor_native::transfer(pending.original_binding(),pending.request(),&pending.observation(),&[source.clone()],&destination,&interrupt_after_prepare),successor_native::TransferOutcome::Completed(_)));
+                                    assert!(stopped.get(),"actual transfer never reached prepared interruption");
+                                    native_state(successor_native::NativeTransferState::Prepared);
+                                }
+                                if interruption=="aborted" {
+                                    augmentagent_channel_core::native_vm::retire_owned_runtimes(pending.original_binding(),destination.path(),&plan.destination.owner,&current).unwrap();
+                                    native_state(successor_native::NativeTransferState::Aborted);
+                                }
+                                let context_before:(i64,String,String)=db.query_row("SELECT sequence,record_sha256,record FROM workflow_owner_successor_native_intent WHERE workflow=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                                let outcome=run_successor_native_setup(&setup_store,&state,dir.path(),setup.clone(),&setup_auth).unwrap();
+                                if interruption=="aborted" {
+                                    assert!(matches!(outcome,SuccessorNativeSetupRun::Outcome(durable::native_prepare::NativePreparationRun::Reconciled {result:durable::native_reconcile::ReconciliationRun::Retained {state:Some(successor_native::NativeTransferState::Aborted),..},..})),"aborted setup escaped its retained purpose: {outcome:?}");
+                                    assert_eq!(WorkflowStore::open(&state).unwrap().owner_successor_pending_transfer(&setup,&setup_auth,millis()).unwrap().unwrap(),pending);
+                                    let events=store.events(&id).unwrap();
+                                    assert!(matches!(run_successor_native_setup(&setup_store,&state,dir.path(),setup.clone(),&setup_auth).unwrap(),SuccessorNativeSetupRun::Outcome(durable::native_prepare::NativePreparationRun::Reconciled {result:durable::native_reconcile::ReconciliationRun::Retained {state:Some(successor_native::NativeTransferState::Aborted),..},..})));
+                                    assert_eq!(store.events(&id).unwrap(),events,"aborted retry created replacement work");
+                                }else {
+                                    assert!(matches!(outcome,SuccessorNativeSetupRun::Outcome(durable::native_prepare::NativePreparationRun::Reconciled {pending:ref original,result:durable::native_reconcile::ReconciliationRun::Settled(_),..}) if original==&pending),"interrupted setup did not settle its original request: {outcome:?}");
+                                    native_state(successor_native::NativeTransferState::Completed);
+                                    assert!(WorkflowStore::open(&state).unwrap().owner_successor_pending_transfer(&setup,&setup_auth,millis()).unwrap().is_none());
+                                    assert!(matches!(run_successor_native_setup(&setup_store,&state,dir.path(),setup.clone(),&setup_auth).unwrap(),SuccessorNativeSetupRun::Outcome(durable::native_prepare::NativePreparationRun::Registered {..})));
+                                }
+                                assert_eq!(db.query_row("SELECT sequence,record_sha256,record FROM workflow_owner_successor_native_intent WHERE workflow=?1",[&id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).unwrap(),context_before,"reconciliation replaced original context");
+                                assert_eq!(store.snapshot(&id).unwrap().unwrap(),before_native_transfer,"setup recovery changed workflow accounting or input progress");
+                                assert_eq!(store.pending_owner_messages(&id).unwrap(),2);
+                                assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+                                assert!(destination.dispatch_allowed().is_err());
+                                assert!(store.owner_turn_for_lease(&copied,millis()).is_err(),"setup became an ordinary productive turn");
+                                assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_body_dispatch WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),0);
+                                println!("successor interruption fixture passed: {interruption} {mode}");return;
+                            }
                         }
                         if std::env::var("JARVIS_TEST_SUCCESSOR_RETRY").as_deref()==Ok("1") {
                             let before_intent_events=store.events(&id).unwrap();

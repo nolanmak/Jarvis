@@ -1053,6 +1053,18 @@ impl AuditLogger {
         &self,
         intent: &crate::native_vm::PreparedLaunchIntent,
     ) -> anyhow::Result<crate::native_vm::PreparedLaunchRecord> {
+        self.native_launch_prepared_with_commit(intent, |_| {})
+    }
+
+    /// The actual constructor retains the known protected receipt before any
+    /// fallible workflow observer or later dispatch fence. This infallible
+    /// capture is descriptive only; it grants no spawn/input/cleanup authority.
+    /// An append error has no known receipt and never invokes this callback.
+    pub(crate) fn native_launch_prepared_with_commit(
+        &self,
+        intent:&crate::native_vm::PreparedLaunchIntent,
+        committed:impl FnOnce(&crate::native_vm::PreparedLaunchRecord),
+    )->anyhow::Result<crate::native_vm::PreparedLaunchRecord> {
         intent.validate()?;
         let original = self
             .native_store_binding()?
@@ -1087,6 +1099,7 @@ impl AuditLogger {
             intent: intent.clone(),
             controller_receipt,
         };
+        committed(&record);
         if let Some(observer) = observer {
             observer(&record)?;
         }

@@ -119,13 +119,37 @@
   "limits": [
     "Successor fixture uses synthetic preparation and empty native runtime inventory. It does not establish a live provider, VM coding session, or retained productive successor conversation.",
     "Native transfer and registered destination retain metadata/setup-only purpose. No productive coding guard, body slot or model input is granted.",
-    "Full CLI suite not repeated at this checkpoint. New successor absent/prepared/aborted interruption and lost live reservation acceptance still need dedicated evidence; shared state-matrix tests retain their own scope.",
-    "Typed no-pending failure is returned but durable setup retry/fingerprint backoff must be connected before worker activation.",
+    "Full CLI suite not repeated at this checkpoint. Dedicated successor absent/prepared/aborted interruption evidence is in followup_interruption_matrix. Actual process loss and lost live reservation recovery remain unproven.",
+    "Durable setup-only retry/fingerprint backoff is connected by f22be695. It does not renew expired authorization or restore a lost setup reservation, and the worker remains unconnected.",
     "Lost reservation and multiple consumed ancestry, first-body/retained-reservation lineage, actual coding constructor and complete C/R source/resource/input proofs remain unfinished.",
     "No deployment, live CLI/Discord coding acceptance, fault soak, unattended acceptance or new autonomous merge is established by this component proof."
   ],
   "productive_execution_verified": false,
   "deployed": false,
   "live_cli_discord_acceptance": false,
-  "epic_1703_complete": false
+  "epic_1703_complete": false,
+  "followup_interruption_matrix": {
+    "source_base": "f22be6956994683ed83cab06c3d7e8b4a151e340",
+    "test": "self_improve::workflow::tests::owner_successor_native_interruption_retains_original_purpose_and_uuid",
+    "log": "/tmp/autoship-owner-successor-interruptions-20261107.log",
+    "result": "1 passed, 0 failed; 156.30s; all six provider/state markers required",
+    "cases": [
+      "Actual core PreparationScan persists original successor-purpose intent but its callback returns unknown acknowledgement: core inspection verifies Absent before controller replay.",
+      "Actual core transfer is interrupted by its current fence only after the original native ledger records Prepared; inspection verifies Prepared before controller replay.",
+      "The prepared destination is retired through actual native authority, producing verified Aborted state."
+    ],
+    "observations": [
+      "Absent and Prepared replay the exact same pending request and settle Completed. Existing sealed audits reopen and no replacement context/UUID is issued.",
+      "Aborted remains pending and held on repeated controller entry; no body slot or ordinary productive turn escapes.",
+      "Reopened workflow store retains the same original intent. Workflow snapshot, queued owner input and model/merge accounting stay unchanged. Both destinations retain their permanent metadata fence."
+    ],
+    "scope": "Synthetic preparation and empty native runtime census, with live original setup reservation retained. This is state-boundary interruption injection, not an actual process-crash/lost-reservation or live provider/VM acceptance.",
+    "full_cli": {
+      "log": "/tmp/autoship-native-constructor-committed-lifetime-cli-20261107.log",
+      "result": "1961 passed, 0 failed, 34 ignored; 437.46s"
+    },
+    "source_sha256": {
+      "crates/augmentagent-cli/src/self_improve_workflow.rs": "0c5eed4891a5ea07f816404e3eb3100b60bb1d6d5cc5c2d5d837f03a0a52a15c"
+    }
+  }
 }

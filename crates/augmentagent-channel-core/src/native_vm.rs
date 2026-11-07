@@ -870,9 +870,23 @@ impl Launch {
         // if acknowledgement fails. Preserve its exact original runtime.
         if let Some(session)=unpublished_session {session.retain();}
         drop(state_lock);
-        // The protected append and optional workflow journal callback complete
-        // before any command can escape preparation or receive prompt bytes.
-        let prepared=owner_logger.native_launch_prepared(&intent)?;
+        // Keep the actual unspawned object alive across protected publication
+        // and its fallible workflow callback. Before a known receipt its drop
+        // cannot invent a lifetime fact. Failed construction retains the same
+        // original runtime even for an otherwise ephemeral request.
+        let mut command = Command::new("/usr/bin/python3");
+        command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
+            .env("PATH","/usr/bin:/bin");
+        let mut result=Self {command,resource_policy,spawn_attempted:false,runtime_birth,aliases,session,ephemeral:false,
+            initial:!resume,authority,store,runtime_relative_path,creation_receipt_sha256,audit_log,
+            observation:None,_directory:directory};
+        // Capture the original committed receipt before an observer can fail.
+        // No command or provider input escapes until every remaining check.
+        let prepared=owner_logger.native_launch_prepared_with_commit(&intent,|prepared| {
+            result.observation=Some(LaunchObservation {prepared:prepared.clone(),logger:std::sync::Arc::downgrade(owner_logger),
+                actual_session:std::sync::Mutex::new(None),input_attempted:std::sync::atomic::AtomicBool::new(false),
+                completion_verified:std::sync::atomic::AtomicBool::new(false),completed:std::sync::atomic::AtomicBool::new(false)});
+        })?;
         let executable_binding=executable_input::ExecutableInputBindingRecord {version:1,actor:"controller".into(),kind:"native_executable_input_binding".into(),
             launch_intent:prepared.intent.clone(),launch_receipt:prepared.controller_receipt.clone(),executable_input};
         executable_binding.validate(&prepared)?;
@@ -886,11 +900,9 @@ impl Launch {
                 "launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"context":context,"transport_role":"fresh_tool_free_review","readonly_transport":transport}))?;
             owner_logger.dispatch_allowed()?;
         }
-        let mut command = Command::new("/usr/bin/python3");
-        command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
-            .env("PATH","/usr/bin:/bin");
-        let result = Self { command, resource_policy,spawn_attempted:false,runtime_birth, aliases, session, ephemeral:native.is_none(), initial:!resume, authority, store, runtime_relative_path, creation_receipt_sha256, audit_log,
-            observation:Some(LaunchObservation {prepared,logger:std::sync::Arc::downgrade(owner_logger),actual_session:std::sync::Mutex::new(None),input_attempted:std::sync::atomic::AtomicBool::new(false),completion_verified:std::sync::atomic::AtomicBool::new(false),completed:std::sync::atomic::AtomicBool::new(false)}),_directory:directory };
+        // Preserve the existing ephemeral cleanup boundary only after all
+        // post-publication constructor work above completed successfully.
+        result.ephemeral=native.is_none();
         // A requested alias permits later lookup but is not a provider ID event.
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.register_alias(id)?; }
         owner_logger.validate_native_store_binding()?;
@@ -1159,6 +1171,10 @@ mod tests {
         launch_intent_child("refuse");
     }
     #[test]
+    fn failed_ephemeral_constructor_retains_committed_unspawned_runtime() {launch_intent_child("refuse-ephemeral");}
+    #[test]
+    fn failed_constructor_records_committed_lifetime_under_owner_pause() {launch_intent_child("refuse-paused");}
+    #[test]
     fn native_preparation_binds_original_owner_preparation_context() {launch_intent_child("preparation-context");}
     #[test]
     fn native_preparation_resolves_original_command_working_directory() {launch_intent_child("executable-resolution");}
@@ -1231,7 +1247,7 @@ mod tests {
             assert_eq!(super::owner_outcome::classify(&error).0,ownership::TransferReason::LockBusy);
             return;
         }
-        let seal=mode=="seal";let refuse=mode=="refuse";
+        let seal=mode=="seal";let refuse=matches!(mode,"refuse"|"refuse-ephemeral"|"refuse-paused");
         const CHILD: &str = "JARVIS_TEST_NATIVE_LAUNCH_INTENT_CHILD";
         if std::env::var_os(CHILD).is_none() {
             if mode=="input-crash" {
@@ -1265,7 +1281,9 @@ mod tests {
                 }
                 return;
             }
-            let test = if mode=="spawn-once" {"prepared_native_launch_allows_only_one_supervisor_attempt"}
+            let test = if mode=="refuse-ephemeral" {"failed_ephemeral_constructor_retains_committed_unspawned_runtime"}
+                else if mode=="refuse-paused" {"failed_constructor_records_committed_lifetime_under_owner_pause"}
+                else if mode=="spawn-once" {"prepared_native_launch_allows_only_one_supervisor_attempt"}
                 else if mode=="constructor-reclaim" {"native_preparation_reclaims_only_before_intent_publication_attempt"}
                 else if mode=="preparation-context" {"native_preparation_binds_original_owner_preparation_context"}
                 else if mode=="asset-input" {"native_preparation_snapshots_referenced_asset_bytes"}
@@ -1346,11 +1364,15 @@ mod tests {
             let saved=std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let captured=saved.clone();
             let sink=crate::audit_chain::AnchoredAudit::new(logger.path().into(),anchors.join("model.json"),&[]).unwrap();
+            let pause_on_callback=mode=="refuse-paused";
+            let controller=std::sync::Arc::downgrade(&logger);
             logger.set_native_launch_observer(std::sync::Arc::new(move |prepared| {
                 let exact=sink.read_receipt(&prepared.controller_receipt)?;
                 ensure!(exact["intent_id"]==prepared.intent.intent_id,"callback did not receive the committed intent");
                 count.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
                 captured.lock().unwrap().push(prepared.clone());
+                if pause_on_callback {controller.upgrade().context("callback controller expired")?
+                    .set_dispatch_observer(std::sync::Arc::new(||anyhow::bail!("owner paused in callback")))?;}
                 ensure!(!refuse,"workflow journal refused launch");Ok(())
             })).unwrap();
             assert!(logger.clone().set_native_launch_observer(std::sync::Arc::new(|_|Ok(()))).is_err(),
@@ -1528,7 +1550,7 @@ mod tests {
                         Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native))
                     }).await
                 }))
-            }else {Launch::prepare(provider,&opts,&command,None,Some(&native))};
+            }else {Launch::prepare(provider,&opts,&command,None,if mode=="refuse-ephemeral" {None}else{Some(&native)})};
             if matches!(mode,"unbound"|"reselect") {
                 assert!(launch.is_err(),"native preparation ignored the original store binding ({mode})");
                 assert!(!state.join(provider).exists(),"refused preparation allocated runtime state");
@@ -1536,6 +1558,7 @@ mod tests {
             }
             if seal {
                 assert!(launch.is_err(),"native preparation returned a dispatchable command without durable launch evidence");
+                assert!(!std::fs::read_to_string(logger.path()).unwrap().lines().any(|line|serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"]=="native_launch_abandoned_before_spawn"),"unknown protected append manufactured a committed lifetime fact");
                 continue;
             }
             if refuse {
@@ -1545,7 +1568,20 @@ mod tests {
                 let prepared=saved.lock().unwrap()[0].clone();
                 assert!(state.join(&prepared.intent.runtime_relative_path).join("owned.json").exists(),"uncertain workflow journal acknowledgement lost original runtime");
                 let committed=sink_for_observation(&logger,&anchors).read_receipt(&prepared.controller_receipt).unwrap();
-                assert_eq!(committed["intent_id"],prepared.intent.intent_id);continue;
+                assert_eq!(committed["intent_id"],prepared.intent.intent_id);
+                let rows=std::fs::read_to_string(logger.path()).unwrap().lines().map(|line|serde_json::from_str::<serde_json::Value>(line).unwrap()).collect::<Vec<_>>();
+                let facts=rows.iter().filter(|row|row["kind"]=="native_launch_abandoned_before_spawn").collect::<Vec<_>>();
+                assert_eq!(facts.len(),1,"{provider}: committed intent lost its original unspawned constructor lifetime after workflow callback refusal");
+                let fact=facts[0];
+                assert_eq!(fact["launch_intent"],serde_json::to_value(&prepared.intent).unwrap());
+                assert_eq!(fact["launch_receipt"],serde_json::to_value(&prepared.controller_receipt).unwrap());
+                assert_eq!(fact["runtime_retired"],false);assert_eq!(fact["original_input_replay_authorized"],false);
+                let session=state.join(&prepared.intent.runtime_relative_path);
+                assert_eq!(fact["creation_receipt_utf8"].as_str().unwrap().as_bytes(),private(&session.join("owned.json")).unwrap());
+                assert!(!session.join("retired.json").exists(),"constructor failure retired uncertain durable state");
+                assert!(!rows.iter().any(|row|row["kind"]=="model_call_admitted"));
+                if mode=="refuse-paused" {assert!(logger.dispatch_allowed().is_err(),"constructor teardown cleared owner pause");}
+                logger.protected_health().unwrap();continue;
             }
             let launch=launch.unwrap();
             if mode=="executable-input" {
