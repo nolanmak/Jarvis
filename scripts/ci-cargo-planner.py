@@ -1832,14 +1832,14 @@ class RootRelay:
                     or not -64<=record['returncode']<=255):raise FreshnessHold('cleanup_uncertain')
             raw=record['returncode']
             if status!=(raw if raw>=0 else 128-raw):raise FreshnessHold('cleanup_uncertain')
-            # Snapshot failed contained output only after these original cleanup
-            # and status checks. The paused parent cannot drain its pipes yet.
-            if started and raw!=0:self.unit_failed_output(value,directory,raw,descriptors)
             # The original cleanup marker and raw status must be validated
             # before removing a signal target or closing its owned pidfd.
             self.unit_credit_drained(value,transport,started)
             self.unit_signal_drained(value,transport,started)
             if transport is not None:transport.check()
+            # Use the same fully drained boundary as effect inspection. Credit
+            # and signal cleanup are settled; the parent is still frozen.
+            if started and raw!=0:self.unit_failed_output(value,directory,raw,descriptors)
             if view is not None:
                 phase[0]='planner_view_publish';self.views.finish(view,directory,raw)
             self.completed.append({'ordinal':ordinal,'uid':execution_identity(value),'started':started,
@@ -2568,15 +2568,27 @@ class UnitPeerRelay(RootRelay):
         self.staged_signals.child_drained(value['ordinal'],transport.staged_signals)
 
     def unit_failed_output(self,value,directory,raw,descriptors):
-        record=self.active_record
-        if record is None or record['last_request_ordinal']!=value['ordinal']:raise FreshnessHold('generation_mismatch')
-        self.freezer.check_frozen_cohort()
-        retain_private_diagnostic(self.admission.target/('.jobserver-credit-'+self.admission.command)/('contained-output-'+str(value['ordinal'])+'.json'),{
-            'version':1,'kind':'ci-contained-output-pipe-diagnostic','binding':self.admission.binding,'command':self.admission.command,
-            'parent_scope':self.scope.name,'child_scope':directory.name,'ordinal':value['ordinal'],'returncode':raw,
-            'stdout':nonconsuming_pipe_diagnostic(descriptors[2]),'stderr':nonconsuming_pipe_diagnostic(descriptors[3]),
-            'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
-        self.freezer.check_frozen_cohort()
+        phase='frozen_before'
+        try:
+            record=self.active_record
+            if record is None or record['last_request_ordinal']!=value['ordinal']:raise FreshnessHold('generation_mismatch')
+            self.freezer.check_frozen_cohort();phase='sample'
+            output=nonconsuming_pipe_diagnostic(descriptors[2]);error=nonconsuming_pipe_diagnostic(descriptors[3])
+            phase='persist'
+            retain_private_diagnostic(self.admission.target/('.jobserver-credit-'+self.admission.command)/('contained-output-'+str(value['ordinal'])+'.json'),{
+                'version':1,'kind':'ci-contained-output-pipe-diagnostic','binding':self.admission.binding,'command':self.admission.command,
+                'parent_scope':self.scope.name,'child_scope':directory.name,'ordinal':value['ordinal'],'returncode':raw,
+                'stdout':output,'stderr':error,'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
+            phase='frozen_after';self.freezer.check_frozen_cohort()
+        except BaseException as error:
+            # This private original scope survives the controller error. No raw
+            # exception text or inferred kernel disposition is published.
+            cache._write_record(directory/'output-diagnostic-error.json',{
+                'version':1,'kind':'ci-contained-output-diagnostic-error','binding':self.admission.binding,'command':self.admission.command,
+                'ordinal':value['ordinal'],'stage':phase,'category':type(error).__name__[:64],
+                'errno':getattr(error,'errno',None),'freshness_reason':getattr(error,'reason',None),
+                'input_closure_complete':False,'full_ci':False,'shipping_authority':False})
+            raise
 
     def unit_started(self,value,directory):
         record=self.active_record
@@ -3613,7 +3625,7 @@ def nonconsuming_pipe_diagnostic(descriptor):
         libc=ctypes.CDLL(None,use_errno=True)
         if not hasattr(libc,'tee'):return unavailable
         tee=libc.tee;tee.argtypes=[ctypes.c_int,ctypes.c_int,ctypes.c_size_t,ctypes.c_uint];tee.restype=ctypes.c_ssize_t
-        count=tee(source,writer,32768,os.SPLICE_F_NONBLOCK)
+        count=tee(source,writer,32768,getattr(os,'SPLICE_F_NONBLOCK',2))
         if count<0:
             number=ctypes.get_errno()
             if number==errno.EAGAIN:return {'status':'empty','complete_stream':False}

@@ -652,8 +652,8 @@ the deliberate contained-effect-transfer hold and every O1–O6/final-C gate rem
 
 A failed contained child can leave its error bytes in a pipe whose reader is the
 frozen parent, so the outer repository record alone cannot recover that failure.
-After checking that child's original cleanup marker/raw status, the unit relay
-rechecks its actual parent's frozen cohort and records a non-consuming snapshot
+After checking that child's original cleanup marker/raw status and settling its
+existing credit/signal cleanup gates, the unit relay rechecks its actual parent's frozen cohort and records a non-consuming snapshot
 of available stdout/stderr pipe bytes in the same private command directory.
 It temporarily opens a reader for the exact FIFO identity and uses nonblocking
 `tee` into a bounded private pipe, closing every new descriptor before returning.
@@ -663,6 +663,9 @@ kernel may return less); it is always marked `complete_stream:false`, including
 empty or unavailable observations. Sample digests cover sampled bytes only.
 The record keeps all input-closure/full-CI/shipping flags false and is diagnostic
 data, never an input census, nonrelease, policy classification or cleanup grant.
+If this observation refuses, its original private scope retains only a bounded
+stage, exception category, errno and typed freshness reason, without raw exception
+text; the refusal is propagated rather than authorizing resume.
 This observation is not final stdio-fidelity evidence for parent-loss or external-alias
 races; those O4 cases still gate activation. Actual child/parent authority and every
 deliberate copy-back gate remain unchanged.
