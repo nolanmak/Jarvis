@@ -727,11 +727,22 @@ admission/worker regressions and refuses a missing live freezer.
 
 At RED baseline `70e8befb`, the original worker admission body ran and cleaned
 up, but the strengthened regression failed after 92.71 seconds with a missing
-proc-view observation. The payload/command was unchanged. The production launch
-and original-worker/planner memory/namespace integration is now under validation;
-no passing current-build original-worker or full compiler/worker result is yet
-claimed. C/R own live admission, memory-control, full worker/Cargo pause and
-teardown exits before treating this profile as verified. Foreign/preopened FDs,
+proc-view observation. The payload/command was unchanged. At `79b96476`, original worker admission passed in 93.58 seconds, including
+actual independent view comparison, namespace pin/enrollment, body execution,
+original cleanup and empty controller pin map at close. All ten root-controlled
+role/proc cases passed in 95.00 seconds, including actual worker/planner-prefix
+memory writes refused through all four aliases. The unchanged worker/Cargo
+pause fixture then passed the new view/RPC/freeze checks across three distinct
+worker namespaces and the real Cargo proc view, but remained red after 116.30
+seconds at the original four GCC vfork refusals (same InputCensusUnknown
+fingerprint). Raw exit 1/version-4 hold, original child reap, returned jobserver
+loan and original host subtree removal were verified. The first integration at
+`145a612d` correctly held after lazy cgroup mounting changed the controller
+reference; moving mount preparation before cloning fixed that ordering without
+relaxing the comparison. All 738 Python and 39 Rust checks passed (30 bulk opt-ins
+ignored). See [private-proc integration evidence](ci-worker-planner-proc-proof.json).
+This verifies the bounded launch/proc-view integration; it does not establish a
+passing full compiler/worker fixture or complete writer closure. Foreign/preopened FDs,
 all other writers/ABIs, immutable-image/live-operation/source/resource handoff
 and complete input closure remain required before runtime vfork admission.
 Carrying cost is one private proc view and retained namespace handle per active

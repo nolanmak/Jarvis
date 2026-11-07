@@ -1,0 +1,369 @@
+{
+  "version": 1,
+  "kind": "worker-planner-private-proc-integration",
+  "baseline_red": "70e8befb",
+  "first_integration": "145a612d",
+  "code_head": "79b96476",
+  "source_sha256": {
+    "scripts/ci-cargo-planner.py": "d86f19cba4522974e60b70b50d42a99d70e65e4cad3092d201440279f577ae33",
+    "scripts/ci-cargo-views.py": "60bd6da9ee51bf506c2f096fd9afc62151c0357351e46a16da81f2327194653d",
+    "scripts/tests/ci_cargo_mount_layout_test.py": "320131cc60930e72f37ee399ed8335bff7fb03d5e4ceb9c354b872ffd71df11b",
+    "scripts/tests/ci_cargo_planner_protocol_test.py": "bb93ae154443f3ec2e19a8c8dcae05e5df2bf5000fcad5b0ae19f3c807904771",
+    "crates/augmentagent-cli/src/self_improve_ci_acceptance.rs": "af3ac458e2b6e5e07be123ad05edac4c8fed064dcff5cf74f6dbb56a927096fb"
+  },
+  "implementation": "Prepare the existing controller cgroup mount before cloning. Repository workers and worker children get private readonly proc views; Cargo uses the same prefix before its existing mounts. Original exec-stop observers check effective visible proc mounts, exact worker proc-only deltas and unchanged other namespaces. Actual namespace FDs bind worker enrollment, RPC and freeze to existing cgroup/UID census; pins retire at original member-and-descendant cleanup. No runtime vfork permission or new pool/credit introduced.",
+  "host": {
+    "python": {
+      "passed": 738,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 43.84,
+      "log": "/tmp/autoship-ci-worker-proc-mount-order-python-20261107.log"
+    },
+    "rust": {
+      "passed": 39,
+      "failed": 0,
+      "ignored": 30,
+      "seconds": 22.19,
+      "log": "/tmp/autoship-ci-worker-proc-mount-order-rust-20261107.log"
+    },
+    "initial_python_run": {
+      "errors": 1,
+      "reason": "credentials-only fixture omitted live worker freezer; test guard separated from actual scope admission, which refuses missing live freezer",
+      "log": "/tmp/autoship-ci-worker-proc-green-python-20261107.log"
+    }
+  },
+  "red": {
+    "exit": 101,
+    "seconds": 92.71,
+    "reason": "original body ran and cleaned up, but no verified private proc observation",
+    "receipt": "/tmp/augmentagent-ci-worker-proc-red-20261107052339/receipt.json",
+    "log": "/tmp/autoship-ci-worker-proc-red-live-20261107.log"
+  },
+  "first_integration_failure": {
+    "exit": 101,
+    "seconds": 87.15,
+    "evidence_sha256": "82f10238c7f40a82a224f3eacda7ea97ddbf293c2bf953d27ede4199ff4e215d",
+    "inspection": "/tmp/autoship-ci-worker-proc-green-inspection-20261107.json",
+    "cause": "worker cloned before lazy controller cgroup2 mount; later pin/delta check correctly refused changed reference topology",
+    "fix": "prepare the original controller mount before any worker namespace clone; do not relax comparison"
+  },
+  "original_worker_admission": {
+    "passed": true,
+    "seconds": 93.58,
+    "receipt": "/tmp/augmentagent-ci-worker-proc-mount-order-20261107054525/receipt.json",
+    "audit": "/tmp/autoship-ci-worker-proc-mount-order-audit-20261107.json",
+    "proc_view": {
+      "controller_layout_sha256": "993403e19cdfb8d33462e62849e5d5b389b2569fbe0758ece3ebcdbc225fadc2",
+      "controller_mount_namespace": "mnt:[4026531832]",
+      "full_ci": false,
+      "input_closure_complete": false,
+      "kind": "ci-readonly-proc-view",
+      "mount_layout_sha256": "1a86f10b206612256a7eac64a7d3e1389137b62b5b54073d9bb72fc6a80450b8",
+      "mount_namespace": "mnt:[4026532327]",
+      "pid": 151,
+      "proc_mount_id": 67,
+      "root_identity": [
+        3,
+        1
+      ],
+      "shipping_authority": false,
+      "version": 1,
+      "visible_proc_mounts": [
+        67
+      ],
+      "worker_delta": true
+    },
+    "original_cgroup_and_cleanup": true,
+    "controller_pin_map_empty_at_close": true,
+    "original_host_resource_subtree_removed": true
+  },
+  "root_controls": {
+    "passed": 10,
+    "seconds": 95.0,
+    "receipt": "/tmp/augmentagent-ci-worker-planner-proc-policy-20261107054939/receipt.json",
+    "audit": "/tmp/autoship-ci-worker-planner-proc-policy-audit-20261107.json",
+    "worker": {
+      "memory": {
+        "mount_readonly": true,
+        "read_control": true,
+        "readonly_fd_write_errno": 9,
+        "victim_final_hex": "6f726967696e616c",
+        "victim_reaped": true,
+        "write_results": {
+          "direct": 30,
+          "fd_alias": 30,
+          "self_root": 30,
+          "victim_root": 30
+        }
+      },
+      "mode": "worker-proc-ro",
+      "original_cleanup": true,
+      "original_exec_ack": true,
+      "proc_view": {
+        "controller_layout_sha256": "1499577fb16e6ea7f9b7dea179f1b45ee842320aee3b8c36ccf31526d84b7ca4",
+        "controller_mount_namespace": "mnt:[4026531832]",
+        "full_ci": false,
+        "input_closure_complete": false,
+        "kind": "ci-readonly-proc-view",
+        "mount_layout_sha256": "6509a6254eca46158a7ab354f3d160cff13b093bbcb584506848b7b9742aeecd",
+        "mount_namespace": "mnt:[4026532327]",
+        "pid": 157,
+        "proc_mount_id": 63,
+        "root_identity": [
+          3,
+          1
+        ],
+        "shipping_authority": false,
+        "version": 1,
+        "visible_proc_mounts": [
+          63
+        ],
+        "worker_delta": true
+      },
+      "uid": 1000
+    },
+    "planner_prefix": {
+      "memory": {
+        "mount_readonly": true,
+        "read_control": true,
+        "readonly_fd_write_errno": 9,
+        "victim_final_hex": "6f726967696e616c",
+        "victim_reaped": true,
+        "write_results": {
+          "direct": 30,
+          "fd_alias": 30,
+          "self_root": 30,
+          "victim_root": 30
+        }
+      },
+      "mode": "planner-proc-ro",
+      "original_cleanup": true,
+      "original_exec_ack": true,
+      "proc_view": {
+        "controller_layout_sha256": "1499577fb16e6ea7f9b7dea179f1b45ee842320aee3b8c36ccf31526d84b7ca4",
+        "controller_mount_namespace": "mnt:[4026531832]",
+        "full_ci": false,
+        "input_closure_complete": false,
+        "kind": "ci-readonly-proc-view",
+        "mount_layout_sha256": "6509a6254eca46158a7ab354f3d160cff13b093bbcb584506848b7b9742aeecd",
+        "mount_namespace": "mnt:[4026532327]",
+        "pid": 162,
+        "proc_mount_id": 63,
+        "root_identity": [
+          3,
+          1
+        ],
+        "shipping_authority": false,
+        "version": 1,
+        "visible_proc_mounts": [
+          63
+        ],
+        "worker_delta": true
+      },
+      "uid": 1001
+    },
+    "prior_eight_cases_passed": true,
+    "original_resource_subtree_removed": true,
+    "resource_exhausted": false
+  },
+  "unchanged_worker_cargo_pause": {
+    "passed": false,
+    "exit": 101,
+    "seconds": 116.3,
+    "evidence_sha256": "f1d4906e257a4cee946fbbaad3999068e8622b061ee0780ca8869936dee420ab",
+    "result": "/tmp/autoship-1703-ci-worker-proc-pause-result-20261107.json",
+    "inspection": "/tmp/autoship-ci-worker-proc-pause-inspection-20261107.json",
+    "audit": "/tmp/autoship-ci-worker-proc-pause-audit-20261107.json",
+    "three_worker_views": [
+      {
+        "pid": 151,
+        "mount_namespace": "mnt:[4026532327]",
+        "controller_mounts": 20,
+        "process_mounts": 21
+      },
+      {
+        "pid": 157,
+        "mount_namespace": "mnt:[4026532328]",
+        "controller_mounts": 20,
+        "process_mounts": 21
+      },
+      {
+        "pid": 164,
+        "mount_namespace": "mnt:[4026532329]",
+        "controller_mounts": 20,
+        "process_mounts": 21
+      }
+    ],
+    "worker_phases": [
+      "worker_entry_check",
+      "worker_enrolled",
+      "worker_granted",
+      "worker_launch_wait",
+      "worker_launch",
+      "worker_entry_check",
+      "worker_enrolled",
+      "worker_granted",
+      "worker_pause_wait",
+      "freezing_workers",
+      "frozen_workers",
+      "worker_uid_census",
+      "worker_pause_verified",
+      "workers_thawed",
+      "worker_request_failed",
+      "worker_request_failed"
+    ],
+    "actual_cargo_proc_observations": {
+      "/ci-source-generations/48d3c642-c2ca-4305-8323-9c0aec01aa8f/target/.cargo-execution-6d64ddcd-5ae0-4c55-b0ec-58df52b78675/command-0/proc-view.json": {
+        "controller_layout_sha256": "c08a8944248f6e9bc18f3309925dbfa640fe61ad2f51bcc517f78f60ac5b957f",
+        "controller_mount_namespace": "mnt:[4026531832]",
+        "full_ci": false,
+        "input_closure_complete": false,
+        "kind": "ci-readonly-proc-view",
+        "mount_layout_sha256": "96cec37287274a65542fead481e83c1f02a149e8843d7d4da4c755756574f9b8",
+        "mount_namespace": "mnt:[4026532330]",
+        "pid": 172,
+        "proc_mount_id": 133,
+        "root_identity": [
+          3,
+          1
+        ],
+        "shipping_authority": false,
+        "version": 1,
+        "visible_proc_mounts": [
+          133
+        ],
+        "worker_delta": false
+      }
+    },
+    "gcc_observation": {
+      "binding": {
+        "authority_sha256": "d01101121a4ca3a241acb0f41a44b6bbb4cf922352ca4575e16b1bae6ee175cf",
+        "cache_identity_sha256": "668230d6c5d4988e24dc47fe407f0ce4a0a8b905a5780ae75750cc8be2223784",
+        "contract_sha256": "b4c27b5ad65ae13a64a2d657b0fc16f254d42d275655b551b999d4512ba4c189",
+        "generation": "48d3c642-c2ca-4305-8323-9c0aec01aa8f",
+        "head": "17a74fb41d6e3ba5a6eedc81f26795d40ae7e4d3",
+        "source_inputs_sha256": "fc40d1c5ae47fb57d319cce40d5de5b72f02762013879e69f88cbb7e0020daa3",
+        "tree": "9ec0e6e478a7569affa5ea10f8fae8af1a62a720"
+      },
+      "command": "dc9ae016-3a08-4f74-b150-c2a06d1aabfa",
+      "denied_execs": 0,
+      "exec_observed": true,
+      "initial_attempts": 4,
+      "kind": "ci-exec-mediation-observation",
+      "notification_errors": 0,
+      "ordinal": 7,
+      "policy_dispositions": [
+        {
+          "after_ack": false,
+          "allowed": true,
+          "clone_flags": 0,
+          "disposition": "exec",
+          "nr": 59,
+          "pid": 368,
+          "response_errno": 0
+        },
+        {
+          "after_ack": false,
+          "allowed": true,
+          "clone_flags": 0,
+          "disposition": "exec",
+          "nr": 59,
+          "pid": 368,
+          "response_errno": 0
+        },
+        {
+          "after_ack": false,
+          "allowed": true,
+          "clone_flags": 0,
+          "disposition": "exec",
+          "nr": 59,
+          "pid": 368,
+          "response_errno": 0
+        },
+        {
+          "after_ack": false,
+          "allowed": true,
+          "clone_flags": 0,
+          "disposition": "exec",
+          "nr": 59,
+          "pid": 368,
+          "response_errno": 0
+        },
+        {
+          "after_ack": true,
+          "allowed": false,
+          "clone_flags": 0,
+          "disposition": "unsupported_vfork",
+          "nr": 58,
+          "pid": 368,
+          "response_errno": 38
+        },
+        {
+          "after_ack": true,
+          "allowed": false,
+          "clone_flags": 0,
+          "disposition": "unsupported_vfork",
+          "nr": 58,
+          "pid": 368,
+          "response_errno": 38
+        },
+        {
+          "after_ack": true,
+          "allowed": false,
+          "clone_flags": 0,
+          "disposition": "unsupported_vfork",
+          "nr": 58,
+          "pid": 368,
+          "response_errno": 38
+        },
+        {
+          "after_ack": true,
+          "allowed": false,
+          "clone_flags": 0,
+          "disposition": "unsupported_vfork",
+          "nr": 58,
+          "pid": 368,
+          "response_errno": 38
+        }
+      ],
+      "returncode": 1,
+      "shipping_authority": false,
+      "version": 1
+    },
+    "held_status": {
+      "binding": {
+        "authority_sha256": "d01101121a4ca3a241acb0f41a44b6bbb4cf922352ca4575e16b1bae6ee175cf",
+        "cache_identity_sha256": "668230d6c5d4988e24dc47fe407f0ce4a0a8b905a5780ae75750cc8be2223784",
+        "contract_sha256": "b4c27b5ad65ae13a64a2d657b0fc16f254d42d275655b551b999d4512ba4c189",
+        "generation": "48d3c642-c2ca-4305-8323-9c0aec01aa8f",
+        "head": "17a74fb41d6e3ba5a6eedc81f26795d40ae7e4d3",
+        "source_inputs_sha256": "fc40d1c5ae47fb57d319cce40d5de5b72f02762013879e69f88cbb7e0020daa3",
+        "tree": "9ec0e6e478a7569affa5ea10f8fae8af1a62a720"
+      },
+      "command": "dc9ae016-3a08-4f74-b150-c2a06d1aabfa",
+      "exec_observed": true,
+      "ordinal": 7,
+      "policy_hold": "input_census_unknown",
+      "returncode": 1,
+      "version": 4
+    },
+    "jobserver_loan_returned": true,
+    "original_resource_subtree_removed": true,
+    "actual_error": "collect2: vfork: Function not implemented"
+  },
+  "spec_audit": {
+    "scope": "worker/planner private proc and adjacent proc-memory subsection",
+    "material_findings": 0,
+    "full_handoff_audit": false
+  },
+  "full_writer_closure": false,
+  "descriptor_ingress_lifetime_closed": false,
+  "input_closure_complete": false,
+  "native_proxy_admission": false,
+  "runtime_vfork_admission": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "deployed": false,
+  "autonomous_merges_claimed": 0
+}
