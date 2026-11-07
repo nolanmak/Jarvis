@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "kind": "v3-post-ready-status-signal-component",
+  "baseline": "3db416ffe44248d5c59f5ed67180dbfb4311c0f7",
+  "source_sha256": {
+    "crates/augmentagent-cli/build.rs": "b6fd69f4f80b565556e0a7f771e0e134d6a07b0abb1ae354a1015aec2eab1cbd",
+    "crates/augmentagent-cli/src/ci_cargo_status_proxy.c": "4abed1f0fc5de14bb55ef69de4184ec15fd00961af5e819a31b175cd6480374c",
+    "crates/augmentagent-cli/src/ci_cargo_status_wire.h": "8aaa08e261006a0402726780477d225b678831e379a1b7685d05d3cc2f9e4ef0",
+    "crates/augmentagent-cli/src/ci_cargo_relay.c": "3704f74ed044f6df693a6835b6a2176d88b3107598e75958b316a249de06ed6b",
+    "crates/augmentagent-cli/src/ci_cargo_exec.c": "c9564ede10d4ec5f1b34eef5c5d0b8bba2b49e487da6cf5a496bc4cacb3bb727",
+    "crates/augmentagent-cli/src/self_improve_ci_acceptance.rs": "2aa821683a08234f8797a681ee00ccc52acc9c7a999b3e4685409d1855108768",
+    "scripts/tests/ci_cargo_status_proxy_test.py": "aeee92cfeed62c22670f8c3fa0a13086167c67bdc2ad25db910b6af1ecab2ea3"
+  },
+  "implementation": "Static post-ready V3 component shares exact response/signal/terminal code with the original V2/V3 relay. No caller switched to native proxy exec.",
+  "red": {
+    "log": "/tmp/autoship-ci-status-proxy-red-20261107.log",
+    "test_methods": 8,
+    "result": "nonzero: static component did not exist",
+    "subtest_failures": 19,
+    "errors": 3
+  },
+  "host": {
+    "component_cases": 9,
+    "component_log": "/tmp/autoship-ci-status-proxy-fds-20261107.log",
+    "component_seconds": 0.538,
+    "python": {
+      "log": "/tmp/autoship-ci-status-proxy-python-20261107.log",
+      "passed": 717,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 42.97
+    },
+    "rust": {
+      "log": "/tmp/autoship-ci-status-proxy-rust-portable-20261107.log",
+      "passed": 38,
+      "failed": 0,
+      "ignored": 28,
+      "seconds": 20.8,
+      "component_cases_required": 9
+    }
+  },
+  "verified_behavior": [
+    "Static ELF has no PT_INTERP.",
+    "Actual inherited socket is matched to sealed 64-byte continuation, exact PID/UID/GID, peer credentials and cookie, connected AF_UNIX seqpacket type and bounded absolute monotonic deadline.",
+    "V3 requires tool-start before native terminal status; bad sequencing, malformed frames and received rights are refused.",
+    "Pending signals are forwarded before tool-start and formerly ignored signals after handler ownership; native parent observes actual fatal signal status.",
+    "Binary stdout/stderr bytes, non-CLOEXEC inherited FIFO lifetime and exec CLOEXEC closure are preserved.",
+    "Wrong/unsealed/extended continuation, identity/cookie mismatch, stream transport, disconnect and deadline fail with infrastructure status 125.",
+    "Original relay code and real Rust spawn/async-Popen/closefrom/stdio/signal tests remain passing."
+  ],
+  "authority_boundary": "Continuation consistency and component exit are not execution admission. Runtime must bind immutable image/configuration, actual root peer, live staging operation, original owner/model/source/resource context and kernel notification before exec. Same-UID conformance does not prove runtime root-role admission.",
+  "spec_audit": {
+    "agent": "ci_status_component_spec_audit_20261107",
+    "result": "No substantiated findings in this bounded component contract; full mechanism remains unfinished."
+  },
+  "vm": null,
+  "component_implemented": true,
+  "runtime_root_role_policy_changed": false,
+  "root_role_admission_proved": false,
+  "native_handoff_integrated": false,
+  "real_v3_proxy_complete": false,
+  "compiler_compatible": false,
+  "complete_writer_coverage": false,
+  "input_closure_complete": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "production_runtime_changed": false,
+  "autonomous_merges_claimed": 0,
+  "remaining": [
+    "Shared-mm-safe original client hook and synchronous errno/PATH/FD semantics before successful exec.",
+    "Exact immutable image/configuration and live root-admission factory; all original writers, mutable pointers, signal/cancellation intervals and resource/supervision joins.",
+    "Actual kernel-observed native handoff with this component and unchanged compiler/worker/generated-publication regressions.",
+    "Full C/R source/input/effect/projection and owner productive bridge, hosted checks, managed rollout and full epic acceptance."
+  ]
+}

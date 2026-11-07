@@ -384,6 +384,90 @@ focused Rust checks passed. See [bounded writer-route evidence](ci-cross-memory-
 these observations do not establish the remaining complete writer or input
 proofs.
 
+#### Post-ready V3 status/signal component
+
+Implement a separate static `ci_cargo_status_proxy` image for the part of
+`delegate_exec` after staging-ready. C owns the component; R retains the original
+PID/wait, execution observation, resources and cleanup. Share its response,
+signal-forwarding and terminal-status code with the existing V2/V3 relay, so a
+second implementation cannot quietly disagree with that protocol. The existing
+relay still performs its original signal setup, CLOEXEC closure and wait; this
+extraction does not switch callers to native proxy exec. The separate image
+must have no ELF interpreter and takes exactly one numeric inherited config FD
+with an empty environment.
+
+**Transport continuation is not execution admission.** The 160-byte original V3
+root configuration and live admission remain separate from the following
+64-byte sealed continuation. This component verifies that its inherited channel
+matches the continuation; it cannot establish that the continuation was approved.
+Before runtime native exec, the original controller must independently bind the
+immutable image, continuation bytes/FDs, actual root peer, live staging operation,
+original model/source/owner/resource context and current kernel notification.
+Root V3 server-role/credential/group policy remains mandatory in that admission.
+Neither a valid capsule, a matching peer supplied in it, nor component exit zero
+can replace that proof. Host/guest same-UID socket tests are protocol conformance,
+not proof of runtime root-role admission. There is no runtime admission switch
+or model-selectable bypass in this component.
+
+Use this fixed little-endian x86-64 continuation layout, with no appended data:
+
+| Offset | Field | Meaning |
+| --- | --- | --- |
+| 0 | magic, 8 bytes | JARVPXY3 |
+| 8 | version, u32 | 1 |
+| 12 | connection, i32 | inherited connected control FD, 3..65535, distinct from config |
+| 16/20/24 | client_pid/client_uid/client_gid, u32 | exact current real/effective/saved identities; client UID/GID nonzero |
+| 28/32/36 | server_pid/server_uid/server_gid, u32 | exact current SO_PEERCRED, PID nonzero and distinct from client |
+| 40 | socket cookie, u64 | nonzero exact SO_COOKIE of the inherited client endpoint |
+| 48 | deadline, i64 | original absolute monotonic milliseconds, not a refreshed timeout |
+| 56 | reserved, u64 | zero |
+
+The config must be an anonymous regular memfd with exactly 64 bytes and all of
+WRITE/GROW/SHRINK/SEAL seals. Its owner must be root or the current client; this
+is an input-consistency restriction, not provenance/admission authority. Reject
+all identity, version, reserved, seal, size and cookie mismatches. Require a
+connected AF_UNIX SOCK_SEQPACKET endpoint and a future deadline no more than
+900000 ms away. Close only the config FD at setup; keep original stdio and
+non-CLOEXEC inherited descriptors intact. The native exec itself closes original
+CLOEXEC descriptors. The component sets no-new-privileges/exec denial and disables
+dumpability; those actions cannot retroactively protect its pre-instruction
+interval from shared-mm writers. The complete writer and immutable-image/config
+proofs above remain prerequisites to runtime exec admission.
+
+Staging-ready has already been consumed by the original caller. The component
+blocks signals until configuration/channel validation and forwarding handlers
+are installed, then forwards ordinary signals as existing JARVSIG3 frames even
+if the old caller ignored or blocked them. The launcher must protect the earlier
+exec interval too; a signal already discarded before proxy ownership is not
+recoverable. The actual delegated tool's requested mask/dispositions remain in
+the original argument payload, outside this continuation. Preserve its separate
+V3 tool-start acknowledgement: require exact JARVRSP3 stage 2/value 0, then stage
+3/exit value 0..255 or stage 5/a representable fatal signal. Retain the existing
+fatal-signal reproduction rules. Reordered, malformed, oversized, rights-bearing,
+disconnected or expired control is infrastructure exit 125. This exit value by
+itself is not a source/policy verdict. The proxy never writes or consumes caller
+stdio and does not create another process or resource grant.
+
+The component tests must execute this exact static binary against real sockets
+and kernel signals: normal status, pending signals before start, previously
+ignored signals after handler ownership, original parent native signal status,
+invalid sequencing/control/rights, invalid or unsealed continuation, identity and
+cookie mismatch, stream-socket rejection, disconnect and deadline. Verify binary
+stdio bytes and inherited FIFO lifetime, including native CLOEXEC closure. Keep
+the original Rust spawning/async-Popen/closefrom/stdio/signal tests through the
+shared code. Run the component conformance on host and declared guest, retaining
+original resource teardown and false full-CI/shipping flags.
+
+The next integration gate remains C/R-owned: actual shared-mm-safe pre-exec
+client hook, synchronous errno/PATH behavior before successful exec, immutable
+image/config and exact live root-admission factory, all writer control, native
+exec observation, V3 signal/cancellation intervals, effect/input/source/resource
+proofs and parent resume. Trigger is before any production vfork continuation or
+final-C grant; carrying cost is a new measured native asset and fixed input ABI,
+with no execution permission or durable grant added here. Root-role integration
+and the unchanged compiler/worker/generated-publication regressions remain
+mandatory. Do not turn component conformance into an original fixture pass.
+
 ### O3. Freeze before capturing a live parent's input
 
 First capture the child's original request, exact stdin to EOF and verified

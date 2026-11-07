@@ -21,6 +21,10 @@ const CARGO_VFORK_PROXY:&[u8]=include_bytes!(concat!(env!("OUT_DIR"),"/ci_cargo_
 #[cfg(all(target_os="linux",target_arch="x86_64"))]
 const CARGO_VFORK_CASES:&[u8]=include_bytes!("ci_cargo_vfork_exec_cases.py");
 #[cfg(all(target_os="linux",target_arch="x86_64"))]
+const CARGO_STATUS_PROXY:&[u8]=include_bytes!(concat!(env!("OUT_DIR"),"/ci_cargo_status_proxy"));
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+const CARGO_STATUS_PROXY_CASES:&[u8]=include_bytes!("../../../scripts/tests/ci_cargo_status_proxy_test.py");
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
 const CARGO_RELAY_LIBRARY:&[u8]=include_bytes!(concat!(env!("OUT_DIR"),"/libci_cargo_relay.so"));
 
 /// Credential and V3 transport feasibility only. Generated input closure,
@@ -507,6 +511,77 @@ fn native_vfork_exec_boundary_preserves_real_parent_release_and_refuses_wrong_im
     let diagnostics=String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(),"native vfork boundary failed: {diagnostics}");
     assert!(diagnostics.contains("Ran 6 tests") && !diagnostics.contains("skipped"),"vfork cases did not execute: {diagnostics}");
+}
+
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[test]
+fn native_v3_status_component_preserves_protocol_signals_and_inherited_descriptors() {
+    let directory=tempfile::tempdir().unwrap();
+    for (name,bytes) in [("native.so",CARGO_EXEC_DENIAL_LIBRARY),("ci_cargo_status_proxy",CARGO_STATUS_PROXY)] {
+        let path=directory.path().join(name);std::fs::write(&path,bytes).unwrap();
+        std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests/ci_cargo_status_proxy_test.py");
+    let output=std::process::Command::new("python3").arg("-I").arg(tests)
+        .env("AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY",directory.path().join("native.so")).output().unwrap();
+    let diagnostics=String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(),"V3 status component failed: {diagnostics}");
+    assert!(diagnostics.contains("Ran 9 tests") && !diagnostics.contains("skipped"),"component cases did not execute: {diagnostics}");
+}
+
+/// Protocol conformance only; root-role admission and native handoff remain separate.
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_v3_status_component()->Result<()> {
+    let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private evidence required");
+    std::fs::create_dir(&evidence)?;std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"shared-ci-v3-status-component",None)?;
+    audit.require_run_resources()?;
+    let target=crate::build_storage::effective_target(&owner);
+    let storage=crate::build_storage::admit_ci(&owner,&target).await?;
+    let fixture=tempfile::Builder::new().prefix("status-component-fixture-").tempdir_in(&target)?;
+    let root=fixture.path();
+    for (name,bytes) in [("native.so",CARGO_EXEC_DENIAL_LIBRARY),("ci_cargo_status_proxy",CARGO_STATUS_PROXY),
+        ("cases.py",CARGO_STATUS_PROXY_CASES)] {
+        let path=root.join(name);std::fs::write(&path,bytes)?;
+        std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700))?;
+    }
+    git(root,&["init","-q"]).await?;git(root,&["add","."]).await?;
+    git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","commit","-qm","status component fixture"]).await?;
+    let head=git(root,&["rev-parse","HEAD"]).await?.trim().to_owned();
+    git(root,&["update-ref","refs/remotes/origin/main",&head]).await?;
+    let binding=binding(root).await?;let session=vm::Session::prepare(&owner,&target)?;
+    let source=snapshot(root,&binding,&target).await?;
+    let command=r#"python3 -I - <<'PY'
+import hashlib,importlib.util,io,json,os,pathlib,shutil,unittest
+for name in ('native.so','ci_cargo_status_proxy'):
+ shutil.copyfile('/workspace/'+name,'/workspace/target/'+name)
+ pathlib.Path('/workspace/target/'+name).chmod(0o700)
+os.environ['AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY']='/workspace/target/native.so'
+spec=importlib.util.spec_from_file_location('status_component_cases','/workspace/cases.py')
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+suite=unittest.defaultTestLoader.loadTestsFromModule(module);diagnostics=io.StringIO()
+result=unittest.TextTestRunner(stream=diagnostics).run(suite)
+record={'run':result.testsRun,'failed':len(result.failures),'errors':len(result.errors),'skipped':len(result.skipped),
+ 'successful':result.wasSuccessful(),'client_uid':os.getuid(),'client_gid':os.getgid(),
+ 'component_sha256':hashlib.sha256(pathlib.Path('/workspace/target/ci_cargo_status_proxy').read_bytes()).hexdigest(),
+ 'root_role_admission_proved':False,'native_handoff_integrated':False,'full_ci_pass':False,'shipping_authority':False}
+assert record['run']==9 and record['skipped']==0 and record['successful'],diagnostics.getvalue()
+print(json.dumps(record))
+PY"#;
+    let result=session.run("repository",&source,root,&binding,None,&[],&[],&[],Some(command),
+        &storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
+    let cases:serde_json::Value=serde_json::from_str(&result.stdout).unwrap_or(serde_json::Value::Null);
+    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({
+        "version":1,"kind":"real_shared_ci_v3_status_component","head":head,"generation":source.generation(),
+        "status":result.status,"cases":cases,"actual_vm_commands":1,"input_closure_complete":false,
+        "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
+    ensure!(result.status=="passed" && cases["run"]==9 && cases["successful"]==true && cases["skipped"]==0,
+        "V3 status component unavailable: {} {}",result.stdout,result.stderr);
+    Ok(())
 }
 
 /// Separate feasibility only: no candidate/runtime activation or passing-CI grant.
