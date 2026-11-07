@@ -591,8 +591,18 @@ At baseline `eaeabe91`, the root-controlled guest regression failed after 92.59
 seconds: actual worker raw exec calls returned EPERM, original exec/reap
 succeeded, but the controller observed zero denial notifications. This is a
 real constructor/listener composition failure, independent of the earlier
-same-UID vfork fixture. The listener-owned change is under validation; no
-passing root probe or restored compiler/worker/publication result is yet claimed.
+same-UID vfork fixture. At `19a8ffc3`, all six root-controlled cases passed in 91.64 seconds:
+each connected role/descendant produced two actual controller refusals, while
+listener loss returned ENOSYS for both calls. The exact embedded native assets
+were verified, and both original RED/GREEN VM resource subtrees were removed
+without exhaustion. All 733 host Python checks and 39 Rust checks passed (30
+opt-ins ignored in the bulk Rust run). This proves the narrower policy ownership
+boundary, not runtime proxy admission. The unchanged original worker/Cargo pause
+fixture still failed in 115.84 seconds with the same InputCensusUnknown evidence
+fingerprint: actual GCC/collect2 hit four refused vfork calls and exited 1. Its
+original child was reaped, version-4 held status retained, jobserver loan returned
+and host VM resource subtree removed. Do not call that original fixture passing.
+See [listener ownership evidence](ci-relay-exec-policy-proof.json).
 C and R own those testable exits before runtime native-handoff activation.
 Carrying cost is three fixed config tags and exact canonical-byte observation;
 there is no durable grant schema or historical owner-preparation rewrite.
