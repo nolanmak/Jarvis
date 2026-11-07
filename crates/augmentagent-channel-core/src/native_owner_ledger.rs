@@ -464,6 +464,15 @@ fn validate_schema(db: &rusqlite::Connection) -> Result<()> {
     }
     Ok(())
 }
+/// Inspect through the current original namespace and the admission history
+/// validator/reservation sum. Never initialize or migrate retained state.
+pub(super) fn inspect_reserved_bytes(root:&Path,lock:&StateLock)->Result<u64> {
+    ensure!(history_bytes(root)?<=HISTORY_LIMIT,R::HistoryCapacity);
+    let Some(db)=super::owner_store::inspect_current(root,lock)? else {return Ok(0)};
+    validate_schema(&db)?;
+    validate_all_history(&db)?;
+    growth(&db)
+}
 impl<'a> Ledger<'a> {
     pub fn open(root: &'a Path, lock: &'a StateLock) -> Result<Self> {
         let held = lock.0.metadata()?;
@@ -1401,6 +1410,52 @@ mod tests {
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         super::super::initialize_native_test_store(root.path());
         root
+    }
+    #[test]
+    fn capacity_inspection_includes_original_pending_transfer_reservations() {
+        let root=fixture();
+        let lock=StateLock::acquire(root.path()).unwrap();
+        let mut ledger=Ledger::open(root.path(),&lock).unwrap();
+        let request=request("capacity-observation");
+        ledger.prepare(&request,&endpoints(&request),u64::MAX).unwrap();
+        let reserved=ledger.reserved_bytes().unwrap();assert!(reserved>0);
+        let state=root.path().canonicalize().unwrap();
+        let policy=root.path().join("capacity-policy.json");
+        super::super::write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/runtime","guest_runtime":"/guest","state_root":state,"memory_mb":512,"max_state_bytes":super::super::SESSION_BYTES,"max_sessions":16,"providers":{}})).unwrap()).unwrap();
+        let before=std::fs::read(root.path().join("runtime-retirement.sqlite")).unwrap();
+        drop(ledger);drop(lock);
+        let report=super::super::state_capacity::inspect_at(Some(&policy));
+        let report=serde_json::to_value(report).unwrap();
+        assert_eq!(report["status"],"capacity-exhausted","pending original transfer reservation falsely reported available native capacity");
+        assert_eq!(report["transfer_reserved_bytes"],reserved);
+        assert_eq!(report["required_reserved_bytes"],super::super::SESSION_BYTES+reserved);
+        assert_eq!(report["blockers"],serde_json::json!(["reserved-bytes"]));
+        assert_eq!(std::fs::read(root.path().join("runtime-retirement.sqlite")).unwrap(),before,"read-only observation mutated original ledger");
+        // The same real ledger transition releases growth only after commit.
+        let lock=StateLock::acquire(root.path()).unwrap();
+        let mut ledger=Ledger::open(root.path(),&lock).unwrap();
+        ledger.commit(&request,seals(&request)).unwrap();
+        assert_eq!(ledger.reserved_bytes().unwrap(),0);
+        let expected=std::fs::read(root.path().join("runtime-retirement.sqlite")).unwrap();
+        drop(ledger);drop(lock);
+        let available=serde_json::to_value(super::super::state_capacity::inspect_at(Some(&policy))).unwrap();
+        assert_eq!(available["status"],"capacity-observed");
+        assert_eq!(available["transfer_reserved_bytes"],0);
+        assert_ne!(available["capacity_fingerprint"],report["capacity_fingerprint"]);
+        assert_eq!(std::fs::read(root.path().join("runtime-retirement.sqlite")).unwrap(),expected);
+        // Corrupt/missing original history must be unknown, never zero growth.
+        let db=rusqlite::Connection::open(root.path().join("runtime-retirement.sqlite")).unwrap();
+        db.execute("UPDATE native_transfer SET request_sha256=?1 WHERE id=?2",params!["f".repeat(64),request.transfer_id]).unwrap();
+        drop(db);
+        let corrupt=std::fs::read(root.path().join("runtime-retirement.sqlite")).unwrap();
+        let unknown=serde_json::to_value(super::super::state_capacity::inspect_at(Some(&policy))).unwrap();
+        assert_eq!(unknown["status"],"observation-unavailable");
+        assert!(unknown.get("capacity_fingerprint").is_none());
+        assert_eq!(std::fs::read(root.path().join("runtime-retirement.sqlite")).unwrap(),corrupt);
+        std::fs::rename(root.path().join("runtime-retirement.sqlite"),root.path().join("retained-original.sqlite")).unwrap();
+        let missing=serde_json::to_value(super::super::state_capacity::inspect_at(Some(&policy))).unwrap();
+        assert_eq!(missing["status"],"observation-unavailable");
+        assert!(!root.path().join("runtime-retirement.sqlite").exists(),"inspection reinitialized missing original ledger");
     }
     #[test]
     fn native_ledger_claims_both_endpoints_and_allows_disjoint_workflows() {

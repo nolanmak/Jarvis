@@ -363,6 +363,19 @@ pub(super) fn current_identity(
     validate_bound_metadata(root, &value)?;
     Ok(value)
 }
+/// Observe an established namespace without migration, initialization or writes.
+/// A partially initialized or legacy ledger is unknown to this observer.
+pub(super) fn inspect_current(root:&Path,lock:&StateLock)->Result<Option<rusqlite::Connection>> {
+    if let Some(expected)=optional::<StoreIdentity>(root,MARKER)? {
+        return Ok(Some(open_bound(root,lock,&expected,true)?));
+    }
+    ensure!(optional::<Bootstrap>(root,BOOTSTRAP)?.is_none(),R::PreparedCorrupt);
+    match root.join(DATABASE).symlink_metadata() {
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>Ok(None),
+        Err(error)=>Err(error.into()),
+        Ok(_)=>Err(R::PreparedCorrupt.into()),
+    }
+}
 pub(super) fn open_bound(
     root: &Path,
     lock: &StateLock,
