@@ -1,0 +1,187 @@
+{
+  "version": 1,
+  "kind": "native-vfork-original-memory-description-lifetime",
+  "source_head": "e86e2972c08954a73615708b8486cf04d6034fb8",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/ci_cargo_vfork_exec_cases.py": "aba745e3d1525fe571463835531b29eef9fd95a4f74c450ab4422e15b35f5113",
+    "crates/augmentagent-cli/src/ci_cargo_exec_memory_cases.py": "acabb40dbbe5cb7638e063f364f3c6d46e7cbbcf356368cd2250457ec2b53654",
+    "scripts/tests/ci_cargo_exec_memory_test.py": "8888e46b788f23c3660f79378ad147b7cfda353d5b7547267780a4e0f95999f3",
+    "crates/augmentagent-cli/src/self_improve_ci_acceptance.rs": "4782eafba19561322a49e3f190ec7e8de388821c83b22531540d6c2ac8e9c3d6",
+    "crates/augmentagent-cli/src/ci_cargo_vfork_producer.c": "aad82a7f1af92ded1a585494753248e1ed69a11460794343225c902977622d95",
+    "crates/augmentagent-cli/src/ci_cargo_vfork_proxy.c": "80fd5f0705502da7baee85d0dc18d88db9649214009d78b209db213e3dd4bb98"
+  },
+  "fixture": "The original producer and static probe source/binaries are unchanged. Test-only controller locates only the fixture-owned4byte shared ELF symbol in the actual original producer mapping. Actual native SYS_vfork and PTRACE_EVENT_EXEC remain mandatory.",
+  "ordering": "Pre-exec: old child memory FD writes42 visible in original parent, then restores41. Post-exec: first consume original parent return frame with41; keep child at original exec stop and original parent waiting; old FD writes99 visible in parent, freshly reopened child mem FD reads the old object address asEIO. Restore41 before detaching child. Original native child wait/status and stdio remain unchanged.",
+  "host_python": {
+    "handle": 29381,
+    "terminal": true,
+    "exit": 0,
+    "tests": 743,
+    "failed": 0,
+    "skipped": 0,
+    "seconds": 43.658,
+    "log": "/tmp/autoship-ci-exec-memory-ordered-python-20261107.log",
+    "log_sha256": "b58f82b244be627363ff6521797589cbd51a48775e494ff49f300fff62812ee2",
+    "supervisor_receipt": "/tmp/autoship-ci-exec-memory-ordered-python-supervisor-20261107.receipt"
+  },
+  "host_rust": {
+    "handle": 45763,
+    "terminal": true,
+    "exit": 0,
+    "tests": 40,
+    "failed": 0,
+    "ignored": 30,
+    "seconds": 11.51,
+    "log": "/tmp/autoship-ci-exec-memory-ordered-rust-20261107.log",
+    "log_sha256": "46c4a2b5bc64a840baa2f7bb5c8be18e578001e9ef93087ae6b1e2e8c32a524f"
+  },
+  "vm": {
+    "handle": 60848,
+    "terminal": true,
+    "exit": 0,
+    "seconds": 95.97,
+    "cases": 7,
+    "result": "/tmp/autoship-1703-ci-exec-memory-ordered-result-20261107.json",
+    "result_sha256": "b5ef257dbe1cb594afb52fc0089a56a8d2216fb8c6510b822c2ed4d3cd33f603",
+    "receipt": "/tmp/augmentagent-ci-exec-memory-ordered-20261107200007/receipt.json",
+    "receipt_sha256": "bf3b770f8885e9e3565900a611d339a8d51521ab7c97fddbfcd2ed00318529f6",
+    "log": "/tmp/autoship-ci-exec-memory-ordered-vm-20261107.log",
+    "log_sha256": "69b0bd4aa363b8dcec18194286dc6228744553b395a1bf1b758257c9a687aca3",
+    "memory_lifetime": {
+      "cloexec_closed_at_exec_stop": true,
+      "complete_writer_closure": false,
+      "feasibility_only": true,
+      "full_ci_pass": false,
+      "image_accepted": true,
+      "mode": "finish",
+      "native_exec_stop": true,
+      "notifications": [
+        {
+          "nr": 59,
+          "pid": 162,
+          "stage": "initial_exec"
+        },
+        {
+          "nr": 58,
+          "pid": 162,
+          "stage": "fixture_vfork_only"
+        },
+        {
+          "image_accepted": true,
+          "nr": 59,
+          "pid": 164,
+          "stage": "verified_exec_stop"
+        }
+      ],
+      "old_parent_value_restored": true,
+      "original_cleanup": true,
+      "original_parent_wait_status": 5888,
+      "parent_released_before_proxy_termination": true,
+      "post_exec_old_fd_mutated_original_parent": true,
+      "post_exec_reopened_child_fd_old_address_errno": 5,
+      "pre_exec_fd_mutated_shared_parent": true,
+      "production_refusal": false,
+      "shared_memory_observed": true,
+      "shipping_authority": false
+    },
+    "production_refusal": {
+      "feasibility_only": true,
+      "full_ci_pass": false,
+      "mode": "production-deny",
+      "notifications": [
+        {
+          "after_ack": false,
+          "allowed": true,
+          "clone_flags": 0,
+          "disposition": "exec",
+          "nr": 59,
+          "pid": 159,
+          "response_errno": 0
+        },
+        {
+          "after_ack": true,
+          "allowed": false,
+          "clone_flags": 0,
+          "disposition": "unsupported_vfork",
+          "nr": 58,
+          "pid": 159,
+          "response_errno": 38
+        }
+      ],
+      "original_cleanup": true,
+      "parent_released_before_proxy_termination": false,
+      "production_refusal": true,
+      "shipping_authority": false
+    },
+    "audit_sha256": "fc056ad5c1aa019727bd7b83064d117c2082a38b4533378bbf6adcad890e248e",
+    "committed_anchor_matches": true,
+    "resource_admission": {
+      "phase": "admitted",
+      "exhausted": false,
+      "original_identity_sha256": "4c1d92d0b8739e70ac81aeec0827e4a9bf49205490a82e9766c051ca91daac94",
+      "limits": {
+        "cpu.max": "200000 100000",
+        "memory.max": "5368709120",
+        "memory.oom.group": "1",
+        "memory.swap.max": "0",
+        "pids.max": "512"
+      },
+      "aggregate_limits": {
+        "cpu_max": "400000 100000",
+        "memory_bytes": 10737418240,
+        "pids": 2048
+      }
+    },
+    "resource_completion": {
+      "phase": "completed",
+      "exhausted": false,
+      "original_identity_sha256": "4c1d92d0b8739e70ac81aeec0827e4a9bf49205490a82e9766c051ca91daac94",
+      "limits": {
+        "cpu.max": "200000 100000",
+        "memory.max": "5368709120",
+        "memory.oom.group": "1",
+        "memory.swap.max": "0",
+        "pids.max": "512"
+      },
+      "aggregate_limits": {
+        "cpu_max": "400000 100000",
+        "memory_bytes": 10737418240,
+        "pids": 2048
+      }
+    },
+    "original_resource_scope_absent": true,
+    "resource_observation_projection": "Public reports omit private cgroup paths and retain the canonical SHA256 of each full original identity. Both original records and their scope observation remain in the protected local audit and /tmp/autoship-ci-exec-memory-ordered-audit-20261107.json; these projections are not executable resource identities."
+  },
+  "initial_experiment": {
+    "code_head": "880ba58fbbb34b2eba776e7d249a65d85686e028",
+    "vm_handle": 48036,
+    "terminal": true,
+    "exit": 0,
+    "cases": 7,
+    "seconds": 97.96,
+    "result": "/tmp/autoship-1703-ci-exec-memory-result-20261107.json",
+    "reason_for_ordered_revision": "Inspection found a timing gap: changing the old shared value before consuming the parent return frame could race its construction. The ordered revision observes memory only after consuming that frame and before child detach. The generic V3 continuation label is consequently not emitted for this memory inspection."
+  },
+  "primary_source_context": {
+    "url": "https://github.com/torvalds/linux/blob/v6.18/fs/proc/base.c",
+    "functions": [
+      "proc_mem_open",
+      "__mem_open",
+      "mem_rw"
+    ],
+    "interpretation": "Upstream implementation retains a selected mm in the opened file and accesses that saved mm. This6.18source is explanatory context, not a claim it is byte-identical to the host or declared guest kernel; the actual runs above supply their own bounded observations."
+  },
+  "conclusion": "An old memory description does not follow the PID into the new image in this controlled case. It still writes the original parent. Child exec-stop is therefore not an original-parent write fence. Both original parent input/effect/resource closure and protection of the new image remain required.",
+  "limits": [
+    "This single-threaded four-byte fixture is not complete descriptor/mapping/cohort/ABI coverage.",
+    "The trusted controller deliberately opens memory FDs outside the inherited unit policy; this is not evidence an untrusted unit may acquire them.",
+    "No live V3 root operation, immutable proxy image/continuation admission factory, source/input/effect transfer, original compiler compatibility or C parent resume is implemented.",
+    "The original unchanged GCC/worker/generated-publication regression remains required and was not rerun to restate its known vfork refusal.",
+    "No production state, native reservation, allowance, owner control, compiler filter or native-vfork permission changed."
+  ],
+  "complete_writer_closure": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "production_runtime_changed": false,
+  "autonomous_merges_claimed": 0
+}

@@ -384,6 +384,39 @@ focused Rust checks passed. See [bounded writer-route evidence](ci-cross-memory-
 these observations do not establish the remaining complete writer or input
 proofs.
 
+#### Original memory descriptions across native exec
+
+The original native producer and static probe now have a separate controlled
+memory-lifetime observation. At the real child's pending exec, the trusted test
+controller opens that child's memory descriptor. Writing the fixture's own
+four-byte `shared` object changes the original parent's view, confirming the
+actual vfork-shared address space. It restores the value before exec proceeds.
+
+After the actual exec stop and receipt of the original parent's return frame,
+the same old descriptor can still change that original parent. A freshly opened
+descriptor for the same child PID instead reports EIO at the old object's now
+unmapped address. The fixture restores the parent value before detaching the
+child; native wait status and original stdout/stderr remain unchanged. The
+ordering matters: changing the value before consuming the return frame could
+race its construction, so the final test waits for that frame first.
+
+This separates the old parent memory lifetime from the new image. It does not
+make the old descriptor safe or turn a child exec stop into a parent write
+fence. Original parent input/effect/resource closure remains required alongside
+new-image integrity, descriptor ingress and the live admission factory. The
+procfs stdio rejection remains necessary. No production vfork, raw exec or
+parent resume is admitted by this observation.
+
+All 743 host Python checks and 40 focused Rust checks passed. The declared VM
+passed seven cases in 95.97 seconds, preserving all six earlier native cases and
+their production-refusal control. Its protected resource admission/completion
+identities matched, completion was not exhausted, and the original scope was
+absent afterward. See [exact evidence](ci-exec-memory-lifetime-proof.json).
+The upstream [proc memory implementation](https://github.com/torvalds/linux/blob/v6.18/fs/proc/base.c)
+is explanatory context for the saved address-space reference, not a claim that
+the tested kernel equals that upstream revision. These remain controlled
+fixture observations, not complete writer closure or an implementation handoff.
+
 #### Post-ready V3 status/signal component
 
 Implement a separate static `ci_cargo_status_proxy` image for the part of
