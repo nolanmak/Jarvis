@@ -1,5 +1,5 @@
-//! Fresh original retained-session metadata inspection. Never execution,
-//! conversation restoration, input nonrelease or completed publication.
+//! Fresh retained-session metadata and borrowed closed-writer observations.
+//! Never execution, conversation restoration or completed publication.
 use super::{ownership::{Authority,PreparationRuntime,RuntimeInventoryRow,TransferBinding,TransferReason as R},owner_ledger::Ledger,StateLock};
 use crate::{AuditLogger,audit_chain::AppendReceipt};
 use anyhow::{ensure,Context,Result};
@@ -45,6 +45,22 @@ pub struct OriginalInputWriterRevocationProof<'a> {metadata:&'a MetadataNativeOw
 impl OriginalInputWriterRevocationProof<'_> {
     pub fn namespace(&self)->&Authority {self.metadata.namespace()}
     pub fn evidence(&self)->&Value {self.evidence}
+    /// Observe an exact request with no original model binding. Reservation
+    /// absence, source freshness and successor admission remain caller joins.
+    /// Unclassified released input refuses even when labelled readonly.
+    pub fn with_unbound_input_nonrelease<T>(&self,request:&str,
+        visit:impl FnOnce(&UnboundNativeInputNonreleaseProof<'_>)->Result<T>)->Result<T> {
+        self.metadata.validate_current()?;
+        let writers=self.evidence["writers"].as_array().context("native nonrelease writer census missing")?;
+        let setup=unbound_input_launches(writers,request)?;
+        let evidence=json!({"version":1,"kind":"unbound_native_input_nonrelease","namespace":self.namespace(),
+            "request_id":request,"original_binding_sha256":digest(self.metadata.binding())?,
+            "native_metadata_sha256":digest(self.metadata.evidence())?,"writer_revocation_sha256":digest(self.evidence)?,
+            "unbound_setup_launches":setup});
+        ensure!(serde_json::to_vec(&evidence)?.len()<=1024*1024,R::HistoryCapacity);
+        self.metadata.validate_current()?;
+        visit(&UnboundNativeInputNonreleaseProof {revocation:self,request,evidence:&evidence})
+    }
     /// Native-only observation for an already-bound original model admission.
     /// Does not grant body replay, source authority or productive setup.
     pub fn with_bound_input_nonrelease<T>(&self, original:&super::OwnerInputReference,
@@ -92,6 +108,31 @@ fn bound_input_launches(writers:&[Value],original:&super::OwnerInputReference)->
     ensure!(!associated.is_empty(),"native nonrelease has no original bound model admission");
     Ok(associated)
 }
+fn unbound_input_launches(writers:&[Value],request:&str)->Result<Vec<Value>> {
+    ensure!(!request.is_empty() && request.len()<=1024,"native nonrelease request exceeds bound");
+    let mut setup=Vec::new();
+    for writer in writers {
+        let prepared=super::PreparedLaunchRecord {
+            intent:serde_json::from_value(writer["launch_intent"].clone())?,
+            controller_receipt:serde_json::from_value(writer["launch_receipt"].clone())?,
+        };
+        prepared.intent.validate()?;
+        let released=writer["release_attempted"].as_bool().context("native nonrelease release disposition missing")?;
+        let reference:Option<super::OwnerInputReference>=serde_json::from_value(
+            writer.get("owner_input").context("native nonrelease owner binding census missing")?.clone())?;
+        if let Some(reference)=reference {
+            reference.validate(&prepared)?;
+            ensure!(reference.request_id!=request,"original native body already has a model binding; bound nonrelease required");
+        }else {
+            // Neither a readonly label nor reservation absence excludes a
+            // possibly released input. Require its separate trusted proof.
+            ensure!(!released,"unclassified original native input release prevents unbound nonrelease");
+            setup.push(json!({"launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,
+                "resource_receipt":writer["resource_receipt"],"closure":writer["closure"]}));
+        }
+    }
+    Ok(setup)
+}
 /// Borrowed original input observation, never a recovered body permission.
 /// Full source proof and original workflow/preparation joins are separate.
 pub struct BoundNativeInputNonreleaseProof<'a> {
@@ -101,6 +142,18 @@ pub struct BoundNativeInputNonreleaseProof<'a> {
 }
 impl BoundNativeInputNonreleaseProof<'_> {
     pub fn original(&self)->&super::OwnerInputReference {self.original}
+    pub fn namespace(&self)->&Authority {self.revocation.namespace()}
+    pub fn binding(&self)->&TransferBinding {self.revocation.metadata.binding()}
+    pub fn evidence(&self)->&Value {self.evidence}
+    pub fn validate_current(&self)->Result<()> {self.revocation.metadata.validate_current()}
+}
+/// Borrowed closed-writer observation. It does not assert SQL reservation
+/// absence or reconstruct a body/continuation capability from that absence.
+pub struct UnboundNativeInputNonreleaseProof<'a> {
+    revocation:&'a OriginalInputWriterRevocationProof<'a>,request:&'a str,evidence:&'a Value,
+}
+impl UnboundNativeInputNonreleaseProof<'_> {
+    pub fn request_id(&self)->&str {self.request}
     pub fn namespace(&self)->&Authority {self.revocation.namespace()}
     pub fn binding(&self)->&TransferBinding {self.revocation.metadata.binding()}
     pub fn evidence(&self)->&Value {self.evidence}
@@ -346,6 +399,44 @@ mod tests {
             "launch_receipt":{"version":1,"sequence":1,"record_sha256":"a".repeat(64),"committed_audit_sha256":"b".repeat(64)},
             "resource_receipt":{"version":1,"sequence":2,"record_sha256":"c".repeat(64),"committed_audit_sha256":"d".repeat(64)},
             "owner_input":original,"release_attempted":released,"closure":{"kind":"completed_native_transfer"}})
+    }
+    #[test]
+    fn unbound_nonrelease_accepts_closed_unexposed_setup_and_retains_its_launch() {
+        let setup=writer(None,false);
+        let selected=unbound_input_launches(&[setup.clone()],"original-request").unwrap();
+        assert_eq!(selected.len(),1);assert_eq!(selected[0]["launch_intent"],setup["launch_intent"]);
+        assert!(unbound_input_launches(&[],"original-request").unwrap().is_empty());
+    }
+    #[test]
+    fn unbound_nonrelease_refuses_an_existing_binding_even_without_release() {
+        let original=reference("original-request");
+        for released in [false,true] {
+            assert!(unbound_input_launches(&[writer(Some(&original),released)],"original-request").is_err());
+        }
+    }
+    #[test]
+    fn unbound_nonrelease_cannot_relabel_preparation_or_generic_release() {
+        for role in [Value::Null,json!({"transport_role":"fresh_tool_free_review"}),
+                json!({"readonly_review":true,"host_tool_channel":"absent"})] {
+            let mut exposed=writer(None,true);exposed["readonly_transport"]=role;
+            assert!(unbound_input_launches(&[exposed],"original-request").is_err());
+        }
+    }
+    #[test]
+    fn unbound_nonrelease_keeps_other_bound_requests_separate() {
+        let prior=reference("previous-request");let setup=writer(None,false);
+        let selected=unbound_input_launches(&[writer(Some(&prior),true),setup.clone()],"original-request").unwrap();
+        assert_eq!(selected.len(),1);assert_eq!(selected[0]["launch_intent"],setup["launch_intent"]);
+    }
+    #[test]
+    fn unbound_nonrelease_requires_explicit_input_identity_and_release_disposition() {
+        for field in ["owner_input","release_attempted","launch_intent","launch_receipt"] {
+            let mut setup=writer(None,false);setup.as_object_mut().unwrap().remove(field);
+            assert!(unbound_input_launches(&[setup],"original-request").is_err(),"missing {field}");
+        }
+        for request in ["",&"x".repeat(1025)] {
+            assert!(unbound_input_launches(&[],request).is_err());
+        }
     }
     #[test]
     fn bound_nonrelease_keeps_other_requests_distinct_from_the_original() {

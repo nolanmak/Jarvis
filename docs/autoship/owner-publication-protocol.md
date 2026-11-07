@@ -698,3 +698,58 @@ The current recovery native namespace is selected through the exact completed fo
 Reopening preparation under that fresh current native proof retains the original input key, activation generation, candidate, protected version-3 preparation and canonical publication. It validates completed canonical/native artifacts as historical evidence through the existing ancestor reader. The completion writer continues to reject a newer namespace as replacement evidence for the original completion; it never rewrites the old completion to match a new claim or native generation. The metadata destination logger remains permanently unable to dispatch models, including after successful settlement. A settlement's `current_context` boolean is descriptive and cannot relax that restriction.
 
 This checkpoint connects authenticated metadata replay and inspection, not the productive owner worker. Its controlled fixtures exercise both provider pins with empty runtime inventory and synthetic acceptance, original core state/locks/audits, interrupted prepared effects, pre-settlement completion, aborts, terminal cleanup and SQL commit failures. They are not a live provider/VM run, actual process-kill acceptance, independently reviewed deployment or productive recovery. The recovery/successor component still owns the reservation-absence lineage change from §45, complete body nonrelease or semantic continuation, ready/consumed successor and actual coding-release constructors. Full C/R source/resource/trusted-input producers, all remaining blocked/correction/storage paths, shared productive gates, worker integration, independent exact-head review, normal rollout and every original live CLI/Discord/merge/soak requirement remain gates. Their producer/constructor integration is the trigger for the next stage; the carrying cost remains strict retained context/native/reservation lineage rather than backfilling permissions from current rows. No completion of this checkpoint authorizes a rollout or a replacement UUID.
+
+## 48. Closed setup without an owner-model binding
+
+Recovery must distinguish a failed native setup before owner-model binding from
+an already-bound body. `with_unbound_input_nonrelease(request_id, visitor)` is a
+separate borrowed observation on `OriginalInputWriterRevocationProof`. It retains
+the original native state/session/audit locks and exact current namespace/store
+binding; the original metadata producer must already have established the full
+namespace census, actual retained inventory/resource quiescence and permanent
+closure of every recorded original input writer. Fresh current-policy/metadata
+checks bracket construction, and the visitor can revalidate that same fence.
+Saved JSON, a missing SQL reservation or a PID cannot construct this capability.
+
+The target request must have no owner-model binding anywhere in that census.
+An existing binding for it refuses even if no release was attempted: that case
+requires the distinct bound-input producer. Other bound requests keep their
+original identities and validated launches; they cannot become this request.
+Unbound setup launches must have explicit known release dispositions and no
+input release attempt. Their exact launch/resource/closure references are
+retained in bounded evidence. A complete launch-free census is allowed, but an
+empty caller-supplied list cannot create the original locked proof. Missing
+binding-census fields, unknown dispositions, invalid launches and possibly
+released unclassified input refuse.
+
+The proof observes native input history for the named request; it does not prove
+SQL reservation absence, source freshness, original preparation identity or
+permission to run a coding body. D/R must join it to the immutable original
+reservation/absence lineage and the §4 ready/consumed successor bridge, and must
+repeat original current scope/source/resource/authorization gates at the real
+input constructor. This is required before the successor path can release any
+model or input. The bridge and productive constructor remain unimplemented;
+there is no worker activation or ordinary model observer installed here.
+
+A released independent-preparation input remains an unclassified release for
+this producer, even when its protected record describes a readonly transport.
+That description is explicitly not a readonly kernel/source/resource proof.
+C/R must provide and join the corresponding trusted exclusion before such a
+history can satisfy coding-body nonrelease; this is a load-bearing successor
+activation gate, not a dropped normal-flow requirement. Retain those histories
+for authenticated reconciliation instead of inferring an unsent coding body or
+starting a new conversation. The carrying cost is one borrowed core type and
+bounded evidence schema; no new accounting counter, reservation, transfer UUID,
+model permit or durable execution grant exists.
+
+Tests require the actual retained-session metadata fixture for both native
+provider pins, original core state/ledger/audit locks and completed transfers.
+The closed unbound setup enters the borrowed visitor; an existing bound model,
+released coding body, generic release and both described preparation forms must
+refuse that visitor. A policy change inside it must invalidate the same proof,
+and the original state lock must still be held. These fixtures use synthetic
+protected launch/resource/input records and do not execute a provider, VM or
+crash/reconnect recovery. The classifier tests separately check absent/unknown
+fields, exact request separation and complete launch-free observations; those
+values alone mint no capability. Full productive recovery, C/R and #1715 live
+CLI/Discord/merge/soak acceptance remain required.

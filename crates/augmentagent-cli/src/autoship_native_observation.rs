@@ -935,6 +935,21 @@ pub(crate) mod tests {
                 assert_eq!(closed.evidence()["writers"][0]["release_attempted"],!matches!(original_input,"none"|"owner-unreleased"));
                 let original:augmentagent_channel_core::native_vm::OwnerInputReference=serde_json::from_value(serde_json::json!({"version":1,"workflow":f.lease.workflow,"request_id":"original-request",
                     "dispatch_sequence":1,"model_admission_sequence":2,"model_receipt":"original-model","claim_sha256":"b".repeat(64)})).unwrap();
+                let mut unbound_visited=false;
+                let unbound=closed.with_unbound_input_nonrelease("original-request",|unreleased| {
+                    unbound_visited=true;assert_eq!(unreleased.request_id(),"original-request");
+                    assert_eq!(unreleased.namespace(),proof.namespace());assert_eq!(unreleased.binding(),proof.binding());
+                    assert_eq!(unreleased.evidence()["kind"],"unbound_native_input_nonrelease");
+                    assert_eq!(unreleased.evidence()["unbound_setup_launches"].as_array().unwrap().len(),1);
+                    unreleased.validate_current()?;
+                    let fd=std::fs::OpenOptions::new().read(true).open(native.join("state.lock"))?;
+                    assert_ne!(unsafe{libc::flock(fd.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+                    let policy=std::path::PathBuf::from(std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").unwrap());let saved=std::fs::read(&policy)?;
+                    std::fs::write(&policy,b"{}")?;let changed=unreleased.validate_current();std::fs::write(&policy,&saved)?;
+                    assert!(changed.is_err(),"unbound native nonrelease ignored a changed actual policy");Ok(())
+                });
+                if original_input=="none" {unbound.expect("closed setup without binding or input must prove unbound nonrelease");assert!(unbound_visited);}
+                else {assert!(unbound.is_err());assert!(!unbound_visited,"bound or unclassified input acquired unbound nonrelease");}
                 let mut nonrelease_visited=false;
                 let result=closed.with_bound_input_nonrelease(&original,|unreleased| {
                     nonrelease_visited=true;assert_eq!(unreleased.original(),&original);assert_eq!(unreleased.namespace(),proof.namespace());assert_eq!(unreleased.binding(),proof.binding());
