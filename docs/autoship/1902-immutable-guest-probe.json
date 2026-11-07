@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1902,
+  "kind": "disposable-immutable-ext4-guest-observation",
+  "status": "tested prerequisite; no production fencing, capacity grant or restoration",
+  "source_base": "c2530c52d877d90da7ee4cf832d9bdf98147560e",
+  "storage_regression": {
+    "test": "build_storage::inherited_ci_storage_tests::managed_command_exports_leases_before_manager_cancellation",
+    "red_log": "/tmp/autoship-managed-command-inherited-storage-red-20261107.log",
+    "red_result": "Actual run_command child received no exported storage descriptors.",
+    "green_log": "/tmp/autoship-managed-command-inherited-storage-green-20261107.log",
+    "green_result": "Actual detached child retained global, updater and physical-target exclusion after original manager future was canceled; stopping the child released them.",
+    "suite_log": "/tmp/autoship-managed-command-inherited-storage-suite-20261107.log",
+    "suite_result": "9 passed,0 failed;1.95s before the additional spawn-failure regression."
+  },
+  "guest_probe": {
+    "all_descendants_reaped": true,
+    "fixture_sha256": "07a529a4ef0db0a62ddaea464040beb91d06021077b7bd49ae3ac27a88b2ffbe",
+    "grants_capacity": false,
+    "guest": {
+      "kind": "guest_kernel",
+      "release": "7.0.0-31-generic",
+      "uid": 0
+    },
+    "host_kernel_verified": false,
+    "host_root_used": false,
+    "kernel_image_sha256": "c85962fc9bbccc7f49141800a896f72734ebe16fd175dd46d9b4206556ed0d09",
+    "observation": {
+      "grants_capacity": false,
+      "observations": [
+        {
+          "case": "directory",
+          "creation": {
+            "denied": true,
+            "errno": 1
+          },
+          "denied": true,
+          "fixture_only": true,
+          "flag_enabled": true,
+          "original_bytes_preserved": true,
+          "removal": {
+            "denied": true,
+            "errno": 1
+          },
+          "supported": true
+        },
+        {
+          "case": "new-open",
+          "denied": true,
+          "errno": 1,
+          "fixture_only": true,
+          "flag_enabled": true,
+          "original_bytes_preserved": true,
+          "supported": true
+        },
+        {
+          "case": "existing-fd",
+          "denied": true,
+          "errno": 1,
+          "fixture_only": true,
+          "flag_enabled": true,
+          "original_bytes_preserved": true,
+          "supported": true
+        },
+        {
+          "case": "existing-mapping",
+          "denied": true,
+          "fixture_only": true,
+          "flag_enabled": true,
+          "original_bytes_preserved": true,
+          "supported": true,
+          "writer_status": 7
+        },
+        {
+          "case": "pending-open",
+          "denied": true,
+          "fixture_only": true,
+          "flag_enabled": true,
+          "original_bytes_preserved": true,
+          "supported": true,
+          "writer_status": 20480
+        }
+      ],
+      "production_state_changed": false,
+      "status": "observed"
+    },
+    "prefaulted_mapping": {
+      "case": "prefaulted-shared-mapping",
+      "denied": true,
+      "fixture_only": true,
+      "flag_enabled": true,
+      "original_bytes_preserved": true,
+      "supported": true,
+      "writer_status": 7
+    },
+    "production_state_changed": false,
+    "status": "observed",
+    "supervisor_exit": 0
+  },
+  "guest_log": "/tmp/autoship-native-custody-immutable-guest-prefaulted-20261107.log",
+  "reproduction": {
+    "build": "CARGO_TARGET_DIR=<existing registered target> CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 scripts/cargo-managed.sh build -p augmentagent-cli --bin augmentagent",
+    "run": "<same target>/debug/augmentagent disk build --target-dir <same target> /usr/bin/python3 -I scripts/tests/native_custody_immutable_vm_probe.py",
+    "placement": "Only managed target/tmp; fixed 64 MiB disposable ext4 image; 512 MiB no-NIC QEMU guest; host /usr read-only; real storage descriptors forwarded through original provider supervisor; cleanup receipt required before removing temporary assets."
+  },
+  "primary_sources": [
+    {
+      "url": "https://raw.githubusercontent.com/torvalds/linux/v7.0/fs/ext4/ioctl.c",
+      "relevance": "ext4_ioctl_setflags waits for direct IO and flushes cached file pages when enabling immutable. This source explanation does not verify the installed host kernel."
+    },
+    {
+      "url": "https://raw.githubusercontent.com/torvalds/linux/v7.0/fs/ext4/file.c",
+      "relevance": "ext4_generic_write_checks refuses immutable-file writes, including writes through a previously opened descriptor."
+    },
+    {
+      "url": "https://raw.githubusercontent.com/torvalds/linux/v7.0/fs/ext4/inode.c",
+      "relevance": "ext4_page_mkwrite refuses writable faults on immutable files."
+    }
+  ],
+  "limits": [
+    "Guest kernel 7.0.0-31 differs from host 7.0.0-30. host_kernel_verified remains false; the pending owner-only host fixture was not run or altered.",
+    "Tests are serial fence-transition observations; concurrent mutation during multi-file fencing, all writer ingress, supported filesystems and capability assumptions remain separate obligations.",
+    "No privileged host helper, immutable custody journal, admission/accounting consumer or production permission change is implemented by these probes. Existing eight sessions and all reservations remain intact.",
+    "No original-input nonrelease, process quiescence, source closure, replay authority or productive coding guard follows from immutable-file observations.",
+    "OT1-OT5 in the retained-write-fence design remain open; this is not a design handoff or activation approval."
+  ],
+  "source_sha256": {
+    "crates/augmentagent-cli/src/build_storage.rs": "d3520a9a64223af2e938ab60a53e046727cb6bbbc936a31945260c5058b2f50c",
+    "scripts/tests/native_custody_immutable_probe.py": "07a529a4ef0db0a62ddaea464040beb91d06021077b7bd49ae3ac27a88b2ffbe",
+    "scripts/tests/native_custody_immutable_vm_probe.py": "a318af0b80713f20b9f8b98e04810d9bf7527bf0f8dec945ad3bc37c6f192818",
+    "scripts/codex-build-vm.py": "a77ff21b703423ab7654528e1846b9a8d5439a2e4e4813c9c68044692feac711",
+    "scripts/provider-supervisor.py": "10929702ac75f16314592bd2c0ca80d12b4aa0c44ed44097b5b88f85bf09c201"
+  },
+  "storage_fix_commit": "d42cbdc6d981cb86285e00c91c07d54a8faba955",
+  "validation": {
+    "full_cli": {
+      "log": "/tmp/autoship-managed-command-inherited-storage-cli-20261107.log",
+      "result": "1963 passed,0 failed,34 ignored;438.82s; includes detached-descendant cancellation and failed-spawn descriptor release"
+    },
+    "production_check": {
+      "log": "/tmp/autoship-managed-command-inherited-storage-production-20261107.log",
+      "result": "passed;10.05s"
+    }
+  }
+}
