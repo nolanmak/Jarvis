@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "kind": "sealed-descriptor-status-launcher-conformance",
+  "source_head": "f3b4abd12352d4d915edf344a346fc97b89328a9",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/ci_cargo_status_continuation.c": "7625dba6169b067fe4047bf2872bc41eef9c02224d2bdadd138b3a7b954cf66c",
+    "crates/augmentagent-cli/src/ci_cargo_status_continuation.h": "d3b6d28950c386e55fbd85172935bbc615a2f535d4546f91e6ead51f8953155e",
+    "crates/augmentagent-cli/src/ci_cargo_status_handoff_cases.py": "8abaa8990d005054937e1d07ddebd387e21162e9138b7e4e24fae834798a9140",
+    "crates/augmentagent-cli/src/ci_cargo_status_vfork_producer.c": "9dbbf349776be8e4d4f298327c63a8681e53f36078aa2adcb4d0b642aa8feb8f",
+    "crates/augmentagent-cli/src/self_improve_ci_acceptance.rs": "24604441f335084d496e1c4c47ed54d92a942ec08db51208e1a3f72525776903",
+    "scripts/tests/ci_cargo_status_handoff_test.py": "4157e0518fdca3732fab7b591f94256ee7afa42a0fbd12d1e37ccc0dbcee960e",
+    "scripts/tests/ci_cargo_status_prepare_test.py": "f547989f436485990c7fae92a77139b447472b37cbdb92d55e875b5d672d5016"
+  },
+  "mechanism": [
+    "Borrow an anonymous sealed0555 executable descriptor with CLOEXEC; reject unsealed/malformed descriptors.",
+    "Use raw execveat AT_EMPTY_PATH with an empty environment and no pathname fallback.",
+    "Retain existing PID/peer/cookie-bound continuation construction, signal masking and failed-exec cleanup.",
+    "Do not close or change the borrowed image descriptor on failure.",
+    "This function conveys no admission authority; the production root controller still has to authenticate the exact original operation and notification."
+  ],
+  "host": {
+    "rust_passed": 41,
+    "rust_ignored": 30,
+    "python_passed": 760,
+    "updater_passed": 116,
+    "failed": 0,
+    "rust_original_session": 26863,
+    "host_original_session": 29014,
+    "terminal": true,
+    "all_descendants_reaped": true,
+    "rust_log_sha256": "f088a29b52334c35a973f801b7ab17d0befbc59a1d78faa8ca429d10564aa10b",
+    "host_log_sha256": "46484e11aa6e83d6ceb075eac294e0bb91b14f2b1327253640be087e68bb7a25"
+  },
+  "vm": {
+    "original_session": 50864,
+    "terminal": true,
+    "exit": 0,
+    "seconds": 97.14,
+    "result": "/tmp/autoship-1703-ci-status-descriptor-result-20261107.json",
+    "result_sha256": "da94144019fcb6582763969f7525d75b96bd40970eb0c0edf4644bc5271e0baa",
+    "receipt": "/tmp/augmentagent-ci-status-descriptor-20261107212217/receipt.json",
+    "receipt_sha256": "200e92ffee07b8f617213ce642b3ecd70e4b492421f23a84a4b753fd8f34837d",
+    "cases": {
+      "asset_sha256": {
+        "ci_cargo_exec_static": "9b7495a0c69b745243e6756fd6125b886210cf4f10702d9a3298301e5284fb42",
+        "ci_cargo_status_proxy": "e98c9b0f084d4135faa9a848d942be7bfa214ebcf4a271ba034feba237d3fcaf",
+        "ci_cargo_status_vfork_producer": "d2207bf99c90349737440531a14b7165976a1614d6a30b189e9483b2d48b3711",
+        "native.so": "d236654199924579528a57e581819111114a05aa7718eb756d12b77f428f2a7b"
+      },
+      "client_gid": 1000,
+      "client_uid": 1000,
+      "errors": 0,
+      "failed": 0,
+      "full_ci_pass": false,
+      "production_native_handoff": false,
+      "root_role_admission_proved": false,
+      "run": 15,
+      "shipping_authority": false,
+      "skipped": 0,
+      "successful": true
+    },
+    "audit_anchor_matches": true,
+    "audit_sha256": "97ada78b7581c2f63d7eee20f7c81250f626a189f5b9f8cf4f795c94f45d0a64",
+    "original_resource_identity_sha256": "b53efefb9f6c0a77d5f03368358a90cf34f0089c9f16a97aaaf5512df6958583",
+    "resource_limits": {
+      "cpu.max": "200000 100000",
+      "memory.max": "5368709120",
+      "memory.oom.group": "1",
+      "memory.swap.max": "0",
+      "pids.max": "512"
+    },
+    "resource_completed": true,
+    "resource_exhausted": false,
+    "resource_path_absent": true
+  },
+  "observations": [
+    "Actual sealed descriptor executes after its source pathname is replaced and returns delegated status23.",
+    "Actual irreversible exec denial retains original image FD identity/flags, channel, FD population and signal mask.",
+    "Actual unsealed image is refused without changing the original descriptors.",
+    "Real vfork child executes the sealed descriptor; the original parent resumes before proxy termination, child image FD closes on exec, actual tool status23 propagates and original descendant cleanup completes.",
+    "The existing production listener still refuses an unadmitted vfork."
+  ],
+  "limitations": [
+    "The new descriptor route is not called by the production relay.",
+    "Original GCC acceptance remains blocked until the authenticated root operation/native notification handoff and complete original writer/input/resource/source proof are implemented.",
+    "No capacity retirement, allowance change, main rollout or autonomous merge is established."
+  ],
+  "production_native_handoff": false,
+  "input_closure_complete": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "autonomous_merges_claimed": 0
+}

@@ -1877,3 +1877,23 @@ This proves physical asset delivery through the trusted startup bootstrap. It
 does not authorize post-entry native execution or establish a live per-operation
 resource/source/writer/input proof. The original compiler vfork blocker remains;
 full CI and shipping authority remain false.
+
+### Sealed descriptor continuation launcher observation (2026-11-07)
+
+`ci-status-descriptor-proof.json` records the native `execveat(AT_EMPTY_PATH)`
+launcher for a borrowed sealed anonymous executable. It retains the original
+continuation and failed-exec signal/FD cleanup, requires CLOEXEC and supplies no
+pathname fallback. Actual source-path replacement still executes the captured
+image and returns delegated status23. Kernel refusal and unsealed-image refusal
+preserve the original descriptors/channel/mask. The real vfork composition
+executes the sealed descriptor, closes its child FD at exec, releases the parent
+before proxy termination and propagates actual delegated status23 with cleanup.
+All15 guest composition cases passed as UID/GID1000; host validation passed760
+Python tests,116 updater checks and41 Rust tests. The original resource scope
+completed without exhaustion and was absent after terminal cleanup.
+
+The production relay does not yet call this route. Its kernel vfork denial
+remains unchanged. Authenticating the original live root operation, exact image,
+request and notification, plus the original writer/input/resource/source proof,
+remains necessary before compiler acceptance. This is component conformance,
+not a full CI or shipping capability.
