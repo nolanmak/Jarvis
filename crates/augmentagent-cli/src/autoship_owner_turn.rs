@@ -50,7 +50,7 @@ impl WorkflowStore {
         let Some((raw,leased,generation))=candidate else {return Ok(None);};
         let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
         if leased>now || matches!(checkpoint.stage,Stage::Merged|Stage::Retired|Stage::Held) {return Ok(None);}
-        let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1 AND state IN ('claimed','uncertain')) OR EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed'))",[workflow],|r|r.get(0))?;
+        let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1 AND state IN ('claimed','uncertain','recovery_ready')) OR EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed'))",[workflow],|r|r.get(0))?;
         let retained=super::native_owner_binding::unretired_owners(&tx,workflow)?;
         if blocked || (retained && !guarded) {return Ok(None);}
         if retained {

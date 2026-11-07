@@ -231,7 +231,7 @@ fn decode(
         );
     } else {
         ensure!(
-            matches!(state.as_str(), "claimed" | "uncertain") && input.state == "pending",
+            matches!(state.as_str(), "claimed" | "uncertain" | "recovery_ready") && input.state == "pending",
             "owner dispatch has no completion disposition"
         );
         super::owner_inbox::require_pending(conn, workflow, request)?;

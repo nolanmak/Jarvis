@@ -416,6 +416,11 @@ impl WorkflowStore {
                 workflow TEXT NOT NULL REFERENCES workflow(id), generation INTEGER NOT NULL,
                 sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record_sha256 TEXT NOT NULL,record TEXT NOT NULL,
                 PRIMARY KEY(workflow,generation));
+            CREATE TABLE IF NOT EXISTS workflow_owner_successor_ready (
+                workflow TEXT NOT NULL REFERENCES workflow(id),generation INTEGER NOT NULL,
+                request_id TEXT NOT NULL REFERENCES workflow_owner_publication_intent(request_id),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record_sha256 TEXT NOT NULL,record TEXT NOT NULL,
+                PRIMARY KEY(workflow,generation));
             CREATE TABLE IF NOT EXISTS workflow_owner_publication_recovery_pending (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id),generation INTEGER NOT NULL,
                 FOREIGN KEY(workflow,generation) REFERENCES workflow_owner_publication_recovery(workflow,generation));
@@ -470,7 +475,8 @@ impl WorkflowStore {
                 workflow TEXT NOT NULL REFERENCES workflow(id), request_id TEXT PRIMARY KEY REFERENCES workflow_owner_message(request_id),
                 owner TEXT NOT NULL, lease_generation INTEGER NOT NULL, pause_revision INTEGER NOT NULL,
                 binding TEXT NOT NULL, state TEXT NOT NULL, started_at INTEGER NOT NULL);
-            CREATE UNIQUE INDEX IF NOT EXISTS one_active_owner_turn ON workflow_owner_turn(workflow) WHERE state IN ('claimed','uncertain');
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_owner_turn_v2 ON workflow_owner_turn(workflow) WHERE state IN ('claimed','uncertain','recovery_ready');
+            DROP INDEX IF EXISTS one_active_owner_turn;
             CREATE TABLE IF NOT EXISTS workflow_owner_message (
                 request_id TEXT PRIMARY KEY REFERENCES discord_control_request(request_id),
                 workflow TEXT NOT NULL REFERENCES command_job(workflow), body TEXT NOT NULL,

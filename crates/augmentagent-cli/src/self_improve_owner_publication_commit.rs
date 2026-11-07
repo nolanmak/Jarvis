@@ -43,6 +43,7 @@ pub(crate) struct OwnerPublicationCompletion {
     scope:ScopeReference,canonical_sha256:String,evidence:Evidence,at_ms:i64,
 }
 impl OwnerPublicationCompletion {
+    pub(crate) fn scope_reference(&self)->&ScopeReference {&self.scope}
     pub(crate) fn workflow(&self)->&str {&self.workflow}
     pub(crate) fn request(&self)->&str {&self.request_id}
     pub(crate) fn generation(&self)->i64 {self.authority.generation(self.activated_generation)}

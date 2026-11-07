@@ -441,6 +441,16 @@ fn with_recovery_native_metadata(state:&Path,worktree:Option<&Path>,
     authorization:&super::targeted::AuthorizedOwnerRecovery<'_>,
     visit:&mut dyn FnMut(&augmentagent_channel_core::native_vm::ownership::MetadataNativeOwnerProof<'_>)->Result<()>,
 )->Result<()> {
+    with_recovery_native_metadata_outcome(state,worktree,recovery,authorization,&mut |proof| {
+        visit(proof)?;Ok(RecoveryMetadataOutcome::Continue)
+    })
+}
+enum RecoveryMetadataOutcome {Continue,SuccessorReady(durable::owner_publication_recovery::ReadySettlement)}
+fn with_recovery_native_metadata_outcome(state:&Path,worktree:Option<&Path>,
+    recovery:Arc<durable::owner_publication_recovery::RecoveryLease>,
+    authorization:&super::targeted::AuthorizedOwnerRecovery<'_>,
+    visit:&mut dyn FnMut(&augmentagent_channel_core::native_vm::ownership::MetadataNativeOwnerProof<'_>)->Result<RecoveryMetadataOutcome>,
+)->Result<()> {
     let store=Arc::new(Mutex::new(WorkflowStore::open(state)?));
     let facts=store.lock().map_err(|_|anyhow::anyhow!("recovery native facts store poisoned"))?
         .owner_publication_recovery_native_facts(&recovery,authorization,millis())?;
@@ -463,7 +473,11 @@ fn with_recovery_native_metadata(state:&Path,worktree:Option<&Path>,
     };
     augmentagent_channel_core::native_vm::ownership::with_metadata_native_owner(&audit,&runtimes,&current,&mut load,&mut |proof| {
         anyhow::ensure!(proof.namespace()==facts.namespace() && proof.binding()==facts.original_binding(),"recovery native metadata differs from original namespace");
-        visit(proof)?;current()
+        match visit(proof)? {
+            RecoveryMetadataOutcome::Continue=>current(),
+            RecoveryMetadataOutcome::SuccessorReady(settled)=>store.lock().map_err(|_|anyhow::anyhow!("ready settlement store poisoned"))?
+                .require_owner_successor_ready_settlement(&settled,authorization,millis()),
+        }
     })
 }
 
@@ -5550,6 +5564,78 @@ else: raise SystemExit('unexpected authority call')
                         assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
                         assert_eq!(db.query_row("SELECT owner,lease_generation,binding,state FROM workflow_owner_turn WHERE request_id=?1",[&original_request],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).unwrap(),turn_before);
                         assert_eq!(db.query_row("SELECT record,record_sha256 FROM workflow_owner_publication_intent WHERE request_id=?1",[&original_request],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).unwrap(),intent_before);
+                        let before_ready=store.snapshot(&id).unwrap().unwrap();let control_ready=store.owner_control(&id).unwrap();
+                        let ready_events=store.events(&id).unwrap();
+                        let settle_ready=|store:&mut WorkflowStore|with_recovery_native_metadata_outcome(&state,Some(dir.path()),later.clone(),&later_auth,&mut |proof| {
+                            let recovered=store.with_owner_recovery_preparation(&later,&later_auth,proof,millis(),|access|
+                                acceptance::owner::publication::reopen_recovery_preparation(access,proof,dir.path()))?;
+                            recovered.with_scope_transition(|transition| {
+                                let scope=transition.register()?;
+                                proof.with_revoked_input_writers(|closed| {
+                                    assert!(closed.with_unbound_input_nonrelease("another-owner-request",|wrong|
+                                        store.prepare_unbound_owner_successor_ready(&later,&later_auth,&recovered,wrong,&scope,millis())).is_err());
+                                    closed.with_unbound_input_nonrelease(&original_request,|unreleased| {
+                                        assert!(store.prepare_unbound_owner_successor_ready(&second,&later_auth,&recovered,unreleased,&scope,millis()).is_err());
+                                        store.prepare_unbound_owner_successor_ready(&later,&later_auth,&recovered,unreleased,&scope,millis())
+                                            .map(RecoveryMetadataOutcome::SuccessorReady)
+                                    })
+                                })
+                            })
+                        });
+                        db.execute_batch("CREATE TRIGGER refuse_ready_settlement BEFORE DELETE ON workflow_owner_publication_recovery_pending BEGIN SELECT RAISE(ABORT,'injected ready settlement failure'); END;").unwrap();
+                        let refused=settle_ready(&mut store).err().expect("ready settlement ignored durable rollback");
+                        assert!(format!("{refused:#}").contains("injected ready settlement failure"),"{refused:#}");
+                        assert_eq!(store.snapshot(&id).unwrap().unwrap(),before_ready);assert_eq!(store.events(&id).unwrap(),ready_events);
+                        assert_eq!(db.query_row("SELECT state FROM workflow_owner_turn WHERE request_id=?1",[&original_request],|r|r.get::<_,String>(0)).unwrap(),turn_before.3);
+                        assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_successor_ready WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),0);
+                        db.execute_batch("DROP TRIGGER refuse_ready_settlement;").unwrap();
+                        let readiness=settle_ready(&mut store);
+                        assert!(readiness.is_ok(),"actual original proof could not settle owner successor readiness: {readiness:?}");
+                        assert!(store.validate_owner_publication_recovery(&later,&later_auth,millis()).is_err());
+                        assert!(store.owner_publication_recovery_plan(&id).unwrap().is_none());
+                        assert_eq!(store.pending_owner_messages(&id).unwrap(),2);
+                        assert_eq!(store.owner_control(&id).unwrap(),control_ready);
+                        assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint,before_ready.checkpoint);
+                        assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,before_ready.model_calls);
+                        assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+                        assert_eq!(db.query_row("SELECT state FROM workflow_owner_turn WHERE request_id=?1",[&original_request],|r|r.get::<_,String>(0)).unwrap(),"recovery_ready");
+                        let mut stale_visited=false;
+                        assert!(with_recovery_native_metadata(&state,Some(dir.path()),later.clone(),&later_auth,&mut |_| {stale_visited=true;Ok(())}).is_err());
+                        assert!(!stale_visited,"settled metadata claim acquired another native visitor");
+                        let saved_ready:(i64,String,String)=db.query_row("SELECT sequence,record_sha256,record FROM workflow_owner_successor_ready WHERE workflow=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                        let saved_ready_event:String=db.query_row("SELECT payload FROM workflow_event WHERE seq=?1",[saved_ready.0],|r|r.get(0)).unwrap();
+                        for fault in ["record","coherent-original","coherent-extra","event","event-bound","orphan-record","pending-pointer"] {
+                            if fault=="record" {db.execute("UPDATE workflow_owner_successor_ready SET record='{}' WHERE workflow=?1",[&id]).unwrap();}
+                            else if fault=="coherent-original" || fault=="coherent-extra" {
+                                let mut changed:serde_json::Value=serde_json::from_str(&saved_ready.2).unwrap();
+                                if fault=="coherent-original" {changed["original"]["input_context"]="b".repeat(64).into();}
+                                else {changed["plan"]["native_nonrelease"]["shipping_authority"]=true.into();}
+                                let raw=serde_json::to_string(&changed).unwrap();let hash=format!("{:x}",Sha256::digest(raw.as_bytes()));
+                                db.execute("UPDATE workflow_owner_successor_ready SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,raw,hash]).unwrap();
+                                let mut event:serde_json::Value=serde_json::from_str(&saved_ready_event).unwrap();event["record_sha256"]=hash.into();
+                                db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![saved_ready.0,serde_json::to_string(&event).unwrap()]).unwrap();
+                            }else if fault=="event" {db.execute("UPDATE workflow_event SET payload='{}' WHERE seq=?1",[saved_ready.0]).unwrap();}
+                            else if fault=="event-bound" {db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![saved_ready.0,"x".repeat(4097)]).unwrap();}
+                            else if fault=="orphan-record" {db.execute("INSERT INTO workflow_owner_successor_ready SELECT workflow,generation+100,request_id,(SELECT min(seq) FROM workflow_event WHERE workflow=?1),record_sha256,record FROM workflow_owner_successor_ready WHERE workflow=?1",[&id]).unwrap();}
+                            else {db.execute("INSERT INTO workflow_owner_publication_recovery_pending VALUES(?1,?2)",rusqlite::params![id,later.generation()]).unwrap();}
+                            assert!(store.owner_publication_recovery_plan(&id).is_err(),"{fault}: damaged readiness retained valid history");
+                            db.execute("UPDATE workflow_owner_successor_ready SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,saved_ready.2,saved_ready.1]).unwrap();
+                            db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![saved_ready.0,saved_ready_event]).unwrap();
+                            db.execute("DELETE FROM workflow_owner_publication_recovery_pending WHERE workflow=?1",[&id]).unwrap();
+                            db.execute("DELETE FROM workflow_owner_successor_ready WHERE workflow=?1 AND generation<>?2",rusqlite::params![id,later.generation()]).unwrap();
+                            assert!(store.owner_publication_recovery_plan(&id).unwrap().is_none());
+                        }
+                        // Remove the unrelated pause/checkpoint barriers in this
+                        // fixture only, so readiness itself must prevent takeover.
+                        let control=store.owner_control(&id).unwrap().unwrap();
+                        if control.paused {store.set_owner_pause(&id,"fixture-owner",control.revision,false,millis()).unwrap();}
+                        let mut runnable=before_ready.checkpoint.clone();runnable.stage=Stage::Build;
+                        db.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",rusqlite::params![id,serde_json::to_string(&runnable).unwrap()]).unwrap();
+                        let after_ready=store.snapshot(&id).unwrap().unwrap();let events_after_ready=store.events(&id).unwrap();
+                        assert!(store.claim_owner_turn_for_setup(&id,"cannot-overtake-ready",millis(),60_000).unwrap().is_none());
+                        assert!(store.claim_productive(&id,"ordinary-cannot-consume-ready",millis(),60_000).unwrap().is_none());
+                        assert_eq!(store.snapshot(&id).unwrap().unwrap(),after_ready);assert_eq!(store.events(&id).unwrap(),events_after_ready);
+                        assert!(db.execute("INSERT INTO workflow_owner_turn SELECT workflow,(SELECT request_id FROM workflow_owner_message WHERE workflow=?1 AND request_id<>?2 LIMIT 1),'overtake',100,pause_revision,binding,'claimed',started_at FROM workflow_owner_turn WHERE request_id=?2",rusqlite::params![id,original_request]).is_err(),"ready turn lost the one-active-turn constraint");
                         return;
                     }
                     if mode.ends_with("-metadata-native-proof") {

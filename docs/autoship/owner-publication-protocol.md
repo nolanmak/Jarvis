@@ -728,8 +728,9 @@ permission to run a coding body. D/R must join it to the immutable original
 reservation/absence lineage and the §4 ready/consumed successor bridge, and must
 repeat original current scope/source/resource/authorization gates at the real
 input constructor. This is required before the successor path can release any
-model or input. The bridge and productive constructor remain unimplemented;
-there is no worker activation or ordinary model observer installed here.
+model or input. The bridge consumption and productive constructor remain unimplemented;
+§49 adds only the unbound metadata-readiness record. There is no worker
+activation or ordinary model observer installed here.
 
 A released independent-preparation input remains an unclassified release for
 this producer, even when its protected record describes a readonly transport.
@@ -760,3 +761,65 @@ and the expanded retained-session integration passed in 110.96 seconds across
 both provider pins. No full CLI-suite rerun, provider/VM execution, productive
 successor, rollout or autonomous merge is claimed by this checkpoint. See
 [bounded unbound-input evidence](1703-unbound-native-nonrelease-proof.json).
+
+## 49. Unbound successor readiness and metadata settlement
+
+The genuinely unbound branch of §4 now has a consuming readiness transaction.
+`prepare_unbound_owner_successor_ready` requires the actual current authenticated
+recovery claim, reopened original preparation, fresh borrowed unbound-native
+nonrelease proof and actual registered write-scope capability. Original native
+state/session/audit locks remain held, followed by the scope lock, workflow
+transaction and bounded canonical-file checks. It rechecks the current native
+frontier/facts, exact request/store binding, original reservation absence,
+completed original publication, canonical evidence and exact registered scope.
+A bound reservation cannot enter this producer; the distinct bound-input and
+semantic-continuation ready producers are still required.
+
+One transaction appends the immutable `owner_successor_ready` event and record,
+changes only the captured turn to `recovery_ready`, removes its metadata recovery
+pending pointer and releases the current metadata lease. The original activation,
+preparation, input key, reservation absence, native namespace, original completion,
+actual scope, checkpoint and control snapshot are retained. The message remains
+pending; queued peers, owner pause, explicit holds, model/attempt spend and merge
+accounting are preserved. No body capability, native logger, input permit or
+productive generation is returned. The ready record is descriptive history and
+must be revalidated by the future execution constructor.
+
+The recovery journal validates the exact ready record/event/publication joins
+before accepting removal of its pending pointer. Missing, substituted, orphaned
+or oversized history holds. A ready turn prevents routine metadata re-claim,
+ordinary workflow acquisition and generic next-owner acquisition. The one-active
+turn index includes `recovery_ready`, with atomic idempotent migration from the
+previous index. History never treats `completed` or `setup_refused` as a shortcut
+for this disposition. Reservation absence stays immutable; it is not rewritten
+when a future legitimate successor reserves its first body.
+
+The ordinary native metadata visitor retains its original post-visit fence.
+A separate typed outcome accepts only the nonserializable settlement token minted
+by the consuming readiness transaction, then validates that exact durable
+settlement while the original native locks remain held. Saved JSON cannot
+construct that token or relax the ordinary visitor. The original metadata claim
+and logger remain permanently unable to dispatch; settling them is expected to
+invalidate their old current-claim callbacks.
+
+The next build exit is still load-bearing: implement
+`claim_recovered_owner_turn_for_setup` to CAS-consume the exact ready bridge for
+the same pending request, under fresh current owner/origin/repository checks and
+unpaused controls. Then join immutable original claim/activation/reservation
+history to fresh native handoff, scope/source/resource and real input constructors
+before any productive capability escapes. Existing reservation and continuation
+paths need their separate original-native proofs. Released independent preparation
+still needs trusted C/R exclusion; its readonly description is insufficient.
+These constructors, worker connection and full CLI/Discord/soak acceptance remain
+unfinished. The carrying cost is one bounded immutable readiness journal and an
+explicit unsettled turn state, with no replacement transfer UUID or execution
+permit.
+
+The controlled recovery regression uses actual original core metadata locks,
+registered scope and canonical completion for both provider pins and both initial
+and revised acceptance. It checks durable rollback after event/record/turn writes,
+wrong request and old-claim refusal, retained pending peers/control/checkpoint/spend,
+old metadata fencing, damaged/coherently substituted history and takeover refusal
+with unrelated pause/checkpoint barriers removed. It uses synthetic preparation
+and empty native runtime inventory; no real provider/VM, process-crash reconnect,
+ready-to-coding dispatch or full epic closure follows from it.
