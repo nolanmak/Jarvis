@@ -143,7 +143,8 @@ def workflow_store_configuration(receipts,pid_for=service_pid):
         if (pid_for('worker')!=pid or birth(pid)!=identity or (proc/'cwd').resolve(strict=True)!=cwd
                 or private(receipts/'worker.json')!=raw):raise Refused('process-changed')
         return {'cwd':str(cwd),'workflow_db':config.get('AUGMENTAGENT_AUTOPR_WORKFLOW_DB'),
-                'state_home':config.get('XDG_STATE_HOME'),'home':config.get('HOME')}
+                'state_home':config.get('XDG_STATE_HOME'),'home':config.get('HOME'),
+                'daily_cap':config.get('AUGMENTAGENT_AUTOPR_DAILY_CAP')}
     except (OSError,ValueError,subprocess.SubprocessError):
         raise Refused('worker-configuration-unavailable') from None
 

@@ -22,9 +22,9 @@ class DeploymentTests(unittest.TestCase):
             self.addCleanup(lambda:child.poll() is None and (child.terminate(),child.wait()))
             value={'version':1,'role':'worker','pid':child.pid,'birth':birth(child.pid),'boot_id':m.boot(),
                 'dry_run':False,'config':{'HOME':str(root/'worker-home'),'XDG_STATE_HOME':str(root/'worker-state'),
-                    'AUGMENTAGENT_AUTOPR':'1','AUGMENTAGENT_AUTOPR_WORKFLOW_DB':'worker.db'}}
+                    'AUGMENTAGENT_AUTOPR':'1','AUGMENTAGENT_AUTOPR_WORKFLOW_DB':'worker.db','AUGMENTAGENT_AUTOPR_DAILY_CAP':'7'}}
             path=receipts/'worker.json';write(path,value);before=path.read_bytes()
-            expected={'cwd':str(root),'workflow_db':'worker.db','state_home':str(root/'worker-state'),'home':str(root/'worker-home')}
+            expected={'cwd':str(root),'workflow_db':'worker.db','state_home':str(root/'worker-state'),'home':str(root/'worker-home'),'daily_cap':'7'}
             self.assertEqual(m.workflow_store_configuration(receipts,lambda role:child.pid),expected)
             self.assertEqual(path.read_bytes(),before)
             for fault in ('birth','public','secret','changed-process'):

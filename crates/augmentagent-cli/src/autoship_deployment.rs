@@ -18,22 +18,27 @@ fn command() -> tokio::process::Command {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerStoreConfiguration {
-    cwd:PathBuf,workflow_db:Option<String>,state_home:Option<String>,home:Option<String>,
+    cwd:PathBuf,workflow_db:Option<String>,state_home:Option<String>,home:Option<String>,daily_cap:Option<String>,
 }
-fn resolve_worker_store(config:WorkerStoreConfiguration)->Result<PathBuf> {
+/// Descriptive settings only; never a workflow lease or admission grant.
+pub(crate) struct WorkerWorkflowConfiguration {pub path:PathBuf,pub daily_cap:u32}
+fn resolve_worker_store(config:WorkerStoreConfiguration)->Result<WorkerWorkflowConfiguration> {
     anyhow::ensure!(config.cwd.is_absolute(),"worker cwd unavailable");
+    let daily_cap=crate::self_improve::AutoPrLoop::cap_from(config.daily_cap.as_deref());
     let path=if let Some(path)=config.workflow_db {
         anyhow::ensure!(!path.is_empty(),"worker workflow store override is empty");PathBuf::from(path)
     } else {
-        augmentagent_channel_core::state_dir::resolve(config.state_home.map(Into::into),config.home.map(Into::into))
-            .unwrap_or_else(||PathBuf::from(".local/state/augmentagent")).join("autopr-workflow.sqlite3")
+        augmentagent_channel_core::state_dir::resolve(config.state_home.map(Into::into),
+            Some(config.home.unwrap_or_else(||".".into()).into()))
+            .context("worker state directory unavailable")?.join("autopr-workflow.sqlite3")
     };
-    Ok(if path.is_absolute() {path}else {config.cwd.join(path)})
+    Ok(WorkerWorkflowConfiguration {path:if path.is_absolute() {path}else {config.cwd.join(path)},daily_cap})
 }
 /// Read the actual worker's private effective-configuration receipt. No native
 /// admission, environment mutation, provider probe or workflow-store write.
-pub fn worker_workflow_store()->Result<PathBuf> {
-    if !cfg!(target_os="linux") {return Ok(crate::autoship_workflow::default_path());}
+pub(crate) fn worker_workflow_configuration()->Result<WorkerWorkflowConfiguration> {
+    if !cfg!(target_os="linux") {return Ok(WorkerWorkflowConfiguration {path:crate::autoship_workflow::default_path(),
+        daily_cap:crate::self_improve::AutoPrLoop::cap_from(std::env::var("AUGMENTAGENT_AUTOPR_DAILY_CAP").ok().as_deref())});}
     let output=std::process::Command::new("/usr/bin/python3")
         .args(["-I","-c",HELPER,"--workflow-store","--receipts"]).arg(receipts()?)
         .stdin(Stdio::null()).output()?;
@@ -163,11 +168,17 @@ mod tests {
     #[test]
     fn worker_store_resolution_uses_worker_override_cwd_and_state_configuration() {
         let config=|workflow_db:Option<&str>,state_home:Option<&str>|WorkerStoreConfiguration {
-            cwd:"/worker/cwd".into(),workflow_db:workflow_db.map(str::to_owned),state_home:state_home.map(str::to_owned),home:Some("/worker/home".into())};
-        assert_eq!(resolve_worker_store(config(Some("/worker/db"),None)).unwrap(),PathBuf::from("/worker/db"));
-        assert_eq!(resolve_worker_store(config(Some("relative.db"),Some("/other"))).unwrap(),PathBuf::from("/worker/cwd/relative.db"));
-        assert_eq!(resolve_worker_store(config(None,Some("/worker/state"))).unwrap(),PathBuf::from("/worker/state/augmentagent/autopr-workflow.sqlite3"));
-        assert_eq!(resolve_worker_store(config(None,Some("relative"))).unwrap(),PathBuf::from("/worker/home/.local/state/augmentagent/autopr-workflow.sqlite3"));
+            cwd:"/worker/cwd".into(),workflow_db:workflow_db.map(str::to_owned),state_home:state_home.map(str::to_owned),home:Some("/worker/home".into()),daily_cap:None};
+        assert_eq!(resolve_worker_store(config(Some("/worker/db"),None)).unwrap().path,PathBuf::from("/worker/db"));
+        assert_eq!(resolve_worker_store(config(Some("relative.db"),Some("/other"))).unwrap().path,PathBuf::from("/worker/cwd/relative.db"));
+        assert_eq!(resolve_worker_store(config(None,Some("/worker/state"))).unwrap().path,PathBuf::from("/worker/state/augmentagent/autopr-workflow.sqlite3"));
+        let expected=augmentagent_channel_core::state_dir::resolve(None,Some("/worker/home".into())).unwrap().join("autopr-workflow.sqlite3");
+        assert_eq!(resolve_worker_store(config(None,Some("relative"))).unwrap().path,expected);
+        let mut homeless=config(None,None);homeless.home=None;
+        let expected=PathBuf::from("/worker/cwd").join(augmentagent_channel_core::state_dir::resolve(None,Some(".".into())).unwrap()).join("autopr-workflow.sqlite3");
+        assert_eq!(resolve_worker_store(homeless).unwrap().path,expected);
+        let mut capped=config(None,None);capped.daily_cap=Some("7".into());
+        assert_eq!(resolve_worker_store(capped).unwrap().daily_cap,7);
         assert!(resolve_worker_store(config(Some(""),None)).is_err());
     }
     #[tokio::test]

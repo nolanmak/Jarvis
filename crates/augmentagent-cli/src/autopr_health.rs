@@ -925,6 +925,15 @@ fn running_binary(repo_root: &Path) -> (Option<(PathBuf, PathBuf)>, Vec<String>)
     (pair, dropins)
 }
 
+/// Read both workflow facts from the same worker-selected store, without
+/// migrating missing state or changing the collector's environment.
+fn workflow_metrics(config:&crate::autoship_deployment::WorkerWorkflowConfiguration,now:i64)
+    ->anyhow::Result<(crate::autoship_workflow::MergeAllowance,u64)> {
+    let store=crate::autoship_workflow::WorkflowStore::open_read_only(&config.path)?
+        .ok_or_else(||anyhow::anyhow!("worker workflow store is missing"))?;
+    Ok((store.merge_allowance(now,config.daily_cap)?,store.capacity_wait_count()?))
+}
+
 /// Gather everything the rules need from this box.
 pub fn collect(repo_root: &Path) -> HealthInputs {
     let now = Utc::now();
@@ -960,16 +969,11 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         DISK_DROP_WINDOW_HOURS,
     );
     crate::disk::save_readings(&filesystems, now);
-    let (merge_allowance, merge_allowance_error) = match crate::self_improve::merge_allowance_status() {
-        Ok(status) => (Some(status), None),
-        Err(error) => (None, Some(format!("{error:#}"))),
-    };
-    let (capacity_waiting_workflows,capacity_observation_error)=match
-        crate::autoship_deployment::worker_workflow_store()
-            .and_then(|path|crate::autoship_workflow::WorkflowStore::open_read_only(&path))
-            .and_then(|store|store.map(|store|store.capacity_wait_count()).transpose()) {
-        Ok(count)=>(count,None),
-        Err(error)=>(None,Some(format!("{error:#}"))),
+    let (merge_allowance,merge_allowance_error,capacity_waiting_workflows,capacity_observation_error)=match
+        crate::autoship_deployment::worker_workflow_configuration()
+            .and_then(|config|workflow_metrics(&config,now.timestamp_millis())) {
+        Ok((allowance,count))=>(Some(allowance),None,Some(count),None),
+        Err(error)=>{let error=format!("{error:#}");(None,Some(error.clone()),None,Some(error))},
     };
     HealthInputs {
         now_or_epoch: Some(now),
@@ -1077,6 +1081,24 @@ async fn notify_owner_of(text: &str) {
 mod tests {
     // (tests continue below; the #1030 case is appended at the end)
     use super::*;
+    #[test]
+    fn workflow_metrics_read_worker_store_and_cap_without_creating_a_fallback_store() {
+        use crate::autoship_workflow::{Binding,Stage,WorkflowStore};
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("worker.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        store.register("owner/repo#1","fix",Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()},10).unwrap();
+        let lease=store.claim("owner/repo#1","worker",20,60_000).unwrap().unwrap();
+        let mut cp=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;cp.stage=Stage::Verify;
+        store.checkpoint(&lease,&cp,21).unwrap();store.defer_run_capacity(&lease,Some(&"a".repeat(64)),30).unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap();let events=store.events(&lease.workflow).unwrap();
+        let config=crate::autoship_deployment::WorkerWorkflowConfiguration {path,daily_cap:7};
+        let (allowance,waits)=workflow_metrics(&config,31).unwrap();
+        assert_eq!(allowance.cap,7);assert_eq!(waits,1);
+        assert_eq!(store.snapshot(&lease.workflow).unwrap(),before);assert_eq!(store.events(&lease.workflow).unwrap(),events);
+        let missing=root.path().join("missing.db");
+        assert!(workflow_metrics(&crate::autoship_deployment::WorkerWorkflowConfiguration {path:missing.clone(),daily_cap:5},31).is_err());
+        assert!(!missing.exists());
+    }
 
     #[test]
     fn policy_hold_is_distinct_from_stale_and_disappears_for_closed_pr() {
