@@ -9,6 +9,7 @@
 #include <sys/prctl.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
+#include <sys/ptrace.h>
 #include <unistd.h>
 
 /* Process-local primitives, not CI authorization. No constructor activates
@@ -64,6 +65,20 @@ static int jarvis_ci_install_unit_policy(int listener) {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
         BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x40000000U, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        /* A future proxy exec must not give its original producer a way to
+         * modify the new mm. Keep the original bootstrap's TRACEME operation;
+         * every foreign ptrace operation and remote memory mutation is denied.
+         * Trusted controller tracing runs outside this inherited unit filter.
+         */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_ptrace, 0, 6),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, PTRACE_TRACEME, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0]) + 4),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        DENY_CALL(SYS_process_vm_writev),
+        DENY_CALL(SYS_process_madvise),
         DENY_CALL(SYS_unshare),
         DENY_CALL(SYS_setns),
         DENY_CALL(SYS_mount),

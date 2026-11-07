@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "kind": "ci-cross-process-memory-writer-denials",
+  "baseline": "001fcea5dd5ea7cdfc6b44dc4e8930b1627644da",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/ci_cargo_exec.c": "c9564ede10d4ec5f1b34eef5c5d0b8bba2b49e487da6cf5a496bc4cacb3bb727",
+    "crates/augmentagent-cli/src/ci_cargo_unit_policy_cases.py": "f6acae3776cb626cf36fd8359537f6346089007e3c8ae784ac6ec721db2aaf53",
+    "crates/augmentagent-cli/src/self_improve_ci_acceptance.rs": "d2131da39074a6d6097a396be90299f39ef72ff800a9600057f07c090a52735b",
+    "scripts/tests/ci_cargo_unit_policy_test.py": "36943c23bf51c15c7c7269404b2aec7605388b2bf30d7a6c422fafecbdd8c8d6",
+    "scripts/ci-cargo-planner.py": "fa07819bab1b61344a133b8d8edda82356067814e3b5e0d5c20c9cdadea1821a",
+    "scripts/provider-supervisor.py": "08eb437fe13068df5f2ee0c1b55a6e4b38c9ba3f351ff76509511ba95815b277"
+  },
+  "red": {
+    "log": "/tmp/autoship-ci-cross-memory-red-20261107.log",
+    "run": 12,
+    "failed": 3,
+    "meaning": "Valid remote writes remained possible after both guard installations; an already-existing thread could also make a zero-length process_vm_writev call instead of receiving the policy refusal. Both foreign-write cases had first passed real remote-write and ptrace attach controls."
+  },
+  "host": {
+    "python": {
+      "log": "/tmp/autoship-ci-cross-memory-python-20261107.log",
+      "passed": 708,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 42.04
+    },
+    "rust": {
+      "log": "/tmp/autoship-ci-cross-memory-rust-20261107.log",
+      "passed": 37,
+      "failed": 0,
+      "ignored": 27,
+      "seconds": 20.24,
+      "native_unit_policy_cases_required": 12,
+      "native_vfork_boundary_cases_required": 6
+    }
+  },
+  "restrictions": [
+    "process_vm_writev returns EPERM.",
+    "process_madvise returns EPERM.",
+    "ptrace allows only the exact full-width TRACEME request; all foreign operations and high-bit aliases return EPERM."
+  ],
+  "actual_controls": [
+    "Write eight bytes successfully to a live related victim and have it verify and reset them before installation.",
+    "SEIZE, INTERRUPT, observe the stop and DETACH that same victim successfully before installation.",
+    "After installation require EPERM for the same valid write and SEIZE; read back eight unchanged original bytes and have the victim verify before actual reap.",
+    "Run both standalone and original-listener guards.",
+    "Existing and new threads test the write refusal under TSYNC.",
+    "Original bootstrap TRACEME and unfiltered trusted controller tracing/exec observations remain mandatory native regressions."
+  ],
+  "spec_audit": {
+    "agent": "ci_vfork_boundary_spec_audit_20261107",
+    "result": "No substantiated contradiction or new requirements guess in this bounded prerequisite; not full-mechanism or independent implementation approval."
+  },
+  "vm_policy": null,
+  "vm_vfork_regression": null,
+  "remote_advice_positive_compatibility_control": false,
+  "complete_writer_coverage": false,
+  "real_v3_proxy_implemented": false,
+  "compiler_compatible": false,
+  "input_closure_complete": false,
+  "full_ci_pass": false,
+  "shipping_authority": false,
+  "production_runtime_changed": false,
+  "autonomous_merges_claimed": 0,
+  "remaining": [
+    "Verified read-only proc mounts and complete inherited descriptor/writable-alias/shared-mapping/async-writer/ABI and pointer proofs.",
+    "Immutable real V3 proxy/configuration, live notification/admission binding, pre-exec errno/PATH/FD behavior, signal/cancellation and original resource ownership.",
+    "Original unchanged pinned compiler/worker/generated-publication regressions, full C/R/source/input/effect/projection and owner productive bridges, hosted checks/rollout and full epic acceptance."
+  ]
+}

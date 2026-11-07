@@ -322,6 +322,59 @@ control. This settles the bounded native-exec feasibility question; it does not
 settle runtime admission, shared-mm writer protection or the real V3 proxy. See
 [host and VM evidence](ci-vfork-exec-boundary-proof.json).
 
+#### Cross-process memory writers before proxy admission
+
+A separate static proxy image alone does not protect its writable arguments or
+stack from its original producer. As a prerequisite for the real V3 proxy, C's
+unit filter must refuse process_vm_writev, process_madvise, and every ptrace
+operation except the exact full-width PTRACE_TRACEME value. These restrictions
+apply to both the standalone TSYNC guard and the combined original listener;
+they are installed before untrusted entry. TRACEME declares the calling task's
+own tracing relationship; it does not grant control of another task. This is an
+operation exception, not a kernel-enforced bootstrap-phase distinction. The
+original supervisor's separate exec acknowledgement/initial-permission state
+still owns that phase. The trusted controller runs outside the inherited unit
+filter and must retain SEIZE, EXEC observation and cleanup behavior.
+
+The reason is integrity of the future image/configuration and capture barrier:
+[process_vm_writev](https://man7.org/linux/man-pages/man2/process_vm_readv.2.html)
+can change another address space, and
+[ptrace](https://man7.org/linux/man-pages/man2/ptrace.2.html) can change another
+task's memory and registers. Remote memory
+[advice](https://man7.org/linux/man-pages/man2/process_madvise.2.html) is also an
+unsupported mutation/control route in this adapter. Refuse all calls to the two
+remote-memory APIs, including self-targeting calls. Preserve process_vm_readv;
+a checked read is not a write permission or complete input proof. Reject high
+ptrace request bits as well as non-TRACEME low values. No new runtime permission,
+parent resume or vfork continuation follows from these denials.
+
+The native regression must use a real related-process victim: first modify eight
+bytes successfully and attach/interrupt/detach successfully before installation.
+Have that victim verify the actual changed bytes and restore its original data.
+After guard installation, require EPERM from the same valid remote-write and
+attach operations, read back the unchanged original bytes, and have the victim
+verify them before actual reap. Exercise both guard variants. The trusted test
+setup creates the victim before installation for those positive controls; this
+is not evidence that a filter can cover arbitrary pre-existing untrusted child
+processes. Existing/new thread tests must also exercise the write restriction
+under TSYNC. Preserve the original bootstrap/exec cases and the separate real
+vfork handoff probe. The remote-advice refusal test is not a positive capability
+or compatibility proof for that API. Require the standalone and listener cases
+on the declared VM kernel as well as the host; original resource teardown and
+false full-CI/shipping flags remain mandatory.
+
+This closes these specific syscall writer routes, not all shared-mm writer
+coverage. Producer proc mounts must still be verified read-only; inherited
+memory/proc descriptors, writable aliases, shared mappings, async writers,
+unknown ABI/policy routes and mutable pre-exec pointers retain their existing
+C/R gates. No errno-only observation is full policy coverage. C owns the guard
+and testable denial exit; R owns unfiltered trusted tracing and original
+supervision/resource joins. Before final-C or proxy runtime admission, C/R must
+complete those remaining writer/input/configuration proofs. The carrying cost
+is a stricter measured helper whose identity must travel through the existing
+activation/runtime binding, with no durable permission-schema change. The real
+V3 proxy and unchanged pinned compiler/worker regressions remain unfinished.
+
 ### O3. Freeze before capturing a live parent's input
 
 First capture the child's original request, exact stdin to EOF and verified

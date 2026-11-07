@@ -1,5 +1,6 @@
 """Run the real unit policy under the unchanged original child supervisor."""
 import os
+import json
 import importlib.util
 from pathlib import Path
 import platform
@@ -106,6 +107,24 @@ class NativeUnitPolicyTests(unittest.TestCase):
 
     def test_existing_and_new_threads_are_guarded(self):
         self.assert_guarded('threads')
+
+    def assert_cross_memory(self,mode):
+        result=self.run_mode(mode)
+        self.assertEqual(result.returncode,0,result.stderr)
+        row=json.loads(result.stdout)
+        self.assertEqual(row['pre_policy_remote_write_bytes'],8)
+        self.assertTrue(row['pre_policy_attach'])
+        self.assertEqual(row['post_policy_remote_write_errno'],1)
+        self.assertEqual(row['post_policy_attach_errno'],1)
+        self.assertEqual(row['post_policy_remote_read_bytes'],8)
+        self.assertTrue(row['victim_bytes_unchanged']);self.assertTrue(row['victim_reaped'])
+        self.assertFalse(row['full_ci_pass']);self.assertFalse(row['shipping_authority'])
+
+    def test_standalone_guard_blocks_real_foreign_memory_writers(self):
+        self.assert_cross_memory('cross-memory')
+
+    def test_original_listener_guard_blocks_real_foreign_memory_writers(self):
+        self.assert_cross_memory('cross-memory-listener')
 
     def test_x32_cannot_alias_native_syscall_numbers(self):
         result = self.run_mode('x32')
