@@ -17,6 +17,7 @@ pub(crate) struct ProcessGroup {
     resource_required: bool,
     vm_preflight: bool,
     resource_observed: AtomicBool,
+    admission_attempted: AtomicBool,
     resource_audit: std::sync::Mutex<Option<(String,Arc<crate::tool_audit::AuditLogger>)>>,
     native_initial:bool,
     native_launch:Option<crate::native_vm::PreparedLaunchRecord>,
@@ -104,6 +105,10 @@ impl ProcessGroup {
     }
     async fn admit_observed(&self, provider:&str,logger:Option<&Arc<crate::tool_audit::AuditLogger>>,model:bool,
         observer:Option<&mut (dyn FnMut(&serde_json::Value)->anyhow::Result<()> + Send)>) -> anyhow::Result<()> {
+        // Claim before the first await, callback or charge. A failed or cancelled
+        // attempt cannot reactivate this same supervisor or spend twice.
+        anyhow::ensure!(!self.admission_attempted.swap(true,Ordering::SeqCst),
+            "supervisor admission already attempted; reconcile instead of retrying");
         self.bind_resource_audit(provider,logger)?;
         let ready=self.receipt.with_file_name("launch-ready");
         // Admission may wait for capacity (reclaiming cache, then a sibling run
@@ -790,7 +795,7 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
     };
     let id = child.id().expect("newly spawned child has a pid") as libc::pid_t;
     clean.store(false, Ordering::SeqCst);
-    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory: owned_directory }))
+    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false),admission_attempted:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory: owned_directory }))
 }
 
 #[cfg(test)]
@@ -842,7 +847,7 @@ mod tests {
         std::fs::write(directory.path().join("launch-ready"),"ready\n").unwrap();
         std::fs::set_permissions(directory.path().join("launch-ready"),std::fs::Permissions::from_mode(0o600)).unwrap();
         let group=ProcessGroup {id:child.id() as libc::pid_t,receipt:receipt.clone(),clean:Arc::new(AtomicBool::new(false)),
-            active_request:None,resource_required:false,vm_preflight:true,resource_observed:AtomicBool::new(false),
+            active_request:None,resource_required:false,vm_preflight:true,resource_observed:AtomicBool::new(false),admission_attempted:AtomicBool::new(false),
             resource_audit:std::sync::Mutex::new(None),native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
         let outcome=group.admit_model("codex",Some(&logger)).await;
         let _=child.kill();child.wait().unwrap();std::fs::write(&receipt,"all-descendants-reaped\n").unwrap();
@@ -870,7 +875,7 @@ mod tests {
             });
             let clean=Arc::new(AtomicBool::new(false));
             let group=ProcessGroup{id,receipt,clean:clean.clone(),active_request:None,
-                resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),
+                resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),admission_attempted:AtomicBool::new(false),
                 resource_audit:std::sync::Mutex::new(None),native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
             drop(group);writer.join().unwrap();
             assert!(clean.load(Ordering::SeqCst),"receipt existence was mistaken for completed publication");
@@ -901,7 +906,7 @@ mod tests {
         std::fs::set_permissions(directory.path().join("launch-ready"),std::fs::Permissions::from_mode(0o600)).unwrap();
         let group=ProcessGroup {id:i32::MAX,receipt,clean:Arc::new(AtomicBool::new(false)),
             active_request:None,resource_required:true,vm_preflight:false,
-            resource_observed:AtomicBool::new(false),resource_audit:std::sync::Mutex::new(None),
+            resource_observed:AtomicBool::new(false),admission_attempted:AtomicBool::new(false),resource_audit:std::sync::Mutex::new(None),
             native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
         assert!(group.verified_quiescence().is_err(),"a file without admission is not authority");
         group.admit_command("verification",None).await.unwrap();
@@ -1530,6 +1535,76 @@ mod tests {
         child.wait().await.unwrap();
         assert!(clean.load(Ordering::SeqCst));
         assert!(!effect.exists());
+    }
+
+    /// A second request against the same supervisor must fail before billing.
+    /// A failed publication is not a second provider invocation.
+    #[tokio::test]
+    async fn supervisor_admission_is_consumed_before_repeat_model_charge() {
+        let directory=tempfile::tempdir().unwrap();
+        let effect=directory.path().join("provider-effect");
+        let mut command=Command::new("/usr/bin/python3");
+        command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('executed')"]).arg(&effect);
+        let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed=count.clone();
+        let logger=Arc::new(crate::tool_audit::AuditLogger::new(directory.path().join("audit")));
+        logger.set_model_call_observer(Arc::new(move |_| {observed.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
+        let (child,group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        group.admit_model("codex",Some(&logger)).await.unwrap();
+        assert!(child.wait_with_output().await.unwrap().status.success());
+        assert!(effect.exists());
+        assert!(group.admit_model("codex",Some(&logger)).await.is_err());
+        assert_eq!(count.load(Ordering::SeqCst),1,"same supervisor charged another model call before refusing duplicate admission");
+        drop(group);
+    }
+
+    #[tokio::test]
+    async fn supervisor_admission_denial_cannot_retry_its_callback() {
+        let directory=tempfile::tempdir().unwrap();
+        let effect=directory.path().join("provider-effect");
+        let mut command=Command::new("/usr/bin/python3");
+        command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).touch()"]).arg(&effect);
+        let attempts=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed=attempts.clone();
+        let logger=Arc::new(crate::tool_audit::AuditLogger::new(directory.path().join("audit")));
+        logger.set_model_call_observer(Arc::new(move |_| {observed.fetch_add(1,Ordering::SeqCst);anyhow::bail!("fixture denial")})).unwrap();
+        let (mut child,group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        assert!(group.admit_model("claude",Some(&logger)).await.unwrap_err().to_string().contains("fixture denial"));
+        assert!(group.admit_model("claude",Some(&logger)).await.unwrap_err().to_string().contains("already attempted"));
+        assert_eq!(attempts.load(Ordering::SeqCst),1);
+        drop(group);child.wait().await.unwrap();assert!(!effect.exists());
+    }
+
+    #[tokio::test]
+    async fn supervisor_admission_cancellation_consumes_the_actual_attempt() {
+        use std::future::Future;
+        let directory=tempfile::tempdir().unwrap();
+        let effect=directory.path().join("provider-effect");
+        let mut command=Command::new("/usr/bin/python3");
+        command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).touch()"]).arg(&effect);
+        let attempts=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed=attempts.clone();
+        let logger=Arc::new(crate::tool_audit::AuditLogger::new(directory.path().join("audit")));
+        logger.set_model_call_observer(Arc::new(move |_| {observed.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
+        let (mut child,group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        let ready=group.receipt.with_file_name("launch-ready");
+        let saved=group.receipt.with_file_name("saved-ready");
+        let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(3);
+        while !launch_readiness(&ready).unwrap() {
+            assert!(tokio::time::Instant::now()<deadline,"supervisor did not publish readiness");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        std::fs::rename(&ready,&saved).unwrap();
+        let mut first=Box::pin(group.admit_model("codex",Some(&logger)));
+        std::future::poll_fn(|context| {
+            assert!(first.as_mut().poll(context).is_pending(),"first attempt did not enter readiness wait");
+            std::task::Poll::Ready(())
+        }).await;
+        drop(first);
+        std::fs::rename(&saved,&ready).unwrap();
+        assert!(group.admit_model("codex",Some(&logger)).await.unwrap_err().to_string().contains("already attempted"));
+        assert_eq!(attempts.load(Ordering::SeqCst),0);
+        drop(group);child.wait().await.unwrap();assert!(!effect.exists());
     }
 
     #[tokio::test]
