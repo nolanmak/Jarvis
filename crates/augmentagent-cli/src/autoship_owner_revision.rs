@@ -9,8 +9,20 @@ pub(super) fn validate_history(conn:&Connection,workflow:&str)->Result<()> {hist
 /// absence never grants a legacy exception to productive owner coding.
 pub(super) fn preparation_for_turn(conn:&Connection,turn:&owner_turn::OwnerTurn)->Result<Option<OwnerPreparationBinding>> {
     validate_history(conn,&turn.lease.workflow)?;
-    let raw:Option<String>=conn.query_row("SELECT p.record FROM workflow_owner_revision r JOIN workflow_owner_preparation p ON p.request_id=r.request_id JOIN workflow_owner_turn t ON t.request_id=r.request_id WHERE r.request_id=?1 AND r.binding=?2 AND r.next_contract=?3 AND t.workflow=?4 AND t.owner=?5 AND t.lease_generation=?6 AND t.pause_revision=?7",
-        params![turn.request_id,serde_json::to_string(&turn.binding)?,turn.binding.contract,turn.lease.workflow,turn.lease.owner,turn.lease.generation,turn.pause_revision],|r|r.get(0)).optional()?;
+    // A consumed, validated successor edge preserves the original identity.
+    // It is descriptive history: executable callers still validate the live
+    // current turn and lease separately before using this preparation.
+    let same_turn=match super::owner_publication_recovery::historical_successor_turn(conn,&turn.lease.workflow,&turn.request_id)? {
+        Some((owner,generation,pause,binding,_))=>owner==turn.lease.owner && generation==turn.lease.generation
+            && pause==turn.pause_revision && binding==turn.binding,
+        None=>conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1 AND request_id=?2 AND owner=?3 AND lease_generation=?4 AND pause_revision=?5 AND binding=?6)",
+            params![turn.lease.workflow,turn.request_id,turn.lease.owner,turn.lease.generation,turn.pause_revision,serde_json::to_string(&turn.binding)?],|r|r.get(0))?,
+    };
+    let same_body:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_message WHERE workflow=?1 AND request_id=?2 AND body=?3)",
+        params![turn.lease.workflow,turn.request_id,turn.body],|r|r.get(0))?;
+    if !same_turn || !same_body {return Ok(None);}
+    let raw:Option<String>=conn.query_row("SELECT p.record FROM workflow_owner_revision r JOIN workflow_owner_preparation p ON p.request_id=r.request_id JOIN workflow_owner_turn t ON t.request_id=r.request_id WHERE r.request_id=?1 AND r.binding=?2 AND r.next_contract=?3 AND t.workflow=?4",
+        params![turn.request_id,serde_json::to_string(&turn.binding)?,turn.binding.contract,turn.lease.workflow],|r|r.get(0)).optional()?;
     raw.map(|raw|Ok(serde_json::from_str(&raw)?)).transpose()
 }
 pub(super) fn require_preparation(conn:&Connection,turn:&owner_turn::OwnerTurn,expected:&OwnerPreparationBinding)->Result<()> {

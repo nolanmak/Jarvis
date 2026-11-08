@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "component": "original preparation history after consumed successor setup",
+  "status": "validated-component-not-productive-recovery-acceptance",
+  "base_commit": "e25cb0122872859c0e534cb9add81cd03972123b",
+  "sources": {
+    "crates/augmentagent-cli/src/autoship_owner_revision.rs": "ca336d3b6d203f3811cf21f785353537f0f10bdb3cb1edd88dda65692255c330",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "cd4708216bd0b7380057035fa40cb8b2f4ee1e3ce3057cb961c577dbbc190ef7"
+  },
+  "red": {
+    "log": "/tmp/autoship-original-preparation-successor-red-20261108.log",
+    "result": "Actual supported successor fixture failed: successor setup hid the original accepted preparation."
+  },
+  "change": [
+    "The existing preparation reader follows the existing validated immutable consumed-successor edge to match the original owner/generation/pause/binding. Without that edge it still requires the matching current turn.",
+    "Both paths require the exact original workflow/request/body and existing revision/preparation history. No mutable current-owner substitution or newest-generation inference is used.",
+    "Current executable turn, lease, controls and preparation validation remain separate; descriptive history cannot reconstruct an executable dispatch."
+  ],
+  "validation": [
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent owner_successor_native_no_pending_refusal_persists_retry -- --nocapture",
+      "log": "/tmp/autoship-original-preparation-successor-final-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "seconds": 51.84,
+      "controlled_provider_cases": [
+        "codex",
+        "claude"
+      ]
+    },
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent autoship_workflow::owner_revision::tests -- --nocapture",
+      "log": "/tmp/autoship-original-preparation-revision-suite-20261108.log",
+      "passed": 16,
+      "failed": 0,
+      "seconds": 1.16
+    },
+    {
+      "command": "scripts/cargo-managed.sh build -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-original-preparation-production-20261108.log",
+      "passed": true
+    }
+  ],
+  "assertions": [
+    "Original preparation remains readable after the actual authenticated fixture successor-setup CAS.",
+    "Old original preparation cannot revive its fenced execution turn.",
+    "Substituted owner, generation, pause revision, binding, body or request never acquires preparation.",
+    "Damaged claim/event, coherent original-owner/readiness substitution and changed current-turn projection refuse historical preparation.",
+    "Expired or differently owned execution leases and owner pause do not erase valid descriptive history; current execution still refuses.",
+    "Observation appends no events; existing fixture snapshot, model-charge, pending-input, allowance and no-productive-successor assertions remain enabled."
+  ],
+  "limits": [
+    "Scripted GitHub authority, private controlled resources and original native/audit fixtures are used; this is not live Discord, provider, VM or independent-review acceptance.",
+    "The existing single-cycle successor history remains bounded by its original rules. Versioned per-cycle migration, reserved body/model/input/result readers, actual source/resource producer closure and productive constructors remain incomplete.",
+    "No production session, policy, reservation, owner hold, allowance or daemon state changed. Hosted exact-head CI, independent review, normal rollout and the full epic live/fault/soak acceptance remain required."
+  ],
+  "all_original_local_handles_terminal": true,
+  "productive_dispatch_or_retirement_granted": false
+}

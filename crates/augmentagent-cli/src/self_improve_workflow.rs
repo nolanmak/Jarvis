@@ -5890,6 +5890,25 @@ else: raise SystemExit('unexpected authority call')
                         assert!(store.owner_successor_native_facts(&setup,&paused_auth,millis()).is_err(),"stale paused preview exposed successor native facts");
                         store.validate_owner_successor_setup(&setup,&setup_auth,millis()).unwrap();
                         WorkflowStore::open(&state).unwrap().validate_owner_successor_setup(&setup,&setup_auth,millis()).unwrap();
+                        // The consumed successor changes the current turn, not
+                        // the original preparation's immutable identity.
+                        let preparation_events=store.events(&id).unwrap();
+                        assert!(store.has_owner_acceptance_for_turn(&turn).unwrap(),"successor setup hid the original accepted preparation");
+                        assert!(store.validate_owner_preparation_for_turn(&turn,&original_preparation,millis()).is_err(),"historical preparation revived the fenced original turn");
+                        for fault in ["owner","generation","pause","binding","body","request"] {
+                            let mut changed=turn.clone();
+                            match fault {
+                                "owner"=>changed.lease.owner="other-owner".into(),
+                                "generation"=>changed.lease.generation=setup.generation(),
+                                "pause"=>changed.pause_revision+=1,
+                                "binding"=>changed.binding.head="e".repeat(40),
+                                "body"=>changed.body.push_str(" changed"),
+                                "request"=>changed.request_id="other-request".into(),
+                                _=>unreachable!(),
+                            }
+                            assert!(!store.has_owner_acceptance_for_turn(&changed).unwrap_or(false),"{fault}: substituted historical turn acquired preparation");
+                        }
+                        assert_eq!(store.events(&id).unwrap(),preparation_events,"historical preparation observation appended workflow history");
                         assert!(WorkflowStore::open(&state).unwrap().claim_recovered_owner_turn_for_setup(&setup_auth,"duplicate-successor",millis(),60_000).unwrap().is_none());
                         assert!(store.owner_successor_setup_plan(&id).unwrap().is_none());assert!(store.owner_publication_recovery_plan(&id).unwrap().is_none());
                         assert_eq!(store.pending_owner_messages(&id).unwrap(),2);assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,before_ready.model_calls);
@@ -6140,6 +6159,7 @@ else: raise SystemExit('unexpected authority call')
                                 "expiry"=>{db.execute("UPDATE workflow SET lease_until=?2 WHERE id=?1",rusqlite::params![id,millis()-1]).unwrap();},_=>unreachable!(),
                             }
                             assert!(store.validate_owner_successor_setup(&setup,&setup_auth,millis()).is_err(),"{fault}: changed successor retained setup claim");
+                            assert_eq!(store.has_owner_acceptance_for_turn(&turn).unwrap_or(false),matches!(fault,"lease-owner"|"expiry"),"{fault}: preparation history ignored damaged ancestry or depended on current execution authority");
                             db.execute("UPDATE workflow_owner_successor_claim SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,saved_claim.2,saved_claim.1]).unwrap();
                             db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![saved_claim.0,claim_event]).unwrap();
                             db.execute("UPDATE workflow_owner_turn SET owner='fresh-owner-successor' WHERE request_id=?1",[&original_request]).unwrap();
@@ -6148,6 +6168,7 @@ else: raise SystemExit('unexpected authority call')
                         }
                         let control=store.owner_control(&id).unwrap().unwrap();store.set_owner_pause(&id,"fixture-owner",control.revision,true,millis()).unwrap();
                         assert!(store.validate_owner_successor_setup(&setup,&setup_auth,millis()).is_err());assert!(store.owner_successor_setup_plan(&id).unwrap().is_none());
+                        assert!(store.has_owner_acceptance_for_turn(&turn).unwrap(),"owner pause erased descriptive original preparation history");
                         let mut paused_native_visited=false;
                         assert!(with_successor_native_metadata(&state,Some(dir.path()),setup.clone(),&setup_auth,&mut |_| {paused_native_visited=true;Ok(())}).is_err());
                         assert!(!paused_native_visited,"paused successor reached original native metadata");
