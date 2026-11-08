@@ -99,6 +99,11 @@ fn original(conn: &Connection, workflow: &str, request: &str) -> Result<Original
 // Independent immutable identity layer. Publication completion reference readers
 // must not re-enter revision/publication/body completion validation here.
 fn original_identity(conn: &Connection, workflow: &str, request: &str) -> Result<Original> {
+    original_identity_at(conn,workflow,request,None)
+}
+// The claim's event boundary preserves its original reservation snapshot.
+// A reservation created after that claim belongs to later history.
+fn original_identity_at(conn:&Connection,workflow:&str,request:&str,before:Option<i64>)->Result<Original> {
     let (raw,len):(String,i64)=conn.query_row("SELECT substr(record,1,4227073),length(CAST(record AS BLOB)) FROM workflow_owner_publication_intent WHERE workflow=?1 AND request_id=?2",params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?)))?;
     ensure!(
         (1..=4 * 1024 * 1024 + 32 * 1024).contains(&len) && raw.len() as i64 == len,
@@ -139,19 +144,7 @@ fn original_identity(conn: &Connection, workflow: &str, request: &str) -> Result
         command.repository == record.repository(),
         "recovery repository changed"
     );
-    let body:Option<(i64,String,i64)>=conn.query_row("SELECT sequence,substr(record,1,16385),length(CAST(record AS BLOB)) FROM workflow_owner_body_dispatch WHERE workflow=?1 AND request_id=?2",params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    let body_dispatch = body
-        .map(|(sequence, raw, len)| {
-            ensure!(
-                (1..=16384).contains(&len) && raw.len() as i64 == len,
-                "recovery body record exceeds bound"
-            );
-            Ok::<_, anyhow::Error>(RecordRef {
-                sequence,
-                sha256: digest(&raw),
-            })
-        })
-        .transpose()?;
+    let body_dispatch = body_dispatch_reference(conn,workflow,request,before)?;
     Ok(Original {
         workflow: workflow.into(),
         request_id: request.into(),
@@ -163,6 +156,31 @@ fn original_identity(conn: &Connection, workflow: &str, request: &str) -> Result
         command,
         body_dispatch,
     })
+}
+// Descriptive reservation snapshot only; never a dispatch capability.
+fn body_dispatch_reference(conn:&Connection,workflow:&str,request:&str,before:Option<i64>)->Result<Option<RecordRef>> {
+    ensure!(before.is_none_or(|sequence|sequence>0),"invalid recovery snapshot boundary");
+    let body:Option<(i64,String,i64)>=conn.query_row("SELECT sequence,substr(record,1,16385),length(CAST(record AS BLOB)) FROM workflow_owner_body_dispatch WHERE workflow=?1 AND request_id=?2",params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    body
+        .map(|(sequence, raw, len)| {
+            ensure!(
+                sequence>0 && (1..=16384).contains(&len) && raw.len() as i64 == len,
+                "recovery body record exceeds bound"
+            );
+            let record:serde_json::Value=serde_json::from_str(&raw)?;
+            let generation=record["generation"].as_i64().context("recovery body generation missing")?;
+            let at=record["started_at_ms"].as_i64().context("recovery body timestamp missing")?;
+            let matches:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND seq=?2 AND kind='owner_body_dispatch_started' AND payload=?3 AND generation=?4 AND at_ms=?5)",
+                params![workflow,sequence,raw,generation,at],|r|r.get(0))?;
+            ensure!(generation>0 && at>=0 && record["workflow"]==workflow && record["request_id"]==request && matches,
+                "recovery body event reference changed");
+            Ok::<_, anyhow::Error>(RecordRef {sequence,sha256:digest(&raw)})
+        })
+        .transpose().map(|reference|reference.filter(|r|before.is_none_or(|end|r.sequence<end)))
+}
+#[cfg(test)]
+pub(crate) fn test_body_dispatch_snapshot(conn:&Connection,workflow:&str,request:&str,before:i64)->Result<serde_json::Value> {
+    Ok(serde_json::to_value(body_dispatch_reference(conn,workflow,request,Some(before))?)?)
 }
 fn table_exists(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_publication_recovery')",[],|r|r.get(0))?)
@@ -221,7 +239,7 @@ fn journal(conn: &Connection, workflow: &str) -> Result<Vec<(Claim, RecordRef)>>
             "recovery claim shape changed"
         );
         ensure!(
-            claim.original == original_identity(conn, workflow, &claim.original.request_id)?,
+            claim.original == original_identity_at(conn, workflow, &claim.original.request_id,Some(sequence))?,
             "recovery original lineage changed"
         );
         match claims.last() {

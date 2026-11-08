@@ -903,6 +903,43 @@ mod tests {
         (store, turn)
     }
     #[test]
+    fn recovery_reservation_snapshot_excludes_a_later_real_dispatch() {
+        let dir=tempfile::tempdir().unwrap();
+        let (mut store,turn)=setup(&dir.path().join("state.db"));
+        let before:i64=store.conn.query_row("SELECT coalesce(max(seq),0)+1 FROM workflow_event",[],|r|r.get(0)).unwrap();
+        let snapshot=|store:&WorkflowStore,at|super::super::owner_publication_recovery::test_body_dispatch_snapshot(&store.conn,&turn.lease.workflow,&turn.request_id,at).unwrap();
+        assert_eq!(snapshot(&store,before),serde_json::Value::Null);
+        let dispatch=store.begin_owner_body_dispatch(&turn,submission::Provider::Codex,5).unwrap();
+        assert_eq!(dispatch.sequence,before);
+        assert_eq!(snapshot(&store,before),serde_json::Value::Null,"a later body reservation rewrote the old recovery snapshot");
+        let current=snapshot(&store,dispatch.sequence+1);
+        assert_eq!(current["sequence"],dispatch.sequence);
+        assert!(current["sha256"].as_str().unwrap().len()==64);
+        store.validate_owner_body_dispatch(&dispatch,6).unwrap();
+        assert!(store.begin_owner_body_dispatch(&turn,submission::Provider::Codex,6).is_err());
+        let read=|store:&WorkflowStore,at|super::super::owner_publication_recovery::test_body_dispatch_snapshot(&store.conn,&turn.lease.workflow,&turn.request_id,at);
+        assert!(read(&store,0).is_err());
+        let raw:String=store.conn.query_row("SELECT record FROM workflow_owner_body_dispatch WHERE request_id=?1",[&turn.request_id],|r|r.get(0)).unwrap();
+        let events=store.events(&turn.lease.workflow).unwrap();
+        for fault in ["event","generation","time","sequence","oversize"] {
+            match fault {
+                "event"=>{store.conn.execute("UPDATE workflow_event SET payload='{}' WHERE seq=?1",[dispatch.sequence]).unwrap();},
+                "generation"=>{store.conn.execute("UPDATE workflow_event SET generation=generation+1 WHERE seq=?1",[dispatch.sequence]).unwrap();},
+                "time"=>{store.conn.execute("UPDATE workflow_event SET at_ms=at_ms+1 WHERE seq=?1",[dispatch.sequence]).unwrap();},
+                "sequence"=>{store.conn.execute("UPDATE workflow_owner_body_dispatch SET sequence=(SELECT min(seq) FROM workflow_event) WHERE request_id=?1",[&turn.request_id]).unwrap();},
+                "oversize"=>{store.conn.execute("UPDATE workflow_owner_body_dispatch SET record=?2 WHERE request_id=?1",params![turn.request_id,"x".repeat(16385)]).unwrap();},
+                _=>unreachable!(),
+            }
+            assert!(read(&store,before).is_err(),"{fault}: a historical boundary hid damaged reservation history");
+            store.conn.execute("UPDATE workflow_event SET payload=?2,generation=?3,at_ms=5 WHERE seq=?1",params![dispatch.sequence,raw,turn.lease.generation]).unwrap();
+            store.conn.execute("UPDATE workflow_owner_body_dispatch SET sequence=?2,record=?3 WHERE request_id=?1",params![turn.request_id,dispatch.sequence,raw]).unwrap();
+            assert_eq!(snapshot(&store,before),serde_json::Value::Null);
+            assert_eq!(snapshot(&store,dispatch.sequence+1),current);
+        }
+        assert_eq!(store.events(&turn.lease.workflow).unwrap(),events);
+        store.validate_owner_body_dispatch(&dispatch,6).unwrap();
+    }
+    #[test]
     fn owner_body_dispatch_is_once_across_restart_and_keeps_input_pending() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");

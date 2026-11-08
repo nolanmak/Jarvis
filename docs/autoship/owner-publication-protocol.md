@@ -423,7 +423,7 @@ Success, future cancellation, write/shutdown failure and process death release t
 
 The behavioral red uses a real blocked subprocess stdin pipe and the actual protected native launch/resource/input marker path. After the marker commits and while a 2 MiB write is pending, another `StateLock::existing` previously succeeded. New success/cancellation/broken-pipe fixtures for both providers require that acquisition to refuse while the write is pending and to succeed after settlement/drop. They also run the actual handoff lock-acquisition path in a bounded subprocess and require prompt `LockBusy` classification while input remains pending. A second behavioral red showed that this acquisition previously blocked instead. They verify exact full input on success, partial/zero input on cancellation/error, one retained marker and refusal of a second release attempt. The existing process-death-before-input, owner binding/prompt/resource, current fence, sealed-audit and pre-byte marker tests remain. Receivers are local scripted children, not provider CLIs or VMs.
 
-This closes the marker-to-stdin authority gap needed before a later revocation producer can rely on acquiring the original native state lock. It does not itself establish original-writer closure, complete input census, source/resource authority, body nonrelease, semantic continuation or a productive successor. Those remain required; the productive owner consumer is still unconnected and the unfinished shared-gate WIP remains unpublished.
+This closes the marker-to-stdin authority gap for writers admitted through this draft's common release boundary. It does not fence an already-prepared writer from an older binary that never acquires that lock at stdin release; the rollout qualification in §57 remains required before using this guarantee across versions. It does not itself establish original-writer closure, complete input census, source/resource authority, body nonrelease, semantic continuation or a productive successor. Those remain required; the productive owner consumer is still unconnected and the unfinished shared-gate WIP remains unpublished.
 
 [Native input authority evidence](1703-native-input-authority-proof.json) records the regression, source inventory and validation.
 
@@ -432,7 +432,7 @@ This closes the marker-to-stdin authority gap needed before a later revocation p
 
 The retained native metadata census now includes every recorded prepared launch, including launches without a resource binding or input marker. For each launch it preserves the exact original launch intent/append receipt, optional original resource receipt, preparation/owner-input association and whether an input-release attempt was recorded. It joins the original owner and exact source audit to the actual native ledger while the original state/session/audit locks remain held. Closure is observed from a validated completed transfer (with original request/receipt digests) or the exact permanent native retirement row. A prepared transfer is not closure; a closure for the same owner in a different audit namespace is insufficient. Closure lookup is cached by original owner/audit within each protected audit scan, and the incremental private evidence is bounded before descending to another namespace.
 
-`MetadataNativeOwnerProof::with_revoked_input_writers` rechecks the live metadata/current-policy fence and requires permanent closure for every recorded launch before visiting a distinct borrowed `OriginalInputWriterRevocationProof`. That proof retains the parent metadata proof and therefore its actual original locks; it has no public constructor, clone, serialization or conversion into an input/body permit. Its descriptive evidence binds the native metadata digest and complete recorded-writer list. Saved evidence cannot construct the proof. This observes existing durable closure; it does not newly transfer or retire any owner. The input-boundary lock retention in §28 excludes an in-flight old writer while this observation is made, and the ledger's permanent closure prevents its future admission.
+`MetadataNativeOwnerProof::with_revoked_input_writers` rechecks the live metadata/current-policy fence and requires permanent closure for every recorded launch before visiting a distinct borrowed `OriginalInputWriterRevocationProof`. That proof retains the parent metadata proof and therefore its actual original locks; it has no public constructor, clone, serialization or conversion into an input/body permit. Its descriptive evidence binds the native metadata digest and complete recorded-writer list. Saved evidence cannot construct the proof. This observes existing durable closure; it does not newly transfer or retire any owner. For writers admitted through the §28 protocol, its input-boundary lock retention excludes an in-flight writer while this observation is made, and the ledger's permanent closure prevents its future admission. This is not a certificate for older writers that never consult that boundary; §57 records the unresolved rollout requirement.
 
 The uninterrupted private `OwnerPublicationGuard` exposes this inspection only through its original opaque draft/turn and fresh native metadata producer. It still denies dispatch/model operations before and after canonical publication. This is not a recovery or terminal authority and does not promote the original metadata generation into a productive lease.
 
@@ -1330,3 +1330,65 @@ or permission to reclaim retained production state. This test-only addition chan
 no production behavior. The remaining reservation/cycle/release/result constructors,
 full original rollout and CLI/Discord/merge/soak acceptance remain required. See
 [the multi-handoff evidence](1703-native-body-lineage-handoff-proof.json).
+
+
+## 56. Recovery reservation snapshots use the claim event boundary
+
+**D56.1 — Preserve the reservation seen by each immutable claim.** The recovery
+journal reconstructs a claim's original body-reservation reference from records
+whose event sequence precedes that exact claim event. A reservation created later
+does not rewrite an earlier absent-reservation snapshot. Current planning still
+reads current reservation history. No original record, digest, event, UUID or
+reservation is rewritten or removed, and an existing reservation still prevents
+another ordinary body dispatch.
+
+Before applying the event boundary, the bounded reference reader checks the
+reservation's actual workflow/request, record length and its exact dispatch event,
+payload, generation and timestamp. A future reservation with damaged provenance
+is an integrity error, not permission to hide it from an older snapshot. Full
+semantic dispatch validation remains separately required. This reference cannot
+construct a dispatch capability or prove nonrelease.
+
+The regression creates a real reservation through the ordinary constructor:
+the previous reader changed an older null snapshot into the new reservation.
+The corrected reader keeps that snapshot null, includes the reservation at a
+later boundary, rejects five damaged-provenance cases and still refuses a second
+reservation. All 330 workflow tests and the existing 12-case authenticated-recovery
+fixture passed, followed by the production build. These are controlled local
+fixtures, not a productive repeated recovery or live acceptance. See
+[the reservation snapshot evidence](1703-recovery-reservation-snapshot-proof.json).
+The historical dispatch/model/result readers, versioned repeated-cycle ancestry,
+actual predecessor dispositions and productive constructors required by §53 remain
+unfinished; this reference fix does not enable them.
+
+## 57. Legacy writer rollout qualification (open)
+
+**D57.1 — Qualify the actual writer, not just its observer.** Deployed commit
+`4b0b2461152bb774e50d9510fc9d3235bce2b006` writes Codex input directly after
+model admission; it does not implement this draft's `record_input_release_attempt`
+protocol. An already-prepared invocation from that implementation is not fenced
+by acquiring the new state lock or appending a new revocation row. Absence of a
+new input marker cannot establish that such an invocation never wrote input.
+The §28/§29 guarantees apply to the participating writer protocol and cannot be
+retroactively assigned to a legacy session.
+
+**D57.2 — Input revocation is separate from retirement.** The deployed retirement
+path inserts `retired_owner` and creates runtime retirement markers. Those records
+participate in pruning and reclamation. Do not use retirement as an input-only
+revocation shortcut, or count its capacity as recovered before the existing
+retirement/resource requirements are met. All unknown old outcomes and their full
+ordinary reservations remain retained and charged.
+
+**Open thread (load-bearing):** native recovery/source/resource producers must
+implement and positively test a version cutover that excludes every older
+prepared writer and release path before any new input-only revocation or repeated
+productive recovery is enabled. The test exit must include an old invocation
+prepared before cutover, input queued or partly written during cutover, fresh and
+resume admission after cutover, and the old retirement/prune paths. A policy
+version, schema row, binary hash, current PID absence or descriptive namespace
+label alone is not that proof. This section introduces no new runtime root, resource-budget increase,
+legacy reclamation or executable cutover.
+Owner: the C/R native producers, with D/R consuming only their verified capability.
+Trigger: before enabling the second productive cycle in §53. Carrying cost:
+legacy sessions remain fully reserved and outcome-uncertain; production capacity
+and full CLI/Discord/merge/fault/soak acceptance remain independent requirements.

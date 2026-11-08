@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "component": "recovery reservation snapshots at immutable claim boundaries",
+  "base_commit": "1d2dcc323bc3ff33a55ce4585b05cde79f9b3f8f",
+  "status": "historical-reference-prerequisite-no-productive-recovery-grant",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_dispatch.rs": "bd297810fae363bed2aadf1fae430cc34002221b2fb7bae083e2d96471e15e1f",
+    "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs": "51f47d6ca7d4bb6d891f124a652a90bc80d0d98dff3073e8d447935107b89e5a"
+  },
+  "red": {
+    "original_handle": 12585,
+    "result": "1 failed, 0 passed; a later real dispatch changed the older snapshot from null to its sequence/digest",
+    "seconds": 0.09
+  },
+  "fixture_correction": "The first expanded run passed five existing tests but the new tamper fixture tried to reference a nonexistent event and was rejected by the foreign key. It now substitutes an existing wrong event; foreign-key enforcement remains enabled. This fixture failure is not counted as the behavioral red.",
+  "validation": [
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent autoship_workflow:: -- --nocapture",
+      "log": "/tmp/autoship-reservation-snapshot-workflow-20261108.log",
+      "passed": 330,
+      "failed": 0,
+      "seconds": 166.84
+    },
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent self_improve::workflow::tests::expired_owner_publication_has_authenticated_metadata_recovery -- --exact --nocapture",
+      "log": "/tmp/autoship-reservation-snapshot-recovery-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "controlled_cases": 12,
+      "seconds": 139.32
+    },
+    {
+      "command": "scripts/cargo-managed.sh build -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-reservation-snapshot-production-20261108.log",
+      "passed": true,
+      "seconds": 28.62
+    }
+  ],
+  "assertions": [
+    "Older absent snapshot remains absent after actual reservation; a later boundary includes its original sequence and digest.",
+    "Missing/mismatched event payload, generation, timestamp, substituted real event sequence and oversized record refuse even at the older boundary.",
+    "Original live dispatch remains valid, second reservation refuses, and snapshot reads append no workflow events."
+  ],
+  "limits": [
+    "This does not enable repeated recovery or supply original writer/resource quiescence, body nonrelease, model admission, release or completion.",
+    "No live model, VM, Discord or autonomous-merge acceptance was performed.",
+    "No production policy, reservation, budget, hold, accounting or service was changed.",
+    "Exact-head independent review, hosted CI, normal updater deployment and all original acceptance remain required."
+  ],
+  "all_original_local_handles_terminal": true,
+  "productive_recovery_granted": false,
+  "production_capacity_changed": false
+}
