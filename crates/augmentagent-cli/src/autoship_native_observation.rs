@@ -53,7 +53,7 @@ fn provider_name(provider: submission::Provider) -> &'static str {
 fn validate(row: &NativeObservation, launch: &native_launch::NativeLaunchRecord) -> Result<()> {
     let intent = &launch.intent;
     ensure!(
-        row.version == 1
+        matches!(row.version,1|2)
             && row.observation_sequence > launch.sequence
             && row.observed_at_ms >= 0
             && row.workflow_id == launch.workflow_id
@@ -68,7 +68,8 @@ fn validate(row: &NativeObservation, launch: &native_launch::NativeLaunchRecord)
         "native observation differs from its original launch"
     );
     ensure!(
-        row.producer == "normal-completion" && row.reconciles_sequence.is_none(),
+        matches!((row.version,row.producer.as_str()),(1,"normal-completion")|(2,"owner-recovery-completion"))
+            && (row.version!=2 || row.certainty==Certainty::Certain) && row.reconciles_sequence.is_none(),
         "unsupported native observation producer"
     );
     ensure!(
@@ -229,6 +230,16 @@ fn decode(conn: &Connection, idx: Indexed) -> Result<NativeObservation> {
                 == u64::try_from(receipt_sequence)?,
         "native observation index differs from its immutable projection"
     );
+    let (kind,actor,payload,at):(String,i64,String,i64)=conn.query_row("SELECT kind,generation,payload,at_ms FROM workflow_event WHERE workflow=?1 AND seq=?2",params![workflow,seq],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+    ensure!(kind=="native_observation_recorded" && payload.len()<=4096 && at>=0,"native observation event missing or oversized");
+    let payload:serde_json::Value=serde_json::from_str(&payload)?;
+    if row.version==1 {
+        ensure!(actor==row.source_owner.lease_generation && payload==serde_json::json!({"provider":provider_name(row.provider),"certainty":row.certainty}),"native observation original event changed");
+    } else {
+        let marker=payload.get("owner_recovery").context("recovery completion provenance missing")?;
+        ensure!(payload==serde_json::json!({"provider":provider_name(row.provider),"certainty":row.certainty,"owner_recovery":marker}),"recovery completion event changed");
+        owner_publication_recovery::validate_completion_import(conn,&row,actor,at,marker)?;
+    }
     Ok(row)
 }
 /// Captured outside the workflow mutex; this is not deserializable authority.
@@ -288,29 +299,39 @@ impl WorkflowStore {
             reconciles_sequence: None,
             proof: Some(proof),
         };
-        validate(&row, &launch)?;
-        let receipt_sequence = i64::try_from(fact.receipt().sequence)?;
+        let row=write_observation_tx(&tx,row,now,None)?;
+        tx.commit()?;Ok(row)
+
+    }
+}
+// One append/index/session-ownership authority for ordinary and recovery
+// observations. The caller supplies its distinct live role, in one transaction.
+fn write_observation_tx(tx:&Transaction<'_>,row:NativeObservation,now:i64,
+    recovery:Option<&owner_publication_recovery::CompletionImport>,
+)->Result<NativeObservation> {
+        validate(&row,&native_launch::recorded_launch(tx,&row.launch_intent_id)?)?;
+        let receipt_sequence=i64::try_from(row.protected_observation_reference.as_ref().context("native observation receipt missing")?.sequence)?;
         let prior=tx.query_row(&format!("SELECT {COLUMNS} FROM workflow_native_observation WHERE source_audit_path=?1 AND receipt_sequence=?2"),
             params![row.source_audit_path,receipt_sequence],indexed).optional()?;
         if let Some(prior) = prior {
-            let prior = decode(&tx, prior)?;
+            let prior = decode(tx, prior)?;
             let mut replay = row;
+            if recovery.is_some() && prior.version==1 {replay.version=prior.version;replay.producer=prior.producer.clone();}
             replay.observation_sequence = prior.observation_sequence;
             ensure!(
                 prior == replay,
                 "native observation receipt was reused with different input"
             );
-            tx.commit()?;
             return Ok(prior);
         }
         let newest:String=tx.query_row("SELECT intent_id FROM workflow_native_launch WHERE workflow=?1 AND provider=?2 AND runtime_relative_path=?3 ORDER BY sequence DESC LIMIT 1",
-            params![lease.workflow,provider_name(row.provider),row.runtime_relative_path],|r|r.get(0))?;
+            params![row.workflow_id,provider_name(row.provider),row.runtime_relative_path],|r|r.get(0))?;
         ensure!(
             newest == row.launch_intent_id,
             "a newer native launch requires its own observation"
         );
         let latest=tx.query_row(&format!("SELECT {COLUMNS} FROM workflow_native_observation WHERE workflow=?1 AND provider=?2 AND runtime_relative_path=?3 ORDER BY sequence DESC LIMIT 1"),
-            params![lease.workflow,provider_name(row.provider),row.runtime_relative_path],indexed).optional()?.map(|r|decode(&tx,r)).transpose()?;
+            params![row.workflow_id,provider_name(row.provider),row.runtime_relative_path],indexed).optional()?.map(|r|decode(tx,r)).transpose()?;
         ensure!(
             row.certainty != Certainty::Certain
                 || latest
@@ -322,11 +343,11 @@ impl WorkflowStore {
             let owner:Option<String>=tx.query_row("SELECT workflow FROM workflow_native_session_owner WHERE provider=?1 AND native_session=?2",
                 params![provider_name(row.provider),session],|r|r.get(0)).optional()?;
             ensure!(
-                owner.as_ref().is_none_or(|owner| owner == &lease.workflow),
+                owner.as_ref().is_none_or(|owner| owner == &row.workflow_id),
                 "observed native session belongs to another workflow"
             );
             let prior=tx.query_row(&format!("SELECT {COLUMNS} FROM workflow_native_observation WHERE provider=?1 AND native_session=?2 ORDER BY sequence LIMIT 1"),
-                params![provider_name(row.provider),session],indexed).optional()?.map(|r|decode(&tx,r)).transpose()?;
+                params![provider_name(row.provider),session],indexed).optional()?.map(|r|decode(tx,r)).transpose()?;
             ensure!(
                 prior
                     .as_ref()
@@ -336,10 +357,10 @@ impl WorkflowStore {
             );
             tx.execute(
                 "INSERT INTO workflow_native_session_owner VALUES(?1,?2,?3) ON CONFLICT DO NOTHING",
-                params![provider_name(row.provider), session, lease.workflow],
+                params![provider_name(row.provider), session, row.workflow_id],
             )?;
         }
-        let (count,bytes):(i64,i64)=tx.query_row("SELECT count(*),coalesce(sum(length(CAST(record AS BLOB))),0) FROM workflow_native_observation WHERE workflow=?1",[&lease.workflow],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let (count,bytes):(i64,i64)=tx.query_row("SELECT count(*),coalesce(sum(length(CAST(record AS BLOB))),0) FROM workflow_native_observation WHERE workflow=?1",[&row.workflow_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
         let estimate = serde_json::to_vec(&row)?.len();
         ensure!(
             estimate <= 32768
@@ -349,18 +370,20 @@ impl WorkflowStore {
             "native observation history capacity reached"
         );
         event(
-            &tx,
-            &lease.workflow,
-            lease.generation,
+            tx,
+            &row.workflow_id,
+            recovery.map_or(row.source_owner.lease_generation,|import|import.generation()),
             "native_observation_recorded",
-            &serde_json::json!({"provider":provider_name(row.provider),"certainty":row.certainty})
-                .to_string(),
+            &match recovery {
+                None=>serde_json::json!({"provider":provider_name(row.provider),"certainty":row.certainty}),
+                Some(import)=>serde_json::json!({"provider":provider_name(row.provider),"certainty":row.certainty,"owner_recovery":import}),
+            }.to_string(),
             now,
         )?;
         let mut row = row;
         row.observation_sequence = tx.query_row(
             "SELECT max(seq) FROM workflow_event WHERE workflow=?1",
-            [&lease.workflow],
+            [&row.workflow_id],
             |r| r.get(0),
         )?;
         let raw = serde_json::to_string(&row)?;
@@ -383,10 +406,36 @@ impl WorkflowStore {
                 raw
             ],
         )?;
-        tx.commit()?;
-        Ok(row)
-
-    }
+        // Validate the event/provenance together with its immutable index.
+        let idx=tx.query_row(&format!("SELECT {COLUMNS} FROM workflow_native_observation WHERE sequence=?1"),[row.observation_sequence],indexed)?;
+        decode(tx,idx)
+}
+/// This native proof cannot be constructed from JSON or a copied workflow
+/// lease. The caller separately validates its current authenticated recovery
+/// role and exact original publication/frontier before calling this writer.
+pub(super) fn record_metadata_completion_tx(tx:&Transaction<'_>,binding:&Binding,
+    proof:&augmentagent_channel_core::native_vm::ownership::MetadataNativeCompletionProof<'_>,
+    import:&owner_publication_recovery::CompletionImport,now:i64,
+)->Result<NativeObservation> {
+    let prepared=proof.prepared();let inventory=proof.inventory();
+    let launch=native_launch::recorded_launch(tx,&prepared.intent.intent_id)?;
+    owner_dispatch::require_same_prepared(&launch,prepared)?;
+    ensure!(launch.workflow_binding==*binding,"recovery completion workflow binding changed");
+    let (audit,digest)=native_launch::original_context(tx,&launch.workflow_id,launch.source_owner.lease_generation,true)?;
+    ensure!(audit==launch.source_audit_path && digest==prepared.intent.original_store_binding_sha256
+        && digest==native_launch::binding_digest(proof.binding())?,"recovery completion original registration changed");
+    let mut original=proof.observation().clone();original.as_object_mut().context("recovery completion observation missing")?.remove("audit_chain");
+    let observed_at_ms=original["observed_at_ms"].as_i64().context("recovery completion timestamp missing")?;
+    ensure!(observed_at_ms<=now,"recovery completion clock predates observation");
+    let row=NativeObservation {version:2,workflow_id:launch.workflow_id.clone(),provider:launch.intent.provider,
+        runtime_relative_path:launch.intent.runtime_relative_path.clone(),native_session_id:Some(inventory.native_session_id.clone()),
+        observation_sequence:i64::MAX,observed_at_ms,workflow_binding:binding.clone(),source_owner:prepared.intent.source_owner.clone(),
+        source_audit_path:launch.source_audit_path.clone(),certainty:Certainty::Certain,producer:"owner-recovery-completion".into(),
+        launch_intent_id:launch.intent.intent_id.clone(),launch_sha256:Some(launch.intent.launch_sha256.clone()),
+        creation_receipt_sha256:launch.intent.creation_receipt_sha256.clone(),completion_sha256:Some(inventory.completion_sha256.clone()),
+        alias_sha256:Some(inventory.alias_sha256.clone()),export_manifest_sha256:Some(inventory.export_manifest_sha256.clone()),
+        protected_observation_reference:Some(proof.receipt().clone()),reconciles_sequence:None,proof:Some(original)};
+    write_observation_tx(tx,row,now,Some(import))
 }
 impl WorkflowStore {
     /// Compatibility wrapper for fixtures; production uses the two-phase ingress.

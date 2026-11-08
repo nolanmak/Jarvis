@@ -4,6 +4,20 @@ use super::*;
 use augmentagent_channel_core::native_vm::{ownership, RuntimeOwner};
 use std::os::unix::fs::PermissionsExt;
 #[tokio::test]
+async fn recovery_completion_observation_preserves_builder_pin_across_native_providers() {
+    super::tests::owner_metadata_recovery_modes_inner_reserved(
+        &["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery"],
+        false,None,Some("late-completion-other-provider"),
+    );
+}
+#[tokio::test]
+async fn recovery_records_changed_completion_after_original_sql_callback_is_lost() {
+    super::tests::owner_metadata_recovery_modes_inner_reserved(
+        &["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery"],
+        false,None,Some("late-completion"),
+    );
+}
+#[tokio::test]
 async fn legacy_input_writer_debt_survives_restart_and_does_not_retry_on_a_timer() {
     super::tests::owner_metadata_recovery_modes_inner_reserved(
         &[
@@ -87,10 +101,12 @@ pub(super) fn seed_reserved_body(
 ) -> ReservedSeed {
     let phase = phase.strip_prefix("successor-").unwrap_or(phase);
     let legacy_writer = matches!(phase, "legacy-writer" | "legacy-blocked");
-    let keep_late_observation = phase == "legacy-blocked";
+    let changed_late_completion=phase.starts_with("late-completion");
+    let other_provider=phase=="late-completion-other-provider";
+    let keep_late_observation = phase == "legacy-blocked" || changed_late_completion;
     let phase = if phase == "stale-model-snapshot" {
         "admitted"
-    } else if matches!(phase, "lost-response" | "legacy-writer" | "legacy-blocked") {
+    } else if matches!(phase, "lost-response" | "legacy-writer" | "legacy-blocked" | "late-completion" | "late-completion-other-provider") {
         "native-bound"
     } else {
         phase
@@ -214,18 +230,36 @@ pub(super) fn seed_reserved_body(
         )
         .unwrap();
     let late = if keep_late_observation {
-        // Actual protected completion captured before handoff, withheld from
-        // SQL to exercise the blocked-status consumer's later evidence input.
-        // The later SQL projection is a controlled fixture, not a production
-        // late-observation admission or an executable completion capability.
-        let second =
-            ownership::observe_native_completion(&audit, &prepared, &session, &resource).unwrap();
+        // Expected data only: legacy-blocked later uses a controlled SQL
+        // projection; late-completion uses the actual fresh native/workflow APIs.
+        let (late_prepared,late_session,late_resource)=if other_provider {
+            let other=if name=="codex" {"claude"}else{"codex"};
+            let value=durable::native_observation::tests::retained_launch_fixture_with_writer_version(native,&audit,other,3,|prepared| {
+                store.record_verified_native_launch(&guard.lease,&guard.binding,&audit,prepared,millis()).unwrap();
+            });
+            let lock=native.join(format!("{other}/session-fixture/lock"));std::fs::write(&lock,b"").unwrap();
+            std::fs::set_permissions(&lock,std::fs::Permissions::from_mode(0o600)).unwrap();
+            value
+        }else {(prepared.clone(),session.clone(),resource.clone())};
+        if changed_late_completion {
+            std::fs::write(native.join(&late_prepared.intent.runtime_relative_path).join("generation-fixture/context"),b"changed export before lost SQL callback").unwrap();
+        }
+        let second=ownership::observe_native_completion(&audit,&late_prepared,&late_session,&late_resource).unwrap();
         let mut proof = audit.read_append_receipt(second.receipt()).unwrap();
         proof.as_object_mut().unwrap().remove("audit_chain");
         let mut row = first;
+        row.provider=if late_prepared.intent.provider=="codex" {durable::submission::Provider::Codex}else{durable::submission::Provider::Claude};
+        row.runtime_relative_path=late_prepared.intent.runtime_relative_path.clone();
+        row.launch_intent_id=late_prepared.intent.intent_id.clone();row.launch_sha256=Some(late_prepared.intent.launch_sha256.clone());
+        row.creation_receipt_sha256=late_prepared.intent.creation_receipt_sha256.clone();
         row.observed_at_ms = second.observed_at_ms();
         row.protected_observation_reference = Some(second.receipt().clone());
         row.proof = Some(proof);
+        let inventory=second.inventory().unwrap();
+        row.native_session_id=second.native_session_id().map(str::to_owned);
+        row.completion_sha256=Some(inventory.completion_sha256.clone());
+        row.alias_sha256=Some(inventory.alias_sha256.clone());
+        row.export_manifest_sha256=Some(inventory.export_manifest_sha256.clone());
         Some(row)
     } else {
         None
@@ -247,7 +281,19 @@ pub(super) async fn settle_reserved_body(
 ) {
     let successor = phase.starts_with("successor-");
     let phase = phase.strip_prefix("successor-").unwrap_or(phase);
+    let import_late=phase.starts_with("late-completion");
+    let phase=if import_late {"native-bound"}else{phase};
     let mut store = WorkflowStore::open(state).unwrap();
+    if import_late {
+        import_changed_completion(state,worktree,recovery.clone(),authorization,late.expect("withheld completion fixture missing"));
+    }
+    // Completion import and publication are separate metadata steps. Re-fetch
+    // normal authorization between them; neither a deadline nor lease changes.
+    let publication_authorization=if import_late {
+        Some(super::super::targeted::authorize_owner_publication_recovery(worktree,authorization.plan(),
+            crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22}).await.unwrap())
+    }else {None};
+    let authorization=publication_authorization.as_ref().unwrap_or(authorization);
     // Publication completion is a real authorized metadata transition.
     with_recovery_native_metadata(
         state,
@@ -882,6 +928,86 @@ pub(super) async fn settle_reserved_body(
         )
         .await;
     }
+}
+
+fn import_changed_completion(state:&Path,worktree:&Path,
+    recovery:Arc<durable::owner_publication_recovery::RecoveryLease>,
+    authorization:&super::super::targeted::AuthorizedOwnerRecovery<'_>,
+    late:&durable::native_observation::NativeObservation,
+) {
+    let mut store=WorkflowStore::open(state).unwrap();
+    let workflow=&late.workflow_id;
+    let before=store.snapshot(workflow).unwrap().unwrap();
+    let db=rusqlite::Connection::open(state).unwrap();let original=original_rows(&db,workflow,recovery.request_id());
+    let queued=store.pending_owner_messages(workflow).unwrap();
+    let command_provider:String=db.query_row("SELECT provider FROM command_job WHERE workflow=?1",[workflow],|r|r.get(0)).unwrap();
+    let mut entered=false;
+    assert!(with_recovery_native_metadata(state,Some(worktree),recovery.clone(),authorization,&mut |_| {entered=true;Ok(())}).is_err(),"stale SQL outcome unexpectedly matched changed physical completion");
+    assert!(!entered);
+    let facts=store.owner_publication_recovery_native_facts(&recovery,authorization,millis()).unwrap();
+    let source=existing_native_audit(state,facts.namespace(),Some(worktree),facts.original_binding()).unwrap();
+    let shared=Arc::new(Mutex::new(WorkflowStore::open(state).unwrap()));
+    source.restrict_to_metadata(durable::owner_publication_recovery::native_metadata_fence(shared.clone(),recovery.clone(),authorization,millis()).unwrap()).unwrap();
+    let raw=late.proof.as_ref().unwrap();
+    let prepared=augmentagent_channel_core::native_vm::PreparedLaunchRecord {
+        intent:serde_json::from_value(raw["launch_intent"].clone()).unwrap(),
+        controller_receipt:serde_json::from_value(raw["launch_receipt"].clone()).unwrap(),
+    };
+    let current=||shared.lock().unwrap().validate_owner_publication_recovery(&recovery,authorization,millis());
+    ownership::with_metadata_native_completion(&source,&prepared,late.protected_observation_reference.as_ref().unwrap(),&current,&mut |proof| {
+        let before_events=store.events(workflow)?;let history=store.native_observation_history(workflow)?;
+        assert_ne!(history.last().unwrap().export_manifest_sha256,late.export_manifest_sha256,"fixture has no semantic outcome change");
+        for table in ["workflow_event","workflow_native_observation"] {
+            db.execute_batch(&format!("CREATE TRIGGER refuse_completion_import BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT,'injected completion rollback'); END;")).unwrap();
+            assert!(store.record_owner_recovery_native_completion(&recovery,authorization,proof,millis()).is_err());
+            assert_eq!(store.events(workflow)?,before_events);assert_eq!(store.native_observation_history(workflow)?,history);
+            assert_eq!(original_rows(&db,workflow,recovery.request_id()),original);
+            db.execute_batch("DROP TRIGGER refuse_completion_import;").unwrap();
+        }
+        let until:i64=db.query_row("SELECT lease_until FROM workflow WHERE id=?1",[workflow],|r|r.get(0)).unwrap();
+        db.execute("UPDATE workflow SET lease_until=?2 WHERE id=?1",rusqlite::params![workflow,millis()-1]).unwrap();
+        assert!(store.record_owner_recovery_native_completion(&recovery,authorization,proof,millis()).is_err(),"expired recovery claim wrote a completion");
+        db.execute("UPDATE workflow SET lease_until=?2 WHERE id=?1",rusqlite::params![workflow,until]).unwrap();
+        let observed=store.record_owner_recovery_native_completion(&recovery,authorization,proof,millis())?;
+        assert_eq!(observed.version,2);assert_eq!(observed.producer,"owner-recovery-completion");
+        assert_eq!(observed.export_manifest_sha256,late.export_manifest_sha256);assert_eq!(observed.source_owner,late.source_owner);
+        let persisted=store.events(workflow)?;assert_eq!(persisted.len(),before_events.len()+1);
+        assert_eq!(store.record_owner_recovery_native_completion(&recovery,authorization,proof,millis())?,observed);
+        assert_eq!(WorkflowStore::open(state)?.record_owner_recovery_native_completion(&recovery,authorization,proof,millis())?,observed);
+        assert_eq!(store.events(workflow)?,persisted);
+        let (kind,generation,payload,at):(String,i64,String,i64)=db.query_row("SELECT kind,generation,payload,at_ms FROM workflow_event WHERE seq=?1",[observed.observation_sequence],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(generation,recovery.generation());
+        let saved:String=db.query_row("SELECT record FROM workflow_native_observation WHERE sequence=?1",[observed.observation_sequence],|r|r.get(0)).unwrap();
+        for fault in ["kind","actor","request","claim","missing-marker","unknown-field","clock","downgrade"] {
+            let mut value:serde_json::Value=serde_json::from_str(&payload).unwrap();
+            match fault {
+                "kind"=>{db.execute("UPDATE workflow_event SET kind='checkpoint' WHERE seq=?1",[observed.observation_sequence]).unwrap();},
+                "actor"=>{db.execute("UPDATE workflow_event SET generation=generation+1 WHERE seq=?1",[observed.observation_sequence]).unwrap();},
+                "clock"=>{db.execute("UPDATE workflow_event SET at_ms=?2 WHERE seq=?1",rusqlite::params![observed.observation_sequence,i64::MAX]).unwrap();},
+                "downgrade"=>{let mut value:serde_json::Value=serde_json::from_str(&saved).unwrap();value["version"]=1.into();value["producer"]="normal-completion".into();db.execute("UPDATE workflow_native_observation SET record=?2 WHERE sequence=?1",rusqlite::params![observed.observation_sequence,serde_json::to_string(&value).unwrap()]).unwrap();},
+                "request"=>value["owner_recovery"]["request_id"]="other-request".into(),
+                "claim"=>value["owner_recovery"]["claim"]["sha256"]="f".repeat(64).into(),
+                "missing-marker"=>{value.as_object_mut().unwrap().remove("owner_recovery");},
+                _=>value["extra"]="untrusted".into(),
+            }
+            if matches!(fault,"request"|"claim"|"missing-marker"|"unknown-field") {
+                db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![observed.observation_sequence,serde_json::to_string(&value).unwrap()]).unwrap();
+            }
+            assert!(store.native_observation_history(workflow).is_err(),"{fault}: recovery provenance corruption accepted");
+            assert!(store.owner_publication_recovery_native_facts(&recovery,authorization,millis()).is_err(),"{fault}: corrupted import exposed aggregate native facts");
+            assert!(store.record_owner_recovery_native_completion(&recovery,authorization,proof,millis()).is_err(),"{fault}: corrupted history treated as replay");
+            db.execute("UPDATE workflow_event SET kind=?2,generation=?3,payload=?4,at_ms=?5 WHERE seq=?1",rusqlite::params![observed.observation_sequence,kind,generation,payload,at]).unwrap();
+            db.execute("UPDATE workflow_native_observation SET record=?2 WHERE sequence=?1",rusqlite::params![observed.observation_sequence,saved]).unwrap();
+        }
+        assert_eq!(store.events(workflow)?,persisted);
+        Ok(())
+    }).expect("verified changed completion could not reach recovery SQL history");
+    assert_eq!(store.snapshot(workflow).unwrap().unwrap(),before);
+    assert_eq!(original_rows(&db,workflow,recovery.request_id()),original);
+    assert_eq!(store.pending_owner_messages(workflow).unwrap(),queued);
+    assert_eq!(db.query_row("SELECT provider FROM command_job WHERE workflow=?1",[workflow],|r|r.get::<_,String>(0)).unwrap(),command_provider);
+    assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+    with_recovery_native_metadata(state,Some(worktree),recovery,authorization,&mut |_|Ok(())).expect("freshly recorded outcome did not repair metadata observation");
 }
 
 async fn persist_legacy_writer_debt(

@@ -75,8 +75,13 @@ fn history_closed(tx: &Connection, workflow: &str) -> Result<()> {
             "lease_generation",
         ),
     ] {
+        // Index closure is separate from actor authority. Ordinary launch
+        // events retain their source generation. Observation decoding below
+        // checks either the original actor or its exact recovery-claim interval;
+        // a metadata import never changes the retained source generation.
+        let actor=if table=="workflow_native_observation" {String::new()}else {format!(" AND p.{generation}=e.generation")};
         let missing: bool=tx.query_row(&format!(
-            "SELECT EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=?1 AND e.kind=?2 AND NOT EXISTS(SELECT 1 FROM {table} p WHERE p.{column}=e.seq AND p.workflow=e.workflow AND p.{generation}=e.generation)) OR EXISTS(SELECT 1 FROM {table} p WHERE p.workflow=?1 AND NOT EXISTS(SELECT 1 FROM workflow_event e WHERE e.seq=p.{column} AND e.workflow=p.workflow AND e.kind=?2 AND e.generation=p.{generation}))"),
+            "SELECT EXISTS(SELECT 1 FROM workflow_event e WHERE e.workflow=?1 AND e.kind=?2 AND NOT EXISTS(SELECT 1 FROM {table} p WHERE p.{column}=e.seq AND p.workflow=e.workflow{actor})) OR EXISTS(SELECT 1 FROM {table} p WHERE p.workflow=?1 AND NOT EXISTS(SELECT 1 FROM workflow_event e WHERE e.seq=p.{column} AND e.workflow=p.workflow AND e.kind=?2{actor}))"),
             params![workflow,kind],|r|r.get(0))?;
         ensure!(!missing, TransferReason::InventoryMissing);
     }

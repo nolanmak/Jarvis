@@ -1,0 +1,141 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Authorized recovery completion observation/provenance writer",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_native_observation.rs": "5aabfcb579f90a260af335629787f171f4f3cc7ae10f7cc2a7dffa81c282a5f6",
+    "crates/augmentagent-cli/src/autoship_native_handoff.rs": "f6aeadb1bb3507d8502ec372670f3974a8ede213d1c99d5fb122862e186e9f95",
+    "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs": "7b693a570c60ceaf5baa145de64aa5cb7248c7225abdd7dcfb7347600fc852d1",
+    "crates/augmentagent-cli/src/autoship_owner_recovery_completion.rs": "b3b7e58f4f76c6758f325d89fe17c44735819886ccc5e40af81197fde8122a2d",
+    "crates/augmentagent-cli/src/self_improve_owner_reserved_ready_tests.rs": "10b259c52b71105dda2c27501992d30f5d2130a330180571e916b52558e627d0"
+  },
+  "behavioral_red": {
+    "handle": 41043,
+    "exit_code": 1,
+    "seconds": 3.11,
+    "log": "/tmp/autoship-recovery-completion-writer-red-20261108.log",
+    "reason": "Actual fresh metadata completion reached the missing authorized workflow writer"
+  },
+  "compile_failure": {
+    "handle": 32018,
+    "exit_code": 1,
+    "log": "/tmp/autoship-recovery-completion-writer-green-20261108.log",
+    "reason": "New provenance struct/function visibility was narrower than its workflow re-export; corrected crate-internal visibility"
+  },
+  "fixture_failure": {
+    "handle": 8981,
+    "exit_code": 1,
+    "seconds": 3.28,
+    "log": "/tmp/autoship-recovery-completion-writer-green2-20261108.log",
+    "reason": "Expected late-row fixture retained first export hash despite the actual new protected completion; fixture now takes all inventory hashes from the real second producer"
+  },
+  "aggregate_red": {
+    "handle": 60628,
+    "exit_code": 1,
+    "seconds": 4.24,
+    "log": "/tmp/autoship-recovery-completion-writer-expanded-20261108.log",
+    "reason": "Aggregate index closure incorrectly equated recovery event actor to original source generation, refusing fresh recorded outcome"
+  },
+  "integrated_green": {
+    "handle": 3249,
+    "exit_code": 0,
+    "passed": 1,
+    "seconds": 77.64,
+    "log": "/tmp/autoship-recovery-completion-writer-integrated-20261108.log",
+    "scope": "Both provider integrations, before final test-only fresh authorization fetch between distinct import/publication steps"
+  },
+  "assertions": [
+    "Actual changed private export/protected completion is absent from stale SQL; fresh physical metadata rejects that old view",
+    "Current opaque recovery claim and freshly authorized native metadata proof write the exact protected result through the common observation append authority",
+    "Version-2 provenance retains original source and identifies exact current recovery actor, request, claim interval and historical native frontier",
+    "Event/index insertion rollback, expired claim, reopen/idempotence and eight provenance/downgrade corruptions are exercised for both providers",
+    "Corrupted imports cannot expose aggregate native facts or succeed as receipt replay",
+    "Fresh recorded outcome supports original native metadata inspection, forward transfer and reservation-preserving readiness",
+    "Original body/model/native rows, charges, control/queue state and merge-only allowance remain intact",
+    "Metadata observations from another actual native provider do not change the requested builder pin, body/model/native rows or charges"
+  ],
+  "fixture_limits": [
+    "Original body/resources use controlled persisted records and protected scripted launch/resource/session receipts",
+    "Changed export is a controlled private file edit verified by actual native producer; no live provider or VM is executed",
+    "No production CLI/private Discord command, real send, autonomous merge or deployment acceptance is demonstrated",
+    "Standalone protected receipt discovery, claimless observation admission and closed/transferred source import remain unimplemented"
+  ],
+  "remaining": [
+    "Connect protected receipt discovery and scheduling to the worker before native transfer",
+    "Support separately authorized observation when debt/expired roles prevent a live recovery claim",
+    "Implement separate closed/transferred-source historical completion producer",
+    "Complete legacy/source/resource/input qualification and immutable debt resolution",
+    "Complete productive repeated-cycle body/model/result/continuation constructors and private coding lifecycle",
+    "Independent exact-head review and trusted hosted Linux/privacy/node-release checks, normal updater rollout",
+    "All original live CLI/private Discord, five autonomous merges, 72h fault and 24h unattended acceptance gates"
+  ],
+  "production_changed": false,
+  "productive_recovery_granted": false,
+  "goal_complete": false,
+  "previous_source_sha256": {
+    "crates/augmentagent-cli/src/autoship_native_observation.rs": "5aabfcb579f90a260af335629787f171f4f3cc7ae10f7cc2a7dffa81c282a5f6",
+    "crates/augmentagent-cli/src/autoship_native_handoff.rs": "f6aeadb1bb3507d8502ec372670f3974a8ede213d1c99d5fb122862e186e9f95",
+    "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs": "7b693a570c60ceaf5baa145de64aa5cb7248c7225abdd7dcfb7347600fc852d1",
+    "crates/augmentagent-cli/src/autoship_owner_recovery_completion.rs": "745f19b7eee1f8626481a0b83a1ec65d8f70cac6ad7669069d21d54287bf4959",
+    "crates/augmentagent-cli/src/self_improve_owner_reserved_ready_tests.rs": "0ca87eb5ff8053bf63fbab1d212e1fc4f6e1597fb2ffbd165e4ea2b186d8aa02"
+  },
+  "preceding_full_cli": {
+    "handle": 48160,
+    "state": "terminal",
+    "log": "/tmp/autoship-recovery-completion-writer-full-cli-20261108.log",
+    "exit_code": 0,
+    "passed": 1983,
+    "failed": 0,
+    "ignored": 34,
+    "seconds": 682.3
+  },
+  "preceding_non_test_compile": {
+    "handle": 57617,
+    "exit_code": 0,
+    "seconds": 44.1,
+    "log": "/tmp/autoship-recovery-completion-writer-production-20261108.log",
+    "scope": "Before final cross-provider correction"
+  },
+  "provider_scope_red": {
+    "handle": 97667,
+    "exit_code": 1,
+    "seconds": 3.43,
+    "log": "/tmp/autoship-recovery-completion-provider-red-20261108.log",
+    "reason": "Metadata provenance incorrectly used the builder pin to reject a real completion from another provider in the same native namespace"
+  },
+  "final_focused_green": {
+    "handle": 66215,
+    "exit_code": 0,
+    "passed": 2,
+    "seconds": 84.2,
+    "log": "/tmp/autoship-recovery-completion-provider-green-20261108.log",
+    "scope": "Same-provider and cross-provider completions, each with both builder pins, actual forward handoff and readiness"
+  },
+  "final_full_cli": {
+    "state": "terminal",
+    "log": "/tmp/autoship-recovery-completion-writer-final-cli-20261108.log",
+    "handle": 87565,
+    "exit_code": 0,
+    "passed": 1984,
+    "failed": 0,
+    "ignored": 34,
+    "seconds": 685.15
+  },
+  "ci_download_evidence": {
+    "github_agents_job": 128688225406,
+    "failure": "setup-deno HTTP504 fetching pinned GitHub release asset",
+    "log": "/tmp/autoship-1758-agents-a4e10e9a.log",
+    "verified_alternative": "https://dl.deno.land/release/v2.7.14/deno-x86_64-unknown-linux-gnu.zip",
+    "archive": "/tmp/autoship-deno-2.7.14-linux-x64.zip",
+    "sha256": "3287efef53606966469cb6a02781327be22b908959397f976e2996dc1b64ae0f",
+    "matches": "Official GitHub release asset digest verified through GitHub API; availability fix not implemented yet"
+  },
+  "final_non_test_compile": {
+    "handle": 98865,
+    "exit_code": 0,
+    "seconds": 25.02,
+    "log": "/tmp/autoship-recovery-completion-writer-final-production-20261108.log",
+    "profile": "dev, debuginfo disabled; not a deployment build"
+  },
+  "all_original_local_handles_terminal": true
+}

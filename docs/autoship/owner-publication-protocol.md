@@ -2009,3 +2009,81 @@ Final validation: the full CLI suite passed 1,982 tests, with zero failures and
 All original local handles are terminal. No production service, native policy,
 reservation, hold, accounting or allowance changed. These local receipts do not
 establish independent review, trusted hosted CI or live workflow acceptance.
+
+## 70. Authorized recovery completion projection and actor provenance
+
+`record_owner_recovery_native_completion` now records the exact original native
+completion under a current opaque recovery claim, fresh repository/owner
+authorization and a borrowed `MetadataNativeCompletionProof`. The original native
+owner must still be current. The consuming transaction joins the original
+publication, policy/store binding, active source registration, prepared launch and
+current native frontier, then rechecks authorization and claim currency before
+commit. No native/current-owner callback runs while that SQL transaction is held.
+The writer changes neither the owner turn, reservation, charges, controls, queued
+instructions nor merge allowance, and does not construct a body/model capability.
+
+Ordinary and recovery writers share one observation/index/session-ownership
+append implementation and its existing history/byte bounds, latest-launch,
+uncertainty and session-ownership rules. Repeating an already recorded protected
+receipt returns its exact row without another event, including a receipt already
+recorded through the original ordinary writer. It does not rewrite that original
+row or its provenance. Rollback at event or projection insertion retains neither
+half. A known uncertain runtime still requires its distinct named reconciliation.
+
+New recovery observations use version 2 and producer
+`owner-recovery-completion`; their protected native producer remains the original
+`normal-completion`. The observation/index retain the original source generation.
+Their workflow event identifies the current metadata actor and carries the exact
+recovery claim reference and original request. Bounded history validation joins
+that event to its actual claim interval and historical native frontier. Ordinary
+version-1 observations retain their original actor/payload format and now have
+an explicit event join as well. Version-1-only observation readers refuse the new
+version; coordinated reader/cutover validation remains a rollout requirement.
+
+The aggregate's former index-closure query incorrectly equated every observation
+actor to its source generation. The integrated regression caught its refusal
+after the new writer committed a valid row. Index closure now checks both halves;
+the observation decoder separately validates original versus recovery actors
+before any aggregate facts are returned. Removing/changing the actor marker,
+claim, request, event kind, timestamp or version cannot expose native facts.
+
+The two-provider regression changes real private export bytes, captures a second
+completion with the actual protected native producer, withholds its ordinary SQL
+callback and expires the original workflow lease. The old SQL view demonstrably
+fails fresh physical metadata inspection. A newly authorized recovery role then
+uses the real native verifier and workflow writer; the fresh SQL view supports
+metadata inspection, forward native transfer and reserved readiness without
+replaying the instruction. Both event/projection insertion failures roll back;
+expired recovery authority, eight provenance corruptions and downgrade attempts
+refuse; reopened duplicate receipt admission changes no events. Original
+body/model/native rows, charges, control state, queued input and merge allowance
+remain intact. Publication obtains fresh normal authorization after the distinct
+import step; no deadline or lease is extended.
+
+The original body/resource setup remains a controlled persisted-record fixture,
+and the changed export is a fixture edit, not a live provider/VM result. The
+expected late row is descriptive test data; the production writer constructs its
+own row from the fresh borrowed native proof. This closes the authorized backend
+projection and stale-view seam, not live worker ingress. Protected receipt
+discovery/scheduling, observation admission when no live recovery claim exists,
+closed/transferred-source historical import, complete legacy/source/resource/input
+qualification, productive repeated-cycle body/model/result/continuation and all
+original rollout/live CLI/private Discord/merge/fault/soak gates remain required.
+Exact test receipts and scope limits are in
+`1703-recovery-completion-writer-proof.json`.
+
+A final cross-provider regression caught an overrestriction in the new provenance
+reader: the original command's builder pin must not reject an observed completion
+from another real provider in the same authenticated native namespace. That pin
+still controls execution/model/body admission. Metadata records the actual exact
+launch/provider without changing it. Both builder pins now pass same-provider
+and cross-provider completion import through full native handoff and reserved
+readiness, preserving the original command provider and body/model/charge rows.
+The request in import provenance identifies the authorizing recovery request; it
+does not relabel every observed launch as that request's executable body attempt.
+
+Final validation for §70: the full CLI suite passed 1,984 tests, with zero
+failures and 34 ignored (685.15 seconds); non-test compilation passed
+(25.02 seconds). All original local handles are terminal. No production policy,
+service, retained state, hold, accounting or allowance changed. Hosted CI,
+independent review and every original live acceptance requirement remain gates.

@@ -2,6 +2,9 @@
 use super::discord_ingress::DiscordOrigin;
 use super::*;
 
+#[path="autoship_owner_recovery_completion.rs"]
+mod completion_import;
+pub(super) use completion_import::{CompletionImport,validate_import as validate_completion_import};
 #[path = "autoship_owner_recovery_blocked.rs"]
 mod blocked;
 #[path = "autoship_owner_input_blocked.rs"]
