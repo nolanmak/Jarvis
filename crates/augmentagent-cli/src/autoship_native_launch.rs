@@ -105,7 +105,7 @@ pub(crate) struct VerifiedLaunchAppend {
     intent:NativeLaunchIntent,
 }
 pub(crate) fn verify_launch_append(audit:&augmentagent_channel_core::AuditLogger,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord)->Result<VerifiedLaunchAppend> {
-    ensure!(prepared.intent.version==2 && audit.native_runtime_owner()?.as_ref()==Some(&prepared.intent.source_owner)
+    ensure!(matches!(prepared.intent.version,2|3) && audit.native_runtime_owner()?.as_ref()==Some(&prepared.intent.source_owner)
         && prepared.intent.source_audit_path==audit.path(),"native launch controller identity mismatch");
     let original_binding=audit.native_store_binding()?.context("native launch original binding missing")?;original_binding.validate()?;
     let digest=format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(&original_binding)?)?));

@@ -237,7 +237,7 @@ pub fn with_current_native_completion(
                 Some("native_launch_intent")=>{
                     let id=row["intent_id"].as_str().context("native launch identity missing")?;
                     ensure!(launches.len()<4096,"native completion launch history exceeds bound");
-                    ensure!(row["version"]==2 && row["source_owner"]==serde_json::to_value(&prepared.intent.source_owner)?,"native completion launch authority changed");
+                    ensure!(matches!(row["version"].as_u64(),Some(2|3)) && row["source_owner"]==serde_json::to_value(&prepared.intent.source_owner)?,"native completion launch authority changed");
                     ensure!(launches.insert(id.into(),false).is_none(),"duplicate native launch intent");
                 }
                 Some("native_launch_uncertain")=>anyhow::bail!("uncertain native namespace cannot complete owner input"),

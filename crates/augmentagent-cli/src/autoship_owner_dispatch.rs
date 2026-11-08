@@ -421,7 +421,7 @@ fn validate_native_admissions_using(conn:&Connection,workflow:&str,decoder:Decod
 }
 fn require_same_prepared(launch:&super::native_launch::NativeLaunchRecord,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord)->Result<()> {
     let provider=match launch.intent.provider {submission::Provider::Codex=>"codex",submission::Provider::Claude=>"claude"};
-    ensure!(prepared.intent.version==2 && launch.intent.intent_id==prepared.intent.intent_id && launch.source_owner==prepared.intent.source_owner
+    ensure!(matches!(prepared.intent.version,2|3) && launch.intent.intent_id==prepared.intent.intent_id && launch.source_owner==prepared.intent.source_owner
         && launch.original_native_binding_sha256==prepared.intent.original_store_binding_sha256
         && launch.intent.controller_receipt.as_ref()==Some(&prepared.controller_receipt)
         && provider==prepared.intent.provider && launch.intent.launch_sha256==prepared.intent.launch_sha256

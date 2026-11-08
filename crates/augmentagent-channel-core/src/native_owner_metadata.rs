@@ -11,6 +11,13 @@ use std::{collections::{BTreeMap,BTreeSet},path::Path,sync::Arc};
 mod body_nonrelease;
 pub use body_nonrelease::{ExpectedBodyInputAttempt,NativeBodyNonreleaseProof};
 
+/// The original writer predates the locked stdin protocol. Waiting or a new
+/// ownership transfer cannot qualify it; retained history needs explicit cutover.
+/// This error is a classification reason, never a cleanup or execution grant.
+#[derive(Debug,thiserror::Error)]
+#[error("legacy native input writer lacks locked release protocol")]
+pub struct LegacyNativeInputWriter;
+
 /// Borrowed under original state/session/audit locks. No constructor, clone,
 /// serialization, or conversion into a productive/input capability.
 pub struct MetadataNativeOwnerProof<'a> {
@@ -32,6 +39,12 @@ impl MetadataNativeOwnerProof<'_> {
         let mut writers=Vec::new();
         for audit in self.evidence["audits"].as_array().context("original input writer audit census missing")? {
             for writer in audit["native_input_writers"].as_array().context("original input writer census missing")? {
+                // A completed transfer closes a participating writer. Older
+                // launch history does not identify the protocol that holds the
+                // original state lock across stdin delivery, so it cannot prove
+                // that an already-retained writer has stopped releasing bytes.
+                // Check the entire original census, including other requests.
+                if writer["launch_intent"]["version"]!=3 {return Err(LegacyNativeInputWriter.into());}
                 ensure!(matches!(writer["closure"]["kind"].as_str(),Some("completed_native_transfer"|"retired_native_owner")),
                     "original native input writer has no permanent closure");
                 writers.push(writer);ensure!(writers.len()<=4096,R::HistoryCapacity);

@@ -1780,3 +1780,64 @@ construct productive release/model/result authority, qualify legacy writers or
 resources, enable repeated recovery cycles or wire worker/CLI/Discord ingress.
 Normal rollout and every original live/fault/soak acceptance requirement remain.
 See [the successor handoff evidence](1703-reserved-successor-proof.json).
+
+## 66. Refuse nonrelease from an unqualified recorded legacy input writer
+
+A completed native transfer previously sufficed to enter
+`with_revoked_input_writers` even when a recorded launch used the old version-2
+native launch-intent format. That format predates the shared stdin boundary's
+retained state lock and does not identify which writer protocol produced the
+launch. Transfer completion alone therefore cannot qualify an old cached input
+writer. The new authenticated regression demonstrated that this history could
+reach and commit reserved readiness before the fix.
+
+New `Launch::prepare` calls emit native launch-intent version 3, identifying the
+producer whose `submit_provider_input` path retains original state authority
+through marker persistence, asynchronous stdin write and shutdown. This is the
+native launch format; body-reservation, readiness, input-reference, input-marker
+and policy versions are unchanged. Historical parsers and exact original append/
+observation/completion/body joins accept versions 2 and 3, retaining all existing
+identity, receipt, digest, field and authority checks. Original version-2 bytes
+are not rewritten, re-signed or relabelled.
+
+The fresh revocation factory now refuses any recorded writer whose launch format
+is not version 3, before creating its borrowed capability or classifying a body
+or request. This applies to every writer in the original audited census, including
+writers associated with other requests. The typed `LegacyNativeInputWriter`
+reason identifies unsupported original protocol; a timer or another transfer
+cannot qualify it. Saved JSON or a version field alone still grants nothing:
+the original protected audit, state/session/audit locks, actual closure and all
+existing native checks remain required. Historical saved readiness remains
+descriptive; it cannot replace this fresh factory at a later boundary.
+
+Both Codex and Claude fixtures retain an original reservation/model/native
+binding whose launch intent is version 2, complete publication and the
+authenticated native transfer, then
+require refusal at the fresh revocation boundary. No readiness record/event is
+written; the recovery claim, original body/model/native/charge rows, queued input,
+control, accounting and audit bytes remain intact across the refusal. The first
+behavioral red reached successful readiness where an error was required; after
+the fix the two cases refuse with the typed reason. An earlier harness run stopped
+at its existing bound/unbound expectation before reaching that regression and is
+not counted as the behavioral red. Current-format fixtures continue through the
+four reserved cases and completed successor handoff in the full suite.
+
+Validation: 1,978 CLI tests passed, with zero failures and 34 ignored (673.09 s).
+The final source also passed all 58 native-runtime tests, including real controlled
+stdin blocking/cancellation/failure and protected-marker cases (6.46 s), and the
+production CLI compiled (1 min 14 s). These use controlled children/runtime and
+persisted-resource fixtures, not a live provider/VM rollout. See
+[the legacy writer evidence](1703-legacy-input-writer-proof.json).
+
+This closes one recorded-writer qualification gap. It does not establish a full
+legacy source/resource/input cutover, account for unclassified actors outside the
+existing census, supply host qualification or mint productive recovery authority.
+The old-created/new-create/resume/alias/retire/prune cutover cases, full C/R proof,
+repeated cycles, productive release/model/result constructors, ingress and every
+original deployment/merge/fault/soak gate remain required. Old builds that only
+understand version 2 refuse new-format records; qualified normal rollout/rollback
+compatibility remains a deployment obligation. No in-place legacy conversion,
+policy re-pinning, capacity change, runtime deletion or accounting reset is
+authorized by this format change. The typed reason is available to the future
+recovery controller; its durable blocked-state/notification integration is not
+claimed by this component.

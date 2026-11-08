@@ -4,6 +4,18 @@ use super::*;
 use augmentagent_channel_core::native_vm::{ownership, RuntimeOwner};
 use std::os::unix::fs::PermissionsExt;
 #[tokio::test]
+async fn reserved_owner_readiness_refuses_legacy_input_writer_protocol() {
+    super::tests::owner_metadata_recovery_modes_inner_reserved(
+        &[
+            "owner-early-acceptance-producer-metadata-recovery",
+            "owner-early-acceptance-producer-claude-metadata-recovery",
+        ],
+        false,
+        None,
+        Some("legacy-writer"),
+    );
+}
+#[tokio::test]
 async fn reserved_owner_readiness_survives_successor_native_handoff() {
     for phase in ["unadmitted", "admitted", "sql-bound", "native-bound"] {
         super::tests::owner_metadata_recovery_modes_inner_reserved(
@@ -58,9 +70,10 @@ pub(super) fn seed_reserved_body(
     phase: &str,
 ) -> durable::owner_dispatch::ReservedOwnerBodyRead {
     let phase = phase.strip_prefix("successor-").unwrap_or(phase);
+    let legacy_writer = phase == "legacy-writer";
     let phase = if phase == "stale-model-snapshot" {
         "admitted"
-    } else if phase == "lost-response" {
+    } else if matches!(phase, "lost-response" | "legacy-writer") {
         "native-bound"
     } else {
         phase
@@ -98,10 +111,11 @@ pub(super) fn seed_reserved_body(
         durable::submission::Provider::Codex => "codex",
         durable::submission::Provider::Claude => "claude",
     };
-    let (prepared, session, resource) = durable::native_observation::tests::retained_launch_fixture(
+    let (prepared, session, resource) = durable::native_observation::tests::retained_launch_fixture_with_writer_version(
         native,
         &audit,
         name,
+        if legacy_writer { 2 } else { 3 },
         |prepared| {
             store
                 .record_verified_native_launch(
@@ -449,7 +463,7 @@ pub(super) async fn settle_reserved_body(
                             );
                             assert_eq!(
                                 unbound_entered,
-                                !matches!(phase, "native-bound" | "lost-response")
+                                !matches!(phase, "native-bound" | "lost-response" | "legacy-writer")
                             );
                         }
                         if check_mismatch && phase == "stale-model-snapshot" {
@@ -505,7 +519,7 @@ pub(super) async fn settle_reserved_body(
             },
         )
     };
-    if !successor && !matches!(phase, "released" | "stale-model-snapshot") {
+    if !successor && !matches!(phase, "released" | "stale-model-snapshot" | "legacy-writer") {
         for fault in ["insert", "pointer", "release", "input-race"] {
             let sql=match fault {
                 "insert"=>"CREATE TRIGGER refuse_reserved_ready BEFORE INSERT ON workflow_owner_successor_ready BEGIN SELECT RAISE(ABORT,'injected reserved readiness rollback'); END;",
@@ -578,11 +592,20 @@ pub(super) async fn settle_reserved_body(
     .await
     .unwrap();
     let result = settle(&mut store, &fresh, phase == "lost-response", true);
-    if phase == "released" {
+    if matches!(phase, "released" | "legacy-writer") {
         let error = result.unwrap_err();
+        if phase == "legacy-writer" {
+            assert!(error.downcast_ref::<ownership::LegacyNativeInputWriter>().is_some(),
+                "legacy writer refusal lost its typed classification: {error:#}");
+        }
+        let expected = if phase == "legacy-writer" {
+            "legacy native input writer lacks locked release protocol"
+        } else {
+            "native body input may already have been released"
+        };
         assert!(
-            format!("{error:#}").contains("native body input may already have been released"),
-            "released input refused at wrong boundary: {error:#}"
+            format!("{error:#}").contains(expected),
+            "unrecoverable input refused at wrong boundary: {error:#}"
         );
         assert_eq!(store.snapshot(&workflow).unwrap().unwrap(), before);
         assert_eq!(store.events(&workflow).unwrap(), events);

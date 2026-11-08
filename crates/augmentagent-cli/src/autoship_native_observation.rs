@@ -115,7 +115,7 @@ fn validate(row: &NativeObservation, launch: &native_launch::NativeLaunchRecord)
     ensure!(
         proof["actor"] == "controller"
             && proof["version"] == 1
-            && proof["launch_intent"]["version"] == 2
+            && matches!(proof["launch_intent"]["version"].as_u64(), Some(2 | 3))
             && proof["launch_intent"]["source_owner"] == serde_json::to_value(&row.source_owner)?
             && proof["launch_intent"]["source_audit_path"] == row.source_audit_path
             && proof["launch_intent"]["original_store_binding_sha256"]
@@ -238,7 +238,7 @@ pub(crate) struct VerifiedObservationAppend {
     proof:serde_json::Value,
 }
 pub(crate) fn verify_observation_append(audit:&augmentagent_channel_core::AuditLogger,fact:&VerifiedNativeObservation)->Result<VerifiedObservationAppend> {
-    let prepared=fact.prepared();ensure!(prepared.intent.version==2,"unsupported native observation preparation");
+    let prepared=fact.prepared();ensure!(matches!(prepared.intent.version,2|3),"unsupported native observation preparation");
     ensure!(audit.path()==prepared.intent.source_audit_path && audit.native_runtime_owner()?.as_ref()==Some(&prepared.intent.source_owner),"native observation controller mismatch");
     let original_binding=audit.native_store_binding()?.context("native observation original binding missing")?;original_binding.validate()?;
     let digest=format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(&original_binding)?)?));
@@ -467,8 +467,18 @@ pub(crate) mod tests {
     )->(PreparedLaunchRecord,AppendReceipt,AppendReceipt) {
         retained_launch_fixture_with_startup(state,audit,provider,record,false)
     }
+    pub(crate) fn retained_launch_fixture_with_writer_version(
+        state:&Path,audit:&AuditLogger,provider:&str,version:u32,
+        record:impl FnOnce(&PreparedLaunchRecord),
+    )->(PreparedLaunchRecord,AppendReceipt,AppendReceipt) {
+        retained_launch_fixture_with_startup_version(state,audit,provider,record,false,version)
+    }
     fn retained_launch_fixture_with_startup(state:&Path,audit:&AuditLogger,provider:&str,
         record:impl FnOnce(&PreparedLaunchRecord),startup:bool)->(PreparedLaunchRecord,AppendReceipt,AppendReceipt) {
+        retained_launch_fixture_with_startup_version(state,audit,provider,record,startup,3)
+    }
+    fn retained_launch_fixture_with_startup_version(state:&Path,audit:&AuditLogger,provider:&str,
+        record:impl FnOnce(&PreparedLaunchRecord),startup:bool,version:u32)->(PreparedLaunchRecord,AppendReceipt,AppendReceipt) {
         directory(&state.join(provider));
         let runtime = state.join(format!("{provider}/session-fixture"));
         directory(&runtime);
@@ -476,7 +486,7 @@ pub(crate) mod tests {
         let owned=serde_json::to_vec(&serde_json::json!({"version":1,"owner":audit.native_runtime_owner().unwrap().unwrap(),"audit_path":audit.path()})).unwrap();
         file(&runtime.join("owned.json"), &owned);
         let intent = PreparedLaunchIntent {
-            version: 2,
+            version,
             intent_id: uuid::Uuid::new_v4().to_string(),
             source_owner: audit.native_runtime_owner().unwrap().unwrap(),
             source_audit_path: audit.path().into(),

@@ -96,7 +96,10 @@ impl PreparedLaunchIntent {
     /// protected append, current owner, native admission or input authority.
     pub fn validate(&self) -> Result<()> {
         let id=uuid::Uuid::parse_str(&self.intent_id)?;
-        ensure!(self.version==2 && !id.is_nil() && id.to_string()==self.intent_id,"invalid native launch intent identity");
+        // Version 2 remains readable original history. Only version 3 identifies
+        // the producer whose shared stdin boundary retains native state authority
+        // through the entire asynchronous write. This parser grants no authority.
+        ensure!(matches!(self.version,2|3) && !id.is_nil() && id.to_string()==self.intent_id,"invalid native launch intent identity");
         ensure!(matches!(self.provider.as_str(),"codex"|"claude"|"qwen"|"glm"),"invalid native launch provider");
         let parts:Vec<_>=self.runtime_relative_path.split('/').collect();
         ensure!(parts.len()==2 && parts[0]==self.provider && parts[1].starts_with("session-") && parts[1].len()>8
@@ -859,7 +862,7 @@ impl Launch {
             None=>None,
         };
         let original_store_binding_sha256=format!("{:x}",Sha256::digest(ownership::canonical_bytes(&serde_json::to_value(&original_binding)?)?));
-        let intent=PreparedLaunchIntent {version:2,intent_id:uuid::Uuid::new_v4().to_string(),original_store_binding_sha256,
+        let intent=PreparedLaunchIntent {version:3,intent_id:uuid::Uuid::new_v4().to_string(),original_store_binding_sha256,
             source_owner:audit_owner,source_audit_path:owner_logger.path().into(),provider:provider.into(),
             runtime_relative_path:runtime_relative_path.clone(),native_session_id,creation_receipt_sha256:creation_receipt_sha256.clone(),
             launch_sha256:format!("{:x}",Sha256::digest(&spec_bytes))};
@@ -1629,7 +1632,7 @@ mod tests {
             let row=rows.iter().find(|row|row["kind"]=="native_launch_intent")
                 .expect("native command escaped preparation without a durable controller launch intent");
             assert_eq!(logger.read_append_receipt(&prepared.controller_receipt).unwrap(),*row);
-            assert_eq!(row["version"],2,"launch evidence needs an explicit original-binding format");
+            assert_eq!(row["version"],3,"new launch evidence must identify the locked input-writer protocol");
             let original=logger.native_store_binding().unwrap().unwrap();
             let original_hash=format!("{:x}",Sha256::digest(ownership::canonical_bytes(&serde_json::to_value(original).unwrap()).unwrap()));
             assert_eq!(row["original_store_binding_sha256"],original_hash,"controller receipt omitted the original store binding");

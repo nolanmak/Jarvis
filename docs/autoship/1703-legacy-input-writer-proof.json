@@ -1,0 +1,84 @@
+{
+  "scope": "Refuse recorded legacy input writers at the fresh native revocation factory; retain old history and identify current locked-stdin producer in native launch-intent version 3",
+  "parent_head": "686dec1260e6f7aa8c02d1e24226c1a4859333da",
+  "source_sha256": {
+    "crates/augmentagent-channel-core/src/native_vm.rs": "dece3b361338a143433ee73f3f230af5c78fead182ed3619016eccfe7e74310b",
+    "crates/augmentagent-channel-core/src/native_owner_metadata.rs": "dba9a34bec58bdf6060da69b37c551eaf04499c994b8582426b7891c6ad5173e",
+    "crates/augmentagent-channel-core/src/native_owner_transfer.rs": "f8758bf361347a7efe2503dbc79beadec4ce1a980088102bf8d1e970c5f13819",
+    "crates/augmentagent-channel-core/src/native_owner_completion.rs": "06d110b06b8d51103c5e6391dbfda4ae6fbca1b41586bf77561bd4d6bac4db3d",
+    "crates/augmentagent-cli/src/autoship_native_launch.rs": "397c09ba4c10adc2f05bcfb69c65b88fe3ca5ed9cb2b48b888cc5f0a79358bf2",
+    "crates/augmentagent-cli/src/autoship_native_observation.rs": "0890d22102553042f7babcba90d5e1d9c2454baa9b07bec9efc30e3b99e48cdc",
+    "crates/augmentagent-cli/src/autoship_owner_dispatch.rs": "40851d03f4eedb7bfdb194971bac56ed190011101ad6579a436321abfe12f21e",
+    "crates/augmentagent-cli/src/self_improve_owner_reserved_ready_tests.rs": "bc0b2302ef991c072fc7af508222c14fe39004cf100a17d21a0cda7996c9617d"
+  },
+  "harness_failure": {
+    "handle": 74044,
+    "exit_code": 1,
+    "log": "/tmp/autoship-legacy-writer-red-20261108.log",
+    "cause": "Existing bound/unbound fixture expectation did not include legacy-writer phase; not counted as behavioral red"
+  },
+  "behavior_red": {
+    "handle": 79576,
+    "exit_code": 1,
+    "log": "/tmp/autoship-legacy-writer-behavior-red-20261108.log",
+    "seconds": 13.79,
+    "observed": "Expected legacy refusal but readiness successfully committed after actual authenticated native transfer"
+  },
+  "focused_green_before_typed_reason": {
+    "handle": 35614,
+    "exit_code": 0,
+    "log": "/tmp/autoship-legacy-writer-green-20261108.log",
+    "seconds": 20.55,
+    "providers": [
+      "codex",
+      "claude"
+    ]
+  },
+  "final_full_cli": {
+    "handle": 9618,
+    "exit_code": 0,
+    "log": "/tmp/autoship-locked-writer-full-cli-20261108.log",
+    "passed": 1978,
+    "failed": 0,
+    "ignored": 34,
+    "seconds": 673.09,
+    "includes_typed_legacy_refusal_and_current_successor_matrix": true
+  },
+  "final_native_runtime": {
+    "handle": 81401,
+    "exit_code": 0,
+    "log": "/tmp/autoship-locked-writer-final-core-20261108.log",
+    "passed": 58,
+    "failed": 0,
+    "ignored": 0,
+    "seconds": 6.46
+  },
+  "final_production_compile": {
+    "handle": 81401,
+    "exit_code": 0,
+    "log": "/tmp/autoship-locked-writer-production-20261108.log",
+    "seconds": 74
+  },
+  "assertions": [
+    "Actual authenticated reserved-readiness pipeline refuses recorded version-2 writer after native transfer for both providers",
+    "Typed LegacyNativeInputWriter reason survives actual metadata call boundary",
+    "Original version-2 records remain readable and byte-for-byte retained",
+    "No readiness/event, model admission, queued-input consumption, accounting or audit mutation from refusal",
+    "Current version-3 reserved states and completed successor handoff pass in full CLI suite",
+    "New actual native launch producer emits version 3; original protected append remains bound to exact intent",
+    "Existing controlled stdin tests retain state authority across write, cancellation, failure and durable release marker"
+  ],
+  "limits": [
+    "Native launch version 3 identifies the current participating writer protocol; a version field or saved JSON is not native authority",
+    "No full original source/resource/input or unknown-actor qualification and no completed legacy cutover",
+    "Controlled retained data and runtime/resource fixtures; no live provider/VM or frozen-host qualification demonstrated",
+    "Historical saved readiness remains descriptive and cannot replace fresh qualified proof",
+    "Old builds supporting only launch-intent version 2 reject version-3 records; deployment/rollback cutover remains required",
+    "Typed reason is not yet integrated with worker durable blocked-state/Discord notifications",
+    "Repeated cycles, productive release/model/result authority, worker/CLI/Discord ingress and all original acceptance remain incomplete",
+    "No production capacity/policy/service/hold/accounting or retained runtime mutation"
+  ],
+  "all_original_local_handles_terminal": true,
+  "productive_recovery_granted": false,
+  "production_rollout_performed": false
+}
