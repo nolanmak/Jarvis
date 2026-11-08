@@ -1,7 +1,7 @@
 {
   "commands": {
     "apple-notes/exporter/1": {
-      "body": "python3 scripts/ci-pinned-tools.py python39",
+      "body": "set -euo pipefail\nsudo apt-get update\nsudo apt-get install -y --no-install-recommends libbz2-dev libffi-dev liblzma-dev libsqlite3-dev libssl-dev zlib1g-dev\npython3 scripts/ci-pinned-tools.py python39\n",
       "shell": "bash",
       "vm_provisioning": [
         "pinned-tool-release"
@@ -126,7 +126,7 @@
       "shell": "bash"
     },
     "imessage/exporter/1": {
-      "body": "python3 scripts/ci-pinned-tools.py python39",
+      "body": "set -euo pipefail\nsudo apt-get update\nsudo apt-get install -y --no-install-recommends libbz2-dev libffi-dev liblzma-dev libsqlite3-dev libssl-dev zlib1g-dev\npython3 scripts/ci-pinned-tools.py python39\n",
       "shell": "bash",
       "vm_provisioning": [
         "pinned-tool-release"
@@ -779,7 +779,7 @@
       "shell": "bash"
     },
     "rust/legacy-python/1": {
-      "body": "python3 scripts/ci-pinned-tools.py python39",
+      "body": "set -euo pipefail\nsudo apt-get update\nsudo apt-get install -y --no-install-recommends libbz2-dev libffi-dev liblzma-dev libsqlite3-dev libssl-dev zlib1g-dev\npython3 scripts/ci-pinned-tools.py python39\n",
       "shell": "bash",
       "vm_provisioning": [
         "pinned-tool-release"
@@ -1003,7 +1003,8 @@
             },
             {
               "command_id": "apple-notes/exporter/1",
-              "name": "Provision verified Python 3.9 compatibility runtime"
+              "name": "Provision verified Python 3.9 compatibility runtime",
+              "timeout-minutes": 5
             },
             {
               "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
@@ -1018,7 +1019,7 @@
         }
       },
       "role": "validation",
-      "sha256": "afcbb387456ccfe0847f8738aeadafc1cc0ec9ac33a8beaa68e7fd7e5c0dbcfd"
+      "sha256": "e61d265d71d54e43a13c06a5406f9591bf512f73874e7fd8c883423e6ed0a80f"
     },
     ".github/workflows/autonomous-code-scanner.yml": {
       "reason": "scheduled autonomous scanner and issue reporting",
@@ -1431,7 +1432,8 @@
             },
             {
               "command_id": "imessage/exporter/1",
-              "name": "Provision verified Python 3.9 compatibility runtime"
+              "name": "Provision verified Python 3.9 compatibility runtime",
+              "timeout-minutes": 5
             },
             {
               "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
@@ -1446,7 +1448,7 @@
         }
       },
       "role": "validation",
-      "sha256": "2bd74da7344f03b51d9558d116576a29bb9385bd3410dc77d6f38c3a02844bd6"
+      "sha256": "a1688061546408f7835a0a4948b980ed12459dedadba9ecff3f3868d891e4e1b"
     },
     ".github/workflows/issue-to-pr.yml": {
       "reason": "issue-driven implementation and publication, not PR validation",
@@ -2787,7 +2789,8 @@
             },
             {
               "command_id": "rust/legacy-python/1",
-              "name": "Provision verified Python 3.9 compatibility runtime"
+              "name": "Provision verified Python 3.9 compatibility runtime",
+              "timeout-minutes": 5
             },
             {
               "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
@@ -3116,7 +3119,7 @@
         }
       },
       "role": "validation",
-      "sha256": "c43453111557c26710b9bdbc76c19ec15c1597f11e5e0925ea3e9a8a6589a058"
+      "sha256": "6a03425098d8ed81bcfa0e28901b00509e339c0b76bafc6965df224f71d1e1fc"
     },
     ".github/workflows/targeted.yml": {
       "defaults": {},
