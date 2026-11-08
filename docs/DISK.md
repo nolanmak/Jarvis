@@ -9,7 +9,7 @@ the logs.
 
 | What | When | Does |
 |---|---|---|
-| `augmentagent disk prune` | daily (`augmentagent-disk-prune.timer`) | Removes cold build output from every target dir the repo owns |
+| `augmentagent disk prune` | hourly (`augmentagent-disk-prune.timer`) | Removes cold build output from every target dir the repo owns, and adopts unmanaged Cargo caches idle ≥7 days (`AUGMENTAGENT_ADOPT_UNMANAGED_DAYS`) |
 | `augmentagent log-rotate` | daily, same timer | Rotates and compresses the state dir's logs and sinks |
 | `augmentagent ops-archive sync` | daily, same timer | Pushes rotated logs to a private repo, if one is configured |
 | `augmentagent deploy prune` | daily, and after every verified update | Keeps the newest deploy snapshots and rollback binaries |

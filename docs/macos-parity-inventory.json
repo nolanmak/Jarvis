@@ -3628,7 +3628,7 @@
       "Synthetic housekeeping directories"
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1406",
-    "test_plan": "Verify 04:37 daily schedule and catch-up behavior, synthetic cleanup, active-build protection and service install/uninstall on each platform.",
+    "test_plan": "Verify hourly (:37) schedule and catch-up behavior, synthetic cleanup, active-build protection and service install/uninstall on each platform.",
     "status": "gap",
     "evidence": null
   },
@@ -3643,7 +3643,7 @@
       "Synthetic housekeeping directories"
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1406",
-    "test_plan": "Verify 04:37 daily schedule and catch-up behavior, synthetic cleanup, active-build protection and service install/uninstall on each platform.",
+    "test_plan": "Verify hourly (:37) schedule and catch-up behavior, synthetic cleanup, active-build protection and service install/uninstall on each platform.",
     "status": "gap",
     "evidence": null
   },
