@@ -383,6 +383,8 @@ fn runtime_authority_from(root:&Path,ledger:&owner_ledger::Ledger<'_>,session:&P
     ledger.resolve(relative_runtime(root,session)?,&ownership::Authority{owner,audit_path},&format!("{:x}",Sha256::digest(bytes)))
 }
 
+#[path="native_launch_prune.rs"]
+mod launch_prune;
 fn prune_and_count(root:&Path,ledger:&owner_ledger::Ledger<'_>) -> Result<usize> {
     let mut count=0;
     for provider in std::fs::read_dir(root)? {
@@ -390,6 +392,7 @@ fn prune_and_count(root:&Path,ledger:&owner_ledger::Ledger<'_>) -> Result<usize>
         if !matches!(provider.file_name().and_then(|name|name.to_str()),Some("codex"|"claude"|"qwen"|"glm")){continue;}
         ensure!(provider.is_dir(),"native provider state is not a directory");
         ensure!(!provider.is_symlink(),"native provider state symlink");
+        let mut launches=launch_prune::collect(&provider)?;
         for entry in std::fs::read_dir(&provider)? {
             let session=entry?.path();
             if !session.file_name().is_some_and(|name|name.to_string_lossy().starts_with("session-")){continue;}
@@ -403,6 +406,7 @@ fn prune_and_count(root:&Path,ledger:&owner_ledger::Ledger<'_>) -> Result<usize>
             if retired && available {
                 let receipts=if reconciled {vec!["retired-owner.json","owned.json"]} else {vec!["retired.json","owned.json","complete.json"]};
                 for name in receipts { let _:serde_json::Value=serde_json::from_slice(&private(&session.join(name))?)?; }
+                launch_prune::remove(launches.remove(&session).unwrap_or_default())?;
                 let aliases=provider.join("aliases");
                 if aliases.is_dir() {
                     for entry in std::fs::read_dir(aliases)? {
@@ -2550,6 +2554,90 @@ else: print(result)
             assert!(!peer.exists(),"valid peer blocked by {field}");
         }
     }
+    #[test]
+    fn retired_session_pruning_removes_linked_launches_before_registration_census() {
+        let (_base,root,retirement,_launch)=lifecycle_fixture();
+        let provider=root.join("codex");
+        std::fs::set_permissions(&provider,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut launches=Vec::new();
+        for name in ["launch-first","launch-resume"] {
+            let path=provider.join(name);std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o700)).unwrap();
+            write(&path.join("launch.json"),&serde_json::to_vec(&serde_json::json!({
+                "version":1,"provider":"codex","session_directory":retirement.session,
+            })).unwrap()).unwrap();launches.push(path);
+        }
+        write(&retirement.session.join("complete.json"),b"{}").unwrap();retire(&retirement);
+        let lock=StateLock::existing(&root).unwrap();
+        let ledger=owner_ledger::Ledger::open(&root,&lock).unwrap();
+        owner_initial::prove_no_prior_state(&root,&ledger,"fresh-workflow").unwrap();
+        assert_eq!(prune_and_count(&root,&ledger).unwrap(),0);
+        for path in launches {assert!(!path.exists(),"retired session left a dangling launch: {}",path.display());}
+        owner_initial::prove_no_prior_state(&root,&ledger,"fresh-workflow")
+            .expect("authorized pruning poisoned the next registration census");
+    }
+
+    #[test]
+    fn retired_session_pruning_preserves_live_locked_and_unknown_launches() {
+        let (_base,root,retirement,_launch)=lifecycle_fixture();
+        let provider=root.join("codex");
+        let peer=session(&root,"session-live-peer","/audit/peer",false);
+        let make=|name:&str,spec:Option<serde_json::Value>| {
+            let path=provider.join(name);std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o700)).unwrap();
+            if let Some(spec)=spec {write(&path.join("launch.json"),&serde_json::to_vec(&spec).unwrap()).unwrap();}
+            path
+        };
+        let linked=make("launch-retired",Some(serde_json::json!({"version":1,"provider":"codex","session_directory":retirement.session})));
+        let live=make("launch-live",Some(serde_json::json!({"version":1,"provider":"codex","session_directory":peer})));
+        let partial=make("launch-partial",None);
+        let wrong=make("launch-wrong-provider",Some(serde_json::json!({"version":1,"provider":"claude","session_directory":retirement.session})));
+        let orphan=make("launch-orphan",Some(serde_json::json!({"version":1,"provider":"codex","session_directory":provider.join("session-missing")})));
+        let malformed=make("launch-malformed",Some(serde_json::json!({"version":2,"provider":"codex","session_directory":retirement.session})));
+        let symlink=provider.join("launch-symlink");std::os::unix::fs::symlink(&partial,&symlink).unwrap();
+        write(&retirement.session.join("complete.json"),b"{}").unwrap();retire(&retirement);
+        let runtime_lock=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600)
+            .open(retirement.session.join("lock")).unwrap();
+        assert_eq!(unsafe{libc::flock(runtime_lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        let lock=StateLock::existing(&root).unwrap();
+        assert_eq!(test_prune(&root,&lock).unwrap(),2);
+        assert!(linked.exists(),"locked runtime lost its launch");
+        assert_eq!(unsafe{libc::flock(runtime_lock.as_raw_fd(),libc::LOCK_UN)},0);
+        assert_eq!(test_prune(&root,&lock).unwrap(),1);
+        assert!(!linked.exists());assert!(peer.exists());
+        for path in [live,partial,wrong,orphan,malformed,symlink] {assert!(path.symlink_metadata().is_ok(),"unknown/live launch removed: {}",path.display());}
+    }
+
+    #[test]
+    fn retired_session_pruning_refuses_changed_launch_identity() {
+        for replace_directory in [false,true] {
+            let (_base,root,retirement,_launch)=lifecycle_fixture();
+            let provider=root.join("codex");let path=provider.join("launch-captured");
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let bytes=serde_json::to_vec(&serde_json::json!({"version":1,"provider":"codex","session_directory":retirement.session})).unwrap();
+            write(&path.join("launch.json"),&bytes).unwrap();
+            write(&retirement.session.join("complete.json"),b"{}").unwrap();retire(&retirement);
+            let lock=StateLock::existing(&root).unwrap();
+            let ledger=owner_ledger::Ledger::open(&root,&lock).unwrap();
+            assert!(owner_handoff::retired(&root,&ledger,&retirement.session).unwrap());
+            write(&retirement.session.join("lock"),b"").unwrap();
+            let _runtime_lock=owner_handoff::session_lock(&retirement.session).unwrap();
+            let linked=launch_prune::collect(&provider).unwrap().remove(&retirement.session).unwrap();
+            if replace_directory {
+                std::fs::rename(&path,provider.join("launch-original-retained")).unwrap();
+                std::fs::create_dir(&path).unwrap();
+                std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o700)).unwrap();
+                write(&path.join("launch.json"),&bytes).unwrap();
+            } else {
+                let mut changed=bytes.clone();changed.push(b' ');
+                std::fs::write(path.join("launch.json"),changed).unwrap();
+            }
+            assert!(launch_prune::remove(linked).is_err(),"changed launch was removed");
+            assert!(path.exists() && retirement.session.exists());
+        }
+    }
+
     #[test]
     fn scope_marker_valid_completion_waits_for_session_lock() {
         let (_base,root,retirement,_launch)=lifecycle_fixture();

@@ -2552,3 +2552,32 @@ CLI builds. Evidence and fixture limits are recorded in
 leak; it neither reclaims the existing retained sessions nor proves restoration.
 All prior normal-ingress, C/R, productive-transition, capacity, review, rollout
 and live acceptance obligations remain open. No production state changed.
+
+## 81. Do not create orphan launch references during qualified pruning
+
+The old session pruner could remove a qualified retired runtime while retaining
+its `launch-*` directories. Initial registration then rejected those dangling
+specs because their original runtime no longer existed. A regression reproduced
+the dangling launch using the original pruning path.
+
+The pruner now indexes bounded, valid private launch references per provider and
+removes references to the same runtime before removing that runtime. The original
+retirement proof, native StateLock and exclusive runtime lock remain required.
+Only directory identity and spec digest are retained in the bounded index; full
+specs are not accumulated. Before removal, directory device/inode/privacy and
+spec digest must still match. A changed reference refuses before runtime removal.
+
+Three tests cover successful pruning followed by a successful real registration
+census; retention of live/locked/partial/malformed/cross-provider/symlinked and
+already-orphaned entries; and refusal of changed bytes or a replacement directory
+with identical spec bytes. All 219 native lifecycle tests and the production CLI
+build pass. The first broad run exposed a missing lock file in the new fixture;
+that setup was corrected and the complete rerun passed. Evidence is recorded in
+`1703-linked-launch-pruning-proof.json`.
+
+This implements only prevention of new dangling references during already-
+authorized session pruning. Already-orphaned and pre-spec partial launches need
+original recovery/custody evidence and remain held. No production cleanup, budget
+change, complete all-writer C/R proof or restoration is claimed. All prior normal
+ingress, productive-transition, capacity, review, rollout and live acceptance
+requirements remain open.

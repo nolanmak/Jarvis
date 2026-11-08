@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "base_head": "ec878ab61390959d7f5e41074535316bf1fd590b",
+  "change": "Remove captured valid launch references before removing the same qualified retired runtime, preventing a new dangling reference from poisoning initial-registration census.",
+  "sources": {
+    "crates/augmentagent-channel-core/src/native_vm.rs": "4f79f96db42972387da43ae2019dcfe5b36cba63c4a35b729919221a64138def",
+    "crates/augmentagent-channel-core/src/native_launch_prune.rs": "c7e9934f7c3f2cd917e31cbe78552e0475e0a35f8c57171a8d61914554613de1"
+  },
+  "evidence": {
+    "behavior_red": {
+      "log": "/tmp/autoship-1703-linked-launch-prune-red-20261108.log",
+      "sha256": "c96140c32bb57c3cc0c107802a44412b6c4e038c14fcdecea5f6209b758bf8cf"
+    },
+    "initial_native_run": {
+      "log": "/tmp/autoship-1703-linked-launch-prune-native-20261108.log",
+      "sha256": "2eef44795846f82c23f275c235b773f446a23cda9cbf5bcf36be6944c015c31a"
+    },
+    "focused_final": {
+      "log": "/tmp/autoship-1703-linked-launch-prune-focused-final-20261108.log",
+      "sha256": "84739dc0134a9a4101bdb07f89b6a16a6750098fff8b9ca1cd5d1e06580a84ec"
+    },
+    "native_final": {
+      "log": "/tmp/autoship-1703-linked-launch-prune-native-final-20261108.log",
+      "sha256": "9120e5c1ce400185bdfe4dc9ea5be8febe940966bdc69a0740c4f79f6d3582b9"
+    },
+    "production": {
+      "log": "/tmp/autoship-1703-linked-launch-prune-production-20261108.log",
+      "sha256": "88ba7ede34cdbca35e195f0bf8bcc7ec65be7d47c83f736ec92685bd22e65726"
+    }
+  },
+  "red_behavior": "Original pruning removed a qualified retired session while leaving launch-first and launch-resume behind; the regression failed on the retained launch path.",
+  "validation": {
+    "new_pruning_tests_passed": 3,
+    "native_lifecycle_tests_passed": 219,
+    "failed": 0,
+    "ignored": 0,
+    "production_compile_passed": true,
+    "initial_native_run": "218 passed, 1 new fixture failure: missing lock file. The fixture now creates its original session lock before acquiring it; the complete rerun passes."
+  },
+  "invariants": [
+    "Keep the existing qualified retirement and exclusive session-lock requirements under the original native StateLock; launch references alone never authorize runtime removal.",
+    "Index only private nonsymlink launch directories with bounded private valid v1 specs naming the same provider and a direct session child. Store a digest, not every full spec; entry count is bounded.",
+    "Remove linked launches before aliases/runtime removal. Revalidate captured directory device/inode, privacy and spec digest before removal; changed identity refuses with the session retained.",
+    "Preserve live or locked runtime launches, partial/malformed/cross-provider entries, symlinks and references whose original runtime is already missing.",
+    "The positive test runs the actual initial-registration census before and after qualified pruning, proving that this cleanup does not create dangling-reference admission failure."
+  ],
+  "limits": [
+    "Only the linked-reference part of the orphan-launch review finding is implemented. Already-orphaned and pre-spec partial directories still need original custody/recovery evidence and remain held; no age/PID/absence-based deletion is added.",
+    "Fixtures use actual private native-store, ledger, retirement and filesystem-lock APIs, with descriptive completion fixtures. No VM/provider execution, complete C/R proof, production cleanup or shipping acceptance is claimed.",
+    "Replacement checks operate within the existing cooperative StateLock custody; this is not a new all-writer exclusion proof.",
+    "The existing production 8GiB policy, reservations, retained sessions, allowances, services and owner holds are unchanged.",
+    "Normal owner ingress, productive admission/transition, preserved publication-gate exits, capacity recovery, independent review, rollout and all original live acceptance/fault/soak requirements remain incomplete."
+  ],
+  "deployed": false,
+  "production_state_changed": false,
+  "goal_complete": false
+}
