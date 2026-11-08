@@ -40,9 +40,10 @@ fn identity_client(https_only:bool)->Result<reqwest::Client> {
     let builder=if https_only {builder}else{builder.no_proxy()};
     builder.build().map_err(|_|anyhow::anyhow!("configured bot verification client unavailable"))
 }
-struct Snapshot {policy:crate::autoship_discord_command::OwnerPolicy,fingerprint:String,verified_at:i64,read:ReadConfig}
+struct Snapshot {policy:crate::autoship_discord_command::OwnerPolicy,fingerprint:String,verified_at:i64,read:ReadConfig,deployment:Option<crate::autoship_deployment::VerifiedWorkerOwner>}
 impl Snapshot {
     fn check(&self)->Result<crate::autoship_discord_command::OwnerPolicy> {
+        if let Some(deployment)=&self.deployment {deployment.current()?;}
         let now=chrono::Utc::now().timestamp_millis();
         anyhow::ensure!(now>=self.verified_at && now<=self.verified_at.saturating_add(MAX_AGE),"configured owner verification expired");
         anyhow::ensure!((self.read)()?.fingerprint()==self.fingerprint,"configured owner identity changed");
@@ -62,7 +63,11 @@ impl VerifiedOwnerPolicy {
 /// Production source is fixed HTTPS Discord and the worker's current runtime
 /// configuration, never saved request identity or a caller-selected endpoint.
 pub(super) async fn configured()->Result<VerifiedOwnerPolicy> {
-    verify_with(&identity_client(true)?,BOT_ENDPOINT,Arc::new(environment)).await
+    let deployment=crate::autoship_deployment::verify_worker_owner().await?;
+    let mut proof=verify_with(&identity_client(true)?,BOT_ENDPOINT,Arc::new(environment)).await?;
+    Arc::get_mut(&mut proof.snapshot).context("owner verification unexpectedly shared")?.deployment=Some(deployment);
+    proof.current()?;
+    Ok(proof)
 }
 async fn verify_with(client:&reqwest::Client,endpoint:&str,read:ReadConfig)->Result<VerifiedOwnerPolicy> {
     let configured=read()?;
@@ -81,7 +86,7 @@ async fn verify_with(client:&reqwest::Client,endpoint:&str,read:ReadConfig)->Res
     anyhow::ensure!(bot.bot && bot.id==id.to_string(),"configured bot identity invalid");
     let proof=VerifiedOwnerPolicy {snapshot:Arc::new(Snapshot {
         policy:crate::autoship_discord_command::OwnerPolicy {bot:id,owner:configured.owner},
-        fingerprint:configured.fingerprint(),verified_at:chrono::Utc::now().timestamp_millis(),read,
+        fingerprint:configured.fingerprint(),verified_at:chrono::Utc::now().timestamp_millis(),read,deployment:None,
     })};
     proof.current()?;Ok(proof)
 }

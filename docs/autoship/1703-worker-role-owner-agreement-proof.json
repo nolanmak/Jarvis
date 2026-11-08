@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Current daemon/worker owner-configuration agreement retained through worker metadata authorization",
+  "extends": "1703-worker-owner-identity-proof.json",
+  "parent_commit": "a296bf4ebf9e9b8f60353371dc4cb195d8b6a4cd",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_deployment.rs": "5a7cce97f356a7f6069bff2044807a7f6cf58c2985c2d9a0a5ab7f316bade657",
+    "crates/augmentagent-cli/src/autoship_deployment.rs": "fb2771faaf43bd00220070d31a50494c72dccd2da7d9f353c5997241add928da",
+    "crates/augmentagent-cli/src/self_improve_worker_owner_identity.rs": "e3125f61775f2a998a77fef45c558388939bbf7aed94a6f6fdf136c2cdbf21ef",
+    "scripts/autoship-deployment-readiness.py": "d2b5665904a8da5ad7b16cab845757a576082ddc13a2fe2676fb17037381cda1",
+    "scripts/tests/autoship_deployment_readiness_test.py": "dcfa3608fd6cbf390967c971599648ed5166e38ee29587995f7217ec8c749ea3"
+  },
+  "red": {
+    "python_log": "/tmp/autoship-owner-deployment-red-20261108.log",
+    "reason": "Versioned owner receipt and owner-agreement inspector absent",
+    "rust_log": "/tmp/autoship-owner-role-guard-red-20261108.log",
+    "rust_limit": "Missing implementation compile errors were accompanied by stale dependency API errors; this is not an isolated behavior-test failure"
+  },
+  "validation": {
+    "original_final_handle": 45190,
+    "exit_code": 0,
+    "workspace_artifact_refresh": {
+      "packages": 47,
+      "managed_wrapper": true,
+      "third_party_dependencies_retained": true,
+      "log": "/tmp/autoship-owner-workspace-artifact-invalidation-20261108.log",
+      "reason": "Sequential cross-worktree reuse left stale core and approval-discord artifacts; all workspace libraries were invalidated before final compilation and tests",
+      "limit": "This manual managed invalidation does not implement or prove automatic source-correct cache reuse"
+    },
+    "non_test_compile": {
+      "passed": true,
+      "seconds": 173,
+      "log": "/tmp/autoship-owner-source-correct-production-20261108.log"
+    },
+    "role_and_startup_tests": {
+      "passed": 4,
+      "seconds": 1.07,
+      "log": "/tmp/autoship-owner-source-correct-deployment-20261108.log"
+    },
+    "identity_transport_regression": {
+      "passed": 8,
+      "seconds": 0.02,
+      "log": "/tmp/autoship-owner-source-correct-identity-20261108.log"
+    },
+    "existing_recovery_snapshot": {
+      "passed": 1,
+      "both_builder_pins": true,
+      "seconds": 5.95,
+      "log": "/tmp/autoship-owner-source-correct-recovery-20261108.log"
+    },
+    "python_deployment": {
+      "passed": 5,
+      "seconds": 1.391,
+      "log": "/tmp/autoship-owner-role-python-final-20261108.log"
+    },
+    "python_updater": {
+      "passed": 1,
+      "seconds": 0.096,
+      "log": "/tmp/autoship-owner-role-updater-regression-20261108.log"
+    }
+  },
+  "assertions": [
+    "Role startup emits version 2 receipts with canonical configured owner, SHA-256 credential fingerprint and actual executable digest; raw credentials never enter receipt configuration or inspector output",
+    "Generic deployment diagnostics retain version 1 compatibility; worker owner admission requires version 2 for both roles and never backfills older receipts",
+    "Owner inspector first requires existing effective-policy/provider/model/state agreement, matching live executable hashes and managed service PID/birth evidence; worker must be the actual calling parent",
+    "Production worker authorization uses its actual current executable and fixed embedded isolated Python inspector, not a caller-supplied saved report or endpoint",
+    "Non-Clone/non-Deserialize worker verifier checks private receipt directory identity, exact receipt hash and inode metadata, actual process birth/owner and mapped executable digest before construction",
+    "Retained checks reject receipt replacement even with identical bytes, content mutation, symlinks, hard links, public permissions, incorrect image or process birth and process exit",
+    "Executable hash capture requires trusted ownership, non-writable group/other permissions, executable mode and bounded regular-file size; retained checks recheck mapped inode/content timestamps without hashing a large image under native/SQL locks",
+    "Worker configured identity attaches the retained role proof before returning its existing transport verifier; current/configuration fences recheck that proof and current environment before repository and SQL/native metadata operations",
+    "No subprocess, network or native/audit discovery is added to retained fence callbacks",
+    "Actual worker upgrades exit for a service restart with a new PID/birth; no speculative in-place-exec protocol or daemon restart was added"
+  ],
+  "limits": [
+    "Role tests use controlled real processes and private synthetic receipts; helper tests inject role lookup results rather than operating actual systemd services",
+    "HTTP regression uses loopback sockets and synthetic credentials; the complete configured-worker/systemd/Discord/GitHub/native chain has not been exercised live",
+    "Existing recovery snapshot regression uses explicit-policy fixture admission; worker-to-live-ledger authorization is not proven by it",
+    "Production worker-specific constructors retain the new proof, but scheduler selection and metadata-controller invocation remain unconnected",
+    "No full current-source CLI suite pass, exact-head independent review, current-head hosted verification, native productive authority, deployed rollout, real private send or autonomous merge is claimed"
+  ],
+  "remaining": [
+    "Connect scheduler admission, complete metadata outcomes and durable blockers/progress",
+    "Complete closed/transferred-source and C/R legacy/source/resource/input qualification and debt recovery",
+    "Productive repeated cycles and complete private coding/follow-up/delivery lifecycle",
+    "Exact-head independent review, trusted hosted verification and normal updater rollout",
+    "Original live CLI/Discord acceptance, five autonomous merges in the acceptance UTC day, 72-hour fault and 24-hour unattended soak"
+  ],
+  "all_original_local_handles_terminal": true,
+  "deployed": false,
+  "productive_authority_granted": false,
+  "goal_complete": false
+}

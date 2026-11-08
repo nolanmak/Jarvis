@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 spec=importlib.util.spec_from_file_location('deployment',Path(__file__).parents[1]/'autoship-deployment-readiness.py')
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 
@@ -95,5 +96,47 @@ class DeploymentTests(unittest.TestCase):
                     self.assertNotIn('do-not-output-this-value',json.dumps(report))
                     self.assertEqual(before,{str(p):p.read_bytes() for p in receipts.iterdir()})
                     write(policy,{'version':1,'providers':{'claude':{},'codex':{}}})
+
+    @unittest.skipUnless(Path('/proc/self/stat').exists(),'Linux process-bound evidence')
+    def test_owner_receipt_records_only_a_versioned_fingerprint(self):
+        with tempfile.TemporaryDirectory() as temporary,patch.dict(os.environ,{'DISCORD_ALLOWED_USER_ID':'22','DISCORD_BOT_TOKEN':'fixture-secret-never-record'},clear=True):
+            receipts=Path(temporary)/'receipts';m.record('worker',os.getppid(),receipts,False,True)
+            raw=(receipts/'worker.json').read_bytes();value=json.loads(raw)
+            self.assertEqual(value['version'],2)
+            self.assertEqual(value['owner_identity'],m.owner_identity(os.environ))
+            self.assertEqual(value['executable_sha256'],m.file_hash(Path('/proc')/str(os.getppid())/'exe'))
+            self.assertNotIn(b'fixture-secret-never-record',raw)
+            self.assertNotIn('DISCORD_BOT_TOKEN',value['config'])
+
+    @unittest.skipUnless(Path('/proc/self/stat').exists(),'Linux process-bound evidence')
+    def test_owner_admission_requires_matching_active_role_receipts_and_caller(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);receipts=root/'receipts';receipts.mkdir(mode=0o700)
+            policy=root/'policy.json';write(policy,{'version':1,'providers':{'claude':{},'codex':{}}})
+            selection=root/'selection';selection.write_text('AUGMENTAGENT_NATIVE_VM_POLICY="'+str(policy)+'"');selection.chmod(0o600)
+            children={role:subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],env={'PATH':'/usr/bin:/bin'}) for role in m.ROLES}
+            self.addCleanup(lambda:[(p.terminate(),p.wait()) for p in children.values() if p.poll() is None])
+            binary=Path(f'/proc/{children["worker"].pid}/exe').resolve();binary_sha=m.file_hash(binary)
+            expected=m.owner_identity({'DISCORD_ALLOWED_USER_ID':'22','DISCORD_BOT_TOKEN':'fixture-secret-never-record'})
+            base={role:{'version':2,'role':role,'pid':child.pid,'birth':birth(child.pid),'boot_id':m.boot(),'dry_run':False,'external':True,'executable_sha256':binary_sha,'policy_sha256':m.digest(policy.read_bytes()),'owner_identity':expected,
+                        'config':{'AUGMENTAGENT_AUTOPR':'1','HOME':str(root),'PATH':'/usr/bin:/bin','AUGMENTAGENT_NATIVE_VM_POLICY':str(policy),'CLAUDE_CLI':'/usr/bin/true','CODEX_CLI':'/usr/bin/true'}} for role,child in children.items()}
+            for case in ['matched','owner-drift','credential-drift','legacy','missing-owner','secret-field','wrong-image','stale','wrong-caller','expected-drift']:
+                with self.subTest(case=case):
+                    values=json.loads(json.dumps(base));configured=expected;caller=children['worker'].pid
+                    if case=='owner-drift':values['daemon']['owner_identity']['owner']='33'
+                    if case=='credential-drift':values['worker']['owner_identity']['credential_sha256']='0'*64
+                    if case=='legacy':values['daemon']['version']=1
+                    if case=='missing-owner':values['daemon'].pop('owner_identity')
+                    if case=='secret-field':values['daemon']['owner_identity']['token']='fixture-secret-never-record'
+                    if case=='wrong-image':values['worker']['executable_sha256']='0'*64
+                    if case=='stale':values['daemon']['birth']='stale'
+                    if case=='wrong-caller':caller=os.getpid()
+                    if case=='expected-drift':configured={**expected,'owner':'44'}
+                    for role,value in values.items():write(receipts/(role+'.json'),value)
+                    before={p.name:p.read_bytes() for p in receipts.iterdir()}
+                    report=m.inspect_owner(binary,selection,receipts,pid_for=lambda role:children[role].pid,configured=configured,caller_pid=caller)
+                    self.assertEqual(report['owner_matches'],case=='matched',report)
+                    self.assertFalse(report['live_verified']);self.assertNotIn('fixture-secret-never-record',json.dumps(report))
+                    self.assertEqual(before,{p.name:p.read_bytes() for p in receipts.iterdir()})
 
 if __name__=='__main__':unittest.main()

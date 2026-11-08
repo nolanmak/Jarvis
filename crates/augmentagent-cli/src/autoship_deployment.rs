@@ -2,6 +2,9 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+#[path = "autoship_owner_deployment.rs"]
+mod owner;
+pub(crate) use owner::{verify_worker_owner, VerifiedWorkerOwner};
 const HELPER: &str = include_str!("../../../scripts/autoship-deployment-readiness.py");
 fn receipts() -> Result<PathBuf> {
     Ok(crate::build_storage::state_dir()?.join("autoship-effective-config"))
@@ -64,6 +67,12 @@ pub struct Report {
     pub expected_executable_sha256: Option<String>,
     #[serde(default)]
     pub selected_policy_sha256: Option<String>,
+    #[serde(default)]
+    pub owner_matches: bool,
+    #[serde(default)]
+    pub owner_status: Option<String>,
+    #[serde(default)]
+    pub owner_configuration_sha256: Option<String>,
 }
 impl Report {
     pub(crate) fn unavailable(status: &str) -> Self {
@@ -76,6 +85,9 @@ impl Report {
             services: serde_json::json!({}),
             expected_executable_sha256: None,
             selected_policy_sha256: None,
+            owner_matches: false,
+            owner_status: None,
+            owner_configuration_sha256: None,
         }
     }
     pub fn preflight(&self) -> Result<()> {
@@ -88,6 +100,9 @@ impl Report {
     }
 }
 pub async fn inspect(repo: &Path) -> Report {
+    inspect_binary(&repo.join("target/release/augmentagent"), false).await
+}
+async fn inspect_binary(binary: &Path, owner: bool) -> Report {
     if !cfg!(target_os = "linux") {
         return Report::unavailable("platform-unverified");
     }
@@ -104,11 +119,21 @@ pub async fn inspect(repo: &Path) -> Report {
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .arg("--binary")
-        .arg(repo.join("target/release/augmentagent"))
+        .arg(binary)
         .arg("--selection")
         .arg(config.join("augmentagent/autoship-native.env"))
         .arg("--receipts")
         .arg(receipts);
+    if owner {
+        command.arg("--owner-identity");
+        // Only the trusted embedded helper receives these values. It emits a
+        // configuration digest, never the credential or an authorization grant.
+        for key in ["DISCORD_ALLOWED_USER_ID", "DISCORD_BOT_TOKEN"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+    }
     for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
@@ -139,7 +164,14 @@ mod tests {
         const CHILD: &str = "AUTOSHIP_EFFECTIVE_CONFIG_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir().unwrap();
-            let status=std::process::Command::new(std::env::current_exe().unwrap())
+            // Cargo follows the invoking umask (often 0002); a writable build
+            // artifact is deliberately refused as a deployed executable. Run
+            // an owned private fixture copy with deployment permissions.
+            use std::os::unix::fs::PermissionsExt;
+            let executable = root.path().join("receipt-fixture");
+            std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let status=std::process::Command::new(executable)
                 .args(["--exact","autoship_deployment::tests::startup_receipt_captures_loaded_configuration_without_credentials","--nocapture"])
                 .env_clear().env("PATH","/usr/bin:/bin").env("HOME",root.path())
                 .env("XDG_STATE_HOME",root.path().join("state")).env(CHILD,root.path()).status().unwrap();
@@ -151,7 +183,7 @@ mod tests {
         let envfile = root.join("loaded.env");
         std::fs::write(
             &envfile,
-            "AUGMENTAGENT_REASONER_CHAIN=codex\nCODEX_API_KEY=private-fixture-never-record\n",
+            "AUGMENTAGENT_REASONER_CHAIN=codex\nCODEX_API_KEY=private-fixture-never-record\nDISCORD_ALLOWED_USER_ID=22\nDISCORD_BOT_TOKEN=private-discord-fixture-never-record\n",
         )
         .unwrap();
         dotenvy::from_path(&envfile).unwrap();
@@ -167,6 +199,20 @@ mod tests {
         assert_eq!(value["config"]["AUGMENTAGENT_REASONER_CHAIN"], "codex");
         assert_eq!(value["pid"], std::process::id());
         assert_eq!(value["role"], "worker");
+        assert_eq!(value["version"], 2);
+        assert_eq!(value["owner_identity"]["owner"], "22");
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            value["owner_identity"]["credential_sha256"],
+            format!(
+                "{:x}",
+                Sha256::digest(b"private-discord-fixture-never-record")
+            )
+        );
+        assert!(value["executable_sha256"]
+            .as_str()
+            .is_some_and(|s| s.len() == 64));
+        assert!(!String::from_utf8_lossy(&bytes).contains("private-discord-fixture-never-record"));
         assert!(!String::from_utf8_lossy(&bytes).contains("private-fixture-never-record"));
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(

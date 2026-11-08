@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -39,6 +40,23 @@ def private(path,limit=65536):
         return data
 
 def digest(data):return hashlib.sha256(data).hexdigest()
+def owner_identity(environment):
+    # Credentials never enter the generic configuration allowlist or output.
+    try:
+        owner=environment.get('DISCORD_ALLOWED_USER_ID','');token=environment.get('DISCORD_BOT_TOKEN','')
+        if not isinstance(owner,str) or not re.fullmatch(r'\+?[0-9]{1,128}',owner) or not 0<int(owner)<2**64:return None
+        if not isinstance(token,str) or not 0<len(token)<=4096:return None
+        return {'owner':str(int(owner)),'credential_sha256':digest(token.encode('utf-8'))}
+    except Exception:return None
+
+def checked_owner(value):
+    if value is None:return None
+    if not isinstance(value,dict) or set(value)!={'owner','credential_sha256'}:raise Refused('owner-identity-invalid')
+    owner=value['owner'];credential=value['credential_sha256']
+    if not isinstance(owner,str) or not re.fullmatch(r'[1-9][0-9]{0,19}',owner) or not 0<int(owner)<2**64:raise Refused('owner-identity-invalid')
+    if not isinstance(credential,str) or not re.fullmatch(r'[0-9a-f]{64}',credential):raise Refused('owner-identity-invalid')
+    return value
+
 def birth(pid):return Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()[19]
 def boot():return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
 
@@ -81,7 +99,11 @@ def snapshot(role,pid,binary,binary_sha,policy,policy_sha,declaration,receipts):
         if proc.stat().st_uid!=os.getuid():raise Refused('process-owner-mismatch')
         identity=birth(pid);cwd=(proc/'cwd').resolve(strict=True)
         raw=private(receipts/(role+'.json'));value=json.loads(raw)
-        if value.get('version')!=1 or value.get('role')!=role:raise Refused('process-receipt-invalid')
+        if value.get('version') not in (1,2) or value.get('role')!=role:raise Refused('process-receipt-invalid')
+        if value['version']==2:
+            if 'owner_identity' not in value:raise Refused('owner-identity-missing')
+            checked_owner(value['owner_identity'])
+            if value.get('executable_sha256')!=binary_sha:raise Refused('receipt-executable-mismatch')
         if value.get('pid')!=pid or value.get('birth')!=identity or value.get('boot_id')!=boot():raise Refused('process-receipt-stale')
         config=value.get('config')
         if not isinstance(config,dict) or not set(config)<=KEYS or any(not isinstance(v,str) for v in config.values()):raise Refused('process-receipt-invalid')
@@ -112,7 +134,7 @@ def snapshot(role,pid,binary,binary_sha,policy,policy_sha,declaration,receipts):
         if birth(pid)!=identity or (proc/'cwd').resolve(strict=True)!=cwd or private(receipts/(role+'.json'))!=raw:raise Refused('process-changed')
         return {'status':'configuration-observed','pid':pid,'birth':identity,'policy_sha256':policy_sha,
                 'executable_sha256':binary_sha,'configuration_sha256':digest(json.dumps(fingerprints,sort_keys=True).encode()),
-                'provider_executable_sha256':providers}
+                'provider_executable_sha256':providers,'receipt_sha256':digest(raw)}
     except Refused as error:return {'status':str(error),'pid':pid}
     except FileNotFoundError:return {'status':'process-evidence-missing','pid':pid}
     except Exception:return {'status':'process-evidence-invalid','pid':pid}
@@ -150,11 +172,43 @@ def inspect(binary, selection, receipts, pid_for=service_pid):
     except Exception:report['status']='deployment-inspection-unavailable'
     return report
 
+def inspect_owner(binary,selection,receipts,pid_for=service_pid,configured=None,caller_pid=None):
+    report=inspect(binary,selection,receipts,pid_for)
+    report.update(owner_matches=False,owner_status='owner-configuration-unverified')
+    if not report['matches']:return report
+    try:
+        expected=checked_owner(owner_identity(os.environ) if configured is None else configured)
+        if expected is None:raise Refused('owner-configuration-unavailable')
+        caller=os.getppid() if caller_pid is None else caller_pid
+        if report['services']['worker']['pid']!=caller:raise Refused('owner-worker-caller-mismatch')
+        directory=receipts.lstat()
+        if not stat.S_ISDIR(directory.st_mode) or directory.st_uid!=os.getuid() or directory.st_mode&0o077:raise Refused('receipt-directory-invalid')
+        captured={}
+        for role in ROLES:
+            raw=private(receipts/(role+'.json'));value=json.loads(raw);service=report['services'][role]
+            if digest(raw)!=service['receipt_sha256']:raise Refused('process-receipt-changed')
+            if value.get('version')!=2:raise Refused('owner-receipt-version-unverified')
+            if checked_owner(value.get('owner_identity'))!=expected:raise Refused('owner-configuration-mismatch')
+            captured[role]=raw
+        for role in ROLES:
+            service=report['services'][role];pid=service['pid']
+            if pid_for(role)!=pid or birth(pid)!=service['birth']:raise Refused('process-changed')
+            if file_hash(Path('/proc')/str(pid)/'exe')!=report['expected_executable_sha256']:raise Refused('executable-changed')
+            if private(receipts/(role+'.json'))!=captured[role]:raise Refused('process-receipt-changed')
+        current=receipts.lstat()
+        if (directory.st_dev,directory.st_ino)!=(current.st_dev,current.st_ino):raise Refused('receipt-directory-changed')
+        report['owner_matches']=True;report['owner_status']='owner-configuration-matched'
+        report['owner_configuration_sha256']=digest(json.dumps(expected,sort_keys=True,separators=(',',':')).encode())
+    except Refused as error:report['owner_status']=str(error)
+    except Exception:report['owner_status']='owner-configuration-unavailable'
+    return report
+
 def record(role,pid,receipts,dry_run,external):
     if role not in ROLES or pid!=os.getppid():raise Refused('record-parent-mismatch')
     identity=birth(pid)
     config={key:value for key,value in os.environ.items() if key in KEYS}
-    value={'version':1,'role':role,'pid':pid,'birth':identity,'boot_id':boot(),'dry_run':dry_run,'external':external,'config':config}
+    value={'version':2,'role':role,'pid':pid,'birth':identity,'boot_id':boot(),'dry_run':dry_run,'external':external,'config':config,
+           'owner_identity':owner_identity(os.environ),'executable_sha256':file_hash(Path('/proc')/str(pid)/'exe')}
     policy=config.get('AUGMENTAGENT_NATIVE_VM_POLICY')
     value['policy_sha256']=digest(private(Path(policy),2*1024**2)) if policy else None
     data=json.dumps(value,sort_keys=True).encode()
@@ -170,7 +224,7 @@ def record(role,pid,receipts,dry_run,external):
         path=receipts/(role+'.json')
         if path.exists() or path.is_symlink():
             previous=json.loads(private(path))
-            if previous.get('version')!=1 or previous.get('role')!=role:raise Refused('preserving-unmanaged-receipt')
+            if previous.get('version') not in (1,2) or previous.get('role')!=role:raise Refused('preserving-unmanaged-receipt')
             prior_pid=previous.get('pid')
             if isinstance(prior_pid,int) and prior_pid>0 and prior_pid!=pid:
                 try:live=previous.get('boot_id')==boot() and previous.get('birth')==birth(prior_pid)
@@ -197,7 +251,7 @@ def activation_needed(selection,receipts,pid_for=service_pid):
     pid=pid_for('daemon')
     if pid<=0:raise Refused('daemon-not-running')
     value=json.loads(private(receipts/'daemon.json'))
-    if value.get('version')!=1 or value.get('role')!='daemon' or value.get('pid')!=pid or value.get('birth')!=birth(pid) or value.get('boot_id')!=boot():
+    if value.get('version') not in (1,2) or value.get('role')!='daemon' or value.get('pid')!=pid or value.get('birth')!=birth(pid) or value.get('boot_id')!=boot():
         raise Refused('daemon-receipt-unverified')
     config=value.get('config',{})
     if config.get('AUGMENTAGENT_AUTOPR','').strip().lower() not in ('1','true'):return False
@@ -212,6 +266,7 @@ def main():
     parser.add_argument('--receipts',type=Path,required=True)
     parser.add_argument('--record',choices=ROLES);parser.add_argument('--pid',type=int)
     parser.add_argument('--activation-needed',action='store_true')
+    parser.add_argument('--owner-identity',action='store_true')
     parser.add_argument('--dry-run',action='store_true');parser.add_argument('--external',action='store_true')
     args=parser.parse_args()
     if args.activation_needed:
@@ -222,7 +277,8 @@ def main():
         except Exception:
             print('effective-configuration-record-failed');return 1
         return 0
-    print(json.dumps(inspect(args.binary,args.selection,args.receipts),sort_keys=True))
+    report=inspect_owner(args.binary,args.selection,args.receipts) if args.owner_identity else inspect(args.binary,args.selection,args.receipts)
+    print(json.dumps(report,sort_keys=True))
     return 0
 
 if __name__=='__main__':raise SystemExit(main())
