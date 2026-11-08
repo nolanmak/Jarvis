@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Integrate worker-bound capacity health with version-2 role receipts",
+  "parent_commit": "f678648084159eb281149f8ca7c92927ae7d5f88",
+  "integrated_health_component": "2515dfddea1175ccaae8d38d560e91b4eecda7cb",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autopr_health.rs": "94abbc36839996041f0feb755a26d031313cf8db138e824d25f2e28b362502d8",
+    "crates/augmentagent-cli/src/autoship_capacity_retry.rs": "76d3d1abafe2e0e18f88985263a287ffdf8e45c1712cb57187107cbaed43bc2f",
+    "crates/augmentagent-cli/src/autoship_deployment.rs": "7df8f102ec8051b0764c927c1de856d9d5fb2465d1727fcc87e7499684431b34",
+    "crates/augmentagent-cli/src/self_improve.rs": "c48d862d5a746e9bc28ef7aaefcc43f1b469218bb763b83a22eac43e851eaed7",
+    "scripts/autoship-deployment-readiness.py": "84047328330fa035fbcc86c714e41910c4d64b2c99e94f8649e89b52a2097648",
+    "scripts/tests/autoship_deployment_readiness_test.py": "4949a5ebb53f4e36a28707cda30c539e967c9dff84e2fedc029f0ad68931e1c0"
+  },
+  "red": {
+    "handle": 70561,
+    "exit_code": 1,
+    "log": "/tmp/autoship-health-integration-v2-red-20261108.log",
+    "reason": "health worker-store observation rejects version-2 startup receipt"
+  },
+  "validation": [
+    {
+      "log": "/tmp/autoship-health-integration-autopr_health__tests-20261108.log",
+      "passed": 32,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 0.05
+    },
+    {
+      "log": "/tmp/autoship-health-integration-final-autoship_deployment__-20261108.log",
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 3.2
+    },
+    {
+      "log": "/tmp/autoship-health-integration-final-autoship_workflow__capacity_retry__tests-20261108.log",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 0.51
+    }
+  ],
+  "python": {
+    "passed": 6,
+    "log": "/tmp/autoship-health-integration-python-green-20261108.log"
+  },
+  "production_compile": {
+    "handle": 63781,
+    "exit_code": 0,
+    "log": "/tmp/autoship-health-integration-production-20261108.log"
+  },
+  "live_diagnostic": {
+    "original_handle": 77181,
+    "exit_code": 1,
+    "meaning": "expected alert status, not command failure",
+    "deployed_report_codes": [
+      "review-held",
+      "draft-stale"
+    ],
+    "integrated_report_codes": [
+      "workflow-capacity-blocked",
+      "review-held",
+      "draft-stale"
+    ],
+    "capacity_finding": {
+      "code": "workflow-capacity-blocked",
+      "detail": "5 active autoship workflow(s) have a durable resource-capacity wait. A running worker or recent manual merge does not clear this blocker.",
+      "fix": "Inspect `augmentagent autopr readiness --json` using the worker's selected policy and delegated resource context. Restore supported capacity or complete verified ownership recovery; never delete unknown sessions or reset reservations.",
+      "severity": "ALERT"
+    },
+    "integrated_binary_deployed": false,
+    "worker_pid": 4075896,
+    "policy_max_state_bytes": 8589934592,
+    "visible_retained_sessions": 8,
+    "full_retained_reservations_preserved": true
+  },
+  "assertions": [
+    "Health reads confirmed merge allowance and durable capacity waits from the actual running worker configuration/store, without creating a missing fallback database or using the observer environment as worker authority.",
+    "Active durable capacity waits produce an ALERT, including waits whose retry time is in the future. Held/terminal/owner-paused workflows are excluded; resume restores a still-present capacity alert.",
+    "Worker store configuration accepts actual supported integer receipt versions 1 and 2. Other versions/types, stale process identity, changed/private-invalid receipt, unexpected configuration fields and ambiguous version-1 HOME/store resolution refuse.",
+    "The merged script retains both owner-identity and workflow-store modes. Descriptive health compatibility does not weaken the separate version-2 managed owner admission or original policy/configuration/runtime fences.",
+    "The integrated binary reads the current worker facts and reports five active capacity-blocked workflows that the deployed binary omitted. This is diagnostic readback only, not activation or deployed acceptance.",
+    "Existing health rules, role/receipt identity tests, bounded helper timeout/reaping, worker-store resolution, native-capacity backoff/wake and owner pause exclusions pass."
+  ],
+  "limits": [
+    "Component PR #1908 had green hosted checks at 2515dfdd before this merge. The merged source and compatibility correction still require fresh current-head hosted verification and exact-head independent review.",
+    "The health command collects diagnostic/disk observations. No notifications, policy changes, session removal, reservation/model-charge/allowance resets or daemon restart were performed.",
+    "Capacity counts and visible inventory are observations, not an original resource-closure or custody-credit capability. Eight retained sessions remain charged under the selected 8 GiB ceiling; the separate 16 GiB proposal awaits explicit owner decision.",
+    "This does not implement full native/source/resource/input/legacy qualification, productive successor/coding/continuation or the full Discord follow-up lifecycle.",
+    "Normal updater rollout, positive managed-worker authorization, live CLI/private Discord acceptance/updates, five real autonomous merges, 72-hour fault and 24-hour unattended soak remain unproven."
+  ],
+  "all_original_local_handles_terminal": true,
+  "deployed": false,
+  "productive_authority_granted": false,
+  "goal_complete": false
+}
