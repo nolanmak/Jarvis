@@ -158,6 +158,10 @@ pub(super) async fn check(pending:OwnerPublicationGuard<'_>,state:&Path,candidat
             let recorded=store.record_successor_bootstrap_launch(persistence.check_external().unwrap(),&append,millis())
                 .expect("actual closed bootstrap cannot enter its durable setup launch journal");
             assert_eq!(recorded.intent.intent_id,prepared.intent.intent_id);
+            store.require_successor_bootstrap_identity(&persistence,&prepared,millis()).unwrap();
+            let mut foreign=prepared.clone();foreign.intent.intent_id=uuid::Uuid::new_v4().to_string();
+            assert!(store.require_successor_bootstrap_identity(&persistence,&foreign,millis()).is_err(),
+                "another prepared attempt passed the coordinator association check");
             let saved_events=store.events(id).unwrap();
             let old_deadline=persistence.authorization_deadline_ms().unwrap();
             assert!(store.record_successor_bootstrap_launch(persistence.check_external().unwrap(),&append,old_deadline+1).is_err(),

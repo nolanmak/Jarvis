@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "base_head": "b4b1e52ebd816c8289036107cf7083f45ced6ee4",
+  "change": "Retain one closed inspection future while refreshing actual worker owner authorization before polling and during readiness waits.",
+  "sources": {
+    "crates/augmentagent-cli/src/self_improve_owner_worker.rs": "97dca290f8f35aa1e5978e5d31a7431f3647fd891e177ceb438b3c77edbff6e2",
+    "crates/augmentagent-cli/src/autoship_owner_successor_bootstrap.rs": "7b870e71dfe02130b61e2e1cfb0f0148509651d7d935973b0aeacbe51633733a",
+    "crates/augmentagent-cli/src/self_improve_owner_publication_yield_tests.rs": "96579c93dcb82743394090c96e7769e466849815613311c3d559b1f3ca446ce0"
+  },
+  "evidence": {
+    "red": {
+      "log": "/tmp/autoship-1703-bootstrap-coordinator-red-20261108.log",
+      "sha256": "6a90c70048f4992d78181d500fb7ab693d8ce6aa4eb9d237e666963ada97b032"
+    },
+    "scheduler": {
+      "log": "/tmp/autoship-1703-bootstrap-coordinator-final-20261108.log",
+      "sha256": "ec6530d647243e1ea7307bb0743cff5ec1f9be57327eb714d8c6c5d6132e2846"
+    },
+    "handoff": {
+      "log": "/tmp/autoship-1703-bootstrap-coordinator-handoff-20261108.log",
+      "sha256": "cd9511eb394d36f75ea27be46efaedb8c547c339a6a8fe01cd918b791ad0da31"
+    },
+    "production": {
+      "log": "/tmp/autoship-1703-bootstrap-coordinator-production-20261108.log",
+      "sha256": "e2c40c594571b84295649e38edc7f03581e34c7ae06bdc86bd59ea8cddc8c6b5"
+    }
+  },
+  "validation": {
+    "scheduler_tests_passed": 4,
+    "handoff_functions_passed": 1,
+    "handoff_provider_acceptance_cases": 4,
+    "production_compile_passed": true,
+    "failed": 0,
+    "actual_vm_launches": 0,
+    "actual_model_calls": 0
+  },
+  "invariants": [
+    "Production wrapper accepts only an actual ClosedNativeBootstrap and matches its exact protected/SQL original prepared identity before inspection and after readiness. Association alone grants no execution authority.",
+    "Renew using authorize_owner_successor_from_worker, never a saved observation or downgraded CLI identity; retain existing constructor, principal, configured identity, provider, setup and accounting.",
+    "Check initial fresh authorization before polling inspection; renewal timer wins simultaneous readiness; hold one pinned inspection future while awaiting refresh without detached tasks or mutexes across network IO.",
+    "Actual issuer deadline determines half-remaining refresh interval, capped at 15 seconds; bounded 195-second wait includes authorization IO. Timeout, revocation or cancellation drops owned futures.",
+    "Actual closed inspection validates current fences and original kernel resources before returning; return type still has no coding/model/input-release API."
+  ],
+  "limits": [
+    "The four scheduler tests use generic pending futures and drop sentinels. They prove scheduling and future ownership only, not actual VM teardown or productive permission.",
+    "The handoff tests use existing controlled owner-authorization fixtures and actual protected APIs/SQLite; no production Discord, VM/provider call or long-duration worker run is claimed.",
+    "The production coordinator compiles but has no normal owner-ingress caller yet. Complete C/R admission, consuming productive transition and six saved publication-gate exits remain unfinished.",
+    "Capacity recovery, exact-head independent approval, main/updater rollout, live CLI/private Discord acceptance, five automated merges and required fault/unattended soak remain incomplete.",
+    "No production policy, budget, retained session, service, owner hold or allowance changed."
+  ],
+  "deployed": false,
+  "normal_owner_consumer_connected": false,
+  "goal_complete": false
+}

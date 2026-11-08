@@ -194,6 +194,14 @@ impl WorkflowStore {
         tx.commit()?;
         *snapshot=checked.next;Ok(())
     }
+    /// SQL-only association check for the actual closed preparation. This may
+    /// precede freshness renewal and grants no authority to start or release it.
+    pub(crate) fn require_successor_bootstrap_identity(&self,authority:&SuccessorBootstrapPersistence,
+        prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,now:i64)->Result<()> {
+        authority.require_setup_current(&self.conn,now)?;
+        recorded(&self.conn,&authority.setup)?.context("successor bootstrap original launch is not recorded")?
+            .require_prepared_identity(prepared)
+    }
     /// `append` was verified against the protected audit before taking the
     /// workflow mutex. No native/audit lock is acquired in this transaction.
     pub(crate) fn record_successor_bootstrap_launch(&mut self,checked:CheckedBootstrapJournal<'_>,

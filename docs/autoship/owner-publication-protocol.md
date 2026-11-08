@@ -2498,3 +2498,29 @@ long preflight's authorization expires, retain the actual attempt and consume th
 complete C/R/productive transition. The preserved six gate exits, retained-session
 capacity, independent review, normal rollout and all original live/shipment/fault/
 soak requirements remain unfinished. No production configuration changed.
+
+## 79. Retain one readiness wait across fresh worker authorization
+
+`inspect_owner_bootstrap` accepts the actual closed bootstrap and matches its
+prepared identity to the original recorded setup launch before starting. This
+association check is descriptive, may precede renewal, and grants no authority.
+The coordinator refreshes through the configured worker issuer before polling
+readiness, then at half the remaining actual deadline (at most 15 seconds). A
+refresh wins simultaneous timer/readiness wakes. The one inspection future stays
+owned throughout refresh IO; no task is detached and no workflow mutex crosses
+network IO. The complete wait, including authorization IO, is bounded to 195
+seconds. Failure, timeout or cancellation drops both owned operations. Actual
+closed inspection validation and the original SQL association are checked again
+before returning the still-restricted inspection.
+
+Four scheduling/ownership tests pass, including initial and later authorization
+failure and timeout during pending renewal. They use generic pending futures and
+drop sentinels, not fabricated native permissions. The actual protected handoff
+fixture passes four provider/request cases and now rejects a different original
+prepared identity. The production CLI builds. See
+`1703-bootstrap-renewal-coordinator-proof.json`.
+
+The production coordinator has no normal owner-ingress caller yet. This does not
+prove real VM refresh/teardown, complete C/R, productive transition or restoration.
+All prior capacity, publication-gate, approval, deployment, live shipping and
+fault/soak requirements remain open. No production state changed.
