@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "base_head": "8e013e74b9c0124edea1344587dddbd17efba279",
+  "change": "Enforce original controller-declared Linux kernel limits on actual supervisor admission and subsequent release rechecks.",
+  "sources": {
+    "crates/augmentagent-channel-core/src/process_tree.rs": "1b9e429da9835a2670f8bf4b374a512d5b6983643cd29b1c5d5d0adb84aabe0a",
+    "crates/augmentagent-channel-core/src/run_resource_limits.rs": "0d02ca615fb68e18a98a5d22a93e5cd860485d7dcf76f6e3d0f2bca2b2d773ad"
+  },
+  "compiled_process_tree_sha256": "9db0f845a279e56b6b5ba12fdb67ef6a02ec423fc51d802e0bf912925a64335e",
+  "post_validation_changes": "Rustdoc comments only; implementation and test behavior are unchanged.",
+  "evidence": {
+    "red": {
+      "log": "/tmp/autoship-1703-kernel-enforcement-red-20261108.log",
+      "sha256": "042c4fc38e6f147fd259f7e37f0c386189a923b8e561130af07f4928e3cdceac"
+    },
+    "lifecycle": {
+      "log": "/tmp/autoship-1703-kernel-enforcement-final-20261108.log",
+      "sha256": "536dcb96e2a426d8cb18c0a2e0f9839c93fb00633740722f0d55f7a16d824c1a"
+    },
+    "native_related": {
+      "log": "/tmp/autoship-1703-kernel-enforcement-native-20261108.log",
+      "sha256": "b3e46c51a1a1bea8f36cad022557ca03ab976d45a5f90b7a2e04d12e73cea245"
+    },
+    "production": {
+      "log": "/tmp/autoship-1703-kernel-enforcement-production-20261108.log",
+      "sha256": "2ff9e5afe67440e2dfe85d7c490900b74cbafd71c745f4e4bae2cd5e6a34a49e"
+    }
+  },
+  "validation": {
+    "red": "Actual delegated-service regression fails: observer changed the real pids ceiling and the previous implementation still released the child.",
+    "lifecycle_passed": 60,
+    "lifecycle_failed": 0,
+    "lifecycle_ignored": 0,
+    "native_related_passed": 287,
+    "native_related_failed": 0,
+    "native_related_preexisting_ignored": 2,
+    "ignored_reasons": [
+      "live_native_web_call_reaches_common_audit_log requires Codex login/public network",
+      "live_codex_native_read_of_the_policy_is_denied requires logged-in Codex CLI and spends a model turn"
+    ],
+    "production_compile_passed": true,
+    "actual_model_calls": 0,
+    "actual_vm_launches": 0
+  },
+  "invariants": [
+    "The real spawn constructor retains the original composed resource policy. Native VM spawn always requires and supplies this declaration.",
+    "Read actual kernel limits before recording admission or invoking controller callbacks, and retain the original cgroup directory handle.",
+    "Unreleased-resource checks, including native resource-ready and final precharge/release boundaries, revalidate the retained handle.",
+    "Actual initial kernel mismatch refuses before the controller callback, charge, child release, and child side effect.",
+    "Actual callback-time mismatch refuses before charging and release.",
+    "Actual postcharge mismatch refuses child release while retaining exactly one prior recorded admission; no refund.",
+    "All three fault cases verify no launch-continue publication and no child side effect.",
+    "Existing private receipt-correlation fixtures retain their limited purpose; their synthetic identities never produce a LiveResourceLimits observation."
+  ],
+  "limits": [
+    "This integrates the kernel-limit component; it does not establish complete source/input/storage custody, descendant lineage or exclusion against arbitrary concurrent writers.",
+    "The real-kernel regression remains an existing opt-in delegated-service test; this run explicitly enabled it. Hosted CI is separate and remains pending for the new commit.",
+    "Full productive admission, retained-session capacity recovery, independent approval, deployment, live CLI/private Discord acceptance, autonomous merges and soak remain incomplete.",
+    "No production policy, session, allowance, owner hold or service changed."
+  ],
+  "deployed": false,
+  "goal_complete": false
+}

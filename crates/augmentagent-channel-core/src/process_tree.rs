@@ -15,6 +15,11 @@ pub(crate) struct ProcessGroup {
     clean: Arc<AtomicBool>,
     active_request: Option<PathBuf>,
     resource_required: bool,
+    // Captured only by the real spawn constructor, before the supervisor runs.
+    // Receipt-correlation fixtures do not supply physical resource admission.
+    declared_resource_policy: Option<serde_json::Value>,
+    #[cfg(target_os="linux")]
+    kernel_limits: std::sync::Mutex<Option<crate::run_resources::LiveResourceLimits>>,
     vm_preflight: bool,
     resource_observed: AtomicBool,
     admission_attempted: AtomicBool,
@@ -82,7 +87,34 @@ impl ProcessGroup {
         anyhow::ensure!(self.resource_required && original==*identity && current["phase"]=="admitted"
             && current["exhausted"]==false && current["identity"]==*identity,
             "native resource boundary lost its original admission");
+        self.validate_declared_kernel_limits()?;
         Ok(())
+    }
+    /// Capture kernel limits from the original declaration; a saved receipt
+    /// cannot supply or replace the retained directory handle.
+    fn observe_declared_kernel_limits(&self,identity:&serde_json::Value)->anyhow::Result<()> {
+        let Some(policy)=self.declared_resource_policy.as_ref() else {return Ok(())};
+        #[cfg(target_os="linux")] {
+            let observed=crate::run_resources::LiveResourceLimits::observe(identity,policy)?;
+            let mut retained=self.kernel_limits.lock().map_err(|_|anyhow::anyhow!("kernel resource lock poisoned"))?;
+            anyhow::ensure!(retained.is_none(),"kernel resource observation already captured");
+            *retained=Some(observed);Ok(())
+        }
+        #[cfg(not(target_os="linux"))] {
+            let _=(identity,policy);
+            anyhow::bail!("declared resource admission requires Linux kernel verification")
+        }
+    }
+    /// Recheck a declared scope through its original retained kernel handle.
+    fn validate_declared_kernel_limits(&self)->anyhow::Result<()> {
+        if self.declared_resource_policy.is_none() {return Ok(())}
+        #[cfg(target_os="linux")] {
+            self.kernel_limits.lock().map_err(|_|anyhow::anyhow!("kernel resource lock poisoned"))?
+                .as_ref().ok_or_else(||anyhow::anyhow!("original kernel resource observation missing"))?.validate()
+        }
+        #[cfg(not(target_os="linux"))] {
+            anyhow::bail!("declared resource admission requires Linux kernel verification")
+        }
     }
     // No user callbacks here: refresh observations after the last callback and
     // before publishing release. This does not establish kernel/source custody.
@@ -166,6 +198,7 @@ impl ProcessGroup {
                 self.resource_observed.store(true,Ordering::SeqCst);
                 return crate::run_resources::admission_failed(provider,logger,"admission_receipt_unavailable");
             };
+            self.observe_declared_kernel_limits(&observation["identity"])?;
             if let Some(logger)=logger.filter(|logger|logger.is_protected()) {
                 logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":provider,"observation":observation}))?;
             }
@@ -818,7 +851,8 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
     };
     let id = child.id().expect("newly spawned child has a pid") as libc::pid_t;
     clean.store(false, Ordering::SeqCst);
-    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false),admission_attempted:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory: owned_directory }))
+    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), declared_resource_policy:resource_policy,
+        #[cfg(target_os="linux")] kernel_limits:std::sync::Mutex::new(None), resource_observed:AtomicBool::new(false),admission_attempted:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory: owned_directory }))
 }
 
 #[cfg(test)]
@@ -870,7 +904,8 @@ mod tests {
         std::fs::write(directory.path().join("launch-ready"),"ready\n").unwrap();
         std::fs::set_permissions(directory.path().join("launch-ready"),std::fs::Permissions::from_mode(0o600)).unwrap();
         let group=ProcessGroup {id:child.id() as libc::pid_t,receipt:receipt.clone(),clean:Arc::new(AtomicBool::new(false)),
-            active_request:None,resource_required:false,vm_preflight:true,resource_observed:AtomicBool::new(false),admission_attempted:AtomicBool::new(false),
+            active_request:None,resource_required:false,vm_preflight:true,declared_resource_policy:None,
+            #[cfg(target_os="linux")] kernel_limits:std::sync::Mutex::new(None),resource_observed:AtomicBool::new(false),admission_attempted:AtomicBool::new(false),
             resource_audit:std::sync::Mutex::new(None),native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
         let outcome=group.admit_model("codex",Some(&logger)).await;
         let _=child.kill();child.wait().unwrap();std::fs::write(&receipt,"all-descendants-reaped\n").unwrap();
@@ -897,7 +932,8 @@ mod tests {
                 output.write_all(&b"all-descendants-reaped\n"[prefix_length..]).unwrap();output.sync_all().unwrap();
             });
             let clean=Arc::new(AtomicBool::new(false));
-            let group=ProcessGroup{id,receipt,clean:clean.clone(),active_request:None,
+            let group=ProcessGroup{id,receipt,clean:clean.clone(),active_request:None,declared_resource_policy:None,
+                #[cfg(target_os="linux")] kernel_limits:std::sync::Mutex::new(None),
                 resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),admission_attempted:AtomicBool::new(false),
                 resource_audit:std::sync::Mutex::new(None),native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
             drop(group);writer.join().unwrap();
@@ -926,7 +962,8 @@ mod tests {
         std::fs::write(directory.path().join("launch-ready"),b"ready\n").unwrap();
         std::fs::set_permissions(directory.path().join("launch-ready"),std::fs::Permissions::from_mode(0o600)).unwrap();
         let group=ProcessGroup {id:i32::MAX,receipt,clean:Arc::new(AtomicBool::new(false)),
-            active_request:None,resource_required:true,vm_preflight:false,
+            active_request:None,resource_required:true,vm_preflight:false,declared_resource_policy:None,
+            #[cfg(target_os="linux")] kernel_limits:std::sync::Mutex::new(None),
             resource_observed:AtomicBool::new(false),admission_attempted:AtomicBool::new(false),resource_audit:std::sync::Mutex::new(None),
             native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
         assert!(group.verified_quiescence().is_err(),"a file without admission is not authority");
@@ -1012,6 +1049,65 @@ mod tests {
         assert!(matches!(proof["verified_state"].as_str(),Some("removed_empty_subtree"|"kernel_empty_subtree_removed")));
         drop(group);
         assert!(directory.join("resource-accounting.json").exists(),"caller-owned recovery receipts were deleted");
+        kernel_limit_changes_block_actual_supervisor_release().await;
+    }
+
+    /// Exercise actual production spawn/release against real kernel scopes.
+    /// Receipt-correlation fixtures elsewhere do not establish this behavior.
+    #[cfg(target_os="linux")]
+    async fn kernel_limit_changes_block_actual_supervisor_release() {
+        for mode in ["initial","observer","post-charge"] {
+            let root=tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+            for name in ["logs","anchors","supervisor"] {
+                let path=root.path().join(name);std::fs::create_dir(&path).unwrap();
+                std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let logger=Arc::new(crate::tool_audit::AuditLogger::protected(root.path().join("logs/audit.jsonl"),
+                root.path().join("anchors/audit.json"),&[]).unwrap());
+            let lease=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600)
+                .open(root.path().join("storage-lease")).unwrap();
+            assert_eq!(unsafe{libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+            let effect=root.path().join("effect");
+            let mut command=Command::new("/usr/bin/python3");
+            command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).touch()"]).arg(&effect)
+                .env_clear().env("PATH","/usr/bin:/bin");
+            let policy=serde_json::json!({"memory_bytes":67108864,"pids":32,"cpu_percent":20});
+            let (mut child,group)=spawn_admitted_storage_at(&command,Arc::new(AtomicBool::new(true)),
+                true,&[lease],&policy,&root.path().join("supervisor")).unwrap();
+            if mode=="initial" {
+                tokio::time::timeout(std::time::Duration::from_secs(5),async {
+                    while !launch_readiness(&group.receipt.with_file_name("launch-ready")).unwrap() {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                }).await.unwrap();
+                let observation:serde_json::Value=serde_json::from_slice(&private_read(
+                    &group.receipt.with_file_name("resource-accounting.json")).unwrap()).unwrap();
+                std::fs::write(std::path::Path::new(observation["identity"]["path"].as_str().unwrap()).join("pids.max"),b"31").unwrap();
+            }
+            let scope=Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+            let callback_scope=scope.clone();let post_charge=mode=="post-charge";
+            let charges=Arc::new(std::sync::atomic::AtomicUsize::new(0));let count=charges.clone();
+            logger.set_model_call_observer(Arc::new(move |_| {
+                count.fetch_add(1,Ordering::SeqCst);
+                if post_charge {std::fs::write(callback_scope.lock().unwrap().as_ref().unwrap().join("pids.max"),b"31")?;}
+                Ok(())
+            })).unwrap();
+            let result=group.admit_observed("verification",Some(&logger),true,Some(&mut |identity| {
+                let path=PathBuf::from(identity["path"].as_str().unwrap());
+                *scope.lock().unwrap()=Some(path.clone());
+                if !post_charge {std::fs::write(path.join("pids.max"),b"31")?;}
+                Ok(())
+            })).await;
+            assert!(result.is_err(),"{mode}: changed actual kernel limits released the child");
+            assert_eq!(scope.lock().unwrap().is_some(),mode!="initial",
+                "initial kernel refusal must precede the controller callback");
+            assert!(!group.receipt.with_file_name("launch-continue").exists());
+            assert_eq!(charges.load(Ordering::SeqCst),usize::from(post_charge),
+                "{mode}: initial refusal charged a call or final refusal refunded an existing charge");
+            drop(group);let _=child.wait().await;
+            assert!(!effect.exists(),"{mode}: model-written child code executed despite refusal");
+        }
     }
 
     #[test]
