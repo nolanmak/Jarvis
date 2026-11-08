@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "base_head": "10386817989813ecd97981ce00718ee09fd63a85",
+  "change": "Add a Linux kernel-limit observation pinned to the actual cgroup directory and checked against the original controller declaration.",
+  "sources": {
+    "crates/augmentagent-channel-core/src/run_resource_limits.rs": "0d02ca615fb68e18a98a5d22a93e5cd860485d7dcf76f6e3d0f2bca2b2d773ad",
+    "crates/augmentagent-channel-core/src/run_resources.rs": "0ea269e0404dc374162651b7084d2830defb1af8939bb21273ffd3bf128d6a0e",
+    "crates/augmentagent-channel-core/src/process_tree.rs": "c0e70d7f771dcd6d95f66bbfdba30a047e9af28eab0966af3c3500eab346eb8d"
+  },
+  "evidence": {
+    "red": {
+      "log": "/tmp/autoship-1703-kernel-limits-red-20261108.log",
+      "sha256": "9ebdef7c926f9237aba7a2030e27809e13f74bab5ce68d2745fd176109361651"
+    },
+    "focused": {
+      "log": "/tmp/autoship-1703-kernel-limits-green-20261108.log",
+      "sha256": "690231b51fd6a5e7a194abeaeeeb1c7a6477bd10b816b7b2808cd7943bcb1dae"
+    },
+    "lifecycle": {
+      "log": "/tmp/autoship-1703-kernel-limits-suite-20261108.log",
+      "sha256": "bc265eae1ca50669091d707567321c68595869206b5e2e62a4b15831ba0d1443"
+    },
+    "production": {
+      "log": "/tmp/autoship-1703-kernel-limits-production-20261108.log",
+      "sha256": "7ee880e8f940e988806538be43720ad1020adee5f96fec3bceae1be7bf889c4e"
+    }
+  },
+  "validation": {
+    "red": "Missing LiveResourceLimits API fails compilation before implementation; not a semantic failure of the existing supervisor.",
+    "lifecycle_passed": 60,
+    "failed": 0,
+    "ignored": 0,
+    "real_kernel_test_enabled": true,
+    "production_compile_passed": true
+  },
+  "real_kernel_service": {
+    "delegate": true,
+    "subgroup": "daemon",
+    "memory_max": "4G",
+    "tasks_max": 1024,
+    "cpu_quota_percent": 200,
+    "model_calls": 0,
+    "vm_launches": 0
+  },
+  "checks": [
+    "Actual cgroup2 filesystem, same host/boot, canonical original inode and same delegated service.",
+    "Kernel memory.max, memory.swap.max, memory.oom.group, pids.max and cpu.max match the original controller declaration.",
+    "Each of the five changed kernel limits is refused; restoring each limit permits a fresh check.",
+    "Wrong policy, forged inode/host/boot and mutually matching forged receipt and changed kernel limit are refused.",
+    "Retained directory descriptor stops yielding a valid observation after actual child exit and scope removal."
+  ],
+  "limits": [
+    "The first attempted real-kernel invocation lacked daemon subgroup and finite CPU/pid ceilings; it was refused. The qualified invocation and complete lifecycle suite passed.",
+    "This is a physical limit observation component, not yet connected to the production owner admission path.",
+    "No descendant-lineage, source/input custody, storage custody, arbitrary-writer exclusion or complete productive admission proof is established.",
+    "Retained-session capacity recovery, independent review, main rollout, CLI/private Discord acceptance, autonomous merges and required soak remain incomplete.",
+    "No production policy, retained session, allowance, owner hold or service was modified."
+  ],
+  "deployed": false,
+  "goal_complete": false
+}

@@ -2,6 +2,12 @@
 use anyhow::{Context, Result};
 use std::{path::Path, sync::Arc};
 
+#[cfg(target_os = "linux")]
+#[path = "run_resource_limits.rs"]
+mod live_limits;
+#[cfg(target_os = "linux")]
+pub use live_limits::LiveResourceLimits;
+
 /// What a run's descendants may do, which decides how much memory its cgroup
 /// reserves (#1627). The reservation is charged against the service ceiling
 /// for the whole run, so a text turn reserving a builder's 4 GiB starved the

@@ -966,8 +966,35 @@ mod tests {
         let (mut child,group)=spawn_admitted_storage_at(&command,Arc::new(AtomicBool::new(true)),
             true,&[lease],&policy,&directory).unwrap();
         let mut admitted=None;
+        let mut kernel_limits=None;
         group.admit_command_observed("verification",None,&mut |identity| {
             assert!(!directory.join("launch-continue").exists(),"callback ran after release");
+            let observed=crate::run_resources::LiveResourceLimits::observe(identity,&policy)?;
+            observed.validate()?;
+            let mut forged=identity.clone();forged["inode"]=serde_json::json!(0);
+            assert!(crate::run_resources::LiveResourceLimits::observe(&forged,&policy).is_err());
+            let mut wrong_policy=policy.clone();wrong_policy["pids"]=serde_json::json!(31);
+            assert!(crate::run_resources::LiveResourceLimits::observe(identity,&wrong_policy).is_err());
+            let path=std::path::Path::new(identity["path"].as_str().unwrap());
+            for (name,changed) in [("memory.max","66060288"),("memory.swap.max","4096"),
+                ("memory.oom.group","0"),("pids.max","31"),("cpu.max","19000 100000")] {
+                let original=std::fs::read(path.join(name))?;
+                std::fs::write(path.join(name),changed)?;
+                assert!(observed.validate().is_err(),"changed kernel ceiling {name} accepted");
+                std::fs::write(path.join(name),original)?;
+                observed.validate()?;
+            }
+            for field in ["host_sha256","boot_id"] {
+                let mut forged=identity.clone();forged[field]=serde_json::json!("foreign");
+                assert!(crate::run_resources::LiveResourceLimits::observe(&forged,&policy).is_err());
+            }
+            std::fs::write(path.join("pids.max"),b"31")?;
+            let mut forged_limits=identity.clone();forged_limits["limits"]["pids.max"]=serde_json::json!("31");
+            assert!(crate::run_resources::LiveResourceLimits::observe(&forged_limits,&policy).is_err(),
+                "matching saved and kernel limits replaced the original controller policy");
+            std::fs::write(path.join("pids.max"),b"32")?;
+            observed.validate()?;
+            kernel_limits=Some(observed);
             admitted=Some(identity.clone());Ok(())
         }).await.unwrap();
         let mut output=BufReader::new(child.stdout.take().unwrap());let mut line=String::new();
@@ -979,6 +1006,7 @@ mod tests {
         child.stdin.take().unwrap().write_all(b"finish\n").await.unwrap();
         assert!(tokio::time::timeout(std::time::Duration::from_secs(10),child.wait()).await.unwrap().unwrap().success());
         group.resource_outcome("verification",None).unwrap();
+        assert!(kernel_limits.unwrap().validate().is_err(),"removed scope retained live authority");
         let proof=group.verified_quiescence().unwrap();
         assert_eq!(proof["identity"],admitted);
         assert!(matches!(proof["verified_state"].as_str(),Some("removed_empty_subtree"|"kernel_empty_subtree_removed")));
