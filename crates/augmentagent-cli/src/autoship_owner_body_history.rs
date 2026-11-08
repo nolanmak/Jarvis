@@ -76,3 +76,58 @@ pub(crate) fn read(tx:&Transaction<'_>,workflow:&str,request:&str)->Result<Optio
         state,reservation:reference(sequence,&raw),provider:record.provider,body_sha256:record.body_sha256,
         preparation,setup,model,native}))
 }
+
+
+/// Original locks remain held by the caller's native proof. This view exposes
+/// observations only; no re-entrant native/current-owner callback or raw SQL.
+/// No Clone/serde/public constructor and no conversion into execution authority.
+pub(crate) struct ReservedBodyNonreleaseRead<'a> {
+    history:&'a OriginalBodyInputHistory,
+    expected:&'a [augmentagent_channel_core::native_vm::ownership::ExpectedBodyInputAttempt],
+    evidence:&'a serde_json::Value,
+}
+impl ReservedBodyNonreleaseRead<'_> {
+    pub(crate) fn history(&self)->&OriginalBodyInputHistory {self.history}
+    pub(crate) fn expected_attempts(&self)->&[augmentagent_channel_core::native_vm::ownership::ExpectedBodyInputAttempt] {self.expected}
+    pub(crate) fn native_evidence(&self)->&serde_json::Value {self.evidence}
+}
+/// Borrowed observation only. No model, body, setup or release permission.
+impl WorkflowStore {
+    pub(crate) fn with_reserved_body_nonrelease<T>(&mut self,workflow:&str,request:&str,
+        closed:&augmentagent_channel_core::native_vm::ownership::OriginalInputWriterRevocationProof<'_>,
+        visit:impl FnOnce(&ReservedBodyNonreleaseRead<'_>)->Result<T>,
+    )->Result<T> {
+        use augmentagent_channel_core::native_vm::{PreparedLaunchRecord,ownership::ExpectedBodyInputAttempt};
+        // Native validation can re-enter a separate workflow connection. Finish
+        // this initial snapshot transaction before invoking the native factory.
+        let history={let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let history=read(&tx,workflow,request)?.context("original reserved body history missing")?;
+            tx.commit()?;history};
+        let expected=[ExpectedBodyInputAttempt {
+            prepared:PreparedLaunchRecord {intent:history.setup.intent.clone(),controller_receipt:history.setup.launch_receipt.clone()},
+            resource_receipt:Some(history.setup.resource_receipt.clone()),
+            owner_input:history.native.as_ref().map(|slot|slot.admission.reference.clone()),
+        }];
+        closed.with_body_input_nonrelease(request,&expected,|proof| {
+            proof.validate_current()?;
+            let binding_sha=format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(proof.binding())?)?));
+            ensure!(proof.namespace().owner.workflow_id==workflow && proof.request_id()==request
+                && proof.expected_attempts()==expected.as_slice() && binding_sha==history.setup.intent.original_store_binding_sha256,
+                "reserved body native proof differs from original SQL history");
+            let result={
+                let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                ensure!(read(&tx,workflow,request)?.as_ref()==Some(&history),"reserved body SQL history changed before native observation");
+                let view=ReservedBodyNonreleaseRead {history:&history,expected:proof.expected_attempts(),evidence:proof.evidence()};
+                let result=visit(&view)?;
+                ensure!(read(&tx,workflow,request)?.as_ref()==Some(&history),"reserved body SQL history changed during native observation");
+                tx.commit()?;result
+            };
+            // Original native locks still span the entire SQL visit. Re-enter
+            // current-owner validation only after its transaction is terminal.
+            proof.validate_current()?;Ok(result)
+        })
+    }
+}
+#[cfg(all(test,target_os="linux"))]
+#[path="autoship_owner_body_history_tests.rs"]
+mod tests;

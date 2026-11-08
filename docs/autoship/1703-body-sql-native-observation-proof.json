@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "component": "original reserved SQL and native input observation join",
+  "base_commit": "ff4eff10733fe0eac943536b7eb23a679c73130b",
+  "status": "borrowed-observation-no-ready-setup-or-execution-grant",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_body_history.rs": "3f2607a2f9d3572255ac80c8678a720bbe9ae895db6c0cdb87fa5a28bd3267c3",
+    "crates/augmentagent-cli/src/autoship_owner_body_history_tests.rs": "61bbdeb8b45a276dacb1138e32acf681f08015779668b82441d81221c931232a"
+  },
+  "feature_red": {
+    "handle": 40397,
+    "log": "/tmp/autoship-body-sql-native-join-transfer-lock-red-20261108.log",
+    "result": "The actual native-core closure and protected SQL fixture reached the unimplemented reserved SQL/native join.",
+    "passed": 0,
+    "failed": 1,
+    "seconds": 0.52
+  },
+  "fixture_corrections": [
+    {
+      "handle": 55043,
+      "log": "/tmp/autoship-body-sql-native-join-red-20261108.log",
+      "result": "The first scripted runtime omitted the persistent session lock made by normal launch; core correctly refused InventoryMissing. The fixture was completed without weakening core admission. This is not feature RED."
+    },
+    {
+      "handle": 7615,
+      "log": "/tmp/autoship-body-sql-native-join-lock-order-green-20261108.log",
+      "result": "The fixture expected Deferred but actual core correctly returned Held(ConversationUncertain). The test now requires that existing hold; runtime classification was unchanged."
+    }
+  ],
+  "unpublished_lock_order_failure": {
+    "handle": 31627,
+    "log": "/tmp/autoship-body-sql-native-join-green-20261108.log",
+    "observed": "The policy callback was not entered and the test failed after 10.58 seconds. That assertion did not print its nested error.",
+    "source_analysis": "The initial observer held an immediate SQL transaction while invoking native current validation. The actual test fence calls WorkflowStore::validate_lease through another connection, which itself opens an immediate transaction. This lock order was corrected before publication.",
+    "resolution": "Native construction/validation occurs outside SQL transactions. SQL is re-read while native locks remain held, and the visitor sees a borrowed data view without a re-entrant validation method."
+  },
+  "validation": [
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-body-sql-native-join-full-cli-20261108.log",
+      "passed": 1974,
+      "failed": 0,
+      "ignored": 34,
+      "seconds": 447.91
+    },
+    {
+      "command": "scripts/cargo-managed.sh build -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-body-sql-native-join-production-20261108.log",
+      "passed": true,
+      "seconds": 36.21
+    }
+  ],
+  "matrix": {
+    "controlled_cases": 12,
+    "provider_pins": [
+      "Codex",
+      "Claude"
+    ],
+    "per_provider": [
+      "model unadmitted / unbound",
+      "model admitted / SQL native absent / unbound",
+      "SQL bound / closed before native binding",
+      "SQL bound / native bound",
+      "released input refusal",
+      "latest uncertain outcome held"
+    ],
+    "additional_checks": [
+      "coherent SQL resource substitution rejected at original native resource comparison",
+      "coherent preparation/reservation/model/native-input claim substitution rejected at original protected model binding",
+      "SQL history changed during native fencing rejected before visitor",
+      "selected policy changed in visitor rejected after SQL transaction completion",
+      "callback failure preserves state",
+      "exclusive native state lock returns WouldBlock inside SQL visitor and becomes available after parent observation",
+      "ordinary claim refuses unsettled owner turn"
+    ],
+    "reachability": "Parent requires the marker printed after the complete provider/phase matrix."
+  },
+  "assertions": [
+    "One exact SQL reservation, original preparation, prepared/resource pair, model receipt and optional SQL native input reference are joined to the fresh native producer.",
+    "SQL workflow snapshots, event bytes, source/destination audits, pending input and merge allowance remain unchanged through joined visits.",
+    "Model-unadmitted cases retain zero calls; other cases retain their one original spent model call. No observation consumes shipping allowance."
+  ],
+  "limits": [
+    "The native core transfer is exercised directly before SQL successor/settlement authority. This does not prove a production recovery claim or completed reserved readiness.",
+    "Runtime/export bytes and resource declarations are controlled fixtures; producers perform real protected-audit/store/locking and same-host kernel checks, with no live VM, provider or model execution.",
+    "Existing participating-writer proof is not legacy writer qualification or complete C/R authority.",
+    "Complete multi-attempt lineage, reserved readiness, productive grants, normal deployment and CLI/Discord/merge/fault/soak acceptance remain required.",
+    "No production policy, compute/storage budget, hold, retained session, shipping accounting or service changed."
+  ],
+  "all_original_local_handles_terminal": true,
+  "full_cli_handle": 57716,
+  "production_handle": 30502,
+  "productive_recovery_granted": false,
+  "production_capacity_changed": false
+}

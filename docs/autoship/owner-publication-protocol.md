@@ -1519,3 +1519,55 @@ readiness construction/readers, repeated-cycle predecessors, consuming model/inp
 result grants, full C/R source/resource/writer qualification and every original
 live acceptance gate remain required. This data cannot reconstruct a dispatch,
 revoke a writer, establish nonrelease or authorize another native attempt.
+
+
+## 61. Join original SQL history to the held native input census
+
+`with_reserved_body_nonrelease` now constructs the native factory's exact
+expectation from the original SQL reservation: its prepared launch/controller
+receipt, resource receipt and optional selected SQL `OwnerInputReference`. It
+requires the resulting native proof's workflow/request and original store-binding
+digest to agree. The core producer still checks the complete recorded writer
+census and permanent closures. Released input and an unknown native outcome do
+not gain another attempt through this observation.
+
+**D61.1 — Keep re-entrant native fences outside workflow transactions.** Native
+current-owner validation may call `validate_lease` on another connection, which
+opens an immediate transaction. Holding the observer's immediate transaction
+through that callback caused a lock inversion in the first unpublished join.
+The observer now finishes its initial SQL snapshot before native construction,
+then re-reads the same history in a new transaction while the original native
+locks remain held. A changed history refuses before the visitor. A final SQL
+comparison precedes transaction completion; the final native-fence check runs
+after that transaction is terminal. This is an observation protocol, not an
+atomic mutation/publication protocol.
+
+The visitor receives a private borrowed `ReservedBodyNonreleaseRead`, with SQL
+history, native expectations and native evidence. It has no raw connection,
+lease/logger, re-entrant native validation method, public constructor, Clone,
+serialization or conversion into execution authority. Its bounded visit must not
+call providers, GitHub or acquire new native locks. Native state/session/audit
+locks span the complete SQL visit; callback failure and stale policy return an
+error without workflow, audit or accounting mutation.
+
+A controlled fixture uses actual private contract activation, ordinary SQL
+reservation/model/native-binding writers, protected native audits, private retained
+runtime/export files and the real core completion/ownership-transfer/metadata
+producers. Both provider pins exercise unadmitted, model-admitted/native-absent,
+SQL-bound/native-unbound and bound cases. Released inputs refuse; latest uncertain
+outcomes retain `Held(ConversationUncertain)`. Coherent SQL resource and
+preparation/model/input-claim substitutions pass SQL validation but fail against
+the original protected native records. A deterministic SQL change during native
+fencing refuses before the visitor. Policy changes, callback failures and lock
+retention/release are also tested. The full CLI suite passed (1,974 passed,
+34 ignored), followed by production compilation. See
+[the joined observation evidence](1703-body-sql-native-observation-proof.json).
+
+The fixture observes a direct native-core transfer before SQL successor/settlement
+authority is granted; the ordinary pending-owner claim guard remains in force.
+It is not a recovered controller/ready/setup or live VM/provider test. This joins
+the existing participating-writer observation only: it does not qualify older
+writers, complete C/R source/resource/input authority, or provide the full ordered
+multi-attempt lineage. Reserved readiness/consumption, productive model/input/result
+constructors, legacy cutover, normal rollout and all original live acceptance
+remain unfinished. Saved history/evidence cannot replace any of those gates.
