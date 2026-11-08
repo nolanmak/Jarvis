@@ -24,8 +24,10 @@ The binary routes therefore have independent source fallbacks:
   SHA-256 `00e07d7c0f2f0cc002432d1ee84d2a40dae404a99303e3f97701c10966c91834`
   matches the release's official Sigstore message digest. The Sigstore signature
   itself was not verified here. Configure disables ensurepip; make uses two jobs
-  without PGO or debug info. No package manager, pip upgrade, sudo or bundled
-  binary-release setup script runs. SSL, sqlite, compression and ctypes imports
+  without PGO or debug info. The declared GitHub job first installs required compiler-library headers
+  from Ubuntu's signed repositories (bzip2, ffi, lzma, sqlite, SSL and zlib).
+  This setup and provisioning share a five-minute step limit. No pip upgrade
+  or bundled binary-release setup script runs. SSL, sqlite, compression and ctypes imports
   must pass before the setup-action cache completion marker is written.
 - Gitleaks comes from the immutable public Go module proxy ZIP, with SHA-256
   `4fd70631c0f6159e38fdb99ad126e3ba60d4212420062029d3dc5f510f6f2961`.
@@ -51,7 +53,7 @@ controlled provisioning exists. No required suite or merge signal is waived.
 
 Local validation on 2026-11-08:
 
-- 63 CI contract/planner/storage/VM/download regression tests pass, including
+- 64 CI contract/planner/storage/VM/download regression tests pass, including
   RED-to-GREEN tests that binary outages reach independent sources and corrupt
   source bytes never reach the compiler or publish a completed installation.
 - All three real pinned binary archives pass installation/executable smoke
@@ -62,7 +64,14 @@ Local validation on 2026-11-08:
 - Real public Go module download, checksum verification and Go 1.27.1 build pass
   in 24.81s. Source and release scanners agree on clean and synthetic-token
   fixtures, and the source scanner reports no leaks across the working tree.
-- Final exact-head hosted results remain pending; earlier hosted results above
+- A subsequent real source-fallback replay on #1758 head 0d636a2c (exporter
+  job 128723431050) exposed missing `_bz2` after both GitHub routes failed.
+  The import smoke check correctly refused the incomplete interpreter and no
+  completion marker was published. The job now declares all required build
+  headers; the new regression failed before that declaration and passes after.
+  System dependency versions follow the runner's signed Ubuntu repositories;
+  immutable binary/source artifact pins and smoke checks remain mandatory.
+- Final exact-head hosted results with header provisioning remain pending; earlier hosted results above
   are evidence of the missing fallback, not approval of the final change.
 - Affected execution workflows use read-only contents permission and checkout
   without persisted credentials. They contain no secret references or

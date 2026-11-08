@@ -45,11 +45,25 @@ class WorkflowTests(unittest.TestCase):
      if tool:
       found+=1
       provision=contract['commands'][steps[i-1]['command_id']]
-      self.assertEqual(provision['body'],'python3 scripts/ci-pinned-tools.py '+tool)
+      self.assertEqual(provision['body'].splitlines()[-1],'python3 scripts/ci-pinned-tools.py '+tool)
+      if tool=='python39':self.assertEqual(steps[i-1]['timeout-minutes'],5)
       self.assertEqual(provision['vm_provisioning'],['pinned-tool-release'])
       self.assertEqual(job['runs-on'],'ubuntu-24.04' if tool=='python39' else 'ubuntu-latest')
       self.assertNotIn('continue-on-error',steps[i-1])
   self.assertEqual(found,6)
+ def test_python39_source_jobs_provision_required_headers_before_building(self):
+  root=Path(__file__).resolve().parents[2]
+  contract=json.loads((root/'scripts/ci-contract.json').read_text())
+  commands=[row for row in contract['commands'].values() if 'python3 scripts/ci-pinned-tools.py python39' in row['body']]
+  self.assertEqual(len(commands),3)
+  required={'libbz2-dev','libffi-dev','liblzma-dev','libsqlite3-dev','libssl-dev','zlib1g-dev'}
+  for row in commands:
+   body=row['body']
+   self.assertIn('sudo apt-get update',body)
+   install=next(line for line in body.splitlines() if line.startswith('sudo apt-get install '))
+   self.assertTrue(required.issubset(set(install.split())),install)
+   self.assertLess(body.index(install),body.index('python3 scripts/ci-pinned-tools.py python39'))
+   self.assertEqual(row['vm_provisioning'],['pinned-tool-release'])
  def test_completed_cache_reuses_without_download_or_mutation(self):
   with tempfile.TemporaryDirectory() as d:
    cache=Path(d)/'deno/2.7.14';cache.mkdir(parents=True);(cache/'x64').mkdir();(cache/'x64.complete').touch()
