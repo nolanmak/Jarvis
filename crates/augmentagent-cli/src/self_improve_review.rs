@@ -15,7 +15,11 @@ impl std::fmt::Display for EvidenceBudget {
 }
 impl std::error::Error for EvidenceBudget {}
 fn unavailable_from_error(provider: augmentagent_channel_core::ProviderKind, error: anyhow::Error) -> IndependentReview {
-    IndependentReview::unavailable(if error.is::<EvidenceBudget>() || error.is::<aligned::RequestBudgetExceeded>() {
+    // Anyhow downcasts retain typed context values; standard source wrappers
+    // need a separate cause walk. Error messages are not budget authority.
+    let evidence_budget=error.is::<EvidenceBudget>() || error.is::<aligned::RequestBudgetExceeded>()
+        || error.chain().any(|cause|cause.is::<EvidenceBudget>() || cause.is::<aligned::RequestBudgetExceeded>());
+    IndependentReview::unavailable(if evidence_budget {
         ReviewUnavailable::EvidenceBudget { detail: format!("{error:#}") }
     } else {
         ReviewUnavailable::NoCapacity { reviewers: vec![provider], detail: format!("aligned review needs recovery: {error:#}") }
@@ -1099,6 +1103,56 @@ mod tests {
         let unregistered=BTreeMap::from([("api.rs".into(),snapshot.files["api.rs"].clone())]);
         assert!(caller_discovery_symbols(path,&snapshot,Some(&unregistered)).await.is_err(),
             "a product file cannot be excluded by claiming it is pinned verifier source");
+    }
+
+    #[derive(Debug)]
+    struct ReportedCause(Box<dyn std::error::Error+Send+Sync>);
+    impl std::fmt::Display for ReportedCause {
+        fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("reported source failure")}
+    }
+    impl std::error::Error for ReportedCause {
+        fn source(&self)->Option<&(dyn std::error::Error+'static)> {Some(self.0.as_ref())}
+    }
+
+    #[test]
+    fn review_budget_classification_recognizes_typed_source_causes_at_every_depth() {
+        for kind in ["evidence","request"] {for depth in 0..4 {
+            let mut cause:Box<dyn std::error::Error+Send+Sync>=if kind=="evidence" {
+                Box::new(EvidenceBudget("complete caller set is too large".into()))
+            }else {Box::new(aligned::RequestBudgetExceeded)};
+            for _ in 0..depth {cause=Box::new(ReportedCause(cause));}
+            let error=anyhow::Error::new(ReportedCause(cause)).context("inner context").context("outer context");
+            assert!(!error.is::<EvidenceBudget>() && !error.is::<aligned::RequestBudgetExceeded>(),
+                "fixture did not put the typed budget behind a source boundary");
+            let result=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
+            assert!(matches!(result.why_unavailable,Some(ReviewUnavailable::EvidenceBudget {..})),"{kind}/{depth}: wrong review recovery category");
+            assert!(!result.available && !result.approved());
+        }}
+    }
+
+    #[test]
+    fn review_budget_classification_preserves_typed_anyhow_contexts() {
+        for request in [false,true] {
+            let error=if request {anyhow::anyhow!("underlying refusal").context(aligned::RequestBudgetExceeded)}
+                else {anyhow::anyhow!("underlying refusal").context(EvidenceBudget("caller budget".into()))};
+            let result=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error.context("inner").context("outer"));
+            assert!(matches!(result.why_unavailable,Some(ReviewUnavailable::EvidenceBudget {..})));
+            assert!(!result.available && !result.approved());
+        }
+    }
+
+    #[test]
+    fn review_budget_classification_does_not_trust_budget_display_text() {
+        for message in ["provider down".to_owned(),EvidenceBudget("caller budget".into()).to_string(),aligned::RequestBudgetExceeded.to_string()] {
+            for depth in 0..4 {
+                let mut cause:Box<dyn std::error::Error+Send+Sync>=Box::new(std::io::Error::other(message.clone()));
+                for _ in 0..depth {cause=Box::new(ReportedCause(cause));}
+                let error=anyhow::Error::new(ReportedCause(cause)).context("outer context");
+                let result=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
+                assert!(matches!(result.why_unavailable,Some(ReviewUnavailable::NoCapacity {..})),"untyped {message:?}/{depth} was treated as a controller budget");
+                assert!(!result.available && !result.approved());
+            }
+        }
     }
 
     #[test]
