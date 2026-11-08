@@ -92,7 +92,9 @@ pub trait OwnerInputAuthorizer:Send+Sync {
         reference:&OwnerInputReference,prompt_sha256:&str,prompt_bytes:usize)->Result<()>;
 }
 impl PreparedLaunchIntent {
-    pub(crate) fn validate(&self) -> Result<()> {
+    /// Validate descriptive fields only. This does not establish an original
+    /// protected append, current owner, native admission or input authority.
+    pub fn validate(&self) -> Result<()> {
         let id=uuid::Uuid::parse_str(&self.intent_id)?;
         ensure!(self.version==2 && !id.is_nil() && id.to_string()==self.intent_id,"invalid native launch intent identity");
         ensure!(matches!(self.provider.as_str(),"codex"|"claude"|"qwen"|"glm"),"invalid native launch provider");

@@ -1608,3 +1608,65 @@ compilation. See [the immutable input-slot evidence](1703-immutable-input-slots-
 This is a prerequisite for version-2 reserved readiness, not its consuming producer
 or a completed recovery/rollout acceptance. All remaining requirements in §53
 and the epic remain open.
+
+
+## 63. Versioned body-state records and current successor preparation
+
+New reservation-absent settlements now write readiness record/event version 2
+with an explicit `body_state` tagged `reservation_absent`. Version-1 records keep
+their original encoding: the new optional field is omitted, and the old unbound
+rules still apply. A version-1 record carrying the new tag, a version-2 record
+missing it, unknown versions and mismatched event versions refuse. Version-2
+absence also checks that no reservation or original model/native slot precedes
+the readiness event; a genuinely later first reservation is a different boundary.
+
+The four reserved tags in §53 are now descriptive record variants. Each retains
+the original SQL history, original first model slot, an ordered original-attempt
+entry and an explicit held-attempt reference using the intent UUID and protected
+launch receipt. The native disposition must match the selected tag: unbound,
+closed-before-binding or bound. Saved validation uses the lower immutable reader
+from §62 and checks the exact reservation, preparation, provider pin, event
+boundary, lineage/selection and original SQL/model/native references. It also
+checks native evidence framing, launch/resource/input references, closure source
+and transfer identity. Unassociated setup records remain in the native census;
+they are not discarded or relabelled as trusted exclusions. The existing native
+intent field validator is public for this descriptive validation only; it grants
+no protected append, admission or input permission.
+
+**Current implementation boundary:** only the existing reservation-absent
+constructor actually commits version-2 readiness. Reserved variants are built
+from the held SQL/native observation and their saved-data validator is connected
+to the readiness reader, but no reserved settlement constructor has been added.
+The positive reserved tests exercise controlled original SQL/native observations,
+not a committed reserved readiness record under an authenticated recovery claim.
+Only the original-attempt projection exists today; additional attempts refuse
+until the recovered model/input projections and complete cycle ancestry exist.
+This is not the full multi-attempt implementation required by §53.
+
+A separate regression caught a real preparation-reader mismatch after consumed
+successor setup. Dispatch identity already accepted either the validated original
+identity or the exact current identity, but `preparation_for_turn` selected only
+the historical identity whenever that edge existed. The valid current successor
+therefore lost its original accepted preparation. The lookup now validates the
+consumed edge first, then permits either exact identity, while keeping the body,
+request and activation binding checks. Damaged ancestry cannot hide behind a
+current-row match. Current execution still separately requires a live authorized
+turn and native/source/resource/scope authority; setup remains metadata only.
+
+The original body-state regression failed at the missing data constructor. The
+first versioned full suite then passed, but the added actual successor-preparation
+regression failed at `current successor identity lost the original accepted
+preparation`. After the fix, the final full CLI suite passed 1,974 tests with
+34 ignored, followed by production compilation. The controlled body-state matrix
+covers both providers, all four reserved tags, altered lineage/selection/model/
+native evidence and provider/event-boundary refusals. Authenticated recovery
+fixtures cover version-2 absence, legacy version-1 compatibility, malformed
+version/tag combinations, current/original preparation identities, substitutions,
+damaged ancestry, pause/expiry semantics and continued execution refusal.
+See [the versioned readiness evidence](1703-versioned-readiness-preparation-proof.json).
+
+Reserved settlement, completed/unstarted predecessor dispositions, repeated
+cycles, consuming model/input/result grants, full C/R and legacy writer
+qualification, worker ingress, normal deployment and all original live acceptance
+requirements remain open. No production limit, retained runtime, hold, accounting
+or service was changed by this work.

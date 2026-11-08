@@ -1,0 +1,83 @@
+{
+  "scope": "Versioned readiness data, legacy compatibility and original/current successor preparation identity; no productive execution grant",
+  "parent_head": "64b5788288e5a0b32d10523ce527f84efa3a45df",
+  "source_sha256": {
+    "crates/augmentagent-channel-core/src/native_vm.rs": "de756969192621ca7af234d69f8ae67d10fa32662c4031e4055924c52bca2510",
+    "crates/augmentagent-cli/src/autoship_owner_body_history.rs": "6e0e9401ff00e5ac59aaabc0c9ebb9505e1fd91a1741d7de4cf6106d86662bdf",
+    "crates/augmentagent-cli/src/autoship_owner_body_history_tests.rs": "b88e772e93d352ba95ffc59da5910c15e403249588a241d39c6ab613f749df75",
+    "crates/augmentagent-cli/src/autoship_owner_dispatch.rs": "37cf3a8cf00e9e1940ee0cabd8c750abc13bbc7e97b920d76da094f81a3c10be",
+    "crates/augmentagent-cli/src/autoship_owner_revision.rs": "fdae8a358217f1567a87d3a1a2b3f4d5d05b98f9d5411bcdd5d97fe800d4d203",
+    "crates/augmentagent-cli/src/autoship_owner_reserved_readiness.rs": "2105f954333db8ee903c781f2b4c4b5610d170f758f6fb30a11620e49f2993c1",
+    "crates/augmentagent-cli/src/autoship_owner_successor_ready.rs": "d603fbe937b6dd9e4722538144059b4e27924254bb36fbbdef1ea34efc885fc1",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "575cec08d814e4d53c89ccb522057001bc8bf8f0816fd8555bdb75c5d63ad63c"
+  },
+  "body_state_red": {
+    "handle": 37808,
+    "exit_code": 1,
+    "log": "/tmp/autoship-reserved-body-state-red-20261108.log",
+    "observed_error": "reserved readiness body-state producer not implemented",
+    "scope": "Missing descriptive body-state construction in the actual held SQL/native observation callback"
+  },
+  "body_state_focused_green": {
+    "handle": 52325,
+    "exit_code": 0,
+    "seconds": 8.34,
+    "log": "/tmp/autoship-reserved-body-state-green-20261108.log",
+    "scope": "Before final provider-pin and preparation-identity changes; final suite below covers final Rust source"
+  },
+  "preparation_red": {
+    "handle": 58335,
+    "exit_code": 1,
+    "seconds": 19.94,
+    "log": "/tmp/autoship-successor-current-preparation-red-20261108.log",
+    "observed_error": "current successor identity lost the original accepted preparation"
+  },
+  "intermediate_full_cli": {
+    "handle": 67815,
+    "exit_code": 0,
+    "passed": 1974,
+    "failed": 0,
+    "ignored": 34,
+    "seconds": 446.64,
+    "scope": "Versioned readiness before adding the current-preparation regression and fix"
+  },
+  "final_full_cli": {
+    "handle": 5043,
+    "exit_code": 0,
+    "passed": 1974,
+    "failed": 0,
+    "ignored": 34,
+    "seconds": 445.67,
+    "log": "/tmp/autoship-reserved-readiness-preparation-final-cli-20261108.log"
+  },
+  "production_compile": {
+    "handle": 28310,
+    "exit_code": 0,
+    "reported_duration": "1m 08s",
+    "log": "/tmp/autoship-reserved-readiness-preparation-production-20261108.log"
+  },
+  "checks": [
+    "Two providers and four positive reserved state classifications; released input and uncertain native outcomes still refuse",
+    "Explicit original attempt lineage and held selection; changed state, model slot, preparation, reservation and unknown fields refuse",
+    "Changed native kind, binding, expected/observed input, attempt count, closure source/UUID and extra fields refuse",
+    "Provider mismatch and reservation/event boundary substitutions refuse",
+    "Actual authenticated reservation-absent v2 settlement and successor setup remain exercised; legacy v1 read and malformed version/tag refusals added",
+    "Current and original preparation identity both remain readable after valid successor consumption",
+    "Altered current owner/generation/pause/head/body/request refuse; damaged ancestry fails before current-row fallback",
+    "Expiry/lease-owner changes preserve data history while live execution refuses; pause preserves descriptive preparation but fences native setup",
+    "Setup still cannot admit a body, model charge or PR mutation; observations preserve events, spent calls and merge allowance"
+  ],
+  "limits": [
+    "The only committing readiness producer remains the reservation-absent producer; reserved settlement is still unimplemented",
+    "Positive reserved tests exercise controlled SQL/native observation data, not a committed authenticated reserved readiness record",
+    "Only the original attempt index exists; repeated-cycle and recovered-model/input/result projections and grants remain incomplete",
+    "Controlled fixture producers use actual protected audit/store/locking and same-host kernel checks, without live VM/provider/model execution",
+    "No full C/R source/resource/writer qualification or legacy writer cutover is established",
+    "No production policy, resource limit, retained runtime, hold, accounting or service mutation performed",
+    "Normal rollout, live CLI/private Discord acceptance, confirmed autonomous-merge acceptance and fault/soak acceptance remain required"
+  ],
+  "all_original_local_handles_terminal": true,
+  "reserved_readiness_committed": false,
+  "productive_recovery_granted": false,
+  "production_capacity_changed": false
+}

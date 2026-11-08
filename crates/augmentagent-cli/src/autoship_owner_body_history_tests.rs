@@ -615,6 +615,7 @@ fn sql_body_history_joins_native_nonrelease_under_original_locks() {
                 std::fs::read(source.path()).unwrap(),
                 std::fs::read(destination.path()).unwrap(),
             ];
+            let saved_reader = Connection::open(base.join("state.db")).unwrap();
             let mut visited = false;
             let audits = vec![source.clone(), destination.clone()];
             ownership::with_metadata_native_owner(&destination,&runtimes,&||fence().map_err(anyhow::Error::new),&mut |_|Ok(audits.clone()),&mut |metadata| {
@@ -684,6 +685,60 @@ fn sql_body_history_joins_native_nonrelease_under_original_locks() {
                     assert!(failed.is_err());
                 }
                 let result=store.with_reserved_body_nonrelease(&turn.lease.workflow,&turn.request_id,closed,|view| {
+                    let ready_body=ReadinessBodyState::from_reserved(view)?;
+                    let ready_json=serde_json::to_value(&ready_body)?;
+                    let h=view.history();
+                    let tx=saved_reader.unchecked_transaction()?;
+                    let before:i64=tx.query_row("SELECT max(seq)+1 FROM workflow_event WHERE workflow=?1",[&turn.lease.workflow],|r|r.get(0))?;
+                    let namespace=metadata.namespace();
+                    let validate=|state:&ReadinessBodyState,native:&serde_json::Value|state.validate_saved(&tx,&turn.lease.workflow,&turn.request_id,
+                        (h.reservation.sequence,&h.reservation.sha256),&preparation,Some(kind),native,namespace,before);
+                    validate(&ready_body,view.native_evidence())?;
+                    let wrong_provider=if kind==submission::Provider::Codex {submission::Provider::Claude}else{submission::Provider::Codex};
+                    assert!(ready_body.validate_saved(&tx,&turn.lease.workflow,&turn.request_id,
+                        (h.reservation.sequence,&h.reservation.sha256),&preparation,Some(wrong_provider),view.native_evidence(),namespace,before).is_err());
+                    assert!(ready_body.validate_saved(&tx,&turn.lease.workflow,&turn.request_id,
+                        (h.reservation.sequence,&h.reservation.sha256),&preparation,Some(kind),view.native_evidence(),namespace,h.reservation.sequence).is_err());
+                    for fault in ["state","lineage","duplicate-lineage","selection","original-model","original-preparation","reservation","unknown"] {
+                        let mut changed=ready_json.clone();
+                        match fault {
+                            "state"=>changed["kind"]=if phase=="unadmitted" {"reserved_model_admitted_native_absent"}else{"reserved_model_unadmitted"}.into(),
+                            "lineage"=>changed["attempt_lineage"]=serde_json::json!([]),
+                            "duplicate-lineage"=>{let first=changed["attempt_lineage"][0].clone();changed["attempt_lineage"].as_array_mut().unwrap().push(first);},
+                            "selection"=>changed["held_attempt"]["intent_id"]=uuid::Uuid::new_v4().to_string().into(),
+                            "original-model"=>changed["original"]["model"]=if phase=="unadmitted" {serde_json::json!({})}else{serde_json::Value::Null},
+                            "original-preparation"=>changed["original"]["preparation"]["artifact_sha256"]="e".repeat(64).into(),
+                            "reservation"=>changed["original"]["reservation"]["sha256"]="f".repeat(64).into(),
+                            "unknown"=>changed["shipping_authority"]=true.into(),
+                            _=>unreachable!(),
+                        }
+                        let result=serde_json::from_value::<ReadinessBodyState>(changed).map_err(anyhow::Error::new)
+                            .and_then(|state|validate(&state,view.native_evidence()));
+                        assert!(result.is_err(),"{fault}: substituted saved body state retained readiness");
+                    }
+                    for fault in ["native-kind","binding","attempt-count","expected-input","observed-input","closure-source","closure-id","unknown"] {
+                        let mut changed=view.native_evidence().clone();
+                        match fault {
+                            "native-kind"=>changed["kind"]="unbound_native_input_nonrelease".into(),
+                            "binding"=>changed["original_binding_sha256"]="e".repeat(64).into(),
+                            "attempt-count"=>{let first=changed["attempts"][0].clone();changed["attempts"].as_array_mut().unwrap().push(first);},
+                            "expected-input"=>changed["attempts"][0]["expected_owner_input"]=serde_json::json!({}),
+                            "observed-input"=>changed["attempts"][0]["observed_owner_input"]=serde_json::json!({}),
+                            "closure-source"=>changed["attempts"][0]["closure"]["source"]["audit_path"]="/different-audit.jsonl".into(),
+                            "closure-id"=>changed["attempts"][0]["closure"]["transfer_id"]="invalid-transfer".into(),
+                            "unknown"=>changed["shipping_authority"]=true.into(),
+                            _=>unreachable!(),
+                        }
+                        assert!(validate(&ready_body,&changed).is_err(),"{fault}: substituted native evidence retained readiness");
+                    }
+                    tx.commit()?;
+                    assert_eq!(ready_json["kind"],match phase {
+                        "unadmitted"=>"reserved_model_unadmitted",
+                        "admitted"=>"reserved_model_admitted_native_absent",
+                        "sql-bound"=>"reserved_sql_bound_native_unbound",
+                        _=>"reserved_native_bound",
+                    });
+                    assert_eq!(serde_json::from_value::<ReadinessBodyState>(ready_json)?,ready_body);
                     let history=view.history();
                     assert_eq!(history.reservation.sha256,reservation_sha);
                     assert_eq!(view.expected_attempts().len(),1);assert_eq!(view.expected_attempts()[0].prepared,prepared);

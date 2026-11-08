@@ -5947,12 +5947,28 @@ else: raise SystemExit('unexpected authority call')
                         assert!(!stale_visited,"settled metadata claim acquired another native visitor");
                         let saved_ready:(i64,String,String)=db.query_row("SELECT sequence,record_sha256,record FROM workflow_owner_successor_ready WHERE workflow=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
                         let saved_ready_event:String=db.query_row("SELECT payload FROM workflow_event WHERE seq=?1",[saved_ready.0],|r|r.get(0)).unwrap();
-                        for fault in ["record","coherent-original","coherent-extra","event","event-bound","orphan-record","pending-pointer","turn-projection"] {
+                        // New absence records are explicit v2; old v1 bytes
+                        // remain readable without introducing a body-state tag.
+                        let current_ready:serde_json::Value=serde_json::from_str(&saved_ready.2).unwrap();
+                        assert_eq!(current_ready["version"],2);
+                        assert_eq!(current_ready["plan"]["body_state"],serde_json::json!({"kind":"reservation_absent"}));
+                        let mut legacy=current_ready.clone();legacy["version"]=1.into();legacy["plan"].as_object_mut().unwrap().remove("body_state");
+                        let legacy=durable::owner_publication_recovery::test_ready_encoding(&serde_json::to_string(&legacy).unwrap()).unwrap();
+                        let hash=format!("{:x}",Sha256::digest(legacy.as_bytes()));
+                        db.execute("UPDATE workflow_owner_successor_ready SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,legacy,hash]).unwrap();
+                        let mut legacy_event:serde_json::Value=serde_json::from_str(&saved_ready_event).unwrap();legacy_event["version"]=1.into();legacy_event["record_sha256"]=hash.into();
+                        db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![saved_ready.0,serde_json::to_string(&legacy_event).unwrap()]).unwrap();
+                        assert!(store.owner_publication_recovery_plan(&id).unwrap().is_none(),"legacy v1 readiness stopped reading after v2 introduction");
+                        db.execute("UPDATE workflow_owner_successor_ready SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,saved_ready.2,saved_ready.1]).unwrap();
+                        db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![saved_ready.0,saved_ready_event]).unwrap();
+                        for fault in ["record","coherent-original","coherent-extra","missing-body-state","legacy-tagged","future-version","event","event-bound","orphan-record","pending-pointer","turn-projection"] {
                             if fault=="record" {db.execute("UPDATE workflow_owner_successor_ready SET record='{}' WHERE workflow=?1",[&id]).unwrap();}
-                            else if fault=="coherent-original" || fault=="coherent-extra" {
+                            else if matches!(fault,"coherent-original"|"coherent-extra"|"missing-body-state"|"legacy-tagged"|"future-version") {
                                 let mut changed:serde_json::Value=serde_json::from_str(&saved_ready.2).unwrap();
                                 if fault=="coherent-original" {changed["original"]["input_context"]="b".repeat(64).into();}
-                                else {changed["plan"]["native_nonrelease"]["shipping_authority"]=true.into();}
+                                else if fault=="coherent-extra" {changed["plan"]["native_nonrelease"]["shipping_authority"]=true.into();}
+                                else if fault=="missing-body-state" {changed["plan"].as_object_mut().unwrap().remove("body_state");}
+                                else {changed["version"]=if fault=="legacy-tagged" {1}else{3}.into();}
                                 let raw=durable::owner_publication_recovery::test_ready_encoding(&serde_json::to_string(&changed).unwrap()).unwrap();let hash=format!("{:x}",Sha256::digest(raw.as_bytes()));
                                 db.execute("UPDATE workflow_owner_successor_ready SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,raw,hash]).unwrap();
                                 let mut event:serde_json::Value=serde_json::from_str(&saved_ready_event).unwrap();event["record_sha256"]=hash.into();
@@ -6056,6 +6072,22 @@ else: raise SystemExit('unexpected authority call')
                         let source_body:String=db.query_row("SELECT body FROM workflow_owner_message WHERE request_id=?1",[&original_request],|r|r.get(0)).unwrap();
                         let copied_turn=durable::owner_turn::OwnerTurn {lease:copied.clone(),request_id:original_request.clone(),body:source_body,pause_revision:store.owner_control(&id).unwrap().unwrap().revision,binding:saved_cp.binding.clone()};
                         durable::owner_dispatch::test_require_recorded_turn(&db,&copied_turn).expect("current setup identity must remain readable without granting execution");
+                        assert!(store.has_owner_acceptance_for_turn(&copied_turn).unwrap(),"current successor identity lost the original accepted preparation");
+                        for fault in ["owner","generation","pause","binding","body","request"] {
+                            let mut changed=copied_turn.clone();
+                            match fault {
+                                "owner"=>changed.lease.owner=turn.lease.owner.clone(),
+                                "generation"=>changed.lease.generation=turn.lease.generation,
+                                "pause"=>changed.pause_revision+=1,
+                                "binding"=>changed.binding.head="e".repeat(40),
+                                "body"=>changed.body.push_str(" changed"),
+                                "request"=>changed.request_id="other-request".into(),
+                                _=>unreachable!(),
+                            }
+                            assert!(!store.has_owner_acceptance_for_turn(&changed).unwrap_or(false),"{fault}: substituted current successor acquired preparation");
+                        }
+                        assert_eq!(store.events(&id).unwrap(),preparation_events,"current preparation reads appended workflow history");
+                        assert!(store.validate_owner_preparation_for_turn(&copied_turn,&original_preparation,millis()).is_err(),"descriptive current preparation promoted setup into execution");
                         let error=store.validate_owner_turn(&copied_turn,millis()).unwrap_err();assert!(format!("{error:#}").contains("owner-successor-setup-only"),"{error:#}");
                         assert!(store.owner_turn_for_lease(&copied,millis()).is_err());
                         assert!(store.begin_owner_body_dispatch(&copied_turn,setup_plan.command().provider.unwrap(),millis()).is_err());
@@ -6347,6 +6379,7 @@ else: raise SystemExit('unexpected authority call')
                             }
                             assert!(store.validate_owner_successor_setup(&setup,&setup_auth,millis()).is_err(),"{fault}: changed successor retained setup claim");
                             assert_eq!(store.has_owner_acceptance_for_turn(&turn).unwrap_or(false),matches!(fault,"lease-owner"|"expiry"),"{fault}: preparation history ignored damaged ancestry or depended on current execution authority");
+                            assert_eq!(store.has_owner_acceptance_for_turn(&copied_turn).unwrap_or(false),matches!(fault,"lease-owner"|"expiry"),"{fault}: current preparation ignored damaged ancestry or depended on the live execution lease");
                             assert_eq!(durable::owner_dispatch::test_require_recorded_turn(&db,&turn).is_ok(),matches!(fault,"lease-owner"|"expiry"),"{fault}: dispatch identity ignored damaged ancestry or depended on the live lease");
                             if !matches!(fault,"lease-owner"|"expiry"|"projection") {assert!(durable::owner_dispatch::test_require_recorded_turn(&db,&copied_turn).is_err(),"{fault}: current-row match concealed damaged successor ancestry");}
                             db.execute("UPDATE workflow_owner_successor_claim SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,saved_claim.2,saved_claim.1]).unwrap();
@@ -6358,6 +6391,7 @@ else: raise SystemExit('unexpected authority call')
                         let control=store.owner_control(&id).unwrap().unwrap();store.set_owner_pause(&id,"fixture-owner",control.revision,true,millis()).unwrap();
                         assert!(store.validate_owner_successor_setup(&setup,&setup_auth,millis()).is_err());assert!(store.owner_successor_setup_plan(&id).unwrap().is_none());
                         assert!(store.has_owner_acceptance_for_turn(&turn).unwrap(),"owner pause erased descriptive original preparation history");
+                        assert!(store.has_owner_acceptance_for_turn(&copied_turn).unwrap(),"owner pause erased descriptive current preparation history");
                         let mut paused_native_visited=false;
                         assert!(with_successor_native_metadata(&state,Some(dir.path()),setup.clone(),&setup_auth,&mut |_| {paused_native_visited=true;Ok(())}).is_err());
                         assert!(!paused_native_visited,"paused successor reached original native metadata");

@@ -12,12 +12,15 @@ pub(super) fn preparation_for_turn(conn:&Connection,turn:&owner_turn::OwnerTurn)
     // A consumed, validated successor edge preserves the original identity.
     // It is descriptive history: executable callers still validate the live
     // current turn and lease separately before using this preparation.
-    let same_turn=match super::owner_publication_recovery::historical_successor_turn(conn,&turn.lease.workflow,&turn.request_id)? {
-        Some((owner,generation,pause,binding,_))=>owner==turn.lease.owner && generation==turn.lease.generation
-            && pause==turn.pause_revision && binding==turn.binding,
-        None=>conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1 AND request_id=?2 AND owner=?3 AND lease_generation=?4 AND pause_revision=?5 AND binding=?6)",
-            params![turn.lease.workflow,turn.request_id,turn.lease.owner,turn.lease.generation,turn.pause_revision,serde_json::to_string(&turn.binding)?],|r|r.get(0))?,
-    };
+    // Validate the consumed edge before either identity match. A matching
+    // current row cannot conceal damaged original/successor ancestry.
+    let historical=super::owner_publication_recovery::historical_successor_turn(conn,&turn.lease.workflow,&turn.request_id)?;
+    let historical_matches=historical.is_some_and(|(owner,generation,pause,binding,_)|
+        owner==turn.lease.owner && generation==turn.lease.generation
+            && pause==turn.pause_revision && binding==turn.binding);
+    let current_matches:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1 AND request_id=?2 AND owner=?3 AND lease_generation=?4 AND pause_revision=?5 AND binding=?6)",
+        params![turn.lease.workflow,turn.request_id,turn.lease.owner,turn.lease.generation,turn.pause_revision,serde_json::to_string(&turn.binding)?],|r|r.get(0))?;
+    let same_turn=historical_matches || current_matches;
     let same_body:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_message WHERE workflow=?1 AND request_id=?2 AND body=?3)",
         params![turn.lease.workflow,turn.request_id,turn.body],|r|r.get(0))?;
     if !same_turn || !same_body {return Ok(None);}

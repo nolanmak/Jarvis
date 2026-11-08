@@ -93,6 +93,10 @@ pub(crate) fn read_recorded_input_slots(tx:&Connection,workflow:&str,request:&st
 }
 
 
+#[path="autoship_owner_reserved_readiness.rs"]
+mod reserved_readiness;
+pub(crate) use reserved_readiness::ReadinessBodyState;
+
 /// Original locks remain held by the caller's native proof. This view exposes
 /// observations only; no re-entrant native/current-owner callback or raw SQL.
 /// No Clone/serde/public constructor and no conversion into execution authority.
