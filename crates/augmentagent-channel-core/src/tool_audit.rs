@@ -308,6 +308,9 @@ struct CapturedScopeMaterialization {
     event:serde_json::Value,
     receipt:crate::audit_chain::AppendReceipt,
 }
+type CurrentAdmission=Arc<dyn Fn()->anyhow::Result<()> + Send + Sync>;
+#[derive(Clone)]
+enum RestrictedAdmission {Metadata(CurrentAdmission),NativePreflight(CurrentAdmission)}
 #[derive(Clone)]
 pub struct AuditLogger {
     path: PathBuf,
@@ -317,7 +320,7 @@ pub struct AuditLogger {
         Arc<std::sync::Mutex<Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>>,
     // Monotonic for this original logger and every clone; observer replacement
     // cannot promote metadata reconciliation into productive execution.
-    metadata_only: Arc<std::sync::RwLock<Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>>,
+    restricted_admission: Arc<std::sync::RwLock<Option<RestrictedAdmission>>>,
     run_resources_required: Arc<std::sync::atomic::AtomicBool>,
     native_runtime_owner: Arc<std::sync::Mutex<Option<crate::native_vm::RuntimeOwner>>>,
     owner_input:Arc<std::sync::Mutex<OwnerInputState>>,
@@ -813,11 +816,35 @@ impl AuditLogger {
         anyhow::ensure!(self.is_protected() && self.native_runtime_owner()?.is_some(),
             "metadata reconciliation requires original protected owner");
         {
-            let mut mode=self.metadata_only.write().map_err(|_|anyhow::anyhow!("metadata admission lock poisoned"))?;
+            let mut mode=self.restricted_admission.write().map_err(|_|anyhow::anyhow!("metadata admission lock poisoned"))?;
             anyhow::ensure!(mode.is_none(),"metadata reconciliation fence already installed");
-            *mode=Some(current);
+            *mode=Some(RestrictedAdmission::Metadata(current));
         }
         self.metadata_reconciliation_allowed()
+    }
+
+    /// Irreversibly limit a distinct controller to preparing a closed native
+    /// bootstrap. Metadata controllers and retained clones cannot be promoted.
+    /// This is not productive dispatch or complete source/resource admission.
+    pub fn restrict_to_native_preflight(&self,current:CurrentAdmission)->anyhow::Result<()> {
+        anyhow::ensure!(self.is_protected() && self.native_runtime_owner()?.is_some(),
+            "native preflight requires original protected owner");
+        {
+            let mut mode=self.restricted_admission.write().map_err(|_|anyhow::anyhow!("restricted admission lock poisoned"))?;
+            anyhow::ensure!(mode.is_none(),"restricted owner role already installed");
+            *mode=Some(RestrictedAdmission::NativePreflight(current));
+        }
+        self.native_preflight_current()
+    }
+    pub(crate) fn native_preflight_current(&self)->anyhow::Result<()> {
+        let current=match self.restricted_admission.read().map_err(|_|anyhow::anyhow!("restricted admission lock poisoned"))?.clone() {
+            Some(RestrictedAdmission::NativePreflight(current))=>current,
+            _=>anyhow::bail!("native preflight role missing"),
+        };
+        self.check_protected_continuity()?;
+        current()?;
+        self.validate_native_store_binding()?;
+        current()
     }
 
     /// Check only the original metadata fence and protected continuity.
@@ -832,15 +859,17 @@ impl AuditLogger {
     /// retained committed audit snapshot; reacquiring it there would deadlock.
     /// This check alone is not a native or publication proof.
     pub(crate) fn metadata_reconciliation_current(&self) -> anyhow::Result<()> {
-        let current=self.metadata_only.read().map_err(|_|anyhow::anyhow!("metadata admission lock poisoned"))?
-            .clone().ok_or_else(||anyhow::anyhow!("metadata reconciliation fence missing"))?;
+        let current=match self.restricted_admission.read().map_err(|_|anyhow::anyhow!("metadata admission lock poisoned"))?.clone() {
+            Some(RestrictedAdmission::Metadata(current))=>current,
+            _=>anyhow::bail!("metadata reconciliation fence missing"),
+        };
         self.check_protected_continuity()?;
         current()
     }
 
-    fn productive_admission(&self) -> anyhow::Result<std::sync::RwLockReadGuard<'_,Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>> {
-        let mode=self.metadata_only.read().map_err(|_|anyhow::anyhow!("metadata admission lock poisoned"))?;
-        anyhow::ensure!(mode.is_none(),"metadata-only owner cannot authorize productive execution");
+    fn productive_admission(&self) -> anyhow::Result<std::sync::RwLockReadGuard<'_,Option<RestrictedAdmission>>> {
+        let mode=self.restricted_admission.read().map_err(|_|anyhow::anyhow!("metadata admission lock poisoned"))?;
+        anyhow::ensure!(mode.is_none(),"restricted owner cannot authorize productive execution");
         Ok(mode)
     }
 
@@ -1065,6 +1094,20 @@ impl AuditLogger {
         intent:&crate::native_vm::PreparedLaunchIntent,
         committed:impl FnOnce(&crate::native_vm::PreparedLaunchRecord),
     )->anyhow::Result<crate::native_vm::PreparedLaunchRecord> {
+        self.native_launch_prepared_checked(intent,committed,&||self.dispatch_allowed())
+    }
+    pub(crate) fn native_bootstrap_prepared_with_commit(&self,
+        authority:&crate::native_vm::NativeBootstrap<'_>,
+        intent:&crate::native_vm::PreparedLaunchIntent,
+        committed:impl FnOnce(&crate::native_vm::PreparedLaunchRecord),
+    )->anyhow::Result<crate::native_vm::PreparedLaunchRecord> {
+        self.native_launch_prepared_checked(intent,committed,&||authority.check_logger(self))
+    }
+    fn native_launch_prepared_checked(&self,intent:&crate::native_vm::PreparedLaunchIntent,
+        committed:impl FnOnce(&crate::native_vm::PreparedLaunchRecord),
+        current:&dyn Fn()->anyhow::Result<()>,
+    )->anyhow::Result<crate::native_vm::PreparedLaunchRecord> {
+        current()?;
         intent.validate()?;
         let original = self
             .native_store_binding()?
@@ -1085,7 +1128,7 @@ impl AuditLogger {
                 && intent.source_audit_path == self.path,
             "native launch source audit mismatch"
         );
-        self.dispatch_allowed()?;
+        current()?;
         let observer = self
             .native_launch_observer
             .lock()
@@ -1103,7 +1146,7 @@ impl AuditLogger {
         if let Some(observer) = observer {
             observer(&record)?;
         }
-        self.dispatch_allowed()?;
+        current()?;
         Ok(record)
     }
 
@@ -1363,7 +1406,7 @@ impl AuditLogger {
             path,
             model_call_observer: Arc::new(std::sync::Mutex::new(None)),
             dispatch_observer: Arc::new(std::sync::Mutex::new(None)),
-            metadata_only: Arc::new(std::sync::RwLock::new(None)),
+            restricted_admission: Arc::new(std::sync::RwLock::new(None)),
             resource_capacity_observer: Arc::new(std::sync::Mutex::new(None)),
             resource_capacity_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             run_resources_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),

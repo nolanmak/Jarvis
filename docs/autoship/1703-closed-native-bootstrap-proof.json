@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "base_head": "7c54b9b97acc80475eb1b1587f41687211be2549",
+  "component": "Distinct preparation-only native bootstrap; not productive admission.",
+  "source_sha256": {
+    "crates/augmentagent-channel-core/src/native_vm.rs": "1b4f189249235ee760e452a4b7d30369acbd84a25f2723c86c12882f11958820",
+    "crates/augmentagent-channel-core/src/tool_audit.rs": "8ce1c1e8466059549a6d5f0c89f37e06856a700ad4b6a602bb741d0043e0f5d7"
+  },
+  "evidence": {
+    "api_compile_red": {
+      "path": "/tmp/autoship-1703-closed-bootstrap-red-20261108.log",
+      "sha256": "158d766c5959ab625e1b6c56373dca58a31f8348dc6e69d9a2c1b3bc0ce8d114"
+    },
+    "lifetime_behavioral_red": {
+      "path": "/tmp/autoship-1703-closed-bootstrap-lifetime-red-20261108.log",
+      "sha256": "eb631e037a1c4dc6b8915eb635b3bc8dafb19af532d8558543da28cc413bcf3d"
+    },
+    "focused_green": {
+      "path": "/tmp/autoship-1703-closed-bootstrap-green-final-20261108.log",
+      "sha256": "30404bd0614bb084c14a0c7438ce0ef8fc02209a78ffe0543000c5a3a6b2a60c"
+    },
+    "related_final": {
+      "path": "/tmp/autoship-1703-closed-bootstrap-suite-final-20261108.log",
+      "sha256": "84b627e74a74d7636b3101de19381711b9e308efc78ff2b4e038ad005e2e4be9"
+    },
+    "cli": {
+      "path": "/tmp/autoship-1703-closed-bootstrap-cli-20261108.log",
+      "sha256": "379c1e1a434db34134e97006768b7fa5cc1f05c00feff970940519acf3792e30"
+    },
+    "production": {
+      "path": "/tmp/autoship-1703-closed-bootstrap-production-20261108.log",
+      "sha256": "ede0accf55438f140e622039ce125b77a2b78041dcde726b22cf9702f53ca34b"
+    }
+  },
+  "tdd": [
+    "The first four preparation-only API tests failed to compile because the capability and restricted role did not exist; this is API RED, not a behavioral failure.",
+    "The added lifetime regression then reproduced native launch controller expired after dropping the caller. The closed bootstrap now retains the exact original controller until its actual launch object is dropped.",
+    "The first selected-policy case incorrectly expected a known-unspawned observation after original policy binding changed. Corrected the fixture to require retained original intent/runtime, no retirement/completion and no invented unspawned proof; production policy validation was preserved."
+  ],
+  "validation": {
+    "focused_test_functions": 7,
+    "provider_cases": 14,
+    "related_passed": 314,
+    "related_failed": 0,
+    "preexisting_systemd_test_ignored": 1,
+    "cli_publication_recovery_passed": 3,
+    "cli_failed": 0,
+    "cli_ignored": 0,
+    "production_compile_passed": true
+  },
+  "implementation": [
+    "An immutable restricted-role union separates metadata reconciliation and native preflight. Neither role can dispatch or charge models; neither can be replaced or promoted across retained logger clones, including after failed restriction.",
+    "NativeBootstrap is borrowed, non-cloneable and non-serializable. It validates the original logger object, current authority and actual original native policy/store binding.",
+    "The shared native constructor uses the same executable/assets/resource policy, ledger, protected launch journal and original unspawned lifetime handling. Ordinary preparation still requires productive dispatch and now checks it before creating native state.",
+    "ClosedNativeBootstrap owns the actual launch and original controller; its public surface exposes descriptive prepared identity only, without command/spawn/input methods. Resume is refused.",
+    "Checks bracket protected intent commit and the workflow callback. Changed authority/policy refuses, and unresolved native state is retained instead of inventing certainty."
+  ],
+  "limits": [
+    "This implements closed preparation only. No normal successor/owner command consumer currently invokes it. A successor SQL launch journal and distinct authorized controller producer must be joined before activation.",
+    "Actual unreleased supervisor/resource inspection and a consuming transition under complete C/R source/resource/input proof remain required. These tests do not provide that proof.",
+    "No productive guard, model/input grant, VM/provider run, real Discord send, autonomous merge or deployment is established.",
+    "The saved publication-gate WIP and its six prepared-body failures remain unresolved; its gate was not applied or relaxed for these tests.",
+    "Final exact-head hosted CI/review, normal rollout and every original live/fault/soak acceptance requirement remain open.",
+    "No production policy, service, retained demand, owner hold or allowance changed."
+  ],
+  "deployed": false,
+  "productive_admission_complete": false,
+  "goal_complete": false
+}

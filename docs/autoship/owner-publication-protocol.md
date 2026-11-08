@@ -2312,3 +2312,35 @@ against concurrent external writers. They do not construct productive permission
 promote a metadata logger, resolve the six preserved publication-gate failures or
 prove VM/provider/live deployment acceptance. Evidence and limits are in
 `1703-native-final-release-proof.json`.
+
+
+## 74. Distinct closed native preparation (preparation component implemented)
+
+`NativeBootstrap` provides a preparation-only path from a distinct restricted
+controller. Metadata reconciliation and native preflight are separate immutable
+roles; neither dispatches, charges a model, becomes the other role or becomes
+productive after observer replacement or failed admission. The original metadata
+logger is never promoted. The bootstrap checks its original logger object,
+current authority and actual selected native store/policy around protected intent
+publication and callbacks, using the existing native constructor and evidence.
+Ordinary native preparation still requires productive dispatch, now checked before
+creating native state.
+
+The returned `ClosedNativeBootstrap` retains the actual launch and original
+controller lifetime. It exposes descriptive prepared identity and has no command,
+spawn or input API. It supports initial pinned preparation only, not a resumed
+conversation. Drop uses the existing original unspawned observation producer;
+changed policy can make that proof unavailable, retaining original intent/runtime
+without inventing retirement, cleanup or completion. The lifetime test first
+reproduced loss of the original controller and now verifies abandonment evidence
+after the caller drops its own controller references.
+
+This does not finish the constructor in §72. No ordinary owner/successor command
+consumer invokes this component yet. A successor SQL launch journal, distinct
+freshly authorized preflight-controller producer, actual closed supervisor/resource
+inspection and consuming transition under complete C/R source/resource/input
+qualification remain required before productive activation. Neither saved launch
+identity nor this preparation object grants a body/model/input permit. The six
+preserved shared-gate failures remain unresolved. Seven focused functions cover
+both provider pins; source hashes, RED distinctions, fixture corrections and
+validation limits are in `1703-closed-native-bootstrap-proof.json`.

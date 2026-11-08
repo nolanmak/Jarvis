@@ -598,6 +598,38 @@ pub(crate) struct Launch {
     observation:Option<LaunchObservation>,
     _directory: tempfile::TempDir,
 }
+/// Borrowed preparation-only authority from a distinct restricted controller.
+/// It cannot release a command, charge a model or submit provider input.
+pub struct NativeBootstrap<'a> {logger:&'a std::sync::Arc<crate::tool_audit::AuditLogger>}
+impl<'a> NativeBootstrap<'a> {
+    pub fn capture(logger:&'a std::sync::Arc<crate::tool_audit::AuditLogger>)->Result<Self> {
+        logger.native_preflight_current()?;Ok(Self {logger})
+    }
+    pub(crate) fn check_logger(&self,logger:&crate::tool_audit::AuditLogger)->Result<()> {
+        ensure!(std::ptr::eq(self.logger.as_ref(),logger),"native bootstrap original logger changed");
+        self.logger.native_preflight_current()
+    }
+    pub fn prepare(&self,provider:&str,opts:&crate::reasoner::ReasonerOpts,original:&Command,
+        bridge:Option<&crate::codex_tools::BridgeLaunch>,native:Option<&crate::native_session::Launch>)->Result<ClosedNativeBootstrap> {
+        ensure!(matches!(provider,"claude"|"codex") && matches!(native,Some(crate::native_session::Launch::Create {..})),
+            "closed bootstrap requires an initial pinned native launch");
+        let launch=Launch::prepare_with_admission(provider,opts,original,bridge,native,PreparationAdmission::Bootstrap(self))?;
+        Ok(ClosedNativeBootstrap {launch,_controller:self.logger.clone()})
+    }
+}
+/// Owns actual prepared state, with no command, spawn or input-release API.
+/// Saved records are descriptive and cannot reconstruct this lifetime.
+pub struct ClosedNativeBootstrap {launch:Launch,_controller:std::sync::Arc<crate::tool_audit::AuditLogger>}
+impl ClosedNativeBootstrap {
+    pub fn prepared_record(&self)->Result<PreparedLaunchRecord> {self.launch.prepared_record()}
+}
+enum PreparationAdmission<'a,'b> {Productive,Bootstrap(&'a NativeBootstrap<'b>)}
+impl PreparationAdmission<'_,'_> {
+    fn current(&self,logger:&crate::tool_audit::AuditLogger)->Result<()> {
+        match self {Self::Productive=>logger.dispatch_allowed(),Self::Bootstrap(authority)=>authority.check_logger(logger)}
+    }
+}
+
 /// One supervisor attempt borrowed from the actual prepared launch. Only this
 /// module can construct it; saved launch records cannot mint a spawn attempt.
 pub(crate) struct NativeSpawn<'a> {launch:&'a Launch}
@@ -713,7 +745,13 @@ impl Launch {
     }
     pub fn prepare(provider: &str, opts: &crate::reasoner::ReasonerOpts, original: &Command,
         bridge: Option<&crate::codex_tools::BridgeLaunch>, native: Option<&crate::native_session::Launch>) -> Result<Self> {
+        Self::prepare_with_admission(provider,opts,original,bridge,native,PreparationAdmission::Productive)
+    }
+    fn prepare_with_admission(provider:&str,opts:&crate::reasoner::ReasonerOpts,original:&Command,
+        bridge:Option<&crate::codex_tools::BridgeLaunch>,native:Option<&crate::native_session::Launch>,
+        admission:PreparationAdmission<'_,'_>)->Result<Self> {
         let owner_logger=opts.audit_logger.as_ref().context("native runtime owner audit unavailable")?;
+        admission.current(owner_logger)?;
         let audit_owner=owner_logger.native_runtime_owner()?.context("native runtime fenced owner unavailable")?;
         let readonly_review=crate::native_session::is_fresh_review();
         if readonly_review {
@@ -887,23 +925,27 @@ impl Launch {
             observation:None,_directory:directory};
         // Capture the original committed receipt before an observer can fail.
         // No command or provider input escapes until every remaining check.
-        let prepared=owner_logger.native_launch_prepared_with_commit(&intent,|prepared| {
+        let committed=|prepared:&PreparedLaunchRecord| {
             result.observation=Some(LaunchObservation {prepared:prepared.clone(),logger:std::sync::Arc::downgrade(owner_logger),
                 actual_session:std::sync::Mutex::new(None),input_attempted:std::sync::atomic::AtomicBool::new(false),
                 completion_verified:std::sync::atomic::AtomicBool::new(false),completed:std::sync::atomic::AtomicBool::new(false)});
-        })?;
+        };
+        let prepared=match &admission {
+            PreparationAdmission::Productive=>owner_logger.native_launch_prepared_with_commit(&intent,committed)?,
+            PreparationAdmission::Bootstrap(authority)=>owner_logger.native_bootstrap_prepared_with_commit(authority,&intent,committed)?,
+        };
         let executable_binding=executable_input::ExecutableInputBindingRecord {version:1,actor:"controller".into(),kind:"native_executable_input_binding".into(),
             launch_intent:prepared.intent.clone(),launch_receipt:prepared.controller_receipt.clone(),executable_input};
         executable_binding.validate(&prepared)?;
         owner_logger.record_controller_receipted(serde_json::to_value(executable_binding)?)?;
-        owner_logger.dispatch_allowed()?;
+        admission.current(owner_logger)?;
         if let Some(context)=&preparation_context {
             context.validate_launch(&prepared.intent)?;
-            owner_logger.dispatch_allowed()?;
+            admission.current(owner_logger)?;
             let transport=preparation_context::ReadonlyPreparationTransport::capture(&prepared.intent);
             owner_logger.record_controller_receipted(serde_json::json!({"version":2,"actor":"controller","kind":"native_owner_preparation_binding",
                 "launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"context":context,"transport_role":"fresh_tool_free_review","readonly_transport":transport}))?;
-            owner_logger.dispatch_allowed()?;
+            admission.current(owner_logger)?;
         }
         // Preserve the existing ephemeral cleanup boundary only after all
         // post-publication constructor work above completed successfully.
@@ -911,7 +953,7 @@ impl Launch {
         // A requested alias permits later lookup but is not a provider ID event.
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.register_alias(id)?; }
         owner_logger.validate_native_store_binding()?;
-        owner_logger.dispatch_allowed()?;
+        admission.current(owner_logger)?;
         Ok(result)
     }
     /// Records exposure *uncertainty* before the first byte. This is not a
@@ -1246,6 +1288,20 @@ mod tests {
                 "owner input differs from sealed original body");Ok(())
         }
     }
+    #[test]
+    fn closed_native_bootstrap_prepares_without_productive_admission() {launch_intent_child("bootstrap");}
+    #[test]
+    fn closed_native_bootstrap_cannot_promote_metadata_authority() {launch_intent_child("bootstrap-metadata");}
+    #[test]
+    fn closed_native_bootstrap_rechecks_original_authority_after_callback() {launch_intent_child("bootstrap-fenced");}
+    #[test]
+    fn closed_native_bootstrap_refuses_different_logger() {launch_intent_child("bootstrap-other-logger");}
+    #[test]
+    fn closed_native_bootstrap_rechecks_selected_policy_after_callback() {launch_intent_child("bootstrap-policy");}
+    #[test]
+    fn closed_native_bootstrap_failed_restriction_stays_restricted() {launch_intent_child("bootstrap-denied");}
+    #[test]
+    fn closed_native_bootstrap_retains_original_controller_lifetime() {launch_intent_child("bootstrap-lifetime");}
     fn launch_intent_child(mode: &str) {
         if let Some(root)=std::env::var_os("JARVIS_TEST_INPUT_AUTHORITY_PROBE") {
             let error=StateLock::acquire(Path::new(&root)).err().expect("handoff acquisition entered an active original input writer");
@@ -1286,7 +1342,14 @@ mod tests {
                 }
                 return;
             }
-            let test = if mode=="refuse-ephemeral" {"failed_ephemeral_constructor_retains_committed_unspawned_runtime"}
+            let test = if mode=="bootstrap" {"closed_native_bootstrap_prepares_without_productive_admission"}
+                else if mode=="bootstrap-metadata" {"closed_native_bootstrap_cannot_promote_metadata_authority"}
+                else if mode=="bootstrap-fenced" {"closed_native_bootstrap_rechecks_original_authority_after_callback"}
+                else if mode=="bootstrap-other-logger" {"closed_native_bootstrap_refuses_different_logger"}
+                else if mode=="bootstrap-policy" {"closed_native_bootstrap_rechecks_selected_policy_after_callback"}
+                else if mode=="bootstrap-denied" {"closed_native_bootstrap_failed_restriction_stays_restricted"}
+                else if mode=="bootstrap-lifetime" {"closed_native_bootstrap_retains_original_controller_lifetime"}
+                else if mode=="refuse-ephemeral" {"failed_ephemeral_constructor_retains_committed_unspawned_runtime"}
                 else if mode=="refuse-paused" {"failed_constructor_records_committed_lifetime_under_owner_pause"}
                 else if mode=="spawn-once" {"prepared_native_launch_allows_only_one_supervisor_attempt"}
                 else if mode=="constructor-reclaim" {"native_preparation_reclaims_only_before_intent_publication_attempt"}
@@ -1370,11 +1433,20 @@ mod tests {
             let captured=saved.clone();
             let sink=crate::audit_chain::AnchoredAudit::new(logger.path().into(),anchors.join("model.json"),&[]).unwrap();
             let pause_on_callback=mode=="refuse-paused";
+            let bootstrap_active=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let bootstrap_fence=bootstrap_active.clone();let fence_bootstrap=mode=="bootstrap-fenced";
+            let changed_policy=(mode=="bootstrap-policy").then(||policy.clone());
             let controller=std::sync::Arc::downgrade(&logger);
             logger.set_native_launch_observer(std::sync::Arc::new(move |prepared| {
                 let exact=sink.read_receipt(&prepared.controller_receipt)?;
                 ensure!(exact["intent_id"]==prepared.intent.intent_id,"callback did not receive the committed intent");
                 count.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                if fence_bootstrap {bootstrap_fence.store(false,std::sync::atomic::Ordering::SeqCst);}
+                if let Some(path)=&changed_policy {
+                    let mut value:serde_json::Value=serde_json::from_slice(&std::fs::read(path)?)?;
+                    value["memory_mb"]=(value["memory_mb"].as_u64().unwrap()+512).into();
+                    std::fs::write(path,serde_json::to_vec(&value)?)?;
+                }
                 captured.lock().unwrap().push(prepared.clone());
                 if pause_on_callback {controller.upgrade().context("callback controller expired")?
                     .set_dispatch_observer(std::sync::Arc::new(||anyhow::bail!("owner paused in callback")))?;}
@@ -1388,6 +1460,84 @@ mod tests {
             let mut opts=crate::reasoner::triage_opts(None);opts.audit_logger=Some(logger.clone());
             let native=crate::native_session::Launch::Create {requested_id:id.map(str::to_owned)};
             let context=OwnerPreparationContext::new(owner.clone(),"original-owner-request".into(),"c".repeat(64)).unwrap();
+            if mode.starts_with("bootstrap") {
+                if mode=="bootstrap-metadata" {
+                    logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture_original_metadata_setup"})).unwrap();
+                    logger.restrict_to_metadata(std::sync::Arc::new(||Ok(()))).unwrap();
+                    assert!(logger.restrict_to_native_preflight(std::sync::Arc::new(||Ok(()))).is_err());
+                    assert!(NativeBootstrap::capture(&logger).is_err());
+                    assert!(Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native)).is_err());
+                    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);
+                    continue;
+                }
+                assert!(NativeBootstrap::capture(&logger).is_err(),"ordinary logger minted bootstrap authority");
+                if mode=="bootstrap-denied" {bootstrap_active.store(false,std::sync::atomic::Ordering::SeqCst);}
+                let active=bootstrap_active.clone();
+                let restricted=logger.restrict_to_native_preflight(std::sync::Arc::new(move || {
+                    ensure!(active.load(std::sync::atomic::Ordering::SeqCst),"bootstrap original authority changed");Ok(())
+                }));
+                if mode=="bootstrap-denied" {
+                    assert!(restricted.is_err());assert!(NativeBootstrap::capture(&logger).is_err());
+                    assert!(logger.dispatch_allowed().is_err());assert!(logger.model_call_admitted(provider).is_err());
+                    assert!(logger.restrict_to_native_preflight(std::sync::Arc::new(||Ok(()))).is_err());
+                    assert!(Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native)).is_err());
+                    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);continue;
+                }
+                restricted.unwrap();
+                let clone=logger.as_ref().clone();
+                clone.set_dispatch_observer(std::sync::Arc::new(||Ok(()))).unwrap();
+                assert!(clone.dispatch_allowed().is_err());assert!(clone.model_call_admitted(provider).is_err());
+                assert!(clone.metadata_reconciliation_allowed().is_err());
+                assert!(clone.restrict_to_metadata(std::sync::Arc::new(||Ok(()))).is_err());
+                assert!(clone.restrict_to_native_preflight(std::sync::Arc::new(||Ok(()))).is_err());
+                assert!(Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native)).is_err());
+                assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);
+                let authority=NativeBootstrap::capture(&logger).unwrap();
+                if mode=="bootstrap-other-logger" {
+                    // Same path and owner fields cannot substitute the original
+                    // logger object retained by this borrowed authority.
+                    let mut other=opts.clone();other.audit_logger=Some(std::sync::Arc::new(logger.as_ref().clone()));
+                    assert!(authority.prepare(provider,&other,&Command::new("/usr/bin/false"),None,Some(&native)).is_err());
+                    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);continue;
+                }
+                assert!(authority.prepare(provider,&opts,&Command::new("/usr/bin/false"),None,
+                    Some(&crate::native_session::Launch::Resume {id:"original-conversation".into()})).is_err());
+                let result=authority.prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native));
+                if matches!(mode,"bootstrap-fenced"|"bootstrap-policy") {
+                    assert!(result.is_err());assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);
+                    assert!(NativeBootstrap::capture(&logger).is_err());
+                } else {
+                    let bootstrap=result.unwrap();
+                    let prepared=bootstrap.prepared_record().unwrap();
+                    assert_eq!(prepared,saved.lock().unwrap()[0]);
+                    assert!(logger.native_launch_prepared(&prepared.intent).is_err(),"bootstrap used ordinary native publication");
+                    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);
+                    assert!(logger.dispatch_allowed().is_err());assert!(logger.model_call_admitted(provider).is_err());
+                    if mode=="bootstrap-lifetime" {
+                        drop(authority);drop(opts);drop(clone);drop(logger);
+                        assert_eq!(bootstrap.prepared_record().unwrap(),prepared,"closed bootstrap lost original controller");
+                        drop(bootstrap);
+                        let sink=crate::audit_chain::AnchoredAudit::new(logs.join("model.jsonl"),anchors.join("model.json"),&[]).unwrap();
+                        sink.inspect_open(|rows| {
+                            ensure!(rows.iter().filter(|row|row["kind"]=="native_launch_abandoned_before_spawn").count()==1,
+                                "closed bootstrap lost original unspawned lifetime");Ok(())
+                        }).unwrap();continue;
+                    }
+                    drop(bootstrap);
+                }
+                let rows:Vec<serde_json::Value>=std::fs::read_to_string(logger.path()).unwrap().lines()
+                    .map(|line|serde_json::from_str(line).unwrap()).collect();
+                assert!(!rows.iter().any(|row|matches!(row["kind"].as_str(),Some("model_call_admitted"|"native_input_release_attempt"|"native_session_observed"))));
+                assert_eq!(rows.iter().filter(|row|row["kind"]=="native_launch_abandoned_before_spawn").count(),usize::from(mode!="bootstrap-policy"));
+                if mode=="bootstrap-policy" {
+                    let prepared=&saved.lock().unwrap()[0];
+                    let original=state.join(&prepared.intent.runtime_relative_path);
+                    assert!(original.join("owned.json").exists());assert!(!original.join("retired.json").exists());
+                    assert!(rows.iter().any(|row|row["kind"]=="native_launch_intent"));
+                    assert!(!rows.iter().any(|row|row["kind"]=="native_launch_completion_verified"),"changed policy fabricated cleanup certainty");
+                }
+                logger.protected_health().unwrap();continue;
+            }
             if mode=="spawn-once" {
                 use std::sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}};
                 let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
