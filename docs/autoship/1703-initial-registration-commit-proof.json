@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "base_head": "e07b76d15e2bc73fbb608c51af4871532a1e5b59",
+  "change": "Validate native selection/store identity and current lease before committing initial owner registration, so a refused admission cannot strand a new binding.",
+  "sources": {
+    "crates/augmentagent-channel-core/src/native_owner_outcome.rs": "9eeed9fbbf99ad0269d0660063433ecfb70d2d14ccdbb6b838231ed0c8aef608",
+    "crates/augmentagent-channel-core/src/native_owner_handoff.rs": "d26e64702ceb71213cebcbe2a22c343c2ae290cbb8a91c1cc4aded8f9fe91067",
+    "crates/augmentagent-cli/src/autoship_native_owner_binding.rs": "d42c209d4712af1b6a167c7090d212875778bb841b3c7718c00cf328de9557ca",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "60ad137eef9f8c3115cc877b286808545472c3b4a4962287c97b821521c5c6e3",
+    "crates/augmentagent-cli/src/autoship_native_observation.rs": "31c9abb6c12bd2f4f4e871bc144c497b6b5aedfec44ec6b678e28d9509918082",
+    "crates/augmentagent-cli/src/autoship_owner_body_history_tests.rs": "107d91a08d392c2f480002caf6383668fbe9c3638928a041ff232c028dd64778"
+  },
+  "evidence": {
+    "missing_api_red": {
+      "log": "/tmp/autoship-1703-initial-registration-red-20261108.log",
+      "sha256": "fafe711d331d0af460878c96a5d7b90eed6152cbfcb0c1addb36998fac51759d"
+    },
+    "behavior_red": {
+      "log": "/tmp/autoship-1703-initial-registration-behavior-red-20261108.log",
+      "sha256": "1974dd136ad7cf6ff4ea1edf7d332c9c3ae605dae13ee2af17dbcc42ebc610da"
+    },
+    "core": {
+      "log": "/tmp/autoship-1703-initial-registration-core-20261108.log",
+      "sha256": "43f6391f2943929876d6e4c610956e19048ae089365be43477b3af95e21fc5b3"
+    },
+    "store": {
+      "log": "/tmp/autoship-1703-initial-registration-store-final-20261108.log",
+      "sha256": "a4853e6225ae51c921843b2ea0c4ca43b3b7a6a677b2c4562fce5160b8ac146a"
+    },
+    "observation": {
+      "log": "/tmp/autoship-1703-initial-registration-observation-20261108.log",
+      "sha256": "6063727d9043bfe7d58e5422309d65b33c7961f181fe7eb089bd009ac6c29dbf"
+    },
+    "body": {
+      "log": "/tmp/autoship-1703-initial-registration-body-20261108.log",
+      "sha256": "93a6909f0856bc3f50ae0deac88df68bf92173147a7800794953ffb5982f25db"
+    },
+    "production": {
+      "log": "/tmp/autoship-1703-initial-registration-production-20261108.log",
+      "sha256": "86f713c58658798d624bc5713040777dc260f9739437df0ec83fd93d4b943857"
+    }
+  },
+  "red_behavior": "The original helper committed an SQLite binding row, then refused the changed policy: observed 1 row where rollback required 0.",
+  "validation": {
+    "core_initial_registration_tests_passed": 7,
+    "workflow_binding_tests_passed": 15,
+    "native_observation_history_tests_passed": 2,
+    "body_history_tests_passed": 1,
+    "failed": 0,
+    "ignored": 0,
+    "production_compile_passed": true
+  },
+  "invariants": [
+    "Native StateLock stays held across absence validation, callback and SQL commit. Final native check reads selected policy and original store identity without acquiring another StateLock or reentering the workflow mutex.",
+    "Production caller invokes the supplied final native check inside the workflow transaction, after registration writes and before commit; it also checks the guard and current SQL lease/binding.",
+    "Failure rolls back new owner, binding and event rows with the original transaction. No compensating deletion or removal of an existing binding is used.",
+    "The native helper no longer performs a fallible post-commit check that could misreport a committed registration as a rolled-back refusal. Returned binding is descriptive and later dispatch gates remain mandatory.",
+    "Destination audit validation occurs before SQL; its lock is not acquired inside the SQL writer."
+  ],
+  "limits": [
+    "This fixes a registration leak in the pending integration, not proof of the cause of the eight existing retained production sessions. Those sessions are unchanged.",
+    "Core regression uses a real private policy/store fixture and a real SQLite registration transaction; workflow tests cover the actual registration tables with descriptive native-binding fixtures. No production VM/provider call, complete source/resource admission or shipping acceptance is claimed.",
+    "The older metadata-only registration API remains for existing callers/fixtures; production native registration uses the checked transaction API.",
+    "Normal owner consumer, complete C/R/productive transition, preserved gate exits, capacity recovery, independent approval, normal rollout and all original live CLI/Discord/shipping/fault/soak requirements remain incomplete."
+  ],
+  "deployed": false,
+  "production_state_changed": false,
+  "goal_complete": false
+}

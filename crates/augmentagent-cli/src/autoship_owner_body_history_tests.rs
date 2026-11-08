@@ -220,13 +220,14 @@ fn sql_body_history_joins_native_nonrelease_under_original_locks() {
             let original = ownership::with_initial_owner_binding(
                 &turn.lease.workflow,
                 &|| Ok(()),
-                &mut |original| {
-                    store.register_initial_native_owner(
+                &mut |original,final_check| {
+                    store.register_initial_native_owner_checked(
                         &turn.lease,
                         &binding,
                         source.path().to_str().unwrap(),
                         original,
-                        now(),
+                        &now,
+                        final_check,
                     )?;
                     Ok(())
                 },

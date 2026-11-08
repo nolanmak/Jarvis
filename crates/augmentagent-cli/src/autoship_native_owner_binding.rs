@@ -58,6 +58,16 @@ impl WorkflowStore {
         native_binding: &TransferBinding,
         now: i64,
     ) -> Result<()> {
+        self.register_initial_native_owner_checked(lease,workflow_binding,audit_path,native_binding,&||now,&||Ok(()))
+    }
+    /// Invoke the native-only final fence inside the same SQL transaction as
+    /// new registration, then recheck the live lease before commit. Failure
+    /// rolls back this attempt's writes without deleting prior owner history.
+    pub(crate) fn register_initial_native_owner_checked(
+        &mut self,lease:&Lease,workflow_binding:&Binding,audit_path:&str,
+        native_binding:&TransferBinding,clock:&dyn Fn()->i64,final_native_check:&dyn Fn()->Result<()>,
+    )->Result<()> {
+        let now=clock();
         ensure!(
             Path::new(audit_path).is_absolute()
                 && audit_path.len() <= 4096
@@ -127,6 +137,8 @@ impl WorkflowStore {
                 now,
             )?;
         }
+        final_native_check()?;
+        require_binding(&tx,lease,workflow_binding,clock())?;
         tx.commit()?;
         Ok(())
     }
@@ -211,6 +223,36 @@ mod tests {
             .unwrap();
         (store, lease, binding)
     }
+    #[test]
+    fn native_initial_owner_final_check_failure_rolls_back_only_current_transaction() {
+        for existing in [false,true] {
+            let temporary=tempfile::tempdir().unwrap();
+            let (mut store,lease,binding)=setup(&temporary.path().join("workflow.sqlite"));
+            let native=native_binding('d');
+            if existing {store.register_initial_native_owner(&lease,&binding,"/private/original",&native,3).unwrap();}
+            let before=store.events(&lease.workflow).unwrap();
+            let result=store.register_initial_native_owner_checked(&lease,&binding,"/private/original",&native,&||4,
+                &||Err(anyhow::anyhow!("selected policy changed before commit")));
+            assert!(result.is_err());
+            assert_eq!(store.events(&lease.workflow).unwrap(),before);
+            assert_eq!(store.native_owner_binding(&lease.workflow,lease.generation).unwrap(),existing.then_some(native));
+            assert_eq!(store.initial_native_owner_available(&lease.workflow).unwrap(),!existing);
+        }
+    }
+
+    #[test]
+    fn native_initial_owner_expiry_during_final_check_rolls_back_new_binding() {
+        let temporary=tempfile::tempdir().unwrap();
+        let (mut store,lease,binding)=setup(&temporary.path().join("workflow.sqlite"));
+        let before=store.events(&lease.workflow).unwrap();
+        let now=std::cell::Cell::new(3);
+        assert!(store.register_initial_native_owner_checked(&lease,&binding,"/private/original",&native_binding('d'),
+            &||now.get(),&||{now.set(103);Ok(())}).is_err());
+        assert_eq!(store.events(&lease.workflow).unwrap(),before);
+        assert!(store.native_owner_binding(&lease.workflow,lease.generation).unwrap().is_none());
+        assert!(store.initial_native_owner_available(&lease.workflow).unwrap());
+    }
+
     #[test]
     fn native_initial_owner_requires_creation_origin_without_backfill() {
         let temporary=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&temporary.path().join("workflow.sqlite")).unwrap();

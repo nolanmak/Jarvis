@@ -659,13 +659,14 @@ pub(crate) mod tests {
             let original = ownership::with_initial_owner_binding(
                 &lease.workflow,
                 &|| Ok(()),
-                &mut |original| {
-                    store.register_initial_native_owner(
+                &mut |original,final_check| {
+                    store.register_initial_native_owner_checked(
                         &lease,
                         &binding,
                         audit.path().to_str().unwrap(),
                         original,
-                        now(),
+                        &now,
+                        final_check,
                     )?;
                     Ok(())
                 },

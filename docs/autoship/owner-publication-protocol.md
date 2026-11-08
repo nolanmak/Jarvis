@@ -2524,3 +2524,31 @@ The production coordinator has no normal owner-ingress caller yet. This does not
 prove real VM refresh/teardown, complete C/R, productive transition or restoration.
 All prior capacity, publication-gate, approval, deployment, live shipping and
 fault/soak requirements remain open. No production state changed.
+
+## 80. Refused initial registration must not strand a binding
+
+Review identified a transaction boundary bug in the pending native-owner
+integration. The original helper committed registration through its callback
+and then ran fallible selection/metadata checks. If those checks refused, the
+new SQL owner history survived despite failed admission. A regression reproduced
+this using a real private native-store policy fixture and SQLite transaction:
+policy refusal left one committed row where zero was required.
+
+The helper now supplies a native-only final check to the trusted callback. The
+production registration callback invokes it inside the same SQL writer, after
+registration writes and before commit, then rechecks the current lease/binding.
+The original native StateLock stays held. This check reads policy and metadata
+identity without another native lock or workflow-mutex acquisition. Destination
+audit validation stays before the SQL writer to preserve lock order. No fallible
+post-commit check misrepresents committed registration as a rollback. Dispatch
+retains its own current authority gates; a returned binding grants no execution.
+
+Failure rolls back only this transaction. Tests confirm that a fresh workflow
+keeps no owner/binding/event rows, an existing binding survives a failed replay,
+and lease expiry during the final check also rolls back. Seven core, fifteen
+store, two observation-history and one body-history tests pass; the production
+CLI builds. Evidence and fixture limits are recorded in
+`1703-initial-registration-commit-proof.json`. This prevents another integration
+leak; it neither reclaims the existing retained sessions nor proves restoration.
+All prior normal-ingress, C/R, productive-transition, capacity, review, rollout
+and live acceptance obligations remain open. No production state changed.

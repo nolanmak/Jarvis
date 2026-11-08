@@ -1521,9 +1521,14 @@ impl WorkflowGuard {
         let original=if let Some((path,original))=registered {
             anyhow::ensure!(Path::new(&path)==self.audit.path(),TransferReason::AuthorityConflict);original
         } else if available {
-            ownership::with_initial_owner_binding(self.id(),&current,&mut |original| {
+            ownership::with_initial_owner_binding(self.id(),&current,&mut |original,final_native_check| {
                 self.store.lock().map_err(|_|anyhow::anyhow!("native registration store poisoned"))?
-                    .register_initial_native_owner(&self.lease,&self.binding,self.audit.path().to_str().context("native audit is not UTF-8")?,original,millis())
+                    .register_initial_native_owner_checked(&self.lease,&self.binding,self.audit.path().to_str().context("native audit is not UTF-8")?,original,&millis,&|| {
+                        final_native_check()?;
+                        // Destination audit was checked before acquiring SQL.
+                        // Do not acquire its lock while holding the writer.
+                        self.healthy_lease()
+                    })
             })?
         } else {
             let state=self.state.clone();

@@ -170,17 +170,20 @@ pub(super) fn capture_owner_with_policy(
 }
 /// Register only after proving a workflow has no prior native state.
 /// The callback runs while the original store's StateLock is held. It must
-/// atomically fence/register workflow metadata; it grants no provider dispatch.
+/// invoke the supplied native-only final check after its SQL writes and before
+/// committing, and recheck workflow authority within that same transaction.
+/// The final check acquires no StateLock or workflow mutex. The returned binding
+/// is descriptive; provider dispatch retains all of its current gates.
 pub fn with_initial_owner_binding(
     workflow:&str,current:&dyn Fn()->Result<(),TransferFenceError>,
-    register:&mut dyn FnMut(&TransferBinding)->anyhow::Result<()>,
+    register:&mut dyn FnMut(&TransferBinding,&dyn Fn()->anyhow::Result<()>)->anyhow::Result<()>,
 ) -> Result<TransferBinding,TransferReason> {
     let path=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY");
     initial_owner_with_policy(path.as_deref().map(Path::new),workflow,current,register)
 }
 pub(super) fn initial_owner_with_policy(
     policy:Option<&Path>,workflow:&str,current:&dyn Fn()->Result<(),TransferFenceError>,
-    register:&mut dyn FnMut(&TransferBinding)->anyhow::Result<()>,
+    register:&mut dyn FnMut(&TransferBinding,&dyn Fn()->anyhow::Result<()>)->anyhow::Result<()>,
 ) -> Result<TransferBinding,TransferReason> {
     if workflow.is_empty() || workflow.len()>4096 || workflow.contains('\0') {return Err(TransferReason::InvalidRequest);}
     let binding=capture_owner_with_policy(policy,current)?;
@@ -192,9 +195,16 @@ pub(super) fn initial_owner_with_policy(
         super::owner_initial::prove_no_prior_state(&binding.canonical_state_root,&ledger,workflow)?;
         selected_fence(policy,&binding.policy_sha256,&binding.canonical_state_root,current)?;
         super::owner_store::validate_bound_metadata(&binding.canonical_state_root,&binding.store)?;
-        register(&binding).context(TransferReason::PersistRetry)?;
-        selected_fence(policy,&binding.policy_sha256,&binding.canonical_state_root,current)?;
-        super::owner_store::validate_bound_metadata(&binding.canonical_state_root,&binding.store)?;
+        // The callback holds its SQL writer here. Do not reenter `current`,
+        // which may acquire that same workflow mutex. Workflow checks belong
+        // in the caller's transaction; only native selection/identity is read.
+        register(&binding,&|| {
+            selected_fence(policy,&binding.policy_sha256,&binding.canonical_state_root,&||Ok(()))?;
+            super::owner_store::validate_bound_metadata(&binding.canonical_state_root,&binding.store)?;
+            Ok(())
+        }).context(TransferReason::PersistRetry)?;
+        // No fallible post-commit check: a later change must be handled by the
+        // next admission gate, never reported as rollback of a committed row.
         Ok(())
     })();
     result.map_err(|error|classify(&error).0)?;

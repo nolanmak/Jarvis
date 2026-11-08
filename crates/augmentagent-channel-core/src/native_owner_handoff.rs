@@ -1895,6 +1895,23 @@ mod tests {
         );
     }
     #[test]
+    fn native_initial_owner_policy_change_rolls_back_registration_transaction() {
+        let f=empty_binding_fixture();let path=policy(&f);
+        let mut db=augmentagent_store::rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE owner_binding(binding TEXT NOT NULL)").unwrap();
+        let result=super::super::owner_outcome::initial_owner_with_policy(Some(&path),"fresh-workflow",&||Ok(()),
+            &mut |binding,final_check| {
+                let tx=db.transaction()?;
+                tx.execute("INSERT INTO owner_binding VALUES(?1)",[serde_json::to_string(binding)?])?;
+                let mut bytes=std::fs::read(&path)?;bytes.push(b' ');std::fs::write(&path,bytes)?;
+                final_check()?;tx.commit()?;Ok(())
+            });
+        assert_eq!(result,Err(TransferReason::AuthorityConflict));
+        let rows:i64=db.query_row("SELECT count(*) FROM owner_binding",[],|r|r.get(0)).unwrap();
+        assert_eq!(rows,0,"failed initial admission left a committed binding that blocks retry");
+    }
+
+    #[test]
     fn native_initial_owner_registration_holds_original_state_lock_through_callback() {
         let f = empty_binding_fixture();
         let path = policy(&f);
@@ -1904,14 +1921,14 @@ mod tests {
             Some(&path),
             "fresh-workflow",
             &|| Ok(()),
-            &mut |binding| {
+            &mut |binding,final_check| {
                 called = true;
                 assert_eq!(*binding, expected);
                 assert!(
                     super::super::StateLock::existing(&f.root).is_err(),
                     "registration escaped the census lock"
                 );
-                Ok(())
+                final_check()
             },
         );
         assert!(result.is_ok(), "{result:?}");
@@ -1926,9 +1943,9 @@ mod tests {
             Some(&path),
             "workflow",
             &|| Ok(()),
-            &mut |_| {
+            &mut |_,final_check| {
                 called = true;
-                Ok(())
+                final_check()
             },
         );
         assert_eq!(result, Err(TransferReason::AuthorityConflict));
@@ -1943,9 +1960,9 @@ mod tests {
             Some(&path),
             "new-workflow",
             &|| Ok(()),
-            &mut |_| {
+            &mut |_,final_check| {
                 called += 1;
-                Ok(())
+                final_check()
             }
         )
         .is_ok());
@@ -1955,9 +1972,9 @@ mod tests {
             Some(&path),
             "new-workflow",
             &|| Ok(()),
-            &mut |_| {
+            &mut |_,final_check| {
                 called += 1;
-                Ok(())
+                final_check()
             },
         );
         assert!(
@@ -1986,9 +2003,9 @@ mod tests {
                 Some(&path),
                 "workflow",
                 &|| Ok(()),
-                &mut |_| {
+                &mut |_,final_check| {
                     called = true;
-                    Ok(())
+                    final_check()
                 }
             ),
             Err(TransferReason::AuthorityConflict)
@@ -2007,13 +2024,13 @@ mod tests {
                 Some(&path),
                 "fresh-workflow",
                 &|| Ok(()),
-                &mut |_| {
+                &mut |_,final_check| {
                     called = true;
                     if change_policy {
                         let mut bytes = std::fs::read(&path)?;
                         bytes.push(b' ');
                         std::fs::write(&path, bytes)?;
-                        Ok(())
+                        final_check()
                     } else {
                         anyhow::bail!("synthetic registration transaction failure")
                     }
@@ -2082,9 +2099,9 @@ mod tests {
                 Some(&policy),
                 "fresh-workflow",
                 &|| Ok(()),
-                &mut |_| {
+                &mut |_,final_check| {
                     called = true;
-                    Ok(())
+                    final_check()
                 },
             );
             assert_eq!(
