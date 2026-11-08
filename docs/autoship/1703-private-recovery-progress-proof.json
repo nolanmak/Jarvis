@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Original-conversation unsupported-input recovery progress",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_input_blocked.rs": "39640d618ec9524eafb124bb195af337e09531ea0136f7e70d2fb5e645975928",
+    "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs": "5efde5d8c0af3cbd9cd1805ec0f0b3a33302cad3dc13fd7fc627a65b76d0df21",
+    "crates/augmentagent-cli/src/autoship_progress.rs": "7bbfcd91b035ed0b36e7db86cae5d9bf4e0216e0a73057244ca5964368bb7211",
+    "crates/augmentagent-cli/src/autoship_workflow.rs": "4ba2720126b47672cfb89d51cff02658ab9eed84895285a0ad9f1612d6ccada3",
+    "crates/augmentagent-cli/src/self_improve_owner_reserved_ready_tests.rs": "af48f7b2a49b14d375e3a890901266abe56ab17ee475cad1f82351c467dca010"
+  },
+  "behavioral_red": {
+    "handle": 67344,
+    "exit_code": 1,
+    "seconds": 23.31,
+    "log": "/tmp/autoship-private-blocker-progress-red-20261108.log",
+    "reason": "Actual committed unsupported-input blocker left only owner-pause-requested progress"
+  },
+  "initial_focused_green": {
+    "handle": 38148,
+    "exit_code": 0,
+    "passed": 1,
+    "seconds": 50.53,
+    "log": "/tmp/autoship-private-blocker-progress-green-20261108.log"
+  },
+  "expanded_focused_green": {
+    "handle": 24442,
+    "exit_code": 0,
+    "passed": 1,
+    "seconds": 62.52,
+    "log": "/tmp/autoship-private-blocker-progress-privacy-20261108.log"
+  },
+  "final_full_cli": {
+    "handle": 18555,
+    "state": "terminal",
+    "log": "/tmp/autoship-private-blocker-progress-full-cli-20261108.log",
+    "exit_code": 0,
+    "passed": 1980,
+    "failed": 0,
+    "ignored": 34,
+    "seconds": 669.65
+  },
+  "assertions": [
+    "Both Codex and Claude authenticated recovery fixtures reach one existing durable progress outbox",
+    "Atomic blocker/event/progress rollback on blocker-index or progress-event insertion failure",
+    "An unrelated repository recipient configured before projection never receives private recovery progress",
+    "Claims reject wrong owner/channel and malformed version, reference, origin or envelope fields",
+    "Legacy direct Progress deserialization refuses the private envelope",
+    "Unknown send survives reopen with exact original destination, nonce and content; duplicate send refused",
+    "Wrong destination cannot confirm; same control observations cannot mint another event",
+    "Original body/model/native rows, charges and merge-only allowance remain intact"
+  ],
+  "fixture_limits": [
+    "Original resource and body records remain controlled persisted fixtures",
+    "No provider request, production VM, live CLI workflow or actual Discord message is executed",
+    "Historical receipts reuse the actual immutable progress event, but changed-latest private-envelope coverage remains limited to source inspection; no broader crash/soak acceptance is claimed"
+  ],
+  "remaining": [
+    "Complete private productive coding and late-outcome admission",
+    "Legacy/source/resource/input qualification with immutable debt-resolution disposition",
+    "Productive release/model/result/continuation constructors and repeated cycles",
+    "Independent exact-head review, hosted CI and normal updater rollout",
+    "Live CLI/private Discord workflow/update acceptance, five autonomous merges and 72h fault/24h unattended soak"
+  ],
+  "production_changed": false,
+  "productive_recovery_granted": false,
+  "goal_complete": false,
+  "final_production_compile": {
+    "handle": 16159,
+    "exit_code": 0,
+    "seconds": 54.92,
+    "log": "/tmp/autoship-private-blocker-progress-production-20261108.log",
+    "profile": "non-test dev, debuginfo disabled; not a deployment build"
+  },
+  "all_original_local_handles_terminal": true
+}

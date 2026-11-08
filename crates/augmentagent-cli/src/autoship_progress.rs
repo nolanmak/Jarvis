@@ -30,39 +30,92 @@ pub struct DeliveryStatus {
 fn exists(conn:&Connection)->Result<bool> {
     Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_progress_event')",[],|r|r.get(0))?)
 }
+// Envelope v2 deliberately cannot deserialize as legacy Progress. Older
+// readers must stop, rather than send private recovery via repository defaults.
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerProgressEnvelope {
+    version:u32,
+    owner_scope:owner_publication_recovery::OwnerProgress,
+    progress:Progress,
+}
+fn decode(conn:&Connection,workflow:&str,sequence:i64,raw:&str)->Result<(Progress,Option<owner_publication_recovery::OwnerProgress>)> {
+    let value:serde_json::Value=serde_json::from_str(raw)?;
+    let (progress,scope)=if value.get("version").is_some() || value.get("owner_scope").is_some() {
+        let envelope:OwnerProgressEnvelope=serde_json::from_value(value)?;
+        ensure!(envelope.version==2,"unsupported private progress envelope");
+        envelope.owner_scope.origin(conn,workflow)?;
+        (envelope.progress,Some(envelope.owner_scope))
+    } else {(serde_json::from_value(value)?,None)};
+    ensure!(progress.workflow==workflow && progress.sequence==sequence,"progress indexed identity changed");
+    Ok((progress,scope))
+}
+fn require_route(conn:&Connection,origin:&discord_ingress::DiscordOrigin,workflow:&str,scope:Option<&owner_publication_recovery::OwnerProgress>)->Result<()> {
+    if let Some(scope)=scope {
+        let captured=scope.origin(conn,workflow)?;
+        ensure!((origin.bot,origin.owner,origin.channel)==(captured.bot,captured.owner,captured.channel),"private progress destination changed");
+        discord_ingress::bound_workflow(conn,&captured,Some(workflow))?;
+        Ok(())
+    } else {delivery::require_destination(conn,origin,workflow)}
+}
+fn historical(conn:&Connection,workflow:&str,sequence:i64)->Result<(Progress,Option<owner_publication_recovery::OwnerProgress>)> {
+    let raw:String=conn.query_row("SELECT payload FROM workflow_progress_event WHERE workflow=?1 AND sequence=?2",params![workflow,sequence],|r|r.get(0))?;
+    decode(conn,workflow,sequence,&raw)
+}
 impl WorkflowStore {
     pub fn progress_events(&self,workflow:&str)->Result<Vec<Progress>> {
         if !exists(&self.conn)? {return Ok(Vec::new());}
-        let mut stmt=self.conn.prepare("SELECT payload FROM workflow_progress_event WHERE workflow=?1 ORDER BY sequence")?;
-        let rows=stmt.query_map([workflow],|r|r.get::<_,String>(0))?;
-        rows.map(|row|Ok(serde_json::from_str(&row?)?)).collect()
+        let mut stmt=self.conn.prepare("SELECT sequence,payload FROM workflow_progress_event WHERE workflow=?1 ORDER BY sequence")?;
+        let rows=stmt.query_map([workflow],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))?;
+        rows.map(|row| {let (seq,raw)=row?;Ok(decode(&self.conn,workflow,seq,&raw)?.0)}).collect()
     }
-    pub fn uncertain_progress(&self,bot:u64,owner:u64)->Result<Vec<(super::discord_ingress::DiscordOrigin,String,i64,String,String)>> {
+    pub fn uncertain_progress(&self,bot:u64,owner:u64)->Result<Vec<(discord_ingress::DiscordOrigin,String,i64,String,String)>> {
         ensure!(bot>0 && owner>0,"progress recovery identity missing");
-        let mut stmt=self.conn.prepare("SELECT d.channel,d.workflow,d.sequence,d.nonce,d.content FROM workflow_progress_delivery d JOIN workflow_delivery_binding b ON b.workflow=d.workflow AND b.bot=d.bot AND b.owner=d.owner AND b.channel=d.channel WHERE d.bot=?1 AND d.owner=?2 AND d.state='uncertain' ORDER BY d.dispatched_at,d.workflow LIMIT 128")?;
+        let mut stmt=self.conn.prepare("SELECT channel,workflow,sequence,nonce,content FROM workflow_progress_delivery WHERE bot=?1 AND owner=?2 AND state='uncertain' ORDER BY dispatched_at,workflow LIMIT 128")?;
         let rows=stmt.query_map(params![bot.to_string(),owner.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))?;
-        rows.map(|row| {let (channel,workflow,sequence,nonce,content)=row?;Ok((super::discord_ingress::DiscordOrigin {bot,owner,channel:channel.parse()?,message:1},workflow,sequence,nonce,content))}).collect()
+        rows.map(|row| {
+            let (channel,workflow,sequence,nonce,content)=row?;
+            let origin=discord_ingress::DiscordOrigin {bot,owner,channel:channel.parse()?,message:1};
+            let (_,scope)=historical(&self.conn,&workflow,sequence)?;
+            require_route(&self.conn,&origin,&workflow,scope.as_ref())?;
+            Ok((origin,workflow,sequence,nonce,content))
+        }).collect()
     }
     pub fn pending_progress(&self,bot:u64,owner:u64)->Result<Vec<(super::discord_ingress::DiscordOrigin,String,i64)>> {
         ensure!(bot>0 && owner>0,"progress recovery identity missing");
         if !exists(&self.conn)? {return Ok(Vec::new());}
-        let mut stmt=self.conn.prepare("SELECT b.channel,b.workflow,s.sequence FROM workflow_delivery_binding b JOIN workflow_progress_state s ON s.workflow=b.workflow WHERE b.bot=?1 AND b.owner=?2 AND NOT EXISTS(SELECT 1 FROM workflow_progress_delivery d WHERE d.workflow=b.workflow AND d.bot=b.bot AND d.owner=b.owner AND d.channel=b.channel AND (d.state='uncertain' OR d.sequence>=s.sequence)) ORDER BY s.workflow,b.channel LIMIT 128")?;
-        let rows=stmt.query_map(params![bot.to_string(),owner.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?;
-        rows.map(|row| {let (channel,workflow,sequence)=row?;Ok((super::discord_ingress::DiscordOrigin {bot,owner,channel:channel.parse()?,message:1},workflow,sequence))}).collect()
+        // Private candidates originate in the authenticated envelope. A default
+        // route may coexist, but can never receive that envelope's progress.
+        let mut stmt=self.conn.prepare("SELECT b.channel,s.workflow,s.sequence,s.payload FROM workflow_delivery_binding b JOIN workflow_progress_state s ON s.workflow=b.workflow WHERE b.bot=?1 AND b.owner=?2 AND json_extract(s.payload,'$.owner_scope') IS NULL
+            UNION SELECT CAST(json_extract(s.payload,'$.owner_scope.origin.channel') AS TEXT),s.workflow,s.sequence,s.payload FROM workflow_progress_state s WHERE CAST(json_extract(s.payload,'$.owner_scope.origin.bot') AS TEXT)=?1 AND CAST(json_extract(s.payload,'$.owner_scope.origin.owner') AS TEXT)=?2
+            ORDER BY 2,1")?;
+        let rows=stmt.query_map(params![bot.to_string(),owner.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))?;
+        let mut pending=Vec::new();
+        for row in rows {
+            let (channel,workflow,sequence,raw)=row?;
+            let origin=discord_ingress::DiscordOrigin {bot,owner,channel:channel.parse()?,message:1};
+            let (_,scope)=decode(&self.conn,&workflow,sequence,&raw)?;
+            require_route(&self.conn,&origin,&workflow,scope.as_ref())?;
+            let blocked:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_progress_delivery WHERE workflow=?1 AND bot=?2 AND owner=?3 AND (state='uncertain' OR (channel=?4 AND sequence>=?5)))",params![workflow,bot.to_string(),owner.to_string(),channel,sequence],|r|r.get(0))?;
+            if !blocked {pending.push((origin,workflow,sequence));if pending.len()==128 {break;}}
+        }
+        Ok(pending)
     }
     pub fn claim_progress(&mut self,origin:&super::discord_ingress::DiscordOrigin,workflow:&str,sequence:i64,now:i64)->Result<Option<(String,String)>> {
         origin.validate()?;
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::delivery::require_destination(&tx,origin,workflow)?;
         let raw:Option<(i64,String)>=tx.query_row("SELECT sequence,payload FROM workflow_progress_state WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         let Some((current,raw))=raw else {return Ok(None);};
         if current!=sequence {return Ok(None);}
-        let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_progress_delivery WHERE workflow=?1 AND bot=?2 AND owner=?3 AND channel=?4 AND (state='uncertain' OR sequence>=?5))",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence],|r|r.get(0))?;
+        let (progress,scope)=decode(&tx,workflow,sequence,&raw)?;
+        require_route(&tx,origin,workflow,scope.as_ref())?;
+        let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_progress_delivery WHERE workflow=?1 AND bot=?2 AND owner=?3 AND (state='uncertain' OR (channel=?4 AND sequence>=?5)))",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence],|r|r.get(0))?;
         if blocked {return Ok(None);}
-        let progress:Progress=serde_json::from_str(&raw)?;
         let nonce=format!("{:x}",Sha256::digest(serde_json::to_vec(&(workflow,origin.bot,origin.owner,origin.channel,sequence))?))[..24].to_string();
-        let content=format!("Autoship {workflow} · update {sequence}: {}. Stage: {:?}. Reason: {}. Next: {} (eligible at: {:?}). PR: {:?}. Requested provider: {:?}; actual provider: {} ({}). Merge: {}. Deployment: {}. Evidence digest: {}. [autoship:{nonce}]",
-            progress.kind,progress.stage,progress.reason,progress.next_action,progress.eligible_at_ms,progress.pr,progress.requested_provider,progress.actual_provider.as_deref().unwrap_or("unknown"),progress.actual_provider_role.as_deref().unwrap_or("unknown"),progress.merge_state,progress.deployment_state,progress.evidence_digest);
+        let content=if scope.is_some() && progress.reason=="native-input-writer-unsupported" {
+            format!("Autoship {workflow} · update {sequence}: session recovery is blocked because the original session input writer is unsupported. Recovery will stay blocked until compatible session evidence is available. Merge: {}. Deployment: {}. [autoship:{nonce}]",progress.merge_state,progress.deployment_state)
+        } else {format!("Autoship {workflow} · update {sequence}: {}. Stage: {:?}. Reason: {}. Next: {} (eligible at: {:?}). PR: {:?}. Requested provider: {:?}; actual provider: {} ({}). Merge: {}. Deployment: {}. Evidence digest: {}. [autoship:{nonce}]",
+            progress.kind,progress.stage,progress.reason,progress.next_action,progress.eligible_at_ms,progress.pr,progress.requested_provider,progress.actual_provider.as_deref().unwrap_or("unknown"),progress.actual_provider_role.as_deref().unwrap_or("unknown"),progress.merge_state,progress.deployment_state,progress.evidence_digest)};
         ensure!(content.chars().count()<=1900,"progress message exceeds Discord bound");
         tx.execute("INSERT INTO workflow_progress_delivery(workflow,bot,owner,channel,sequence,nonce,content,state,dispatched_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'uncertain',?8)",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence,nonce,content,now])?;
         tx.commit()?;Ok(Some((nonce,content)))
@@ -70,7 +123,8 @@ impl WorkflowStore {
     pub fn confirm_progress(&mut self,origin:&super::discord_ingress::DiscordOrigin,workflow:&str,sequence:i64,message:u64,now:i64)->Result<()> {
         origin.validate()?;ensure!(message>0,"progress remote message missing");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::delivery::require_destination(&tx,origin,workflow)?;
+        let (_,scope)=historical(&tx,workflow,sequence)?;
+        require_route(&tx,origin,workflow,scope.as_ref())?;
         let (state,prior):(String,Option<String>)=tx.query_row("SELECT state,message FROM workflow_progress_delivery WHERE workflow=?1 AND bot=?2 AND owner=?3 AND channel=?4 AND sequence=?5",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence],|r|Ok((r.get(0)?,r.get(1)?)))?;
         if state=="confirmed" {ensure!(prior.as_deref()==Some(message.to_string().as_str()),"progress receipt conflict");return Ok(());}
         ensure!(state=="uncertain","progress was never dispatched");
@@ -79,6 +133,18 @@ impl WorkflowStore {
     }
     pub fn progress_delivery(&self,workflow:&str)->Result<DeliveryStatus> {
         if !exists(&self.conn)? {return Ok(DeliveryStatus {state:"not-observed".into(),pending_events:0,oldest_pending_at_ms:None,latest_sequence:None});}
+        let latest:Option<(i64,String)>=self.conn.query_row("SELECT sequence,payload FROM workflow_progress_state WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if let Some((sequence,raw))=latest {
+            let (_,scope)=decode(&self.conn,workflow,sequence,&raw)?;
+            if let Some(scope)=scope {
+                let origin=scope.origin(&self.conn,workflow)?;
+                let bound=discord_ingress::bound_workflow(&self.conn,&origin,Some(workflow)).is_ok();
+                let uncertain:Option<i64>=self.conn.query_row("SELECT min(dispatched_at) FROM workflow_progress_delivery WHERE workflow=?1 AND bot=?2 AND owner=?3 AND state='uncertain'",params![workflow,origin.bot.to_string(),origin.owner.to_string()],|r|r.get(0))?;
+                let confirmed:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_progress_delivery WHERE workflow=?1 AND bot=?2 AND owner=?3 AND channel=?4 AND sequence=?5 AND state='confirmed')",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence],|r|r.get(0))?;
+                let created:i64=self.conn.query_row("SELECT created_at FROM workflow_progress_event WHERE workflow=?1 AND sequence=?2",params![workflow,sequence],|r|r.get(0))?;
+                return Ok(DeliveryStatus {state:if uncertain.is_some() {"delivery-uncertain"} else if confirmed {"delivery-confirmed"} else if bound {"delivery-pending"} else {"delivery-unconfigured"}.into(),pending_events:i64::from(!confirmed),oldest_pending_at_ms:uncertain.or_else(||(!confirmed).then_some(created)),latest_sequence:Some(sequence)});
+            }
+        }
         let delivery_table:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_progress_delivery')",[],|r|r.get(0))?;
         let new_routes:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_delivery_binding')",[],|r|r.get(0))?;
         let routes=if new_routes {"workflow_delivery_binding"} else {"discord_workflow_binding"};
@@ -112,10 +178,11 @@ fn code(value:&str,fallback:&str)->String {
 }
 
 pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Result<()> {
-    if !matches!(source,"registered"|"checkpoint"|"autonomous_merge_confirmed"|"command_queued"|"command_attempt_finished"|"owner_control_changed"|"owner_input_queued"|"native_model_admitted") {return Ok(());}
+    if !matches!(source,"registered"|"checkpoint"|"autonomous_merge_confirmed"|"command_queued"|"command_attempt_finished"|"owner_control_changed"|"owner_input_queued"|"native_model_admitted"|"owner_recovery_legacy_input_blocked") {return Ok(());}
     let previous:Option<(i64,String,bool)>=tx.query_row("SELECT sequence,fingerprint,terminal FROM workflow_progress_state WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     if previous.as_ref().is_some_and(|p|p.2) {return Ok(());}
-    super::delivery::apply_default(tx,workflow,now)?;
+    let private=owner_publication_recovery::owner_progress(tx,workflow,now)?;
+    if private.is_none() {super::delivery::apply_default(tx,workflow,now)?;}
     let snapshot:Option<(String,Option<u64>)>=tx.query_row("SELECT checkpoint,pr FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let checkpoint=snapshot.as_ref().map(|(raw,_)|serde_json::from_str::<Checkpoint>(raw)).transpose()?;
     let requested:Option<String>=tx.query_row("SELECT provider FROM command_job WHERE workflow=?1",[workflow],|r|r.get(0)).optional()?;
@@ -144,6 +211,14 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
         }
     }
     else if source=="owner_control_changed" {kind="resume-requested".into();reason="owner-resume-accepted".into();action="await_worker".into();}
+    if let Some((_,blocked))=&private {
+        use owner_publication_recovery::RecoveryBlockedState;
+        match blocked {
+            Some(RecoveryBlockedState::LegacyInputWriter)=>{kind="blocked".into();reason="native-input-writer-unsupported".into();action="qualify_original_input_writer".into();eligible=None;},
+            Some(RecoveryBlockedState::HistoryCapacity)=>{kind="blocked".into();reason="session-recovery-history-capacity".into();action="inspect_session_recovery".into();eligible=None;},
+            _=>{},
+        }
+    }
     let external_merge=checkpoint.as_ref().is_some_and(|c|c.stage==Stage::Merged && c.next.reason=="external_merge_reconciled");
     let terminal=confirmed || external_merge || stage==Some(Stage::Retired);
     if external_merge {kind="merged".into();reason="external-merge-observed".into();action="complete".into();eligible=None;}
@@ -161,13 +236,16 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
         let reviewer=value["reviewer"].as_bool().context("native provider role missing")?;
         (provider,Some(if reviewer {"reviewer"}else{"workflow"}.into()))
     }else{(None,None)};
-    let fingerprint=format!("{:x}",Sha256::digest(serde_json::to_vec(&(&kind,stage,&reason,&action,&evidence_digest,&actual_provider,&actual_provider_role))?));
+    let fields=(&kind,stage,&reason,&action,&evidence_digest,&actual_provider,&actual_provider_role);
+    let scope=private.map(|(scope,_)|scope);
+    // Keep the original fingerprint byte-for-byte for ordinary progress.
+    let fingerprint=format!("{:x}",Sha256::digest(match &scope {Some(scope)=>serde_json::to_vec(&(fields,scope))?,None=>serde_json::to_vec(&fields)?}));
     let changed=previous.as_ref().is_none_or(|p|p.1!=fingerprint);
     let sequence=previous.as_ref().map_or(1,|p|p.0+i64::from(changed));
     let progress=Progress {workflow:workflow.into(),sequence,kind,stage,reason,next_action:action,eligible_at_ms:eligible,
         pr:snapshot.and_then(|s|s.1),requested_provider,actual_provider,actual_provider_role,
         merge_state:if confirmed {"observed-autonomous-merge"} else if external_merge {"observed-external-merge"} else {"not-confirmed"}.into(),deployment_state:"unknown".into(),evidence_digest,observed_at_ms:now};
-    let payload=serde_json::to_string(&progress)?;
+    let payload=match scope {Some(owner_scope)=>serde_json::to_string(&OwnerProgressEnvelope {version:2,owner_scope,progress})?,None=>serde_json::to_string(&progress)?};
     if changed {tx.execute("INSERT INTO workflow_progress_event(workflow,sequence,payload,created_at) VALUES(?1,?2,?3,?4)",params![workflow,sequence,payload,now])?;}
     tx.execute("INSERT INTO workflow_progress_state VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workflow) DO UPDATE SET sequence=excluded.sequence,fingerprint=excluded.fingerprint,terminal=excluded.terminal,payload=excluded.payload",params![workflow,sequence,fingerprint,terminal,payload])?;
     Ok(())

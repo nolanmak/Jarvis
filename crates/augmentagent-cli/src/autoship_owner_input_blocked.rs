@@ -5,6 +5,33 @@ use augmentagent_channel_core::native_vm::{
     PreparedLaunchRecord,
 };
 const KIND: &str = "owner_recovery_legacy_input_blocked";
+/// Saved routing expectation only. Every delivery re-reads its original blocker
+/// and authenticated private message; this JSON cannot grant a destination.
+#[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OwnerProgress {reference:RecordRef,origin:DiscordOrigin}
+impl OwnerProgress {
+    pub(crate) fn origin(&self,conn:&Connection,workflow:&str)->Result<DiscordOrigin> {
+        let rows=load(conn,workflow)?;
+        let (record,_)=rows.iter().find(|(_,r)|r==&self.reference).context("private progress original blocker missing")?;
+        let claims=journal(conn,workflow)?;
+        let (claim,_)=claims.iter().find(|(_,r)|r==&record.claim).context("private progress original claim missing")?;
+        let message=super::super::owner_inbox::message_evidence(conn,workflow,&record.request_id)?;
+        ensure!(self.origin==claim.original.origin && message.origin==self.origin
+            && matches!(message.state.as_str(),"pending"|"applied"),"private progress original destination changed");
+        Ok(self.origin.clone())
+    }
+}
+pub(super) fn owner_progress(conn:&Connection,workflow:&str,now:i64)->Result<Option<(OwnerProgress,Option<RecoveryBlockedState>)>> {
+    let rows=load(conn,workflow)?;
+    let Some((record,reference))=rows.last() else {return Ok(None)};
+    let claims=journal(conn,workflow)?;
+    let (claim,_)=claims.iter().find(|(_,r)|r==&record.claim).context("private progress original claim missing")?;
+    let scope=OwnerProgress {reference:reference.clone(),origin:claim.original.origin.clone()};
+    scope.origin(conn,workflow)?;
+    let blocked=match plan(conn,workflow)? {Some(plan)=>blocked::blocked_state(conn,&plan,now)?,None=>None};
+    Ok(Some((scope,blocked)))
+}
 #[cfg(test)]
 pub(super) fn fixture_encoding(raw: &str) -> Result<String> {
     let record: Record = serde_json::from_str(raw)?;
@@ -476,7 +503,7 @@ impl WorkflowStore {
             authorization,
             chrono::Utc::now().timestamp_millis(),
         )?;
-        event(
+        let sequence=append_event(
             &tx,
             &lease.claim.original.workflow,
             lease.generation(),
@@ -484,11 +511,6 @@ impl WorkflowStore {
             &serde_json::json!({"version":1,"request_id":record.request_id,"record_sha256":hash})
                 .to_string(),
             now,
-        )?;
-        let sequence: i64 = tx.query_row(
-            "SELECT max(seq) FROM workflow_event WHERE workflow=?1",
-            [&lease.claim.original.workflow],
-            |r| r.get(0),
         )?;
         tx.execute(
             "INSERT INTO workflow_owner_legacy_input_blocked VALUES(?1,?2,?3,?4,?5)",
@@ -501,6 +523,8 @@ impl WorkflowStore {
             ],
         )?;
         load(&tx, &lease.claim.original.workflow)?;
+        super::super::progress::project(&tx,&lease.claim.original.workflow,KIND,now)?;
+        require_authorized_claim(&tx,lease,authorization,chrono::Utc::now().timestamp_millis())?;
         tx.commit()?;
         proof.validate_current()?;
         Ok(())

@@ -1910,3 +1910,51 @@ qualification producers, productive recovery/continuation and repeated-cycle
 constructors, worker ingress and every original rollout/merge/fault/soak acceptance
 requirement remain open. A policy edit or timer is not a legacy cutover or a debt
 resolution; that still requires its own original proof and immutable disposition.
+
+## 68. Original-conversation recovery progress
+
+The unsupported-input blocker now projects progress inside the transaction that
+appends its event and validated index. A projection failure rolls back both
+halves of the blocker and preserves the original typed refusal. Projection runs
+after the index exists; the unprojected event primitive never commits on its own.
+
+Private recovery progress uses a version-2 envelope containing a routing
+expectation for the exact blocker and original authenticated Discord message.
+Every read/claim/receipt revalidates that original history. Dispatch additionally
+requires the original inbound workflow binding and the transport's existing
+owner-DM checks. Repository notification defaults remain separate and cannot
+receive the private envelope, including when configured before the blocker.
+Legacy direct-Progress readers reject the envelope because it lacks their
+required top-level fields. Unknown envelope versions/fields refuse rather than
+falling back to ordinary routing. Ordinary progress retains its original payload
+and fingerprint format, avoiding a rollout-wide repeat of unchanged updates.
+
+The delivery claim saves uncertainty before any send; restart reconciliation
+uses the exact historical progress event, original destination, nonce and
+content. Uncertain older sends prevent another update for the same owner and
+workflow across channels. Confirmation never uses a later progress selection to
+retarget an earlier send. The human-readable unsupported-writer message contains
+fixed recovery guidance and truthful merge/deployment status, never the queued
+instruction, native session identifier, raw error or host audit path.
+
+The behavioral regression originally observed only `owner-pause-requested`
+after the controller committed unsupported-input debt. Both Codex and Claude
+fixtures now reach the private outbox, reject a different owner/channel and
+substituted envelope references, reject unknown versions/fields,
+retain the same uncertain send after reopening, and confirm it exactly once.
+Injection at either blocker-index insertion or progress-event insertion rolls
+back the blocker/event/progress together. Unchanged control observations dedupe;
+original body/model/native rows, charges and merge allowance remain intact.
+These are controlled authenticated fixtures; no real Discord message or provider
+request is sent, and original resources remain synthetic. Exact validation and
+limitations are recorded in `1703-private-recovery-progress-proof.json`. The final
+CLI suite passed 1,980 tests with zero failures and 34 ignored (669.65 seconds);
+non-test compilation passed (54.92 seconds). All original local handles are
+terminal. These results do not establish hosted CI or deployment acceptance.
+
+This closes the new unsupported-input blocker's progress-outbox seam. It does
+not complete private productive coding, late-outcome admission, legacy/source/
+resource qualification, repeated productive cycles or the original live CLI/
+Discord, rollout, autonomous-merge and fault/soak acceptance requirements. No
+production service, capacity policy, retained session, allowance or hold changes
+as part of this component.

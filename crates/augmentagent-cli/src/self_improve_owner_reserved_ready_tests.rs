@@ -639,28 +639,24 @@ pub(super) async fn settle_reserved_body(
     .await
     .unwrap();
     if phase == "legacy-blocked" {
-        db.execute_batch("CREATE TRIGGER refuse_legacy_blocker BEFORE INSERT ON workflow_owner_legacy_input_blocked BEGIN SELECT RAISE(ABORT,'injected legacy blocker rollback'); END;").unwrap();
-        let failed = settle(&mut store, &fresh, false, true).unwrap_err();
-        assert!(failed
-            .downcast_ref::<ownership::LegacyNativeInputWriter>()
-            .is_some());
-        assert!(format!("{failed:#}").contains("legacy input blocker could not be persisted"));
-        assert_eq!(store.events(&workflow).unwrap(), events);
-        assert_eq!(
-            db.query_row(
-                "SELECT count(*) FROM workflow_owner_legacy_input_blocked WHERE workflow=?1",
-                [&workflow],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            0
-        );
-        assert_eq!(
-            original_rows(&db, &workflow, recovery.request_id()),
-            original
-        );
-        db.execute_batch("DROP TRIGGER refuse_legacy_blocker;")
-            .unwrap();
+        // An unrelated repository recipient exists before projection. A private
+        // recovery update must neither inherit it nor change the route.
+        store.configure_delivery("owner/repo","github:owner",durable::delivery::Destination {bot:11,owner:99,channel:88},millis()).unwrap();
+        let progress=store.progress_events(&workflow).unwrap();
+        for table in ["workflow_owner_legacy_input_blocked","workflow_progress_event"] {
+            db.execute_batch(&format!("CREATE TRIGGER refuse_legacy_blocker BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT,'injected legacy blocker rollback'); END;")).unwrap();
+            let active=super::super::targeted::authorize_owner_publication_recovery(
+                worktree,authorization.plan(),crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22},
+            ).await.unwrap();
+            let failed=settle(&mut store,&active,false,true).unwrap_err();
+            assert!(failed.downcast_ref::<ownership::LegacyNativeInputWriter>().is_some());
+            assert!(format!("{failed:#}").contains("legacy input blocker could not be persisted"));
+            assert_eq!(store.events(&workflow).unwrap(),events);
+            assert_eq!(store.progress_events(&workflow).unwrap(),progress);
+            assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_legacy_input_blocked WHERE workflow=?1",[&workflow],|r|r.get::<_,i64>(0)).unwrap(),0);
+            assert_eq!(original_rows(&db,&workflow,recovery.request_id()),original);
+            db.execute_batch("DROP TRIGGER refuse_legacy_blocker;").unwrap();
+        }
     }
     let fresh = if phase == "legacy-blocked" {
         super::super::targeted::authorize_owner_publication_recovery(
@@ -1160,6 +1156,65 @@ async fn persist_legacy_writer_debt(
     );
     assert_eq!(store.pending_owner_messages(workflow).unwrap(), queued);
     assert_eq!(store.merge_allowance(millis(), 5).unwrap().confirmed, 0);
+    check_private_recovery_progress(state,workflow,recovery.request_id(),authorization.plan().origin());
+}
+
+fn check_private_recovery_progress(state:&Path,workflow:&str,request:&str,origin:&durable::discord_ingress::DiscordOrigin) {
+    let mut store=WorkflowStore::open(state).unwrap();
+    let before=store.snapshot(workflow).unwrap().unwrap();
+    let db=rusqlite::Connection::open(state).unwrap();
+    let original=original_rows(&db,workflow,request);
+    store.configure_delivery("owner/repo","github:owner",durable::delivery::Destination {bot:origin.bot,owner:99,channel:88},millis()).unwrap();
+    let progress=store.progress_events(workflow).unwrap().pop().expect("private blocker has no durable progress");
+    assert_eq!(progress.reason,"native-input-writer-unsupported","committed input blocker never reached progress outbox");
+    let payload:String=db.query_row("SELECT payload FROM workflow_progress_state WHERE workflow=?1",[workflow],|r|r.get(0)).unwrap();
+    // Legacy binaries cannot reinterpret a private envelope as public progress.
+    assert!(serde_json::from_str::<durable::progress::Progress>(&payload).is_err());
+    for fault in ["version","owner","channel","reference","unknown-field"] {
+        let mut value:serde_json::Value=serde_json::from_str(&payload).unwrap();
+        match fault {
+            "version"=>value["version"]=3.into(),
+            "owner"=>value["owner_scope"]["origin"]["owner"]=99.into(),
+            "channel"=>value["owner_scope"]["origin"]["channel"]=88.into(),
+            "reference"=>value["owner_scope"]["reference"]["sha256"]="f".repeat(64).into(),
+            _=>value["unexpected"]="private data".into(),
+        }
+        db.execute("UPDATE workflow_progress_state SET payload=?2 WHERE workflow=?1",rusqlite::params![workflow,serde_json::to_string(&value).unwrap()]).unwrap();
+        assert!(store.claim_progress(origin,workflow,progress.sequence,millis()).is_err(),"{fault}: invalid private envelope claimed");
+        db.execute("UPDATE workflow_progress_state SET payload=?2 WHERE workflow=?1",rusqlite::params![workflow,payload]).unwrap();
+    }
+    let pending=store.pending_progress(origin.bot,origin.owner).unwrap();
+    let selected=pending.iter().filter(|(_,w,_)|w==workflow).collect::<Vec<_>>();
+    assert_eq!(selected.len(),1);assert_eq!(selected[0].0.channel,origin.channel);
+    assert!(store.pending_progress(origin.bot,99).unwrap().iter().all(|(_,w,_)|w!=workflow),"private blocker reached repository delivery default");
+    let mut wrong=origin.clone();wrong.owner=99;wrong.channel=88;
+    assert!(store.claim_progress(&wrong,workflow,progress.sequence,millis()).is_err());
+    let mut wrong=origin.clone();wrong.channel+=1;
+    assert!(store.claim_progress(&wrong,workflow,progress.sequence,millis()).is_err());
+    let (nonce,content)=store.claim_progress(origin,workflow,progress.sequence,millis()).unwrap().expect("private blocker could not be claimed");
+    assert!(content.contains("session recovery"));
+    let body:String=db.query_row("SELECT body FROM workflow_owner_message WHERE workflow=?1 AND request_id=?2",rusqlite::params![workflow,request],|r|r.get(0)).unwrap();
+    assert!(!content.contains(&body));assert!(!content.contains("/sys/fs/"));
+    drop(store);
+    let mut store=WorkflowStore::open(state).unwrap();
+    assert!(store.claim_progress(origin,workflow,progress.sequence,millis()).unwrap().is_none());
+    let uncertain=store.uncertain_progress(origin.bot,origin.owner).unwrap();
+    let selected=uncertain.iter().filter(|(_,w,_,_,_)|w==workflow).collect::<Vec<_>>();
+    assert_eq!(selected.len(),1);assert_eq!(selected[0].0.channel,origin.channel);assert_eq!(selected[0].3,nonce);assert_eq!(selected[0].4,content);
+    assert!(store.uncertain_progress(origin.bot,99).unwrap().iter().all(|(_,w,_,_,_)|w!=workflow));
+    assert_eq!(store.progress_delivery(workflow).unwrap().state,"delivery-uncertain");
+    assert!(store.confirm_progress(&wrong,workflow,progress.sequence,777,millis()).is_err());
+    // Re-observing unchanged controls cannot mint another progress send.
+    let control=store.owner_control(workflow).unwrap().unwrap();
+    let events=store.progress_events(workflow).unwrap();
+    store.set_owner_pause(workflow,"github:owner",control.revision,control.paused,millis()).unwrap();
+    assert_eq!(store.progress_events(workflow).unwrap(),events);
+    store.confirm_progress(origin,workflow,progress.sequence,777,millis()).unwrap();
+    assert!(store.pending_progress(origin.bot,origin.owner).unwrap().iter().all(|(_,w,_)|w!=workflow));
+    assert_eq!(store.progress_delivery(workflow).unwrap().state,"delivery-confirmed");
+    assert_eq!(store.snapshot(workflow).unwrap().unwrap(),before);
+    assert_eq!(original_rows(&db,workflow,request),original);
+    assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
 }
 
 async fn consume_reserved_successor(state: &Path, worktree: &Path, workflow: &str, request: &str) {

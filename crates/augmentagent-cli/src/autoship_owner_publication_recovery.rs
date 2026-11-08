@@ -6,6 +6,8 @@ use super::*;
 mod blocked;
 #[path = "autoship_owner_input_blocked.rs"]
 mod input_blocked;
+pub(crate) use input_blocked::OwnerProgress;
+pub(super) fn owner_progress(conn:&Connection,workflow:&str,now:i64)->Result<Option<(OwnerProgress,Option<RecoveryBlockedState>)>> {input_blocked::owner_progress(conn,workflow,now)}
 #[cfg(test)]
 pub(crate) fn test_legacy_input_blocker_encoding(raw:&str)->Result<String> {input_blocked::fixture_encoding(raw)}
 #[path="autoship_owner_recovery_native_intent.rs"]

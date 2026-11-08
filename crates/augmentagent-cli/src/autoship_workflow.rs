@@ -2202,12 +2202,18 @@ fn event(
     payload: &str,
     now_ms: i64,
 ) -> Result<()> {
+    append_event(tx,workflow,generation,kind,payload,now_ms)?;
+    progress::project(tx,workflow,kind,now_ms)?;
+    Ok(())
+}
+// A projection that reads its own index must run after that index is appended,
+// inside the same transaction. This primitive alone never commits the event.
+fn append_event(tx:&Transaction<'_>,workflow:&str,generation:i64,kind:&str,payload:&str,now_ms:i64)->Result<i64> {
     tx.execute(
         "INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,?2,?3,?4,?5)",
         params![workflow, generation, kind, payload, now_ms],
     )?;
-    progress::project(tx,workflow,kind,now_ms)?;
-    Ok(())
+    Ok(tx.last_insert_rowid())
 }
 
 #[cfg(test)]
