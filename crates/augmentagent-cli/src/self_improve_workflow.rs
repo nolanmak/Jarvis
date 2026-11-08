@@ -4322,14 +4322,15 @@ else: raise SystemExit('unexpected authority call')
     #[tokio::test]
     async fn owner_body_admission_rechecks_original_preparation_in_actual_callbacks() {
         let control=control_dir();
-        let status=std::process::Command::new(std::env::current_exe().unwrap())
+        let output=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
             .env("AUTOSHIP_INITIAL_GUARD_CHILD",control.path())
             .env("AUTOSHIP_INITIAL_GUARD_MODE","owner-early-acceptance-producer-body-admission")
             .env("XDG_STATE_HOME",control.path().join("operator-state"))
             .env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json"))
-            .status().unwrap();
-        assert!(status.success(),"original owner preparation admission callback fixture failed");
+            .output().unwrap();
+        assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("owner model charge provenance fixture passed"),"actual charge provenance fixture did not execute");
     }
     #[tokio::test]
     async fn resumed_owner_body_callbacks_bind_the_prepared_launch_after_reservation() {
@@ -4344,6 +4345,7 @@ else: raise SystemExit('unexpected authority call')
             .output().unwrap();
         assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
         assert!(String::from_utf8_lossy(&output.stdout).contains("resumed prepared callbacks passed"),"resumed fixture did not execute");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("owner model charge provenance fixture passed"),"resumed charge provenance fixture did not execute");
     }
     async fn check_prepared_owner_body_callbacks(guard:&WorkflowGuard,prepared:Arc<acceptance::owner::PreparedOwnerAcceptance>,artifact:&Path) {
         let preparation=prepared.validate_activated(guard,&guard.worktree).unwrap();
@@ -4438,6 +4440,33 @@ else: raise SystemExit('unexpected authority call')
             }
             prepared.validate_activated(guard,&guard.worktree).unwrap();
         }
+        // Use the actually committed charge, not synthetic admission rows.
+        // Both native binding and the final input callback must recheck it.
+        let check_charge_provenance=|admit:&dyn Fn()->Result<()>| {
+            let receipt:String=db.query_row("SELECT receipt FROM workflow_owner_body_model_admission WHERE request_id=?1",[&turn.request_id],|r|r.get(0)).unwrap();
+            let (sequence,generation,at):(i64,i64,i64)=db.query_row("SELECT seq,generation,at_ms FROM workflow_event WHERE workflow=?1 AND kind='resource_charged' AND payload=?2",rusqlite::params![guard.id(),receipt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            let original_events=guard.store.lock().unwrap().events(guard.id()).unwrap();
+            let before=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
+            for fault in ["generation","missing","timestamp","after-admission","duplicate","receipt"] {
+                match fault {
+                    "generation"=>{db.execute("UPDATE workflow_event SET generation=generation+1 WHERE seq=?1",[sequence]).unwrap();},
+                    "missing"=>{db.execute("DELETE FROM workflow_event WHERE seq=?1",[sequence]).unwrap();},
+                    "timestamp"=>{db.execute("UPDATE workflow_event SET at_ms=at_ms+1 WHERE seq=?1",[sequence]).unwrap();},
+                    "after-admission"=>{db.execute("UPDATE workflow_event SET seq=(SELECT max(seq)+1 FROM workflow_event) WHERE seq=?1",[sequence]).unwrap();},
+                    "duplicate"=>{db.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,?2,'resource_charged',?3,?4)",rusqlite::params![guard.id(),generation,receipt,at]).unwrap();},
+                    "receipt"=>{db.execute("UPDATE workflow_event SET payload='unrelated-charge' WHERE seq=?1",[sequence]).unwrap();},
+                    _=>unreachable!(),
+                }
+                let faulted_events=guard.store.lock().unwrap().events(guard.id()).unwrap();
+                assert!(admit().is_err(),"{fault}: owner input accepted damaged model charge provenance");
+                assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap(),before,"{fault}: refusal changed accounting or workflow state");
+                assert_eq!(guard.store.lock().unwrap().events(guard.id()).unwrap(),faulted_events,"{fault}: refusal published events");
+                db.execute("DELETE FROM workflow_event WHERE seq=?1 OR (workflow=?2 AND kind='resource_charged' AND payload=?3)",rusqlite::params![sequence,guard.id(),receipt]).unwrap();
+                db.execute("INSERT INTO workflow_event(seq,workflow,generation,kind,payload,at_ms) VALUES(?1,?2,?3,'resource_charged',?4,?5)",rusqlite::params![sequence,guard.id(),generation,receipt,at]).unwrap();
+                assert_eq!(guard.store.lock().unwrap().events(guard.id()).unwrap(),original_events);
+            }
+        };
+        check_charge_provenance(&||controller.bind_model(&native,&resource).map(|_|()));
         // The exact old prepared launch is the admitted one. A newer valid
         // protected launch cannot substitute for it after model admission.
         let mut later=native.intent.clone();later.intent_id=uuid::Uuid::new_v4().to_string();later.runtime_relative_path="codex/session-later-input-fixture".into();
@@ -4455,6 +4484,7 @@ else: raise SystemExit('unexpected authority call')
         let reference=controller.bind_model(&native,&resource).unwrap();
         assert_eq!(controller.bind_model(&native,&resource).unwrap(),reference,"binding replay changed original admission");
         controller.authorize_input(&native,&resource,&reference,&controller.prompt_sha256,controller.prompt_bytes).unwrap();
+        check_charge_provenance(&||controller.authorize_input(&native,&resource,&reference,&controller.prompt_sha256,controller.prompt_bytes));
         assert!(controller.authorize_input(&native,&resource,&reference,&"f".repeat(64),controller.prompt_bytes).is_err());
         assert!(controller.authorize_input(&later,&later_resource,&reference,&controller.prompt_sha256,controller.prompt_bytes).is_err());
         let mut forged=reference.clone();forged.claim_sha256="f".repeat(64);
@@ -4482,6 +4512,7 @@ else: raise SystemExit('unexpected authority call')
         assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,1);
         assert_eq!(store.pending_owner_messages(guard.id()).unwrap(),1);assert!(!store.owner_control(guard.id()).unwrap().unwrap().paused);
         assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+        println!("owner model charge provenance fixture passed");
         if resumed {println!("resumed prepared callbacks passed");}
     }
 

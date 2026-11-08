@@ -323,6 +323,15 @@ fn validate_model_admissions(conn:&Connection,workflow:&str)->Result<()> {
             "owner model admission event changed");
         let charge:(i64,i64,i64)=conn.query_row("SELECT wall_ms,model_calls,tokens FROM resource_charge WHERE workflow=?1 AND id=?2",params![workflow,receipt],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
         ensure!(charge==(0,1,0),"owner model admission charge changed");
+        // The charge and admission are appended by the same original
+        // transaction. Amount alone cannot attribute another generation's spend.
+        let charge_events:Vec<(i64,i64,i64)>={
+            let mut query=conn.prepare("SELECT seq,generation,at_ms FROM workflow_event WHERE workflow=?1 AND kind='resource_charged' AND payload=?2 ORDER BY seq LIMIT 2")?;
+            let rows=query.query_map(params![workflow,receipt],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?.collect::<rusqlite::Result<_>>()?;rows
+        };
+        ensure!(charge_events.len()==1 && charge_events[0].0>dispatch_sequence
+            && charge_events[0].0<sequence && charge_events[0].1==record.generation
+            && charge_events[0].2==event.3,"owner model admission charge provenance changed");
     }
     ensure!(events==count,"owner model admission history is incomplete");Ok(())
 }
@@ -390,6 +399,7 @@ impl WorkflowStore {
         resource:&augmentagent_channel_core::audit_chain::AppendReceipt,now:i64)->Result<augmentagent_channel_core::native_vm::OwnerInputReference> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_prepared_dispatch_tx(&tx,lease,dispatch,preparation,provider,now)?;
+        validate_model_admissions(&tx,&lease.workflow)?;
         let reference=model_reference(&tx,&lease.workflow,&dispatch.record.request_id)?;
         ensure!(dispatch.model_receipt.get()==Some(&reference.model_receipt),"owner native binding lacks original captured model admission");
         let launch=super::native_launch::recorded_launch(&tx,&prepared.intent.intent_id)?;
@@ -422,6 +432,8 @@ impl WorkflowStore {
             "owner input native reference changed");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_prepared_dispatch_tx(&tx,lease,dispatch,preparation,provider,now)?;
+        validate_model_admissions(&tx,&lease.workflow)?;
+        validate_native_admissions(&tx,&lease.workflow)?;
         require_same_prepared(&super::native_launch::recorded_launch(&tx,&prepared.intent.intent_id)?,prepared)?;
         let raw:String=tx.query_row("SELECT record FROM workflow_owner_body_native_admission WHERE workflow=?1 AND request_id=?2",params![lease.workflow,dispatch.record.request_id],|row|row.get(0))?;
         ensure!(raw==serde_json::to_string(captured)?,"owner input lost original native binding");tx.commit()?;Ok(())

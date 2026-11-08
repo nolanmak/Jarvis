@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "component": "original owner-model charge provenance at native binding and input release",
+  "base_commit": "1271ba6ff4d6cb7e53d13b448cde964bd3ab6823",
+  "status": "original-slot-accounting-join-no-recovered-model-grant",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_dispatch.rs": "720fdaea2698bc75e2fe9f7846eea5246499316ce0a3f530ea72a290a906f5e2",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "b932e2b2516614fc1d602bf58235a91fcfa53e1421043555e5081684733187a2"
+  },
+  "red": {
+    "handle": 32097,
+    "log": "/tmp/autoship-owner-model-charge-red-20261108.log",
+    "result": "The actual owner callback accepted the committed charge event after its generation was changed.",
+    "passed": 0,
+    "failed": 1,
+    "seconds": 2.86
+  },
+  "validation": [
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent owner_body_ -- --nocapture",
+      "log": "/tmp/autoship-owner-model-charge-green-20261108.log",
+      "passed": 12,
+      "failed": 0,
+      "controlled_charge_fault_cases": 24,
+      "seconds": 5.19
+    },
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent autoship_workflow:: -- --nocapture",
+      "log": "/tmp/autoship-owner-model-charge-workflow-20261108.log",
+      "passed": 330,
+      "failed": 0,
+      "seconds": 178.65
+    },
+    {
+      "command": "scripts/cargo-managed.sh build -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-owner-model-charge-production-20261108.log",
+      "passed": true,
+      "seconds": 31.3
+    }
+  ],
+  "fault_matrix": {
+    "provider": "Codex controlled callback fixture",
+    "reservation_modes": [
+      "initial",
+      "resumed resource-ready"
+    ],
+    "boundaries": [
+      "native model binding",
+      "owner input authorization"
+    ],
+    "faults": [
+      "charge-event generation",
+      "missing charge event",
+      "charge-event timestamp",
+      "charge event after admission",
+      "duplicate charge event",
+      "charge-event receipt"
+    ]
+  },
+  "assertions": [
+    "The reader joins exactly one original charge event between reservation and admission, with the original dispatch generation and admission timestamp.",
+    "Both actual owner callback boundaries refuse every matrix fault without new events, model charges, workflow changes or allowance effects.",
+    "Original successful model admission, input binding replay, exact launch/prompt binding and failure rollback remain covered.",
+    "Each matrix case restores the original fixture event bytes and both parent tests require a post-matrix reachability marker.",
+    "The final fixture retains one spent model admission, pending original input and zero confirmed autonomous merges."
+  ],
+  "limits": [
+    "Controlled native declarations and protected-store callbacks; no live provider, VM, Discord, merge or rollout was exercised.",
+    "Recovered and continuation model-slot projections and productive constructors remain unfinished.",
+    "Complete source/resource/input closure, legacy writer cutover and all original live acceptance remain required.",
+    "No production policy, capacity reservation, compute budget, hold, shipping accounting or service changed."
+  ],
+  "all_original_local_handles_terminal": true,
+  "green_and_production_handle": 5042,
+  "productive_recovery_granted": false,
+  "production_capacity_changed": false
+}

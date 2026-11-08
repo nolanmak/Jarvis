@@ -1433,3 +1433,45 @@ and an actual consumed setup; it has no pre-existing body reservation. It does
 not prove complete reserved-body recovery, productive input release, model/result
 completion, repeated-cycle ancestry or legacy writer cutover. Those producers and
 all original live CLI/Discord/merge/fault/soak acceptance remain required by §53.
+
+
+## 59. Original owner-model charges retain their admission provenance
+
+**D59.1 — A charge amount is not its original attribution.** The original owner
+model-slot reader now requires exactly one `resource_charged` event for its
+workflow and receipt. That event must follow the original body reservation,
+precede the model-admission event, have the dispatch generation and retain the
+same timestamp as the model admission. The existing `(wall_ms, model_calls,
+tokens) = (0, 1, 0)` charge-row check and exact model record/event joins remain.
+This follows the actual writer, which commits the charge and both events in one
+transaction. A duplicate event is rejected even when one of its copies matches;
+filtering only for a matching generation would conceal damaged attribution.
+
+Both native model binding and final owner-input authorization revalidate this
+model history inside their existing short workflow transaction. Final input
+also revalidates the native-admission projection against that model history.
+An earlier successful binding is not a substitute for a fresh check at release.
+No workflow mutex or SQLite connection is extended over native IO.
+
+A regression through the actual callback accepted a changed charge-event
+generation before this fix. Six fault cases now refuse at both binding and
+input authorization: wrong generation, missing event, changed timestamp, event
+after model admission, duplicate event and changed receipt. Initial and resumed
+reservation fixtures exercise all 24 combinations and require unchanged workflow
+snapshot/accounting and no callback events. Each case restores its exact original
+fixture events. Existing successful admission/binding replay and exact prompt/
+launch checks remain, with one spent model call and zero confirmed shipments.
+The test parents require completion markers emitted after the new checks.
+
+All 12 owner-body tests, all 330 workflow tests and production compilation passed.
+The new fault matrix uses controlled Codex callback fixtures and scripted native
+resource declarations; it performs no live provider or VM execution. See
+[the charge provenance evidence](1703-owner-model-charge-provenance-proof.json).
+
+These checks concern the original model slot. The recovered `body_recovery`,
+`continuation` and `continuation_retry` slots in §53 must bind their own admitted
+attempt generation and common charge, rather than weakening the original-slot
+comparison or resetting previous spend. Those constructors/readers, complete
+C/R closure, legacy writer cutover, productive recovery, normal rollout and all
+original live acceptance remain unfinished. No missing charge evidence is
+reconstructed, no reservation is reclaimed and no budget or allowance changes.
