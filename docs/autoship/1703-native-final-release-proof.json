@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "base_head": "3608bbfc1c25a510e7adfea22f1b07256bbb87d3",
+  "source": "crates/augmentagent-channel-core/src/process_tree.rs",
+  "source_sha256": "5e8481ba3d200ba6cd5a70ee17b15c2cf1ec79d8bfcb5f02738ac7d1765e9355",
+  "change": "Refresh current resources, startup inputs, selected native policy/store and dispatch fence before supervisor release; native VM groups require model admission.",
+  "evidence": {
+    "red": {
+      "log": "/tmp/autoship-1703-native-final-release-red4-20261108.log",
+      "sha256": "96513fd28c638fab73e7d2062de3752c162bd7a3ad6e3d228ee93ac2ccf5f593"
+    },
+    "focused_green": {
+      "log": "/tmp/autoship-1703-native-final-release-green-20261108.log",
+      "sha256": "fb8d4ea0683d99c110123f6192668cfe81e7d58d90fafcb28436051dd3f2d49e"
+    },
+    "lifecycle": {
+      "log": "/tmp/autoship-1703-native-final-release-suite-20261108.log",
+      "sha256": "db6f602117a714b190b49d3df88a44240a6d784b0ded0a27aea26b71809ade28"
+    },
+    "related": {
+      "log": "/tmp/autoship-1703-native-final-release-related-20261108.log",
+      "sha256": "589eeac2dd5cca034ef88c0e612a1631ddaeb98a8a4908bd981d38741675eb54"
+    },
+    "production": {
+      "log": "/tmp/autoship-1703-native-final-release-production-20261108.log",
+      "sha256": "5710cbf65fdd3aec506bc8fb0cd8f64abf94d7fa81244e39cb9fcfa53f4d1c1b"
+    }
+  },
+  "red": {
+    "tests": 4,
+    "failed": 4,
+    "reason": "Original release accepts callback-time resource/startup/policy changes and generic command release of a VM preflight group."
+  },
+  "validation": {
+    "lifecycle_passed": 59,
+    "lifecycle_failed": 0,
+    "lifecycle_preexisting_ignored": 1,
+    "related_passed": 248,
+    "related_failed": 0,
+    "related_ignored": 0,
+    "new_regressions": 7,
+    "production_compile_passed": true
+  },
+  "invariants": [
+    "One-shot admission is consumed before refusing a VM command release.",
+    "Recheck current resource and startup correlation after the final precharge dispatch callback.",
+    "After model/native-owner callbacks and staging complete synced release bytes, recheck current dispatch, resource and startup correlation and original native policy/store binding before publishing launch-continue.",
+    "A denied release retains any model admission already recorded; no refund or allowance mutation.",
+    "Ordinary command release, native positive admission, cancellation and cleanup regressions remain covered."
+  ],
+  "fixture_correction": "The existing command quiescence fixture wrote cleanup-complete before admitting the command. It now writes cleanup after successful admission, preserving all identity/kernel-completion checks.",
+  "limits": [
+    "Controlled supervisor/launch/resource fixtures use actual admission and protected audit APIs, not an actual VM/provider or complete kernel/source custody proof.",
+    "Final receipt rechecks detect callback-time mutation; they do not establish exclusion against arbitrary concurrent external writers. Complete C/R input/source/resource admission remains required.",
+    "The separate publication-gate WIP is not applied or validated here; its six prepared-body failures remain unresolved.",
+    "Productive preflight constructor, complete ordinary CLI/private Discord lifecycle, review, rollout, autonomous merges and fault/unattended soak remain unproven.",
+    "No production service, native policy, owner hold, allowance or deployment changed."
+  ],
+  "deployed": false,
+  "goal_complete": false
+}

@@ -2288,3 +2288,27 @@ Detailed source hashes, commands, receipts and limitations are in
 `1703-live-publication-yield-proof.json`. Current-head hosted CI/independent review,
 normal updater rollout, full live CLI/private Discord and shipment/fault/soak
 acceptance remain required under #1703.
+
+
+## 73. Refresh observations at the final supervisor release boundary
+
+The actual supervisor admission path previously validated resources and startup
+before model admission, then published `launch-continue` after model and native
+owner callbacks without refreshing those observations. Four behavioral RED cases
+reproduced release after resource/startup/selected-policy mutation and release of
+a VM preflight group through generic command admission.
+
+VM groups now require model admission; refusal consumes the original one-shot
+attempt. Current resources and startup/policy binding are refreshed before model
+accounting and again after the last dispatch callback, immediately before
+publishing the complete synced release marker. A failure after accounting retains
+the original charge. Seven new regression cases include precharge and postcharge
+dispatch changes; valid native and ordinary command releases remain covered.
+The command-quiescence fixture now records cleanup after successful admission,
+rather than treating a completed supervisor as releasable.
+
+These are current receipt/callback checks, not complete C/R custody or exclusion
+against concurrent external writers. They do not construct productive permission,
+promote a metadata logger, resolve the six preserved publication-gate failures or
+prove VM/provider/live deployment acceptance. Evidence and limits are in
+`1703-native-final-release-proof.json`.
