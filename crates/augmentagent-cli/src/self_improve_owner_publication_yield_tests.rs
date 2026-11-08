@@ -109,6 +109,11 @@ pub(super) async fn check(pending:OwnerPublicationGuard<'_>,state:&Path,candidat
     if paused {assert!(setup.is_none(),"metadata handoff cleared owner's pause");}
     else {
         let setup=Arc::new(setup.expect("uninterrupted publication never reached shared setup"));
+        if std::env::var("AUTOSHIP_INITIAL_GUARD_MODE").unwrap().contains("bootstrap-handoff") {
+            let events=store.events(id).unwrap();
+            assert!(store.owner_successor_bootstrap_persistence(setup.clone(),&setup_auth,millis()).is_err(),"bootstrap preceded actual native ownership setup");
+            assert_eq!(store.events(id).unwrap(),events);
+        }
         let transferred=run_successor_native_setup(&shared,state,candidate,setup.clone(),&setup_auth).unwrap();
         assert!(matches!(transferred,SuccessorNativeSetupRun::Outcome(durable::native_prepare::NativePreparationRun::Pending {
             outcome:augmentagent_channel_core::native_vm::ownership::TransferOutcome::Completed(_),settlement:Some(_),settlement_failed:false,..})),"{transferred:?}");
@@ -119,6 +124,79 @@ pub(super) async fn check(pending:OwnerPublicationGuard<'_>,state:&Path,candidat
         assert_eq!(store.owner_successor_native_facts(&setup,&setup_auth,millis()).unwrap().namespace().owner.lease_generation,setup.generation());
         let ordinary=Lease {workflow:id.into(),owner:"uninterrupted-successor-setup".into(),generation:setup.generation()};
         assert!(store.validate_dispatch(&ordinary,&before.checkpoint.binding,millis()).is_err(),"native setup became coding authority");
+        if std::env::var("AUTOSHIP_INITIAL_GUARD_MODE").unwrap().contains("bootstrap-handoff") {
+            let setup_auth=super::super::targeted::authorize_owner_successor(candidate,&setup_plan,policy).await.unwrap();
+            let usage=store.snapshot(id).unwrap().unwrap();
+            let facts=store.owner_successor_native_facts(&setup,&setup_auth,millis()).unwrap();
+            let preflight=existing_native_audit(state,facts.namespace(),Some(candidate),facts.original_binding()).unwrap();
+            let persistence=Arc::new(store.owner_successor_bootstrap_persistence(setup.clone(),&setup_auth,millis()).unwrap());
+            assert!(store.owner_successor_bootstrap_persistence(setup.clone(),&setup_auth,millis()).is_err(),
+                "same live setup minted two preparation controllers before either launch was journaled");
+            preflight.restrict_to_native_preflight(persistence.native_fence(shared.clone())).unwrap();
+            let mut opts=augmentagent_channel_core::reasoner::triage_opts(None);opts.cwd=Some(candidate.into());
+            opts.audit_logger=Some(preflight.clone());
+            let provider=match setup_plan.command().provider.unwrap() {durable::submission::Provider::Codex=>"codex",durable::submission::Provider::Claude=>"claude"};
+            let native=augmentagent_channel_core::native_session::Launch::Create {requested_id:None};
+            let bootstrap=augmentagent_channel_core::native_vm::NativeBootstrap::capture(&preflight).unwrap()
+                .prepare(provider,&opts,&tokio::process::Command::new("/usr/bin/false"),None,Some(&native)).unwrap();
+            let prepared=bootstrap.prepared_record().unwrap();
+            let append=durable::native_launch::verify_launch_append(&preflight,&prepared).unwrap();
+            assert!(store.record_verified_launch_append(&ordinary,&before.checkpoint.binding,&append,millis()).is_err(),"ordinary dispatch bypassed setup role");
+            persistence.check_external().unwrap();
+            let events=store.events(id).unwrap();let launches=store.native_launch_intents(id).unwrap();
+            for (point,definition) in [
+                ("generic_event","BEFORE INSERT ON workflow_event WHEN NEW.kind='native_launch_intent_recorded'"),
+                ("native_row","BEFORE INSERT ON workflow_native_launch"),
+                ("setup_context","BEFORE INSERT ON workflow_event WHEN NEW.kind='owner_successor_bootstrap_launch_recorded'"),
+            ] {
+                db.execute_batch(&format!("CREATE TRIGGER deny_bootstrap {definition} BEGIN SELECT RAISE(ABORT,'fixture {point}'); END;")).unwrap();
+                assert!(store.record_successor_bootstrap_launch(persistence.check_external().unwrap(),&append,millis()).is_err(),"{point} did not refuse");
+                assert_eq!(store.events(id).unwrap(),events,"{point} left half a journal");
+                assert_eq!(store.native_launch_intents(id).unwrap(),launches,"{point} left half a native record");
+                db.execute_batch("DROP TRIGGER deny_bootstrap").unwrap();
+            }
+            let recorded=store.record_successor_bootstrap_launch(persistence.check_external().unwrap(),&append,millis())
+                .expect("actual closed bootstrap cannot enter its durable setup launch journal");
+            assert_eq!(recorded.intent.intent_id,prepared.intent.intent_id);
+            let saved_events=store.events(id).unwrap();
+            assert_eq!(store.record_successor_bootstrap_launch(persistence.check_external().unwrap(),&append,millis()).unwrap(),recorded);
+            assert_eq!(store.events(id).unwrap(),saved_events,"same original bootstrap replay appended another event");
+            assert!(store.owner_successor_bootstrap_persistence(setup.clone(),&setup_auth,millis()).err().unwrap().to_string().contains("already has an original launch"));
+            let mut reopened=WorkflowStore::open(state).unwrap();
+            assert_eq!(reopened.record_successor_bootstrap_launch(persistence.check_external().unwrap(),&append,millis()).unwrap(),recorded);
+            assert_eq!(store.events(id).unwrap(),saved_events);
+            assert!(store.record_successor_bootstrap_launch(persistence.check_external().unwrap(),&append,millis()+300_001).is_err());
+            let (context_seq,context_raw):(i64,String)=db.query_row("SELECT seq,payload FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='owner_successor_bootstrap_launch_recorded'",rusqlite::params![id,setup.generation()],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            let original:serde_json::Value=serde_json::from_str(&context_raw).unwrap();
+            for field in ["version","request_id","native_sha256","setup","extra"] {
+                let mut changed=original.clone();
+                match field {
+                    "version"=>changed["version"]=99.into(),
+                    "setup"=>changed["setup"]["sha256"]="a".repeat(64).into(),
+                    "extra"=>changed["extra"]=true.into(),
+                    _=>changed[field]="substituted".into(),
+                }
+                let raw=serde_json::to_string(&changed).unwrap();
+                db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![context_seq,raw]).unwrap();
+                assert!(store.record_successor_bootstrap_launch(persistence.check_external().unwrap(),&append,millis()).is_err(),"changed {field} was accepted");
+                assert!(persistence.native_fence(shared.clone())().is_err(),"changed {field} left native preflight live");
+                assert_eq!(db.query_row("SELECT payload FROM workflow_event WHERE seq=?1",[context_seq],|r|r.get::<_,String>(0)).unwrap(),raw);
+                db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![context_seq,context_raw]).unwrap();
+            }
+            db.execute("UPDATE workflow_event SET kind='fixture_missing_bootstrap_context' WHERE seq=?1",[context_seq]).unwrap();
+            assert!(store.record_successor_bootstrap_launch(persistence.check_external().unwrap(),&append,millis()).is_err(),"native row recreated missing bootstrap ancestry");
+            db.execute("UPDATE workflow_event SET kind='owner_successor_bootstrap_launch_recorded' WHERE seq=?1",[context_seq]).unwrap();
+            db.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) SELECT workflow,generation,kind,payload,at_ms FROM workflow_event WHERE seq=?1",[context_seq]).unwrap();
+            let duplicate=db.last_insert_rowid();
+            assert!(store.record_successor_bootstrap_launch(persistence.check_external().unwrap(),&append,millis()).is_err(),"duplicate bootstrap ancestry was accepted");
+            db.execute("DELETE FROM workflow_event WHERE seq=?1",[duplicate]).unwrap();
+            assert_eq!(store.events(id).unwrap(),saved_events);
+            let after=store.snapshot(id).unwrap().unwrap();
+            assert_eq!((after.attempts,after.wall_ms,after.model_calls,after.tokens,after.generation,after.lease_until_ms),
+                (usage.attempts,usage.wall_ms,usage.model_calls,usage.tokens,usage.generation,usage.lease_until_ms));
+            assert!(preflight.dispatch_allowed().is_err());assert!(preflight.model_call_admitted(provider).is_err());
+            drop(bootstrap);
+        }
     }
     assert_eq!(db.query_row("SELECT record FROM workflow_owner_publication_intent WHERE workflow=?1",[id],|r|r.get::<_,String>(0)).unwrap(),intent);
     assert_eq!(db.query_row("SELECT record FROM workflow_owner_preparation WHERE request_id=?1",[&request],|r|r.get::<_,String>(0)).unwrap(),preparation);

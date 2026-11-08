@@ -4351,6 +4351,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successor_closed_bootstrap_has_authorized_durable_launch_journal() {
+        let mut modes=Vec::new();
+        for provider in ["","claude-"] {for kind in ["initial","revision"] {
+            modes.push(format!("owner-early-acceptance-producer-{provider}bootstrap-handoff-publication-{kind}"));
+        }}
+        owner_metadata_recovery_modes(&modes.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
     async fn completed_live_publication_yields_to_authenticated_metadata_without_expiry() {
         let mut modes=Vec::new();
         for provider in ["","claude-"] {for paused in ["","paused-"] {for kind in ["initial","revision"] {
@@ -4721,11 +4730,16 @@ else: raise SystemExit('unexpected authority call')
         let bootstrap=native.join("authority-bootstrap.json");
         std::fs::write(&bootstrap,serde_json::to_vec(&serde_json::json!({"version":1,"epoch":uuid::Uuid::new_v4().to_string(),"root_identity_sha256":root_identity})).unwrap()).unwrap();
         std::fs::set_permissions(&bootstrap,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mode=std::env::var(MODE).unwrap();
+        let profiles=if mode.contains("bootstrap-handoff") {
+            std::env::set_var("AUGMENTAGENT_RUN_RESOURCES","1");
+            serde_json::json!({"codex":{"gateway":{},"auth_file":null,"auth_relative":".codex/auth.json"},
+                "claude":{"gateway":{},"auth_file":null,"auth_relative":".claude.json"}})
+        }else {serde_json::json!({})};
         let policy=control.join("policy.json");
         std::fs::write(&policy,serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/unused-runtime","guest_runtime":"/unused-guest",
-            "state_root":native,"memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,"providers":{}})).unwrap()).unwrap();
+            "state_root":native,"memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,"providers":profiles})).unwrap()).unwrap();
         std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
-        let mode=std::env::var(MODE).unwrap();
         struct GuardRepo {root:tempfile::TempDir,candidate:Option<PathBuf>}
         impl GuardRepo {fn path(&self)->&Path {self.candidate.as_deref().unwrap_or_else(||self.root.path())}}
         let root=repo();

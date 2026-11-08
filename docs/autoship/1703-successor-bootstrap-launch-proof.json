@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "base_head": "33629bc6de5d58820288fa05ae979f97b8823b48",
+  "component": "Record one original closed native preparation under the actual successor setup authority.",
+  "source_sha256": {
+    "crates/augmentagent-channel-core/src/native_vm.rs": "5fa7e0313301ce63b0b28a6445b03c36d39fcfe5ca95d5a8a4016bfee3e7664d",
+    "crates/augmentagent-channel-core/src/tool_audit.rs": "2b80bf1a9b718298bf75d1effc312cc6a4087f5e6a6349e3478459b9a28f2073",
+    "crates/augmentagent-cli/src/autoship_native_launch.rs": "9ed8f8797754bd7a86527d496494ccd4d82b5b9e00e0c1d4b59cfb219b670373",
+    "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs": "eca9788ad751a61cc0628914f6f1d5282b4b901d59bd1da93f2af1ac35ef39df",
+    "crates/augmentagent-cli/src/autoship_owner_successor_claim.rs": "bea0108510ad5dcf1ae70e6f411d4bd0d7183061758e29f66a4ee8d5a907f655",
+    "crates/augmentagent-cli/src/autoship_owner_successor_native.rs": "c40682c1e446b218c91da8c75ca269bcbabe9d63d224c1758bc990d4f5184810",
+    "crates/augmentagent-cli/src/self_improve_owner_publication_yield_tests.rs": "0d921ced26049bdb521a0e673244ee51c811028d937eccdb8460e5becb8fbcc7",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "63a8b0962bd268052c766e56d79f95919ef0f5cca9f197418cde6615d1b024f4",
+    "crates/augmentagent-cli/src/autoship_owner_successor_bootstrap.rs": "cddb3e89c55968c6738240ebceb2f66710b1c8a0aa67671ba9e63e806309a66c"
+  },
+  "evidence": {
+    "ordinary_setup_writer_red": {
+      "path": "/tmp/autoship-1703-successor-bootstrap-journal-red-20261108.log",
+      "sha256": "63da98882ed71ffd3781f833044a966982830703b047c01d928718cd6d255f7f"
+    },
+    "duplicate_controller_red": {
+      "path": "/tmp/autoship-1703-successor-bootstrap-controller-red-20261108.log",
+      "sha256": "59db1cd7953301b7d3b4fe450b768a884ebc86fb55a2adc43647b2fbf869cef4"
+    },
+    "duplicate_preparation_red": {
+      "path": "/tmp/autoship-1703-bootstrap-duplicate-preparation-red-20261108.log",
+      "sha256": "112889098cbf373bffa80b7bef4a4ca9dcd65aa39f344f2d1a88076e2e91bf1e"
+    },
+    "core_final": {
+      "path": "/tmp/autoship-1703-successor-bootstrap-core-final-20261108.log",
+      "sha256": "8812c1cd5c6e18ab8503e247ce2b8be2cdbc823e14092b90cd4070d4468802bd"
+    },
+    "workflow_final": {
+      "path": "/tmp/autoship-1703-successor-bootstrap-journal-validation-final-20261108.log",
+      "sha256": "1b0e0841766deb0831c08eb9670920b4b4d66734ff02a0b119d52a2d5a6ecb14"
+    },
+    "production": {
+      "path": "/tmp/autoship-1703-successor-bootstrap-journal-production-20261108.log",
+      "sha256": "f46db5a381f9cf0d6a9fca9855a15108cc04cb1c9b57874b2f375a183f183b7b"
+    }
+  },
+  "tdd": [
+    "The first actual protected closed preparation failed at the ordinary journal writer with owner-successor-setup-only. That refusal remains; the new typed setup writer records only descriptive launch intent.",
+    "A second behavioral RED reproduced two preparation controllers minted from the same actual live setup before either recorded a launch. The live setup now issues one controller.",
+    "A third behavioral RED reproduced a second native preparation from the same preflight controller. The logger now claims its original preparation attempt before constructor I/O; retained clones share that claim."
+  ],
+  "validation": {
+    "core_passed": 314,
+    "core_failed": 0,
+    "core_preexisting_systemd_test_ignored": 1,
+    "workflow_and_integration_passed": 341,
+    "workflow_failed": 0,
+    "workflow_ignored": 0,
+    "new_provider_acceptance_cases": 4,
+    "existing_publication_handoff_cases": 8,
+    "production_compile_passed": true
+  },
+  "invariants": [
+    "The controller comes from an actual opaque setup and fresh original-owner authorization, after original native ownership settlement. Existing body reservations require their separate preservation path.",
+    "Metadata recovery, setup preparation and productive execution remain distinct. Ordinary dispatch/model admission still refuse; no raw lease or saved record constructs this controller.",
+    "A consumed configuration-check token and actual protected append lookup precede the immediate workflow transaction. The writer acquires no native/audit lock inside that transaction.",
+    "The normal and setup writers share descriptive native insertion; each establishes its own authority first. There is no ignore-publication or skip-review flag.",
+    "The native record and bounded strict setup ancestry event commit together. Failure at generic event, native row or setup event rolls every half back.",
+    "Unknown/substituted/duplicate/missing ancestry, wrong original source, changed pin, stale authority and extra unclassified setup launches refuse. A native row cannot recreate a missing setup event.",
+    "Reopening the database with the original retained live capability replays the same intent without another event. A recorded attempt cannot mint a replacement controller.",
+    "Snapshot attempts/wall/model/token usage, lease/generation, original acceptance/preparation, queued instructions, owner controls and shipping allowance are preserved. Full native retained-session demand is not discounted."
+  ],
+  "limits": [
+    "Controlled original publication/native/acceptance fixtures and a stubbed GitHub authority exercise real protected APIs. No guest VM, provider/model, real Discord send or autonomous merge runs.",
+    "The new setup authority and journal are exercised by the integration fixture; normal worker/CLI owner intake is not connected to a production preflight-controller producer.",
+    "Actual closed supervisor/resource inspection, complete C/R source/resource/input qualification, protected storage/result retention and the consuming productive transition remain required. The launch journal is not nonrelease, cleanup or execution proof.",
+    "Database reopen retains the original live capabilities; it does not establish reconstruction after worker restart or automatic recovery of every partial constructor outcome.",
+    "The shared publication-gate WIP remains at local commit f3298779ccb3e3dc968c8363f01e8f5827262d0c, not applied here. Its six prepared-body failures remain unresolved.",
+    "Historical closed-source outcomes, repeated reservation/model/input/result/continuation and full private coding/followup lifecycle remain incomplete.",
+    "Final-head trusted CI/independent review, normal rollout, original live CLI/private Discord, five autonomous merges and fault/unattended soak remain unproven.",
+    "No production service, policy, retained demand, owner hold or allowance changed. The separate 16 GiB proposal remains unapplied."
+  ],
+  "deployed": false,
+  "productive_owner_admission_complete": false,
+  "goal_complete": false
+}

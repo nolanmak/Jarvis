@@ -321,6 +321,7 @@ pub struct AuditLogger {
     // Monotonic for this original logger and every clone; observer replacement
     // cannot promote metadata reconciliation into productive execution.
     restricted_admission: Arc<std::sync::RwLock<Option<RestrictedAdmission>>>,
+    native_bootstrap_claimed:Arc<std::sync::atomic::AtomicBool>,
     run_resources_required: Arc<std::sync::atomic::AtomicBool>,
     native_runtime_owner: Arc<std::sync::Mutex<Option<crate::native_vm::RuntimeOwner>>>,
     owner_input:Arc<std::sync::Mutex<OwnerInputState>>,
@@ -835,6 +836,17 @@ impl AuditLogger {
             *mode=Some(RestrictedAdmission::NativePreflight(current));
         }
         self.native_preflight_current()
+    }
+    pub(crate) fn native_bootstrap_available(&self)->anyhow::Result<()> {
+        self.native_preflight_current()?;
+        anyhow::ensure!(!self.native_bootstrap_claimed.load(std::sync::atomic::Ordering::Acquire),
+            "native bootstrap preparation already attempted; reconcile original launch");Ok(())
+    }
+    pub(crate) fn claim_native_bootstrap(&self)->anyhow::Result<()> {
+        self.native_preflight_current()?;
+        anyhow::ensure!(self.native_bootstrap_claimed.compare_exchange(false,true,
+            std::sync::atomic::Ordering::AcqRel,std::sync::atomic::Ordering::Acquire).is_ok(),
+            "native bootstrap preparation already attempted; reconcile original launch");Ok(())
     }
     pub(crate) fn native_preflight_current(&self)->anyhow::Result<()> {
         let current=match self.restricted_admission.read().map_err(|_|anyhow::anyhow!("restricted admission lock poisoned"))?.clone() {
@@ -1407,6 +1419,7 @@ impl AuditLogger {
             model_call_observer: Arc::new(std::sync::Mutex::new(None)),
             dispatch_observer: Arc::new(std::sync::Mutex::new(None)),
             restricted_admission: Arc::new(std::sync::RwLock::new(None)),
+            native_bootstrap_claimed:Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resource_capacity_observer: Arc::new(std::sync::Mutex::new(None)),
             resource_capacity_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             run_resources_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),

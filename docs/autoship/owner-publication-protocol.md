@@ -2344,3 +2344,39 @@ identity nor this preparation object grants a body/model/input permit. The six
 preserved shared-gate failures remain unresolved. Seven focused functions cover
 both provider pins; source hashes, RED distinctions, fixture corrections and
 validation limits are in `1703-closed-native-bootstrap-proof.json`.
+
+
+## 75. Original successor preparation intent (setup component implemented)
+
+After actual native ownership setup, fresh original-owner authorization and the
+opaque live `SuccessorSetup` can produce one preparation controller for an
+unreserved request. The live setup issues this controller once. The native logger
+also claims one actual constructor attempt before private preparation I/O, shared
+across retained clones. Neither marker is native absence or permission to rebuild
+an interrupted attempt; the original effect still needs recovery qualification.
+
+A consumed configuration-check token and protected launch-append verification
+precede the short SQL writer. A transaction-borrowed opaque context admits the
+existing descriptive native launch record and a strict version-1 setup ancestry
+event together. It binds the original request/setup reference, generation,
+original native namespace/store, checkpoint, provider pin and exact native record.
+The setup event is bounded to 16 KiB and 1,024 entries per workflow; current setup
+admits one classified launch. Missing, substituted, unknown or duplicate ancestry
+holds. A native row cannot recreate its missing setup context. Retained original
+capabilities replay the same record after database reopen without another event;
+this does not reconstruct live authority after a process restart.
+
+The ordinary writer still refuses setup-only generations. No productive predicate
+is relaxed. The new writer records intent rather than input exposure, cleanup or
+model/body permission. Three rollback windows, strict history refusals, stale
+admission, original replay, accounting/control preservation and both one-shot
+failures are exercised through actual protected APIs for both provider pins and
+initial/revised acceptance. Detailed RED/green evidence and limits are in
+`1703-successor-bootstrap-launch-proof.json`.
+
+Normal owner ingress still needs the production controller bridge, actual closed
+supervisor/resource inspection, complete C/R source/resource/input qualification
+and the consuming productive constructor. Partial constructor outcomes, reserved
+bodies and repeated cycles require their actual recovery paths. The six saved
+publication-gate failures and all original live/rollout/review/soak acceptance
+requirements remain open. No production configuration or service changed.

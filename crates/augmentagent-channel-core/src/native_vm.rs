@@ -603,7 +603,7 @@ pub(crate) struct Launch {
 pub struct NativeBootstrap<'a> {logger:&'a std::sync::Arc<crate::tool_audit::AuditLogger>}
 impl<'a> NativeBootstrap<'a> {
     pub fn capture(logger:&'a std::sync::Arc<crate::tool_audit::AuditLogger>)->Result<Self> {
-        logger.native_preflight_current()?;Ok(Self {logger})
+        logger.native_bootstrap_available()?;Ok(Self {logger})
     }
     pub(crate) fn check_logger(&self,logger:&crate::tool_audit::AuditLogger)->Result<()> {
         ensure!(std::ptr::eq(self.logger.as_ref(),logger),"native bootstrap original logger changed");
@@ -613,6 +613,10 @@ impl<'a> NativeBootstrap<'a> {
         bridge:Option<&crate::codex_tools::BridgeLaunch>,native:Option<&crate::native_session::Launch>)->Result<ClosedNativeBootstrap> {
         ensure!(matches!(provider,"claude"|"codex") && matches!(native,Some(crate::native_session::Launch::Create {..})),
             "closed bootstrap requires an initial pinned native launch");
+        self.check_logger(opts.audit_logger.as_ref().context("native bootstrap original logger missing")?)?;
+        // Claim before constructor I/O. Failure keeps the original attempt
+        // consumed across every retained logger clone; never retry by UUID.
+        self.logger.claim_native_bootstrap()?;
         let launch=Launch::prepare_with_admission(provider,opts,original,bridge,native,PreparationAdmission::Bootstrap(self))?;
         Ok(ClosedNativeBootstrap {launch,_controller:self.logger.clone()})
     }
@@ -1508,6 +1512,13 @@ mod tests {
                     assert!(NativeBootstrap::capture(&logger).is_err());
                 } else {
                     let bootstrap=result.unwrap();
+                    if mode=="bootstrap" {
+                        let repeated=crate::native_session::Launch::Create {requested_id:None};
+                        let second=authority.prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&repeated));
+                        assert!(second.is_err(),"same preflight controller started a second native preparation");
+                        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1,"repeat preparation left another protected intent");
+                        assert!(NativeBootstrap::capture(&std::sync::Arc::new(logger.as_ref().clone())).is_err(),"a retained logger clone reset preparation ownership");
+                    }
                     let prepared=bootstrap.prepared_record().unwrap();
                     assert_eq!(prepared,saved.lock().unwrap()[0]);
                     assert!(logger.native_launch_prepared(&prepared.intent).is_err(),"bootstrap used ordinary native publication");

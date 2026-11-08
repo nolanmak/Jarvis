@@ -5,7 +5,7 @@ use augmentagent_channel_core::native_vm::ownership::{Authority,MetadataNativeOw
 use std::sync::{Arc,Mutex};
 use crate::autoship_workflow::owner_publication::OwnerPublicationNativeFacts;
 
-fn original(conn:&Connection,setup:&SuccessorSetup)->Result<Original> {
+pub(super) fn original(conn:&Connection,setup:&SuccessorSetup)->Result<Original> {
     let (claim,reference)=source(conn,&setup.record.workflow,setup.record.ready_generation)?;
     ensure!(reference==setup.record.recovery,"successor original recovery changed");
     Ok(claim.original)

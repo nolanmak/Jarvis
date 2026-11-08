@@ -5,6 +5,9 @@ mod native;
 pub(crate) use native::{SuccessorPreparationRead,metadata_fence as successor_native_metadata_fence};
 #[path="autoship_owner_successor_transfer.rs"]
 mod transfer;
+#[path="autoship_owner_successor_bootstrap.rs"]
+mod bootstrap;
+pub(crate) use bootstrap::{SuccessorBootstrapPersistence,SuccessorBootstrapJournalContext};
 #[path="autoship_owner_successor_retry.rs"]
 mod retry;
 pub(crate) use transfer::{SuccessorNativePersistence,SnapshotContext as SuccessorNativeSnapshotContext};
@@ -31,7 +34,9 @@ struct Record {
 }
 /// Acquired only by the successful CAS. No Clone/serde/raw lease/turn/logger.
 /// Process loss cannot reconstruct this object from its descriptive journal.
-pub(crate) struct SuccessorSetup {record:Record,reference:RecordRef}
+pub(crate) struct SuccessorSetup {record:Record,reference:RecordRef,
+    bootstrap_controller_issued:std::sync::atomic::AtomicBool,
+}
 impl SuccessorSetup {
     pub(crate) fn workflow_id(&self)->&str {&self.record.workflow}
     pub(crate) fn generation(&self)->i64 {self.record.setup.generation}
@@ -148,7 +153,7 @@ impl WorkflowStore {
         tx.execute("DELETE FROM review WHERE workflow=?1",[&record.workflow])?;tx.execute("DELETE FROM review_fragment WHERE workflow=?1",[&record.workflow])?;
         let reference=RecordRef {sequence,sha256:hash};ensure!(read(&tx,&record.workflow)?.is_some_and(|(_,r)|r==reference),"successor setup claim append changed");
         owner_revision::validate_history(&tx,&record.workflow)?;history(&tx,&record.workflow)?;
-        tx.commit()?;Ok(Some(SuccessorSetup {record,reference}))
+        tx.commit()?;Ok(Some(SuccessorSetup {record,reference,bootstrap_controller_issued:std::sync::atomic::AtomicBool::new(false)}))
     }
     pub(crate) fn validate_owner_successor_setup(&self,setup:&SuccessorSetup,authorization:&crate::self_improve::targeted::AuthorizedOwnerSuccessor<'_>,now:i64)->Result<()> {
         require_authorized_setup(&self.conn,setup,authorization,now)

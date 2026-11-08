@@ -32,7 +32,7 @@ mod successor_ready;
 pub(crate) use successor_ready::ReadySettlement;
 #[path="autoship_owner_successor_claim.rs"]
 mod successor_claim;
-pub(crate) use successor_claim::{SuccessorPlan,SuccessorSetup,SuccessorPreparationRead,successor_native_metadata_fence,SuccessorNativePersistence,SuccessorNativeSnapshotContext};
+pub(crate) use successor_claim::{SuccessorBootstrapPersistence,SuccessorBootstrapJournalContext,SuccessorPlan,SuccessorSetup,SuccessorPreparationRead,successor_native_metadata_fence,SuccessorNativePersistence,SuccessorNativeSnapshotContext};
 
 /// Selection data only; the worker must acquire fresh original-owner authority.
 /// This combines existing recovery debt and preparation scheduling in the

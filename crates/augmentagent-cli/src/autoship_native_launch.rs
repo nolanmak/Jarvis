@@ -149,49 +149,7 @@ impl WorkflowStore {
         require_native_dispatch_tx(&tx,lease,binding,now)?;
         let (audit,native_binding)=original_context(&tx,&lease.workflow,lease.generation,true)?;
         if let Some((expected_audit,expected_binding))=expected {ensure!(audit==expected_audit && native_binding==binding_digest(expected_binding)?,"native launch original context changed after verification");}
-        let prior: Option<IndexedRecord>=tx.query_row(&format!("SELECT {COLUMNS} FROM workflow_native_launch WHERE intent_id=?1"),
-            [&intent.intent_id],indexed).optional()?;
-        if let Some(prior)=prior {
-            let record=decode_record(&tx,prior)?;
-            ensure!(record.workflow_id==lease.workflow && record.source_owner.lease_generation==lease.generation
-                && record.workflow_binding==*binding && record.intent==*intent
-                && record.source_audit_path==audit && record.original_native_binding_sha256==native_binding,
-                "native launch intent is immutable");
-            tx.commit()?;return Ok(record);
-        }
-        let provider=provider_name(intent.provider);
-        // A retained path cannot silently refer to another physical creation.
-        let previous: Option<IndexedRecord>=tx.query_row(&format!("SELECT {COLUMNS} FROM workflow_native_launch WHERE workflow=?1 AND provider=?2 AND runtime_relative_path=?3 ORDER BY sequence LIMIT 1"),
-            params![lease.workflow,provider,intent.runtime_relative_path],indexed).optional()?;
-        if let Some(previous)=previous {
-            let previous=decode_record(&tx,previous)?;
-            ensure!(previous.original_native_binding_sha256==native_binding
-                && previous.intent.creation_receipt_sha256==intent.creation_receipt_sha256,
-                "native launch runtime creation changed");
-        }
-        if let Some(session)=&intent.native_session_id {
-            let owner: Option<String>=tx.query_row("SELECT workflow FROM workflow_native_session_owner WHERE provider=?1 AND native_session=?2",
-                params![provider,session],|row|row.get(0)).optional()?;
-            ensure!(owner.as_ref().is_none_or(|owner|owner==&lease.workflow),"native launch session belongs to another workflow");
-            let previous: Option<IndexedRecord>=tx.query_row(&format!("SELECT {COLUMNS} FROM workflow_native_launch WHERE provider=?1 AND native_session=?2 ORDER BY sequence LIMIT 1"),
-                params![provider,session],indexed).optional()?;
-            if let Some(previous)=previous {
-                let previous=decode_record(&tx,previous)?;
-                ensure!(previous.workflow_id==lease.workflow && previous.intent.runtime_relative_path==intent.runtime_relative_path
-                    && previous.original_native_binding_sha256==native_binding,"native launch session moved between runtimes");
-            }
-            tx.execute("INSERT INTO workflow_native_session_owner VALUES(?1,?2,?3) ON CONFLICT DO NOTHING",params![provider,session,lease.workflow])?;
-        }
-        event(&tx,&lease.workflow,lease.generation,"native_launch_intent_recorded",
-            &serde_json::json!({"provider":provider,"launch_sha256":intent.launch_sha256}).to_string(),now)?;
-        let sequence: i64=tx.query_row("SELECT MAX(seq) FROM workflow_event WHERE workflow=?1",[&lease.workflow],|row|row.get(0))?;
-        let record=NativeLaunchRecord {version:1,workflow_id:lease.workflow.clone(),sequence,
-            source_owner:RuntimeOwner {workflow_id:lease.workflow.clone(),lease_generation:lease.generation},
-            source_audit_path:audit,workflow_binding:binding.clone(),original_native_binding_sha256:native_binding,
-            intent:intent.clone(),recorded_at_ms:now};
-        let raw=serde_json::to_string(&record)?;ensure!(raw.len()<=16384,"native launch journal record exceeds bound");
-        tx.execute("INSERT INTO workflow_native_launch VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![intent.intent_id,lease.workflow,sequence,lease.generation,provider,intent.runtime_relative_path,intent.native_session_id,raw])?;
+        let record=append_intent(&tx,&lease.workflow,lease.generation,binding,intent,&audit,&native_binding,now)?;
         tx.commit()?;Ok(record)
     }
 
@@ -199,6 +157,74 @@ impl WorkflowStore {
     pub fn native_launch_intents(&self, workflow: &str) -> Result<Vec<NativeLaunchRecord>> {
         history(&self.conn, workflow)
     }
+}
+
+/// The borrowed context is constructed only inside the authenticated setup TX.
+/// This records a closed preparation; it supplies no native/model dispatch.
+pub(super) fn append_successor_bootstrap(
+    context:&super::owner_publication_recovery::SuccessorBootstrapJournalContext<'_,'_,'_>,
+    append:&VerifiedLaunchAppend,now:i64,
+)->Result<NativeLaunchRecord> {
+    let namespace=context.namespace();
+    ensure!(append.prepared.intent.source_owner==namespace.owner
+        && append.prepared.intent.source_audit_path==Path::new(&namespace.audit_path)
+        && append.original_binding==*context.original_binding(),"bootstrap launch protected source changed");
+    let (audit,binding)=original_context(context.connection(),&namespace.owner.workflow_id,namespace.owner.lease_generation,true)?;
+    ensure!(audit==namespace.audit_path && binding==binding_digest(&append.original_binding)?,"bootstrap launch original SQL context changed");
+    append_intent(context.transaction(),&namespace.owner.workflow_id,namespace.owner.lease_generation,
+        context.binding(),&append.intent,&audit,&binding,now)
+}
+
+/// Shared descriptive insertion only. Both callers must first establish their
+/// distinct authority inside the same immediate transaction.
+fn append_intent(tx:&Transaction<'_>,workflow:&str,generation:i64,binding:&Binding,
+    intent:&NativeLaunchIntent,audit:&str,native_binding:&str,now:i64)->Result<NativeLaunchRecord> {
+    intent.validate()?;ensure!(now>=0,"invalid native launch time");
+    let prior: Option<IndexedRecord>=tx.query_row(&format!("SELECT {COLUMNS} FROM workflow_native_launch WHERE intent_id=?1"),
+        [&intent.intent_id],indexed).optional()?;
+    if let Some(prior)=prior {
+        let record=decode_record(tx,prior)?;
+        ensure!(record.workflow_id==workflow && record.source_owner.lease_generation==generation
+            && record.workflow_binding==*binding && record.intent==*intent
+            && record.source_audit_path==audit && record.original_native_binding_sha256==native_binding,
+            "native launch intent is immutable");
+        return Ok(record);
+    }
+    let provider=provider_name(intent.provider);
+    // A retained path cannot silently refer to another physical creation.
+    let previous: Option<IndexedRecord>=tx.query_row(&format!("SELECT {COLUMNS} FROM workflow_native_launch WHERE workflow=?1 AND provider=?2 AND runtime_relative_path=?3 ORDER BY sequence LIMIT 1"),
+        params![workflow,provider,intent.runtime_relative_path],indexed).optional()?;
+    if let Some(previous)=previous {
+        let previous=decode_record(tx,previous)?;
+        ensure!(previous.original_native_binding_sha256==native_binding
+            && previous.intent.creation_receipt_sha256==intent.creation_receipt_sha256,
+            "native launch runtime creation changed");
+    }
+    if let Some(session)=&intent.native_session_id {
+        let owner: Option<String>=tx.query_row("SELECT workflow FROM workflow_native_session_owner WHERE provider=?1 AND native_session=?2",
+            params![provider,session],|row|row.get(0)).optional()?;
+        ensure!(owner.as_ref().is_none_or(|owner|owner==&workflow),"native launch session belongs to another workflow");
+        let previous: Option<IndexedRecord>=tx.query_row(&format!("SELECT {COLUMNS} FROM workflow_native_launch WHERE provider=?1 AND native_session=?2 ORDER BY sequence LIMIT 1"),
+            params![provider,session],indexed).optional()?;
+        if let Some(previous)=previous {
+            let previous=decode_record(tx,previous)?;
+            ensure!(previous.workflow_id==workflow && previous.intent.runtime_relative_path==intent.runtime_relative_path
+                && previous.original_native_binding_sha256==native_binding,"native launch session moved between runtimes");
+        }
+        tx.execute("INSERT INTO workflow_native_session_owner VALUES(?1,?2,?3) ON CONFLICT DO NOTHING",params![provider,session,workflow])?;
+    }
+    event(tx,&workflow,generation,"native_launch_intent_recorded",
+        &serde_json::json!({"provider":provider,"launch_sha256":intent.launch_sha256}).to_string(),now)?;
+    let sequence: i64=tx.query_row("SELECT MAX(seq) FROM workflow_event WHERE workflow=?1",[&workflow],|row|row.get(0))?;
+    let record=NativeLaunchRecord {version:1,workflow_id:workflow.to_owned(),sequence,
+        source_owner:RuntimeOwner {workflow_id:workflow.to_owned(),lease_generation:generation},
+        source_audit_path:audit.to_owned(),workflow_binding:binding.clone(),original_native_binding_sha256:native_binding.to_owned(),
+        intent:intent.clone(),recorded_at_ms:now};
+    let raw=serde_json::to_string(&record)?;ensure!(raw.len()<=16384,"native launch journal record exceeds bound");
+    tx.execute("INSERT INTO workflow_native_launch VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![intent.intent_id,workflow,sequence,generation,provider,intent.runtime_relative_path,intent.native_session_id,raw])?;
+    Ok(record)
+
 }
 
 pub(super) fn history(conn: &Connection, workflow: &str) -> Result<Vec<NativeLaunchRecord>> {
