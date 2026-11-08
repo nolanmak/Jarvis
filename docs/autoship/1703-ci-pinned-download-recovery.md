@@ -53,7 +53,7 @@ controlled provisioning exists. No required suite or merge signal is waived.
 
 Local validation on 2026-11-08:
 
-- 64 CI contract/planner/storage/VM/download regression tests pass, including
+- 66 CI contract/planner/storage/VM/download regression tests pass, including
   RED-to-GREEN tests that binary outages reach independent sources and corrupt
   source bytes never reach the compiler or publish a completed installation.
 - All three real pinned binary archives pass installation/executable smoke
@@ -71,6 +71,12 @@ Local validation on 2026-11-08:
   headers; the new regression failed before that declaration and passes after.
   System dependency versions follow the runner's signed Ubuntu repositories;
   immutable binary/source artifact pins and smoke checks remain mandatory.
+- The exporter job now explicitly runs `python39 --verify-source` in a private
+  hosted prefix, after its required compatibility tests. This compiles the
+  pinned PSF source and checks the complete required extension set even when
+  binary downloads or tool-cache lookup succeed. It has the same five-minute
+  step bound and explicit controlled-provisioning declaration; local host setup
+  is refused. Its first hosted result remains unproven.
 - Final exact-head hosted results with header provisioning remain pending; earlier hosted results above
   are evidence of the missing fallback, not approval of the final change.
 - Affected execution workflows use read-only contents permission and checkout

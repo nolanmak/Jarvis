@@ -11,6 +11,13 @@
       "body": "python3 -m unittest discover -s scripts/apple-notes/tests -v",
       "shell": "bash"
     },
+    "apple-notes/exporter/4": {
+      "body": "python3 scripts/ci-pinned-tools.py python39 --verify-source",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pinned-tool-release"
+      ]
+    },
     "bridge-suites/bridge-suites/1": {
       "body": "sudo apt-get -o Acquire::Retries=3 update\nsudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends \\\n  poppler-utils libseccomp2 ripgrep python3-packaging python3-yaml openssl\n",
       "shell": "bash"
@@ -1014,12 +1021,17 @@
             },
             {
               "command_id": "apple-notes/exporter/3"
+            },
+            {
+              "command_id": "apple-notes/exporter/4",
+              "name": "Verify pinned Python source fallback",
+              "timeout-minutes": 5
             }
           ]
         }
       },
       "role": "validation",
-      "sha256": "e61d265d71d54e43a13c06a5406f9591bf512f73874e7fd8c883423e6ed0a80f"
+      "sha256": "5bc76db36b34f9f211d6005a854a53fbca8659bb336b124c47aec3fd91b479b1"
     },
     ".github/workflows/autonomous-code-scanner.yml": {
       "reason": "scheduled autonomous scanner and issue reporting",

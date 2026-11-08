@@ -198,7 +198,24 @@ def provision(tool):
   finish_cache(tool,target,complete)
  print(f'Provisioned {tool} {version} from SHA-256 verified release bytes',flush=True)
 
+def verify_python39_source():
+ """Exercise the real source path in a private hosted prefix, even on cache hits."""
+ if os.environ.get('GITHUB_ACTIONS')!='true' or platform.system()!='Linux' or platform.machine()!='x86_64':
+  raise RuntimeError('Source verification requires an isolated GitHub Linux x64 job')
+ if 'VERSION_ID="24.04"' not in Path('/etc/os-release').read_text():
+  raise RuntimeError('Source verification requires Ubuntu 24.04')
+ with tempfile.TemporaryDirectory(prefix='python-source-canary-',dir=Path(os.environ['RUNNER_TEMP'])) as temporary:
+  stage=Path(temporary);target=stage/'python'
+  build_python39(target,stage)
+  finish_cache('python39',target,stage/'python.complete')
+ print('Pinned Python source fallback verified in a private hosted prefix',flush=True)
+
 if __name__=='__main__':
  parser=argparse.ArgumentParser(description=__doc__)
  parser.add_argument('tool',choices=PINS)
- provision(parser.parse_args().tool)
+ parser.add_argument('--verify-source',action='store_true',help='Verify Python source fallback in a private hosted prefix')
+ args=parser.parse_args()
+ if args.verify_source:
+  if args.tool!='python39':parser.error('--verify-source requires python39')
+  verify_python39_source()
+ else:provision(args.tool)
