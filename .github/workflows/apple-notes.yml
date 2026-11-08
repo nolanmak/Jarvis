@@ -37,3 +37,6 @@ jobs:
         with:
           python-version: '3.9.25'
       - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id apple-notes/exporter/3"
+      - name: Verify pinned Python source fallback
+        timeout-minutes: 5
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id apple-notes/exporter/4"

@@ -54,7 +54,7 @@ class WorkflowTests(unittest.TestCase):
  def test_python39_source_jobs_provision_required_headers_before_building(self):
   root=Path(__file__).resolve().parents[2]
   contract=json.loads((root/'scripts/ci-contract.json').read_text())
-  commands=[row for row in contract['commands'].values() if 'python3 scripts/ci-pinned-tools.py python39' in row['body']]
+  commands=[row for row in contract['commands'].values() if row['body'].splitlines()[-1]=='python3 scripts/ci-pinned-tools.py python39']
   self.assertEqual(len(commands),3)
   required={'libbz2-dev','libffi-dev','liblzma-dev','libsqlite3-dev','libssl-dev','zlib1g-dev'}
   for row in commands:
@@ -64,6 +64,18 @@ class WorkflowTests(unittest.TestCase):
    self.assertTrue(required.issubset(set(install.split())),install)
    self.assertLess(body.index(install),body.index('python3 scripts/ci-pinned-tools.py python39'))
    self.assertEqual(row['vm_provisioning'],['pinned-tool-release'])
+ def test_exporter_checks_the_source_path_with_controlled_provisioning(self):
+  root=Path(__file__).resolve().parents[2];contract=json.loads((root/'scripts/ci-contract.json').read_text())
+  job=contract['workflows']['.github/workflows/apple-notes.yml']['jobs']['exporter']
+  checks=[step for step in job['steps'] if 'command_id' in step and '--verify-source' in contract['commands'][step['command_id']]['body']]
+  self.assertEqual(len(checks),1,'hosted source fallback is never exercised')
+  step=checks[0];self.assertEqual(step['timeout-minutes'],5)
+  self.assertEqual(contract['commands'][step['command_id']]['vm_provisioning'],['pinned-tool-release'])
+  self.assertNotIn('continue-on-error',step)
+ def test_source_verification_refuses_local_host_setup(self):
+  with patch.dict(os.environ,{'GITHUB_ACTIONS':'false'}),patch.object(tools,'build_python39') as build:
+   with self.assertRaisesRegex(RuntimeError,'GitHub'):tools.verify_python39_source()
+   build.assert_not_called()
  def test_completed_cache_reuses_without_download_or_mutation(self):
   with tempfile.TemporaryDirectory() as d:
    cache=Path(d)/'deno/2.7.14';cache.mkdir(parents=True);(cache/'x64').mkdir();(cache/'x64.complete').touch()
