@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "component": "physical native recovery-context index migration",
+  "status": "validated-prerequisite-v1-only-not-repeated-cycle-activation",
+  "base_commit": "b3bdf0a5f483452047fb67edbcafe98abcf2d8a9",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_recovery_context_index.rs": "93015a425c6cd718b0a41f1bf541a0c9b256680ac6ab2267fb140442635c8e2f",
+    "crates/augmentagent-cli/src/autoship_workflow.rs": "ef129d696e240331947b4e78bc4b86c7500c0b44aa6115c2d6d80ff55ff49b66",
+    "crates/augmentagent-cli/src/autoship_owner_recovery_native_intent.rs": "3556ceeb7a7cdf93afe1bd40f6fd56c998f3b6d9b4fe3dcf5c8b707133601703",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "986d41a2520a55a33e0a12ca02c77bb7f4d028c1923b6e18085a8df9701e40c0"
+  },
+  "implementation": [
+    "Move the physical key from workflow/request to workflow/generation while retaining unique workflow/transfer UUID and both unique original event references. Existing eight column values, JSON bytes, hashes and event records are copied unchanged.",
+    "Recognize only the exact known legacy/current schema token structure. Refuse custom indexes, triggers and incoming foreign keys, including SQLite-preserved uppercase names. Unknown type/column/constraint shapes do not become supported through whitespace normalization.",
+    "Perform schema creation, copy, replacement and commit in the original BEGIN IMMEDIATE. Retain the ordinary protected allocation claim until commit or connection-close rollback, including copy failure and unknown commit replies. Reserve a conservative four existing database images plus 1 MiB for copy/index/WAL growth through the shared admission service, retaining the configured floor and other live writers' claims.",
+    "The v1 journal explicitly refuses repeated original requests. The physical key does not authorize another recovery cycle, model call, body release or replacement UUID."
+  ],
+  "red_evidence": [
+    {
+      "log": "/tmp/autoship-recovery-context-index-red-fixed-fixture-20261108.log",
+      "result": "Both initial tests failed: old request-wide key remained and unsupported legacy extensions were accepted."
+    },
+    {
+      "log": "/tmp/autoship-recovery-context-schema-token-red-20261108.log",
+      "result": "A T EXT column type incorrectly matched TEXT when all whitespace was stripped; token-preserving matching fixes it."
+    },
+    {
+      "log": "/tmp/autoship-recovery-context-schema-case-red-20261108.log",
+      "result": "An uppercase-referenced trigger was missed by exact-case metadata matching."
+    },
+    {
+      "log": "/tmp/autoship-recovery-context-zero-floor-red-20261108.log",
+      "result": "Saturating subtraction waived required growth with a zero configured floor; checked subtraction refuses insufficient capacity."
+    }
+  ],
+  "final_validation": [
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent recovery_context_index::tests -- --nocapture",
+      "log": "/tmp/autoship-recovery-context-index-acceptance-20261108.log",
+      "passed": 5,
+      "failed": 0,
+      "seconds": 0.6,
+      "covers": [
+        "verbatim migration and idempotent reopen",
+        "8 unsupported/corrupted legacy-schema cases with atomic preservation",
+        "allocation lifetime across failed copy/rollback",
+        "abrupt process exit before commit and after commit without acknowledgement",
+        "space floor, zero-floor demand, other-writer reservation and overflow boundaries"
+      ]
+    },
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent owner_recovery_native_intent_is_atomic_and_replayable -- --nocapture",
+      "log": "/tmp/autoship-recovery-context-native-acceptance-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "seconds": 7.1,
+      "providers": [
+        "codex",
+        "claude"
+      ],
+      "covers": [
+        "actual existing protected native-intent fixture survives legacy-table conversion/reopen with identical record, event, hash and transfer UUID",
+        "actual v1 reader refuses two legacy contexts after the physical key expands",
+        "existing rollback and lost-commit-ack assertions remain enabled"
+      ]
+    },
+    {
+      "command": "scripts/cargo-managed.sh build -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-recovery-context-production-acceptance-20261108.log",
+      "passed": true
+    }
+  ],
+  "broad_validation": {
+    "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent autoship_workflow:: -- --nocapture",
+    "log": "/tmp/autoship-recovery-context-store-suite-final-20261108.log",
+    "passed": 329,
+    "failed": 0,
+    "seconds": 170.51,
+    "scope": "Ran before final case-fold and zero-floor hardening. Those final localized changes passed the focused migration tests, actual both-provider fixture and production compile above; exact new-head hosted CI remains required."
+  },
+  "limits": [
+    "This is the physical-index prerequisite only. Versioned cycle/purpose links, predecessor/disposition readers and constructors, reserved body/model/input/result integration and productive repeated recovery remain incomplete.",
+    "The unit migration rows are opaque fixtures; the integrated native histories and authority responses are controlled fixtures, not live provider/Discord/VM or full C/R source/resource/input acceptance.",
+    "No production DB, runtime, policy, session, hold, charge or merge allowance changed. The 8 GiB native-state policy remains unchanged pending the owner decision.",
+    "Independent exact-head review, normal updater rollout and the complete original CLI/Discord/merge/fault/soak acceptance remain required."
+  ],
+  "all_original_local_handles_terminal": true,
+  "production_capacity_changed": false,
+  "productive_recovery_granted": false
+}

@@ -5058,6 +5058,26 @@ else: raise SystemExit('unexpected authority call')
                                 }
                                 assert_eq!(store.events(&id).unwrap(),events);
                                 let context:(i64,i64,String,String)=db.query_row("SELECT pending_sequence,sequence,record_sha256,record FROM workflow_owner_recovery_native_intent WHERE workflow=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+                                durable::recovery_context_index::install_legacy_fixture(&db).unwrap();
+                                drop(WorkflowStore::open(&state).unwrap());
+                                assert_eq!(db.query_row("SELECT pending_sequence,sequence,record_sha256,record FROM workflow_owner_recovery_native_intent WHERE workflow=?1",[&id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).unwrap(),context,"migration changed actual original native intent");
+                                match store.prepare_owner_recovery_native_intent(&recovery,&authorization,&facts,scan,millis()) {
+                                    durable::owner_publication_recovery::RecoveryNativeIntentPersistence::Durable(receipt)=>assert_eq!(receipt.transfer_id(),expected),_=>panic!("migrated original native intent did not replay"),
+                                }
+                                assert_eq!(store.events(&id).unwrap(),events,"schema migration appended authority history");
+                                // The expanded physical key is not permission
+                                // to infer a second cycle from legacy records.
+                                let duplicate=uuid::Uuid::new_v4().to_string();
+                                db.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,?2,'fixture_untrusted_pending','fixture',1)",rusqlite::params![id,recovery.generation()+1]).unwrap();
+                                let duplicate_pending=db.last_insert_rowid();
+                                db.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,?2,'owner_recovery_native_intent_recorded','fixture',1)",rusqlite::params![id,recovery.generation()+1]).unwrap();
+                                let duplicate_event=db.last_insert_rowid();
+                                db.execute("INSERT INTO workflow_owner_recovery_native_intent SELECT workflow,request_id,?2,generation+1,?3,?4,record_sha256,record FROM workflow_owner_recovery_native_intent WHERE workflow=?1 AND transfer_id=?5",rusqlite::params![id,duplicate,duplicate_pending,duplicate_event,expected]).unwrap();
+                                let error=store.read_owner_recovery_native_intent(&recovery,&authorization,millis()).err().expect("legacy duplicate context was accepted");
+                                assert!(format!("{error:#}").contains("legacy recovery context cannot imply a repeated cycle"),"{error:#}");
+                                db.execute("DELETE FROM workflow_owner_recovery_native_intent WHERE workflow=?1 AND transfer_id=?2",rusqlite::params![id,duplicate]).unwrap();
+                                db.execute("DELETE FROM workflow_event WHERE seq IN (?1,?2)",rusqlite::params![duplicate_pending,duplicate_event]).unwrap();
+                                assert_eq!(store.events(&id).unwrap(),events);
                                 db.execute("DELETE FROM workflow_owner_recovery_native_intent WHERE workflow=?1",[&id]).unwrap();
                                 assert!(store.read_owner_recovery_native_intent(&recovery,&authorization,millis()).is_err());
                                 assert!(matches!(store.prepare_owner_recovery_native_intent(&recovery,&authorization,&facts,scan,millis()),durable::owner_publication_recovery::RecoveryNativeIntentPersistence::Unknown {..}),"lost context was treated as no pending");

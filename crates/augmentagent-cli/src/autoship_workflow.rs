@@ -6,6 +6,8 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
+#[path="autoship_recovery_context_index.rs"]
+pub(crate) mod recovery_context_index;
 
 #[path = "autoship_merge_allowance.rs"]
 mod merge_allowance;
@@ -454,7 +456,7 @@ impl WorkflowStore {
                 workflow TEXT NOT NULL REFERENCES workflow(id),request_id TEXT NOT NULL,transfer_id TEXT NOT NULL,
                 generation INTEGER NOT NULL,pending_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
                 sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),record_sha256 TEXT NOT NULL,record TEXT NOT NULL,
-                PRIMARY KEY(workflow,request_id),UNIQUE(workflow,transfer_id),UNIQUE(workflow,generation));
+                PRIMARY KEY(workflow,generation),UNIQUE(workflow,transfer_id));
             CREATE TABLE IF NOT EXISTS workflow_owner_recovery_blocked (
                 workflow TEXT NOT NULL REFERENCES workflow(id),
                 sequence INTEGER PRIMARY KEY REFERENCES workflow_event(seq),
@@ -698,7 +700,16 @@ impl WorkflowStore {
                 workflow TEXT NOT NULL, sequence INTEGER NOT NULL, payload TEXT NOT NULL,
                 created_at INTEGER NOT NULL, delivery_state TEXT NOT NULL DEFAULT 'queued',
                 PRIMARY KEY(workflow,sequence));
-            COMMIT;")?;
+            ")?;
+        let mut migration_space=None;
+        let initialized=recovery_context_index::migrate(&conn,path,&mut migration_space)
+            .and_then(|()|{conn.execute_batch("COMMIT")?;Ok(())});
+        if let Err(error)=initialized {
+            // Roll back/close SQLite while any migration growth is still
+            // reserved. A lost COMMIT acknowledgement never releases early.
+            drop(conn);
+            return Err(error);
+        }
         Ok(Self { conn })
     }
 

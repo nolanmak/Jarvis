@@ -46,9 +46,10 @@ fn history(conn:&Connection,workflow:&str)->Result<Vec<(ContextRecord,PendingNat
     let claims=journal(conn,workflow)?;
     let mut query=conn.prepare("SELECT request_id,transfer_id,generation,pending_sequence,sequence,record_sha256,substr(record,1,16385),length(CAST(record AS BLOB)) FROM workflow_owner_recovery_native_intent WHERE workflow=?1 ORDER BY sequence LIMIT 1025")?;
     let rows=query.query_map([workflow],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,i64>(7)?)))?;
-    let mut result=Vec::new();
+    let mut result=Vec::new();let mut legacy_requests=std::collections::BTreeSet::new();
     for row in rows {
         let (request,id,generation,pending_sequence,sequence,sha,raw,len)=row?;
+        ensure!(legacy_requests.insert(request.clone()),"legacy recovery context cannot imply a repeated cycle");
         ensure!(result.len()<1024 && (1..=16384).contains(&len) && raw.len() as i64==len && digest(&raw)==sha,"recovery native context exceeds bound or changed");
         let context:ContextRecord=serde_json::from_str(&raw)?;
         let index=claims.iter().position(|(_,reference)|*reference==context.claim).context("recovery native context claim missing")?;
