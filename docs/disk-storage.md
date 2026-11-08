@@ -57,6 +57,28 @@ set to their supervisor and VM, rather than reopening lock paths. Canceling the
 manager cannot release a surviving descendant's inherited exclusions; failed
 spawn closes the exported duplicates without retaining a nonexistent worker.
 
+Python brokers must explicitly forward the open descriptors through each
+`subprocess.Popen` hop; its default descriptor handling closes them even when
+lease environment metadata is inherited:
+
+```python
+raw = (os.environ.get("JARVIS_STORAGE_LEASE_FDS")
+       or os.environ.get("JARVIS_STORAGE_LEASE_FD", ""))
+fds = tuple(int(value) for value in raw.split(",") if value)
+child = subprocess.Popen(argv, pass_fds=fds)
+```
+
+This example inherits the matching environment as well. A broker that constructs
+its own child environment must preserve the descriptor metadata with those same
+open descriptions. Missing or stale descriptors must refuse launch; clearing the
+metadata or reopening lock paths does not preserve the original lease. Exercise
+broker tests through the managed wrapper, including controller death and
+verification that the lease stays held until descendant cleanup completes.
+
+For managed `disk build` commands, export ownership commits when the OS spawn
+succeeds, before waiting for the worker. Cancellation while waiting preserves
+that export. A later failed spawn cannot reset an earlier worker's ownership.
+
 Repository `cargo-managed.sh` tool requests map to managed Cargo inside the VM;
 they never execute a candidate-controlled host wrapper. Deterministic host gates
 and explicit host/legacy builders retain verified target leases and parent-proof
