@@ -55,6 +55,12 @@ class WorkflowTests(unittest.TestCase):
    cache=Path(d)/'deno/2.7.14';cache.mkdir(parents=True);(cache/'x64').mkdir();(cache/'x64.complete').touch()
    with patch.dict(os.environ,{'GITHUB_ACTIONS':'true','RUNNER_TEMP':d,'RUNNER_TOOL_CACHE':d}),patch.object(tools.platform,'system',return_value='Linux'),patch.object(tools.platform,'machine',return_value='x86_64'),patch.object(tools,'download') as download:
     tools.provision('deno');download.assert_not_called()
+ def test_python_uses_setup_actions_agent_tools_directory(self):
+  with tempfile.TemporaryDirectory() as d:
+   cache=Path(d)/'agent/Python/3.9.25';cache.mkdir(parents=True);(cache/'x64').mkdir();(cache/'x64.complete').touch()
+   with patch.dict(os.environ,{'GITHUB_ACTIONS':'true','RUNNER_TEMP':d,'RUNNER_TOOL_CACHE':d+'/other','AGENT_TOOLSDIRECTORY':d+'/agent'}),patch.object(tools.platform,'system',return_value='Linux'),patch.object(tools.platform,'machine',return_value='x86_64'),patch.object(Path,'read_text',return_value='VERSION_ID="24.04"'),patch.object(tools,'download') as download:
+    tools.provision('python39');download.assert_not_called()
+   self.assertFalse((Path(d)/'other').exists())
  def test_incomplete_cache_is_preserved_and_refused(self):
   with tempfile.TemporaryDirectory() as d:
    cache=Path(d)/'deno/2.7.14/x64';cache.mkdir(parents=True);(cache/'owned').write_text('keep')

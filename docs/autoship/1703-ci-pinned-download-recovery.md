@@ -26,7 +26,7 @@ silently marked passed or skipped. Required suites and merge signals are unchang
 
 Validation on 2026-11-08:
 
-- 60 CI contract, planner, storage, VM and pinned-download regression tests pass.
+- 61 CI contract, planner, storage, VM and pinned-download regression tests pass.
 - All three real, previously downloaded hash-pinned archives pass installation
   and executable smoke tests in a disposable simulated runner cache.
 - That CPython 3.9.25 passes all 91 Apple Notes exporter tests.

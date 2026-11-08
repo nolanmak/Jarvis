@@ -77,7 +77,9 @@ def provision(tool):
  if tool=='python39' and 'VERSION_ID="24.04"' not in Path('/etc/os-release').read_text():
   raise RuntimeError('Pinned Python artifact requires Ubuntu 24.04')
  if tool!='gitleaks':
-  root=Path(os.environ['RUNNER_TOOL_CACHE'])/('deno' if tool=='deno' else 'Python')/version
+  # setup-python prefers AGENT_TOOLSDIRECTORY; setup-deno uses RUNNER_TOOL_CACHE.
+  cache=os.environ.get('AGENT_TOOLSDIRECTORY','').strip() if tool=='python39' else ''
+  root=Path(cache or os.environ['RUNNER_TOOL_CACHE'])/('deno' if tool=='deno' else 'Python')/version
   target=root/'x64';complete=root/'x64.complete'
   if target.is_dir() and complete.is_file():return
   # Never replace an incomplete installation belonging to a different step.
