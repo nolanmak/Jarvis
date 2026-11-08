@@ -17,6 +17,7 @@ capacity=importlib.util.module_from_spec(spec);spec.loader.exec_module(capacity)
 
 class CapacityPolicyTests(unittest.TestCase):
     def setUp(self):
+        """Create a private legacy-store fixture with retained data and original locks."""
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name);self.state=self.root/'state';self.state.mkdir(mode=0o700)
         for path in (self.root/'provision.lock',self.state/'state.lock'):
@@ -35,15 +36,18 @@ class CapacityPolicyTests(unittest.TestCase):
         self.path.write_text(json.dumps(self.value));self.path.chmod(0o600)
 
     def snapshot(self):
+        """Observe fixture file contents to detect unintended writes or deletion."""
         return {str(p.relative_to(self.root)):p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
 
     def test_preview_preserves_every_live_file_and_makes_no_grant(self):
+        """Verify preview leaves every fixture file and execution permission unchanged."""
         before=self.snapshot();p=capacity.update(self.path,16*1024**3)
         self.assertEqual(self.snapshot(),before)
         self.assertFalse(p['policy_applied']);self.assertFalse(p['execution_authorized'])
         self.assertEqual(p['memory_mb'],1024);self.assertEqual(p['max_sessions'],16)
 
     def test_explicit_hash_bound_apply_changes_only_capacity_and_replays_once(self):
+        """Verify an approved update preserves other state and replay does not increase again."""
         p=capacity.update(self.path,16*1024**3);before=self.snapshot()
         result=capacity.update(self.path,16*1024**3,apply=True,expected_source=p['source_sha256'],expected_candidate=p['candidate_sha256'])
         self.assertTrue(result['policy_applied'])
@@ -54,12 +58,14 @@ class CapacityPolicyTests(unittest.TestCase):
         self.assertTrue(again['already_applied']);self.assertFalse(again['policy_applied'])
 
     def test_apply_requires_both_reviewed_hashes(self):
+        """Refuse absent or mismatched approval hashes without changing fixture files."""
         before=self.snapshot()
         for source,candidate in ((None,None),('a'*64,None),(None,'a'*64),('a'*64,'b'*64)):
             with self.assertRaises(capacity.Hold):capacity.update(self.path,16*1024**3,apply=True,expected_source=source,expected_candidate=candidate)
         self.assertEqual(self.snapshot(),before)
 
     def test_bound_or_unknown_state_never_uses_legacy_apply(self):
+        """Refuse legacy apply when the store declares binding-aware authority."""
         p=capacity.update(self.path,16*1024**3)
         self.state.joinpath('authority-epoch.json').write_text('{}')
         before=self.snapshot()
@@ -67,12 +73,14 @@ class CapacityPolicyTests(unittest.TestCase):
         self.assertEqual(self.snapshot(),before)
 
     def test_shrink_or_unchanged_limit_is_refused(self):
+        """Keep unchanged and reduced budgets outside the supported increase operation."""
         before=self.snapshot()
         for size in (0,4*1024**3,8*1024**3):
             with self.assertRaises(capacity.Hold):capacity.update(self.path,size)
         self.assertEqual(self.snapshot(),before)
 
     def test_both_original_locks_are_required_without_creating_replacements(self):
+        """Refuse either busy original lock without creating new coordination files."""
         for path in (self.root/'provision.lock',self.state/'state.lock'):
             before=self.snapshot()
             with path.open('r+b') as lock:
@@ -81,6 +89,7 @@ class CapacityPolicyTests(unittest.TestCase):
             self.assertEqual(self.snapshot(),before)
 
     def test_new_ledger_without_epoch_marker_is_not_treated_as_legacy(self):
+        """Refuse an unfamiliar schema even when its epoch marker is missing."""
         with sqlite3.connect(self.db) as db:db.execute('CREATE TABLE native_transfer(id TEXT)')
         p=capacity.update(self.path,16*1024**3);self.assertFalse(p['apply_supported'])
         before=self.snapshot()
@@ -88,6 +97,7 @@ class CapacityPolicyTests(unittest.TestCase):
         self.assertEqual(self.snapshot(),before)
 
     def test_reviewed_source_changes_are_refused_and_never_overwritten(self):
+        """Preserve an intervening policy edit after the owner reviewed an older source."""
         p=capacity.update(self.path,16*1024**3)
         altered=dict(self.value,memory_mb=2048);self.path.write_text(json.dumps(altered))
         before=self.snapshot()
@@ -95,14 +105,17 @@ class CapacityPolicyTests(unittest.TestCase):
         self.assertEqual(self.snapshot(),before)
 
     def test_publication_error_before_replace_keeps_original_and_cleans_only_own_temp(self):
+        """Verify a pre-commit I/O failure preserves the policy and removes only owned staging."""
         p=capacity.update(self.path,16*1024**3);before=self.snapshot()
         with mock.patch.object(capacity.os,'replace',side_effect=OSError(errno.EIO,'fixture')):
             with self.assertRaises(OSError):capacity.update(self.path,16*1024**3,apply=True,expected_source=p['source_sha256'],expected_candidate=p['candidate_sha256'])
         self.assertEqual(self.snapshot(),before)
 
     def test_directory_sync_failure_retains_published_policy_and_uncertainty_on_retry(self):
+        """Keep publication uncertainty until both the file and directory sync can succeed."""
         p=capacity.update(self.path,16*1024**3);fsync=os.fsync
         def fail_directory(fd):
+            """Inject a directory durability failure after real file sync."""
             if os.path.isdir(f'/proc/self/fd/{fd}'):raise OSError(errno.EIO,'fixture')
             fsync(fd)
         with mock.patch.object(capacity.os,'fsync',side_effect=fail_directory):
@@ -113,13 +126,17 @@ class CapacityPolicyTests(unittest.TestCase):
         self.assertTrue(result['already_applied']);self.assertFalse(result['policy_applied'])
 
     def test_lost_rename_response_never_claims_original_policy_survived(self):
+        """Verify a committed rename with lost response is reported as uncertain."""
         p=capacity.update(self.path,16*1024**3);replace=os.replace
-        def lost_response(*args,**kwargs):replace(*args,**kwargs);raise OSError(errno.EIO,'lost acknowledgement')
+        def lost_response(*args,**kwargs):
+            """Commit the actual rename before simulating a lost acknowledgement."""
+            replace(*args,**kwargs);raise OSError(errno.EIO,'lost acknowledgement')
         with mock.patch.object(capacity.os,'replace',side_effect=lost_response):
             with self.assertRaises(capacity.PublicationUnknown):capacity.update(self.path,16*1024**3,apply=True,expected_source=p['source_sha256'],expected_candidate=p['candidate_sha256'])
         self.assertEqual(json.loads(self.path.read_bytes())['max_state_bytes'],16*1024**3)
 
     def test_policy_and_lock_symlinks_are_refused(self):
+        """Prevent policy or coordination links from redirecting the owner command."""
         for path in (self.path,self.root/'provision.lock',self.state/'state.lock'):
             saved=path.with_name(path.name+'.fixture-original');path.rename(saved);path.symlink_to(saved)
             before=self.snapshot()
@@ -128,12 +145,14 @@ class CapacityPolicyTests(unittest.TestCase):
             path.unlink();saved.rename(path)
 
     def test_duplicate_policy_fields_are_refused_without_rewrite(self):
+        """Reject duplicate JSON keys without rewriting ambiguous source evidence."""
         self.path.write_text(self.path.read_text()[:-1]+',"max_state_bytes":8589934592}')
         before=self.snapshot()
         with self.assertRaises(capacity.Hold):capacity.update(self.path,16*1024**3)
         self.assertEqual(self.snapshot(),before)
 
     def test_real_cli_defaults_to_preview_and_emits_no_provider_configuration(self):
+        """Exercise the actual CLI preview and its restricted public projection."""
         before=self.snapshot()
         result=subprocess.run([sys.executable,str(Path(__file__).with_name('native-capacity-policy.py')),
             '--policy',str(self.path),'--max-state-bytes',str(16*1024**3)],capture_output=True,text=True)
@@ -142,6 +161,7 @@ class CapacityPolicyTests(unittest.TestCase):
         self.assertEqual(self.snapshot(),before)
 
     def test_temporary_name_collision_never_deletes_existing_file(self):
+        """Preserve a pre-existing file when staging cannot create its own pathname."""
         p=capacity.update(self.path,16*1024**3)
         other=self.root/'.capacity-policy-fixture';other.write_bytes(b'not this invocation');other.chmod(0o600)
         before=self.snapshot()
@@ -150,9 +170,11 @@ class CapacityPolicyTests(unittest.TestCase):
         self.assertEqual(self.snapshot(),before)
 
     def test_replaced_temporary_file_is_not_published_or_deleted(self):
+        """Preserve a substituted staging file and refuse publishing it as the approved policy."""
         p=capacity.update(self.path,16*1024**3);original=self.path.read_bytes();fsync=os.fsync
         temporary=self.root/'.capacity-policy-fixture'
         def replace_after_sync(fd):
+            """Substitute the staging pathname while its original inode remains held."""
             fsync(fd)
             if os.readlink(f'/proc/self/fd/{fd}')==str(temporary):
                 temporary.rename(self.root/'fixture-original-retained')
@@ -163,10 +185,12 @@ class CapacityPolicyTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(),original);self.assertTrue(temporary.exists())
 
     def test_replay_does_not_confirm_a_policy_replaced_during_sync(self):
+        """Retain uncertainty when a matching target disappears during confirmation."""
         p=capacity.update(self.path,16*1024**3)
         capacity.update(self.path,16*1024**3,apply=True,expected_source=p['source_sha256'],expected_candidate=p['candidate_sha256'])
         fsync=os.fsync;changed=False
         def replace_during_confirmation(fd):
+            """Replace the selected policy while the retry syncs its prior inode."""
             nonlocal changed
             fsync(fd)
             if not changed and os.readlink(f'/proc/self/fd/{fd}')==str(self.path):
@@ -178,14 +202,17 @@ class CapacityPolicyTests(unittest.TestCase):
         self.assertTrue(changed);self.assertEqual(json.loads(self.path.read_bytes())['max_state_bytes'],32*1024**3)
 
     def test_file_sync_capacity_failure_keeps_original_and_releases_staging(self):
+        """Preserve the original policy when staged file sync reports no space."""
         p=capacity.update(self.path,16*1024**3);before=self.snapshot()
         with mock.patch.object(capacity.os,'fsync',side_effect=OSError(errno.ENOSPC,'fixture')):
             with self.assertRaises(OSError):capacity.update(self.path,16*1024**3,apply=True,expected_source=p['source_sha256'],expected_candidate=p['candidate_sha256'])
         self.assertEqual(self.snapshot(),before)
 
     def test_replaced_original_lock_prevents_publication(self):
+        """Refuse publication after the held native lock loses its original pathname."""
         p=capacity.update(self.path,16*1024**3);original=self.path.read_bytes();fsync=os.fsync;changed=False
         def replace_lock_after_stage(fd):
+            """Replace the native lock after staging to test loss of coordination."""
             nonlocal changed
             fsync(fd)
             if not changed and '/.capacity-policy-' in os.readlink(f'/proc/self/fd/{fd}'):
@@ -196,6 +223,7 @@ class CapacityPolicyTests(unittest.TestCase):
         self.assertTrue(changed);self.assertEqual(self.path.read_bytes(),original)
 
     def test_wal_mode_without_sidecars_cannot_make_preview_create_them(self):
+        """Verify unsupported WAL mode cannot make a read-only preview create sidecars."""
         db=sqlite3.connect(self.db)
         try:self.assertEqual(db.execute('PRAGMA journal_mode=WAL').fetchone(),('wal',))
         finally:db.close()
@@ -207,6 +235,7 @@ class CapacityPolicyTests(unittest.TestCase):
         self.assertEqual(self.snapshot(),before,'read-only preview created SQLite WAL/SHM files')
 
     def test_pending_wal_schema_is_refused_without_ignoring_its_authority(self):
+        """Keep pending WAL schema authority intact instead of reading only the base database."""
         db=sqlite3.connect(self.db)
         try:
             db.execute('PRAGMA journal_mode=WAL');db.execute('CREATE TABLE native_transfer(id TEXT)');db.commit()

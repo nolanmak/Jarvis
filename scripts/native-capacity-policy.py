@@ -23,20 +23,27 @@ class PublicationUnknown(Hold):pass
 
 
 def require(value,reason):
+    """Refuse an unsafe operation with a bounded public reason code."""
     if not value:raise Hold(reason)
 
 
-def identity(info):return (info.st_dev,info.st_ino,info.st_uid,info.st_gid,info.st_mode,info.st_nlink)
-def digest(data):return hashlib.sha256(data).hexdigest()
+def identity(info):
+    """Capture inode, owner and link metadata for later object-identity checks."""
+    return (info.st_dev,info.st_ino,info.st_uid,info.st_gid,info.st_mode,info.st_nlink)
+def digest(data):
+    """Fingerprint exact policy bytes without returning their private contents."""
+    return hashlib.sha256(data).hexdigest()
 
 
 def owned(info,directory=False,limit=2*1024**2):
+    """Check the expected private owner, node kind, link count and size bound."""
     return ((stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
         and info.st_uid==os.geteuid() and not info.st_mode&0o077
         and (directory or info.st_nlink==1 and info.st_size<=limit))
 
 
 def private(parent,name):
+    """Read one pinned private file and refuse link, size or identity changes."""
     descriptor=os.open(name,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
     with os.fdopen(descriptor,'rb') as stream:
         before=os.fstat(stream.fileno());require(owned(before),'policy-not-private')
@@ -48,6 +55,7 @@ def private(parent,name):
 
 
 def no_duplicates(pairs):
+    """Reject ambiguous JSON fields before deriving an approved candidate."""
     result={}
     for key,value in pairs:
         require(key not in result,'duplicate-policy-field');result[key]=value
@@ -55,6 +63,7 @@ def no_duplicates(pairs):
 
 
 def state_format(state):
+    """Classify the locked legacy ledger without creating or ignoring sidecars."""
     try:os.stat('authority-epoch.json',dir_fd=state,follow_symlinks=False)
     except FileNotFoundError:pass
     else:return 'binding-aware'
@@ -83,6 +92,7 @@ def state_format(state):
 
 
 def update(path,requested,*,apply=False,expected_source=None,expected_candidate=None):
+    """Preview or explicitly publish one approved capacity increase while retaining state."""
     require(type(apply) is bool,'invalid-operation')
     require(type(requested) is int and 0<requested<=2**64-1,'invalid-capacity')
     if apply:
@@ -92,6 +102,7 @@ def update(path,requested,*,apply=False,expected_source=None,expected_candidate=
     require(path.is_absolute() and path.name=='policy.json' and path.parent.resolve()==path.parent,'managed-policy-path-required')
     with ExitStack() as stack:
         def descriptor(name,*,parent=None,directory=False):
+            """Open an existing private coordination object and retain its descriptor."""
             flags=(os.O_RDONLY if directory else os.O_RDWR)|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK
             if directory:flags|=os.O_DIRECTORY
             fd=os.open(name,flags,dir_fd=parent);stack.callback(os.close,fd)
@@ -105,6 +116,7 @@ def update(path,requested,*,apply=False,expected_source=None,expected_candidate=
             except BlockingIOError:raise Hold('native-policy-busy') from None
             locks.append((parent,name,fd))
         def check_context():
+            """Recheck original private directories and coordination-file identities."""
             require(owned(os.fstat(root),directory=True) and owned(os.fstat(state),directory=True)
                 and identity(os.fstat(root))==identity(path.parent.lstat())
                 and identity(os.fstat(state))==identity((path.parent/'state').lstat()),'managed-state-changed')
@@ -112,6 +124,7 @@ def update(path,requested,*,apply=False,expected_source=None,expected_candidate=
                 require(owned(os.fstat(fd)) and identity(os.fstat(fd))==identity(os.stat(name,dir_fd=parent,follow_symlinks=False)),
                     'original-native-policy-lock-changed')
         def confirm(expected):
+            """Sync and re-read the approved policy, retaining uncertainty if its context changed."""
             try:
                 os.fsync(root)
                 observed,_=private(root,'policy.json')
@@ -186,6 +199,7 @@ def update(path,requested,*,apply=False,expected_source=None,expected_candidate=
 
 
 def main():
+    """Parse explicit owner options and emit bounded results with typed exit codes."""
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--policy',type=Path,required=True)
     parser.add_argument('--max-state-bytes',type=int,required=True)
