@@ -26,6 +26,11 @@ struct Measurements {
 }
 
 impl Report {
+    /// Observed boundary identity including exhaustion. This is scheduling
+    /// data, not availability, reclamation proof or an admission capability.
+    pub fn observed_fingerprint(&self)->Option<&str> {
+        self.measurements.as_ref().map(|m|m.capacity_fingerprint.as_str())
+    }
     /// Scheduling evidence only, available after all observed storage boundaries
     /// permit a fresh session. This is never a runtime admission capability.
     pub fn available_fingerprint(&self)->Option<&str> {

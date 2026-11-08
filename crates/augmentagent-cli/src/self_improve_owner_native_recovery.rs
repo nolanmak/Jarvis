@@ -6,6 +6,9 @@ use augmentagent_channel_core::native_vm::ownership::{self, *};
 #[derive(Debug)]
 pub(super) enum OwnerRecoveryNativeRun {
     Current,
+    PreparationDeferred {
+        gate: durable::owner_publication_recovery::PreparationRetryGate,
+    },
     Reconciled {
         transfer_id: String,
         result: durable::native_reconcile::ReconciliationRun,
@@ -98,6 +101,22 @@ pub(super) fn recover_owner_native_handoff(
             Ok(())
         })?;
         return Ok(OwnerRecoveryNativeRun::Current);
+    }
+    // Observe native/configuration dependencies outside the workflow mutex.
+    // Unknown capacity does not wake a known unchanged retry.
+    let environment = durable::owner_publication_recovery::PreparationEnvironment::observe()?;
+    let gate = store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("recovery retry store poisoned"))?
+        .owner_recovery_native_retry_gate(
+            &recovery,
+            authorization,
+            &facts,
+            &environment,
+            millis(),
+        )?;
+    if gate != durable::owner_publication_recovery::PreparationRetryGate::Ready {
+        return Ok(OwnerRecoveryNativeRun::PreparationDeferred { gate });
     }
     let workflow = facts.namespace().owner.workflow_id.clone();
     let binding = store
@@ -196,6 +215,17 @@ pub(super) fn recover_owner_native_handoff(
                 staged.is_none() && attempted.is_none(),
                 "native preparation lost its original intent disposition"
             );
+            store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recovery retry write store poisoned"))?
+                .defer_owner_recovery_native_preparation(
+                    &recovery,
+                    authorization,
+                    &facts,
+                    &environment,
+                    &failure,
+                    millis(),
+                )?;
             Ok(OwnerRecoveryNativeRun::NoPending { failure })
         }
         PreparedTransferResult::PersistenceUnknown { reason, .. } => {

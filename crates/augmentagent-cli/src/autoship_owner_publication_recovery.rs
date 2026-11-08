@@ -16,6 +16,11 @@ pub(crate) fn test_legacy_input_blocker_encoding(raw:&str)->Result<String> {inpu
 #[path="autoship_owner_recovery_native_intent.rs"]
 mod native_intent;
 pub(crate) use native_intent::RecoveryNativeIntentPersistence;
+#[path="autoship_owner_recovery_retry.rs"]
+mod preparation_retry;
+pub(crate) use preparation_retry::{PreparationEnvironment,PreparationRetryGate};
+#[cfg(test)]
+pub(crate) fn test_preparation_retry_encoding(raw:&str)->Result<String> {preparation_retry::fixture_encoding(raw)}
 pub(crate) use blocked::RecoveryBlockedState;
 #[path="autoship_owner_successor_ready.rs"]
 mod successor_ready;

@@ -6,7 +6,7 @@ pub use super::owner_outcome::{
     validate_owner_binding, with_initial_owner_binding, TransferBinding, TransferFenceError,
     TransferObservation, TransferOutcome, TransferReason,
 };
-pub use super::owner_preparation::{NoPendingPreparationFailure,PreparationFingerprintInput,PreparationCapacity,PreparationRuntime,PreparationPlan,PreparedHandoffIntent,PreparationPersistence,PreparationScan,PreparedTransferResult,prepare_transfer};
+pub use super::owner_preparation::{NoPendingPreparationFailure,PreparationFingerprintInput,PreparationCapacity,PreparationRuntime,PreparationPlan,PreparedHandoffIntent,PreparationPersistence,PreparationScan,PreparedTransferResult,prepare_transfer,preparation_policy_sha256};
 pub use super::owner_reconciliation::{with_transfer_inspection,NativeTransferInspection,NativeTransferState,with_retired_aborted_namespace,RetiredNativeNamespace};
 use anyhow::{ensure, Result};
 #[cfg(test)]

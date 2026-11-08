@@ -4,6 +4,13 @@ use super::*;
 use augmentagent_channel_core::native_vm::{ownership, RuntimeOwner};
 use std::os::unix::fs::PermissionsExt;
 #[tokio::test]
+async fn owner_preparation_retry_persists_across_claims_and_wakes_on_changed_inputs() {
+    super::tests::owner_metadata_recovery_modes_inner_reserved(
+        &["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery"],
+        false,None,Some("retry-unadmitted"),
+    );
+}
+#[tokio::test]
 async fn recovery_controller_carries_other_provider_completion_through_native_handoff() {
     super::tests::owner_metadata_recovery_modes_inner_reserved(
         &["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery"],
@@ -115,6 +122,7 @@ pub(super) fn seed_reserved_body(
     native: &Path,
     phase: &str,
 ) -> ReservedSeed {
+    let phase=phase.strip_prefix("retry-").unwrap_or(phase);
     let phase=phase.strip_prefix("controller-").unwrap_or(phase);
     let phase = phase.strip_prefix("successor-").unwrap_or(phase);
     let legacy_writer = matches!(phase, "legacy-writer" | "legacy-blocked");
@@ -296,6 +304,8 @@ pub(super) async fn settle_reserved_body(
     initial: Option<&durable::owner_dispatch::ReservedOwnerBodyRead>,
     late: Option<&durable::native_observation::NativeObservation>,
 ) {
+    let retry_case=phase.starts_with("retry-");
+    let phase=phase.strip_prefix("retry-").unwrap_or(phase);
     let controller=phase.starts_with("controller-");
     let phase=phase.strip_prefix("controller-").unwrap_or(phase);
     let successor = phase.starts_with("successor-");
@@ -327,6 +337,10 @@ pub(super) async fn settle_reserved_body(
         .owner_publication_recovery_native_facts(&recovery, authorization, millis())
         .unwrap();
     let workflow = facts.namespace().owner.workflow_id.clone();
+    if retry_case {
+        super::owner_retry_tests::check_retry_journal(state,worktree,recovery,authorization).await;
+        return;
+    }
     let source = existing_native_audit(
         state,
         facts.namespace(),
@@ -361,33 +375,6 @@ pub(super) async fn settle_reserved_body(
         .unwrap();
     if controller {
         let db=rusqlite::Connection::open(state).unwrap();
-        let before_native=store.snapshot(&workflow).unwrap().unwrap();
-        let events_before_native=store.events(&workflow).unwrap();
-        // Only this subprocess's private synthetic policy is moved. A missing
-        // selection must remain a typed no-pending hold, with no model spend.
-        let fixture_root=PathBuf::from(std::env::var_os("AUTOSHIP_INITIAL_GUARD_CHILD").unwrap());
-        let policy=PathBuf::from(std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").unwrap());
-        assert!(policy.starts_with(&fixture_root));
-        let offline=policy.with_extension("controller-offline");
-        std::fs::rename(&policy,&offline).unwrap();
-        struct RestorePolicy {from:PathBuf,to:PathBuf}
-        impl Drop for RestorePolicy {fn drop(&mut self) {if self.from.exists() {let _=std::fs::rename(&self.from,&self.to);}}}
-        let restore=RestorePolicy {from:offline,to:policy};
-        let first_missing=recover_owner_native_handoff(&shared,state,worktree,recovery.clone(),authorization).unwrap();
-        let fingerprint=match first_missing {OwnerRecoveryNativeRun::NoPending {failure}=>{
-            assert_eq!(failure.reason(),ownership::TransferReason::RuntimeUnavailable);assert!(!failure.is_deferred());failure.fingerprint().to_owned()
-        },other=>panic!("missing policy did not return no-pending hold: {other:?}")};
-        let repeated=recover_owner_native_handoff(&shared,state,worktree,recovery.clone(),authorization).unwrap();
-        assert!(matches!(repeated,OwnerRecoveryNativeRun::NoPending {ref failure} if failure.fingerprint()==fingerprint),"unchanged missing selection lost its failure fingerprint: {repeated:?}");
-        drop(restore);
-        db.execute_batch("CREATE TRIGGER refuse_controller_native_intent BEFORE INSERT ON workflow_owner_recovery_native_intent BEGIN SELECT RAISE(ABORT,'injected controller intent rollback'); END;").unwrap();
-        let refused=recover_owner_native_handoff(&shared,state,worktree,recovery.clone(),authorization).unwrap();
-        assert!(matches!(refused,OwnerRecoveryNativeRun::NoPending {ref failure} if failure.reason()==ownership::TransferReason::PersistRetry && failure.is_deferred()),"rolled-back intent was not a known no-pending retry: {refused:?}");
-        db.execute_batch("DROP TRIGGER refuse_controller_native_intent;").unwrap();
-        assert_eq!(store.snapshot(&workflow).unwrap().unwrap(),before_native);
-        assert_eq!(store.events(&workflow).unwrap(),events_before_native);
-        assert!(store.owner_recovery_pending_transfer(&recovery,authorization,millis()).unwrap().is_none());
-        assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_recovery_native_intent WHERE workflow=?1",[&workflow],|r|r.get::<_,i64>(0)).unwrap(),0);
         db.execute_batch("CREATE TRIGGER refuse_controller_native_settlement BEFORE INSERT ON workflow_native_handoff_completed BEGIN SELECT RAISE(ABORT,'injected controller native settlement rollback'); END;").unwrap();
         // A real WAL commit acknowledgement is lost while the intent itself
         // is durable. The controller must resolve that exact persisted intent

@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Persistent owner-recovery preparation backoff and dependency observations",
+  "parent_commit": "f8c21cde69594bd1dd08d59f5b424d83cc027ade",
+  "extends": "1703-native-handoff-controller-proof.json",
+  "source_sha256": {
+    "crates/augmentagent-channel-core/src/native_owner_preparation.rs": "ddbb58e7a301ec520523368a1cdddb94388dfc989a9e9b151fe3e463adaab98f",
+    "crates/augmentagent-channel-core/src/native_owner_transfer.rs": "7b01910645026531bd95271b54f3b77099464b0d646ff72e3613cc44a743f76d",
+    "crates/augmentagent-channel-core/src/native_state_capacity.rs": "58a59f99b0b195997a36d76eb8ce1e9235d39790c5bbdc5e015aeda5ba548463",
+    "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs": "ac55702e5d889b27f9c235c871abce795a43193c5f176277270958ba887d6e26",
+    "crates/augmentagent-cli/src/autoship_owner_recovery_retry.rs": "df28fe5084f1454f8775c947c0c04e4841bacf72b58ace0b56826a2b387581e0",
+    "crates/augmentagent-cli/src/autoship_workflow.rs": "5fc5f988e700cd793bccf234395a00e4980f1423a9c1ce77e35c859acac3423e",
+    "crates/augmentagent-cli/src/self_improve_owner_native_recovery.rs": "73b454606f7bd628c480ef8101157fb835ad0b06957bb6886523ca9870e5ceea",
+    "crates/augmentagent-cli/src/self_improve_owner_retry_tests.rs": "018334c9c871f6a652bc594f87af49ab23cd78904398042a0b9175e85c0c1ab4",
+    "crates/augmentagent-cli/src/self_improve_owner_reserved_ready_tests.rs": "17901808b3cd7cbdb7fa4c02303010fee6b90a438da91854f9e66e455ea12002",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "6a71be0560603d3d76cc185faecc680f7f3e782236ca878a461b987bf19fe525"
+  },
+  "red": {
+    "original_handle": 11547,
+    "exit_code": 1,
+    "reason": "Preparation environment/gate and persistent retry APIs absent",
+    "log": "/tmp/autoship-recovery-preparation-retry-red-20261108.log"
+  },
+  "validation": {
+    "final_cli_handle": 61791,
+    "final_cli_exit_code": 0,
+    "persisted_retry_and_controller": {
+      "passed_test_functions": 1,
+      "both_builder_pins": true,
+      "seconds": 30.26,
+      "log": "/tmp/autoship-recovery-preparation-retry-final-20261108.log"
+    },
+    "timing_and_unknown_observation_boundaries": {
+      "passed_test_functions": 3,
+      "seconds": 0.0,
+      "log": "/tmp/autoship-recovery-preparation-retry-boundaries-20261108.log"
+    },
+    "native_controller_regressions": {
+      "passed_test_functions": 2,
+      "provider_phase_cases": 6,
+      "both_builder_pins": true,
+      "seconds": 222.61,
+      "log": "/tmp/autoship-recovery-preparation-retry-native-regressions-20261108.log"
+    },
+    "core_handle": 37617,
+    "core_exit_code": 0,
+    "capacity_boundaries": {
+      "passed_test_functions": 1,
+      "log": "/tmp/autoship-recovery-preparation-retry-capacity-core-20261108.log"
+    },
+    "preparation_fingerprints": {
+      "passed_test_functions": 4,
+      "log": "/tmp/autoship-recovery-preparation-retry-preparation-core-20261108.log"
+    },
+    "non_test_compile": {
+      "original_handle": 61791,
+      "exit_code": 0,
+      "seconds": 58.42,
+      "log": "/tmp/autoship-recovery-preparation-retry-production-20261108.log"
+    },
+    "final_non_test_compile": {
+      "original_handle": 13283,
+      "exit_code": 0,
+      "seconds": 27.5,
+      "log": "/tmp/autoship-recovery-preparation-retry-final-production-20261108.log"
+    }
+  },
+  "assertions": [
+    "Native recovery controller checks a persisted preparation gate before creating/opening another preparation destination or entering core preparation; repeated deferred calls leave the audit unchanged",
+    "Transient preparation failures schedule 5/10/20/40/60 minute capped backoff; nondeferred integrity/configuration holds have no time-only retry deadline",
+    "The bounded canonical retry journal joins its exact original request/intent, actual metadata claim/event window, protected source-facts fingerprint, diagnostic failure inputs and predecessor record; event/index count and digest joins reject missing/corrupt halves",
+    "Database reopen and a genuinely new metadata claim retain the same deadline when original dependencies are unchanged; claim generation is not a retry reset",
+    "Duplicate failures append no new journal event. A refused retry index insert rolls back the retry event and leaves original workflow state/spend unchanged",
+    "Changing private policy selection wakes a previously deferred observation; missing policy is then recorded as an unchanged hold, and restoring selection allows fresh inspection",
+    "Policy/capacity observations are captured outside workflow/native locks and expire after 30 seconds. Unavailable capacity observations cannot themselves clear a known unchanged schedule; last-known capacity is retained only for change detection",
+    "The observed-capacity fingerprint includes exhausted boundaries and remains separate from the existing availability fingerprint; neither is an admission or cleanup capability",
+    "Read-only preclaim preparation status is available to the future selector. Actual pending effects take precedence over preparation scheduling",
+    "Current retry writes independently refuse active/unknown native persistence, historical forward contexts, unresolved abort barriers and remote operations; saved diagnostic failures cannot hide pending or completed native transfer",
+    "Both builder pins retain original owner controls, queued input and recorded model spend through retry/reclaim. The existing lost-acknowledgement, same-ID native replay and released-input refusal regressions still pass"
+  ],
+  "limits": [
+    "The fixtures use synthetic persisted native/body/resource setup with actual protected native/audit/SQL APIs; no VM, provider, body, live worker or real private message executes",
+    "Fresh metadata claim takeover is exercised through controlled SQL lease expiry, not an actual daemon/process restart or native cleanup",
+    "Clock/backoff curve and unavailable-capacity edge checks are pure boundary tests; the real store regression covers the first transient deadline, unchanged hold, fresh claim and policy-selection changes without weakening actual authorization deadlines",
+    "Early wake in this component observes validated source SQL facts, private policy bytes and coarse native capacity boundaries. Full C/R physical/source qualification and its recovery observations remain separate required work",
+    "Retry/status methods and controller checks are connected internally, but no owner-recovery queue selector or live scheduler invocation has been connected",
+    "Private delivery projection for these retry outcomes, unbound/closed-source orchestration, productive constructors, current full CLI suite, exact-head review, current hosted checks, rollout and epic acceptance remain unproven"
+  ],
+  "remaining": [
+    "Connect the distinct authenticated owner-recovery selector using the read-only preparation status before claiming, with complete outcome/private-progress handling",
+    "Complete unbound and closed/transferred-source orchestration and post-commit lookup-unavailability fault coverage",
+    "Complete C/R source/resource/input qualification and legacy debt recovery, including qualified physical/source change observations",
+    "Productive repeated body/model/release/result/continuation cycles and private coding/follow-up/delivery",
+    "Exact-head independent review, trusted hosted verification and ordinary updater rollout",
+    "Original live CLI/Discord acceptance, five confirmed autonomous merges in the acceptance UTC day, 72-hour fault and 24-hour unattended soak"
+  ],
+  "all_original_local_handles_terminal": true,
+  "scheduler_connected": false,
+  "deployed": false,
+  "productive_authority_granted": false,
+  "goal_complete": false
+}

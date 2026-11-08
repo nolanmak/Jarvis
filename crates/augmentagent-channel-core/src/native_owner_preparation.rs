@@ -44,6 +44,8 @@ impl NoPendingPreparationFailure {
         let fingerprint=format!("{:x}",Sha256::digest(canonical_bytes(&value)?));
         Ok(Self {input,reason,fingerprint,deferred})
     }
+    /// Descriptive inputs only; these cannot prove absence or admit transfer.
+    pub fn fingerprint_input(&self)->&PreparationFingerprintInput {&self.input}
     pub fn workflow_id(&self)->&str {&self.input.workflow_id}
     pub fn workflow_binding(&self)->&Value {&self.input.workflow_binding}
     pub fn fingerprint(&self)->&str {&self.fingerprint}
@@ -89,6 +91,11 @@ pub enum PreparedTransferResult {
     NoPending(NoPendingPreparationFailure),
     Pending {intent:PreparedHandoffIntent,outcome:super::ownership::TransferOutcome},
     PersistenceUnknown {reason:TransferReason,attempted:Option<PreparedHandoffIntent>},
+}
+/// Bounded private declaration observation for scheduling, never admission.
+pub fn preparation_policy_sha256()->Option<String> {
+    let path=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY")?;
+    super::private(std::path::Path::new(&path)).ok().map(|bytes|format!("{:x}",Sha256::digest(bytes)))
 }
 pub fn prepare_transfer(binding:&super::ownership::TransferBinding,plan:&PreparationPlan,sources:&[std::sync::Arc<crate::tool_audit::AuditLogger>],destination:&std::sync::Arc<crate::tool_audit::AuditLogger>,current:&dyn Fn()->Result<(),super::ownership::TransferFenceError>,persist:&mut dyn FnMut(&PreparationScan<'_>)->PreparationPersistence)->Result<PreparedTransferResult,TransferReason> {
     let path=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY");
