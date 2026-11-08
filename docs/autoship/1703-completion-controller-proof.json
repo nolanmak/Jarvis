@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Known-launch reconstruction, protected completion projection and truthful metadata progress",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_native_launch.rs": "e296d69d46608fcae9148d4ec055a68dc690a7c1d8fd40a30328f34fd7297dc2",
+    "crates/augmentagent-cli/src/autoship_owner_publication.rs": "cec4da72371f1a80cee2d4eb920520d83c47010135f4a7c86413acf1bff65ec5",
+    "crates/augmentagent-cli/src/autoship_owner_recovery_completion.rs": "4f22564dc26f21f0dc8c42b9d3c7b2218c4c612387f0db70a8c4e4d05070c700",
+    "crates/augmentagent-cli/src/self_improve_owner_completion_recovery.rs": "8770ded84c3feaf779e3082113d6faf183d45337d76ab5ef28dc2ce3b4fe2713",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "377a4540bdcffb182fe64fb5f690d52586a30fe0f85ed5b35ef475376c7eb26e",
+    "crates/augmentagent-cli/src/self_improve_owner_reserved_ready_tests.rs": "326db8521043a24c2f0ad174986bcec4043d1ba401c757111cca3874268cb54f",
+    "crates/augmentagent-cli/src/build_storage.rs": "b83d600fcd8d46cb529fdbc654a27477cc0e7356f7a60d43fcd602f375704e9d"
+  },
+  "red": {
+    "handle": 95750,
+    "exit_code": 1,
+    "log": "/tmp/autoship-completion-controller-red-20261108.log",
+    "reason": "Controller entry point missing at three regression call sites"
+  },
+  "compile_failure": {
+    "handle": 34691,
+    "exit_code": 1,
+    "log": "/tmp/autoship-completion-controller-green-20261108.log",
+    "reason": "Referenced private module instead of existing public crate re-export; corrected without exposing the module"
+  },
+  "validation": {
+    "cross_provider": {
+      "handle": 53065,
+      "exit_code": 0,
+      "passed": 1,
+      "both_builder_pins": true,
+      "seconds": 94.15,
+      "log": "/tmp/autoship-completion-controller-green2-20261108.log"
+    },
+    "same_provider": {
+      "handle": 29574,
+      "exit_code": 0,
+      "passed": 1,
+      "both_builder_pins": true,
+      "seconds": 89.7,
+      "log": "/tmp/autoship-completion-controller-same-provider-green-20261108.log"
+    },
+    "parallel_storage": {
+      "handle": 29574,
+      "exit_code": 0,
+      "passed": 204,
+      "threads": 8,
+      "seconds": 23.38,
+      "log": "/tmp/autoship-completion-controller-storage-regression-20261108.log"
+    },
+    "production_compile": {
+      "handle": 29574,
+      "exit_code": 0,
+      "seconds": 39.43,
+      "log": "/tmp/autoship-completion-controller-production-20261108.log",
+      "deployed": false
+    },
+    "uncaptured_detached_child": {
+      "handle": 45423,
+      "exit_code": 0,
+      "passed": 1,
+      "seconds": 0.05,
+      "cleanup_warning": false,
+      "log": "/tmp/autoship-storage-ready-cleanup-verified-20261108.log"
+    }
+  },
+  "assertions": [
+    "Controller receives only original state/worktree and current authenticated opaque recovery claim, not fixture prepared records or completion receipts",
+    "Known latest SQL launches are bounded and checked against the original active native namespace; protected prepared bytes are reconstructed and compared to the selected SQL launch identity",
+    "Fresh native proof retains original state/session/audit locks; its SQL append uses a separate connection without holding the metadata fence mutex",
+    "Each receipt commits atomically; a later batch error may retain earlier valid metadata imports and requires a fresh read on retry",
+    "Writer connection change accounting distinguishes appended observations from validated duplicates; duplicate scans report zero new writes",
+    "Both provider pins, same/cross-provider actual protected completion, rollback and provenance corruption checks preserve original body/model/native history, controls, queued messages and merge allowance"
+  ],
+  "storage_ci_red": {
+    "head": "ed371581c8460548d8de863940ba9fe550798083",
+    "job": 128714238382,
+    "passed": 196,
+    "failed": 8,
+    "log": "/tmp/autoship-1758-platform-ed371581.log",
+    "observed": "Detached-worker test read an empty readiness file; subsequent tests reported busy retention/target locks",
+    "inference": "Non-atomic readiness plus removing fixture roots before detached storage release can contaminate parallel tests through recycled inodes",
+    "correction_commit": "1f38d6c7c9ca7e384cbb71aa14c25f70d5aa5395",
+    "standalone_pr": 1907,
+    "standalone_head": "5a009887",
+    "standalone_head_hosted": "unproven"
+  },
+  "fixture_limits": [
+    "Original native/body/resource setup remains synthetic persisted state; no provider/model/VM or real Discord is executed",
+    "Controller is not yet selected by the live worker scheduler",
+    "Only already-recorded exact launches under the active original native namespace are supported; closed/transferred-source completion producer remains unfinished",
+    "Counts are descriptive, never ready/absence/productive authority"
+  ],
+  "remaining": [
+    "Fresh configured owner-policy admission and worker scheduling/invocation",
+    "Full original C/R legacy/source/resource/input qualification and debt settlement",
+    "Closed/transferred-source completion admission",
+    "Productive repeated body/release/model/result/continuation cycles and full private coding/follow-up/delivery lifecycle",
+    "Exact-head independent review and trusted hosted verification, ordinary updater rollout",
+    "All original CLI/private Discord acceptance, five confirmed auto merges on the acceptance UTC day, 72h fault and 24h unattended soak"
+  ],
+  "all_original_local_handles_terminal": true,
+  "deployed": false,
+  "goal_complete": false
+}

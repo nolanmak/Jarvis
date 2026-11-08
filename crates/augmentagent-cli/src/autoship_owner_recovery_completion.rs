@@ -27,6 +27,17 @@ pub(crate) fn validate_import(conn:&Connection,row:&NativeObservation,actor:i64,
     Ok(())
 }
 impl WorkflowStore {
+    /// Reports only writes made by this exclusively borrowed connection. A
+    /// validated duplicate is not fresh progress and never resets accounting.
+    pub(crate) fn record_owner_recovery_native_completion_progress(&mut self,
+        lease:&RecoveryLease,authorization:&crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+        proof:&augmentagent_channel_core::native_vm::ownership::MetadataNativeCompletionProof<'_>,now:i64,
+    )->Result<(NativeObservation,bool)> {
+        let before:i64=self.conn.query_row("SELECT total_changes()",[],|row|row.get(0))?;
+        let observation=self.record_owner_recovery_native_completion(lease,authorization,proof,now)?;
+        let after:i64=self.conn.query_row("SELECT total_changes()",[],|row|row.get(0))?;
+        Ok((observation,after>before))
+    }
     /// Caller holds the original native locks through a fresh, distinct borrowed
     /// proof. No native/current-owner callback is invoked inside this SQL write.
     pub(crate) fn record_owner_recovery_native_completion(&mut self,

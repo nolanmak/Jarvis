@@ -959,9 +959,9 @@ fn import_changed_completion(state:&Path,worktree:&Path,
     assert!(ownership::with_discovered_metadata_native_completion(&source,&prepared,&||anyhow::bail!("injected stale recovery authority"),&mut |_| {unauthorized_visit=true;Ok(())}).is_err());
     assert!(!unauthorized_visit);
     let current=||shared.lock().unwrap().validate_owner_publication_recovery(&recovery,authorization,millis());
-    let discovered=ownership::with_discovered_metadata_native_completion(&source,&prepared,&current,&mut |proof| {
+    let before_events=store.events(workflow).unwrap();let history=store.native_observation_history(workflow).unwrap();
+    let inspected=ownership::with_discovered_metadata_native_completion(&source,&prepared,&current,&mut |proof| {
         assert_eq!(Some(proof.receipt()),late.protected_observation_reference.as_ref(),"discovery selected a different original protected completion");
-        let before_events=store.events(workflow)?;let history=store.native_observation_history(workflow)?;
         assert_ne!(history.last().unwrap().export_manifest_sha256,late.export_manifest_sha256,"fixture has no semantic outcome change");
         for table in ["workflow_event","workflow_native_observation"] {
             db.execute_batch(&format!("CREATE TRIGGER refuse_completion_import BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT,'injected completion rollback'); END;")).unwrap();
@@ -974,6 +974,22 @@ fn import_changed_completion(state:&Path,worktree:&Path,
         db.execute("UPDATE workflow SET lease_until=?2 WHERE id=?1",rusqlite::params![workflow,millis()-1]).unwrap();
         assert!(store.record_owner_recovery_native_completion(&recovery,authorization,proof,millis()).is_err(),"expired recovery claim wrote a completion");
         db.execute("UPDATE workflow SET lease_until=?2 WHERE id=?1",rusqlite::params![workflow,until]).unwrap();
+        Ok(())
+    }).expect("negative import cases failed before controller discovery");
+    assert!(inspected);
+    for table in ["workflow_event","workflow_native_observation"] {
+        db.execute_batch(&format!("CREATE TRIGGER refuse_completion_import BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT,'injected completion rollback'); END;")).unwrap();
+        assert!(recover_known_native_completions(state,Some(worktree),recovery.clone(),authorization).is_err());
+        assert_eq!(store.events(workflow).unwrap(),before_events);assert_eq!(store.native_observation_history(workflow).unwrap(),history);
+        db.execute_batch("DROP TRIGGER refuse_completion_import;").unwrap();
+    }
+    // The controller receives no prepared record, protected completion receipt
+    // or fixture proof. It reconstructs its inputs from original durable state.
+    let projected=recover_known_native_completions(state,Some(worktree),recovery.clone(),authorization).unwrap();
+    assert!(projected.observed>0);assert_eq!(projected.appended,1);
+    let replay=recover_known_native_completions(state,Some(worktree),recovery.clone(),authorization).unwrap();
+    assert_eq!(replay.observed,projected.observed);assert_eq!(replay.appended,0,"duplicate receipt became fresh worker progress");
+    let discovered=ownership::with_discovered_metadata_native_completion(&source,&prepared,&current,&mut |proof| {
         let observed=store.record_owner_recovery_native_completion(&recovery,authorization,proof,millis())?;
         assert_eq!(observed.version,2);assert_eq!(observed.producer,"owner-recovery-completion");
         assert_eq!(observed.export_manifest_sha256,late.export_manifest_sha256);assert_eq!(observed.source_owner,late.source_owner);

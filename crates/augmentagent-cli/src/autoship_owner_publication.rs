@@ -132,6 +132,10 @@ impl OwnerPublicationNativeFacts {
             "version":1,"workflow":self.facts.workflow_id,"binding":self.facts.workflow_binding,"namespace":self.namespace(),
             "original_binding":self.original_binding(),"source":self.facts.source_registration_sha256,"latest":self.facts.latest_input_sha256}))?)))
     }
+    /// Descriptive latest SQL launches, never prepared/native dispatch proof.
+    pub(crate) fn completion_launches(&self)->Vec<super::native_launch::NativeLaunchRecord> {
+        self.facts.runtimes.iter().map(|runtime|runtime.latest_launch.clone()).collect()
+    }
     pub(crate) fn runtimes(&self)->Result<Vec<augmentagent_channel_core::native_vm::ownership::PreparationRuntime>> {
         use augmentagent_channel_core::native_vm::ownership::{PreparationRuntime,RuntimeInventoryRow};
         self.facts.runtimes.iter().map(|runtime| {

@@ -29,6 +29,14 @@ pub struct NativeLaunchRecord {
     pub recorded_at_ms: i64,
 }
 
+impl NativeLaunchRecord {
+    /// Compare descriptive SQL/protected launch identities only. This grants
+    /// no current owner, model, completion or input-release authority.
+    pub(crate) fn require_prepared_identity(&self,prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord)->Result<()> {
+        super::owner_dispatch::require_same_prepared(self,prepared)
+    }
+}
+
 fn hash(value: &str) -> bool {
     value.len()==64 && value.bytes().all(|byte| matches!(byte,b'0'..=b'9'|b'a'..=b'f'))
 }
