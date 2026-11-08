@@ -12,7 +12,7 @@ def load(name, path):
 targeted = load('ci_targeted', 'scripts/ci-targeted.py')
 ci = load('ci_contract_for_targeted', 'scripts/ci-contract.py')
 CONTRACT = json.loads((ROOT / 'scripts/ci-contract.json').read_text())
-CONTRACT_INPUTS = ['scripts/ci-contract.py', 'scripts/ci-contract.json', 'scripts/ci-contract-sync.py', 'scripts/tests/ci_contract_test.py']
+CONTRACT_INPUTS = ['scripts/ci-contract.py', 'scripts/ci-contract.json', 'scripts/ci-contract-sync.py', 'scripts/tests/ci_contract_test.py', 'scripts/ci-pinned-tools.py', 'scripts/tests/ci_pinned_tools_test.py']
 FIXTURE = {
     'core': {'dir': 'crates/core', 'deps': set()},
     'store': {'dir': 'crates/store', 'deps': {'core'}},

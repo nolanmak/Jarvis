@@ -16,6 +16,8 @@ on:
       - "scripts/ci-contract-sync.py"
       - "scripts/tests/ci_contract_test.py"
 # Superseded PR heads cancel; non-PR runs retain distinct queue slots.
+      - "scripts/ci-pinned-tools.py"
+      - "scripts/tests/ci_pinned_tools_test.py"
 concurrency:
   group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}"
   cancel-in-progress: "${{ github.event_name == 'pull_request' }}"

@@ -7,7 +7,7 @@ ROOT=Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('shared_ci',ROOT/'scripts/ci-contract.py');ci=importlib.util.module_from_spec(spec);spec.loader.exec_module(ci)
 class ContractTests(unittest.TestCase):
  def test_autoship_cli_suites_execute_as_separate_cargo_commands(self):
-  body=json.loads((ROOT/'scripts/ci-contract.json').read_text())['commands']['rust/cli/6']['body']
+  body=json.loads((ROOT/'scripts/ci-contract.json').read_text())['commands']['rust/cli/7']['body']
   with tempfile.TemporaryDirectory() as directory:
    root=Path(directory);cargo=root/'cargo';calls=root/'calls'
    cargo.write_text('#!'+sys.executable+'\nimport json,os,sys\nwith open(os.environ["CALLS"],"a") as f:f.write(json.dumps(sys.argv[1:])+"\\n")\n');cargo.chmod(0o700)
