@@ -1,0 +1,736 @@
+//! Controlled persisted-body fixtures feeding actual authorized metadata APIs.
+//! Original resource setup is synthetic; no VM, provider or body is executed.
+use super::*;
+use augmentagent_channel_core::native_vm::{ownership, RuntimeOwner};
+use std::os::unix::fs::PermissionsExt;
+#[tokio::test]
+async fn reserved_owner_readiness_rejects_model_only_snapshot_change() {
+    super::tests::owner_metadata_recovery_modes_inner_reserved(
+        &[
+            "owner-early-acceptance-producer-metadata-recovery",
+            "owner-early-acceptance-producer-claude-metadata-recovery",
+        ],
+        false,
+        None,
+        Some("stale-model-snapshot"),
+    );
+}
+#[tokio::test]
+async fn reserved_owner_readiness_preserves_original_body_and_spend() {
+    for phase in [
+        "unadmitted",
+        "admitted",
+        "sql-bound",
+        "native-bound",
+        "released",
+        "lost-response",
+    ] {
+        super::tests::owner_metadata_recovery_modes_inner_reserved(
+            &[
+                "owner-early-acceptance-producer-metadata-recovery",
+                "owner-early-acceptance-producer-claude-metadata-recovery",
+            ],
+            false,
+            None,
+            Some(phase),
+        );
+    }
+}
+pub(super) fn seed_reserved_body(
+    guard: &WorkflowGuard,
+    turn: &durable::owner_turn::OwnerTurn,
+    preparation: &acceptance::owner::PreparedOwnerAcceptance,
+    native: &Path,
+    phase: &str,
+) -> durable::owner_dispatch::ReservedOwnerBodyRead {
+    let phase = if phase == "stale-model-snapshot" {
+        "admitted"
+    } else if phase == "lost-response" {
+        "native-bound"
+    } else {
+        phase
+    };
+    // Test-only persisted-record construction. The actual metadata guard stays
+    // fenced; a private fixture logger creates controlled original audit rows.
+    assert!(guard.metadata_only);
+    assert!(guard.audit.dispatch_allowed().is_err());
+    let audit = open_audit_generation(
+        &guard.state,
+        guard.id(),
+        Some(&guard.worktree),
+        guard.lease.generation,
+    )
+    .unwrap();
+    audit
+        .set_native_runtime_owner(RuntimeOwner {
+            workflow_id: guard.id().into(),
+            lease_generation: guard.lease.generation,
+        })
+        .unwrap();
+    audit
+        .set_native_store_binding(guard.audit.native_store_binding().unwrap().unwrap())
+        .unwrap();
+    audit.require_run_resources().unwrap();
+    let mut store = WorkflowStore::open(&guard.state).unwrap();
+    let provider = store
+        .owner_publication_recovery_plan(guard.id())
+        .unwrap()
+        .unwrap()
+        .command()
+        .provider
+        .unwrap();
+    let name = match provider {
+        durable::submission::Provider::Codex => "codex",
+        durable::submission::Provider::Claude => "claude",
+    };
+    let (prepared, session, resource) = durable::native_observation::tests::retained_launch_fixture(
+        native,
+        &audit,
+        name,
+        |prepared| {
+            store
+                .record_verified_native_launch(
+                    &guard.lease,
+                    &guard.binding,
+                    &audit,
+                    prepared,
+                    millis(),
+                )
+                .unwrap();
+        },
+    );
+    let lock = native.join(format!("{name}/session-fixture/lock"));
+    std::fs::write(&lock, b"").unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let binding = preparation.activation_binding().unwrap();
+    let dispatch = store
+        .test_begin_resource_ready_owner_body(
+            turn,
+            provider,
+            &binding,
+            &prepared,
+            &resource,
+            millis(),
+        )
+        .unwrap();
+    let initial = store
+        .read_reserved_owner_body(guard.id(), &turn.request_id)
+        .unwrap();
+    if phase != "unadmitted" {
+        store
+            .charge_prepared_owner_model(
+                &guard.lease,
+                "reserved-original-model",
+                millis(),
+                None,
+                provider,
+                &dispatch,
+                &binding,
+            )
+            .unwrap();
+    }
+    let input = if matches!(phase, "sql-bound" | "native-bound" | "released") {
+        Some(
+            store
+                .bind_prepared_owner_native(
+                    &guard.lease,
+                    &dispatch,
+                    &binding,
+                    provider,
+                    &prepared,
+                    &resource,
+                    millis(),
+                )
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    if matches!(phase, "native-bound" | "released") {
+        audit.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_owner_model_bound",
+            "launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"resource_receipt":resource,"owner_input":input})).unwrap();
+    }
+    if phase == "released" {
+        audit.record_controller(serde_json::json!({"version":2,"actor":"controller","kind":"native_input_release_attempt",
+            "launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"resource_receipt":resource,"owner_input":input,
+            "prompt_sha256":"a".repeat(64),"prompt_bytes":5,"recorded_at_ms":millis()})).unwrap();
+    }
+    let completion =
+        ownership::observe_native_completion(&audit, &prepared, &session, &resource).unwrap();
+    store
+        .record_verified_native_observation(
+            &guard.lease,
+            &guard.binding,
+            &audit,
+            &completion,
+            millis(),
+        )
+        .unwrap();
+    assert!(
+        guard.audit.dispatch_allowed().is_err(),
+        "synthetic body records promoted the metadata guard"
+    );
+    initial
+}
+pub(super) async fn settle_reserved_body(
+    state: &Path,
+    worktree: &Path,
+    recovery: Arc<durable::owner_publication_recovery::RecoveryLease>,
+    authorization: &super::super::targeted::AuthorizedOwnerRecovery<'_>,
+    phase: &str,
+    initial: Option<&durable::owner_dispatch::ReservedOwnerBodyRead>,
+) {
+    let mut store = WorkflowStore::open(state).unwrap();
+    // Publication completion is a real authorized metadata transition.
+    with_recovery_native_metadata(
+        state,
+        Some(worktree),
+        recovery.clone(),
+        authorization,
+        &mut |proof| {
+            let recovered = store.with_owner_recovery_preparation(
+                &recovery,
+                authorization,
+                proof,
+                millis(),
+                |access| {
+                    acceptance::owner::publication::reopen_recovery_preparation(
+                        access, proof, worktree,
+                    )
+                },
+            )?;
+            recovered.with_scope_transition(|transition| {
+                store.complete_recovered_owner_publication(
+                    &recovery,
+                    authorization,
+                    &recovered,
+                    transition,
+                    millis(),
+                )
+            })
+        },
+    )
+    .unwrap();
+    let facts = store
+        .owner_publication_recovery_native_facts(&recovery, authorization, millis())
+        .unwrap();
+    let workflow = facts.namespace().owner.workflow_id.clone();
+    let source = existing_native_audit(
+        state,
+        facts.namespace(),
+        Some(worktree),
+        facts.original_binding(),
+    )
+    .unwrap();
+    let destination =
+        open_audit_generation(state, &workflow, Some(worktree), recovery.generation()).unwrap();
+    destination
+        .set_native_runtime_owner(RuntimeOwner {
+            workflow_id: workflow.clone(),
+            lease_generation: recovery.generation(),
+        })
+        .unwrap();
+    destination
+        .set_native_store_binding(facts.original_binding().clone())
+        .unwrap();
+    destination.require_run_resources().unwrap();
+    destination.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":workflow,"generation":recovery.generation()})).unwrap();
+    let shared = Arc::new(Mutex::new(WorkflowStore::open(state).unwrap()));
+    destination
+        .restrict_to_metadata(
+            durable::owner_publication_recovery::native_metadata_fence(
+                shared.clone(),
+                recovery.clone(),
+                authorization,
+                millis(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let plan = ownership::PreparationPlan {
+        workflow_id: workflow.clone(),
+        source_owners: vec![facts.namespace().clone()],
+        destination: ownership::Authority {
+            owner: destination.native_runtime_owner().unwrap().unwrap(),
+            audit_path: destination.path().to_str().unwrap().into(),
+        },
+        runtimes: facts.runtimes().unwrap(),
+        fingerprint_input: ownership::PreparationFingerprintInput {
+            workflow_id: workflow.clone(),
+            workflow_binding: serde_json::to_value(
+                store
+                    .snapshot(&workflow)
+                    .unwrap()
+                    .unwrap()
+                    .checkpoint
+                    .binding,
+            )
+            .unwrap(),
+            original_binding_sha256: None,
+            source_registration_sha256: None,
+            latest_input_sha256: Some(facts.fingerprint().unwrap()),
+            selected_policy_sha256: None,
+            capacity_class: Default::default(),
+        },
+    };
+    let current = || {
+        shared
+            .lock()
+            .unwrap()
+            .validate_owner_publication_recovery(&recovery, authorization, millis())
+            .map_err(|_| ownership::TransferFenceError::NotCurrent)
+    };
+    let mut recorded = false;
+    let prepared = ownership::prepare_transfer(
+        facts.original_binding(),
+        &plan,
+        &[source.clone()],
+        &destination,
+        &current,
+        &mut |scan| {
+            match store.prepare_owner_recovery_native_intent(
+                &recovery,
+                authorization,
+                &facts,
+                scan,
+                millis(),
+            ) {
+                durable::owner_publication_recovery::RecoveryNativeIntentPersistence::Durable(
+                    _,
+                ) => recorded = true,
+                _ => panic!("reserved body could not persist its actual forward recovery intent"),
+            }
+            ownership::PreparationPersistence::Unknown {
+                reason: ownership::TransferReason::PendingUnknown,
+                attempted: None,
+            }
+        },
+    )
+    .unwrap();
+    assert!(
+        recorded
+            && matches!(
+                prepared,
+                ownership::PreparedTransferResult::PersistenceUnknown { .. }
+            )
+    );
+    let pending = store
+        .owner_recovery_pending_transfer(&recovery, authorization, millis())
+        .unwrap()
+        .unwrap();
+    let mode = durable::native_reconcile::Mode::OwnerRecovery {
+        lease: &recovery,
+        authorization,
+    };
+    let reconciled = durable::native_reconcile::run(
+        &shared,
+        mode,
+        &pending,
+        Some((&[source.clone()], &destination)),
+        &millis,
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            reconciled,
+            durable::native_reconcile::ReconciliationRun::Settled(_)
+        ),
+        "reserved original writer did not close: {reconciled:?}"
+    );
+    assert!(destination.dispatch_allowed().is_err());
+    let snapshot = store
+        .read_reserved_owner_body(&workflow, recovery.request_id())
+        .unwrap();
+    let expected = snapshot.expected_attempts();
+    let before = store.snapshot(&workflow).unwrap().unwrap();
+    let events = store.events(&workflow).unwrap();
+    let db = rusqlite::Connection::open(state).unwrap();
+    let owner: String = db
+        .query_row("SELECT owner FROM workflow WHERE id=?1", [&workflow], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let original = original_rows(&db, &workflow, recovery.request_id());
+    let control = store.owner_control(&workflow).unwrap();
+    let queued = store.pending_owner_messages(&workflow).unwrap();
+    let audit_before = [
+        std::fs::read(source.path()).unwrap(),
+        std::fs::read(destination.path()).unwrap(),
+    ];
+    assert_eq!(
+        before.model_calls,
+        if phase == "unadmitted" { 0 } else { 1 }
+    );
+    let settle = |store: &mut WorkflowStore,
+                  active_authorization: &super::super::targeted::AuthorizedOwnerRecovery<'_>,
+                  lose_response: bool,
+                  check_mismatch: bool| {
+        with_recovery_native_metadata_outcome(
+            state,
+            Some(worktree),
+            recovery.clone(),
+            active_authorization,
+            &mut |proof| {
+                let recovered = store.with_owner_recovery_preparation(
+                    &recovery,
+                    active_authorization,
+                    proof,
+                    millis(),
+                    |access| {
+                        acceptance::owner::publication::reopen_recovery_preparation(
+                            access, proof, worktree,
+                        )
+                    },
+                )?;
+                recovered.with_scope_transition(|transition| {
+                    let scope = transition.register()?;
+                    proof.with_revoked_input_writers(|closed| {
+                        if check_mismatch && phase != "released" {
+                            let mut entered = false;
+                            let wrong = closed.with_body_input_nonrelease(
+                                "different-owner-request",
+                                &[],
+                                |body| {
+                                    entered = true;
+                                    store
+                                        .prepare_reserved_owner_successor_ready(
+                                            &recovery,
+                                            active_authorization,
+                                            &recovered,
+                                            body,
+                                            &snapshot,
+                                            &scope,
+                                            millis(),
+                                        )
+                                        .map(|_| ())
+                                },
+                            );
+                            assert!(
+                                entered && wrong.is_err(),
+                                "a native proof for another request settled this reservation"
+                            );
+                            let mut unbound_entered = false;
+                            let absent = closed.with_unbound_input_nonrelease(
+                                recovery.request_id(),
+                                |unbound| {
+                                    unbound_entered = true;
+                                    store
+                                        .prepare_unbound_owner_successor_ready(
+                                            &recovery,
+                                            active_authorization,
+                                            &recovered,
+                                            unbound,
+                                            &scope,
+                                            millis(),
+                                        )
+                                        .map(|_| ())
+                                },
+                            );
+                            assert!(
+                                absent.is_err(),
+                                "reserved body was relabelled as reservation-absent"
+                            );
+                            assert_eq!(
+                                unbound_entered,
+                                !matches!(phase, "native-bound" | "lost-response")
+                            );
+                        }
+                        if check_mismatch && phase == "stale-model-snapshot" {
+                            let initial =
+                                initial.expect("missing initial unadmitted snapshot fixture");
+                            assert_eq!(
+                                initial.expected_attempts(),
+                                expected,
+                                "model-only case changed native references"
+                            );
+                            let stale = closed.with_body_input_nonrelease(
+                                recovery.request_id(),
+                                initial.expected_attempts(),
+                                |body| {
+                                    store.prepare_reserved_owner_successor_ready(
+                                        &recovery,
+                                        active_authorization,
+                                        &recovered,
+                                        body,
+                                        initial,
+                                        &scope,
+                                        millis(),
+                                    )
+                                },
+                            );
+                            let error = stale
+                                .err()
+                                .expect("a changed model slot settled with a stale SQL snapshot");
+                            assert!(
+                                format!("{error:#}").contains(
+                                    "reserved body SQL snapshot changed before readiness"
+                                ),
+                                "model snapshot refused at wrong boundary: {error:#}"
+                            );
+                        }
+                        closed.with_body_input_nonrelease(recovery.request_id(), expected, |body| {
+                            let settled = store.prepare_reserved_owner_successor_ready(
+                                &recovery,
+                                active_authorization,
+                                &recovered,
+                                body,
+                                &snapshot,
+                                &scope,
+                                millis(),
+                            )?;
+                            if lose_response {
+                                bail!("injected readiness response loss");
+                            }
+                            Ok(RecoveryMetadataOutcome::SuccessorReady(settled))
+                        })
+                    })
+                })
+            },
+        )
+    };
+    if !matches!(phase, "released" | "stale-model-snapshot") {
+        for fault in ["insert", "pointer", "release", "input-race"] {
+            let sql=match fault {
+                "insert"=>"CREATE TRIGGER refuse_reserved_ready BEFORE INSERT ON workflow_owner_successor_ready BEGIN SELECT RAISE(ABORT,'injected reserved readiness rollback'); END;",
+                "pointer"=>"CREATE TRIGGER refuse_reserved_ready BEFORE DELETE ON workflow_owner_publication_recovery_pending BEGIN SELECT RAISE(ABORT,'injected reserved readiness rollback'); END;",
+                "release"=>"CREATE TRIGGER refuse_reserved_ready BEFORE UPDATE OF owner ON workflow WHEN NEW.owner IS NULL BEGIN SELECT RAISE(ABORT,'injected reserved readiness rollback'); END;",
+                "input-race"=>"CREATE TRIGGER refuse_reserved_ready BEFORE INSERT ON workflow_owner_successor_ready BEGIN
+                    UPDATE workflow_owner_body_dispatch SET record=json_set(record,'$.prepared_setup.resource_receipt.record_sha256','eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee') WHERE workflow=NEW.workflow AND request_id=NEW.request_id;
+                    UPDATE workflow_event SET payload=(SELECT record FROM workflow_owner_body_dispatch WHERE workflow=NEW.workflow AND request_id=NEW.request_id) WHERE seq=(SELECT sequence FROM workflow_owner_body_dispatch WHERE workflow=NEW.workflow AND request_id=NEW.request_id);
+                    END;",
+                _=>unreachable!(),
+            };
+            db.execute_batch(sql).unwrap();
+            let fresh = super::super::targeted::authorize_owner_publication_recovery(
+                worktree,
+                authorization.plan(),
+                crate::autoship_discord_command::OwnerPolicy { bot: 11, owner: 22 },
+            )
+            .await
+            .unwrap();
+            let error = settle(&mut store, &fresh, false, false).unwrap_err();
+            if fault != "input-race" {
+                assert!(
+                    format!("{error:#}").contains("injected reserved readiness rollback"),
+                    "{fault}: {error:#}"
+                );
+            } else {
+                assert!(
+                    format!("{error:#}").contains("history changed")
+                        || format!("{error:#}").contains("prepared resource")
+                        || format!("{error:#}").contains("reservation changed"),
+                    "input race refused at wrong boundary: {error:#}"
+                );
+            }
+            assert_eq!(
+                store.snapshot(&workflow).unwrap().unwrap(),
+                before,
+                "{fault}: transaction changed workflow"
+            );
+            assert_eq!(
+                store.events(&workflow).unwrap(),
+                events,
+                "{fault}: transaction leaked an event"
+            );
+            assert_eq!(
+                original_rows(&db, &workflow, recovery.request_id()),
+                original,
+                "{fault}: transaction changed original slots/spend"
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM workflow_owner_successor_ready WHERE workflow=?1",
+                    [&workflow],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            db.execute_batch("DROP TRIGGER refuse_reserved_ready;")
+                .unwrap();
+            store
+                .validate_owner_publication_recovery(&recovery, &fresh, millis())
+                .unwrap();
+        }
+    }
+    let fresh = super::super::targeted::authorize_owner_publication_recovery(
+        worktree,
+        authorization.plan(),
+        crate::autoship_discord_command::OwnerPolicy { bot: 11, owner: 22 },
+    )
+    .await
+    .unwrap();
+    let result = settle(&mut store, &fresh, phase == "lost-response", true);
+    if phase == "released" {
+        let error = result.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("native body input may already have been released"),
+            "released input refused at wrong boundary: {error:#}"
+        );
+        assert_eq!(store.snapshot(&workflow).unwrap().unwrap(), before);
+        assert_eq!(store.events(&workflow).unwrap(), events);
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM workflow_owner_successor_ready WHERE workflow=?1",
+                [&workflow],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        store
+            .validate_owner_publication_recovery(&recovery, &fresh, millis())
+            .unwrap();
+    } else {
+        if phase == "lost-response" {
+            assert!(
+                format!("{:#}", result.unwrap_err()).contains("injected readiness response loss")
+            );
+        } else {
+            result.unwrap();
+        }
+        let (ready_sequence, ready_raw): (i64, String) = db
+            .query_row(
+                "SELECT sequence,record FROM workflow_owner_successor_ready WHERE workflow=?1",
+                [&workflow],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let ready: serde_json::Value = serde_json::from_str(&ready_raw).unwrap();
+        assert_eq!(ready["version"], 2);
+        assert_eq!(ready["generation"], recovery.generation());
+        assert_eq!(
+            ready["plan"]["body_state"]["kind"],
+            match phase {
+                "unadmitted" => "reserved_model_unadmitted",
+                "admitted" | "stale-model-snapshot" => "reserved_model_admitted_native_absent",
+                "sql-bound" => "reserved_sql_bound_native_unbound",
+                _ => "reserved_native_bound",
+            }
+        );
+        assert_eq!(
+            ready["plan"]["body_state"]["original"]["model"].is_null(),
+            phase == "unadmitted"
+        );
+        assert_eq!(
+            ready["plan"]["original_dispatch"],
+            ready["original"]["body_dispatch"]
+        );
+        let (sequence,raw):(i64,String)=db.query_row("SELECT sequence,record FROM workflow_owner_body_dispatch WHERE workflow=?1 AND request_id=?2",rusqlite::params![workflow,recovery.request_id()],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(
+            ready["plan"]["original_dispatch"],
+            serde_json::json!({"sequence":sequence,"sha256":format!("{:x}",Sha256::digest(raw.as_bytes()))})
+        );
+        assert!(ready_sequence > sequence);
+        assert_eq!(store.events(&workflow).unwrap().len(), events.len() + 1);
+        assert_eq!(
+            db.query_row(
+                "SELECT owner IS NULL AND lease_until=0 FROM workflow WHERE id=?1",
+                [&workflow],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap(),
+            true
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT state FROM workflow_owner_turn WHERE workflow=?1 AND request_id=?2",
+                rusqlite::params![workflow, recovery.request_id()],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "recovery_ready"
+        );
+        assert!(store
+            .owner_publication_recovery_plan(&workflow)
+            .unwrap()
+            .is_none());
+        assert!(
+            store
+                .owner_successor_setup_plan(&workflow)
+                .unwrap()
+                .is_some(),
+            "committed reserved readiness did not survive immutable history validation"
+        );
+        let mut replayed = false;
+        assert!(with_recovery_native_metadata(
+            state,
+            Some(worktree),
+            recovery.clone(),
+            &fresh,
+            &mut |_| {
+                replayed = true;
+                Ok(())
+            }
+        )
+        .is_err());
+        assert!(!replayed, "settled or lost-response claim was replayed");
+        let current = store.snapshot(&workflow).unwrap().unwrap();
+        assert_eq!(
+            (
+                current.generation,
+                current.checkpoint,
+                current.attempts,
+                current.wall_ms,
+                current.model_calls,
+                current.tokens
+            ),
+            (
+                before.generation,
+                before.checkpoint.clone(),
+                before.attempts,
+                before.wall_ms,
+                before.model_calls,
+                before.tokens
+            )
+        );
+        let raw = Lease {
+            workflow: workflow.clone(),
+            owner,
+            generation: recovery.generation(),
+        };
+        assert!(store
+            .charge(
+                &raw,
+                "ready-is-not-execution",
+                durable::ResourceCharge {
+                    model_calls: 1,
+                    ..Default::default()
+                },
+                millis()
+            )
+            .is_err());
+        assert!(store
+            .begin_operation(
+                &raw,
+                OperationKind::CreatePr,
+                &before.checkpoint.binding,
+                millis()
+            )
+            .is_err());
+    }
+    assert_eq!(
+        original_rows(&db, &workflow, recovery.request_id()),
+        original
+    );
+    assert_eq!(store.owner_control(&workflow).unwrap(), control);
+    assert_eq!(store.pending_owner_messages(&workflow).unwrap(), queued);
+    assert_eq!(store.merge_allowance(millis(), 5).unwrap().confirmed, 0);
+    assert_eq!(std::fs::read(source.path()).unwrap(), audit_before[0]);
+    assert_eq!(std::fs::read(destination.path()).unwrap(), audit_before[1]);
+}
+fn original_rows(db: &rusqlite::Connection, workflow: &str, request: &str) -> serde_json::Value {
+    use rusqlite::OptionalExtension;
+    let reservation:Option<(i64,String)>=db.query_row("SELECT sequence,record FROM workflow_owner_body_dispatch WHERE workflow=?1 AND request_id=?2",rusqlite::params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?))).optional().unwrap();
+    let model:Option<(i64,String,String)>=db.query_row("SELECT sequence,receipt,record FROM workflow_owner_body_model_admission WHERE workflow=?1 AND request_id=?2",rusqlite::params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().unwrap();
+    let native:Option<(i64,String,String)>=db.query_row("SELECT sequence,intent_id,record FROM workflow_owner_body_native_admission WHERE workflow=?1 AND request_id=?2",rusqlite::params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().unwrap();
+    let mut query=db.prepare("SELECT id,wall_ms,model_calls,tokens FROM resource_charge WHERE workflow=?1 ORDER BY id").unwrap();
+    let charges: Vec<(String, i64, i64, i64)> = query
+        .query_map([workflow], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    serde_json::json!({"reservation":reservation,"model":model,"native":native,"charges":charges})
+}

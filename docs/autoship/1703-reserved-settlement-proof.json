@@ -1,0 +1,118 @@
+{
+  "scope": "Committing reserved metadata readiness with authorized recovery/native/scope authorities and complete pre-native SQL snapshot; no productive grant",
+  "parent_head": "30f0e5b78a51722029c35255083fc4aa71795829",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_body_history.rs": "1c0677017747d9028aeaac691c3a97cd802176a5bdf4d64112fa6cbed86fe354",
+    "crates/augmentagent-cli/src/autoship_owner_dispatch.rs": "178c2b85260422fc1693dae4bfcc108183e6c67b3b0c0861bb16856f6a8c99b0",
+    "crates/augmentagent-cli/src/autoship_owner_reserved_readiness.rs": "f1baf2f007d61f605dbe4ae5e995f71b0823543a448ad28eb4acedd5a0076222",
+    "crates/augmentagent-cli/src/autoship_owner_successor_ready.rs": "adae4c1f079e0bcc3c2ec51876a027d2945c62abab8c2f2eada23abbe8d5ac2d",
+    "crates/augmentagent-cli/src/self_improve.rs": "59b331a1cebf06711a8f667e3ede9fae179ed8ac6a71e9ccbe7fd92d98fa155a",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "2484088dcb2dcb293809b630f1e398b3a9bdaf9b498eb3e259c31cd34cf647b7",
+    "crates/augmentagent-cli/src/self_improve_owner_reserved_ready_tests.rs": "46a9040e69413c1e5d138757fb905b6954d5a14a313f20bd7e43120cd0da598a"
+  },
+  "constructor_red": {
+    "handle": 26427,
+    "exit_code": 1,
+    "log": "/tmp/autoship-reserved-settlement-red-20261108.log",
+    "observed_error": "reserved owner successor readiness not implemented",
+    "scope": "Fixture reached the missing writer after actual authorized publication, native-intent persistence and authenticated native handoff"
+  },
+  "initial_constructor_green": {
+    "handle": 45958,
+    "exit_code": 0,
+    "seconds": 105.6,
+    "scope": "Initial ten cases before atomicity/reply-loss/model-snapshot extensions"
+  },
+  "expanded_green": {
+    "handle": 45558,
+    "exit_code": 0,
+    "seconds": 307.91,
+    "log": "/tmp/autoship-reserved-settlement-fresh-auth-final-20261108.log",
+    "cases": 12,
+    "scope": "Four positive states, released refusal and post-commit reply loss for each provider, before final complete-snapshot binding"
+  },
+  "model_snapshot_red": {
+    "handle": 87914,
+    "exit_code": 1,
+    "seconds": 25.77,
+    "log": "/tmp/autoship-reserved-model-snapshot-behavior-red-20261108.log",
+    "observed_error": "a changed model slot settled with a stale SQL snapshot",
+    "native_expectations_unchanged": true
+  },
+  "model_snapshot_green": {
+    "handle": 55943,
+    "exit_code": 0,
+    "seconds": 28.88,
+    "log": "/tmp/autoship-reserved-model-snapshot-green-20261108.log",
+    "providers": [
+      "codex",
+      "claude"
+    ]
+  },
+  "preceding_full_failure": {
+    "handle": 43856,
+    "exit_code": 1,
+    "passed": 1975,
+    "failed": 1,
+    "ignored": 34,
+    "seconds": 544.46,
+    "log": "/tmp/autoship-reserved-settlement-final-cli-20261108.log",
+    "failure": "self_improve::tests::individual_hung_gate_is_stopped_without_deleting_candidate: timed-out descendant must be terminated",
+    "reserved_cases_passed": true
+  },
+  "gate_recheck": {
+    "handle": 43677,
+    "exit_code": 0,
+    "seconds": 0.45,
+    "scope": "Original delayed-write fixture, isolated"
+  },
+  "gate_barrier_green": {
+    "handle": 49139,
+    "exit_code": 0,
+    "seconds": 0.45,
+    "log": "/tmp/autoship-hung-gate-barrier-20261108.log",
+    "scope": "Write released only after timeout/teardown returns; deadline and preservation assertions retained; test-only change"
+  },
+  "final_full_cli": {
+    "handle": 7022,
+    "exit_code": 0,
+    "passed": 1976,
+    "failed": 0,
+    "ignored": 34,
+    "seconds": 540.33,
+    "log": "/tmp/autoship-reserved-settlement-barrier-final-cli-20261108.log"
+  },
+  "final_production_compile": {
+    "handle": 21860,
+    "exit_code": 0,
+    "seconds": 38.47,
+    "log": "/tmp/autoship-reserved-settlement-final-production-20261108.log"
+  },
+  "fixture_corrections": [
+    "The input-mutation test initially expected only the later snapshot/resource rejection; the admitted cases correctly rejected earlier at the original model-to-reservation join. The assertion now accepts that precise rejection too; no runtime guard was relaxed.",
+    "The extended fault sequence reached the real 30-second authorization deadline. Each attempt now uses the normal fresh authorization API; production deadlines and lease limits remain unchanged.",
+    "A partial test-interface edit failed compilation before the behavioral model-snapshot red; this is not counted as feature evidence."
+  ],
+  "assertions": [
+    "One atomic record/event/ready-disposition/pointer-removal/metadata-lease-release transition",
+    "Exact original reservation, preparation, first model/native slots and all common resource charges preserved",
+    "Rollback at insertion, pointer deletion, lease release and in-transaction input mutation",
+    "Wrong-request proof and reserved-as-absent attempts refuse",
+    "Released input never acquires reserved readiness",
+    "Caller reply lost after COMMIT leaves one valid record and cannot replay old claim",
+    "Stale model-only snapshot refuses despite unchanged native expectations; fresh snapshot succeeds",
+    "Queued inputs, control/hold, checkpoint, attempts/wall/model/token counts, source/destination audits and confirmed shipping allowance preserved",
+    "Metadata readiness does not permit model charging or PR creation"
+  ],
+  "limits": [
+    "Original body data/resource setup is controlled persisted-record fixture construction; no live original productive constructor, VM/provider/model execution is demonstrated",
+    "Participating-writer observations do not establish full legacy-writer/source/resource qualification",
+    "Only the original attempt projection exists; complete repeated-cycle/multi-attempt dispositions and productive release/model/result grants remain incomplete",
+    "Worker ingress, normal deployment, real CLI/private Discord acceptance, five confirmed autonomous merges and fault/soak acceptance remain required",
+    "No production policy, budget, retained runtime, hold, accounting or service mutation performed"
+  ],
+  "all_original_local_handles_terminal": true,
+  "reserved_readiness_committed_in_authenticated_fixture": true,
+  "productive_recovery_granted": false,
+  "production_capacity_changed": false
+}

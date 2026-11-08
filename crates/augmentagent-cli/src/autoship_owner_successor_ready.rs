@@ -89,11 +89,39 @@ pub(super) fn for_claim(conn:&Connection,claim:&Claim,reference:&RecordRef)->Res
         && serde_json::from_str::<serde_json::Value>(&event.2)?==serde_json::json!({"version":record.version,"request_id":record.original.request_id,"record_sha256":hash}),"owner readiness event changed");
     Ok(Some(RecordRef {sequence,sha256:hash}))
 }
+/// The shared writer accepts only the distinct actual borrowed native proofs.
+/// Saved body-state data cannot select a branch or construct this authority.
+enum InputNonrelease<'a,'b> {
+    Unbound(&'a UnboundNativeInputNonreleaseProof<'b>),
+    Reserved(&'a augmentagent_channel_core::native_vm::ownership::NativeBodyNonreleaseProof<'b>,&'a super::super::owner_dispatch::ReservedOwnerBodyRead),
+}
+impl InputNonrelease<'_,'_> {
+    fn request_id(&self)->&str {match self {Self::Unbound(p)=>p.request_id(),Self::Reserved(p,_)=>p.request_id()}}
+    fn namespace(&self)->&Authority {match self {Self::Unbound(p)=>p.namespace(),Self::Reserved(p,_)=>p.namespace()}}
+    fn binding(&self)->&augmentagent_channel_core::native_vm::ownership::TransferBinding {match self {Self::Unbound(p)=>p.binding(),Self::Reserved(p,_)=>p.binding()}}
+    fn validate_current(&self)->Result<()> {match self {Self::Unbound(p)=>p.validate_current(),Self::Reserved(p,_)=>p.validate_current()}}
+}
 impl WorkflowStore {
+    pub(crate) fn prepare_reserved_owner_successor_ready(&mut self,
+        lease:&RecoveryLease,authorization:&crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+        prepared:&crate::self_improve::RecoveredOwnerPreparation<'_,'_,'_>,
+        proof:&augmentagent_channel_core::native_vm::ownership::NativeBodyNonreleaseProof<'_>,
+        snapshot:&super::super::owner_dispatch::ReservedOwnerBodyRead,
+        scope:&RegisteredScope<'_>,now:i64)->Result<ReadySettlement> {
+        self.prepare_owner_successor_ready(lease,authorization,prepared,InputNonrelease::Reserved(proof,snapshot),scope,now)
+    }
     pub(crate) fn prepare_unbound_owner_successor_ready(&mut self,
         lease:&RecoveryLease,authorization:&crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
         prepared:&crate::self_improve::RecoveredOwnerPreparation<'_,'_,'_>,
         proof:&UnboundNativeInputNonreleaseProof<'_>,scope:&RegisteredScope<'_>,now:i64)->Result<ReadySettlement> {
+        self.prepare_owner_successor_ready(lease,authorization,prepared,InputNonrelease::Unbound(proof),scope,now)
+    }
+    // Use a store connection independent of the native proof's current-owner
+    // fence. No native/current-owner callback may run inside the SQL transaction.
+    fn prepare_owner_successor_ready(&mut self,
+        lease:&RecoveryLease,authorization:&crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+        prepared:&crate::self_improve::RecoveredOwnerPreparation<'_,'_,'_>,
+        proof:InputNonrelease<'_,'_>,scope:&RegisteredScope<'_>,now:i64)->Result<ReadySettlement> {
         prepared.require_recovery_claim(lease)?;prepared.validate_native_current()?;proof.validate_current()?;scope.validate_current()?;
         ensure!(proof.request_id()==lease.request_id() && proof.namespace()==prepared.native_namespace()
             && proof.binding()==prepared.native_binding(),"owner readiness original native input proof changed");
@@ -106,15 +134,29 @@ impl WorkflowStore {
         let completed=super::super::owner_publication::completion(&tx,intent.workflow(),intent.request(),&intent,&raw)?.context("owner readiness requires completed publication")?;
         intent.validate_completed_canonical_files(&completed)?;
         ensure!(completed.scope_reference()==scope.reference(),"owner readiness registered scope changed");scope.validate_current()?;
-        ensure!(super::super::owner_dispatch::read_body_input_history(&tx,intent.workflow(),intent.request())?.is_none()
-            && lease.claim.original.body_dispatch.is_none() && original_identity(&tx,intent.workflow(),intent.request())?==lease.claim.original,"owner readiness original reservation absence changed");
+        let history=super::super::owner_dispatch::read_body_input_history(&tx,intent.workflow(),intent.request())?;
+        ensure!(original_identity(&tx,intent.workflow(),intent.request())?==lease.claim.original,"owner readiness original reservation snapshot changed");
+        let native_namespace=proof.namespace().clone();
+        let plan=match proof {
+            InputNonrelease::Unbound(proof)=>{
+                ensure!(history.is_none() && lease.claim.original.body_dispatch.is_none(),"owner readiness original reservation absence changed");
+                Plan::UnexposedBody {original_dispatch:None,native_nonrelease:proof.evidence().clone(),body_state:Some(ReadinessBodyState::ReservationAbsent)}
+            },
+            InputNonrelease::Reserved(proof,snapshot)=>{
+                let history=history.context("reserved owner readiness original body missing")?;
+                snapshot.require_current(&history)?;
+                let reference=lease.claim.original.body_dispatch.clone().context("reserved owner readiness claim reservation missing")?;
+                let state=ReadinessBodyState::from_native(&history,proof)?;
+                Plan::UnexposedBody {original_dispatch:Some(reference),native_nonrelease:proof.evidence().clone(),body_state:Some(state)}
+            },
+        };
         let publication:(i64,String)=tx.query_row("SELECT sequence,record_sha256 FROM workflow_owner_publication_completion WHERE request_id=?1",[intent.request()],|r|Ok((r.get(0)?,r.get(1)?)))?;
         let checkpoint:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[intent.workflow()],|r|r.get(0))?;
         let record=Record {version:2,original:lease.claim.original.clone(),recovery:lease.reference.clone(),generation:lease.generation(),
             publication:RecordRef {sequence:publication.0,sha256:publication.1},binding:intent.recovery_binding().clone(),
-            native_namespace:proof.namespace().clone(),native_facts_sha256:facts.fingerprint()?,scope:scope.reference().clone(),
+            native_namespace,native_facts_sha256:facts.fingerprint()?,scope:scope.reference().clone(),
             checkpoint:serde_json::from_str(&checkpoint)?,control:owner_control::read(&tx,intent.workflow())?.context("owner readiness control missing")?,
-            plan:Plan::UnexposedBody {original_dispatch:None,native_nonrelease:proof.evidence().clone(),body_state:Some(ReadinessBodyState::ReservationAbsent)},at_ms:now};
+            plan,at_ms:now};
         let raw=serde_json::to_string(&record)?;ensure!(raw.len()<=MAX_READY,"owner readiness exceeds bound");let hash=digest(&raw);
         let (count,bytes):(i64,i64)=tx.query_row("SELECT count(*),coalesce(sum(length(CAST(record AS BLOB))),0) FROM workflow_owner_successor_ready WHERE workflow=?1",[intent.workflow()],|r|Ok((r.get(0)?,r.get(1)?)))?;
         ensure!(count<1024 && bytes.checked_add(raw.len() as i64).is_some_and(|n|n<=128*1024*1024),"owner readiness history exceeds bound");

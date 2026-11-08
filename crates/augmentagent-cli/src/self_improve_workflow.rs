@@ -2935,6 +2935,10 @@ async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
     Ok(out.trim().to_string())
 }
 
+#[cfg(all(test,target_os="linux"))]
+#[path="self_improve_owner_reserved_ready_tests.rs"]
+mod reserved_ready_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4273,6 +4277,9 @@ mod tests {
     fn owner_metadata_recovery_modes(modes:&[&str]) {owner_metadata_recovery_modes_with_retry(modes,false)}
     fn owner_metadata_recovery_modes_with_retry(modes:&[&str],retry:bool) {owner_metadata_recovery_modes_inner(modes,retry,None)}
     fn owner_metadata_recovery_modes_inner(modes:&[&str],retry:bool,interruption:Option<&str>) {
+        owner_metadata_recovery_modes_inner_reserved(modes,retry,interruption,None)
+    }
+    pub(super) fn owner_metadata_recovery_modes_inner_reserved(modes:&[&str],retry:bool,interruption:Option<&str>,reserved:Option<&str>) {
         use std::os::unix::fs::PermissionsExt;
         for mode in modes {
         let control=control_dir();let gh=control.path().join("gh-recovery");
@@ -4291,11 +4298,13 @@ else: raise SystemExit('unexpected authority call')
         let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--test-threads=1","--nocapture"])
             .env("AUTOSHIP_INITIAL_GUARD_CHILD",control.path()).env("AUTOSHIP_INITIAL_GUARD_MODE",mode)
             .env("JARVIS_TEST_SUCCESSOR_RETRY",if retry {"1"}else{"0"})
+            .env("JARVIS_TEST_RESERVED_READY",reserved.unwrap_or(""))
             .env("JARVIS_TEST_SUCCESSOR_INTERRUPTION",interruption.unwrap_or("")).env("GH_BIN",&gh).env("XDG_STATE_HOME",control.path().join("operator-state")).env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json")).output().unwrap();
-        assert!(output.status.success(),"{mode}: {} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(),"{mode} reserved={reserved:?}: {} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        if let Some(phase)=reserved {assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("reserved readiness fixture passed: {phase}")),"actual reserved readiness fixture did not execute");}
         if retry {assert!(String::from_utf8_lossy(&output.stdout).contains("successor native retry fixture passed"),"actual successor retry fixture did not execute");}
         if let Some(case)=interruption {assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("successor interruption fixture passed: {case}")),"actual successor interruption fixture did not execute");}
-        if !retry && interruption.is_none() && matches!(*mode,"owner-early-acceptance-producer-metadata-recovery"|"owner-early-acceptance-producer-claude-metadata-recovery") {
+        if reserved.is_none() && !retry && interruption.is_none() && matches!(*mode,"owner-early-acceptance-producer-metadata-recovery"|"owner-early-acceptance-producer-claude-metadata-recovery") {
             assert!(String::from_utf8_lossy(&output.stdout).contains("successor versioned cycle fixture passed"),"actual successor cycle fixture did not execute");
         }
         }
@@ -5601,6 +5610,9 @@ else: raise SystemExit('unexpected authority call')
                     guard.store.lock().unwrap().validate_owner_publication_metadata(&pending._metadata,millis()).unwrap();
                     if mode.ends_with("-metadata-recovery") {
                         let policy=crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22};
+                        let reserved_phase=std::env::var("JARVIS_TEST_RESERVED_READY").unwrap_or_default();
+                        #[cfg(target_os="linux")]
+                        let initial_reserved_read=if !reserved_phase.is_empty() {Some(super::reserved_ready_tests::seed_reserved_body(guard,&turn,&prepared,&native,&reserved_phase))}else{None};
                         let live_plan=WorkflowStore::open(&state).unwrap().owner_publication_recovery_plan(&id).unwrap().unwrap();
                         assert_eq!(live_plan.command().provider,Some(if mode.contains("-claude-") {durable::submission::Provider::Claude}else{durable::submission::Provider::Codex}));
                         let live_auth=super::super::targeted::authorize_owner_publication_recovery(dir.path(),&live_plan,policy).await.unwrap();
@@ -5638,6 +5650,11 @@ else: raise SystemExit('unexpected authority call')
                         });
                         let (index,recovery)=winner;let recovery=Arc::new(recovery);assert_eq!(recovery.generation(),original_generation+1);assert_eq!(recovery.request_id(),original_request);
                         store.validate_owner_publication_recovery(&recovery,&authorization,millis()).unwrap();
+                        #[cfg(target_os="linux")]
+                        if !reserved_phase.is_empty() {
+                            super::reserved_ready_tests::settle_reserved_body(&state,dir.path(),recovery.clone(),&authorization,&reserved_phase,initial_reserved_read.as_ref()).await;
+                            println!("reserved readiness fixture passed: {reserved_phase}");return;
+                        }
                         let native_facts=store.owner_publication_recovery_native_facts(&recovery,&authorization,millis()).unwrap();
                         let original_audit=PathBuf::from(&native_facts.namespace().audit_path);let audit_before=std::fs::read(&original_audit).unwrap();
                         let mut native_visited=false;

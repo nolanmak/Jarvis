@@ -86,6 +86,34 @@ fn closure(value: &serde_json::Value, intent: &PreparedLaunchIntent) -> Result<(
     Ok(())
 }
 impl ReadinessBodyState {
+    /// Join a real borrowed native proof to the caller's transaction-bound SQL
+    /// history. Current-owner validation must run before opening that transaction.
+    pub(crate) fn from_native(
+        history: &OriginalBodyInputHistory,
+        proof: &augmentagent_channel_core::native_vm::ownership::NativeBodyNonreleaseProof<'_>,
+    ) -> Result<Self> {
+        let expected = history.expected_attempts();
+        let binding = format!(
+            "{:x}",
+            Sha256::digest(
+                augmentagent_channel_core::native_vm::ownership::canonical_bytes(
+                    &serde_json::to_value(proof.binding())?
+                )?
+            )
+        );
+        ensure!(
+            proof.request_id() == history.request_id
+                && proof.namespace().owner.workflow_id == history.workflow
+                && proof.expected_attempts() == expected.as_slice()
+                && binding == history.setup.intent.original_store_binding_sha256,
+            "reserved readiness original native/SQL expectation changed"
+        );
+        Self::from_reserved(&ReservedBodyNonreleaseRead {
+            history,
+            expected: proof.expected_attempts(),
+            evidence: proof.evidence(),
+        })
+    }
     fn payload(&self) -> Result<&ReservedInputRecord> {
         match self {
             Self::ReservedModelUnadmitted(v)

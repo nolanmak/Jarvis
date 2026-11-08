@@ -13476,9 +13476,14 @@ for tool, arguments in [
     async fn individual_hung_gate_is_stopped_without_deleting_candidate() {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         std::fs::write(dir.path().join("candidate"), "keep work").unwrap();
-        let result = run_sandboxed_bounded("/bin/sh", &["-c", "sleep 0.2; touch late-write"],
+        // A fixed delayed write races the controller's scheduling under load:
+        // it can happen before the timeout is even observed. Permit the write
+        // only after timeout/teardown returns, so any marker proves a survivor.
+        let result = run_sandboxed_bounded("/bin/sh", &["-c", "while [ ! -e release-write ]; do sleep 0.01; done; touch late-write"],
             dir.path(), &[("PATH".into(), "/usr/bin:/bin".into())], std::time::Duration::from_millis(20), &test_resource_audit(dir.path())).await;
         assert!(format!("{:#}", result.unwrap_err()).contains("verification invocation timed out"));
+        assert!(!dir.path().join("late-write").exists());
+        std::fs::write(dir.path().join("release-write"), b"timeout returned").unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(!dir.path().join("late-write").exists(), "timed-out descendant must be terminated");
         assert_eq!(std::fs::read_to_string(dir.path().join("candidate")).unwrap(), "keep work");

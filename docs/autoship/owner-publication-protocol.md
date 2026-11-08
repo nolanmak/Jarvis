@@ -1633,13 +1633,14 @@ they are not discarded or relabelled as trusted exclusions. The existing native
 intent field validator is public for this descriptive validation only; it grants
 no protected append, admission or input permission.
 
-**Current implementation boundary:** only the existing reservation-absent
-constructor actually commits version-2 readiness. Reserved variants are built
+**Implementation boundary at `30f0e5b7` (reserved settlement superseded by §64):**
+only the existing reservation-absent constructor committed version-2 readiness. Reserved variants are built
 from the held SQL/native observation and their saved-data validator is connected
-to the readiness reader, but no reserved settlement constructor has been added.
+to the readiness reader, but no reserved settlement constructor had been added
+at that checkpoint.
 The positive reserved tests exercise controlled original SQL/native observations,
 not a committed reserved readiness record under an authenticated recovery claim.
-Only the original-attempt projection exists today; additional attempts refuse
+Only the original-attempt projection existed at that checkpoint; additional attempts refused
 until the recovered model/input projections and complete cycle ancestry exist.
 This is not the full multi-attempt implementation required by §53.
 
@@ -1665,8 +1666,82 @@ version/tag combinations, current/original preparation identities, substitutions
 damaged ancestry, pause/expiry semantics and continued execution refusal.
 See [the versioned readiness evidence](1703-versioned-readiness-preparation-proof.json).
 
-Reserved settlement, completed/unstarted predecessor dispositions, repeated
-cycles, consuming model/input/result grants, full C/R and legacy writer
-qualification, worker ingress, normal deployment and all original live acceptance
-requirements remain open. No production limit, retained runtime, hold, accounting
-or service was changed by this work.
+At that checkpoint, reserved settlement and the broader recovery work remained
+open; §64 adds the reserved metadata writer. Completed/unstarted predecessor
+dispositions, repeated cycles, consuming model/input/result grants, full C/R and
+legacy writer qualification, worker ingress, normal deployment and all original
+live acceptance requirements remain required. No production limit, retained
+runtime, hold, accounting or service was changed by that work.
+
+
+## 64. Commit reserved readiness under the actual recovery and native authorities
+
+`prepare_reserved_owner_successor_ready` now commits metadata readiness for the
+four reserved variants. It requires the actual authorized recovery claim,
+claim-bound recovered preparation, completed publication/canonical files, a fresh
+borrowed `NativeBodyNonreleaseProof`, the current registered scope and the complete
+SQL observation made before entering the native factory. The shared writer also
+serves reservation-absent readiness; saved JSON cannot select its private proof
+union or reconstruct either native authority.
+
+The SQL observation is a private, non-cloneable, non-serializable
+`ReservedOwnerBodyRead`. It retains the entire original history, including the
+first model slot, while exposing only native expectation data. Its read transaction
+finishes before native locking. The consuming immediate transaction re-reads full
+history and requires exact equality, joins it to the actual native expectations,
+checks the current original claim snapshot and publication/scope, and validates
+the appended version-2 readiness record before commit. A model-only change must
+refuse even when the prepared/resource/input references have not changed. The
+new regression originally demonstrated that gap; matching native expectations
+alone was insufficient.
+
+The record/event, original turn's `recovery_ready` disposition, recovery-pointer
+removal and metadata-lease release commit together. Original reservation,
+preparation, model/native admission records, resource charges, queued input,
+checkpoint, owner controls and merge allowance remain intact. Native/current-owner
+callbacks run before the SQL transaction. After commit the old metadata lease is
+intentionally gone: the outer metadata visitor validates the actual
+`ReadySettlement`, rather than revalidating that expired role. Callers must use a
+store connection independent of the native current-owner fence; no same-mutex
+callback or nested immediate transaction is introduced.
+
+The authenticated fixture now seeds controlled persisted body records, completes
+publication through the real recovery API, persists the actual forward native
+intent, runs authenticated native reconciliation to close the original writer,
+and obtains fresh native/registered-scope evidence before calling the reserved
+writer. Both Codex and Claude cover four positive reserved cases, released-input
+refusal and a caller reply lost after SQL commit. The latter leaves one valid
+readiness record, can be read through the successor planner, and cannot replay the
+old metadata claim. It is not a simulated SQLite COMMIT-acknowledgement fault.
+
+Failures before readiness insertion, recovery-pointer removal and lease release
+roll back the entire transaction. A coherent body/resource record and dispatch
+event mutation injected during insertion is rejected by the original model/
+reservation or saved-history joins and likewise rolls back. Wrong-request native
+proofs and attempts to use the reservation-absent path refuse. A separate two-
+provider case reads the first slot before model admission, then admits the model
+without changing native expectations; the stale complete snapshot now refuses
+before readiness writes, while a fresh snapshot succeeds. Original charges and
+source/destination audits remain unchanged. Each fault attempt obtains a fresh
+grant through the normal repository/owner authorization path; the production
+30-second authorization deadline and metadata lease limits are unchanged.
+
+The final full CLI run passed 1,976 tests, with 34 ignored, and production
+compilation passed. One preceding full run failed the existing test-only hung-gate
+fixture. It used a delayed write whose timing could race when the controller
+observed the timeout; an isolated rerun passed. The fixture now releases that write
+only after timeout/teardown returns, preserving its 20 ms deadline and candidate/
+no-late-write assertions. Production gate code was not changed. The corrected
+fixture passed both alone and in the final full suite. See
+[the reserved-settlement evidence](1703-reserved-settlement-proof.json) for exact
+runs, failures and source hashes.
+
+**Current boundary:** these are authenticated metadata transitions using controlled
+original runtime/export/resource fixtures. The original reservation is seeded by
+the existing test-only persisted-record helper; this does not establish a live
+resource-ready original-body constructor, VM/provider/model execution or CLI/
+Discord workflow acceptance. Only the original attempt projection is supported;
+complete multi-attempt/cycle predecessors, productive release/model/result grants,
+full source/resource/legacy-writer qualification, worker ingress and every original
+rollout/merge/fault/soak requirement remain open. No production policy, capacity,
+retained runtime, hold, accounting or service was changed.

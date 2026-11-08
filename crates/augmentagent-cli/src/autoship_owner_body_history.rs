@@ -110,6 +110,37 @@ impl ReservedBodyNonreleaseRead<'_> {
     pub(crate) fn expected_attempts(&self)->&[augmentagent_channel_core::native_vm::ownership::ExpectedBodyInputAttempt] {self.expected}
     pub(crate) fn native_evidence(&self)->&serde_json::Value {self.evidence}
 }
+impl OriginalBodyInputHistory {
+    fn expected_attempts(&self)->[augmentagent_channel_core::native_vm::ownership::ExpectedBodyInputAttempt;1] {
+        use augmentagent_channel_core::native_vm::{PreparedLaunchRecord,ownership::ExpectedBodyInputAttempt};
+        [ExpectedBodyInputAttempt {prepared:PreparedLaunchRecord {intent:self.setup.intent.clone(),controller_receipt:self.setup.launch_receipt.clone()},
+            resource_receipt:Some(self.setup.resource_receipt.clone()),owner_input:self.native.as_ref().map(|slot|slot.admission.reference.clone())}]
+    }
+}
+/// One complete SQL observation, including the original model slot. This is
+/// data, not native/workflow authority; no Clone, serde or public constructor.
+pub(crate) struct ReservedOwnerBodyRead {
+    history:OriginalBodyInputHistory,
+    expected:Vec<augmentagent_channel_core::native_vm::ownership::ExpectedBodyInputAttempt>,
+}
+impl ReservedOwnerBodyRead {
+    /// Consume neither model nor workflow authority. Compare the full original
+    /// slot observation inside the caller's consuming workflow transaction.
+    pub(crate) fn require_current(&self,history:&OriginalBodyInputHistory)->Result<()> {
+        ensure!(&self.history==history,"reserved body SQL snapshot changed before readiness");Ok(())
+    }
+    pub(crate) fn expected_attempts(&self)->&[augmentagent_channel_core::native_vm::ownership::ExpectedBodyInputAttempt] {&self.expected}
+}
+impl WorkflowStore {
+    /// Expectations only; these cannot establish a native writer disposition.
+    /// Finish this transaction before entering the native proof factory.
+    pub(crate) fn read_reserved_owner_body(&mut self,workflow:&str,request:&str)
+        ->Result<ReservedOwnerBodyRead> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let h=read(&tx,workflow,request)?.context("original reserved body history missing")?;
+        let expected=h.expected_attempts().to_vec();tx.commit()?;Ok(ReservedOwnerBodyRead {history:h,expected})
+    }
+}
 /// Borrowed observation only. No model, body, setup or release permission.
 impl WorkflowStore {
     pub(crate) fn with_reserved_body_nonrelease<T>(&mut self,workflow:&str,request:&str,
