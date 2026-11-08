@@ -1475,3 +1475,47 @@ comparison or resetting previous spend. Those constructors/readers, complete
 C/R closure, legacy writer cutover, productive recovery, normal rollout and all
 original live acceptance remain unfinished. No missing charge evidence is
 reconstructed, no reservation is reclaimed and no budget or allowance changes.
+
+
+## 60. Original reserved-body SQL input history
+
+The shared `read_body_input_history` reader now observes the original resource-ready
+reservation inside one workflow transaction. It retains exact record digests and event-payload references
+for the reservation, first model admission, common charge event and optional SQL
+native admission, together with the immutable preparation and prepared launch/
+resource pair. The existing complete dispatch/model/native validators run before
+constructing this data. The reservation-absent readiness constructor uses this
+shared read for its absence check; it still refuses an existing reservation.
+
+The descriptive SQL states are `reserved_model_unadmitted`,
+`reserved_model_admitted_native_absent` and `reserved_sql_bound`. The last means
+only that SQL committed its selected input reference. It is not either native
+binding disposition in §53: fresh whole-lineage native proof must distinguish
+closed-before-binding from an actual bound writer. Version-1 body reservations
+remain ineligible because they lack the required resource-ready input history.
+The snapshot's format version is separate from the readiness journal version.
+
+**D60.1 — Absence of a projection is not absence of spent work.** Unclassified
+native model-admission events after the reservation in its generation refuse.
+A spent model charge must retain exactly one attribution event; a model charge
+attributed after this reservation must have its original body slot. Preparation
+spend before reservation remains distinct. Losing both slot metadata and its
+owner-body event field cannot relabel admitted work as model-unadmitted. Further
+loss of the model-admission event or common charge event likewise refuses while
+the original model charge stays spent. No history is backfilled or refunded.
+
+The actual resource-ready callback fixture reads all three SQL stages and exact
+references, tests legacy refusal and damaged native/charge references, and requires
+no snapshot/event mutation by these reads. The first feature test reached the
+unsupported reserved-history path; a second behavioral red caught paired model
+projection loss being reported as model-unadmitted. Final owner-body tests and
+production compilation passed. The existing 12-case authenticated-recovery matrix
+also passed before the final reserved-only missing-attribution guard was added.
+See [the SQL history evidence](1703-original-body-sql-history-proof.json).
+
+This implements the original SQL observation, not the full immutable multi-attempt
+lineage or reserved readiness producer. Native proof composition, version-2
+readiness construction/readers, repeated-cycle predecessors, consuming model/input/
+result grants, full C/R source/resource/writer qualification and every original
+live acceptance gate remain required. This data cannot reconstruct a dispatch,
+revoke a writer, establish nonrelease or authorize another native attempt.

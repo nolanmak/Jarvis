@@ -79,7 +79,8 @@ impl WorkflowStore {
         let completed=super::super::owner_publication::completion(&tx,intent.workflow(),intent.request(),&intent,&raw)?.context("owner readiness requires completed publication")?;
         intent.validate_completed_canonical_files(&completed)?;
         ensure!(completed.scope_reference()==scope.reference(),"owner readiness registered scope changed");scope.validate_current()?;
-        ensure!(lease.claim.original.body_dispatch.is_none() && original_identity(&tx,intent.workflow(),intent.request())?==lease.claim.original,"owner readiness original reservation absence changed");
+        ensure!(super::super::owner_dispatch::read_body_input_history(&tx,intent.workflow(),intent.request())?.is_none()
+            && lease.claim.original.body_dispatch.is_none() && original_identity(&tx,intent.workflow(),intent.request())?==lease.claim.original,"owner readiness original reservation absence changed");
         let publication:(i64,String)=tx.query_row("SELECT sequence,record_sha256 FROM workflow_owner_publication_completion WHERE request_id=?1",[intent.request()],|r|Ok((r.get(0)?,r.get(1)?)))?;
         let checkpoint:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[intent.workflow()],|r|r.get(0))?;
         let record=Record {version:1,original:lease.claim.original.clone(),recovery:lease.reference.clone(),generation:lease.generation(),

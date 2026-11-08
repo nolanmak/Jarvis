@@ -1,5 +1,15 @@
 //! One durable owner-body dispatch reservation. It never proves completion.
 use super::*;
+#[path="autoship_owner_body_history.rs"]
+mod body_history;
+pub(super) use body_history::read as read_body_input_history;
+#[cfg(test)]
+pub(crate) fn test_body_input_history(conn:&Connection,workflow:&str,request:&str)->Result<serde_json::Value> {
+    let tx=conn.unchecked_transaction()?;
+    let value=serde_json::to_value(read_body_input_history(&tx,workflow,request)?)?;
+    tx.commit()?;Ok(value)
+}
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

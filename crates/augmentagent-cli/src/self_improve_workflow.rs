@@ -4345,6 +4345,7 @@ else: raise SystemExit('unexpected authority call')
             .output().unwrap();
         assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
         assert!(String::from_utf8_lossy(&output.stdout).contains("resumed prepared callbacks passed"),"resumed fixture did not execute");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("reserved body SQL history fixture passed"),"reserved SQL history fixture did not execute");
         assert!(String::from_utf8_lossy(&output.stdout).contains("owner model charge provenance fixture passed"),"resumed charge provenance fixture did not execute");
     }
     async fn check_prepared_owner_body_callbacks(guard:&WorkflowGuard,prepared:Arc<acceptance::owner::PreparedOwnerAcceptance>,artifact:&Path) {
@@ -4391,6 +4392,31 @@ else: raise SystemExit('unexpected authority call')
         let (original_preparation,original_receipts):(String,String)=db.query_row("SELECT record,receipts FROM workflow_owner_preparation WHERE request_id=?1",[&turn.request_id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         let activation:String=db.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='owner_acceptance_registered'",[guard.id()],|r|r.get(0)).unwrap();
         let reservation:String=db.query_row("SELECT record FROM workflow_owner_body_dispatch WHERE request_id=?1",[&turn.request_id],|r|r.get(0)).unwrap();
+        let body_input_history=|expected:&str,reference:Option<&augmentagent_channel_core::native_vm::OwnerInputReference>| {
+            let before=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
+            let events=guard.store.lock().unwrap().events(guard.id()).unwrap();
+            let observed=durable::owner_dispatch::test_body_input_history(&db,guard.id(),&turn.request_id);
+            if resumed {
+                let value=observed.expect("resource-ready original body needs its exact SQL input history");
+                assert_eq!(value["state"],expected);
+                assert_eq!(value["workflow"],guard.id());assert_eq!(value["request_id"],turn.request_id);
+                assert_eq!(value["setup"]["intent"],serde_json::to_value(&native.intent).unwrap());
+                assert_eq!(value["setup"]["resource_receipt"],serde_json::to_value(&resource).unwrap());
+                assert_eq!(value["reservation"]["sha256"],format!("{:x}",Sha256::digest(reservation.as_bytes())));
+                assert_eq!(value["model"].is_null(),expected=="reserved_model_unadmitted");
+                if expected!="reserved_model_unadmitted" {
+                    let (model_sequence,receipt,raw):(i64,String,String)=db.query_row("SELECT sequence,receipt,record FROM workflow_owner_body_model_admission WHERE request_id=?1",[&turn.request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                    assert_eq!(value["model"]["admission"]["sequence"],model_sequence);
+                    assert_eq!(value["model"]["admission"]["sha256"],format!("{:x}",Sha256::digest(raw.as_bytes())));
+                    assert_eq!(value["model"]["receipt"],receipt);assert_eq!(value["model"]["charge"]["model_calls"],1);
+                }
+                if let Some(reference)=reference {assert_eq!(value["native"]["admission"]["reference"],serde_json::to_value(reference).unwrap());}
+                else {assert!(value["native"].is_null());}
+            }else {assert!(observed.is_err(),"legacy reservation gained resource-ready recovery history");}
+            assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap(),before);
+            assert_eq!(guard.store.lock().unwrap().events(guard.id()).unwrap(),events);
+        };
+        body_input_history("reserved_model_unadmitted",None);
         let bytes=std::fs::read(artifact).unwrap();
         for fault in ["preparation-pair","reservation-downgrade","artifact","provider","intact"] {
             match fault {
@@ -4440,6 +4466,7 @@ else: raise SystemExit('unexpected authority call')
             }
             prepared.validate_activated(guard,&guard.worktree).unwrap();
         }
+        body_input_history("reserved_model_admitted_native_absent",None);
         // Use the actually committed charge, not synthetic admission rows.
         // Both native binding and the final input callback must recheck it.
         let check_charge_provenance=|admit:&dyn Fn()->Result<()>| {
@@ -4459,6 +4486,7 @@ else: raise SystemExit('unexpected authority call')
                 }
                 let faulted_events=guard.store.lock().unwrap().events(guard.id()).unwrap();
                 assert!(admit().is_err(),"{fault}: owner input accepted damaged model charge provenance");
+                assert!(durable::owner_dispatch::test_body_input_history(&db,guard.id(),&turn.request_id).is_err(),"{fault}: SQL body history accepted damaged charge provenance");
                 assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap(),before,"{fault}: refusal changed accounting or workflow state");
                 assert_eq!(guard.store.lock().unwrap().events(guard.id()).unwrap(),faulted_events,"{fault}: refusal published events");
                 db.execute("DELETE FROM workflow_event WHERE seq=?1 OR (workflow=?2 AND kind='resource_charged' AND payload=?3)",rusqlite::params![sequence,guard.id(),receipt]).unwrap();
@@ -4482,6 +4510,7 @@ else: raise SystemExit('unexpected authority call')
         assert_eq!(guard.store.lock().unwrap().events(guard.id()).unwrap(),history);
         db.execute_batch("DROP TRIGGER deny_native_input_bind").unwrap();
         let reference=controller.bind_model(&native,&resource).unwrap();
+        body_input_history("reserved_sql_bound",Some(&reference));
         assert_eq!(controller.bind_model(&native,&resource).unwrap(),reference,"binding replay changed original admission");
         controller.authorize_input(&native,&resource,&reference,&controller.prompt_sha256,controller.prompt_bytes).unwrap();
         check_charge_provenance(&||controller.authorize_input(&native,&resource,&reference,&controller.prompt_sha256,controller.prompt_bytes));
@@ -4491,6 +4520,7 @@ else: raise SystemExit('unexpected authority call')
         assert!(controller.authorize_input(&native,&resource,&forged,&controller.prompt_sha256,controller.prompt_bytes).is_err());
         let original_native:String=db.query_row("SELECT record FROM workflow_owner_body_native_admission WHERE request_id=?1",[&turn.request_id],|row|row.get(0)).unwrap();
         db.execute("UPDATE workflow_owner_body_native_admission SET record='{}' WHERE request_id=?1",[&turn.request_id]).unwrap();
+        assert!(durable::owner_dispatch::test_body_input_history(&db,guard.id(),&turn.request_id).is_err(),"body SQL history ignored a damaged native reference");
         assert!(controller.authorize_input(&native,&resource,&reference,&controller.prompt_sha256,controller.prompt_bytes).is_err());
         db.execute("UPDATE workflow_owner_body_native_admission SET record=?2 WHERE request_id=?1",rusqlite::params![turn.request_id,original_native]).unwrap();
         controller.authorize_input(&native,&resource,&reference,&controller.prompt_sha256,controller.prompt_bytes).unwrap();
@@ -4504,6 +4534,11 @@ else: raise SystemExit('unexpected authority call')
         // broaden a previously used captured callback into legacy admission.
         db.execute("DELETE FROM workflow_owner_body_model_admission WHERE workflow=?1",[guard.id()]).unwrap();
         db.execute("UPDATE workflow_event SET payload=json_remove(payload,'$.owner_body') WHERE workflow=?1 AND kind='native_model_admitted'",[guard.id()]).unwrap();
+        assert!(durable::owner_dispatch::test_body_input_history(&db,guard.id(),&turn.request_id).is_err(),"paired model projection loss relabelled admitted work as model-unadmitted");
+        db.execute("DELETE FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' AND json_extract(payload,'$.receipt')=?2",rusqlite::params![guard.id(),reference.model_receipt]).unwrap();
+        assert!(durable::owner_dispatch::test_body_input_history(&db,guard.id(),&turn.request_id).is_err(),"lost model admission event concealed a charged original call");
+        db.execute("DELETE FROM workflow_event WHERE workflow=?1 AND kind='resource_charged' AND payload=?2",rusqlite::params![guard.id(),reference.model_receipt]).unwrap();
+        assert!(durable::owner_dispatch::test_body_input_history(&db,guard.id(),&turn.request_id).is_err(),"unattributed model spend became model-unadmitted history");
         let before=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
         assert!(guard.audit.model_call_admitted("codex").is_err(),
             "owner body reservation admitted a second native call that could replay the original input");
@@ -4513,7 +4548,7 @@ else: raise SystemExit('unexpected authority call')
         assert_eq!(store.pending_owner_messages(guard.id()).unwrap(),1);assert!(!store.owner_control(guard.id()).unwrap().unwrap().paused);
         assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
         println!("owner model charge provenance fixture passed");
-        if resumed {println!("resumed prepared callbacks passed");}
+        if resumed {println!("reserved body SQL history fixture passed");println!("resumed prepared callbacks passed");}
     }
 
     #[tokio::test]

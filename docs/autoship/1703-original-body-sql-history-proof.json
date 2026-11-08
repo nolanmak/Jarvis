@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "component": "original resource-ready body SQL input history",
+  "base_commit": "f4e2dd16111859005ca71f7c0296d55180e103d3",
+  "status": "original-sql-observation-no-reserved-readiness-or-execution-grant",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_dispatch.rs": "bfcda86b7cb2e47977f5516fcdabdaa536fa16c13d27e219ea2ecef49816cb32",
+    "crates/augmentagent-cli/src/autoship_owner_body_history.rs": "e2da7f0ac731bcd2431e06cd02abc0a397a71d840e3b29c9963bd4f5ea41c9d5",
+    "crates/augmentagent-cli/src/autoship_owner_successor_ready.rs": "1d5271e4c72947f37da6d32338069b08a24afb83f9adedead42b8afe5903dff9",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "2162edd0921ef5c0e8037f117b71ea5fd5fb8ab86efd262efd2c0e8f7f44dedd"
+  },
+  "red": [
+    {
+      "kind": "feature not implemented",
+      "handle": 75236,
+      "log": "/tmp/autoship-body-sql-history-behavior-red-20261108.log",
+      "result": "The actual resource-ready body fixture reached the unsupported reserved SQL history path.",
+      "seconds": 2.32
+    },
+    {
+      "kind": "paired projection loss",
+      "handle": 45067,
+      "log": "/tmp/autoship-body-sql-history-paired-loss-red-20261108.log",
+      "result": "Losing the model slot and owner-body event field relabelled admitted work as model-unadmitted.",
+      "seconds": 3.83
+    }
+  ],
+  "compile_correction": {
+    "handle": 41444,
+    "log": "/tmp/autoship-body-sql-history-red-20261108.log",
+    "result": "Initial module re-export visibility failed compilation; fixed before behavioral RED. This is not counted as RED coverage."
+  },
+  "validation": [
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent owner_body_ -- --nocapture",
+      "log": "/tmp/autoship-body-sql-history-final-green-20261108.log",
+      "passed": 12,
+      "failed": 0,
+      "seconds": 5.4
+    },
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent self_improve::workflow::tests::expired_owner_publication_has_authenticated_metadata_recovery -- --exact --nocapture",
+      "log": "/tmp/autoship-body-sql-history-recovery-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "controlled_cases": 12,
+      "seconds": 137.09,
+      "scope": "Before the final missing-attribution guard within the reserved-only branch. The absence reader and readiness consumer were unchanged afterward; final owner-body tests exercised the final reserved branch."
+    },
+    {
+      "command": "scripts/cargo-managed.sh build -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-body-sql-history-final-production-20261108.log",
+      "passed": true,
+      "seconds": 14.05
+    }
+  ],
+  "assertions": [
+    "Actual version-3 resource-ready SQL history progresses through model-unadmitted, model-admitted/native-absent and SQL-bound while keeping the same reservation digest and prepared/resource pair.",
+    "The first model slot retains its actual admission digest, receipt and common charge reference; SQL-bound retains the exact captured OwnerInputReference.",
+    "Legacy reservation observations refuse rather than assigning absent resource history.",
+    "Charge-provenance faults and a damaged native record refuse; reads retain workflow snapshots and event bytes.",
+    "Paired model projection loss, subsequent model-admission-event loss and common-charge-event loss remain errors, with the original model call still spent.",
+    "The resumed parent requires a marker after all SQL history assertions, so an early exit is not positive coverage."
+  ],
+  "limits": [
+    "The positive new SQL-stage fixture is a controlled Codex version-3 callback fixture; it does not establish version-2 live execution, native body nonrelease or source/resource closure.",
+    "Only the original SQL slot is observed; complete multi-attempt lineage and reserved readiness remain unfinished.",
+    "No live provider, VM, Discord, merge, rollout or soak acceptance was performed.",
+    "No production policy, budget, hold, reservation, accounting or service changed."
+  ],
+  "all_original_local_handles_terminal": true,
+  "final_validation_handle": 89067,
+  "productive_recovery_granted": false,
+  "production_capacity_changed": false
+}
