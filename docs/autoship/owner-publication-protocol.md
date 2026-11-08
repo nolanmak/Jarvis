@@ -1958,3 +1958,54 @@ resource qualification, repeated productive cycles or the original live CLI/
 Discord, rollout, autonomous-merge and fault/soak acceptance requirements. No
 production service, capacity policy, retained session, allowance or hold changes
 as part of this component.
+
+## 69. Fresh metadata completion observation before native handoff
+
+A completion can commit in the original protected native audit while its workflow
+callback is lost. After the old workflow lease expires, the existing productive
+completion verifier correctly rejects a metadata-only logger. Reusing or relaxing
+that productive admission would confuse an observation with owner-body completion.
+
+`with_metadata_native_completion` supplies a separate borrowed
+`MetadataNativeCompletionProof`. It requires an installed current metadata fence
+and the exact original prepared launch and protected completion receipt. The
+productive and metadata entry points share the same original state/session/audit
+locking, selected-policy/store binding, current original-native-owner check,
+physical runtime/export comparison, kernel/resource closure, latest-receipt
+selection, uncertainty refusal and complete-launch census. Their role predicates
+and resulting proof types remain distinct. Metadata evidence has kind
+`metadata_native_completion`; it cannot be passed as `NativeCompletionProof` to
+complete an owner body. Neither proof can be reconstructed from saved JSON.
+
+The regression expired the original workflow lease after an actual protected
+completion, confirmed that its delayed ordinary SQL callback refused, installed
+a current metadata role, then attempted completion inspection. It initially
+failed at the productive admission check. The new metadata path passes for Codex
+and Claude while retaining the original state lock, keeping model dispatch
+fenced, and changing no workflow, audit or accounting state. Nine negative
+conditions for each provider cover missing/stale/midway role fences, wrong launch
+or receipt, changed export bytes, superseded completion, uncertainty and an
+incomplete launch. The initial stale-role test fixture tried to install an
+already-invalid fence and was correctly rejected at installation; the corrected
+fixture installs a valid fence before revoking it. No deadline or production
+guard was weakened. The focused seven-test completion suite includes the existing
+productive factory's native lock, retired-owner and completion regression tests.
+
+This is the native observation component. It applies while the original native
+owner is still current, before transfer/retirement. It does not import a receipt
+from a closed/transferred source, qualify a legacy writer, reconstruct an
+executable dispatch or clear known uncertainty. Workflow admission still needs a
+fresh authenticated recovery role, exact original publication/native registration
+and launch joins, atomic idempotent observation/provenance storage, and original
+budget/controls preservation. Protected-receipt discovery and the worker wakeup
+must use that writer before productive ingress. They are not implemented by this
+factory. The physical export/protected-journal fixtures do not run a provider/VM
+or establish full host C/R qualification. Exact validation and limits are in
+`1703-metadata-completion-proof.json`; all original rollout and live acceptance
+requirements remain open.
+
+Final validation: the full CLI suite passed 1,982 tests, with zero failures and
+34 ignored (678.33 seconds); non-test compilation passed (1 minute 29 seconds).
+All original local handles are terminal. No production service, native policy,
+reservation, hold, accounting or allowance changed. These local receipts do not
+establish independent review, trusted hosted CI or live workflow acceptance.

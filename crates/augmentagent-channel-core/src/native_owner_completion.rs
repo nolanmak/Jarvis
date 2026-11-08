@@ -189,8 +189,69 @@ pub fn with_current_native_completion(
     current: &dyn Fn() -> Result<()>,
     visit: &mut dyn FnMut(&NativeCompletionProof<'_>) -> Result<()>,
 ) -> Result<()> {
+    with_native_completion_inner(logger,prepared,reference,current,CompletionAdmission::Productive,
+        &mut |binding,inventory,evidence,_completed,state| {
+            visit(&NativeCompletionProof {prepared,receipt:reference,binding,inventory,evidence,_state:state})
+        })
+}
+
+/// A fresh observation of a completion that committed before its workflow
+/// callback was lost. It is distinct from NativeCompletionProof: this borrowed
+/// metadata cannot complete an owner body, release input, or admit a model call.
+/// SQL recovery must separately validate its current authenticated plan and
+/// exact original launch/registration before recording any observation.
+pub struct MetadataNativeCompletionProof<'a> {
+    prepared:&'a PreparedLaunchRecord,
+    receipt:&'a AppendReceipt,
+    binding:&'a super::ownership::TransferBinding,
+    inventory:&'a RuntimeInventoryRow,
+    evidence:&'a Value,
+    observation:&'a Value,
+    _state:&'a super::StateLock,
+}
+impl MetadataNativeCompletionProof<'_> {
+    pub fn prepared(&self)->&PreparedLaunchRecord {self.prepared}
+    pub fn receipt(&self)->&AppendReceipt {self.receipt}
+    pub fn binding(&self)->&super::ownership::TransferBinding {self.binding}
+    pub fn inventory(&self)->&RuntimeInventoryRow {self.inventory}
+    pub fn evidence(&self)->&Value {self.evidence}
+    pub fn observation(&self)->&Value {self.observation}
+}
+/// Inspects the exact latest protected completion while holding original
+/// state/session/audit locks. Requires an installed metadata fence, never the
+/// expired original dispatch lease. Refuses uncertainty, incomplete launches,
+/// changed runtime/export bytes and closed/transferred original native owners.
+/// This performs no observation append or workflow mutation.
+pub fn with_metadata_native_completion(logger:&AuditLogger,prepared:&PreparedLaunchRecord,
+    reference:&AppendReceipt,current:&dyn Fn()->Result<()>,
+    visit:&mut dyn FnMut(&MetadataNativeCompletionProof<'_>)->Result<()>,
+)->Result<()> {
+    with_native_completion_inner(logger,prepared,reference,current,CompletionAdmission::Metadata,
+        &mut |binding,inventory,evidence,observation,state| {
+            visit(&MetadataNativeCompletionProof {prepared,receipt:reference,binding,inventory,evidence,observation,_state:state})
+        })
+}
+#[derive(Clone,Copy)]
+enum CompletionAdmission {Productive,Metadata}
+impl CompletionAdmission {
+    fn verify_launch(self,logger:&AuditLogger,prepared:&PreparedLaunchRecord)->Result<()> {
+        match self {
+            Self::Productive=>logger.verify_native_launch_reference(prepared),
+            Self::Metadata=>{logger.metadata_reconciliation_current()?;logger.verify_native_launch_history(prepared)},
+        }
+    }
+    fn selection(self,logger:&AuditLogger,binding:&super::ownership::TransferBinding)->Result<()> {
+        match self {Self::Productive=>logger.dispatch_allowed()?,Self::Metadata=>logger.metadata_reconciliation_current()?}
+        selected_binding(binding)
+    }
+    fn kind(self)->&'static str {match self {Self::Productive=>"current_native_completion",Self::Metadata=>"metadata_native_completion"}}
+}
+fn with_native_completion_inner(logger:&AuditLogger,prepared:&PreparedLaunchRecord,
+    reference:&AppendReceipt,current:&dyn Fn()->Result<()>,admission:CompletionAdmission,
+    visit:&mut dyn FnMut(&super::ownership::TransferBinding,&RuntimeInventoryRow,&Value,&Value,&super::StateLock)->Result<()>,
+)->Result<()> {
     current()?;
-    logger.verify_native_launch_reference(prepared)?;
+    admission.verify_launch(logger,prepared)?;
     ensure!(logger.native_runtime_owner()?.as_ref()==Some(&prepared.intent.source_owner),
         "native completion owner changed");
     let completed=referenced_event(logger,prepared,reference,"native_launch_completion_verified")?;
@@ -206,7 +267,7 @@ pub fn with_current_native_completion(
     let identity=&admitted["resource_identity"];
     ensure!(identity.is_object(),"native completion resource identity missing");
     let binding=logger.native_store_binding()?.context("original native binding missing")?;
-    selection(logger,&binding)?;
+    admission.selection(logger,&binding)?;
     let (root,store)=binding.retirement_store()?;
     let lock=super::StateLock::existing(root)?;
     let ledger=super::owner_ledger::Ledger::open_bound(root,&lock,store,true)?;
@@ -256,12 +317,11 @@ pub fn with_current_native_completion(
             "native namespace has an incomplete launch");
         let quiescent=crate::run_resources::verify_quiescent(identity)?;
         let actual=inventory()?;
-        selection(logger,&binding)?;current()?;
-        let evidence=json!({"version":1,"kind":"current_native_completion","launch_intent_id":prepared.intent.intent_id,
+        admission.selection(logger,&binding)?;current()?;
+        let evidence=json!({"version":1,"kind":admission.kind(),"launch_intent_id":prepared.intent.intent_id,
             "completion_reference":reference,"original_store_binding_sha256":prepared.intent.original_store_binding_sha256,
             "inventory":actual,"audit":audited["audit"],"namespace_validation":audited["validation"],"quiescent_resource":quiescent});
-        let proof=NativeCompletionProof {prepared,receipt:reference,binding:&binding,inventory:&actual,evidence:&evidence,_state:&lock};
-        visit(&proof)
+        visit(&binding,&actual,&evidence,&completed,&lock)
     })
 }
 

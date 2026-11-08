@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Fresh metadata-only original native completion proof",
+  "source_sha256": {
+    "crates/augmentagent-channel-core/src/native_owner_completion.rs": "f47f6a1de7c07b36a2c39bd3ab2adeb4af230d48d97b69e7a6f635f9bd8296e8",
+    "crates/augmentagent-channel-core/src/native_owner_transfer.rs": "b03a541d152f2f082e7feac1315d3b948902c3b88ee069a516fa11c2938149d9",
+    "crates/augmentagent-cli/src/autoship_native_observation.rs": "249da71d2253581ad93fc135861aa106ca64d77002fbdf0590faf7634ad0529a"
+  },
+  "behavioral_red": {
+    "handle": 40131,
+    "exit_code": 1,
+    "seconds": 0.34,
+    "log": "/tmp/autoship-metadata-completion-red-20261108.log",
+    "reason": "Actual protected completion with expired original workflow lease refused at productive admission under installed metadata role"
+  },
+  "initial_green": {
+    "handle": 69946,
+    "exit_code": 0,
+    "passed": 1,
+    "seconds": 0.72,
+    "log": "/tmp/autoship-metadata-completion-green-20261108.log"
+  },
+  "fixture_failure": {
+    "handle": 19592,
+    "exit_code": 1,
+    "passed": 6,
+    "failed": 1,
+    "seconds": 1.28,
+    "log": "/tmp/autoship-metadata-completion-expanded-20261108.log",
+    "reason": "Stale-role fixture correctly refused installation of an already-invalid metadata fence; changed fixture to install valid fence before revocation"
+  },
+  "focused_completion_suite": {
+    "handle": 96996,
+    "exit_code": 0,
+    "passed": 7,
+    "seconds": 6.54,
+    "log": "/tmp/autoship-metadata-completion-final-focused-20261108.log"
+  },
+  "full_cli": {
+    "handle": 71070,
+    "state": "terminal",
+    "log": "/tmp/autoship-metadata-completion-full-cli-20261108.log",
+    "exit_code": 0,
+    "passed": 1982,
+    "failed": 0,
+    "ignored": 34,
+    "seconds": 678.33
+  },
+  "assertions": [
+    "Both provider pins freshly verify an exact protected completion after the original SQL lease expires",
+    "Delayed old ordinary SQL callback remains refused",
+    "Productive completion factory still refuses the metadata-only logger",
+    "Metadata visitor retains original native state lock and cannot dispatch a model",
+    "Missing/stale/midway metadata roles, wrong launch or receipt, changed bytes, superseded receipt, uncertainty and pending launch refuse without visitor or workflow/audit mutation",
+    "Existing productive completion and native locks/retirement tests still pass through the shared validator"
+  ],
+  "fixture_limits": [
+    "Protected scripted resource/session records and real local export/lock checks; no provider request, live native VM or production host qualification",
+    "A controlled release/new SQL claim represents loss of the original callback; no live crash acceptance is claimed",
+    "The tested metadata role uses an actual current workflow lease and logger fence, not the final owner-recovery authorization/writer integration"
+  ],
+  "remaining": [
+    "Authenticated owner-recovery SQL observation/provenance writer with original registration/launch/publication joins and atomic rollback/idempotence",
+    "Protected completion receipt discovery and worker integration before native transfer",
+    "Separate transferred-source historical observation support; factory refuses closed original native owners",
+    "Legacy/source/resource/input qualification and immutable debt resolution",
+    "Productive body/model/result/repeated-cycle constructors and full private coding lifecycle",
+    "Exact-head independent review and trusted hosted CI, normal updater rollout",
+    "All original live CLI/private Discord, five autonomous merges, 72h fault and 24h unattended acceptance gates"
+  ],
+  "production_changed": false,
+  "productive_recovery_granted": false,
+  "goal_complete": false,
+  "previous_head_hosted_ci_incident": {
+    "head": "16aad3e692c5fd50551400717581d407c04cf4fa",
+    "cli_job": 128682114324,
+    "cli_log": "/tmp/autoship-1758-cli-16aad3e6.log",
+    "targeted_job": 128682122676,
+    "targeted_log": "/tmp/autoship-1758-targeted-16aad3e6.log",
+    "initial_failure": "Both failed during setup-deno downloading pinned 2.7.14 asset with HTTP 504 before test steps",
+    "targeted_retry_job": 128683640879,
+    "targeted_retry_log": "/tmp/autoship-1758-targeted-16aad3e6-retry.log",
+    "targeted_retry_result": "Deno setup succeeded; contract aggregate still refused because cli job retained its download failure",
+    "deno_release_verified": {
+      "tag": "v2.7.14",
+      "asset": "deno-x86_64-unknown-linux-gnu.zip",
+      "sha256": "3287efef53606966469cb6a02781327be22b908959397f976e2996dc1b64ae0f"
+    },
+    "new_head_checks_required": true,
+    "independent_review": "unproven"
+  },
+  "non_test_compile": {
+    "handle": 28146,
+    "exit_code": 0,
+    "duration": "1m 29s",
+    "log": "/tmp/autoship-metadata-completion-production-20261108.log",
+    "profile": "dev, debuginfo disabled; not a deployment build"
+  },
+  "all_original_local_handles_terminal": true
+}

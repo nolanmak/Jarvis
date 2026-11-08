@@ -3394,6 +3394,78 @@ pub(crate) mod tests {
         let fact=f.complete();(f,fact)
     }
     #[test]
+    fn metadata_native_completion_survives_old_workflow_lease_without_productive_authority() {
+        if child("metadata_native_completion_survives_old_workflow_lease_without_productive_authority") {return;}
+        for provider in ["codex","claude"] {
+            let mut f=Fixture::with_native_provider(false,false,false,provider);
+            f.audit.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":f.lease.workflow,"generation":f.lease.generation})).unwrap();
+            f.audit.require_run_resources().unwrap();
+            file(&f._root.path().join(format!("native/{provider}/session-fixture/lock")),b"");
+            let fact=f.complete();
+            // Native completion committed before process loss; its SQL callback
+            // never committed. A current metadata role owns the new SQL lease.
+            f.store.release(&f.lease,now()).unwrap();
+            let successor=f.store.claim(&f.lease.workflow,"metadata-result-observer",now(),60_000).unwrap().unwrap();
+            assert!(f.record(&fact).is_err(),"expired original lease admitted its delayed callback");
+            let shared=std::sync::Arc::new(std::sync::Mutex::new(WorkflowStore::open(&f.path).unwrap()));
+            let checked=shared.clone();let lease=successor.clone();let binding=f.binding.clone();
+            f.audit.restrict_to_metadata(std::sync::Arc::new(move ||checked.lock().unwrap().validate_lease(&lease,&binding,now()))).unwrap();
+            let before=f.store.snapshot(&successor.workflow).unwrap().unwrap();let events=f.store.events(&successor.workflow).unwrap();
+            let mut forbidden=false;
+            assert!(ownership::with_current_native_completion(&f.audit,&f.prepared,fact.receipt(),&||Ok(()),&mut |_| {forbidden=true;Ok(())}).is_err());
+            assert!(!forbidden,"productive completion factory accepted a metadata-only logger");
+            let mut visited=false;
+            ownership::with_metadata_native_completion(&f.audit,&f.prepared,fact.receipt(),&||shared.lock().unwrap().validate_lease(&successor,&f.binding,now()),&mut |proof| {
+                visited=true;assert_eq!(proof.inventory(),fact.inventory().unwrap());
+                assert_eq!(proof.prepared(),&f.prepared);assert_eq!(proof.receipt(),fact.receipt());
+                assert_eq!(proof.binding(),&f.audit.native_store_binding().unwrap().unwrap());
+                assert_eq!(proof.observation()["launch_intent"],serde_json::to_value(&f.prepared.intent).unwrap());
+                assert_eq!(proof.evidence()["kind"],"metadata_native_completion");
+                assert!(ownership::validate_owner_binding(proof.binding(),&||Ok(())).is_err(),"metadata completion lost original state lock");
+                assert!(f.audit.dispatch_allowed().is_err(),"completion inspection enabled model dispatch");
+                Ok(())
+            }).expect("late completion needs a metadata-only fresh verification path");
+            assert!(visited);assert_eq!(f.store.snapshot(&successor.workflow).unwrap().unwrap(),before);assert_eq!(f.store.events(&successor.workflow).unwrap(),events);
+        }
+    }
+    #[test]
+    fn metadata_native_completion_refuses_missing_fence_stale_roles_and_changed_outcomes() {
+        if child("metadata_native_completion_refuses_missing_fence_stale_roles_and_changed_outcomes") {return;}
+        for provider in ["codex","claude"] {
+            for fault in ["missing-fence","stale-role","midway-role","wrong-receipt","wrong-launch","changed-export","superseded","uncertain","pending-launch"] {
+                let f=Fixture::with_native_provider(false,false,false,provider);
+                f.audit.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":f.lease.workflow,"generation":f.lease.generation})).unwrap();
+                f.audit.require_run_resources().unwrap();
+                file(&f._root.path().join(format!("native/{provider}/session-fixture/lock")),b"");
+                let fact=f.complete();
+                if fault=="superseded" {f.complete();}
+                if fault=="uncertain" {f.uncertain(true);}
+                if fault=="pending-launch" {
+                    let mut intent=f.prepared.intent.clone();intent.intent_id=uuid::Uuid::new_v4().to_string();
+                    f.audit.native_launch_prepared(&intent).unwrap();
+                }
+                if fault!="missing-fence" {
+                    let stale=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));let checked=stale.clone();
+                    f.audit.restrict_to_metadata(std::sync::Arc::new(move || {anyhow::ensure!(!checked.load(std::sync::atomic::Ordering::SeqCst),"metadata role lost");Ok(())})).unwrap();
+                    stale.store(fault=="stale-role",std::sync::atomic::Ordering::SeqCst);
+                }
+                if fault=="changed-export" {file(&f._root.path().join(format!("native/{provider}/session-fixture/generation-fixture/context")),b"changed completion bytes");}
+                let reference=if fault=="wrong-receipt" {&f.session}else{fact.receipt()};
+                let mut prepared=f.prepared.clone();
+                if fault=="wrong-launch" {prepared.intent.intent_id=uuid::Uuid::new_v4().to_string();}
+                let snapshot=f.store.snapshot(&f.lease.workflow).unwrap().unwrap();let events=f.store.events(&f.lease.workflow).unwrap();
+                let audit=std::fs::read(f.audit.path()).unwrap();let calls=std::cell::Cell::new(0);
+                let mut visited=false;
+                let result=ownership::with_metadata_native_completion(&f.audit,&prepared,reference,&|| {
+                    let count=calls.get();calls.set(count+1);anyhow::ensure!(fault!="midway-role" || count==0,"metadata authority changed before visitor");Ok(())
+                },&mut |_| {visited=true;Ok(())});
+                assert!(result.is_err(),"{provider}/{fault}: invalid completion admitted");assert!(!visited,"{provider}/{fault}: invalid metadata visitor ran");
+                assert_eq!(std::fs::read(f.audit.path()).unwrap(),audit);
+                assert_eq!(f.store.snapshot(&f.lease.workflow).unwrap().unwrap(),snapshot);assert_eq!(f.store.events(&f.lease.workflow).unwrap(),events);
+            }
+        }
+    }
+    #[test]
     fn current_native_completion_proof_holds_locks_and_refuses_changed_bytes() {
         if child("current_native_completion_proof_holds_locks_and_refuses_changed_bytes") {return;}
         use std::os::fd::AsRawFd;
