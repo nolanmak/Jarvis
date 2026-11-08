@@ -4,6 +4,10 @@ use super::*;
 
 #[path = "autoship_owner_recovery_blocked.rs"]
 mod blocked;
+#[path = "autoship_owner_input_blocked.rs"]
+mod input_blocked;
+#[cfg(test)]
+pub(crate) fn test_legacy_input_blocker_encoding(raw:&str)->Result<String> {input_blocked::fixture_encoding(raw)}
 #[path="autoship_owner_recovery_native_intent.rs"]
 mod native_intent;
 pub(crate) use native_intent::RecoveryNativeIntentPersistence;

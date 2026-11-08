@@ -1841,3 +1841,72 @@ policy re-pinning, capacity change, runtime deletion or accounting reset is
 authorized by this format change. The typed reason is available to the future
 recovery controller; its durable blocked-state/notification integration is not
 claimed by this component.
+
+## 67. Persist unsupported-input recovery debt without receipt-driven retries
+
+The shared recovery metadata controller now catches the actual typed
+`LegacyNativeInputWriter` refusal while retaining the original native proof. It
+uses an independent workflow connection to record the observation; the mutex used
+by the native current-owner fence remains free. A persistence failure preserves
+the typed refusal and reports that the blocker could not be saved. It never
+reports readiness or applies the pending instruction.
+
+`workflow_owner_legacy_input_blocked` is a bounded projection of the same workflow
+event journal, unique per recovery claim. The atomic record/event binds the exact
+request/publication/claim, historical native frontier and original SQL launch
+reference, plus observed controls and native history. The writer requires fresh
+authorized metadata/native facts and their unchanged transaction snapshot. It
+refuses unsettled native transfers, abort obligations and remote mutations rather
+than preventing their reconciliation. Native callbacks stay outside SQL. Duplicate
+recording for the same claim/witness/outcome is idempotent. This projection and
+the existing abort-blocked history share the 1,024-record budget; each record is
+at most 32 KiB. History exhaustion holds even if a dependency changes.
+
+Claim admission and status read this durable debt after reopening the store.
+Neither lease expiry nor a later clock makes an unchanged unsupported writer
+eligible for another metadata claim. The original reservation, model/native
+records, spent charges, controls, queued input and shipping allowance remain
+intact. The observation does not release the current metadata lease or grant a
+model/input capability.
+
+Integrity and retry dependencies are distinct. A canonical checksum retains the
+complete protected-observation prefix at the blocker event. A separate outcome
+checksum includes per-launch provider, certainty, actual session and completion/
+alias/export identities. Protected source-receipt order selects the latest
+observation; SQL insertion order, receipt churn, timestamps and ownership changes
+do not become outcome progress. Older arrivals cannot roll back a newer outcome,
+and conflicting data for the same source receipt refuses. The history reader
+decodes/hashes each observation once per ordered history walk. A changed validated
+outcome can wake metadata inspection; it cannot authorize original-body replay or
+substitute for a provider conversation frontier or original input qualification.
+
+The controller regression first failed because no durable observation was made.
+The actual two-provider fixture now covers insertion rollback, idempotence,
+reopening, two-hour clock advance, expired-lease claim refusal, missing index/event
+halves, coherent launch/frontier/history/outcome substitutions and unsupported
+record versions. Damaged native observation data refuses. A second protected
+completion captured before handoff is projected later through a controlled SQL
+fixture: its unchanged outcome remains blocked despite its new receipt. This is
+a status-consumer test, not production late-observation admission. A separate
+semantic-consumer unit covers changed outcomes, causally older arrivals and
+conflicting reuse. The actual late-outcome producer and its live integration
+remain required.
+
+Review found that the first dependency checksum incorrectly counted a repeated
+completion receipt as a new outcome. The behavioral red reproduced that wake-up;
+the two checksums above fix it. A preceding full suite also correctly refused a
+successor fixture that exceeded its test-only 60-second lease under parallel load
+(88.49 seconds). The long successor matrix now uses the repository's existing
+normal workflow lease constant and separately proves actual expiry refuses before
+native visitor entry. Production lease behavior and the 30-second authorization
+deadline are unchanged.
+
+The final CLI suite passed 1,980 tests, with zero failures and 34 ignored
+(678.27 seconds); production compilation passed (55.12 seconds). Exact runs and
+limits are in [the durable input-blocker evidence](1703-legacy-input-debt-proof.json).
+No production policy, budget, retained runtime, hold, accounting or service was
+changed. Private Discord progress projection/delivery, actual late-outcome and
+qualification producers, productive recovery/continuation and repeated-cycle
+constructors, worker ingress and every original rollout/merge/fault/soak acceptance
+requirement remain open. A policy edit or timer is not a legacy cutover or a debt
+resolution; that still requires its own original proof and immutable disposition.

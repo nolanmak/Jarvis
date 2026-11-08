@@ -133,14 +133,21 @@ pub(super) fn require_terminal(conn:&Connection,pending:&PendingNativeHandoff)->
 /// Follow only the validated completed edge, never the greatest generation or
 /// an occupied destination row. Retained original publication remains immutable.
 pub(super) fn frontier(conn:&Connection,original:&Original)->Result<augmentagent_channel_core::native_vm::ownership::Authority> {
+    frontier_inner(conn,original,u64::MAX,true)
+}
+/// Immutable frontier at an event boundary; retired registrations remain history.
+pub(super) fn frontier_at(conn:&Connection,original:&Original,before:u64)->Result<augmentagent_channel_core::native_vm::ownership::Authority> {
+    frontier_inner(conn,original,before,false)
+}
+fn frontier_inner(conn:&Connection,original:&Original,before:u64,active:bool)->Result<augmentagent_channel_core::native_vm::ownership::Authority> {
     let (record,_)=original_record(conn,original)?;
     let pending=forward(conn,original)?;
-    let completed=native_pending::settlement::History::load(conn,&original.workflow,u64::MAX)?;
+    let completed=native_pending::settlement::History::load(conn,&original.workflow,before)?;
     let selected=if let Some(pending)=pending.as_ref() {
         (completed.current_pending(pending.request().destination.owner.lease_generation,pending.workflow_binding())?.as_ref()==Some(pending)).then_some(pending)
     }else {None};
     let generation=selected.map_or(original.activated_generation,|pending|pending.request().destination.owner.lease_generation);
-    let (audit,binding,audit_len,binding_len):(String,String,i64,i64)=conn.query_row("SELECT substr(o.audit_path,1,4097),substr(b.binding,1,16385),length(CAST(o.audit_path AS BLOB)),length(CAST(b.binding AS BLOB)) FROM workflow_native_owner o JOIN workflow_native_owner_binding b ON b.workflow=o.workflow AND b.lease_generation=o.lease_generation WHERE o.workflow=?1 AND o.lease_generation=?2 AND o.retired_at IS NULL AND o.retirement_reason IS NULL",params![original.workflow,generation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+    let (audit,binding,audit_len,binding_len):(String,String,i64,i64)=conn.query_row("SELECT substr(o.audit_path,1,4097),substr(b.binding,1,16385),length(CAST(o.audit_path AS BLOB)),length(CAST(b.binding AS BLOB)) FROM workflow_native_owner o JOIN workflow_native_owner_binding b ON b.workflow=o.workflow AND b.lease_generation=o.lease_generation WHERE o.workflow=?1 AND o.lease_generation=?2 AND (NOT ?3 OR (o.retired_at IS NULL AND o.retirement_reason IS NULL))",params![original.workflow,generation,active],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
     ensure!((1..=4096).contains(&audit_len) && audit.len() as i64==audit_len && (1..=16384).contains(&binding_len) && binding.len() as i64==binding_len,"recovery frontier registration exceeds bound");
     record.validate_native_binding(&serde_json::from_str(&binding)?)?;
     let namespace=augmentagent_channel_core::native_vm::ownership::Authority {owner:augmentagent_channel_core::native_vm::RuntimeOwner {workflow_id:original.workflow.clone(),lease_generation:generation},audit_path:audit};

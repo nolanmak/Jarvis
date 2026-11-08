@@ -26,6 +26,7 @@ struct Blocked {
 /// Scheduler/status data only. None of these variants grants native authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RecoveryBlockedState {
+    LegacyInputWriter,
     NamespaceObligations { eligible_at_ms: i64 },
     OriginalPublicationUnavailable,
     ForwardNativeFrontierUnavailable,
@@ -95,10 +96,12 @@ fn load(conn: &Connection, workflow: &str) -> Result<Vec<(Blocked, RecordRef)>> 
     ensure!(count == result.len() as i64, "blocked recovery history index missing");
     Ok(result)
 }
+pub(super) fn retained_count(conn:&Connection,workflow:&str)->Result<usize> {Ok(load(conn,workflow)?.len())}
 // Shares claim acquisition's immediate transaction. This is metadata admission
 // only; existing current claims can inspect and settle cleanup during backoff.
 pub(super) fn blocked_state(conn: &Connection, plan: &RecoveryPlan, now: i64) -> Result<Option<RecoveryBlockedState>> {
     let history = load(conn, &plan.original.workflow)?;
+    if let Some(state)=super::input_blocked::state(conn,plan,now,history.len())? {return Ok(Some(state));}
     let Some((record,_)) = history.last() else { return Ok(None); };
     ensure!(record.request_id == plan.original.request_id && record.intent == plan.original.intent
         && record.generation <= plan.predecessor.generation && record.observed_at_ms <= now,
@@ -142,7 +145,7 @@ impl WorkflowStore {
         if let Some((record,_)) = prior.last().filter(|(record,_)| record.claim == lease.reference && record.obligations == current) {
             return Ok(record.eligible_at_ms);
         }
-        ensure!(prior.len() < 1024, "recovery blocked history capacity reached");
+        ensure!(prior.len()+super::input_blocked::retained_count(&tx,&lease.claim.original.workflow)? < 1024, "recovery blocked history capacity reached");
         let failures = prior.iter().rev().find(|(record,_)| record.request_id == lease.request_id() && record.obligations == current)
             .map_or(1, |(record,_)| record.failures.saturating_add(1));
         let eligible_at_ms = deadline(now, failures, &current)?;

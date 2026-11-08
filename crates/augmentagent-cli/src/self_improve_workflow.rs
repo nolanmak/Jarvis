@@ -489,7 +489,18 @@ fn with_recovery_native_metadata_outcome(state:&Path,worktree:Option<&Path>,
     };
     augmentagent_channel_core::native_vm::ownership::with_metadata_native_owner(&audit,&runtimes,&current,&mut load,&mut |proof| {
         anyhow::ensure!(proof.namespace()==facts.namespace() && proof.binding()==facts.original_binding(),"recovery native metadata differs from original namespace");
-        match visit(proof)? {
+        let outcome=match visit(proof) {
+            Ok(outcome)=>outcome,
+            Err(error) if error.downcast_ref::<augmentagent_channel_core::native_vm::ownership::LegacyNativeInputWriter>().is_some()=>{
+                // The native current-owner fence uses `store`; its mutex must
+                // remain free while this writer revalidates that same proof.
+                let recorded=WorkflowStore::open(state).and_then(|mut blocked|
+                    blocked.record_owner_recovery_legacy_writer_blocked(&recovery,authorization,proof,millis()));
+                return Err(match recorded {Ok(())=>error,Err(blocked)=>error.context(format!("legacy input blocker could not be persisted: {blocked:#}"))});
+            },
+            Err(error)=>return Err(error),
+        };
+        match outcome {
             RecoveryMetadataOutcome::Continue=>current(),
             RecoveryMetadataOutcome::SuccessorReady(settled)=>store.lock().map_err(|_|anyhow::anyhow!("ready settlement store poisoned"))?
                 .require_owner_successor_ready_settlement(&settled,authorization,millis()),
@@ -5652,7 +5663,7 @@ else: raise SystemExit('unexpected authority call')
                         store.validate_owner_publication_recovery(&recovery,&authorization,millis()).unwrap();
                         #[cfg(target_os="linux")]
                         if !reserved_phase.is_empty() {
-                            super::reserved_ready_tests::settle_reserved_body(&state,dir.path(),recovery.clone(),&authorization,&reserved_phase,initial_reserved_read.as_ref()).await;
+                            super::reserved_ready_tests::settle_reserved_body(&state,dir.path(),recovery.clone(),&authorization,&reserved_phase,initial_reserved_read.as_ref().map(|s|&s.initial),initial_reserved_read.as_ref().and_then(|s|s.late.as_ref())).await;
                             println!("reserved readiness fixture passed: {reserved_phase}");return;
                         }
                         let native_facts=store.owner_publication_recovery_native_facts(&recovery,&authorization,millis()).unwrap();

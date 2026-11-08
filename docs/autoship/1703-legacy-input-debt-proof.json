@@ -1,0 +1,103 @@
+{
+  "scope": "Durable unsupported-writer observation and metadata claim admission; full history integrity separated from semantic outcome eligibility; no input/model authority",
+  "parent_head": "ccaffe82fd6001c258fde3d4c1c2911d2faf5dd7",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_input_blocked.rs": "8cfa9b451e67b04f171dc4364f2ff657bf085013574392bd31a43198909186ab",
+    "crates/augmentagent-cli/src/autoship_owner_dispatch.rs": "e54a1049d78ff8ff1fc2df8698b4a998512ec1bf6828252751d6b004eecf6b0c",
+    "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs": "a43d0dab71cb5d4ded07695c89ebaad145428cca4d04042c9ac957aa434e4194",
+    "crates/augmentagent-cli/src/autoship_owner_recovery_blocked.rs": "9a309e4ae8076bab16d6fc8ed74af2c3fc54d272a047ccd38bc528ecb95b421a",
+    "crates/augmentagent-cli/src/autoship_owner_recovery_native_intent.rs": "64e784e7349629f75c42d7a24321fe05d5c2e7f0836223e9c53ced20bd201b42",
+    "crates/augmentagent-cli/src/autoship_workflow.rs": "dc9fe10e881c2bdf711ab889ea78826f73739cbae5f7b6b7fa20a93b510f9e38",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "5945d07cebc27385362ca211b53a3309bee064429990fcb499c653a75912e8e4",
+    "crates/augmentagent-cli/src/self_improve_owner_reserved_ready_tests.rs": "b7305425e35c384b2b3f6d05b4381c986aeff303b60795d601f9d43eb6e6726c"
+  },
+  "writer_red": {
+    "handle": 52358,
+    "exit_code": 1,
+    "seconds": 11.32,
+    "log": "/tmp/autoship-legacy-debt-red-20261108.log",
+    "reason": "Actual authorized metadata refusal reached missing durable writer"
+  },
+  "controller_red": {
+    "handle": 55370,
+    "exit_code": 1,
+    "seconds": 10.21,
+    "log": "/tmp/autoship-legacy-debt-controller-red-20261108.log",
+    "reason": "Shared metadata controller left no durable blocker"
+  },
+  "rollback_tamper_green": {
+    "handle": 27934,
+    "exit_code": 0,
+    "seconds": 45.33,
+    "log": "/tmp/autoship-legacy-debt-rollback-tamper-20261108.log",
+    "scope": "Before final semantic comparison refinement"
+  },
+  "preceding_full_failure": {
+    "handle": 62821,
+    "exit_code": 1,
+    "passed": 1978,
+    "failed": 1,
+    "ignored": 34,
+    "seconds": 560.07,
+    "log": "/tmp/autoship-legacy-debt-full-cli-20261108.log",
+    "failure": "reserved_owner_readiness_survives_successor_native_handoff: transferred preparation correctly refused expired 60s test lease; child ran 88.49s"
+  },
+  "semantic_red": {
+    "handle": 73727,
+    "exit_code": 1,
+    "seconds": 23.26,
+    "log": "/tmp/autoship-legacy-debt-semantic-red-20261108.log",
+    "reason": "A new receipt for unchanged native completion incorrectly made metadata eligible"
+  },
+  "semantic_focused_green": {
+    "handle": 28977,
+    "exit_code": 0,
+    "seconds": 48.67,
+    "log": "/tmp/autoship-legacy-debt-semantic-green-20261108.log",
+    "scope": "Both provider integrations, before final canonical-byte serialization refinement"
+  },
+  "final_full_cli": {
+    "handle": 7004,
+    "exit_code": 0,
+    "passed": 1980,
+    "failed": 0,
+    "ignored": 34,
+    "seconds": 678.27,
+    "log": "/tmp/autoship-legacy-debt-final-cli-20261108.log"
+  },
+  "final_production_compile": {
+    "handle": 21607,
+    "exit_code": 0,
+    "seconds": 55.12,
+    "log": "/tmp/autoship-legacy-debt-production-20261108.log"
+  },
+  "assertions": [
+    "Actual shared metadata controller automatically persists typed unsupported-input refusal under actual original native proof and current authorization",
+    "Index/event insertion is atomic; failed insertion rolls back its event and returns original typed refusal with persistence failure",
+    "Per-claim idempotence, restart and two-hour clock advance do not spend model/ship allowance or admit timer retry",
+    "Seven blocker event/index/coherent-reference/schema corruptions and damaged native observation data refuse",
+    "Original reservation/model/native/charge rows, controls and queued instruction remain intact",
+    "Full canonical protected observation history is checked separately from semantic outcome identity",
+    "Actual repeated protected completion with unchanged outcome does not wake metadata despite a new receipt",
+    "Semantic consumer unit verifies changed outcome, stale causal arrival and conflicting source-receipt reuse",
+    "Current-format reserved readiness and successor handoff continue passing, with explicit expired-setup refusal before native visitor",
+    "Combined legacy-input/abort blocked history retains 1024-record bound and no timeout bypass at exhaustion"
+  ],
+  "fixture_limits": [
+    "Original reservation/resources use controlled persisted records; no real provider or production VM execution",
+    "Delayed second native observation is a controlled SQL projection of a protected completion captured before handoff; production late-outcome admission is not demonstrated",
+    "Changed semantic-outcome eligibility is covered by a data-consumer unit; actual changed-outcome producer/live integration remains required",
+    "Long successor fixture uses existing normal workflow LEASE_MS instead of its former arbitrary 60s TTL; production defaults/guard behavior and 30s authorization deadline unchanged"
+  ],
+  "remaining": [
+    "Private Discord progress projection/delivery for this event is not connected",
+    "Full source/resource/input legacy qualification and immutable qualification/debt-resolution disposition remain required",
+    "Actual late-outcome producer, productive release/model/result/continuation and repeated-cycle constructors remain unfinished",
+    "Worker/CLI/private Discord ingress, normal updater rollout and independent exact-head review/hosted CI remain required",
+    "All original five-autonomous-merge and 72h fault/24h unattended acceptance gates remain required"
+  ],
+  "all_original_local_handles_terminal": true,
+  "production_changed": false,
+  "productive_recovery_granted": false,
+  "goal_complete": false
+}

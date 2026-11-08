@@ -4,6 +4,18 @@ use super::*;
 use augmentagent_channel_core::native_vm::{ownership, RuntimeOwner};
 use std::os::unix::fs::PermissionsExt;
 #[tokio::test]
+async fn legacy_input_writer_debt_survives_restart_and_does_not_retry_on_a_timer() {
+    super::tests::owner_metadata_recovery_modes_inner_reserved(
+        &[
+            "owner-early-acceptance-producer-metadata-recovery",
+            "owner-early-acceptance-producer-claude-metadata-recovery",
+        ],
+        false,
+        None,
+        Some("legacy-blocked"),
+    );
+}
+#[tokio::test]
 async fn reserved_owner_readiness_refuses_legacy_input_writer_protocol() {
     super::tests::owner_metadata_recovery_modes_inner_reserved(
         &[
@@ -62,18 +74,23 @@ async fn reserved_owner_readiness_preserves_original_body_and_spend() {
         );
     }
 }
+pub(super) struct ReservedSeed {
+    pub(super) initial: durable::owner_dispatch::ReservedOwnerBodyRead,
+    pub(super) late: Option<durable::native_observation::NativeObservation>,
+}
 pub(super) fn seed_reserved_body(
     guard: &WorkflowGuard,
     turn: &durable::owner_turn::OwnerTurn,
     preparation: &acceptance::owner::PreparedOwnerAcceptance,
     native: &Path,
     phase: &str,
-) -> durable::owner_dispatch::ReservedOwnerBodyRead {
+) -> ReservedSeed {
     let phase = phase.strip_prefix("successor-").unwrap_or(phase);
-    let legacy_writer = phase == "legacy-writer";
+    let legacy_writer = matches!(phase, "legacy-writer" | "legacy-blocked");
+    let keep_late_observation = phase == "legacy-blocked";
     let phase = if phase == "stale-model-snapshot" {
         "admitted"
-    } else if matches!(phase, "lost-response" | "legacy-writer") {
+    } else if matches!(phase, "lost-response" | "legacy-writer" | "legacy-blocked") {
         "native-bound"
     } else {
         phase
@@ -111,23 +128,24 @@ pub(super) fn seed_reserved_body(
         durable::submission::Provider::Codex => "codex",
         durable::submission::Provider::Claude => "claude",
     };
-    let (prepared, session, resource) = durable::native_observation::tests::retained_launch_fixture_with_writer_version(
-        native,
-        &audit,
-        name,
-        if legacy_writer { 2 } else { 3 },
-        |prepared| {
-            store
-                .record_verified_native_launch(
-                    &guard.lease,
-                    &guard.binding,
-                    &audit,
-                    prepared,
-                    millis(),
-                )
-                .unwrap();
-        },
-    );
+    let (prepared, session, resource) =
+        durable::native_observation::tests::retained_launch_fixture_with_writer_version(
+            native,
+            &audit,
+            name,
+            if legacy_writer { 2 } else { 3 },
+            |prepared| {
+                store
+                    .record_verified_native_launch(
+                        &guard.lease,
+                        &guard.binding,
+                        &audit,
+                        prepared,
+                        millis(),
+                    )
+                    .unwrap();
+            },
+        );
     let lock = native.join(format!("{name}/session-fixture/lock"));
     std::fs::write(&lock, b"").unwrap();
     std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -186,7 +204,7 @@ pub(super) fn seed_reserved_body(
     }
     let completion =
         ownership::observe_native_completion(&audit, &prepared, &session, &resource).unwrap();
-    store
+    let first = store
         .record_verified_native_observation(
             &guard.lease,
             &guard.binding,
@@ -195,11 +213,28 @@ pub(super) fn seed_reserved_body(
             millis(),
         )
         .unwrap();
+    let late = if keep_late_observation {
+        // Actual protected completion captured before handoff, withheld from
+        // SQL to exercise the blocked-status consumer's later evidence input.
+        // The later SQL projection is a controlled fixture, not a production
+        // late-observation admission or an executable completion capability.
+        let second =
+            ownership::observe_native_completion(&audit, &prepared, &session, &resource).unwrap();
+        let mut proof = audit.read_append_receipt(second.receipt()).unwrap();
+        proof.as_object_mut().unwrap().remove("audit_chain");
+        let mut row = first;
+        row.observed_at_ms = second.observed_at_ms();
+        row.protected_observation_reference = Some(second.receipt().clone());
+        row.proof = Some(proof);
+        Some(row)
+    } else {
+        None
+    };
     assert!(
         guard.audit.dispatch_allowed().is_err(),
         "synthetic body records promoted the metadata guard"
     );
-    initial
+    ReservedSeed { initial, late }
 }
 pub(super) async fn settle_reserved_body(
     state: &Path,
@@ -208,6 +243,7 @@ pub(super) async fn settle_reserved_body(
     authorization: &super::super::targeted::AuthorizedOwnerRecovery<'_>,
     phase: &str,
     initial: Option<&durable::owner_dispatch::ReservedOwnerBodyRead>,
+    late: Option<&durable::native_observation::NativeObservation>,
 ) {
     let successor = phase.starts_with("successor-");
     let phase = phase.strip_prefix("successor-").unwrap_or(phase);
@@ -463,7 +499,13 @@ pub(super) async fn settle_reserved_body(
                             );
                             assert_eq!(
                                 unbound_entered,
-                                !matches!(phase, "native-bound" | "lost-response" | "legacy-writer")
+                                !matches!(
+                                    phase,
+                                    "native-bound"
+                                        | "lost-response"
+                                        | "legacy-writer"
+                                        | "legacy-blocked"
+                                )
                             );
                         }
                         if check_mismatch && phase == "stale-model-snapshot" {
@@ -519,7 +561,12 @@ pub(super) async fn settle_reserved_body(
             },
         )
     };
-    if !successor && !matches!(phase, "released" | "stale-model-snapshot" | "legacy-writer") {
+    if !successor
+        && !matches!(
+            phase,
+            "released" | "stale-model-snapshot" | "legacy-writer" | "legacy-blocked"
+        )
+    {
         for fault in ["insert", "pointer", "release", "input-race"] {
             let sql=match fault {
                 "insert"=>"CREATE TRIGGER refuse_reserved_ready BEFORE INSERT ON workflow_owner_successor_ready BEGIN SELECT RAISE(ABORT,'injected reserved readiness rollback'); END;",
@@ -591,14 +638,65 @@ pub(super) async fn settle_reserved_body(
     )
     .await
     .unwrap();
+    if phase == "legacy-blocked" {
+        db.execute_batch("CREATE TRIGGER refuse_legacy_blocker BEFORE INSERT ON workflow_owner_legacy_input_blocked BEGIN SELECT RAISE(ABORT,'injected legacy blocker rollback'); END;").unwrap();
+        let failed = settle(&mut store, &fresh, false, true).unwrap_err();
+        assert!(failed
+            .downcast_ref::<ownership::LegacyNativeInputWriter>()
+            .is_some());
+        assert!(format!("{failed:#}").contains("legacy input blocker could not be persisted"));
+        assert_eq!(store.events(&workflow).unwrap(), events);
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM workflow_owner_legacy_input_blocked WHERE workflow=?1",
+                [&workflow],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            original_rows(&db, &workflow, recovery.request_id()),
+            original
+        );
+        db.execute_batch("DROP TRIGGER refuse_legacy_blocker;")
+            .unwrap();
+    }
+    let fresh = if phase == "legacy-blocked" {
+        super::super::targeted::authorize_owner_publication_recovery(
+            worktree,
+            authorization.plan(),
+            crate::autoship_discord_command::OwnerPolicy { bot: 11, owner: 22 },
+        )
+        .await
+        .unwrap()
+    } else {
+        fresh
+    };
     let result = settle(&mut store, &fresh, phase == "lost-response", true);
-    if matches!(phase, "released" | "legacy-writer") {
+    if phase == "legacy-blocked" {
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM workflow_owner_legacy_input_blocked WHERE workflow=?1",
+                [&workflow],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1,
+            "shared native metadata controller did not persist its legacy refusal"
+        );
+    }
+    if matches!(phase, "released" | "legacy-writer" | "legacy-blocked") {
         let error = result.unwrap_err();
-        if phase == "legacy-writer" {
-            assert!(error.downcast_ref::<ownership::LegacyNativeInputWriter>().is_some(),
-                "legacy writer refusal lost its typed classification: {error:#}");
+        if matches!(phase, "legacy-writer" | "legacy-blocked") {
+            assert!(
+                error
+                    .downcast_ref::<ownership::LegacyNativeInputWriter>()
+                    .is_some(),
+                "legacy writer refusal lost its typed classification: {error:#}"
+            );
         }
-        let expected = if phase == "legacy-writer" {
+        let expected = if matches!(phase, "legacy-writer" | "legacy-blocked") {
             "legacy native input writer lacks locked release protocol"
         } else {
             "native body input may already have been released"
@@ -608,7 +706,11 @@ pub(super) async fn settle_reserved_body(
             "unrecoverable input refused at wrong boundary: {error:#}"
         );
         assert_eq!(store.snapshot(&workflow).unwrap().unwrap(), before);
-        assert_eq!(store.events(&workflow).unwrap(), events);
+        if matches!(phase, "legacy-writer" | "legacy-blocked") {
+            assert_eq!(store.events(&workflow).unwrap().len(), events.len() + 1);
+        } else {
+            assert_eq!(store.events(&workflow).unwrap(), events);
+        }
         assert_eq!(
             db.query_row(
                 "SELECT count(*) FROM workflow_owner_successor_ready WHERE workflow=?1",
@@ -758,9 +860,306 @@ pub(super) async fn settle_reserved_body(
     assert_eq!(store.merge_allowance(millis(), 5).unwrap().confirmed, 0);
     assert_eq!(std::fs::read(source.path()).unwrap(), audit_before[0]);
     assert_eq!(std::fs::read(destination.path()).unwrap(), audit_before[1]);
+    if !matches!(phase, "legacy-writer" | "legacy-blocked") {
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM workflow_owner_legacy_input_blocked WHERE workflow=?1",
+                [&workflow],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "non-legacy recovery acquired unsupported-writer debt"
+        );
+    }
     if successor {
         consume_reserved_successor(state, worktree, &workflow, recovery.request_id()).await;
     }
+    if phase == "legacy-blocked" {
+        persist_legacy_writer_debt(
+            state,
+            worktree,
+            &workflow,
+            recovery,
+            &fresh,
+            late.expect("missing withheld original observation fixture"),
+        )
+        .await;
+    }
+}
+
+async fn persist_legacy_writer_debt(
+    state: &Path,
+    worktree: &Path,
+    workflow: &str,
+    recovery: Arc<durable::owner_publication_recovery::RecoveryLease>,
+    authorization: &super::super::targeted::AuthorizedOwnerRecovery<'_>,
+    late: &durable::native_observation::NativeObservation,
+) {
+    let mut store = WorkflowStore::open(state).unwrap();
+    let before = store.snapshot(workflow).unwrap().unwrap();
+    let events = store.events(workflow).unwrap();
+    let db = rusqlite::Connection::open(state).unwrap();
+    let original = original_rows(&db, workflow, recovery.request_id());
+    let queued = store.pending_owner_messages(workflow).unwrap();
+    with_recovery_native_metadata(
+        state,
+        Some(worktree),
+        recovery.clone(),
+        authorization,
+        &mut |proof| {
+            store.record_owner_recovery_legacy_writer_blocked(
+                &recovery,
+                authorization,
+                proof,
+                millis(),
+            )?;
+            let persisted = store.events(workflow)?;
+            assert_eq!(persisted, events);
+            store.record_owner_recovery_legacy_writer_blocked(
+                &recovery,
+                authorization,
+                proof,
+                millis(),
+            )?;
+            assert_eq!(store.events(workflow)?, persisted);
+            Ok(())
+        },
+    )
+    .expect("actual legacy writer refusal must persist durable debt");
+    let reopened = WorkflowStore::open(state).unwrap();
+    for now in [millis(), millis() + 7_200_000] {
+        assert_eq!(
+            reopened
+                .owner_publication_recovery_blocked_state(workflow, now)
+                .unwrap(),
+            Some(durable::owner_publication_recovery::RecoveryBlockedState::LegacyInputWriter)
+        );
+    }
+    assert_eq!(reopened.snapshot(workflow).unwrap().unwrap(), before);
+    assert_eq!(
+        original_rows(&db, workflow, recovery.request_id()),
+        original
+    );
+    assert_eq!(reopened.pending_owner_messages(workflow).unwrap(), queued);
+    assert_eq!(reopened.merge_allowance(millis(), 5).unwrap().confirmed, 0);
+    let (generation,sequence,hash,raw):(i64,i64,String,String)=db.query_row("SELECT generation,sequence,record_sha256,record FROM workflow_owner_legacy_input_blocked WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    let event: String = db
+        .query_row(
+            "SELECT payload FROM workflow_event WHERE workflow=?1 AND seq=?2",
+            rusqlite::params![workflow, sequence],
+            |r| r.get(0),
+        )
+        .unwrap();
+    for fault in [
+        "event",
+        "orphan",
+        "coherent-launch",
+        "coherent-frontier",
+        "coherent-observations",
+        "coherent-outcomes",
+        "version",
+    ] {
+        if fault == "event" {
+            db.execute(
+                "UPDATE workflow_event SET payload='{}' WHERE seq=?1",
+                [sequence],
+            )
+            .unwrap();
+        } else if fault == "orphan" {
+            db.execute(
+                "DELETE FROM workflow_owner_legacy_input_blocked WHERE workflow=?1",
+                [workflow],
+            )
+            .unwrap();
+        } else {
+            let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            match fault {
+                "coherent-launch" => value["launch"]["sha256"] = "f".repeat(64).into(),
+                "coherent-frontier" => {
+                    value["native_namespace"]["audit_path"] = "/substituted/audit".into()
+                }
+                "coherent-observations" => value["observations_sha256"] = "f".repeat(64).into(),
+                "coherent-outcomes" => value["outcomes_sha256"] = "f".repeat(64).into(),
+                _ => value["version"] = 2.into(),
+            }
+            let changed = durable::owner_publication_recovery::test_legacy_input_blocker_encoding(
+                &serde_json::to_string(&value).unwrap(),
+            )
+            .unwrap();
+            let digest = format!("{:x}", Sha256::digest(changed.as_bytes()));
+            db.execute("UPDATE workflow_owner_legacy_input_blocked SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![workflow,changed,digest]).unwrap();
+            let mut value: serde_json::Value = serde_json::from_str(&event).unwrap();
+            value["record_sha256"] = digest.into();
+            db.execute(
+                "UPDATE workflow_event SET payload=?2 WHERE seq=?1",
+                rusqlite::params![sequence, serde_json::to_string(&value).unwrap()],
+            )
+            .unwrap();
+        }
+        let error = reopened
+            .owner_publication_recovery_blocked_state(workflow, millis())
+            .unwrap_err();
+        let expected = match fault {
+            "event" => "legacy input blocker event changed",
+            "orphan" => "legacy input blocker history missing or oversized",
+            "coherent-launch" => "legacy input blocker launch reference changed",
+            "coherent-frontier" => "legacy input blocker native frontier changed",
+            "coherent-observations" => "legacy input blocker native observation snapshot changed",
+            "coherent-outcomes" => "legacy input blocker native outcome snapshot changed",
+            _ => "legacy input blocker original lineage changed",
+        };
+        assert!(
+            format!("{error:#}").contains(expected),
+            "{fault}: refused at wrong boundary: {error:#}"
+        );
+        db.execute(
+            "INSERT OR REPLACE INTO workflow_owner_legacy_input_blocked VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![workflow, generation, sequence, hash, raw],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE workflow_event SET payload=?2 WHERE seq=?1",
+            rusqlite::params![sequence, event],
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .owner_publication_recovery_blocked_state(workflow, millis())
+                .unwrap(),
+            Some(durable::owner_publication_recovery::RecoveryBlockedState::LegacyInputWriter)
+        );
+    }
+    // Controlled process-loss fixture: expire only its private SQL lease.
+    db.execute(
+        "UPDATE workflow SET lease_until=?2 WHERE id=?1",
+        rusqlite::params![workflow, millis() - 1],
+    )
+    .unwrap();
+    let plan = store
+        .owner_publication_recovery_plan(workflow)
+        .unwrap()
+        .unwrap();
+    let fresh = super::super::targeted::authorize_owner_publication_recovery(
+        worktree,
+        &plan,
+        crate::autoship_discord_command::OwnerPolicy { bot: 11, owner: 22 },
+    )
+    .await
+    .unwrap();
+    let events = store.events(workflow).unwrap();
+    assert!(store
+        .claim_owner_publication_recovery(&fresh, "timer-cannot-qualify-legacy", millis(), 60_000)
+        .unwrap()
+        .is_none());
+    assert_eq!(store.events(workflow).unwrap(), events);
+    // Consumer fixture: commit the exact second protected completion's data
+    // after the blocker. No provider is run and no late-admission permission is
+    // fabricated; that production producer remains a separate requirement.
+    let mut row = late.clone();
+    let tx = db.unchecked_transaction().unwrap();
+    let provider = match row.provider {
+        durable::submission::Provider::Codex => "codex",
+        durable::submission::Provider::Claude => "claude",
+    };
+    tx.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,?2,'native_observation_recorded',?3,?4)",rusqlite::params![workflow,row.source_owner.lease_generation,serde_json::json!({"provider":provider,"certainty":row.certainty}).to_string(),millis()]).unwrap();
+    row.observation_sequence = tx.last_insert_rowid();
+    let raw = serde_json::to_string(&row).unwrap();
+    tx.execute(
+        "INSERT INTO workflow_native_observation VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        rusqlite::params![
+            row.observation_sequence,
+            workflow,
+            provider,
+            row.runtime_relative_path,
+            row.source_owner.lease_generation,
+            row.launch_intent_id,
+            row.native_session_id,
+            row.source_audit_path,
+            i64::try_from(
+                row.protected_observation_reference
+                    .as_ref()
+                    .unwrap()
+                    .sequence
+            )
+            .unwrap(),
+            raw
+        ],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    db.execute(
+        "UPDATE workflow_native_observation SET record='{}' WHERE sequence=?1",
+        [row.observation_sequence],
+    )
+    .unwrap();
+    assert!(
+        reopened
+            .owner_publication_recovery_blocked_state(workflow, millis())
+            .is_err(),
+        "damaged native evidence cleared the input blocker"
+    );
+    db.execute(
+        "UPDATE workflow_native_observation SET record=?2 WHERE sequence=?1",
+        rusqlite::params![row.observation_sequence, raw],
+    )
+    .unwrap();
+    assert_eq!(
+        reopened
+            .owner_publication_recovery_blocked_state(workflow, millis())
+            .unwrap(),
+        Some(durable::owner_publication_recovery::RecoveryBlockedState::LegacyInputWriter),
+        "a new receipt for an unchanged native outcome woke metadata recovery"
+    );
+    let fresh = super::super::targeted::authorize_owner_publication_recovery(
+        worktree,
+        &plan,
+        crate::autoship_discord_command::OwnerPolicy { bot: 11, owner: 22 },
+    )
+    .await
+    .unwrap();
+    let events = store.events(workflow).unwrap();
+    assert!(store
+        .claim_owner_publication_recovery(
+            &fresh,
+            "duplicate-outcome-cannot-retry",
+            millis(),
+            60_000
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(store.events(workflow).unwrap(), events);
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM workflow_owner_legacy_input_blocked WHERE workflow=?1",
+            [workflow],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    let after = store.snapshot(workflow).unwrap().unwrap();
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(
+        (
+            after.attempts,
+            after.wall_ms,
+            after.model_calls,
+            after.tokens
+        ),
+        (
+            before.attempts,
+            before.wall_ms,
+            before.model_calls,
+            before.tokens
+        )
+    );
+    assert_eq!(
+        original_rows(&db, workflow, recovery.request_id()),
+        original
+    );
+    assert_eq!(store.pending_owner_messages(workflow).unwrap(), queued);
+    assert_eq!(store.merge_allowance(millis(), 5).unwrap().confirmed, 0);
 }
 
 async fn consume_reserved_successor(state: &Path, worktree: &Path, workflow: &str, request: &str) {
@@ -821,7 +1220,7 @@ async fn consume_reserved_successor(state: &Path, worktree: &Path, workflow: &st
                 &authorization,
                 "reserved-successor",
                 millis(),
-                60_000,
+                LEASE_MS,
             )
             .expect("reserved readiness successor claim failed")
             .unwrap(),
@@ -970,6 +1369,38 @@ async fn consume_reserved_successor(state: &Path, worktree: &Path, workflow: &st
             millis()
         )
         .is_err());
+    // Use the normal workflow lease for this long integration fixture, while
+    // proving that actual expiry still fences the role before native access.
+    let authorization = super::super::targeted::authorize_owner_successor(
+        worktree,
+        &plan,
+        crate::autoship_discord_command::OwnerPolicy { bot: 11, owner: 22 },
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE workflow SET lease_until=?2 WHERE id=?1",
+        rusqlite::params![workflow, millis() - 1],
+    )
+    .unwrap();
+    let expired = store
+        .validate_owner_successor_setup(&setup, &authorization, millis())
+        .unwrap_err();
+    assert!(format!("{expired:#}").contains("successor setup lease or intent changed"));
+    let mut visited = false;
+    assert!(with_successor_native_metadata(
+        state,
+        Some(worktree),
+        setup,
+        &authorization,
+        &mut |_| {
+            visited = true;
+            Ok(())
+        }
+    )
+    .is_err());
+    assert!(!visited);
+    assert_eq!(original_rows(&db, workflow, request), original);
 }
 fn original_rows(db: &rusqlite::Connection, workflow: &str, request: &str) -> serde_json::Value {
     use rusqlite::OptionalExtension;
