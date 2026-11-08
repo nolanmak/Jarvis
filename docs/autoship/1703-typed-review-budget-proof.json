@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1885,
+  "integration_source_sha256": "2f1167bf84a42248ec2ddeb20f717422dd4b09df2f781b7f4328a15d093c9fc0",
+  "main_based_pr": "https://github.com/nolanmak/Jarvis/pull/1910",
+  "main_based_commit": "d55bec53",
+  "change": "Recognize typed budget errors through standard error causes while preserving typed Anyhow contexts; never classify by display text.",
+  "tdd": "RED reproduced EvidenceBudget behind a standard source wrapper being reported as reviewer capacity; two control tests passed and the typed-source test failed.",
+  "evidence": {
+    "red": {
+      "path": "/tmp/autoship-1703-review-budget-source-red-20261108.log",
+      "sha256": "9cd83e5d5778470ce314714402e93dd9c09918bf553379f946c35337fa137d5a"
+    },
+    "green": {
+      "path": "/tmp/autoship-1703-review-budget-source-green-20261108.log",
+      "sha256": "f265accbf4b3783040c4ed6f20ae5eb1c58641b6a4af156d5c725a2a0a716793"
+    },
+    "production": {
+      "path": "/tmp/autoship-1703-review-budget-source-production-20261108.log",
+      "sha256": "ffb3cf87be03f4102847a212a7fe35a8adba9255943cc61665b2ab0315e81525"
+    }
+  },
+  "validation": {
+    "review_tests_passed": 53,
+    "failed": 0,
+    "preexisting_opt_in_packing_replay_ignored": 1,
+    "new_case_count": 22,
+    "production_compile_passed": true
+  },
+  "coverage": [
+    "Both budget types at one through four standard source-wrapper depths, under two Anyhow context layers.",
+    "Both budget types supplied as typed Anyhow context values.",
+    "Provider-down and exact budget-display text lookalikes at every tested source depth remain ordinary unavailable failures.",
+    "Every case remains unavailable and unapproved; no review permission is produced."
+  ],
+  "limits": [
+    "No native/provider/VM execution or production rollout was performed.",
+    "Tests/build ran in the integration worktree; the separate main-based file differs only in a pre-existing caller-discovery comment. Hosted CI must validate the exact main-based commit.",
+    "A wrapper that discards type information is not recognized by guessing from its text. Producers must preserve typed budget causes/context if classification is required.",
+    "This fixes classification, not native runtime capacity, missing valid independent review, QA/scoper disagreements or every backlog PR.",
+    "Existing eight retained native sessions, original outcomes, holds, resource/merge budgets and policy are unchanged.",
+    "The selected runtime policy is hashed in existing native bindings; a capacity-policy rollout requires a valid binding transition as well as the pending explicit owner decision. No policy change was applied.",
+    "The broader productive owner constructor, six saved publication-gate failures, full C/R proofs and original deployment/live/fault/soak acceptance remain open."
+  ],
+  "deployed": false,
+  "runtime_capacity_restored": false,
+  "goal_complete": false
+}
