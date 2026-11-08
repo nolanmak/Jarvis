@@ -36,12 +36,18 @@ fn resolve_worker_store(config:WorkerStoreConfiguration)->Result<WorkerWorkflowC
 }
 /// Read the actual worker's private effective-configuration receipt. No native
 /// admission, environment mutation, provider probe or workflow-store write.
-pub(crate) fn worker_workflow_configuration()->Result<WorkerWorkflowConfiguration> {
+pub(crate) async fn worker_workflow_configuration()->Result<WorkerWorkflowConfiguration> {
     if !cfg!(target_os="linux") {return Ok(WorkerWorkflowConfiguration {path:crate::autoship_workflow::default_path(),
         daily_cap:crate::self_improve::AutoPrLoop::cap_from(std::env::var("AUGMENTAGENT_AUTOPR_DAILY_CAP").ok().as_deref())});}
-    let output=std::process::Command::new("/usr/bin/python3")
-        .args(["-I","-c",HELPER,"--workflow-store","--receipts"]).arg(receipts()?)
-        .stdin(Stdio::null()).output()?;
+    let mut command=command();
+    command.args(["--workflow-store","--receipts"]).arg(receipts()?);
+    read_worker_store_configuration(command,std::time::Duration::from_secs(15)).await
+}
+async fn read_worker_store_configuration(mut command:tokio::process::Command,deadline:std::time::Duration)
+    ->Result<WorkerWorkflowConfiguration> {
+    command.stdin(Stdio::null()).kill_on_drop(true);
+    let output=tokio::time::timeout(deadline,command.output()).await
+        .context("worker workflow store configuration timed out")??;
     anyhow::ensure!(output.status.success() && output.stdout.len()<=16384,"worker workflow store configuration unavailable");
     resolve_worker_store(serde_json::from_slice(&output.stdout).context("worker workflow store configuration invalid")?)
 }
@@ -165,6 +171,41 @@ pub async fn inspect(repo: &Path) -> Report {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn worker_store_helper_is_bounded_and_stops_on_timeout() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_file = root.path().join("helper.pid");
+        let mut command = tokio::process::Command::new("/usr/bin/python3");
+        command.args(["-I", "-c", "import os,sys,time; from pathlib import Path; Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"])
+            .arg(&pid_file);
+        let error = read_worker_store_configuration(command, std::time::Duration::from_secs(2))
+            .await.err().expect("hanging helper must time out");
+        assert!(format!("{error:#}").contains("timed out"));
+        let pid = std::fs::read_to_string(pid_file).expect("helper started before deadline");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while Path::new(&format!("/proc/{pid}")).exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("timed-out helper must be killed and reaped");
+    }
+    #[tokio::test]
+    async fn worker_store_helper_preserves_success_and_refuses_bad_output() {
+        for (script, accepted) in [
+            (r#"print('{"cwd":"/worker","workflow_db":"db","state_home":null,"home":null,"daily_cap":"7"}')"#, true),
+            ("print('invalid')", false),
+            ("print('x' * 16385)", false),
+            ("raise SystemExit(1)", false),
+        ] {
+            let mut command = tokio::process::Command::new("/usr/bin/python3");
+            command.args(["-I", "-c", script]);
+            let result = read_worker_store_configuration(command, std::time::Duration::from_secs(2)).await;
+            assert_eq!(result.is_ok(), accepted, "{script}");
+            if let Ok(config) = result {
+                assert_eq!(config.path, PathBuf::from("/worker/db"));
+                assert_eq!(config.daily_cap, 7);
+            }
+        }
+    }
     #[test]
     fn worker_store_resolution_uses_worker_override_cwd_and_state_configuration() {
         let config=|workflow_db:Option<&str>,state_home:Option<&str>|WorkerStoreConfiguration {

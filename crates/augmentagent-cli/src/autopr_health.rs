@@ -935,7 +935,7 @@ fn workflow_metrics(config:&crate::autoship_deployment::WorkerWorkflowConfigurat
 }
 
 /// Gather everything the rules need from this box.
-pub fn collect(repo_root: &Path) -> HealthInputs {
+pub async fn collect(repo_root: &Path) -> HealthInputs {
     let now = Utc::now();
     let dir = state_dir();
     // #1413 — right after a rotation the live log is nearly empty; the tail
@@ -970,7 +970,7 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
     );
     crate::disk::save_readings(&filesystems, now);
     let (merge_allowance,merge_allowance_error,capacity_waiting_workflows,capacity_observation_error)=match
-        crate::autoship_deployment::worker_workflow_configuration()
+        crate::autoship_deployment::worker_workflow_configuration().await
             .and_then(|config|workflow_metrics(&config,now.timestamp_millis())) {
         Ok((allowance,count))=>(Some(allowance),None,Some(count),None),
         Err(error)=>{let error=format!("{error:#}");(None,Some(error.clone()),None,Some(error))},
@@ -1029,7 +1029,7 @@ pub async fn run(repo_root: &Path, notify: bool, json: bool) -> anyhow::Result<i
         if let Err(error) = &result { cleanup_detail.push_str(&format!("cleanup failed: {error:#}")); }
         tracing::info!(result = ?result, cleanup = %cleanup_detail, "disk pressure reconciliation");
     }
-    let inputs = collect(repo_root);
+    let inputs = collect(repo_root).await;
     let mut findings = analyze(&inputs, &thresholds);
     if let Some(finding) = deployment_finding(&crate::autoship_deployment::inspect(repo_root).await) {
         findings.push(finding);

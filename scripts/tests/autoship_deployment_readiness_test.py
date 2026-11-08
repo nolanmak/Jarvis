@@ -34,7 +34,7 @@ class DeploymentTests(unittest.TestCase):
                 write(path,current)
                 if fault=='public':path.chmod(0o644)
                 calls=[]
-                def pid_for(role):
+                def pid_for(role,calls=calls,fault=fault):
                     calls.append(role)
                     return 0 if fault=='changed-process' and len(calls)>1 else child.pid
                 with self.subTest(fault=fault),self.assertRaises(m.Refused):m.workflow_store_configuration(receipts,pid_for)
@@ -105,7 +105,7 @@ class DeploymentTests(unittest.TestCase):
                     expected=binary if case!='wrong-binary' else Path('/usr/bin/true')
                     before={str(p):p.read_bytes() for p in receipts.iterdir()}
                     calls=[]
-                    def pid_for(role):
+                    def pid_for(role,calls=calls,case=case):
                         calls.append(role)
                         if case=='changed-policy' and len(calls)==4:write(policy,{'version':1,'providers':{'claude':{},'codex':{}},'changed':True})
                         return 0 if case=='worker-stopped' and role=='worker' else children[role].pid
