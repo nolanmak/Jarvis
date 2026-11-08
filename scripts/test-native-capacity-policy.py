@@ -162,5 +162,58 @@ class CapacityPolicyTests(unittest.TestCase):
             with self.assertRaises(capacity.Hold):capacity.update(self.path,16*1024**3,apply=True,expected_source=p['source_sha256'],expected_candidate=p['candidate_sha256'])
         self.assertEqual(self.path.read_bytes(),original);self.assertTrue(temporary.exists())
 
+    def test_replay_does_not_confirm_a_policy_replaced_during_sync(self):
+        p=capacity.update(self.path,16*1024**3)
+        capacity.update(self.path,16*1024**3,apply=True,expected_source=p['source_sha256'],expected_candidate=p['candidate_sha256'])
+        fsync=os.fsync;changed=False
+        def replace_during_confirmation(fd):
+            nonlocal changed
+            fsync(fd)
+            if not changed and os.readlink(f'/proc/self/fd/{fd}')==str(self.path):
+                replacement=self.root/'fixture-intervening-policy'
+                replacement.write_text(json.dumps(dict(self.value,max_state_bytes=32*1024**3)));replacement.chmod(0o600)
+                os.replace(replacement,self.path);changed=True
+        with mock.patch.object(capacity.os,'fsync',side_effect=replace_during_confirmation):
+            with self.assertRaises(capacity.PublicationUnknown):capacity.update(self.path,16*1024**3,apply=True,expected_source=p['source_sha256'],expected_candidate=p['candidate_sha256'])
+        self.assertTrue(changed);self.assertEqual(json.loads(self.path.read_bytes())['max_state_bytes'],32*1024**3)
+
+    def test_file_sync_capacity_failure_keeps_original_and_releases_staging(self):
+        p=capacity.update(self.path,16*1024**3);before=self.snapshot()
+        with mock.patch.object(capacity.os,'fsync',side_effect=OSError(errno.ENOSPC,'fixture')):
+            with self.assertRaises(OSError):capacity.update(self.path,16*1024**3,apply=True,expected_source=p['source_sha256'],expected_candidate=p['candidate_sha256'])
+        self.assertEqual(self.snapshot(),before)
+
+    def test_replaced_original_lock_prevents_publication(self):
+        p=capacity.update(self.path,16*1024**3);original=self.path.read_bytes();fsync=os.fsync;changed=False
+        def replace_lock_after_stage(fd):
+            nonlocal changed
+            fsync(fd)
+            if not changed and '/.capacity-policy-' in os.readlink(f'/proc/self/fd/{fd}'):
+                lock=self.state/'state.lock';lock.rename(self.state/'fixture-original-lock')
+                lock.write_bytes(b'');lock.chmod(0o600);changed=True
+        with mock.patch.object(capacity.os,'fsync',side_effect=replace_lock_after_stage):
+            with self.assertRaises(capacity.Hold):capacity.update(self.path,16*1024**3,apply=True,expected_source=p['source_sha256'],expected_candidate=p['candidate_sha256'])
+        self.assertTrue(changed);self.assertEqual(self.path.read_bytes(),original)
+
+    def test_wal_mode_without_sidecars_cannot_make_preview_create_them(self):
+        db=sqlite3.connect(self.db)
+        try:self.assertEqual(db.execute('PRAGMA journal_mode=WAL').fetchone(),('wal',))
+        finally:db.close()
+        before=self.snapshot()
+        try:
+            result=capacity.update(self.path,16*1024**3)
+            self.assertFalse(result['apply_supported'])
+        except (capacity.Hold,sqlite3.Error):pass
+        self.assertEqual(self.snapshot(),before,'read-only preview created SQLite WAL/SHM files')
+
+    def test_pending_wal_schema_is_refused_without_ignoring_its_authority(self):
+        db=sqlite3.connect(self.db)
+        try:
+            db.execute('PRAGMA journal_mode=WAL');db.execute('CREATE TABLE native_transfer(id TEXT)');db.commit()
+            before=self.snapshot()
+            with self.assertRaises(capacity.Hold):capacity.update(self.path,16*1024**3)
+            self.assertEqual(self.snapshot(),before)
+        finally:db.close()
+
 
 if __name__=='__main__':unittest.main()

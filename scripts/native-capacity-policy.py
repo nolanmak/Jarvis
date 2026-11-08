@@ -61,10 +61,18 @@ def state_format(state):
     name='runtime-retirement.sqlite'
     before=os.stat(name,dir_fd=state,follow_symlinks=False)
     require(owned(before,limit=128*1024**2),'ledger-not-private')
+    for suffix in ('-wal','-shm','-journal'):
+        try:os.stat(name+suffix,dir_fd=state,follow_symlinks=False)
+        except FileNotFoundError:continue
+        raise Hold('native-ledger-recovery-required')
     # Use SQLite's VFS, never a raw descriptor/copy of a live database. Opening
     # and closing raw database FDs could release this process's SQLite locks.
+    # This standalone command holds the original StateLock around every read.
+    # The unix-none VFS refuses WAL instead of creating shared-memory files.
+    # Do not use immutable=1: it can ignore pending WAL authority and report a
+    # legacy-looking base schema. Existing sidecars require explicit recovery.
     deadline=time.monotonic()+2
-    with closing(sqlite3.connect(f'file:/proc/self/fd/{state}/{name}?mode=ro',uri=True,timeout=0)) as db:
+    with closing(sqlite3.connect(f'file:/proc/self/fd/{state}/{name}?mode=ro&vfs=unix-none',uri=True,timeout=0)) as db:
         db.set_progress_handler(lambda:int(time.monotonic()>deadline),1000)
         tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         columns=[(r[1],r[2],r[3],r[5]) for r in db.execute('PRAGMA table_info(retired_owner)')]
@@ -90,10 +98,26 @@ def update(path,requested,*,apply=False,expected_source=None,expected_candidate=
             require(owned(os.fstat(fd),directory),'managed-state-not-private');return fd
         root=descriptor(path.parent,directory=True)
         state=descriptor('state',parent=root,directory=True)
+        locks=[]
         for parent,name in ((root,'provision.lock'),(state,'state.lock')):
             fd=descriptor(name,parent=parent)
             try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
             except BlockingIOError:raise Hold('native-policy-busy') from None
+            locks.append((parent,name,fd))
+        def check_context():
+            require(owned(os.fstat(root),directory=True) and owned(os.fstat(state),directory=True)
+                and identity(os.fstat(root))==identity(path.parent.lstat())
+                and identity(os.fstat(state))==identity((path.parent/'state').lstat()),'managed-state-changed')
+            for parent,name,fd in locks:
+                require(owned(os.fstat(fd)) and identity(os.fstat(fd))==identity(os.stat(name,dir_fd=parent,follow_symlinks=False)),
+                    'original-native-policy-lock-changed')
+        def confirm(expected):
+            try:
+                os.fsync(root)
+                observed,_=private(root,'policy.json')
+                require(digest(observed)==expected,'publication-changed')
+                check_context()
+            except (OSError,Hold):raise PublicationUnknown('policy-publication-unconfirmed-inspect-before-retry') from None
         data,source_info=private(root,'policy.json');source=digest(data)
         value=json.loads(data,object_pairs_hook=no_duplicates)
         require(type(value) is dict and set(value)=={'version','runtime_config','guest_runtime','state_root','memory_mb','max_state_bytes','max_sessions','providers'},'unsupported-policy')
@@ -102,8 +126,7 @@ def update(path,requested,*,apply=False,expected_source=None,expected_candidate=
             and type(value['max_sessions']) is int and value['max_sessions']>0
             and type(value['max_state_bytes']) is int and 1024**3<=value['max_state_bytes']<=2**64-1
             and value['state_root']==str(path.parent/'state') and type(value['providers']) is dict,'unsupported-policy')
-        require(identity(os.fstat(root))==identity(path.parent.lstat())
-            and identity(os.fstat(state))==identity((path.parent/'state').lstat()),'managed-state-changed')
+        check_context()
         kind=state_format(state)
         if apply:require(kind=='legacy-schema','binding-aware-or-unknown-state-requires-migration')
         replay=apply and source==expected_candidate and value['max_state_bytes']==requested
@@ -121,26 +144,27 @@ def update(path,requested,*,apply=False,expected_source=None,expected_candidate=
         if replay:
             # A matching pathname proves current contents, not durability after
             # a prior rename/sync error. Confirm both before clearing uncertainty.
-            fd=os.open('policy.json',os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=root)
+            fd=None
             try:
+                fd=os.open('policy.json',os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=root)
                 require(identity(os.fstat(fd))==identity(source_info),'policy-changed-before-confirmation')
-                try:os.fsync(fd);os.fsync(root)
-                except OSError:raise PublicationUnknown('policy-publication-unconfirmed-inspect-before-retry') from None
-            finally:os.close(fd)
+                os.fsync(fd);confirm(source)
+            except (OSError,Hold):raise PublicationUnknown('policy-publication-unconfirmed-inspect-before-retry') from None
+            finally:
+                if fd is not None:os.close(fd)
             return report
         require(source==expected_source and candidate_sha==expected_candidate,'reviewed-policy-hash-mismatch')
         temporary='.capacity-policy-'+secrets.token_hex(16);published=False;anchor=None
         try:
-            fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600,dir_fd=root)
-            anchor=os.dup(fd);stack.callback(os.close,anchor)
-            with os.fdopen(fd,'wb') as stream:
+            anchor=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600,dir_fd=root)
+            stack.callback(os.close,anchor)
+            with os.fdopen(anchor,'wb',closefd=False) as stream:
                 stream.write(payload);stream.flush();os.fchmod(stream.fileno(),stat.S_IMODE(source_info.st_mode));os.fsync(stream.fileno())
             staged,staged_info=private(root,temporary)
             require(staged==payload and identity(staged_info)==identity(os.fstat(anchor)),'staged-policy-changed')
             observed,info=private(root,'policy.json')
             require(observed==data and identity(info)==identity(source_info),'policy-changed-before-publication')
-            require(identity(os.fstat(root))==identity(path.parent.lstat())
-                and identity(os.fstat(state))==identity((path.parent/'state').lstat()),'managed-state-changed')
+            check_context()
             try:os.replace(temporary,'policy.json',src_dir_fd=root,dst_dir_fd=root)
             except OSError as error:
                 # The rename may have committed despite a lost acknowledgement.
@@ -150,13 +174,7 @@ def update(path,requested,*,apply=False,expected_source=None,expected_candidate=
                 if observed==data and identity(info)==identity(source_info):raise error
                 raise PublicationUnknown('policy-publication-unconfirmed-inspect-before-retry') from None
             published=True
-            try:
-                os.fsync(root)
-                observed,_=private(root,'policy.json')
-                require(digest(observed)==candidate_sha
-                    and identity(os.fstat(root))==identity(path.parent.lstat())
-                    and identity(os.fstat(state))==identity((path.parent/'state').lstat()),'publication-changed')
-            except (OSError,Hold):raise PublicationUnknown('policy-publication-unconfirmed-inspect-before-retry') from None
+            confirm(candidate_sha)
             return dict(report,reason='capacity-policy-applied',policy_applied=True)
         finally:
             if not published and anchor is not None:

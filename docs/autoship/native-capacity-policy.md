@@ -38,6 +38,11 @@ provision lock, then the existing native state lock, nonblocking, while checking
 and publishing. Missing, linked or nonprivate locks are errors; it never creates
 replacement coordination files. SQLite is inspected through its read-only VFS,
 without opening/copying the live database through a raw file descriptor.
+This is a standalone Linux command: the original state lock serializes its
+legacy-ledger inspection. WAL/SHM/journal sidecars require recovery and refuse
+inspection. The read-only `unix-none` VFS refuses WAL-mode databases without
+creating sidecars. Plain SQLite `mode=ro` alone can create WAL/SHM files;
+`immutable=1` can ignore their authority, so neither is used as a shortcut.
 
 The private managed policy is published by same-directory atomic rename after
 file sync, followed by directory sync and content/path confirmation. Before
@@ -46,7 +51,11 @@ temporary file. A retained original file descriptor prevents inode reuse from
 turning a replacement temporary path into this invocation's file. A lost rename acknowledgement or failed post-rename sync returns
 publication uncertainty; it never rolls back a possibly committed change. Retry
 with the same reviewed hashes confirms an already matching target without a
-second increase, and must sync it before clearing uncertainty.
+second increase, and must sync it before clearing uncertainty. Confirmation
+re-reads the approved bytes and checks the original directory and lock-file
+identities after sync; a replaced policy or coordination file cannot produce a
+false confirmed result. Before publication, loss of an original lock refuses
+without replacing the policy.
 
 This is deliberately not the policy migration protocol for draft #1758.
 An authority-epoch marker or unfamiliar native-ledger schema prevents legacy
@@ -65,7 +74,7 @@ the JSON `reason` distinguishes them. Exit 3 is a guarded refusal. Exit 4 means
 unavailable evidence or uncertain publication; inspect `reason` before retry.
 `execution_authorized` and `binding_migration_authorized` remain false.
 
-Validation: sixteen fixture/CLI tests, including lost acknowledgement and sync
+Validation: twenty-one fixture/CLI tests, including lost acknowledgement and sync
 failures, plus twenty-three shared-CI contract tests. The native provider bridge
 suite runs the new tests. A live **preview only** classified the selected ledger
 as legacy and left its 8 GiB policy unchanged. See

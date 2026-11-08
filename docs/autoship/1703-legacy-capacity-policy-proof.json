@@ -4,8 +4,8 @@
   "main_base": "cbafe3216e36df1c254ef4b42139854192a5e1d1",
   "change": "Add an explicit owner capacity-policy preview/apply command for the legacy store used on current main. Preserve all retained native state and resource declarations.",
   "sources": {
-    "scripts/native-capacity-policy.py": "51849284c4d4b6f8718e69dacf66f7d10ad5b8da06799a5b9d794b76fa863312",
-    "scripts/test-native-capacity-policy.py": "33e6e2d6da22fbc2b0ac418d9945e2823e4e756280c2888ec0dfc1af61e10580",
+    "scripts/native-capacity-policy.py": "0799a7cde2e14a3f1995424203e756318d025dfe9ef60f79b183a7bf6d8afb4e",
+    "scripts/test-native-capacity-policy.py": "075720672a28805cc35627777deb3377a6d723a5c905a22e31fbc40e30dcbbc9",
     "scripts/ci-contract.json": "3a7e679b7d464cf7b27e25764d6a85ff2c88ecd620e8ae5e9f76c0e6ada4b651"
   },
   "evidence": {
@@ -22,25 +22,38 @@
       "sha256": "5ec350fb829f498ab584bd35c539d9adb2fb00cdd1298f922524d8219c1106e6"
     },
     "final": {
-      "log": "/tmp/autoship-1703-legacy-capacity-final-20261108.log",
-      "sha256": "1772ce9883c10177edbe5d2f9501b4b7717e0029a11a4ee2cdef50ddfbff49f7"
+      "log": "/tmp/autoship-1703-capacity-confirmation-final-20261108.log",
+      "sha256": "247af5f9a3c922a33558c89ff4a924c04bb614dec5a70eadcb5e83cc30a13d0d"
     },
     "ci_contract": {
-      "log": "/tmp/autoship-1703-legacy-capacity-ci-contract-20261108.log",
-      "sha256": "ddba798fc631171c4c67fcae098a59aab4965a4e98bd26f253286ff7033a7718"
+      "log": "/tmp/autoship-1703-capacity-confirmation-ci-contract-20261108.log",
+      "sha256": "1fcd8adc4acb63af0b5e509b74bf265814e8740f51cb37ae9a44e7ac3039a20f"
     },
     "temporary_identity_red": {
       "log": "/tmp/autoship-1703-legacy-capacity-temp-red-20261108.log",
       "sha256": "662940295498b900e6f5c641509936c2995981c11188e7e0084e1fc19b394edc"
+    },
+    "replay_replacement_red": {
+      "log": "/tmp/autoship-1703-capacity-replay-replacement-red-20261108.log",
+      "sha256": "c06623ea41f59b7cc165240c9595e2092b1bbc8c4ff122e80b264022e75dee96"
+    },
+    "original_lock_red": {
+      "log": "/tmp/autoship-1703-capacity-original-lock-red-20261108.log",
+      "sha256": "9a9b478bd5391dd7fd03a73f8140c2de6aaf5887b2063985bbd13e5b393f05b3"
+    },
+    "wal_preview_red": {
+      "log": "/tmp/autoship-1703-capacity-wal-preview-red-20261108.log",
+      "sha256": "62c8a83364ff8ff2008d5d78ae8dbfab65b8c41321b56613f08df91f50475599"
     }
   },
   "validation": {
-    "capacity_tests_passed": 16,
+    "capacity_tests_passed": 21,
     "ci_contract_tests_passed": 23,
     "ci_contract_verify_passed": true,
     "failed": 0,
     "live_read_only_preview_succeeded": true,
-    "live_policy_applied": false
+    "live_policy_applied": false,
+    "wal_preview_observation": "Default SQLite mode=ro created WAL/SHM files on a WAL-mode fixture with no sidecars. The command now refuses sidecars and uses the unix-none read-only VFS under its original StateLock; it never ignores WAL with immutable=1."
   },
   "limits": [
     "Main native_vm::Launch::prepare reads policy on each attempt. The newer TransferBinding/authority-epoch protocol in draft #1758 is not present in the inspected live schema; its migration constraint must not be attributed to the old live limiter.",
@@ -51,5 +64,6 @@
     "Core owner integration, modern binding transition, independent review, main/updater rollout and original live CLI/Discord/shipment/fault/soak acceptance remain incomplete."
   ],
   "deployed": false,
-  "goal_complete": false
+  "goal_complete": false,
+  "followup_base_head": "965ef63f84cf245a2c92a4133ffd1ae7c7ff239c"
 }
