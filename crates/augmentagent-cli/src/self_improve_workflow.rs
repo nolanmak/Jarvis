@@ -162,6 +162,9 @@ use completion_recovery::recover_known_native_completions;
 #[path = "self_improve_owner_metadata_recovery.rs"]
 mod owner_metadata_recovery;
 use owner_metadata_recovery::{recover_owner_publication,settle_reserved_owner_readiness};
+#[path = "self_improve_owner_native_recovery.rs"]
+mod owner_native_recovery;
+use owner_native_recovery::{recover_owner_native_handoff,OwnerRecoveryNativeRun};
 
 const LEASE_MS: i64 = 10 * 60 * 1000;
 const RENEW_SECS: u64 = 60;

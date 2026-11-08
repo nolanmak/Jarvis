@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Original owner native-handoff controller with verified replay and distinct preparation outcomes",
+  "parent_commit": "e036aec410e6d44bd990c8f701db5d5b3c3a68cc",
+  "extends": "1703-publication-readiness-controller-proof.json",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/self_improve_owner_native_recovery.rs": "cf1f413765e84ce59894c12aa560948631a20979e4194f104e31ec3e6ebeaf84",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "d3871f69a3cd3ef9f455ea14d77b634d5101c0c6d3ca36ccad36faf19d90bd84",
+    "crates/augmentagent-cli/src/self_improve_owner_reserved_ready_tests.rs": "621e97050db2a88855983b8f22ae062b70e4fa810abd472c54e0685644ffaf38"
+  },
+  "red": {
+    "original_handle": 38058,
+    "exit_code": 1,
+    "reason": "Native recovery controller and result type absent",
+    "log": "/tmp/autoship-native-controller-red-20261108.log"
+  },
+  "validation": {
+    "initial_native_controller": {
+      "original_handle": 92681,
+      "exit_code": 0,
+      "passed_test_functions": 1,
+      "seconds": 112.9,
+      "log": "/tmp/autoship-native-controller-green-20261108.log"
+    },
+    "preparation_refusal_and_rollback": {
+      "original_handle": 73596,
+      "exit_code": 0,
+      "passed_test_functions": 1,
+      "seconds": 120.1,
+      "log": "/tmp/autoship-native-controller-final-20261108.log"
+    },
+    "other_provider_completion": {
+      "original_handle": 83695,
+      "exit_code": 0,
+      "passed_test_functions": 1,
+      "seconds": 111.23,
+      "log": "/tmp/autoship-native-controller-cross-provider-20261108.log"
+    },
+    "final_real_lost_ack_fault": {
+      "original_handle": 38448,
+      "exit_code": 0,
+      "passed_test_functions": 2,
+      "seconds": 235.76,
+      "builder_pins": [
+        "codex",
+        "claude"
+      ],
+      "provider_phase_cases": 6,
+      "phases": [
+        "native-bound",
+        "released",
+        "late-completion-other-provider"
+      ],
+      "log": "/tmp/autoship-native-controller-lost-ack-final-20261108.log"
+    },
+    "non_test_compile": {
+      "original_handle": 83695,
+      "exit_code": 0,
+      "seconds": 27.47,
+      "log": "/tmp/autoship-native-controller-production-20261108.log"
+    },
+    "current_non_test_compile": {
+      "original_handle": 34230,
+      "exit_code": 0,
+      "seconds": 0.49,
+      "log": "/tmp/autoship-native-controller-final-production-20261108.log"
+    }
+  },
+  "assertions": [
+    "Existing pending intent is resolved before any new preparation; reconciliation receives that exact validated original record and reloads its protected source/destination audit bindings",
+    "A new initial intent is persisted under the original locked core PreparationScan. The SQL durability receipt is never converted into a core transfer intent",
+    "The durability-only callback stops the preparation stage without native transfer. The controller re-reads the exact pending transfer ID after releasing scan locks, then invokes the existing native-inspection/replay/verified-SQL-settlement path under fresh current checks",
+    "Current SQL registration is not enough for the Current outcome: the controller also acquires actual original native metadata proof and returns no logger or execution capability",
+    "Missing private fixture policy produces a stable RuntimeUnavailable no-pending hold; a refused SQL intent transaction produces a distinct deferred PersistRetry with no pending intent or workflow events/spend changes",
+    "A real SQLite WAL hook returns IOERR after durable intent commit. The writer resolves the same persisted intent before the controller performs native reconciliation; the hook is verified to have fired once per fixture case",
+    "A separate SQL settlement trigger rolls back metadata after actual native completion. The controller reports retained Completed/PersistRetry state; removing the trigger allows the same transfer ID to settle",
+    "After settlement the next call reports Current without another workflow event or replacement native context/UUID",
+    "Destination loggers remain restricted to metadata. The full reserved controller fixtures retain original reservation/model/resource/input history, owner controls, queued peers and spend; released body input still refuses readiness",
+    "The other-provider fixture carries actual completion discovery/import through publication repair, the new native-handoff controller and reserved readiness while retaining the pinned command builder"
+  ],
+  "limits": [
+    "Native body/resource setup is synthetic persisted fixture state; actual protected native/audit/SQL APIs run, but no VM/provider/body or live coding session executes",
+    "Authorization in these fixtures uses the existing explicit-policy test path, not the complete managed-role/Discord/GitHub worker chain",
+    "Lost intent acknowledgement is exercised with a successful verified readback. The public persistence-unknown branch retains attempted IDs in code, but post-commit lookup unavailability has not been separately injected through this controller",
+    "No-pending failure fingerprints are returned but their persistent preparation-backoff journal and dependency-change wakeup are not connected here",
+    "No separate authenticated owner selector or live worker/controller invocation exists yet; unbound and closed/transferred-source orchestration remain incomplete",
+    "No productive recovery authority, full current CLI suite, exact-head independent review, current-head hosted verification, rollout, autonomous merge or soak acceptance is claimed"
+  ],
+  "remaining": [
+    "Persist no-pending preparation retry/hold state with exact original lineage and dependency fingerprint; do not turn unknown intent persistence into a no-pending retry",
+    "Connect the distinct authenticated owner recovery queue and complete outcome/notification handling before ordinary productive preflight",
+    "Complete unbound and closed/transferred-source orchestration plus C/R source/resource/input qualification and debt recovery",
+    "Productive repeated body/model/release/result/continuation cycles and private coding/follow-up/delivery",
+    "Exact-head independent review, trusted hosted verification and ordinary updater rollout",
+    "Original live CLI/Discord acceptance, five confirmed auto merges on the acceptance UTC day, 72-hour fault and 24-hour unattended soak"
+  ],
+  "all_original_local_handles_terminal": true,
+  "scheduler_connected": false,
+  "deployed": false,
+  "productive_authority_granted": false,
+  "goal_complete": false
+}

@@ -4,6 +4,13 @@ use super::*;
 use augmentagent_channel_core::native_vm::{ownership, RuntimeOwner};
 use std::os::unix::fs::PermissionsExt;
 #[tokio::test]
+async fn recovery_controller_carries_other_provider_completion_through_native_handoff() {
+    super::tests::owner_metadata_recovery_modes_inner_reserved(
+        &["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery"],
+        false,None,Some("controller-late-completion-other-provider"),
+    );
+}
+#[tokio::test]
 async fn recovery_controller_repairs_publication_and_settles_only_unreleased_reserved_body() {
     for phase in ["native-bound","released"] {
         super::tests::owner_metadata_recovery_modes_inner_reserved(
@@ -352,6 +359,55 @@ pub(super) async fn settle_reserved_body(
             .unwrap(),
         )
         .unwrap();
+    if controller {
+        let db=rusqlite::Connection::open(state).unwrap();
+        let before_native=store.snapshot(&workflow).unwrap().unwrap();
+        let events_before_native=store.events(&workflow).unwrap();
+        // Only this subprocess's private synthetic policy is moved. A missing
+        // selection must remain a typed no-pending hold, with no model spend.
+        let fixture_root=PathBuf::from(std::env::var_os("AUTOSHIP_INITIAL_GUARD_CHILD").unwrap());
+        let policy=PathBuf::from(std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").unwrap());
+        assert!(policy.starts_with(&fixture_root));
+        let offline=policy.with_extension("controller-offline");
+        std::fs::rename(&policy,&offline).unwrap();
+        struct RestorePolicy {from:PathBuf,to:PathBuf}
+        impl Drop for RestorePolicy {fn drop(&mut self) {if self.from.exists() {let _=std::fs::rename(&self.from,&self.to);}}}
+        let restore=RestorePolicy {from:offline,to:policy};
+        let first_missing=recover_owner_native_handoff(&shared,state,worktree,recovery.clone(),authorization).unwrap();
+        let fingerprint=match first_missing {OwnerRecoveryNativeRun::NoPending {failure}=>{
+            assert_eq!(failure.reason(),ownership::TransferReason::RuntimeUnavailable);assert!(!failure.is_deferred());failure.fingerprint().to_owned()
+        },other=>panic!("missing policy did not return no-pending hold: {other:?}")};
+        let repeated=recover_owner_native_handoff(&shared,state,worktree,recovery.clone(),authorization).unwrap();
+        assert!(matches!(repeated,OwnerRecoveryNativeRun::NoPending {ref failure} if failure.fingerprint()==fingerprint),"unchanged missing selection lost its failure fingerprint: {repeated:?}");
+        drop(restore);
+        db.execute_batch("CREATE TRIGGER refuse_controller_native_intent BEFORE INSERT ON workflow_owner_recovery_native_intent BEGIN SELECT RAISE(ABORT,'injected controller intent rollback'); END;").unwrap();
+        let refused=recover_owner_native_handoff(&shared,state,worktree,recovery.clone(),authorization).unwrap();
+        assert!(matches!(refused,OwnerRecoveryNativeRun::NoPending {ref failure} if failure.reason()==ownership::TransferReason::PersistRetry && failure.is_deferred()),"rolled-back intent was not a known no-pending retry: {refused:?}");
+        db.execute_batch("DROP TRIGGER refuse_controller_native_intent;").unwrap();
+        assert_eq!(store.snapshot(&workflow).unwrap().unwrap(),before_native);
+        assert_eq!(store.events(&workflow).unwrap(),events_before_native);
+        assert!(store.owner_recovery_pending_transfer(&recovery,authorization,millis()).unwrap().is_none());
+        assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_recovery_native_intent WHERE workflow=?1",[&workflow],|r|r.get::<_,i64>(0)).unwrap(),0);
+        db.execute_batch("CREATE TRIGGER refuse_controller_native_settlement BEFORE INSERT ON workflow_native_handoff_completed BEGIN SELECT RAISE(ABORT,'injected controller native settlement rollback'); END;").unwrap();
+        // A real WAL commit acknowledgement is lost while the intent itself
+        // is durable. The controller must resolve that exact persisted intent
+        // before native replay; the separate SQL settlement still rolls back.
+        shared.lock().unwrap().test_lose_recovery_commit_ack();
+        let first=recover_owner_native_handoff(&shared,state,worktree,recovery.clone(),authorization).unwrap();
+        assert_eq!(shared.lock().unwrap().test_finish_recovery_commit_ack_loss(),1,"intent commit acknowledgement loss was not exercised");
+        let first_id=match first {
+            OwnerRecoveryNativeRun::Reconciled {transfer_id,result:durable::native_reconcile::ReconciliationRun::Retained {state:Some(ownership::NativeTransferState::Completed),..}}=>transfer_id,
+            other=>panic!("native settlement rollback was not retained: {other:?}"),
+        };
+        assert_eq!(store.owner_recovery_pending_transfer(&recovery,authorization,millis()).unwrap().unwrap().request().transfer_id,first_id);
+        db.execute_batch("DROP TRIGGER refuse_controller_native_settlement;").unwrap();
+        let retried=recover_owner_native_handoff(&shared,state,worktree,recovery.clone(),authorization).unwrap();
+        assert!(matches!(retried,OwnerRecoveryNativeRun::Reconciled {ref transfer_id,result:durable::native_reconcile::ReconciliationRun::Settled(_)} if transfer_id==&first_id),"native retry did not settle the original transfer: {retried:?}");
+        let events_before=store.events(&workflow).unwrap();
+        assert!(matches!(recover_owner_native_handoff(&shared,state,worktree,recovery.clone(),authorization).unwrap(),OwnerRecoveryNativeRun::Current));
+        assert_eq!(store.events(&workflow).unwrap(),events_before,"current native handoff was repeated");
+        assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_recovery_native_intent WHERE workflow=?1",[&workflow],|r|r.get::<_,i64>(0)).unwrap(),1,"native recovery minted a replacement UUID");
+    } else {
     let plan = ownership::PreparationPlan {
         workflow_id: workflow.clone(),
         source_owners: vec![facts.namespace().clone()],
@@ -442,6 +498,7 @@ pub(super) async fn settle_reserved_body(
         ),
         "reserved original writer did not close: {reconciled:?}"
     );
+    }
     assert!(destination.dispatch_allowed().is_err());
     let snapshot = store
         .read_reserved_owner_body(&workflow, recovery.request_id())
