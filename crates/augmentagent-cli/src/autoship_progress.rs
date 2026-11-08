@@ -116,6 +116,7 @@ impl WorkflowStore {
             format!("Autoship {workflow} · update {sequence}: session recovery is blocked because the original session input writer is unsupported. Recovery will stay blocked until compatible session evidence is available. Merge: {}. Deployment: {}. [autoship:{nonce}]",progress.merge_state,progress.deployment_state)
         } else if scope.is_some() && progress.kind.starts_with("owner-recovery-") {
             let status=match progress.reason.as_str() {
+                "owner-publication-yielded"=>"Your updated acceptance is recorded. Metadata recovery is queued; a new coding turn has not started.",
                 "owner-metadata-ready" if progress.next_action=="await_owner_resume"=>"Recovery metadata is ready and waiting for you to resume. A new coding turn has not started.",
                 "owner-metadata-ready"=>"Recovery metadata is ready for guarded turn setup. A new coding turn has not started.",
                 "owner-recovery-authorization-blocked"=>"Session recovery is waiting for current owner and repository authorization. A new coding turn has not started.",
@@ -186,11 +187,12 @@ fn code(value:&str,fallback:&str)->String {
 }
 
 pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Result<()> {
-    if !matches!(source,"registered"|"checkpoint"|"autonomous_merge_confirmed"|"command_queued"|"command_attempt_finished"|"owner_control_changed"|"owner_input_queued"|"native_model_admitted"|"owner_recovery_legacy_input_blocked"|"owner_recovery_attempt_finished") {return Ok(());}
+    if !matches!(source,"registered"|"checkpoint"|"autonomous_merge_confirmed"|"command_queued"|"command_attempt_finished"|"owner_control_changed"|"owner_input_queued"|"native_model_admitted"|"owner_recovery_legacy_input_blocked"|"owner_recovery_attempt_finished"|"owner_publication_yielded") {return Ok(());}
     let previous:Option<(i64,String,bool)>=tx.query_row("SELECT sequence,fingerprint,terminal FROM workflow_progress_state WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     if previous.as_ref().is_some_and(|p|p.2) {return Ok(());}
     let private=if source=="owner_recovery_attempt_finished" {Some(owner_publication_recovery::attempt_progress(tx,workflow,now)?)}else{owner_publication_recovery::owner_progress(tx,workflow,now)?};
     ensure!(source!="owner_recovery_attempt_finished" || private.is_some(),"owner recovery update requires authenticated original conversation");
+    ensure!(source!="owner_publication_yielded" || private.is_some(),"owner publication yield update requires authenticated original conversation");
     if private.is_none() {super::delivery::apply_default(tx,workflow,now)?;}
     let snapshot:Option<(String,Option<u64>)>=tx.query_row("SELECT checkpoint,pr FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let checkpoint=snapshot.as_ref().map(|(raw,_)|serde_json::from_str::<Checkpoint>(raw)).transpose()?;
@@ -220,6 +222,9 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
         }
     }
     else if source=="owner_control_changed" {kind="resume-requested".into();reason="owner-resume-accepted".into();action="await_worker".into();}
+    if source=="owner_publication_yielded" && control!=Some(true) && stage!=Some(Stage::Held) {
+        kind="owner-recovery-pending".into();reason="owner-publication-yielded".into();action="await_session_recovery".into();eligible=None;
+    }
     if source=="owner_recovery_attempt_finished" {
         let (outcome,why,_)=attempt.as_ref().context("owner recovery attempt missing")?;
         ensure!(matches!(outcome.as_str(),"progress"|"deferred"|"failed"),"invalid recovery attempt outcome");

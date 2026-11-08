@@ -156,6 +156,9 @@ impl augmentagent_channel_core::native_vm::OwnerInputAuthorizer for OwnerInputCo
     }
 }
 
+#[cfg(test)]
+#[path="self_improve_owner_publication_yield_tests.rs"]
+mod publication_yield_tests;
 #[path = "self_improve_owner_completion_recovery.rs"]
 mod completion_recovery;
 use completion_recovery::recover_known_native_completions;
@@ -373,6 +376,16 @@ pub(super) struct OwnerPublicationGuard<'a> {
 }
 
 impl OwnerPublicationGuard<'_> {
+    /// End the metadata actor explicitly; recovery, setup and coding each keep
+    /// their own fresh authority. This is not native teardown or input completion.
+    fn yield_to_metadata_recovery(mut self)->Result<()> {
+        self._publication.metadata_turn(&self._guard.repository,&self._guard.lease,&self._guard.binding,&self._guard.worktree)?;
+        self._guard.store.lock().map_err(|_|anyhow::anyhow!("publication yield store poisoned"))?
+            .yield_completed_owner_publication(&self._metadata,&self._publication,millis())?;
+        self._guard.heartbeat.cancel();
+        self._guard.released=true;
+        Ok(())
+    }
     fn publish_canonical(&self)->Result<()> {
         let guard=&self._guard;
         let _turn=self._publication.metadata_turn(&guard.repository,&guard.lease,&guard.binding,&guard.worktree)?;
@@ -4338,6 +4351,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_live_publication_yields_to_authenticated_metadata_without_expiry() {
+        let mut modes=Vec::new();
+        for provider in ["","claude-"] {for paused in ["","paused-"] {for kind in ["initial","revision"] {
+            modes.push(format!("owner-early-acceptance-producer-{provider}handoff-{paused}publication-{kind}"));
+        }}}
+        owner_metadata_recovery_modes(&modes.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
     async fn expired_owner_publication_has_authenticated_metadata_recovery() {
         owner_metadata_recovery_modes(&["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery","owner-early-acceptance-producer-recovery-revised-metadata-recovery","owner-early-acceptance-producer-claude-recovery-revised-metadata-recovery","owner-early-acceptance-producer-transfer-recovery","owner-early-acceptance-producer-claude-transfer-recovery","owner-early-acceptance-producer-absent-transfer-recovery","owner-early-acceptance-producer-claude-absent-transfer-recovery","owner-early-acceptance-producer-prepared-transfer-recovery","owner-early-acceptance-producer-claude-prepared-transfer-recovery","owner-early-acceptance-producer-aborted-transfer-recovery","owner-early-acceptance-producer-claude-aborted-transfer-recovery"]);
     }
@@ -4837,6 +4859,12 @@ else: raise SystemExit('unexpected authority call')
                     let prepared=acceptance::owner::test_publication_preparation(dir.path(),&control,&first,publication_previous.as_ref()).await.unwrap();
                     let previous=publication_previous.as_ref().map(|p|&p.baseline.registration);
                     let pending=first.activate_prepared_owner_acceptance(&prepared,previous).await.unwrap();
+                    if mode.contains("-handoff-") {
+                        let mut store=WorkflowStore::open(&state).unwrap();let before=store.snapshot(&id).unwrap();let events=store.events(&id).unwrap();
+                        let error=store.yield_completed_owner_publication(&pending._metadata,&pending._publication,millis()).unwrap_err();
+                        assert!(format!("{error:#}").contains("requires completed publication"),"{error:#}");
+                        assert_eq!(store.snapshot(&id).unwrap(),before);assert_eq!(store.events(&id).unwrap(),events);
+                    }
                     let before=WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap();
                     use std::os::fd::AsRawFd;
                     let canonical=control.join("issue-77-workflow.json");
@@ -5011,6 +5039,10 @@ else: raise SystemExit('unexpected authority call')
                     assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&id).unwrap().unwrap(),before);
                     assert!(pending._guard.validate_before_side_effect().is_err());assert!(pending._guard.audit.model_call_admitted("codex").is_err());
                     std::fs::write(&canonical,&next_canonical).unwrap();
+                    if mode.contains("-handoff-") {
+                        publication_yield_tests::check(pending,&state,dir.path(),&canonical,&id,mode.contains("-handoff-paused-")).await;
+                        return;
+                    }
 
                     let mut store=WorkflowStore::open(&state).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
                     store.set_owner_pause(&id,"fixture-owner",revision,true,millis()).unwrap();drop(store);

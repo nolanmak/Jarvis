@@ -1,5 +1,9 @@
 //! Immutable private intent/completion history; never coding authority.
 use super::*;
+#[path="autoship_owner_publication_yield.rs"]
+mod yielding;
+#[cfg(test)]
+pub(crate) fn test_yield_encoding(raw:&str)->Result<String> {yielding::fixture_encoding(raw)}
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Reference {version:u32,record_sha256:String}
@@ -90,7 +94,7 @@ pub(super) fn validate_history(conn:&Connection,workflow:&str)->Result<()> {
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_publication_intent')",[],|r|r.get(0))?;
     if !exists {
         let completed_events:i64=conn.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1 AND kind='owner_publication_completed'",[workflow],|r|r.get(0))?;
-        ensure!(events==0 && completed_events==0,"owner publication index missing");return Ok(())
+        ensure!(events==0 && completed_events==0 && yielding::validate_history(conn,workflow)?==0,"owner publication index missing");return Ok(())
     }
     let mut q=conn.prepare("SELECT request_id,sequence,record_sha256,record FROM workflow_owner_publication_intent WHERE workflow=?1 ORDER BY sequence LIMIT 1025")?;
     let mut count=0;let mut bytes=0usize;let mut completed_count=0;
@@ -114,7 +118,9 @@ pub(super) fn validate_history(conn:&Connection,workflow:&str)->Result<()> {
     let pending:i64=conn.query_row("SELECT count(*) FROM workflow_owner_publication_pending WHERE workflow=?1",[workflow],|r|r.get(0))?;
     let completed:i64=conn.query_row("SELECT count(*) FROM workflow_owner_publication_completion WHERE workflow=?1",[workflow],|r|r.get(0))?;
     let completed_events:i64=conn.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1 AND kind='owner_publication_completed'",[workflow],|r|r.get(0))?;
-    ensure!(pending+completed_count==count && completed==completed_count && completed_events==completed_count,"owner publication pending/completion history incomplete");Ok(())
+    ensure!(pending+completed_count==count && completed==completed_count && completed_events==completed_count,"owner publication pending/completion history incomplete");
+    bytes=bytes.checked_add(yielding::validate_history(conn,workflow)?).context("owner publication yield retention overflow")?;
+    ensure!(bytes<=128*1024*1024,"owner publication yield exceeds shared history budget");Ok(())
 }
 
 /// Current metadata projection only. It cannot attest physical inventory,

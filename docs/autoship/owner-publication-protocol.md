@@ -49,6 +49,14 @@ Productive dispatch, model charging, body reservation, publication and merge adm
 
 Native setup/reconciliation cannot use that productive predicate: it must finish the work that will satisfy it. Introduce a private, nonserializable metadata authority with exactly three variants: `LiveOwnerTurn`, `RecoveryLease` and `TerminalCheckpoint`. The uninterrupted activation path mints `LiveOwnerTurn` from the consuming original guard/preparation after the intent/activation transaction, binding its current activated lease, exact intent and original native registration. No recovery lease is fabricated for this path. The other variants validate the current recovery lease or existing terminal-native checkpoint and the same original lineage/registration. Each authorizes only inspection, original transfer settlement, scope/metadata commit and result settlement for that intent. It never installs an executable reasoner or an ordinary model observer. Its audit/model dispatch is denied, including after pending input becomes applied. Productive callbacks are installed only by the separate post-publication productive constructor.
 
+After uninterrupted publication, §72 explicitly relinquishes the original live
+metadata actor. A separately authenticated claim from the existing recovery
+service may then continue the common readiness/setup pipeline. This is an actual
+lease release and a new real metadata claim, not a fabricated recovery lease or
+an expired timestamp written to simulate a crash. The original metadata guard
+never becomes productive; fresh productive source/resource/input admission is
+still required after setup.
+
 The original opaque preparation and live body-dispatch capability remain required for coding. Publication rows and native session strings cannot reconstruct them. A recovery producer may reopen the exact original preparation only through authenticated lineage plus fresh original native proof; it cannot derive a new context filename from the recovery generation or reinterpret old preparation-free history as ready.
 
 Required native producer contracts, before a journal writer is enabled:
@@ -2187,3 +2195,96 @@ All original review, trusted hosted CI, normal updater rollout, live CLI/private
 Discord coding/followups/updates, five autonomous shipments and fault/unattended
 soak requirements remain required. No capacity policy, retained reservation,
 legacy writer protocol, production service or deployment changes here.
+
+
+## 72. Explicit live-publication handoff to the shared recovery service
+
+**D72.1 — Relinquish the metadata actor; reuse the real recovery claim.** An
+uninterrupted completed publisher previously had no consuming transition. Dropping
+its metadata guard stopped renewal but left its live lease blocking the worker
+until expiry. The new `OwnerPublicationGuard::yield_to_metadata_recovery` consumes
+the original opaque guard/draft and calls
+`yield_completed_owner_publication`. It does not return a productive guard,
+synthesize a recovery lease or update an expiry timestamp to simulate failure.
+The next worker must pass the existing current managed-role, bot/owner and GitHub
+authorization and actually win `claim_owner_publication_recovery`.
+
+The yield transaction requires the exact current live lease and binding, the
+original pending request/body and claimed-turn projection, its immutable original
+preparation/draft, and validated completed publication/canonical files. An
+uncompleted publication cannot yield through this constructor. The event binds
+workflow/request, original actor and activated generation, intent digest, exact
+completion sequence/digest, binding and time. `workflow_event` is its sole journal:
+there is no second permission table. Version/unknown-field, actor, completion,
+intent and binding substitutions and duplicate yields refuse historical reads.
+At most 1,024 records of 8 KiB count toward the existing shared 128 MiB publication
+history bound.
+
+The strict `owner_publication_yielded` event, owner/lease release and private
+progress projection commit together. A failed event, release or outbox write
+rolls back all three. The workflow generation, checkpoint, input, controls,
+publication/preparation, native registrations/effects, resource demand, spend and
+merge allowance stay intact. The consuming guard then stops renewal and marks
+only its SQL lease released. Its original audit/model fences remain denied; no
+ordinary release-after-teardown or retirement routine is called.
+
+**D72.2 — Yield is not native settlement.** Ending a metadata lease is allowed
+without declaring a native invocation stopped or an unknown effect resolved.
+This writer therefore runs outside native proof visitors and makes no native I/O,
+callback or cleanup request in its SQL transaction. A real held native state lock
+can coexist with this yield. It is not used as quiescence, nonrelease, transfer,
+source/resource or execution evidence. All original native obligations survive;
+the existing recovery service must inspect or reconcile them under its actual
+fresh native producers before readiness or setup. Later loss of the caller or a
+commit reply follows actual durable lease/event state, without manufacturing a
+new request, model charge or transfer identity. A descriptive yield event never
+reconstructs authority; an ordinary interrupted predecessor still uses normal
+fresh recovery admission.
+
+Newer owner pause, queued peers and nonterminal holds do not prevent this unpaid
+relinquishment, and are never cleared by it. Terminal workflows refuse. The
+private queued update uses the original request/publication scope and authenticated
+origin, never the repository delivery default. Its pending message explicitly
+says that coding has not started. An existing pause/hold retains its higher-priority
+status. The shared rotating queue and durable five-minute schedule select the
+released work without waiting for artificial lease expiry. Existing readiness
+and setup constructors retain all their own checks, including pause refusal and
+single-use native transfer. No new workflow engine or parallel setup protocol is
+introduced for the uninterrupted case.
+
+The behavioral red completed actual private publication, dropped its original
+publisher, then found that a freshly authorized metadata claim was still refused.
+The new regression covers both provider pins, initial/revised acceptance and
+paused/unpaused owners (eight isolated cases). It includes missing completion,
+changed canonical files, event/release/outbox rollback, coherent history
+substitutions and duplicates, original private routing, queued-input/accounting
+preservation, actual queue selection and readiness projection. Unpaused cases
+traverse the real protected metadata pass, consume shared readiness/setup and
+perform a verified native-core successor transfer; exact replay creates no second
+transfer. Paused cases reach metadata readiness while refusing setup. A copied
+ordinary lease still cannot dispatch. An initial extended fixture incorrectly
+expected a fresh transfer to use the replay-only result variant; the corrected
+assertion requires actual completion, verified SQL settlement and subsequent
+registered-frontier replay. It does not accept a held/unknown result.
+
+The final productive constructor has a load-bearing preflight boundary still to
+implement. Existing ordinary native preparation requires productive dispatch;
+the permanently metadata-only setup logger cannot be promoted to satisfy it.
+D/R/C must supply a distinct typed path for the unreleased trusted bootstrap,
+then consume complete source/resource/input admission at the actual supervisor
+boundary before any provider/model/input grant escapes. A launch-spec startup
+record, saved resource receipt or cleared metadata flag cannot fill that gap.
+This remains the trigger for the six legitimate productive-body fixture exits,
+not a completed interface or implementation handoff.
+
+The preparation/resource/export setup and repository authorization are controlled
+fixtures. No live VM/provider, coding body, real Discord send, autonomous merge or
+production configuration/deployment is established. The original uninterrupted
+and recovered productive constructor still needs complete C/R admission,
+reservation-preserving repeated-cycle body/model/input/result/continuation and the
+shared all-consumer publication gate. Its six preserved gate-WIP prepared-body
+failures remain required work, not disabled tests or synthetic productive grants.
+Detailed source hashes, commands, receipts and limitations are in
+`1703-live-publication-yield-proof.json`. Current-head hosted CI/independent review,
+normal updater rollout, full live CLI/private Discord and shipment/fault/soak
+acceptance remain required under #1703.

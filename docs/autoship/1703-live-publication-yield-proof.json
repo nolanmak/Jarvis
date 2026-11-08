@@ -1,0 +1,167 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Explicit uninterrupted publication yield into the existing authenticated metadata recovery service",
+  "recorded_at": "2026-11-08T18:09:42.373112+00:00",
+  "parent_commit": "df574cb32ebd56faa4d4fcb74c55baa59e9510df",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_publication.rs": "afd61f360a05a33ec0ad84fc65e9f5e7649a876a794f37b7cf1f53f9e7cd7e05",
+    "crates/augmentagent-cli/src/autoship_progress.rs": "c8906ba319f883f28d9c5de6d37be1e33f9c3235a035ca244aa789b959b09e3d",
+    "crates/augmentagent-cli/src/autoship_workflow.rs": "cb743544de8fa46cf899b522f644c5a41ded068a4aab88aa03e02b12fbda37b3",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "fe6a6010b358f0ca09c0958ae96f5e9898ac401e7f3300f57217099d43ae8021",
+    "crates/augmentagent-cli/src/autoship_owner_publication_yield.rs": "50ff2bd0becfbd79cc44c764563c84269d4733be0133998639ba65938a23d447",
+    "crates/augmentagent-cli/src/self_improve_owner_publication_yield_tests.rs": "6c8d9c71b38f87dbaa3f12cd5853bd63ec89bd5a6e124c8a72d46e5b3300148f"
+  },
+  "red": {
+    "handle": 82250,
+    "exit_code": 1,
+    "log": "/tmp/autoship-1703-live-publication-yield-red-20261108.log",
+    "reason": "Completed original publisher drop stops renewal but leaves a live lease; fresh normal recovery claim refuses until expiry."
+  },
+  "new_regression": {
+    "handle": 56966,
+    "exit_code": 0,
+    "log": "/tmp/autoship-1703-live-publication-yield-final-20261108.log",
+    "passed": 1,
+    "failed": 0,
+    "ignored": 0,
+    "seconds": 72.36,
+    "cases": 8,
+    "dimensions": {
+      "provider": [
+        "codex",
+        "claude"
+      ],
+      "acceptance": [
+        "initial",
+        "revision"
+      ],
+      "owner_pause": [
+        false,
+        true
+      ]
+    }
+  },
+  "validation": [
+    {
+      "name": "test-autoship_workflow::",
+      "command": [
+        "scripts/cargo-managed.sh",
+        "test",
+        "-p",
+        "augmentagent-cli",
+        "--bin",
+        "augmentagent",
+        "autoship_workflow::",
+        "--",
+        "--test-threads=1"
+      ],
+      "log": "/tmp/autoship-1703-live-publication-yield-validation-20261108-0.log",
+      "exit_code": 0,
+      "seconds": 306.55,
+      "passed": 339,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "test-owner_publication_commits_initial_and_revision_without_productive_admission",
+      "command": [
+        "scripts/cargo-managed.sh",
+        "test",
+        "-p",
+        "augmentagent-cli",
+        "--bin",
+        "augmentagent",
+        "owner_publication_commits_initial_and_revision_without_productive_admission",
+        "--",
+        "--test-threads=1"
+      ],
+      "log": "/tmp/autoship-1703-live-publication-yield-validation-20261108-1.log",
+      "exit_code": 0,
+      "seconds": 13.13,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "test-expired_owner_publication_has_authenticated_metadata_recovery",
+      "command": [
+        "scripts/cargo-managed.sh",
+        "test",
+        "-p",
+        "augmentagent-cli",
+        "--bin",
+        "augmentagent",
+        "expired_owner_publication_has_authenticated_metadata_recovery",
+        "--",
+        "--test-threads=1"
+      ],
+      "log": "/tmp/autoship-1703-live-publication-yield-validation-20261108-2.log",
+      "exit_code": 0,
+      "seconds": 149.95,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "test-late_native_completion_wakes_legacy_debt_after_recovery_lease_expires",
+      "command": [
+        "scripts/cargo-managed.sh",
+        "test",
+        "-p",
+        "augmentagent-cli",
+        "--bin",
+        "augmentagent",
+        "late_native_completion_wakes_legacy_debt_after_recovery_lease_expires",
+        "--",
+        "--test-threads=1"
+      ],
+      "log": "/tmp/autoship-1703-live-publication-yield-validation-20261108-3.log",
+      "exit_code": 0,
+      "seconds": 59.21,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "production-build",
+      "command": [
+        "scripts/cargo-managed.sh",
+        "build",
+        "-p",
+        "augmentagent-cli",
+        "--bin",
+        "augmentagent"
+      ],
+      "log": "/tmp/autoship-1703-live-publication-yield-validation-20261108-4.log",
+      "exit_code": 0,
+      "seconds": 49.1
+    }
+  ],
+  "distinct_related_test_functions_passed": 343,
+  "all_original_local_handles_terminal": true,
+  "assertions": [
+    "The consuming original opaque publication guard/draft explicitly relinquishes only its metadata lease. It does not call ordinary teardown/retirement, charge elapsed metadata work, fabricate expiry or produce a coding guard.",
+    "Exact current lease/binding, immutable original pending request/preparation/draft and completed canonical publication are required. Pending/changed publication refuses without mutation.",
+    "A strict bounded version-1 event is the sole yield journal. Its immutable original actor, intent and exact completion joins remain validated after recovery/setup changes current ownership; duplicate/substituted/unknown history refuses.",
+    "Yield event, SQL lease release and original private outbox projection commit together. Event insertion, release update and progress insertion failures roll back every half.",
+    "New pause and queued input are retained. Nonterminal metadata relinquishment is separate from productive permission; terminal resurrection is refused in the writer. No native effect, registration, result, reservation, accounting or allowance is reset.",
+    "A real held native state lock coexists with yield, demonstrating that the writer does not reopen native locks or infer teardown. Actual native proofs still gate later recovery/setup.",
+    "The production metadata selector immediately selects the released work through its normal shared schedule; repeated selection cannot bypass its five-minute throttle.",
+    "Fresh original-owner/GitHub authorization and an actual normal recovery CAS lead through the real protected metadata pass, original preparation reopening, canonical lineage, native transfer, readiness and original-private readiness projection.",
+    "Unpaused cases consume shared successor setup, require actual core Completed outcome plus verified SQL settlement, and repeat as Registered without another event/transfer. Paused cases preserve pause/queued peers and refuse setup.",
+    "Original audit dispatch and model calls remain fenced; a copied ordinary successor lease cannot execute. Wrong repository delivery defaults receive no private update."
+  ],
+  "fixture_correction": "The first extended test expected a fresh native transfer to return Reconciled (the existing-pending replay variant). Corrected to require Pending with actual Completed outcome, Some verified SQL settlement and settlement_failed=false, then Registered replay with unchanged events. The production implementation was not relaxed.",
+  "limits": [
+    "Controlled original preparation/resource/native fixtures and stubbed repository authorization exercise actual protected APIs. There is no live provider, VM/body, positive deployed managed-worker admission, Discord send or autonomous merge.",
+    "This connects the uninterrupted publication lifecycle to existing metadata readiness/setup; it does not implement final productive execution or claim that normal owner-command intake is activated.",
+    "The shared publication gate remains separately preserved at local WIP commit f3298779ccb3e3dc968c8363f01e8f5827262d0c on refs/heads/wip/autoship-publication-gate-20261108. Its six earlier prepared-body failures are unresolved. These component tests exclude that WIP, with no ignored test or synthetic productive grant added.",
+    "Complete C/R source/resource/input qualification, final native preflight-to-productive constructor, repeated reservation/model/input/result/continuation and historical closed-source outcomes remain required.",
+    "Fresh final-head hosted checks/independent review, normal updater rollout, actual CLI/private Discord coding/followups/updates, five autonomous merges, 72-hour fault and 24-hour unattended soak remain unproven.",
+    "No production service, native policy, retained demand, owner hold or allowance changed. The separate 16 GiB native-state proposal remains pending approval."
+  ],
+  "deployed": false,
+  "productive_authority_granted": false,
+  "goal_complete": false
+}

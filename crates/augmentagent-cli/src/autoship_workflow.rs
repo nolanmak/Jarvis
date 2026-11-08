@@ -25,6 +25,8 @@ mod review_epoch;
 mod conversations;
 #[path="autoship_owner_publication.rs"]
 mod owner_publication;
+#[cfg(test)]
+pub(crate) use owner_publication::test_yield_encoding;
 #[path="autoship_owner_publication_recovery.rs"]
 pub(crate) mod owner_publication_recovery;
 pub(crate) use owner_publication::{LiveOwnerTurn,OwnerPublicationNativeFacts,OwnerPublicationCommitMetadata,OwnerPublicationReadContext};
