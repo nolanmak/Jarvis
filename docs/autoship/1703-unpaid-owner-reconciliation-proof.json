@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Independent unpaid original-owner metadata reconciliation",
+  "parent_commit": "e94fae33dcadb72cde819e6b5000cb7cad633d87",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_submission.rs": "2305561d57369bb729412bd59abde04ffd50960634d9f7cfba9353a5ae09e9e6",
+    "crates/augmentagent-cli/src/autoship_worker_queue.rs": "59f6e026eda1affe598aa17c919fef84cc997e9db5374aa7853f908cb7b4a385",
+    "crates/augmentagent-cli/src/self_improve.rs": "bcd9da2a71e494ecdc33012d61529aaca3be611457ff8676414b583e8bdf0905",
+    "crates/augmentagent-cli/src/self_improve_owner_worker_tests.rs": "ff9374a8fa8b80af88a6c20c69f3e0e0b8e9f7783b7985d8a1dcb2bd81888c8e",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "57df47c124547496521debd8ad3a5dee51e6bbeb5bac17640c583a6d823ff562"
+  },
+  "red": [
+    {
+      "handle": 82632,
+      "exit_code": 1,
+      "log": "/tmp/autoship-owner-unpaid-reconciliation-red-20261108.log",
+      "reason": "Independent recovery loop and metadata-only queue API missing"
+    },
+    {
+      "handle": 2333,
+      "exit_code": 1,
+      "log": "/tmp/autoship-owner-unpaid-fairness-red-20261108.log",
+      "reason": "Metadata-only selection consumes ordinary command yield marker"
+    }
+  ],
+  "validation": [
+    {
+      "log": "/tmp/autoship-owner-unpaid-final-autoship_workflow__submission__tests-20261108.log",
+      "passed": 21,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 1.09
+    },
+    {
+      "log": "/tmp/autoship-owner-unpaid-final-owner_metadata_reconciliation_runs_while_capped_and_merge_sweep_is_stalled-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 0.07
+    },
+    {
+      "log": "/tmp/autoship-owner-unpaid-final-the_sweep_is_free_bounded_and_runs_while_capped-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 0.07
+    },
+    {
+      "log": "/tmp/autoship-owner-unpaid-final-worker_-20261108.log",
+      "passed": 28,
+      "failed": 0,
+      "ignored": 2,
+      "seconds": 131.38
+    },
+    {
+      "log": "/tmp/autoship-owner-unpaid-upgrade-final-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 0.08
+    }
+  ],
+  "production_compile": {
+    "handle": 23360,
+    "exit_code": 0,
+    "log": "/tmp/autoship-owner-unpaid-production-final-20261108.log"
+  },
+  "all_original_local_handles_terminal": true,
+  "assertions": [
+    "The normal worker starts an independent metadata-recovery timer at the existing unpaid reconciliation cadence (at most five minutes). It is independent of builder dispatch, merge allowance and merge-sweep completion.",
+    "The clock-controlled scheduler test confirms repeated metadata callbacks while the confirmed merge allowance is exhausted and the merge-sweep callback never completes; the builder callback must not execute.",
+    "The distinct metadata-only selector cannot select or reserve ordinary command work. A deliberately older ordinary peer keeps its attempt unchanged, and metadata selection neither consumes nor rewrites the ordinary automatic-lane yield marker.",
+    "Combined and metadata-only paths share actual original-owner recovery entry, current managed-role/bot/owner/GitHub authorization before claim, protected native metadata phases, conditional attempt completion and original private outbox projection.",
+    "Native/configuration observations occur on the owned blocking task before the selector opens its SQL transaction. The selected workflow store path is carried through the owned worker task and attempt completion.",
+    "No reasoner, coding guard, body/model/input admission, shipping reservation or daily-counter reservation is introduced in the metadata-only path. Metadata readiness remains separate from productive permission.",
+    "An upgrade waits for active builder, merge sweep and metadata callbacks before returning UpgradeRequested; the completed builder result is persisted. Explicit shutdown retains its existing cancellation semantics.",
+    "Worker authorization/transport/wake/takeover/readiness/private-progress regressions, all ordinary submission/queue tests and the capped merge-sweep test pass; final non-test compilation passes."
+  ],
+  "limits": [
+    "The exhausted-allowance/stalled-sweep and upgrade tests use controlled callbacks to exercise actual scheduler lifetimes. They do not invoke a normally deployed managed worker or native recovery against production state.",
+    "Actual queue/protected metadata cases use synthetic persisted native/resource/body setup and explicit fixture owner authorization. The real worker-entry refusal and protected metadata gates remain exercised; positive live managed-role admission is unproven.",
+    "The 51-test-execution batch precedes only the test-only extension of the existing upgrade test. The final upgrade regression and production build use final source; one upgrade test is repeated, so 52 passing executions are not 52 distinct functions.",
+    "Each metadata pass selects one bounded recovery job. Candidate scans remain bounded to 64; the persisted cursor advances on actual selection passes. Large-backlog timing and failure behavior still require live acceptance.",
+    "No real Discord message, VM/provider/model/body, autonomous merge, production resource policy mutation, reservation reduction or deployment occurred.",
+    "The native custody investigation has no approved complete resource-bound producer. Full ordinary retained-session demand remains charged; the unlinked-writer/resource counterexample is not waived.",
+    "Native/source/resource/input/legacy qualification, productive successor construction, closed-source/complete outcome handling, full private coding/follow-up lifecycle, detailed recovery status and current-build live CLI/Discord acceptance remain incomplete.",
+    "Fresh combined-head hosted checks, exact-head independent review, normal updater rollout, five actual autonomous merges, 72-hour fault and 24-hour unattended soak remain unproven."
+  ],
+  "unpaid_recovery_connected_in_source": true,
+  "productive_authority_granted": false,
+  "deployed": false,
+  "goal_complete": false
+}

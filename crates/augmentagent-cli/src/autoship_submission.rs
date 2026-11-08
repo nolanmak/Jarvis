@@ -213,10 +213,16 @@ impl WorkflowStore {
     /// Failures and process death both retain the five-minute retry delay.
     /// Alternating with the automatic lane prevents command traffic starvation.
     pub fn next_command_job(&mut self,repository:&str,now:i64)->Result<Option<String>> {
-        Ok(worker_queue::select(self,repository,None,now)?.map(|job|job.workflow))
+        Ok(worker_queue::select(self,repository,None,false,now)?.map(|job|job.workflow))
     }
     pub(crate) fn next_worker_job(&mut self,repository:&str,environment:&super::owner_publication_recovery::PreparationEnvironment,now:i64)->Result<Option<SelectedWorkerJob>> {
-        worker_queue::select(self,repository,Some(environment),now)
+        worker_queue::select(self,repository,Some(environment),false,now)
+    }
+
+    /// Unpaid reconciliation may reserve metadata recovery only. Ordinary
+    /// commands keep their own attempt and model/merge admission boundaries.
+    pub(crate) fn next_owner_recovery_job(&mut self,repository:&str,environment:&super::owner_publication_recovery::PreparationEnvironment,now:i64)->Result<Option<SelectedWorkerJob>> {
+        worker_queue::select(self,repository,Some(environment),true,now)
     }
 
     /// Read the original admission before revalidating a possibly closed target.

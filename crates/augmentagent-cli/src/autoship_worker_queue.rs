@@ -15,6 +15,7 @@ pub(super) fn select(
     store: &mut WorkflowStore,
     repository: &str,
     environment: Option<&PreparationEnvironment>,
+    owner_only: bool,
     now: i64,
 ) -> Result<Option<SelectedWorkerJob>> {
     let repository = normalized_repository(repository)?;
@@ -29,7 +30,7 @@ pub(super) fn select(
         )
         .optional()?
         .unwrap_or(false);
-    if yielding {
+    if yielding && !owner_only {
         tx.execute(
             "UPDATE command_lane_turn SET yield_normal=0 WHERE repository=?1",
             [&repository],
@@ -37,11 +38,11 @@ pub(super) fn select(
         tx.commit()?;
         return Ok(None);
     }
-    let normal: Option<String> = tx
+    let normal: Option<String> = if owner_only {None}else{tx
         .query_row(&due_command_sql(&tx)?, params![repository, now], |r| {
             r.get(0)
         })
-        .optional()?;
+        .optional()?};
     let mut recovery = None;
     if let Some(environment) = environment {
         let candidates = recovery_candidates(&tx, &repository, now)?;
@@ -95,7 +96,9 @@ pub(super) fn select(
         }
         tx.execute("INSERT INTO command_schedule(workflow,attempted_at,eligible_at) VALUES(?1,?2,?3) ON CONFLICT(workflow) DO UPDATE SET attempted_at=excluded.attempted_at,eligible_at=excluded.eligible_at",params![job.workflow,now,now.saturating_add(300_000)])?;
         tx.execute("INSERT INTO command_attempt(workflow,selected_at,finished_at,outcome,reason,eligible_at) VALUES(?1,?2,NULL,'selected','worker-attempt-unconfirmed',?3) ON CONFLICT(workflow) DO UPDATE SET selected_at=excluded.selected_at,finished_at=NULL,outcome=excluded.outcome,reason=excluded.reason,eligible_at=excluded.eligible_at",params![job.workflow,now,now.saturating_add(300_000)])?;
+        if !owner_only {
         tx.execute("INSERT INTO command_lane_turn(repository,yield_normal) VALUES(?1,1) ON CONFLICT(repository) DO UPDATE SET yield_normal=1",[&repository])?;
+        }
     }
     tx.commit()?;
     Ok(selected)

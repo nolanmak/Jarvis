@@ -176,8 +176,8 @@ mod owner_worker_tests;
 
 /// Keep native/SQL metadata work off the async executor. Fresh role and remote
 /// authorization are acquired inside this owned blocking task, before any claim.
-pub(super) async fn run_owner_metadata_worker(repo:&Path,id:&str)->Result<RunReport> {
-    let repo=repo.to_path_buf();let id=id.to_owned();let state=path();let runtime=tokio::runtime::Handle::current();
+pub(super) async fn run_owner_metadata_worker(repo:&Path,state:PathBuf,id:&str)->Result<RunReport> {
+    let repo=repo.to_path_buf();let id=id.to_owned();let runtime=tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move ||runtime.block_on(owner_worker::from_worker(repo,state,id)))
         .await.context("owner recovery worker task failed")?
 }
@@ -197,6 +197,40 @@ pub(super) async fn select_worker_job(state:PathBuf,repository:String)->Result<O
         };
         Ok(selected.map(|job|(job,now)))
     }).await.context("worker selection task failed")?
+}
+
+/// Both build-loop and unpaid reconciliation dispatch use the same metadata
+/// entry, current authorization, conditional attempt completion and private outbox.
+pub(super) async fn run_owner_recovery_attempt(repo:&Path,state:PathBuf,id:&str,selected_at:i64)->Result<RunReport> {
+    use durable::submission::AttemptOutcome;
+    let result=run_owner_metadata_worker(repo,state.clone(),id).await;
+    let (outcome,reason)=match &result {
+        Ok(report) if !report.is_idle()=>(AttemptOutcome::Progress,"owner-metadata-ready"),
+        Ok(_)=>(AttemptOutcome::Deferred,"owner-recovery-deferred"),
+        Err(error) if error.downcast_ref::<super::targeted::CommandFailure>().is_some_and(|f|f.code==3)=>(AttemptOutcome::Deferred,"owner-recovery-authorization-blocked"),
+        Err(_)=>(AttemptOutcome::Failed,"owner-recovery-blocked"),
+    };
+    WorkflowStore::open(&state)?.finish_owner_recovery_attempt(id,selected_at,outcome,reason,millis())?;
+    match result {Ok(report)=>Ok(report),Err(error)=>{
+        tracing::warn!(workflow=%id,reason,"owner recovery held; ordinary queued work remains eligible: {error:#}");
+        Ok(RunReport::held(format!("Owner session recovery blocked: {reason}")))
+    }}
+}
+/// One bounded metadata selection. Never selects an ordinary command, creates a
+/// coding guard, consults a model or reserves shipping allowance.
+pub(super) async fn reconcile_owner_metadata(repo:&Path)->Result<()> {
+    let state=path();
+    let queued=WorkflowStore::open_read_only(&state)?.map(|store|store.has_command_jobs()).transpose()?.unwrap_or(false);
+    if !queued {return Ok(())}
+    let repository=tokio::time::timeout(std::time::Duration::from_secs(30),canonical_repository(repo)).await.context("owner recovery repository lookup timed out")??;
+    let selection_state=state.clone();
+    let next=tokio::task::spawn_blocking(move ||->Result<_> {
+        let environment=durable::owner_publication_recovery::PreparationEnvironment::observe()?;
+        let now=millis();let mut store=WorkflowStore::open(&selection_state)?;
+        Ok(store.next_owner_recovery_job(&repository,&environment,now)?.map(|job|(job.workflow,now)))
+    }).await.context("owner recovery selection task failed")??;
+    if let Some((id,selected_at))=next {run_owner_recovery_attempt(repo,state,&id,selected_at).await?;}
+    Ok(())
 }
 
 /// Capacity and policy observations can touch native storage. Keep them off the

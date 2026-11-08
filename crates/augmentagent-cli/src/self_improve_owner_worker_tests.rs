@@ -199,11 +199,15 @@ pub(super) async fn check_worker_queue(
         )
         .unwrap()
         .workflow;
+    db.execute("UPDATE command_job SET created_at=1 WHERE workflow=?1",[&peer]).unwrap();
     let selected_at = millis();
     let first = store
-        .next_worker_job("owner/repo", &environment, selected_at)
+        .next_owner_recovery_job("owner/repo", &environment, selected_at)
         .unwrap()
         .unwrap();
+    assert!(store.command_attempt(&peer).unwrap().is_none(),"metadata reconciliation reserved an ordinary command");
+    assert_eq!(db.query_row("SELECT coalesce((SELECT yield_normal FROM command_lane_turn WHERE repository='owner/repo'),0)",[],|r|r.get::<_,i64>(0)).unwrap(),0,
+        "unpaid metadata selection consumed an ordinary scheduling turn");
     assert!(
         first.owner_recovery && first.workflow == id,
         "eligible original owner recovery was not selected: {first:?}"
@@ -274,13 +278,6 @@ pub(super) async fn check_worker_queue(
     assert_eq!(update.deployment_state,"unknown");
     assert_eq!(update.eligible_at_ms,None,"attempt delay misreported as native recovery eligibility");
     check_worker_progress_route(&mut store,&db,&id,authorization.plan().origin(),update.sequence);
-    assert!(
-        store
-            .next_worker_job("owner/repo", &environment, millis())
-            .unwrap()
-            .is_none(),
-        "command lane did not yield its automatic-work turn"
-    );
     let next = store
         .next_worker_job("owner/repo", &environment, millis())
         .unwrap()
@@ -289,6 +286,8 @@ pub(super) async fn check_worker_queue(
         !next.owner_recovery && next.workflow == peer,
         "owner recovery starved ordinary queued work: {next:?}"
     );
+    assert!(store.next_worker_job("owner/repo",&environment,millis()).unwrap().is_none(),
+        "ordinary command selection lost its automatic-work yield");
     assert_eq!(
         store.snapshot(&id).unwrap().unwrap().model_calls,
         before.model_calls

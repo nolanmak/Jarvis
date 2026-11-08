@@ -7651,20 +7651,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             if let Some((job,selected_at)) = next {
                 let id=job.workflow;
                 if job.owner_recovery {
-                    use crate::autoship_workflow::submission::AttemptOutcome;
-                    let result=workflow::run_owner_metadata_worker(repo_root,&id).await;
-                    let (outcome,reason)=match &result {
-                        Ok(report) if !report.is_idle()=>(AttemptOutcome::Progress,"owner-metadata-ready"),
-                        Ok(_)=>(AttemptOutcome::Deferred,"owner-recovery-deferred"),
-                        Err(error) if error.downcast_ref::<targeted::CommandFailure>().is_some_and(|f|f.code==3)=>(AttemptOutcome::Deferred,"owner-recovery-authorization-blocked"),
-                        Err(_)=>(AttemptOutcome::Failed,"owner-recovery-blocked"),
-                    };
-                    crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
-                        .finish_owner_recovery_attempt(&id,selected_at,outcome,reason,chrono::Utc::now().timestamp_millis())?;
-                    return match result {Ok(report)=>Ok(report),Err(error)=>{
-                        warn!(workflow=%id,reason,"owner recovery held; ordinary queued work remains eligible: {error:#}");
-                        Ok(RunReport::held(format!("Owner session recovery blocked: {reason}")))
-                    }};
+                    return workflow::run_owner_recovery_attempt(repo_root,workflow::path(),&id,selected_at).await;
                 }
                 use crate::autoship_workflow::submission::AttemptOutcome;
                 let result = targeted::work_once_mode(repo_root, &id, targeted::ExecutionMode::Background).await;
@@ -11864,6 +11851,7 @@ impl AutoPrLoop {
             .context("another auto-ship supervisor is already running")?;
         let (root, dry_run) = (self.repo_root.clone(), self.dry_run);
         let sweep_root = root.clone();
+        let recovery_root = root.clone();
         let canary_stop = shutdown.clone();
         // Observability has its own lifetime: slow/unavailable reviewer probes
         // must not delay merge reconciliation or consume a builder attempt.
@@ -11887,7 +11875,7 @@ impl AutoPrLoop {
                 }
             }
         };
-        let shipping = self.run_with(shutdown, move || {
+        let shipping = self.run_with_recovery(shutdown, move || {
             let root = root.clone();
             async move { run_once(&root, dry_run).await }
         }, move || {
@@ -11910,6 +11898,9 @@ impl AutoPrLoop {
                 if let Err(error)=legacy_readmission::sweep(root,None,dry_run).await {warn!("legacy hold readmission deferred: {error:#}");}
                 merged
             }
+        },move || {
+            let root=recovery_root.clone();
+            async move {if dry_run {Ok(())}else{workflow::reconcile_owner_metadata(&root).await}}
         });
         tokio::select! { result = shipping => result, result = canary => result }
     }
@@ -11933,10 +11924,35 @@ impl AutoPrLoop {
     where F: Fn() -> T, T: std::future::Future<Output = Result<RunReport>>,
         S: Fn() -> U, U: std::future::Future<Output = usize>,
     {
+        self.run_with_recovery(shutdown,tick,sweep,||async {Ok(())}).await
+    }
+
+    async fn run_with_recovery<F,T,S,U,R,V>(self,shutdown:tokio_util::sync::CancellationToken,tick:F,sweep:S,recover:R)->Result<()>
+    where F:Fn()->T,T:std::future::Future<Output=Result<RunReport>>,
+        S:Fn()->U,U:std::future::Future<Output=usize>,
+        R:Fn()->V,V:std::future::Future<Output=Result<()>>,
+    {
         let interval = self.interval.min(std::time::Duration::from_secs(300));
         let stop = shutdown.clone();
         let upgrade_stop = tokio_util::sync::CancellationToken::new();
         let reconciliation_stop = upgrade_stop.clone();
+        let metadata_stop=shutdown.clone();let metadata_upgrade_stop=upgrade_stop.clone();
+        let metadata=async move {
+            let mut timer=tokio::time::interval(interval);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {biased;
+                    _=metadata_stop.cancelled()=>return Ok::<(),anyhow::Error>(()),
+                    _=metadata_upgrade_stop.cancelled()=>return Ok(()),
+                    _=timer.tick()=>{},
+                }
+                tokio::select! {
+                    _=metadata_stop.cancelled()=>return Ok(()),
+                    result=recover()=>if let Err(error)=result {warn!("owner metadata reconciliation deferred: {error:#}");},
+                }
+            }
+        };
+        tokio::pin!(metadata);
         let reconciliation = async move {
             let mut timer = tokio::time::interval(interval);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -11962,11 +11978,13 @@ impl AutoPrLoop {
                     // A replacement waits for the independently running merge
                     // sweep too. Only operator shutdown cancels active work.
                     upgrade_stop.cancel();
-                    reconciliation.await?;
+                    let (reconciled,recovered)=tokio::join!(reconciliation,metadata);
+                    reconciled?;recovered?;
                 }
                 result
             },
             result = &mut reconciliation => result,
+            result = &mut metadata => result,
         }
     }
 
@@ -12286,15 +12304,22 @@ mod tests {
         let sweep_started = Arc::new(tokio::sync::Notify::new());
         let sweep_finish = Arc::new(tokio::sync::Notify::new());
         let (ss, sf) = (sweep_started.clone(), sweep_finish.clone());
-        let task = tokio::spawn(worker.run_with(tokio_util::sync::CancellationToken::new(), move || {
+        let metadata_started=Arc::new(tokio::sync::Notify::new());
+        let metadata_finish=Arc::new(tokio::sync::Notify::new());
+        let (ms,mf)=(metadata_started.clone(),metadata_finish.clone());
+        let task = tokio::spawn(worker.run_with_recovery(tokio_util::sync::CancellationToken::new(), move || {
                 let (s, f) = (s.clone(), f.clone());
                 async move { s.notify_one(); f.notified().await; Ok(RunReport::built("synthetic finished run".into())) }
             }, move || {
                 let (ss, sf) = (ss.clone(), sf.clone());
                 async move { ss.notify_one(); sf.notified().await; 0 }
+            },move || {
+                let (ms,mf)=(ms.clone(),mf.clone());
+                async move {ms.notify_one();mf.notified().await;Ok(())}
             }));
         started.notified().await;
         sweep_started.notified().await;
+        metadata_started.notified().await;
         let replacement = state.path().join("replacement");
         std::fs::write(&replacement, "new").unwrap();
         std::fs::rename(replacement, &binary).unwrap();
@@ -12306,8 +12331,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(!task.is_finished(), "reload must also wait for reconciliation");
         sweep_finish.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!task.is_finished(),"reload cancelled active owner metadata reconciliation");
+        metadata_finish.notify_one();
         let error = tokio::time::timeout(std::time::Duration::from_secs(5), task).await
-            .expect("worker did not finish after both boundaries").unwrap().unwrap_err();
+            .expect("worker did not finish after all three boundaries").unwrap().unwrap_err();
         assert!(error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some());
         let counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
         assert_eq!(counter.runs, 1, "finished work must be recorded before the worker reloads");
@@ -16096,6 +16124,24 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     // Draft restoration, exact-head mutation and pending checks are exercised
     // with fake GitHub transport in progress_tests and publication::tests.
 
+
+    #[tokio::test(start_paused = true)]
+    async fn owner_metadata_reconciliation_runs_while_capped_and_merge_sweep_is_stalled() {
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let state=tempfile::tempdir().unwrap();
+        let mut lp=AutoPrLoop::for_tests(PathBuf::from("/nonexistent"),1,state.path());
+        lp.interval=std::time::Duration::from_secs(5);
+        confirm_test_merge(&lp.workflow_path,1,chrono::Utc::now());
+        let stop=tokio_util::sync::CancellationToken::new();
+        let cancel=stop.clone();let calls=Arc::new(AtomicUsize::new(0));let seen=calls.clone();
+        lp.run_with_recovery(stop,||async {panic!("merge-capped builder must not run");#[allow(unreachable_code)] Ok(RunReport::idle())},
+            ||async {std::future::pending::<usize>().await},move || {
+                let seen=seen.clone();let cancel=cancel.clone();async move {
+                    if seen.fetch_add(1,Ordering::SeqCst)>=2 {cancel.cancel();}Ok(())
+                }
+            }).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst),3);
+    }
 
     /// C1, C5, C7 — the sweep runs while capped, spends no reasoner call, and
     /// is bounded so a backlog cannot stall a tick.
