@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "component": "explicit successor setup cycle identity",
+  "status": "versioned-metadata-linkage-no-repeated-cycle-or-body-grant",
+  "base_commit": "9a490b4fa44e6330b0cc90e43550d3a88bc5704b",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_successor_transfer.rs": "7d8cabe896e0639ef4ac8bcb0b2372fbca2bb27e054aca7c1dd185750532faf7",
+    "crates/augmentagent-cli/src/autoship_owner_successor_claim.rs": "18cb4e8ea9d8449cb7496852b2205265c6faac93f5a70c0d7f2cc3f5170e1362",
+    "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs": "075f8240c03027fdcacbb8ef98ca67b768da0ecf6302f4425c8df3d80dc8544b",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "8b676db49762ce000e1a89b3983fb35d3f1ce7df40eab1c7d0e7c04d98dee338"
+  },
+  "change": [
+    "New successor-native context/event records use version 2. The strict successor_setup key binds the actual consumed setup reference. Its recovery_ready predecessor binds the actual readiness reference, originating recovery-claim reference and original native source.",
+    "The existing writer derives this data from the captured successful setup CAS and validated original native frontier. The reader joins it to the same immutable setup/readiness/recovery and native pending/source records.",
+    "Canonical version-1 context/event encodings remain readable with the new cycle omitted. Unsupported versions, purposes and fields; mismatched record/event versions; missing cycles; and changed setup/ready/recovery/source references refuse.",
+    "The existing single-setup/context and current authorization/lease/control barriers remain. These descriptors never recreate a setup capability, model observer, body grant or predecessor disposition for a second cycle."
+  ],
+  "coverage_correction": {
+    "initial_retry_only_run": "/tmp/autoship-successor-cycle-v2-red-20261108.log",
+    "observation": "The retry-only parent returned before the native context was created and passed without exercising the new assertions. It is not RED or version-2 coverage.",
+    "corrected_red": "/tmp/autoship-successor-cycle-v2-full-path-red-20261108.log",
+    "red_result": "The full recovery fixture reached the actual successor context and failed on version 1 versus required version 2.",
+    "nonvacuity": "Plain default Codex/Claude metadata-recovery parents now require the marker emitted only after the actual cycle assertions, coherent substitutions, legacy read and original-record restoration complete."
+  },
+  "validation": [
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent expired_owner_publication_has_authenticated_metadata_recovery -- --nocapture",
+      "log": "/tmp/autoship-successor-cycle-v2-full-path-green-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "controlled_cases": 12,
+      "seconds": 136.48
+    },
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent self_improve::workflow::tests::owner_successor_native_ -- --nocapture",
+      "log": "/tmp/autoship-successor-cycle-v2-interruption-matrix-20261108.log",
+      "passed": 2,
+      "failed": 0,
+      "controlled_cases": 8,
+      "seconds": 157.29
+    },
+    {
+      "command": "scripts/cargo-managed.sh build -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-successor-cycle-v2-production-20261108.log",
+      "passed": true,
+      "seconds": 46.87
+    }
+  ],
+  "assertions": [
+    "Both providers reach the actual consumed-setup context, its original readiness and source.",
+    "Nine coherently rehashed context/event substitutions refuse: missing cycle, legacy cycle, changed setup, readiness, recovery, source generation/audit, unknown version and mismatched event version.",
+    "Wrong-purpose and extra cycle/predecessor fields refuse through the exact production record type.",
+    "A representative original version-1 context/event remains readable with the same native UUID; original version-2 bytes are restored before existing settlement tests.",
+    "Existing native intent rollback/lost acknowledgement, replay, absent/prepared/aborted interruption, setup-only execution denial, accounting preservation, owner-pause and damaged-ancestry assertions remain enabled."
+  ],
+  "limits": [
+    "Runtime/provider/authority data are controlled fixtures. No live model, Discord or native VM acceptance is claimed.",
+    "Completed/unstarted predecessor dispositions, multiple-cycle ancestry, reserved-body readiness/release/model/result constructors and complete C/R producer closure remain required.",
+    "No production session, policy, budget, hold, input or shipping allowance changed. The 8 GiB native-state decision remains pending.",
+    "Exact-head independent review, hosted CI, normal updater rollout and all original CLI/Discord/merge/fault/soak acceptance remain required."
+  ],
+  "all_original_local_handles_terminal": true,
+  "productive_recovery_granted": false,
+  "production_capacity_changed": false
+}

@@ -937,3 +937,6 @@ pub(crate) fn test_successor_encoding(raw:&str)->Result<String> {successor_claim
 
 #[cfg(test)]
 pub(crate) fn test_recovery_context_encoding(raw:&str)->Result<String> {native_intent::fixture_encoding(raw)}
+
+#[cfg(test)]
+pub(crate) fn test_successor_native_context_encoding(raw:&str)->Result<String> {successor_claim::fixture_native_context_encoding(raw)}

@@ -55,5 +55,9 @@
     "No production session, policy, reservation, owner hold, allowance or daemon state changed. Hosted exact-head CI, independent review, normal rollout and the full epic live/fault/soak acceptance remain required."
   ],
   "all_original_local_handles_terminal": true,
-  "productive_dispatch_or_retirement_granted": false
+  "productive_dispatch_or_retirement_granted": false,
+  "coverage_note_20261108": {
+    "prior_local_scope": "The named retry-only parent covered preparation reads and substitutions before the early retry return. It did not reach the later native-transfer/ancestry assertions. Original local pass counts and source hashes remain historical.",
+    "expanded_local_scope": "The full 12-case recovery fixture now reaches and validates the successor context, including the later preparation/ancestry assertions, with an explicit reachability marker. See 1703-successor-cycle-v2-proof.json and /tmp/autoship-successor-cycle-v2-full-path-green-20261108.log."
+  }
 }

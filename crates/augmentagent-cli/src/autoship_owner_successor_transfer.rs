@@ -9,7 +9,21 @@ struct ContextRecord {
     version:u32,workflow:String,request_id:String,generation:i64,setup:RecordRef,ready:RecordRef,
     original_intent:super::super::super::owner_publication::Reference,
     source:Authority,facts_sha256:String,pending:RecordRef,at_ms:i64,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    cycle:Option<SuccessorCycle>,
 }
+#[derive(PartialEq,Eq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields,tag="purpose",rename_all="snake_case")]
+enum SuccessorCycle {SuccessorSetup {setup:RecordRef,predecessor:SetupPredecessor}}
+#[derive(PartialEq,Eq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields,tag="kind",rename_all="snake_case")]
+enum SetupPredecessor {RecoveryReady {ready:RecordRef,recovery:RecordRef,source:Authority}}
+/// Descriptive setup-cycle identity; not a body release or retry disposition.
+fn setup_cycle(setup:&RecordRef,ready:&RecordRef,recovery:&RecordRef,source:&Authority)->SuccessorCycle {
+    SuccessorCycle::SuccessorSetup {setup:setup.clone(),predecessor:SetupPredecessor::RecoveryReady {ready:ready.clone(),recovery:recovery.clone(),source:source.clone()}}
+}
+#[cfg(test)]
+pub(super) fn fixture_encoding(raw:&str)->Result<String> {Ok(serde_json::to_string(&serde_json::from_str::<ContextRecord>(raw)?)?)}
 /// Borrowed live reservation plus exact durable purpose, never a coding lease.
 pub(crate) struct SuccessorNativeIntent<'a> {pending:PendingNativeHandoff,_setup:&'a SuccessorSetup}
 impl SuccessorNativeIntent<'_> {
@@ -52,12 +66,17 @@ fn history(conn:&Connection,workflow:&str)->Result<Option<(ContextRecord,Pending
     ensure!((1..=16384).contains(&len) && raw.len() as i64==len && digest(&raw)==sha,"successor native context exceeds bound or changed");
     let record:ContextRecord=serde_json::from_str(&raw)?;
     let (original,source)=original_source(conn,workflow,&setup)?;
-    ensure!(serde_json::to_string(&record)?==raw && record.version==1 && record.workflow==workflow && record.request_id==setup.request_id
+    ensure!(serde_json::to_string(&record)?==raw && matches!(record.version,1|2) && record.workflow==workflow && record.request_id==setup.request_id
         && record.generation==generation && generation==setup.setup.generation && record.setup==setup_ref && setup_sequence==setup_ref.sequence
         && record.ready==setup.ready && record.original_intent==original.intent && record.source==source
         && record.setup.sequence<pending_sequence && pending_sequence<sequence && record.pending.sequence==pending_sequence
         && record.at_ms>=setup.at_ms && record.at_ms<setup.lease_until
         && record.facts_sha256.len()==64 && record.facts_sha256.bytes().all(|b|matches!(b,b'0'..=b'9'|b'a'..=b'f')),"successor native context lineage changed");
+    ensure!(match record.version {
+        1=>record.cycle.is_none(),
+        2=>record.cycle.as_ref()==Some(&setup_cycle(&setup_ref,&setup.ready,&setup.recovery,&source)),
+        _=>false,
+    },"successor native cycle or original predecessor changed");
     let pending=native_pending::recorded_pending(conn,workflow,&id)?;
     let expected_sha=format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(&pending)?)?));
     let (intent,_)=native_intent::original_record(conn,&original)?;
@@ -66,7 +85,7 @@ fn history(conn:&Connection,workflow:&str)->Result<Option<(ContextRecord,Pending
         && pending.request().destination==destination(conn,workflow,generation)? && pending.workflow_binding()==&setup.checkpoint.binding,"successor native pending scope changed");
     let (kind,event_generation,payload,at,event_len):(String,i64,String,i64,i64)=conn.query_row("SELECT kind,generation,substr(payload,1,4097),at_ms,length(CAST(payload AS BLOB)) FROM workflow_event WHERE workflow=?1 AND seq=?2",params![workflow,sequence],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
     ensure!((1..=4096).contains(&event_len) && payload.len() as i64==event_len && kind=="owner_successor_native_intent_recorded" && event_generation==generation && at==record.at_ms
-        && serde_json::from_str::<serde_json::Value>(&payload)?==serde_json::json!({"version":1,"request_id":record.request_id,"transfer_id":id,"record_sha256":sha}),"successor native context event changed");
+        && serde_json::from_str::<serde_json::Value>(&payload)?==serde_json::json!({"version":record.version,"request_id":record.request_id,"transfer_id":id,"record_sha256":sha}),"successor native context event changed");
     let pending_at:i64=conn.query_row("SELECT at_ms FROM workflow_event WHERE workflow=?1 AND seq=?2",params![workflow,pending_sequence],|r|r.get(0))?;
     ensure!(pending_at==record.at_ms,"successor native pending time changed");
     Ok(Some((record,pending)))
@@ -160,9 +179,10 @@ impl WorkflowStore {
         let pending=PendingNativeHandoff {version:1,request,original_binding:snapshot.original_binding,workflow_binding:setup.record.checkpoint.binding.clone(),observation_revision:snapshot.observation.revision,observation_sha256:snapshot.observation.sha256,observation_certain:true};
         let (sequence,sha256)=native_pending::append_pending(&tx,&pending,now)?;
         let (original,source)=original_source(&tx,&setup.record.workflow,&setup.record)?;
-        let context=ContextRecord {version:1,workflow:setup.record.workflow.clone(),request_id:setup.request_id().into(),generation:setup.generation(),setup:setup.reference.clone(),ready:setup.record.ready.clone(),original_intent:original.intent,source,facts_sha256:fresh.fingerprint()?,pending:RecordRef {sequence,sha256},at_ms:now};
+        let cycle=setup_cycle(&setup.reference,&setup.record.ready,&setup.record.recovery,&source);
+        let context=ContextRecord {version:2,workflow:setup.record.workflow.clone(),request_id:setup.request_id().into(),generation:setup.generation(),setup:setup.reference.clone(),ready:setup.record.ready.clone(),original_intent:original.intent,source,facts_sha256:fresh.fingerprint()?,pending:RecordRef {sequence,sha256},at_ms:now,cycle:Some(cycle)};
         let raw=serde_json::to_string(&context)?;ensure!(raw.len()<=16384,"successor native context exceeds bound");let sha=digest(&raw);
-        event(&tx,&setup.record.workflow,setup.generation(),"owner_successor_native_intent_recorded",&serde_json::json!({"version":1,"request_id":setup.request_id(),"transfer_id":pending.request().transfer_id,"record_sha256":sha}).to_string(),now)?;
+        event(&tx,&setup.record.workflow,setup.generation(),"owner_successor_native_intent_recorded",&serde_json::json!({"version":context.version,"request_id":setup.request_id(),"transfer_id":pending.request().transfer_id,"record_sha256":sha}).to_string(),now)?;
         let context_sequence:i64=tx.query_row("SELECT max(seq) FROM workflow_event WHERE workflow=?1",[&setup.record.workflow],|r|r.get(0))?;
         tx.execute("INSERT INTO workflow_owner_successor_native_intent VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![setup.record.workflow,setup.generation(),setup.reference.sequence,pending.request().transfer_id,sequence,context_sequence,sha,raw])?;
         history(&tx,&setup.record.workflow)?;

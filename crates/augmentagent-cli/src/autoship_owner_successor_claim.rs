@@ -173,3 +173,6 @@ fn require_current_setup(conn:&Connection,setup:&SuccessorSetup,now:i64)->Result
 
 #[cfg(test)]
 pub(super) fn fixture_encoding(raw:&str)->Result<String> {let record:Record=serde_json::from_str(raw)?;Ok(serde_json::to_string(&record)?)}
+
+#[cfg(test)]
+pub(super) fn fixture_native_context_encoding(raw:&str)->Result<String> {transfer::fixture_encoding(raw)}
