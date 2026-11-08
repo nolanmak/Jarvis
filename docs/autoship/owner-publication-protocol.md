@@ -1745,3 +1745,38 @@ complete multi-attempt/cycle predecessors, productive release/model/result grant
 full source/resource/legacy-writer qualification, worker ingress and every original
 rollout/merge/fault/soak requirement remain open. No production policy, capacity,
 retained runtime, hold, accounting or service was changed.
+
+## 65. Reserved readiness survives its consuming successor handoff
+
+The authenticated reserved-body fixture now continues beyond readiness planning:
+it consumes that readiness through `claim_recovered_owner_turn_for_setup`, reads
+the original body history through the consumed edge, reopens the original private
+preparation, and runs `run_successor_native_setup` through an actual completed
+native transfer and SQL settlement. It then reopens preparation from the new
+native namespace and re-reads the same original body history. All four reserved
+states run for both Codex and Claude, using the existing controlled runtime and
+persisted-resource fixtures. The eight cases passed in 445.64 seconds.
+
+The original reservation, first model/native records and common charges remain
+byte-for-byte unchanged. Checkpoint, attempts, wall/model/token accounting, queued
+owner messages and confirmed shipping allowance remain unchanged by setup and
+transfer. A second connection cannot consume the same readiness again. Copying
+the setup lease does not expose an ordinary owner turn or admit a model charge.
+The fixture first proves its existing owner pause/held checkpoint prevents setup,
+then makes only its private fixture runnable. Production holds are untouched.
+
+Two preceding runs exposed fixture sequencing issues rather than a production
+regression: the first still had those intentional pause/hold barriers; the second
+reused one authorization across enough synchronous stages to hit the actual
+30-second deadline. The final fixture reauthorizes through the normal repository
+and owner API between stages. No authorization deadline or setup lease was
+extended, and no runtime validation was weakened. This test-only addition does not
+claim a new production fix or a new full-suite run. The previous full CLI and
+production compilation receipts remain evidence for their previous source scope.
+
+This closes the reserved readiness-to-single-successor metadata validation gap;
+it does not close the original productive body-construction fixture limitation,
+construct productive release/model/result authority, qualify legacy writers or
+resources, enable repeated recovery cycles or wire worker/CLI/Discord ingress.
+Normal rollout and every original live/fault/soak acceptance requirement remain.
+See [the successor handoff evidence](1703-reserved-successor-proof.json).

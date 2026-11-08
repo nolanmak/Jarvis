@@ -1,0 +1,64 @@
+{
+  "scope": "Authenticated reserved readiness consumption, completed successor native handoff and original-history/preparation preservation; test-only change",
+  "parent_head": "98c0d47b9779d7cc1ca9bd89c70f1da1697c8313",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/self_improve_owner_reserved_ready_tests.rs": "ad945972a7f7e1be85bf31a4ee58e06e9195b006a560cec19a780b3240514291",
+    "crates/augmentagent-cli/src/autoship_owner_successor_claim.rs": "18cb4e8ea9d8449cb7496852b2205265c6faac93f5a70c0d7f2cc3f5170e1362",
+    "crates/augmentagent-cli/src/autoship_owner_successor_native.rs": "b386deba7a45e6eb734c83c8b39f880b030eefa18f33a56e088f8bcd84004103",
+    "crates/augmentagent-cli/src/autoship_owner_successor_transfer.rs": "7d8cabe896e0639ef4ac8bcb0b2372fbca2bb27e054aca7c1dd185750532faf7",
+    "crates/augmentagent-cli/src/autoship_owner_body_history.rs": "1c0677017747d9028aeaac691c3a97cd802176a5bdf4d64112fa6cbed86fe354"
+  },
+  "fixture_barrier_failure": {
+    "handle": 5519,
+    "exit_code": 1,
+    "log": "/tmp/autoship-reserved-successor-red-20261108.log",
+    "cause": "Existing fixture owner pause and held checkpoint correctly prevented successor claim; not a production regression red"
+  },
+  "fixture_authorization_failure": {
+    "handle": 97639,
+    "exit_code": 1,
+    "log": "/tmp/autoship-reserved-successor-behavior-20261108.log",
+    "cause": "Reused authorization expired during later original preparation read; normal fresh authorization now obtained between stages"
+  },
+  "final_focused_test": {
+    "handle": 83545,
+    "exit_code": 0,
+    "log": "/tmp/autoship-reserved-successor-fresh-auth-20261108.log",
+    "test": "self_improve::workflow::reserved_ready_tests::reserved_owner_readiness_survives_successor_native_handoff",
+    "passed": 1,
+    "failed": 0,
+    "seconds": 445.64,
+    "authenticated_child_cases": 8,
+    "providers": [
+      "codex",
+      "claude"
+    ],
+    "states": [
+      "reserved_model_unadmitted",
+      "reserved_model_admitted_native_absent",
+      "reserved_sql_bound_native_unbound",
+      "reserved_native_bound"
+    ]
+  },
+  "assertions": [
+    "Owner pause/held checkpoint prevents successor claim without changing events or workflow",
+    "Actual authenticated readiness consumption, completed native transfer and SQL settlement",
+    "Original SQL body history remains equal after successor claim and completed native handoff",
+    "Original private preparation reopens before and after native handoff",
+    "Duplicate second connection cannot consume readiness again",
+    "Original reservation, first model/native records and charges remain exact",
+    "No setup/transfer change to checkpoint, queued input, attempts, wall/model/token counts or confirmed merges",
+    "Copied setup lease cannot expose ordinary owner turn or charge a model call"
+  ],
+  "limits": [
+    "Controlled persisted original-body/resource fixtures; no actual VM/provider/model execution",
+    "No new production behavior changed; prior full-suite/build receipts retain their prior source scope",
+    "No new post-transfer whole-body nonrelease proof is asserted by this test",
+    "Single successor only; productive release/model/result constructors, repeated cycles and full source/resource/legacy qualification remain required",
+    "Worker/CLI/Discord ingress, normal rollout, five autonomous merges and fault/soak acceptance remain incomplete",
+    "No production policy, capacity, budget, retained runtime, hold, accounting or service mutation"
+  ],
+  "all_original_local_handles_terminal": true,
+  "productive_recovery_granted": false,
+  "live_acceptance_proven": false
+}

@@ -4,6 +4,20 @@ use super::*;
 use augmentagent_channel_core::native_vm::{ownership, RuntimeOwner};
 use std::os::unix::fs::PermissionsExt;
 #[tokio::test]
+async fn reserved_owner_readiness_survives_successor_native_handoff() {
+    for phase in ["unadmitted", "admitted", "sql-bound", "native-bound"] {
+        super::tests::owner_metadata_recovery_modes_inner_reserved(
+            &[
+                "owner-early-acceptance-producer-metadata-recovery",
+                "owner-early-acceptance-producer-claude-metadata-recovery",
+            ],
+            false,
+            None,
+            Some(&format!("successor-{phase}")),
+        );
+    }
+}
+#[tokio::test]
 async fn reserved_owner_readiness_rejects_model_only_snapshot_change() {
     super::tests::owner_metadata_recovery_modes_inner_reserved(
         &[
@@ -43,6 +57,7 @@ pub(super) fn seed_reserved_body(
     native: &Path,
     phase: &str,
 ) -> durable::owner_dispatch::ReservedOwnerBodyRead {
+    let phase = phase.strip_prefix("successor-").unwrap_or(phase);
     let phase = if phase == "stale-model-snapshot" {
         "admitted"
     } else if phase == "lost-response" {
@@ -180,6 +195,8 @@ pub(super) async fn settle_reserved_body(
     phase: &str,
     initial: Option<&durable::owner_dispatch::ReservedOwnerBodyRead>,
 ) {
+    let successor = phase.starts_with("successor-");
+    let phase = phase.strip_prefix("successor-").unwrap_or(phase);
     let mut store = WorkflowStore::open(state).unwrap();
     // Publication completion is a real authorized metadata transition.
     with_recovery_native_metadata(
@@ -488,7 +505,7 @@ pub(super) async fn settle_reserved_body(
             },
         )
     };
-    if !matches!(phase, "released" | "stale-model-snapshot") {
+    if !successor && !matches!(phase, "released" | "stale-model-snapshot") {
         for fault in ["insert", "pointer", "release", "input-race"] {
             let sql=match fault {
                 "insert"=>"CREATE TRIGGER refuse_reserved_ready BEFORE INSERT ON workflow_owner_successor_ready BEGIN SELECT RAISE(ABORT,'injected reserved readiness rollback'); END;",
@@ -718,6 +735,218 @@ pub(super) async fn settle_reserved_body(
     assert_eq!(store.merge_allowance(millis(), 5).unwrap().confirmed, 0);
     assert_eq!(std::fs::read(source.path()).unwrap(), audit_before[0]);
     assert_eq!(std::fs::read(destination.path()).unwrap(), audit_before[1]);
+    if successor {
+        consume_reserved_successor(state, worktree, &workflow, recovery.request_id()).await;
+    }
+}
+
+async fn consume_reserved_successor(state: &Path, worktree: &Path, workflow: &str, request: &str) {
+    let mut store = WorkflowStore::open(state).unwrap();
+    let db = rusqlite::Connection::open(state).unwrap();
+    let original = original_rows(&db, workflow, request);
+    let history = durable::owner_dispatch::test_body_input_history(&db, workflow, request).unwrap();
+    let queued = store.pending_owner_messages(workflow).unwrap();
+    // The shared recovery fixture deliberately leaves an owner pause and held
+    // checkpoint. Prove those still block, then make only this fixture runnable.
+    let blocked_plan = store.owner_successor_setup_plan(workflow).unwrap().unwrap();
+    let blocked_auth = super::super::targeted::authorize_owner_successor(
+        worktree,
+        &blocked_plan,
+        crate::autoship_discord_command::OwnerPolicy { bot: 11, owner: 22 },
+    )
+    .await
+    .unwrap();
+    let blocked = store.snapshot(workflow).unwrap().unwrap();
+    let blocked_events = store.events(workflow).unwrap();
+    assert!(store
+        .claim_recovered_owner_turn_for_setup(
+            &blocked_auth,
+            "held-reserved-successor",
+            millis(),
+            60_000,
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(store.snapshot(workflow).unwrap().unwrap(), blocked);
+    assert_eq!(store.events(workflow).unwrap(), blocked_events);
+    let control = store.owner_control(workflow).unwrap().unwrap();
+    if control.paused {
+        store
+            .set_owner_pause(workflow, "fixture-owner", control.revision, false, millis())
+            .unwrap();
+    }
+    let mut checkpoint = blocked.checkpoint;
+    checkpoint.stage = Stage::Build;
+    checkpoint.next.eligible_at_ms = 0;
+    db.execute(
+        "UPDATE workflow SET checkpoint=?2 WHERE id=?1",
+        rusqlite::params![workflow, serde_json::to_string(&checkpoint).unwrap()],
+    )
+    .unwrap();
+    let before = store.snapshot(workflow).unwrap().unwrap();
+    let plan = store.owner_successor_setup_plan(workflow).unwrap().unwrap();
+    let authorization = super::super::targeted::authorize_owner_successor(
+        worktree,
+        &plan,
+        crate::autoship_discord_command::OwnerPolicy { bot: 11, owner: 22 },
+    )
+    .await
+    .unwrap();
+    let setup = Arc::new(
+        store
+            .claim_recovered_owner_turn_for_setup(
+                &authorization,
+                "reserved-successor",
+                millis(),
+                60_000,
+            )
+            .expect("reserved readiness successor claim failed")
+            .unwrap(),
+    );
+    store
+        .validate_owner_successor_setup(&setup, &authorization, millis())
+        .unwrap();
+    assert!(store
+        .owner_successor_setup_plan(workflow)
+        .unwrap()
+        .is_none());
+    assert!(WorkflowStore::open(state)
+        .unwrap()
+        .claim_recovered_owner_turn_for_setup(
+            &authorization,
+            "duplicate-reserved-successor",
+            millis(),
+            60_000,
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        durable::owner_dispatch::test_body_input_history(&db, workflow, request)
+            .expect("original body history unreadable after successor claim"),
+        history
+    );
+    with_successor_native_metadata(
+        state,
+        Some(worktree),
+        setup.clone(),
+        &authorization,
+        &mut |proof| {
+            let prepared = store.with_owner_successor_preparation(
+                &setup,
+                &authorization,
+                proof,
+                millis(),
+                |access| {
+                    acceptance::owner::publication::reopen_successor_preparation(
+                        access, proof, worktree,
+                    )
+                },
+            )?;
+            prepared.require_setup(&setup)?;
+            assert_eq!(prepared.request_id(), request);
+            Ok(())
+        },
+    )
+    .expect("reserved successor cannot reopen original preparation");
+    let authorization = super::super::targeted::authorize_owner_successor(
+        worktree,
+        &plan,
+        crate::autoship_discord_command::OwnerPolicy { bot: 11, owner: 22 },
+    )
+    .await
+    .unwrap();
+    let shared = Arc::new(Mutex::new(WorkflowStore::open(state).unwrap()));
+    let run = run_successor_native_setup(&shared, state, worktree, setup.clone(), &authorization)
+        .expect("reserved successor native handoff failed");
+    assert!(
+        matches!(
+            run,
+            SuccessorNativeSetupRun::Outcome(
+                durable::native_prepare::NativePreparationRun::Pending {
+                    outcome: ownership::TransferOutcome::Completed(_),
+                    settlement: Some(_),
+                    settlement_failed: false,
+                    ..
+                }
+            )
+        ),
+        "reserved successor did not settle its native handoff: {run:?}"
+    );
+    let authorization = super::super::targeted::authorize_owner_successor(
+        worktree,
+        &plan,
+        crate::autoship_discord_command::OwnerPolicy { bot: 11, owner: 22 },
+    )
+    .await
+    .unwrap();
+    let facts = store
+        .owner_successor_native_facts(&setup, &authorization, millis())
+        .unwrap();
+    assert_eq!(facts.namespace().owner.lease_generation, setup.generation());
+    with_successor_native_metadata(
+        state,
+        Some(worktree),
+        setup.clone(),
+        &authorization,
+        &mut |proof| {
+            let prepared = store.with_owner_successor_preparation(
+                &setup,
+                &authorization,
+                proof,
+                millis(),
+                |access| {
+                    acceptance::owner::publication::reopen_successor_preparation(
+                        access, proof, worktree,
+                    )
+                },
+            )?;
+            prepared.require_setup(&setup)?;
+            Ok(())
+        },
+    )
+    .expect("transferred reserved successor cannot reopen original preparation");
+    assert_eq!(
+        durable::owner_dispatch::test_body_input_history(&db, workflow, request)
+            .expect("original body history unreadable after native handoff"),
+        history
+    );
+    assert_eq!(original_rows(&db, workflow, request), original);
+    let after = store.snapshot(workflow).unwrap().unwrap();
+    assert_eq!(
+        (
+            after.checkpoint,
+            after.attempts,
+            after.wall_ms,
+            after.model_calls,
+            after.tokens
+        ),
+        (
+            before.checkpoint,
+            before.attempts,
+            before.wall_ms,
+            before.model_calls,
+            before.tokens
+        )
+    );
+    assert_eq!(store.pending_owner_messages(workflow).unwrap(), queued);
+    assert_eq!(store.merge_allowance(millis(), 5).unwrap().confirmed, 0);
+    let copied = Lease {
+        workflow: workflow.into(),
+        owner: "reserved-successor".into(),
+        generation: setup.generation(),
+    };
+    assert!(store.owner_turn_for_lease(&copied, millis()).is_err());
+    assert!(store
+        .charge(
+            &copied,
+            "reserved-setup-is-not-execution",
+            durable::ResourceCharge {
+                model_calls: 1,
+                ..Default::default()
+            },
+            millis()
+        )
+        .is_err());
 }
 fn original_rows(db: &rusqlite::Connection, workflow: &str, request: &str) -> serde_json::Value {
     use rusqlite::OptionalExtension;
