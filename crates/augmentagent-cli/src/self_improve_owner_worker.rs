@@ -80,8 +80,10 @@ pub(super) async fn from_worker(repo: PathBuf, state: PathBuf, id: String) -> Re
             "Owner recovery no longer needs metadata work".into(),
         ));
     };
+    let observing_completion=store.owner_publication_recovery_blocked_state(&id,millis())?
+        ==Some(durable::owner_publication_recovery::RecoveryBlockedState::LegacyInputWriter);
     let environment = durable::owner_publication_recovery::PreparationEnvironment::observe()?;
-    if !matches!(
+    if !observing_completion && !matches!(
         store.owner_recovery_native_preparation_status(&id, &environment, millis())?,
         Some(durable::owner_publication_recovery::PreparationRetryGate::Ready)
     ) {
@@ -97,13 +99,15 @@ pub(super) async fn from_worker(repo: PathBuf, state: PathBuf, id: String) -> Re
                 reason: "owner-recovery-authorization-blocked",
             })?;
     let candidate = store.owner_recovery_candidate(&plan)?;
-    let Some(recovery) = store.claim_owner_publication_recovery(
+    let recovery=if observing_completion {
+        completion_recovery::recover_blocked_native_completions(&state,Some(&candidate),&authorization)?
+    } else {store.claim_owner_publication_recovery(
         &authorization,
         "autoship-owner-metadata-worker",
         millis(),
         300_000,
-    )?
-    else {
+    )?.map(Arc::new)};
+    let Some(recovery)=recovery else {
         return Ok(RunReport::held(
             "Owner recovery claim is unavailable".into(),
         ));
@@ -113,7 +117,7 @@ pub(super) async fn from_worker(repo: PathBuf, state: PathBuf, id: String) -> Re
         &shared,
         &state,
         &candidate,
-        Arc::new(recovery),
+        recovery,
         &authorization,
     )? {
         MetadataPass::Ready => Ok(RunReport::triage(

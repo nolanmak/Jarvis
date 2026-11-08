@@ -1,0 +1,219 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Atomic late-completion observation and metadata claim after lease expiry",
+  "recorded_at": "2026-11-08T17:30:36.835506+00:00",
+  "parent_commit": "7dce1714cbf1996e30b93af6638ed49cd3d0e2e0",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autopr_health.rs": "8c0c19cfc96772fb93c76bf002ca8614c0b4c48d92c8723740c5678013d2e330",
+    "crates/augmentagent-cli/src/autoship_owner_input_blocked.rs": "393a13a7256052a720bb2ea45169e20b3786a16a253425e6f8536a4cc9b50ac9",
+    "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs": "b0c008bbfce0df3bebaad66284bfe114c195497113efbcb4c578dcb2a75a4f26",
+    "crates/augmentagent-cli/src/autoship_owner_recovery_completion.rs": "272c417f5e85ad5800b3e9ed7dcf5a4965764eb50f3cbdb44efdeabfbd0ab54a",
+    "crates/augmentagent-cli/src/autoship_owner_recovery_retry.rs": "1f623ce4a0592f7bb165d22f2b9a2409008be4e0b805b088331bb57ec3dd31ce",
+    "crates/augmentagent-cli/src/autoship_worker_queue.rs": "131e1961864811d5492b72eb235495f7dda4f2c8bcf1b9da8bb04b4f22132a87",
+    "crates/augmentagent-cli/src/self_improve_owner_completion_recovery.rs": "998279dc8de0246ac5fed8d99ccdad17de3ed94a5558a3d48843d7491ae223bc",
+    "crates/augmentagent-cli/src/self_improve_owner_reserved_ready_tests.rs": "96a6312f7968ed029896613bcae26f4e013128fa76f91d5962408911c9852504",
+    "crates/augmentagent-cli/src/self_improve_owner_worker.rs": "17a846c9f0c341d8622f200ee3d20212c02c1360d3d7ae3dced59ff6e5dddd4c",
+    "crates/augmentagent-cli/src/autoship_owner_completion_observer.rs": "fe0abc56db92aeb1aadd18fbdedaa3e85cb7fe6fafd5f66227f3176c83e6522f"
+  },
+  "red": {
+    "handle": 62641,
+    "exit_code": 1,
+    "log": "/tmp/autoship-1703-late-completion-cycle-red-final-20261108.log",
+    "reason": "Changed protected completion cannot import under expired claim; ordinary replacement claim is held by legacy-input debt."
+  },
+  "fixture_correction": "The initial fixture attempted completion after native transfer and correctly refused original source-owner mismatch. The final regression observes actual original active-source completion before native handoff; closed-source import remains required separately.",
+  "new_regression": {
+    "handle": 32016,
+    "exit_code": 0,
+    "log": "/tmp/autoship-1703-late-completion-cycle-final-20261108.log",
+    "passed": 1,
+    "failed": 0,
+    "ignored": 0,
+    "seconds": 55.91,
+    "provider_cases": [
+      "codex",
+      "claude"
+    ]
+  },
+  "validation": [
+    {
+      "name": "test-autopr_health::tests::",
+      "command": [
+        "scripts/cargo-managed.sh",
+        "test",
+        "-p",
+        "augmentagent-cli",
+        "--bin",
+        "augmentagent",
+        "autopr_health::tests::",
+        "--",
+        "--test-threads=1"
+      ],
+      "log": "/tmp/autoship-1703-expired-claim-completion-validation-20261108-0.log",
+      "exit_code": 0,
+      "seconds": 7.42,
+      "passed": 32,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "test-autoship_workflow::",
+      "command": [
+        "scripts/cargo-managed.sh",
+        "test",
+        "-p",
+        "augmentagent-cli",
+        "--bin",
+        "augmentagent",
+        "autoship_workflow::",
+        "--",
+        "--test-threads=1"
+      ],
+      "log": "/tmp/autoship-1703-expired-claim-completion-validation-20261108-1.log",
+      "exit_code": 0,
+      "seconds": 301.98,
+      "passed": 339,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "test-expired_owner_publication_has_authenticated_metadata_recovery",
+      "command": [
+        "scripts/cargo-managed.sh",
+        "test",
+        "-p",
+        "augmentagent-cli",
+        "--bin",
+        "augmentagent",
+        "expired_owner_publication_has_authenticated_metadata_recovery",
+        "--",
+        "--test-threads=1"
+      ],
+      "log": "/tmp/autoship-1703-expired-claim-completion-validation-20261108-2.log",
+      "exit_code": 0,
+      "seconds": 147.98,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "test-legacy_input_writer_debt_survives_restart_and_does_not_retry_on_a_timer",
+      "command": [
+        "scripts/cargo-managed.sh",
+        "test",
+        "-p",
+        "augmentagent-cli",
+        "--bin",
+        "augmentagent",
+        "legacy_input_writer_debt_survives_restart_and_does_not_retry_on_a_timer",
+        "--",
+        "--test-threads=1"
+      ],
+      "log": "/tmp/autoship-1703-expired-claim-completion-validation-20261108-3.log",
+      "exit_code": 0,
+      "seconds": 71.35,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "test-recovery_records_changed_completion_after_original_sql_callback_is_lost",
+      "command": [
+        "scripts/cargo-managed.sh",
+        "test",
+        "-p",
+        "augmentagent-cli",
+        "--bin",
+        "augmentagent",
+        "recovery_records_changed_completion_after_original_sql_callback_is_lost",
+        "--",
+        "--test-threads=1"
+      ],
+      "log": "/tmp/autoship-1703-expired-claim-completion-validation-20261108-4.log",
+      "exit_code": 0,
+      "seconds": 99.17,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "test-worker_queue_selects_recovery_fairly_and_refuses_unverified_worker",
+      "command": [
+        "scripts/cargo-managed.sh",
+        "test",
+        "-p",
+        "augmentagent-cli",
+        "--bin",
+        "augmentagent",
+        "worker_queue_selects_recovery_fairly_and_refuses_unverified_worker",
+        "--",
+        "--test-threads=1"
+      ],
+      "log": "/tmp/autoship-1703-expired-claim-completion-validation-20261108-5.log",
+      "exit_code": 0,
+      "seconds": 11.29,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "test-worker_metadata_pass_handles_unbound_reserved_and_completed_handoff_takeover",
+      "command": [
+        "scripts/cargo-managed.sh",
+        "test",
+        "-p",
+        "augmentagent-cli",
+        "--bin",
+        "augmentagent",
+        "worker_metadata_pass_handles_unbound_reserved_and_completed_handoff_takeover",
+        "--",
+        "--test-threads=1"
+      ],
+      "log": "/tmp/autoship-1703-expired-claim-completion-validation-20261108-6.log",
+      "exit_code": 0,
+      "seconds": 122.73,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "production-build",
+      "command": [
+        "scripts/cargo-managed.sh",
+        "build",
+        "-p",
+        "augmentagent-cli",
+        "--bin",
+        "augmentagent"
+      ],
+      "log": "/tmp/autoship-1703-expired-claim-completion-validation-20261108-7.log",
+      "exit_code": 0,
+      "seconds": 66.99
+    }
+  ],
+  "distinct_related_test_functions_passed": 377,
+  "all_original_local_handles_terminal": true,
+  "assertions": [
+    "The unchanged ordinary claim path still refuses legacy debt. A private nonserializable observation scope requires fresh exact original-owner authorization, expired exact predecessor, validated debt and no unsettled effects.",
+    "Actual protected launch receipt discovery and borrowed native completion proof precede one SQL transaction. Claim append and completion import commit only when validated semantic outcome changes and no remaining blocker holds; failure or receipt churn rolls both back.",
+    "The retained metadata fence transitions only to its own actually committed opaque claim; it cannot deserialize or infer a replacement lease. No native/current-owner callback runs inside the SQL append transaction.",
+    "Version-2 imported native history retains strict source/actor provenance validation before the legacy blocker reader accepts it.",
+    "An explicit ObserveCompletion queue disposition uses the existing bounded unpaid five-minute attempt schedule; the real worker retains current managed-role/bot/owner/GitHub authorization before observation.",
+    "Both providers exercise unchanged outcome, schedule throttling, claim/event/projection rollback, changed physical completion, exact new metadata claim, fresh native metadata inspection, executable-dispatch refusal and reopened history.",
+    "Original body/model/native rows, spent accounting, owner controls, queued messages and confirmed merge allowance remain unchanged.",
+    "The macOS health CI failure was SQLITE_CANTOPEN_SYMLINK through /var. Only the temporary fixture parent is canonicalized; production NOFOLLOW is retained. All 32 health tests pass locally; new-head macOS CI is still required."
+  ],
+  "limits": [
+    "Persisted body/resource setup and repository authorization are controlled fixtures using actual protected native/SQL APIs; this is not deployed positive worker, provider/VM/model/body execution or a real Discord send.",
+    "This producer supports original active source only. Historical closed/transferred-source observation, complete outcomes and unsupported legacy writer qualification remain required.",
+    "The separate shared publication-gate WIP was hash-verified and isolated for this component validation. Its earlier 334-pass/6-fail prepared-body suite is preserved in /tmp/autoship-1703-publication-gate-wip-20261108.json; these 339 workflow passes do not validate or resolve that WIP.",
+    "Uninterrupted and recovered productive constructors, complete C/R source/resource/input admission, repeated body/model/result/continuation cycles and private coding/followups remain incomplete.",
+    "The fresh spec audit mapped 173 seams; per-seam audit and independent exact-head code review are not established by that map.",
+    "Fresh trusted final-head hosted CI and workflow secret audit, independent review, normal updater rollout, actual CLI/private Discord initiation/coding/updates, five autonomous merges, 72-hour fault and 24-hour unattended soak remain required.",
+    "Native policy stays at 8 GiB with full ordinary retained-session demand. The separate 16 GiB proposal remains pending approval; no service, reservation, hold, allowance or deployment changed."
+  ],
+  "deployed": false,
+  "productive_authority_granted": false,
+  "goal_complete": false
+}

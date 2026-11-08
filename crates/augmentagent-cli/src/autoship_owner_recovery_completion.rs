@@ -5,7 +5,12 @@ use super::super::native_observation::NativeObservation;
 #[derive(Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CompletionImport {version:u32,generation:i64,request_id:String,claim:RecordRef}
-impl CompletionImport {pub(crate) fn generation(&self)->i64 {self.generation}}
+impl CompletionImport {
+    pub(crate) fn generation(&self)->i64 {self.generation}
+    pub(super) fn for_lease(lease:&RecoveryLease)->Self {
+        Self {version:1,generation:lease.generation(),request_id:lease.request_id().into(),claim:lease.reference.clone()}
+    }
+}
 /// Historical provenance only. Avoids the higher-level body-completion and
 /// current lease validators: an imported observation remains history afterward.
 pub(crate) fn validate_import(conn:&Connection,row:&NativeObservation,actor:i64,at:i64,value:&serde_json::Value)->Result<()> {

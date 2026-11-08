@@ -1084,7 +1084,7 @@ mod tests {
     #[test]
     fn workflow_metrics_read_worker_store_and_cap_without_creating_a_fallback_store() {
         use crate::autoship_workflow::{Binding,Stage,WorkflowStore};
-        let root=tempfile::tempdir().unwrap();let path=root.path().join("worker.db");
+        let root=tempfile::tempdir().unwrap();let path=root.path().canonicalize().unwrap().join("worker.db");
         let mut store=WorkflowStore::open(&path).unwrap();
         store.register("owner/repo#1","fix",Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()},10).unwrap();
         let lease=store.claim("owner/repo#1","worker",20,60_000).unwrap().unwrap();

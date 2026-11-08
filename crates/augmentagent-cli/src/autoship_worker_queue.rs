@@ -54,7 +54,7 @@ pub(super) fn select(
                 environment,
                 now,
             ) {
-                Ok(Some(PreparationRetryGate::Ready)) => {
+                Ok(Some(PreparationRetryGate::Ready | PreparationRetryGate::ObserveCompletion)) => {
                     recovery = Some(id);
                     break;
                 }
@@ -146,7 +146,7 @@ pub(super) fn due(
             environment,
             now,
         ) {
-            Ok(Some(PreparationRetryGate::Ready)) => {
+            Ok(Some(PreparationRetryGate::Ready | PreparationRetryGate::ObserveCompletion)) => {
                 ready = true;
                 break;
             }

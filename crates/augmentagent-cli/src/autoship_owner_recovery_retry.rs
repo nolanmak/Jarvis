@@ -8,6 +8,8 @@ const KIND: &str = "owner_recovery_native_preparation_retry";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PreparationRetryGate {
     Ready,
+    /// Bounded unpaid observation only; ordinary claim admission stays held.
+    ObserveCompletion,
     Held,
     Deferred { eligible_at_ms: i64 },
 }

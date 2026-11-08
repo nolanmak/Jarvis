@@ -211,7 +211,7 @@ impl ObservationRead {
             let row = &self.rows[self.cursor];
             if row.protected_observation_reference.is_some() && row.proof.is_some() {
                 ensure!(
-                    row.version == 1,
+                    matches!(row.version,1|2),
                     "unsupported legacy blocker native outcome version"
                 );
                 self.sha256.update(

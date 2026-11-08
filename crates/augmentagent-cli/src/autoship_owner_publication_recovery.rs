@@ -4,6 +4,9 @@ use super::*;
 
 #[path="autoship_owner_recovery_completion.rs"]
 mod completion_import;
+#[path="autoship_owner_completion_observer.rs"]
+mod completion_observer;
+pub(crate) use completion_observer::completion_observation_fence;
 pub(super) use completion_import::{CompletionImport,validate_import as validate_completion_import};
 #[path = "autoship_owner_recovery_blocked.rs"]
 mod blocked;
@@ -37,7 +40,11 @@ pub(crate) use successor_claim::{SuccessorPlan,SuccessorSetup,SuccessorPreparati
 pub(super) fn worker_recovery_gate(conn:&Connection,workflow:&str,environment:&PreparationEnvironment,now:i64)->Result<Option<PreparationRetryGate>> {
     let Some(plan)=plan(conn,workflow)? else {return Ok(None)};
     if plan.predecessor.lease_until>now {return Ok(None);}
-    if blocked::blocked_state(conn,&plan,now)?.is_some() {return Ok(Some(PreparationRetryGate::Held));}
+    match blocked::blocked_state(conn,&plan,now)? {
+        Some(RecoveryBlockedState::LegacyInputWriter)=>return Ok(Some(PreparationRetryGate::ObserveCompletion)),
+        Some(_)=>return Ok(Some(PreparationRetryGate::Held)),
+        None=>{},
+    }
     preparation_retry::scheduling_status(conn,workflow,environment,now)
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,7 +74,7 @@ struct Predecessor {
     lease_until: i64,
 }
 /// Read-only claim preview. It is neither authentication nor native authority.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecoveryPlan {
     original: Original,
     predecessor: Predecessor,
@@ -409,6 +416,64 @@ fn plan(conn: &Connection, workflow: &str) -> Result<Option<RecoveryPlan>> {
         previous: previous.map(|(_, reference)| reference),
     }))
 }
+// SQL-only shared claim writer. Both callers independently check admission;
+// completion observation may commit this claim only with changed verified evidence.
+fn append_claim_tx(tx:&Transaction<'_>,authorization:&crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+    current:&RecoveryPlan,owner:&str,now:i64,ttl:i64)->Result<Option<RecoveryLease>> {
+    ensure!(!owner.is_empty() && owner.len()<=256 && owner.bytes().all(|b|b.is_ascii_graphic()) && ttl>0,"invalid recovery lease");
+    let until=now.checked_add(ttl).context("recovery lease overflow")?;
+    let generation = current
+        .predecessor
+        .generation
+        .checked_add(1)
+        .context("recovery generation overflow")?;
+    let checkpoint: String = tx.query_row(
+        "SELECT checkpoint FROM workflow WHERE id=?1",
+        [&current.original.workflow],
+        |r| r.get(0),
+    )?;
+    let claim = Claim {
+        version: 1,
+        original: current.original.clone(),
+        predecessor: current.predecessor.clone(),
+        previous: current.previous.clone(),
+        owner: owner.into(),
+        generation,
+        claimed_at: now,
+        lease_until: until,
+        github_principal: authorization.principal().into(),
+        control: owner_control::read(tx, &current.original.workflow)?
+            .context("recovery owner control missing")?,
+        checkpoint: serde_json::from_str(&checkpoint)?,
+    };
+    let raw = serde_json::to_string(&claim)?;
+    ensure!(raw.len() <= 32768, "recovery claim exceeds bound");
+    let sha = digest(&raw);
+    let changed=tx.execute("UPDATE workflow SET owner=?2,generation=?3,lease_until=?4,heartbeat_at=?5 WHERE id=?1 AND generation=?6 AND owner IS ?7 AND lease_until=?8 AND lease_until<=?5",
+        params![claim.original.workflow,owner,generation,until,now,claim.predecessor.generation,claim.predecessor.owner,claim.predecessor.lease_until])?;
+    if changed != 1 {
+        return Ok(None);
+    }
+    event(tx,&claim.original.workflow,generation,"owner_publication_recovery_claimed",&serde_json::json!({"version":1,"request_id":claim.original.request_id,"record_sha256":sha}).to_string(),now)?;
+    let sequence: i64 = tx.query_row(
+        "SELECT max(seq) FROM workflow_event WHERE workflow=?1",
+        [&claim.original.workflow],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO workflow_owner_publication_recovery VALUES(?1,?2,?3,?4,?5)",
+        params![claim.original.workflow, generation, sequence, sha, raw],
+    )?;
+    tx.execute("INSERT INTO workflow_owner_publication_recovery_pending VALUES(?1,?2) ON CONFLICT(workflow) DO UPDATE SET generation=excluded.generation",params![claim.original.workflow,generation])?;
+    let reference = RecordRef {
+        sequence,
+        sha256: sha,
+    };
+    let recorded = history(tx, &claim.original.workflow)?
+        .context("recovery claim missing after append")?;
+    ensure!(recorded.1 == reference, "recovery append changed");
+    Ok(Some(RecoveryLease {claim,reference}))
+}
 impl WorkflowStore {
     pub(crate) fn owner_publication_recovery_plan(
         &self,
@@ -432,7 +497,7 @@ impl WorkflowStore {
                 && ttl > 0,
             "invalid recovery lease"
         );
-        let until = now.checked_add(ttl).context("recovery lease overflow")?;
+        now.checked_add(ttl).context("recovery lease overflow")?;
         let expected = authorization.plan();
         authorization.require(expected, now)?;
         let tx = self
@@ -446,58 +511,9 @@ impl WorkflowStore {
         }
         authorization.require(&current, now)?;
         if blocked::blocked_state(&tx, &current, now)?.is_some() { return Ok(None); }
-        let generation = current
-            .predecessor
-            .generation
-            .checked_add(1)
-            .context("recovery generation overflow")?;
-        let checkpoint: String = tx.query_row(
-            "SELECT checkpoint FROM workflow WHERE id=?1",
-            [&current.original.workflow],
-            |r| r.get(0),
-        )?;
-        let claim = Claim {
-            version: 1,
-            original: current.original,
-            predecessor: current.predecessor,
-            previous: current.previous,
-            owner: owner.into(),
-            generation,
-            claimed_at: now,
-            lease_until: until,
-            github_principal: authorization.principal().into(),
-            control: owner_control::read(&tx, &expected.original.workflow)?
-                .context("recovery owner control missing")?,
-            checkpoint: serde_json::from_str(&checkpoint)?,
-        };
-        let raw = serde_json::to_string(&claim)?;
-        ensure!(raw.len() <= 32768, "recovery claim exceeds bound");
-        let sha = digest(&raw);
-        let changed=tx.execute("UPDATE workflow SET owner=?2,generation=?3,lease_until=?4,heartbeat_at=?5 WHERE id=?1 AND generation=?6 AND owner IS ?7 AND lease_until=?8 AND lease_until<=?5",
-            params![claim.original.workflow,owner,generation,until,now,claim.predecessor.generation,claim.predecessor.owner,claim.predecessor.lease_until])?;
-        if changed != 1 {
-            return Ok(None);
-        }
-        event(&tx,&claim.original.workflow,generation,"owner_publication_recovery_claimed",&serde_json::json!({"version":1,"request_id":claim.original.request_id,"record_sha256":sha}).to_string(),now)?;
-        let sequence: i64 = tx.query_row(
-            "SELECT max(seq) FROM workflow_event WHERE workflow=?1",
-            [&claim.original.workflow],
-            |r| r.get(0),
-        )?;
-        tx.execute(
-            "INSERT INTO workflow_owner_publication_recovery VALUES(?1,?2,?3,?4,?5)",
-            params![claim.original.workflow, generation, sequence, sha, raw],
-        )?;
-        tx.execute("INSERT INTO workflow_owner_publication_recovery_pending VALUES(?1,?2) ON CONFLICT(workflow) DO UPDATE SET generation=excluded.generation",params![claim.original.workflow,generation])?;
-        let reference = RecordRef {
-            sequence,
-            sha256: sha,
-        };
-        let recorded = history(&tx, &claim.original.workflow)?
-            .context("recovery claim missing after append")?;
-        ensure!(recorded.1 == reference, "recovery append changed");
+        let lease=append_claim_tx(&tx,authorization,&current,owner,now,ttl)?;
         tx.commit()?;
-        Ok(Some(RecoveryLease { claim, reference }))
+        Ok(lease)
     }
     pub(crate) fn validate_owner_publication_recovery(
         &self,

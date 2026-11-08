@@ -1025,9 +1025,17 @@ do not establish live provider/VM coding. Lost live setup reservations still nee
 an explicit actual-native disposition before authenticated replacement; lease
 expiry alone never clears them. Multiple consumed ancestry, coding constructor,
 C/R source/resource/input proofs and body reservation lineage remain activation
-gates. Before connecting the worker, D/R must also persist the typed no-pending
-failure fingerprint and retry backoff; this setup-only producer currently
-returns the failure without scheduling another run. Unknown persistence retains
+gates. The setup-only `autoship_owner_successor_retry` component now persists a
+strict version-1 event journal: exact setup reference, predecessor reference,
+native-facts and failure fingerprints, reason/disposition, failure count, observed
+time and capped 5/10/20/40/60-minute retry deadline. Its deferred reader and writer
+revalidate the actual live setup, absence of pending transfers/remote operations,
+abort barriers and exact native facts; malformed history and expired setup refuse.
+This corrects the earlier statement that no journal exists. It does not finish
+worker setup scheduling: D/R still must resolve setup-lease lifetime across a
+retry deadline, integrity holds versus timed retries, changed policy/capacity
+wakeups and repeated-cycle ancestry before connecting productive setup. A timer
+never recreates a lost setup reservation. Unknown persistence retains
 its attempted transfer ID and must never be treated as no pending work. The carrying cost is one bounded purpose context per setup transfer plus
 existing pending/settlement history, not another shipping/model allowance.
 
@@ -2087,3 +2095,95 @@ failures and 34 ignored (685.15 seconds); non-test compilation passed
 (25.02 seconds). All original local handles are terminal. No production policy,
 service, retained state, hold, accounting or allowance changed. Hosted CI,
 independent review and every original live acceptance requirement remain gates.
+
+
+## 71. Observe changed completion before acquiring a replacement claim
+
+**D71.1 — Commit claim and changed completion together.** Legacy-input debt in
+§67 prevents claim churn until a validated outcome changes. The §70 importer
+requires a current claim. After the prior claim expires, those two requirements
+formed a cycle: the actual protected native completion could not reach SQL to
+wake admission. The new observation scope exists to break that cycle without
+turning debt, expiry or copied history into execution permission.
+
+`begin_owner_completion_observation` requires fresh original-owner/repository
+authorization, the exact current descriptive recovery plan, an expired predecessor
+and validated `LegacyInputWriter` debt. It refuses unsettled native/remote effects
+and orphaned pending state. The private nonserializable `CompletionObservation`
+retains that exact plan, not a reconstructed lease. Its native logger is restricted
+to metadata. Every fence revalidates current configuration, the short authorization
+deadline and the exact predecessor/debt. This path grants no transfer, cleanup,
+body, model or input permission.
+
+`recover_blocked_native_completions` discovers bounded original launch receipts
+from validated workflow history, reopens the actual protected original audit and
+uses `with_discovered_metadata_native_completion`. The original active source
+registration, prepared launch, original store/policy and held native proof must
+agree. A supplied expected row, receipt string or fingerprint cannot replace the
+borrowed proof. Closed or transferred source import still needs its distinct
+historical producer; such launches refuse here and must not be relabelled active.
+
+While the actual native proof remains borrowed, `claim_with_owner_native_completion`
+uses one immediate transaction to revalidate the exact expired predecessor and
+fresh authorization, CAS-append the ordinary immutable recovery-claim history,
+and append the native observation with its actual original source and new metadata
+actor. It then requires the validated legacy semantic-outcome dependency to have
+changed and all remaining recovery debt to admit the new claim. An unchanged
+outcome, duplicate or causally older receipt, another blocker or failed write
+rolls back the candidate claim and import together. Receipt churn cannot create
+another durable claim. Existing known uncertainty retains the named reconciliation
+requirement.
+
+The ordinary claim constructor still refuses unchanged debt. The shared SQL claim
+append helper is private; only the normal admission path and this proof-bearing
+atomic writer call it. No native/current-owner callback runs inside its workflow
+transaction. After a successful commit, the live observation scope retains only
+that exact newly created opaque metadata lease. Its post-visitor native fence
+therefore checks its own committed settlement instead of reopening the old
+predecessor. Failed/uncertain commit does not mint that live lease from saved JSON;
+subsequent recovery must inspect actual committed history under fresh authority.
+The existing immutable claim/event/observation versions and actor intervals remain
+in use. The blocker reader now accepts strictly decoded version-2 imports as well
+as version-1 ordinary observations; it does not bypass their provenance validation.
+
+**D71.2 — Schedule unpaid observation separately from claim admission.**
+`ObserveCompletion` is an explicit queue disposition, not `Ready` for coding or
+native setup. The existing bounded rotating metadata queue selects it through the
+same durable five-minute attempt schedule. The real worker verifies managed role,
+bot/owner configuration and repository authority before observation. No-change
+inspection returns held without a new workflow claim, native transfer or model
+charge. A successful atomic import supplies the exact metadata lease to the
+existing metadata pass, whose remaining proof checks still apply. A timer cannot
+qualify the unsupported writer or release the original instruction. Original
+controls, queued messages, reservations, spend and confirmed-merge allowance remain
+unchanged. Private progress remains bound to the captured original request/origin.
+
+The regression first failed with `recovery metadata lease expired or terminal`
+after actual protected completion changed and the ordinary replacement claim was
+refused. The two-provider fixture uses controlled persisted body/resource records,
+real private exports and protected native completion/metadata/SQL writers; it does
+not run a provider or VM. It tests unchanged receipt rollback, the five-minute
+observation schedule, failures at claim/event/projection insertion, actual changed
+completion import, fresh metadata inspection, executable-dispatch refusal,
+reopened history and preservation of accounting/controls/queued instructions.
+Exact commands, source hashes and receipts belong in
+`1703-expired-claim-completion-observation-proof.json`.
+
+Audit disposition: this resolves the fresh audit's expired-claim/late-completion
+authority cycle for the original active namespace. §52 now describes its existing
+retry journal accurately; the remaining lifecycle and integrity-hold questions
+stay open. The uninterrupted post-publication productive constructor remains a
+load-bearing open thread alongside the recovered constructor and complete C/R
+source/resource/input qualification. The shared publication-gate WIP's six
+historical prepared-body tests still need legitimate productive admission; no
+test-only grant or ignored test resolves that requirement. The §7 prerequisite
+sequencing and all-reader/cached-callback gate must be reconciled before productive
+activation/rollout; component construction is not evidence that those gates are
+complete. D/R owns these exits under #1703. The fresh audit mapped 173 seams; that
+map is not a completed per-seam check or independent code review. No coding-agent
+handoff or restoration certification follows from this component.
+
+All original review, trusted hosted CI, normal updater rollout, live CLI/private
+Discord coding/followups/updates, five autonomous shipments and fault/unattended
+soak requirements remain required. No capacity policy, retained reservation,
+legacy writer protocol, production service or deployment changes here.
