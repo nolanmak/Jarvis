@@ -1987,27 +1987,52 @@ mod inherited_ci_storage_tests {
     /// A real detached worker retains exclusions after its manager is canceled.
     #[tokio::test]
     async fn managed_command_exports_leases_before_manager_cancellation() {
-        let state=tempfile::tempdir().unwrap();let cache=tempfile::tempdir().unwrap();
+        let state=std::sync::Arc::new(tempfile::tempdir().unwrap());let cache=std::sync::Arc::new(tempfile::tempdir().unwrap());
         let mut lease=Lease::try_at(state.path()).unwrap().unwrap();
         lease.ci_update_exclusion=Some(ci_update_exclusion(state.path()).unwrap());
         lease.protect_targets(&[cache.path().to_owned()]).await.unwrap();
         let ready=cache.path().join("descendant-ready");let stop=cache.path().join("stop-descendant");
-        struct Stop(PathBuf);
-        impl Drop for Stop {fn drop(&mut self) {let _=std::fs::write(&self.0,b"stop");}}
-        let _stop=Stop(stop.clone());
+        struct Stop {path:PathBuf,state:std::sync::Arc<tempfile::TempDir>,cache:std::sync::Arc<tempfile::TempDir>}
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                let _=std::fs::write(&self.path,b"stop");
+                // A panic must not remove/recycle fixture inodes while the
+                // detached child still owns their exported leases. Its own
+                // hard deadline is 15s; wait for all three actual exclusions.
+                let deadline=std::time::Instant::now()+Duration::from_secs(20);
+                loop {
+                    let owner=Lease::try_at(self.state.path()).ok().flatten();
+                    let updater=ci_update_exclusion(self.state.path()).ok();
+                    let target=crate::storage_leases::TargetLeases::try_directory(self.cache.path()).ok().flatten();
+                    if owner.is_some() && updater.is_some() && target.is_some() {return;}
+                    if std::time::Instant::now()>=deadline {
+                        // Preserve private test evidence rather than unlinking
+                        // a possibly live namespace. This is a fixture failure.
+                        eprintln!("test child storage cleanup did not finish; preserving {} and {}",self.state.path().display(),self.cache.path().display());
+                        std::mem::forget(self.state.clone());std::mem::forget(self.cache.clone());return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        let _stop=Stop {path:stop.clone(),state:state.clone(),cache:cache.clone()};
         let code=r#"
 import os,sys,time
 from pathlib import Path
 ready,stop=map(Path,sys.argv[1:])
+def publish(value):
+    pending=ready.with_name(ready.name+'.pending')
+    pending.write_text(value)
+    os.replace(pending,ready)
 fds=[int(value) for value in os.environ.get('JARVIS_STORAGE_LEASE_FDS','').split(',') if value]
 if len(fds)<4:
-    ready.write_text('missing exported storage descriptors')
+    publish('missing exported storage descriptors')
     raise SystemExit(86)
 assert os.environ.get('JARVIS_STORAGE_LEASE_FD')==str(fds[0])
 for fd in fds: os.fstat(fd)
 if os.fork()==0:
     os.setsid()
-    ready.write_text(str(os.getpid()))
+    publish(str(os.getpid()))
     deadline=time.monotonic()+15
     while not stop.exists() and time.monotonic()<deadline: time.sleep(0.005)
     os._exit(0)
