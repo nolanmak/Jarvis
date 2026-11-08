@@ -589,14 +589,14 @@
       "body": "bash scripts/check-no-personal-data.sh --tracked",
       "shell": "bash"
     },
-    "privacy/privacy/3": {
+    "privacy/privacy/4": {
       "body": "python3 scripts/ci-pinned-tools.py gitleaks\n",
       "shell": "bash",
       "vm_provisioning": [
         "gitleaks-release"
       ]
     },
-    "privacy/privacy/4": {
+    "privacy/privacy/5": {
       "body": "set -euo pipefail\nmkdir \"$RUNNER_TEMP/release-source\"\ngit archive HEAD | tar -x -C \"$RUNNER_TEMP/release-source\"\n\"$RUNNER_TEMP/gitleaks\" dir \"$RUNNER_TEMP/release-source\" --redact=100 --no-banner\n",
       "shell": "bash",
       "vm_provisioning": [
@@ -2383,12 +2383,19 @@
               "name": "Check tracked files, including templates"
             },
             {
-              "command_id": "privacy/privacy/3",
+              "uses": "actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff",
+              "with": {
+                "cache": false,
+                "go-version": "1.27.1"
+              }
+            },
+            {
+              "command_id": "privacy/privacy/4",
               "name": "Install pinned secret scanner",
               "shell": "bash"
             },
             {
-              "command_id": "privacy/privacy/4",
+              "command_id": "privacy/privacy/5",
               "name": "Scan exactly the release tree",
               "shell": "bash"
             }
@@ -2396,7 +2403,7 @@
         }
       },
       "role": "validation",
-      "sha256": "bece4043820dd1f33e7a47514e8a59a19eeb1328e88aca52ab310202f336ccf9"
+      "sha256": "3f504dfae00685432887a4b327ed1d1c38818e643037f3320a766a6051fc0c46"
     },
     ".github/workflows/rust-cache.yml": {
       "reason": "main-branch Rust dependency cache warming, not PR validation",

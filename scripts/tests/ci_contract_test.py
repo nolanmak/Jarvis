@@ -31,7 +31,7 @@ class ContractTests(unittest.TestCase):
   with patch.object(ci,'prerequisite_check',return_value=[]):
    plan=ci.plan(c,self.args(ROOT,changed_file=['scripts/ci-contract.json'],probe_prerequisites=True,vm_runtime=True))
   rows={row['command_id']:row for row in plan['checks'] if row.get('platform')=='linux' and 'command_id' in row}
-  for identifier in ['browser-sidecar/synthetic-page/2','browser-sidecar/synthetic-page/3','rust/pdf/5','rust/pdf/6','rust/pdf/10','rust/pdf/14','model-router/adapter-compose/1','model-router/pinned-gateway/2','model-router/codex-redirect/2','model-router/codex-redirect/4','computer-use/browser/6','platform/platform/36','privacy/privacy/4']:
+  for identifier in ['browser-sidecar/synthetic-page/2','browser-sidecar/synthetic-page/3','rust/pdf/5','rust/pdf/6','rust/pdf/10','rust/pdf/14','model-router/adapter-compose/1','model-router/pinned-gateway/2','model-router/codex-redirect/2','model-router/codex-redirect/4','computer-use/browser/6','platform/platform/36','privacy/privacy/5']:
    self.assertEqual(rows[identifier]['status'],'remote_required',identifier)
   for identifier in ['rust/pdf/7','rust/pdf/8','rust/pdf/9','model-router/codex-redirect/3','model-router/installer/3','computer-use/browser/8']:
    self.assertEqual(rows[identifier]['status'],'ready',identifier)

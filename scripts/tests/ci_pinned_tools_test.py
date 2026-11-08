@@ -61,6 +61,26 @@ class WorkflowTests(unittest.TestCase):
    with patch.dict(os.environ,{'GITHUB_ACTIONS':'true','RUNNER_TEMP':d,'RUNNER_TOOL_CACHE':d+'/other','AGENT_TOOLSDIRECTORY':d+'/agent'}),patch.object(tools.platform,'system',return_value='Linux'),patch.object(tools.platform,'machine',return_value='x86_64'),patch.object(Path,'read_text',return_value='VERSION_ID="24.04"'),patch.object(tools,'download') as download:
     tools.provision('python39');download.assert_not_called()
    self.assertFalse((Path(d)/'other').exists())
+ def test_python_binary_outage_tries_independent_source_but_never_executes_corrupt_bytes(self):
+  def response(request,**kwargs):
+   if request.full_url.startswith('https://www.python.org/'):return io.BytesIO(b'corrupt source')
+   raise urllib.error.HTTPError(request.full_url,504,'gateway',{},None)
+  with tempfile.TemporaryDirectory() as d:
+   with patch.dict(os.environ,{'GITHUB_ACTIONS':'true','RUNNER_TEMP':d,'RUNNER_TOOL_CACHE':d+'/cache','AGENT_TOOLSDIRECTORY':''}),patch.object(tools.platform,'system',return_value='Linux'),patch.object(tools.platform,'machine',return_value='x86_64'),patch.object(Path,'read_text',return_value='VERSION_ID="24.04"'),patch.object(tools.urllib.request,'urlopen',side_effect=response) as request,patch.object(tools.subprocess,'run') as execute:
+    with self.assertRaises(RuntimeError):tools.provision('python39')
+    self.assertTrue(any(call.args[0].full_url.startswith('https://www.python.org/') for call in request.call_args_list),'binary outage never reached independent source fallback')
+    execute.assert_not_called()
+   self.assertFalse((Path(d)/'cache/Python/3.9.25/x64.complete').exists())
+ def test_scanner_binary_outage_tries_pinned_module_but_never_executes_corrupt_bytes(self):
+  def response(request,**kwargs):
+   if request.full_url.startswith('https://proxy.golang.org/'):return io.BytesIO(b'corrupt source')
+   raise urllib.error.HTTPError(request.full_url,504,'gateway',{},None)
+  with tempfile.TemporaryDirectory() as d:
+   with patch.dict(os.environ,{'GITHUB_ACTIONS':'true','RUNNER_TEMP':d}),patch.object(tools.platform,'system',return_value='Linux'),patch.object(tools.platform,'machine',return_value='x86_64'),patch.object(tools.urllib.request,'urlopen',side_effect=response) as request,patch.object(tools.subprocess,'run') as execute:
+    with self.assertRaises(RuntimeError):tools.provision('gitleaks')
+    self.assertTrue(any(call.args[0].full_url.startswith('https://proxy.golang.org/') for call in request.call_args_list),'binary outage never reached module fallback')
+    execute.assert_not_called()
+   self.assertFalse((Path(d)/'gitleaks').exists())
  def test_incomplete_cache_is_preserved_and_refused(self):
   with tempfile.TemporaryDirectory() as d:
    cache=Path(d)/'deno/2.7.14/x64';cache.mkdir(parents=True);(cache/'owned').write_text('keep')

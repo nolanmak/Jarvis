@@ -16,7 +16,7 @@ VM_PROVISIONING = {
  'codex-global-runtime':'pinned Codex CLI in persistent writable job prefix',
  'browser-binary-runtime':'pinned browser binary provisioning outside registry-only transport',
  'pinned-tool-release':'hash-pinned Linux runner tool-cache provisioning',
- 'gitleaks-release':'hash-pinned gitleaks release artifact provisioning',
+ 'gitleaks-release':'hash-pinned gitleaks binary or source provisioning',
 }
 def vm_provisioning(command):
     requirements=command.get('vm_provisioning',[])
