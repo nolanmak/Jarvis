@@ -159,6 +159,39 @@ pub(super) async fn check(pending:OwnerPublicationGuard<'_>,state:&Path,candidat
                 .expect("actual closed bootstrap cannot enter its durable setup launch journal");
             assert_eq!(recorded.intent.intent_id,prepared.intent.intent_id);
             let saved_events=store.events(id).unwrap();
+            let old_deadline=persistence.authorization_deadline_ms().unwrap();
+            assert!(store.record_successor_bootstrap_launch(persistence.check_external().unwrap(),&append,old_deadline+1).is_err(),
+                "expired bootstrap snapshot remained valid");
+            assert!(persistence.check_authorization_renewal(&setup_auth).is_err(),"same authorization extended its own lifetime");
+            let stale_check=persistence.check_external().unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let renewed_auth=super::super::targeted::authorize_owner_successor(candidate,&setup_plan,policy).await.unwrap();
+            let pin:String=db.query_row("SELECT provider FROM command_job WHERE workflow=?1",[id],|r|r.get(0)).unwrap();
+            let changed=if setup_plan.command().provider==Some(durable::submission::Provider::Claude) {
+                durable::submission::Provider::Codex
+            }else {durable::submission::Provider::Claude};
+            db.execute("UPDATE command_job SET provider=?2 WHERE workflow=?1",rusqlite::params![id,serde_json::to_string(&Some(changed)).unwrap()]).unwrap();
+            assert!(store.renew_successor_bootstrap_authorization(persistence.check_authorization_renewal(&renewed_auth).unwrap(),millis()).is_err(),
+                "changed current provider policy renewed original preparation");
+            assert_eq!(persistence.authorization_deadline_ms().unwrap(),old_deadline);
+            db.execute("UPDATE command_job SET provider=?2 WHERE workflow=?1",rusqlite::params![id,pin]).unwrap();
+            let first=persistence.check_authorization_renewal(&renewed_auth).unwrap();
+            let second=persistence.check_authorization_renewal(&renewed_auth).unwrap();
+            let mut first_store=WorkflowStore::open(state).unwrap();let mut second_store=WorkflowStore::open(state).unwrap();
+            let published=std::thread::scope(|scope| {
+                let one=scope.spawn(move ||first_store.renew_successor_bootstrap_authorization(first,millis()).is_ok());
+                let two=scope.spawn(move ||second_store.renew_successor_bootstrap_authorization(second,millis()).is_ok());
+                usize::from(one.join().unwrap())+usize::from(two.join().unwrap())
+            });
+            assert_eq!(published,1,"competing connections published two authorization replacements");
+            assert!(persistence.authorization_deadline_ms().unwrap()>old_deadline);
+            assert!(persistence.check_authorization_renewal(&renewed_auth).is_err(),"renewal replay extended freshness again");
+            assert!(store.record_successor_bootstrap_launch(stale_check,&append,millis()).is_err(),"old configuration check crossed authorization renewal");
+            assert_eq!(store.record_successor_bootstrap_launch(persistence.check_external().unwrap(),&append,(old_deadline+1).max(renewed_auth.issued_at())).unwrap(),recorded,
+                "fresh authorization could not retain the original prepared attempt past the old deadline");
+            assert!(preflight.dispatch_allowed().is_err());assert!(preflight.model_call_admitted(provider).is_err());
+            assert!(augmentagent_channel_core::native_vm::NativeBootstrap::capture(&preflight).is_err(),"renewal reset the original constructor claim");
+            assert_eq!(store.events(id).unwrap(),saved_events,"authorization renewal manufactured workflow progress");
             assert_eq!(store.record_successor_bootstrap_launch(persistence.check_external().unwrap(),&append,millis()).unwrap(),recorded);
             assert_eq!(store.events(id).unwrap(),saved_events,"same original bootstrap replay appended another event");
             assert!(store.owner_successor_bootstrap_persistence(setup.clone(),&setup_auth,millis()).err().unwrap().to_string().contains("already has an original launch"));

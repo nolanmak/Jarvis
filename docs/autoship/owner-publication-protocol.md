@@ -2459,3 +2459,42 @@ the consuming productive transition, six saved publication-gate exits, capacity
 recovery, independent review, rollout and original live/shipment/fault/soak exits
 remain open. The newer sealed-descriptor observations on #1811 still do not supply
 its missing production native handoff or full-input/CI/shipping authority.
+
+
+## 78. Renew fresh authorization without reconstructing the prepared attempt
+
+The bootstrap controller's authorization lasts at most 30 seconds, while closed
+supervisor setup can wait longer. Its live authority now retains an immutable
+current authorization observation behind a publication lock. Renewal requires a
+new opaque original-owner authorization with strictly later issuer time and
+deadline. It preserves principal, configured identity/source kind, provider,
+original setup/native namespace/binding and current control/checkpoint. It does
+not stretch the old snapshot, reset the native constructor, promote a restricted
+logger, change a lease/generation, charge a model or manufacture progress.
+
+External owner/configuration checks produce a consumed renewal token before SQL.
+The writer compares the already-checked plan to current setup and checks native
+ancestry in SQL. All publication paths take the SQL writer before the authority
+lock. A checked journal call holds the exact authorization observation and its
+read guard through commit; renewal publishes under the write guard. Consequently
+old checked calls and competing renewals cannot splice different observations.
+The verified configured-identity comparison excludes observation age but includes
+bot, owner and credential binding; this material is private and never logged.
+
+Actual private publication/yield/recovery/setup/native-preparation fixtures cover
+both provider pins and initial/revised acceptance. They refuse expired decisions,
+reused authorization, stale checked calls and changed current provider. Two actual
+SQLite connections compete in each of the four cases, with one publication.
+The original prepared record replays under fresh authorization at a decision time
+past the old deadline without another native/event record, accounting or input
+change. The preflight role and original constructor claim remain restricted.
+Nine transport/identity and four targeted-command tests pass; one existing live
+worker probe remains opt-in. The production CLI builds. Details and limitations
+are in `1703-bootstrap-authorization-renewal-proof.json`.
+
+This is a live-authority renewal component, not automatic worker renewal scheduling
+or real long-duration VM acceptance. Normal owner ingress must renew before a
+long preflight's authorization expires, retain the actual attempt and consume the
+complete C/R/productive transition. The preserved six gate exits, retained-session
+capacity, independent review, normal rollout and all original live/shipment/fault/
+soak requirements remain unfinished. No production configuration changed.

@@ -55,6 +55,10 @@ impl Snapshot {
 pub(super) struct VerifiedOwnerPolicy {snapshot:Arc<Snapshot>}
 impl VerifiedOwnerPolicy {
     pub(super) fn current(&self)->Result<crate::autoship_discord_command::OwnerPolicy> {self.snapshot.check()}
+    /// Stable verified identity across freshness renewals; never log this binding.
+    pub(super) fn authorization_binding(&self)->String {
+        format!("v1:{}:{}:{}",self.snapshot.policy.owner,self.snapshot.policy.bot,self.snapshot.fingerprint)
+    }
     pub(super) fn expires_at(&self)->i64 {self.snapshot.verified_at.saturating_add(MAX_AGE)}
     pub(super) fn fence(&self)->Arc<dyn Fn()->Result<()>+Send+Sync> {
         let snapshot=self.snapshot.clone();Arc::new(move ||snapshot.check().map(|_|()))
@@ -126,6 +130,29 @@ mod tests {
         let policy=proof.current().unwrap();assert_eq!(policy.bot,11);assert_eq!(policy.owner,22);
         assert!(!format!("{:?}",state.lock().unwrap().authorization).contains("fixture-token"));
         let request=server.request.lock().unwrap();assert!(request.starts_with("GET /users/@me HTTP/1.1\r\n"));assert!(request.to_lowercase().contains("authorization: bot fixture-token\r\n"));
+    }
+    /// Fresh transport observations retain the same identity binding; a
+    /// different owner, bot or credential cannot renew the original identity.
+    #[tokio::test]
+    async fn renewal_binding_tracks_identity_instead_of_observation_age() {
+        /// Obtain a new observation through the actual loopback verifier transport.
+        async fn lookup(owner:&str,token:&str,bot:&str)->VerifiedOwnerPolicy {
+            let body=serde_json::json!({"id":bot,"bot":true}).to_string();
+            let server=Server::new(200,&body);let configured=ConfiguredOwner::parse(owner,token).unwrap();
+            let read:ReadConfig=Arc::new(move ||Ok(configured.clone()));
+            verify_with(&identity_client(false).unwrap(),&server.url,read).await.unwrap()
+        }
+        let first=lookup("22","fixture-token","11").await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let second=lookup("22","fixture-token","11").await;
+        assert!(first.authorization_binding()==second.authorization_binding());
+        assert!(!Arc::ptr_eq(&first.snapshot,&second.snapshot));
+        assert!(!first.authorization_binding().contains("fixture-token"));
+        for (owner,token,bot) in [("33","fixture-token","11"),("22","different-token","11"),("22","fixture-token","12")] {
+            let changed=lookup(owner,token,bot).await;
+            assert!(changed.current().is_ok());
+            assert!(first.authorization_binding()!=changed.authorization_binding());
+        }
     }
     #[tokio::test]
     async fn revocation_reaches_an_already_captured_fence() {

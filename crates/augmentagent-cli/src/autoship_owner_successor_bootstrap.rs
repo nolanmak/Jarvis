@@ -44,29 +44,82 @@ fn recorded(conn:&Connection,setup:&SuccessorSetup)->Result<Option<NativeLaunchR
     Ok(Some(launch))
 }
 
-/// Captured only from an actual live setup and fresh original-owner authority.
-/// No raw lease, Clone, serde or constructor from saved journal data.
-pub(crate) struct SuccessorBootstrapPersistence {
-    setup:Arc<SuccessorSetup>,issued:i64,expires:i64,
-    configuration:Option<Arc<dyn Fn()->Result<()>+Send+Sync>>,
-    namespace:Authority,original_binding:TransferBinding,
-    provider:Option<submission::Provider>,
+/// One immutable authorization observation. A new observation never changes
+/// the prepared attempt, principal, configured identity or provider selection.
+struct BootstrapAuthorization {
+    issued:i64,expires:i64,configuration:Option<Arc<dyn Fn()->Result<()>+Send+Sync>>,
 }
-/// One checked journal call, consumed by the SQL writer. Not execution authority.
-pub(crate) struct CheckedBootstrapJournal<'a> {authority:&'a SuccessorBootstrapPersistence,at_ms:i64}
-impl SuccessorBootstrapPersistence {
-    /// Call outside workflow/native locks. Protected launch verification follows
-    /// this check, and the SQL writer rechecks the original live setup itself.
-    pub(crate) fn check_external(&self)->Result<CheckedBootstrapJournal<'_>> {
-        if let Some(current)=&self.configuration {current()?;}
-        let at_ms=chrono::Utc::now().timestamp_millis();self.require_time(at_ms)?;
-        Ok(CheckedBootstrapJournal {authority:self,at_ms})
-    }
+impl BootstrapAuthorization {
+    /// Enforce the issuer deadline without extending the maximum snapshot age.
     fn require_time(&self,now:i64)->Result<()> {
-        ensure!(now>=self.issued && now<=self.expires,"successor bootstrap authorization expired");Ok(())
+        ensure!(now>=self.issued && now<=self.expires && self.expires<=self.issued.saturating_add(30_000),
+            "successor bootstrap authorization expired");Ok(())
     }
+}
+/// Captured only from actual live setup. Fresh authorization can be replaced
+/// under the same controller; its one-shot native constructor cannot be reset.
+pub(crate) struct SuccessorBootstrapPersistence {
+    setup:Arc<SuccessorSetup>,authorization:std::sync::RwLock<Arc<BootstrapAuthorization>>,
+    principal:String,configuration_binding:Option<String>,
+    namespace:Authority,original_binding:TransferBinding,provider:Option<submission::Provider>,
+}
+/// One checked journal call tied to its exact live authorization observation.
+pub(crate) struct CheckedBootstrapJournal<'a> {
+    authority:&'a SuccessorBootstrapPersistence,snapshot:Arc<BootstrapAuthorization>,at_ms:i64,
+}
+/// Consumed only after a fresh original-owner check outside workflow/native locks.
+pub(crate) struct CheckedBootstrapRenewal<'a,'plan> {
+    authority:&'a SuccessorBootstrapPersistence,
+    authorization:&'a crate::self_improve::targeted::AuthorizedOwnerSuccessor<'plan>,
+    prior:Arc<BootstrapAuthorization>,next:Arc<BootstrapAuthorization>,at_ms:i64,
+}
+impl SuccessorBootstrapPersistence {
+    /// Retain this exact immutable observation without holding a lock over IO.
+    fn snapshot(&self)->Result<Arc<BootstrapAuthorization>> {
+        Ok(self.authorization.read().map_err(|_|anyhow::anyhow!("bootstrap authorization poisoned"))?.clone())
+    }
+    /// Scheduling information only; reading this cannot extend freshness.
+    pub(crate) fn authorization_deadline_ms(&self)->Result<i64> {Ok(self.snapshot()?.expires)}
+    /// Call outside workflow/native locks. Replacing authorization during this
+    /// external check refuses instead of splicing two different observations.
+    pub(crate) fn check_external(&self)->Result<CheckedBootstrapJournal<'_>> {
+        let snapshot=self.snapshot()?;
+        if let Some(current)=&snapshot.configuration {current()?;}
+        let at_ms=chrono::Utc::now().timestamp_millis();snapshot.require_time(at_ms)?;
+        let current=self.authorization.read().map_err(|_|anyhow::anyhow!("bootstrap authorization poisoned"))?;
+        ensure!(Arc::ptr_eq(&current,&snapshot),"bootstrap authorization changed during check");
+        Ok(CheckedBootstrapJournal {authority:self,snapshot,at_ms})
+    }
+    /// Actual fresh owner/configuration checks happen before taking the store
+    /// mutex. Reusing a snapshot or changing its source/identity/pin refuses.
+    pub(crate) fn check_authorization_renewal<'a,'plan>(&'a self,
+        authorization:&'a crate::self_improve::targeted::AuthorizedOwnerSuccessor<'plan>,
+    )->Result<CheckedBootstrapRenewal<'a,'plan>> {
+        let prior=self.snapshot()?;let at_ms=chrono::Utc::now().timestamp_millis();
+        authorization.require(authorization.plan(),at_ms)?;
+        ensure!(authorization.principal()==self.principal
+            && authorization.configuration_binding()==self.configuration_binding
+            && authorization.plan().command().provider==self.provider,"bootstrap authorization identity or provider changed");
+        let next=Arc::new(BootstrapAuthorization {issued:authorization.issued_at(),expires:authorization.expires_at(),
+            configuration:authorization.configuration_fence()});
+        next.require_time(at_ms)?;
+        ensure!(next.issued>prior.issued && next.expires>prior.expires,"bootstrap renewal requires a newer owner authorization and deadline");
+        let current=self.authorization.read().map_err(|_|anyhow::anyhow!("bootstrap authorization poisoned"))?;
+        ensure!(Arc::ptr_eq(&current,&prior),"bootstrap authorization changed during renewal check");
+        Ok(CheckedBootstrapRenewal {authority:self,authorization,prior,next,at_ms})
+    }
+    /// Validate current SQL ancestry under the current authorization observation.
     fn require_current(&self,conn:&Connection,now:i64)->Result<()> {
-        self.require_time(now)?;require_current_setup(conn,&self.setup,now)?;
+        let snapshot=self.authorization.read().map_err(|_|anyhow::anyhow!("bootstrap authorization poisoned"))?;
+        self.require_current_with(conn,now,&snapshot)
+    }
+    /// Check a pinned observation while its publication read guard remains held.
+    fn require_current_with(&self,conn:&Connection,now:i64,snapshot:&BootstrapAuthorization)->Result<()> {
+        snapshot.require_time(now)?;self.require_setup_current(conn,now)
+    }
+    /// Check SQL-only setup invariants independently of an older snapshot deadline.
+    fn require_setup_current(&self,conn:&Connection,now:i64)->Result<()> {
+        require_current_setup(conn,&self.setup,now)?;
         let pin:String=conn.query_row("SELECT substr(provider,1,65) FROM command_job WHERE workflow=?1",[self.setup.workflow_id()],|r|r.get(0))?;
         ensure!(pin==serde_json::to_string(&self.provider)?,"successor bootstrap provider policy changed");
         native_pending::require_clear_abort_barriers(conn,self.setup.workflow_id())?;
@@ -79,9 +132,11 @@ impl SuccessorBootstrapPersistence {
     }
     pub(crate) fn native_fence(self:&Arc<Self>,store:Arc<Mutex<WorkflowStore>>)->Arc<dyn Fn()->Result<()>+Send+Sync> {
         let original=self.clone();Arc::new(move || {
-            original.check_external()?;
+            let checked=original.check_external()?;
             let store=store.lock().map_err(|_|anyhow::anyhow!("successor bootstrap store poisoned"))?;
-            original.require_current(&store.conn,chrono::Utc::now().timestamp_millis())
+            let snapshot=original.authorization.read().map_err(|_|anyhow::anyhow!("bootstrap authorization poisoned"))?;
+            ensure!(Arc::ptr_eq(&snapshot,&checked.snapshot),"bootstrap authorization changed before native check");
+            original.require_current_with(&store.conn,chrono::Utc::now().timestamp_millis(),&snapshot)
         })
     }
 }
@@ -107,8 +162,10 @@ impl WorkflowStore {
         ensure!(recorded(&tx,&setup)?.is_none(),"successor bootstrap already has an original launch; reconcile it");
         let facts=super::native::facts(&tx,&setup,now)?;
         ensure!(facts.namespace().owner.lease_generation==setup.generation(),"successor bootstrap needs completed native ownership setup");
-        let result=SuccessorBootstrapPersistence {issued:authorization.issued_at(),expires:authorization.expires_at(),
-            configuration:authorization.configuration_fence(),namespace:facts.namespace().clone(),original_binding:facts.original_binding().clone(),
+        let result=SuccessorBootstrapPersistence {authorization:std::sync::RwLock::new(Arc::new(BootstrapAuthorization {
+                issued:authorization.issued_at(),expires:authorization.expires_at(),configuration:authorization.configuration_fence()})),
+            principal:authorization.principal().into(),configuration_binding:authorization.configuration_binding(),
+            namespace:facts.namespace().clone(),original_binding:facts.original_binding().clone(),
             provider:authorization.plan().command().provider,setup};
         result.require_current(&tx,now)?;tx.commit()?;
         // No native effects have begun. One original setup object can issue
@@ -118,6 +175,25 @@ impl WorkflowStore {
             "successor bootstrap preparation controller already issued");
         Ok(result)
     }
+    /// Replace only the live authorization observation, with no native effect,
+    /// progress event, lease generation change or constructor-claim reset.
+    pub(crate) fn renew_successor_bootstrap_authorization(&mut self,checked:CheckedBootstrapRenewal<'_,'_>,now:i64)->Result<()> {
+        let authority=checked.authority;ensure!(now>=checked.at_ms,"bootstrap renewal check is newer than its write");
+        // All paths take the SQL writer before this lock, including separate
+        // connections. Journal checks hold a read guard through SQL commit.
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut snapshot=authority.authorization.write().map_err(|_|anyhow::anyhow!("bootstrap authorization poisoned"))?;
+        ensure!(Arc::ptr_eq(&snapshot,&checked.prior),"bootstrap authorization changed before renewal");
+        checked.next.require_time(now)?;
+        ensure!(checked.next.issued>snapshot.issued && checked.next.expires>snapshot.expires,"bootstrap renewal did not advance actual authorization");
+        require_setup_plan(&tx,&authority.setup,checked.authorization.plan(),now)?;
+        ensure!(checked.authorization.principal()==authority.principal
+            && checked.authorization.configuration_binding()==authority.configuration_binding
+            && checked.authorization.plan().command().provider==authority.provider,"bootstrap renewal identity or provider changed");
+        authority.require_setup_current(&tx,now)?;
+        tx.commit()?;
+        *snapshot=checked.next;Ok(())
+    }
     /// `append` was verified against the protected audit before taking the
     /// workflow mutex. No native/audit lock is acquired in this transaction.
     pub(crate) fn record_successor_bootstrap_launch(&mut self,checked:CheckedBootstrapJournal<'_>,
@@ -125,7 +201,9 @@ impl WorkflowStore {
     )->Result<NativeLaunchRecord> {
         let authority=checked.authority;ensure!(now>=checked.at_ms,"bootstrap journal check is newer than its write");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        authority.require_current(&tx,now)?;
+        let snapshot=authority.authorization.read().map_err(|_|anyhow::anyhow!("bootstrap authorization poisoned"))?;
+        ensure!(Arc::ptr_eq(&snapshot,&checked.snapshot),"bootstrap journal authorization changed after external check");
+        authority.require_current_with(&tx,now,&snapshot)?;
         let access=SuccessorBootstrapJournalContext {tx:&tx,authority};
         let prior=recorded(&tx,&authority.setup)?;
         let result=native_launch::append_successor_bootstrap(&access,append,now)?;
@@ -141,7 +219,7 @@ impl WorkflowStore {
             event(&tx,authority.setup.workflow_id(),authority.setup.generation(),KIND,&raw,now)?;
         }
         ensure!(recorded(&tx,&authority.setup)?.as_ref()==Some(&result),"successor bootstrap journal append changed");
-        authority.require_current(&tx,chrono::Utc::now().timestamp_millis())?;
+        authority.require_current_with(&tx,chrono::Utc::now().timestamp_millis(),&snapshot)?;
         tx.commit()?;Ok(result)
     }
 }

@@ -101,6 +101,8 @@ pub(crate) struct AuthorizedOwnerSuccessor<'a> {
 impl AuthorizedOwnerSuccessor<'_> {
     pub(crate) fn issued_at(&self)->i64 {self.authorized_at}
     pub(crate) fn expires_at(&self)->i64 {self.worker_policy.as_ref().map_or(self.authorized_at.saturating_add(30_000),|policy|policy.expires_at().min(self.authorized_at.saturating_add(30_000)))}
+    /// Actual configured identity, separate from the snapshot's short deadline.
+    pub(crate) fn configuration_binding(&self)->Option<String> {self.worker_policy.as_ref().map(|policy|policy.authorization_binding())}
     pub(crate) fn configuration_fence(&self)->Option<Arc<dyn Fn()->Result<()>+Send+Sync>> {self.worker_policy.as_ref().map(|policy|policy.fence())}
     pub(crate) fn plan(&self)->&crate::autoship_workflow::owner_publication_recovery::SuccessorPlan {self.plan}
     pub(crate) fn principal(&self)->&str {&self.principal}

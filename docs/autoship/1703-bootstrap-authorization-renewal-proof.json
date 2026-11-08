@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "base_head": "68567d6ab9ec5d2412c943d0e2fe43adb326d3e2",
+  "change": "Refresh the live bootstrap authorization only from a strictly newer original-owner observation, preserving the original one-shot prepared attempt.",
+  "sources": {
+    "crates/augmentagent-cli/src/autoship_owner_successor_bootstrap.rs": "9c894db99d169370e40e7403edbba52fc8c6198e644334279e81d0c79a97470e",
+    "crates/augmentagent-cli/src/autoship_owner_successor_claim.rs": "1542762e9f8f75c8b20906d3652563c061a14e2da246967203d93d37f284414f",
+    "crates/augmentagent-cli/src/self_improve_owner_publication_yield_tests.rs": "7c2f56bbd2e6ad522d47c84594e3d087491c7552a6fd323dff2d3de55344ad4b",
+    "crates/augmentagent-cli/src/self_improve_targeted.rs": "3fa1df9b9973623760c234f2c10a94cf514e1f704192a01a591d1974bc993d1f",
+    "crates/augmentagent-cli/src/self_improve_worker_owner_identity.rs": "69fa8ef14fa1a3132199e96c7a1d14fa4411c97ee3399e2e4538bbb8d298161f"
+  },
+  "evidence": {
+    "red_missing_api": {
+      "log": "/tmp/autoship-1703-bootstrap-renewal-red-20261108.log",
+      "sha256": "57e322032f98dfd62f307d75e3969fcefc1df4688131edb178ada8f50330d269"
+    },
+    "handoff": {
+      "log": "/tmp/autoship-1703-bootstrap-renewal-final-20261108.log",
+      "sha256": "bcf0f52d35ef0ff263444129db8426236c472dbfd2df0199922868ee82fcf189"
+    },
+    "identity": {
+      "log": "/tmp/autoship-1703-bootstrap-renewal-identity-20261108.log",
+      "sha256": "1978b48739846c2a82d1811860d0ee8f4619da9f9d8c61f8374dbc7b4b668569"
+    },
+    "targeted": {
+      "log": "/tmp/autoship-1703-bootstrap-renewal-targeted-20261108.log",
+      "sha256": "9f26830ecfaec50c455caf4df4877e95f1ff00a0c1fcb492d13e08911c44d5b5"
+    },
+    "production": {
+      "log": "/tmp/autoship-1703-bootstrap-renewal-production-20261108.log",
+      "sha256": "46eaee8fa3b845b8d16b82c03be34430acc45c202592bb1ea7fe3a150dc2faaf"
+    }
+  },
+  "validation": {
+    "handoff_functions_passed": 1,
+    "actual_handoff_cases": 4,
+    "provider_pins": [
+      "codex",
+      "claude"
+    ],
+    "acceptance": [
+      "initial",
+      "revision"
+    ],
+    "competing_connections_per_case": 2,
+    "successful_renewal_publications_per_case": 1,
+    "identity_tests_passed": 9,
+    "targeted_tests_passed": 4,
+    "targeted_existing_live_worker_probe_ignored": 1,
+    "failed": 0,
+    "production_compile_passed": true,
+    "actual_vm_launches": 0,
+    "actual_model_calls": 0
+  },
+  "invariants": [
+    "No snapshot age extension: both issuer time and deadline must advance from a fresh opaque AuthorizedOwnerSuccessor; the original 30-second bound remains enforced.",
+    "Retain original principal, verified configured identity/source kind, provider pin, live setup, native namespace, original binding, control, checkpoint and pending-input state.",
+    "External owner/configuration validation precedes SQL; renewal compares the already-checked plan with current setup inside SQL without repeating external validation there.",
+    "Checked journal tokens retain the exact immutable authorization Arc. A current read guard stays held through journal commit; renewal takes the SQL writer before the authorization write guard.",
+    "Only one competing proposal based on the old observation can publish; old checked tokens, same-snapshot replay and changed current provider fail without extending the deadline.",
+    "Fresh publication changes only the live authorization reference: no native launch, workflow event/progress, generation/lease, accounting, owner control or queued-input mutation.",
+    "The permanently restricted preflight logger stays unable to dispatch or charge a model, and its already-consumed native constructor remains consumed.",
+    "Verified bot/owner/credential binding stays stable across genuinely new transport observations and differs for changed identities; binding material is not logged."
+  ],
+  "limits": [
+    "The expiry boundary uses the actual issuer deadlines plus injected decision timestamps; it is not a real long-duration VM preparation or automatic refresh-loop acceptance test.",
+    "Repository authorization is stubbed in the handoff fixtures. Identity tests use actual loopback HTTP transport, not production Discord or real message delivery.",
+    "Rustdoc-only comments were added after focused handoff validation; identity/targeted validation and the production build include those comments.",
+    "Normal owner-ingress renewal scheduling, complete C/R source/input/storage/alias qualification, consuming productive transition and six preserved publication-gate exits remain required.",
+    "Retained native state stays at the existing 8GiB policy; capacity recovery, independent approval, main/updater rollout, live CLI/private Discord, automated merges and required fault/unattended soak remain incomplete.",
+    "No production service, policy, native session, allowance, owner hold or deployment changed."
+  ],
+  "deployed": false,
+  "normal_owner_consumer_connected": false,
+  "goal_complete": false
+}

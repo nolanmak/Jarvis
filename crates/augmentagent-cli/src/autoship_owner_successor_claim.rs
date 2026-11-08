@@ -162,7 +162,10 @@ impl WorkflowStore {
 fn require_authorized_setup(conn:&Connection,setup:&SuccessorSetup,
     authorization:&crate::self_improve::targeted::AuthorizedOwnerSuccessor<'_>,now:i64)->Result<()> {
     authorization.require(authorization.plan(),now)?;
-    let plan=authorization.plan();
+    require_setup_plan(conn,setup,authorization.plan(),now)
+}
+/// Compare an externally authorized plan to the original live SQL setup.
+fn require_setup_plan(conn:&Connection,setup:&SuccessorSetup,plan:&SuccessorPlan,now:i64)->Result<()> {
     ensure!(setup.record.ready==plan.ready && setup.record.ready_generation==plan.generation
         && setup.record.request_id==plan.original.request_id && setup.record.workflow==plan.original.workflow
         && setup.record.control==plan.control && setup.record.checkpoint==plan.checkpoint,
