@@ -14,6 +14,7 @@ impl std::fmt::Display for EvidenceBudget {
     }
 }
 impl std::error::Error for EvidenceBudget {}
+/// Classify typed budget causes without granting authority to error display text.
 fn unavailable_from_error(provider: augmentagent_channel_core::ProviderKind, error: anyhow::Error) -> IndependentReview {
     // Anyhow downcasts retain typed context values; standard source wrappers
     // need a separate cause walk. Error messages are not budget authority.
@@ -1105,15 +1106,19 @@ mod tests {
             "a product file cannot be excluded by claiming it is pinned verifier source");
     }
 
+    /// Preserve a typed source behind a standard error boundary for regression coverage.
     #[derive(Debug)]
     struct ReportedCause(Box<dyn std::error::Error+Send+Sync>);
     impl std::fmt::Display for ReportedCause {
+        /// Render neutral text so classification must inspect the underlying source.
         fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("reported source failure")}
     }
     impl std::error::Error for ReportedCause {
+        /// Expose the original typed cause through the standard error interface.
         fn source(&self)->Option<&(dyn std::error::Error+'static)> {Some(self.0.as_ref())}
     }
 
+    /// Recognize both typed budget causes through nested standard and Anyhow wrappers.
     #[test]
     fn review_budget_classification_recognizes_typed_source_causes_at_every_depth() {
         for kind in ["evidence","request"] {for depth in 0..4 {
@@ -1130,6 +1135,7 @@ mod tests {
         }}
     }
 
+    /// Retain budget classification when the budget itself is an Anyhow context value.
     #[test]
     fn review_budget_classification_preserves_typed_anyhow_contexts() {
         for request in [false,true] {
@@ -1141,6 +1147,7 @@ mod tests {
         }
     }
 
+    /// Keep provider failures unavailable even when their messages imitate budget errors.
     #[test]
     fn review_budget_classification_does_not_trust_budget_display_text() {
         for message in ["provider down".to_owned(),EvidenceBudget("caller budget".into()).to_string(),aligned::RequestBudgetExceeded.to_string()] {
