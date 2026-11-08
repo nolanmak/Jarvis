@@ -86,6 +86,7 @@ pub(crate) struct OwnerPublicationRecord {
     next_manifest:String,next_evidence:Evidence,
 }
 impl OwnerPublicationRecord {
+    pub(crate) fn candidate_path(&self)->&Path {self.candidate.root_path()}
     pub(crate) fn workflow(&self)->&str {&self.input.workflow}
     pub(crate) fn repository(&self)->&str {&self.repository}
     pub(crate) fn recovery_binding(&self)->&crate::autoship_workflow::Binding {&self.next_binding}

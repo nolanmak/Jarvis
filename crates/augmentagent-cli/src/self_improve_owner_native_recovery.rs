@@ -95,7 +95,9 @@ pub(super) fn recover_owner_native_handoff(
         .lock()
         .map_err(|_| anyhow::anyhow!("recovery native facts store poisoned"))?
         .owner_publication_recovery_native_facts(&recovery, authorization, millis())?;
-    if facts.namespace().owner.lease_generation == recovery.generation() {
+    let forward_complete=store.lock().map_err(|_|anyhow::anyhow!("recovery frontier store poisoned"))?
+        .owner_recovery_forward_complete(&recovery,authorization,millis())?;
+    if facts.namespace().owner.lease_generation == recovery.generation() || forward_complete {
         // SQL registration alone cannot turn into a current native observation.
         with_recovery_native_metadata(state, Some(worktree), recovery, authorization, &mut |_| {
             Ok(())

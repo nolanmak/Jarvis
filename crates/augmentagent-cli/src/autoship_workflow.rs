@@ -531,6 +531,8 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS command_attempt (
                 workflow TEXT PRIMARY KEY REFERENCES command_job(workflow), selected_at INTEGER NOT NULL,
                 finished_at INTEGER, outcome TEXT NOT NULL, reason TEXT NOT NULL, eligible_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS owner_recovery_queue_cursor (
+                repository TEXT PRIMARY KEY,last_workflow TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS command_lane_turn (
                 repository TEXT PRIMARY KEY, yield_normal INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS command_client_intent (

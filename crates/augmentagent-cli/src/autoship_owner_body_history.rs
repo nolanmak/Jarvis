@@ -134,11 +134,16 @@ impl ReservedOwnerBodyRead {
 impl WorkflowStore {
     /// Expectations only; these cannot establish a native writer disposition.
     /// Finish this transaction before entering the native proof factory.
-    pub(crate) fn read_reserved_owner_body(&mut self,workflow:&str,request:&str)
-        ->Result<ReservedOwnerBodyRead> {
+    pub(crate) fn read_reserved_owner_body(&mut self,workflow:&str,request:&str)->Result<ReservedOwnerBodyRead> {
+        self.read_owner_body_readiness(workflow,request)?.context("original reserved body history missing")
+    }
+    /// Complete validated SQL history only; None is not native nonrelease or
+    /// permission to manufacture an unbound body. Consuming proof APIs recheck.
+    pub(crate) fn read_owner_body_readiness(&mut self,workflow:&str,request:&str)->Result<Option<ReservedOwnerBodyRead>> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let h=read(&tx,workflow,request)?.context("original reserved body history missing")?;
-        let expected=h.expected_attempts().to_vec();tx.commit()?;Ok(ReservedOwnerBodyRead {history:h,expected})
+        let history=read(&tx,workflow,request)?;
+        let snapshot=history.map(|h| {let expected=h.expected_attempts().to_vec();ReservedOwnerBodyRead {history:h,expected}});
+        tx.commit()?;Ok(snapshot)
     }
 }
 /// Borrowed observation only. No model, body, setup or release permission.

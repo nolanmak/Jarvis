@@ -2,6 +2,9 @@
 //! authorize the caller and target before admission. This module never calls a
 //! provider or grants publication authority; dispatch must enforce its policy.
 use super::*;
+#[path="autoship_worker_queue.rs"]
+mod worker_queue;
+pub(crate) use worker_queue::SelectedWorkerJob;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -160,6 +163,14 @@ impl WorkflowStore {
     /// machine reasons only; provider output and credentials never belong here.
     pub fn finish_command_attempt(&self, workflow: &str, selected_at: i64, outcome: AttemptOutcome,
         reason: &str, now: i64) -> Result<bool> {
+        self.finish_worker_attempt(workflow,selected_at,outcome,reason,now,true)
+    }
+    /// Recovery results must not inherit a repository's default recipient.
+    /// Private owner progress projection remains a separate required adapter.
+    pub(crate) fn finish_owner_recovery_attempt(&self,workflow:&str,selected_at:i64,outcome:AttemptOutcome,reason:&str,now:i64)->Result<bool> {
+        self.finish_worker_attempt(workflow,selected_at,outcome,reason,now,false)
+    }
+    fn finish_worker_attempt(&self,workflow:&str,selected_at:i64,outcome:AttemptOutcome,reason:&str,now:i64,project:bool)->Result<bool> {
         ensure!(outcome != AttemptOutcome::Selected, "attempt outcome is not terminal");
         ensure!(!reason.is_empty() && reason.len()<=128 && reason.bytes().all(|b|b.is_ascii_lowercase() || b==b'-'), "invalid attempt reason");
         let outcome=serde_json::to_value(outcome)?;
@@ -167,7 +178,7 @@ impl WorkflowStore {
         let changed=tx.execute("UPDATE command_attempt SET finished_at=?3,outcome=?4,reason=?5
             WHERE workflow=?1 AND selected_at=?2 AND finished_at IS NULL",
             params![workflow,selected_at,now,outcome.as_str().unwrap(),reason])? == 1;
-        if changed {super::progress::project(&tx,workflow,"command_attempt_finished",now)?;}
+        if changed && project {super::progress::project(&tx,workflow,"command_attempt_finished",now)?;}
         tx.commit()?;Ok(changed)
     }
 
@@ -194,37 +205,18 @@ impl WorkflowStore {
             |row| row.get::<_,String>(0)).optional()?.is_some())
     }
 
+    pub(crate) fn worker_queue_due(&self,repository:&str,environment:&super::owner_publication_recovery::PreparationEnvironment,now:i64)->Result<bool> {
+        worker_queue::due(self,repository,environment,now)
+    }
+
     /// Reserve a scheduling turn, not a workflow lease or permission to spend.
     /// Failures and process death both retain the five-minute retry delay.
     /// Alternating with the automatic lane prevents command traffic starvation.
-    pub fn next_command_job(&mut self, repository: &str, now: i64) -> Result<Option<String>> {
-        let repository = repository.to_ascii_lowercase();
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let yield_normal: bool = tx.query_row(
-            "SELECT yield_normal FROM command_lane_turn WHERE repository=?1", [&repository],
-            |row| row.get(0)).optional()?.unwrap_or(false);
-        if yield_normal {
-            tx.execute("UPDATE command_lane_turn SET yield_normal=0 WHERE repository=?1", [&repository])?;
-            tx.commit()?;
-            return Ok(None);
-        }
-        let id: Option<String> = tx.query_row(
-            &due_command_sql(&tx)?,
-            params![repository,now], |row| row.get(0)).optional()?;
-        if let Some(id) = &id {
-            tx.execute("INSERT INTO command_schedule(workflow,attempted_at,eligible_at) VALUES(?1,?2,?3)
-                ON CONFLICT(workflow) DO UPDATE SET attempted_at=excluded.attempted_at,eligible_at=excluded.eligible_at",
-                params![id,now,now.saturating_add(300_000)])?;
-            tx.execute("INSERT INTO command_attempt(workflow,selected_at,finished_at,outcome,reason,eligible_at)
-                VALUES(?1,?2,NULL,'selected','worker-attempt-unconfirmed',?3)
-                ON CONFLICT(workflow) DO UPDATE SET selected_at=excluded.selected_at,finished_at=NULL,
-                outcome=excluded.outcome,reason=excluded.reason,eligible_at=excluded.eligible_at",
-                params![id,now,now.saturating_add(300_000)])?;
-            tx.execute("INSERT INTO command_lane_turn(repository,yield_normal) VALUES(?1,1)
-                ON CONFLICT(repository) DO UPDATE SET yield_normal=1", [&repository])?;
-        }
-        tx.commit()?;
-        Ok(id)
+    pub fn next_command_job(&mut self,repository:&str,now:i64)->Result<Option<String>> {
+        Ok(worker_queue::select(self,repository,None,now)?.map(|job|job.workflow))
+    }
+    pub(crate) fn next_worker_job(&mut self,repository:&str,environment:&super::owner_publication_recovery::PreparationEnvironment,now:i64)->Result<Option<SelectedWorkerJob>> {
+        worker_queue::select(self,repository,Some(environment),now)
     }
 
     /// Read the original admission before revalidating a possibly closed target.

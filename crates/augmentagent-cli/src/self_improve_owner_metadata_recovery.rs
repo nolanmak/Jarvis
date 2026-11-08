@@ -56,11 +56,32 @@ pub(super) fn settle_reserved_owner_readiness(
     recovery: Arc<durable::owner_publication_recovery::RecoveryLease>,
     authorization: &super::super::targeted::AuthorizedOwnerRecovery<'_>,
 ) -> Result<()> {
+    settle_readiness(state, worktree, recovery, authorization, true)
+}
+pub(super) fn settle_owner_readiness(
+    state: &Path,
+    worktree: &Path,
+    recovery: Arc<durable::owner_publication_recovery::RecoveryLease>,
+    authorization: &super::super::targeted::AuthorizedOwnerRecovery<'_>,
+) -> Result<()> {
+    settle_readiness(state, worktree, recovery, authorization, false)
+}
+fn settle_readiness(
+    state: &Path,
+    worktree: &Path,
+    recovery: Arc<durable::owner_publication_recovery::RecoveryLease>,
+    authorization: &super::super::targeted::AuthorizedOwnerRecovery<'_>,
+    require_reserved: bool,
+) -> Result<()> {
     let mut writer = WorkflowStore::open(state)?;
     let facts =
         writer.owner_publication_recovery_native_facts(&recovery, authorization, millis())?;
     let snapshot = writer
-        .read_reserved_owner_body(&facts.namespace().owner.workflow_id, recovery.request_id())?;
+        .read_owner_body_readiness(&facts.namespace().owner.workflow_id, recovery.request_id())?;
+    anyhow::ensure!(
+        !require_reserved || snapshot.is_some(),
+        "original reserved body history missing"
+    );
     with_recovery_native_metadata_outcome(
         state,
         Some(worktree),
@@ -81,22 +102,36 @@ pub(super) fn settle_reserved_owner_readiness(
             recovered.with_scope_transition(|transition| {
                 let scope = transition.register()?;
                 proof.with_revoked_input_writers(|closed| {
-                    closed.with_body_input_nonrelease(
-                        recovery.request_id(),
-                        snapshot.expected_attempts(),
-                        |body| {
-                            let settled = writer.prepare_reserved_owner_successor_ready(
-                                &recovery,
-                                authorization,
-                                &recovered,
-                                body,
-                                &snapshot,
-                                &scope,
-                                millis(),
-                            )?;
-                            Ok(RecoveryMetadataOutcome::SuccessorReady(settled))
-                        },
-                    )
+                    let settled = match &snapshot {
+                        Some(snapshot) => closed.with_body_input_nonrelease(
+                            recovery.request_id(),
+                            snapshot.expected_attempts(),
+                            |body| {
+                                writer.prepare_reserved_owner_successor_ready(
+                                    &recovery,
+                                    authorization,
+                                    &recovered,
+                                    body,
+                                    snapshot,
+                                    &scope,
+                                    millis(),
+                                )
+                            },
+                        )?,
+                        None => {
+                            closed.with_unbound_input_nonrelease(recovery.request_id(), |body| {
+                                writer.prepare_unbound_owner_successor_ready(
+                                    &recovery,
+                                    authorization,
+                                    &recovered,
+                                    body,
+                                    &scope,
+                                    millis(),
+                                )
+                            })?
+                        }
+                    };
+                    Ok(RecoveryMetadataOutcome::SuccessorReady(settled))
                 })
             })
         },

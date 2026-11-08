@@ -168,6 +168,48 @@ mod owner_retry_tests;
 #[path = "self_improve_owner_native_recovery.rs"]
 mod owner_native_recovery;
 use owner_native_recovery::{recover_owner_native_handoff,OwnerRecoveryNativeRun};
+#[path="self_improve_owner_worker.rs"]
+mod owner_worker;
+#[cfg(test)]
+#[path="self_improve_owner_worker_tests.rs"]
+mod owner_worker_tests;
+
+/// Keep native/SQL metadata work off the async executor. Fresh role and remote
+/// authorization are acquired inside this owned blocking task, before any claim.
+pub(super) async fn run_owner_metadata_worker(repo:&Path,id:&str)->Result<RunReport> {
+    let repo=repo.to_path_buf();let id=id.to_owned();let state=path();let runtime=tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move ||runtime.block_on(owner_worker::from_worker(repo,state,id)))
+        .await.context("owner recovery worker task failed")?
+}
+
+/// The selection receipt is only scheduling data; execution reauthorizes it.
+pub(super) async fn select_worker_job(state:PathBuf,repository:String)->Result<Option<(durable::submission::SelectedWorkerJob,i64)>> {
+    tokio::task::spawn_blocking(move || {
+        let environment=durable::owner_publication_recovery::PreparationEnvironment::observe();
+        let now=millis();
+        let mut store=WorkflowStore::open(&state)?;
+        let selected=match environment {
+            Ok(environment)=>store.next_worker_job(&repository,&environment,now)?,
+            Err(error)=>{
+                tracing::warn!("owner preparation observation unavailable; ordinary command selection continues: {error:#}");
+                store.next_command_job(&repository,now)?.map(|workflow|durable::submission::SelectedWorkerJob {workflow,owner_recovery:false})
+            }
+        };
+        Ok(selected.map(|job|(job,now)))
+    }).await.context("worker selection task failed")?
+}
+
+/// Capacity and policy observations can touch native storage. Keep them off the
+/// async executor and outside the read-only workflow transaction.
+pub(super) async fn owner_worker_queue_due(state:PathBuf,repository:String)->Result<bool> {
+    tokio::task::spawn_blocking(move || {
+        let Some(store)=WorkflowStore::open_read_only(&state)? else {return Ok(false)};
+        if !store.has_command_jobs()? {return Ok(false)}
+        if store.command_queue_due(&repository,millis())? {return Ok(true)}
+        let environment=durable::owner_publication_recovery::PreparationEnvironment::observe()?;
+        store.worker_queue_due(&repository,&environment,millis())
+    }).await.context("owner queue wake task failed")?
+}
 
 const LEASE_MS: i64 = 10 * 60 * 1000;
 const RENEW_SECS: u64 = 60;
@@ -5636,7 +5678,7 @@ else: raise SystemExit('unexpected authority call')
                         let policy=crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22};
                         let reserved_phase=std::env::var("JARVIS_TEST_RESERVED_READY").unwrap_or_default();
                         #[cfg(target_os="linux")]
-                        let initial_reserved_read=if !reserved_phase.is_empty() {Some(super::reserved_ready_tests::seed_reserved_body(guard,&turn,&prepared,&native,&reserved_phase))}else{None};
+                        let initial_reserved_read=if !reserved_phase.is_empty() && reserved_phase!="worker-unbound" {Some(super::reserved_ready_tests::seed_reserved_body(guard,&turn,&prepared,&native,&reserved_phase))}else{None};
                         let live_plan=WorkflowStore::open(&state).unwrap().owner_publication_recovery_plan(&id).unwrap().unwrap();
                         assert_eq!(live_plan.command().provider,Some(if mode.contains("-claude-") {durable::submission::Provider::Claude}else{durable::submission::Provider::Codex}));
                         let live_auth=super::super::targeted::authorize_owner_publication_recovery(dir.path(),&live_plan,policy).await.unwrap();

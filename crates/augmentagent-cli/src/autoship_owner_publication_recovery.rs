@@ -29,6 +29,15 @@ pub(crate) use successor_ready::ReadySettlement;
 mod successor_claim;
 pub(crate) use successor_claim::{SuccessorPlan,SuccessorSetup,SuccessorPreparationRead,successor_native_metadata_fence,SuccessorNativePersistence,SuccessorNativeSnapshotContext};
 
+/// Selection data only; the worker must acquire fresh original-owner authority.
+/// This combines existing recovery debt and preparation scheduling in the
+/// selecting transaction without native inspection or nested transactions.
+pub(super) fn worker_recovery_gate(conn:&Connection,workflow:&str,environment:&PreparationEnvironment,now:i64)->Result<Option<PreparationRetryGate>> {
+    let Some(plan)=plan(conn,workflow)? else {return Ok(None)};
+    if plan.predecessor.lease_until>now {return Ok(None);}
+    if blocked::blocked_state(conn,&plan,now)?.is_some() {return Ok(Some(PreparationRetryGate::Held));}
+    preparation_retry::scheduling_status(conn,workflow,environment,now)
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecordRef {
@@ -836,6 +845,22 @@ pub(super) fn require_transfer_context(
     Ok(())
 }
 impl WorkflowStore {
+    /// Descriptor only. The later native proof independently verifies this
+    /// exact frontier; a replacement metadata claim never implies a new hop.
+    pub(crate) fn owner_recovery_forward_complete(&mut self,lease:&RecoveryLease,
+        authorization:&crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,now:i64)->Result<bool> {
+        let facts=self.owner_publication_recovery_native_facts(lease,authorization,now)?;
+        let forward=native_intent::forward(&self.conn,&lease.claim.original)?;
+        Ok(forward.as_ref().is_some_and(|pending|facts.namespace()==&pending.request().destination))
+    }
+    /// Candidate path is descriptive; native preparation reopening still checks
+    /// the original physical checkout and every protected artifact.
+    pub(crate) fn owner_recovery_candidate(&self,plan:&RecoveryPlan)->Result<std::path::PathBuf> {
+        let current=self.owner_publication_recovery_plan(&plan.original.workflow)?.context("owner recovery plan unavailable")?;
+        ensure!(current.same_original(plan),"owner recovery original plan changed");
+        let (record,_)=native_intent::original_record(&self.conn,&plan.original)?;
+        Ok(record.candidate_path().to_path_buf())
+    }
     pub(crate) fn owner_recovery_pending_transfer(
         &mut self,
         lease: &RecoveryLease,

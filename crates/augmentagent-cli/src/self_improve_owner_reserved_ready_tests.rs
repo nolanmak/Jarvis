@@ -4,6 +4,22 @@ use super::*;
 use augmentagent_channel_core::native_vm::{ownership, RuntimeOwner};
 use std::os::unix::fs::PermissionsExt;
 #[tokio::test]
+async fn worker_queue_selects_recovery_fairly_and_refuses_unverified_worker() {
+    super::tests::owner_metadata_recovery_modes_inner_reserved(
+        &["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery"],
+        false,None,Some("worker-queue-native-bound"),
+    );
+}
+#[tokio::test]
+async fn worker_metadata_pass_handles_unbound_reserved_and_completed_handoff_takeover() {
+    for phase in ["worker-unbound","worker-native-bound","worker-restart-native-bound"] {
+        super::tests::owner_metadata_recovery_modes_inner_reserved(
+            &["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery"],
+            false,None,Some(phase),
+        );
+    }
+}
+#[tokio::test]
 async fn owner_preparation_retry_persists_across_claims_and_wakes_on_changed_inputs() {
     super::tests::owner_metadata_recovery_modes_inner_reserved(
         &["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery"],
@@ -122,6 +138,7 @@ pub(super) fn seed_reserved_body(
     native: &Path,
     phase: &str,
 ) -> ReservedSeed {
+    let phase=phase.strip_prefix("worker-queue-").or_else(||phase.strip_prefix("worker-restart-")).or_else(||phase.strip_prefix("worker-")).unwrap_or(phase);
     let phase=phase.strip_prefix("retry-").unwrap_or(phase);
     let phase=phase.strip_prefix("controller-").unwrap_or(phase);
     let phase = phase.strip_prefix("successor-").unwrap_or(phase);
@@ -304,6 +321,14 @@ pub(super) async fn settle_reserved_body(
     initial: Option<&durable::owner_dispatch::ReservedOwnerBodyRead>,
     late: Option<&durable::native_observation::NativeObservation>,
 ) {
+    if phase.starts_with("worker-queue-") {
+        super::owner_worker_tests::check_worker_queue(state,worktree,recovery,authorization).await;
+        return;
+    }
+    if phase.starts_with("worker-") {
+        super::owner_worker_tests::check_metadata_pass(state,worktree,recovery,authorization,phase=="worker-restart-native-bound").await;
+        return;
+    }
     let retry_case=phase.starts_with("retry-");
     let phase=phase.strip_prefix("retry-").unwrap_or(phase);
     let controller=phase.starts_with("controller-");

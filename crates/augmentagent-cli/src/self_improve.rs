@@ -7647,10 +7647,25 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         if queued {
             let repository = tokio::time::timeout(std::time::Duration::from_secs(30),
                 workflow::canonical_repository(repo_root)).await.context("queue repository lookup timed out")??;
-            let selected_at = chrono::Utc::now().timestamp_millis();
-            let next = crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
-                .next_command_job(&repository, selected_at)?;
-            if let Some(id) = next {
+            let next = workflow::select_worker_job(workflow::path(),repository).await?;
+            if let Some((job,selected_at)) = next {
+                let id=job.workflow;
+                if job.owner_recovery {
+                    use crate::autoship_workflow::submission::AttemptOutcome;
+                    let result=workflow::run_owner_metadata_worker(repo_root,&id).await;
+                    let (outcome,reason)=match &result {
+                        Ok(report) if !report.is_idle()=>(AttemptOutcome::Progress,"owner-metadata-ready"),
+                        Ok(_)=>(AttemptOutcome::Deferred,"owner-recovery-deferred"),
+                        Err(error) if error.downcast_ref::<targeted::CommandFailure>().is_some_and(|f|f.code==3)=>(AttemptOutcome::Deferred,"owner-recovery-authorization-blocked"),
+                        Err(_)=>(AttemptOutcome::Failed,"owner-recovery-blocked"),
+                    };
+                    crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
+                        .finish_owner_recovery_attempt(&id,selected_at,outcome,reason,chrono::Utc::now().timestamp_millis())?;
+                    return match result {Ok(report)=>Ok(report),Err(error)=>{
+                        warn!(workflow=%id,reason,"owner recovery held; ordinary queued work remains eligible: {error:#}");
+                        Ok(RunReport::held(format!("Owner session recovery blocked: {reason}")))
+                    }};
+                }
                 use crate::autoship_workflow::submission::AttemptOutcome;
                 let result = targeted::work_once_mode(repo_root, &id, targeted::ExecutionMode::Background).await;
                 let paused=crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
@@ -12008,10 +12023,8 @@ impl AutoPrLoop {
                                 continue;
                             }
                         }
-                        let due = crate::autoship_workflow::WorkflowStore::open_read_only(&self.workflow_path)
-                            .and_then(|store| store.map(|store| store.command_queue_due(
-                                self.command_repository.as_deref().unwrap(), (self.clock)().timestamp_millis()))
-                                .transpose().map(|due| due.unwrap_or(false)));
+                        let due = workflow::owner_worker_queue_due(self.workflow_path.clone(),
+                            self.command_repository.as_deref().unwrap().to_owned()).await;
                         match due {
                             Ok(true) => break,
                             Ok(false) => {},

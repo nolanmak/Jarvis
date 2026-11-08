@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Worker queue admission and guarded metadata recovery orchestration",
+  "parent_commit": "52261360ad641dd0ce5c322b7de66d3e56dcd697",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_body_history.rs": "e447c977c4327af5c139baf4b0af1d68e2acea52f052fc01e0fb309db3472788",
+    "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs": "5f82a75453f2ce35a27b67f4bbfe4ae74b7d932c1ae0773d686482773a81ad7d",
+    "crates/augmentagent-cli/src/autoship_owner_recovery_retry.rs": "204dc27274cfe0cd7f75dc308ec2e9dd8298b9b7261cdb027fe343d851f09d99",
+    "crates/augmentagent-cli/src/autoship_submission.rs": "eb463145da44d127ab3a063ba33ab0d50d73aa5d546f84f12a62cff183399d6c",
+    "crates/augmentagent-cli/src/autoship_workflow.rs": "395efaa92bb5b5af056511a19fe9270ffda076e13d9566855633701905385051",
+    "crates/augmentagent-cli/src/self_improve.rs": "b698baa5d93079ae1922d875f4c870dd63a36651875c045c338bca984a13de2e",
+    "crates/augmentagent-cli/src/self_improve_owner_metadata_recovery.rs": "bd314eebfea8367f2104c4c853145d4753f83a10fc0f9abb5ee9d4835828663a",
+    "crates/augmentagent-cli/src/self_improve_owner_native_recovery.rs": "4d39c2600f77669ed18b1b48e934c7153fa7794506ba23ee4007af17ce6cbecd",
+    "crates/augmentagent-cli/src/self_improve_owner_publication.rs": "fe34a0f9ace49555d00a67a41eff19b38b75f9023ad55735d18ef194a48ca2ef",
+    "crates/augmentagent-cli/src/self_improve_owner_reserved_ready_tests.rs": "d8666ddedfe4ea7307a64d506bb50d74471d86870f065bdefbd0d4fd468d0486",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "47460f9e6441aac70b00b7ecdd499acb34bba5853df055de559dc1b24a197426",
+    "crates/augmentagent-cli/src/autoship_worker_queue.rs": "40d579db91ec1da36986eb84dccf7501b07f1a4b4c4fb22ed5e01343afe768dc",
+    "crates/augmentagent-cli/src/self_improve_owner_worker.rs": "ad5c3377f3ec8547b7a946aca6eb1e23832de2eba1a387ee708029fe7a6fab0b",
+    "crates/augmentagent-cli/src/self_improve_owner_worker_tests.rs": "b558f20acf3fb715a893b4cda9981a3910f654d31c87ac86b57efae4be47f143"
+  },
+  "red": [
+    {
+      "handle": 96491,
+      "exit_code": 1,
+      "log": "/tmp/autoship-worker-metadata-pass-red-20261108.log",
+      "reason": "Metadata pass API absent"
+    },
+    {
+      "handle": 70821,
+      "exit_code": 1,
+      "log": "/tmp/autoship-worker-recovery-queue-red-20261108.log",
+      "reason": "Worker queue and recovery attempt APIs absent"
+    },
+    {
+      "handle": 7961,
+      "exit_code": 1,
+      "log": "/tmp/autoship-worker-recovery-wake-red-20261108.log",
+      "reason": "Recovery wake API absent"
+    }
+  ],
+  "validation": [
+    {
+      "handle": 74495,
+      "exit_code": 0,
+      "passed": 28,
+      "ignored": 2,
+      "seconds": 95.71,
+      "log": "/tmp/autoship-worker-recovery-integrated-green-20261108.log",
+      "scope": "worker_ filter, including two new recovery regressions across both builder pins"
+    },
+    {
+      "handle": 22768,
+      "exit_code": 0,
+      "passed": 21,
+      "ignored": 0,
+      "seconds": 1.09,
+      "log": "/tmp/autoship-worker-recovery-ordinary-queue-20261108.log",
+      "scope": "autoship_workflow::submission::tests"
+    },
+    {
+      "handle": 77343,
+      "exit_code": 0,
+      "log": "/tmp/autoship-worker-recovery-production-20261108.log",
+      "scope": "managed non-test CLI compilation"
+    },
+    {
+      "handle": 49190,
+      "exit_code": 0,
+      "log": "/tmp/autoship-worker-recovery-retry-regression-20261108.log",
+      "scope": "persistent retry across fresh claims and changed dependency regression, both builder pins"
+    }
+  ],
+  "assertions": [
+    "run_once selects distinct original-owner metadata work; actual managed-worker owner/bot/GitHub authorization is required before claiming. Selection is never a workflow lease or coding authority.",
+    "A shared protected metadata pass reconciles known pending effects first, imports known original-namespace completions and repairs publication before handoff, then settles readiness only under native writer-revocation and original input nonrelease proofs.",
+    "Reserved and unbound cases reach guarded readiness using their distinct native proof APIs. A replacement metadata claim after an already completed handoff revalidates the existing native frontier without inventing another handoff.",
+    "Live owner claims cannot be selected for takeover. Eligible expired recovery wakes the worker even when ordinary command eligibility is false; the wake hint does not mutate ownership and is repository scoped.",
+    "Queue selection preserves workflow state and uses the durable command attempt delay, age ordering and alternating automatic lane; ordinary peers remain eligible after a refused recovery attempt.",
+    "The real worker entry with missing owner/bot configuration refuses before a new claim; fixtures have no fixture-policy override to that entry.",
+    "Attempt completion is conditional on the original unfinished selection and cannot overwrite a prior terminal result. Recovery attempts do not use generic recipient progress projection.",
+    "Policy/capacity observation, selection and native metadata work run on blocking tasks outside the async executor; observations occur outside SQL/native locks. Unavailable preparation observation retains ordinary command selection.",
+    "Original body/model charge, checkpoint, controls, queued input and completed handoff context remain unchanged in the full metadata fixtures."
+  ],
+  "limits": [
+    "Native body/resource setup is synthetic persisted state. Protected native/audit/SQL APIs are real; no VM/provider/model/body or live private message executes.",
+    "No normally deployed managed-worker positive admission, full live scheduler recovery or private productive coding acceptance is proven. The real worker-entry test exercises refusal only.",
+    "Recovery candidate scans are bounded to 64 rows per selection/wake. The durable selection cursor rotates on actual selection passes; beyond-window work can wait for the normal worker tick.",
+    "The normal outer loop still applies its existing merge-allowance dispatch gate. Metadata-only continuation at exhausted merge allowance needs separate consideration.",
+    "Private recovery retry/result delivery is deliberately not projected through a repository default recipient. The required original-conversation progress adapter remains incomplete.",
+    "Completion import from closed/transferred sources and unavailable post-commit lookup fault coverage remain incomplete.",
+    "Full C/R custody/resource/source/input qualification, legacy debt settlement and productive repeated successor/body/release/model/result cycles remain incomplete.",
+    "Worker filtered tests and ordinary queue tests preceded only a documentation-comment correction; the final persistent retry regression and non-test build use the final source.",
+    "Fresh combined-head hosted checks, exact-head independent review, rollout, CLI/Discord acceptance, five confirmed autonomous merges, 72h fault and 24h unattended soak are not proven."
+  ],
+  "all_original_local_handles_terminal": true,
+  "scheduler_connected_in_source": true,
+  "deployed": false,
+  "productive_authority_granted": false,
+  "goal_complete": false
+}

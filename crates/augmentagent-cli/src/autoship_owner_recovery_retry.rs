@@ -302,6 +302,39 @@ fn validate(
     );
     Ok(actual)
 }
+pub(super) fn scheduling_status(
+    conn: &Connection,
+    workflow: &str,
+    environment: &PreparationEnvironment,
+    now: i64,
+) -> Result<Option<PreparationRetryGate>> {
+    environment.require_recent(now)?;
+    let Some(plan) = plan(conn, workflow)? else {
+        return Ok(None);
+    };
+    let prior = history(conn, workflow, now)?;
+    ensure!(
+        !native_pending::orphaned(conn, workflow)?,
+        "preparation status has uncertain native persistence"
+    );
+    let pending:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_handoff_pending WHERE workflow=?1) OR EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL)",[workflow],|r|r.get(0))?;
+    if pending || native_intent::forward(conn, &plan.original)?.is_some() {
+        return Ok(Some(PreparationRetryGate::Ready));
+    }
+    let (record, _) = native_intent::original_record(conn, &plan.original)?;
+    let context = RecoveryNativeContext {
+        conn: conn,
+        workflow,
+        binding: record.recovery_binding().clone(),
+        namespace: native_intent::frontier(conn, &plan.original)?,
+    };
+    let actual = super::super::native_handoff::read_recovery_metadata_facts(&context)?;
+    let facts = OwnerPublicationNativeFacts::from_recovery_metadata(actual).fingerprint()?;
+    let state = prior
+        .filter(|(r, _)| same_dependencies(r, &plan.original, &facts, &environment.value))
+        .map_or(PreparationRetryGate::Ready, |(r, _)| gate(&r, now));
+    Ok(Some(state))
+}
 impl WorkflowStore {
     /// Read-only scheduling preview before claiming. No owner/repository/native
     /// authority is returned; dispatch must independently acquire all of it.
@@ -312,39 +345,14 @@ impl WorkflowStore {
         environment: &PreparationEnvironment,
         now: i64,
     ) -> Result<Option<PreparationRetryGate>> {
-        environment.require_recent(now)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let Some(plan) = plan(&tx, workflow)? else {
-            tx.commit()?;
-            return Ok(None);
-        };
-        let prior = history(&tx, workflow, now)?;
-        ensure!(
-            !native_pending::orphaned(&tx, workflow)?,
-            "preparation status has uncertain native persistence"
-        );
-        let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_native_handoff_pending WHERE workflow=?1) OR EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL)",[workflow],|r|r.get(0))?;
-        if pending || native_intent::forward(&tx, &plan.original)?.is_some() {
-            tx.commit()?;
-            return Ok(Some(PreparationRetryGate::Ready));
-        }
-        let (record, _) = native_intent::original_record(&tx, &plan.original)?;
-        let context = RecoveryNativeContext {
-            conn: &tx,
-            workflow,
-            binding: record.recovery_binding().clone(),
-            namespace: native_intent::frontier(&tx, &plan.original)?,
-        };
-        let actual = super::super::native_handoff::read_recovery_metadata_facts(&context)?;
-        let facts = OwnerPublicationNativeFacts::from_recovery_metadata(actual).fingerprint()?;
-        let state = prior
-            .filter(|(r, _)| same_dependencies(r, &plan.original, &facts, &environment.value))
-            .map_or(PreparationRetryGate::Ready, |(r, _)| gate(&r, now));
+        let result = scheduling_status(&tx, workflow, environment, now)?;
         tx.commit()?;
-        Ok(Some(state))
+        Ok(result)
     }
+
     /// A current metadata claim may read scheduling data. This neither renews
     /// that claim nor establishes native absence, completion or availability.
     pub(crate) fn owner_recovery_native_retry_gate(
