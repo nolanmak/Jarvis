@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Protected receipt discovery for lost SQL completion callbacks",
+  "source_sha256": {
+    "crates/augmentagent-channel-core/src/audit_chain.rs": "9241ed9dd19ce04914063b4129bd6bf01778e7fa569c0d8acdfa3eba49c3e51b",
+    "crates/augmentagent-channel-core/src/tool_audit.rs": "7d96b73a9704a843cd20fdaa080737053c8adc25bc1e1d3bfaed448045d23c73",
+    "crates/augmentagent-channel-core/src/native_owner_completion.rs": "ee3cf54bd640560b3979dd1f6220e68a767d030f55fdbec59cbc5c9f3c0d53fb",
+    "crates/augmentagent-channel-core/src/native_owner_transfer.rs": "44afafa31ab01f2721d2a52d9c7a9f9323a92c98ba084eeb56f98a3302964aef",
+    "crates/augmentagent-cli/src/self_improve_owner_reserved_ready_tests.rs": "c49ef9e2e78a34c54f2afbebcf304ae3ead09c37be4635227cd9d7a96c2c8198"
+  },
+  "red": {
+    "handle": 56502,
+    "exit_code": 1,
+    "log": "/tmp/autoship-completion-discovery-red-20261108.log",
+    "reason": "Three missing latest_receipt method errors after adding the discovery regressions"
+  },
+  "validation": {
+    "core_new": {
+      "handle": 55113,
+      "passed": 2,
+      "exit_code": 0,
+      "log": "/tmp/autoship-completion-discovery-core-green-20261108.log"
+    },
+    "audit_regression": {
+      "handle": 71824,
+      "passed": 28,
+      "seconds": 0.89,
+      "exit_code": 0,
+      "log": "/tmp/autoship-completion-discovery-audit-regression-20261108.log"
+    },
+    "final_provider_cases": {
+      "handle": 30881,
+      "passed": 2,
+      "exit_code": 0,
+      "logs": [
+        "/tmp/autoship-completion-discovery-provider-final-20261108.log",
+        "/tmp/autoship-completion-discovery-same-provider-final-20261108.log"
+      ],
+      "seconds": [
+        81.43,
+        77.97
+      ]
+    },
+    "preceding_non_test_compile": {
+      "handle": 71824,
+      "exit_code": 0,
+      "seconds": 59.7,
+      "log": "/tmp/autoship-completion-discovery-production-20261108.log",
+      "scope": "Same production code; before final test-only authority rejection assertions"
+    }
+  },
+  "assertions": [
+    "Discover the latest matching original committed event without receiving its withheld completion receipt as input",
+    "Hash original raw record and committed prefix under the existing audit writer lock; do not reconstruct receipt hashes from serialized JSON",
+    "No audit/anchor writes, no repair of pending/tampered/unanchored evidence",
+    "A descriptive candidate is freshly checked through the existing metadata completion proof and original state/session/audit locks before SQL import",
+    "Ordinary logger and rejected current authority cannot enter the metadata proof visitor",
+    "Both builder pins and cross-provider actual native completion preserve original selection, body, model/native charges, owner controls, queued messages and merge allowance",
+    "Existing SQL import rollback, stale claim, restart/dedup and provenance corruption assertions remain exercised"
+  ],
+  "fixture_limits": [
+    "Original persisted resource/body setup is synthetic; no provider, VM, real Discord or model is run",
+    "Discovery needs the already-known exact original PreparedLaunchRecord; prepared-launch discovery is not supplied",
+    "Only active original native ownership is supported by this completion producer; closed/transferred source completion admission remains unfinished",
+    "No candidate/false result grants absence, completion, productive body/input/model or cleanup authority"
+  ],
+  "remaining": [
+    "Live worker scheduling, prepared-launch reconstruction and discovery/writer invocation",
+    "Full C/R legacy/source/resource/input qualification and debt resolution",
+    "Closed/transferred-source completion producer",
+    "Productive repeated body/release/result/continuation cycles",
+    "Full private coding and truthful delivery lifecycle",
+    "Exact-head independent review and trusted CI, ordinary updater rollout",
+    "All original CLI/Discord acceptance, five confirmed auto merges per acceptance UTC day, 72h fault and 24h unattended soak"
+  ],
+  "all_original_local_handles_terminal": true,
+  "production_changed": false,
+  "goal_complete": false
+}

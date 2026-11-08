@@ -947,14 +947,20 @@ fn import_changed_completion(state:&Path,worktree:&Path,
     let facts=store.owner_publication_recovery_native_facts(&recovery,authorization,millis()).unwrap();
     let source=existing_native_audit(state,facts.namespace(),Some(worktree),facts.original_binding()).unwrap();
     let shared=Arc::new(Mutex::new(WorkflowStore::open(state).unwrap()));
-    source.restrict_to_metadata(durable::owner_publication_recovery::native_metadata_fence(shared.clone(),recovery.clone(),authorization,millis()).unwrap()).unwrap();
     let raw=late.proof.as_ref().unwrap();
     let prepared=augmentagent_channel_core::native_vm::PreparedLaunchRecord {
         intent:serde_json::from_value(raw["launch_intent"].clone()).unwrap(),
         controller_receipt:serde_json::from_value(raw["launch_receipt"].clone()).unwrap(),
     };
+    let mut unauthorized_visit=false;
+    assert!(ownership::with_discovered_metadata_native_completion(&source,&prepared,&||Ok(()),&mut |_| {unauthorized_visit=true;Ok(())}).is_err(),"ordinary logger acquired a metadata completion role through discovery");
+    assert!(!unauthorized_visit);
+    source.restrict_to_metadata(durable::owner_publication_recovery::native_metadata_fence(shared.clone(),recovery.clone(),authorization,millis()).unwrap()).unwrap();
+    assert!(ownership::with_discovered_metadata_native_completion(&source,&prepared,&||anyhow::bail!("injected stale recovery authority"),&mut |_| {unauthorized_visit=true;Ok(())}).is_err());
+    assert!(!unauthorized_visit);
     let current=||shared.lock().unwrap().validate_owner_publication_recovery(&recovery,authorization,millis());
-    ownership::with_metadata_native_completion(&source,&prepared,late.protected_observation_reference.as_ref().unwrap(),&current,&mut |proof| {
+    let discovered=ownership::with_discovered_metadata_native_completion(&source,&prepared,&current,&mut |proof| {
+        assert_eq!(Some(proof.receipt()),late.protected_observation_reference.as_ref(),"discovery selected a different original protected completion");
         let before_events=store.events(workflow)?;let history=store.native_observation_history(workflow)?;
         assert_ne!(history.last().unwrap().export_manifest_sha256,late.export_manifest_sha256,"fixture has no semantic outcome change");
         for table in ["workflow_event","workflow_native_observation"] {
@@ -1002,6 +1008,7 @@ fn import_changed_completion(state:&Path,worktree:&Path,
         assert_eq!(store.events(workflow)?,persisted);
         Ok(())
     }).expect("verified changed completion could not reach recovery SQL history");
+    assert!(discovered,"recovery failed to discover the withheld original completion receipt");
     assert_eq!(store.snapshot(workflow).unwrap().unwrap(),before);
     assert_eq!(original_rows(&db,workflow,recovery.request_id()),original);
     assert_eq!(store.pending_owner_messages(workflow).unwrap(),queued);

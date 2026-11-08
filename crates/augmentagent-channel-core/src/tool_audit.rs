@@ -1446,6 +1446,19 @@ impl AuditLogger {
         result
     }
 
+    /// Locate a descriptive candidate only. The native completion visitor
+    /// reopens it under fresh original-store/session/audit locks before use.
+    pub(crate) fn discover_native_completion_receipt(&self,prepared:&crate::native_vm::PreparedLaunchRecord)
+        ->anyhow::Result<Option<crate::audit_chain::AppendReceipt>> {
+        self.metadata_reconciliation_current()?;
+        self.verify_native_launch_history(prepared)?;
+        let reference=self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("completion discovery requires protected audit"))?
+            .latest_receipt(|row|row["kind"]=="native_launch_completion_verified"
+                && row["launch_intent"]["intent_id"].as_str()==Some(prepared.intent.intent_id.as_str()))?;
+        self.metadata_reconciliation_current()?;
+        Ok(reference)
+    }
+
     /// Read one historical record through this logger's original anchor. This
     /// does not attest current writer health, ownership, or model admission.
     pub fn read_append_receipt(

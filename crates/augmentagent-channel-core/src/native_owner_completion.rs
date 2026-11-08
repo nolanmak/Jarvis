@@ -231,6 +231,21 @@ pub fn with_metadata_native_completion(logger:&AuditLogger,prepared:&PreparedLau
             visit(&MetadataNativeCompletionProof {prepared,receipt:reference,binding,inventory,evidence,observation,_state:state})
         })
 }
+/// Recover a lost callback's completion reference from its original protected
+/// audit, then run the same fresh physical completion validator. Discovery is
+/// descriptive: false means no candidate, never proof of absence/completion.
+/// A concurrent newer append is rejected by the validator's latest-event gate.
+/// No source/session lock or borrowed proof escapes the visitor.
+pub fn with_discovered_metadata_native_completion(logger:&AuditLogger,prepared:&PreparedLaunchRecord,
+    current:&dyn Fn()->Result<()>,visit:&mut dyn FnMut(&MetadataNativeCompletionProof<'_>)->Result<()>,
+)->Result<bool> {
+    current()?;
+    let reference=logger.discover_native_completion_receipt(prepared)?;
+    current()?;
+    let Some(reference)=reference else {return Ok(false)};
+    with_metadata_native_completion(logger,prepared,&reference,current,visit)?;
+    Ok(true)
+}
 #[derive(Clone,Copy)]
 enum CompletionAdmission {Productive,Metadata}
 impl CompletionAdmission {

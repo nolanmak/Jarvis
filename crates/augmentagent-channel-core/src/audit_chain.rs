@@ -173,6 +173,37 @@ fn verify_recovery_seal(anchor: &Anchor, proof: &serde_json::Value) -> Result<()
 }
 
 impl AnchoredAudit {
+    /// Discover a historical descriptor under the existing writer gate. It is
+    /// not current-owner/completion authority; consumers must freshly validate
+    /// the returned reference under their own live native role and locks.
+    pub(crate) fn latest_receipt(&self, mut matches:impl FnMut(&serde_json::Value)->bool)->Result<Option<AppendReceipt>> {
+        let (_lock,anchor,rows,clean)=self.locked_snapshot_from(true)?;
+        ensure!(clean,"receipt discovery requires complete committed audit evidence");
+        let selected=rows.iter().enumerate().rev().find_map(|(index,row)|matches(row).then_some(index));
+        let Some(selected)=selected else {return Ok(None)};
+        // Hash original bytes rather than reserializing a parsed row. Keep the
+        // original append lock through this read and recheck the opened inode.
+        let file=private_existing(&self.log)?;
+        let mut bytes=Vec::new();(&file).take(LIMIT+1).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() as u64<=LIMIT && bytes.len()==anchor.bytes && digest(&bytes)==anchor.hash,
+            "audit changed during receipt discovery");
+        let mut offset=0;let mut index=0;let mut found=None;
+        for line in bytes.split_inclusive(|byte|*byte==b'\n') {
+            ensure!(line.ends_with(b"\n"),"discovered audit record is incomplete");
+            let end=offset+line.len();let raw=&line[..line.len()-1];
+            if !raw.is_empty() {
+                if index==selected {
+                    found=Some(AppendReceipt {version:1,sequence:index as u64+1,
+                        record_sha256:digest(raw),committed_audit_sha256:digest(&bytes[..end])});
+                }
+                index+=1;
+            }
+            offset=end;
+        }
+        ensure!(index==rows.len(),"receipt discovery sequence changed");
+        verify_existing_identity(&self.log,&file)?;
+        Ok(Some(found.context("discovered audit record is missing")?))
+    }
     /// Verify a historical append reference against this existing audit only.
     /// This lookup grants no current runtime or transfer authority.
     /// A busy writer returns an I/O WouldBlock error for a fenced retry.
@@ -683,6 +714,35 @@ impl AnchoredAudit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn receipt_discovery_returns_latest_exact_committed_bytes_without_writes() {
+        let (_directory, sink) = setup();
+        let first=sink.append_receipted(serde_json::json!({"kind":"completion","launch":"original"})).unwrap();
+        sink.append(serde_json::json!({"kind":"completion","launch":"other"})).unwrap();
+        let latest=sink.append_receipted(serde_json::json!({"kind":"completion","launch":"original"})).unwrap();
+        sink.append(serde_json::json!({"kind":"later"})).unwrap();
+        let before=[fs::read(&sink.log).unwrap(),fs::read(&sink.anchor).unwrap()];
+        let found=sink.latest_receipt(|row|row["kind"]=="completion" && row["launch"]=="original").unwrap().unwrap();
+        assert_ne!(found,first);assert_eq!(found,latest);
+        assert_eq!(sink.read_receipt(&found).unwrap()["launch"],"original");
+        assert!(sink.latest_receipt(|row|row["launch"]=="missing").unwrap().is_none());
+        assert_eq!(fs::read(&sink.log).unwrap(),before[0]);assert_eq!(fs::read(&sink.anchor).unwrap(),before[1]);
+    }
+    #[test]
+    fn receipt_discovery_refuses_tampered_or_uncommitted_evidence() {
+        for mode in ["modified","pending","unanchored"] {
+            let (_directory,sink)=setup();
+            sink.append(serde_json::json!({"kind":"completion"})).unwrap();
+            match mode {
+                "modified"=>{let mut bytes=fs::read(&sink.log).unwrap();bytes[0]=b' ';fs::write(&sink.log,bytes).unwrap();},
+                "pending"=>{let mut anchor:serde_json::Value=serde_json::from_slice(&fs::read(&sink.anchor).unwrap()).unwrap();anchor["pending"]="{\"kind\":\"later\"}\n".into();fs::write(&sink.anchor,serde_json::to_vec(&anchor).unwrap()).unwrap();},
+                _=>{let mut file=OpenOptions::new().append(true).open(&sink.log).unwrap();file.write_all(b"{}\n").unwrap();},
+            }
+            let before=[fs::read(&sink.log).unwrap(),fs::read(&sink.anchor).unwrap()];
+            assert!(sink.latest_receipt(|_|true).is_err(),"{mode}");
+            assert_eq!(fs::read(&sink.log).unwrap(),before[0]);assert_eq!(fs::read(&sink.anchor).unwrap(),before[1]);
+        }
+    }
     #[test]
     fn receipt_lookup_returns_its_exact_record_after_later_appends_and_sealing() {
         let (_directory, sink) = setup();
