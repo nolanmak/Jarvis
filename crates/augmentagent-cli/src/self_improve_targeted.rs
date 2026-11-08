@@ -2,6 +2,8 @@
 //! policy as unattended execution. Resolution is read-only and spends no models.
 use super::*;
 use crate::autoship_workflow::submission::{Request, Target};
+#[path = "self_improve_worker_owner_identity.rs"]
+mod worker_owner_identity;
 
 pub(super) enum Resolved {
     Issue(Issue),
@@ -68,21 +70,25 @@ async fn authorized_repository_name(repo:&Path,requested:&str)->Result<String> {
 pub(crate) struct AuthorizedOwnerRecovery<'a> {
     plan:&'a crate::autoship_workflow::owner_publication_recovery::RecoveryPlan,
     principal:String,authorized_at:i64,
+    worker_policy:Option<worker_owner_identity::VerifiedOwnerPolicy>,
 }
 impl AuthorizedOwnerRecovery<'_> {
     pub(crate) fn plan(&self)->&crate::autoship_workflow::owner_publication_recovery::RecoveryPlan {self.plan}
     pub(crate) fn principal(&self)->&str {&self.principal}
-    pub(crate) fn expires_at(&self)->i64 {self.authorized_at.saturating_add(30_000)}
+    pub(crate) fn issued_at(&self)->i64 {self.authorized_at}
+    pub(crate) fn expires_at(&self)->i64 {self.worker_policy.as_ref().map_or(self.authorized_at.saturating_add(30_000),|policy|policy.expires_at().min(self.authorized_at.saturating_add(30_000)))}
+    pub(crate) fn configuration_fence(&self)->Option<Arc<dyn Fn()->Result<()>+Send+Sync>> {self.worker_policy.as_ref().map(|policy|policy.fence())}
     pub(crate) fn require(&self,plan:&crate::autoship_workflow::owner_publication_recovery::RecoveryPlan,now:i64)->Result<()> {
         anyhow::ensure!(self.plan.same_original(plan) && now>=self.authorized_at && now-self.authorized_at<=30_000,
-            "owner publication recovery authorization expired or changed");Ok(())
+            "owner publication recovery authorization expired or changed");
+        if let Some(policy)=&self.worker_policy {policy.current()?;}Ok(())
     }
 }
 pub(crate) async fn authorize_owner_publication_recovery<'a>(repo:&Path,
     plan:&'a crate::autoship_workflow::owner_publication_recovery::RecoveryPlan,
     policy:crate::autoship_discord_command::OwnerPolicy)->Result<AuthorizedOwnerRecovery<'a>> {
     let principal=authorize_original_owner(repo,plan.origin(),plan.command(),policy).await?;
-    Ok(AuthorizedOwnerRecovery {plan,principal,authorized_at:chrono::Utc::now().timestamp_millis()})
+    Ok(AuthorizedOwnerRecovery {plan,principal,authorized_at:chrono::Utc::now().timestamp_millis(),worker_policy:None})
 }
 
 /// Fresh original owner/repository authorization for one exact ready bridge.
@@ -90,21 +96,43 @@ pub(crate) async fn authorize_owner_publication_recovery<'a>(repo:&Path,
 pub(crate) struct AuthorizedOwnerSuccessor<'a> {
     plan:&'a crate::autoship_workflow::owner_publication_recovery::SuccessorPlan,
     principal:String,authorized_at:i64,
+    worker_policy:Option<worker_owner_identity::VerifiedOwnerPolicy>,
 }
 impl AuthorizedOwnerSuccessor<'_> {
-    pub(crate) fn expires_at(&self)->i64 {self.authorized_at.saturating_add(30_000)}
+    pub(crate) fn issued_at(&self)->i64 {self.authorized_at}
+    pub(crate) fn expires_at(&self)->i64 {self.worker_policy.as_ref().map_or(self.authorized_at.saturating_add(30_000),|policy|policy.expires_at().min(self.authorized_at.saturating_add(30_000)))}
+    pub(crate) fn configuration_fence(&self)->Option<Arc<dyn Fn()->Result<()>+Send+Sync>> {self.worker_policy.as_ref().map(|policy|policy.fence())}
     pub(crate) fn plan(&self)->&crate::autoship_workflow::owner_publication_recovery::SuccessorPlan {self.plan}
     pub(crate) fn principal(&self)->&str {&self.principal}
     pub(crate) fn require(&self,plan:&crate::autoship_workflow::owner_publication_recovery::SuccessorPlan,now:i64)->Result<()> {
         anyhow::ensure!(self.plan.same_ready(plan) && now>=self.authorized_at && now-self.authorized_at<=30_000,
-            "owner successor authorization expired or changed");Ok(())
+            "owner successor authorization expired or changed");
+        if let Some(policy)=&self.worker_policy {policy.current()?;}Ok(())
     }
 }
 pub(crate) async fn authorize_owner_successor<'a>(repo:&Path,
     plan:&'a crate::autoship_workflow::owner_publication_recovery::SuccessorPlan,
     policy:crate::autoship_discord_command::OwnerPolicy)->Result<AuthorizedOwnerSuccessor<'a>> {
     let principal=authorize_original_owner(repo,plan.origin(),plan.command(),policy).await?;
-    Ok(AuthorizedOwnerSuccessor {plan,principal,authorized_at:chrono::Utc::now().timestamp_millis()})
+    Ok(AuthorizedOwnerSuccessor {plan,principal,authorized_at:chrono::Utc::now().timestamp_millis(),worker_policy:None})
+}
+/// Worker admission verifies configured transport identity before repository
+/// authorization and retains that exact observation through all later fences.
+pub(crate) async fn authorize_owner_publication_recovery_from_worker<'a>(repo:&Path,
+    plan:&'a crate::autoship_workflow::owner_publication_recovery::RecoveryPlan,
+)->Result<AuthorizedOwnerRecovery<'a>> {
+    let policy=worker_owner_identity::configured().await?;
+    let mut authorization=authorize_owner_publication_recovery(repo,plan,policy.current()?).await?;
+    policy.current()?;authorization.worker_policy=Some(policy);
+    authorization.require(plan,chrono::Utc::now().timestamp_millis())?;Ok(authorization)
+}
+pub(crate) async fn authorize_owner_successor_from_worker<'a>(repo:&Path,
+    plan:&'a crate::autoship_workflow::owner_publication_recovery::SuccessorPlan,
+)->Result<AuthorizedOwnerSuccessor<'a>> {
+    let policy=worker_owner_identity::configured().await?;
+    let mut authorization=authorize_owner_successor(repo,plan,policy.current()?).await?;
+    policy.current()?;authorization.worker_policy=Some(policy);
+    authorization.require(plan,chrono::Utc::now().timestamp_millis())?;Ok(authorization)
 }
 async fn authorize_original_owner(repo:&Path,origin:&crate::autoship_workflow::discord_ingress::DiscordOrigin,
     request:&Request,policy:crate::autoship_discord_command::OwnerPolicy)->Result<String> {

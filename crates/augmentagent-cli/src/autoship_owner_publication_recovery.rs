@@ -522,10 +522,13 @@ pub(crate) fn native_metadata_fence(
         .map_err(|_| anyhow::anyhow!("recovery metadata store poisoned"))?
         .validate_owner_publication_recovery(&lease, authorization, now)?;
     let expires = authorization.expires_at();
+    let issued=authorization.issued_at();
+    let configuration=authorization.configuration_fence();
     Ok(std::sync::Arc::new(move || {
+        if let Some(configuration)=&configuration {configuration()?;}
         let now = chrono::Utc::now().timestamp_millis();
         ensure!(
-            now <= expires,
+            now >= issued && now <= expires,
             "recovery native metadata authorization expired"
         );
         let locked = store

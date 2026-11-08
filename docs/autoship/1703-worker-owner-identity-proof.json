@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Worker-runtime configured owner verification and retained metadata configuration fences",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/self_improve_worker_owner_identity.rs": "ebe0b0e3eb0d961877a1614f879d112dffc066f4d8f2dd683d6f5e192faee789",
+    "crates/augmentagent-cli/src/self_improve_targeted.rs": "595b3c516d188d4906a5b10ea45b2060ea088c19e0e14e569407b9deb8d595d3",
+    "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs": "f95a2ca2d43d0c6661520ed697c4fb3c2ed024e0ea9bcf4be20f41af318f7922",
+    "crates/augmentagent-cli/src/autoship_owner_successor_native.rs": "03b6cc60b5686d097f94218fe76eacb41df52e7ea6d7ddb3ec09879e568413e8"
+  },
+  "red": {
+    "handle": 32857,
+    "exit_code": 1,
+    "log": "/tmp/autoship-worker-owner-identity-red-20261108.log",
+    "reason": "Missing identity types/verification functions after adding transport and revocation tests"
+  },
+  "validation": {
+    "initial_transport_cases": {
+      "handle": 69116,
+      "passed": 7,
+      "seconds": 0.02,
+      "exit_code": 0,
+      "log": "/tmp/autoship-worker-owner-identity-green-20261108.log"
+    },
+    "final_transport_cases": {
+      "handle": 20759,
+      "passed": 8,
+      "seconds": 0.02,
+      "exit_code": 0,
+      "log": "/tmp/autoship-worker-owner-identity-final-20261108.log"
+    },
+    "existing_recovery_snapshot": {
+      "handle": 20759,
+      "passed": 1,
+      "both_builder_pins": true,
+      "seconds": 5.73,
+      "exit_code": 0,
+      "log": "/tmp/autoship-worker-owner-identity-recovery-regression-20261108.log"
+    },
+    "non_test_compile": {
+      "handle": 20759,
+      "seconds": 44.64,
+      "exit_code": 0,
+      "log": "/tmp/autoship-worker-owner-identity-production-20261108.log",
+      "deployed": false
+    }
+  },
+  "protocol_source": "https://github.com/discord/discord-api-docs/blob/main/developers/resources/user.mdx#get-current-user",
+  "assertions": [
+    "Worker constructors obtain current configured bot identity from fixed HTTPS GET /api/v10/users/@me; saved request bot/owner numbers cannot supply that verification",
+    "Only a bot with a canonical nonzero numeric ID is accepted; current configured owner must be nonzero and is later compared to immutable original owner through existing repository authorization",
+    "No redirects; connection/request bounds 5s/10s; response budget 8192 bytes",
+    "Authorization header is sensitive; invalid environment/header, response and HTTP errors do not echo credentials or response content",
+    "A non-Clone/non-Deserialize verifier retains the actual transport observation deadline and configuration fingerprint; production reader captures no token",
+    "Recovery and successor worker authorizers retain the same verifier after GitHub authorization, and use the earlier policy/repository deadline",
+    "Existing SQL authorization checks and both native metadata fences recheck runtime configuration through the retained verifier without network/native IO under their locks",
+    "Native fences preserve the actual repository-authorization issued-at lower bound instead of deriving it from a shortened expiry",
+    "Configuration change during lookup cannot publish a verifier; owner/token changes invalidate an already captured fence; capturing a fence never remints expiry"
+  ],
+  "limits": [
+    "HTTP tests use real loopback sockets and synthetic fixture credentials, not live Discord authorization",
+    "Worker-specific constructors compile but live scheduler selection/invocation is not connected",
+    "The verifier checks this worker process runtime environment; cross-role daemon/worker effective configuration binding and restart/cutover evidence remain unfinished",
+    "Existing recovery regression exercises legacy explicit-policy admission; complete worker-policy-to-live-ledger/Discord acceptance is not established",
+    "No model/provider/VM, real private send, native capacity recovery, deployment or autonomous merge is demonstrated"
+  ],
+  "remaining": [
+    "Bind matching daemon/worker deployed owner configuration and actual current runtime identity before scheduler admission",
+    "Connect scheduler with complete metadata outcomes and durable blocker/progress behavior, not a projection-only retry loop",
+    "Complete original C/R legacy/source/resource/input qualification and debt resolution",
+    "Productive repeated cycles and full private coding/follow-up/delivery lifecycle",
+    "Independent exact-head review and trusted hosted verification; ordinary updater rollout",
+    "Original live CLI/private Discord acceptance, five confirmed auto merges on acceptance UTC day, 72h fault and 24h unattended soak"
+  ],
+  "all_original_local_handles_terminal": true,
+  "deployed": false,
+  "productive_authority_granted": false,
+  "goal_complete": false
+}

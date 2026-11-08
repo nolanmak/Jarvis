@@ -29,9 +29,12 @@ pub(crate) fn metadata_fence(store:Arc<Mutex<WorkflowStore>>,setup:Arc<Successor
     store.lock().map_err(|_|anyhow::anyhow!("successor metadata store poisoned"))?
         .validate_owner_successor_setup(&setup,authorization,now)?;
     let expires=authorization.expires_at();
+    let issued=authorization.issued_at();
+    let configuration=authorization.configuration_fence();
     Ok(Arc::new(move || {
+        if let Some(configuration)=&configuration {configuration()?;}
         let now=chrono::Utc::now().timestamp_millis();
-        ensure!(now>=expires.saturating_sub(30_000) && now<=expires,"successor native metadata authorization expired");
+        ensure!(now>=issued && now<=expires,"successor native metadata authorization expired");
         let locked=store.lock().map_err(|_|anyhow::anyhow!("successor metadata store poisoned"))?;
         require_current_setup(&locked.conn,&setup,now)
     }))
