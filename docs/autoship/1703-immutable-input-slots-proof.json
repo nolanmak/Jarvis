@@ -1,0 +1,58 @@
+{
+  "scope": "Nonrecursive immutable original body input slots below readiness validation; no execution authority",
+  "parent_head": "5ea45060115724744d0b4df4d9283fa19d015013",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_body_history.rs": "0ce9a0411ad26e17242ebba80fd20c5e6fbefb4af44d0d1e1647387d62989af9",
+    "crates/augmentagent-cli/src/autoship_owner_body_history_tests.rs": "7fa242e235c51174a4ab359ae5ba1f4e416658a018d27d8a03b97786ebfea4a1",
+    "crates/augmentagent-cli/src/autoship_owner_dispatch.rs": "a451ac7b6c70f4c682921ee511062baee4aad6c912f6a3a918339661ef9ee7bd",
+    "crates/augmentagent-cli/src/autoship_owner_revision.rs": "2b097a03e4e392500c8315ddf3ed8693888f1433fa048470e2eebe4eb2e5fa11"
+  },
+  "feature_red": {
+    "handle": 6478,
+    "exit_code": 1,
+    "log": "/tmp/autoship-immutable-input-slots-red-20261108.log",
+    "observed_error": "immutable input slots re-entered current owner validation: original owner preparation missing or changed"
+  },
+  "focused_green": {
+    "handle": 42535,
+    "exit_code": 0,
+    "cases": 12,
+    "seconds": 7.95,
+    "scope": "Before final Connection signature, reexport and test formatting; full suite below covers final Rust source",
+    "log": "/tmp/autoship-immutable-input-slots-green-20261108.log"
+  },
+  "full_cli": {
+    "handle": 37469,
+    "exit_code": 0,
+    "passed": 1974,
+    "failed": 0,
+    "ignored": 34,
+    "seconds": 446.23,
+    "log": "/tmp/autoship-immutable-input-slots-full-cli-20261108.log"
+  },
+  "production_compile": {
+    "handle": 90508,
+    "exit_code": 0,
+    "seconds": 33.18,
+    "log": "/tmp/autoship-immutable-input-slots-production-20261108.log"
+  },
+  "checks": [
+    "Both Codex and Claude across the six existing controlled phases",
+    "Immutable snapshot preserved after current owner projection changes; ordinary reader refuses",
+    "Damaged reservation/native event payloads refuse",
+    "Misattributed model charge generation refuses",
+    "Changed preparation baseline receipt set refuses",
+    "Existing complete native join/race/uncertainty/lock-retention tests still pass"
+  ],
+  "limits": [
+    "No native VM/provider/model execution in the controlled matrix",
+    "Lower reader deliberately excludes current owner, publication/cycle ancestry, completion disposition and native/source/resource/input authority",
+    "Caller must own a coherent read transaction and anchor the exact snapshot to validated immutable publication/cycle history",
+    "Reserved readiness v2 consuming producer and repeated-cycle lineage still incomplete",
+    "No production policy, resource limit, retained session, accounting, hold or service mutation performed",
+    "No normal deployment, live CLI/private Discord acceptance, autonomous-merge acceptance or fault/soak acceptance demonstrated"
+  ],
+  "all_original_local_handles_terminal": true,
+  "productive_recovery_granted": false,
+  "production_capacity_changed": false
+}

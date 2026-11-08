@@ -2,7 +2,7 @@
 use super::*;
 #[path="autoship_owner_body_history.rs"]
 mod body_history;
-pub(super) use body_history::read as read_body_input_history;
+pub(super) use body_history::{read as read_body_input_history,read_recorded_input_slots as read_recorded_body_input_slots};
 #[cfg(test)]
 pub(crate) fn test_body_input_history(conn:&Connection,workflow:&str,request:&str)->Result<serde_json::Value> {
     let tx=conn.unchecked_transaction()?;
@@ -151,7 +151,10 @@ impl OwnerBodyDispatch {
         self.record.launch_floor
     }
 }
-fn decode(
+type DecodeBody = fn(&Connection,&str,&str,i64,&str)->Result<Record>;
+/// Record/event/input/launch joins only. Deliberately excludes owner projection,
+/// revision authority and completion disposition so readiness can read downward.
+fn decode_recorded_slots(
     conn: &Connection,
     request: &str,
     workflow: &str,
@@ -215,6 +218,24 @@ fn decode(
         record.body_sha256 == format!("{:x}", Sha256::digest(input.body.as_bytes())),
         "owner dispatch input changed"
     );
+    if let Some(preparation)=&record.preparation {
+        let (raw,receipts,registration,binding):(String,String,String,String)=conn.query_row(
+            "SELECT p.record,p.receipts,r.registration,r.binding FROM workflow_owner_preparation p JOIN workflow_owner_revision r ON r.request_id=p.request_id WHERE p.request_id=?1",
+            [request],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        ensure!(raw.len()<=4096 && receipts.len()<=4*1024*1024 && registration.len()<=4*1024*1024 && binding.len()<=16384,
+            "recorded body preparation exceeds bound");
+        ensure!(serde_json::from_str::<OwnerPreparationBinding>(&raw)?==*preparation
+            && serde_json::from_str::<Binding>(&binding)?==record.binding,"recorded body preparation or binding changed");
+        let registration:crate::autoship_contract::RegisteredContract=serde_json::from_str(&registration)?;
+        let receipts:Vec<crate::autoship_contract::VerifierReceipt>=serde_json::from_str(&receipts)?;
+        ensure!(registration.contract_hash()==record.binding.contract,"recorded body registration contract changed");
+        preparation.validate(&registration,&receipts)?;
+    }
+    Ok(record)
+}
+fn decode(conn:&Connection,request:&str,workflow:&str,sequence:i64,raw:&str)->Result<Record> {
+    let record=decode_recorded_slots(conn,request,workflow,sequence,raw)?;
+    let input=super::owner_inbox::message_evidence(conn,workflow,request)?;
     if let Some(preparation)=&record.preparation {
         super::owner_revision::require_preparation(conn,&owner_turn::OwnerTurn {
             lease:Lease {workflow:record.workflow.clone(),owner:record.owner.clone(),generation:record.generation},
@@ -312,6 +333,9 @@ pub(super) fn require_no_body_reservation(conn:&Connection,lease:&Lease)->Result
     ensure!(!reserved,"reserved owner body requires its original prepared model admission");Ok(())
 }
 fn validate_model_admissions(conn:&Connection,workflow:&str)->Result<()> {
+    validate_model_admissions_using(conn,workflow,decode)
+}
+fn validate_model_admissions_using(conn:&Connection,workflow:&str,decoder:DecodeBody)->Result<()> {
     let events:i64=conn.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' AND json_type(payload,'$.owner_body') IS NOT NULL",
         [workflow],|row|row.get(0))?;
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_body_model_admission')",[],|row|row.get(0))?;
@@ -322,7 +346,7 @@ fn validate_model_admissions(conn:&Connection,workflow:&str)->Result<()> {
         let (request,sequence,receipt,raw)=row?;count+=1;
         ensure!(count<=4096 && raw.len()<=16384,"owner model admission history exceeds bound");
         let (dispatch_sequence,dispatch_raw):(i64,String)=conn.query_row("SELECT sequence,record FROM workflow_owner_body_dispatch WHERE workflow=?1 AND request_id=?2",params![workflow,request],|row|Ok((row.get(0)?,row.get(1)?)))?;
-        let record=decode(conn,&request,workflow,dispatch_sequence,&dispatch_raw)?;
+        let record=decoder(conn,&request,workflow,dispatch_sequence,&dispatch_raw)?;
         let preparation=record.preparation.as_ref().context("owner model admission lacks original preparation")?;
         let value:serde_json::Value=serde_json::from_str(&raw)?;
         let expected=serde_json::json!({"receipt":receipt,"provider":record.provider,"reviewer":false,
@@ -363,6 +387,9 @@ fn model_reference(conn:&Connection,workflow:&str,request:&str)->Result<augmenta
         model_admission_sequence:model_sequence,model_receipt:receipt,claim_sha256:format!("{:x}",Sha256::digest(raw.as_bytes()))})
 }
 fn validate_native_admissions(conn:&Connection,workflow:&str)->Result<()> {
+    validate_native_admissions_using(conn,workflow,decode)
+}
+fn validate_native_admissions_using(conn:&Connection,workflow:&str,decoder:DecodeBody)->Result<()> {
     let events:i64=conn.query_row("SELECT count(*) FROM workflow_event WHERE workflow=?1 AND kind='owner_body_native_bound'",[workflow],|row|row.get(0))?;
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_body_native_admission')",[],|row|row.get(0))?;
     if !exists {ensure!(events==0,"owner native admission index missing");return Ok(())}
@@ -375,7 +402,7 @@ fn validate_native_admissions(conn:&Connection,workflow:&str)->Result<()> {
             && value.reference==model_reference(conn,workflow,&request)?,"owner native admission reference changed");
         let launch=super::native_launch::recorded_launch(conn,&intent)?;
         let (dispatch_sequence,dispatch_raw):(i64,String)=conn.query_row("SELECT sequence,record FROM workflow_owner_body_dispatch WHERE workflow=?1 AND request_id=?2",params![workflow,request],|row|Ok((row.get(0)?,row.get(1)?)))?;
-        let dispatch=decode(conn,&request,workflow,dispatch_sequence,&dispatch_raw)?;
+        let dispatch=decoder(conn,&request,workflow,dispatch_sequence,&dispatch_raw)?;
         ensure!(launch.workflow_id==workflow && launch.source_owner.lease_generation==dispatch.generation
             && launch.workflow_binding==dispatch.binding && launch.intent.provider==dispatch.provider
             && launch.intent.controller_receipt.as_ref()==Some(&value.launch_receipt)
@@ -450,6 +477,9 @@ impl WorkflowStore {
     }
 }
 pub(super) fn validate_history(conn: &Connection, workflow: &str) -> Result<()> {
+    validate_history_using(conn,workflow,decode)
+}
+fn validate_history_using(conn:&Connection,workflow:&str,decoder:DecodeBody)->Result<()> {
     // Read-only inspection may see a pre-migration store. No record is inferred
     // when either half of an already persisted reservation is missing.
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_body_dispatch')",[],|r|r.get(0))?;
@@ -471,7 +501,7 @@ pub(super) fn validate_history(conn: &Connection, workflow: &str) -> Result<()> 
         let (request, sequence, raw) = row?;
         count += 1;
         ensure!(count <= 4096, "owner dispatch history exceeds bound");
-        decode(conn, &request, workflow, sequence, &raw)?;
+        decoder(conn, &request, workflow, sequence, &raw)?;
     }
     ensure!(count == events, "owner dispatch history is incomplete");
     let results: i64 = conn.query_row(
@@ -488,8 +518,8 @@ pub(super) fn validate_history(conn: &Connection, workflow: &str) -> Result<()> 
         results == completed && results <= count,
         "owner completion history is incomplete"
     );
-    validate_model_admissions(conn,workflow)?;
-    validate_native_admissions(conn,workflow)
+    validate_model_admissions_using(conn,workflow,decoder)?;
+    validate_native_admissions_using(conn,workflow,decoder)
 
 }
 /// Read one completed private response with its original authenticated origin.

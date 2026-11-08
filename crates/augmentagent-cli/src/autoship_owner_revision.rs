@@ -53,7 +53,7 @@ impl OwnerPreparationBinding {
     fn registration_digest(registration:&RegisteredContract)->Result<String> {
         Ok(format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(registration)?)?)))
     }
-    fn validate(&self,registration:&RegisteredContract,receipts:&[VerifierReceipt])->Result<()> {
+    pub(super) fn validate(&self,registration:&RegisteredContract,receipts:&[VerifierReceipt])->Result<()> {
         registration.verify_metadata()?;
         ensure!(self.version==1 && [&self.artifact_sha256,&self.context_sha256,&self.registration_sha256,&self.baseline_receipts_sha256].into_iter()
             .all(|value|value.len()==64 && value.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),"invalid owner preparation binding");

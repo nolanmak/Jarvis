@@ -299,6 +299,109 @@ fn sql_body_history_joins_native_nonrelease_under_original_locks() {
             } else {
                 None
             };
+            // Immutable input slots must survive a changed controller projection;
+            // the ordinary reader must continue refusing that projection.
+            let history = {
+                let tx = store.conn.unchecked_transaction().unwrap();
+                let expected = read(&tx, &turn.lease.workflow, &turn.request_id).unwrap();
+                assert_eq!(
+                    read_recorded_input_slots(&tx, &turn.lease.workflow, &turn.request_id).unwrap(),
+                    expected
+                );
+                tx.commit().unwrap();
+                expected
+            };
+            store.conn.execute("UPDATE workflow_owner_turn SET owner='different-controller' WHERE request_id=?1", [&turn.request_id]).unwrap();
+            {
+                let tx = store.conn.unchecked_transaction().unwrap();
+                assert!(read(&tx, &turn.lease.workflow, &turn.request_id).is_err());
+                assert_eq!(
+                    read_recorded_input_slots(&tx, &turn.lease.workflow, &turn.request_id)
+                        .expect("immutable input slots re-entered current owner validation"),
+                    history
+                );
+                tx.commit().unwrap();
+            }
+            // Changing projection independence must not weaken immutable joins.
+            for kind in [
+                "owner_body_dispatch_started",
+                "resource_charged",
+                "owner_body_native_bound",
+            ] {
+                let row:Option<(i64,String,i64)>=store.conn.query_row(
+                    "SELECT seq,payload,generation FROM workflow_event WHERE workflow=?1 AND kind=?2 ORDER BY seq LIMIT 1",
+                    params![turn.lease.workflow,kind],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().unwrap();
+                let Some((sequence, payload, generation)) = row else {
+                    continue;
+                };
+                if kind == "resource_charged" {
+                    store
+                        .conn
+                        .execute(
+                            "UPDATE workflow_event SET generation=generation+100 WHERE seq=?1",
+                            [sequence],
+                        )
+                        .unwrap();
+                } else {
+                    store
+                        .conn
+                        .execute(
+                            "UPDATE workflow_event SET payload='{}' WHERE seq=?1",
+                            [sequence],
+                        )
+                        .unwrap();
+                }
+                let tx = store.conn.unchecked_transaction().unwrap();
+                assert!(
+                    read_recorded_input_slots(&tx, &turn.lease.workflow, &turn.request_id).is_err(),
+                    "{kind}: immutable reader lost provenance checks"
+                );
+                tx.commit().unwrap();
+                store
+                    .conn
+                    .execute(
+                        "UPDATE workflow_event SET payload=?2,generation=?3 WHERE seq=?1",
+                        params![sequence, payload, generation],
+                    )
+                    .unwrap();
+            }
+            let receipts: String = store
+                .conn
+                .query_row(
+                    "SELECT receipts FROM workflow_owner_preparation WHERE request_id=?1",
+                    [&turn.request_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE workflow_owner_preparation SET receipts='[]' WHERE request_id=?1",
+                    [&turn.request_id],
+                )
+                .unwrap();
+            {
+                let tx = store.conn.unchecked_transaction().unwrap();
+                assert!(
+                    read_recorded_input_slots(&tx, &turn.lease.workflow, &turn.request_id).is_err(),
+                    "damaged preparation baseline became an immutable body snapshot"
+                );
+                tx.commit().unwrap();
+            }
+            store
+                .conn
+                .execute(
+                    "UPDATE workflow_owner_preparation SET receipts=?2 WHERE request_id=?1",
+                    params![turn.request_id, receipts],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE workflow_owner_turn SET owner=?2 WHERE request_id=?1",
+                    params![turn.request_id, turn.lease.owner],
+                )
+                .unwrap();
             if matches!(phase, "native-bound" | "released") {
                 source.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"native_owner_model_bound",
                 "launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,"resource_receipt":resource,"owner_input":reference})).unwrap();

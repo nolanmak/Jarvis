@@ -1571,3 +1571,40 @@ writers, complete C/R source/resource/input authority, or provide the full order
 multi-attempt lineage. Reserved readiness/consumption, productive model/input/result
 constructors, legacy cutover, normal rollout and all original live acceptance
 remain unfinished. Saved history/evidence cannot replace any of those gates.
+
+
+## 62. Immutable input slots below readiness validation
+
+The reserved-readiness reader cannot call the complete owner-body history reader:
+that reader validates revision/current-turn history, which follows consumed
+successor edges back through readiness. `read_recorded_body_input_slots` now
+provides the lower input-record layer without that upward dependency. Its caller
+must own a coherent SQL read transaction. It returns descriptive data only.
+
+The shared decoder retains the exact reservation/event and authenticated input
+joins, original prepared native launch/resource identity, preparation registration
+and baseline receipt digest, first model admission and uniquely attributed common
+charge, and optional SQL native admission. Both readers use the same model/native
+validators. The ordinary reader additionally retains revision authority, original
+or current turn identity and completion/pending-input disposition validation.
+A changed current owner therefore remains a dispatch refusal while leaving the
+unchanged immutable input slots readable.
+
+This lower layer deliberately does not validate current ownership, publication or
+cycle ancestry, completion outcomes, native nonrelease, source custody or execution
+authority. Completion rows/events are counted, not interpreted here. A future
+readiness reader must anchor the exact reservation to its validated immutable
+publication/cycle and compare its saved input snapshot. A self-consistent snapshot,
+an absent first model slot, or a changed current projection grants no retry.
+Version-1 body reservations remain unsupported by this input-history format.
+
+The controlled Codex/Claude matrix checks projection-independent reads for all
+12 existing phases. Damaged reservation/native events, charge-generation
+provenance and preparation receipts still refuse. The first behavioral test failed
+because the immutable reader reached original-owner preparation validation; the
+split reader passes while the ordinary reader still refuses the changed owner.
+The full CLI suite passed 1,974 tests with 34 ignored, followed by production
+compilation. See [the immutable input-slot evidence](1703-immutable-input-slots-proof.json).
+This is a prerequisite for version-2 reserved readiness, not its consuming producer
+or a completed recovery/rollout acceptance. All remaining requirements in §53
+and the epic remain open.

@@ -32,9 +32,12 @@ pub(crate) struct OriginalBodyInputHistory {
 /// must be re-read in a consuming transaction; saved data is never authority.
 pub(crate) fn read(tx:&Transaction<'_>,workflow:&str,request:&str)->Result<Option<OriginalBodyInputHistory>> {
     validate_history(tx,workflow)?;
+    recorded_slots(tx,workflow,request)
+}
+fn recorded_slots(tx:&Connection,workflow:&str,request:&str)->Result<Option<OriginalBodyInputHistory>> {
     let row:Option<(i64,String)>=tx.query_row("SELECT sequence,record FROM workflow_owner_body_dispatch WHERE workflow=?1 AND request_id=?2",params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let Some((sequence,raw))=row else {return Ok(None)};
-    let record=decode(tx,request,workflow,sequence,&raw)?;
+    let record=decode_recorded_slots(tx,request,workflow,sequence,&raw)?;
     ensure!(matches!(record.version,2|3),"legacy body reservation lacks resource-ready input history");
     // Missing both projection halves must not turn spent work into an absent
     // first model slot. Generic preparation before reservation remains distinct.
@@ -75,6 +78,18 @@ pub(crate) fn read(tx:&Transaction<'_>,workflow:&str,request:&str)->Result<Optio
     Ok(Some(OriginalBodyInputHistory {version:1,workflow:record.workflow,request_id:record.request_id,
         state,reservation:reference(sequence,&raw),provider:record.provider,body_sha256:record.body_sha256,
         preparation,setup,model,native}))
+}
+
+
+/// Immutable input slots only; never current owner, publication, completion,
+/// native nonrelease or execution authority. Used beneath readiness readers.
+/// The caller must anchor the reservation to its validated publication/cycle
+/// and compare the saved snapshot; self-consistent SQL alone grants nothing.
+/// Completion records are counted, not interpreted by this input-only layer.
+/// Callers must own a read transaction for coherence across these queries.
+pub(crate) fn read_recorded_input_slots(tx:&Connection,workflow:&str,request:&str)->Result<Option<OriginalBodyInputHistory>> {
+    validate_history_using(tx,workflow,decode_recorded_slots)?;
+    recorded_slots(tx,workflow,request)
 }
 
 
