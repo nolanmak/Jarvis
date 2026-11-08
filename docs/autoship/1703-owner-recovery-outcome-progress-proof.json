@@ -1,0 +1,111 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Private original-conversation recovery outcome updates",
+  "parent_commit": "d26684640814f3cc0e711e688d2b017e496d7a8b",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_input_blocked.rs": "8cc6b36322e01fbeb4de56124ab80de4344a88c5c69104162243a2623bdec4ae",
+    "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs": "c33417670feb7d36613338bf84620f94570088c78413197c2ba2cee56206bf49",
+    "crates/augmentagent-cli/src/autoship_progress.rs": "49b5a0af8711ddf31c7b8c8ba6a4557119007bb2726e147f81877b405a78b630",
+    "crates/augmentagent-cli/src/autoship_submission.rs": "c41d7e4025c5a6f3ebb06bb698887b7b9b068926beb8c7b237c17356c097b3aa",
+    "crates/augmentagent-cli/src/autoship_worker_queue.rs": "1a67a2e7e26e03da6979204a2362e7f7ec85cc2499486c735c4d4187d65ef4de",
+    "crates/augmentagent-cli/src/autoship_workflow.rs": "2f4b4b6c2815556a40ef941ee3ae697ed9d359acb3dbe5f6282350b2bdc88dae",
+    "crates/augmentagent-cli/src/self_improve_owner_worker_tests.rs": "241327dc1c8731e7a5e5da6fe165c0768134e02b1a5d9859f449405c8959f355"
+  },
+  "red": {
+    "handle": 45381,
+    "exit_code": 1,
+    "log": "/tmp/autoship-private-recovery-progress-red-20261108.log",
+    "reason": "Recovery result commits without a durable private update"
+  },
+  "validation": [
+    {
+      "log": "/tmp/autoship-private-recovery-progress-worker-regressions-20261108.log",
+      "passed": 28,
+      "failed": 0,
+      "ignored": 2,
+      "seconds": 131.67
+    },
+    {
+      "log": "/tmp/autoship-private-recovery-progress-outbox-regressions-20261108.log",
+      "passed": 25,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 246.09
+    },
+    {
+      "log": "/tmp/autoship-private-recovery-final-admitted_provider-20261108.log",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 0.12
+    },
+    {
+      "log": "/tmp/autoship-private-recovery-final-autoship_workflow__submission__tests-20261108.log",
+      "passed": 21,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 1.07
+    },
+    {
+      "log": "/tmp/autoship-private-recovery-final-legacy_input_writer_debt_survives_restart_and_does_not_retry_on_a_timer-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 68.44
+    },
+    {
+      "log": "/tmp/autoship-private-recovery-final-owner_preparation_retry_persists_across_claims_and_wakes_on_changed_inputs-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 32.37
+    },
+    {
+      "log": "/tmp/autoship-private-recovery-final-prepared_owner_model_admission-20261108.log",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 0.76
+    },
+    {
+      "log": "/tmp/autoship-private-recovery-final-worker_queue_selects_recovery_fairly_and_refuses_unverified_worker-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 8.2
+    }
+  ],
+  "production_build": {
+    "handle": 62784,
+    "exit_code": 0,
+    "log": "/tmp/autoship-private-recovery-progress-production-20261108.log"
+  },
+  "all_original_local_handles_terminal": true,
+  "assertions": [
+    "Queue selection atomically retains the selected original request/publication reference with its exact selection timestamp; attempt completion re-reads that matching scope rather than inferring a recipient from the latest request or repository default.",
+    "Version-3 private envelopes revalidate immutable original publication history, authenticated owner message/body digest, workflow and exact original bot/owner/channel. Version-2 legacy blocker envelopes remain readable; wrong-version/scope combinations and unknown fields refuse.",
+    "Recovery attempt completion and progress projection share a transaction. An injected outbox failure rolls back the terminal attempt and leaves prior progress unchanged; duplicate completion cannot overwrite the first result.",
+    "Forged version, request, owner, channel and original reference refuse. A different repository default cannot receive the update. Uncertain sends survive reopen, refuse resend and confirm only against the original route.",
+    "A metadata-ready outcome additionally requires the validated successor-readiness history for the selected original request. A ready outcome without that record refuses and rolls back.",
+    "Positive cases select expired recovery, acquire a fresh authorized metadata claim, run actual guarded metadata recovery, and project ready updates for unbound/reserved/interrupted-handoff cases across both builder pins. The recorded owner pause is preserved and the next action remains owner resume.",
+    "Recovery text distinguishes metadata readiness from a new coding turn. Merge remains not-confirmed and deployment unknown absent their independent evidence. Queue retry delay is not presented as native preparation eligibility.",
+    "Model-admission event append, owner index and progress projection now occur in that order in one transaction. Projection cannot observe the half-indexed model admission. Existing admission rollback/idempotency/competition and admitted-provider tests pass.",
+    "Legacy input blocker privacy/dedup/restart, persistent preparation backoff, ordinary command fairness, worker role/transport checks, progress outbox and simulated uncertain-merge/background-queue regressions pass."
+  ],
+  "limits": [
+    "Native/resource/body setup in recovery cases is synthetic persisted state with real protected native/audit/SQL functions. No VM/provider/model/body or positive normally deployed managed-worker authorization is demonstrated.",
+    "The 28-test worker run precedes only the final human-readable recovery message formatting change; the final queue test, 25 progress tests, other targeted regressions and production compilation use final source.",
+    "The GitHub progress regressions use stubbed GitHub services; their simulated merges do not count as live autonomous merges.",
+    "No real Discord message was sent. Gateway/current-owner qualification, cutover, actual delivery and full private productive coding/follow-up lifecycle still need live acceptance.",
+    "Preparation failures currently project a bounded held/authorization/blocked outcome. Detailed preparation reason/dependency-change notification and complete outcome coverage remain separate work.",
+    "Prior queue scan bounds and outer merge-allowance dispatch limitations remain. Closed/transferred-source completion import and unavailable post-commit lookup fault coverage remain incomplete.",
+    "Full C/R custody/resource/source/input qualification, legacy debt settlement, repeated productive successor/body/release/model/result cycles, fresh combined-head hosted checks, exact-head independent review and normal updater rollout remain incomplete.",
+    "Five real confirmed autonomous merges on acceptance UTC day, 72-hour fault tests and 24-hour unattended soak remain unproven."
+  ],
+  "private_outcome_projection_connected_in_source": true,
+  "live_discord_messages_sent": false,
+  "deployed": false,
+  "productive_authority_granted": false,
+  "goal_complete": false
+}

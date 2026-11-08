@@ -531,6 +531,8 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS command_attempt (
                 workflow TEXT PRIMARY KEY REFERENCES command_job(workflow), selected_at INTEGER NOT NULL,
                 finished_at INTEGER, outcome TEXT NOT NULL, reason TEXT NOT NULL, eligible_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS owner_recovery_attempt_scope (
+                workflow TEXT PRIMARY KEY REFERENCES command_job(workflow),selected_at INTEGER NOT NULL,scope TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS owner_recovery_queue_cursor (
                 repository TEXT PRIMARY KEY,last_workflow TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS command_lane_turn (
@@ -1575,10 +1577,11 @@ impl WorkflowStore {
                 now_ms,
             )?;
             if let Some(admission)=admission {
-                event(&tx,&lease.workflow,lease.generation,"native_model_admitted",&admission,now_ms)?;
+                append_event(&tx,&lease.workflow,lease.generation,"native_model_admitted",&admission,now_ms)?;
                 if let Some((dispatch,_))=owner_body {
                     owner_dispatch::index_model_admission(&tx,dispatch,receipt_id,&admission)?;
                 }
+                progress::project(&tx,&lease.workflow,"native_model_admitted",now_ms)?;
             }
         }
         tx.commit()?;

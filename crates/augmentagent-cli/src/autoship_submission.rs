@@ -166,7 +166,7 @@ impl WorkflowStore {
         self.finish_worker_attempt(workflow,selected_at,outcome,reason,now,true)
     }
     /// Recovery results must not inherit a repository's default recipient.
-    /// Private owner progress projection remains a separate required adapter.
+    /// The original authenticated owner conversation is revalidated atomically.
     pub(crate) fn finish_owner_recovery_attempt(&self,workflow:&str,selected_at:i64,outcome:AttemptOutcome,reason:&str,now:i64)->Result<bool> {
         self.finish_worker_attempt(workflow,selected_at,outcome,reason,now,false)
     }
@@ -178,7 +178,7 @@ impl WorkflowStore {
         let changed=tx.execute("UPDATE command_attempt SET finished_at=?3,outcome=?4,reason=?5
             WHERE workflow=?1 AND selected_at=?2 AND finished_at IS NULL",
             params![workflow,selected_at,now,outcome.as_str().unwrap(),reason])? == 1;
-        if changed && project {super::progress::project(&tx,workflow,"command_attempt_finished",now)?;}
+        if changed {super::progress::project(&tx,workflow,if project {"command_attempt_finished"}else{"owner_recovery_attempt_finished"},now)?;}
         tx.commit()?;Ok(changed)
     }
 

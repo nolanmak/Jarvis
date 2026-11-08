@@ -9,9 +9,21 @@ const KIND: &str = "owner_recovery_legacy_input_blocked";
 /// and authenticated private message; this JSON cannot grant a destination.
 #[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct OwnerProgress {reference:RecordRef,origin:DiscordOrigin}
+pub(crate) struct OwnerProgress {
+    reference:RecordRef,origin:DiscordOrigin,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    request:Option<String>,
+}
 impl OwnerProgress {
+    pub(crate) fn envelope_version(&self)->u32 {if self.request.is_some() {3}else{2}}
     pub(crate) fn origin(&self,conn:&Connection,workflow:&str)->Result<DiscordOrigin> {
+        if let Some(request)=&self.request {
+            let original=original(conn,workflow,request)?;
+            let (sequence,sha256):(i64,String)=conn.query_row("SELECT sequence,record_sha256 FROM workflow_owner_publication_intent WHERE workflow=?1 AND request_id=?2",params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            ensure!(self.reference==RecordRef {sequence,sha256} && self.origin==original.origin,
+                "private progress original publication or destination changed");
+            return Ok(self.origin.clone());
+        }
         let rows=load(conn,workflow)?;
         let (record,_)=rows.iter().find(|(_,r)|r==&self.reference).context("private progress original blocker missing")?;
         let claims=journal(conn,workflow)?;
@@ -22,12 +34,46 @@ impl OwnerProgress {
         Ok(self.origin.clone())
     }
 }
+pub(super) fn selected_scope(conn:&Connection,workflow:&str)->Result<OwnerProgress> {
+    let plan=plan(conn,workflow)?.context("selected owner recovery original plan missing")?;
+    let request=plan.original.request_id;
+    let (sequence,sha256):(i64,String)=conn.query_row("SELECT sequence,record_sha256 FROM workflow_owner_publication_intent WHERE workflow=?1 AND request_id=?2",params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    let scope=OwnerProgress {reference:RecordRef {sequence,sha256},origin:plan.original.origin,request:Some(request)};
+    scope.origin(conn,workflow)?;Ok(scope)
+}
+pub(super) fn attempt_progress(conn:&Connection,workflow:&str,now:i64)->Result<(OwnerProgress,Option<RecoveryBlockedState>)> {
+    let (raw,len):(String,i64)=conn.query_row("SELECT substr(s.scope,1,8193),length(CAST(s.scope AS BLOB)) FROM owner_recovery_attempt_scope s JOIN command_attempt a ON a.workflow=s.workflow AND a.selected_at=s.selected_at WHERE s.workflow=?1 AND a.finished_at IS NOT NULL",[workflow],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    ensure!((1..=8192).contains(&len) && raw.len() as i64==len,"selected recovery scope exceeds bound");
+    let scope:OwnerProgress=serde_json::from_str(&raw)?;
+    ensure!(scope.envelope_version()==3 && serde_json::to_string(&scope)?==raw,"selected recovery scope encoding changed");
+    scope.origin(conn,workflow)?;
+    let reason:String=conn.query_row("SELECT reason FROM command_attempt WHERE workflow=?1",[workflow],|r|r.get(0))?;
+    if reason=="owner-metadata-ready" {
+        let (claim,reference)=history(conn,workflow)?.context("ready progress has no recovery claim")?;
+        ensure!(scope.request.as_deref()==Some(claim.original.request_id.as_str())
+            && successor_ready::for_claim(conn,&claim,&reference)?.is_some(),
+            "ready progress has no validated original successor readiness");
+    }
+    let blocked=match plan(conn,workflow)? {Some(plan)=>blocked::blocked_state(conn,&plan,now)?,None=>None};
+    Ok((scope,blocked))
+}
 pub(super) fn owner_progress(conn:&Connection,workflow:&str,now:i64)->Result<Option<(OwnerProgress,Option<RecoveryBlockedState>)>> {
     let rows=load(conn,workflow)?;
+    let publication_table:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_publication_intent')",[],|r|r.get(0))?;
+    let latest:Option<(String,i64,String)>=if publication_table {conn.query_row("SELECT request_id,sequence,record_sha256 FROM workflow_owner_publication_intent WHERE workflow=?1 ORDER BY sequence DESC LIMIT 1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?}else{None};
+    if let Some((request,sequence,sha256))=latest {
+        if rows.last().is_none_or(|(r,_)|r.request_id!=request) {
+            let original=original(conn,workflow,&request)?;
+            let scope=OwnerProgress {reference:RecordRef {sequence,sha256},origin:original.origin,request:Some(request)};
+            scope.origin(conn,workflow)?;
+            let blocked=match plan(conn,workflow)? {Some(plan)=>blocked::blocked_state(conn,&plan,now)?,None=>None};
+            return Ok(Some((scope,blocked)));
+        }
+    }
     let Some((record,reference))=rows.last() else {return Ok(None)};
     let claims=journal(conn,workflow)?;
     let (claim,_)=claims.iter().find(|(_,r)|r==&record.claim).context("private progress original claim missing")?;
-    let scope=OwnerProgress {reference:reference.clone(),origin:claim.original.origin.clone()};
+    let scope=OwnerProgress {reference:reference.clone(),origin:claim.original.origin.clone(),request:None};
     scope.origin(conn,workflow)?;
     let blocked=match plan(conn,workflow)? {Some(plan)=>blocked::blocked_state(conn,&plan,now)?,None=>None};
     Ok(Some((scope,blocked)))

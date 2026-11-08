@@ -43,7 +43,7 @@ fn decode(conn:&Connection,workflow:&str,sequence:i64,raw:&str)->Result<(Progres
     let value:serde_json::Value=serde_json::from_str(raw)?;
     let (progress,scope)=if value.get("version").is_some() || value.get("owner_scope").is_some() {
         let envelope:OwnerProgressEnvelope=serde_json::from_value(value)?;
-        ensure!(envelope.version==2,"unsupported private progress envelope");
+        ensure!(envelope.version==envelope.owner_scope.envelope_version(),"unsupported private progress envelope");
         envelope.owner_scope.origin(conn,workflow)?;
         (envelope.progress,Some(envelope.owner_scope))
     } else {(serde_json::from_value(value)?,None)};
@@ -114,6 +114,14 @@ impl WorkflowStore {
         let nonce=format!("{:x}",Sha256::digest(serde_json::to_vec(&(workflow,origin.bot,origin.owner,origin.channel,sequence))?))[..24].to_string();
         let content=if scope.is_some() && progress.reason=="native-input-writer-unsupported" {
             format!("Autoship {workflow} · update {sequence}: session recovery is blocked because the original session input writer is unsupported. Recovery will stay blocked until compatible session evidence is available. Merge: {}. Deployment: {}. [autoship:{nonce}]",progress.merge_state,progress.deployment_state)
+        } else if scope.is_some() && progress.kind.starts_with("owner-recovery-") {
+            let status=match progress.reason.as_str() {
+                "owner-metadata-ready" if progress.next_action=="await_owner_resume"=>"Recovery metadata is ready and waiting for you to resume. A new coding turn has not started.",
+                "owner-metadata-ready"=>"Recovery metadata is ready for guarded turn setup. A new coding turn has not started.",
+                "owner-recovery-authorization-blocked"=>"Session recovery is waiting for current owner and repository authorization. A new coding turn has not started.",
+                _=>"Session recovery is blocked. A new coding turn has not started; inspect autoship status for the blocker.",
+            };
+            format!("Autoship {workflow} · update {sequence}: {status} Merge: {}. Deployment: {}. [autoship:{nonce}]",progress.merge_state,progress.deployment_state)
         } else {format!("Autoship {workflow} · update {sequence}: {}. Stage: {:?}. Reason: {}. Next: {} (eligible at: {:?}). PR: {:?}. Requested provider: {:?}; actual provider: {} ({}). Merge: {}. Deployment: {}. Evidence digest: {}. [autoship:{nonce}]",
             progress.kind,progress.stage,progress.reason,progress.next_action,progress.eligible_at_ms,progress.pr,progress.requested_provider,progress.actual_provider.as_deref().unwrap_or("unknown"),progress.actual_provider_role.as_deref().unwrap_or("unknown"),progress.merge_state,progress.deployment_state,progress.evidence_digest)};
         ensure!(content.chars().count()<=1900,"progress message exceeds Discord bound");
@@ -178,10 +186,11 @@ fn code(value:&str,fallback:&str)->String {
 }
 
 pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Result<()> {
-    if !matches!(source,"registered"|"checkpoint"|"autonomous_merge_confirmed"|"command_queued"|"command_attempt_finished"|"owner_control_changed"|"owner_input_queued"|"native_model_admitted"|"owner_recovery_legacy_input_blocked") {return Ok(());}
+    if !matches!(source,"registered"|"checkpoint"|"autonomous_merge_confirmed"|"command_queued"|"command_attempt_finished"|"owner_control_changed"|"owner_input_queued"|"native_model_admitted"|"owner_recovery_legacy_input_blocked"|"owner_recovery_attempt_finished") {return Ok(());}
     let previous:Option<(i64,String,bool)>=tx.query_row("SELECT sequence,fingerprint,terminal FROM workflow_progress_state WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     if previous.as_ref().is_some_and(|p|p.2) {return Ok(());}
-    let private=owner_publication_recovery::owner_progress(tx,workflow,now)?;
+    let private=if source=="owner_recovery_attempt_finished" {Some(owner_publication_recovery::attempt_progress(tx,workflow,now)?)}else{owner_publication_recovery::owner_progress(tx,workflow,now)?};
+    ensure!(source!="owner_recovery_attempt_finished" || private.is_some(),"owner recovery update requires authenticated original conversation");
     if private.is_none() {super::delivery::apply_default(tx,workflow,now)?;}
     let snapshot:Option<(String,Option<u64>)>=tx.query_row("SELECT checkpoint,pr FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let checkpoint=snapshot.as_ref().map(|(raw,_)|serde_json::from_str::<Checkpoint>(raw)).transpose()?;
@@ -211,6 +220,17 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
         }
     }
     else if source=="owner_control_changed" {kind="resume-requested".into();reason="owner-resume-accepted".into();action="await_worker".into();}
+    if source=="owner_recovery_attempt_finished" {
+        let (outcome,why,_)=attempt.as_ref().context("owner recovery attempt missing")?;
+        ensure!(matches!(outcome.as_str(),"progress"|"deferred"|"failed"),"invalid recovery attempt outcome");
+        ensure!(matches!(why.as_str(),"owner-metadata-ready"|"owner-recovery-deferred"|"owner-recovery-authorization-blocked"|"owner-recovery-blocked"),"invalid owner recovery result code");
+        kind=if outcome=="progress" {"owner-recovery-ready"}else{"owner-recovery-blocked"}.into();
+        reason=why.clone();
+        action=if outcome=="progress" {if control==Some(true) {"await_owner_resume"}else{"prepare_owner_successor"}}else{"inspect_owner_recovery"}.into();
+        // The queue attempt delay is not the native preparation deadline. No
+        // productive work or time-only recovery eligibility is inferred here.
+        eligible=None;
+    }
     if let Some((_,blocked))=&private {
         use owner_publication_recovery::RecoveryBlockedState;
         match blocked {
@@ -245,7 +265,7 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     let progress=Progress {workflow:workflow.into(),sequence,kind,stage,reason,next_action:action,eligible_at_ms:eligible,
         pr:snapshot.and_then(|s|s.1),requested_provider,actual_provider,actual_provider_role,
         merge_state:if confirmed {"observed-autonomous-merge"} else if external_merge {"observed-external-merge"} else {"not-confirmed"}.into(),deployment_state:"unknown".into(),evidence_digest,observed_at_ms:now};
-    let payload=match scope {Some(owner_scope)=>serde_json::to_string(&OwnerProgressEnvelope {version:2,owner_scope,progress})?,None=>serde_json::to_string(&progress)?};
+    let payload=match scope {Some(owner_scope)=>serde_json::to_string(&OwnerProgressEnvelope {version:owner_scope.envelope_version(),owner_scope,progress})?,None=>serde_json::to_string(&progress)?};
     if changed {tx.execute("INSERT INTO workflow_progress_event(workflow,sequence,payload,created_at) VALUES(?1,?2,?3,?4)",params![workflow,sequence,payload,now])?;}
     tx.execute("INSERT INTO workflow_progress_state VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workflow) DO UPDATE SET sequence=excluded.sequence,fingerprint=excluded.fingerprint,terminal=excluded.terminal,payload=excluded.payload",params![workflow,sequence,fingerprint,terminal,payload])?;
     Ok(())

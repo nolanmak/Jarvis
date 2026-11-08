@@ -89,6 +89,10 @@ pub(super) fn select(
         (None, None) => None,
     };
     if let Some(job) = &selected {
+        if job.owner_recovery {
+            let scope=super::super::owner_publication_recovery::selected_progress_scope(&tx,&job.workflow)?;
+            tx.execute("INSERT INTO owner_recovery_attempt_scope VALUES(?1,?2,?3) ON CONFLICT(workflow) DO UPDATE SET selected_at=excluded.selected_at,scope=excluded.scope",params![job.workflow,now,serde_json::to_string(&scope)?])?;
+        }
         tx.execute("INSERT INTO command_schedule(workflow,attempted_at,eligible_at) VALUES(?1,?2,?3) ON CONFLICT(workflow) DO UPDATE SET attempted_at=excluded.attempted_at,eligible_at=excluded.eligible_at",params![job.workflow,now,now.saturating_add(300_000)])?;
         tx.execute("INSERT INTO command_attempt(workflow,selected_at,finished_at,outcome,reason,eligible_at) VALUES(?1,?2,NULL,'selected','worker-attempt-unconfirmed',?3) ON CONFLICT(workflow) DO UPDATE SET selected_at=excluded.selected_at,finished_at=NULL,outcome=excluded.outcome,reason=excluded.reason,eligible_at=excluded.eligible_at",params![job.workflow,now,now.saturating_add(300_000)])?;
         tx.execute("INSERT INTO command_lane_turn(repository,yield_normal) VALUES(?1,1) ON CONFLICT(repository) DO UPDATE SET yield_normal=1",[&repository])?;
