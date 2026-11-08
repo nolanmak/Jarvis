@@ -6,11 +6,16 @@ use std::process::Stdio;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+#[cfg(target_os="linux")]
+#[path="resource_supervisor.rs"]
+mod resource_supervisor;
 
 /// Private supervisor owns all descendants, even after session detachment.
 /// The caller must check `clean` before treating an error as failover-eligible.
 pub(crate) struct ProcessGroup {
     id: libc::pid_t,
+    #[cfg(target_os="linux")]
+    original_supervisor: Option<resource_supervisor::OriginalSupervisor>,
     receipt: PathBuf,
     clean: Arc<AtomicBool>,
     active_request: Option<PathBuf>,
@@ -22,6 +27,7 @@ pub(crate) struct ProcessGroup {
     kernel_limits: std::sync::Mutex<Option<crate::run_resources::LiveResourceLimits>>,
     vm_preflight: bool,
     resource_observed: AtomicBool,
+    resource_result: std::sync::OnceLock<bool>,
     admission_attempted: AtomicBool,
     resource_audit: std::sync::Mutex<Option<(String,Arc<crate::tool_audit::AuditLogger>)>>,
     native_initial:bool,
@@ -96,6 +102,8 @@ impl ProcessGroup {
         let Some(policy)=self.declared_resource_policy.as_ref() else {return Ok(())};
         #[cfg(target_os="linux")] {
             let observed=crate::run_resources::LiveResourceLimits::observe(identity,policy)?;
+            self.original_supervisor.as_ref().ok_or_else(||anyhow::anyhow!("original resource supervisor missing"))?
+                .validate_scope(identity)?;
             let mut retained=self.kernel_limits.lock().map_err(|_|anyhow::anyhow!("kernel resource lock poisoned"))?;
             anyhow::ensure!(retained.is_none(),"kernel resource observation already captured");
             *retained=Some(observed);Ok(())
@@ -109,8 +117,14 @@ impl ProcessGroup {
     fn validate_declared_kernel_limits(&self)->anyhow::Result<()> {
         if self.declared_resource_policy.is_none() {return Ok(())}
         #[cfg(target_os="linux")] {
-            self.kernel_limits.lock().map_err(|_|anyhow::anyhow!("kernel resource lock poisoned"))?
-                .as_ref().ok_or_else(||anyhow::anyhow!("original kernel resource observation missing"))?.validate()
+            let identity=self.resource_admission.lock().map_err(|_|anyhow::anyhow!("resource admission lock poisoned"))?
+                .clone().ok_or_else(||anyhow::anyhow!("original resource admission missing"))?;
+            let retained=self.kernel_limits.lock().map_err(|_|anyhow::anyhow!("kernel resource lock poisoned"))?;
+            let limits=retained.as_ref().ok_or_else(||anyhow::anyhow!("original kernel resource observation missing"))?;
+            limits.validate()?;
+            self.original_supervisor.as_ref().ok_or_else(||anyhow::anyhow!("original resource supervisor missing"))?
+                .validate_scope(&identity)?;
+            limits.validate()
         }
         #[cfg(not(target_os="linux"))] {
             anyhow::bail!("declared resource admission requires Linux kernel verification")
@@ -220,17 +234,21 @@ impl ProcessGroup {
         while !launch_readiness(&ready)? {
             if let Some(current)=preflight {current.native_preflight_current()?;}
             if self.receipt.exists() || tokio::time::Instant::now()>=deadline {
-                self.resource_outcome(provider,logger)?;
                 let startup=private_read(&self.receipt.with_file_name("vm-startup-failure.json")).ok()
                     .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok());
                 if let Some(category)=startup.as_ref().and_then(native_setup_category) {
+                    // Known setup refusal is not a positive resource outcome
+                    // and must not be reclassified by teardown's later reader.
+                    self.resource_observed.store(true,Ordering::SeqCst);
+                    let _=self.resource_result.set(false);
                     if let Some(logger)=logger {
                         logger.record_controller(serde_json::json!({"kind":"native_setup_failed","provider":provider,"category":category}))?;
                     }
                     return Err(crate::reasoner::ReasonerError::Local {
-                        message:format!("{provider}: native VM setup failed before model admission ({category}); resource limits were not exhausted")
+                        message:format!("{provider}: native VM setup failed before model admission ({category}); reconcile the original attempt")
                     }.into());
                 }
+                self.resource_outcome(provider,logger)?;
                 let phase=if startup.as_ref().and_then(|value|value.get("phase")).and_then(|value|value.as_str())==Some("native_credential_in_use") {
                     "native_credential_in_use"
                 } else {"launch_readiness_unavailable"};
@@ -313,9 +331,43 @@ impl ProcessGroup {
             "command completion lacks its exact admitted resource identity");
         crate::run_resources::verify_quiescent(&admitted)
     }
+    /// Use the original Linux process handle; legacy fixtures and non-Linux
+    /// transports keep their existing signaling fallback.
+    fn signal_original_supervisor(&self,signal:i32) {
+        #[cfg(target_os="linux")] if let Some(original)=self.original_supervisor.as_ref() {
+            let _=original.signal(signal);return;
+        }
+        unsafe {libc::kill(self.id,signal);}
+    }
+    /// Fallback may clean only the scope retained after actual owner validation.
+    /// Never reopen the supervisor's mutable accounting file as cleanup authority.
+    fn cleanup_original_resource_scope(&self)->anyhow::Result<()> {
+        anyhow::ensure!(self.declared_resource_policy.is_some(),"original resource declaration unavailable");
+        #[cfg(target_os="linux")] anyhow::ensure!(self.original_supervisor.is_some()
+            && self.kernel_limits.lock().map_err(|_|anyhow::anyhow!("kernel resource lock poisoned"))?.is_some(),
+            "original resource ownership unavailable");
+        let identity=self.resource_admission.lock().map_err(|_|anyhow::anyhow!("resource admission lock poisoned"))?
+            .clone().ok_or_else(||anyhow::anyhow!("original resource scope was not observed"))?;
+        let mut receipt=tempfile::NamedTempFile::new_in(self.receipt.parent().ok_or_else(||anyhow::anyhow!("resource directory missing"))?)?;
+        receipt.write_all(&serde_json::to_vec(&serde_json::json!({"identity":identity}))?)?;
+        receipt.as_file().sync_all()?;
+        let status=std::process::Command::new("/usr/bin/python3").arg("-I")
+            .arg(self.receipt.with_file_name("run-resource-scope.py")).arg("--cleanup").arg(receipt.path())
+            .env_clear().stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status()?;
+        anyhow::ensure!(status.success(),"original resource cleanup unavailable");Ok(())
+    }
     pub(crate) fn resource_outcome(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
-        if self.resource_observed.swap(true,Ordering::SeqCst) { return Ok(()); }
-        crate::run_resources::record_outcome(&self.receipt.with_file_name("resource-accounting.json"),self.resource_required,provider,logger)
+        if self.resource_observed.swap(true,Ordering::SeqCst) {
+            anyhow::ensure!(self.resource_result.get()==Some(&true),
+                "original resource outcome is pending or refused; reconcile instead of retrying");
+            return Ok(());
+        }
+        let result=(|| {
+            let original=self.resource_admission.lock().map_err(|_|anyhow::anyhow!("resource admission lock poisoned"))?.clone();
+            crate::run_resources::record_original_outcome(&self.receipt.with_file_name("resource-accounting.json"),self.resource_required,provider,logger,original.as_ref())
+        })();
+        let _=self.resource_result.set(result.is_ok());
+        result
     }
 }
 
@@ -344,7 +396,7 @@ impl Drop for ProcessGroup {
         if !complete() {
             // Signal the supervisor, which retains ownership of detached
             // grandchildren and acknowledges only after reaping every child.
-            unsafe { libc::kill(self.id, libc::SIGTERM); }
+            self.signal_original_supervisor(libc::SIGTERM);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             while !complete() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -355,13 +407,9 @@ impl Drop for ProcessGroup {
         }
         let mut processes_settled = complete();
         if !processes_settled {
-            unsafe { libc::kill(self.id,libc::SIGKILL); }
+            self.signal_original_supervisor(libc::SIGKILL);
             if self.resource_required {
-                let killed=std::process::Command::new("/usr/bin/python3").arg("-I")
-                    .arg(self.receipt.with_file_name("run-resource-scope.py")).arg("--cleanup")
-                    .arg(self.receipt.with_file_name("resource-accounting.json"))
-                    .env_clear().stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status()
-                    .is_ok_and(|status|status.success());
+                let killed=self.cleanup_original_resource_scope().is_ok();
                 if killed {
                     // This is kernel-proven quiescence, not a claim that a dead
                     // supervisor personally reaped every process.
@@ -897,8 +945,13 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
     };
     let id = child.id().expect("newly spawned child has a pid") as libc::pid_t;
     clean.store(false, Ordering::SeqCst);
-    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), declared_resource_policy:resource_policy,
-        #[cfg(target_os="linux")] kernel_limits:std::sync::Mutex::new(None), resource_observed:AtomicBool::new(false),admission_attempted:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory: owned_directory }))
+    let mut group=ProcessGroup { id, receipt, clean, active_request, vm_preflight,
+        #[cfg(target_os="linux")] original_supervisor:None, resource_required:resource_policy.is_some(), declared_resource_policy:resource_policy,
+        #[cfg(target_os="linux")] kernel_limits:std::sync::Mutex::new(None), resource_observed:AtomicBool::new(false),resource_result:std::sync::OnceLock::new(),admission_attempted:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory: owned_directory };
+    #[cfg(target_os="linux")] {
+        group.original_supervisor=Some(resource_supervisor::OriginalSupervisor::capture(&child).map_err(std::io::Error::other)?);
+    }
+    Ok((child,group))
 }
 
 #[cfg(test)]
@@ -949,9 +1002,10 @@ mod tests {
         let directory=tempfile::tempdir_in(root.path()).unwrap();let receipt=directory.path().join("cleanup-complete");
         std::fs::write(directory.path().join("launch-ready"),"ready\n").unwrap();
         std::fs::set_permissions(directory.path().join("launch-ready"),std::fs::Permissions::from_mode(0o600)).unwrap();
-        let group=ProcessGroup {id:child.id() as libc::pid_t,receipt:receipt.clone(),clean:Arc::new(AtomicBool::new(false)),
+        let group=ProcessGroup {id:child.id() as libc::pid_t,
+            #[cfg(target_os="linux")] original_supervisor:None,receipt:receipt.clone(),clean:Arc::new(AtomicBool::new(false)),
             active_request:None,resource_required:false,vm_preflight:true,declared_resource_policy:None,
-            #[cfg(target_os="linux")] kernel_limits:std::sync::Mutex::new(None),resource_observed:AtomicBool::new(false),admission_attempted:AtomicBool::new(false),
+            #[cfg(target_os="linux")] kernel_limits:std::sync::Mutex::new(None),resource_observed:AtomicBool::new(false),resource_result:std::sync::OnceLock::new(),admission_attempted:AtomicBool::new(false),
             resource_audit:std::sync::Mutex::new(None),native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
         let outcome=group.admit_model("codex",Some(&logger)).await;
         let _=child.kill();child.wait().unwrap();std::fs::write(&receipt,"all-descendants-reaped\n").unwrap();
@@ -978,9 +1032,10 @@ mod tests {
                 output.write_all(&b"all-descendants-reaped\n"[prefix_length..]).unwrap();output.sync_all().unwrap();
             });
             let clean=Arc::new(AtomicBool::new(false));
-            let group=ProcessGroup{id,receipt,clean:clean.clone(),active_request:None,declared_resource_policy:None,
+            let group=ProcessGroup{id,receipt,
+            #[cfg(target_os="linux")] original_supervisor:None,clean:clean.clone(),active_request:None,declared_resource_policy:None,
                 #[cfg(target_os="linux")] kernel_limits:std::sync::Mutex::new(None),
-                resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),admission_attempted:AtomicBool::new(false),
+                resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),resource_result:std::sync::OnceLock::new(),admission_attempted:AtomicBool::new(false),
                 resource_audit:std::sync::Mutex::new(None),native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
             drop(group);writer.join().unwrap();
             assert!(clean.load(Ordering::SeqCst),"receipt existence was mistaken for completed publication");
@@ -1007,10 +1062,11 @@ mod tests {
         write(&serde_json::json!({"phase":"admitted","exhausted":false,"identity":identity}));
         std::fs::write(directory.path().join("launch-ready"),b"ready\n").unwrap();
         std::fs::set_permissions(directory.path().join("launch-ready"),std::fs::Permissions::from_mode(0o600)).unwrap();
-        let group=ProcessGroup {id:i32::MAX,receipt,clean:Arc::new(AtomicBool::new(false)),
+        let group=ProcessGroup {id:i32::MAX,
+            #[cfg(target_os="linux")] original_supervisor:None,receipt,clean:Arc::new(AtomicBool::new(false)),
             active_request:None,resource_required:true,vm_preflight:false,declared_resource_policy:None,
             #[cfg(target_os="linux")] kernel_limits:std::sync::Mutex::new(None),
-            resource_observed:AtomicBool::new(false),admission_attempted:AtomicBool::new(false),resource_audit:std::sync::Mutex::new(None),
+            resource_observed:AtomicBool::new(false),resource_result:std::sync::OnceLock::new(),admission_attempted:AtomicBool::new(false),resource_audit:std::sync::Mutex::new(None),
             native_initial:false,native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
         assert!(group.verified_quiescence().is_err(),"a file without admission is not authority");
         group.admit_command("verification",None).await.unwrap();
@@ -1089,6 +1145,7 @@ mod tests {
         child.stdin.take().unwrap().write_all(b"finish\n").await.unwrap();
         assert!(tokio::time::timeout(std::time::Duration::from_secs(10),child.wait()).await.unwrap().unwrap().success());
         group.resource_outcome("verification",None).unwrap();
+        group.resource_outcome("verification",None).expect("same successful original outcome must remain idempotent");
         assert!(kernel_limits.unwrap().validate().is_err(),"removed scope retained live authority");
         let proof=group.verified_quiescence().unwrap();
         assert_eq!(proof["identity"],admitted);
@@ -1096,7 +1153,8 @@ mod tests {
         drop(group);
         assert!(directory.join("resource-accounting.json").exists(),"caller-owned recovery receipts were deleted");
         kernel_limit_changes_block_actual_supervisor_release().await;
-        for case in ["ready","cancel","startup"] {
+        substituted_live_scope_cannot_release_another_supervisor().await;
+        for case in ["ready","cancel","startup","setup-failure"] {
         let output=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","native_vm::tests::closed_native_bootstrap_prepares_without_productive_admission","--nocapture"])
             .env("JARVIS_TEST_NATIVE_LAUNCH_INTENT_CHILD","1")
@@ -1105,6 +1163,72 @@ mod tests {
             .output().unwrap();
         assert!(output.status.success(),"closed bootstrap inspection {case}: {} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
 
+        }
+    }
+
+    /// A genuine sibling cgroup cannot stand in for the original supervisor's scope.
+    #[cfg(target_os="linux")]
+    async fn substituted_live_scope_cannot_release_another_supervisor() {
+        for mode in ["admission","cleanup","outcome"] {
+        let root=tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        let policy=serde_json::json!({"memory_bytes":67108864,"pids":32,"cpu_percent":20});
+        let mut groups=Vec::new();
+        for index in 0..2 {
+            let directory=root.path().join(index.to_string());std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let lease=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600)
+                .open(directory.join("storage-lease")).unwrap();
+            assert_eq!(unsafe{libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+            let mut command=Command::new("/usr/bin/true");command.env_clear().env("PATH","/usr/bin:/bin");
+            let (child,group)=spawn_admitted_storage_at(&command,Arc::new(AtomicBool::new(true)),true,&[lease],&policy,&directory).unwrap();
+            group.await_resource_readiness("verification",None,None).await.unwrap();
+            groups.push((child,group));
+        }
+        let (mut first,first_group)=groups.remove(0);let (mut second,second_group)=groups.remove(0);
+        let mut original:serde_json::Value=serde_json::from_slice(&private_read(&first_group.receipt.with_file_name("resource-accounting.json")).unwrap()).unwrap();
+        let foreign:serde_json::Value=serde_json::from_slice(&private_read(&second_group.receipt.with_file_name("resource-accounting.json")).unwrap()).unwrap();
+        let actual_path=PathBuf::from(original["identity"]["path"].as_str().unwrap());
+        if mode=="cleanup" {first_group.capture_resource_admission("verification",None).unwrap();}
+        else if mode=="outcome" {
+            first_group.admit_command("verification",None).await.unwrap();
+            assert!(first.wait().await.unwrap().success());
+            original["phase"]="completed".into();original["exhausted"]=false.into();
+        } else {std::fs::write(actual_path.join("memory.max"),b"134217728").unwrap();}
+        original["identity"]=foreign["identity"].clone();
+        std::fs::write(first_group.receipt.with_file_name("resource-accounting.json"),serde_json::to_vec(&original).unwrap()).unwrap();
+        if mode=="admission" {
+            let result=first_group.admit_command("verification",None).await;
+            assert!(result.is_err(),"valid sibling limits authorized a different, weakened actual scope");
+            assert!(!first_group.receipt.with_file_name("launch-continue").exists());
+            drop(first_group);let _=first.wait().await;
+        } else if mode=="outcome" {
+            for name in ["logs","anchors"] {std::fs::create_dir(root.path().join(name)).unwrap();}
+            let logger=Arc::new(crate::tool_audit::AuditLogger::protected(root.path().join("logs/audit.jsonl"),
+                root.path().join("anchors/audit.json"),&[]).unwrap());
+            assert!(first_group.resource_outcome("verification",Some(&logger)).is_err(),
+                "completion accepted a substituted live sibling's resource identity");
+            assert!(first_group.resource_outcome("verification",Some(&logger)).is_err(),
+                "repeated resource observation cleared prior refusal");
+            original["identity"]=first_group.resource_admission.lock().unwrap().clone().unwrap();
+            std::fs::write(first_group.receipt.with_file_name("resource-accounting.json"),serde_json::to_vec(&original).unwrap()).unwrap();
+            assert!(first_group.resource_outcome("verification",Some(&logger)).is_err(),
+                "rewritten bytes reactivated a failed original outcome");
+            let rows:Vec<serde_json::Value>=std::fs::read_to_string(logger.path()).unwrap().lines()
+                .map(|line|serde_json::from_str(line).unwrap()).collect();
+            assert_eq!(rows.len(),1,"repeated refused observation published duplicate audit events");
+            let observation=&rows.last().unwrap()["observation"];
+            assert_eq!(observation["phase"],"resource_identity_mismatch");
+            assert!(observation.get("identity").is_none(),"foreign identity polluted protected outcome history");
+            drop(first_group);
+        } else {
+            first.start_kill().unwrap();let _=first.wait().await;
+            let clean=first_group.clean.clone();drop(first_group);
+            assert!(clean.load(Ordering::SeqCst),"verified original scope was not settled");
+            assert!(!actual_path.exists(),"cleanup followed substituted accounting instead of the original scope");
+        }
+        assert!(std::path::Path::new(foreign["identity"]["path"].as_str().unwrap()).exists(),"failed cleanup touched the sibling scope");
+        drop(second_group);let _=second.wait().await;
         }
     }
 

@@ -306,12 +306,28 @@ pub fn install_helper(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Read an unbound diagnostic receipt. Owned command completion uses the
+/// original-scope variant through `CommandGuard`, not this diagnostic helper.
 pub fn record_outcome(
     path: &Path,
     required: bool,
     provider: &str,
     logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
 ) -> Result<()> {
+    record_outcome_checked(path,required,provider,logger,OutcomeBinding::Unbound)
+}
+
+/// Compare the observation to this actual command's retained admission before
+/// accepting or publishing resource completion. Missing admission never passes.
+pub(crate) fn record_original_outcome(path:&Path,required:bool,provider:&str,
+    logger:Option<&Arc<crate::tool_audit::AuditLogger>>,original:Option<&serde_json::Value>)->Result<()> {
+    record_outcome_checked(path,required,provider,logger,OutcomeBinding::Original(original))
+}
+enum OutcomeBinding<'a> {Unbound,Original(Option<&'a serde_json::Value>)}
+
+/// Parse once and publish only an observation qualified by its caller's role.
+fn record_outcome_checked(path:&Path,required:bool,provider:&str,
+    logger:Option<&Arc<crate::tool_audit::AuditLogger>>,binding:OutcomeBinding<'_>)->Result<()> {
     use std::{
         io::Read,
         os::unix::fs::{MetadataExt, OpenOptionsExt},
@@ -339,6 +355,14 @@ pub fn record_outcome(
     })();
     let observation = result
         .unwrap_or_else(|_| serde_json::json!({"phase":"receipt_unavailable","exhausted":true}));
+    let observation=match binding {
+        OutcomeBinding::Unbound=>observation,
+        OutcomeBinding::Original(Some(original)) if observation.get("identity")==Some(original)=>observation,
+        OutcomeBinding::Original(Some(_))=>serde_json::json!({"phase":if observation.get("identity").is_some() {
+            "resource_identity_mismatch"}else{"resource_identity_unavailable"},"exhausted":true}),
+        OutcomeBinding::Original(None) if observation.get("identity").is_none() && observation["phase"]!="completed"=>observation,
+        OutcomeBinding::Original(None)=>serde_json::json!({"phase":"resource_admission_unverified","exhausted":true}),
+    };
     let exhausted = observation.get("exhausted").and_then(|v| v.as_bool()) != Some(false)
         || observation.get("phase").and_then(|v| v.as_str()) != Some("completed");
     if let Some(logger) = logger.filter(|l| l.is_protected()) {

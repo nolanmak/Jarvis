@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "base_head": "e648d0dcaa1230a8acf428854d0eb71d6a6e5d76",
+  "change": "Bind declared resource scope, completion and fallback cleanup to the actual original supervisor and preserve refused outcome truth.",
+  "sources": {
+    "crates/augmentagent-channel-core/src/process_tree.rs": "61499c91740a945f78dd2121cd6a192b77f96ecd1d7a97f96a1b82b9489ff2aa",
+    "crates/augmentagent-channel-core/src/resource_supervisor.rs": "50d644ef97d2ad04a507d1978bd8351a08300640b5a22463281c4d2bb151fe24",
+    "crates/augmentagent-channel-core/src/run_resources.rs": "ab7ac1f8022516142e2606dbb7e0e581951cbe078e47dd3a9b743838f9f81cad",
+    "crates/augmentagent-channel-core/src/native_vm.rs": "292086989342a7210d613eacf1551de95e726c6407f46d8abf6047a9b6994865"
+  },
+  "evidence": {
+    "scope_red": {
+      "log": "/tmp/autoship-1703-original-scope-red2-20261108.log",
+      "sha256": "1867a6f98eed4f889b799ff9a013b068a3e176f62a2afd878d29d3f8ff7347b4"
+    },
+    "exit_red": {
+      "log": "/tmp/autoship-1703-original-supervisor-exit-red-20261108.log",
+      "sha256": "7acccbc8d8f762040f0790860fef902bbcc7e60553a1f50dd84d63edfdb18cdd"
+    },
+    "outcome_red": {
+      "log": "/tmp/autoship-1703-original-outcome-red2-20261108.log",
+      "sha256": "64d71874178a8c2c6741582a17c54f098673602d516ca7964848e7f7eb7258d5"
+    },
+    "repeat_red": {
+      "log": "/tmp/autoship-1703-original-outcome-repeat-red-20261108.log",
+      "sha256": "35feab42dff8e1a765a46a5ab55406cc49983d642ada956999c7083e3d739055"
+    },
+    "setup_red": {
+      "log": "/tmp/autoship-1703-known-setup-red-20261108.log",
+      "sha256": "cd173d8cdecedac32a48a5874ba0267e260faee3e3475cf59d22d62ead55406b"
+    },
+    "process_tree": {
+      "log": "/tmp/autoship-1703-original-owner-final-20261108.log",
+      "sha256": "1aaf00b8b4e7b741ce1a405cdd8be1583f40823412899352ae67ab616a841402"
+    },
+    "resources": {
+      "log": "/tmp/autoship-1703-original-owner-resources-20261108.log",
+      "sha256": "97d9008bf0467acb93edfcb4d675e46b5248584c4604526265c7719d9e3f0392"
+    },
+    "native_launch": {
+      "log": "/tmp/autoship-1703-original-owner-native-final-20261108.log",
+      "sha256": "7e5e7037090a1b30cb9bbe5519a8f83bbfdfdc151790024e31e9d3b06e7b689e"
+    },
+    "production": {
+      "log": "/tmp/autoship-1703-original-owner-production-20261108.log",
+      "sha256": "32b49d306c31ef01ca2882534eac4f9332c9983e8299f1a3e1e0ede3dab622d2"
+    }
+  },
+  "validation": {
+    "process_tree_passed": 62,
+    "resource_passed": 9,
+    "native_launch_passed": 1,
+    "failed": 0,
+    "ignored": 0,
+    "real_kernel_cases_enabled": true,
+    "closed_inspection_cases_per_provider": [
+      "ready",
+      "cancel",
+      "startup",
+      "setup-failure"
+    ],
+    "provider_pins": [
+      "codex",
+      "claude"
+    ],
+    "production_compile_passed": true,
+    "actual_model_calls": 0,
+    "actual_vm_launches": 0
+  },
+  "red_observations": [
+    "A genuine sibling cgroup authorized a different actual scope whose memory limit was weakened.",
+    "An exited unreaped child made safe original-process capture fail.",
+    "A completed observation naming a still-live sibling was accepted.",
+    "Calling resource_outcome again converted a prior refusal into success.",
+    "The new original-scope guard initially masked a known startup error as resource capacity; the final version preserves the local setup failure."
+  ],
+  "invariants": [
+    "Capture Linux pidfd, original start time and parent from the actual retained child handle; saved PID/receipt cannot construct it.",
+    "Before and after resource checks, require the original live task and exactly one writable kernel attachment descriptor matching the observed scope. This is current ownership, not full writer exclusion.",
+    "Signal the original Linux task by pidfd; retain an exited child handle for teardown without treating it as live admission.",
+    "Fallback cleanup uses the retained admission identity in a fresh controller-private file, not mutable supervisor accounting. Missing original ownership remains unverified.",
+    "The hard-kill regression retains the sibling while removing the previously observed original scope.",
+    "Completion parses once and matches the retained original admission before reporting success or publishing an outcome. Rejected identity is omitted from protected observation history.",
+    "An immutable per-attempt terminal result preserves successful idempotence and keeps pending/refused outcomes refused after repeated calls or rewritten receipt bytes.",
+    "Known native setup errors stay Local, publish no positive resource outcome, and do not mark capacity health as exhausted."
+  ],
+  "limits": [
+    "This does not prove complete source/input/storage custody, absence of all writable aliases/FD replacement or exclusion against arbitrary concurrent external writers. It grants no retained-session reservation credit.",
+    "Linux production uses retained process handles; legacy private transport fixtures and non-Linux signaling retain their existing fallback.",
+    "The declared-resource real-kernel tests and packaged supervisor are actual. Closed-inspection startup uses a private controlled command fixture, not an actual VM/provider or complete sealed-executable proof.",
+    "Source branch #1811 at dd3f7602 has newer sealed-descriptor VM conformance, but its production native handoff/input closure/full-CI/shipping authority remain false; no C producer was imported here.",
+    "Normal owner ingress, complete C/R qualification, consuming productive transition, six saved publication-gate exits, retained-session recovery, independent review, rollout and all live/shipment/fault/soak acceptance remain required.",
+    "No production policy, service, session, allowance, owner hold or deployment changed."
+  ],
+  "deployed": false,
+  "goal_complete": false
+}

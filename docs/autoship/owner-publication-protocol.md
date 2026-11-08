@@ -2418,3 +2418,44 @@ retain the inspected attempt without resetting its one-shot claim or promoting t
 preflight logger. Partial outcomes, repeated cycles and the six saved shared-gate
 fixture exits remain open, as do retained-session capacity recovery, independent
 review, normal rollout and all original live/shipment/fault/soak acceptance.
+
+
+## 77. Original supervisor/scope ownership and truthful terminal outcomes
+
+A real two-supervisor regression accepted a sibling's genuine kernel scope while
+the original scope's memory ceiling was weakened. Declared-resource admission now
+also requires the original Linux child handle, retained pidfd/start/parent identity
+and its sole writable kernel cgroup attachment descriptor. Current task and scope
+ownership are refreshed around resource validation. An exited, unreaped original
+child can still supply safe teardown targeting; it never qualifies live admission.
+Linux signaling uses that original pidfd rather than a recyclable numeric PID.
+
+Fallback cleanup now uses the identity retained after actual admission/ownership
+checks, placed in a fresh controller-private receipt. It cannot follow a later
+replacement in the supervisor's accounting file. A hard-killed-original regression
+verifies that fallback removes the original scope and leaves the sibling intact.
+Missing original ownership remains unverified rather than granting cleanup.
+
+Completion also checks the retained original identity before success or protected
+outcome publication. Its rejected observation does not copy the foreign identity
+into protected history. A second behavioral RED exposed the old repeated-call
+shortcut: after refusal, another call returned success. An immutable per-attempt
+terminal result now preserves successful idempotence while keeping pending/failed
+outcomes refused, including after receipt bytes are rewritten. Known native setup
+failure remains a Local setup error and cannot be relabeled as capacity exhaustion
+by the later resource reader or teardown.
+
+All 62 process-tree tests, nine resource tests and the native one-supervisor-attempt
+test pass with the delegated kernel cases enabled; the production CLI builds.
+The expanded existing kernel fixture includes eight closed-inspection cases across
+both provider pins, with no real VM/provider call. Source hashes, distinct REDs,
+cleanup observations and limitations are in
+`1703-original-supervisor-resource-proof.json`.
+
+These checks establish current original task/scope correlation, not complete
+writer/alias/source/input/storage custody or retained-session growth closure. No
+native reservation is reduced. Normal owner-ingress consumption, complete C/R and
+the consuming productive transition, six saved publication-gate exits, capacity
+recovery, independent review, rollout and original live/shipment/fault/soak exits
+remain open. The newer sealed-descriptor observations on #1811 still do not supply
+its missing production native handoff or full-input/CI/shipping authority.

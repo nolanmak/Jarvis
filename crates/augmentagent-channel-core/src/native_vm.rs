@@ -1543,6 +1543,8 @@ probe=pathlib.Path(sys.argv[4]);temporary=probe.with_suffix('.pending')
 temporary.write_text(ready.with_name('resource-accounting.json').read_text());temporary.chmod(0o600);temporary.replace(probe)
 if sys.argv[3]=='cancel':
     while True: time.sleep(.005)
+if sys.argv[3]=='setup-failure':
+    failure=ready.with_name('vm-startup-failure.json');failure.write_text(json.dumps({'phase':'native_setup_failed','native_vm_failure':'ValueError'}));failure.chmod(0o600);sys.exit(125)
 startup.write_text(json.dumps({'version':1,'phase':'inputs_staged','launch_sha256':('f'*64 if sys.argv[3]=='startup' else sys.argv[1])}))
 startup.chmod(0o600)
 ready.write_text('ready\n');ready.chmod(0o600)
@@ -1565,6 +1567,13 @@ pathlib.Path(sys.argv[2]).touch()
                                 // End of scope drops the actual pending future,
                                 // including its supervisor and original controller.
                             });
+                            let value:serde_json::Value=serde_json::from_slice(&std::fs::read(&probe).unwrap()).unwrap();
+                            value["identity"].clone()
+                        } else if case=="setup-failure" {
+                            let error=runtime.block_on(bootstrap.inspect_resources()).err().expect("known setup failure reached readiness");
+                            assert!(matches!(crate::reasoner::ReasonerError::find_in(&error),Some(crate::reasoner::ReasonerError::Local {..})),
+                                "setup failure was relabeled as resource capacity: {error:#}");
+                            assert!(!logger.resource_capacity_seen(),"known setup failure polluted capacity health");
                             let value:serde_json::Value=serde_json::from_slice(&std::fs::read(&probe).unwrap()).unwrap();
                             value["identity"].clone()
                         } else if case=="startup" {
