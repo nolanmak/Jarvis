@@ -75,6 +75,32 @@
     "All original CLI/Discord acceptance, five confirmed auto merges per acceptance UTC day, 72h fault and 24h unattended soak"
   ],
   "all_original_local_handles_terminal": true,
-  "production_changed": false,
-  "goal_complete": false
+  "goal_complete": false,
+  "combined_branch": {
+    "native_change_commit": "74282254",
+    "ci_repair_head": "8b18b5fad64d87f5b1832ffd65f60ba33bce144d",
+    "merge_commit": "180ebdb3c7879f8afe8f2719a4e7be7a7dc9fd11",
+    "native_sources_unchanged_since_focused_tests": true,
+    "handle": 49043,
+    "exit_code": 0,
+    "tests": {
+      "ci_python": {
+        "passed": 63,
+        "log": "/tmp/autoship-completion-discovery-combined-ci-tests-20261108.log"
+      },
+      "hosted_policy_rust": {
+        "passed": 5,
+        "seconds": 0.27,
+        "log": "/tmp/autoship-completion-discovery-combined-hosted-tests-20261108.log"
+      }
+    },
+    "non_test_compile": {
+      "seconds": 15.19,
+      "log": "/tmp/autoship-completion-discovery-combined-production-20261108.log"
+    },
+    "complete_current_head_hosted_ci": "unproven",
+    "independent_exact_head_review": "unproven"
+  },
+  "deployed": false,
+  "live_production_runtime_changed": false
 }
