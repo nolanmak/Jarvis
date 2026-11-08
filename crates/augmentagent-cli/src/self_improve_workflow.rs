@@ -5962,6 +5962,8 @@ else: raise SystemExit('unexpected authority call')
                         // the original preparation's immutable identity.
                         let preparation_events=store.events(&id).unwrap();
                         assert!(store.has_owner_acceptance_for_turn(&turn).unwrap(),"successor setup hid the original accepted preparation");
+                        durable::owner_dispatch::test_require_recorded_turn(&db,&turn).expect("successor setup hid the original dispatch turn identity");
+                        assert!(store.begin_prepared_owner_body_dispatch(&turn,setup_plan.command().provider.unwrap(),&original_preparation,millis()).is_err(),"historical dispatch identity revived original body admission");
                         assert!(store.validate_owner_preparation_for_turn(&turn,&original_preparation,millis()).is_err(),"historical preparation revived the fenced original turn");
                         for fault in ["owner","generation","pause","binding","body","request"] {
                             let mut changed=turn.clone();
@@ -5975,6 +5977,7 @@ else: raise SystemExit('unexpected authority call')
                                 _=>unreachable!(),
                             }
                             assert!(!store.has_owner_acceptance_for_turn(&changed).unwrap_or(false),"{fault}: substituted historical turn acquired preparation");
+                            if fault!="body" {assert!(durable::owner_dispatch::test_require_recorded_turn(&db,&changed).is_err(),"{fault}: substituted historical dispatch turn accepted");}
                         }
                         assert_eq!(store.events(&id).unwrap(),preparation_events,"historical preparation observation appended workflow history");
                         assert!(WorkflowStore::open(&state).unwrap().claim_recovered_owner_turn_for_setup(&setup_auth,"duplicate-successor",millis(),60_000).unwrap().is_none());
@@ -5986,6 +5989,7 @@ else: raise SystemExit('unexpected authority call')
                         let copied=Lease {workflow:id.clone(),owner:"fresh-owner-successor".into(),generation:setup.generation()};
                         let source_body:String=db.query_row("SELECT body FROM workflow_owner_message WHERE request_id=?1",[&original_request],|r|r.get(0)).unwrap();
                         let copied_turn=durable::owner_turn::OwnerTurn {lease:copied.clone(),request_id:original_request.clone(),body:source_body,pause_revision:store.owner_control(&id).unwrap().unwrap().revision,binding:saved_cp.binding.clone()};
+                        durable::owner_dispatch::test_require_recorded_turn(&db,&copied_turn).expect("current setup identity must remain readable without granting execution");
                         let error=store.validate_owner_turn(&copied_turn,millis()).unwrap_err();assert!(format!("{error:#}").contains("owner-successor-setup-only"),"{error:#}");
                         assert!(store.owner_turn_for_lease(&copied,millis()).is_err());
                         assert!(store.begin_owner_body_dispatch(&copied_turn,setup_plan.command().provider.unwrap(),millis()).is_err());
@@ -6277,6 +6281,8 @@ else: raise SystemExit('unexpected authority call')
                             }
                             assert!(store.validate_owner_successor_setup(&setup,&setup_auth,millis()).is_err(),"{fault}: changed successor retained setup claim");
                             assert_eq!(store.has_owner_acceptance_for_turn(&turn).unwrap_or(false),matches!(fault,"lease-owner"|"expiry"),"{fault}: preparation history ignored damaged ancestry or depended on current execution authority");
+                            assert_eq!(durable::owner_dispatch::test_require_recorded_turn(&db,&turn).is_ok(),matches!(fault,"lease-owner"|"expiry"),"{fault}: dispatch identity ignored damaged ancestry or depended on the live lease");
+                            if !matches!(fault,"lease-owner"|"expiry"|"projection") {assert!(durable::owner_dispatch::test_require_recorded_turn(&db,&copied_turn).is_err(),"{fault}: current-row match concealed damaged successor ancestry");}
                             db.execute("UPDATE workflow_owner_successor_claim SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,saved_claim.2,saved_claim.1]).unwrap();
                             db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![saved_claim.0,claim_event]).unwrap();
                             db.execute("UPDATE workflow_owner_turn SET owner='fresh-owner-successor' WHERE request_id=?1",[&original_request]).unwrap();

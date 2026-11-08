@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "component": "historical dispatch turn identity across actual successor setup",
+  "base_commit": "ac2472f10ebe57f68d580fa19f207a97164b448c",
+  "status": "historical-reader-prerequisite-no-executable-recovery-grant",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_dispatch.rs": "476053ebb86ef68e9d955b5bfd37df13776b11d8c608f52ad9b3a0deaab9ecf6",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "b72d0ba79b717dd46fd633dadaa657db16a0361d2c2c93bc8d8379a933aed64f"
+  },
+  "red": {
+    "handle": 83883,
+    "log": "/tmp/autoship-dispatch-historical-turn-red-20261108.log",
+    "result": "The actual successor fixture failed: successor setup hid the original dispatch turn identity: owner dispatch turn changed.",
+    "passed": 0,
+    "failed": 1,
+    "seconds": 19.7
+  },
+  "validation": [
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent self_improve::workflow::tests::expired_owner_publication_has_authenticated_metadata_recovery -- --exact --nocapture",
+      "log": "/tmp/autoship-dispatch-historical-turn-green-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "controlled_cases": 12,
+      "seconds": 137.13
+    },
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent autoship_workflow:: -- --nocapture",
+      "log": "/tmp/autoship-dispatch-historical-turn-workflow-20261108.log",
+      "passed": 330,
+      "failed": 0,
+      "seconds": 155.29
+    },
+    {
+      "command": "scripts/cargo-managed.sh build -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-dispatch-historical-turn-production-20261108.log",
+      "passed": true,
+      "seconds": 27.57
+    }
+  ],
+  "assertions": [
+    "The exact turn-identity reader used by dispatch decode accepts the original publication turn through the real consumed successor edge and retains the current setup identity as readable data.",
+    "Substituted owner, generation, pause revision, binding and request refuse.",
+    "Damaged successor record/event, coherently changed original owner/readiness and changed turn projection refuse; current-row matches do not bypass damaged ancestry.",
+    "Lease expiry or a changed workflow lease owner does not erase immutable identity, while current executable validation still refuses.",
+    "Old-turn body admission, copied setup execution, model charge and PR mutation remain forbidden; history reads append no events."
+  ],
+  "limits": [
+    "The real successor fixture has no pre-existing body reservation. Positive identity coverage does not establish complete reserved-body recovery.",
+    "Repeated-cycle readers, predecessor dispositions, productive release/model/result constructors and complete native source/resource/input closure remain unfinished.",
+    "No live model, VM, Discord, autonomous merge, rollout or soak acceptance was performed.",
+    "No production policy, budget, hold, session reservation or service was changed."
+  ],
+  "all_original_local_handles_terminal": true,
+  "green_and_production_handle": 3153,
+  "productive_recovery_granted": false,
+  "production_capacity_changed": false
+}

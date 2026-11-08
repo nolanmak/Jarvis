@@ -1368,7 +1368,10 @@ unfinished; this reference fix does not enable them.
 model admission; it does not implement this draft's `record_input_release_attempt`
 protocol. An already-prepared invocation from that implementation is not fenced
 by acquiring the new state lock or appending a new revocation row. Absence of a
-new input marker cannot establish that such an invocation never wrote input.
+new input marker cannot establish that such an invocation never wrote input. This
+draft's native bindings also pin the complete policy hash. A proposed version
+cutover must account for that pin; changing the selected policy does not migrate
+or authorize silent repinning of existing binding records.
 The §28/§29 guarantees apply to the participating writer protocol and cannot be
 retroactively assigned to a legacy session.
 
@@ -1392,3 +1395,41 @@ Owner: the C/R native producers, with D/R consuming only their verified capabili
 Trigger: before enabling the second productive cycle in §53. Carrying cost:
 legacy sessions remain fully reserved and outcome-uncertain; production capacity
 and full CLI/Discord/merge/fault/soak acceptance remain independent requirements.
+
+
+## 58. Dispatch turn identity follows the consumed successor edge
+
+**D58.1 — Historical identity and executable admission are separate.** Dispatch
+record decoding now accepts its exact recorded owner/generation/pause/binding
+from either the current turn projection or the original turn carried by the
+validated consumed successor edge. The latter reader joins the actual original
+publication, owner claim, preparation, recovery and ready/setup records. Merely
+changing the workflow generation does not establish that history. The successor
+edge is validated before either identity is accepted: a matching current row
+cannot conceal a damaged edge. Body bytes/digest, dispatch event, preparation,
+model/input/result history and pending/applied disposition retain their separate
+checks.
+
+This changes descriptive decoding only. `validate_dispatch_tx` still requires
+the current owner turn/lease before reading the captured reservation, and the
+ordinary reservation constructor still validates that current turn first. No
+saved record, matching original identity or copied setup lease constructs an
+executable dispatch. The current identity remains readable for a reservation
+created under a later owner; this does not itself authorize creating one.
+
+The actual authenticated-successor fixture reproduced the old identity check
+rejecting the original turn after takeover. Its positive path now reads both
+original and current setup identities. Five owner/generation/pause/binding/request
+substitutions refuse. Damaged or coherently substituted successor record/event/
+ready/original-owner data and a changed turn projection refuse; lease expiry or
+a different current workflow lease owner does not erase otherwise valid history.
+The fixture separately requires old-turn body admission, copied setup execution,
+model charging and PR operations to remain forbidden. The full 12-case provider
+matrix, all 330 workflow tests and production build passed. See
+[the dispatch identity evidence](1703-dispatch-historical-turn-proof.json).
+
+The positive fixture exercises the exact identity reader used by dispatch decode
+and an actual consumed setup; it has no pre-existing body reservation. It does
+not prove complete reserved-body recovery, productive input release, model/result
+completion, repeated-cycle ancestry or legacy writer cutover. Those producers and
+all original live CLI/Discord/merge/fault/soak acceptance remain required by §53.

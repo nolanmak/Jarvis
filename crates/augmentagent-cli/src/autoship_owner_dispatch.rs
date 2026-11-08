@@ -211,16 +211,10 @@ fn decode(
             request_id:record.request_id.clone(),body:input.body.clone(),pause_revision:record.pause_revision,binding:record.binding.clone(),
         },preparation)?;
     }
-    let turn:(String,i64,i64,String)=conn.query_row("SELECT owner,lease_generation,pause_revision,binding FROM workflow_owner_turn WHERE workflow=?1 AND request_id=?2",params![workflow,request],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-    ensure!(
-        turn == (
-            record.owner.clone(),
-            record.generation,
-            record.pause_revision,
-            serde_json::to_string(&record.binding)?
-        ),
-        "owner dispatch turn changed"
-    );
+    require_recorded_turn(conn,&owner_turn::OwnerTurn {
+        lease:Lease {workflow:record.workflow.clone(),owner:record.owner.clone(),generation:record.generation},
+        request_id:record.request_id.clone(),body:input.body.clone(),pause_revision:record.pause_revision,binding:record.binding.clone(),
+    })?;
     let state: String = conn.query_row(
         "SELECT state FROM workflow_owner_turn WHERE request_id=?1",
         [request],
@@ -239,6 +233,31 @@ fn decode(
         super::owner_inbox::require_pending(conn, workflow, request)?;
     }
     Ok(record)
+}
+// Historical identity only. The live dispatch validator separately requires
+// the current owner turn and lease before any productive operation.
+fn require_recorded_turn(conn:&Connection,expected:&owner_turn::OwnerTurn)->Result<()> {
+    // Validate the consumed edge even when the current projection matches.
+    // A damaged successor must not disappear behind the current-row fallback.
+    let historical=super::owner_publication_recovery::historical_successor_turn(conn,&expected.lease.workflow,&expected.request_id)?;
+    let historical_matches=historical.is_some_and(|(owner,generation,pause,binding,_)|
+        owner==expected.lease.owner && generation==expected.lease.generation
+            && pause==expected.pause_revision && binding==expected.binding);
+    let turn:(String,i64,i64,String)=conn.query_row("SELECT owner,lease_generation,pause_revision,binding FROM workflow_owner_turn WHERE workflow=?1 AND request_id=?2",params![expected.lease.workflow,expected.request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+    ensure!(
+        turn == (
+            expected.lease.owner.clone(),
+            expected.lease.generation,
+            expected.pause_revision,
+            serde_json::to_string(&expected.binding)?
+        ) || historical_matches,
+        "owner dispatch turn changed"
+    );
+    Ok(())
+}
+#[cfg(test)]
+pub(crate) fn test_require_recorded_turn(conn:&Connection,turn:&owner_turn::OwnerTurn)->Result<()> {
+    require_recorded_turn(conn,turn)
 }
 /// Descriptive event binding; only the captured live reservation can supply it.
 /// Neither this value nor its saved event reconstructs dispatch authority.
