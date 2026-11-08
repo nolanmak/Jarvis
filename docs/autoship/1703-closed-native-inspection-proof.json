@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "base_head": "e7adc2506238b0983ca2e47404d8c7754c135e04",
+  "change": "Consume original closed native preparation into a restricted unreleased supervisor inspection.",
+  "sources": {
+    "crates/augmentagent-channel-core/src/native_bootstrap_inspection.rs": "a05b381b5aa11ae223d525651dd1fa9a967d31b1a0b90acca750257134e253a8",
+    "crates/augmentagent-channel-core/src/native_vm.rs": "74a6476039c941275763a0ec3e438d8ed006eb1b28d6ebaa908b4e61c30f58ea",
+    "crates/augmentagent-channel-core/src/process_tree.rs": "7a95d1abe11008566d819931d71c447dd0602b83f2d4117109a3cb1274e9c890",
+    "crates/augmentagent-channel-core/src/tool_audit.rs": "8d5d90a93be3edb8c4b3fa2272daf3a0ef7d966f6a1950d7cc94350f9fcc65da"
+  },
+  "evidence": {
+    "red_missing_api": {
+      "log": "/tmp/autoship-1703-closed-inspection-red-20261108.log",
+      "sha256": "dcd238340e00b459511127b14c86be327c1e1248ea984bad5601ba36ed99d25e"
+    },
+    "red_productive_cycle": {
+      "log": "/tmp/autoship-1703-closed-inspection-suite-20261108.log",
+      "sha256": "a9188d51fe893868bffdb4577744192ebcae5e1ab0f6f68c823175d5d585469d"
+    },
+    "lifecycle": {
+      "log": "/tmp/autoship-1703-closed-inspection-validation-20261108.log",
+      "sha256": "0878cd6ae46ff13ba39d935dbc73e16515f944a3d26a570588f6d6979e80ca55"
+    },
+    "restricted_preparation": {
+      "log": "/tmp/autoship-1703-closed-inspection-bootstrap-20261108.log",
+      "sha256": "3fbf9184e1afef32f8df07addcc91f2a743bb4e7262a8204948c71bbe7f181e6"
+    },
+    "production": {
+      "log": "/tmp/autoship-1703-closed-inspection-production-20261108.log",
+      "sha256": "d2d5c5af41bcbaf9317d85ebb604f5e5d8d591a3162c3b24cc4d25add1c3248f"
+    }
+  },
+  "validation": {
+    "lifecycle_passed": 60,
+    "lifecycle_failed": 0,
+    "lifecycle_ignored": 0,
+    "restricted_preparation_passed": 7,
+    "restricted_preparation_failed": 0,
+    "restricted_preparation_ignored": 0,
+    "provider_pins": [
+      "codex",
+      "claude"
+    ],
+    "real_kernel_cases_per_provider": [
+      "readiness plus kernel/policy/owner-fence refusal and teardown",
+      "cancellation while actual startup is waiting",
+      "malformed startup refuses and tears down"
+    ],
+    "production_compile_passed": true,
+    "actual_vm_launches": 0,
+    "actual_provider_calls": 0
+  },
+  "invariants": [
+    "Consume original prepared lifetime and its one-shot supervisor attempt; saved launch data cannot construct the inspection.",
+    "Retain original controller and launch through group teardown, including dropping a pending inspection future.",
+    "Separate restricted-role protected history verification from productive dispatch; ordinary productive verification is unchanged.",
+    "Share original readiness, startup-correlation and kernel-resource capture helpers with ordinary admission.",
+    "Require actual initial native supervisor, original declaration, exact prepared record, live kernel limits, current preflight fence and closed release barrier.",
+    "Inspection exposes descriptive identity plus fresh validation only; it does not emit productive native-resource/startup/model/input binding records.",
+    "Cleanup kills/reaps actual descendants but retains original native intent/runtime; no false unspawned, native completion or retirement event."
+  ],
+  "limits": [
+    "The six delegated cases use actual native preparation, protected audit APIs, packaged supervisor and real kernel scopes. Only inside the private test, the prepared command is replaced by a controlled startup fixture; no actual VM/provider or complete sealed-executable/source/input fidelity is established.",
+    "The existing opt-in kernel test explicitly runs all six cases; no required publication-gate test was removed or ignored.",
+    "Normal owner ingress does not yet call this component. Complete C/R source/input/storage/descendant qualification, the consuming productive transition, partial-outcome recovery and the six saved publication-gate failures remain required.",
+    "Retained-session capacity, independent review, main/updater rollout, live CLI/private Discord acceptance, automated shipment and fault/unattended soak remain incomplete.",
+    "No production policy, service, session, allowance or owner hold changed."
+  ],
+  "normal_owner_consumer_connected": false,
+  "deployed": false,
+  "goal_complete": false
+}

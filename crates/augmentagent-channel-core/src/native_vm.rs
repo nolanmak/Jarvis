@@ -621,9 +621,13 @@ impl<'a> NativeBootstrap<'a> {
         Ok(ClosedNativeBootstrap {launch,_controller:self.logger.clone()})
     }
 }
-/// Owns actual prepared state, with no command, spawn or input-release API.
+/// Owns actual prepared state. It can inspect a closed supervisor, but exposes
+/// no command, productive spawn, or input-release API.
 /// Saved records are descriptive and cannot reconstruct this lifetime.
 pub struct ClosedNativeBootstrap {launch:Launch,_controller:std::sync::Arc<crate::tool_audit::AuditLogger>}
+#[path="native_bootstrap_inspection.rs"]
+mod bootstrap_inspection;
+pub use bootstrap_inspection::ClosedNativeInspection;
 impl ClosedNativeBootstrap {
     pub fn prepared_record(&self)->Result<PreparedLaunchRecord> {self.launch.prepared_record()}
 }
@@ -1307,6 +1311,7 @@ mod tests {
     #[test]
     fn closed_native_bootstrap_retains_original_controller_lifetime() {launch_intent_child("bootstrap-lifetime");}
     fn launch_intent_child(mode: &str) {
+        let mode=if std::env::var_os("JARVIS_TEST_CLOSED_BOOTSTRAP_INSPECTION").is_some() {"bootstrap-inspection"} else {mode};
         if let Some(root)=std::env::var_os("JARVIS_TEST_INPUT_AUTHORITY_PROBE") {
             let error=StateLock::acquire(Path::new(&root)).err().expect("handoff acquisition entered an active original input writer");
             assert_eq!(super::owner_outcome::classify(&error).0,ownership::TransferReason::LockBusy);
@@ -1511,7 +1516,7 @@ mod tests {
                     assert!(result.is_err());assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);
                     assert!(NativeBootstrap::capture(&logger).is_err());
                 } else {
-                    let bootstrap=result.unwrap();
+                    let mut bootstrap=result.unwrap();
                     if mode=="bootstrap" {
                         let repeated=crate::native_session::Launch::Create {requested_id:None};
                         let second=authority.prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&repeated));
@@ -1524,6 +1529,79 @@ mod tests {
                     assert!(logger.native_launch_prepared(&prepared.intent).is_err(),"bootstrap used ordinary native publication");
                     assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);
                     assert!(logger.dispatch_allowed().is_err());assert!(logger.model_call_admitted(provider).is_err());
+                    if mode=="bootstrap-inspection" {
+                        let effect=root.join(format!("{provider}-forbidden-provider-effect"));
+                        let case=std::env::var("JARVIS_TEST_CLOSED_BOOTSTRAP_INSPECTION").unwrap();
+                        let probe=root.join(format!("{provider}-actual-resource-probe.json"));
+                        // Controlled trusted startup fixture; actual kernel scope and
+                        // packaged supervisor, but no guest/provider or complete C/R proof.
+                        let mut command=Command::new("/usr/bin/python3");
+                        command.args(["-I","-c",r#"import json,os,pathlib,sys,time
+ready=pathlib.Path(os.environ['JARVIS_NATIVE_VM_READY'])
+startup=ready.with_name('vm-startup-inputs.json')
+probe=pathlib.Path(sys.argv[4]);temporary=probe.with_suffix('.pending')
+temporary.write_text(ready.with_name('resource-accounting.json').read_text());temporary.chmod(0o600);temporary.replace(probe)
+if sys.argv[3]=='cancel':
+    while True: time.sleep(.005)
+startup.write_text(json.dumps({'version':1,'phase':'inputs_staged','launch_sha256':('f'*64 if sys.argv[3]=='startup' else sys.argv[1])}))
+startup.chmod(0o600)
+ready.write_text('ready\n');ready.chmod(0o600)
+while not pathlib.Path(os.environ['JARVIS_NATIVE_VM_CONTINUE']).exists(): time.sleep(.005)
+pathlib.Path(sys.argv[2]).touch()
+"#]).arg(&prepared.intent.launch_sha256).arg(&effect).arg(&case).arg(&probe).env_clear().env("PATH","/usr/bin:/bin");
+                        bootstrap.launch.command=command;
+                        let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                        let identity=if case=="cancel" {
+                            runtime.block_on(async {
+                                let inspect=bootstrap.inspect_resources();tokio::pin!(inspect);
+                                tokio::select! {
+                                    _=&mut inspect=>panic!("closed inspection completed before readiness"),
+                                    _=async {
+                                        tokio::time::timeout(std::time::Duration::from_secs(10),async {
+                                            while !probe.exists() {tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+                                        }).await.unwrap();
+                                    }=>{}
+                                }
+                                // End of scope drops the actual pending future,
+                                // including its supervisor and original controller.
+                            });
+                            let value:serde_json::Value=serde_json::from_slice(&std::fs::read(&probe).unwrap()).unwrap();
+                            value["identity"].clone()
+                        } else if case=="startup" {
+                            assert!(runtime.block_on(bootstrap.inspect_resources()).is_err(),"malformed startup reached inspected readiness");
+                            let value:serde_json::Value=serde_json::from_slice(&std::fs::read(&probe).unwrap()).unwrap();
+                            value["identity"].clone()
+                        } else {
+                            let inspection=runtime.block_on(bootstrap.inspect_resources()).unwrap();
+                            assert_eq!(inspection.prepared_record(),&prepared);
+                            inspection.validate().unwrap();
+                            let identity=inspection.resource_identity().clone();
+                            assert!(crate::run_resources::verify_quiescent(&identity).is_err());
+                            assert!(logger.dispatch_allowed().is_err());assert!(logger.model_call_admitted(provider).is_err());
+                            let path=Path::new(identity["path"].as_str().unwrap()).join("pids.max");
+                            let original=std::fs::read(&path).unwrap();std::fs::write(&path,b"511").unwrap();
+                            assert!(inspection.validate().is_err(),"closed inspection accepted changed kernel limits");
+                            std::fs::write(&path,original).unwrap();inspection.validate().unwrap();
+                            let policy_bytes=std::fs::read(&policy).unwrap();
+                            let mut changed:serde_json::Value=serde_json::from_slice(&policy_bytes).unwrap();
+                            changed["memory_mb"]=1024.into();std::fs::write(&policy,serde_json::to_vec(&changed).unwrap()).unwrap();
+                            assert!(inspection.validate().is_err(),"closed inspection accepted a substituted selected policy");
+                            std::fs::write(&policy,policy_bytes).unwrap();inspection.validate().unwrap();
+                            bootstrap_active.store(false,std::sync::atomic::Ordering::SeqCst);
+                            assert!(inspection.validate().is_err(),"closed inspection ignored original owner fence");
+                            drop(inspection);
+                            identity
+                        };
+                        assert!(crate::run_resources::verify_quiescent(&identity).is_ok(),"closed inspection leaked live descendants");
+                        assert!(!effect.exists(),"closed inspection released provider code");
+                        let rows:Vec<serde_json::Value>=std::fs::read_to_string(logger.path()).unwrap().lines()
+                            .map(|line|serde_json::from_str(line).unwrap()).collect();
+                        assert!(!rows.iter().any(|row|matches!(row["kind"].as_str(),Some("model_call_admitted"|"native_input_release_attempt"|"native_launch_abandoned_before_spawn"|"native_launch_completion_verified"|"native_launch_resource_binding"|"native_startup_inputs_observed"))));
+                        logger.protected_health().unwrap();
+                        assert!(state.join(&prepared.intent.runtime_relative_path).join("owned.json").exists());
+                        assert!(!state.join(&prepared.intent.runtime_relative_path).join("retired.json").exists());
+                        continue;
+                    }
                     if mode=="bootstrap-lifetime" {
                         drop(authority);drop(opts);drop(clone);drop(logger);
                         assert_eq!(bootstrap.prepared_record().unwrap(),prepared,"closed bootstrap lost original controller");

@@ -1277,6 +1277,14 @@ impl AuditLogger {
         self.verify_native_launch_history_with(prepared,||self.dispatch_allowed())
     }
 
+    /// Verify a restricted preflight's original launch with its current role
+    /// before and after protected history inspection. This grants no dispatch.
+    pub(crate) fn verify_native_preflight_reference(
+        &self,prepared:&crate::native_vm::PreparedLaunchRecord,
+    )->anyhow::Result<()> {
+        self.verify_native_launch_history_with(prepared,||self.native_preflight_current())
+    }
+
     /// Verify original protected history only. This returns no dispatch, input,
     /// recovery or cleanup authority and deliberately cannot clear owner holds.
     pub(crate) fn verify_native_launch_history(

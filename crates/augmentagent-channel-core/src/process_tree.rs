@@ -162,56 +162,8 @@ impl ProcessGroup {
             "supervisor admission already attempted; reconcile instead of retrying");
         anyhow::ensure!(!self.vm_preflight || model,"native VM release requires model admission");
         self.bind_resource_audit(provider,logger)?;
-        let ready=self.receipt.with_file_name("launch-ready");
-        // Admission may wait for capacity (reclaiming cache, then a sibling run
-        // finishing) before it writes launch-ready; give it that long.
-        let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(
-            ADMISSION_WAIT_SECS+if self.vm_preflight { 65 } else { 5 });
-        while !launch_readiness(&ready)? {
-            if self.receipt.exists() || tokio::time::Instant::now()>=deadline {
-                self.resource_outcome(provider,logger)?;
-                let startup=private_read(&self.receipt.with_file_name("vm-startup-failure.json")).ok()
-                    .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-                if let Some(category)=startup.as_ref().and_then(native_setup_category) {
-                    if let Some(logger)=logger {
-                        logger.record_controller(serde_json::json!({"kind":"native_setup_failed","provider":provider,"category":category}))?;
-                    }
-                    return Err(crate::reasoner::ReasonerError::Local {
-                        message:format!("{provider}: native VM setup failed before model admission ({category}); resource limits were not exhausted")
-                    }.into());
-                }
-                let phase=if startup.as_ref().and_then(|value|value.get("phase")).and_then(|value|value.as_str())==Some("native_credential_in_use") {
-                    "native_credential_in_use"
-                } else {"launch_readiness_unavailable"};
-                return crate::run_resources::admission_failed(provider,logger,phase);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        if self.vm_preflight {self.validate_startup_inputs()?;}
-        let mut resource_identity=None;
-        if self.resource_required {
-            let parsed=private_read(&self.receipt.with_file_name("resource-accounting.json")).ok()
-                .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-            let Some(observation)=parsed.filter(|value|value.get("phase").and_then(|v|v.as_str())==Some("admitted")
-                && value.get("exhausted").and_then(|v|v.as_bool())==Some(false)
-                && value.pointer("/identity/limits").is_some_and(|v|v.is_object())) else {
-                self.resource_observed.store(true,Ordering::SeqCst);
-                return crate::run_resources::admission_failed(provider,logger,"admission_receipt_unavailable");
-            };
-            self.observe_declared_kernel_limits(&observation["identity"])?;
-            if let Some(logger)=logger.filter(|logger|logger.is_protected()) {
-                logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":provider,"observation":observation}))?;
-            }
-            resource_identity=Some(observation["identity"].clone());
-        }
-        if let Some(identity)=&resource_identity {
-            let parent=self.receipt.parent().ok_or_else(||anyhow::anyhow!("resource admission directory missing"))?;
-            let mut original=tempfile::NamedTempFile::new_in(parent)?;
-            original.write_all(&serde_json::to_vec(identity)?)?;original.as_file().sync_all()?;
-            original.persist_noclobber(parent.join("resource-admitted.json")).map_err(|error|error.error)?;
-            std::fs::File::open(parent)?.sync_all()?;
-        }
-        *self.resource_admission.lock().map_err(|_|anyhow::anyhow!("resource admission lock poisoned"))?=resource_identity.clone();
+        self.await_resource_readiness(provider,logger,None).await?;
+        let resource_identity=self.capture_resource_admission(provider,logger)?;
         if let Some(observer)=observer {
             observer(resource_identity.as_ref().ok_or_else(||anyhow::anyhow!("observed command requires a correlated resource scope"))?)?;
         }
@@ -255,6 +207,100 @@ impl ProcessGroup {
             .map_err(|error|error.error)?;
         std::fs::File::open(self.receipt.parent().unwrap())?.sync_all()?;
         Ok(())
+    }
+    /// Wait for complete private readiness; optional preflight stays restricted.
+    async fn await_resource_readiness(&self,provider:&str,logger:Option<&Arc<crate::tool_audit::AuditLogger>>,
+        preflight:Option<&crate::tool_audit::AuditLogger>)->anyhow::Result<()> {
+        if let Some(current)=preflight {current.native_preflight_current()?;}
+        let ready=self.receipt.with_file_name("launch-ready");
+        // Admission may wait for capacity (reclaiming cache, then a sibling run
+        // finishing) before it writes launch-ready; give it that long.
+        let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(
+            ADMISSION_WAIT_SECS+if self.vm_preflight { 65 } else { 5 });
+        while !launch_readiness(&ready)? {
+            if let Some(current)=preflight {current.native_preflight_current()?;}
+            if self.receipt.exists() || tokio::time::Instant::now()>=deadline {
+                self.resource_outcome(provider,logger)?;
+                let startup=private_read(&self.receipt.with_file_name("vm-startup-failure.json")).ok()
+                    .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+                if let Some(category)=startup.as_ref().and_then(native_setup_category) {
+                    if let Some(logger)=logger {
+                        logger.record_controller(serde_json::json!({"kind":"native_setup_failed","provider":provider,"category":category}))?;
+                    }
+                    return Err(crate::reasoner::ReasonerError::Local {
+                        message:format!("{provider}: native VM setup failed before model admission ({category}); resource limits were not exhausted")
+                    }.into());
+                }
+                let phase=if startup.as_ref().and_then(|value|value.get("phase")).and_then(|value|value.as_str())==Some("native_credential_in_use") {
+                    "native_credential_in_use"
+                } else {"launch_readiness_unavailable"};
+                return crate::run_resources::admission_failed(provider,logger,phase);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        if let Some(current)=preflight {current.native_preflight_current()?;}
+        Ok(())
+    }
+    /// Retain actual kernel observation and original private receipt before use.
+    fn capture_resource_admission(&self,provider:&str,logger:Option<&Arc<crate::tool_audit::AuditLogger>>)
+        ->anyhow::Result<Option<serde_json::Value>> {
+        if self.vm_preflight {self.validate_startup_inputs()?;}
+        let mut resource_identity=None;
+        if self.resource_required {
+            let parsed=private_read(&self.receipt.with_file_name("resource-accounting.json")).ok()
+                .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            let Some(observation)=parsed.filter(|value|value.get("phase").and_then(|v|v.as_str())==Some("admitted")
+                && value.get("exhausted").and_then(|v|v.as_bool())==Some(false)
+                && value.pointer("/identity/limits").is_some_and(|v|v.is_object())) else {
+                self.resource_observed.store(true,Ordering::SeqCst);
+                return crate::run_resources::admission_failed(provider,logger,"admission_receipt_unavailable").map(|()|None);
+            };
+            self.observe_declared_kernel_limits(&observation["identity"])?;
+            if let Some(logger)=logger.filter(|logger|logger.is_protected()) {
+                logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":provider,"observation":observation}))?;
+            }
+            resource_identity=Some(observation["identity"].clone());
+        }
+        if let Some(identity)=&resource_identity {
+            let parent=self.receipt.parent().ok_or_else(||anyhow::anyhow!("resource admission directory missing"))?;
+            let mut original=tempfile::NamedTempFile::new_in(parent)?;
+            original.write_all(&serde_json::to_vec(identity)?)?;original.as_file().sync_all()?;
+            original.persist_noclobber(parent.join("resource-admitted.json")).map_err(|error|error.error)?;
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        *self.resource_admission.lock().map_err(|_|anyhow::anyhow!("resource admission lock poisoned"))?=resource_identity.clone();
+        Ok(resource_identity)
+    }
+    /// Inspect one closed initial supervisor without dispatch, charge or input.
+    pub(crate) async fn inspect_native_preflight(&self,prepared:&crate::native_vm::PreparedLaunchRecord,
+        logger:&Arc<crate::tool_audit::AuditLogger>)->anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(!self.admission_attempted.swap(true,Ordering::SeqCst),
+            "supervisor admission already attempted; reconcile instead of retrying");
+        anyhow::ensure!(self.vm_preflight && self.native_initial && self.declared_resource_policy.is_some()
+            && self.native_launch.as_ref()==Some(prepared),"closed inspection lacks original initial supervisor");
+        self.bind_resource_audit(&prepared.intent.provider,Some(logger))?;
+        logger.native_preflight_current()?;
+        logger.verify_native_preflight_reference(prepared)?;
+        self.await_resource_readiness(&prepared.intent.provider,Some(logger),Some(logger)).await?;
+        let identity=self.capture_resource_admission(&prepared.intent.provider,Some(logger))?
+            .ok_or_else(||anyhow::anyhow!("closed inspection has no resource identity"))?;
+        self.validate_closed_native_resources(prepared,logger)?;
+        Ok(identity)
+    }
+    /// Fresh correlation and kernel observation only; no productive authority.
+    pub(crate) fn validate_closed_native_resources(&self,prepared:&crate::native_vm::PreparedLaunchRecord,
+        logger:&crate::tool_audit::AuditLogger)->anyhow::Result<serde_json::Value> {
+        logger.native_preflight_current()?;
+        anyhow::ensure!(self.vm_preflight && self.native_initial && self.declared_resource_policy.is_some()
+            && self.admission_attempted.load(Ordering::SeqCst) && self.native_launch.as_ref()==Some(prepared),
+            "closed inspection original supervisor changed");
+        logger.verify_native_preflight_reference(prepared)?;
+        let identity=self.resource_admission.lock().map_err(|_|anyhow::anyhow!("resource admission lock poisoned"))?
+            .clone().ok_or_else(||anyhow::anyhow!("closed inspection resource observation missing"))?;
+        self.validate_unreleased_resources(&identity)?;
+        self.validate_startup_inputs()?;
+        logger.native_preflight_current()?;
+        Ok(identity)
     }
     pub(crate) fn native_resource_receipt(&self)->anyhow::Result<Option<crate::audit_chain::AppendReceipt>> {
         Ok(self.native_resource.lock().map_err(|_|anyhow::anyhow!("native resource receipt lock poisoned"))?.clone())
@@ -1050,6 +1096,16 @@ mod tests {
         drop(group);
         assert!(directory.join("resource-accounting.json").exists(),"caller-owned recovery receipts were deleted");
         kernel_limit_changes_block_actual_supervisor_release().await;
+        for case in ["ready","cancel","startup"] {
+        let output=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","native_vm::tests::closed_native_bootstrap_prepares_without_productive_admission","--nocapture"])
+            .env("JARVIS_TEST_NATIVE_LAUNCH_INTENT_CHILD","1")
+            .env("JARVIS_TEST_CLOSED_BOOTSTRAP_INSPECTION",case).env("AUGMENTAGENT_RUN_RESOURCES","1")
+            .env_remove("AUGMENTAGENT_RUN_MEMORY_BYTES").env_remove("AUGMENTAGENT_RUN_HOST_OVERHEAD_BYTES")
+            .output().unwrap();
+        assert!(output.status.success(),"closed bootstrap inspection {case}: {} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+
+        }
     }
 
     /// Exercise actual production spawn/release against real kernel scopes.

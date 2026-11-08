@@ -2380,3 +2380,41 @@ and the consuming productive constructor. Partial constructor outcomes, reserved
 bodies and repeated cycles require their actual recovery paths. The six saved
 publication-gate failures and all original live/rollout/review/soak acceptance
 requirements remain open. No production configuration or service changed.
+
+
+## 76. Closed supervisor/resource inspection (component implemented)
+
+Original `ClosedNativeBootstrap` can now be consumed into an actual supervisor
+inspection while retaining its launch and permanently restricted controller.
+The one-shot supervisor claim is consumed before inspection. No ordinary release,
+model charge, provider input, role promotion or reconstructed saved-record grant
+is exposed. Cancellation owns the original group before the first await, so group
+teardown precedes dropping the launch/controller. Native intent/runtime remain
+retained; descendant cleanup alone does not establish native absence or retirement.
+
+The initial behavioral run reached the productive history verifier and correctly
+refused the restricted controller. A separate verifier now checks protected launch
+history under the current native-preflight fence before and after the read. The
+productive verifier is unchanged. Shared readiness/resource helpers preserve the
+ordinary admission path while requiring an initial native supervisor, its original
+declaration and prepared record, startup correlation, actual kernel limits and a
+closed release barrier for inspection. The returned object exposes descriptive
+identity and fresh validation only. An inspection is not a productive reservation.
+
+The existing delegated-kernel test exercises readiness, pending-future cancellation
+and malformed startup for both provider pins. It also refuses changed kernel,
+selected-policy and original-owner fences, checks actual descendant quiescence and
+absence of child side effects, and retains native intent without false unspawned,
+completion, retirement, model or input records. These fixtures use actual native
+preparation and packaged supervision, but replace the command inside the private
+test with controlled startup code. They do not run a VM/provider or prove complete
+sealed source/input fidelity. All 60 lifecycle tests and seven restricted native
+preparation tests pass; the production CLI builds. Details and source hashes are
+in `1703-closed-native-inspection-proof.json`.
+
+This is not a normal owner-ingress or productive constructor handoff. Complete C/R
+source/input/storage/descendant qualification and the consuming transition must
+retain the inspected attempt without resetting its one-shot claim or promoting the
+preflight logger. Partial outcomes, repeated cycles and the six saved shared-gate
+fixture exits remain open, as do retained-session capacity recovery, independent
+review, normal rollout and all original live/shipment/fault/soak acceptance.
