@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Preserve committed native transfer identity through unavailable postcommit reads",
+  "parent_commit": "3df649b32bddc1c2ad3c94ac7071dc62a775ea52",
+  "extends": "1703-native-handoff-controller-proof.json",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_recovery_native_intent.rs": "444546c1d1aa944fffd1ab1656343a3760e2c628f71844658bae599ecdfdb97b",
+    "crates/augmentagent-cli/src/self_improve_owner_native_recovery.rs": "d91b69b6a3ebfa9ba5029dd18b42d80e84b4d6acd0a05422ab14b6673b0905d8",
+    "crates/augmentagent-cli/src/self_improve_owner_reserved_ready_tests.rs": "08d4744de20c652ca494ce2a1167de9af26d8a8275d75b7eb00ab1404903732e"
+  },
+  "red": {
+    "handle": 82313,
+    "exit_code": 1,
+    "log": "/tmp/autoship-recovery-postcommit-lookup-red-verified-20261108.log",
+    "failure": "controller-lookupverified-native-bound loses the saved transfer identity to generic native-transfer-pending-unknown error"
+  },
+  "validation": [
+    {
+      "log": "/tmp/autoship-recovery-postcommit-lookup-reclaim-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 110.66
+    },
+    {
+      "log": "/tmp/autoship-postcommit-regression-owner_preparation_retry_persists_across_claims_and_wakes_on_changed_inputs-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 31.14
+    },
+    {
+      "log": "/tmp/autoship-postcommit-regression-recovery_controller_-20261108.log",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 225.47
+    },
+    {
+      "log": "/tmp/autoship-postcommit-regression-worker_metadata_pass_handles_unbound_reserved_and_completed_handoff_takeover-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 122.92
+    },
+    {
+      "log": "/tmp/autoship-postcommit-regression-worker_queue_selects_recovery_fairly_and_refuses_unverified_worker-20261108.log",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "seconds": 8.22
+    }
+  ],
+  "final_batch_handle": 55775,
+  "final_batch_exit_code": 0,
+  "production_compile": {
+    "log": "/tmp/autoship-recovery-postcommit-production-20261108.log",
+    "passed": true
+  },
+  "assertions": [
+    "Actual SQLite WAL commit and authorizer callbacks refuse reads of the original pending table immediately after durable commit or after the writer verification transaction. Denied-read and durable-commit counters prove each injection occurred.",
+    "When saved transfer identity is already known, a later preparation revalidation error or pending lookup failure returns PersistenceUnknown with that identity. It cannot be converted into NoPending, success, replacement preparation or coding authority.",
+    "The refused lookup leaves the pre-existing completed-transfer count unchanged and the committed recovery intent available through an independent connection; destination dispatch remains refused.",
+    "The immediate-postcommit case retries under the same valid claim, settles the original transfer ID and retains one recovery intent. A repeated current inspection appends no event.",
+    "The post-verification case reopens the workflow store, expires the original claim in controlled SQL and acquires a fresh authorized metadata claim. The superseded claim refuses; the replacement settles the original transfer ID and retains one intent.",
+    "Fresh-claim replay preserves original request/body rows, checkpoint, model-call totals, owner control and queued input. Merge allowance confirmed remains zero.",
+    "Existing different-provider completion import, lost commit acknowledgement, actual native completion plus SQL settlement rollback, released-body refusal, worker ready/progress paths, queue authorization/fairness and persistent preparation retry regressions pass."
+  ],
+  "limits": [
+    "The authorizer fault is a real SQLite read refusal triggered at commit boundaries, not a physical disk/device/network outage. Hooks are cfg(test), static-lifetime and used in disposable serial child processes; production persistence uses the same unchanged SQL writer.",
+    "Native/resource/body setup is synthetic persisted state with actual protected core/audit/SQL APIs. No provider/VM/model/body or real Discord message executes.",
+    "Takeover uses a reopened store and controlled SQL lease expiry with real authorization and CAS APIs; it is not an actual normally deployed worker restart or positive live managed-role admission.",
+    "The core preparation-error preservation and later controller-lookup-error branches are both implemented; the read-refusal matrix establishes the externally retained identity and replay contract, not an independently instrumented branch-coverage count.",
+    "The existing successor-setup path and closed/transferred-source completion importer still require their own complete outcome/physical qualification coverage.",
+    "No productive coding guard is constructed. Full custody/resource/source/input and legacy qualification, repeated productive body/release/model/result/continuation cycles, detailed private recovery status, and the full Discord coding/follow-up lifecycle remain incomplete.",
+    "Fresh combined-head hosted checks, exact-head independent review, normal updater rollout, current-build live CLI/Discord acceptance, five confirmed autonomous merges, 72-hour fault and 24-hour unattended soak remain unproven."
+  ],
+  "all_original_local_handles_terminal": true,
+  "deployed": false,
+  "productive_authority_granted": false,
+  "goal_complete": false
+}

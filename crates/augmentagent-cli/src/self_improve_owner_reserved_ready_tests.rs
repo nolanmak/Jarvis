@@ -4,6 +4,14 @@ use super::*;
 use augmentagent_channel_core::native_vm::{ownership, RuntimeOwner};
 use std::os::unix::fs::PermissionsExt;
 #[tokio::test]
+async fn recovery_retains_transfer_identity_when_postcommit_lookup_is_unavailable() {
+    for phase in ["controller-lookupcommit-native-bound","controller-lookupverified-native-bound"] {
+        super::tests::owner_metadata_recovery_modes_inner_reserved(
+            &["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery"],
+            false,None,Some(phase));
+    }
+}
+#[tokio::test]
 async fn worker_queue_selects_recovery_fairly_and_refuses_unverified_worker() {
     super::tests::owner_metadata_recovery_modes_inner_reserved(
         &["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery"],
@@ -141,6 +149,7 @@ pub(super) fn seed_reserved_body(
     let phase=phase.strip_prefix("worker-queue-").or_else(||phase.strip_prefix("worker-restart-")).or_else(||phase.strip_prefix("worker-")).unwrap_or(phase);
     let phase=phase.strip_prefix("retry-").unwrap_or(phase);
     let phase=phase.strip_prefix("controller-").unwrap_or(phase);
+    let phase=phase.strip_prefix("lookupcommit-").or_else(||phase.strip_prefix("lookupverified-")).unwrap_or(phase);
     let phase = phase.strip_prefix("successor-").unwrap_or(phase);
     let legacy_writer = matches!(phase, "legacy-writer" | "legacy-blocked");
     let changed_late_completion=phase.starts_with("late-completion");
@@ -331,8 +340,11 @@ pub(super) async fn settle_reserved_body(
     }
     let retry_case=phase.starts_with("retry-");
     let phase=phase.strip_prefix("retry-").unwrap_or(phase);
+    let lookup_fault=phase.starts_with("controller-lookup");
+    let lookup_verified=phase.starts_with("controller-lookupverified-");
     let controller=phase.starts_with("controller-");
     let phase=phase.strip_prefix("controller-").unwrap_or(phase);
+    let phase=phase.strip_prefix("lookupcommit-").or_else(||phase.strip_prefix("lookupverified-")).unwrap_or(phase);
     let successor = phase.starts_with("successor-");
     let phase = phase.strip_prefix("successor-").unwrap_or(phase);
     let import_late=phase.starts_with("late-completion");
@@ -398,7 +410,56 @@ pub(super) async fn settle_reserved_body(
             .unwrap(),
         )
         .unwrap();
-    if controller {
+    if lookup_fault {
+        let db=rusqlite::Connection::open(state).unwrap();
+        let completed_before:i64=db.query_row("SELECT count(*) FROM workflow_native_handoff_completed WHERE workflow=?1",[&workflow],|r|r.get(0)).unwrap();
+        shared.lock().unwrap().test_block_committed_recovery_lookup(lookup_verified);
+        let result=recover_owner_native_handoff(&shared,state,worktree,recovery.clone(),authorization);
+        let denied=shared.lock().unwrap().test_finish_committed_recovery_lookup_fault();
+        assert!(denied>0,"postcommit pending read was not refused");
+        let result=result.expect("durable transfer identity was lost to a generic lookup error");
+        let id=match result {OwnerRecoveryNativeRun::PersistenceUnknown {attempted_transfer:Some(id),..}=>id,other=>panic!("postcommit lookup failure was not retained as unknown: {other:?}")};
+        let pending=store.owner_recovery_pending_transfer(&recovery,authorization,millis()).unwrap().unwrap();
+        assert_eq!(pending.request().transfer_id,id);
+        let db=rusqlite::Connection::open(state).unwrap();
+        assert_eq!(db.query_row("SELECT count(*) FROM workflow_native_handoff_completed WHERE workflow=?1",[&workflow],|r|r.get::<_,i64>(0)).unwrap(),completed_before);
+        assert!(destination.dispatch_allowed().is_err());
+        if lookup_verified {
+            // Recreate the worker store and genuinely replace the expired
+            // metadata claim before resolving the already committed intent.
+            let preserved=original_rows(&db,&workflow,recovery.request_id());
+            let before=store.snapshot(&workflow).unwrap().unwrap();
+            let control=store.owner_control(&workflow).unwrap();
+            let queued=store.pending_owner_messages(&workflow).unwrap();
+            db.execute("UPDATE workflow SET lease_until=?2 WHERE id=?1",rusqlite::params![workflow,millis()-1]).unwrap();
+            let mut reopened=WorkflowStore::open(state).unwrap();
+            let fresh_plan=reopened.owner_publication_recovery_plan(&workflow).unwrap().unwrap();
+            let fresh_auth=super::super::targeted::authorize_owner_publication_recovery(worktree,&fresh_plan,
+                crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22}).await.unwrap();
+            let fresh=Arc::new(reopened.claim_owner_publication_recovery(&fresh_auth,"lookup-outage-replacement-worker",millis(),300_000).unwrap().unwrap());
+            assert!(fresh.generation()>recovery.generation());
+            assert!(recover_owner_native_handoff(&shared,state,worktree,recovery.clone(),authorization).is_err(),"superseded recovery still controlled the pending intent");
+            let replacement=Arc::new(Mutex::new(reopened));
+            let resumed=recover_owner_native_handoff(&replacement,state,worktree,fresh.clone(),&fresh_auth).unwrap();
+            assert!(matches!(resumed,OwnerRecoveryNativeRun::Reconciled {ref transfer_id,result:durable::native_reconcile::ReconciliationRun::Settled(_)} if transfer_id==&id),"replacement worker changed original transfer: {resumed:?}");
+            assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_recovery_native_intent WHERE workflow=?1",[&workflow],|r|r.get::<_,i64>(0)).unwrap(),1);
+            let events=store.events(&workflow).unwrap();
+            assert!(matches!(recover_owner_native_handoff(&replacement,state,worktree,fresh,&fresh_auth).unwrap(),OwnerRecoveryNativeRun::Current));
+            assert_eq!(store.events(&workflow).unwrap(),events);
+            let after=store.snapshot(&workflow).unwrap().unwrap();
+            assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.checkpoint,before.checkpoint);
+            assert_eq!(store.owner_control(&workflow).unwrap(),control);assert_eq!(store.pending_owner_messages(&workflow).unwrap(),queued);
+            assert_eq!(original_rows(&db,&workflow,recovery.request_id()),preserved);
+            assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
+            return;
+        }
+        let resumed=recover_owner_native_handoff(&shared,state,worktree,recovery.clone(),authorization).unwrap();
+        assert!(matches!(resumed,OwnerRecoveryNativeRun::Reconciled {ref transfer_id,result:durable::native_reconcile::ReconciliationRun::Settled(_)} if transfer_id==&id),"lookup recovery changed original transfer: {resumed:?}");
+        assert_eq!(db.query_row("SELECT count(*) FROM workflow_owner_recovery_native_intent WHERE workflow=?1",[&workflow],|r|r.get::<_,i64>(0)).unwrap(),1);
+        let events=store.events(&workflow).unwrap();
+        assert!(matches!(recover_owner_native_handoff(&shared,state,worktree,recovery.clone(),authorization).unwrap(),OwnerRecoveryNativeRun::Current));
+        assert_eq!(store.events(&workflow).unwrap(),events);
+    } else if controller {
         let db=rusqlite::Connection::open(state).unwrap();
         db.execute_batch("CREATE TRIGGER refuse_controller_native_settlement BEFORE INSERT ON workflow_native_handoff_completed BEGIN SELECT RAISE(ABORT,'injected controller native settlement rollback'); END;").unwrap();
         // A real WAL commit acknowledgement is lost while the intent itself

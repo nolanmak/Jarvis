@@ -240,3 +240,45 @@ impl WorkflowStore {
         LOST_COMMIT_ACKS.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
+
+// Disposable-child fault injection: refuse actual SQLite reads after the durable
+// commit, either immediately or after the writer's positive verification read.
+#[cfg(test)]
+mod lookup_fault {
+    use super::*;
+    use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering::SeqCst};
+    static AFTER_VERIFY:AtomicBool=AtomicBool::new(false);
+    static COMMITTED:AtomicBool=AtomicBool::new(false);
+    static BLOCKED:AtomicBool=AtomicBool::new(false);
+    static DENIED:AtomicUsize=AtomicUsize::new(0);
+    unsafe extern "C" fn committed(_: *mut std::ffi::c_void,_:*mut rusqlite::ffi::sqlite3,_:*const std::ffi::c_char,_:std::ffi::c_int)->std::ffi::c_int {
+        COMMITTED.store(true,SeqCst);
+        if !AFTER_VERIFY.load(SeqCst) {BLOCKED.store(true,SeqCst);}
+        rusqlite::ffi::SQLITE_OK
+    }
+    unsafe extern "C" fn authorize(_: *mut std::ffi::c_void,action:std::ffi::c_int,arg:*const std::ffi::c_char,_:*const std::ffi::c_char,_:*const std::ffi::c_char,_:*const std::ffi::c_char)->std::ffi::c_int {
+        if arg.is_null() {return rusqlite::ffi::SQLITE_OK;}
+        let name=unsafe {std::ffi::CStr::from_ptr(arg)}.to_bytes();
+        if action==rusqlite::ffi::SQLITE_TRANSACTION && name==b"COMMIT" && COMMITTED.load(SeqCst) && AFTER_VERIFY.load(SeqCst) {BLOCKED.store(true,SeqCst);}
+        if action==rusqlite::ffi::SQLITE_READ && name==b"workflow_native_handoff_pending" && BLOCKED.load(SeqCst) {
+            DENIED.fetch_add(1,SeqCst);return rusqlite::ffi::SQLITE_DENY;
+        }
+        rusqlite::ffi::SQLITE_OK
+    }
+    impl WorkflowStore {
+        pub(crate) fn test_block_committed_recovery_lookup(&mut self,after_verify:bool) {
+            AFTER_VERIFY.store(after_verify,SeqCst);COMMITTED.store(false,SeqCst);BLOCKED.store(false,SeqCst);DENIED.store(0,SeqCst);
+            unsafe {
+                rusqlite::ffi::sqlite3_wal_hook(self.conn.handle(),Some(committed),std::ptr::null_mut());
+                assert_eq!(rusqlite::ffi::sqlite3_set_authorizer(self.conn.handle(),Some(authorize),std::ptr::null_mut()),rusqlite::ffi::SQLITE_OK);
+            }
+        }
+        pub(crate) fn test_finish_committed_recovery_lookup_fault(&mut self)->usize {
+            unsafe {
+                rusqlite::ffi::sqlite3_wal_hook(self.conn.handle(),None,std::ptr::null_mut());
+                assert_eq!(rusqlite::ffi::sqlite3_set_authorizer(self.conn.handle(),None,std::ptr::null_mut()),rusqlite::ffi::SQLITE_OK);
+            }
+            assert!(COMMITTED.load(SeqCst),"lookup fault never reached a durable commit");DENIED.load(SeqCst)
+        }
+    }
+}

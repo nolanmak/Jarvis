@@ -210,7 +210,22 @@ pub(super) fn recover_owner_native_handoff(
                 attempted=attempted_transfer;PreparationPersistence::Unknown {reason,attempted:None}
             },
         }
-    }).map_err(anyhow::Error::new)?;
+    });
+    let outcome=match outcome {
+        Ok(outcome)=>outcome,
+        Err(error)=>{
+            if let Some(id)=staged.as_ref().or(attempted.as_ref()) {
+                // Core revalidation can fail after the SQL callback has saved
+                // this exact intent. Losing the later read is not no-pending
+                // evidence and cannot erase the identity needed for replay.
+                tracing::warn!(transfer_id=%id,"recovery preparation could not revalidate its saved intent: {error:#}");
+                return Ok(OwnerRecoveryNativeRun::PersistenceUnknown {
+                    reason:TransferReason::PendingUnknown,attempted_transfer:Some(id.clone()),
+                });
+            }
+            return Err(anyhow::Error::new(error));
+        }
+    };
     match outcome {
         PreparedTransferResult::NoPending(failure) => {
             anyhow::ensure!(
@@ -237,10 +252,18 @@ pub(super) fn recover_owner_native_handoff(
                     attempted_transfer: attempted,
                 });
             };
-            let pending = store
-                .lock()
-                .map_err(|_| anyhow::anyhow!("recovery staged intent store poisoned"))?
-                .owner_recovery_pending_transfer(&recovery, authorization, millis())?;
+            let pending=store.lock()
+                .map_err(|_|anyhow::anyhow!("recovery staged intent store poisoned"))
+                .and_then(|mut store|store.owner_recovery_pending_transfer(&recovery,authorization,millis()));
+            let pending=match pending {
+                Ok(pending)=>pending,
+                Err(error)=>{
+                    tracing::warn!(transfer_id=%staged,"recovery saved intent lookup unavailable: {error:#}");
+                    return Ok(OwnerRecoveryNativeRun::PersistenceUnknown {
+                        reason:TransferReason::PendingUnknown,attempted_transfer:Some(staged),
+                    });
+                }
+            };
             match pending {
                 Some(pending) if pending.request().transfer_id == staged => {
                     reconcile_original(store, state, worktree, &recovery, authorization, &pending)
