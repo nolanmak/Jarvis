@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "main_base": "cbafe3216e36df1c254ef4b42139854192a5e1d1",
+  "change": "Add an explicit owner capacity-policy preview/apply command for the legacy store used on current main. Preserve all retained native state and resource declarations.",
+  "sources": {
+    "scripts/native-capacity-policy.py": "51849284c4d4b6f8718e69dacf66f7d10ad5b8da06799a5b9d794b76fa863312",
+    "scripts/test-native-capacity-policy.py": "33e6e2d6da22fbc2b0ac418d9945e2823e4e756280c2888ec0dfc1af61e10580",
+    "scripts/ci-contract.json": "3a7e679b7d464cf7b27e25764d6a85ff2c88ecd620e8ae5e9f76c0e6ada4b651"
+  },
+  "evidence": {
+    "missing_api_red": {
+      "log": "/tmp/autoship-1703-legacy-capacity-red-20261108.log",
+      "sha256": "0c087b17eace91fd0a96754874b213d94575e17902bb9c0a833aa6c4927af83c"
+    },
+    "directory_sync_red": {
+      "log": "/tmp/autoship-1703-legacy-capacity-sync-red-20261108.log",
+      "sha256": "952c46474adab7aa99bddb3a24cf5ec49063cc6da5d57243b77d16fced4f6d29"
+    },
+    "lost_rename_red": {
+      "log": "/tmp/autoship-1703-legacy-capacity-rename-red-20261108.log",
+      "sha256": "5ec350fb829f498ab584bd35c539d9adb2fb00cdd1298f922524d8219c1106e6"
+    },
+    "final": {
+      "log": "/tmp/autoship-1703-legacy-capacity-final-20261108.log",
+      "sha256": "1772ce9883c10177edbe5d2f9501b4b7717e0029a11a4ee2cdef50ddfbff49f7"
+    },
+    "ci_contract": {
+      "log": "/tmp/autoship-1703-legacy-capacity-ci-contract-20261108.log",
+      "sha256": "ddba798fc631171c4c67fcae098a59aab4965a4e98bd26f253286ff7033a7718"
+    },
+    "temporary_identity_red": {
+      "log": "/tmp/autoship-1703-legacy-capacity-temp-red-20261108.log",
+      "sha256": "662940295498b900e6f5c641509936c2995981c11188e7e0084e1fc19b394edc"
+    }
+  },
+  "validation": {
+    "capacity_tests_passed": 16,
+    "ci_contract_tests_passed": 23,
+    "ci_contract_verify_passed": true,
+    "failed": 0,
+    "live_read_only_preview_succeeded": true,
+    "live_policy_applied": false
+  },
+  "limits": [
+    "Main native_vm::Launch::prepare reads policy on each attempt. The newer TransferBinding/authority-epoch protocol in draft #1758 is not present in the inspected live schema; its migration constraint must not be attributed to the old live limiter.",
+    "The live preview classified the selected store as legacy-schema and left the policy at 8GiB. A 16GiB target was inspected as an option, not chosen or authorized.",
+    "Apply refuses positive binding-aware markers, unfamiliar ledger schema, busy/missing/unsafe original locks, stale reviewed hashes and non-increases. It does not create an epoch, migrate bindings or repair missing historical authority.",
+    "Legacy-schema classification is based on the original private ledger shape. It is not a complete retained-session custody or quiescence proof, and it grants no deletion or reservation credit.",
+    "Actual apply, idempotent replay and all publication failures were tested only on private fixtures. No live policy, session, daemon, allowance, owner hold or deployment changed.",
+    "Core owner integration, modern binding transition, independent review, main/updater rollout and original live CLI/Discord/shipment/fault/soak acceptance remain incomplete."
+  ],
+  "deployed": false,
+  "goal_complete": false
+}
