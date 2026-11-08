@@ -159,6 +159,9 @@ impl augmentagent_channel_core::native_vm::OwnerInputAuthorizer for OwnerInputCo
 #[path = "self_improve_owner_completion_recovery.rs"]
 mod completion_recovery;
 use completion_recovery::recover_known_native_completions;
+#[path = "self_improve_owner_metadata_recovery.rs"]
+mod owner_metadata_recovery;
+use owner_metadata_recovery::{recover_owner_publication,settle_reserved_owner_readiness};
 
 const LEASE_MS: i64 = 10 * 60 * 1000;
 const RENEW_SECS: u64 = 60;

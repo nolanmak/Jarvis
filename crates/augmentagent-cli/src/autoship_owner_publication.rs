@@ -252,6 +252,20 @@ impl WorkflowStore {
 impl WorkflowStore {
     /// The caller holds the recovered preparation's original native proof and
     /// scope transition. No new native lock or provider call enters this SQL TX.
+    /// Only changes made by this exclusively borrowed connection count. A
+    /// validated existing completion must not restart progress/backoff clocks.
+    pub(crate) fn complete_recovered_owner_publication_progress(&mut self,
+        lease:&super::owner_publication_recovery::RecoveryLease,
+        authorization:&crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
+        prepared:&crate::self_improve::RecoveredOwnerPreparation<'_,'_,'_>,
+        transition:&augmentagent_channel_core::autoship_write_scope::ScopeTransition,now:i64,
+    )->Result<bool> {
+        let before:i64=self.conn.query_row("SELECT total_changes()",[],|r|r.get(0))?;
+        self.complete_recovered_owner_publication(lease,authorization,prepared,transition,now)?;
+        let after:i64=self.conn.query_row("SELECT total_changes()",[],|r|r.get(0))?;
+        ensure!(after>=before,"publication recovery write counter decreased");
+        Ok(after>before)
+    }
     pub(crate) fn complete_recovered_owner_publication(&mut self,lease:&super::owner_publication_recovery::RecoveryLease,
         authorization:&crate::self_improve::targeted::AuthorizedOwnerRecovery<'_>,
         prepared:&crate::self_improve::RecoveredOwnerPreparation<'_,'_,'_>,

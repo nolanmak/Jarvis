@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "epic": 1703,
+  "component": "Protected publication repair and reserved-body readiness controller functions",
+  "parent_commit": "5b9dbdcbc7b6ced100292c18cd7c5dfc5ff3e3e2",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/self_improve_owner_metadata_recovery.rs": "b48012409d4bf514a16968e496ce6c6677ec18b658ad9dad86a0316edf224768",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "1d5d0274756b24b0ad09fe7e21156f2978fcff0b33ad7d7b3e0b758160165dc6",
+    "crates/augmentagent-cli/src/autoship_owner_publication.rs": "9c2508c1dbc54709cd8d2882c29a8f4910e5f16aefecc381c821a3126f13f032",
+    "crates/augmentagent-cli/src/self_improve_owner_reserved_ready_tests.rs": "25d00aec88ffbba0be9e98839e823586cb10d554d245889d6c1ff46314d88f44"
+  },
+  "red": {
+    "original_handle": 13677,
+    "exit_code": 1,
+    "reason": "Production publication and reserved-readiness controller functions absent",
+    "log": "/tmp/autoship-metadata-controller-red-20261108.log"
+  },
+  "validation": {
+    "controller": {
+      "original_handle": 47869,
+      "exit_code": 0,
+      "passed_test_functions": 1,
+      "seconds": 98.28,
+      "provider_phase_cases": 4,
+      "builder_pins": [
+        "codex",
+        "claude"
+      ],
+      "phases": [
+        "native-bound",
+        "released"
+      ],
+      "rollback_cases_per_pin": [
+        "ready-insert",
+        "recovery-pointer-delete",
+        "lease-release",
+        "input-race"
+      ],
+      "log": "/tmp/autoship-metadata-controller-green2-20261108.log"
+    },
+    "lost_original_sql_callback": {
+      "original_handle": 48107,
+      "exit_code": 0,
+      "passed_test_functions": 1,
+      "both_builder_pins": true,
+      "seconds": 93.98,
+      "log": "/tmp/autoship-metadata-controller-late-completion-20261108.log"
+    },
+    "different_native_provider_completion": {
+      "original_handle": 48107,
+      "exit_code": 0,
+      "passed_test_functions": 1,
+      "both_builder_pins": true,
+      "seconds": 99.88,
+      "log": "/tmp/autoship-metadata-controller-cross-provider-20261108.log"
+    },
+    "non_test_compile": {
+      "original_handle": 48107,
+      "exit_code": 0,
+      "seconds": 19.56,
+      "log": "/tmp/autoship-metadata-controller-production-20261108.log",
+      "deployed": false
+    }
+  },
+  "assertions": [
+    "Publication controller receives only state/candidate paths, an existing typed metadata claim and current authorization; it reconstructs the exact private preparation under the actual original native metadata proof",
+    "Publication controller retains original scope-transition and canonical commit validation; no prepared object, completion receipt, raw record or native execution logger is supplied or returned",
+    "Publication progress is computed from actual writes on the exclusively borrowed writer connection; repeated validated completion returns false and appends no workflow events",
+    "Reserved readiness controller obtains the complete original SQL body snapshot before native lock acquisition; the consuming readiness transaction revalidates that snapshot and the original reservation/model/resource/input joins",
+    "Readiness requires actual original writer revocation, exact expected prepared/resource/input attempts, native body nonrelease and registered scope; missing reserved history is an error, never an absent-body fallback",
+    "The readiness token remains inside the protected visitor and is checked after the consuming transaction; an old metadata claim is never promoted into a body/coding role",
+    "Both builder pins preserve original slots, charges, queued peers, owner pause/control and checkpoint during rollback; a body that may already have been released refuses readiness",
+    "Existing lost-completion fixtures now use the publication controller after the actual completion discovery/import path; both same-provider and different-provider native completions retain the pinned command builder"
+  ],
+  "limits": [
+    "Controlled fixtures use synthetic persisted body/resource setup with actual protected native/audit/SQL APIs; they do not execute a provider, VM or body",
+    "Controller tests use existing explicit-policy fixture authorization; no live managed-role/Discord/GitHub worker authorization chain is demonstrated",
+    "Late-completion regressions exercise the new publication controller followed by the existing fixture-composed native handoff/readiness; the new readiness controller is separately exercised by the four controller cases",
+    "The readiness controller in this component handles reserved original bodies only; the unbound-case orchestration remains separate",
+    "No complete worker scheduler selection, native-handoff/retry orchestration, closed/transferred-source completion import, productive recovery constructor or real private delivery is claimed",
+    "No current full CLI suite, exact-head independent review, current-head hosted verification, deployment, autonomous merge or soak acceptance is claimed"
+  ],
+  "remaining": [
+    "Compose complete native-handoff outcomes and persisted no-pending retry behavior without substituting a projection-only retry loop",
+    "Connect a distinct authenticated owner-recovery selector before ordinary productive execution preflight; retain ordinary pending-input exclusion and holds",
+    "Complete unbound and closed/transferred-source orchestration, C/R source/resource/input qualification and debt recovery",
+    "Productive repeated body/release/model/result/continuation cycles and the private coding/follow-up/delivery lifecycle",
+    "Exact-head independent review, trusted hosted verification and ordinary updater rollout",
+    "Original live CLI/Discord acceptance, five confirmed autonomous merges on the acceptance UTC day, 72h fault and 24h unattended soak"
+  ],
+  "all_original_local_handles_terminal": true,
+  "scheduler_connected": false,
+  "deployed": false,
+  "productive_authority_granted": false,
+  "goal_complete": false
+}

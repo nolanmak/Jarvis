@@ -4,6 +4,15 @@ use super::*;
 use augmentagent_channel_core::native_vm::{ownership, RuntimeOwner};
 use std::os::unix::fs::PermissionsExt;
 #[tokio::test]
+async fn recovery_controller_repairs_publication_and_settles_only_unreleased_reserved_body() {
+    for phase in ["native-bound","released"] {
+        super::tests::owner_metadata_recovery_modes_inner_reserved(
+            &["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery"],
+            false,None,Some(&format!("controller-{phase}")),
+        );
+    }
+}
+#[tokio::test]
 async fn recovery_completion_observation_preserves_builder_pin_across_native_providers() {
     super::tests::owner_metadata_recovery_modes_inner_reserved(
         &["owner-early-acceptance-producer-metadata-recovery","owner-early-acceptance-producer-claude-metadata-recovery"],
@@ -99,6 +108,7 @@ pub(super) fn seed_reserved_body(
     native: &Path,
     phase: &str,
 ) -> ReservedSeed {
+    let phase=phase.strip_prefix("controller-").unwrap_or(phase);
     let phase = phase.strip_prefix("successor-").unwrap_or(phase);
     let legacy_writer = matches!(phase, "legacy-writer" | "legacy-blocked");
     let changed_late_completion=phase.starts_with("late-completion");
@@ -279,6 +289,8 @@ pub(super) async fn settle_reserved_body(
     initial: Option<&durable::owner_dispatch::ReservedOwnerBodyRead>,
     late: Option<&durable::native_observation::NativeObservation>,
 ) {
+    let controller=phase.starts_with("controller-");
+    let phase=phase.strip_prefix("controller-").unwrap_or(phase);
     let successor = phase.starts_with("successor-");
     let phase = phase.strip_prefix("successor-").unwrap_or(phase);
     let import_late=phase.starts_with("late-completion");
@@ -294,36 +306,16 @@ pub(super) async fn settle_reserved_body(
             crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22}).await.unwrap())
     }else {None};
     let authorization=publication_authorization.as_ref().unwrap_or(authorization);
-    // Publication completion is a real authorized metadata transition.
-    with_recovery_native_metadata(
-        state,
-        Some(worktree),
-        recovery.clone(),
-        authorization,
-        &mut |proof| {
-            let recovered = store.with_owner_recovery_preparation(
-                &recovery,
-                authorization,
-                proof,
-                millis(),
-                |access| {
-                    acceptance::owner::publication::reopen_recovery_preparation(
-                        access, proof, worktree,
-                    )
-                },
-            )?;
-            recovered.with_scope_transition(|transition| {
-                store.complete_recovered_owner_publication(
-                    &recovery,
-                    authorization,
-                    &recovered,
-                    transition,
-                    millis(),
-                )
-            })
-        },
-    )
-    .unwrap();
+    // Use the production controller without injecting preparation or native
+    // proof objects. An already-completed publication is not fresh progress.
+    let completion_count:i64=rusqlite::Connection::open(state).unwrap().query_row(
+        "SELECT count(*) FROM workflow_owner_publication_completion WHERE request_id=?1",
+        [recovery.request_id()],|r|r.get(0)).unwrap();
+    assert_eq!(recover_owner_publication(state,worktree,recovery.clone(),authorization).unwrap(),completion_count==0);
+    let publication_workflow=store.owner_publication_recovery_native_facts(&recovery,authorization,millis()).unwrap().namespace().owner.workflow_id.clone();
+    let after_publication=store.events(&publication_workflow).unwrap();
+    assert!(!recover_owner_publication(state,worktree,recovery.clone(),authorization).unwrap());
+    assert_eq!(store.events(&publication_workflow).unwrap(),after_publication,"duplicate publication controller scan reported progress or appended events");
     let facts = store
         .owner_publication_recovery_native_facts(&recovery, authorization, millis())
         .unwrap();
@@ -632,7 +624,8 @@ pub(super) async fn settle_reserved_body(
             )
             .await
             .unwrap();
-            let error = settle(&mut store, &fresh, false, false).unwrap_err();
+            let error = if controller {settle_reserved_owner_readiness(state,worktree,recovery.clone(),&fresh)}
+                else {settle(&mut store, &fresh, false, false)}.unwrap_err();
             if fault != "input-race" {
                 assert!(
                     format!("{error:#}").contains("injected reserved readiness rollback"),
@@ -715,7 +708,8 @@ pub(super) async fn settle_reserved_body(
     } else {
         fresh
     };
-    let result = settle(&mut store, &fresh, phase == "lost-response", true);
+    let result = if controller {settle_reserved_owner_readiness(state,worktree,recovery.clone(),&fresh)}
+        else {settle(&mut store, &fresh, phase == "lost-response", true)};
     if phase == "legacy-blocked" {
         assert_eq!(
             db.query_row(
