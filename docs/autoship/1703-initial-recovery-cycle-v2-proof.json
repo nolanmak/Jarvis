@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "component": "explicit initial native recovery-cycle journal identity",
+  "status": "initial-cycle-only-not-repeated-recovery-activation",
+  "base_commit": "34ab1cab820ab6569744376353eb130fa22d981b",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_owner_recovery_native_intent.rs": "d2d6882883d95790dac7773d256e506585bc3f84c7fac64a076b11811dd4e8e9",
+    "crates/augmentagent-cli/src/autoship_owner_publication_recovery.rs": "587b465b097340a1c922ad6157b0dfd7a52591f05a73eeabdf5ff5cec3916f80",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "592f5288e014e0a57eb3c43803ec5afe7386184d59f59205c8f0e70facf3d2ab"
+  },
+  "change": [
+    "New contexts and their matching journal events use version 2. The strict publication_recovery cycle key binds the actual recovery-claim reference; its original_publication predecessor binds the existing validated completion and actual original native source namespace.",
+    "The production context writer derives these references from its current authorized recovery claim, completed original publication and actual prepared native request. The reader validates the cycle against the original immutable claim, publication, registration, pending transfer and event joins.",
+    "Version-1 records remain readable with their original canonical shape. An absent cycle remains omitted from serialization, preserving the original encoding. Version 1 with a cycle, version 2 without one, unknown versions/purposes/fields and changed nested references refuse.",
+    "Both version-1 and initial version-2 records remain single-initial-cycle per original request. No latest-generation selection, native UUID replacement, model/body permission or repeated-cycle predecessor proof is inferred."
+  ],
+  "red": {
+    "log": "/tmp/autoship-recovery-cycle-v2-red-20261108.log",
+    "result": "The existing actual native-intent fixture failed because the new writer still emitted version 1 with no explicit cycle."
+  },
+  "validation": [
+    {
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent self_improve::workflow::tests::owner_recovery_ -- --nocapture",
+      "log": "/tmp/autoship-recovery-cycle-v2-matrix-20261108.log",
+      "passed": 3,
+      "failed": 0,
+      "seconds": 123.12,
+      "controlled_cases": 26,
+      "providers": [
+        "codex",
+        "claude"
+      ],
+      "groups": [
+        "actual native snapshot claim authority",
+        "native-intent persistence, rollback, lost commit acknowledgement, cycle integrity and v1 compatibility",
+        "forward transfer: live/later claim, core prepared/completed/aborted, SQL rollback/commit, terminal absent/prepared/completed/aborted"
+      ]
+    },
+    {
+      "command": "scripts/cargo-managed.sh build -p augmentagent-cli --bin augmentagent",
+      "log": "/tmp/autoship-recovery-cycle-v2-production-20261108.log",
+      "passed": true,
+      "seconds": 48.26
+    }
+  ],
+  "added_checks": [
+    "New version-2 cycle values join the actual prepared source and current original claim/completion.",
+    "Coherently rehashed record/event substitutions refuse for missing cycle, version-1 cycle, changed claim, changed completion, changed source generation/audit, unknown version and mismatched event version.",
+    "Unknown purpose and extra cycle/predecessor fields refuse in the exact production record type.",
+    "A representative canonical original version-1 record/event remains readable under the same actual protected fixture and transfer UUID.",
+    "Physical-index conversion preserves the exact version-2 record and transfer; duplicate initial records still refuse; idempotent rereads append no events."
+  ],
+  "limits": [
+    "The provider/runtime/authority data are controlled fixtures. No live provider, Discord, native VM model call, complete C/R proof or acceptance shipment is claimed.",
+    "Only the original-publication predecessor exists here. Completed-cycle or constructor-proven unstarted dispositions, repeated-cycle ancestry, consuming setup/release/model/result slots and full reserved-body recovery remain incomplete.",
+    "No production runtime, native policy, budget, hold, input or allowance changed. The production 8 GiB capacity decision is still pending.",
+    "Exact-head independent review, hosted CI, normal updater rollout and all original CLI/Discord/merge/fault/soak requirements remain."
+  ],
+  "all_original_local_handles_terminal": true,
+  "productive_recovery_granted": false,
+  "production_capacity_changed": false
+}

@@ -19,7 +19,26 @@ pub(crate) enum RecoveryNativeIntentPersistence<'a> {
 struct ContextRecord {
     version:u32,request_id:String,intent:super::super::owner_publication::Reference,
     claim:RecordRef,generation:i64,completion:RecordRef,pending:RecordRef,created_at:i64,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    cycle:Option<RecoveryCycle>,
 }
+#[derive(PartialEq,Eq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields,tag="purpose",rename_all="snake_case")]
+enum RecoveryCycle {
+    PublicationRecovery {recovery:RecordRef,predecessor:CyclePredecessor},
+}
+#[derive(PartialEq,Eq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields,tag="kind",rename_all="snake_case")]
+enum CyclePredecessor {
+    OriginalPublication {completion:RecordRef,source:augmentagent_channel_core::native_vm::ownership::Authority},
+}
+/// Descriptive initial-cycle identity only. A later cycle needs its distinct
+/// verified predecessor disposition; these references never mint that proof.
+fn initial_cycle(claim:&RecordRef,completion:&RecordRef,source:&augmentagent_channel_core::native_vm::ownership::Authority)->RecoveryCycle {
+    RecoveryCycle::PublicationRecovery {recovery:claim.clone(),predecessor:CyclePredecessor::OriginalPublication {completion:completion.clone(),source:source.clone()}}
+}
+#[cfg(test)]
+pub(super) fn fixture_encoding(raw:&str)->Result<String> {Ok(serde_json::to_string(&serde_json::from_str::<ContextRecord>(raw)?)?)}
 pub(super) fn original_record(conn:&Connection,original:&Original)->Result<(crate::self_improve::OwnerPublicationRecord,String)> {
     let (raw,len):(String,i64)=conn.query_row("SELECT substr(record,1,4227073),length(CAST(record AS BLOB)) FROM workflow_owner_publication_intent WHERE workflow=?1 AND request_id=?2",params![original.workflow,original.request_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
     ensure!((1..=4227072).contains(&len) && raw.len() as i64==len,"recovery native intent original exceeds bound");
@@ -46,15 +65,15 @@ fn history(conn:&Connection,workflow:&str)->Result<Vec<(ContextRecord,PendingNat
     let claims=journal(conn,workflow)?;
     let mut query=conn.prepare("SELECT request_id,transfer_id,generation,pending_sequence,sequence,record_sha256,substr(record,1,16385),length(CAST(record AS BLOB)) FROM workflow_owner_recovery_native_intent WHERE workflow=?1 ORDER BY sequence LIMIT 1025")?;
     let rows=query.query_map([workflow],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,i64>(7)?)))?;
-    let mut result=Vec::new();let mut legacy_requests=std::collections::BTreeSet::new();
+    let mut result=Vec::new();let mut initial_requests=std::collections::BTreeSet::new();
     for row in rows {
         let (request,id,generation,pending_sequence,sequence,sha,raw,len)=row?;
-        ensure!(legacy_requests.insert(request.clone()),"legacy recovery context cannot imply a repeated cycle");
+        ensure!(initial_requests.insert(request.clone()),"initial recovery context cannot imply a repeated cycle");
         ensure!(result.len()<1024 && (1..=16384).contains(&len) && raw.len() as i64==len && digest(&raw)==sha,"recovery native context exceeds bound or changed");
         let context:ContextRecord=serde_json::from_str(&raw)?;
         let index=claims.iter().position(|(_,reference)|*reference==context.claim).context("recovery native context claim missing")?;
         let claim=&claims[index].0;let original=&claim.original;
-        ensure!(context.version==1 && serde_json::to_string(&context)?==raw && context.request_id==request && request==original.request_id
+        ensure!(matches!(context.version,1|2) && serde_json::to_string(&context)?==raw && context.request_id==request && request==original.request_id
             && context.intent==original.intent && generation==context.generation && generation==claim.generation
             && context.pending.sequence==pending_sequence && context.claim.sequence<pending_sequence && pending_sequence<sequence
             && claims.get(index+1).is_none_or(|(_,next)|sequence<next.sequence)
@@ -66,6 +85,11 @@ fn history(conn:&Connection,workflow:&str)->Result<Vec<(ContextRecord,PendingNat
             && pending.request().source_owners.len()==1 && pending.request().source_owners[0].owner.lease_generation==original.activated_generation,
             "recovery native context original namespace changed");
         let source=&pending.request().source_owners[0];
+        ensure!(match context.version {
+            1=>context.cycle.is_none(),
+            2=>context.cycle.as_ref()==Some(&initial_cycle(&context.claim,&context.completion,source)),
+            _=>false,
+        },"recovery native cycle or original predecessor changed");
         let (audit,binding):(String,String)=conn.query_row("SELECT substr(o.audit_path,1,4097),substr(b.binding,1,16385) FROM workflow_native_owner o JOIN workflow_native_owner_binding b ON b.workflow=o.workflow AND b.lease_generation=o.lease_generation WHERE o.workflow=?1 AND o.lease_generation=?2",params![workflow,original.activated_generation],|r|Ok((r.get(0)?,r.get(1)?)))?;
         ensure!(audit.len()<=4096 && binding.len()<=16384 && source.audit_path==audit && serde_json::from_str::<augmentagent_channel_core::native_vm::ownership::TransferBinding>(&binding)?==*pending.original_binding(),"recovery native context source registration changed");
         let (record,_)=original_record(conn,original)?;record.validate_native_binding(pending.original_binding())?;
@@ -77,7 +101,7 @@ fn history(conn:&Connection,workflow:&str)->Result<Vec<(ContextRecord,PendingNat
         ensure!(pending_sha==context.pending.sha256,"recovery native pending digest changed");
         let (kind,event_generation,payload,at):(String,i64,String,i64)=conn.query_row("SELECT kind,generation,payload,at_ms FROM workflow_event WHERE workflow=?1 AND seq=?2",params![workflow,sequence],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
         ensure!(kind=="owner_recovery_native_intent_recorded" && event_generation==generation && at==context.created_at
-            && serde_json::from_str::<serde_json::Value>(&payload)?==serde_json::json!({"version":1,"request_id":request,"transfer_id":id,"record_sha256":sha}),"recovery native context event changed");
+            && serde_json::from_str::<serde_json::Value>(&payload)?==serde_json::json!({"version":context.version,"request_id":request,"transfer_id":id,"record_sha256":sha}),"recovery native context event changed");
         result.push((context,pending));
     }
     Ok(result)
@@ -172,10 +196,12 @@ impl WorkflowStore {
         let pending=PendingNativeHandoff {version:1,request,original_binding:snapshot.original_binding,workflow_binding:basis.snapshot_facts().workflow_binding.clone(),
             observation_revision:snapshot.observation.revision,observation_sha256:snapshot.observation.sha256,observation_certain:true};
         let (sequence,sha256)=native_pending::append_pending(&tx,&pending,now)?;
-        let context=ContextRecord {version:1,request_id:lease.request_id().into(),intent:lease.claim.original.intent.clone(),claim:lease.reference.clone(),generation:lease.generation(),
-            completion,pending:RecordRef {sequence,sha256},created_at:now};
+        let source=pending.request().source_owners.first().context("recovery native original source missing")?;
+        let cycle=initial_cycle(&lease.reference,&completion,source);
+        let context=ContextRecord {version:2,request_id:lease.request_id().into(),intent:lease.claim.original.intent.clone(),claim:lease.reference.clone(),generation:lease.generation(),
+            completion,pending:RecordRef {sequence,sha256},created_at:now,cycle:Some(cycle)};
         let raw=serde_json::to_string(&context)?;ensure!(raw.len()<=16384,"recovery native context exceeds bound");let sha=digest(&raw);
-        event(&tx,&lease.claim.original.workflow,lease.generation(),"owner_recovery_native_intent_recorded",&serde_json::json!({"version":1,"request_id":lease.request_id(),"transfer_id":pending.request().transfer_id,"record_sha256":sha}).to_string(),now)?;
+        event(&tx,&lease.claim.original.workflow,lease.generation(),"owner_recovery_native_intent_recorded",&serde_json::json!({"version":context.version,"request_id":lease.request_id(),"transfer_id":pending.request().transfer_id,"record_sha256":sha}).to_string(),now)?;
         let context_sequence:i64=tx.query_row("SELECT max(seq) FROM workflow_event WHERE workflow=?1",[&lease.claim.original.workflow],|r|r.get(0))?;
         tx.execute("INSERT INTO workflow_owner_recovery_native_intent VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![lease.claim.original.workflow,lease.request_id(),pending.request().transfer_id,lease.generation(),sequence,context_sequence,sha,raw])?;
         history(&tx,&lease.claim.original.workflow)?;

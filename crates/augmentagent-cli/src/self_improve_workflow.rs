@@ -5058,6 +5058,51 @@ else: raise SystemExit('unexpected authority call')
                                 }
                                 assert_eq!(store.events(&id).unwrap(),events);
                                 let context:(i64,i64,String,String)=db.query_row("SELECT pending_sequence,sequence,record_sha256,record FROM workflow_owner_recovery_native_intent WHERE workflow=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+                                let cycle:serde_json::Value=serde_json::from_str(&context.3).unwrap();
+                                assert_eq!(cycle["version"],2,"new recovery contexts need an explicit versioned cycle");
+                                assert_eq!(cycle["cycle"]["purpose"],"publication_recovery");
+                                assert_eq!(cycle["cycle"]["recovery"],cycle["claim"]);
+                                assert_eq!(cycle["cycle"]["predecessor"]["kind"],"original_publication");
+                                assert_eq!(cycle["cycle"]["predecessor"]["completion"],cycle["completion"]);
+                                assert_eq!(cycle["cycle"]["predecessor"]["source"],serde_json::to_value(&scan.source_owners()[0]).unwrap());
+                                let context_event:String=db.query_row("SELECT payload FROM workflow_event WHERE seq=?1",[context.1],|r|r.get(0)).unwrap();
+                                let install_cycle=|value:&serde_json::Value| {
+                                    let raw=durable::owner_publication_recovery::test_recovery_context_encoding(&serde_json::to_string(value).unwrap()).unwrap();
+                                    let sha=format!("{:x}",Sha256::digest(raw.as_bytes()));
+                                    db.execute("UPDATE workflow_owner_recovery_native_intent SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,raw,sha]).unwrap();
+                                    let mut event:serde_json::Value=serde_json::from_str(&context_event).unwrap();event["version"]=value["version"].clone();event["record_sha256"]=sha.into();
+                                    db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![context.1,serde_json::to_string(&event).unwrap()]).unwrap();
+                                };
+                                for fault in ["purpose","extra-cycle","extra-predecessor"] {
+                                    let mut value=cycle.clone();
+                                    if fault=="purpose" {value["cycle"]["purpose"]="unclassified_body_replay".into();}
+                                    else if fault=="extra-cycle" {value["cycle"]["new_authority"]=true.into();}
+                                    else {value["cycle"]["predecessor"]["new_authority"]=true.into();}
+                                    assert!(durable::owner_publication_recovery::test_recovery_context_encoding(&serde_json::to_string(&value).unwrap()).is_err(),"{fault}: unknown cycle fields were accepted");
+                                }
+                                for fault in ["missing-cycle","legacy-cycle","claim","completion","source","audit","version","event-version"] {
+                                    let mut value=cycle.clone();
+                                    match fault {
+                                        "missing-cycle"=>{value.as_object_mut().unwrap().remove("cycle");},
+                                        "legacy-cycle"=>value["version"]=1.into(),
+                                        "claim"=>value["cycle"]["recovery"]["sha256"]="b".repeat(64).into(),
+                                        "completion"=>value["cycle"]["predecessor"]["completion"]["sha256"]="b".repeat(64).into(),
+                                        "source"=>value["cycle"]["predecessor"]["source"]["owner"]["lease_generation"]=(scan.source_owners()[0].owner.lease_generation+100).into(),
+                                        "audit"=>value["cycle"]["predecessor"]["source"]["audit_path"]="/unrelated-original-audit".into(),
+                                        "version"=>value["version"]=99.into(),"event-version"=>{},_=>unreachable!(),
+                                    }
+                                    install_cycle(&value);
+                                    if fault=="event-version" {
+                                        let mut event:serde_json::Value=serde_json::from_str(&context_event).unwrap();event["version"]=1.into();
+                                        db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![context.1,serde_json::to_string(&event).unwrap()]).unwrap();
+                                    }
+                                    assert!(store.read_owner_recovery_native_intent(&recovery,&authorization,millis()).is_err(),"{fault}: coherent cycle substitution was accepted");
+                                }
+                                let mut legacy=cycle.clone();legacy["version"]=1.into();legacy.as_object_mut().unwrap().remove("cycle");
+                                install_cycle(&legacy);
+                                assert_eq!(store.read_owner_recovery_native_intent(&recovery,&authorization,millis()).unwrap().unwrap().transfer_id(),expected,"original v1 encoding lost compatibility");
+                                db.execute("UPDATE workflow_owner_recovery_native_intent SET record=?2,record_sha256=?3 WHERE workflow=?1",rusqlite::params![id,context.3,context.2]).unwrap();
+                                db.execute("UPDATE workflow_event SET payload=?2 WHERE seq=?1",rusqlite::params![context.1,context_event]).unwrap();
                                 durable::recovery_context_index::install_legacy_fixture(&db).unwrap();
                                 drop(WorkflowStore::open(&state).unwrap());
                                 assert_eq!(db.query_row("SELECT pending_sequence,sequence,record_sha256,record FROM workflow_owner_recovery_native_intent WHERE workflow=?1",[&id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).unwrap(),context,"migration changed actual original native intent");
@@ -5074,7 +5119,7 @@ else: raise SystemExit('unexpected authority call')
                                 let duplicate_event=db.last_insert_rowid();
                                 db.execute("INSERT INTO workflow_owner_recovery_native_intent SELECT workflow,request_id,?2,generation+1,?3,?4,record_sha256,record FROM workflow_owner_recovery_native_intent WHERE workflow=?1 AND transfer_id=?5",rusqlite::params![id,duplicate,duplicate_pending,duplicate_event,expected]).unwrap();
                                 let error=store.read_owner_recovery_native_intent(&recovery,&authorization,millis()).err().expect("legacy duplicate context was accepted");
-                                assert!(format!("{error:#}").contains("legacy recovery context cannot imply a repeated cycle"),"{error:#}");
+                                assert!(format!("{error:#}").contains("initial recovery context cannot imply a repeated cycle"),"{error:#}");
                                 db.execute("DELETE FROM workflow_owner_recovery_native_intent WHERE workflow=?1 AND transfer_id=?2",rusqlite::params![id,duplicate]).unwrap();
                                 db.execute("DELETE FROM workflow_event WHERE seq IN (?1,?2)",rusqlite::params![duplicate_pending,duplicate_event]).unwrap();
                                 assert_eq!(store.events(&id).unwrap(),events);

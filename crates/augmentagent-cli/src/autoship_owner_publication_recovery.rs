@@ -934,3 +934,6 @@ pub(super) fn require_no_successor_setup_dispatch(conn:&Connection,workflow:&str
 
 #[cfg(test)]
 pub(crate) fn test_successor_encoding(raw:&str)->Result<String> {successor_claim::fixture_encoding(raw)}
+
+#[cfg(test)]
+pub(crate) fn test_recovery_context_encoding(raw:&str)->Result<String> {native_intent::fixture_encoding(raw)}
