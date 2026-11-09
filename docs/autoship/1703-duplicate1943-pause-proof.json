@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T13:27:46.187000+00:00",
+  "parent_issue": 1703,
+  "workflow": "nolanmak/jarvis#1943",
+  "initial_pause": {
+    "accepted": false,
+    "reason": "workflow-not-found",
+    "error": "no durable command job"
+  },
+  "control_join": {
+    "request_id": "autoship-control-duplicate1943-20261109",
+    "accepted": true,
+    "joined": true,
+    "reason": "joined"
+  },
+  "pause": {
+    "accepted": true,
+    "reason": "owner-pause-requested",
+    "quiescence": "unverified",
+    "worker_enforcement": "unverified"
+  },
+  "durable_owner_control": {
+    "workflow": "nolanmak/jarvis#1943",
+    "revision": 1,
+    "paused": 1,
+    "updated_at": 1794230825085
+  },
+  "pr_aliases": [
+    {
+      "pr": 1944,
+      "workflow": null
+    },
+    {
+      "pr": 1945,
+      "workflow": null
+    }
+  ],
+  "queued_pr_controls": [
+    {
+      "workflow": "nolanmak/jarvis/pr/1944",
+      "paused": false
+    },
+    {
+      "workflow": "nolanmak/jarvis/pr/1945",
+      "paused": false
+    }
+  ],
+  "original_work": {
+    "generation": 1,
+    "lease_active": true,
+    "recorded_model_admissions": 10
+  },
+  "limits": [
+    "Normal control request preserves original candidate, evidence, generation and native work; no direct DB mutations.",
+    "An accepted pause does not prove worker enforcement, descendant teardown or released resources.",
+    "PR1944 and PR1945 remain independent unpaused command targets.",
+    "No source-work reset, native kill/restart, manual merge or allowance credit."
+  ]
+}

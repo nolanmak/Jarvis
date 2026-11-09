@@ -780,3 +780,18 @@ fixtures inspect durable FairSched, DailyCounter and merge allowance after one
 actual scheduler turn, distinguishing paid PR/build holds from unpaid holds.
 This bounded test-first repair does not enable concurrency or claim autosizing,
 independent approval, merge, deployment or live queue recovery.
+
+## Normal pause requested for duplicate issue1943 work
+
+[Control receipt](1703-duplicate1943-pause-proof.json) records the normal CLI
+join (`autoship-control-duplicate1943-20261109`, accepted/joined) and subsequent
+accepted pause revision 1 on the original issue1943 workflow. Direct pause first
+refused because autonomous work had no durable command job; joining the existing
+workflow supplied the supported control entry without resetting its generation.
+PR1944 and PR1945 have no shared alias and remain unpaused.
+
+The original lease was still active at observation, with ten recorded admissions.
+Enforcement and descendant teardown are unverified; no process was killed, no
+lease cleared and no quiescence/released-resource claim is made. This stops
+future work only when the existing controller enforces the pause. It is not a
+worker restart, a repair deployment or a confirmed merge.
