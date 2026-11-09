@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "parent_issue": 1703,
+  "repair_issue": 1943,
+  "pr": 1944,
+  "head": "932e8807058b667f165350109d9a22c8936f3127",
+  "hosted_validation": {
+    "run": 42604343264,
+    "job": 129116468662,
+    "conclusion": "success",
+    "reported_checks_and_statuses": 16,
+    "cli_binary_suite": {
+      "passed": 1753,
+      "failed": 0,
+      "ignored": 33
+    },
+    "new_coordinator_tests": 9,
+    "new_tests_individually_confirmed": true
+  },
+  "command": {
+    "repository": "nolanmak/jarvis",
+    "target": {
+      "kind": "pr",
+      "number": 1944
+    },
+    "requested_until": "merged",
+    "request_id": "autoship-recovery-pr1944-20261109",
+    "dry_run_reason": "target-validated",
+    "accepted": true,
+    "joined": false,
+    "workflow": "nolanmak/jarvis/pr/1944",
+    "reason": "queued",
+    "stage": "queued",
+    "complete": false,
+    "worker_state": "unknown",
+    "merge_state": "unknown",
+    "deployment_state": "unknown"
+  },
+  "limits": [
+    "Queue acceptance is not worker execution, independent review, merge or deployment.",
+    "Scripted verifier/executor tests do not establish a production baseline.",
+    "Original PR1937 workflow was not reset or restarted.",
+    "Full automatic host capacity, productive owner ingress and live CLI/Discord/shipment/fault/soak acceptance remain open."
+  ]
+}

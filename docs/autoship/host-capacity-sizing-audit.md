@@ -603,3 +603,23 @@ source facts, complete inventory, no paid duplicate scope and race-boundary test
 Strict trust/unknown classification, remote dispatch, pending intent exclusions
 and the external-create race remain explicit handoff gates. No implementation,
 RED/GREEN, approval, deployment or restored shipment is claimed.
+
+## Verified verifier-repair CI and normal command submission
+
+#1944 at 932e8807058b667f165350109d9a22c8936f3127 now has all 16
+reported hosted checks/statuses passing. The downloaded targeted log confirms
+all nine new coordinator tests, original-process crash/reopen, missing committed
+response detection, three-source-family hold and command-finish progress tests.
+Full CLI binary suite: 1,753 passed, zero failed, 33 existing ignored cases.
+The later redundant local managed run was still waiting on the actual worker VM
+lease; only our own exact waiting manage-parent was canceled after hosted success,
+and its original handle terminated 143. No local GREEN or VM/cache change claimed.
+
+The PR is now ready for independent code review. The actual production command
+accepted request autoship-recovery-pr1944-20261109 through the existing guarded
+autopr API after a successful target-validation dry run. The
+[receipt](1703-pr1944-command-proof.json) records queued, worker/review/merge/
+deployment unproven. No review, CI or merge bypass; no restart of PR1937.
+The separate #1942 guard regressions are in draft #1945 at 97444937, with hosted
+execution pending and no behavior repair or confirmed RED yet. Complete capacity,
+productive owner ingress and parent #1703 live acceptance remain unfinished.
