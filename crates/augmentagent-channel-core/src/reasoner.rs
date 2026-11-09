@@ -837,6 +837,22 @@ pub trait Reasoner: Send + Sync {
     }
 }
 
+/// Actual Claude command and all private files it references. No spawn/input
+/// operation is exposed by this preparation owner.
+pub(crate) struct PreparedClaudeInvocation {
+    pub(crate) command: Command,
+    pub(crate) bridge: Option<crate::codex_tools::ClaudeBridgeLaunch>,
+    launch_audit: Option<Arc<crate::tool_audit::AuditLogger>>,
+    vm_required: bool,
+    clear_environment: bool,
+    router: Option<crate::model_router::RouterConfig>,
+    routed_model: Option<String>,
+    _review_directory: Option<tempfile::TempDir>,
+    _scope: Option<crate::autoship_scope::NativeScope>,
+    _handoff_hooks: Option<crate::handoff::ClaudeHooks>,
+    _voice_mcp_file: Option<tempfile::NamedTempFile>,
+}
+
 pub struct ClaudeCliReasoner {
     bin: String,
     /// #898 — shared cap on concurrent CLI children; the global gate in
@@ -1194,24 +1210,12 @@ fn select_final_text(blocks: &[String], result: Option<&str>, capture: TextCaptu
 }
 
 impl ClaudeCliReasoner {
-    /// Single-shot spawn-and-read. Pulled out of [`Reasoner::call`] so the
-    /// outer wrapper can retry on a recoverable failure (corrupted
-    /// `~/.claude.json`, see #141).
-    async fn call_once(
-        &self,
-        opts: &ReasonerOpts,
-        user_message: &str,
-        capture: TextCapture,
-        clean: Arc<std::sync::atomic::AtomicBool>,
-    ) -> Result<String, CallError> {
-        let fresh_review = crate::native_session::is_fresh_review();
-        if fresh_review && (!opts.allowed_tools.is_empty() || opts.settings_json.is_some() || opts.handoff_path.is_some()) {
-            return Err(CallError::Other(anyhow::anyhow!("fresh review must use supplied evidence without tools, settings or handoff history")));
-        }
+    /// Construct the real Claude invocation while retaining every private
+    /// policy/hook asset. Construction never spawns or releases provider input.
+    pub(crate) fn prepare_invocation(bin: &str, opts: &ReasonerOpts, fresh_review: bool,
+        native_launch: Option<&crate::native_session::Launch>,
+    ) -> anyhow::Result<PreparedClaudeInvocation> {
         let review_directory = if fresh_review { Some(tempfile::tempdir()?) } else { None };
-        let mut native_lease = crate::native_session::current_for(crate::providers::ProviderKind::Claude)?
-            .map(|session| session.begin(crate::providers::ProviderKind::Claude))
-            .transpose()?;
         let mut args: Vec<String> = vec![
             "-p".into(),
             "--output-format".into(),
@@ -1225,16 +1229,16 @@ impl ClaudeCliReasoner {
                 "--setting-sources".into(), "".into(), "--strict-mcp-config".into(),
                 "--mcp-config".into(), r#"{"mcpServers":{}}"#.into(), "--disable-slash-commands".into()]);
         }
-        if let Some(lease) = &native_lease {
-            match lease.launch() {
+        if let Some(launch) = native_launch {
+            match launch {
                 crate::native_session::Launch::Create { requested_id: Some(id) } => {
-                    args.extend(["--session-id".into(), id]);
+                    args.extend(["--session-id".into(), id.clone()]);
                 }
                 crate::native_session::Launch::Resume { id } => {
-                    args.extend(["--resume".into(), id]);
+                    args.extend(["--resume".into(), id.clone()]);
                 }
                 crate::native_session::Launch::Create { requested_id: None } => {
-                    return Err(CallError::Other(anyhow::anyhow!("Claude session ID was not assigned")));
+                    anyhow::bail!("Claude session ID was not assigned");
                 }
             }
         }
@@ -1331,8 +1335,8 @@ impl ClaudeCliReasoner {
 
 
         let mut cmd = match &native_scope {
-            Some(scope) if !vm_required => scope.command(&self.bin),
-            _ => Command::new(&self.bin),
+            Some(scope) if !vm_required => scope.command(bin),
+            _ => Command::new(bin),
         };
         cmd.args(&args)
             .stdin(Stdio::piped())
@@ -1382,8 +1386,35 @@ impl ClaudeCliReasoner {
             }
         }
         if !vm_required { if let Some(scope) = &native_scope { scope.configure(&mut cmd); } }
-        crate::run_resources::check_requirement("claude",launch_audit.as_ref())?;
+        Ok(PreparedClaudeInvocation { command: cmd, bridge: claude_bridge,
+            launch_audit, vm_required, clear_environment, router, routed_model,
+            _review_directory: review_directory, _scope: native_scope,
+            _handoff_hooks: handoff_hooks, _voice_mcp_file })
+    }
+
+    /// Single-shot spawn-and-read. Pulled out of [`Reasoner::call`] so the
+    /// outer wrapper can retry on a recoverable failure (corrupted
+    /// `~/.claude.json`, see #141).
+    async fn call_once(
+        &self,
+        opts: &ReasonerOpts,
+        user_message: &str,
+        capture: TextCapture,
+        clean: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<String, CallError> {
+        let fresh_review = crate::native_session::is_fresh_review();
+        if fresh_review && (!opts.allowed_tools.is_empty() || opts.settings_json.is_some() || opts.handoff_path.is_some()) {
+            return Err(CallError::Other(anyhow::anyhow!("fresh review must use supplied evidence without tools, settings or handoff history")));
+        }
+        let mut native_lease = crate::native_session::current_for(crate::providers::ProviderKind::Claude)?
+            .map(|session| session.begin(crate::providers::ProviderKind::Claude))
+            .transpose()?;
         let native_launch = native_lease.as_ref().map(|lease|lease.launch());
+        let PreparedClaudeInvocation { command: cmd, bridge: claude_bridge,
+            launch_audit, vm_required, clear_environment, router, routed_model,
+            _review_directory, _scope, _handoff_hooks, _voice_mcp_file } =
+            Self::prepare_invocation(&self.bin,opts,fresh_review,native_launch.as_ref())?;
+        crate::run_resources::check_requirement("claude",launch_audit.as_ref())?;
         // Resolve declaration errors before allocating a native runtime or intent.
         let run_policy = crate::run_resources::declared_policy_for(crate::run_resources::run_kind_for(opts))?;
         let mut native_vm = if vm_required {

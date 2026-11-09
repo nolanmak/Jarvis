@@ -622,7 +622,7 @@ impl<'a> NativeBootstrap<'a> {
         // consumed across every retained logger clone; never retry by UUID.
         self.logger.claim_native_bootstrap()?;
         let launch=Launch::prepare_with_admission(provider,opts,original,bridge,native,PreparationAdmission::Bootstrap(self))?;
-        Ok(ClosedNativeBootstrap {launch,_codex_invocation:None,_controller:self.logger.clone()})
+        Ok(ClosedNativeBootstrap {launch,_codex_invocation:None,_claude_invocation:None,_controller:self.logger.clone()})
     }
 
     /// Prepare the pinned Codex invocation through its ordinary provider
@@ -641,7 +641,23 @@ impl<'a> NativeBootstrap<'a> {
         self.check_logger(opts.audit_logger.as_ref().context("native bootstrap original logger missing")?)?;
         let launch=Launch::prepare_with_admission("codex",opts,&invocation.command,Some(&invocation.bridge),
             Some(native),PreparationAdmission::Bootstrap(self))?;
-        Ok(ClosedNativeBootstrap {launch,_codex_invocation:Some(invocation),_controller:self.logger.clone()})
+        Ok(ClosedNativeBootstrap {launch,_codex_invocation:Some(invocation),_claude_invocation:None,_controller:self.logger.clone()})
+    }
+
+    /// Prepare pinned Claude through its ordinary adapter, retaining private
+    /// scope, bridge and hook assets without exposing spawn or input release.
+    pub fn prepare_claude(&self,opts:&crate::reasoner::ReasonerOpts,
+        native:&crate::native_session::Launch)->Result<ClosedNativeBootstrap> {
+        ensure!(matches!(native,crate::native_session::Launch::Create {..})
+            && !crate::native_session::is_fresh_review(),"closed Claude bootstrap requires initial owner preparation");
+        self.check_logger(opts.audit_logger.as_ref().context("native bootstrap original logger missing")?)?;
+        self.logger.claim_native_bootstrap()?;
+        let bin=std::env::var("CLAUDE_CLI").unwrap_or_else(|_|"claude".into());
+        let invocation=crate::reasoner::ClaudeCliReasoner::prepare_invocation(&bin,opts,false,Some(native))?;
+        self.check_logger(opts.audit_logger.as_ref().context("native bootstrap original logger missing")?)?;
+        let launch=Launch::prepare_with_admission("claude",opts,&invocation.command,
+            invocation.bridge.as_ref().map(|bridge|&bridge.bridge),Some(native),PreparationAdmission::Bootstrap(self))?;
+        Ok(ClosedNativeBootstrap {launch,_codex_invocation:None,_claude_invocation:Some(invocation),_controller:self.logger.clone()})
     }
 }
 /// Owns actual prepared state. It can inspect a closed supervisor, but exposes
@@ -651,6 +667,7 @@ pub struct ClosedNativeBootstrap {
     launch:Launch,
     // Holds all command assets through inspection and descendant teardown.
     _codex_invocation:Option<crate::codex::PreparedInvocation>,
+    _claude_invocation:Option<crate::reasoner::PreparedClaudeInvocation>,
     _controller:std::sync::Arc<crate::tool_audit::AuditLogger>,
 }
 #[path="native_bootstrap_inspection.rs"]
@@ -1331,6 +1348,12 @@ mod tests {
     #[test]
     fn failed_codex_provider_preparation_consumes_closed_bootstrap_attempt() {launch_intent_child("bootstrap-codex-provider-failed");}
     #[test]
+    fn closed_claude_bootstrap_uses_provider_preparation_without_dispatch() {launch_intent_child("bootstrap-claude-provider");}
+    #[test]
+    fn failed_claude_provider_preparation_consumes_closed_bootstrap_attempt() {launch_intent_child("bootstrap-claude-provider-failed");}
+    #[test]
+    fn closed_claude_bootstrap_uses_registered_scope_without_dispatch() {launch_intent_child("bootstrap-claude-provider-scoped");}
+    #[test]
     fn closed_native_bootstrap_cannot_promote_metadata_authority() {launch_intent_child("bootstrap-metadata");}
     #[test]
     fn closed_native_bootstrap_rechecks_original_authority_after_callback() {launch_intent_child("bootstrap-fenced");}
@@ -1386,6 +1409,9 @@ mod tests {
             let test = if mode=="bootstrap" {"closed_native_bootstrap_prepares_without_productive_admission"}
                 else if mode=="bootstrap-codex-provider" {"closed_codex_bootstrap_uses_provider_preparation_without_dispatch"}
                 else if mode=="bootstrap-codex-provider-failed" {"failed_codex_provider_preparation_consumes_closed_bootstrap_attempt"}
+                else if mode=="bootstrap-claude-provider" {"closed_claude_bootstrap_uses_provider_preparation_without_dispatch"}
+                else if mode=="bootstrap-claude-provider-failed" {"failed_claude_provider_preparation_consumes_closed_bootstrap_attempt"}
+                else if mode=="bootstrap-claude-provider-scoped" {"closed_claude_bootstrap_uses_registered_scope_without_dispatch"}
                 else if mode=="bootstrap-metadata" {"closed_native_bootstrap_cannot_promote_metadata_authority"}
                 else if mode=="bootstrap-fenced" {"closed_native_bootstrap_rechecks_original_authority_after_callback"}
                 else if mode=="bootstrap-other-logger" {"closed_native_bootstrap_refuses_different_logger"}
@@ -1451,6 +1477,7 @@ mod tests {
         std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",&policy);
         for (provider,id) in [("codex",Some("requested-codex-id")),("claude",None)] {
             if mode.starts_with("bootstrap-codex-provider") && provider!="codex" {continue;}
+            if mode.starts_with("bootstrap-claude-provider") && provider!="claude" {continue;}
             if mode=="input-crash" && std::env::var("JARVIS_TEST_INPUT_CRASH_PROVIDER").unwrap()!=provider {continue;}
             if mode=="asset-input" && provider!="codex" {continue;}
             let logs=root.as_path().join(format!("logs-{provider}")); let anchors=root.as_path().join(format!("anchors-{provider}"));
@@ -1502,6 +1529,18 @@ mod tests {
                 crate::audit_chain::AnchoredAudit::new(logger.path().into(),anchors.join("model.json"),&[]).unwrap()
                 .seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"sealed"}))).unwrap();}
             let mut opts=crate::reasoner::triage_opts(None);opts.audit_logger=Some(logger.clone());
+            if mode=="bootstrap-claude-provider-scoped" {
+                std::env::set_var(crate::state_dir::STATE_HOME_ENV,root.join("application-state"));
+                std::env::set_var("CLAUDE_CONFIG_DIR",root.join("absent-provider-config"));
+                let worktree=root.join("candidate");std::fs::create_dir(&worktree).unwrap();
+                write(&worktree.join("existing.rs"),b"original source\n").unwrap();
+                crate::autoship_write_scope::register(&worktree,&"c".repeat(64),
+                    vec![crate::autoship_write_scope::DeclaredPath{path:"existing.rs".into(),directory:false}],vec![]).unwrap();
+                opts.cwd=Some(worktree.clone());opts.add_dirs=vec![worktree];
+                opts.allowed_tools=vec!["Read".into(),"Write".into(),"Edit".into()];
+                opts.env.push((crate::autoship_scope::SCOPE_ENV.into(),"1".into()));
+            }
+            let id=if mode.starts_with("bootstrap-claude-provider") && mode!="bootstrap-claude-provider-failed" {Some("requested-claude-bootstrap-id")}else{id};
             let native=crate::native_session::Launch::Create {requested_id:id.map(str::to_owned)};
             let context=OwnerPreparationContext::new(owner.clone(),"original-owner-request".into(),"c".repeat(64)).unwrap();
             if mode.starts_with("bootstrap") {
@@ -1550,16 +1589,30 @@ mod tests {
                     std::env::set_var("CODEX_CLI","/usr/bin/false");
                     let mut other=opts.clone();other.audit_logger=Some(std::sync::Arc::new(logger.as_ref().clone()));
                     assert!(authority.prepare_codex(&other,"private owner preparation input",&native).is_err());
+                    assert!(authority.prepare_codex(&opts,"private owner preparation input",&crate::native_session::Launch::Resume{id:"old-conversation".into()}).is_err());
                     assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0,"different logger constructed a provider invocation");
                     if mode=="bootstrap-codex-provider-failed" {opts.settings_json=Some(r#"{"unsupported_bootstrap_fixture":true}"#.into());}
                     authority.prepare_codex(&opts,"private owner preparation input",&native)
+                }else if mode.starts_with("bootstrap-claude-provider") {
+                    std::env::set_var("CLAUDE_CLI","/usr/bin/false");
+                    let mut other=opts.clone();other.audit_logger=Some(std::sync::Arc::new(logger.as_ref().clone()));
+                    assert!(authority.prepare_claude(&other,&native).is_err());
+                    assert!(authority.prepare_claude(&opts,&crate::native_session::Launch::Resume{id:"old-conversation".into()}).is_err());
+                    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);
+                    authority.prepare_claude(&opts,&native)
                 }else{authority.prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native))};
-                if mode=="bootstrap-codex-provider-failed" {
+                if matches!(mode,"bootstrap-codex-provider-failed"|"bootstrap-claude-provider-failed") {
                     let error=result.err().expect("invalid private bridge settings prepared a native launch");
-                    assert!(format!("{error:#}").contains("unsupported settings"),"provider preparation failed before the intended bridge refusal");
+                    let expected=if provider=="codex" {"unsupported settings"}else{"Claude session ID was not assigned"};
+                    assert!(format!("{error:#}").contains(expected),"provider preparation failed before the intended constructor refusal");
                     assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);
                     opts.settings_json=None;
-                    assert!(authority.prepare_codex(&opts,"replayed private input",&native).is_err(),"failed provider construction reset the consumed setup");
+                    if provider=="codex" {
+                        assert!(authority.prepare_codex(&opts,"replayed private input",&native).is_err(),"failed provider construction reset the consumed setup");
+                    }else{
+                        let corrected=crate::native_session::Launch::Create{requested_id:Some("requested-claude-bootstrap-id".into())};
+                        assert!(authority.prepare_claude(&opts,&corrected).is_err(),"failed Claude construction reset the consumed setup");
+                    }
                     assert!(NativeBootstrap::capture(&logger).is_err());
                     assert!(logger.dispatch_allowed().is_err());assert!(logger.model_call_admitted(provider).is_err());
                     let raw=match std::fs::read_to_string(logger.path()) {
@@ -1585,6 +1638,25 @@ mod tests {
                         assert!(NativeBootstrap::capture(&std::sync::Arc::new(logger.as_ref().clone())).is_err(),"a retained logger clone reset preparation ownership");
                     }
                     let prepared=bootstrap.prepared_record().unwrap();
+                    if mode.starts_with("bootstrap-claude-provider") {
+                        let invocation=bootstrap._claude_invocation.as_ref().expect("closed preparation lost its Claude invocation");
+                        let args:Vec<_>=invocation.command.as_std().get_args().map(|arg|arg.to_string_lossy().into_owned()).collect();
+                        assert!(args.windows(2).any(|pair|pair==["--session-id","requested-claude-bootstrap-id"]));
+                        assert!(args.windows(2).any(|pair|pair==["--tools",""]),"text preparation inherited native tools");
+                        assert!(!args.iter().any(|arg|arg=="--resume"));
+                        let spec:serde_json::Value=serde_json::from_slice(&std::fs::read(bootstrap.launch._directory.path().join("launch.json")).unwrap()).unwrap();
+                        assert_eq!(spec["provider"],"claude");
+                        assert!(spec["argv"].as_array().unwrap().iter().any(|arg|arg=="--session-id"));
+                        if mode=="bootstrap-claude-provider-scoped" {
+                            let bridge=invocation.bridge.as_ref().expect("guarded Claude preparation omitted its tool bridge");
+                            assert!(bridge.config_path.is_file() && bridge.bridge.policy_path.is_file(),"private bridge assets did not survive preparation");
+                            assert!(args.iter().any(|arg|arg.contains("mcp__jarvis__Write")));
+                            assert!(spec["mcp_argv"].is_array());
+                            assert_eq!(std::fs::read(root.join("candidate/existing.rs")).unwrap(),b"original source\n");
+                        }
+                        assert!(authority.prepare_claude(&opts,&native).is_err(),"one setup prepared a second Claude invocation");
+                        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);
+                    }
                     if mode=="bootstrap-codex-provider" {
                         let invocation=bootstrap._codex_invocation.as_ref().expect("closed preparation lost its provider files");
                         let args:Vec<_>=invocation.command.as_std().get_args().map(|arg|arg.to_string_lossy().into_owned()).collect();
