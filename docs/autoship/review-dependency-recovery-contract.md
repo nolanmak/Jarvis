@@ -37,7 +37,12 @@ criterion_ids (nonempty unique known registered criteria), a nonempty question
 - bytes with start_byte inclusive and end_byte exclusive.
 Represent selectors as a deny_unknown_fields tagged enum. Names are Rust
 identifiers accepted by the existing syn dependency, with optional r# prefix;
-there is no regex/glob/path expression. Exact case matters. Byte bounds are
+there is no regex/glob/path expression. Validate the request name using
+syn::parse_str::<syn::Ident>, then compare with parsed declaration identifiers
+after stripping one leading r# from each. Exact case matters; foo and r#foo
+match each other in both directions. Keyword identifiers require valid raw
+spelling to pass the request parser. Preserve original spelling in source
+evidence; normalization is lookup identity only. Byte bounds are
 checked usize values with start < end, strict UTF-8 boundaries and end <= blob
 size. Requests are data, never tools or host filesystem permission.
 
@@ -48,14 +53,36 @@ requests on approve/changes_requested. Preserve the old public parser wrapper
 for path-only callers/tests; a new production parser returns typed requests.
 A path-only wrapper must reject a typed range/item request, not discard it.
 
-D3. Render initial source chunks with exact UTF-8 byte offsets and their
-immutable path/OID/size metadata. Caller streams already supply byte offsets;
-replace candidate #part numbering with equally explicit source byte offsets.
-Metadata is not source coverage. Instructions ask for concrete item names or
-byte ranges when a whole dependency cannot fit. No function index or extra
-metadata inventory is required: names can come from observed declarations/
-call sites; exact byte windows refer to supplied offsets. An unknown name is
-not guessed or replaced with the first approximate match.
+Canonical adjacent nesting is fixed, for example:
+```json
+{"missing_sources":[{"path":"src/logic.rs","criterion_ids":["C1"],"question":"Does caller use the callee result correctly?","selector":{"kind":"rust_item","name":"caller"}}]}
+```
+The other selector objects are exactly {"kind":"whole_file"} and
+{"kind":"bytes","start_byte":0,"end_byte":128}. No selector fields live
+beside path/question/criterion_ids, and fields belonging to another kind
+are rejected. This is nested, internally tagged selector JSON; all examples
+are inside an otherwise valid incomplete response with binding/findings.
+
+D3. Render proven candidate regular-file chunks and direct caller-stream
+chunks with exact UTF-8 byte offsets and immutable path/revision/OID/size
+metadata. Replace candidate #part numbering for those raw bytes. Preserve
+source bodies and full role coverage. Metadata is not source coverage.
+
+Do not label rendered text as raw file coordinates. candidate_snapshot
+currently prepends a deletion explanation to base content, and inline caller
+context is serialized JSON containing files. Preserve these existing bodies
+as explicitly rendered historical/context evidence with offsets into that
+rendered body, its body hash and bound base/head identities. They are not
+addressable candidate source ranges. Initial deletion evidence may retain
+the already-bound base bytes; recovery continues to resolve candidate head
+only. A missing deleted path is unavailable, not permission to read another
+revision. Symlink blob text may remain initial diff evidence but must not be
+mislabelled a regular-file source or grant recovery permission.
+
+Instructions ask for concrete item names or byte ranges when a whole
+dependency cannot fit. No function index is required: names can come from
+observed declarations/call sites, and exact byte windows refer to raw source
+offsets. An unknown name is not guessed or replaced with an approximate match.
 
 D4. Initial request packing uses at most MAX_PROMPT_BYTES/2 including system,
 contract, issue, prior findings and all other actual serialized fields. This
@@ -111,7 +138,17 @@ D6. Keep the current maximum two reviewer observations per original group.
 A valid first incomplete response may produce one coherent recovery call.
 A structured-format correction consumes the second observation and cannot
 then start another recovery call. The second response must complete the
-assigned group or leave it incomplete. No partial approval union or third
+assigned group or leave it incomplete. If any requested dependency is denied,
+unknown, unsupported, malformed, outside its ranges or otherwise unavailable,
+abort before observation two; do not pay for a known-incomplete subset.
+Return through existing run_impl error/unavailable_from_error handling, with
+available=false and no completed group, cache approval or merge authority.
+Size/working-set refusal uses existing typed EvidenceBudget; other producer
+failures retain their contextual errors. C1 does not pretend that existing
+generic outer failure projection or failed-finding persistence is repaired;
+those are explicit C2 exits. The current in-attempt GroupReview retains valid
+findings while constructing a successful response; durable failure retention
+remains C2. Partial source is not published as successful recovery. No partial approval union or third
 call/generation. Selector extraction uses no model calls, so worst_case_calls
 remains 6*initial_groups+2, calculated with D4's actual initial groups. Native
 quota/resource charging and immutable canary reservation remain unchanged.
@@ -207,9 +244,17 @@ response/cache budgets, escaping, original findings, format correction,
 incomplete second response and existing completed-cache/crash/binding/native
 identity behavior. Failed-review history, free deterministic hold and wake
 acceptance remain mandatory C2 exits. Verify diagnostic planner/reservation and
-final-authority actual-source consumption. Add a real PR1944-source profile
-probe: its required item pair and request metadata must fit without changing
-the limits. Otherwise this design has not resolved the observed blocker.
+final-authority actual-source consumption. The v1 PR1944 incident records only a whole-file missing path, not the
+underlying item pair/question. Do not invent one and credit it as incident
+acceptance. Before implementation, a real public-source profile may measure
+item lookup/serialized sizes on immutable3c00c759, explicitly labelled
+construction evidence. The required incident-resolution probe is parked
+until the first preserved normal PR1944 attempt under the new protocol
+supplies its actual typed request, criterion/question, original assigned
+group and exact serialized metadata. Owner #1709/#1952 must capture and
+replay that input, then establish actual independent completion. This
+deferral does not block generic C1 TDD/handoff, but blocks #1952 live closure;
+if the real coherent source still cannot fit, the incident remains open.
 
 Managed wrapper or immutable hosted CI only. Independent code approval, normal
 merge/updater rollout and replay of original PR1944 are separate exits. Source
