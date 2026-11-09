@@ -67,6 +67,17 @@ pub struct CodexCliReasoner {
     usage_log: std::sync::Arc<crate::token_usage::UsageLogger>,
 }
 
+/// Original provider command and the private files it references. Keeping this
+/// owner alive is required even when its native supervisor remains closed.
+pub(crate) struct PreparedInvocation {
+    pub(crate) command: Command,
+    pub(crate) bridge: crate::codex_tools::BridgeLaunch,
+    model: String,
+    capability: crate::providers::CapabilityClass,
+    prompt: String,
+    _directory: tempfile::TempDir,
+}
+
 /// The runner the bridge reported for a Bash call (#1041). It leads a result
 /// (`{"runner": "vm", ...}`, surviving truncation) or a failure raised after
 /// the process started (`[runner=host] ...`). Anything else was refused
@@ -194,31 +205,21 @@ impl CodexCliReasoner {
         }
     }
 
-    async fn call_once(
-        &self,
-        opts: &ReasonerOpts,
-        user_message: &str,
-        all_blocks: bool,
-        clean: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> anyhow::Result<String> {
-        let provider = self.provider_name();
-        let fresh_review=crate::native_session::is_fresh_review();
-        if fresh_review {
-            anyhow::ensure!(opts.allowed_tools.is_empty() && opts.settings_json.is_none() && opts.handoff_path.is_none(),
-                "fresh review must use supplied evidence without tools, settings or handoff history");
-        }
-        let mut native_lease = crate::native_session::current_for(self.kind)?
-            .map(|session| session.begin(self.kind))
-            .transpose()?;
-        let native_launch = native_lease.as_ref().map(|lease| lease.launch());
-        let router = crate::model_router::current()?.filter(|r| r.enabled() || self.kind != ProviderKind::Codex);
-        if matches!(self.kind, ProviderKind::Qwen | ProviderKind::Glm) && router.is_none() {
+    /// Build the actual provider invocation without spawning, charging a call,
+    /// or releasing input. The returned owner retains its private bridge files.
+    pub(crate) fn prepare_invocation(
+        bin: &str, kind: ProviderKind, opts: &ReasonerOpts, user_message: &str, fresh_review: bool,
+        native_launch: Option<&crate::native_session::Launch>,
+    ) -> anyhow::Result<PreparedInvocation> {
+        let provider = kind.name();
+        let router = crate::model_router::current()?.filter(|r| r.enabled() || kind != ProviderKind::Codex);
+        if matches!(kind, ProviderKind::Qwen | ProviderKind::Glm) && router.is_none() {
             return Err(ReasonerError::Local { message: "Runpod model requires a configured 9Router endpoint".into() }.into());
         }
-        let model = if self.kind == ProviderKind::Codex {
+        let model = if kind == ProviderKind::Codex {
             router.as_ref().and_then(|r| r.model(ProviderKind::Codex, tier_of(opts)))
                 .unwrap_or_else(|| model_for(ProviderKind::Codex, tier_of(opts)))
-        } else { model_for(self.kind, tier_of(opts)) };
+        } else { model_for(kind, tier_of(opts)) };
         let capability = crate::providers::classify(opts);
 
         // `IMAGE:` markers → native `-i` attachments (see crate::images).
@@ -282,13 +283,13 @@ impl CodexCliReasoner {
         if native_launch.is_none() {
             args.push("--ephemeral".into());
         }
-        if matches!(native_launch.as_ref(), Some(crate::native_session::Launch::Resume { .. })) {
+        if matches!(native_launch, Some(crate::native_session::Launch::Resume { .. })) {
             args.insert(1, "resume".into());
         }
         if let Some(router) = &router {
             for value in router.codex_overrides() { args.extend(["-c".into(), value]); }
         }
-        if let Some((context, compact)) = match self.kind {
+        if let Some((context, compact)) = match kind {
             ProviderKind::Qwen => Some((262_144, 229_376)),
             ProviderKind::Glm => Some((32_768, 24_576)),
             _ => None,
@@ -314,12 +315,12 @@ impl CodexCliReasoner {
         // "-" = read the prompt from stdin, mirroring the claude spawn shape.
         args.push("-".into());
 
-        let mut cmd = Command::new(&self.bin);
+        let mut cmd = Command::new(bin);
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if matches!(native_launch.as_ref(), Some(crate::native_session::Launch::Resume { .. })) {
+        if matches!(native_launch, Some(crate::native_session::Launch::Resume { .. })) {
             cmd.current_dir(&bridge.native_cwd);
         }
 
@@ -344,6 +345,32 @@ impl CodexCliReasoner {
         // Integration environment is carried in the owner-private broker
         // policy, never exposed to native tools or placed on argv.
 
+
+        Ok(PreparedInvocation { command: cmd, bridge, model, capability,
+            prompt: user_message.to_owned(), _directory: tmp })
+    }
+
+    async fn call_once(
+        &self,
+        opts: &ReasonerOpts,
+        user_message: &str,
+        all_blocks: bool,
+        clean: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> anyhow::Result<String> {
+        let provider = self.provider_name();
+        let fresh_review=crate::native_session::is_fresh_review();
+        if fresh_review {
+            anyhow::ensure!(opts.allowed_tools.is_empty() && opts.settings_json.is_none() && opts.handoff_path.is_none(),
+                "fresh review must use supplied evidence without tools, settings or handoff history");
+        }
+        let mut native_lease = crate::native_session::current_for(self.kind)?
+            .map(|session| session.begin(self.kind))
+            .transpose()?;
+        let native_launch = native_lease.as_ref().map(|lease| lease.launch());
+        let PreparedInvocation { command: cmd, bridge, model, capability,
+            prompt: user_message, _directory: _invocation_directory } =
+            Self::prepare_invocation(&self.bin, self.kind, opts, user_message, fresh_review, native_launch.as_ref())?;
+        let user_message = user_message.as_str();
 
         let launch_audit=opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger);
         crate::run_resources::check_requirement(provider,launch_audit.as_ref())?;

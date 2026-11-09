@@ -622,13 +622,37 @@ impl<'a> NativeBootstrap<'a> {
         // consumed across every retained logger clone; never retry by UUID.
         self.logger.claim_native_bootstrap()?;
         let launch=Launch::prepare_with_admission(provider,opts,original,bridge,native,PreparationAdmission::Bootstrap(self))?;
-        Ok(ClosedNativeBootstrap {launch,_controller:self.logger.clone()})
+        Ok(ClosedNativeBootstrap {launch,_codex_invocation:None,_controller:self.logger.clone()})
+    }
+
+    /// Prepare the pinned Codex invocation through its ordinary provider
+    /// adapter. This consumes one setup attempt and retains the actual bridge;
+    /// it exposes neither productive dispatch nor provider stdin.
+    pub fn prepare_codex(&self,opts:&crate::reasoner::ReasonerOpts,prompt:&str,
+        native:&crate::native_session::Launch)->Result<ClosedNativeBootstrap> {
+        ensure!(matches!(native,crate::native_session::Launch::Create {..})
+            && !crate::native_session::is_fresh_review(),"closed Codex bootstrap requires initial owner preparation");
+        self.check_logger(opts.audit_logger.as_ref().context("native bootstrap original logger missing")?)?;
+        // Claim before provider/bridge constructor I/O, just as the raw
+        // preparation path claims before its native constructor I/O.
+        self.logger.claim_native_bootstrap()?;
+        let invocation=crate::codex::CodexCliReasoner::prepare_invocation(&crate::codex::codex_bin(),
+            crate::providers::ProviderKind::Codex,opts,prompt,false,Some(native))?;
+        self.check_logger(opts.audit_logger.as_ref().context("native bootstrap original logger missing")?)?;
+        let launch=Launch::prepare_with_admission("codex",opts,&invocation.command,Some(&invocation.bridge),
+            Some(native),PreparationAdmission::Bootstrap(self))?;
+        Ok(ClosedNativeBootstrap {launch,_codex_invocation:Some(invocation),_controller:self.logger.clone()})
     }
 }
 /// Owns actual prepared state. It can inspect a closed supervisor, but exposes
 /// no command, productive spawn, or input-release API.
 /// Saved records are descriptive and cannot reconstruct this lifetime.
-pub struct ClosedNativeBootstrap {launch:Launch,_controller:std::sync::Arc<crate::tool_audit::AuditLogger>}
+pub struct ClosedNativeBootstrap {
+    launch:Launch,
+    // Holds all command assets through inspection and descendant teardown.
+    _codex_invocation:Option<crate::codex::PreparedInvocation>,
+    _controller:std::sync::Arc<crate::tool_audit::AuditLogger>,
+}
 #[path="native_bootstrap_inspection.rs"]
 mod bootstrap_inspection;
 pub use bootstrap_inspection::ClosedNativeInspection;
@@ -1303,6 +1327,10 @@ mod tests {
     #[test]
     fn closed_native_bootstrap_prepares_without_productive_admission() {launch_intent_child("bootstrap");}
     #[test]
+    fn closed_codex_bootstrap_uses_provider_preparation_without_dispatch() {launch_intent_child("bootstrap-codex-provider");}
+    #[test]
+    fn failed_codex_provider_preparation_consumes_closed_bootstrap_attempt() {launch_intent_child("bootstrap-codex-provider-failed");}
+    #[test]
     fn closed_native_bootstrap_cannot_promote_metadata_authority() {launch_intent_child("bootstrap-metadata");}
     #[test]
     fn closed_native_bootstrap_rechecks_original_authority_after_callback() {launch_intent_child("bootstrap-fenced");}
@@ -1356,6 +1384,8 @@ mod tests {
                 return;
             }
             let test = if mode=="bootstrap" {"closed_native_bootstrap_prepares_without_productive_admission"}
+                else if mode=="bootstrap-codex-provider" {"closed_codex_bootstrap_uses_provider_preparation_without_dispatch"}
+                else if mode=="bootstrap-codex-provider-failed" {"failed_codex_provider_preparation_consumes_closed_bootstrap_attempt"}
                 else if mode=="bootstrap-metadata" {"closed_native_bootstrap_cannot_promote_metadata_authority"}
                 else if mode=="bootstrap-fenced" {"closed_native_bootstrap_rechecks_original_authority_after_callback"}
                 else if mode=="bootstrap-other-logger" {"closed_native_bootstrap_refuses_different_logger"}
@@ -1420,6 +1450,7 @@ mod tests {
         // Isolated subprocess: never mutate another Rust test's policy selection.
         std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",&policy);
         for (provider,id) in [("codex",Some("requested-codex-id")),("claude",None)] {
+            if mode.starts_with("bootstrap-codex-provider") && provider!="codex" {continue;}
             if mode=="input-crash" && std::env::var("JARVIS_TEST_INPUT_CRASH_PROVIDER").unwrap()!=provider {continue;}
             if mode=="asset-input" && provider!="codex" {continue;}
             let logs=root.as_path().join(format!("logs-{provider}")); let anchors=root.as_path().join(format!("anchors-{provider}"));
@@ -1515,7 +1546,32 @@ mod tests {
                 }
                 assert!(authority.prepare(provider,&opts,&Command::new("/usr/bin/false"),None,
                     Some(&crate::native_session::Launch::Resume {id:"original-conversation".into()})).is_err());
-                let result=authority.prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native));
+                let result=if mode.starts_with("bootstrap-codex-provider") {
+                    std::env::set_var("CODEX_CLI","/usr/bin/false");
+                    let mut other=opts.clone();other.audit_logger=Some(std::sync::Arc::new(logger.as_ref().clone()));
+                    assert!(authority.prepare_codex(&other,"private owner preparation input",&native).is_err());
+                    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0,"different logger constructed a provider invocation");
+                    if mode=="bootstrap-codex-provider-failed" {opts.settings_json=Some(r#"{"unsupported_bootstrap_fixture":true}"#.into());}
+                    authority.prepare_codex(&opts,"private owner preparation input",&native)
+                }else{authority.prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native))};
+                if mode=="bootstrap-codex-provider-failed" {
+                    let error=result.err().expect("invalid private bridge settings prepared a native launch");
+                    assert!(format!("{error:#}").contains("unsupported settings"),"provider preparation failed before the intended bridge refusal");
+                    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);
+                    opts.settings_json=None;
+                    assert!(authority.prepare_codex(&opts,"replayed private input",&native).is_err(),"failed provider construction reset the consumed setup");
+                    assert!(NativeBootstrap::capture(&logger).is_err());
+                    assert!(logger.dispatch_allowed().is_err());assert!(logger.model_call_admitted(provider).is_err());
+                    let raw=match std::fs::read_to_string(logger.path()) {
+                        Ok(raw)=>raw,
+                        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>String::new(),
+                        Err(error)=>panic!("read original bootstrap audit: {error}"),
+                    };
+                    let rows:Vec<serde_json::Value>=raw.lines()
+                        .map(|line|serde_json::from_str(line).unwrap()).collect();
+                    assert!(!rows.iter().any(|row|matches!(row["kind"].as_str(),Some("model_call_admitted"|"native_launch_prepared"|"native_input_release_attempt"))));
+                    continue;
+                }
                 if matches!(mode,"bootstrap-fenced"|"bootstrap-policy") {
                     assert!(result.is_err());assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);
                     assert!(NativeBootstrap::capture(&logger).is_err());
@@ -1529,6 +1585,21 @@ mod tests {
                         assert!(NativeBootstrap::capture(&std::sync::Arc::new(logger.as_ref().clone())).is_err(),"a retained logger clone reset preparation ownership");
                     }
                     let prepared=bootstrap.prepared_record().unwrap();
+                    if mode=="bootstrap-codex-provider" {
+                        let invocation=bootstrap._codex_invocation.as_ref().expect("closed preparation lost its provider files");
+                        let args:Vec<_>=invocation.command.as_std().get_args().map(|arg|arg.to_string_lossy().into_owned()).collect();
+                        assert!(args.iter().any(|arg|arg=="--strict-config"));
+                        assert!(args.iter().any(|arg|arg=="--ignore-user-config"));
+                        assert!(!args.iter().any(|arg|arg=="--ephemeral"),"pinned native creation became ephemeral");
+                        assert!(invocation.bridge.policy_path.is_file(),"private bridge lifetime ended before bootstrap");
+                        let spec:serde_json::Value=serde_json::from_slice(&std::fs::read(bootstrap.launch._directory.path().join("launch.json")).unwrap()).unwrap();
+                        assert_eq!(spec["provider"],"codex");
+                        assert!(spec["argv"].as_array().unwrap().iter().any(|arg|arg=="--strict-config"));
+                        assert!(spec["mcp_argv"].is_array(),"provider bootstrap omitted its guarded tool transport");
+                        assert!(!args.iter().any(|arg|arg.contains("private owner preparation input")),"private input reached provider argv");
+                        assert!(authority.prepare_codex(&opts,"second private input",&native).is_err(),"one setup prepared a second provider invocation");
+                        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);
+                    }
                     assert_eq!(prepared,saved.lock().unwrap()[0]);
                     assert!(logger.native_launch_prepared(&prepared.intent).is_err(),"bootstrap used ordinary native publication");
                     assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);
