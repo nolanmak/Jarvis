@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T22:22:26.550730+00:00",
+  "related_issue": 1943,
+  "status": "v2_fixture_compile_failure_v3_live_not_native_acceptance",
+  "v2": {
+    "managed_exit": 1,
+    "child_exit": 2,
+    "status": "unexpected_fixture_compile_failure",
+    "code": "EFBIG",
+    "file_class": "rust_incremental_dep_graph",
+    "kernel_file_limit_bytes": 268435456,
+    "behavioral_red": false,
+    "correction": "disable dev/test incremental for inner Cargo test; preserve kernel file limit"
+  },
+  "v2_log_sha256": "747560125c5173d5d1580fde1f265825129651d83447ca147e54ff3e2b6609bd",
+  "v3": {
+    "helper_path": "autoship_verifiers/issue_1955_receipt.py",
+    "helper_sha256": "c9f3f4e697dca215088191fcddcf283b9eb2c2bc5ad8b94cd0fb63c042cb80b0",
+    "parser_suffix_sha256": "0366929bd554d92ecd687d77b57069da384f808d261e84aa442544aa85403270",
+    "synthetic_parser_controls": [
+      {
+        "case": "valid_true",
+        "exit_code": 0,
+        "emits_valid_behavior": true
+      },
+      {
+        "case": "valid_false",
+        "exit_code": 0,
+        "emits_valid_behavior": true
+      },
+      {
+        "case": "missing",
+        "exit_code": 1,
+        "emits_valid_behavior": false
+      },
+      {
+        "case": "duplicate",
+        "exit_code": 1,
+        "emits_valid_behavior": false
+      },
+      {
+        "case": "malformed",
+        "exit_code": 1,
+        "emits_valid_behavior": false
+      },
+      {
+        "case": "duplicate_key",
+        "exit_code": 1,
+        "emits_valid_behavior": false
+      },
+      {
+        "case": "non_finite",
+        "exit_code": 1,
+        "emits_valid_behavior": false
+      },
+      {
+        "case": "bool_counter",
+        "exit_code": 1,
+        "emits_valid_behavior": false
+      },
+      {
+        "case": "unknown_field",
+        "exit_code": 1,
+        "emits_valid_behavior": false
+      },
+      {
+        "case": "writable_source",
+        "exit_code": 1,
+        "emits_valid_behavior": false
+      }
+    ],
+    "all_controls_passed": true,
+    "production_workflow_source_matches_original_committed_blobs": true,
+    "probe_injection": "private runtime copy only",
+    "configuration": "Cargo --config profile.dev.incremental=false --config profile.test.incremental=false; debug remains0, jobs1, offline/locked",
+    "current_run": "original-base managed sandbox experiment still live"
+  },
+  "limits": [
+    "EFBIG is the kernel per-file limit on compiler incremental output, not ENOSPC or a host/cache capacity diagnosis. The business observation never ran.",
+    "No file, storage, safety-floor or capacity limit raised; no cache manually deleted or unregistered target allocated.",
+    "Exact v3 parsing suffix tested with synthetic stdout only. Actual original/candidate/mutant observations and independent registration remain unproven.",
+    "The original #1954 workflow remains normally paused with its original request, charges, published source, failed candidate history and pinned verifier unchanged.",
+    "No native baseline, approval, merge, deployment or restored Autoship claim."
+  ]
+}

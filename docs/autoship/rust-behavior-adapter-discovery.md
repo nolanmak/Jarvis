@@ -139,3 +139,24 @@ and portable Cargo lookup from the controller-supplied PATH. Neither helper
 placement nor tool discovery is waived because a local prototype can run.
 All staged changes must keep the same observation on both heads; an independent
 registered proposal still has to reproduce its own original-base behavior.
+
+## Compiler per-file limit and corrected experiment
+
+The [corrected baseline experiment](1703-private-adapter-compiler-limit-observation.json)
+finished with fixture failure: Rust could not write its incremental
+dep-graph.part.bin because the unchanged 256 MiB RLIMIT_FSIZE returned EFBIG.
+No business observation ran. This is not host disk/cache exhaustion, intended
+behavioral RED or an enrolled receipt.
+
+The next private helper disables dev/test incremental compilation through Cargo
+configuration while preserving debug0, one job, offline/locked mode and the
+original kernel/storage limits. It also uses the supported autoship_verifiers
+path, discovers Cargo from the existing controller PATH, refuses an ordinary
+Git checkout, and rejects writable-source setup before emitting business data.
+Both exported production workflow blobs still match their original commits;
+the probe is appended only to the disposable runtime copy. Ten exact-parser
+controls pass, including valid true/false business data and refused writable
+source. These controls do not establish execution of the Rust behavior.
+The new original-base run is live at this checkpoint. Original/candidate/mutant
+behavior, bounded teardown and independent complete-contract reproduction
+remain required before treating the worked proposal as accepted evidence.
