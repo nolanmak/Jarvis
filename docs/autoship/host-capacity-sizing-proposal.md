@@ -23,6 +23,15 @@ read-only-default proposal is superseded. An inspection command remains read-onl
 The owner has requested automatic sizing on the current host; another choice of
 an arbitrary fixed capacity is not a prerequisite to designing this feature.
 
+Dependency refinement: the closed
+[host memory facts/default-sizing component](host-memory-facts-contract.md)
+may be implemented under C1 while the remaining C0 contract stays open. It
+strengthens the existing supervisor decoder and supplies M1-M3 data helpers;
+it adds no activation, configuration writer, full-capacity status or new
+admission authority. Complete C1 and dependent integration/activation remain
+blocked on their full reviewed prerequisites. Do not treat helper completion
+as complete detection, automatic sizing or deployed recovery.
+
 #1913 is the separate guarded legacy-budget recovery command, #1914 reports
 capacity and #1915 preserves precise private blockers. They do not implement this
 feature. Their reviews/rollouts and the existing restoration work continue; the

@@ -7,6 +7,11 @@ handoff or an assertion about deployed behavior. The
 Decisions below resolve specific questions; the open-contract checklist prevents
 those decisions from being mistaken for completion of C0.
 
+The separately closed [memory component](host-memory-facts-contract.md) permits
+implementation of M1-M3 data helpers and the existing supervisor's input decoder
+before the rest of C0 closes. References below to blocked C1 mean complete C1
+and integration/activation; this bounded exception is not a full contract handoff.
+
 ## 1. Memory quantities and planning
 
 M1. All memory values are checked unsigned byte integers. GiB means 2^30 bytes;

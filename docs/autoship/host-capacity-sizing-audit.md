@@ -238,3 +238,20 @@ remain load-bearing C0 gates. Its experiment-polish suggestion to emit pairwise
 input comparisons was implemented; these comparisons do not enlarge the stated
 evidence scope. No production configuration/accounting was modified, and C1-C5
 remain blocked pending complete C0 closure and the final whole-contract audit.
+
+The bounded memory component in `host-memory-facts-contract.md` received a
+fresh-reader audit, author conversation/source cross-check and all 16 mapped
+seam checks (six grouped read-only auditors). No retained component-contract
+finding remained. This closes that small implementation contract, not full C0.
+The feature plan explicitly permits these settled data helpers and strengthening
+the existing supervisor decoder under C1 while complete discovery, accounting,
+migration, activation and remaining C0 work retain their prerequisites. This
+removes an overbroad helper dependency without weakening any execution gate.
+
+The existing `available_memory()` source accepts the second token on the first
+matching line without validating total, units, duplicates or u64 range. TDD
+fixtures in the implementation worktree reproduce 11 malformed observations
+accepted through that unchanged production entry on main `416f392b`; valid
+kB/zero and missing-availability compatibility cases run separately. Missing
+new parser/planner APIs are not counted as deployed behavioral regressions.
+Implementation/CI/independent review/rollout evidence remains separate.
