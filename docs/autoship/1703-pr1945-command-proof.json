@@ -47,5 +47,21 @@
     "Queue acceptance is not worker execution, merge or deployment.",
     "No original request, workflow, owner hold or PR head was reset.",
     "Full automatic host capacity, productive owner ingress and live CLI/Discord/shipment/fault/soak acceptance remain open."
-  ]
+  ],
+  "latest_attempt": {
+    "observed_at_utc": "2026-11-09T15:46:12.955137+00:00",
+    "selected_at_ms": 1794237647612,
+    "finished_at_ms": 1794238846461,
+    "outcome": "failed",
+    "outer_reason": "execution-failed",
+    "workflow_reason": "acceptance_registration_retry",
+    "next_action": "rescope_executable_acceptance",
+    "model_admissions": 7,
+    "wall_ms": 1186347,
+    "baseline_result": "unexpected_failure",
+    "verifier_id": "linked_pr_observations",
+    "compiler_error": "E0277: PathBuf does not implement Display in generated autoship_case.rs fixture formatting",
+    "regression_owner_issue": 1943,
+    "limits": "The independent baseline did not reproduce intended product behavior; no reviewer approval, autonomous merge or rollout is inferred. Original workflow/candidate/request remain preserved."
+  }
 }

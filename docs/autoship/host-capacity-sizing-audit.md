@@ -897,3 +897,28 @@ active generation-1 lease and five recorded native admissions at observation.
 This proves recovery beyond the earlier quota refusal, not completed acceptance
 or merge. Original requests, candidate/provenance and all parent live exits
 remain preserved.
+
+## Review dependency design audit and PR1945 actual failed attempt
+
+The [review dependency contract investigation](review-dependency-recovery-contract.md)
+records a fresh-reader rejection of the multipart-local-approval proposal:
+complete bytes distributed among reviewers do not prove anyone reasoned about
+a dependency crossing parts. Five additional findings concern encoded bounds,
+wake/counter identities, unknown original-result recovery, response persistence
+and failure transitions. All six are open design gates; none is code approval.
+A map enumerated 30 seams for that proposal; they are not all checked. The
+replacement direction must investigate the existing final-authority immutable
+window selector and preserve actual coherent review, unread-source labels and
+all budget/provenance/diagnostic semantics before handoff.
+
+PR1945's [original command proof](1703-pr1945-command-proof.json) now records
+its actual finished attempt after seven model admissions and approximately
+19.8 minutes. The independent baseline verifier failed to compile its generated
+fixture: E0277, PathBuf formatted as Display. That is unexpected verifier
+failure, not intended behavior RED. The source repair remains #1943/#1944; no
+original request reset or manual protected-verifier edit was performed.
+
+#1951 remains draft at04c29b8d. Its final bridge regression job is GREEN;
+the explicitly registered actual CLI integrations and other required checks
+are still awaiting the original hosted jobs. No main rollout or autonomous
+merge is claimed.
