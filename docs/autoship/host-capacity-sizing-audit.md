@@ -156,3 +156,43 @@ delivered and never determines execution or allowance. Final persisted attention
 schema and #1714 integration remain explicit C0 gates. These are proposed
 behavioral fixtures and reviewed working contracts, not implementation/live
 acceptance or the final whole-contract seam audit.
+
+The compatibility checkpoint adds S8/S9's proposed monotonic protocol floor,
+same-inode negative open fences, staged old-writer handoff, and boot/rollback
+requirements. In particular, a writer's already-open descriptor survives chmod;
+new-client rejection cannot stand in for checked old-controller handoff. The
+normal native-owner history contributes correlation, not cleanup authority.
+
+The disposable Linux probe in `probes/storage_compat_permissions.py` passed
+22 predicates across storage-temp and private systemd-user runtime locations:
+12 permission/flock predicates and 10 actual legacy Python scratch-gate
+predicates. It records the imported bridge SHA-256; at this checkpoint that is
+`42bbc1aa57cbc2e750f9ee804132aee0799adedeb0233857974676b39e390c6f`.
+It creates only private temporary files and never creates a VM image, opens an
+application state/lock, invokes a model, or changes production permissions.
+The mode-01700 scratch-root discriminator rejects the legacy allocator's exact
+0700 validator, while a preopened root descriptor remains usable. This is
+evidence for that negative gate, not a complete migration test or a grant.
+
+Additional source tracing includes the Rust compute-retention `usage.json`
+publisher consumed by Python scratch admission. It must be covered by the final
+consumer/startup matrix. Scratch-root mode alone does not fence that allocator
+or every sweeper. New protocol session paths avoid the legacy immediate-child
+session-prefix sweep; original live legacy paths must not be moved.
+
+The compatibility audit identified eight already-open C0 implementation-contract
+gates: original handoff producer/completeness, full bootstrap entry-point matrix,
+protocol/marker/registry formats, per-step journal/crash recovery, snapshot
+projection/compatibility matrix, actual growth/inode/quota profiles, held bridge
+APIs, and exact SQL/config/provenance/legacy-versus-bound migration handlers.
+These remain prerequisites for implementation handoff, not follow-up cleanup
+after activation. The checkpoint does not close C0 or unblock C1-C5.
+
+A fresh-reader recheck found a boot-specific ambiguity: fence recreation could
+be read as enough to reopen admission after an interrupted cutover. S9 now
+explicitly resumes the same journal and requires checked handoff/import/
+publication/loaded completion before admission. The probe now refuses an
+unexpected legacy-source SHA and executes the exact hashed bytes, and the
+contract explicitly limits temporary/runtime observations instead of presenting
+them as certification of production filesystem profiles. Final pinned legacy
+entry-point and full migration/profile tests remain required.

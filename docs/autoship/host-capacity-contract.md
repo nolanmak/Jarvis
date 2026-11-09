@@ -581,6 +581,12 @@ must adapt those operations to the common authority and carry the original
 storage binding to the actual VM command. Do not implement a second independent
 SQL reader/allocator in Python or accept a policy JSON flag as a held allocation.
 Exact bridge request/descriptor APIs remain C0 work before C2 implementation.
+The compute retention publisher in `code_mode/compute/retention.rs` also writes
+`compute-artifacts/usage.json` (`schemaVersion=1`, `reservedBytes`) before task
+leases; the Python allocator reads that private inventory under the directory
+lock. It is an existing local accounting input, not already a global claim.
+The final consumer/migration matrix must account for its allocator and sweeper
+as well as the VM image allocator; neither can be omitted or counted twice.
 Auto mode replaces the bridge's managed 24 GiB aggregate scratch-budget default
 with common per-filesystem accounting, rather than leaving another fixed pool
 to block a larger host. Preserve explicit operator scratch ceilings as additional
@@ -820,16 +826,182 @@ metadata rewritten after losing original handles, a copied completion JSON,
 or an old unqualified legacy retirement record is insufficient release proof.
 No new table, registry field, event or replay ID creates cleanup authority.
 
-S8. Mixed-version/startup fencing is still load-bearing C0 work. In particular,
+S8. Mixed-version/startup fencing is load-bearing. In particular,
 old v1 readers delete unlocked process claims before parsing their version, and
 old native admission never consults the shared registry. A new table/row type
 or a documented “upgrade every writer” convention does not structurally fence
 them. Before auto activation, the supported migration must verify the complete
 managed writer set, enforce a compatible minimum version/startup barrier across
 reboot and rollback, and positively settle incompatible active writers. Unknown
-compatibility keeps activation blocked. This section specifies durable balance
-and ordering; it does not yet approve that compatibility protocol or bootstrap
-automatic mode on an existing legacy host.
+compatibility keeps activation blocked. S9 specifies the proposed negative
+fences and handoff requirements; their original-proof APIs, publication journal
+and complete managed-consumer integration still block implementation handoff.
+
+S9. Use a monotonic per-UID minimum storage protocol of 2, persisted with the
+durable registry/control plane before publishing the first protocol-2 fence.
+This floor is independent of auto versus fixed sizing. Switching back to fixed
+does not permit an allocator that ignores retained commitments. Once published,
+normal rollback cannot erase the floor, return lock permissions to legacy mode,
+or restore older authority/accounting. Prepare a retained, compatible recovery
+binary/configuration through the normal snapshot/updater path first. A failure
+after floor publication is a publication/recovery operation, not an untouched
+failure eligible to re-enable old code.
+
+The supported initial permission-fence profile is an unprivileged, nonzero
+real/effective UID on local Linux filesystems supporting read-only exclusive
+flock (the current ext4 storage and systemd-user runtime filesystem arrangement).
+Root, privilege-bypassing capabilities, remote-lock semantics or unknown file/
+namespace identity do not qualify through this profile. This is a negative
+compatibility mechanism, not exclusive physical disk protection against unrelated
+applications or deliberate owner bypass.
+
+#### Negative old-client fences
+
+- Preserve the original shared admission-lock inode. Through its held descriptor,
+  set/verify owner-read-only mode 0400 and synchronize it. Protocol-2 code opens
+  that checked inode read-only and takes the same exclusive flock. Legacy
+  `storage_reservations::open_private` requires read+write and therefore fails
+  before admitting a new writer. Never unlink/replace an owned lock to obtain
+  an uncontended one.
+- Publish a private reserved compatibility marker in the existing process-claim
+  namespace, with a reserved valid UUID `.reservation` filename and mode 0400.
+  Protocol-2 inventory recognizes only the exact marker bound to the persistent
+  protocol/registry and current namespace identities. Legacy claim scanning opens
+  records read+write before reclaiming free flocks, so it fails on that marker
+  instead of deleting an unlocked durable row. A generic unknown record cannot
+  be skipped as a marker. The exact marker encoding remains part of the final
+  schema; an ID alone cannot authorize exclusion or parent-claim reuse.
+- Apply the same checked read-only-lock protocol to each participating native
+  root's existing `state.lock`, which legacy native admission/retirement opens
+  read+write. New native policy format/loader also refuses old code, but this
+  inode fence covers a caller that cached a v1 policy before the change.
+- The Python scratch allocator bypasses those lock inodes. Its existing
+  `_open_root` accepts only exact owner mode 0700. The proposed protocol-2
+  scratch-root discriminator is mode 01700 on the same checked directory:
+  owner access remains, while the old allocator refuses before image creation.
+  Compatible code must explicitly validate the new mode rather than silently
+  chmod it back. A private `protocol-2` child holds new image/session paths;
+  its name does not match the legacy Rust sweeper's immediate-child
+  `jarvis-vm-session-` filter. Do not move or rename old live session paths.
+  This fences fresh old Python allocation only: it neither revokes preopened
+  directory descriptors nor fences Rust compute allocation or every cleanup
+  path. Those consumers still require the complete startup/handoff matrix.
+- Guard both legacy global lock-directory selections (`/run/user/UID` and its
+  `/tmp` fallback), or refuse activation if either cannot be safely fenced.
+  New compatible clients use one bound coordination namespace and refuse a
+  missing/replaced namespace rather than silently starting another allocator.
+  Runtime-directory loss is not permission to use an unfenced fallback.
+
+#### Positive handoff, not an absence scan
+
+Permissions do not revoke a descriptor already opened read+write. A disposable
+non-root kernel experiment verified that such a descriptor still writes/locks
+after chmod 0400. The marker protects legacy claim-scanning paths, but is not
+proof that every old native/prune/controller path has stopped.
+
+Before authorizing protocol-2 allocations, the migration controller must hold
+the startup/deployment exclusion and obtain an original, checked compatibility
+handoff covering every supported
+managed consumer instance: daemon/worker controllers, native owners, CLI work
+controllers, builders, snapshots, pruners, and the Python bridge/cache helpers.
+Cover their controller processes and delegated descriptors, not only guest or
+run-child cgroups. Binary version, quiet PID, expired lease, zero model calls,
+an unlocked flock or a process census alone is insufficient.
+
+This handoff is an opaque original-proof capability, not a deserializable
+`all_writers_stopped` flag or a result minted from callback-selected booleans.
+The migration may wait for normal guarded drain/recovery outside storage/native
+locks; it may not kill sessions, bypass owner holds or reclaim unknown state.
+Existing native owner registration history (`workflow_native_owner`, registered
+before dispatch) contributes completeness/correlation evidence but does not
+itself prove quiescence or authorize retirement. Missing producer/instance
+coverage keeps activation prepared/held with capacity-protocol-incompatible.
+Do not set owner retirement fields, release retained charges or call native
+retirement/pruning merely to make this handoff appear complete. Normal actual
+workflow retirement remains a separate original-proof-governed operation.
+
+Use a staged cutover rather than assuming all old consumers obey a new flag:
+
+1. Prepare the compatible recovery binary and complete entry-point/bootstrap
+   plan; publish the guarded startup selection before the persistent protocol
+   floor/fences. This ensures reboot during a partial migration cannot restart
+   an old managed writer without bootstrap. A source-backed old entry point not
+   covered by the plan blocks this step; names/version flags are not coverage.
+2. Persist the protocol floor and install/verify the negative fences under the
+   original native/common lock inodes. Release those locks. Fresh legacy opens
+   now fail, while already-admitted/preopened old instances may drain under their
+   original fixed-mode authorization. No new protocol-2 allocation is permitted.
+3. Obtain the positive original handoff, including controllers with preopened
+   descriptors, through normal guarded drain/recovery. Do not wait for them while
+   holding storage/native locks. Binary capability alone does not change an
+   already-prepared incompatible invocation into a compatible one.
+4. Reacquire/revalidate the original native/common locks, handoff, closed consumer
+   set and all fence identities. Only now import final legacy balances and publish
+   the compatible policy/schema/registry operation. Then complete ordinary guarded
+   reload/readback before permitting new protocol-2 work.
+
+Keep the same migration operation across lost acknowledgements and known waiting
+phases. Pending compatible drain is a journalled publishing step, not permission
+to reopen legacy locks or recompute the plan. A failed/unknown handoff remains
+held; do not “try a v2 allocation” as a test of whether an old waiter exists.
+
+#### Boot and rollback cutover
+
+The persistent minimum protocol survives reboot; `/run` locks/markers do not.
+The supported service/CLI/updater entry points must run compatible bootstrap
+before any managed allocation. Bootstrap verifies the persistent registry and
+publishes/verifies the negative fences in both legacy coordination locations,
+then resumes the same journalled migration. Recreating fences alone cannot
+permit admission: positive handoff, final balance import, compatible policy/
+registry publication and actual loaded readback must all be durably complete
+and revalidated first. An interrupted cutover remains held at its original step.
+Its source/binary binding and unit ordering
+are checked in the final C3 matrix, not inferred from a helpful executable flag.
+It performs no model work and does not convert stored records into a live
+execution grant. A failed bootstrap leaves managed admission blocked with precise
+diagnostics; it cannot select a clean empty runtime directory as recovery.
+
+New code revalidates these negative fences and namespace identity on each
+admission. Fixed mode, updater repair and resource-only rollback still obey
+the minimum protocol. Unknown/corrupt registry or fence data refuses admission;
+neither an old snapshot nor a mode toggle resets it.
+
+### Compatibility fixtures and evidence scope
+
+- Non-root disposable-file probe: a fresh legacy O_RDWR open of mode 0400 fails;
+  a checked O_RDONLY descriptor obtains exclusive flock; an already-open O_RDWR
+  descriptor remains valid. A second descriptor also respects an existing
+  exclusive holder. These observations were reproduced in both a storage-temp
+  directory and the private systemd-user runtime directory using
+  `python3 docs/autoship/probes/storage_compat_permissions.py`.
+  This samples the current temporary/runtime mounts; it does not certify every
+  supported storage filesystem, remount profile, or actual deployment namespace.
+- A mode-0400 reserved claim marker rejects the legacy read+write open before
+  its free-flock deletion logic. This kernel-open experiment was reproduced;
+  actual old Rust/native/bridge entry-point acceptance remains required by C2/C3.
+- The same probe imports the repository's actual old `BuildScratch`, records
+  its SHA-256 (refusing an unreviewed source revision), and verifies mode 01700
+  makes `open()` return
+  `build_scratch_unavailable` before `_require_space` or image allocation.
+  A deliberately preopened directory descriptor remains usable. Both locations
+  pass, and no VM image is created. This tests only the legacy root validator,
+  not compatible allocation, Rust sweeping, or complete migration readiness.
+- A retained preopened legacy descriptor/controller prevents handoff even if its
+  model count is zero or its run-child cgroup is empty. Fence installation alone
+  cannot mark that case loaded/compatible.
+- Reboot removes temporary coordination but keeps retained rows and protocol
+  floor: no managed writer starts before compatible bootstrap recreates/verifies
+  both fences. Fallback replacement or a foreign directory remains unknown.
+- Switching auto to fixed or selecting an old rollback binary does not restore
+  mode 0600, delete the marker, drop the protocol floor or hide native charges.
+- A legacy root with incomplete owner history/proofs remains held with its data
+  and full charges preserved. A bound-owner schema uses its actual qualified
+  migration handler; the legacy budget writer from #1913 is not such a handler.
+
+These decisions specify the required mechanism and tests. They do not claim the
+handoff producer, marker/schema, complete startup matrix or bound-owner migration
+handler is implemented or closed. No production permissions were changed by the
+kernel experiment; it used only disposable temporary directories.
 
 ## 8. Configured mode, publication and runtime adaptation
 
@@ -879,11 +1051,14 @@ eligible to recompute another candidate.
 Reconciliation compares every affected file's original/candidate identities and
 digests while preserving the original operation. If all candidate files are
 durably present, continue to `published-awaiting-load`. A proven untouched source
-set may terminate `failed-before-write`. Partial or contradictory state stays
+set may terminate `failed-before-write`. Unexplained partial or contradictory state stays
 uncertain and fences new auto admission until that same operation is reconciled
 through its recorded write plan. The detailed multi-file step journal must be
 specified with the final schema; this state list alone does not authorize
 blindly rewriting an observed mixed set or rolling back authority.
+An intact journal may identify a known partial publishing step, such as S9's
+fences-installed/waiting-for-drain phase. Resume that guarded step of the same
+operation; it is neither loaded success nor an unexplained lost acknowledgement.
 
 Use existing deployment pin, active-work, memory-pressure and restart-budget
 guards. `scripts/check-for-updates.sh` already distinguishes policy selection
