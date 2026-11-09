@@ -89,6 +89,19 @@ impl ItemRanges<'_> {
     ) -> Range<usize> {
         self.source_line_range(span.start().line, brace.end().line)
     }
+    fn push_source_container(
+        &mut self,
+        span: proc_macro2::Span,
+        brace: proc_macro2::Span,
+        attrs: &[syn::Attribute],
+    ) -> usize {
+        let previous = self.context.len();
+        self.context.push(self.source_header_range(span, brace));
+        for attr in attrs {
+            self.context.push(self.source_span_range(attr.span()));
+        }
+        previous
+    }
     fn collect_requested_item(&mut self, name: &syn::Ident, span: proc_macro2::Span) {
         if name.to_string().trim_start_matches("r#") == self.name {
             self.ranges.push(self.source_span_range(span));
@@ -143,30 +156,29 @@ impl<'ast> Visit<'ast> for ItemRanges<'_> {
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         self.collect_requested_item(&item.ident, item.span());
         if let Some((brace, _)) = &item.content {
-            self.context
-                .push(self.source_header_range(item.span(), brace.span.open()));
+            let previous = self.push_source_container(item.span(), brace.span.open(), &item.attrs);
             syn::visit::visit_item_mod(self, item);
-            self.context.pop();
+            self.context.truncate(previous);
         }
     }
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
-        self.context
-            .push(self.source_header_range(item.span(), item.brace_token.span.open()));
+        let previous =
+            self.push_source_container(item.span(), item.brace_token.span.open(), &item.attrs);
         syn::visit::visit_item_impl(self, item);
-        self.context.pop();
+        self.context.truncate(previous);
     }
     fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
         self.collect_requested_item(&item.ident, item.span());
-        self.context
-            .push(self.source_header_range(item.span(), item.brace_token.span.open()));
+        let previous =
+            self.push_source_container(item.span(), item.brace_token.span.open(), &item.attrs);
         syn::visit::visit_item_trait(self, item);
-        self.context.pop();
+        self.context.truncate(previous);
     }
     fn visit_item_foreign_mod(&mut self, item: &'ast syn::ItemForeignMod) {
-        self.context
-            .push(self.source_header_range(item.span(), item.brace_token.span.open()));
+        let previous =
+            self.push_source_container(item.span(), item.brace_token.span.open(), &item.attrs);
         syn::visit::visit_item_foreign_mod(self, item);
-        self.context.pop();
+        self.context.truncate(previous);
     }
 }
 fn requested_item_ranges(source: &str, name: &str) -> Result<Vec<Range<usize>>> {
@@ -364,7 +376,7 @@ mod tests {
     }
     #[test]
     fn raw_names_duplicates_and_container_attributes_are_exact_source() {
-        let source="#[cfg(any())]\nmod first {\nstruct Foo;\nimpl Foo\nwhere Foo: Sized\n{\n#[inline]\nfn r#cap() -> u32 { 3 }\n}\n}\nmod second {\nfn cap() -> u32 { 4 }\n}\n";
+        let source="#[cfg(any())]\nmod first {\n#![allow(dead_code)]\nstruct Foo;\nimpl Foo\nwhere Foo: Sized\n{\n#![allow(unused)]\n#[inline]\nfn r#cap() -> u32 { 3 }\n}\n}\nmod second {\nfn cap() -> u32 { 4 }\n}\n";
         for name in ["cap", "r#cap"] {
             let ranges = requested_item_ranges(source, name).unwrap();
             let text = ranges
@@ -375,6 +387,8 @@ mod tests {
             for required in [
                 "#[cfg(any())]",
                 "mod first",
+                "#![allow(dead_code)]",
+                "#![allow(unused)]",
                 "impl Foo",
                 "where Foo: Sized",
                 "#[inline]",
