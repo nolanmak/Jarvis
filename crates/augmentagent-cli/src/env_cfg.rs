@@ -28,7 +28,9 @@ use std::collections::BTreeMap;
 /// Embedded snapshot of `.env.example` so the binary still has a key list
 /// when it runs outside the repo (systemd unit, /usr/local/bin install). The
 /// runtime file at `./.env.example` takes precedence when present.
-const EMBEDDED_DOTENV_EXAMPLE: &str = include_str!("../../../.env.example");
+#[path = "env_key_snapshot.rs"]
+mod env_key_snapshot;
+use env_key_snapshot::EMBEDDED_DOTENV_EXAMPLE;
 
 /// Substrings (case-insensitive) that mark a key as secret for masking.
 /// Sourced from the issue spec — kept here as a single source of truth so the
