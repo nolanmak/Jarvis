@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T15:28:10.161971+00:00",
+  "owner_issue": 1706,
+  "comment": "https://github.com/nolanmak/Jarvis/issues/1706#issuecomment-6743892485",
+  "window_utc": "2026-11-09T15:15:19Z through 2026-11-09T15:16:48Z",
+  "workflows": [
+    "nolanmak/jarvis/pr/1945",
+    "nolanmak/jarvis/pr/1947",
+    "nolanmak/jarvis/pr/1949",
+    "nolanmak/jarvis/pr/1937"
+  ],
+  "reported_reason": "target-authorization-failed",
+  "actual_error": "target lookup failed: gh: API rate limit exceeded (HTTP 403)",
+  "later_read_only_control": "Ordinary CLI dry run for PR1947 returned target-validated; current actor admin permission observed.",
+  "next_requirement": "Distinguish quota/transport uncertainty from grant denial; fail closed, preserve original requests and use typed retry/backoff without model or merge spend.",
+  "limits": [
+    "Interactive CLI success does not prove service token/API bucket recovered.",
+    "No environment or credentials read/copied, restart, grant bypass, request reset or quota timestamp inferred from another context."
+  ]
+}

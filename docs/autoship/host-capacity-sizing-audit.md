@@ -841,3 +841,34 @@ unmerged. They were admitted/paused through the normal CLI and have no shared
 PR alias at observation. Do not resume them while their PR remains active.
 Full capacity, provenance compatibility, targeted PR classification, typed
 identity outcomes and parent live acceptance remain unfinished.
+
+## Repair prerequisites GREEN; filtered-source defect reproduced
+
+PR1947's [paid-held fairness proof](1703-paid-held-fairness-red-proof.json)
+now records exact-head 1ff444fc GREEN: 1,746 CLI unit passes, zero failures,
+33 existing ignored. PR1949's [three-writer proof](1703-attempt-history-red-proof.json)
+records 388e6202 GREEN: 1,747 passes, zero failures, 33 existing ignored,
+including all six new lock/failure/crash tests. Both PRs are ready and admitted
+through their original normal CLI requests; neither is merged or deployed.
+
+The live worker actually selected the queued repairs. Its authorization refusal
+was [GitHub quota exhaustion](1703-worker-github-quota-proof.json), not proof
+of revoked grants. This misleading classification and its retry behavior are
+recorded under #1706. An interactive dry run later succeeded; that does not
+prove the worker's token/API quota bucket recovered. No credentials changed.
+
+#1950/#1951 repair a separate real source-input defect: credential filtering
+omits .env.example while the CLI required it at compile time. The same actual
+production BuildSnapshot/production Rust module case first failed missing input,
+then passed at 2691add3 with a public 147-name/no-values source asset.
+The [bounded proof](1703-filtered-env-input-proof.json) records both heads,
+run/job identities, canonical public data and the limits of local/hosted evidence.
+Actual CLI tests and remaining hosted checks are still running; draft1951 is
+not yet admitted. Source issue1950 is held through normal CLI controls to avoid
+a duplicate build, with no native resource release inferred.
+
+PR1944's original attempt completed after eleven recorded admissions and
+approximately 99.7 minutes, publishing head3c00c759. It now has no active lease
+and is held for resume_preserved_work. Old932e8807 CI does not cover that head.
+No command reset, manual candidate edit, code approval, autonomous merge,
+capacity activation or completion of #1703 is claimed.

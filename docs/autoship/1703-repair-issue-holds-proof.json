@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "observed_at": "2026-11-09T14:05:28.115680+00:00",
-  "purpose": "Prevent duplicate issue builds while the draft repair PRs are tested, until linked-PR selection is deployed.",
+  "purpose": "Prevent duplicate issue builds while active repair PRs are tested or queued, until linked-PR selection is deployed.",
   "holds": [
     {
       "workflow": "nolanmak/jarvis#1946",
@@ -24,6 +24,15 @@
       "native_owner_rows": 0,
       "pr": 1949,
       "pr_alias_workflow": null
+    },
+    {
+      "workflow": "nolanmak/jarvis#1950",
+      "request_id": "autoship-protect-repair1950-20261109",
+      "paused": true,
+      "revision": 1,
+      "updated_at_ms": 1794236728687,
+      "pr": 1951,
+      "limits": "Accepted normal CLI pause receipt; no native retirement or released capacity inferred."
     }
   ],
   "release_condition": "Reassess only if the corresponding PR is closed unmerged and work must return to the issue lane; merged PRs close their source issue. Do not resume an issue into a duplicate build while its PR remains active.",

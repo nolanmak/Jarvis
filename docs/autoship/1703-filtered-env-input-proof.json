@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T15:28:10.161971+00:00",
+  "parent_issue": 1703,
+  "owner_issue": 1707,
+  "repair_issue": 1950,
+  "pr": 1951,
+  "red": {
+    "head": "f07ec11a5e111b7792f43c17646493956bc9b56c",
+    "run": 42638392463,
+    "job": 129232575325,
+    "case": "FilteredEnvInputTests.test_real_embedded_schema_compiles_after_source_filtering",
+    "failure": "Actual production Rust module failed compilation with exit 101: omitted .env.example. Full-source control compiled; private canaries excluded.",
+    "python_suite": {
+      "passed": 501,
+      "failed": 1,
+      "skipped": 53
+    }
+  },
+  "green": {
+    "head": "2691add3d0f553372910935d0bb188d4596270ad",
+    "run": 42642846423,
+    "job": 129248172654,
+    "case_result": "passed",
+    "python_suite": {
+      "passed": 502,
+      "failed": 0,
+      "skipped": 53
+    },
+    "log_sha256": "3c99937b4d5f6e6520ac26d7e58a329571042640da32c051c3b8070d7bce4c94",
+    "scope": "Actual fresh Rust compilation of the production dependency-free constant module after production BuildSnapshot filtering; not a whole CLI build or native VM replay."
+  },
+  "public_inventory": {
+    "canonical_base": "416f392b17b56b2a43e67a3e430835902387941a",
+    "canonical_template_git_blob": "b42815fc495908d3e110903dac740b8a08fa1946",
+    "key_count": 147,
+    "asset_bytes": 4295,
+    "asset_sha256": "a4d418dfbb2479777f32d8db83898e411ddf2724432bfd2bcf914d845a5d8e80",
+    "contents": "Sorted public names only, each NAME= plus newline; no values."
+  },
+  "full_cli_validation": {
+    "run": 42642846494,
+    "job": 129248335305,
+    "state": "in_progress"
+  },
+  "local_replay": "Initial managed probe failed missing input during rustdoc. Strengthened fresh local compilation was cancelled while awaiting managed admission; original processes verified terminal before editing. No fresh local GREEN claimed.",
+  "limits": [
+    "Actual CLI fallback/runtime-template tests remain pending hosted completion.",
+    "No whole native VM replay, independent code approval, merge or updater rollout claimed.",
+    "No credential filter exception, private value, borrowed cache, native state reset or capacity increase."
+  ]
+}

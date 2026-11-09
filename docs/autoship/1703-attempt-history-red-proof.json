@@ -25,16 +25,30 @@
   "implementation": {
     "head": "388e6202e9790531271e8add9f894b52230121b7",
     "run": 42630481781,
-    "state": "in_progress",
+    "state": "completed",
     "production_writers": 3,
     "behavior_tests": 6,
     "whitespace": "passed",
-    "rust_syntax": "passed"
+    "rust_syntax": "passed",
+    "job": 129205199594,
+    "conclusion": "success",
+    "cli_unit_tests": {
+      "passed": 1747,
+      "failed": 0,
+      "ignored": 33
+    },
+    "log_sha256": "6580662080a36bdd081f65256c185eec2492a1ffa901b6e5a72e371b9b7ab624"
   },
   "limits": [
-    "No hosted GREEN or local full-suite pass claimed yet.",
+    "Hosted exact-head CLI/integration GREEN verified; no local full-suite pass claimed. Independent approval, merge and normal rollout remain pending.",
     "No concurrent consumer, capacity increase, native state reset, review approval, merge or deployment.",
     "Fixture SIGKILL is limited to an original disposable test child; it grants no native retirement/release authority.",
     "All live writer versions must drain/upgrade before enabling concurrent consumption."
-  ]
+  ],
+  "command": {
+    "request_id": "autoship-recovery-pr1949-20261109",
+    "workflow": "nolanmak/jarvis/pr/1949",
+    "ready": true,
+    "latest_observation": "Selected by live worker; rejected target-authorization-failed, with actual cause GitHub HTTP 403 rate limit. No model dispatch recorded for this attempt."
+  }
 }

@@ -49,10 +49,10 @@
     "whitespace": "passed",
     "rust_syntax": "passed",
     "hosted_run": 42626678480,
-    "hosted_state": "in_progress"
+    "hosted_state": "completed_failure_legacy_layout_assertion"
   },
   "limits": [
-    "Hosted GREEN and independent approval remain pending.",
+    "Independent approval, merge and normal rollout remain pending; hosted exact-head GREEN is verified.",
     "No local full Rust suite was run; original production VM/build custody was preserved.",
     "No concurrent consumer, source binding, native runtime, capacity policy, merge credit or production deployment changed.",
     "Resolved PR classification and broader peer fairness/inactivity remain #1706 requirements.",
@@ -79,8 +79,21 @@
     "head": "1ff444fcb56e113325c7f00c8839b38b3891cf3e",
     "run": 42629214521,
     "job": 129200832827,
-    "state": "in_progress",
+    "state": "completed",
     "change": "Replaced only obsolete accounting-layout assertions with real worker completed-paid controls; original rotation checks remain.",
-    "worker_tests": 5
+    "worker_tests": 5,
+    "conclusion": "success",
+    "cli_unit_tests": {
+      "passed": 1746,
+      "failed": 0,
+      "ignored": 33
+    },
+    "log_sha256": "1187986a14db8e43451bc3c12269636f47922e974f307f07ae6a92c05216a84f"
+  },
+  "command": {
+    "request_id": "autoship-recovery-pr1947-20261109",
+    "workflow": "nolanmak/jarvis/pr/1947",
+    "ready": true,
+    "latest_observation": "Selected by live worker; rejected target-authorization-failed, with actual cause GitHub HTTP 403 rate limit. No model dispatch recorded for this attempt."
   }
 }
