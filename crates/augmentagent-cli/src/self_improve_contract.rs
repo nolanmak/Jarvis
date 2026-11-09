@@ -1129,6 +1129,9 @@ async fn initial_baseline_candidates(root:&Path,source:AcceptanceSource,base:&st
     let environment=environment_id(root)?;
     let epoch=amendment::digest(&serde_json::to_vec(&("initial-baseline-repair-v1",workflow.id(),
         &workflow.binding().contract,source,base,&environment,scope,required_criteria))?);
+    // Slot 1 keeps the pre-repair correction key so a workflow interrupted
+    // under the single-correction scheme replays its saved response instead of
+    // paying for a new one.
     let legacy=amendment::digest(format!("{source}|{base}|{environment}|{}",serde_json::to_string(required_criteria)?).as_bytes());
     let epoch_ref=epoch.as_str();let legacy_ref=legacy.as_str();
     initial_repair::run(&epoch,
