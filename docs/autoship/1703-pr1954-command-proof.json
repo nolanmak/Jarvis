@@ -99,7 +99,7 @@
     "No private bot/owner/channel/message/native identifiers, tokens or message content are published.",
     "C2, actual original1944 replay, automatic capacity and full parent live/fault/soak acceptance remain open.",
     "Keep the queued command/PR input and protected verifier state intact; no duplicate issue builder.",
-    "The worker reports verifier_passed and is mapping alignment, not merged/deployed. The source-keyword observer gap is tracked separately; native acceptance does not prove complete behavioral coverage or independent review."
+    "The worker reached verifier_passed/map_alignment, then returned to build/acceptance_failed with ten model admissions. The downstream failure is not yet attributed to a specific alignment/receipt error. No accepted review, candidate CI, merge or deployment is established."
   ],
   "worker_diagnostic": {
     "worker_error_at_utc": "2026-11-09T18:45:21.450880Z",
