@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T16:45:07.141590+00:00",
+  "parent_issue": 1703,
+  "owner_issue": 1709,
+  "repair_issue": 1952,
+  "component_issue": 1953,
+  "pr": 1954,
+  "base": "416f392b17b56b2a43e67a3e430835902387941a",
+  "head": "9146acb424a52f4e9ef89d28d7bfed0a524eb2f6",
+  "branch": "fix/autoship-review-dependency-ranges",
+  "state": "draft_tests_first",
+  "change": "Extract unchanged production group adapter behind scripted/native transport interface. Add legacy retained-finding control and two new coherent large-file cases; fixture Rust code is actually compiled/executed before scripted review.",
+  "expected_red": [
+    "related_large_source_items_reach_one_request_and_reject_the_seeded_defect",
+    "related_large_source_items_allow_a_complete_fixed_group_without_dropping_scope"
+  ],
+  "control": "legacy_whole_file_recovery_keeps_original_findings_after_later_approval",
+  "hosted_validation": {
+    "run": 42657183954,
+    "state": "in_progress",
+    "conclusion": null
+  },
+  "local_attempt": {
+    "original_session": 77462,
+    "process_group": 1311020,
+    "stage": "disk manage-parent admission",
+    "cargo_or_rustc_observed": false,
+    "interrupted_original_owned_waiting_group": true,
+    "exit_code": 130,
+    "original_pids_confirmed_absent_before_source_edits": [
+      1311020,
+      1311027,
+      1311035
+    ],
+    "result": "No compilation, RED or GREEN claimed; moved verification to immutable hosted CI.",
+    "cache": "No borrowed cache, unregistered target, pruning, lease bypass or override."
+  },
+  "source_hold": {
+    "workflow": "nolanmak/jarvis#1953",
+    "request_id": "autoship-protect-repair1953-20261109",
+    "pause_accepted": true,
+    "revision": 1,
+    "updated_at_ms": 1794241676075,
+    "limits": "Receipt is owner intent, not native quiescence or resource-release proof."
+  },
+  "limits": [
+    "No automated RED until hosted compiler/tests execute and the intended assertions fail.",
+    "No source-recovery implementation, review approval, native replay, merge or rollout claimed.",
+    "C2 failed-history/free holds/wake, actual original PR1944 dependency capture and full1703 exits remain required."
+  ]
+}

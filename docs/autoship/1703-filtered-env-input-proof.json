@@ -57,7 +57,7 @@
   },
   "local_replay": "Initial managed probe failed missing input during rustdoc. Strengthened fresh local compilation was cancelled while awaiting managed admission; original processes verified terminal before editing. No fresh local GREEN claimed.",
   "limits": [
-    "Actual final-head CLI fallback/runtime-template integration tests and filtered-module regression pass; other required hosted checks and independent code approval remain pending.",
+    "All currently reported PR1951 checks/statuses pass after infrastructure-only retries on unchanged04c29b8d; native worker acceptance still failed, so no deployment or shipment is established.",
     "No whole native VM replay, independent code approval, merge or updater rollout claimed.",
     "No credential filter exception, private value, borrowed cache, native state reset or capacity increase."
   ],
@@ -66,13 +66,16 @@
     "bridge_run": 42645634641,
     "bridge_state": "completed_success",
     "rust_run": 42645634622,
-    "rust_state": "in_progress",
+    "rust_state": "completed_success_after_runner_retry",
     "change": "Add env_key_snapshot_cli to existing rust/cli/6 integration command and suite-registration assertion.",
     "local_contract_verify": "passed",
     "local_contract_tests": 23,
     "local_targeted_plan_tests": 11,
     "cli_job_state": "completed_success",
-    "remaining": "Other required hosted Linux jobs and aggregate targeted verdict pending."
+    "remaining": "Independent accepted code approval, native acceptance repair, merge and normal rollout remain pending.",
+    "aggregate_run": 42645634722,
+    "aggregate_attempt": 2,
+    "aggregate_state": "completed_success"
   },
   "prior_cli_validation": {
     "run": 42642846494,
@@ -125,7 +128,12 @@
     "annotation": "The hosted runner lost communication with the server.",
     "logs": "Job log unavailable; no completed failing test step supplied.",
     "action": "POST rerun only failed job after confirming unchanged PR head04c29b8d; accepted, same run queued.",
-    "rerun_state": "queued_at_observation",
-    "limits": "Runner disconnect is observed; underlying CPU/memory/network cause is not established. Required CI still pending."
+    "rerun_state": "completed_success",
+    "limits": "Runner disconnect is observed; underlying CPU/memory/network cause is not established. Required CI still pending.",
+    "rerun_attempt": 2,
+    "rerun_job": 129287129560,
+    "aggregate_run": 42645634722,
+    "aggregate_attempt": 2,
+    "aggregate_conclusion": "success"
   }
 }

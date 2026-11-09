@@ -966,3 +966,28 @@ job log. Only that job was rerun against unchanged04c29b8d; accepted/queued
 at observation. The [proof](1703-filtered-env-input-proof.json) separates actual
 CLI/bridge GREEN, infrastructure retry and failed native acceptance. No
 required check, review gate or normal updater was bypassed.
+
+## Coherent-source C1 enters real test-first implementation
+
+Native child #1953 under #1952 owns the reviewed C1 implementation. Draft
+#1954 at9146acb4 extracts the existing production group adapter without changing
+the old recovery algorithm and adds actual Git/Rust/scripted-transport cases.
+The large fixture compiles/runs to confirm8 for the seeded cap defect and3
+when fixed before the mock review sees source. Two new cases are expected
+RED; the legacy control retains an initial concrete finding after approval.
+[Checkpoint proof](1703-review-range-test-first-proof.json) records the pending
+hosted run42657183954; no automated RED/GREEN is claimed before actual results.
+
+The managed local attempt waited at parent admission with only its original
+bash/augmentagent processes and no compiler. Only that owned waiting group
+was interrupted; exit130 and original PID absence were verified before edits.
+No Cargo cache was borrowed/force-unlocked or created outside registration.
+Verification moved to immutable hosted CI. Source issue1953 is separately
+held through normal CLI while its manual draft is developed.
+
+#1951's infrastructure retry and aggregate recheck are now GREEN on unchanged
+04c29b8d (Rust run42645634622 attempt2/job129287129560; targeted42645634722
+attempt2). All currently reported statuses/checks pass, but its first actual
+native attempt still failed acceptance registration from unsupported fixture
+tool/binary assumptions. No accepted independent review, merge, main rollout
+or parent live recovery is inferred from CI success.
