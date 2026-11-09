@@ -341,3 +341,14 @@ dependent implementation ready or establish deployment. See the
 Documentation review: [PR #1916](https://github.com/nolanmak/Jarvis/pull/1916).
 The document is on that review branch until normal merge; it is not a deployed
 feature or an exception to independent code review and required CI.
+
+
+### Audited shared-authority prerequisite
+
+[#1930](https://github.com/nolanmak/Jarvis/issues/1930), under C2 #1920, may
+extract the existing admission/CI cleanup authority into channel-core under the
+[closed extraction contract](shared-storage-extraction-contract.md). Fresh-reader
+and all 28 mapped sub-seams were checked, including source counterparts. The
+implementation preserves current semantics and moves checkout ownership tests
+with the authority; it adds no native charges or activation. This scoped
+exception does not unblock full C0/C2, durable native enrollment or deployment.

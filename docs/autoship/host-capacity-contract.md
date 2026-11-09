@@ -812,7 +812,10 @@ also invokes CLI `build_storage_ci_holds.rs` reconciliation. Native constructors
 live in channel-core, which cannot import the CLI. Lift the existing common
 admission/claim/cleanup-fence implementation into the shared lower layer and
 keep CLI adapters; do not duplicate its lock/scan arithmetic in native admission
-or omit the CI uncertainty fence. Exact public/opaque APIs remain C0 work.
+or omit the CI uncertainty fence. The behavior-preserving extraction API and
+test movement are now specified in the separately audited
+[shared storage extraction contract](shared-storage-extraction-contract.md),
+prerequisite #1930. Native durable/publication/bridge APIs remain C0 work.
 
 `storage_leases::lock_directory()` uses `/run/user/UID` or `/tmp`. Those are
 temporary coordination locations, not durable retained-session accounting.

@@ -322,3 +322,25 @@ for `inspect_owner_bootstrap`. Scope materialization retains descriptive origina
 creation handles, not complete all-writer custody. The ACL experiment supplies
 neither productive source/resource/input qualification nor a replacement grant;
 that constructor and normal owner-ingress work remain required under #1703.
+
+
+## Shared-authority extraction prerequisite (#1930)
+
+The closed shared-storage-extraction-contract.md was checked by a fresh reader,
+conversation/source comparison, and all 28 mapped sub-seams grouped across five
+mechanism boundaries and crosscut delivery/persistence obligations. Source
+counterparts were inspected at unchanged main 416f392b. One source-bound finding
+was resolved and rechecked: active CI lifetime locks protect their source but
+are skipped by global admission reconciliation; abandoned/unlocked unresolved
+holds block admission. No remaining scoped contract finding was retained.
+
+Source verification confirmed the real core CommandAdmission dependency is
+acyclic, Busy re-exports preserve downcasts, the checkout allocation split is
+feasible, and current tests comprise 11 holds, four reservations and three
+checkouts. Test movement must keep one actual registry and fake binding under
+cfg(test), update the crash-child name, and positively verify child execution.
+The extraction keeps formats/namespace/lifetimes; native durable integration,
+full C0 handoff, code approval, deployment and #1703 acceptance remain open.
+
+A managed unchanged-main baseline is running in the named implementation
+worktree. No extraction source edits or production changes have been made.
