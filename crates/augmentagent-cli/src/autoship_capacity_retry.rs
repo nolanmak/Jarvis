@@ -36,18 +36,26 @@ fn previous(tx:&Transaction<'_>,workflow:&str,generation:i64,now:i64)->Result<Op
 impl WorkflowStore {
     /// Read-only health observation; never claims, wakes or charges work.
     pub fn resource_capacity_wait_count(&self)->Result<u64> {
+        let started=std::time::Instant::now();let budget=std::time::Duration::from_secs(2);
         let mut statement=self.conn.prepare("SELECT substr(w.checkpoint,1,1048577),length(CAST(w.checkpoint AS BLOB)),COALESCE(c.paused,0)
             FROM workflow w LEFT JOIN workflow_owner_control c ON c.workflow=w.id
             WHERE w.id NOT LIKE 'autoship-observation/%' AND w.id NOT LIKE 'autoship-canary/%'
-            ORDER BY w.id LIMIT 1025")?;
+            ORDER BY w.id")?;
         let rows=statement.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)))?;
-        let mut count=0;let mut seen=0;
+        // Stream bounded checkpoints through the canonical parser. A SQL-only
+        // candidate filter would silently hide malformed non-waiting history.
+        // Bound actual waits separately from historical rows and elapsed work.
+        let mut count=0;
         for row in rows {
-            let (raw,size,paused)=row?;seen+=1;
-            ensure!(seen<=1024 && (0..=1048576).contains(&size) && matches!(paused,0|1),"capacity health evidence exceeds bound or is invalid");
+            ensure!(started.elapsed()<budget,"capacity health observation exceeded its time budget");
+            let (raw,size,paused)=row?;
+            ensure!((0..=1048576).contains(&size) && matches!(paused,0|1),"capacity health evidence exceeds bound or is invalid");
             let cp:Checkpoint=serde_json::from_str(&raw)?;cp.binding.validate()?;
-            if paused==0 && active(cp.stage) && cp.next.reason=="resource_capacity" && cp.next.action=="await_capacity" {count+=1;}
+            if paused==0 && active(cp.stage) && cp.next.reason=="resource_capacity" && cp.next.action=="await_capacity" {
+                count+=1;ensure!(count<=1024,"capacity health wait count exceeds bound");
+            }
         }
+        ensure!(started.elapsed()<budget,"capacity health observation exceeded its time budget");
         Ok(count)
     }
 
@@ -169,6 +177,28 @@ mod tests {
         }
         store.conn.execute("UPDATE workflow SET checkpoint='broken' WHERE id=?1",[&lease.workflow]).unwrap();
         assert!(store.resource_capacity_wait_count().is_err(),"corrupt evidence must not appear as zero waits");
+    }
+    #[test]
+    fn capacity_health_bound_counts_waits_without_expiring_on_terminal_history() {
+        let root=tempfile::tempdir().unwrap();let (mut store,lease)=setup(&root.path().join("state.db"));
+        store.defer_run_capacity(&lease,None,30).unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();let events=store.events(&lease.workflow).unwrap();
+        let mut terminal=before.checkpoint.clone();terminal.stage=Stage::Merged;
+        let terminal_raw=serde_json::to_string(&terminal).unwrap();
+        store.conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<2048)
+            INSERT INTO workflow(id,branch,checkpoint,heartbeat_at,progress_at)
+            SELECT 'owner/repo#history-'||x,'fixture',?1,1,1 FROM n",[&terminal_raw]).unwrap();
+        assert_eq!(store.resource_capacity_wait_count().unwrap(),1,"unrelated historical rows exhausted the candidate bound");
+        for corrupted in ["broken","{}",r#"{"stage":"merged"}"#] {
+            store.conn.execute("UPDATE workflow SET checkpoint=?1 WHERE id='owner/repo#history-1'",[corrupted]).unwrap();
+            assert!(store.resource_capacity_wait_count().is_err(),"corrupt history became a healthy zero count: {corrupted}");
+            store.conn.execute("UPDATE workflow SET checkpoint=?1 WHERE id='owner/repo#history-1'",[&terminal_raw]).unwrap();
+        }
+        store.conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1024)
+            INSERT INTO workflow(id,branch,checkpoint,heartbeat_at,progress_at)
+            SELECT 'owner/repo#candidate-'||x,'fixture',?1,1,1 FROM n",[serde_json::to_string(&before.checkpoint).unwrap()]).unwrap();
+        assert!(store.resource_capacity_wait_count().is_err(),"more than 1024 actual waits must stay bounded");
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(store.events(&lease.workflow).unwrap(),events);
     }
     #[test]
     fn native_capacity_backoff_survives_restarts_heads_and_duplicate_observations() {

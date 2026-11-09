@@ -960,11 +960,23 @@ fn capacity_finding(i:&HealthInputs)->Option<Finding> {
 }
 
 /// Both metrics come from one verified worker-selected store; no initialization.
+struct WorkflowMetrics {
+    allowance:Option<crate::autoship_workflow::MergeAllowance>,
+    allowance_error:Option<String>,
+    capacity_waits:Option<u64>,
+    capacity_wait_error:bool,
+}
 fn workflow_metrics(config:&crate::autoship_deployment::WorkerWorkflowConfiguration,now:i64)
-    ->anyhow::Result<(crate::autoship_workflow::MergeAllowance,u64)> {
+    ->anyhow::Result<WorkflowMetrics> {
     let store=crate::autoship_workflow::WorkflowStore::open_read_only(&config.path)?
         .ok_or_else(||anyhow::anyhow!("worker workflow store is missing"))?;
-    Ok((store.merge_allowance(now,config.daily_cap)?,store.resource_capacity_wait_count()?))
+    let (allowance,allowance_error)=match store.merge_allowance(now,config.daily_cap) {
+        Ok(value)=>(Some(value),None),Err(_)=>(None,Some("worker merge allowance unavailable".into())),
+    };
+    let (capacity_waits,capacity_wait_error)=match store.resource_capacity_wait_count() {
+        Ok(value)=>(Some(value),false),Err(_)=>(None,true),
+    };
+    Ok(WorkflowMetrics{allowance,allowance_error,capacity_waits,capacity_wait_error})
 }
 
 /// Gather everything the rules need from this box.
@@ -1010,7 +1022,7 @@ pub async fn collect(repo_root: &Path) -> HealthInputs {
                     .expect("native capacity report serializes")
             });
             match workflow_metrics(&config,now.timestamp_millis()) {
-                Ok((allowance,count))=>(Some(allowance),None,native,Some(count),false),
+                Ok(metrics)=>(metrics.allowance,metrics.allowance_error,native,metrics.capacity_waits,metrics.capacity_wait_error),
                 Err(_)=>(None,Some("worker workflow metrics unavailable".into()),native,None,true),
             }
         }
@@ -1136,12 +1148,49 @@ mod tests {
         let before=store.snapshot(&lease.workflow).unwrap();let events=store.events(&lease.workflow).unwrap();
         let observer=WorkflowStore::open(&decoy).unwrap();assert_eq!(observer.resource_capacity_wait_count().unwrap(),0);
         let config=crate::autoship_deployment::WorkerWorkflowConfiguration{path:worker,daily_cap:7,native_policy:None};
-        let (allowance,waiting)=workflow_metrics(&config,31).unwrap();
-        assert_eq!(allowance.cap,7);assert_eq!(allowance.confirmed,0);assert_eq!(waiting,1);
+        let metrics=workflow_metrics(&config,31).unwrap();let allowance=metrics.allowance.unwrap();
+        assert_eq!(allowance.cap,7);assert_eq!(allowance.confirmed,0);assert_eq!(metrics.capacity_waits,Some(1));
+        assert!(metrics.allowance_error.is_none());assert!(!metrics.capacity_wait_error);
         assert_eq!(store.snapshot(&lease.workflow).unwrap(),before);assert_eq!(store.events(&lease.workflow).unwrap(),events);
         let absent=root.path().join("missing.db");
         assert!(workflow_metrics(&crate::autoship_deployment::WorkerWorkflowConfiguration{path:absent.clone(),daily_cap:7,native_policy:None},31).is_err());
         assert!(!absent.exists(),"health initialized an absent worker store");
+    }
+
+    #[test]
+    fn worker_metric_read_errors_do_not_discard_the_other_observation() {
+        use crate::autoship_workflow::{Binding,WorkflowStore};
+        for break_capacity in [true,false] {
+            let root=tempfile::tempdir().unwrap();let path=root.path().join("worker.db");
+            let mut store=WorkflowStore::open(&path).unwrap();
+            store.register("owner/repo#1","fix",Binding{head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()},10).unwrap();
+            let db=rusqlite::Connection::open(&path).unwrap();
+            if break_capacity {
+                db.execute("UPDATE workflow SET checkpoint='broken'",[]).unwrap();
+                assert_eq!(store.merge_allowance(31,7).unwrap().cap,7);
+                assert!(store.resource_capacity_wait_count().is_err());
+            } else {
+                db.execute_batch("ALTER TABLE merge_allowance_dispatch RENAME COLUMN merged_at_ms TO fixture_broken_column").unwrap();
+                assert!(store.merge_allowance(31,7).is_err());
+                assert_eq!(store.resource_capacity_wait_count().unwrap(),0);
+            }
+            let config=crate::autoship_deployment::WorkerWorkflowConfiguration{path,daily_cap:7,native_policy:None};
+            let metrics=workflow_metrics(&config,31).expect("one failed metric discarded the independent healthy observation");
+            let mut input=healthy();
+            if break_capacity {
+                assert_eq!(metrics.allowance.unwrap().cap,7);assert!(metrics.allowance_error.is_none());
+                assert!(metrics.capacity_waits.is_none());assert!(metrics.capacity_wait_error);
+            } else {
+                assert!(metrics.allowance.is_none());assert!(metrics.allowance_error.is_some());
+                assert_eq!(metrics.capacity_waits,Some(0));assert!(!metrics.capacity_wait_error);
+            }
+            input.merge_allowance_error=metrics.allowance_error;
+            input.resource_capacity_waits=metrics.capacity_waits;
+            input.resource_capacity_wait_error=metrics.capacity_wait_error;
+            let found=analyze(&input,&Thresholds::default());
+            assert_eq!(found.iter().any(|f|f.code=="merge-accounting-unavailable"),!break_capacity);
+            assert_eq!(found.iter().any(|f|f.code=="capacity-state-unavailable"),break_capacity);
+        }
     }
 
     fn native_capacity_sample(budget:u64)->serde_json::Value {
