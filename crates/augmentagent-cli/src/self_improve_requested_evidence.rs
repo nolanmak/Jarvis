@@ -4,7 +4,7 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
-fn admitted_path(path: &str) -> bool {
+pub(super) fn admitted_path(path: &str) -> bool {
     evidence_plan::valid_missing_path(path)
         && !path.chars().any(char::is_control)
         && !path.split('/').any(|part| {
