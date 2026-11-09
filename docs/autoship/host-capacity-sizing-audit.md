@@ -418,3 +418,20 @@ the shared CI command authority. Host raw archive and compressed logical file
 bounds do not establish whole-launch physical allocation, aggregate RAM,
 original C/R input/body authority, durable storage or restoration. Hosted CI,
 independent code approval, merge and rollout remain pending.
+
+
+## Native publication temporary-storage contract (#1934)
+
+A real unchanged-main experiment reproduced four leaked 64 KiB temporary files
+on four failed file-sync publications (262144 bytes), without changing the old
+destination. Two test-first regressions reproduce file-sync and rename leakage.
+Fresh-reader and all 13 mapped seams were checked against native atomic,
+RefreshCheckpoint, main, outer startup handling and gateway counterparts.
+
+Resolved/rechecked findings specify original-error preservation when main tries
+its failure observation, fixed OSError-subclass uncertainty and sanitized exit
+126 despite refused startup diagnostics, exact source evidence after a raised
+rename, explicit complete short-write handling, and the remaining pre-existing
+1 MiB credential-output/read round-trip gate. No checkpoint/digest clears the
+new process latch or authorizes native release. Full metadata/growth, original
+custody, schema/migration and productive handoff remain C0/#1703 gates.
