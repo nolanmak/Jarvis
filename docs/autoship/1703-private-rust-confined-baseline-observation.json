@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T23:40:45.508118+00:00",
+  "related_issues": [
+    1943,
+    1952,
+    1955
+  ],
+  "pr": 1956,
+  "status": "valid_unregistered_original_base_observation",
+  "source_head": "416f392b17b56b2a43e67a3e430835902387941a",
+  "managed_exit": 0,
+  "observer_exit": 0,
+  "actual_data": {
+    "actual_provider": "codex",
+    "fixture_source_read_only": true,
+    "protected_admissions": 1,
+    "protected_audit_healthy": true,
+    "receipt_linked": false,
+    "workflow_admissions": 1,
+    "workflow_model_calls": 1
+  },
+  "log_sha256": "802b06a3057a0753feb5b1431e8ccb7f46dfe6e497ebc0062cbcfc7d250dd3f5",
+  "prototype_files": [
+    {
+      "path": "crates/augmentagent-cli/src/bin/autoship_receipt_observer.rs",
+      "bytes": 183,
+      "sha256": "8ff32c9b6b37f3678ede8f0f532d498e361700f10e3a8839ed0c3a26bf5f6dc3"
+    },
+    {
+      "path": "autoship_verifiers/issue_1955/observe.py",
+      "bytes": 5912,
+      "sha256": "b69361789887fd6473aa7b3258897410dfb866184996b3f1ada275eb7dc65015"
+    },
+    {
+      "path": "autoship_verifiers/issue_1955/workflow_probe.rs",
+      "bytes": 5452,
+      "sha256": "fc05e4ea5623d4b8b999c8dd1621ba58f343fa962df0dcc981434112e10afd16"
+    },
+    {
+      "path": "autoship_verifiers/issue_1955/public_env_template.txt",
+      "bytes": 26521,
+      "sha256": "e3452397d5d0ab9c3dd8a0069031b298de312c73a151baa05b91fc41731a0a51"
+    }
+  ],
+  "fixture_instrumentation": "cfg(test)-only closed transport for the five actual metadata Git reads used by the original git_binding algorithm. Executes real Git inside existing observer group; refuses all other commands. Original production method bodies retained.",
+  "compilation_profile": "offline/locked; dev/test incremental=false; debug0; jobs1; CLI+embeddings selected with ort/alternative-backend solely for observer compilation.",
+  "limits": [
+    "This is valid actual behavioral data from the original source under the existing nested sandbox, not a registered VerifierReceipt or native code approval.",
+    "No real model/provider launched; the admission is a scripted call into the actual WorkflowGuard/store/audit producer using disposable state.",
+    "The metadata Git transport is a declared fixture boundary, not validation of production CommandGroup creation, cancellation, quiescence or resource release.",
+    "Candidate ordinary managed observation was previously true; same-profile confined candidate behavior has not been observed here. Normal independent candidate verification remains mandatory.",
+    "Original #1954 request/charges/published input/pinned verifier remain unchanged and paused.",
+    "No production source, installed profile, sandbox grant, safety floor, request or allowance was reset."
+  ]
+}

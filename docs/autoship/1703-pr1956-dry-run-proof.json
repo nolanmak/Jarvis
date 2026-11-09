@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T23:44:03.870693+00:00",
+  "pr": 1956,
+  "command": "target/release/augmentagent autopr run --repo nolanmak/Jarvis --pr 1956 --until merged --request-id autoship-correlation-preflight1956-20261109 --dry-run --json",
+  "exit": 0,
+  "reply": {
+    "accepted": false,
+    "complete": false,
+    "dry_run": true,
+    "execution_readiness": "unverified",
+    "provider": null,
+    "reason": "target-validated",
+    "repository": "nolanmak/jarvis",
+    "requested_until": "merged",
+    "schema_version": 1,
+    "target": {
+      "kind": "pr",
+      "number": 1956
+    }
+  },
+  "limits": [
+    "Read-only target validation; no queued command, model admission, runtime/capacity readiness, independent approval or rollout is established.",
+    "The interactive API window recovered; this does not prove service credential/bucket state."
+  ]
+}

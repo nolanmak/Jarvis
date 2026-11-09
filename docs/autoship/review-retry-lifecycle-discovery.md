@@ -126,3 +126,23 @@ consult adjudicated amendment before unavailable handling; its complete-role
 validator must remain intact. The existing GitHub operation table is not a
 native observation ledger. Exact native dispatch/result custody and complete
 paid-path admission mapping are the next load-bearing source tasks.
+
+### Source follow-up: authorization before workflow and paid admission
+
+On main416f392b, self_improve_targeted::read turns every unsuccessful gh lookup
+into a generic target-lookup error. work_once_mode wraps authorize_command
+with CommandFailure(code2,target-authorization-failed). CLI run/control also
+map authorization errors to that denial. Discord control and owner-message
+ingress map errors to the same stable refusal; owner inbox permits that
+refusal value. Earlier recorded production quota failures are owned by #1706.
+
+This is a separate source boundary from a known deterministic evidence hold.
+A failed remote lookup cannot establish either a revoked grant or positive
+authority. R/S/#1706/#1712 must map pre-workflow submit, existing-command worker,
+CLI control, Discord control and owner-message ingress, including pending
+authorization, replay and retry behavior. Do not silently finalize a transient
+lookup failure as permanent denial, treat it as owner authorization, allocate
+a new request ID to evade its recorded receipt, or spend models to reconstruct
+the missing trusted inputs. Exact typed results and receipt transitions remain
+implementation gates; this inventory does not introduce another ingress engine
+or override the existing owner-turn/final-dispatch guards.

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T23:18:08.286476+00:00",
+  "owner_issue": 1706,
+  "context": "interactive CLI API bucket only; does not prove service credential/bucket state",
+  "core": {
+    "limit": 5000,
+    "remaining": 0,
+    "reset_utc_epoch": 1794266572
+  },
+  "successful_read_before_exhaustion": {
+    "endpoint": "repository actions permissions workflow",
+    "default_workflow_permissions": "read",
+    "can_approve_pull_request_reviews": false
+  },
+  "failed_following_read": "current remote main ref; HTTP403 API rate limit exceeded",
+  "source_head_audited_locally": "416f392b17b56b2a43e67a3e430835902387941a",
+  "source_findings": [
+    "Every unsuccessful target gh lookup becomes generic error; worker wraps it as target-authorization-failed code2.",
+    "Run/control and Discord/owner-ingress consumers collapse authorization lookup errors into denial; exact deferred authorization/replay semantics need #1706/#1712 resolution."
+  ],
+  "limits": [
+    "No token/environment copying, token hopping, service restart, authentication/allowance reset or permission bypass.",
+    "No current service-quota exhaustion, service recovery or remote main equality inferred from this interactive read.",
+    "No PR body or new native target submitted while the required GitHub input check is unavailable."
+  ]
+}

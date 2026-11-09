@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T23:05:02.845549+00:00",
+  "observed_at": "2026-11-09T23:44:03.869205+00:00",
   "issue": 1952,
   "component": "C2 review retry lifecycle",
   "status": "working_contract_not_implementation_ready",
@@ -184,6 +184,25 @@
   "spec_hashes_at_full_design_consistency_pass": {
     "review-retry-lifecycle-contract.md": "fcf14d69ca38f32761a95060f80df785cc62b0d3d738a81bec23780a49d8ea25",
     "review-retry-lifecycle-discovery.md": "c737b7cad6e6aad107c7c95e8083de836dbfe24cb5a89866e0c93fafd3edce52",
+    "review-dependency-recovery-contract.md": "397a9cc68d2c726a2b67e8179e728431748ec8db939acde803e202cd1645afb0",
+    "1703-review-retry-lifecycle-seam-map.md": "c7f9747e4d80a03b8b71ac1b974c92e34df6465b1b40cffa5376c11dfb1a542b"
+  },
+  "authorization_followup_recheck": {
+    "seams": [
+      "S14",
+      "S17",
+      "S19",
+      "S20",
+      "S22",
+      "S32"
+    ],
+    "design_only": true,
+    "result": "All remain consistent after adding explicit pre-workflow authorization source mapping; exact typed/replay/receipt interfaces remain gated.",
+    "source_verified": "Generic gh lookup error; worker/run/control denial wrapping; Discord and owner-inbox stable refusal mapping. No service-quota state inferred from interactive API reads."
+  },
+  "spec_hashes_after_authorization_followup": {
+    "review-retry-lifecycle-contract.md": "fcf14d69ca38f32761a95060f80df785cc62b0d3d738a81bec23780a49d8ea25",
+    "review-retry-lifecycle-discovery.md": "80d33cebeb6399d6e084f1f673100191f76fc48a15db0ed68eb3eef6b64744eb",
     "review-dependency-recovery-contract.md": "397a9cc68d2c726a2b67e8179e728431748ec8db939acde803e202cd1645afb0",
     "1703-review-retry-lifecycle-seam-map.md": "c7f9747e4d80a03b8b71ac1b974c92e34df6465b1b40cffa5376c11dfb1a542b"
   }

@@ -1,8 +1,9 @@
 # Genuine Rust behavioral adapters — source discovery
 
-Status: experimental route to test under #1943 / #1710 / #1952 / #1703,
-**not implementation-ready or a registered acceptance proposal**. Original
-#1954 request, published source and pinned observer remain preserved.
+Status: worked experimental receipt-case recipe under #1943 / #1710 / #1952 /
+#1703, with valid unregistered original-base data. This is **not registered
+acceptance evidence, code approval or full C2 implementation readiness**.
+Original #1954 request, published source and pinned observer remain preserved.
 
 ## Observed failure and existing capability
 
@@ -219,3 +220,34 @@ this fixture validation is not an observed receipt result or native baseline.
 The prepared PR1956 body is stale and unsubmitted; the latest readable recipe
 still needs actual behavioral evidence and independent complete-contract
 construction/reproduction. Original #1954 and the broader goal remain open.
+
+## Valid original-base observation through a closed metadata transport
+
+V5 passed canonical Git setup, then WorkflowGuard's actual git_binding reached
+the parent's run, whose process_group(0) was denied by the existing sandbox.
+That was another constructor/fixture failure, not behavioral RED.
+
+The [v6 original-base observation](1703-private-rust-confined-baseline-observation.json)
+completed with exit0 and valid actual data: one workflow charge, one healthy
+protected admission, fixture source read-only, and receipt_linked=false. It
+appends a cfg(test)-only transport that shadows the glob-imported parent run
+inside the copied workflow module. It executes only the five exact real Git
+binding reads, with bounded output/time, inside the existing observer group;
+all other commands refuse. The git_binding algorithm and actual workflow/store/
+accounting/audit producer bodies remain intact. No fake Git output is supplied.
+
+This instrumentation is explicit: it does not test production CommandGroup
+creation, cancellation, quiescence or release. Original source blobs, sandbox
+grants and production profiles remain unchanged. The earlier ordinary managed
+candidate observation was true, but a same-profile confined candidate result
+is not claimed here. Normal independent candidate verification is mandatory.
+
+The untrusted handoff recipe carries four readable pinned files. Rust sources
+are formatted after this prototype and their pin hashes differ accordingly;
+the final independently constructed proposal must reproduce its own original
+baseline and cover every owner requirement. The child still emits actual
+values without a receipt-linked expected-answer assertion. Parent comparison
+owns the business oracle. The repository privacy scanner passes all four exact
+proposed bodies; hosted gitleaks and all required exact-head CI remain mandatory.
+A successful local prototype is not a registered VerifierReceipt or merge
+permission. #1954 remains paused and original #1703 exits remain open.
