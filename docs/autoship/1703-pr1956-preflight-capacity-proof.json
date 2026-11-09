@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T23:53:58.448217+00:00",
+  "parent_issue": 1703,
+  "scheduling_issue": 1706,
+  "capacity_epic": 1917,
+  "related_pr": 1956,
+  "command": {
+    "workflow": "nolanmak/jarvis/pr/1956",
+    "stage": "queued",
+    "reason": "execution-readiness-blocked",
+    "next_action": "retry_worker_attempt",
+    "last_attempt": {
+      "eligible_at_ms": 1794268697549,
+      "finished_at_ms": 1794268401463,
+      "outcome": "deferred",
+      "reason": "execution-readiness-blocked",
+      "selected_at_ms": 1794268397549
+    },
+    "lease": {
+      "active": false
+    },
+    "merge": {
+      "state": "not-confirmed"
+    }
+  },
+  "worker_active": true,
+  "service_process_and_membership_stable": true,
+  "passive_reference_envelopes": [
+    {
+      "reference_requested_bytes": 4294967296,
+      "status": "available_for_reference",
+      "observation": {
+        "reserved_before_bytes": 126885888,
+        "requested_bytes": 4294967296,
+        "host_available_bytes": 6375665664,
+        "host_margin_bytes": 268435456
+      }
+    },
+    {
+      "reference_requested_bytes": 6442450944,
+      "status": "refused_for_reference",
+      "refusal": {
+        "phase": "admission_failed",
+        "exhausted": true,
+        "refusal_code": "host_headroom",
+        "facts": {
+          "requested_bytes": 6442450944,
+          "reservation_slack_bytes": 0,
+          "margin_bytes": 268435456,
+          "required_bytes": 6710886400,
+          "available_bytes": 6375665664
+        }
+      }
+    }
+  ],
+  "source_head": "416f392b17b56b2a43e67a3e430835902387941a",
+  "limits": [
+    "The initial attempt and worker error correlate by finish time; the latest stored attempt has only a generic reason. Neither is a persisted typed resource receipt.",
+    "Reference demand vectors are not the selected worker policy and do not establish the exact original refusal metric.",
+    "Interactive readiness has no service resource/provider declarations; it cannot diagnose the service by itself.",
+    "No service environment copied, cgroup entered, reservation created, reclaim requested, limit changed, process signalled or storage deleted.",
+    "PR1956 remains unmerged; queued acceptance is not model progress, review approval or rollout."
+  ],
+  "next_action": "Preserve the command and attach its original typed preflight refusal to durable attempt/status/private progress under #1706/#1714; automatic sizing remains #1917.",
+  "initial_attempt_error": {
+    "selected_at_ms": 1794268037521,
+    "finished_at_ms": 1794268041516,
+    "timestamp_utc": "2026-11-09T23:47:21.532016Z",
+    "message": "execution-readiness-blocked: workflow-resource:capacity-exhausted"
+  }
+}

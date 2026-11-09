@@ -1235,3 +1235,12 @@ These events do not prove successful tests, current candidate publication,
 acceptance, review, merge or rollout. The exact failed verifier receipt remains
 unlocated. Published input CI still applies only to 3debdb8d, and the weak
 source-keyword observer discovery remains tracked under #1943.
+
+
+## PR1956 queued preflight reproduction (2026-11-09)
+
+[Recorded command and passive resource observations](1703-pr1956-preflight-capacity-proof.json) show the normal PR-target command accepted and selected, then deferred with `execution-readiness-blocked` before workflow execution. The initial attempt finished at 23:47:21.516 UTC; the worker logged `workflow-resource:capacity-exhausted` at 23:47:21.532 UTC. The command remains queued, without an active workflow lease or confirmed merge. A subsequent deferred attempt is retained separately in the artifact.
+
+A later shared-lock passive observation of the same worker aggregate allowed a 4 GiB reference demand and refused a 6 GiB reference demand for `host_headroom`: 6,710,886,400 bytes required including margin versus 6,375,665,664 bytes available. These reference vectors are not a captured worker policy or the original per-command refusal; they cannot establish its exact exhausted metric. No service environment was copied, cgroup entered, reservation created, reclaim requested, ceiling changed, process signalled or storage deleted.
+
+This reproduces an outstanding #1706/#1714 reporting boundary: pre-workflow execution readiness loses the original typed refusal when it stores only the command reason. #1915 preserves an existing workflow checkpoint blocker and does not by itself supply this missing pre-workflow receipt. Preserve the original attempt identity, typed bounded numeric refusal, unpaid retry eligibility and private projection without requiring a workflow/model admission to reconstruct it. Automatic sizing/integration remains #1917; this observation does not authorize shrinking complete demand, replacing the registered command or declaring restoration.
