@@ -73,13 +73,20 @@ class Runtime:
         return instance
 
 
-def initrd(entries):
+def initrd(entries, max_bytes=None):
     """Build newc directly: no root-owned device nodes needed on the host."""
+    if max_bytes is not None and (type(max_bytes) is not int or max_bytes <= 0):
+        raise Unavailable('invalid VM initrd byte budget')
     archive = bytearray()
     for inode, (name, mode, data, major, minor) in enumerate([*entries, ('TRAILER!!!', 0, b'', 0, 0)], 1):
         encoded = name.encode() + b'\0'
         fields = [inode, mode, 0, 0, 1, 0, len(data), 0, 0, major, minor, len(encoded), 0]
-        archive.extend(b'070701' + ''.join(f'{value:08x}' for value in fields).encode() + encoded)
+        header = b'070701' + ''.join(f'{value:08x}' for value in fields).encode() + encoded
+        next_size = (len(archive) + len(header) + 3) // 4 * 4
+        next_size = (next_size + len(data) + 3) // 4 * 4
+        if max_bytes is not None and next_size > max_bytes:
+            raise Unavailable('VM initrd exceeds byte budget')
+        archive.extend(header)
         archive.extend(b'\0' * (-len(archive) % 4))
         archive.extend(data)
         archive.extend(b'\0' * (-len(archive) % 4))

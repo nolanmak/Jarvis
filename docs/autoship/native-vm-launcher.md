@@ -30,6 +30,15 @@ and a current guarded edit plus independent review. Never dump credential values
 or complete process environments for that check. Existing runtime generations
 remain available while their leases drain.
 
+Native boot archives have a 128 MiB uncompressed newc ceiling, including every
+header, name, alignment byte and trailer. Busybox, modules and launcher scripts
+are read through bounded regular-file descriptors against remaining capacity.
+The compressed image has a separate 129 MiB cap checked before exclusive 0600
+output creation. Oversized or observed-changing input refuses preparation;
+this does not resize guest RAM or establish a whole-launch physical disk or
+host memory bound. The shared build-VM codec retains its existing behavior when
+no optional archive cap is supplied.
+
 The daemon reads `AUGMENTAGENT_NATIVE_VM_POLICY` itself, never from model options.
 The file must be owner-private, regular and single-link. Its version 1 shape is:
 
