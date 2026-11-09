@@ -63,7 +63,7 @@ def insert(db, p=None, omit_demand=False, digest_override=None):
 
 def signature(db):
     return db.execute("SELECT type,name,tbl_name,sql FROM sqlite_schema "
-                      "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").fetchall()
+                      "WHERE name NOT GLOB 'sqlite_*' ORDER BY type,name").fetchall()
 
 
 def initialize(db):
@@ -233,6 +233,16 @@ def main():
             else:
                 raise AssertionError(label + ' accepted')
             invalid.close()
+        unknown = connect(root / 'unknown-schema.sqlite'); initialize(unknown)
+        unknown.execute('CREATE TABLE sqlitex_unexpected(value TEXT)')
+        try:
+            inventory(unknown, expected)
+        except ValueError as error:
+            assert str(error) == 'unknown schema or graph'
+            checks.append('unknown-nonreserved-schema-object-is-refused')
+        else:
+            raise AssertionError('unknown schema object was ignored')
+        unknown.close()
         lifecycle = connect(root / 'lifecycle.sqlite'); initialize(lifecycle)
         lifecycle.execute('BEGIN IMMEDIATE'); insert(lifecycle); lifecycle.commit()
         lifecycle.execute("UPDATE capacity_allocations SET phase='held'")

@@ -901,7 +901,7 @@ duplicates, changed replay parameters, unbound rows and unknown state values.
 The proposed exact balance representation, graph validation, canonical replay
 and state constraints are in the separately audited
 [native durable balance checkpoint](native-storage-ledger-contract.md), with
-executable DDL and a disposable 40-predicate SQLite probe. That checkpoint adds
+executable DDL and a disposable 41-predicate SQLite probe. That checkpoint adds
 no production schema or release authority. Original binding/proof producers,
 registry/anchor/migration integration and control-plane growth remain gates.
 

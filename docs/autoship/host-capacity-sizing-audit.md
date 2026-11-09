@@ -363,7 +363,7 @@ pending-only insertion and collision guards covering all unique keys, plus
 retained-state filesystem and launch-settlement constraints. No remaining
 checkpoint finding was retained. This is not a full C0 handoff audit.
 
-The committed disposable Python/SQLite experiment passes 40 predicates on
+The committed disposable Python/SQLite experiment passes 41 predicates on
 SQLite 3.45.1, including real constraints/transitions, replacement refusal,
 checked overflow, missing graph/replay refusal, full create/resume/retirement
 history, read lock refusal, reopen and pre/postcommit process crashes. Both

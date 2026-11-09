@@ -134,7 +134,7 @@ The committed disposable [SQLite probe](probes/native_storage_ledger.py) exercis
 real DDL, transitions, immutable rows, checked sums, graph/replay validation,
 commit/reopen and child-process crashes. Run `python3
 docs/autoship/probes/native_storage_ledger.py` from the repository root. On this
-host SQLite 3.45.1 passes all 40 predicates; both crash-child execution markers
+host SQLite 3.45.1 passes all 41 predicates; both crash-child execution markers
 are verified. This is not production Rust reader/writer evidence.
 It must distinguish precommit crash (no published intent, hence no writer
 permitted) from postcommit crash (full pending charge survives). No VM, model,

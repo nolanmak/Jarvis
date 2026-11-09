@@ -365,7 +365,7 @@ not deliver native enrollment or activate machine-sized capacity.
 The [balance/replay amendment](native-storage-ledger-contract.md) specifies
 proposed tables, complete graph/replay checks and lifecycle constraints in the
 existing native database. Fresh-reader and all 16 mapped seams were reviewed;
-all 40 disposable SQLite predicates pass. This closes the identified
+all 41 disposable SQLite predicates pass. This closes the identified
 representation ambiguities at checkpoint scope, not full C0 or a production
 implementation exception. Original proof, registry/migration, full producer
 and pre-intent control-plane growth remain load-bearing gates.
