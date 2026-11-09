@@ -500,3 +500,23 @@ privacy and node-release now pass at b7b3f15b (runs 42595275735/42595275315).
 Other hosted jobs remain running with no current failures. Independent accepted
 review, merge and normal rollout remain pending. Capacity integration and
 productive owner ingress remain unfinished; no live policy/state changed.
+
+
+## Publication replay checkpoint and actual crash evidence
+
+host-capacity-publication-contract.md narrows L2/L3's durable multi-file mechanics,
+with an explicit remaining-gate list and no implementation exception. The actual
+embedded provisioner was killed after real replace 1/2/3 in disposable state; all
+three fsynced execution markers and SIGKILL statuses were checked. The first two
+leave mixed candidate/source files, all precede manager reload, and ordinary
+same-source reruns complete. See 1703-capacity-publication-crash-proof.json and
+probes/native_capacity_publication_crash.py; no future publisher/physical power
+loss/native custody/production activation proof is claimed.
+
+Fresh-reader review identified discarded installed-object evidence after prefix
+advancement. J4/J5 now persist completed_objects atomically with the prefix and
+retain them through recovery/last-loaded evidence; J10 adds the crash/replacement
+fixture. Recheck resolved the finding. All 53 seams are inventoried, not claimed
+reviewed. Whole C0/full seam review, final schemas, writer/startup handoff, security
+supersession, control-plane growth, snapshot and process receipt contracts still
+block integration and activation.

@@ -1428,6 +1428,17 @@ compatibility refuses explicitly and requires compatible roll-forward. Never
 erase durable rows or the minimum-protocol fence to make rollback succeed.
 The final compatibility matrix and snapshot projection schema still block C3.
 
+The [publication replay checkpoint](host-capacity-publication-contract.md)
+specifies the immutable operation, bounded file/progress records, original
+temporary/installed identity retention and exact mixed-set reconciliation. Three
+disposable actual-provisioner SIGKILL cases demonstrate the current in-memory
+plan boundary and ordinary same-source rerun behavior. It does not close final
+mode/provenance schemas, all-writer participation, security-preserving partial
+supersession, growth bootstrap, snapshot projection or loaded receipt formats.
+Its fresh-reader finding was corrected; 53 seams are mapped, not fully audited.
+It authorizes no publisher implementation or activation.
+
+
 L5. Runtime observation reuses the worker's existing unpaid reconciliation loop,
 whose interval is capped at 300 seconds with missed ticks skipped. Observe at
 startup and on each pass; no additional allocator or independent paid retry loop.

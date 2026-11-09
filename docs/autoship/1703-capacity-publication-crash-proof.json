@@ -1,0 +1,33 @@
+{
+  "cases": [
+    {
+      "changed_targets": 1,
+      "kill_after_real_replace": 1,
+      "manager_not_reloaded_at_crash": true,
+      "ordinary_same_source_rerun_completed": true,
+      "untouched_targets": 2,
+      "verified_sigkill_marker": true
+    },
+    {
+      "changed_targets": 2,
+      "kill_after_real_replace": 2,
+      "manager_not_reloaded_at_crash": true,
+      "ordinary_same_source_rerun_completed": true,
+      "untouched_targets": 1,
+      "verified_sigkill_marker": true
+    },
+    {
+      "changed_targets": 3,
+      "kill_after_real_replace": 3,
+      "manager_not_reloaded_at_crash": true,
+      "ordinary_same_source_rerun_completed": true,
+      "untouched_targets": 0,
+      "verified_sigkill_marker": true
+    }
+  ],
+  "future_publisher_verified": false,
+  "native_custody_proved": false,
+  "physical_power_loss_verified": false,
+  "production_mutated": false,
+  "source_sha256": "dd870acb177f678ddd8fc50d1d1c317abd37f9f8e5f14c1fe7309a1ebab40e73"
+}
