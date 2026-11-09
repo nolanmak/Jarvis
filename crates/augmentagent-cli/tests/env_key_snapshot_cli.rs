@@ -2,6 +2,9 @@
 use std::{path::Path, process::Command};
 
 fn list(directory: &Path) -> Vec<String> {
+    // Stop dotenv's ancestor search inside our fixture, including when a
+    // caller puts TMPDIR under a checkout with its own private environment.
+    std::fs::write(directory.join(".env"), "").unwrap();
     let result = Command::new(env!("CARGO_BIN_EXE_augmentagent"))
         .args(["env", "--json", "list"])
         .current_dir(directory).env_clear().env("PATH", "/usr/bin:/bin")
