@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T18:21:49.110269+00:00",
+  "observed_at": "2026-11-09T18:23:53.713823+00:00",
   "parent_issue": 1703,
   "owner_issue": 1709,
   "repair_issue": 1952,
@@ -181,5 +181,67 @@
     "shared_core_remaining": 0,
     "reset_unix": 1794248419,
     "action": "Waited for declared reset and polled the same run; observed success. No token rotation or job restart."
+  },
+  "final_head_startup_failure": {
+    "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+    "targeted_run": 42673227287,
+    "attempt": 1,
+    "status": "completed",
+    "conclusion": "failure",
+    "targeted_jobs": 0,
+    "cause": "GitHub workflow-level Internal server error, verified on each public run annotation",
+    "targeted_correlation_id": "e79cd831-5aa9-48ab-8e23-74438438bff7",
+    "annotation_urls": [
+      "https://github.com/nolanmak/Jarvis/actions/runs/42673227287",
+      "https://github.com/nolanmak/Jarvis/actions/runs/42673227913",
+      "https://github.com/nolanmak/Jarvis/actions/runs/42673227263",
+      "https://github.com/nolanmak/Jarvis/actions/runs/42673227210",
+      "https://github.com/nolanmak/Jarvis/actions/runs/42673227314",
+      "https://github.com/nolanmak/Jarvis/actions/runs/42673227824"
+    ],
+    "test_result": "No Rust compile, behavioral RED or GREEN inferred from workflow startup failure.",
+    "retry": {
+      "targeted_attempt": 2,
+      "observed_status": "queued",
+      "head_unchanged": true,
+      "failed_workflow_requests": [
+        {
+          "run": 42673227287,
+          "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+          "rerun_request_exit": 0,
+          "cause": "Verified public workflow-level Internal server error; no test failure inferred"
+        },
+        {
+          "run": 42673227913,
+          "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+          "rerun_request_exit": 0,
+          "cause": "Verified public workflow-level Internal server error; no test failure inferred"
+        },
+        {
+          "run": 42673227263,
+          "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+          "rerun_request_exit": 0,
+          "cause": "Verified public workflow-level Internal server error; no test failure inferred"
+        },
+        {
+          "run": 42673227210,
+          "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+          "rerun_request_exit": 0,
+          "cause": "Verified public workflow-level Internal server error; no test failure inferred"
+        },
+        {
+          "run": 42673227314,
+          "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+          "rerun_request_exit": 0,
+          "cause": "Verified public workflow-level Internal server error; no test failure inferred"
+        },
+        {
+          "run": 42673227824,
+          "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+          "rerun_request_exit": 0,
+          "cause": "Verified public workflow-level Internal server error; no test failure inferred"
+        }
+      ]
+    }
   }
 }

@@ -1054,3 +1054,17 @@ Normal CLI dry-run validated PR1954 with exit0/reason target-validated; accepted
 was false as expected for a dry-run, and the PR workflow/event counts stayed
 0/0. This does not queue work or prove native readiness. Independent review,
 normal merge/updater, original1944 replay, C2 and full1703 exits stay open.
+
+## Final-head hosted startup failure and same-head retry
+
+3debdb8d targeted run42673227287 attempt1 failed before creating a Rust job.
+Its public workflow annotation reports Internal server error (correlation
+e79cd831-5aa9-48ab-8e23-74438438bff7). Five other failed workflows on the head
+report their own matching workflow-level server errors; their source URLs
+are in the proof. None is credited as a Rust test failure, RED or GREEN.
+
+The six failed workflows were each confirmed terminal on the same head before
+normal rerun requests were accepted. Targeted attempt2 is authoritatively
+queued on that unchanged head; no observation timeout caused a restart, no
+source changed and no required check was skipped. Final validation remains
+pending;1754-test GREEN on7812314e remains correctly scoped to that head.
