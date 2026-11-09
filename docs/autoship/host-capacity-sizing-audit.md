@@ -1019,3 +1019,20 @@ regressions through the new immutable source producer. It also preserves
 inner container attributes and adds correction/identity/wire-boundary and
 large-stream EOF tests. Hosted run42667732148 is pending; no native acceptance,
 review, merge or rollout claimed.
+
+## Coherent-source C1 hosted GREEN; final scope correction pending
+
+Head7d865307 run42667732148/job129335771012 passed the hosted targeted
+crate tests and applicable Linux aggregation. CLI unit result:1754 passed,
+0 failed,33 existing ignored. The seeded cross-item defect/fixed cases,
+legacy retention, protected paths, exact selector limits, correction bound,
+metadata/native IDs, Unicode coordinates, container attributes and large
+immutable byte/EOF cases pass. The proof retains the exact head/job/log hash.
+
+Final revision7812314e corrects the expanded recovery prompt to remain partial:
+the initial inventory can exclude separately streamed caller groups, so fitting
+that inventory does not establish global source coverage. All evidence is still
+supplied and all controller groups/roles remain required. The existing real
+recovery test now asserts that label. This final head is pushed but not yet
+validated;7d865307 GREEN is not credited to it. Draft1954, independent approval,
+normal rollout, original1944 replay, C2 and full1703 acceptance remain open.

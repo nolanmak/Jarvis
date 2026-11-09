@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T17:46:16.131632+00:00",
+  "observed_at": "2026-11-09T18:03:34.081478+00:00",
   "parent_issue": 1703,
   "owner_issue": 1709,
   "repair_issue": 1952,
@@ -9,7 +9,7 @@
   "base": "416f392b17b56b2a43e67a3e430835902387941a",
   "head": "9146acb424a52f4e9ef89d28d7bfed0a524eb2f6",
   "branch": "fix/autoship-review-dependency-ranges",
-  "state": "draft_implementation_hosted_validation_pending",
+  "state": "component_green_at_7d865307_final_scope_revision_pending",
   "change": "Extract unchanged production group adapter behind scripted/native transport interface. Add legacy retained-finding control and two new coherent large-file cases; fixture Rust code is actually compiled/executed before scripted review.",
   "expected_red": [
     "related_large_source_items_reach_one_request_and_reject_the_seeded_defect",
@@ -83,8 +83,8 @@
     "log_sha256": "cd45bb763b68cb706a947ca36bd8c9df8028b6501d25656f6931474199bfef42"
   },
   "implementation": {
-    "head": "7d865307b03a0206fb1f1d0764e0e08009a685f0",
-    "state": "pushed_draft_pending_hosted_compile_and_tests",
+    "head": "7812314e",
+    "state": "final_scope_label_correction_pushed_pending_exact_head_ci",
     "changes": [
       "Strict typed incomplete source requests with legacy path compatibility",
       "Exact immutable regular Git Rust items with container headers, or UTF-8 byte intervals",
@@ -94,14 +94,15 @@
       "Share inline-versus-streamed caller selection between diagnostic and production paths",
       "Move original immutable whole-file regressions through the new production reader",
       "Include inner container attributes with requested members",
-      "Cover two-call correction exhaustion, actual identity/static metadata limits, exact request count/question/path bounds, and byte windows across >8MiB immutable blobs with invalid EOF refusal"
+      "Cover two-call correction exhaustion, actual identity/static metadata limits, exact request count/question/path bounds, and byte windows across >8MiB immutable blobs with invalid EOF refusal",
+      "Recovery expansion keeps partial group scope because the initial inventory may omit separately streamed caller groups; original controller group/role requirements remain mandatory"
     ],
     "local_validation": [
       "rustfmt syntax parse",
       "git diff --check"
     ],
     "green_claimed": false,
-    "run": 42667732148
+    "run": null
   },
   "implementation_validation": [
     {
@@ -117,6 +118,32 @@
       ],
       "result": "No CLI unit GREEN or behavioral RED claimed for implementation compile failure.",
       "log_sha256": "4ca1177367bb0ba8cb3429b7435b9b43adb66f396ba05079078528a5017f0a1f"
+    },
+    {
+      "head": "7d865307b03a0206fb1f1d0764e0e08009a685f0",
+      "run": 42667732148,
+      "job": 129335771012,
+      "state": "completed",
+      "conclusion": "success",
+      "cli_unit_result": {
+        "passed": 1754,
+        "failed": 0,
+        "ignored": 33
+      },
+      "cases": [
+        "related_large_source_items_reach_one_request_and_reject_the_seeded_defect",
+        "related_large_source_items_allow_a_complete_fixed_group_without_dropping_scope",
+        "credential_and_control_paths_are_refused_before_a_second_observation",
+        "malformed_then_incomplete_cannot_read_another_dependency_or_call_again",
+        "native_identity_limits_and_static_metadata_are_enforced_at_dispatch",
+        "initial_half_budget_preserves_unicode_source_coordinates_without_omission",
+        "raw_names_duplicates_and_container_attributes_are_exact_source",
+        "immutable_byte_windows_reject_symlinks_and_non_utf8_boundaries",
+        "byte_window_can_cross_large_blob_batches_but_cannot_hide_invalid_eof",
+        "source_request_limits_and_incomplete_only_envelopes_are_exact"
+      ],
+      "scope": "Hosted targeted crate tests and applicable Linux aggregation succeeded. Scripted review adapter fixtures are not native model acceptance.",
+      "log_sha256": "0da1b9c8cc53a2d231d83cf0cd23aaaf87b80fe102bfd8a69bd71a074d67c8a5"
     }
   ]
 }
