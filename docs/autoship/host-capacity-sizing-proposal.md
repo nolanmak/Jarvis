@@ -1,251 +1,279 @@
-# Host-aware autoship capacity sizing — proposal
+# Automatic host-sized Autoship capacity
 
-## 1. Status and purpose
+## 1. Outcome, status and authority
 
-Draft under #1703 and resource ownership #1676. This records the owner's request
-to optimize capacity for the machine running Jarvis. It is not implementation
-handoff, a policy approval, an admission capability, or restoration evidence.
-Resolve the load-bearing questions in section 8 before enabling automatic policy
-changes. The immediate legacy capacity recovery in #1913 is independent and must
-not wait for this project. #1914 reports capacity; #1915 preserves command blockers.
+Under #1703, with existing storage ownership in #1676 and retained-runtime
+recovery in #1902. On a supported fresh deployment Jarvis must detect the
+machine's effective resources and configure usable Autoship capacity automatically.
+The owner must not have to discover and replace an arbitrary 8 GiB default.
+Revalidate admission as resources and competing work change. Explicit operator
+ceilings remain overrides; unavailable evidence must never mean unlimited.
 
-The November 8 incident had eight retained runtimes, each charged a conservative
-1 GiB reservation, against an 8 GiB retained-state budget. A new runtime required
-9 GiB. Freeing unrelated build caches did not change that policy limit. The
-proposed 16 GiB replacement remains an operator choice, not an applied setting.
+Initial support is the existing Linux Autoship deployment with cgroup v2 and
+the existing delegated runtime/supervisor controls. This does not expand macOS
+deployment scope. Unsupported platforms/controller arrangements refuse auto
+activation explicitly; supported hosts with temporarily unavailable measurements
+retain configured auto mode with admission blocked and a recoverable reason.
+C0 must enumerate filesystem/profile support and these distinction tests.
 
-## 2. Measurements and existing owners
+This is the feature plan, not a claim of implementation or deployment. The first
+contract task below must close the listed engineering decisions before dependent
+coding tasks start. Automatic deployment is the product requirement; the former
+read-only-default proposal is superseded. An inspection command remains read-only.
+The owner has requested automatic sizing on the current host; another choice of
+an arbitrary fixed capacity is not a prerequisite to designing this feature.
 
-Read-only observations on November 9, 2026 around 01:36 UTC (November 8 in New
-York): the state filesystem `/` had about 39 GiB available; host RAM was about
-15.5 GiB total and 6 GiB available; nearly all 4 GiB swap was used. The runtime
-slice declared MemoryHigh=8 GiB, MemoryMax=10 GiB, CPUQuota=400%, TasksMax=2048.
-These are a historical sample, not values to hardcode or current admission proof.
-`/mnt/build` and `/mnt/store` are different filesystems. Archive free space is
-not hot-state capacity. The sample's slice limit is not proof that no ancestor
-has a tighter effective limit.
+#1913 is the separate guarded legacy-budget recovery command, #1914 reports
+capacity and #1915 preserves precise private blockers. They do not implement this
+feature. Their reviews/rollouts and the existing restoration work continue; the
+capacity feature must not be misrepresented as already live.
 
-Reuse these owners rather than introducing another allocator:
+## 2. Resource model and decisions
 
-- `native_vm.rs`: policy, retained-session demand, state lock, native admission.
-- `native_state_capacity.rs`: read-only storage observation and retry fingerprint.
-- `run_resources.rs` and the descendant supervisor: execution demand, composed
-  native/build guest memory, controller overhead, live reservation admission.
-- `build_storage.rs`, `storage_reservations.rs`, `storage_leases.rs`: build growth
-  reservations and coordinated cleanup/admission.
-- Existing updater/provisioning: policy publication and guarded reload.
-- Workflow capacity retry, health and private outbox: waiting, recovery and
-  truthful delivery. None is a second admission authority.
+D1. Capacity has separate dimensions: retained runtime disk state, concurrent
+execution memory/CPU/PIDs/file descriptors, and build/snapshot growth on each
+actual filesystem. Eight retained runtimes do not mean eight GiB of live RAM.
+Memory totals cannot size a disk budget. Archive free space cannot fund a state
+or build filesystem on another device. Logical VM filesystems need their own
+usable-space checks in addition to backing storage.
 
-## 3. Decisions and reasons
+D2. Fresh supported deployments default to automatic sizing. Detect host memory,
+currently available memory, CPU affinity and effective ancestor cgroup limits,
+current commitments, and the actual state/build/snapshot filesystem identities.
+Compute an aggregate usable envelope after protected system/daemon headroom and
+existing commitments. Fit complete declared runs within it; do not shrink a
+native guest, build guest or controller's required demand to make admission pass.
+A machine too small for one required run reports that precise blocker.
+Swap is a pressure signal, not additional physical RAM for admitting guests.
+C0 must distinguish hard minimum demand from maxima and schedulable shares for
+each dimension; a fractional CPU limit must not be mistaken for zero CPUs.
 
-D1. Separate retained-state bytes, retained-session count, and concurrent
-execution resources. Increasing a disk budget changes neither guest RAM nor
-concurrency. Raising bytes can still leave the session-count limit binding.
+D3. Use one admission authority for each resource through the existing owners.
+Reuse native admission, the descendant supervisor, storage reservations/leases,
+provisioning/updater, health and the private outbox. Detection/planning returns
+data, never an execution grant. Reserve actual commitments on demand; do not
+reserve every resource's entire theoretical capacity for one subsystem and starve
+builds or other eligible work. Scheduling fairness and owner holds remain intact.
 
-D2. Keep every retained runtime's full current reservation until original
-resource ownership and checked retirement justify releasing it. Small `du`, old
-timestamps, missing PIDs, leases or visible file flags are not future-growth
-bounds. This project does not implement reservation discounts or cleanup by age.
+D4. Preserve full current retained-session demand until positively checked
+retirement releases it. File sizes, age, a missing PID and absence of a visible
+writer do not justify discounts or deletion. Current native accounting charges
+1 GiB per retained session; that policy reservation is not a demonstrated kernel
+bound on all future disk growth. Keep accounting and physical guarantees distinct.
+Uncoordinated applications can still consume physical capacity; define truthful
+pressure/failure recovery rather than promise exclusive space from a sample.
 
-D3. Introduce observation/recommendation first. Default behavior is read-only.
-An eventual automatic mode requires an explicit owner ceiling and supported
-publication integration. Recommendations never rewrite policy by themselves.
-The initial sizing target is the smallest retained-byte budget that can cover
-the controller-declared next runtime allocation while retaining every existing
-reservation. It is not the largest budget the host could support, a forecast of
-daily shipments, or a session-count/concurrency tuning algorithm. With no declared
-allocation demand, recommend no policy change. Report other binding limits
-without recommending changes to them. The demand producer and its revision must
-be specified with the observation contract in section 8.
+D5. Storage accounting is per actual filesystem device and uses conservative
+full active growth claims. A claim touching multiple paths on the same device is
+counted once. Do not deduct its materialized usage from its remaining promise
+without a real producer contract. Native retained demand must join the existing
+build/snapshot accounting before automatic allocation relies on a combined view.
+No second independent native ledger or allocator may decide the same commitment.
 
-D4. Compute storage headroom on the actual state filesystem, preserving its
-configured free-space floor and other writers' outstanding growth commitments.
-Do not pool partitions or credit materialized usage against a reservation without
-an authoritative contract allowing that credit. Current build/snapshot accounting
-conservatively subtracts each active claim's full `growth` value from measured
-available bytes; do not reinterpret it as measured remaining growth. There is no
-approved combined native/build sizing formula yet: section 8 owns the native
-reservation integration. Never infer unused reservation credit from file sizes.
+D6. Explicit fixed overrides are supported and visibly labelled. They cannot
+exceed effective enclosing hard limits or silently violate protected floors.
+Reject a new ceiling below live commitments without rewriting configuration.
+If the system shrinks below existing commitments, retain their accounting,
+pause new admission and report the deficit. Do not kill sessions, prune unknown
+state, reset allowance, clear holds, or revoke a live guarantee to fit a new size.
+Recovery revalidates ordinary admission; it does not dispatch work directly.
 
-D5. Execution admission continues to use the existing supervisor's authoritative
-live reservations and effective ancestor limits. Host RAM total, available RAM,
-swap size, CPU count, or historical RSS alone cannot authorize concurrency or
-shrink the composed native/build/controller demand. A planner may recommend a
-limit but every actual launch still passes existing admission.
+D7. Measurements bind policy revision, process/resource scope, mount identity,
+clock/freshness and demand revision. Missing, stale, replaced, unsupported or
+inconsistent inputs remain unknown and block increases/new automatic admission.
+The contract task must define coherent sampling, exact freshness rules and
+revalidation under the existing allocation locks. Polling is observational; it
+cannot bypass the per-launch guards. Define bounded hysteresis for increases and
+immediate handling of real admission pressure, without treating every byte change
+as useful work or a new alert.
 
-D6. Stale, missing, unsupported or inconsistent measurements produce unknown
-recommendations. They never raise a budget. Linux/cgroup support must be explicit;
-other platforms retain their existing fixed policy until separately supported.
-The observation contract must identify the source mount and effective resource
-scope, observation time, policy/configuration revision, demand and limiting reason.
-Private paths and runtime identities stay in protected state; public output is
-numeric/allowlisted. A cached observation is never a launch grant.
+D8. Fresh installation, upgrade of an existing deployment, and runtime adaptation
+must all be designed. Preserve explicit legacy overrides unless authorized to
+switch them to auto; never infer intent merely because a value equals an old
+default. The current owner's request authorizes designing/enabling supported auto
+mode, not bypassing code review or migration guards. Use normal deployment
+snapshots/updater and effective configuration readback. Bound-owner schemas need
+their actual migration protocol; #1913's legacy writer cannot migrate them.
+Durable uncertain publication retains the original candidate until reconciled;
+never recompute a second candidate to hide a lost acknowledgement.
 
-D7. R1 reports pressure/unknown/recovery without changing admission. Existing
-fixed-policy guards continue to decide all launches. R2 must add its pressure
-handling inside the existing native allocation owner, not in the reporting
-planner: known insufficient headroom denies new allocations; unknown or stale
-evidence also denies new allocations while automatic mode is enabled; recovered
-evidence permits revalidation through ordinary admission, never direct dispatch.
-Enabling automatic mode on an unsupported platform must be refused; fixed mode
-retains its existing behavior. The concrete producer/API remains section 8 work.
-Do not revoke a live guarantee, kill retained sessions,
-silently lower a configured budget below existing commitments, override floors,
-or rewrite owner holds. Once a supported observation shows recovery, existing
-fingerprint reconciliation may wake a queue; ordinary admission runs again.
-Reject a requested owner ceiling below current retained commitments and leave
-the existing configuration unchanged, showing required versus requested bytes.
-If commitments later exceed an already configured ceiling, retain those
-commitments, deny additional allocations and report the deficit until checked
-retirement reduces demand or an approved ceiling change resolves it.
+Installer-managed leaf limits are outputs, not immutable inputs of their own
+sizing calculation. Derive them from host/enclosing limits outside that managed
+leaf; preserve external ancestors and explicit operator ceilings as constraints.
+Record managed-limit provenance and verify effective limits after installation
+and reload. A legacy 10G leaf cannot perpetuate itself merely by being read as
+the host envelope. Ambiguous legacy provenance stays fixed until a supported
+explicit `enable auto` migration records its scope/revision and replay identity.
+The current host's owner request supplies the product authorization; the normal
+authenticated operation and its durable publication record still provide the
+implementation boundary. No new request for an arbitrary byte value is needed.
 
-D8. Automatic publication, if enabled later, must reuse reviewed policy/schema
-support, source/candidate revisions, original coordination locks, atomic durable
-publication and explicit uncertain-outcome recovery. A newly computed candidate
-must not replace a possibly committed candidate after a lost acknowledgement.
-The legacy command in #1913 does not support modern bound-owner policy migration;
-unsupported schemas remain blocked until their own migration protocol exists.
+D9. CLI and private Discord status must show configured mode/overrides, detected
+limits, protected reserves, committed demand, currently admissible work and the
+limiting resource. Unknown is not zero. Deduplicate unchanged blockers and emit
+recovery only from current evidence. Retrying, starting a PID, raising a number,
+passing component tests and merging this feature are not successful shipment.
+No benchmark is requested. #1703's full CLI/Discord/shipment/soak acceptance stays
+in force independently of this capacity feature's tests.
 
-## 4. Proposed delivery sequence and testable exits
+## 3. Verified current code and incident
 
-R1 — Read-only sizing report in existing capacity diagnostics. Resource owner R
-implements it; H/N consume the same result. First add failing fixtures for:
-8 retained + 1 new runtime at an 8 GiB cap; bytes available but session cap full;
-large archive with constrained state mount; shared-filesystem writers; smaller
-ancestor cgroup; unlimited leaf with finite ancestor; unavailable/stale samples;
-and integer overflow. Exit: useful recommendation or explicit unknown without
-policy, session, reservation, model-call or allowance mutation. Implementation is
-blocked on section 8's observation and accounting contracts.
-Also prove the observer does not create coordination files, remove idle claims,
-reconcile CI holds, prune data, or rewrite reservation files. Existing admission
-APIs have side effects and cannot be called as a read-only measurement shortcut.
+The November 8 incident had eight retained runtimes charged 1 GiB each against
+an 8 GiB policy ceiling. One more required 9 GiB and was refused before model
+work. Freeing unrelated build caches did not change that ceiling. A November 9
+read-only sample found about 39 GiB free on the state filesystem, 15.5 GiB total
+host RAM and nearly full swap. The runtime slice declared an 8 GiB MemoryHigh,
+10 GiB MemoryMax, CPUQuota 400% and TasksMax 2048. These are historical evidence,
+not defaults or proof of current effective ancestor limits.
 
-R2 — Opt-in bounded sizing in existing admission/publication owners, after R1's
-contract is resolved. Add failing fixtures for competing publishers, changed
-policy/mount/reservations between plan and apply, mount loss, pressure after
-publication, source replacement, lost rename acknowledgement, failed sync,
-restart/replay, unsupported schemas and a lower owner ceiling than live demand.
-Exit: supported policy changes retain all accounting commitments and ordinary per-launch
-admission remains mandatory; uncertainty is durable and visible. A source-hash
-check alone does not validate resource headroom. Until the common reservation
-transaction is designed and implemented, automatic increases remain disabled.
+Current implementation boundaries:
 
-R3 — Current-host rollout and portability acceptance. Use normal reviewed CI,
-deploy snapshot and updater guards. Observe an authorized queued workflow reach
-actual model work after capacity recovers, then verify required checks and merge
-receipts separately. Exercise shrink/recovery on disposable hosts before enabling
-automatic mode in production. No production pressure injection or privileged
-filesystem transition is authorized by this proposal. This is recovery acceptance;
-the full CLI/Discord, five-shipment and soak requirements of #1703 remain open.
+- `scripts/provision-native-vm-probe.py` initializes new policies with fixed
+  max_state_bytes=8 GiB and max_sessions=16 when explicit arguments are absent.
+- `scripts/install-autostart.sh` defaults Linux service memory high/max to 8G/10G.
+- `native_vm.rs` / `native_state_capacity.rs` own native admission, state locking,
+  retained count and policy limits. Their existing check does not join the CLI
+  storage ledger or its configured free-space floors.
+- `run_resources.rs` and the supervisor own actual per-run demand, composed
+  native/build guest memory plus controller overhead, and live resource checks.
+- `storage_reservations.rs` publishes per-device fixed growth claims; its
+  Admission::lock can create metadata/reconcile CI holds, and claims() can remove
+  stale records. They are not read-only inspection APIs. Exported claims retain
+  their flock lifetime through descendants.
+- `build_storage.rs` subtracts other writers' full claims before admitting growth.
+  `deploy_snapshot.rs` publishes its peak claim on the snapshot filesystem.
+- Updater/provisioning own policy publication/reload; workflow capacity retry,
+  health and the private outbox own scheduling and truthful reporting.
 
-## 5. Non-goals
+## 4. Dependency-ordered GitHub work breakdown and TDD exits
 
-No new queue, allocator or workflow engine; no self-hosted public-PR runner;
-no archive migration; no automatic mount/provisioning changes; no session
-reservation discounts; no raising a resource ceiling merely to meet the daily
-shipping target; no benchmark restart. Independent review, hosted CI, owner
-authorization and existing holds stay required.
+Each task belongs under the capacity epic linked from #1703. C0 is contract work;
+C1-C5 are blocked until its relevant contract is reviewed and recorded here.
+Every implementation PR records failing assertions against its parent revision,
+then green results, tested SHA, affected suites and required hosted CI. Use real
+production entry points with disposable filesystems/Git repos, fake clocks and
+scripted external boundaries. Subprocess crash tests cover durable changes. Do
+not replace behavior tests with source-string assertions or mocks skipping the
+entry point. Rust session tests use `scripts/cargo-managed.sh`.
 
-## 6. Glossary
+### C0 — Close the host-capacity contract
 
-Retained-state budget: policy ceiling for all retained runtime disk reservations.
-Execution reservation: live descendant resource commitment for a running attempt.
-Available bytes: filesystem measurement, not unspent native-policy allowance.
-Recommendation: observational data that cannot authorize a launch or policy write.
-Owner ceiling: explicit upper bound for an opted-in sizing policy, not a promise
-that that amount is physically available. Retirement: positively checked release
-of original runtime ownership, not absence from a process list.
+Owner: resource admission (R), with provider/deploy (P), health (H), delivery (N)
+and acceptance (E). Before downstream implementation, define the result schema,
+units, resource identity/freshness algorithm, default headroom, effective ancestor
+resolution, exact sizing/admission equations, native growth producer, lock order,
+policy representation/migration and publication/recovery states. Define override,
+shrink/unknown/recovery/hysteresis behavior and each consumer API. Map every
+writer, including unresolved CI cleanup and legacy/bound-owner versions.
 
-## 7. Deferrals and risks
+Exit: no load-bearing placeholder below remains; worked fixtures specify exact
+outputs and failure states; the spec passes fresh-reader and complete seam audits.
+This task is ready for design work, not a license to invent a second allocator.
 
-Actual use may remain far below conservative reservations. Carrying cost: more
-waiting and a larger disk budget until original-resource closure/retirement is
-available. R owns that separate work; its trigger is positive custody/resource
-proof, not this host's current free-space measurement. Do not backfill that proof.
+### C1 — Detect effective machine resources
 
-Other applications can consume free space after any observation. Existing
-per-launch and available in-run resource enforcement remain mandatory; this does
-not claim that current native retained-state accounting enforces a kernel disk
-growth bound. Automatic sizing cannot promise global physical capacity from a
-sample. Section 8 must document which shared writers participate, which physical
-resources are actually bounded, and how uncoordinated exhaustion is surfaced and
-recovered. Retaining accounting commitments is not a physical space guarantee.
+Depends on C0. Add failing fixtures for 2/8/16/64 GiB machines; a 64 GiB host with
+a 2 GiB ancestor cap; unlimited leaf/limited ancestor; CPU affinity plus fractional
+quota; PIDs/FD ceilings; current commitments; differing/shared devices; full logical
+VM image with ample backing space; stale/partial input, overflow and mount/process
+replacement. Prove discovery changes no policy, claims, CI holds, files or services.
 
-## 8. Open threads — block implementation handoff
+Exit: deterministic bounded observations, explicit per-resource unknown/errors,
+and correct effective limits. A cached result cannot authorize a launch.
 
-1. R: specify one cross-writer, per-filesystem growth-accounting contract and its
-   real producer/consumer APIs. Separate materialized usage from outstanding
-   commitments without double credit. Include native writes, builds, snapshots
-   and unrelated consumers. Blocks recommendation formula and automatic writes.
-2. R/P: specify measurement identity, freshness, ancestor-limit resolution,
-   source consistency and under-lock revalidation boundaries. Include filesystem
-   replacement/remount and concurrent reservation/publication. Blocks R1/R2.
-3. Owner/R: select explicit ceilings and opted-in resources. The proposed 16 GiB
-   immediate recovery value is not that general policy approval. Blocks automatic
-   mode only; diagnostics and existing fixed-policy recovery can proceed.
-4. R: define supported legacy versus bound-owner publication/reload behavior,
-   concurrency control, uncertainty persistence and recovery before R2. Existing
-   bindings must never acquire new authority from a planner's recommendation.
-5. H/N/E: define bounded private reason codes, freshness display, alert deduplication
-   and recovery evidence once R's contract settles. Blocks reporting handoff and
-   R3 acceptance, not the independent #1914/#1915 fixes.
-6. R: verify actual disk-growth enforcement coverage and define residual
-   exhaustion/recovery behavior for uncoordinated consumers. Blocks safety claims
-   and R2 activation; neither a planner nor current reserved-byte accounting is a
-   substitute for that evidence.
+### C2 — Join native demand to shared storage admission
 
-This proposal deliberately exposes those missing contracts. No implementation
-issue should claim automatic sizing is ready until they have concrete answers.
+Depends on C0/C1's storage contract. Start with failing simultaneous native/build/
+snapshot admission fixtures on one device and split devices. Exercise duplicate
+paths, two state roots, active/exported claims, crashes, unknown cleanup holds,
+legacy writers and missing evidence. No reservation is released from age, `du`
+or absent processes. Preserve full retained native demand and snapshot floors.
 
-## 9. Proposal checkpoint audit
+Exit: measuring/reserving/releasing actual demand uses one coordinated authority;
+competing admissions cannot spend the same headroom; uncertainty remains held;
+ordinary builders/snapshots respect native claims and native allocations respect
+theirs. Explicitly verify what physical enforcement exists and its residual limits.
 
-A fresh reader raised eight findings. Four exposed missing decisions now recorded:
-the next-allocation retained-byte target, phase-specific advisory versus admission
-behavior, ceilings below existing commitments, and the distinction between
-accounting reservations and physical disk-growth enforcement. The remaining
-accounting, observation, publication/reload and reporting contracts are explicitly
-parked in section 8 with owners and blocked phases. This checkpoint is not a
-handoff audit; a full seam audit is still required after those contracts settle.
+### C3 — Apply automatic deployment defaults and supported migration
 
-## 10. Current source contracts checked after the draft audit
+Depends on C0-C2. Reproduce the fixed 8 GiB/16-session and 8G/10G initialization
+behavior first. Test new installations on small/large/constrained hosts, explicit
+overrides, existing fixed policies, current-host auto enablement, unsupported
+schemas, filesystem loss, mixed versions, and a ceiling below commitments. Crash
+at each file/rename/sync/reload boundary; replay uncertain publication exactly.
 
-These observations narrow the open work; they do not establish a combined
-allocator or safe automatic policy application.
+Exit: supported fresh deployments configure host-derived capacity automatically;
+existing deployments switch only through supported migration and preserve all
+sessions/charges/holds. Effective worker configuration agrees with the plan after
+normal rollout. No raw DB backups, retention/floor overrides or manual restart
+shortcut. Installer-only success does not complete this task.
 
-1. [Storage reservations](../../crates/augmentagent-cli/src/storage_reservations.rs)
-   publishes a fixed `Claim.growth` against deduplicated filesystem device IDs.
-   `Claims::reserved_on` sums full growth once per claim/device; it does not
-   subtract bytes already materialized by that writer. The flock-held claim
-   persists while exported descendants retain its descriptor. Preserve this
-   conservative contract until any replacement has real evidence and migration.
-2. The same module's `Admission::lock` may create coordination metadata and
-   reconcile uncertain CI cleanup. `Admission::claims` can open/create records
-   and unlink stale claims after acquiring their locks. Neither is a read-only
-   reporting API. R1 needs a supported nonmutating observation path; observation
-   failure must not trigger cleanup. Do not invoke these APIs on production state
-   merely to collect the proposed sizing report.
-3. [Build admission](../../crates/augmentagent-cli/src/build_storage.rs)
-   checks each monitored path's available bytes minus other writers' full claims
-   against the configured floor, then publishes its own growth claim under the
-   short admission lock. Different paths on one device must not multiply a
-   claim. Target leases and the build lock have distinct purposes from the short
-   allocation lock; do not wait for a target/process while holding that lock.
-4. [Snapshot creation](../../crates/augmentagent-cli/src/deploy_snapshot.rs)
-   checks the snapshot filesystem, subtracts other writers' claims, and publishes
-   the snapshot peak on its actual device before work. An archive snapshot claim
-   does not consume root-filesystem headroom unless the two truly share a device.
-5. [Native capacity](../../crates/augmentagent-channel-core/src/native_state_capacity.rs)
-   currently compares retained plus additional sessions with `max_sessions` and
-   `max_state_bytes`, stored bytes with that budget, and available bytes with
-   `SESSION_BYTES` (1 GiB). Native preparation holds its separate state lock.
-   This check does not join CLI build/snapshot `Admission`/`Claims` accounting or
-   apply their configured free-space floors. Increasing the policy cap does not
-   add that missing coordination. Implementing it requires a deliberate common
-   producer/consumer boundary across the channel-core and CLI layers, including
-   lock ordering, inherited writer lifetime, crash recovery and mixed-version
-   behavior; a second independent native growth ledger would not solve it.
+### C4 — Adapt admission while the worker runs
 
-The next contract task for R is therefore concrete: define native participation
-in the existing storage accounting, plus a nonmutating observer. Do not implement
-a free-space percentage tuner first and describe it as cross-writer admission.
+Depends on C0-C3. Fail tests for resource shrink/growth, competing jobs, missing
+samples, a lost/replaced mount, stale configuration and oscillating headroom.
+Use fake clocks to verify cadence, hysteresis, immediate real pressure refusal,
+fairness, bounded wakes and unchanged-input alert deduplication. Assert zero paid
+model calls and zero merge allowance consumed by capacity deferral.
+
+Exit: running workers revalidate and adapt safely without operator tuning,
+restarting sessions or erasing commitments. Ready work advances when resources
+recover through ordinary admission; a larger displayed budget alone is not proof.
+
+### C5 — CLI/Discord visibility and deployed acceptance
+
+Depends on C0-C4; integrate #1914/#1915 rather than duplicate their readers/outbox.
+Fail fixtures that confuse retained disk with live RAM, report unknown as zero,
+read the observer's environment instead of the worker's, leak private paths/IDs,
+overwrite a precise blocker, or report a retry as progress. Test private delivery
+reopen/deduplication and uncertain sends.
+
+Exit: inspect the real effective configuration and advance existing authorized
+queued work through actual model activity after normal rollout. Validate capacity
+shrink/recovery on disposable hosts before production. Publish separate component,
+rollout and live-work evidence; keep the parent epic's five-merge, 72-hour fault
+and 24-hour unattended requirements open until independently proven.
+
+## 5. Engineering decisions still owned by C0
+
+These are implementation-contract tasks, not unanswered requests for the owner
+to pick arbitrary machine limits. C0 blocks dependent coding until they are
+specified and audited:
+
+1. Exact default headroom and resource-vector sizing equations; how current
+   commitments and complete per-run demand interact without greedy pool capture.
+2. Native participation in the existing per-filesystem ledger, durable lifetime,
+   original release proof and cross-version compatibility. No inferred discount.
+3. Observation identity, freshness/clock rules, ancestor resolution, coherent
+   reads and allocation-lock revalidation, including replace/remount cases.
+   Distinguish installer-managed leaf outputs from immutable enclosing limits;
+   specify provenance, bootstrap order and post-reload readback.
+4. Stable auto/fixed configuration representation; supported legacy and bound-
+   owner migration; complete pending/uncertain/applied/effectively-loaded states.
+   Ambiguous legacy settings require an explicit scoped auto-mode operation,
+   never guessing provenance from a numeric value.
+5. Precise pressure/unknown/recovery reasons, hysteresis, alert lifecycle and
+   current-worker effective readback, with public/private output boundaries.
+6. Actual disk-growth enforcement coverage and residual exhaustion/recovery for
+   writers outside coordination. Accounting reservation is not a physical quota.
+
+## 6. Non-goals and glossary
+
+No new workflow engine/independent allocator, self-hosted public-PR runner,
+archive migration, privileged freeze/quota rollout, reservation discounts,
+cleanup by age, weakening of independent review/CI/owner controls, or benchmark.
+No claim that a sample excludes all future uncoordinated writes.
+
+Retained state: disk state kept across turns, separate from live execution RAM.
+Effective limit: tightest relevant host/ancestor/operator limit with protected
+headroom accounted for. Commitment: existing authority's declared reserved demand,
+not current file size or RSS. Auto: deployed sizing/admission behavior; inspect:
+a read-only command showing that behavior. Observation: data, not a launch grant.
+
+## 7. Tracking and audit status
+
+Dedicated epic and C0-C5 issue links will be recorded here on publication. The
+previous fresh-reader audit covered the superseded read-only proposal. This
+revision incorporates the owner's explicit automatic-default requirement and
+requires a new fresh-reader and seam audit before issue handoff. C0 is the only
+design-ready task; dependent implementation tasks remain blocked as stated.
