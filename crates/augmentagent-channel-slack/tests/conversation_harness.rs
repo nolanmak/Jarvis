@@ -23,7 +23,8 @@ use augmentagent_channel_core::surface_conformance::{
 use augmentagent_channel_core::surface_turn::turn_env;
 use augmentagent_channel_slack::delivery::ProgressConfig;
 use augmentagent_channel_slack::harness::{
-    SlackConversationHarness, CANCELLED_REPLY, INTERRUPTED_REPLY, SLACK_INBOUND_DIR_ENV,
+    SlackConversationHarness, CANCELLED_REPLY, INTERRUPTED_REPLY, SESSION_UNCERTAIN_REPLY,
+    SLACK_INBOUND_DIR_ENV,
 };
 use augmentagent_channel_slack::inbound::InboundOptions;
 use augmentagent_channel_slack::interactive::{
@@ -42,7 +43,8 @@ use augmentagent_channel_slack::transport::web::{
 };
 use augmentagent_store::owner::ControlConversationKind;
 use augmentagent_store::{
-    Store, SurfaceConversationRef, SurfaceTurnRef, SurfaceTurnResolution, SurfaceTurnStatus,
+    NativeConversation, Store, SurfaceConversationRef, SurfaceTurnRef, SurfaceTurnResolution,
+    SurfaceTurnStatus,
 };
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -1033,6 +1035,82 @@ async fn restart_mid_turn_reports_the_interruption_once_and_the_thread_keeps_its
             .count(),
         1
     );
+}
+
+// #1790 (#1774) — the provider is stopped by a host signal *during* the turn (the
+// typed `ReasonerError::Interrupted`, not a string-matched failure): the owner
+// gets the interruption wording instead of an error, the turn is closed as
+// interrupted and the agent is never asked again. The conversation itself is
+// not latched, so the uncertain-session wording stays reserved for a session
+// the store really marked — the arm the interrupted one precedes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interrupted_answer_is_reported_without_a_retry_and_is_not_an_uncertain_session() {
+    let h = Harness::new();
+    let provider = Arc::new(RecordingNativeProvider::new(ProviderKind::Claude));
+    let agent = FakeAgent::new(Arc::clone(&provider));
+    agent
+        .interrupt_next
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (connector, mut servers) = DuplexConnector::new();
+    let running = start(h.surface(
+        Arc::clone(&h.store),
+        connector,
+        harness_for(&h.store, agent.clone(), &h.wiki),
+        h.config(false, false),
+    ));
+    let mut server = Server::accept(&mut servers).await;
+    let stopped = "1700001000.000100";
+    server
+        .deliver(&owner_dm("e1", "draft the memo", stopped))
+        .await;
+    eventually("interruption reported", || h.answers(DM, None).len() == 1).await;
+    assert_eq!(h.answers(DM, None)[0], INTERRUPTED_REPLY);
+
+    // Nothing re-ran it: the inbound event is consumed, not requeued, and
+    // there is no second agent call and no provider call at all.
+    eventually("inbound event consumed", || {
+        h.inbound_status(&format!("{DM}:{stopped}")) == "handled"
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(agent.seen.lock().unwrap().len(), 1);
+    assert!(provider.calls().is_empty());
+    let claim = thread_turn(DM, None, stopped);
+    assert_eq!(
+        h.store
+            .surface_turn_state(&claim)
+            .unwrap()
+            .unwrap()
+            .resolution,
+        Some(SurfaceTurnResolution::Interrupted)
+    );
+    let dm = workspace().conversation(DM, None).unwrap();
+    assert!(
+        !h.store
+            .surface_conversation(&dm)
+            .unwrap()
+            .is_some_and(|c| c.uncertain),
+        "a host signal must not latch the conversation"
+    );
+
+    // A session the store did mark uncertain is the other arm, and it never
+    // reaches the agent.
+    h.store
+        .bind_surface_conversation(&NativeConversation {
+            conversation: dm,
+            provider: "claude".into(),
+            native_session_id: "stuck-session".into(),
+            cwd: h.wiki.to_string_lossy().into_owned(),
+            uncertain: true,
+        })
+        .unwrap();
+    server
+        .deliver(&owner_dm("e2", "and the memo?", "1700001000.000200"))
+        .await;
+    eventually("uncertain reported", || h.answers(DM, None).len() == 2).await;
+    assert_eq!(h.answers(DM, None)[1], SESSION_UNCERTAIN_REPLY);
+    assert_eq!(agent.seen.lock().unwrap().len(), 1);
+    running.stop().await;
 }
 
 // ---------------------------------------------------------------------------
