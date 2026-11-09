@@ -954,8 +954,12 @@ configuration, not to hiding existing usable capacity for another interval.
 If pressure returns between observation and execution, the fresh original
 allocation guard refuses before paid release. Neither transition is shipment.
 
-L7. A resource wait is reconciled observationally, without reopening a productive
-attempt every hour against unchanged evidence. Preserve its existing protected
+L7. A resource wait uses unpaid observation/reconciliation, without reopening a
+productive attempt every hour against unchanged evidence. The worker may invoke
+the existing authority's unpaid, original-proof-checked hold/cleanup reconciliation
+on that pass; this is distinct from a pure status inspection. Otherwise an old
+cleanup hold could prevent the very paid attempt whose admission used to clear
+it. No release follows from time or a free flock alone. Preserve its existing protected
 workflow checkpoint, generation, owner controls, demand and binding. Its wake
 fingerprint binds policy/demand/loaded/resource identities plus the typed
 known/unknown/blocked/available outcome for that complete next action; raw
@@ -997,7 +1001,244 @@ the existing full execution boundary authorizes it.
   leaves configuration/security/accounting intact; rollback to a binary that
   ignores durable native claims refuses independently of numerical capacity.
 
-## 9. Open contract checklist and handoff gate
+## 9. Versioned CLI/private Discord projection
+
+N1. Introduce `CapacityStatusV1` as observation/projection data, never an
+execution or cleanup grant. Its JSON object has these fields:
+
+| Field | Type and meaning |
+| --- | --- |
+| `schema_version` | Integer 1 |
+| `configured_mode` | `auto`, `fixed`, or `unknown`; control-plane intent, not proof of loaded mode |
+| `overrides` | Bounded applicable override inventory defined below, including evidence completeness |
+| `configuration_state` | L3 state, `unchanged`, or `unknown` |
+| `outcome` | `available`, `blocked`, `unknown`, `unsupported`, or `not-evaluated` for the full next action |
+| `demand_state` | `selected`, `not-selected`, or `unavailable` for the inspected next action |
+| `demand_kind` | P2 role identifier for the selected complete declaration, or null |
+| `worker_evidence` | `current`, `missing`, or `stale`; from actual selected worker evidence |
+| `observed_at_ms` | UTC milliseconds for this observation, or null if not observed |
+| `measurement_age_ms` | Nonnegative age of the measured result, or null when unverified; never an execution freshness waiver |
+| `predicates` | Typed rows defined in N2 |
+| `omitted_predicates` | Nonnegative count of checked rows omitted from the bounded projection |
+| `reason_codes` | Sorted, deduplicated allowlist values defined in N3 |
+| `next_action` | `await_capacity`, `await_configuration`, `inspect_private_status`, or `none` |
+| `next_check_at_ms` | UTC next observational eligibility, or null when unknown/not applicable |
+
+All fields are required in version 1, including explicit nulls. Available means
+the authoritative observation checked the whole declared resource vector and
+configuration prerequisites, not merely the rows displayed. It is still subject
+to current owner controls and actual fresh execution admission. A known configured
+mode may be shown while worker evidence is missing; loaded metrics stay unknown.
+Without a selected demand, outcome is not-evaluated, not a claim that a run fits
+or that the work queue is idle. A selected but incomplete/unverified producer
+declaration is unavailable/unknown. Raw global resource observations alone cannot
+stand in for the complete native-with-build action.
+
+`overrides` contains `status` (`complete`, `incomplete`, `unavailable`), `entries`
+and `omitted_count` (nonnegative integer or null when unknown). A complete empty
+list means no applicable override; an unavailable/incomplete list does not.
+At most 64 entries are projected within the same overall byte bound. Each entry
+has `resource`, `domain`, `ceiling` (N2 quantity) and `source`. Resource is
+`memory`, `cpu`, `tasks`, `descriptors`, `native-state-bytes`, `native-sessions`
+or `scratch-bytes`. Source is `explicit-argument`, `explicit-environment`,
+`recorded-operator` or `recorded-legacy-override`, backed by L1 provenance rather
+than guessed from numbers. Scope the inventory to the selected deployment and
+inspected action; old unrelated root settings are not that action's overrides.
+Per-root limits use response-local `root-N` ordinals, not filesystem ordinals.
+Render these as explicit overrides. If legacy intent is unclassified, mark the
+inventory incomplete and label that uncertainty; do not pretend the fixed value
+is an explicit override or report an empty complete list. No source filenames,
+environment variable contents, actor IDs or provenance digests are emitted.
+Override units are byte for memory/native-state/scratch bytes, cpu for CPU,
+task for host tasks, descriptor for NOFILE, and session for native session count.
+Reject a mismatched resource/unit pair instead of formatting it plausibly.
+
+N2. A predicate row contains `kind`, `domain`, `status`, `required`, `available`,
+`deficit` and `context`. `status` is `pass`, `blocked`, `unknown`, or `unsupported`.
+Unknown numeric evidence is null, never zero. A quantity is
+`{numerator: u64, denominator: positive u64, unit: enum}` in reduced form;
+unit is `byte`, `task`, `descriptor`, `inode`, `session` or `cpu`. Byte/task/descriptor/inode/session
+quantities have denominator 1. CPU quantities retain exact rational rates;
+integer-percent display cannot turn a small nonzero detected rate into zero.
+Comparisons/arithmetic are checked, without floating-point rounding or saturation.
+
+Predicate kinds are `memory-aggregate`, `memory-host`, `memory-ancestor`,
+`cpu-minimum`, `tasks-aggregate`, `tasks-ancestor`, `tasks-host`, `tasks-user`,
+`descriptor-process`, `descriptor-host`, `storage-bytes`, `storage-inodes`,
+`storage-quota`, `logical-image`, `native-session-count`, `native-retained-bytes`
+and `native-stored-bytes`. Native per-root count/byte rows preserve the additional
+S4 policy predicates; a free filesystem cannot hide a configured session limit.
+Use each contract's actual left-hand required
+amount and right-hand available bound: for example memory aggregate is R+Q
+versus min(B_loaded,B_current), while storage bytes is H+P+D+Q versus F.
+Known deficit is max(0,required-available) in that same unit; a deficit can exceed
+new demand when commitments already exceed a limit. Do not subtract headroom
+again from an already-net amount just for rendering.
+
+`context` permits only these fixed keys with quantity-or-null values:
+`effective_limit`, `protected`, `committed`, `requested`, `desired_limit`,
+`published_limit`, `loaded_limit`, `original_peak`, `remaining_peak`, `retained`,
+`active_growth`, `process_growth`.
+Each present non-null value uses the row's unit. Absent/not-applicable keys are
+omitted; unknown applicable keys are present/null. Thus a CPU scheduling maximum
+does not invent a committed CPU reservation, and descriptor host pressure does
+not masquerade as an exclusive file-handle pool. Context preserves desired/
+published/loaded distinctions and retained-vs-active storage detail through the
+actual predicate/domain rows, not a misleading combined RAM/disk scalar.
+The retained/active_growth/process_growth keys apply only to storage-byte rows
+and correspond to S4's retained durable, other durable growth and process totals.
+
+Domains are projection-local ordinals such as `runtime-1`, `storage-1`, `root-1`
+and `image-1`, with a fixed `runtime|storage|root|image` prefix and positive decimal suffix.
+They identify rows within this response, not stable private root/volume identities.
+Internal binding carries full identities only in protected state. Multiple paths
+to one filesystem use the same storage ordinal. Do not emit actual paths, mount
+names, provider session IDs, process IDs, machine/boot IDs, inode identities,
+credentials, environment contents or protected evidence/replay digests here.
+
+The serialized projection is bounded to 65536 bytes and 64 rows. Summarize by
+resource kind/domain, prioritizing unknown/unsupported and blocked rows before
+passes, in fixed kind/domain order. Record omitted checked rows explicitly;
+omission never makes an unknown/blocked full vector available. If even a valid
+summary cannot fit, emit a small unknown projection with
+`capacity-evidence-unavailable`, preserving the full protected diagnostic. Never
+truncate a JSON string into apparently valid evidence or forward arbitrary
+source fields/error prose as context.
+
+N3. New projected reason codes are exactly `capacity-memory`, `capacity-cpu`,
+`capacity-tasks`, `capacity-descriptors`, `capacity-storage-bytes`,
+`capacity-storage-inodes`, `capacity-storage-quota`, `capacity-logical-image`,
+`capacity-evidence-unavailable`, `capacity-publication-uncertain`,
+`capacity-awaiting-load`, `capacity-protocol-incompatible`,
+`capacity-override-conflict`, `capacity-producer-unverified` and
+`capacity-native-sessions`. The last identifies the separate configured root/session-count
+constraint; it is not mapped to host task exhaustion.
+Map protected producer outcomes to these values; unknown input becomes
+capacity-evidence-unavailable without copying its text. Configuration uncertainty
+and missing evidence remain distinct from a measured zero-capacity deficit.
+Overall workflow owner pause, authorization, provider readiness, merge and
+deployment facts retain their existing precedence/authority.
+
+N4. Add optional/defaulted `capacity: CapacityStatusV1` to the existing `Progress`
+serialization; legacy progress rows without it remain readable and report no
+capacity observation. Unknown/malformed future nested capacity data renders as
+unavailable while preserving the valid surrounding workflow progress and private
+diagnostic, not a fabricated available state or a dropped merge event. Old readers
+may ignore the additive field; they cannot certify new capacity from its absence.
+Projection/encoding failure does not mutate the R-owned outcome, rewrite a
+protected workflow checkpoint or turn completed work into an execution failure.
+
+The R-owned protected workflow capacity observation/checkpoint transaction
+supplies this projection for the same workflow binding, demand, selection window
+and lease generation. N derives it; it does not maintain a second balance or
+query a different ambient policy. Integrate #1914's worker-selected evidence and
+#1915's precise-blocker preservation. Only meaningful capacity/configuration
+state transitions change the durable notification fingerprint, as in L7.
+Raw free-byte/age churn does not create a new Discord update every poll.
+
+An emitted progress event's capacity snapshot is immutable and labelled with its
+observation time. An already dispatched outbox row freezes its exact content,
+nonce, workflow sequence and destination. Do not refresh that content in place
+to hide an uncertain send. A fresh interactive status query may collect newer
+read-only evidence; it is distinct from claiming an older event is current.
+Capacity recovery is not a model admission, completed stage, autonomous merge,
+deployment receipt or a reason to reset their counters.
+
+N5. The future `augmentagent capacity inspect --json` returns this versioned
+private diagnostic without creating directories, claims, CI cleanup holds or
+changing policy. It uses the actual worker receipt and common read-only inventory
+APIs. It must not wrap today's `autopr-health` command as a supposedly pure
+collector: that command can invoke pressure pruning even without `--notify`.
+Unconfigured or unavailable state returns an unknown diagnostic, not implicit
+default limits. Human CLI/private Discord status uses the same typed projection.
+An optional authorized workflow target supplies its current protected demand;
+the generic inspection without a target returns demand_state=not-selected and
+outcome=not-evaluated. It does not claim/advance a queue item to select one.
+Interactive autoship status for an existing issue/PR uses that workflow's demand
+and binding, rather than silently substituting the cheapest text role.
+A completed safe inspection returns command success even for blocked/unknown
+outcomes; callers must read the typed outcome, never treat CLI exit success as
+run admission. Invocation/authorization failures retain existing nonzero CLI
+error conventions and cannot return another owner's diagnostic.
+
+Keep `autopr-health --json`'s existing array-of-findings shape; derive new capacity
+findings through its analyzer instead of replacing that array with a new envelope.
+Its existing housekeeping authority remains separate from capacity inspection.
+Do not feed new private diagnostic contents through the generic webhook/Slack
+health router without verified private owner destination. A public-safe status
+may expose the allowlisted category and observation availability only.
+
+Private Discord rendering shows mode, current configuration/admission state,
+active explicit overrides or their unavailable-provenance label,
+the primary limiting resource and its required/available/deficit quantities,
+the next observational action/time, and separate delivery state. Preserve the
+existing 1900-character message bound and transport nonce marker; summarize
+secondary resources rather than clipping the marker or immutable proof content.
+The updated human renderer omits the legacy base `evidence_digest` as well as
+new protected capacity digests. Preserve the field in legacy serialization and
+already-dispatched content for compatibility/reconciliation; do not rewrite history.
+Render unknown as unknown, not “0 free.” The existing authorized owner/workflow
+destination check applies before any detailed response or update is queued or dispatched.
+Its existing ingress/delivery evidence must positively establish the owner-private
+destination; a channel name or configured webhook variable is not that proof.
+Show the workflow's next action separately from the capacity recheck; a paused
+workflow still awaits owner resume even when its resource predicates pass.
+No new public-channel fallback or Slack expansion is introduced.
+
+N6. Capacity state and delivery state are independent. Use the existing #1714
+outbox and its remote-evidence/explicit-owner-resolution protocol. Later progress
+stays pending behind an uncertain send; never skip it or mint another nonce to
+claim recovery delivered. The existing successful remote proof or explicit
+authorized resolution settles that original uncertainty before later updates.
+
+For an uncertainty episode, status exposes `delivery-uncertain` immediately.
+At 10 minutes unresolved age, expose local health/private-CLI attention and
+queue one private delivery-attention intent at the next eligible attention slot
+through the same service. Attention intents, including a new episode's first
+intent, are bounded to one per 6 hours and at most four in the rolling interval
+`(now-24h, now]` per owner/workflow/destination across episodes. Persist due times
+and deduplication so restart or a new uncertainty episode cannot reset the bound.
+Local attention is visible at 10 minutes even while the next intent slot is
+rate-limited. Reconciliation runs each ordinary unpaid pass
+using #1714's bounded transport operation; insufficient remote evidence stays
+uncertain and offers the existing owner-resolution action.
+
+Attention is separate from the capacity/blocker fields and never overwrites
+them. An attention intent behind uncertainty may remain pending or coalesce
+after successful reconciliation; report it as pending, never delivered. Do not
+introduce another sender/route to evade the ordering guard. Local attention
+remains visible while the transport cannot deliver. Coalesce only undispatched
+reminders/latest status; preserve all dispatched content and evidence. Once
+the original delivery is reconciled, ordinary current-state delivery resumes.
+Delivery failure never grants/denies execution or changes merge allowance.
+
+### Reporting and delivery fixtures
+
+- Legacy Progress without capacity decodes with no observation; malformed or
+  version-2 nested capacity cannot become available or erase a confirmed merge.
+- A valid explicit 8 GiB ceiling is labelled as an override even when it equals
+  an old default. Unclassified legacy provenance remains incomplete, not an
+  inferred override/default. A root's 16-session cap is separate from host PID
+  capacity and uses session quantities, even with abundant backing disk space.
+- Required memory 12.5 GiB versus available 12 GiB displays a 0.5 GiB deficit;
+  retained disk commitments never render as live RAM use. Detected 1/2 CPU is
+  distinct from its rounded 37-percent managed quota.
+- Missing worker receipt plus known configured auto mode shows auto intent,
+  worker unavailable and unknown loaded values, without the observer's limits.
+- Candidate published but worker not reloaded stays awaiting load even if
+  numerical predicates otherwise fit. Owner pause still dominates the next
+  action; a nested capacity-available result does not resume it.
+- Injected paths, credential-like strings, native IDs and unknown reason/context
+  keys cannot reach projected JSON/Discord/webhook text. Response aliases share
+  one filesystem ordinal; omitted failing rows cannot produce available outcome.
+- At t=599 seconds of uncertainty, no attention intent; t=600 queues one, with
+  later updates still pending. Restart/repeated passes at t=600 queue no duplicate.
+  Another reminder is ineligible before 6 hours; the rolling-day cap still applies.
+- A capacity recovery observed while an earlier send is uncertain changes
+  current local capacity state but does not claim the recovery was delivered.
+  Reconciliation confirms the exact original send before any queued later update.
+
+## 10. Open contract checklist and handoff gate
 
 Memory equations above are proposed engineering decisions with exact fixtures.
 They require fresh-reader review and source/integration validation before C0
@@ -1019,8 +1260,9 @@ this partial document as the completed contract.
   preservation of current security, owner controls and accounting.
 - [ ] R/H: integration validation of section 8's cadence/hysteresis/shrink/recovery
   decisions, with final stable reason identifiers and worker readback mapping.
-- [ ] H/N: versioned CLI/private Discord payload mapping, privacy classification,
-  deduplication, uncertain delivery reconciliation and bounded alert lifecycle.
+- [ ] H/N: source/integration validation of section 9's payload, privacy, outbox
+  snapshot/deduplication and bounded-attention contracts, including final persisted
+  attention schema and #1714 transport/owner-resolution linkage.
 - [ ] E: reviewed complete contract plus fresh-reader, conversation and full seam
   audits; reproducible fixtures covering every contract branch.
 

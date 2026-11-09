@@ -133,3 +133,26 @@ findings in L1-L7 and confirmed the timing/accounting examples. These are workin
 design fixtures, not implemented fake-clock/runtime test results. Final schemas,
 step journal, compatibility/projection matrix and structural startup fence
 remain load-bearing C0 gates before downstream handoff.
+
+The reporting checkpoint defines CapacityStatusV1, typed predicate quantities,
+explicit demand selection, bounded safe override provenance, legacy Progress
+compatibility and unchanged health-array output. The author verified the current
+Progress/outbox serialization, 1900-character message guard and health collector's
+pruning side effect. Pure capacity inspection therefore uses a separate read-only
+path; worker unpaid original-proof reconciliation remains allowed to clear
+recoverable holds without waiting for a productive attempt.
+
+Fresh-reader review found a real visibility gap: the first projection could not
+label an active explicit override. N1/N5 now carry/render a bounded typed override
+inventory, evidence completeness and safe provenance. Recheck found that resolved,
+including root/session versus filesystem/PID distinctions. Additional author
+checks preserved immutable dispatched content, separate workflow/capacity actions,
+privacy redaction and attention limits across restart and repeated episodes.
+
+The delivery checkpoint keeps later updates behind uncertainty, exposes local
+attention after 10 minutes, and bounds private attention intents to one per six
+hours/four per rolling day across episodes. Pending attention is not claimed
+delivered and never determines execution or allowance. Final persisted attention
+schema and #1714 integration remain explicit C0 gates. These are proposed
+behavioral fixtures and reviewed working contracts, not implementation/live
+acceptance or the final whole-contract seam audit.
