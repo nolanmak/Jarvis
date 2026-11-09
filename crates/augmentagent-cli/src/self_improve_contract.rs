@@ -1853,6 +1853,7 @@ pub(super) async fn verify_with_repair_for(
     control: &Path,
     workflow: &mut workflow::WorkflowGuard,
 ) -> Result<CandidateReceiptReference> {
+    workflow.require_fresh_issue(worktree).await?;
     source.validate()?;
     ensure!(
         prepared.proposal.contract.source()? == source,
@@ -1910,6 +1911,7 @@ pub(super) async fn verify_with_repair_for(
                 bail!("legacy verifier migration requires a valid independently red behavioral oracle");
             }
             Err(error) => {
+                if linked_claims::report(&error).is_some() {return Err(error);}
                 workflow
                     .transition(
                         crate::autoship_workflow::Stage::Scope,
@@ -1984,6 +1986,7 @@ pub(super) async fn verify_with_repair_for(
                 return Ok(reference);
             }
             Err(error) => {
+                if linked_claims::report(&error).is_some() {return Err(error);}
                 if workflow.audit_logger().resource_capacity_seen() { return Err(error); }
                 let error=if transient_verifier_infrastructure(&format!("{error:#}")) {
                     error.context("acceptance infrastructure unavailable")

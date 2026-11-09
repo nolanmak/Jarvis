@@ -56,6 +56,8 @@ mod adoption_acceptance;
 mod adopted_execution;
 #[path = "self_improve_adoption.rs"]
 mod adoption;
+#[path = "self_improve_linked_claims.rs"]
+mod linked_claims;
 #[path = "self_improve_policy_hold.rs"]
 mod policy_hold;
 #[path = "self_improve_legacy_readmission.rs"]
@@ -1053,29 +1055,9 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
 /// per-issue convention?
 async fn has_open_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
     if publication::pending_issue(repo_root,issue).await? { return Ok(true); }
-    let gh = gh_bin();
-    let branch = format!("{BRANCH_PREFIX}{issue}");
-    let (ok, stdout, _) = run(
-        &gh,
-        &[
-            "pr", "list", "--state", "open", "--head", &branch, "--json",
-            "number,isCrossRepository,headRepositoryOwner",
-        ],
-        repo_root,
-    )
-    .await?;
-    if !ok {
-        // If `gh pr list` flaked, be conservative and assume a PR exists so we
-        // don't open a duplicate.
-        warn!(issue, "gh pr list failed; assuming PR exists (safe dedup)");
-        return Ok(true);
-    }
-    let arr: serde_json::Value = serde_json::from_str(&stdout).unwrap_or(serde_json::json!([]));
-    // #1006 — only OUR branch claims the issue. A fork may carry the same
-    // name, and treating that as a claim skips the issue forever with no
-    // comment, no label and no trace.
-    let owner = repo_owner_from_remote(repo_root).await;
-    Ok(agent_pr_exists(&arr, owner.as_deref()))
+    let repository=workflow::canonical_repository(repo_root).await
+        .map_err(|_|anyhow::Error::from(linked_claims::Hold::Unknown))?;
+    Ok(!linked_claims::observe(repo_root,&repository,issue).await?.is_empty())
 }
 
 /// Reasoner opts scoped to write/edit/bash within the per-attempt worktree.
@@ -5320,8 +5302,10 @@ async fn red_main_plan(repo_root: &Path, red: &RedMain) -> RedMainPlan {
     if AttemptLedger::load(&attempt_ledger_path()).attempted_today(utc_day_now(), number) {
         return RedMainPlan::Hold(format!("issue #{number} already attempted today"));
     }
-    if has_open_agent_pr(repo_root, number).await.unwrap_or(true) {
-        return RedMainPlan::Resume(number);
+    match has_open_agent_pr(repo_root, number).await {
+        Ok(true) => return RedMainPlan::Resume(number),
+        Ok(false) => (),
+        Err(_) => return RedMainPlan::Hold(linked_claims::Hold::Unknown.to_string()),
     }
     // Build the Issue the same way pick_issue does, trust gate included —
     // the daemon files with the owner's gh login, but nothing here assumes it.
@@ -7908,6 +7892,11 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         )));
     }
 
+    match has_open_agent_pr(repo_root,issue.number).await {
+        Ok(true)=>return Ok(RunReport::held(linked_claims::Hold::Claimed.to_string())),
+        Ok(false)=>(),
+        Err(_)=>return Ok(RunReport::held(linked_claims::Hold::Unknown.to_string())),
+    }
     let branch = format!("{BRANCH_PREFIX}{}", issue.number);
     let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Issue(issue.number)).await?;
     reasoner.track_review_history(repo_root, &branch, false)?;
@@ -7928,6 +7917,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     };
     let capacity_accounting = workflow_guard.capacity_accounting(false)?;
     let outcome = async {
+    workflow_guard.require_fresh_issue(repo_root).await?;
     workflow_guard.bind_builder(reasoner.as_ref())?;
     workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "trusted_request_acquired", "scope_request", chrono::Utc::now().timestamp_millis()).await?;
     let (base_ok, candidate_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
@@ -8012,6 +8002,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     {
         Ok(p) => Some(parse_scope_output(&p)),
         Err(e) => {
+            if let Some(report)=linked_claims::report(&e) {return Ok(report);}
             warn!(
                 issue = issue.number,
                 "scoping pass failed; building without a spec: {e:#}"
@@ -8024,6 +8015,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             None
         }
     };
+    workflow_guard.require_fresh_issue(repo_root).await?;
     if let Some(s) = &mut scope {
         if s.relevance == Relevance::Overtaken && !is_red_main_issue(&issue.body) {
             if acceptance::readiness::prove_current_main(repo_root,&issue,s,&mut workflow_guard).await? {
@@ -8055,6 +8047,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             // around, and a not-fixable verdict is not: its objection would
             // reach none of the children.
             if sc.fixable && !sc.guarded_paths && !is_slice_body(&issue.body) {
+                workflow_guard.require_fresh_issue(repo_root).await?;
                 let plan = reasoner
                     .call(&slice_opts(worktree.clone()), &build_slice_prompt(&issue, sc))
                     .await
@@ -8077,7 +8070,10 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                             )));
                         }
                         Ok(_) => {}
-                        Err(e) => warn!(issue = issue.number, "filing slices failed: {e:#}"),
+                        Err(e) => {
+                            if let Some(report)=linked_claims::report(&e) {return Ok(report);}
+                            warn!(issue = issue.number, "filing slices failed: {e:#}");
+                        },
                     }
                 }
             }
@@ -8124,6 +8120,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         issue.number, candidate_base, acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria, &workflow_guard).await {
         Ok(prepared) => prepared,
         Err(error) => {
+            if let Some(report)=linked_claims::report(&error) {return Ok(report);}
             if error.downcast_ref::<acceptance::BaselineNotRed>().is_some() {
                 let children=acceptance::readiness::decompose_unverifiable(repo_root,&worktree,&issue,&criteria,&format!("{error:#}"),&mut workflow_guard).await?;
                 if !children.is_empty() {return Ok(RunReport::triage(format!("issue #{}: acceptance split into observable children {:?}",issue.number,children)));}
@@ -8144,6 +8141,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     let prompt = format!("{}\nThe controller installed independently registered immutable regression harnesses. Do not edit/remove them; implement against this exact contract: {}",
         build_fix_prompt_with_criteria(&issue, plan.as_deref(), prior_attempts.as_deref(), &criteria),
         serde_json::to_string(prepared_acceptance.baseline.registration.contract())?);
+    workflow_guard.require_fresh_issue(repo_root).await?;
     let mut summary = match reasoner.call_with_storage(&opts, &prompt).await {
         Ok(s) => s,
         Err(err) => {
@@ -8182,6 +8180,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             return Err(err).context("reasoner failed during self-improve");
         }
     };
+    workflow_guard.require_fresh_issue(repo_root).await?;
 
     // Did anything change? A no-op run still burned a reasoner call, so it
     // counts as an attempt (#630) — otherwise the unattended loop silently
@@ -8206,6 +8205,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         if spent < revise_rounds() {
             spent += 1;
             info!(issue = issue.number, "builder made no changes; one follow-up");
+            workflow_guard.require_fresh_issue(repo_root).await?;
             match reasoner
                 .call_revision_with_storage(&fix_opts(worktree.clone()), &build_no_change_prompt(&issue))
                 .await
@@ -8310,6 +8310,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         info!(issue = issue.number, lines, "initial diff over cap; one shrink attempt");
         spent += 1;
         let snapshot = snapshot_tree(&worktree).await?;
+        workflow_guard.require_fresh_issue(repo_root).await?;
         match reasoner
             .call_revision_with_storage(
                 &fix_opts(worktree.clone()),
@@ -8429,6 +8430,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             round += 1;
             info!(issue = issue.number, round, max_rounds, "initial gate red; repair round");
             let snapshot = snapshot_tree(&worktree).await?;
+            workflow_guard.require_fresh_issue(repo_root).await?;
             match reasoner
                 .call_revision_with_storage(
                     &fix_opts(worktree.clone()),
@@ -8525,6 +8527,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         // #1488 a reject is not terminal: its notes drive revision rounds,
         // and the revised diff is QA'd again before Stage 4 sees it. Runs
         // before the dry-run exit so dry runs exercise the full pipeline.
+        workflow_guard.require_fresh_issue(repo_root).await?;
         match reasoner
             .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None, &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>()))
             .await
@@ -8560,6 +8563,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         {
             recovery::commit_candidate(&worktree, &issue).await?;
             workflow_guard.transition(crate::autoship_workflow::Stage::Review, "candidate_verified", "review", chrono::Utc::now().timestamp_millis()).await?;
+            workflow_guard.require_fresh_issue(repo_root).await?;
             let review = independent_review_with_context(&reasoner, &issue, worktree.clone(), &criteria,
                 qa_ok, &review_notes, round, None, 0, Some(&workflow_guard), acceptance_receipt.as_ref().map(|receipt| (&prepared_acceptance, receipt))).await;
             if review.available && !review.approved() {
@@ -8615,9 +8619,11 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                         pending_guard = Some(ParkReason::Oversize(lines));
                         continue;
                     }
+                    workflow_guard.require_fresh_issue(repo_root).await?;
                     let qa = reasoner.call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None, &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>())).await?;
                     (qa_ok, review_notes) = parse_review_output(&qa);
                     workflow_guard.transition(crate::autoship_workflow::Stage::Review, "amended_candidate_verified", "review", 0).await?;
+                    workflow_guard.require_fresh_issue(repo_root).await?;
                     independent = Some(independent_review_with_context(reasoner.as_ref(), &issue, worktree.clone(), &criteria,
                         qa_ok, &review_notes, round, None, 0, Some(&workflow_guard),
                         acceptance_receipt.as_ref().map(|receipt| (&prepared_acceptance, receipt))).await);
@@ -8677,6 +8683,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 Some(session) => (session.opts,session.prompt),
                 None => (fix_opts(worktree.clone()),build_revise_prompt(&issue,&findings,lines,prior_attempts.as_deref())),
             };
+            workflow_guard.require_fresh_issue(repo_root).await?;
             let call = reasoner.call_revision_with_storage(&repair_opts,&repair_prompt);
             let revised = episode::dispatch(&workflow_guard,episode_dispatch,async { match &episode_native_sessions { Some(sessions) => sessions.scope(call).await, None => call.await } }).await;
             if let Some(sessions) = &episode_native_sessions { workflow_guard.record_episode_sessions(sessions)?; }
@@ -8826,6 +8833,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                     // #1488 AC2 — QA re-reviews every revised diff, with its
                     // previous findings, before Stage 4 is asked about it.
                     let prior_qa = review_notes.clone();
+                    workflow_guard.require_fresh_issue(repo_root).await?;
                     match reasoner
                         .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, Some(&prior_qa), &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>()))
                         .await
@@ -8847,6 +8855,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                         recovery::commit_candidate(&worktree, &issue).await?;
                         workflow_guard.transition(crate::autoship_workflow::Stage::Review, "revision_verified", "review", chrono::Utc::now().timestamp_millis()).await?;
                         let previous = independent.as_ref().and_then(|r| r.structured.clone());
+                        workflow_guard.require_fresh_issue(repo_root).await?;
                         independent = Some(independent_review_with_context(&reasoner, &issue, worktree.clone(), &criteria,
                             qa_ok, &review_notes, round, previous.as_ref(), 0, Some(&workflow_guard), acceptance_receipt.as_ref().map(|receipt| (&prepared_acceptance, receipt))).await);
                     }
@@ -9058,6 +9067,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                 files = hits.len(),
                 "commit refused by the personal-data guard; one repair round"
             );
+            workflow_guard.require_fresh_issue(repo_root).await?;
             match reasoner
                 .call_revision_with_storage(&fix_opts(worktree.clone()), &build_pii_fix_prompt(&hits))
                 .await
@@ -9282,7 +9292,10 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     let created = publication::publish(&workflow_guard, &worktree, &branch, published_head, issue.number, &args).await;
     let (ok, stdout, e) = match created {
         Ok(created) => (true, created.url, String::new()),
-        Err(error) => (false, String::new(), format!("{error:#}")),
+        Err(error) => {
+            if let Some(report)=linked_claims::report(&error) {return Ok(report);}
+            (false, String::new(), format!("{error:#}"))
+        },
     };
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
     cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
@@ -9503,6 +9516,10 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     )))
     }.await;
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+    let outcome=match outcome {
+        Err(error)=>match linked_claims::report(&error) {Some(report)=>Ok(report),None=>Err(error)},
+        other=>other,
+    };
     capacity_accounting.settle_ci(outcome)
 }
 
@@ -10431,29 +10448,8 @@ async fn pick_issue_for_repo(
 
 /// `gh pr list --repo` dedup for a specific remote repo. Conservative on
 /// failure (assume a PR exists ⇒ skip), same as the single-repo path.
-async fn has_open_agent_pr_remote(
-    full_name: &str,
-    repo_dir: &Path,
-    issue: u64,
-) -> Result<bool> {
-    let gh = gh_bin();
-    let branch = format!("{BRANCH_PREFIX}{issue}");
-    let (ok, stdout, _) = run(
-        &gh,
-        &[
-            "pr", "list", "--repo", full_name, "--state", "open", "--head", &branch,
-            "--json", "number",
-        ],
-        repo_dir,
-    )
-    .await?;
-    if !ok {
-        warn!(repo = full_name, issue, "gh pr list failed; assuming PR exists");
-        return Ok(true);
-    }
-    let arr: serde_json::Value =
-        serde_json::from_str(&stdout).unwrap_or(serde_json::json!([]));
-    Ok(arr.as_array().map(|a| !a.is_empty()).unwrap_or(false))
+async fn has_open_agent_pr_remote(full_name:&str,repo_dir:&Path,issue:u64)->Result<bool> {
+    Ok(!linked_claims::observe(repo_dir,full_name,issue).await?.is_empty())
 }
 
 /// Per-repo verification gate. Runs the repo's configured `build_cmd` with
@@ -10615,6 +10611,9 @@ async fn process_one_repo(
         bail!("git checkout -b failed: {}", truncate(&e, 200));
     }
 
+    if let Err(error)=linked_claims::require_absence(&workspace,&repo.full_name,issue.number).await {
+        return Ok(error.to_string());
+    }
     // Hand the issue to the reasoner, scoped to the clone.
     let opts = fix_opts(workspace.clone());
     let prompt = format!(
@@ -10783,6 +10782,13 @@ pub async fn open_approved_runs(store: &Store) -> Result<String> {
             run_row.diff_lines,
             run_row.issue_number
         );
+        let Some(issue)=u64::try_from(run_row.issue_number).ok().filter(|n|*n>0) else {
+            out.push(format!("{}: {}",repo.full_name,linked_claims::Hold::Unknown));continue;
+        };
+        if let Err(error)=linked_claims::require_absence(&agent_workdir(),&repo.full_name,issue).await {
+            out.push(format!("{}: {}",repo.full_name,error));
+            continue; // Keep the approved row/branch for reconciliation.
+        }
         let (ok, stdout, e) = run(
             &gh,
             &[
@@ -19008,8 +19014,11 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
     /// have nothing to judge.
     #[test]
     fn pr_queries_request_the_head_repository() {
+        for field in ["isCrossRepository","headRepositoryOwner"] {
+            assert!(linked_claims::FIELDS.split(',').any(|value|value==field));
+        }
         let src = include_str!("self_improve.rs");
-        for f in ["async fn find_resumable_draft(", "async fn has_open_agent_pr("] {
+        for f in ["async fn find_resumable_draft("] {
             let start = src.find(f).expect(f);
             let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
             assert!(
@@ -20171,6 +20180,12 @@ import json, os, sys
 args = sys.argv[1:]
 with open(os.environ['AUTOSHIP_LINKED_PR_CALLS'], 'a') as stream:
     stream.write(json.dumps(args) + '\n')
+mode = os.environ['AUTOSHIP_LINKED_PR_CASE']
+if args[:2] == ['label', 'create'] and mode == 'midflight-slicing':
+    sys.exit(0)
+if args[:1] == ['api'] and '/issues?state=all' in args[1] and mode == 'midflight-slicing':
+    open(os.environ['AUTOSHIP_LINKED_PR_MARKER'], 'w').close()
+    print('[]'); sys.exit(0)
 if args[:2] == ['repo', 'view']:
     print('fixture-owner/repo'); sys.exit(0)
 if args[:2] == ['issue', 'list']:
@@ -20186,6 +20201,9 @@ if args[:1] == ['api'] and '/issues?' in args[1]:
         'user': {'login': 'fixture-owner'}, 'author_association': 'OWNER'}]
         if args[1].endswith('page=1') else [])); sys.exit(0)
 assert args[:2] == ['pr', 'list'], args
+assert args[args.index('--state') + 1] == 'open', args
+if mode in ['midflight', 'midflight-slicing'] and not os.path.exists(os.environ['AUTOSHIP_LINKED_PR_MARKER']):
+    print('[]'); sys.exit(0)
 if os.environ['AUTOSHIP_LINKED_PR_CASE'] == 'malformed':
     print('{not-json'); sys.exit(0)
 # The old branch-filtered query misses the real authorized linked PR.
@@ -20208,10 +20226,18 @@ print(json.dumps([{'number': 77, 'isDraft': False,
                 assert!(std::process::Command::new("/usr/bin/git")
                     .args(args).current_dir(&repo).status().unwrap().success());
             }
+            std::fs::write(repo.join("code.txt"),"baseline\n").unwrap();
+            for args in [vec!["add","code.txt"], vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","baseline"]] {
+                assert!(std::process::Command::new("/usr/bin/git").args(args).current_dir(&repo).status().unwrap().success());
+            }
+            assert!(std::process::Command::new("/usr/bin/git")
+                .args(["update-ref","refs/remotes/origin/main","HEAD"]).current_dir(&repo).status().unwrap().success());
             let name = match case {
                 "primary" => "authorized_linked_pr_suppresses_primary_fresh_work",
                 "primary-selection" => "linked_pr_is_not_returned_by_real_fresh_issue_selector",
                 "remote-selection" => "linked_pr_is_not_returned_by_real_remote_issue_selector",
+                "midflight" => "pr_appearing_after_selection_holds_real_guard_before_further_work",
+                "midflight-slicing" => "pr_appearing_at_child_creation_preserves_plan_and_parent",
                 "remote" => "authorized_linked_pr_suppresses_remote_fresh_work",
                 "malformed" => "malformed_inventory_does_not_authorize_fresh_work",
                 _ => unreachable!(),
@@ -20224,7 +20250,9 @@ print(json.dumps([{'number': 77, 'isDraft': False,
                 .env("GH_BIN", &gh).env("AUGMENTAGENT_GH_OWNER", "fixture-owner")
                 .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS", "fixture-owner")
                 .env("AUTOSHIP_LINKED_PR_CALLS", root.path().join("calls"))
-                .env("AUTOSHIP_LINKED_PR_CASE", case).env(CHILD, &repo)
+                .env("AUTOSHIP_LINKED_PR_CASE", case)
+                .env("AUTOSHIP_LINKED_PR_MARKER",root.path().join("claim-open"))
+                .env(CHILD, &repo)
                 .current_dir(&repo).output().await.unwrap();
             assert!(output.status.success(), "{case}: {}\n{}",
                 String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
@@ -20232,6 +20260,47 @@ print(json.dumps([{'number': 77, 'isDraft': False,
             return;
         }
         let repo = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        if matches!(case,"midflight"|"midflight-slicing") {
+            let path=PathBuf::from(std::env::var_os("AUGMENTAGENT_AUTOPR_WORKFLOW_DB").unwrap());
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+                repo_root:&repo,worktree:&repo,repository:"fixture-owner/repo",source_issue:Some(42),pr:None,
+                branch:"fixture",contract:"original-contract",environment:"fixture-environment",
+            }).await.unwrap().unwrap();
+            guard.checkpoint(crate::autoship_workflow::Stage::Build,"fixture_dispatch","build",0,&["original-evidence".into()]).await.unwrap();
+            let before=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            let error=if case=="midflight" {
+                guard.require_fresh_issue(&repo).await.unwrap();
+                std::fs::write(std::env::var_os("AUTOSHIP_LINKED_PR_MARKER").unwrap(),"").unwrap();
+                guard.require_fresh_issue(&repo).await.unwrap_err()
+            } else {
+                let issue=Issue {number:42,title:"Correct widget rounding".into(),body:"Round widget values consistently.".into(),author:"fixture-owner".into(),author_trusted:true,research_filed:false};
+                let plan=vec![Slice{title:"Round small values".into(),body:"Cover small widget values.".into()},
+                    Slice{title:"Round large values".into(),body:"Cover large widget values.".into()}];
+                file_slices(&repo,&issue,&plan,&guard).await.unwrap_err()
+            };
+            assert_eq!(error.downcast_ref::<linked_claims::Hold>(),Some(&linked_claims::Hold::Claimed));
+            assert!(linked_claims::report(&error).is_some());
+            let after=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(after.checkpoint.stage,before.checkpoint.stage);
+            assert_eq!(after.checkpoint.binding,before.checkpoint.binding);
+            assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+            assert_eq!(after.progress_at_ms,before.progress_at_ms);
+            assert_eq!(after.model_calls,0);
+            assert_eq!(after.checkpoint.next.reason,"linked_pr_claim_exists");
+            assert_eq!(after.checkpoint.next.action,"reconcile_existing_pr");
+            let calls=std::fs::read_to_string(std::env::var_os("AUTOSHIP_LINKED_PR_CALLS").unwrap()).unwrap();
+            for line in calls.lines() {
+                let args:Vec<String>=serde_json::from_str(line).unwrap();
+                assert!(!(args.first().is_some_and(|v|v=="issue") && args.get(1).is_some_and(|v|matches!(v.as_str(),"create"|"edit"|"comment"))),"parent/child mutation escaped observed claim");
+            }
+            if case=="midflight-slicing" {
+                let conn=rusqlite::Connection::open(&path).unwrap();
+                let retained:String=conn.query_row("SELECT plan FROM slice_plan WHERE parent=42",[],|r|r.get(0)).unwrap();
+                assert_eq!(serde_json::from_str::<Vec<Slice>>(&retained).unwrap().len(),2);
+            }
+            assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(),"baseline\n");
+            guard.finish().unwrap();return;
+        }
         if case == "primary-selection" {
             let result = pick_issue(&repo, true).await;
             match result {
@@ -20270,6 +20339,10 @@ print(json.dumps([{'number': 77, 'isDraft': False,
         }
     }
 
+    #[tokio::test]
+    async fn pr_appearing_after_selection_holds_real_guard_before_further_work() { fixture("midflight").await; }
+    #[tokio::test]
+    async fn pr_appearing_at_child_creation_preserves_plan_and_parent() { fixture("midflight-slicing").await; }
     #[tokio::test]
     async fn linked_pr_is_not_returned_by_real_fresh_issue_selector() {
         fixture("primary-selection").await;

@@ -156,6 +156,7 @@ async fn reconcile_one(repo:&Path,repository:&str,store:&mut crate::autoship_wor
                 info!(pr=pr.number,"reconciled pending publication without rebuilding");
             }
             Err(error)=> {
+                if linked_claims::report(&error).is_some() {guard.finish()?;return Ok(());}
                 guard.transition(crate::autoship_workflow::Stage::Publish,"remote_publication_unconfirmed","await_publication_reconcile",now+60_000).await?;
                 warn!(workflow=%id,"publication reconciliation deferred: {error:#}");
             }
@@ -235,6 +236,7 @@ pub(super) async fn publish(
             found
         } else {
             creation_facts(&mut github,repository,issue,branch,head,args).await?;
+            guard.require_fresh_issue(worktree).await?;
             // GitHub rejects a second OPEN PR for the same repository/head/base.
             // Full open/closed/merged history above guards already-known terminal
             // publications. Retry the identical identity after bounded backoff;

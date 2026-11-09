@@ -665,6 +665,7 @@ pub(super) async fn gate_for(
             opts.model = Some(build_model());
         }
         origin.validate(&head)?;
+        workflow.require_fresh_issue(root).await?;
         let (output, native_id) = augmentagent_channel_core::native_session::fresh_review_scope(
             provider,
             augmentagent_channel_core::model_router::native_reviewer_scope(
@@ -692,6 +693,7 @@ pub(super) async fn gate_for(
             Ok(reply) => reply,
             Err(_) => {
                 let retry_prompt=format!("{prompt}\nThe previous response was not valid schema JSON. Return only the requested object; do not change criteria or code.");
+                workflow.require_fresh_issue(root).await?;
                 let (retry, native_id) =
                     augmentagent_channel_core::native_session::fresh_review_scope(
                         provider,
