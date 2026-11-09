@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "issue": 1942,
+  "pr": 1945,
+  "head": "974449375abc1e7102162eacfc4af41788dea4e4",
+  "source_behavior": "Original primary/remote guards unchanged; three subprocess regressions added",
+  "hosted_run": 42606536731,
+  "hosted_job": 129123860560,
+  "log_sha256": "f2a6969cefb4c3726399624ff2115e132ecb82945ed857b0efdbe575a276d7ff",
+  "cli_suite": {
+    "passed": 1741,
+    "failed": 3,
+    "ignored": 33
+  },
+  "failures": [
+    "self_improve::linked_pr_dedup_regressions::authorized_linked_pr_suppresses_primary_fresh_work",
+    "self_improve::linked_pr_dedup_regressions::authorized_linked_pr_suppresses_remote_fresh_work",
+    "self_improve::linked_pr_dedup_regressions::malformed_inventory_does_not_authorize_fresh_work"
+  ],
+  "observed_failure": "Existing linked PR or malformed inventory returned confirmed absence, authorizing duplicate fresh work",
+  "limits": [
+    "These regressions execute the original guards, not full selection/scope/publication.",
+    "The subsequent c162f2a1 baseline adds actual primary/remote selector tests and stronger positive-claim assertions; its hosted execution is pending.",
+    "Behavior implementation is still a local draft with validation in progress; this receipt claims no GREEN, code approval, merge or rollout."
+  ]
+}

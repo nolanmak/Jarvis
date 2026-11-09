@@ -648,3 +648,20 @@ original immutable-head CI run is live. No behavior fix or passing Rust result
 is claimed. Original active issue1943 and queued PR1944 remain distinct retained
 workflows; the [receipt](1703-linked-pr-dedup-observation.json) records chronology
 and limitations without inferring productive progress from heartbeats.
+
+## Confirmed linked-PR guard RED
+
+The original #1945 hosted run at 97444937 terminated with exactly the three
+expected guard regression failures: primary arbitrary-branch claim, remote claim
+and malformed JSON. Full CLI result was 1,741 passed, three failed, 33 ignored;
+no unrelated failures. The [RED receipt](1703-linked-pr-dedup-red.json) binds the
+exact head, run/job, failure names and downloaded-log digest. This is actual
+behavior failure, not missing new API or source-string inspection.
+
+The stronger c162f2a1 baseline was pushed only after that original job finished;
+its actual primary/remote selector execution remains pending. A local draft now
+shares adoption references, checks complete authorized inventory and wires typed
+holds into fresh model/decomposition/publication boundaries and status. The
+managed local test run acquired its registered build lease and is compiling, so
+its source is frozen until the original handle terminates. No passing Rust,
+independent code approval, merge, activation or restoration claim.
