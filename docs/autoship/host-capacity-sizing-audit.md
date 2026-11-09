@@ -922,3 +922,22 @@ original request reset or manual protected-verifier edit was performed.
 the explicitly registered actual CLI integrations and other required checks
 are still awaiting the original hosted jobs. No main rollout or autonomous
 merge is claimed.
+
+## Filtered-source repair ready and queued after actual CLI GREEN
+
+#1951 final04c29b8d now has actual CLI job129258197660 GREEN: 1,741 unit
+passes, zero failures, 33 existing ignores. Both newly registered integration
+cases individually passed: runtime-template precedence and standalone fallback
+with exact canonical parity/regeneration. Final bridge42645634641/job129258010808
+passes the fresh filtered-module compile; Python suite502 passes/53 skips.
+The [proof](1703-filtered-env-input-proof.json) retains logs/hashes and the
+earlier registration gap without crediting it as integration GREEN.
+
+The PR was marked ready and admitted via normal CLI request
+autoship-recovery-pr1951-20261109, joined=false, canonical independent workflow
+nolanmak/jarvis/pr/1951. Readback is awaiting-worker-claim, no last attempt,
+no active lease and no owner pause. Source issue1950 remains separately held.
+Other required Linux jobs and aggregate targeted verdict are still running;
+queue admission is not execution, approval, merge or rollout. No source/body
+churn is planned while this request owns the published candidate. Parent
+automatic capacity, productive ingress, live shipment and soak exits remain open.

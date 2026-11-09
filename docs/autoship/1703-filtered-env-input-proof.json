@@ -18,17 +18,17 @@
     }
   },
   "green": {
-    "head": "2691add3d0f553372910935d0bb188d4596270ad",
-    "run": 42642846423,
-    "job": 129248172654,
+    "head": "04c29b8d7613e4459a32c4eef1628e9d953a63ed",
+    "run": 42645634641,
+    "job": 129258010808,
     "case_result": "passed",
     "python_suite": {
       "passed": 502,
       "failed": 0,
       "skipped": 53
     },
-    "log_sha256": "3c99937b4d5f6e6520ac26d7e58a329571042640da32c051c3b8070d7bce4c94",
-    "scope": "Actual fresh Rust compilation of the production dependency-free constant module after production BuildSnapshot filtering; not a whole CLI build or native VM replay."
+    "log_sha256": "f117958af58bff9fc5dca36a76603d182667713023f275d92130e7283a8cbf09",
+    "scope": "Real production BuildSnapshot filtered-module compilation, actual fresh fixture crates, private canaries absent; full native VM replay still separate."
   },
   "public_inventory": {
     "canonical_base": "416f392b17b56b2a43e67a3e430835902387941a",
@@ -39,6 +39,42 @@
     "contents": "Sorted public names only, each NAME= plus newline; no values."
   },
   "full_cli_validation": {
+    "head": "04c29b8d7613e4459a32c4eef1628e9d953a63ed",
+    "run": 42645634622,
+    "job": 129258197660,
+    "state": "completed",
+    "conclusion": "success",
+    "cli_unit_tests": {
+      "passed": 1741,
+      "failed": 0,
+      "ignored": 33
+    },
+    "integration_tests": {
+      "runtime_template_keeps_precedence_over_the_embedded_inventory": "passed",
+      "standalone_inventory_is_complete_and_matches_full_checkout_when_available": "passed"
+    },
+    "log_sha256": "11f21c6e1f7dd8893df9baccd94297ac181061d56c173de7bef99048e89f4acc"
+  },
+  "local_replay": "Initial managed probe failed missing input during rustdoc. Strengthened fresh local compilation was cancelled while awaiting managed admission; original processes verified terminal before editing. No fresh local GREEN claimed.",
+  "limits": [
+    "Actual final-head CLI fallback/runtime-template integration tests and filtered-module regression pass; other required hosted checks and independent code approval remain pending.",
+    "No whole native VM replay, independent code approval, merge or updater rollout claimed.",
+    "No credential filter exception, private value, borrowed cache, native state reset or capacity increase."
+  ],
+  "final_validation": {
+    "head": "04c29b8d7613e4459a32c4eef1628e9d953a63ed",
+    "bridge_run": 42645634641,
+    "bridge_state": "completed_success",
+    "rust_run": 42645634622,
+    "rust_state": "in_progress",
+    "change": "Add env_key_snapshot_cli to existing rust/cli/6 integration command and suite-registration assertion.",
+    "local_contract_verify": "passed",
+    "local_contract_tests": 23,
+    "local_targeted_plan_tests": 11,
+    "cli_job_state": "completed_success",
+    "remaining": "Other required hosted Linux jobs and aggregate targeted verdict pending."
+  },
+  "prior_cli_validation": {
     "run": 42642846494,
     "job": 129248335305,
     "state": "completed",
@@ -51,21 +87,17 @@
     "log_sha256": "acd5cc7cae7f8ba2dfc60f23fb9ca5e63965a6913754a97f302742660aabc847",
     "coverage_gap": "This full CI path did not register the new env_key_snapshot_cli target; no pass for its two tests is claimed."
   },
-  "local_replay": "Initial managed probe failed missing input during rustdoc. Strengthened fresh local compilation was cancelled while awaiting managed admission; original processes verified terminal before editing. No fresh local GREEN claimed.",
-  "limits": [
-    "Actual CLI fallback/runtime-template tests must execute and pass on final04c29b8d; earlier successful full job did not run them.",
-    "No whole native VM replay, independent code approval, merge or updater rollout claimed.",
-    "No credential filter exception, private value, borrowed cache, native state reset or capacity increase."
-  ],
-  "final_validation": {
-    "head": "04c29b8d7613e4459a32c4eef1628e9d953a63ed",
-    "bridge_run": 42645634641,
-    "bridge_state": "in_progress",
-    "rust_run": 42645634622,
-    "rust_state": "queued",
-    "change": "Add env_key_snapshot_cli to existing rust/cli/6 integration command and suite-registration assertion.",
-    "local_contract_verify": "passed",
-    "local_contract_tests": 23,
-    "local_targeted_plan_tests": 11
+  "command": {
+    "request_id": "autoship-recovery-pr1951-20261109",
+    "workflow": "nolanmak/jarvis/pr/1951",
+    "accepted": true,
+    "joined": false,
+    "reason": "queued",
+    "ready": true,
+    "requested_until": "merged",
+    "last_attempt": null,
+    "owner_control": null,
+    "merge_state": "not-confirmed",
+    "latest_reason": "awaiting-worker-claim"
   }
 }
