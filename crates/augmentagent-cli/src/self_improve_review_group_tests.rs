@@ -374,9 +374,17 @@ async fn bounded_protocol_case(
     native_id: &str,
     responses: Vec<serde_json::Value>,
 ) -> (Result<CompletedGroup>, usize) {
+    bounded_protocol_source_case(actor_session, native_id, responses, "fn source() {}\n").await
+}
+async fn bounded_protocol_source_case(
+    actor_session: &str,
+    native_id: &str,
+    responses: Vec<serde_json::Value>,
+    source: &str,
+) -> (Result<CompletedGroup>, usize) {
     let root = tempfile::tempdir().unwrap();
     git_fixture(root.path(), &["init", "-q"]);
-    std::fs::write(root.path().join("source.rs"), "fn source() {}\n").unwrap();
+    std::fs::write(root.path().join("source.rs"), source).unwrap();
     git_fixture(root.path(), &["add", "."]);
     git_fixture(
         root.path(),
@@ -407,9 +415,14 @@ async fn bounded_protocol_case(
         system_bytes: 1024,
         controller_acceptance: None,
     };
+    let prefix = source
+        .lines()
+        .next()
+        .map(|line| format!("{line}\n"))
+        .unwrap_or_default();
     let original = inputs
         .request(
-            BTreeMap::from([("source.rs".into(), "fn source() {}\n".into())]),
+            BTreeMap::from([(format!("source.rs#bytes-0-{}", prefix.len()), prefix)]),
             false,
             None,
         )
@@ -508,5 +521,26 @@ async fn native_identity_limits_and_static_metadata_are_enforced_at_dispatch() {
     assert_eq!(
         calls, 0,
         "oversized static metadata must not reach the model transport"
+    );
+}
+
+#[tokio::test]
+async fn all_matching_requested_items_must_fit_before_another_observation() {
+    let padding = "x".repeat(300 * 1024);
+    let source=format!("mod first {{\nfn cap() {{ /*{padding}*/ }}\n}}\nmod second {{\nfn cap() {{ /*{padding}*/ }}\n}}\n");
+    let request = serde_json::json!({"decision":"incomplete","findings":[],"missing_sources":[{"path":"source.rs","criterion_ids":["C1"],"question":"Do both cap implementations preserve behavior?","selector":{"kind":"rust_item","name":"cap"}}]});
+    let (result, calls) = bounded_protocol_source_case(
+        "fixture-reviewer",
+        "actual-native-session",
+        vec![request],
+        &source,
+    )
+    .await;
+    assert!(is_evidence_budget(
+        &result.err().expect("all matches must fit together")
+    ));
+    assert_eq!(
+        calls, 1,
+        "a fitting subset must never reach a recovery observation"
     );
 }
