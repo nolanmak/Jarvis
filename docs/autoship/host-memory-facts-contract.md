@@ -80,3 +80,19 @@ hook is added here. These are remaining work with their existing owners/gates.
 - A read-only real `/proc/meminfo` smoke sample proves only this host decoder.
   Hosted CI and independent review are required before normal rollout. No new
   local full gate, VM, paid model call or production-state mutation is needed.
+
+## Implementation checkpoint
+
+Tracked component: [#1928](https://github.com/nolanmak/Jarvis/issues/1928), native
+child of C1. Source [PR #1929](https://github.com/nolanmak/Jarvis/pull/1929), head
+`471388a8`, implements these helpers and the existing admission-decoder change.
+Eleven malformed inputs were accepted on unchanged main `416f392b`; a separate
+readiness regression reported a wrong-unit sample available. Both behavioral
+red cases are corrected. New-API absence is not counted as deployed behavior.
+
+Local evidence: 25 ordinary resource tests pass; nine initially skipped isolated
+resource cases then pass in their documented delegated service; all three
+readiness cases pass in a separate isolated delegated service. Actual read-only
+host decoder smoke and whitespace checks pass. These 37 exercised tests do not
+prove full resource discovery, host-sized activation, native growth or shipping.
+Hosted CI, independent code approval and normal rollout remain pending.
