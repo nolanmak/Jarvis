@@ -4,8 +4,8 @@
   "main_base": "cbafe3216e36df1c254ef4b42139854192a5e1d1",
   "change": "Add an explicit owner capacity-policy preview/apply command for the legacy store used on current main. Preserve all retained native state and resource declarations.",
   "sources": {
-    "scripts/native-capacity-policy.py": "fe972351eec8d55ef649103d0f1de6f40f428a804eab6732831f1d947e90b550",
-    "scripts/test-native-capacity-policy.py": "bf54e214091c96f5867c6049070fce06a1aa9e1e45c473ccee4cc0a09a29ca4b",
+    "scripts/native-capacity-policy.py": "ccad0177e6680e16ac29b39a26548f77e63c2d143153f978be513ca200bc2ef1",
+    "scripts/test-native-capacity-policy.py": "d105968837a7480deb96e811de00cada0183e5a766036446a862565d62e75b63",
     "scripts/ci-contract.json": "3a7e679b7d464cf7b27e25764d6a85ff2c88ecd620e8ae5e9f76c0e6ada4b651"
   },
   "evidence": {
@@ -56,10 +56,22 @@
     "hosted_bridge_before_docstrings": {
       "log": "/tmp/autoship-1913-hosted-bridge-6f620ce3-20261108.log",
       "sha256": "73040554ed55c4122e6d18614cdcdd61d07a99886c4e1bc0617fbed52d2235f9"
+    },
+    "audit_regressions_red": {
+      "log": "/tmp/autoship-1703-capacity-audit-red-20261108.log",
+      "sha256": "85de2a991d0a52b26e824ebf48c27f0614cb96d976287f52ab5c39d230105412"
+    },
+    "audit_regressions_green": {
+      "log": "/tmp/autoship-1703-capacity-audit-green-20261108.log",
+      "sha256": "ed3a8bb308c3028c1052d32e14fa5a399c42fb2aa2f4f966266c676ea8e2a0fe"
+    },
+    "audit_ci_contract": {
+      "log": "/tmp/autoship-1703-capacity-audit-ci-contract-20261108.log",
+      "sha256": "45e94cf68f38fdf5522b7231cb17e639c9584f7de5308b13eb22fe6c5215b478"
     }
   },
   "validation": {
-    "capacity_tests_passed": 21,
+    "capacity_tests_passed": 28,
     "ci_contract_tests_passed": 23,
     "ci_contract_verify_passed": true,
     "failed": 0,
@@ -69,7 +81,17 @@
     "hosted_bridge_passed_head": "6f620ce3d101ec61da99fb7cd35a6004e0d57bf2",
     "hosted_bridge_run": "https://github.com/nolanmak/Jarvis/actions/runs/42536255231",
     "post_docstring_hosted_checks": "pending",
-    "function_docstrings_added_without_behavior_change": true
+    "function_docstrings_added_without_behavior_change": true,
+    "audit_followup_hosted_checks": "pending",
+    "audit_seams_checked": 28,
+    "audit_findings_resolved": [
+      "Exact stored legacy DDL and complete sqlite_master object allowlist",
+      "Confirmation binds approved bytes to the held synced policy inode",
+      "All error JSON includes both false authorization flags",
+      "Cleanup and descriptor-close errors preserve publication outcome",
+      "CLI apply/replay, refusal, unavailable and uncertain exit projections",
+      "Document cooperative-writer boundary and late replacement uncertainty"
+    ]
   },
   "limits": [
     "Main native_vm::Launch::prepare reads policy on each attempt. The newer TransferBinding/authority-epoch protocol in draft #1758 is not present in the inspected live schema; its migration constraint must not be attributed to the old live limiter.",
@@ -77,7 +99,8 @@
     "Apply refuses positive binding-aware markers, unfamiliar ledger schema, busy/missing/unsafe original locks, stale reviewed hashes and non-increases. It does not create an epoch, migrate bindings or repair missing historical authority.",
     "Legacy-schema classification is based on the original private ledger shape. It is not a complete retained-session custody or quiescence proof, and it grants no deletion or reservation credit.",
     "Actual apply, idempotent replay and all publication failures were tested only on private fixtures. No live policy, session, daemon, allowance, owner hold or deployment changed.",
-    "Core owner integration, modern binding transition, independent review, main/updater rollout and original live CLI/Discord/shipment/fault/soak acceptance remain incomplete."
+    "Core owner integration, modern binding transition, independent review, main/updater rollout and original live CLI/Discord/shipment/fault/soak acceptance remain incomplete.",
+    "Private permissions and flock require cooperating owner-controlled metadata writers; they are not atomic protection against arbitrary same-UID pathname replacement. Temporary cleanup is best effort."
   ],
   "deployed": false,
   "goal_complete": false,

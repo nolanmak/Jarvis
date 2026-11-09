@@ -22,6 +22,12 @@ class Hold(Exception):pass
 class PublicationUnknown(Hold):pass
 
 
+def close_descriptor(fd):
+    """Release a descriptor without replacing an established publication outcome."""
+    try:os.close(fd)
+    except OSError:pass
+
+
 def require(value,reason):
     """Refuse an unsafe operation with a bounded public reason code."""
     if not value:raise Hold(reason)
@@ -83,9 +89,10 @@ def state_format(state):
     deadline=time.monotonic()+2
     with closing(sqlite3.connect(f'file:/proc/self/fd/{state}/{name}?mode=ro&vfs=unix-none',uri=True,timeout=0)) as db:
         db.set_progress_handler(lambda:int(time.monotonic()>deadline),1000)
-        tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        columns=[(r[1],r[2],r[3],r[5]) for r in db.execute('PRAGMA table_info(retired_owner)')]
-        legacy=(tables=={'retired_owner'} and columns==[('audit_path','TEXT',1,1),('workflow','TEXT',1,2),('generation','INTEGER',1,3)]
+        objects=list(db.execute('SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name'))
+        legacy=(objects==[
+            ('index','sqlite_autoindex_retired_owner_1','retired_owner',None),
+            ('table','retired_owner','retired_owner','CREATE TABLE retired_owner(audit_path TEXT NOT NULL,workflow TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(audit_path,workflow,generation))')]
             and db.execute('PRAGMA journal_mode').fetchone()==('delete',))
     require(identity(before)==identity(os.stat(name,dir_fd=state,follow_symlinks=False)),'ledger-changed')
     return 'legacy-schema' if legacy else 'unknown'
@@ -105,7 +112,7 @@ def update(path,requested,*,apply=False,expected_source=None,expected_candidate=
             """Open an existing private coordination object and retain its descriptor."""
             flags=(os.O_RDONLY if directory else os.O_RDWR)|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK
             if directory:flags|=os.O_DIRECTORY
-            fd=os.open(name,flags,dir_fd=parent);stack.callback(os.close,fd)
+            fd=os.open(name,flags,dir_fd=parent);stack.callback(close_descriptor,fd)
             require(owned(os.fstat(fd),directory),'managed-state-not-private');return fd
         root=descriptor(path.parent,directory=True)
         state=descriptor('state',parent=root,directory=True)
@@ -123,12 +130,12 @@ def update(path,requested,*,apply=False,expected_source=None,expected_candidate=
             for parent,name,fd in locks:
                 require(owned(os.fstat(fd)) and identity(os.fstat(fd))==identity(os.stat(name,dir_fd=parent,follow_symlinks=False)),
                     'original-native-policy-lock-changed')
-        def confirm(expected):
-            """Sync and re-read the approved policy, retaining uncertainty if its context changed."""
+        def confirm(expected,synced):
+            """Bind approved bytes and context to the held policy inode that was synced."""
             try:
                 os.fsync(root)
-                observed,_=private(root,'policy.json')
-                require(digest(observed)==expected,'publication-changed')
+                observed,info=private(root,'policy.json')
+                require(digest(observed)==expected and identity(info)==identity(os.fstat(synced)),'publication-changed')
                 check_context()
             except (OSError,Hold):raise PublicationUnknown('policy-publication-unconfirmed-inspect-before-retry') from None
         data,source_info=private(root,'policy.json');source=digest(data)
@@ -161,16 +168,16 @@ def update(path,requested,*,apply=False,expected_source=None,expected_candidate=
             try:
                 fd=os.open('policy.json',os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=root)
                 require(identity(os.fstat(fd))==identity(source_info),'policy-changed-before-confirmation')
-                os.fsync(fd);confirm(source)
+                os.fsync(fd);confirm(source,fd)
             except (OSError,Hold):raise PublicationUnknown('policy-publication-unconfirmed-inspect-before-retry') from None
             finally:
-                if fd is not None:os.close(fd)
+                if fd is not None:close_descriptor(fd)
             return report
         require(source==expected_source and candidate_sha==expected_candidate,'reviewed-policy-hash-mismatch')
         temporary='.capacity-policy-'+secrets.token_hex(16);published=False;anchor=None
         try:
             anchor=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600,dir_fd=root)
-            stack.callback(os.close,anchor)
+            stack.callback(close_descriptor,anchor)
             with os.fdopen(anchor,'wb',closefd=False) as stream:
                 stream.write(payload);stream.flush();os.fchmod(stream.fileno(),stat.S_IMODE(source_info.st_mode));os.fsync(stream.fileno())
             staged,staged_info=private(root,temporary)
@@ -187,7 +194,7 @@ def update(path,requested,*,apply=False,expected_source=None,expected_candidate=
                 if observed==data and identity(info)==identity(source_info):raise error
                 raise PublicationUnknown('policy-publication-unconfirmed-inspect-before-retry') from None
             published=True
-            confirm(candidate_sha)
+            confirm(candidate_sha,anchor)
             return dict(report,reason='capacity-policy-applied',policy_applied=True)
         finally:
             if not published and anchor is not None:
@@ -195,7 +202,9 @@ def update(path,requested,*,apply=False,expected_source=None,expected_candidate=
                     remaining=os.stat(temporary,dir_fd=root,follow_symlinks=False);original=os.fstat(anchor)
                     if owned(remaining) and (remaining.st_dev,remaining.st_ino)==(original.st_dev,original.st_ino):
                         os.unlink(temporary,dir_fd=root)
-                except FileNotFoundError:pass
+                # Staging cleanup is best effort; its failure must never turn
+                # a possibly committed rename into a false no-effect result.
+                except OSError:pass
 
 
 def main():
@@ -211,11 +220,11 @@ def main():
         print(json.dumps(update(args.policy,args.max_state_bytes,apply=args.apply,
             expected_source=args.expected_source_sha256,expected_candidate=args.expected_candidate_sha256),sort_keys=True));return 0
     except PublicationUnknown as error:
-        print(json.dumps({'schema_version':1,'reason':str(error),'policy_applied':'unknown','execution_authorized':False}));return 4
+        print(json.dumps({'schema_version':1,'reason':str(error),'policy_applied':'unknown','execution_authorized':False,'binding_migration_authorized':False}));return 4
     except Hold as error:
-        print(json.dumps({'schema_version':1,'reason':str(error),'policy_applied':False,'execution_authorized':False}));return 3
+        print(json.dumps({'schema_version':1,'reason':str(error),'policy_applied':False,'execution_authorized':False,'binding_migration_authorized':False}));return 3
     except (OSError,ValueError,sqlite3.Error):
-        print(json.dumps({'schema_version':1,'reason':'native-policy-evidence-unavailable','policy_applied':False,'execution_authorized':False}));return 4
+        print(json.dumps({'schema_version':1,'reason':'native-policy-evidence-unavailable','policy_applied':False,'execution_authorized':False,'binding_migration_authorized':False}));return 4
 
 
 if __name__=='__main__':raise SystemExit(main())
