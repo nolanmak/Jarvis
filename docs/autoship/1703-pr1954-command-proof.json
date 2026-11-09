@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T18:48:22.281598+00:00",
+  "parent_issue": 1703,
+  "owner_issue": 1709,
+  "repair_issue": 1952,
+  "component_issue": 1953,
+  "pr": 1954,
+  "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+  "pr_ready_for_review": true,
+  "request_id": "autoship-recovery-pr1954-20261109",
+  "normal_cli_submission": {
+    "schema_version": 1,
+    "accepted": true,
+    "complete": false,
+    "workflow": "nolanmak/jarvis/pr/1954",
+    "repository": "nolanmak/jarvis",
+    "target": {
+      "kind": "pr",
+      "number": 1954
+    },
+    "stage": "queued",
+    "reason": "queued",
+    "next_action": "inspect_workflow",
+    "requested_until": "merged",
+    "provider": null,
+    "head": null,
+    "command_exit": 0
+  },
+  "workflow_status": {
+    "workflow": "nolanmak/jarvis/pr/1954",
+    "stage": "queued",
+    "reason": "execution-readiness-blocked",
+    "next_action": "retry_worker_attempt",
+    "eligible_at_ms": 1794250217593,
+    "complete": false,
+    "durable_command_jobs": 1,
+    "executing_workflow_record_exists": false,
+    "command_attempts": 1,
+    "last_attempt": {
+      "outcome": "deferred",
+      "reason": "execution-readiness-blocked",
+      "selected_at_ms": 1794249917593,
+      "finished_at_ms": 1794249921432
+    },
+    "actual_native_model_admission_events": 0
+  },
+  "private_progress": {
+    "latest_actual_sequence": 2,
+    "current_route_receipts": [
+      {
+        "state": "confirmed",
+        "count": 2,
+        "last_sequence": 2,
+        "last_confirmed_at_ms": 1794249949142
+      }
+    ]
+  },
+  "required_ci": {
+    "code_test_step": "success",
+    "cli_tests_passed": 1758,
+    "cli_tests_failed": 0,
+    "existing_ignored": 33,
+    "targeted_run": 42673227287,
+    "attempt": 2,
+    "job": 129350959940,
+    "linux_aggregate": "failure",
+    "cause": "Three required jobs missing during GitHub Actions/Checks API major outage",
+    "provider_incident": "https://www.githubstatus.com/incidents/tp8cghg7tlc4"
+  },
+  "limits": [
+    "Queued command intent can exist before an executing workflow row: execution preflight deferral is not evidence that the durable request was lost.",
+    "The worker has deferred preflight with execution-readiness-blocked. Its precise underlying resource/provider/deployment cause has not yet been established; do not guess from an operator-shell probe.",
+    "Acceptance is queued intent, not productive execution, native readiness, accepted review, merge or deployment.",
+    "Code tests are GREEN; full required CI remains blocked. All merge gates remain enforced.",
+    "A confirmed private route receipt proves transport confirmation, not owner reading or Discord coding follow-up.",
+    "No private bot/owner/channel/message/native identifiers, tokens or message content are published.",
+    "C2, original PR1944 replay, automatic capacity and parent live/fault/soak exits remain open.",
+    "Preserve the original queued PR1954 branch/body/request; do not reset or create a duplicate issue builder."
+  ]
+}

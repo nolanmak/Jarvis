@@ -9,7 +9,7 @@
   "base": "416f392b17b56b2a43e67a3e430835902387941a",
   "head": "9146acb424a52f4e9ef89d28d7bfed0a524eb2f6",
   "branch": "fix/autoship-review-dependency-ranges",
-  "state": "final_code_tests_green_ci_infrastructure_hold",
+  "state": "code_green_ready_queued_ci_outage_and_execution_readiness_holds",
   "change": "Extract unchanged production group adapter behind scripted/native transport interface. Add legacy retained-finding control and two new coherent large-file cases; fixture Rust code is actually compiled/executed before scripted review.",
   "expected_red": [
     "related_large_source_items_reach_one_request_and_reject_the_seeded_defect",
@@ -284,5 +284,6 @@
     "reported_started_at": "2026-11-09T18:12:37.232Z",
     "source_updated_at": "2026-11-09T18:24:51.616Z",
     "retry_policy": "No further blind retries while the provider reports an outage. Recover only terminal failed workflows and recheck the full required Linux aggregate after service recovery; do not waive missing jobs."
-  }
+  },
+  "normal_submission_proof": "1703-pr1954-command-proof.json"
 }

@@ -1085,3 +1085,26 @@ GREEN is not full CI GREEN. Ready-for-review/normal submission can proceed
 with this hold explicit; no review, merge, updater rollout or incident exit is
 claimed. The epic1703 checkpoint now links the actual capacity/review issues
 and current PR heads, preserving every original completion requirement.
+
+## C1 ready, normal command accepted, worker preflight deferred
+
+PR1954 on3debdb8d is ready for review. Normal CLI request
+autoship-recovery-pr1954-20261109 was accepted with stage queued,
+complete=false and until=merged. Actual private progress sequence1 has
+a confirmed receipt on the currently bound route. The [command proof](1703-pr1954-command-proof.json)
+records the later authoritative worker status and receipt counts without
+publishing private identifiers.
+
+The worker attempted preflight and recorded execution-readiness-blocked, with
+no native model admission events. A durable command job exists even though
+an executing workflow row has not been instantiated. A proof writer initially
+assumed such a row must already exist; it failed before writing, then normal
+CLI status and command-job/attempt records established the correct pre-admission
+state. The request was not lost or resubmitted. Its precise underlying readiness
+cause is not established by the generic status or an operator-shell probe.
+
+Ready/queued follows final code-test GREEN with the required CI outage hold
+explicit; it is not merge permission. No Linux/privacy/node-release or
+independent-review gate was waived. Preserve this command/PR input and the
+source1953 hold. C2, original1944 replay, automatic capacity and all full1703
+acceptance remain unfinished.
