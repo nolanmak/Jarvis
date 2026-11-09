@@ -20153,3 +20153,81 @@ mod runtime_readiness_gate_tests {
         assert_eq!(std::fs::read_dir(root).unwrap().count(),0,"no lock, workflow, model or build state before readiness");
     }
 }
+
+#[cfg(test)]
+mod linked_pr_dedup_regressions {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // Every override is confined to a disposable child; never read the daemon's
+    // workflow database or change process-global configuration in parallel tests.
+    async fn fixture(case: &str) {
+        const CHILD: &str = "AUTOSHIP_LINKED_PR_DEDUP_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let gh = root.path().join("github.py");
+            std::fs::write(&gh, r#"#!/usr/bin/python3
+import json, os, sys
+args = sys.argv[1:]
+assert args[:2] == ['pr', 'list'], args
+with open(os.environ['AUTOSHIP_LINKED_PR_CALLS'], 'a') as stream:
+    stream.write(json.dumps(args) + '\n')
+if os.environ['AUTOSHIP_LINKED_PR_CASE'] == 'malformed':
+    print('{not-json'); sys.exit(0)
+# The old branch-filtered query misses the real authorized linked PR.
+if '--head' in args:
+    print('[]'); sys.exit(0)
+print(json.dumps([{'number': 77, 'isDraft': False,
+    'headRefName': 'fix/credential-roundtrip', 'headRefOid': 'a' * 40,
+    'baseRefName': 'main', 'isCrossRepository': False,
+    'headRepositoryOwner': {'login': 'fixture-owner'},
+    'author': {'login': 'fixture-owner'}, 'authorAssociation': 'OWNER',
+    'title': 'Repair credential roundtrip', 'body': 'Closes #42',
+    'closingIssuesReferences': [{'number': 42,
+        'url': 'https://github.com/fixture-owner/repo/issues/42'}]}]))
+"#).unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let repo = root.path().join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            for args in [vec!["init", "--quiet"],
+                vec!["remote", "add", "origin", "https://github.com/fixture-owner/repo.git"]] {
+                assert!(std::process::Command::new("/usr/bin/git")
+                    .args(args).current_dir(&repo).status().unwrap().success());
+            }
+            let name = match case {
+                "primary" => "authorized_linked_pr_suppresses_primary_fresh_work",
+                "remote" => "authorized_linked_pr_suppresses_remote_fresh_work",
+                "malformed" => "malformed_inventory_does_not_authorize_fresh_work",
+                _ => unreachable!(),
+            };
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &format!("self_improve::linked_pr_dedup_regressions::{name}"), "--nocapture"])
+                .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", root.path())
+                .env("XDG_STATE_HOME", root.path().join("state"))
+                .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB", root.path().join("workflow.db"))
+                .env("GH_BIN", &gh).env("AUGMENTAGENT_GH_OWNER", "fixture-owner")
+                .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS", "fixture-owner")
+                .env("AUTOSHIP_LINKED_PR_CALLS", root.path().join("calls"))
+                .env("AUTOSHIP_LINKED_PR_CASE", case).env(CHILD, &repo)
+                .current_dir(&repo).output().await.unwrap();
+            assert!(output.status.success(), "{case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(root.path().join("calls").exists(), "real GitHub guard was not exercised");
+            return;
+        }
+        let repo = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let result = if case == "remote" {
+            has_open_agent_pr_remote("fixture-owner/repo", &repo, 42).await
+        } else { has_open_agent_pr(&repo, 42).await };
+        // Err is safe unknown. Only a confirmed false authorizes fresh work.
+        assert!(!matches!(result, Ok(false)),
+            "{case}: existing linked PR or unknown inventory authorized duplicate fresh work");
+    }
+
+    #[tokio::test]
+    async fn authorized_linked_pr_suppresses_primary_fresh_work() { fixture("primary").await; }
+    #[tokio::test]
+    async fn authorized_linked_pr_suppresses_remote_fresh_work() { fixture("remote").await; }
+    #[tokio::test]
+    async fn malformed_inventory_does_not_authorize_fresh_work() { fixture("malformed").await; }
+}
