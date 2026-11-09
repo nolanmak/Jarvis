@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T17:33:23.321625+00:00",
+  "observed_at": "2026-11-09T17:46:16.131632+00:00",
   "parent_issue": 1703,
   "owner_issue": 1709,
   "repair_issue": 1952,
@@ -83,19 +83,40 @@
     "log_sha256": "cd45bb763b68cb706a947ca36bd8c9df8028b6501d25656f6931474199bfef42"
   },
   "implementation": {
-    "head": "11495e1f",
+    "head": "7d865307b03a0206fb1f1d0764e0e08009a685f0",
     "state": "pushed_draft_pending_hosted_compile_and_tests",
     "changes": [
       "Strict typed incomplete source requests with legacy path compatibility",
       "Exact immutable regular Git Rust items with container headers, or UTF-8 byte intervals",
       "One coherent recovery preserves original evidence, all requested dependencies and earlier findings",
       "Half-budget initial packing with exact source metadata and byte coordinates",
-      "Two observations, bounded identities/completed encoding, shared diagnostic reservation packing"
+      "Two observations, bounded identities/completed encoding, shared diagnostic reservation packing",
+      "Share inline-versus-streamed caller selection between diagnostic and production paths",
+      "Move original immutable whole-file regressions through the new production reader",
+      "Include inner container attributes with requested members",
+      "Cover two-call correction exhaustion, actual identity/static metadata limits, exact request count/question/path bounds, and byte windows across >8MiB immutable blobs with invalid EOF refusal"
     ],
     "local_validation": [
       "rustfmt syntax parse",
       "git diff --check"
     ],
-    "green_claimed": false
-  }
+    "green_claimed": false,
+    "run": 42667732148
+  },
+  "implementation_validation": [
+    {
+      "head": "11495e1f1eeb89fb1eced3882d6275256f69f79c",
+      "run": 42665671159,
+      "job": 129328536696,
+      "state": "completed",
+      "conclusion": "failure",
+      "stage": "compilation",
+      "errors": [
+        "diagnostic_call_bound referenced missing caller_plan",
+        "existing regression tests referenced removed immutable_file reader"
+      ],
+      "result": "No CLI unit GREEN or behavioral RED claimed for implementation compile failure.",
+      "log_sha256": "4ca1177367bb0ba8cb3429b7435b9b43adb66f396ba05079078528a5017f0a1f"
+    }
+  ]
 }

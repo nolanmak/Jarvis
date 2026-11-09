@@ -1008,3 +1008,14 @@ observations/cache encoding. Rustfmt syntax parsing and whitespace checks
 pass; hosted compile/tests are pending. Native incident replay, independent
 review, merge, normal rollout and C2 remain open. This is no capacity
 activation or autoship restoration claim.
+
+## Coherent-source compilation correction
+
+Implementation11495e1f run42665671159/job129328536696 failed compilation:
+the diagnostic helper lacked caller_plan, and three old regressions called
+the removed reader. This is neither behavioral RED nor GREEN. Head7d865307
+shares production/diagnostic caller selection and runs those original
+regressions through the new immutable source producer. It also preserves
+inner container attributes and adds correction/identity/wire-boundary and
+large-stream EOF tests. Hosted run42667732148 is pending; no native acceptance,
+review, merge or rollout claimed.
