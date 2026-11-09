@@ -202,9 +202,13 @@ runs must retain fresh actual observations and immutable reservations.
 Source inspection identifies the existing integration points for C2:
 IndependentReview can remain available=false with structured partial evidence;
 recorded_verdict then returns None. Issue-backed resume already records
-structured receipts before handling unavailable. Source-less adoption currently
-keeps partial structured evidence only in its in-memory previous variable,
-and only records a publication verdict when recorded_verdict is Some.
+structured receipts before handling unavailable. Source-less adoption sets its in-memory previous value and records a
+publication verdict only when recorded_verdict is Some; its subsequent
+episode::evaluate also records any supplied structured evidence under
+episode-evidence-* even if available=false. Reuse that existing hook rather
+than inventing a duplicate store. It does not prove the failed-recovery
+producer currently returns structured partial evidence, or establish its
+restoration/wake lifecycle.
 Review-epoch invalidation deletes current indexes/fragments but preserves
 workflow_event history. current_review_history intentionally only authorizes
 the current binding/epoch. verify_fresh_review_origin also intentionally
@@ -261,3 +265,14 @@ merge/updater rollout and replay of original PR1944 are separate exits. Source
 issue1952 remains held until a reviewed implementation lane exists. Full
 automatic capacity, productive owner CLI/Discord sessions, five autonomous
 merges and fault/unattended acceptance remain open in #1703; no benchmark.
+
+## Source baseline for implementation
+
+The documentation worktree has an older source ancestor. Implement C1 from
+current main, verified as416f392b17b56b2a43e67a3e430835902387941a at this
+checkpoint, not by copying its source files. Primary source comparison finds
+the relevant review-module delta is the wrapped typed-budget classifier
+(#1885) and its regression tests. Preserve that classifier, its source-chain/
+context handling and lookalike-string refusal. Other cited producer/parser/
+episode/custody APIs were checked against the current deployment checkout.
+A later main change requires the usual source revalidation before editing.
