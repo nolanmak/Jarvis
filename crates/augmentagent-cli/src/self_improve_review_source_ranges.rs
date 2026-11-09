@@ -389,4 +389,72 @@ mod tests {
         assert!(requested_item_ranges("invoke! { fn hidden() {} }", "hidden").is_err());
         assert!(requested_item_ranges("struct Bad {", "Bad").is_err());
     }
+    #[tokio::test]
+    async fn byte_window_can_cross_large_blob_batches_but_cannot_hide_invalid_eof() {
+        let (root, _) = committed_fixture();
+        let body = format!("{}αβtail", "x".repeat(ITEM_BYTES + 4096));
+        std::fs::write(root.path().join("logic.rs"), &body).unwrap();
+        let commit = |message: &str| {
+            for args in [
+                vec!["add", "logic.rs"],
+                vec![
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-qm",
+                    message,
+                ],
+            ] {
+                assert!(std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root.path())
+                    .output()
+                    .unwrap()
+                    .status
+                    .success());
+            }
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root.path())
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        let head = commit("large source");
+        let start = ITEM_BYTES - 64 * 1024;
+        let mut request = aligned::ReviewSourceRequest {
+            path: "logic.rs".into(),
+            criterion_ids: vec!["C1".into()],
+            question: "Inspect exact boundary".into(),
+            selector: aligned::ReviewSourceSelector::Bytes {
+                start_byte: start,
+                end_byte: body.len(),
+            },
+        };
+        let files = resolve_review_source_request(root.path(), &head, &request)
+            .await
+            .unwrap();
+        assert_eq!(files.values().next().unwrap(), &body[start..]);
+        request.selector = aligned::ReviewSourceSelector::RustItem { name: "cap".into() };
+        let error = resolve_review_source_request(root.path(), &head, &request)
+            .await
+            .unwrap_err();
+        assert!(is_evidence_budget(&error));
+        let mut invalid = body.into_bytes();
+        invalid.push(0xff);
+        std::fs::write(root.path().join("logic.rs"), invalid).unwrap();
+        let head = commit("invalid suffix");
+        request.selector = aligned::ReviewSourceSelector::Bytes {
+            start_byte: 0,
+            end_byte: 3,
+        };
+        assert!(
+            resolve_review_source_request(root.path(), &head, &request)
+                .await
+                .is_err(),
+            "a valid selected prefix cannot publish before the entire immutable stream validates"
+        );
+    }
 }
