@@ -19,8 +19,23 @@
   ],
   "observed_failure": "Existing linked PR or malformed inventory returned confirmed absence, authorizing duplicate fresh work",
   "limits": [
-    "These regressions execute the original guards, not full selection/scope/publication.",
-    "The subsequent c162f2a1 baseline adds actual primary/remote selector tests and stronger positive-claim assertions; its hosted execution is pending.",
-    "Behavior implementation is still a local draft with validation in progress; this receipt claims no GREEN, code approval, merge or rollout."
-  ]
+    "Original guard and actual selector behavior failures are confirmed; all five are expected, with no unrelated failures.",
+    "Local implementation at ede8a63a remains draft. Focused precommit run passed 23; final full CLI and hosted runs are pending.",
+    "No independent code approval, merge, normal rollout or restoration is claimed."
+  ],
+  "real_selector_baseline": {
+    "head": "c162f2a160e45a82fd5c23d2b779888852006f80",
+    "run": 42609061267,
+    "job": 129132420839,
+    "cli_suite": {
+      "passed": 1741,
+      "failed": 5,
+      "ignored": 33
+    },
+    "additional_failures": [
+      "self_improve::linked_pr_dedup_regressions::linked_pr_is_not_returned_by_real_fresh_issue_selector",
+      "self_improve::linked_pr_dedup_regressions::linked_pr_is_not_returned_by_real_remote_issue_selector"
+    ],
+    "log_sha256": "21476deb2c45a8bbf641eefc4a51c329c3436660d16f886b5fce72b27d02bf38"
+  }
 }

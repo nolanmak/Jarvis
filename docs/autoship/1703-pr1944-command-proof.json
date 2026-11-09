@@ -41,5 +41,18 @@
     "Scripted verifier/executor tests do not establish a production baseline.",
     "Original PR1937 workflow was not reset or restarted.",
     "Full automatic host capacity, productive owner ingress and live CLI/Discord/shipment/fault/soak acceptance remain open."
-  ]
+  ],
+  "foreground_work_attempt": {
+    "command": "augmentagent autopr work --once --workflow nolanmak/jarvis/pr/1944 --json",
+    "exit_code": 3,
+    "reason": "execution-readiness-blocked",
+    "detail_code": "native-runtime:policy-missing",
+    "after_status": {
+      "stage": "queued",
+      "last_attempt": null,
+      "lease_active": false,
+      "reason": "awaiting-worker-claim"
+    },
+    "limits": "Interactive shell lacks configured worker policy; this is not a diagnosis that the background worker is missing policy. No private worker environment copied, limits changed, request reset or merge performed."
+  }
 }

@@ -665,3 +665,35 @@ holds into fresh model/decomposition/publication boundaries and status. The
 managed local test run acquired its registered build lease and is compiling, so
 its source is frozen until the original handle terminates. No passing Rust,
 independent code approval, merge, activation or restoration claim.
+
+## Linked-PR draft implementation and selector RED
+
+#1945 at ede8a63a implements the shared reference observer, both complete
+inventory adapters, strict metadata/reference validation, model/decomposition/
+publication checks, approved-remote-run preservation and precise existing-stage
+holds/progress. Original actual-selector baseline c162f2a1 completed with the
+five expected failures, 1,741 other passes and 33 ignored cases.
+
+The first local draft compiled and passed eight focused cases; two new guard
+fixtures lacked synthetic origin/main. Corrected fixtures then passed while a
+new malformed-reference URL test gave actual RED (22 pass/one fail). After URL
+validation, 23 related cases passed, including real primary/remote selectors,
+midflight guard, child-create hold, immutable admitted-plan/candidate preservation,
+unchanged-stage hold idempotence and command-finish progress. The privacy hook
+then flagged a synthetic email-shaped userinfo URL; the test assembles identical
+input from fragments and the hook passes without bypass. Final-head full CLI/
+hosted tests remain pending. Broader publication/remote-approved race fixtures,
+pre-guard command status, independent review and rollout remain delivery gates.
+
+Formal closing associations on #1944→#1943 and #1945→#1942 are now verified.
+They previously only said Refs in prose; the earlier #1943/#1944 overlap alone
+was not a proven structured claim. Existing eight component PR/issue pairs were
+also inspected and already had correct formal links. No heads/request IDs changed.
+
+A normal foreground work-once attempt on existing queued PR1944 refused before
+dispatch with execution-readiness-blocked/native-runtime:policy-missing in this
+interactive shell. Status remains queued, no last attempt/active lease. This
+does not diagnose the configured background worker's policy; no environment was
+copied or guard bypassed. The original active issue1943 later showed eight calls
+and acceptance_failed Build, a real change from its earlier seven-call stage.
+Queue acceptance, model work and focused tests remain distinct from shipment.

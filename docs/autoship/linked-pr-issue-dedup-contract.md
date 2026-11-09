@@ -254,7 +254,12 @@ At 2026-11-09T11:13:22Z the original worker held active issue workflow
 `nolanmak/jarvis#1943` at Build/criteria_registered, seven recorded model calls,
 current heartbeat and about 50 minutes since stage progress. The ready repair
 PR #1944 was separately queued with no worker workflow yet. The issue attempt
-began before PR #1944 was opened; this is evidence for a midflight appearance
-case, not proof that initial issue selection missed an already-open PR. Nested
+began before PR #1944 was opened. A later structured-reference check found
+#1944/#1945 only had prose Refs links, so that original overlap demonstrates
+parallel work, not a proven GitHub claim or initial-selection miss. Formal
+closing associations were subsequently added and verified without changing
+heads/request IDs; the receipt separates those observations. Midflight claim
+refusal is tested with explicit synthetic closing references, not inferred from
+the earlier overlap. Nested
 build QEMU was live with about 730 CPU seconds; heartbeat alone is not productive
 model progress or a reason to kill/reset the original process.

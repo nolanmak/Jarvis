@@ -56,5 +56,31 @@
     "The original runtime observation is historical, not a claim those PIDs, leases or stages remain current.",
     "Heartbeat and CPU counters do not prove productive model progress, a completed test or authority to terminate/restart.",
     "The issue1943 attempt started before PR1944 opened; do not label this as an initial-selection miss."
-  ]
+  ],
+  "formal_reference_followup": {
+    "observed_at_utc": "2026-11-09T11:50:50.294433+00:00",
+    "first_check_before_metadata_repair": {
+      "1944": [],
+      "1945": []
+    },
+    "after_adding_formal_closing_links": [
+      {
+        "pr": 1944,
+        "head": "932e8807058b667f165350109d9a22c8936f3127",
+        "draft": false,
+        "closing_issues": [
+          1943
+        ]
+      },
+      {
+        "pr": 1945,
+        "head": "ede8a63aa6fda7fc095028c4657e1b8d27aa8c66",
+        "draft": true,
+        "closing_issues": [
+          1942
+        ]
+      }
+    ],
+    "limits": "Original issue1943/PR1944 overlap proved parallel work only, not a formal GitHub claim then. Association was explicitly corrected later; heads and request IDs were preserved."
+  }
 }
