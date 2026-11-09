@@ -41,12 +41,31 @@
   "full_cli_validation": {
     "run": 42642846494,
     "job": 129248335305,
-    "state": "in_progress"
+    "state": "completed",
+    "conclusion": "success",
+    "cli_unit_tests": {
+      "passed": 1741,
+      "failed": 0,
+      "ignored": 33
+    },
+    "log_sha256": "acd5cc7cae7f8ba2dfc60f23fb9ca5e63965a6913754a97f302742660aabc847",
+    "coverage_gap": "This full CI path did not register the new env_key_snapshot_cli target; no pass for its two tests is claimed."
   },
   "local_replay": "Initial managed probe failed missing input during rustdoc. Strengthened fresh local compilation was cancelled while awaiting managed admission; original processes verified terminal before editing. No fresh local GREEN claimed.",
   "limits": [
-    "Actual CLI fallback/runtime-template tests remain pending hosted completion.",
+    "Actual CLI fallback/runtime-template tests must execute and pass on final04c29b8d; earlier successful full job did not run them.",
     "No whole native VM replay, independent code approval, merge or updater rollout claimed.",
     "No credential filter exception, private value, borrowed cache, native state reset or capacity increase."
-  ]
+  ],
+  "final_validation": {
+    "head": "04c29b8d7613e4459a32c4eef1628e9d953a63ed",
+    "bridge_run": 42645634641,
+    "bridge_state": "in_progress",
+    "rust_run": 42645634622,
+    "rust_state": "queued",
+    "change": "Add env_key_snapshot_cli to existing rust/cli/6 integration command and suite-registration assertion.",
+    "local_contract_verify": "passed",
+    "local_contract_tests": 23,
+    "local_targeted_plan_tests": 11
+  }
 }

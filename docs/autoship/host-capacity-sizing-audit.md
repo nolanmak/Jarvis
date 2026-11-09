@@ -872,3 +872,28 @@ approximately 99.7 minutes, publishing head3c00c759. It now has no active lease
 and is held for resume_preserved_work. Old932e8807 CI does not cover that head.
 No command reset, manual candidate edit, code approval, autonomous merge,
 capacity activation or completion of #1703 is claimed.
+
+## Missing integration coverage corrected; exact review hold identified
+
+The completed 2691add3 CLI job passed 1,741 unit tests with 33 existing ignores,
+but inspection of its actual log showed the full workflow's explicit suite list
+did not run the two new env inventory integrations. #1951 final04c29b8d adds
+that test target to existing rust/cli/6 and extends its registration check.
+Contract verification, 23 contract tests and 11 targeted-plan tests pass locally.
+Hosted bridge42645634641 is live and Rust42645634622 queued at observation;
+no final-head or actual-integration GREEN is claimed yet.
+
+PR1944's specific [independent review hold](1703-pr1944-review-dependency-proof.json)
+is now tracked in native child #1952 under #1709: the requested immutable
+self_improve.rs at3c00c759 is 967,956 bytes, above the 524,288-byte one-request
+recovery bound. Existing initial evidence sharding does not solve that requested
+whole-file recovery path. The new issue records behavior-first exits and
+load-bearing design gates; it is not implementation-ready or permission to
+truncate source, raise limits or substitute CI for approval. Its issue lane is
+held through normal CLI control pending that design/implementation handoff.
+
+The worker later passed authorization and claimed original PR1945, with an
+active generation-1 lease and five recorded native admissions at observation.
+This proves recovery beyond the earlier quota refusal, not completed acceptance
+or merge. Original requests, candidate/provenance and all parent live exits
+remain preserved.

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T15:33:58.880227+00:00",
+  "parent_issue": 1703,
+  "owner_issue": 1709,
+  "repair_issue": 1952,
+  "blocked_pr": 1944,
+  "head": "3c00c759017ed2718de114c0b7e8df17e5346415",
+  "production_log_at": "2026-11-09T15:15:09.867884Z",
+  "reason": "review-evidence-budget",
+  "detail": "requested source exceeds recovery bound: crates/augmentagent-cli/src/self_improve.rs",
+  "immutable_source_bytes": 967956,
+  "per_request_limit_bytes": 524288,
+  "mechanism": "Initial review supports sharding; requested missing-path recovery reads the whole immutable file and refuses above one request size.",
+  "status": "Design required for lossless bounded recovery; independent approval absent. Hosted checks on the published head passed, which does not replace review.",
+  "source_issue_hold": {
+    "workflow": "nolanmak/jarvis#1952",
+    "request_id": "autoship-protect-repair1952-20261109",
+    "pause_accepted": true,
+    "revision": 1,
+    "updated_at_ms": 1794238386126,
+    "release_trigger": "Reassess only after recovery design/audit and an explicit implementation lane are ready; do not automatically scope an unsettled design."
+  },
+  "limits": [
+    "No source truncation, request-budget increase, review fabrication, command reset or merge bypass.",
+    "Quiescence/native retirement/resource release not inferred from accepted pause."
+  ]
+}
