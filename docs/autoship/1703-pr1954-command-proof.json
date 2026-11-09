@@ -47,16 +47,16 @@
     "active_candidate_head": "3774813c719e6fa8931cffd99bac123252abb517",
     "actual_native_model_admission_events": 13,
     "first_native_admission_at_ms": 1794251042483,
-    "last_native_admission_at_ms": 1794255284109
+    "last_native_admission_at_ms": 1794257563517
   },
   "private_progress": {
-    "latest_actual_sequence": 6,
+    "latest_actual_sequence": 16,
     "current_route_receipts": [
       {
         "state": "confirmed",
-        "count": 5,
-        "last_sequence": 6,
-        "last_confirmed_at_ms": 1794251268609
+        "count": 11,
+        "last_sequence": 16,
+        "last_confirmed_at_ms": 1794257778179
       }
     ]
   },
