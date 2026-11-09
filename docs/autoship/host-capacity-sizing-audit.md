@@ -255,3 +255,35 @@ accepted through that unchanged production entry on main `416f392b`; valid
 kB/zero and missing-availability compatibility cases run separately. Missing
 new parser/planner APIs are not counted as deployed behavioral regressions.
 Implementation/CI/independent review/rollout evidence remains separate.
+
+The memory-admission refinement separates the protected managed-envelope share
+H from the existing runtime free-memory margin F_mem=256 MiB. H still reduces
+the managed maximum once; current OS/unrelated use is accounted by MemAvailable
+and ancestor charges. The revised busy-host, aggregate, external-pressure,
+explicit-reserve, equality and one-byte-deficit fixtures were recomputed with
+exact rational/integer arithmetic. The proposal adds the runtime margin to its
+external-ancestor predicate; it does not change the deployed fixed-mode policy
+or the closed M1-M3 helper component in PR #1929.
+
+Fresh-reader plus author source/conversation checks and 24 mapped amendment
+seams were reviewed in eight groups. Two substantive findings were resolved:
+
+- Maximizing aggregate charged memory and then subtracting it from reservations
+  can minimize future slack and falsely fit a new run. M6/O3 now derive R_i,
+  C_i and S_i in each complete pass and retain upper R and upper S separately.
+  The decreasing-charge fixture exposes the formerly false 8.25 GiB fit and
+  requires 10.25 GiB against 9 GiB available. Root-added seam 25 covers the same
+  task-accounting correction in P3/O6 and its typed N2 projection: the task
+  counterexample correctly refuses 2008 required against 2000.
+- A protected-reserve minimum could not be represented by N1's old ceiling-only
+  entry. L1/N1 now retain typed property/value/provenance, distinguish maximum
+  from protected-memory-reserve, and render the latter as an outside-capacity
+  minimum. Equal numeric H/B values do not merge these meanings.
+
+Rechecks found both findings resolved, including the additional task seam and
+fresh-reader equality-boundary suggestion. All 25 scoped seams hold at this
+checkpoint. This is not a full working-contract handoff audit, code approval or
+current-worker admission evidence. Existing complete-vector, common accounting,
+observation/provenance, SQL/migration/rollback, original handoff and projection
+integration gates remain open. No production setting, reservation, retained
+session, model call or shipping allowance was changed by these design checks.

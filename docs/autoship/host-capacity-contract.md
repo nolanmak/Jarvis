@@ -34,6 +34,9 @@ the effective machine envelope for the OS and unrelated work, with a 1 GiB
 minimum on small machines. It is a conservative initial policy, not a measured
 claim about the owner's workload. An explicit reserve may increase H. Lowering
 this protected default is not part of automatic sizing.
+H protects the total capacity outside the managed envelope. It is not an
+additional requirement to keep H bytes unused after current OS/unrelated usage
+has already been reflected in an availability/charged-memory observation.
 
 Current free memory does not rewrite these desired settings every tick. It
 constrains immediate admission in section 2. `MemoryHigh` is a throttling
@@ -85,12 +88,27 @@ and worker, not two independently admitted service pools. Migration cannot enabl
 auto mode until that common accounting scope is verified. No second allocator
 or process-local snapshot decides concurrent admission.
 
-Let Q be the new run's complete declared memory, R the sum of existing full run
-reservations plus non-run charges including M4's daemon minimum, C the observed
-non-reclaimable charged memory in that same aggregate, and S = max(0, R - C).
-R also includes aggregate kernel charges absent from child accounting, as the
-current supervisor does; a child is never counted again as an unrelated sibling.
-If hierarchical accounting is inconsistent, return unknown and resample.
+Let Q be the new run's complete declared memory. For each complete O3 pass i,
+let R_i sum existing full run reservations and non-run charges including M4's
+daemon minimum; let C_i be the non-reclaimable charge in the same aggregate.
+R_i also includes aggregate kernel charges absent from child accounting, as the
+current supervisor does. Cover any observed aggregate excess with
+`R_i=max(R_i,C_i)`; a child is never counted again as an unrelated sibling.
+Compute `S_i=max(0,R_i-C_i)` from that pass's consistent accounting.
+If hierarchical accounting is inconsistent or either pass is incomplete,
+return unknown and resample rather than selecting the convenient pass.
+
+For admission use `R=max(R_A,R_B)` and `S=max(S_A,S_B)`. A positive charge
+pressure predicate may use `C_upper=max(C_A,C_B)`, but must never derive S as
+`max(0,R-C_upper)`: maximizing a subtracted charge can hide future reservation
+slack. Table fixtures below have identical per-pass accounting unless stated.
+
+Let F_mem=256 MiB be the runtime free-memory margin, retaining the current
+supervisor's host margin. F_mem and H answer different questions: H caps total
+managed capacity through B, while F_mem leaves immediate spare capacity after
+current usage and unpaid reservation slack. This version adds no configurable
+F_mem override; the M3 reserve override changes H/B, not F_mem. Do not infer
+F_mem from retained disk charges, current free RAM or a desired service limit.
 
 All following predicates must hold on fresh, identity-checked observations
 inside the existing admission lock:
@@ -107,40 +125,86 @@ inside the existing admission lock:
    services meet at their actual shared enclosing aggregate. Unknown membership
    blocks admission; the planner cannot choose a more convenient scope. Include
    every enforced ancestor limit until reload/readback proves it changed.
-3. `Q + S + H <= MemAvailable` on the host.
-4. For each finite external ancestor, `charged_ancestor + Q + S + H <= limit`.
+3. `Q + S + F_mem <= MemAvailable` on the host.
+4. For each finite external ancestor, `charged_ancestor + Q + S + F_mem <= limit`.
    Ancestor charges include competing siblings. Subtract its verified reclaimable
    inactive-file cache as in the existing supervisor; unavailable accounting is
    unknown, not an invented zero. For a limit tighter than the plan, recompute
    the smaller envelope before admitting; never reuse a larger H/B pair to
    manufacture a fit.
 
-H is tested against raw host/ancestor headroom, and is already excluded from
-B_loaded. Do not subtract H from B_loaded again. These are simultaneous bounds
-on the same work, not additive deductions from a net pool. S accounts for idle
-runs' future use because `MemAvailable`/ancestor charges already reflect current
-usage; adding all R to those usage-based checks would count live usage twice.
+When integrating these predicates, preserve the existing typed host_headroom/
+ancestor_headroom refusal codes and populate the complete operands. Host facts
+carry requested_bytes=Q, reservation_slack_bytes=S, margin_bytes=F_mem,
+required_bytes=Q+S+F_mem and available_bytes=the selected MemAvailable.
+Ancestor facts carry current_bytes=its upper charged usage, limit_bytes=its raw
+ceiling, Q/S/F_mem and required_bytes=current_bytes+Q+S+F_mem. Existing
+shortfall/reclaim/wait consumers must use required_bytes minus available_bytes
+or limit_bytes respectively, with checked arithmetic. Reusing the old ancestor
+shortfall expression without F_mem would understate the new guard's deficit.
+Unknown operands never produce a fabricated numeric shortfall.
+
+H is already excluded from B_loaded/B_current. Do not subtract it from B again
+or substitute it for F_mem in a current-usage check. Both current OS/unrelated use
+and any remaining capacity protected by the managed envelope participate in
+physical pressure; the quarter is not a second unused-memory floor. S accounts
+for idle runs' future use because MemAvailable/ancestor charges already reflect
+current usage; adding all R there would count live usage twice. The aggregate,
+actual-scope, host and ancestor predicates still all apply, preserving complete
+run ceilings and the protected managed cap even when an availability check fits.
+
+This resolves the previous draft's use of H in both planning and runtime-free
+predicates. It changes that proposed policy, not the deployed supervisor: the
+existing host F_mem stays 256 MiB, and the proposed external-ancestor F_mem guard
+is an additional bound. The kernel describes
+[MemAvailable](https://docs.kernel.org/filesystems/proc.html#meminfo) as an
+estimate for new allocations without swapping; it is not guaranteed physical
+isolation from later unrelated allocations.
 
 For an existing fixed deployment, retain its current supervisor checks until
 the supported migration installs the complete auto contract. This document does
-not authorize silently replacing its 256 MiB host margin with H.
+not authorize a partial admission-policy rollout or a floor override.
 
 ### Exact admission fixtures
 
-All values below are GiB; B_loaded=12, H=4, Q=6. In the first four rows the
-external ancestor is the host and supplies no tighter independent bound.
+All values below are GiB; B_loaded=B_current=12, H=4, F_mem=0.25, Q=6.
+All actual managed-scope bounds fit unless the aggregate row says otherwise.
+In the table rows the external ancestor is the host and supplies no tighter
+independent bound.
 
-| R | C | S | MemAvailable | R+Q | Q+S+H | Result |
+| R | C | S | MemAvailable | R+Q | Q+S+F_mem | Result |
 | --- | --- | --- | --- | --- | --- | --- |
-| 0.5 | 0.5 | 0 | 12 | 6.5 | 10 | memory admissible |
-| 0.5 | 0.5 | 0 | 9 | 6.5 | 10 | host pressure, deficit 1 GiB |
-| 6.5 | 2.5 | 4 | 14 | 12.5 | 14 | aggregate deficit 0.5 GiB |
-| 4.5 | 1.5 | 3 | 12 | 10.5 | 13 | host pressure, deficit 1 GiB |
+| 0.5 | 0.5 | 0 | 12 | 6.5 | 6.25 | memory admissible |
+| 0.5 | 0.5 | 0 | 9 | 6.5 | 6.25 | memory admissible; outside use is already observed |
+| 0.5 | 0.5 | 0 | 6 | 6.5 | 6.25 | host pressure, deficit 0.25 GiB |
+| 6.5 | 2.5 | 4 | 14 | 12.5 | 10.25 | aggregate deficit 0.5 GiB |
+| 4.5 | 1.5 | 3 | 9 | 10.5 | 9.25 | host pressure, deficit 0.25 GiB |
+
+Busy-host counterexample: physical=16, H=4, B=12, R=C=1, Q=6,
+MemAvailable=7. Aggregate required=7 and host required=6.25 both fit. The old
+draft incorrectly required 10 free despite its managed cap already protecting
+the outside share. This is a memory-only fixture, not an overall run grant.
+An idle retained native disk session never increases R/C/S in this fixture.
+
+Higher protected reserve remains binding: physical=16, explicit H=8 yields
+B_current=B_loaded=8. With R=C=3, Q=6 and MemAvailable=12, host required=6.25
+fits but aggregate required=9 exceeds B by 1 GiB. The runtime margin does not
+undo an explicit protected-envelope override.
 
 External-ancestor example: E=16, B_loaded=12, H=4, R=C=0.5,
 Q=6, MemAvailable=20 on a larger physical host; an external limit of 16
-with charged usage 7 requires `7+6+0+4=17`, so refuse with ancestor deficit
-1 GiB. Large host availability cannot override that ancestor.
+with charged usage 10 requires `10+6+0+0.25=16.25`, so refuse with ancestor
+deficit 0.25 GiB. Large host availability cannot override that ancestor.
+
+Inclusive boundary pairs (all other predicates pass):
+
+- Host required=6.25 GiB=6710886400 bytes: availability exactly 6710886400
+  passes; 6710886399 refuses with a one-byte deficit.
+- Ancestor charged=10 GiB, Q=6 GiB, S=0 and F_mem=0.25 GiB require
+  17448304640 bytes: an ancestor limit exactly that value passes; one byte
+  less refuses with a one-byte deficit. Recompute current E/H/B for either
+  limit; they still fit the other predicates, rather than inheriting a stale
+  E=16 from the preceding example.
 
 Swap is never added to RAM. Swap exhaustion alone is reported as pressure, not
 used to invent an admission capacity or force-kill sessions. Any new PSI/event
@@ -230,8 +294,8 @@ O1. Discovery is a read-only producer. Its private version-1 result contains:
 - Physical RAM, MemAvailable, CPU affinity/effective cpuset, exact quota/period
   rates and per-field errors. Parsed `max` is typed `unlimited`; missing is typed
   `unknown`. Unknown fields do not contain a fabricated numeric zero.
-- Derived E/H/B and CPU values, existing reservations, proposed complete run
-  demand, every evaluated predicate and all limiting deficits. An observation
+- Derived E/H/B, runtime free-memory margin F_mem and CPU values, existing
+  reservations, proposed complete run demand, every evaluated predicate and all limiting deficits. An observation
   has no launch-grant field. Public/private projection is specified separately.
 
 O2. The observing context must be the actual worker/supervisor selected by the
@@ -252,9 +316,14 @@ O3. A coherent-enough sample uses this ordered protocol:
    policy or publishes a reservation.
 3. Read the same identity/configuration/limit set again (pass B), plus a second
    counter/availability sample. A/B identities, revisions, membership, affinity,
-   cpuset and raw ceilings must agree. With charges use the greater observed
-   current value and smaller observed reclaimable value; with availability use
-   the smaller sample. Clamp derived non-reclaimable charges at zero.
+   cpuset and raw ceilings must agree. Derive non-reclaimable charges and the
+   full R_i/S_i reservation accounting within each complete pass, clamping
+   charge subtraction at zero. Use upper per-pass charge bounds for additive
+   pressure checks and lower availability for free-space checks. Memory slack
+   is a separately selected upper bound `max(S_A,S_B)` as in M6, never derived
+   by subtracting an upper charge bound. Do not combine a child/non-run sample
+   from one pass with parent accounting from the other to synthesize R_i/S_i.
+   Incomplete/inconsistent accounting makes that attempt unknown.
 4. Sample duration must be at most 250000000 ns. A completed sample is usable
    only while `now_boottime - start_boottime <= 500000000 ns`, on the same boot,
    with nondecreasing clock values. At most two full collection attempts are
@@ -295,7 +364,14 @@ possible; existing kernel enforcement and truthful failure recovery handle it.
   worker changes namespace/membership, CPU is removed from effective cpuset, or
   policy changes between A/B: discard that attempt, never join the two versions.
 - Current memory reads 3/4 GiB, reclaimable cache 1/0.5 GiB, host availability
-  10/9 GiB: use charged memory 3.5 GiB and availability 9 GiB.
+  10/9 GiB: per-pass charges are 2/3.5 GiB; use upper charge 3.5 GiB for an
+  additive pressure predicate and availability 9 GiB. Independently derive
+  reservation slack from each pass; that upper charge is not its subtrahend.
+- Stable R_A=R_B=6.5 GiB, aggregate C_A=4.5/C_B=2.5 GiB, Q=6 GiB,
+  host availability 9 GiB in both passes and a sufficient managed envelope:
+  S_A=2/S_B=4 GiB, so host required=10.25 GiB and refuses by 1.25 GiB.
+  Subtracting C_upper=4.5 instead would falsely require only 8.25 GiB.
+  N2 must expose selected reservation_slack=4 GiB, not recompute it from maxima.
 - The status collector's cgroup differs from the selected worker: do not use
   local fallback. Return unknown unless it observes the verified target context.
 - The boot ID changes, clock goes backward or required controller accounting
@@ -315,7 +391,9 @@ Valid zero ceilings are known exhausted limits; they are not missing data.
 Unlimited NPROC is distinct from an unavailable threshold. Same-UID usage is
 not a substitute for identifying the launcher's own enforced process limit.
 Limits/declarations/identities must agree across passes; use greater task/file
-usage and smaller availability. Newly applied child limits/privilege state are
+usage for additive pressure and smaller availability. P3 reservation slack is
+separately maximized from consistent per-pass accounting; a maximum observed
+task count cannot be subtracted to minimize that slack. Newly applied child limits/privilege state are
 verified at the original pre-release boundary rather than trusted from a saved
 JSON report. No overall known result is claimed before storage evidence exists.
 
@@ -527,9 +605,14 @@ validated declaration before auto activation, never an inferred guest-only size.
 This resource inventory does not authorize new host execution or relax isolation.
 
 P3. Within the common supervisor admission operation, for the actual scope
-chain of the new run, let R_tasks be existing full run declarations plus
-max(64, non-run task use), C_tasks the scope's current observed tasks and
-S_tasks=max(0,R_tasks-C_tasks). Admit only if:
+chain of the new run, compute per complete pass i: R_tasks_i is existing full
+run declarations plus max(64, non-run task use), covering any greater observed
+scope charge; C_tasks_i is that scope's observed tasks; and
+S_tasks_i=max(0,R_tasks_i-C_tasks_i). Use upper R_tasks=max(R_tasks_A,R_tasks_B)
+and S_tasks=max(S_tasks_A,S_tasks_B), retaining scope/UID membership for each
+applicable slack. Do not compute slack by subtracting the greatest observed
+task count from a separately combined reservation count. Additive external/
+host/UID pressure counts use their upper per-pass observations. Admit only if:
 
 - R_tasks + requested_tasks fits the smaller of current planned and loaded
   managed aggregate ceilings, and fits every enclosing managed service ceiling
@@ -543,6 +626,14 @@ S_tasks=max(0,R_tasks-C_tasks). Admit only if:
   requested_tasks + 64 fits the child's enforced soft threshold. Same-real-UID
   processes can have different soft/hard limits; do not invent one UID-wide
   threshold from the observer's or another service's settings.
+
+Task slack fixture: stable R_tasks=1088, C_tasks_A=512/C_tasks_B=256 and
+requested_tasks=512 give S_tasks_A=576/S_tasks_B=832. With global current tasks
+600 in both passes and global ceiling 2000, required=600+832+512+64=2008,
+so refuse by eight tasks even though the managed aggregate requirement 1600
+fits its 1936 ceiling. Subtracting maximum C_tasks instead would falsely fit
+at 1752. An increase in unrelated task use can offset a managed task decrease;
+constant global counts do not justify selecting the smaller managed slack.
 
 The host task count is the total-entities field in
 [/proc/loadavg](https://man7.org/linux/man-pages/man5/proc_loadavg.5.html),
@@ -1178,7 +1269,8 @@ kernel experiment; it used only disposable temporary directories.
 ## 8. Configured mode, publication and runtime adaptation
 
 L1. Supported fresh Linux deployments persist `mode=auto` by default. Explicit
-caller resource ceilings are recorded as overrides with their provenance, even
+caller resource settings, including maximum limits and M3's protected-memory
+reserve minimum, are recorded with property, value and provenance, even
 when numerically equal to an old default. Absent arguments are not implicit
 8 GiB/16-session, 8G/10G service or 24 GiB scratch overrides. A supported machine
 that cannot fit a complete run remains configured auto and reports the limiting
@@ -1385,7 +1477,10 @@ stand in for the complete native-with-build action.
 and `omitted_count` (nonnegative integer or null when unknown). A complete empty
 list means no applicable override; an unavailable/incomplete list does not.
 At most 64 entries are projected within the same overall byte bound. Each entry
-has `resource`, `domain`, `ceiling` (N2 quantity) and `source`. Resource is
+has `resource`, `domain`, `property`, `value` (N2 quantity) and `source`. Property
+is `maximum` or `protected-memory-reserve`; the latter is valid only for memory
+and identifies M3's H minimum, not B or the runtime F_mem margin. Maximum
+identifies an explicit upper limit for the named resource. Resource is
 `memory`, `cpu`, `tasks`, `descriptors`, `native-state-bytes`, `native-sessions`
 or `scratch-bytes`. Source is `explicit-argument`, `explicit-environment`,
 `recorded-operator` or `recorded-legacy-override`, backed by L1 provenance rather
@@ -1399,6 +1494,11 @@ environment variable contents, actor IDs or provenance digests are emitted.
 Override units are byte for memory/native-state/scratch bytes, cpu for CPU,
 task for host tasks, descriptor for NOFILE, and session for native session count.
 Reject a mismatched resource/unit pair instead of formatting it plausibly.
+Also reject an invalid property/resource combination. Preserve reserve intent
+in L1's configuration/provenance operation, even when it equals the protected
+default; do not infer it from a loaded MemoryMax or encode H as a maximum.
+Render a protected-memory-reserve as a minimum outside the managed envelope,
+distinct from a managed hard limit and from the immediate free-memory margin.
 
 N2. A predicate row contains `kind`, `domain`, `status`, `required`, `available`,
 `deficit` and `context`. `status` is `pass`, `blocked`, `unknown`, or `unsupported`.
@@ -1417,7 +1517,11 @@ and `native-stored-bytes`. Native per-root count/byte rows preserve the addition
 S4 policy predicates; a free filesystem cannot hide a configured session limit.
 Use each contract's actual left-hand required
 amount and right-hand available bound: for example memory aggregate is R+Q
-versus min(B_loaded,B_current), while storage bytes is H+P+D+Q versus F.
+versus min(B_loaded,B_current), memory-host is Q+S+F_mem versus MemAvailable,
+and memory-ancestor is charged_ancestor+Q+S+F_mem versus its raw limit.
+F_mem is M6's runtime memory margin; S4's F is filesystem availability, a
+separate byte quantity used only by storage rows. Storage bytes uses H+P+D+Q
+versus that filesystem F; storage floors are not the memory protected envelope.
 Known deficit is max(0,required-available) in that same unit; a deficit can exceed
 new demand when commitments already exceed a limit. Do not subtract headroom
 again from an already-net amount just for rendering.
@@ -1425,7 +1529,7 @@ again from an already-net amount just for rendering.
 `context` permits only these fixed keys with quantity-or-null values:
 `effective_limit`, `protected`, `committed`, `requested`, `desired_limit`,
 `published_limit`, `loaded_limit`, `original_peak`, `remaining_peak`, `retained`,
-`active_growth`, `process_growth`.
+`active_growth`, `process_growth`, `free_margin`, `reservation_slack`.
 Each present non-null value uses the row's unit. Absent/not-applicable keys are
 omitted; unknown applicable keys are present/null. Thus a CPU scheduling maximum
 does not invent a committed CPU reservation, and descriptor host pressure does
@@ -1434,6 +1538,11 @@ published/loaded distinctions and retained-vs-active storage detail through the
 actual predicate/domain rows, not a misleading combined RAM/disk scalar.
 The retained/active_growth/process_growth keys apply only to storage-byte rows
 and correspond to S4's retained durable, other durable growth and process totals.
+The free_margin key is a byte quantity on memory host/ancestor rows, exposing
+F_mem independently of protected H. Reservation_slack carries M6's upper
+per-pass S on those byte rows, and P3's applicable upper per-pass task slack on
+task pressure rows. It is never rederived by subtracting independently maximized
+displayed commitment/current values. All context values retain their row's unit.
 
 Domains are projection-local ordinals such as `runtime-1`, `storage-1`, `root-1`
 and `image-1`, with a fixed `runtime|storage|root|image` prefix and positive decimal suffix.
@@ -1567,6 +1676,11 @@ Delivery failure never grants/denies execution or changes merge allowance.
   an old default. Unclassified legacy provenance remains incomplete, not an
   inferred override/default. A root's 16-session cap is separate from host PID
   capacity and uses session quantities, even with abundant backing disk space.
+- Explicit protected reserve H=8 GiB on a 16 GiB envelope records
+  `{resource:memory,property:protected-memory-reserve,value:8 GiB}` and renders
+  minimum protected outside capacity; a separate explicit managed maximum
+  records property=maximum. Neither becomes an unused-free-memory floor or
+  disappears merely because the current computed B is also 8 GiB.
 - Required memory 12.5 GiB versus available 12 GiB displays a 0.5 GiB deficit;
   retained disk commitments never render as live RAM use. Detected 1/2 CPU is
   distinct from its rounded 37-percent managed quota.
