@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T20:46:06.621826+00:00",
+  "parent_issue": 1952,
+  "component_issue": 1955,
+  "pr": 1956,
+  "status": "behavioral_red_observed_implementation_validation_running",
+  "contract_checkpoint": "af744bc7",
+  "source_base": "416f392b17b56b2a43e67a3e430835902387941a",
+  "behavioral_red": {
+    "head": "2e9b8f0d54c6bca8caa48ae775abd1e11c2af6e0",
+    "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent model_admission_audit_names_the_committed_accounting_receipt -- --nocapture",
+    "managed_exit": 1,
+    "cargo_exit": 101,
+    "test": "self_improve::workflow::tests::model_admission_audit_names_the_committed_accounting_receipt",
+    "tests_passed": 0,
+    "tests_failed": 1,
+    "tests_ignored": 0,
+    "tests_filtered_out": 1774,
+    "expected_assertion": "protected admission must identify the original committed charge",
+    "observed": "Audit accounting_receipt is None while the actual disposable WorkflowGuard admission event has the committed model-call receipt.",
+    "log_sha256": "427f5926990b0bc7a9ab3b352283233c9fd58c5443e3e748169b70662fa307bf",
+    "limits": "Compiled and executed against unchanged production behavior; scripted admission fixture, no native model or production state."
+  },
+  "implementation": {
+    "head": "899e1479",
+    "production_files": [
+      "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "crates/augmentagent-cli/src/self_improve_workflow.rs"
+    ],
+    "additional_test_file": "crates/augmentagent-channel-core/src/process_tree.rs",
+    "validation": "managed core audit suite running; no GREEN claimed",
+    "published_pr_head_at_creation": "2e9b8f0d54c6bca8caa48ae775abd1e11c2af6e0"
+  },
+  "source_queue": {
+    "workflow": "nolanmak/jarvis#1955",
+    "request_id": "autoship-correlation-source1955-20261109",
+    "paused_revision": 1,
+    "attempt_rows_observed": 0,
+    "actual_model_admissions_observed": 0
+  },
+  "limits": [
+    "The managed wrapper registered and used this worktree own target; no borrowed/unregistered target, lock override or manual cleanup.",
+    "Source remains frozen until each managed run is terminal.",
+    "Hosted checks, independent code approval, normal merge/updater rollout and real native receipt observation remain pending.",
+    "This bounded prerequisite does not close failed-result custody, no-spend holds, automatic host sizing or parent CLI/Discord/merge/fault/soak acceptance.",
+    "Original PR1954 command, branch/body, pinned verifier and native runtime were unchanged."
+  ]
+}
