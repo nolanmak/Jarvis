@@ -148,9 +148,6 @@ fn guard_allows_read(path: &str, env: &[(String, String)]) -> Option<bool> {
 struct FakeAgent {
     provider: Arc<RecordingNativeProvider>,
     seen: Mutex<Vec<AgentCall>>,
-    /// When set, the answer future fails with this error instead of
-    /// reaching the provider.
-    fail: Option<fn() -> anyhow::Error>,
     /// #1779 D4 — fail the next answer the way a deploy restart does.
     interrupt_next: std::sync::atomic::AtomicBool,
 }
@@ -160,16 +157,6 @@ impl FakeAgent {
         Arc::new(Self {
             provider,
             seen: Mutex::new(Vec::new()),
-            fail: None,
-            interrupt_next: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    fn failing(provider: Arc<RecordingNativeProvider>, fail: fn() -> anyhow::Error) -> Arc<Self> {
-        Arc::new(Self {
-            provider,
-            seen: Mutex::new(Vec::new()),
-            fail: Some(fail),
             interrupt_next: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -210,9 +197,6 @@ impl QueryHandler for FakeAgent {
                 || ctx.guild_id.is_some(),
             file_access,
         });
-        if let Some(fail) = self.fail {
-            return Err(fail());
-        }
         if self
             .interrupt_next
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -920,7 +904,7 @@ async fn a_host_signal_mid_turn_replies_interrupted_and_the_thread_continues() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_replayed_event_never_starts_a_second_turn_even_across_restart() {
+async fn a_redelivered_event_never_starts_a_second_turn_even_across_restart() {
     let h = Harness::new();
     let provider = Arc::new(RecordingNativeProvider::new(ProviderKind::Claude));
     let msg = owner_dm("e1", "only once", "1700000500.000100");
@@ -1053,7 +1037,7 @@ async fn restart_mid_turn_reports_the_interruption_once_and_the_thread_keeps_its
     );
 }
 
-// #1774 — the provider is stopped by a host signal *during* the turn (the
+// #1790 (#1774) — the provider is stopped by a host signal *during* the turn (the
 // typed `ReasonerError::Interrupted`, not a string-matched failure): the owner
 // gets the interruption wording instead of an error, the turn is closed as
 // interrupted and the agent is never asked again. The conversation itself is
@@ -1063,9 +1047,10 @@ async fn restart_mid_turn_reports_the_interruption_once_and_the_thread_keeps_its
 async fn an_interrupted_answer_is_reported_without_a_retry_and_is_not_an_uncertain_session() {
     let h = Harness::new();
     let provider = Arc::new(RecordingNativeProvider::new(ProviderKind::Claude));
-    let agent = FakeAgent::failing(Arc::clone(&provider), || {
-        augmentagent_channel_core::reasoner::interrupted_error("claude", 15)
-    });
+    let agent = FakeAgent::new(Arc::clone(&provider));
+    agent
+        .interrupt_next
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let (connector, mut servers) = DuplexConnector::new();
     let running = start(h.surface(
         Arc::clone(&h.store),
