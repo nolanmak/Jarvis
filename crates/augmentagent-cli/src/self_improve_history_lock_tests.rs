@@ -73,7 +73,10 @@ if a[:2] == ['issue', 'list']:
     print(json.dumps([{'number': 7, 'labels': [{'name': scenario['label']}]}]))
 elif a and a[0] == 'api':
     print(json.dumps([{'id': 1, 'body': scenario['reason']}]))
-elif a[:2] in (['issue', 'comment'], ['issue', 'edit']):
+elif a[:2] == ['issue', 'comment']:
+    print('ok')
+elif a[:2] == ['issue', 'edit']:
+    (root / 'at-history-boundary').write_text('last remote step finished')
     print('ok')
 else:
     raise SystemExit(91)
@@ -87,7 +90,8 @@ else:
         .env("AUGMENTAGENT_AUTOPR_HISTORY_FILE", &path)
         .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
         .spawn().unwrap();
-    if !wait_for(&root.path().join("entered"), std::time::Duration::from_secs(10)) {
+    let entry = if mode == "readmit" { "at-history-boundary" } else { "entered" };
+    if !wait_for(&root.path().join(entry), std::time::Duration::from_secs(10)) {
         let _ = child.kill();
         let output = child.wait_with_output().unwrap();
         panic!("fixture did not enter writer: {}", String::from_utf8_lossy(&output.stderr));
@@ -107,7 +111,17 @@ else:
     let after = AttemptHistory::load(&path);
     assert!(after.issues.contains_key(&1));
     assert!(after.issues.contains_key(&99), "writer loaded a stale snapshot before taking the lock");
-    if mode == "readmit" { assert!(!after.issues.contains_key(&7)); }
+    if mode == "readmit" {
+        assert!(!after.issues.contains_key(&7));
+        let calls: Vec<Vec<String>> = std::fs::read_to_string(root.path().join("gh-calls.jsonl")).unwrap()
+            .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let reset = calls.iter().position(|args| args.first().map(String::as_str) == Some("issue")
+            && args.get(1).map(String::as_str) == Some("comment")).unwrap();
+        let unlabel = calls.iter().position(|args| args.first().map(String::as_str) == Some("issue")
+            && args.get(1).map(String::as_str) == Some("edit")).unwrap();
+        assert!(reset < unlabel, "readmission must keep reset marker before unlabelling");
+        assert!(calls[reset].iter().any(|arg| arg.contains(ATTEMPT_RESET_MARKER)));
+    }
     else {
         assert_eq!(after.issues[&7].len(), 2);
         assert_eq!(after.issues[&7].last().unwrap().stage, "child");
@@ -126,4 +140,95 @@ async fn infrastructure_attempt_waits_for_history_lock_and_keeps_peer_update() {
 #[tokio::test]
 async fn readmission_reset_waits_for_history_lock_and_keeps_peer_update() {
     locked_writer("readmit", "self_improve::history_lock_tests::readmission_reset_waits_for_history_lock_and_keeps_peer_update").await;
+}
+
+#[test]
+fn untrusted_history_lock_refuses_edit_without_unlocked_fallback() {
+    use std::os::unix::{ffi::OsStrExt, fs::symlink};
+    for kind in ["symlink", "hardlink", "fifo", "permissive"] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("history.json");
+        let mut seed = AttemptHistory::default(); seed.push(1, record("original")); seed.save(&path);
+        let before = std::fs::read(&path).unwrap();
+        let lock = root.path().join("history.json.lock");
+        let sentinel = root.path().join("sentinel");
+        std::fs::write(&sentinel, b"untouched").unwrap();
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600)).unwrap();
+        match kind {
+            "symlink" => symlink(&sentinel, &lock).unwrap(),
+            "hardlink" => std::fs::hard_link(&sentinel, &lock).unwrap(),
+            "fifo" => {
+                let name = std::ffi::CString::new(lock.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+            "permissive" => {
+                std::fs::write(&lock, b"").unwrap();
+                std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let mut edited = false;
+        assert!(AttemptHistory::update_persist(&path, |_| edited = true).is_err(), "{kind}");
+        assert!(!edited, "{kind} must refuse before editing");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"untouched");
+        assert!(std::fs::symlink_metadata(&lock).is_ok(), "refusal must preserve the original lock path");
+    }
+}
+
+#[test]
+fn failed_history_publication_preserves_committed_context_and_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("history.json");
+    let mut seed = AttemptHistory::default(); seed.push(1, record("original")); seed.save(&path);
+    let before = std::fs::read(&path).unwrap();
+    std::fs::create_dir(root.path().join("history.json.tmp")).unwrap();
+    assert!(AttemptHistory::update_persist(&path, |h| h.push(7, record("unpublished"))).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(root.path().join("history.json.tmp").is_dir());
+    assert!(root.path().join("history.json.lock").is_file());
+    assert!(!root.path().join("history.json.bak").exists());
+}
+
+#[test]
+fn killed_fixture_writer_releases_same_lock_inode_without_publishing_its_edit() {
+    use std::os::unix::process::ExitStatusExt;
+    const TEST: &str = "self_improve::history_lock_tests::killed_fixture_writer_releases_same_lock_inode_without_publishing_its_edit";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let root = PathBuf::from(root);
+        AttemptHistory::update_persist(&root.join("history.json"), |history| {
+            history.push(100, record("uncommitted fixture edit"));
+            std::fs::write(root.join("lock-held"), b"original child owns lock").unwrap();
+            loop { std::thread::park(); }
+        }).unwrap();
+        unreachable!();
+    }
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("history.json");
+    let mut seed = AttemptHistory::default(); seed.push(7, record("committed")); seed.save(&path);
+    let before = std::fs::read(&path).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture"]).env_clear()
+        .env("PATH", "/usr/bin:/bin").env("HOME", root.path()).env(CHILD_ROOT, root.path())
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    if !wait_for(&root.path().join("lock-held"), std::time::Duration::from_secs(10)) {
+        let _ = child.kill(); let output = child.wait_with_output().unwrap();
+        panic!("fixture child never owned lock: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let lock = root.path().join("history.json.lock");
+    let original_inode = std::fs::metadata(&lock).unwrap().ino();
+    let while_held = std::fs::read(&path).unwrap();
+    // Only this original disposable child is terminated. Confirm death before
+    // testing kernel flock release; no production/native lease is inferred.
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    assert_eq!(while_held, before);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    AttemptHistory::update_persist(&path, |h| h.push(9, record("after confirmed fixture death"))).unwrap();
+    assert_eq!(std::fs::metadata(&lock).unwrap().ino(), original_inode);
+    let after = AttemptHistory::load(&path);
+    assert!(after.issues.contains_key(&7)); assert!(after.issues.contains_key(&9));
+    assert!(!after.issues.contains_key(&100));
+    assert_eq!(std::fs::read(AttemptHistory::bak_path(&path)).unwrap(), before);
 }
