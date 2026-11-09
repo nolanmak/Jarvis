@@ -16,6 +16,25 @@ use std::{
 };
 
 const LIMIT: u64 = 64 * 1024 * 1024;
+
+// Bound the serialized representation, including a pending line's second
+// layer of JSON escaping. Do not allocate a complete encoded anchor first.
+struct BoundedAnchorWriter<'a,W:Write+?Sized> {
+    writer:&'a mut W,
+    remaining:usize,
+}
+impl<W:Write+?Sized> Write for BoundedAnchorWriter<'_,W> {
+    fn write(&mut self,bytes:&[u8])->std::io::Result<usize> {
+        if bytes.len()>self.remaining {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                "audit anchor exceeds workflow budget"));
+        }
+        let written=self.writer.write(bytes)?;
+        self.remaining-=written;
+        Ok(written)
+    }
+    fn flush(&mut self)->std::io::Result<()> {self.writer.flush()}
+}
 #[derive(Debug)]
 pub(crate) struct GenerationSealed;
 impl std::fmt::Display for GenerationSealed {
@@ -109,7 +128,7 @@ impl AnchoredAudit {
     fn save(&self, anchor: &Anchor) -> Result<()> {
         let parent = self.anchor.parent().unwrap();
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-        serde_json::to_writer(temp.as_file_mut(), anchor)?;
+        serde_json::to_writer(BoundedAnchorWriter {writer:temp.as_file_mut(),remaining:LIMIT as usize}, anchor)?;
         temp.as_file().sync_all()?;
         temp.persist(&self.anchor).map_err(|e| e.error)?;
         File::open(parent)?.sync_all()?;
@@ -265,6 +284,130 @@ mod tests {
         .unwrap();
         (dir, sink)
     }
+    #[test]
+    fn pending_anchor_expansion_refuses_before_committed_evidence_changes() {
+        let (_dir, sink) = setup();
+        sink.append(serde_json::json!({"kind":"original"})).unwrap();
+        let log_before=fs::read(&sink.log).unwrap();
+        let anchor_before=fs::read(&sink.anchor).unwrap();
+        // The log line fits 64 MiB, but embedding its escaping in pending
+        // makes the recovery anchor exceed the reader's existing 64 MiB cap.
+        let record=serde_json::json!({"payload":"\\".repeat(22*1024*1024)});
+        assert!(serde_json::to_vec(&record).unwrap().len() < LIMIT as usize);
+        let result=sink.append(record);
+        assert!(result.is_err(),"accepted an append whose pending anchor cannot be recovered");
+        assert_eq!(fs::read(&sink.log).unwrap(),log_before);
+        assert_eq!(fs::read(&sink.anchor).unwrap(),anchor_before);
+        assert_eq!(fs::read_dir(sink.anchor.parent().unwrap()).unwrap().count(),2,
+            "oversized pending serialization leaked a temporary");
+        sink.append(serde_json::json!({"kind":"after-refusal"})).unwrap();
+    }
+
+    #[test]
+    fn recovery_seal_refuses_oversized_validation_before_replacing_anchor() {
+        let (_dir, sink) = setup();
+        sink.append(serde_json::json!({"kind":"original"})).unwrap();
+        let log_before=fs::read(&sink.log).unwrap();
+        let anchor_before=fs::read(&sink.anchor).unwrap();
+        let result=sink.seal_for_recovery(|_|Ok(serde_json::json!({"validation":"p".repeat(LIMIT as usize)})));
+        assert!(result.is_err(),"saved a sealed anchor its own reader refuses");
+        assert_eq!(fs::read(&sink.log).unwrap(),log_before);
+        assert_eq!(fs::read(&sink.anchor).unwrap(),anchor_before);
+        assert_eq!(fs::read_dir(sink.anchor.parent().unwrap()).unwrap().count(),2);
+        assert!(sink.seal_for_recovery(|_|Ok(serde_json::json!({"closed":true}))).is_ok());
+    }
+
+    #[test]
+    fn anchor_encoded_limit_is_inclusive_and_overflow_preserves_original_object() {
+        let (_dir,sink)=setup();
+        let mut anchor=Anchor {version:1,pending:Some(String::new()),..Default::default()};
+        let overhead=serde_json::to_vec(&anchor).unwrap().len();
+        anchor.pending=Some("p".repeat(LIMIT as usize-overhead));
+        sink.save(&anchor).unwrap();
+        let before=fs::metadata(&sink.anchor).unwrap();
+        assert_eq!(before.len(),LIMIT);
+        let decoded:Anchor=serde_json::from_reader(std::io::BufReader::new(private_open(&sink.anchor,false).unwrap())).unwrap();
+        assert_eq!(decoded.pending.as_ref().unwrap().len(),LIMIT as usize-overhead);
+        anchor.pending.as_mut().unwrap().push('p');
+        assert!(sink.save(&anchor).is_err(),"accepted LIMIT+1 encoded bytes");
+        let after=fs::metadata(&sink.anchor).unwrap();
+        assert_eq!((after.dev(),after.ino(),after.len()),(before.dev(),before.ino(),LIMIT));
+        let current:Anchor=serde_json::from_reader(std::io::BufReader::new(private_open(&sink.anchor,false).unwrap())).unwrap();
+        assert_eq!(current.pending,decoded.pending);
+        assert_eq!(fs::read_dir(sink.anchor.parent().unwrap()).unwrap().count(),1);
+    }
+
+    #[test]
+    fn anchor_stream_counts_actual_short_writes_and_propagates_io_failure() {
+        struct ScriptedWriter {bytes:Vec<u8>,zero:bool,fail:bool}
+        impl Write for ScriptedWriter {
+            fn write(&mut self,data:&[u8])->std::io::Result<usize> {
+                if self.fail {return Err(std::io::Error::other("scripted write failure"))}
+                if self.zero {return Ok(0)}
+                let count=data.len().min(2);self.bytes.extend_from_slice(&data[..count]);Ok(count)
+            }
+            fn flush(&mut self)->std::io::Result<()> {Ok(())}
+        }
+        let mut inner=ScriptedWriter {bytes:Vec::new(),zero:false,fail:false};
+        {
+            let mut writer=BoundedAnchorWriter {writer:&mut inner,remaining:5};
+            writer.write_all(b"abc").unwrap();
+            assert_eq!(writer.remaining,2);
+            writer.write_all(b"de").unwrap();
+            assert_eq!(writer.remaining,0);
+            assert_eq!(writer.write_all(b"f").unwrap_err().kind(),std::io::ErrorKind::InvalidData);
+        }
+        assert_eq!(inner.bytes,b"abcde");
+        for (zero,fail) in [(true,false),(false,true)] {
+            let mut inner=ScriptedWriter {bytes:Vec::new(),zero,fail};
+            let mut writer=BoundedAnchorWriter {writer:&mut inner,remaining:5};
+            let error=writer.write_all(b"abc").unwrap_err();
+            assert_eq!(error.kind(),if zero {std::io::ErrorKind::WriteZero}else{std::io::ErrorKind::Other});
+            assert_eq!(writer.remaining,5);
+            assert!(inner.bytes.is_empty());
+        }
+        let mut untouched=Vec::new();
+        assert!(BoundedAnchorWriter {writer:&mut untouched,remaining:2}.write_all(b"abc").is_err());
+        assert!(untouched.is_empty(),"single oversized chunk must refuse before its write");
+    }
+
+    #[test]
+    fn oversized_append_does_not_rollback_prior_pending_recovery() {
+        let (_dir,sink)=setup();
+        sink.append(serde_json::json!({"kind":"original"})).unwrap();
+        let mut anchor:Anchor=serde_json::from_slice(&fs::read(&sink.anchor).unwrap()).unwrap();
+        anchor.pending=Some("{\"recovered\":true}\n".into());
+        sink.save(&anchor).unwrap();
+        private_open(&sink.log,true).unwrap().write_all(b"{\"recover").unwrap();
+        assert!(sink.append(serde_json::json!({"payload":"\\".repeat(22*1024*1024)})).is_err());
+        let current:Anchor=serde_json::from_slice(&fs::read(&sink.anchor).unwrap()).unwrap();
+        assert!(current.pending.is_none());
+        let log=fs::read_to_string(&sink.log).unwrap();
+        assert_eq!(log.lines().count(),2);
+        assert_eq!(log.matches("recovered").count(),1);
+        for line in log.lines() {
+            assert!(serde_json::from_str::<serde_json::Value>(line).unwrap().get("payload").is_none());
+        }
+        sink.append(serde_json::json!({"kind":"after-refusal"})).unwrap();
+        assert_eq!(fs::read_to_string(&sink.log).unwrap().lines().count(),3);
+    }
+
+    #[test]
+    fn already_sealed_retry_keeps_qualified_original_proof_without_new_serialization() {
+        let (_dir,sink)=setup();
+        sink.append(serde_json::json!({"kind":"original"})).unwrap();
+        let proof=sink.seal_for_recovery(|_|Ok(serde_json::json!({"closed":true}))).unwrap();
+        let before=fs::read(&sink.anchor).unwrap();
+        let mut qualified=false;
+        let repeated=sink.seal_for_recovery(|_| {
+            qualified=true;
+            Ok(serde_json::json!({"unused":"p".repeat(LIMIT as usize+1)}))
+        }).unwrap();
+        assert!(qualified);
+        assert_eq!(repeated,proof);
+        assert_eq!(fs::read(&sink.anchor).unwrap(),before);
+    }
+
     #[test]
     fn recovery_seal_preserves_interrupted_tail_and_blocks_late_writers() {
         let (_dir, sink) = setup();
