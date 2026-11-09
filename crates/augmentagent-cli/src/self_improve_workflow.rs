@@ -837,7 +837,7 @@ impl WorkflowGuard {
         let store = self.store.clone();
         let lease = self.lease.clone();
         let observational = self.repository.starts_with("autoship-observation/") || self.repository.starts_with("autoship-canary/");
-        self.audit.set_model_call_observer(Arc::new(move |provider| {
+        self.audit.set_correlated_model_call_observer(Arc::new(move |provider| {
             anyhow::ensure!(!capacity_flag.load(Ordering::SeqCst), "resource_capacity: await_capacity checkpoint retained");
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
             anyhow::ensure!(!matches!(store.snapshot(&lease.workflow)?.context("workflow missing")?.checkpoint.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot admit another model call");
@@ -849,7 +849,8 @@ impl WorkflowGuard {
             let actual=match provider {"codex"=>Some(durable::submission::Provider::Codex),"claude"=>Some(durable::submission::Provider::Claude),_=>None};
             store.charge_admitted_model(&lease,&receipt,millis(),observational.then(observation_call_cap),
                 bounded.as_ref().map(|b|(b.purpose.as_str(),&b.binding,b.limit)),actual,
-                augmentagent_channel_core::native_session::is_fresh_review())
+                augmentagent_channel_core::native_session::is_fresh_review())?;
+            Ok(receipt)
         }))
     }
     /// Builder identity is checked independently of audit binding so reviewer
