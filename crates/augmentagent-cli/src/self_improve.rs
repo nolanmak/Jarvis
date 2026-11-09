@@ -20234,8 +20234,11 @@ print(json.dumps([{'number': 77, 'isDraft': False,
         let repo = PathBuf::from(std::env::var_os(CHILD).unwrap());
         if case == "primary-selection" {
             let result = pick_issue(&repo, true).await;
-            assert!(!matches!(result, Ok(Some(_))),
-                "existing arbitrary-branch linked PR was selected for duplicate fresh scoping");
+            match result {
+                Ok(None) => (),
+                Ok(Some(_)) => panic!("existing arbitrary-branch linked PR was selected for duplicate fresh scoping"),
+                Err(error) => panic!("valid linked PR fixture became unknown: {error:#}"),
+            }
             return;
         }
         if case == "remote-selection" {
@@ -20247,16 +20250,24 @@ print(json.dumps([{'number': 77, 'isDraft': False,
                 enabled: true, created_at_ms: 0, updated_at_ms: 0,
             };
             let result = pick_issue_for_repo(&configured, &repo, &store).await;
-            assert!(!matches!(result, Ok(Some(_))),
-                "existing linked PR was selected by configured-repository fresh work");
+            match result {
+                Ok(None) => (),
+                Ok(Some(_)) => panic!("existing linked PR was selected by configured-repository fresh work"),
+                Err(error) => panic!("valid remote linked PR fixture became unknown: {error:#}"),
+            }
             return;
         }
         let result = if case == "remote" {
             has_open_agent_pr_remote("fixture-owner/repo", &repo, 42).await
         } else { has_open_agent_pr(&repo, 42).await };
-        // Err is safe unknown. Only a confirmed false authorizes fresh work.
-        assert!(!matches!(result, Ok(false)),
-            "{case}: existing linked PR or unknown inventory authorized duplicate fresh work");
+        if case == "malformed" {
+            // Err is safe unknown. Only a confirmed false authorizes fresh work.
+            assert!(!matches!(result, Ok(false)),
+                "malformed inventory authorized duplicate fresh work");
+        } else {
+            assert!(matches!(result, Ok(true)),
+                "{case}: valid existing linked PR was not positively recognized");
+        }
     }
 
     #[tokio::test]
