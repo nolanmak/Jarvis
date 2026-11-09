@@ -785,6 +785,9 @@ The independently bounded boot-archive component is scoped in
 [native-initrd-budget-contract.md](native-initrd-budget-contract.md), #1932.
 Fresh-reader/all 17 mapped seam review permits its narrow producer work; it
 does not close whole-launch growth, physical profiles or complete C0/C2.
+Implementation PR #1933 at c60a7ae1 passes 13 new component cases and 92 total
+selected existing/new cases, with six KVM cases skipped. Hosted CI, independent
+approval and rollout remain pending; it supplies no C/R or productive grant.
 
 Required producer behavior before C2 can claim bounded growth:
 

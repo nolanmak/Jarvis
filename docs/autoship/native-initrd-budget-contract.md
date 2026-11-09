@@ -81,3 +81,14 @@ implementation while full C0 stays open. Its whole-contract audit and complete
 RED cases are recorded: three expected refusal assertions fail and one new
 encoder argument is absent. No implementation pass or old-limit regression
 is claimed by this baseline.
+
+
+Implementation [PR #1933](https://github.com/nolanmak/Jarvis/pull/1933), source
+c60a7ae1, passes all 13 new component cases and existing native/provider/shared
+VM/CI-contract suites: 92 passed, six existing KVM integration cases skipped
+because JARVIS_TEST_VM_CONFIG was unselected. Real sparse overflow refuses before
+payload reads; FIFO, observed mutation/shrink/short EOF, compressed prewrite
+refusal, exclusive 0600 output, fsync failure and actual main routing are covered.
+The test suite is registered in hosted bridge-suites. CI-contract verification
+and whitespace pass. Hosted exact-head CI, independent approval and normal
+rollout remain pending; no live VM/model or capacity activation is proved.

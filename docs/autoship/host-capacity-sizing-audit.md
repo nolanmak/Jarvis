@@ -408,3 +408,13 @@ new shared codec argument. This is not a claimed old enforced-limit defect.
 Production-path/per-category, source mutation/nonregular, output failure,
 compatibility and full suites remain required implementation evidence. No VM,
 credentials, model, production policy or services were changed.
+
+The scoped implementation is now #1933 at c60a7ae1. All 13 new component cases
+pass; existing native 20, provisioning 9, shared VM 11 passed/6 skipped, CI VM
+16 and CI-contract 23 give 92 passing cases in total. Six existing KVM runtime
+cases were not run, and no VM/model/credential deployment proof is claimed.
+Actual native main calls bounded encoding before QEMU; suite registration is in
+the shared CI command authority. Host raw archive and compressed logical file
+bounds do not establish whole-launch physical allocation, aggregate RAM,
+original C/R input/body authority, durable storage or restoration. Hosted CI,
+independent code approval, merge and rollout remain pending.
