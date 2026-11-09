@@ -61,10 +61,12 @@ be specified with the observation contract in section 8.
 
 D4. Compute storage headroom on the actual state filesystem, preserving its
 configured free-space floor and other writers' outstanding growth commitments.
-Do not pool partitions or double-count promises already represented by available
-space. There is no approved numerical sizing formula yet: section 8 owns the
-materialized-versus-outstanding accounting question. Never infer unused
-reservation credit from file-size observation.
+Do not pool partitions or credit materialized usage against a reservation without
+an authoritative contract allowing that credit. Current build/snapshot accounting
+conservatively subtracts each active claim's full `growth` value from measured
+available bytes; do not reinterpret it as measured remaining growth. There is no
+approved combined native/build sizing formula yet: section 8 owns the native
+reservation integration. Never infer unused reservation credit from file sizes.
 
 D5. Execution admission continues to use the existing supervisor's authoritative
 live reservations and effective ancestor limits. Host RAM total, available RAM,
@@ -115,6 +117,9 @@ ancestor cgroup; unlimited leaf with finite ancestor; unavailable/stale samples;
 and integer overflow. Exit: useful recommendation or explicit unknown without
 policy, session, reservation, model-call or allowance mutation. Implementation is
 blocked on section 8's observation and accounting contracts.
+Also prove the observer does not create coordination files, remove idle claims,
+reconcile CI holds, prune data, or rewrite reservation files. Existing admission
+APIs have side effects and cannot be called as a read-only measurement shortcut.
 
 R2 — Opt-in bounded sizing in existing admission/publication owners, after R1's
 contract is resolved. Add failing fixtures for competing publishers, changed
@@ -202,3 +207,45 @@ accounting reservations and physical disk-growth enforcement. The remaining
 accounting, observation, publication/reload and reporting contracts are explicitly
 parked in section 8 with owners and blocked phases. This checkpoint is not a
 handoff audit; a full seam audit is still required after those contracts settle.
+
+## 10. Current source contracts checked after the draft audit
+
+These observations narrow the open work; they do not establish a combined
+allocator or safe automatic policy application.
+
+1. [Storage reservations](../../crates/augmentagent-cli/src/storage_reservations.rs)
+   publishes a fixed `Claim.growth` against deduplicated filesystem device IDs.
+   `Claims::reserved_on` sums full growth once per claim/device; it does not
+   subtract bytes already materialized by that writer. The flock-held claim
+   persists while exported descendants retain its descriptor. Preserve this
+   conservative contract until any replacement has real evidence and migration.
+2. The same module's `Admission::lock` may create coordination metadata and
+   reconcile uncertain CI cleanup. `Admission::claims` can open/create records
+   and unlink stale claims after acquiring their locks. Neither is a read-only
+   reporting API. R1 needs a supported nonmutating observation path; observation
+   failure must not trigger cleanup. Do not invoke these APIs on production state
+   merely to collect the proposed sizing report.
+3. [Build admission](../../crates/augmentagent-cli/src/build_storage.rs)
+   checks each monitored path's available bytes minus other writers' full claims
+   against the configured floor, then publishes its own growth claim under the
+   short admission lock. Different paths on one device must not multiply a
+   claim. Target leases and the build lock have distinct purposes from the short
+   allocation lock; do not wait for a target/process while holding that lock.
+4. [Snapshot creation](../../crates/augmentagent-cli/src/deploy_snapshot.rs)
+   checks the snapshot filesystem, subtracts other writers' claims, and publishes
+   the snapshot peak on its actual device before work. An archive snapshot claim
+   does not consume root-filesystem headroom unless the two truly share a device.
+5. [Native capacity](../../crates/augmentagent-channel-core/src/native_state_capacity.rs)
+   currently compares retained plus additional sessions with `max_sessions` and
+   `max_state_bytes`, stored bytes with that budget, and available bytes with
+   `SESSION_BYTES` (1 GiB). Native preparation holds its separate state lock.
+   This check does not join CLI build/snapshot `Admission`/`Claims` accounting or
+   apply their configured free-space floors. Increasing the policy cap does not
+   add that missing coordination. Implementing it requires a deliberate common
+   producer/consumer boundary across the channel-core and CLI layers, including
+   lock ordering, inherited writer lifetime, crash recovery and mixed-version
+   behavior; a second independent native growth ledger would not solve it.
+
+The next contract task for R is therefore concrete: define native participation
+in the existing storage accounting, plus a nonmutating observer. Do not implement
+a free-space percentage tuner first and describe it as cross-writer admission.
