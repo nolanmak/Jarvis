@@ -350,3 +350,31 @@ The worktree is clean and whitespace checks pass. Hosted targeted/exporter
 setup fails before tests on pinned release download HTTP 504s; remaining CI,
 independent code approval, merge and rollout are unfinished. No production
 policy/session/service changes or native enrollment occurred.
+
+
+## Native durable balance/replay checkpoint
+
+The new native-storage-ledger-contract.md and executable SQL were checked by a
+fresh reader, conversation/source comparison, and all 16 mapped seams. Six
+findings were resolved and rechecked: initial terminal insertion, retained
+filesystem placement, new-resume versus historical validity, retained release
+ordering, global session binding, and SQL REPLACE bypass. The final DDL has
+pending-only insertion and collision guards covering all unique keys, plus
+retained-state filesystem and launch-settlement constraints. No remaining
+checkpoint finding was retained. This is not a full C0 handoff audit.
+
+The committed disposable Python/SQLite experiment passes 40 predicates on
+SQLite 3.45.1, including real constraints/transitions, replacement refusal,
+checked overflow, missing graph/replay refusal, full create/resume/retirement
+history, read lock refusal, reopen and pre/postcommit process crashes. Both
+children provide verified execution markers. It touches only its own temporary
+SQLite fixtures; it exercises neither production Rust admission nor original
+release capability, filesystem/quota/inode or kernel power-loss behavior.
+
+The native existing retirement table remains unchanged in the proposed schema.
+Original binding/proof APIs, registry/anchor/schema migration integration,
+full growth and profile enforcement, and bounded pre-intent control-plane
+reservation/transfer/recovery still block production implementation. In
+particular, ledger and rollback-journal writes cannot be authorized by their
+own not-yet-committed row. These obligations remain in #1918/#1920; no DB,
+registry, permission, snapshot or deployed capacity policy was changed.

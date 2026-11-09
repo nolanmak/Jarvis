@@ -898,6 +898,13 @@ checked-sum overflow yields unknown. The native database is the sole durable
 balance for these rows. Version migration and table constraints must reject
 duplicates, changed replay parameters, unbound rows and unknown state values.
 
+The proposed exact balance representation, graph validation, canonical replay
+and state constraints are in the separately audited
+[native durable balance checkpoint](native-storage-ledger-contract.md), with
+executable DDL and a disposable 40-predicate SQLite probe. That checkpoint adds
+no production schema or release authority. Original binding/proof producers,
+registry/anchor/migration integration and control-plane growth remain gates.
+
 There are two distinct commitment kinds:
 
 - `retained`: the full existing 1 GiB logical session charge, from creation until
@@ -1073,10 +1080,19 @@ the common lock, so no cooperating allocation can change mid-scan. A busy or
 invalid database produces a recoverable storage outcome; do not wait while
 holding the global lock or omit that root to obtain a result. Durable database
 transactions require full synchronization and directory synchronization at
-creation/publication boundaries. Exact schema/SQL and replay-record binding must
-be checked by the C0 migration contract before implementation.
+creation/publication boundaries. The proposed balance SQL and canonical replay
+are specified in the linked checkpoint; qualified owner binding, final schema
+integration and migration must still pass C0 before implementation. In
+particular, bounded SQLite intent/journal and registry growth needs a qualified
+pre-existing control-plane reservation/bootstrap allowance before the intent
+can be committed. An uncommitted row cannot authorize its own physical writes.
+Coverage, transfer and recovery for that interval remain a growth/bootstrap
+gate; the checkpoint does not silently assume zero overhead.
 
-S7. Release is a separate, original-proof-consuming operation. Record
+S7. Release is a separate, original-proof-consuming operation. Every launch
+allocation must be released before the retained allocation may enter
+release-pending. Historical settled resume operations remain valid against the
+original retained tombstone after final retirement. Record
 `release-pending` while still charging the full row, obtain the existing native
 qualified retirement/quiescence proof, unlink only the precisely owned artifacts
 through that protocol, sync affected parent directories and complete its durable
