@@ -592,3 +592,14 @@ the current draft head is running; CI-contract/whitespace pass. Independent code
 approval, rollout and original-command live recovery remain pending. #1941's
 separate audit-bound patch now has all 16 reported hosted checks/statuses passing,
 without code approval or rollout. Full capacity/owner/live acceptance remains open.
+
+## Linked-PR duplicate scoping investigation
+
+#1942 now has a repository [investigation contract](linked-pr-issue-dedup-contract.md).
+Source verification confirms both primary and remote branch-only guards, the
+existing arbitrary-branch adoption path, targeted issue reconciliation, and the
+publication intent/direct-identity recovery boundary. The draft requires shared
+source facts, complete inventory, no paid duplicate scope and race-boundary tests.
+Strict trust/unknown classification, remote dispatch, pending intent exclusions
+and the external-create race remain explicit handoff gates. No implementation,
+RED/GREEN, approval, deployment or restored shipment is claimed.
