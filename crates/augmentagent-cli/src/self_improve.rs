@@ -12223,6 +12223,71 @@ mod tests {
         }
     }
 
+    // A paid attempt may still be a durable hold (for example CI infrastructure
+    // retry). Exercise the real worker settlement and persisted fairness state.
+    async fn assert_deferred_turn_fairness(resumed: bool, billed: bool) {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let mut worker = AutoPrLoop::for_tests("/nonexistent".into(), 5, state.path());
+        worker.interval = std::time::Duration::from_secs(1);
+        let now = chrono::Utc::now();
+        worker.clock = Arc::new(move || now);
+        FairSched::update_persist(&worker.fair_path, |fair| {
+            fair.resumes_since_build = 2;
+            fair.resume_reservations_since_build = 3;
+        });
+        let fair_path = worker.fair_path.clone();
+        let counter_path = worker.counter_path.clone();
+        let workflow_path = worker.workflow_path.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let timer_stop = stop.clone();
+        let run = worker.run_with(stop, move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok(RunReport {
+                    message: "durable verification retry; candidate preserved".into(),
+                    billed, held: true, resumed,
+                })
+            }
+        }, || async { 0 });
+        let timer = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            timer_stop.cancel();
+        };
+        let (result, ()) = tokio::join!(run, timer);
+        result.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "fixture must settle exactly one attempt");
+        assert_eq!(DailyCounter::load(&counter_path).runs_today(utc_day_of(now)), if billed { 1 } else { 0 },
+            "compute spend must remain attributable even when work is held");
+        let allowance = crate::autoship_workflow::WorkflowStore::open(&workflow_path).unwrap()
+            .merge_allowance(now.timestamp_millis(), 5).unwrap();
+        assert_eq!(allowance.confirmed, 0);
+        assert_eq!(allowance.available, 5, "a paid retry is not a merged PR");
+        let fair = FairSched::load(&fair_path);
+        let expected = if billed { if resumed { (3, 3) } else { (0, 0) } } else { (2, 3) };
+        assert_eq!((fair.resumes_since_build, fair.resume_reservations_since_build), expected,
+            "held control flow must not erase a paid turn's fairness settlement");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paid_deferred_pr_updates_resume_debt_without_spending_merge_allowance() {
+        assert_deferred_turn_fairness(true, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paid_deferred_build_clears_resume_debt() {
+        assert_deferred_turn_fairness(false, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unpaid_deferred_turn_preserves_resume_debt() {
+        assert_deferred_turn_fairness(true, false).await;
+        assert_deferred_turn_fairness(false, false).await;
+    }
+
     // #1705: an infrastructure fault must never exhaust the shipping allowance.
     #[tokio::test(start_paused = true)]
     async fn failed_attempts_do_not_exhaust_shipping_allowance() {
