@@ -770,8 +770,9 @@ The aggregate home-seed violation is tracked in
 Three overflow regressions fail on main `416f392b`, including the real 64 MiB
 boundary. Final selected home bytes are checked after credential selection;
 exact fit, smaller replacement and preserved refreshed auth remain supported.
-All 26 native-provider and nine provisioning tests pass locally. CI, independent
-review and rollout remain pending. This bounds final seed data, not metadata,
+All 26 native-provider and nine provisioning tests pass locally; all 17 hosted
+checks/statuses pass at `4a958e57`. Independent review and rollout remain pending.
+This bounds final seed data, not metadata,
 combined initrd inputs/peak, interrupted-launch accumulation or whole-launch
 physical growth. Those C0/C2 obligations remain open.
 

@@ -95,4 +95,5 @@ resource cases then pass in their documented delegated service; all three
 readiness cases pass in a separate isolated delegated service. Actual read-only
 host decoder smoke and whitespace checks pass. These 37 exercised tests do not
 prove full resource discovery, host-sized activation, native growth or shipping.
-Hosted CI, independent code approval and normal rollout remain pending.
+All 17 hosted checks/statuses pass at `471388a8`. Independent code approval and
+normal rollout remain pending; the component is unmerged and not deployed.
