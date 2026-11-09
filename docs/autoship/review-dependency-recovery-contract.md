@@ -1,161 +1,218 @@
-# Large immutable review dependency recovery — #1952
+# Coherent immutable review dependency recovery — #1952
 
-Status: investigation/design draft. Not an implementation handoff or activation
-authority. Owner #1709; parent #1703. Live incident and original PR identity are
-in [the bounded receipt](1703-pr1944-review-dependency-proof.json).
+Status: replacement design, awaiting fresh-reader/source/seam validation. Not
+implementation-ready or activation authority. Owner #1709; parent #1703.
+Incident identity: [PR1944 receipt](1703-pr1944-review-dependency-proof.json).
 
-## Observed problem
+## Problem and outcome
 
-At candidate3c00c759, self_improve.rs is 967,956 bytes. The review request limit
-is 524,288 serialized bytes including system text. Initial review can shard
-large evidence, but missing-path recovery reads a full requested blob and
-refuses it above that request limit. Repeated unchanged review cannot fix the
-controller's representation. Complete CI does not substitute for review.
+At candidate3c00c759, self_improve.rs is 967,956 bytes. The serialized native
+request limit including system text is 524,288 bytes. Initial review shards
+large source, but missing_paths recovery requires a whole file to fit one
+request. Merely combining independent approvals of more byte shards does not
+prove anyone evaluated the missing relationship across them. That multipart
+proposal was rejected after fresh-reader audit; it must not be implemented.
 
-## Decisions and reasons
+The replacement lets the same reviewer role request precise immutable source
+items/ranges and then receive all requested dependencies together with its
+original assigned evidence in one bounded recovery request. Approval is still
+the actual independent review decision. If necessary coherent context cannot
+fit or remains insufficient, retain an explicit incomplete/budget hold. Never
+turn byte coverage, an index, selected source or CI into a review verdict.
 
-D1. Keep the per-request limit and exact head/base/contract/evidence binding.
-Do not raise it, clip evidence, turn a source manifest into source coverage,
-or ask a builder to alter protected acceptance/reviewer evidence.
+## Decisions and protocol
 
-D2. Reuse the existing immutable Git source producer and lossless packer.
-self_improve_review_callers::Plan::named already resolves a regular tracked
-blob, binds its OID/size and streams strict UTF-8 in stable 32 KiB windows.
-It rejects binary/invalid UTF-8 and verifies complete reads/child success.
-Its 256-entry/8 MiB batch bounds are working-set bounds, not whole-file limits.
-The recovery adapter must separately retain valid_missing_path's credential
-and control-path exclusions; named does not enforce that policy itself.
+D1. Preserve exact head/base/contract/evidence and native independence. Keep
+MAX_PROMPT_BYTES (512 KiB), MAX_RESPONSE_BYTES (128 KiB), three-role coverage,
+all initial candidate/caller byte coverage, prior findings, final adjudication
+and current admission/storage authorities. No extra selector models, new
+scheduler, native continuation, per-part state or approval authority.
 
-D3. A proposed recovery generation may contain multiple bounded source groups,
-but grouping alone is not a sufficient completion rule (see rejected proposal).
-Every required group must have an actual independent native response. Any
-incomplete group keeps the original group incomplete; a third recovery
-generation is forbidden. An approve for a part never approves the whole PR.
-The original incomplete pass's concrete findings and all recovery findings
-remain inputs to existing final adjudication. Source-dependent findings must
-retain the exact original and recovered source needed by final authority.
+D2. Add a strict source-request response variant for incomplete decisions:
+missing_sources is an array of at most16 objects. Each contains a literal path (nonempty, at most4096 UTF-8 bytes),
+criterion_ids (nonempty unique known registered criteria), a nonempty question
+(max4096 UTF-8 bytes), and one selector:
+- whole_file;
+- rust_item with a literal Rust identifier name;
+- bytes with start_byte inclusive and end_byte exclusive.
+Represent selectors as a deny_unknown_fields tagged enum. Names are Rust
+identifiers accepted by the existing syn dependency, with optional r# prefix;
+there is no regex/glob/path expression. Exact case matters. Byte bounds are
+checked usize values with start < end, strict UTF-8 boundaries and end <= blob
+size. Requests are data, never tools or host filesystem permission.
 
-D4. Reuse the existing workflow lease, model admission/resource ledger,
-review_fragment cache, three-role controller and final-adjudication machinery.
-Do not add another scheduler, provider path, approval flag or storage authority.
-A request carries its original group identity and exact dependency ranges.
-A restart may reuse only fully validated completed parts for the same binding
-and protocol; parent completion requires every planned part, with original
-native session independence checked. A missing part is incomplete, not empty.
+Keep legacy missing_paths as whole-file requests with implicit all-current-
+criteria question. Reject simultaneous missing_paths and missing_sources,
+wrong-field types, unknown selectors/fields, excessive requests and source
+requests on approve/changes_requested. Preserve the old public parser wrapper
+for path-only callers/tests; a new production parser returns typed requests.
+A path-only wrapper must reject a typed range/item request, not discard it.
 
-D5. Reject unknown/denied source and insufficient budgets before the affected
-extra call. A real budget or transport failure remains a typed hold with the
-original candidate and successful evidence preserved. No command reset,
-retained-session deletion or merge allowance debit can repair this failure.
+D3. Render initial source chunks with exact UTF-8 byte offsets and their
+immutable path/OID/size metadata. Caller streams already supply byte offsets;
+replace candidate #part numbering with equally explicit source byte offsets.
+Metadata is not source coverage. Instructions ask for concrete item names or
+byte ranges when a whole dependency cannot fit. No function index or extra
+metadata inventory is required: names can come from observed declarations/
+call sites; exact byte windows refer to supplied offsets. An unknown name is
+not guessed or replaced with the first approximate match.
 
-## Existing consumer constraints
+D4. Initial request packing uses at most MAX_PROMPT_BYTES/2 including system,
+contract, issue, prior findings and all other actual serialized fields. This
+leaves recovery room without truncating an assigned group. The small complete
+candidate fast path remains when it fits that initial bound. Larger candidates
+are losslessly packed into more partial groups, with every group required for
+every role. Diagnostic and production planners use this same packing/count.
+The recovery request uses the unchanged full MAX_PROMPT_BYTES. All original
+assigned files/context and every requested dependency/question must fit
+together; do not drop original evidence or choose a fitting subset.
 
-- evidence_plan::recover currently returns one Request. GroupReview allows
-  two observations, with the original findings retained, and finish requires
-  completion. Merely returning the first packed part violates that contract.
-- CompletedGroup currently stores recovered_files and finding_evidence, which
-  can duplicate source. Persisting a whole large recovery in that object can
-  breach WorkflowStore::record_review_fragment's 8 MiB encoded payload bound.
-  Source byte size is not encoded size; JSON escaping and repeated evidence
-  must be accounted before choosing a durable representation.
-- The final adjudicator consumes actual finding source, not only request
-  hashes. Its existing bounded source-selection/requested-evidence path must
-  receive exact recovered bytes/ranges, preserving supporting and opposing
-  evidence. A manifest alone does not discharge that handoff.
-- worst_case_calls currently reserves 6*initial_groups+2 for a diagnostic
-  canary. reserve_observation is immutable per lease/generation: a second
-  different reservation is rejected. Model admission cannot exceed it.
-  Dynamic recovery must not silently borrow the shipping budget or report
-  partial diagnostic evidence as a completed probe. Normal shipping also
-  retains the existing actual per-call admission and workflow budgets.
+## Immutable source production
 
-## Rejected multipart proposal and fresh-reader findings
+D5. Reuse the existing no-replace-objects Git reader, literal tree lookup and
+credential/control-path policy. Resolve each path to exactly one regular tracked
+blob at the bound head; reject symlink, submodule, directory, missing/denied
+path, binary and invalid UTF-8. Also retain requested_evidence's stronger
+control-character and credential-directory exclusions. Never read working-tree
+files, runtime .env, another revision or a model-supplied blob identity.
 
-The first proposed D6–D9 split the original group plus requested source into
-independent recovery parts and combined local approvals. Fresh-reader review
-rejected that as a handoff design: every part can approve locally while no
-reviewer evaluates the cross-part relationship that caused missing_paths.
-Existing final adjudication consumes findings; it cannot necessarily recover
-a relationship that no partial reviewer identified as a finding. Complete
-byte delivery is not complete dependency reasoning. Do not implement or
-promote that multipart proposal. D3 describes a coverage constraint only, not
-a sufficient completion rule; D4's reuse constraints grant no such authority.
+whole_file retains the existing bounded full-file behavior. For rust_item,
+check immutable size before reading; at most8 MiB of source may be parsed,
+matching the existing bounded inline caller working set. This is an item-
+lookup working-set cap, not permission to stage 8 MiB into a model request.
+Reuse syn::parse_file and Visit already used by self_improve_review_symbols.rs.
+Collect all matching fn/struct/enum/union/trait/trait-alias/type/const/static/
+inline-or-external-mod items, named macro declarations, impl fn/const/type,
+trait fn/const/type and foreign fn/static/type. Field/variant names, pattern
+bindings and macro invocations are not item declarations; request their
+containing item or exact bytes. Do not infer a semantic call graph or expand
+macros. Use whole lines spanning each exact AST item, so non-ASCII column
+units cannot shift byte selection. Deduplicate identical/overlapping ranges.
+Include enclosing impl/trait/foreign-block headers and enclosing inline
+module attributes/header as companion ranges for selected members; include
+their attributes and where clauses. Their source is required context.
+Label each range by literal path and absolute byte interval. A duplicate name
+supplies all matches together or refuses budget; never silently choose one.
+No match, parse failure or source above the item working set is typed
+unavailable evidence, not an empty successful lookup. Precise byte requests
+remain available for large/non-Rust/ambiguous sources.
 
-The fresh-reader pass found six unresolved contracts:
+For bytes, reuse caller_stream's strict UTF-8/complete-EOF producer. Drain the
+original immutable stream, collect only requested bounded intervals, verify
+original blob size and child success, then publish those exact bytes. The
+stream's 8 MiB/256-entry batches are working-set bounds, not a whole-file cap.
+Refuse a requested raw range above MAX_PROMPT_BYTES before allocation. Verify
+HEAD still equals binding before recovery publication and before the call.
+Only fully validated reads can become supplied evidence.
 
-1. A bounded coherent operation must actually evaluate cross-source dependency
-   relationships; a union of part approvals is insufficient.
-2. Plan/parent identities, references and findings need explicit encoded bounds
-   and overflow behavior, not merely the existing per-child writer limit.
-3. Wake identity must agree with epoch/binding/admission-counter identity;
-   waking into the same exhausted counter is not recovery, and resetting it
-   destroys the bound.
-4. Lost native-result recovery needs an existing authoritative producer,
-   retrieval and validation transition. A phrase such as original positive
-   evidence does not name one. No resource-release or retry capability can be
-   inferred from lease expiry, handle absence or a cache key.
-5. Required findings cannot first hit an unpersistable encoded response after
-   the only allowed observation. A pre-call bound or bounded durable response
-   representation must preserve useful successful evidence on overflow.
-6. Failure classes must specify admitted/result state, cacheability, next
-   action and wake trigger. Transport after admission differs from both
-   pre-admission quota refusal and a completed-but-incomplete review response.
+## Recovery, persistence and failure semantics
 
-A separate source comparison also finds that diagnostic runs deliberately
-disable normal review-fragment reuse. Any replacement must preserve fresh
-actual diagnostic observations; production failure/cache behavior cannot
-silently become a diagnostic completion proof.
+D6. Keep the current maximum two reviewer observations per original group.
+A valid first incomplete response may produce one coherent recovery call.
+A structured-format correction consumes the second observation and cannot
+then start another recovery call. The second response must complete the
+assigned group or leave it incomplete. No partial approval union or third
+call/generation. Selector extraction uses no model calls, so worst_case_calls
+remains 6*initial_groups+2, calculated with D4's actual initial groups. Native
+quota/resource charging and immutable canary reservation remain unchanged.
+Diagnostic runs still require fresh actual observations and do not reuse
+normal fragment successes/failures as diagnostic proof.
 
-The seam map enumerated 30 seams for the rejected proposal. These are mapped,
-not all checked. No all-seam or implementation-readiness claim is made.
+D7. Preserve the original incomplete response's valid findings and every
+valid recovery finding using existing GroupReview retention. Cache completion
+only after actual independent native responses and current binding checks.
+Store requested exact source ranges under the existing recovered-source
+namespace, include them in finding_evidence, and forward actual bytes through
+existing final_source_evidence/final-authority selection. Neither source
+hashes nor questions are findings or verdicts. Question criteria guide
+evidence selection/review only and cannot remove registered requirements.
 
-## Next design investigation and handoff gates
+No growing parent/part graph is introduced. A normal completed record has
+at most two requests/responses. Prove a conservative encoded bound of
+4*MAX_PROMPT_BYTES + 12*MAX_RESPONSE_BYTES +64 KiB, below the existing8 MiB
+fragment-writer limit, from source-map duplication, normalized findings and
+bounded validated actor/binding/session metadata. Check that bound at the
+production serialization boundary. Before any reviewer call, require the
+encoded static binding/actor/model/role/original-hash metadata (plus two
+64-byte request hashes) to fit32 KiB. Actual returned native IDs must be
+nonempty ASCII graphic strings of at most512 bytes; retain exact IDs, never
+truncate or derive replacements. Native VM observation already caps them
+at256 bytes; independently verify this production path in source/tests.
+Oversized/invalid actual identities are transport/protocol failure, not a
+valid completed observation or deterministic source failure. These checks
+leave the conservative64 KiB metadata remainder; no unbounded response spool.
 
-Inspect the existing final-authority requested-source/evidence-window producer
-before inventing a replacement. It already reads immutable source, reconstructs
-exact selected ranges, distinguishes unread text from supplied evidence, and
-keeps source-selection work separate from rulings. Determine whether it can
-supply a coherent bounded dependency context to the original reviewer.
+## Staged delivery, without closing the parent early
 
-This is a candidate direction, not a settled solution. The review protocol
-currently requests exact paths without a structured dependency question.
-Settle how a question/criterion and original evidence guide selection, how
-supporting and opposing source are retained, and what happens when necessary
-coherent context still cannot fit. A selector/index never independently
-approves code or proves the reviewer saw omitted bytes. An unresolved real
-dependency remains incomplete with an explicit scope/policy recovery route.
+C1 is the D1–D7 coherent-source protocol/producer/packing component. It does
+not introduce multipart recovery, a growing parent graph, terminal cache
+records, new admission counters or a lost-native-result replay operation.
+Current completed-fragment, exception, custody and per-workflow actual-charge
+paths remain in force. Within a successful recovery, all initial findings are
+retained and forwarded to final authority. C1 must not claim to solve failed-
+review history retention, unchanged paid retries or generic failure projection.
 
-Preserve the existing one-recovery-generation/structured-correction rules
-unless a separately reviewed amendment defines a replacement. Count selector
-and reviewer calls at every production and diagnostic entry point, preserve
-the immutable diagnostic reservation, exact final-source handoff, native
-provenance and current durable writer limits. Finish the lost-response and
-stable typed-hold/wake contracts above before adding new per-part state.
+C2 remains required in #1952/#1709/#1706: preserve partial observations/source
+and findings through failed recovery, persist a deterministic unsupported-input
+hold without repeated unchanged model spend, distinguish terminal source/
+representation failures from transient admission/transport/storage failures,
+and implement source/contract/epoch/model/policy wake semantics. This needs
+its own reviewed lifecycle contract before implementation. Current native
+outcome uncertainty, lost results and cache-publish failure cannot be promoted
+into successful observations, resource release or retry authority. Diagnostic
+runs must retain fresh actual observations and immutable reservations.
 
-Owner #1709/#1952. The six findings and source comparison block implementation
-handoff and activation. They are design work to resolve here, not questions
-the owner must answer or permission to weaken evidence. No schema, API,
-resource policy, cache, original command or native state changed in this
-investigation. Fresh-reader, conversation/source and all mapped seam checks
-are required on the replacement design before handoff.
+Source inspection identifies the existing integration points for C2:
+IndependentReview can remain available=false with structured partial evidence;
+recorded_verdict then returns None. Issue-backed resume already records
+structured receipts before handling unavailable. Source-less adoption currently
+keeps partial structured evidence only in its in-memory previous variable,
+and only records a publication verdict when recorded_verdict is Some.
+Review-epoch invalidation deletes current indexes/fragments but preserves
+workflow_event history. current_review_history intentionally only authorizes
+the current binding/epoch. verify_fresh_review_origin also intentionally
+requires the current binding; do not weaken either to recover historical
+facts. A historical-finding reader/resolution transition must have a separate
+non-approval contract and cannot validate an old origin as current authority.
 
-## Test-first build order and exits
+Fresh-reader findings about whole-file multipart reasoning are resolved by
+D4–D6: the actual reviewer receives original evidence plus all requested
+related source in one request and may still refuse completeness. The former
+new parent/part graph and per-part lifetime counter are cut from C1. Encoded
+success-record growth is handled by D7 without raising the writer limit.
+Historical failed observations, wake/counter identities and lost-result
+producers are explicitly C2 gates, not silently treated as implemented.
 
-First finish the open contracts and check fresh-reader, conversation/source
-and every mapped seam. Then add a scripted-provider test at the production
-review/recovery adapter using a real disposable immutable Git dependency above
-one request. Record the current exact budget failure as behavioral RED; an
-incident log or helper-only test is not this automated RED.
+C1 may be handed to implementation only after source/fresh-reader/all mapped
+C1 seams are checked. That scoped handoff does not close C2, #1952, #1709 or
+#1703. C1 code must be reviewed, normally rolled out and exercised on the
+preserved PR1944 command; if the actual required coherent source cannot fit,
+this is still an unresolved incident, not a successful component live exit.
 
-GREEN must prove complete original/recovered byte coverage, every required
-role/group, retained findings, exact serialized budgets, original session
-independence and existing final authority. Test UTF-8/escaping/exact/+1,
-credential and control exclusions, unsupported Git entries, missing/changed
-source, incomplete second generation, budget refusal before extra spend,
-crash/restart, missing/conflicting cache parts and stale head/protocol.
+## Test-first delivery and readiness gates
 
-Run affected checks through the managed wrapper or immutable hosted CI. Code
-approval, normal merge/updater rollout and replay of the preserved original
-PR1944 command are separate exits. Five autonomous merges, owner CLI/Discord
-coding and fault/unattended acceptance remain #1703 requirements. No benchmark
-is requested.
+For C1, first verify the source/API assumptions, fresh-reader findings and
+every mapped C1 seam. Then use a scripted provider boundary through the real production
+review/recovery adapter and a real immutable disposable Git source >512 KiB.
+The first response requests two distant related Rust items; recovery must
+supply both together with original evidence. A seeded cross-item defect must
+produce changes_requested, not composed local approvals. Record the current
+actual budget/unsupported-protocol failure as RED before implementation.
+
+GREEN must cover full candidate/caller initial coverage, exact requests and
+source/companions, duplicate names, raw identifiers, macro/impl/module context,
+UTF-8/newline/byte offsets, hostile/unknown fields, source-path exclusions,
+unsupported Git entries, absent/malformed source, exact/+1 initial/recovery/
+response/cache budgets, escaping, original findings, format correction,
+incomplete second response and existing completed-cache/crash/binding/native
+identity behavior. Failed-review history, free deterministic hold and wake
+acceptance remain mandatory C2 exits. Verify diagnostic planner/reservation and
+final-authority actual-source consumption. Add a real PR1944-source profile
+probe: its required item pair and request metadata must fit without changing
+the limits. Otherwise this design has not resolved the observed blocker.
+
+Managed wrapper or immutable hosted CI only. Independent code approval, normal
+merge/updater rollout and replay of original PR1944 are separate exits. Source
+issue1952 remains held until a reviewed implementation lane exists. Full
+automatic capacity, productive owner CLI/Discord sessions, five autonomous
+merges and fault/unattended acceptance remain open in #1703; no benchmark.
