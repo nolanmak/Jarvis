@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T20:09:14.582094+00:00",
+  "workflow": "nolanmak/jarvis/pr/1954",
+  "process_observation": {
+    "pid": 2237426,
+    "start_ticks": 639822687,
+    "live": true,
+    "ownership_record_matches_workflow": true,
+    "ownership_generation": 1
+  },
+  "native_tool_audit": {
+    "record_count": 134,
+    "tool_event_count": 63,
+    "tool_counts": {
+      "mcp__jarvis__Bash": 31,
+      "mcp__jarvis__Read": 15,
+      "mcp__jarvis__Grep": 9,
+      "mcp__jarvis__Edit": 6,
+      "mcp__jarvis__Glob": 1,
+      "mcp__jarvis__Write": 1
+    },
+    "latest_tool_at": "2026-11-09T20:08:06.333477577+00:00",
+    "latest_cargo_test_at": "2026-11-09T20:08:06.333477577+00:00"
+  },
+  "limits": [
+    "Tool audit events prove recent activity, not successful test results or accepted review.",
+    "A Cargo mention does not establish a completed build or GREEN.",
+    "No original prompt, tool arguments, output, native session identifier or audit path is published.",
+    "This read-only observation does not reset, cancel or duplicate the original selected attempt.",
+    "The exact acceptance failure receipt remains unlocated."
+  ]
+}

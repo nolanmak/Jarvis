@@ -1218,3 +1218,20 @@ criterion. A reviewed coverage/counterexample contract and original evidence
 lineage are required before implementation; this discovery is not a coding
 handoff, permission to alter an enrolled verifier or permission to bypass
 acceptance. Preserve the active attempt while determining its actual failure.
+
+
+## PR1954 has a positively identified live repair runtime
+
+At 20:09:14 UTC, the native launch process remains present and its original
+owned.json binds workflow nolanmak/jarvis/pr/1954, generation 1. Its private
+audit contains 63 tool events, including six edits, with the latest Cargo/test
+invocation at 20:08:06 UTC. [Sanitized process/audit observation](1703-pr1954-live-runtime-observation.json)
+records process birth and counts without disclosing prompt, command arguments,
+private audit paths or native identifiers. This is stronger evidence than the
+selected row or lease alone, and supports continuing to observe the same
+original attempt rather than restarting it.
+
+These events do not prove successful tests, current candidate publication,
+acceptance, review, merge or rollout. The exact failed verifier receipt remains
+unlocated. Published input CI still applies only to 3debdb8d, and the weak
+source-keyword observer discovery remains tracked under #1943.
