@@ -7562,8 +7562,8 @@ pub struct RunReport {
     pub message: String,
     /// True when the builder ran. Only these consume daily budget.
     pub billed: bool,
-    /// #931 — idle-class with a reason: the tick ends here, unbilled, and
-    /// the loop does not spin through its triage burst.
+    /// #931 — idle-class with a reason: the tick ends here without spinning
+    /// through its triage burst. Prior paid work remains independently billed.
     held: bool,
     /// #1532 — this run resumed a sitting draft rather than building a new
     /// issue, so the fair-scheduling debt counter can tell them apart.
@@ -12053,16 +12053,18 @@ impl AutoPrLoop {
                     counter.settle_reservation(&reservation, completed_day, billed);
                     Ok(counter.runs_today(completed_day))
                 })?;
+                // A durable retry may be both paid and held. Settle its
+                // fairness before idle/held controls whether this tick stops.
+                // Keep one debt-accounting site next to compute settlement:
+                // paid resumes owe the issue lane a turn; paid builds settle up.
+                if let Ok(report) = &outcome {
+                    if report.billed {
+                        FairSched::update_persist(&self.fair_path, |fair| fair.record_billed(report.resumed));
+                    }
+                }
                 match outcome {
                     Ok(r) if r.is_idle() => break,
                     Ok(r) if r.billed => {
-                        // The reservation was settled against the actual completion day.
-                        // #1532 — the single debt-accounting site, next to the
-                        // one that spends the budget: a billed resume owes the
-                        // new-issue lane a slot, a billed build settles up.
-                        // Persisted, so it survives the post-merge daemon
-                        // restart exactly as the run count does (#814).
-                        FairSched::update_persist(&self.fair_path, |f| f.record_billed(r.resumed));
                         info!(attempts_today=runs_today, merge_cap=self.daily_cap, "auto-PR: {r}");
                         break;
                     }
