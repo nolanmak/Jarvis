@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T13:11:52.179000+00:00",
+  "parent_issue": 1703,
+  "owner_issue": 1706,
+  "deployed_source": "416f392b17b56b2a43e67a3e430835902387941a",
+  "commands": [
+    {
+      "workflow": "nolanmak/jarvis/pr/1944",
+      "created_at_ms": 1794222618483,
+      "queue_age_ms": 7293696,
+      "last_attempt": null
+    },
+    {
+      "workflow": "nolanmak/jarvis/pr/1945",
+      "created_at_ms": 1794228247166,
+      "queue_age_ms": 1665013,
+      "last_attempt": null
+    }
+  ],
+  "active_workflow": {
+    "id": "nolanmak/jarvis#1943",
+    "generation": 1,
+    "lease_until": 1794230504746,
+    "heartbeat_at": 1794229904746,
+    "progress_at": 1794227221227,
+    "model_calls": 10,
+    "wall_ms": 10322014,
+    "stage": "build",
+    "reason": "acceptance_failed",
+    "next_action": "repair_implementation",
+    "observed_lease_active": true
+  },
+  "source_findings": [
+    {
+      "file": "crates/augmentagent-cli/src/self_improve.rs",
+      "function": "AutoPrLoop::run_builds",
+      "finding": "queue_timer is polled during the inter-attempt wait; the active tick select polls shutdown and tick only."
+    },
+    {
+      "file": "crates/augmentagent-cli/src/self_improve.rs",
+      "function": "run_selected",
+      "finding": "The global RunLock is held for the entire selected attempt, including explicit PR execution."
+    },
+    {
+      "file": "crates/augmentagent-cli/src/self_improve.rs",
+      "function": "AutoPrLoop::run_with",
+      "finding": "Merge reconciliation has an independent future; this does not dispatch queued command work."
+    }
+  ],
+  "limits": [
+    "Observed queue starvation is not proof sufficient spare full-run capacity existed.",
+    "Live worker descendants include running QEMU processes; no hang or safe teardown inferred.",
+    "No queue reset, owner pause, cancellation, private environment copying, second worker or gate bypass performed.",
+    "No fairness implementation or behavioral test pass claimed.",
+    "A fix must preserve the original candidate, positive teardown before lease release, full resource admission, exact-head review and confirmed-merge accounting."
+  ]
+}

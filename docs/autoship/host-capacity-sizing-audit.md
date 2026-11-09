@@ -733,3 +733,33 @@ pending rows is not absence of progress: actual state/confirmed sequence are
 read separately. This establishes transport confirmation, not owner initiation,
 reading, productive coding follow-up, merge or deployed restoration. Complete
 capacity/owner integration and #1703 acceptance remain open.
+
+## Live command starvation during an active builder
+
+[Read-only production evidence](1703-active-build-queue-starvation-proof.json)
+records PR #1944 queued for over two hours and #1945 for over 27 minutes, both
+without a command attempt. The independent worker is live; issue #1943 retains
+a fresh generation-1 lease and active VM descendants. This is not a proven hang.
+
+Source inspection of `AutoPrLoop::run_builds` establishes that queue polling
+occurs only during the wait between attempts. Its active `tick()` select polls
+shutdown and the tick, with no command queue branch. `run_selected` separately
+holds a global execution lock throughout the attempt. Simply adding another
+queue poll or starting another worker cannot establish safe peer execution.
+Independent merge reconciliation already exists but cannot supply the missing
+review/execution attempt for these queued PRs.
+
+This is evidence for the existing #1706 ready-peer requirement, not a new capacity
+policy or an assertion that spare full-run capacity was available. Its fix needs
+a behavioral regression with a progressing long-lived builder, an authorized
+queued PR, explicitly sufficient declared resources and a ten-minute bound. Also
+verify insufficient capacity yields the precise blocker without model spend;
+no duplicate target execution; original work/lease custody survives; owner pause
+and shutdown retain their semantics; upgrades do not cancel an active builder;
+and allowance remains based only on confirmed merges. Test the real command
+selection/execution boundary, rather than source strings or callback count alone.
+The implementation must explicitly resolve the global-lock handoff using existing
+workspace and resource authorities before enabling concurrent execution. No
+whole-run timeout, VM interruption, second supervisor or original-work reset was
+applied. This records a live reproduction; it does not claim RED/GREEN test or
+implementation completion.
