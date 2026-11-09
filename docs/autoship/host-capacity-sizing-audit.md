@@ -46,3 +46,21 @@ Fresh-reader review plus 56 mapped seam checks across 19 focused review groups w
 Specification SHA-256: `37827a3c6b764c27687276f0e451290e2b33b4f31c4cf184d4af8cc42800e072`.
 
 The detailed mapping and focused review notes were retained as session audit artifacts; this repository record preserves coverage and dispositions. Later contract or implementation changes require their own appropriate review and acceptance.
+
+## C0 working checkpoint after issue publication
+
+The separate [working contract](host-capacity-contract.md) now proposes exact
+memory planning/admission equations and nine worked fixtures, and records the
+source-verified native storage producer inventory. The planning audit above does
+not approve that new contract or close #1918.
+
+A fresh-reader checkpoint found one wrong-build ambiguity: Q could have been
+charged against a daemon-only service ceiling for a worker launch. Section 2
+now restricts that check to the new run's actual enforced ancestor chain, with
+cross-service accounting at the real shared aggregate. Seven remaining findings
+correspond to the contract's explicit open gates: storage, observation, other
+resource dimensions, migration, runtime adaptation, rollback and reporting.
+They remain owned by C0 and block downstream implementation. The reviewer found
+the memory arithmetic internally consistent; the author independently recomputed
+all nine numerical fixtures. This is arithmetic/design evidence, not runtime
+test evidence. Full seam review is still required before implementation handoff.
