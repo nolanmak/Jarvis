@@ -64,3 +64,14 @@ They remain owned by C0 and block downstream implementation. The reviewer found
 the memory arithmetic internally consistent; the author independently recomputed
 all nine numerical fixtures. This is arithmetic/design evidence, not runtime
 test evidence. Full seam review is still required before implementation handoff.
+
+The next C0 checkpoint specifies exact fractional CPU conversion, per-run
+maximum versus reserved memory, desired/enforced reload boundaries, and a
+memory/CPU observation protocol with conservative two-pass sampling, a 250 ms
+collection bound, 500 ms freshness and two-attempt limit. Five CPU planning
+fixtures, two reload-boundary cases and the observation boundary arithmetic
+were recomputed. A fresh-reader recheck found no new wrong-build/forced-guess
+findings in these sections. Shared supervisor scope, managed provenance and
+real-entry-point replacement/shrink/cleanup evidence remain implementation
+validation requirements; PID/FD and storage observations remain open C0 work.
+This checkpoint is not the complete-contract seam audit or C0 closure.

@@ -142,7 +142,166 @@ used to invent an admission capacity or force-kill sessions. Any new PSI/event
 based refusal threshold requires a separately specified contract and fixtures;
 this version relies on the hard and available-memory checks above.
 
-## 3. Native storage producer: verified boundaries
+## 3. CPU ceiling and scheduling
+
+C1. CPU bandwidth is a rate ceiling, not a promised minimum throughput or an
+exclusive reservation. In cgroup v2, `cpu.max` is quota/period; cpuset effective
+CPUs restrict placement. Nested ceilings cannot override their ancestors.
+See the [kernel controller contract](https://docs.kernel.org/admin-guide/cgroup-v2.html#cpu).
+Use the effective CPU affinity inherited by this launch, intersected with the
+applicable effective cpuset. Never use the observer terminal's affinity in
+place of the worker/supervisor's. Count logical CPUs; do not assume SMT siblings
+are separate physical cores or promise a performance multiplier.
+
+C2. Retain CPU rates as exact positive rational numbers until conversion to the
+existing integer-percent policy. Let `E_cpu` be the minimum of the usable CPU
+set's cardinality and every finite external quota/period ratio. Verified managed
+output quotas are excluded only when planning their replacement, as for M2.
+Desired managed aggregate quota is `floor(75 * E_cpu)` percent of one CPU.
+The remaining quarter is protected from consumption by Jarvis's managed work;
+this is a bandwidth ceiling, not a reservation the kernel gives to the OS.
+Use a 100000 microsecond period and quota `percent * 1000` microseconds, with
+overflow checks. Flooring never raises a measured ceiling.
+
+C3. Values below 1 percent after this conversion cannot be represented by the
+current supervisor contract and produce `cpu-below-supported-minimum`, with
+the nonzero detected rational rate retained in the observation. They are not
+reported as zero detected CPUs. Larger fractional rates such as half a CPU
+remain supported. The period/quota pair must be accepted and read back on the
+supported host before activation; inability to enforce it is unsupported,
+not an excuse to round upward.
+
+C4. The existing run declaration's CPU value (default 200 percent) is a maximum,
+not mandatory reserved bandwidth. In auto mode, set the run maximum to the
+minimum of that declaration and all currently enforced CPU ceilings on its
+actual ancestor chain, rounded down to a supported integer percent. Also cap
+it at the current recomputed auto budget. Explicit operator maxima still cap
+the result. This clamp must be versioned/visible with desired and effective
+values; fixed mode preserves the old declaration/refusal behavior.
+
+Unlike guest memory, reducing this scheduling ceiling does not resize a guest
+or remove a memory guarantee. No CPU-based concurrency multiplier is inferred:
+admitted runs share their ancestor's quota under the existing fair scheduler.
+Use equal run `cpu.weight` (100); do not infer private progress or paid-call
+permission from a CPU rate. The existing workflow fairness, bounded calls and
+resource cleanup still apply. Instantaneous CPU utilization is not spare quota
+to reserve, and a busy sample cannot erase an existing run's accounting.
+
+### Exact CPU fixtures
+
+No operator override; the managed quotas have been successfully installed/read
+back; run maximum is the default 200 percent. The affinity and cpuset column
+is the final intersection, not the host's total CPU count.
+
+| Effective CPUs in set | External quota/period | E_cpu | Managed percent | Run percent |
+| --- | --- | --- | --- | --- |
+| 8 | unlimited | 8 | 600 | 200 |
+| 8 | 400000/100000 | 4 | 300 | 200 |
+| 2 | 400000/100000 | 2 | 150 | 150 |
+| 8 | 50000/100000 | 1/2 | 37 | 37 |
+| 1 | 1000/100000 | 1/100 | 0 after conversion | refuse; detected 1/100 |
+
+Reload-boundary fixture: desired managed percent=300, currently enforced
+managed percent=100, declared run maximum=200. The run ceiling stays at 100
+until actual reload/readback; a desired increase never grants 200 early.
+If a new external constraint lowers the current budget to 37, the next run
+is capped at 37 even if the old managed aggregate is still 300.
+
+## 4. Memory/CPU observation and freshness
+
+O1. Discovery is a read-only producer. Its private version-1 result contains:
+
+- `schema_version`, `status` (`known`, `unknown`, `unsupported`), a stable
+  `reason_code`, sample start/end CLOCK_BOOTTIME nanoseconds and kernel boot ID.
+- The original worker/supervisor PID plus `/proc/PID/stat` start time, held
+  process identity, UID, cgroup namespace identity and cgroup-v2 mount identity.
+  A numeric PID without its start time and held live identity is insufficient.
+- Policy revision/digest, demand revision/digest and managed-provenance revision.
+  Auto/fixed mode and desired/published/effectively-loaded revisions are distinct.
+- Actual cgroup membership and the complete enclosing chain, identified by
+  held directory descriptors, device/inode, mount identity and namespace. Each
+  node has raw limits, observed charges/cache and a separately justified
+  managed/external classification. Paths alone are not object identities.
+- Physical RAM, MemAvailable, CPU affinity/effective cpuset, exact quota/period
+  rates and per-field errors. Parsed `max` is typed `unlimited`; missing is typed
+  `unknown`. Unknown fields do not contain a fabricated numeric zero.
+- Derived E/H/B and CPU values, existing reservations, proposed complete run
+  demand, every evaluated predicate and all limiting deficits. An observation
+  has no launch-grant field. Public/private projection is specified separately.
+
+O2. The observing context must be the actual worker/supervisor selected by the
+existing worker receipt, or an original child whose inherited membership and
+affinity are verified against it. A CLI observer cannot substitute its own
+environment, cgroup, daemon PID or policy when that receipt is stale/missing.
+Planning an installer output may separately inspect the verified external chain;
+record that as a plan, never as the current worker's effective run observation.
+
+O3. A coherent-enough sample uses this ordered protocol:
+
+1. Open and hold the process/scope identities. Read boot, process start time,
+   membership/namespace, policy/demand/provenance revisions, affinity/cpuset,
+   enclosing object identities and limits (pass A).
+2. Read counters, host availability and reservations. Discovery uses only
+   nonmutating observation APIs: it never invokes storage `Admission::lock`,
+   `claims()`, reconciles CI holds, enables controllers, creates a cgroup, writes
+   policy or publishes a reservation.
+3. Read the same identity/configuration/limit set again (pass B), plus a second
+   counter/availability sample. A/B identities, revisions, membership, affinity,
+   cpuset and raw ceilings must agree. With charges use the greater observed
+   current value and smaller observed reclaimable value; with availability use
+   the smaller sample. Clamp derived non-reclaimable charges at zero.
+4. Sample duration must be at most 250000000 ns. A completed sample is usable
+   only while `now_boottime - start_boottime <= 500000000 ns`, on the same boot,
+   with nondecreasing clock values. At most two full collection attempts are
+   allowed per observation request. A second identity/configuration change or
+   elapsed bound returns `observation-unstable`; unreadable inputs return
+   `observation-unavailable`. Never loop indefinitely to obtain a convenient
+   sample. The caller's bounded helper/watchdog also bounds a nonresponding
+   collector; a response arriving after expiry is not accepted.
+
+This protocol detects replacement and bounds observation age; it is not an
+atomic kernel snapshot or a claim that unrelated applications cannot allocate
+after the read. Ancestor limits and per-run kernel enforcement remain necessary.
+Admission must not reuse a “known” result as an authorization token.
+
+O4. The existing resource admission owner holds its common allocation lock,
+collects/revalidates this evidence in that context, and checks the current
+reservation set and complete demand before publishing the new reservation.
+If the sample expires or any bound identity/revision changes before publication,
+discard it and use the bounded resampling outcome above. Discovery never takes
+that mutating authority merely to offer a status preview.
+
+Before paid model release, the existing original process-group/resource
+boundary verifies actual new-run membership, applied limits and unchanged
+bound policy/demand/managed revisions. A replaced scope, missing readback,
+reduced ancestor or invalidated reservation remains closed with a capacity
+outcome; any created descendants follow checked cleanup/uncertain-hold rules.
+An inspection record or serialized resource facts cannot substitute for the
+original execution authority/handles. Live shrink after admission is still
+possible; existing kernel enforcement and truthful failure recovery handle it.
+
+### Exact observation fixtures
+
+- Collection 100 ms, used at age 400 ms: fresh if every identity/revision still
+  matches. The same result used at age 500 ms is fresh; 500 ms plus 1 ns is stale.
+- A 250 ms collection is within bounds; 250 ms plus 1 ns is not. A late first
+  attempt may retry once; two unstable/late attempts return unknown.
+- PID is reused with another start time, cgroup is replaced at the same path,
+  worker changes namespace/membership, CPU is removed from effective cpuset, or
+  policy changes between A/B: discard that attempt, never join the two versions.
+- Current memory reads 3/4 GiB, reclaimable cache 1/0.5 GiB, host availability
+  10/9 GiB: use charged memory 3.5 GiB and availability 9 GiB.
+- The status collector's cgroup differs from the selected worker: do not use
+  local fallback. Return unknown unless it observes the verified target context.
+- The boot ID changes, clock goes backward or required controller accounting
+  disappears: unknown; previous-boot/timestamp data cannot grant recovery.
+
+O5. Required fields above define the memory/CPU observation contract only.
+Storage mount/volume identity, logical image checks, filesystem/inode/quota
+support and durable reservation observations must be completed below before C0
+closes. A partial memory/CPU result never claims overall capacity is known.
+
+## 5. Native storage producer: verified boundaries
 
 These findings describe the source on the base of documentation PR #1916.
 They are not proof that the current 1 GiB logical session charge bounds physical
@@ -192,7 +351,7 @@ Those are required behaviors, not an approved new ledger format. Exact growth
 budgets, inode/block support, durable representation, writer compatibility,
 lock ordering, publication and release proofs remain C0 work below.
 
-## 4. Open contract checklist and handoff gate
+## 6. Open contract checklist and handoff gate
 
 Memory equations above are proposed engineering decisions with exact fixtures.
 They require fresh-reader review and source/integration validation before C0
@@ -201,10 +360,11 @@ this partial document as the completed contract.
 
 - [ ] R/P: full native storage peak, inode/block limits, shared durable claim
   representation, all-writer compatibility, lock order and crash-safe release.
-- [ ] R: CPU quota/affinity fractions, minimum versus maximum CPU/PID/FD demand,
-  scheduling/fairness and their exact fixture outputs.
-- [ ] R: observation schema, scope identity, monotonic freshness, coherent read
-  protocol and allocation-lock revalidation/replacement rules.
+- [ ] R: PID/FD demand, sizing and admission fixtures; CPU and memory decisions
+  above need complete-vector integration validation.
+- [ ] R: storage observation identity, filesystem/inode/quota/image support,
+  durable reservation visibility and coherent replacement/recovery rules.
+  Memory/CPU observation decisions above still require integration validation.
 - [ ] P: auto/fixed config schema, supported legacy/bound migration, managed
   provenance and publication/reload/uncertainty replay states.
 - [ ] P/E: snapshot configuration coverage, compatibility/rollback rules and
