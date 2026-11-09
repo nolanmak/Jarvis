@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "observed_at_utc": "2026-11-09T12:48:29.350393+00:00",
+  "source": "Production delivery CLI verified bot identity and single-owner private DM; read-only SQL joined receipts against those current routes",
+  "default_configuration": {
+    "accepted": true,
+    "reason": "delivery-default-unchanged"
+  },
+  "explicit_rebindings": [
+    {
+      "workflow": "nolanmak/jarvis/pr/1944",
+      "accepted": true,
+      "reason": "delivery-bound",
+      "execution": "not-started-by-delivery-command"
+    },
+    {
+      "workflow": "nolanmak/jarvis#1943",
+      "accepted": true,
+      "reason": "delivery-bound",
+      "execution": "not-started-by-delivery-command"
+    }
+  ],
+  "routes": [
+    {
+      "workflow": "nolanmak/jarvis/pr/1944",
+      "latest_progress_sequence": 1,
+      "current_verified_route_receipts": [
+        {
+          "state": "confirmed",
+          "count": 1,
+          "last_sequence": 1,
+          "last_confirmed_at_ms": 1794222648161
+        }
+      ]
+    },
+    {
+      "workflow": "nolanmak/jarvis#1943",
+      "latest_progress_sequence": 10,
+      "current_verified_route_receipts": [
+        {
+          "state": "confirmed",
+          "count": 5,
+          "last_sequence": 10,
+          "last_confirmed_at_ms": 1794227238146
+        }
+      ]
+    },
+    {
+      "workflow": "nolanmak/jarvis/pr/1945",
+      "latest_progress_sequence": 1,
+      "current_verified_route_receipts": [
+        {
+          "state": "confirmed",
+          "count": 1,
+          "last_sequence": 1,
+          "last_confirmed_at_ms": 1794228258194
+        }
+      ]
+    }
+  ],
+  "limits": [
+    "No bot, owner, channel or message snowflakes, tokens or message content are published.",
+    "Confirmed receipts establish transport confirmation, not owner reading, coding follow-up, review, merge or rollout.",
+    "Receipts include earlier default-route sends; rebinding itself need not create a new message.",
+    "DeliveryStatus.latest_sequence is the latest pending sequence; null with zero pending does not mean no progress. This proof separately reads actual progress state and matching confirmed sequence."
+  ]
+}

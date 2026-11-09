@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "observed_at_utc": "2026-11-09T12:48:29.350393+00:00",
+  "parent_issue": 1703,
+  "issue": 1942,
+  "pr": 1945,
+  "head": "c5c91de999a7cf4d9525d76dd1e3cb50014a0bdf",
+  "hosted_validation": {
+    "run": 42615684500,
+    "job": 129154844678,
+    "conclusion": "success",
+    "reported_checks_and_statuses": 16,
+    "cli_binary_suite": {
+      "passed": 1759,
+      "failed": 0,
+      "ignored": 33
+    },
+    "submission_integration_suite": {
+      "passed": 21,
+      "failed": 0,
+      "ignored": 0
+    },
+    "new_case_execution_individually_confirmed": true,
+    "log_sha256": "d5b1495eaa35021dfdd14435072905643edb25af27d0f976b5116a80b16c9c6d"
+  },
+  "command": {
+    "repository": "nolanmak/jarvis",
+    "target": {
+      "kind": "pr",
+      "number": 1945
+    },
+    "requested_until": "merged",
+    "request_id": "autoship-recovery-pr1945-20261109",
+    "dry_run_reason": "target-validated",
+    "accepted": true,
+    "joined": false,
+    "workflow": "nolanmak/jarvis/pr/1945",
+    "reason": "queued",
+    "stage": "queued",
+    "complete": false,
+    "worker_state": "unknown",
+    "merge_state": "unknown",
+    "deployment_state": "unknown"
+  },
+  "limits": [
+    "Ready and CI success are not independent accepted code approval.",
+    "Queue acceptance is not worker execution, merge or deployment.",
+    "No original request, workflow, owner hold or PR head was reset.",
+    "Full automatic host capacity, productive owner ingress and live CLI/Discord/shipment/fault/soak acceptance remain open."
+  ]
+}

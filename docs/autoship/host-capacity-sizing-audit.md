@@ -697,3 +697,39 @@ does not diagnose the configured background worker's policy; no environment was
 copied or guard bypassed. The original active issue1943 later showed eight calls
 and acceptance_failed Build, a real change from its earlier seven-call stage.
 Queue acceptance, model work and focused tests remain distinct from shipment.
+
+## Linked-PR repair final hosted verification and delivery check
+
+#1945 at c5c91de999a7cf4d9525d76dd1e3cb50014a0bdf has all 16 reported
+hosted checks/statuses passing. The exact-head log confirms all 1,759 CLI unit
+tests pass, zero failed, 33 existing ignored; all 21 submission integration tests
+pass. New pre-checkpoint CLI/private blockers and authorization priority, four
+pending-publication modes, three approved-remote modes and the actual oversized
+scope-refusal consumer are individually confirmed. The latter now owns the
+real parent mutation fallback, so the fixture proves a child-create claim returns
+before any parent comment/label rather than only testing a transport helper.
+
+The prior ede8a63a full CLI suite already passed 1,755 cases; its CLI integration
+step found a minimal-row fixture becoming unknown with an untyped exit 4. The
+shared fixed command blocker vocabulary now preserves deferred unknown/claim
+status before a checkpoint exists, with valid/unknown/fork/ambiguous CLI cases.
+The following test-only mutable-store compile error was corrected. Managed full
+local attempts ended at storage-busy admission without compilation/execution;
+final broad validation is hosted. No cache, live VM, limit or deployment bypass.
+
+The PR is ready for independent review and its normal production command was
+accepted under autoship-recovery-pr1945-20261109. The
+[command/CI receipt](1703-pr1945-command-proof.json) distinguishes queued from
+execution, review, merge and deployment. The original #1937/#1944 requests and
+active issue1943 were not restarted or reset. CodeRabbit success and no-secret
+Claude no-op are not accepted code review; normal rollout remains pending.
+
+The production delivery CLI verified the configured private owner DM. Its default
+was already correct; explicit bindings for queued PR1944 and active issue1943
+were accepted. A read-only join verifies confirmed actual send receipts against
+those routes; the [delivery proof](1703-private-progress-delivery-proof.json)
+includes no private identities/content. Null latest pending sequence with no
+pending rows is not absence of progress: actual state/confirmed sequence are
+read separately. This establishes transport confirmation, not owner initiation,
+reading, productive coding follow-up, merge or deployed restoration. Complete
+capacity/owner integration and #1703 acceptance remain open.
