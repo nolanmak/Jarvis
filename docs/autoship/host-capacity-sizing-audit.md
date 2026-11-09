@@ -488,3 +488,15 @@ policy change occurred. This closes no full capacity/productive ingress gate.
 The earlier atomic publication repair #1935 at cef4663d now has all 17 reported
 hosted checks/statuses passing, with no submitted reviews. This is hosted CI
 proof, not independent accepted approval, merge, rollout or live acceptance.
+
+## Credential repair required privacy recovery
+
+#1937's first hosted bridge suite passed, but required privacy found a generic
+API-key match on adjacent public OAuth route/client-UUID fixture literals. Head
+b7b3f15b separates those assignments; no scanner rule/allowlist or production
+code changed. The SHA-256-verified pinned gitleaks 8.30.1 scanner passes its exact
+git-archived release tree; all 29 native cases reran green. Hosted bridge-suites,
+privacy and node-release now pass at b7b3f15b (runs 42595275735/42595275315).
+Other hosted jobs remain running with no current failures. Independent accepted
+review, merge and normal rollout remain pending. Capacity integration and
+productive owner ingress remain unfinished; no live policy/state changed.
