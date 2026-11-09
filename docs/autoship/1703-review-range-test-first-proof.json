@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T18:23:53.713823+00:00",
+  "observed_at": "2026-11-09T18:42:37.362724+00:00",
   "parent_issue": 1703,
   "owner_issue": 1709,
   "repair_issue": 1952,
@@ -9,7 +9,7 @@
   "base": "416f392b17b56b2a43e67a3e430835902387941a",
   "head": "9146acb424a52f4e9ef89d28d7bfed0a524eb2f6",
   "branch": "fix/autoship-review-dependency-ranges",
-  "state": "implementation_green_final_boundary_tests_pending",
+  "state": "final_code_tests_green_ci_infrastructure_hold",
   "change": "Extract unchanged production group adapter behind scripted/native transport interface. Add legacy retained-finding control and two new coherent large-file cases; fixture Rust code is actually compiled/executed before scripted review.",
   "expected_red": [
     "related_large_source_items_reach_one_request_and_reject_the_seeded_defect",
@@ -56,9 +56,10 @@
     "limits": "Receipt is owner intent, not native quiescence or resource-release proof."
   },
   "limits": [
-    "Scripted adapter tests do not prove native/model review or actual PR1944 incident acceptance.",
-    "Implementation is pending hosted compile/tests, independent review, merge and normal updater rollout.",
-    "C2 failed-history/free holds/wake, actual original PR1944 dependency capture and full1703 exits remain required."
+    "Final code tests are GREEN; the required Linux aggregate is not. No complete CI pass or accepted independent review is claimed.",
+    "Ready-for-review and normal queue submission may proceed with the infrastructure hold explicit; neither may waive CI or authorize a merge.",
+    "Scripted adapter tests do not prove actual native model review or original PR1944 incident acceptance.",
+    "Independent review, normal merge/updater rollout, actual1944 replay, C2 and all parent1703 live exits remain required."
   ],
   "additional_red": {
     "head": "b4605e45bca46277b8cfc6ff2249bd535069c6ca",
@@ -84,7 +85,7 @@
   },
   "implementation": {
     "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
-    "state": "final_boundary_tests_pushed_pending_exact_head_ci",
+    "state": "final_code_tests_green_required_ci_infrastructure_hold",
     "changes": [
       "Strict typed incomplete source requests with legacy path compatibility",
       "Exact immutable regular Git Rust items with container headers, or UTF-8 byte intervals",
@@ -103,7 +104,9 @@
       "git diff --check"
     ],
     "green_claimed": false,
-    "run": 42673227287
+    "run": 42673227287,
+    "code_tests_green": true,
+    "all_required_ci_green": false
   },
   "implementation_validation": [
     {
@@ -159,6 +162,34 @@
       },
       "scope": "Includes assertion that expanded initial context cannot claim global completeness while caller groups may be streamed separately.",
       "log_sha256": "0ee3c2b6e2a0733b8d5bc89a935fb26764c3052b38665ed1446f8c265e193675"
+    },
+    {
+      "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+      "run": 42673227287,
+      "attempt": 2,
+      "job": 129350959940,
+      "state": "completed",
+      "conclusion": "failure",
+      "targeted_crate_tests": "success",
+      "cli_unit_result": {
+        "passed": 1758,
+        "failed": 0,
+        "ignored": 33
+      },
+      "new_exact_boundary_cases": [
+        "review_response_accepts_exact_byte_limit_and_refuses_one_more",
+        "review_fragment_writer_accepts_exact_limit_and_refuses_extra_byte_without_publication",
+        "exact_serialized_initial_and_recovery_request_limits_include_system_bytes",
+        "all_matching_requested_items_must_fit_before_another_observation"
+      ],
+      "linux_aggregation": "failure",
+      "missing_jobs": [
+        "apple-notes.yml: exporter",
+        "bridge-suites.yml: bridge-suites",
+        "model-router.yml: codex-redirect"
+      ],
+      "cause": "Missing jobs in finished workflows with public Internal server error annotations; GitHub status reports an active major Actions/Checks API outage.",
+      "log_sha256": "63103ab9622264f4b98631d25c32dec39075d6da3409bff578d17c7c1cd31f89"
     }
   ],
   "submission_preflight": {
@@ -243,5 +274,15 @@
         }
       ]
     }
+  },
+  "provider_incident": {
+    "source": "https://www.githubstatus.com/api/v2/summary.json",
+    "incident": "https://www.githubstatus.com/incidents/tp8cghg7tlc4",
+    "name": "Incident with Actions and Checks API",
+    "reported_actions_status": "major_outage",
+    "reported_incident_status": "investigating",
+    "reported_started_at": "2026-11-09T18:12:37.232Z",
+    "source_updated_at": "2026-11-09T18:24:51.616Z",
+    "retry_policy": "No further blind retries while the provider reports an outage. Recover only terminal failed workflows and recheck the full required Linux aggregate after service recovery; do not waive missing jobs."
   }
 }

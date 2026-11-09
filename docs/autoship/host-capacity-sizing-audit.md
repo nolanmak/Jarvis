@@ -1068,3 +1068,20 @@ normal rerun requests were accepted. Targeted attempt2 is authoritatively
 queued on that unchanged head; no observation timeout caused a restart, no
 source changed and no required check was skipped. Final validation remains
 pending;1754-test GREEN on7812314e remains correctly scoped to that head.
+
+## Final C1 code tests GREEN; required Linux gate remains held
+
+On final head3debdb8d, targeted attempt2/job129350959940 completed the real
+crate-test step successfully:1758 CLI unit tests passed,0 failed,33 existing
+ignored. All four explicit exact-boundary/no-extra-observation additions pass.
+The full job failed only in its later applicable-Linux aggregation: exporter,
+bridge-suites and codex-redirect were missing from finished runs whose public
+workflow annotations report Internal server error. No failed test is inferred.
+
+GitHub's official status reports a major Actions outage and an investigating
+Actions/Checks API incident beginning18:12:37 UTC. We stop blind retries, keep
+all required checks, and record the actual job/log hash in the proof. Code
+GREEN is not full CI GREEN. Ready-for-review/normal submission can proceed
+with this hold explicit; no review, merge, updater rollout or incident exit is
+claimed. The epic1703 checkpoint now links the actual capacity/review issues
+and current PR heads, preserving every original completion requirement.
