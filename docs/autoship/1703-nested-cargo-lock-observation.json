@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T21:36:17.779432+00:00",
+  "related_issue": 1943,
+  "context": "Primary-authored minimal std-only Cargo run executable invokes cargo check in a second std-only fixture using the same inherited managed CARGO_TARGET_DIR.",
+  "result": {
+    "nested_success": true,
+    "timed_out": false
+  },
+  "managed_exit": 0,
+  "deadline_seconds": 10,
+  "managed_worktree_target_reused": true,
+  "log_sha256": "469de6ee17c1984217b6dd430e8a3383b4457a0799c80d845a71a0b7549ffc63",
+  "limits": [
+    "This establishes nested Cargo lock availability for the selected local Cargo/toolchain/managed-cache context only.",
+    "It is not execution under the production verifier sandbox, a Rust private API observer, a baseline receipt or native code approval.",
+    "No new target, storage bypass, original workflow reset or protected verifier edit was used.",
+    "Validate source-copy custody, immutable injected probe bytes, controller output framing and actual baseline/candidate behavior before proposing a runnable adapter."
+  ]
+}

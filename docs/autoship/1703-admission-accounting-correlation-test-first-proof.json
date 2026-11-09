@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T20:51:25.586116+00:00",
+  "observed_at": "2026-11-09T21:36:17.776474+00:00",
   "parent_issue": 1952,
   "component_issue": 1955,
   "pr": 1956,
-  "status": "managed_affected_suites_green_hosted_ci_pending",
+  "status": "managed_and_hosted_green_independent_acceptance_review_pending",
   "contract_checkpoint": "af744bc7",
   "source_base": "416f392b17b56b2a43e67a3e430835902387941a",
   "behavioral_red": {
@@ -29,7 +29,7 @@
       "crates/augmentagent-cli/src/self_improve_workflow.rs"
     ],
     "additional_test_file": "crates/augmentagent-channel-core/src/process_tree.rs",
-    "validation": "all three managed affected suites passed; hosted targeted job still running",
+    "validation": "All three managed affected suites and exact-head hosted job/required Linux aggregate passed.",
     "published_pr_head_at_creation": "2e9b8f0d54c6bca8caa48ae775abd1e11c2af6e0",
     "published_pr_head": "899e14797e25cf9ad8a6234c00c0eb2548cf5e76"
   },
@@ -43,9 +43,9 @@
   "limits": [
     "The managed wrapper registered and used this worktree own target; no borrowed/unregistered target, lock override or manual cleanup.",
     "Source remains frozen until each managed run is terminal.",
-    "Hosted checks, independent code approval, normal merge/updater rollout and real native receipt observation remain pending.",
     "This bounded prerequisite does not close failed-result custody, no-spend holds, automatic host sizing or parent CLI/Discord/merge/fault/soak acceptance.",
-    "Original PR1954 command, branch/body, pinned verifier and native runtime were unchanged."
+    "Original PR1954 command, branch/body, pinned verifier and native runtime were unchanged.",
+    "Independent code approval, normal merge/updater rollout and real native receipt observation remain pending. No PR1956 native command was submitted while preparing a genuine acceptance adapter."
   ],
   "managed_green": {
     "head": "899e14797e25cf9ad8a6234c00c0eb2548cf5e76",
@@ -88,11 +88,37 @@
   },
   "hosted_ci": {
     "head": "899e14797e25cf9ad8a6234c00c0eb2548cf5e76",
-    "pending_run": 42696309670,
-    "pending_job": 129429109096,
-    "job_state": "in_progress",
-    "active_step": "Targeted crate tests",
-    "required_linux_aggregate": "pending",
+    "run": 42696309670,
+    "attempt": 1,
+    "job": 129429109096,
+    "job_state": "completed",
+    "conclusion": "success",
+    "required_linux_aggregate": "success",
+    "all_reported_checkruns": 15,
+    "all_reported_checkruns_success": true,
+    "new_and_extended_test_cases_confirmed": [
+      "self_improve::workflow::tests::model_admission_audit_names_the_committed_accounting_receipt",
+      "tool_audit::tests::model_admission_retains_the_exact_accounting_and_resource_receipts",
+      "tool_audit::tests::model_admission_legacy_and_unbound_callbacks_do_not_invent_correlation",
+      "tool_audit::tests::model_admission_replacement_and_clones_share_one_snapshot_slot",
+      "tool_audit::tests::model_admission_rejects_invalid_receipts_without_undoing_the_callback",
+      "tool_audit::tests::model_admission_callback_and_audit_failures_do_not_publish_success",
+      "process_tree::tests::model_admission_binds_the_exact_supervisor_resource_identity",
+      "process_tree::tests::denied_model_admission_never_dispatches_waiting_provider"
+    ],
+    "full_unit_summaries": [
+      {
+        "passed": 699,
+        "failed": 0,
+        "existing_ignored": 15
+      },
+      {
+        "passed": 1742,
+        "failed": 0,
+        "existing_ignored": 33
+      }
+    ],
+    "log_sha256": "e1011a7aa2a5ba146ea631c185f03c511010f136806be16868594454b8e774bc",
     "independent_approval": false
   }
 }
