@@ -9,6 +9,35 @@ selection of checks. Both `.yml` and `.yaml` files participate in inventory.
 The scheduled scanner, issue implementation automation and advisory Claude
 review are explicitly inventoried as non-validation workflows.
 
+## Current production routing
+
+Autoship's production `verification_gate` and targeted intermediate gate call
+`self_improve_hosted_ci::preflight`. This is a trusted workflow/command-inventory
+check before publication: it starts no candidate process or local Cargo build
+and records hosted verification as pending. It is not passing CI evidence.
+After publication the controller reads GitHub evidence for the exact pushed
+head. The earlier full local CI implementation is used by explicit diagnostic
+interfaces and selected test fixtures; it is not the default production gate.
+These statements are source-verified against main `416f392b`.
+
+The hosted reader selects applicable Ubuntu jobs from the embedded trusted
+inventory and requires privacy and node-release coverage. macOS matrix jobs
+are excluded from that selection, while any additional branch-protection
+required contexts remain mandatory. Pending, missing, stale or changed-policy
+evidence cannot become a pass. Neither a queued macOS workflow alone nor a
+local VM pass substitutes for the applicable hosted Linux jobs.
+
+Builder-directed targeted tests and registered executable acceptance observers
+can still run inside isolated VMs. They are separate from the hosted merge
+signal. A long native builder call therefore does not establish that the old
+full local CI gate is running, nor does completing its local tests establish
+exact-head hosted CI or independent approval.
+
+The local controller interface below documents the retained diagnostic/test
+machinery. It does not promise automatic local fallback when GitHub evidence
+is unavailable. Production holds preserve the candidate and the requirement
+for authoritative hosted results.
+
 To change an existing command, edit its `commands` entry in the JSON. To add a
 workflow/step, write its ordinary `run` body then run:
 
