@@ -560,3 +560,14 @@ recovery. Existing adoption and one baseline correction already exist; neither
 is falsely described as absent. Those real failures must be repaired through the
 normal authority/review/CI path. Full capacity integration, productive owner
 ingress and #1703 CLI/Discord/merge/fault/soak acceptance remain incomplete.
+
+## Initial acceptance repair contract (#1943)
+
+acceptance-verifier-repair-contract.md is separate workflow-repair scope, not a
+capacity C0 exception. Fresh-reader and all 31 narrow mapped seams were checked;
+missing-evidence exit/environment identity/reset ordering/positive-persistence
+crash findings were resolved/rechecked. Source 2ba400d2 preserves the existing
+one-correction behavior in the actual preparation path and its managed CLI RED
+fails because a second independent correction is unreachable. The closed scoped
+contract allows implementation while complete capacity/owner/live requirements
+remain unfinished. Code approval/hosted CI/normal rollout are still required.
