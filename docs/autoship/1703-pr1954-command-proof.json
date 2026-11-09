@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T19:29:47.899660+00:00",
+  "observed_at": "2026-11-09T20:14:47.976428+00:00",
   "parent_issue": 1703,
   "owner_issue": 1709,
   "repair_issue": 1952,
@@ -43,10 +43,10 @@
       "selected_at_ms": 1794251027680,
       "finished_at_ms": null
     },
-    "active_candidate_head": "fcc76249b444b6267eb7107b0480ee339633035f",
-    "actual_native_model_admission_events": 7,
+    "active_candidate_head": "a135f8a29936e659b00d361c924353e3904fe422",
+    "actual_native_model_admission_events": 10,
     "first_native_admission_at_ms": 1794251042483,
-    "last_native_admission_at_ms": 1794251242870
+    "last_native_admission_at_ms": 1794255284109
   },
   "private_progress": {
     "latest_actual_sequence": 6,
@@ -94,12 +94,12 @@
     "Current attempt rows are mutable per workflow and are not a lifetime attempt count; native_model_admitted events are the admission-count evidence.",
     "Actual model admissions prove dispatched model work, not seven completed repairs or an accepted review.",
     "Required CI GREEN applies to published input3debdb8d, not automatically to the worker active candidate head or future publication.",
-    "The workflow is in acceptance implementation repair, not merged/deployed; independent review and new-candidate validation remain required.",
     "Private receipt confirmations establish transport, not owner reading or owner Discord coding initiation/follow-up.",
     "Reference memory probes do not authorize admission/release and do not close automatic host sizing.",
     "No private bot/owner/channel/message/native identifiers, tokens or message content are published.",
     "C2, actual original1944 replay, automatic capacity and full parent live/fault/soak acceptance remain open.",
-    "Keep the queued command/PR input and protected verifier state intact; no duplicate issue builder."
+    "Keep the queued command/PR input and protected verifier state intact; no duplicate issue builder.",
+    "The worker reports verifier_passed and is mapping alignment, not merged/deployed. The source-keyword observer gap is tracked separately; native acceptance does not prove complete behavioral coverage or independent review."
   ],
   "worker_diagnostic": {
     "worker_error_at_utc": "2026-11-09T18:45:21.450880Z",
@@ -133,5 +133,15 @@
       "actual_native_model_admission_events": 0,
       "current_attempt_row_count": 1
     }
+  },
+  "candidate_diff_observation": {
+    "candidate": "a135f8a29936e659b00d361c924353e3904fe422",
+    "against_published_input": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+    "changed_paths": [
+      "autoship_verifiers/observe.py",
+      "crates/augmentagent-cli/src/self_improve_review_plan.rs"
+    ],
+    "no_retained_env_fixture_or_cargo_profile_changes": true,
+    "limit": "Tool mutation requests are not automatically retained candidate edits; this comparison does not prove candidate CI, review or publication."
   }
 }
