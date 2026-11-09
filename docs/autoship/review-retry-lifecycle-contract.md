@@ -106,6 +106,36 @@ RetirePr/ReadyPr/RetargetPr), not native review observations. Do not relabel a
 review call as one of those operations. Identify the real native-dispatch and
 reconciliation producer before specifying the transaction boundary.
 
+## Wake terminology and logical transitions
+
+A **revalidation claim** owns one bounded unpaid check of a held input. It is
+not a model admission or a cleared hold. A **paid episode** is one execution
+of the existing affected pipeline under its normal complete call budgets;
+it may contain several actual native calls. “One wake” means at most one paid
+episode can be opened from a successful claimed revalidation of the current
+input revision, not one unbounded provider permission and not exactly one
+model call. Failed probes never authorize a paid episode.
+
+| Logical state and observation | Required logical result |
+| --- | --- |
+| Held; same inputs and same deterministic failure | Remain held; no paid episode |
+| Held; trusted relevant input changed | One lease-fenced unpaid revalidation claim; hold remains effective |
+| Revalidation still proves unsupported/oversized/denied evidence | Keep the hold with the precise current blocker; retain original immutable facts |
+| Revalidation cannot establish trusted inputs or original result custody | Recoverable unknown/reconciliation hold; zero new model admissions |
+| Revalidation proves the recorded blocker resolved and original outcomes reconciled | Record eligibility for one existing execution claim bound to the exact revalidated inputs; not dispatch permission |
+| Eligible; owner, source, policy or relevant input changes before final launch | Revoke stale eligibility and return to unpaid revalidation; do not spend from the old claim |
+| Eligible; current ownership, exact inputs and all existing guards pass | Open at most one paid episode; actual calls still require final dispatch, native resource and purpose-budget admission |
+| Checking/eligible/running controller crashes | Reconcile original claim and any native submissions before claiming another paid episode; lease expiry alone does not clear uncertainty |
+
+A failed or unavailable unpaid probe may be retried through bounded ordinary
+reconciliation backoff without creating a paid episode or erasing history.
+Repeated status/probe receipts do not change semantic identity. An eligible
+record is neither an owner grant nor an exception to the final dispatch fence.
+Logical eligibility must be consumed atomically with the existing execution
+ownership; the exact schema, native correlation and crash-replay transactions
+remain R/P and R/S implementation gates. These logical states do not authorize
+creating a parallel workflow engine or a separate spend/release ledger.
+
 ## Existing dispatch and uncertainty seams verified
 
 The shared production hook is
@@ -137,6 +167,15 @@ Never conclude no spend from an Err or recover uncertainty merely by calling
 fresh_review_scope again. Exact API extension and crash-safe result handoff
 remain unresolved; do not claim that the in-memory guard closes restart loss.
 
+NativeSession::Drop also marks registered fresh-review runtime paths retired.
+native_vm::prune_and_count can later delete unlocked owned state with retirement
+and completion evidence. Runtime transcript/export availability therefore
+cannot be assumed to outlive the review scope until a later caller persists
+its result. Durable observation custody and that existing retirement lifecycle
+must be joined explicitly. Preserve normal resource/retirement authority; do
+not pin every native runtime forever or count a new facts event as release
+proof. This carrying cost blocks the result-custody interface above.
+
 ## Behavior-first exits for these decisions
 
 1. Real group adapter: valid finding plus denied/oversized dependency produces
@@ -145,6 +184,8 @@ remain unresolved; do not claim that the in-memory guard closes restart loss.
 2. Crash/reopen at first result persistence and dependency refusal: original
    identity/finding survives, or uncertainty blocks reissue; no fabricated
    completed fragment, structured review, amendment or publication verdict.
+   Include fresh-scope return/drop followed by normal native pruning before
+   outer publication: a runtime export is not assumed to remain available.
 3. Actual issue-backed and source-less entry paths: same-input resume performs
    zero additional native admissions, including acceptance repair and QA.
    Current owner/head changes preserve historical facts outside approval history.
@@ -176,3 +217,15 @@ These are engineering obligations owned by the listed existing subsystems,
 not a request for the owner to pick machine limits or waive acceptance. This
 working contract closes the representation and pre-dispatch placement choices;
 it does not claim the remaining interfaces are ready. No benchmark is active.
+
+
+## Working checkpoint audit
+
+[Design audit receipt](1703-review-retry-lifecycle-design-audit.json) records the
+fresh-reader/source passes. A cross-document recording-hook contradiction was
+corrected and rechecked; the explicit unpaid-claim/eligibility/paid-episode
+terminology was independently rechecked. [All 39 mapped seams](1703-review-retry-lifecycle-seam-map.md)
+remain to be judged after their load-bearing interfaces are settled. A map is
+not a completed seam audit. The parked schema, native result custody, complete
+paid-path mapping and transaction questions still prevent implementation
+handoff; this checkpoint does not approve code or claim deployed recovery.

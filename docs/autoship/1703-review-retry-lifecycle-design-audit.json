@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T20:24:52.563856+00:00",
+  "issue": 1952,
+  "component": "C2 review retry lifecycle",
+  "status": "working_contract_not_implementation_ready",
+  "specs": [
+    "review-retry-lifecycle-contract.md",
+    "review-retry-lifecycle-discovery.md"
+  ],
+  "fresh_reader": {
+    "completed": true,
+    "finding_count": 5,
+    "already_parked_load_bearing_gates": 4,
+    "new_cross_document_contradictions": 1,
+    "new_contradictions_resolved_and_rechecked": 1,
+    "resolution": "Discovery behavior test now uses the separate historical-facts reader and excludes current structured/publication hooks.",
+    "wake_addition_recheck": "No new contradiction or overclaim found; unpaid revalidation, input-bound eligibility and one existing paid pipeline episode are distinct."
+  },
+  "conversation_source_pass": {
+    "completed_for_this_working_checkpoint": true,
+    "main_source": "416f392b17b56b2a43e67a3e430835902387941a",
+    "published_c1_source": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+    "verified_boundaries": [
+      "Issue-backed QA and acceptance precede independent review.",
+      "Structured review evidence reaches amendment checks before unavailable handling in both consumer families.",
+      "Current approval history has owner/epoch/binding fences; failed facts must not weaken them.",
+      "WorkflowGuard installs a shared final dispatch observer and a separate provider-only model-accounting observer.",
+      "fresh_review_scope returns actual native identity only on success; in-memory uncertainty does not establish durable result custody.",
+      "Fresh native session drop can mark runtime retired; later normal pruning can remove completed state before an outer caller persists its result."
+    ]
+  },
+  "seam_pass": {
+    "mapping_status": "mapped",
+    "mapped_seams": 39,
+    "map": "1703-review-retry-lifecycle-seam-map.md",
+    "judgments_completed": false,
+    "seam_judgments_completed": 0,
+    "handoff_audit_completed": false
+  },
+  "remaining_gates": [
+    "Exact durable native dispatch/result/resource correlation and crash ordering.",
+    "Bounded schemas, original response/source custody, storage growth, retention and conflict handling.",
+    "Complete paid-entry map, earliest trusted inputs and legacy behavior.",
+    "Transactional claim/eligibility/dispatch replay using existing ownership.",
+    "Compatible public/private projections and real command/Discord tests.",
+    "Behavioral RED/GREEN, hosted CI, independent code review, normal rollout and original-incident acceptance."
+  ],
+  "limits": [
+    "Design audit is not implementation, code approval, model admission, retirement/release authority, review authority or restoration.",
+    "No source implementation, production settings, original command or protected verifier was changed.",
+    "All seam judgments remain required before implementation handoff."
+  ]
+}

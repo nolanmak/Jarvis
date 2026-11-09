@@ -62,9 +62,11 @@ all requested items. No benchmark, approval bypass or allowance reset applies.
   as non-approval facts. The result remains unavailable; no fragment completion,
   merge-ready receipt or recorded publication verdict can be fabricated.
 - Run the issue-backed and source-less entry paths through that failed result.
-  Demonstrate existing recording hooks receive it; do not merely test a new
-  serializer. Advance the owner epoch/head and prove historical facts remain
-  inspectable without appearing in current approval history.
+  Demonstrate their explicit historical-facts reader receives the original
+  separate non-approval observation; current structured/publication hooks must
+  not receive it as ReviewEvidence. Do not merely test a serializer or duplicate
+  an existing successful-review recorder. Advance the owner epoch/head and prove
+  historical facts remain inspectable outside current approval history.
 - Repeat the same durable unsupported input through the actual command worker
   and resume path. Assert zero **additional actual model admissions**, including
   QA/scoping/acceptance repair before the reviewer. Preserve command identity,
