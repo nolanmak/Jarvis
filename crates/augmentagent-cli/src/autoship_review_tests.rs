@@ -1014,3 +1014,13 @@ async fn cached_receipts_cannot_bypass_typed_repair_routing() {
         assert!(adjudication_groups::validate(&cached,&binding(),&[item],&builders(),&ReviewOrigin::RecordedBuilders,&BTreeSet::new()).is_err());
     }
 }
+
+#[test]
+fn review_response_accepts_exact_byte_limit_and_refuses_one_more() {
+    let mut raw=serde_json::json!({"binding":binding(),"decision":"approve","findings":[]}).to_string();
+    raw.push_str(&" ".repeat(MAX_RESPONSE_BYTES-raw.len()));
+    assert_eq!(raw.len(),MAX_RESPONSE_BYTES);
+    assert!(parse_review_pass_with_sources(&raw,&binding(),actor("codex","actual-review"),ReviewRole::Diff,coverage(),&criteria()).unwrap().0.completed);
+    raw.push(' ');
+    assert!(parse_review_pass_with_sources(&raw,&binding(),actor("codex","actual-review"),ReviewRole::Diff,coverage(),&criteria()).is_err());
+}

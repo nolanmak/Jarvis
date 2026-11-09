@@ -524,6 +524,25 @@ mod tests {
         );
     }
     #[test]
+    fn exact_serialized_initial_and_recovery_request_limits_include_system_bytes() {
+        let binding=binding();let contract=BTreeMap::from([("C1".into(),"Preserve source".into())]);
+        let inputs=Inputs {binding:&binding,issue:"boundary",contract:&contract,prior:&[],system_bytes:1024,controller_acceptance:None};
+        let empty=BTreeMap::from([("source:boundary".into(),String::new())]);
+        let overhead=inputs.request(empty.clone(),false,None).unwrap().prompt.len()+inputs.system_bytes;
+        let body="a".repeat(aligned::MAX_PROMPT_BYTES/2-overhead);
+        let original=BTreeMap::from([("source:boundary".into(),body.clone())]);
+        let exact=inputs.pack_initial(&original,false).unwrap();assert_eq!(exact.len(),1);
+        assert_eq!(exact[0].prompt.len()+inputs.system_bytes,aligned::MAX_PROMPT_BYTES/2);
+        let expanded=inputs.pack_initial(&BTreeMap::from([("source:boundary".into(),body+"a")]),false).unwrap();
+        assert!(expanded.len()>1);assert_eq!(expanded.iter().flat_map(|r|r.files.values()).map(String::len).sum::<usize>(),aligned::MAX_PROMPT_BYTES/2-overhead+1);
+        let recovery=serde_json::json!({"attempt":1,"maximum_attempts":1,"missing_sources":[],"previous_findings":[]});
+        let overhead=inputs.request(empty,false,Some(recovery.clone())).unwrap().prompt.len()+inputs.system_bytes;
+        let body="a".repeat(aligned::MAX_PROMPT_BYTES-overhead);
+        let exact=inputs.request(BTreeMap::from([("source:boundary".into(),body.clone())]),false,Some(recovery.clone())).unwrap();
+        assert_eq!(exact.prompt.len()+inputs.system_bytes,aligned::MAX_PROMPT_BYTES);
+        assert!(is_evidence_budget(&inputs.request(BTreeMap::from([("source:boundary".into(),body+"a")]),false,Some(recovery)).err().expect("one byte over must be unavailable")));
+    }
+    #[test]
     fn initial_half_budget_preserves_unicode_source_coordinates_without_omission() {
         let binding=binding();let contract=BTreeMap::from([("C1".into(),"Preserve source".into())]);
         let inputs=Inputs {binding:&binding,issue:"wide source",contract:&contract,prior:&[],system_bytes:1024,controller_acceptance:None};

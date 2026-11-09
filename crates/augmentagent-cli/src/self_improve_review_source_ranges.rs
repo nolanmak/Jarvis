@@ -451,6 +451,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(files.values().next().unwrap(), &body[start..]);
+        request.selector = aligned::ReviewSourceSelector::Bytes {
+            start_byte: 0,
+            end_byte: aligned::MAX_PROMPT_BYTES,
+        };
+        let exact = resolve_review_source_request(root.path(), &head, &request)
+            .await
+            .unwrap();
+        assert_eq!(
+            exact.values().next().unwrap(),
+            &body[..aligned::MAX_PROMPT_BYTES]
+        );
+        request.selector = aligned::ReviewSourceSelector::Bytes {
+            start_byte: 0,
+            end_byte: aligned::MAX_PROMPT_BYTES + 1,
+        };
+        assert!(is_evidence_budget(
+            &resolve_review_source_request(root.path(), &head, &request)
+                .await
+                .unwrap_err()
+        ));
         request.selector = aligned::ReviewSourceSelector::RustItem { name: "cap".into() };
         let error = resolve_review_source_request(root.path(), &head, &request)
             .await
