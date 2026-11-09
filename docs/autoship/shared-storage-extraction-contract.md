@@ -117,7 +117,7 @@ Implementation PR #1931 at b4a77220 preserves the existing authority and
 adapters. Unchanged-main baseline: 11 cleanup tests pass. Final-head combined
 core/CLI managed run: 41 selected tests pass, none ignored, including all 18
 moved cases, actual CLI consumers and both crash-child branches with execution
-markers. Hosted targeted/exporter setup fails before tests on pinned Deno and
-Python release download HTTP 504s; those gates remain unresolved. Independent
-code approval, merge and rollout remain pending. No native enrollment or live
+markers. All 25 current-head hosted checks/statuses pass after pinned-download recovery
+and targeted dependency re-verification. Independent code approval, merge and
+rollout remain pending. No native enrollment or live
 capacity change.

@@ -378,3 +378,15 @@ reservation/transfer/recovery still block production implementation. In
 particular, ledger and rollback-journal writes cannot be authorized by their
 own not-yet-committed row. These obligations remain in #1918/#1920; no DB,
 registry, permission, snapshot or deployed capacity policy was changed.
+
+
+## Shared extraction hosted verification
+
+At source head b4a77220, all 25 reported hosted checks/statuses on #1931 pass.
+The initial pinned Deno/Python HTTP 504 setup failures recovered after direct
+checks of the same assets returned HTTP 200. Exporter passed its failed-job
+retry. Targeted's second attempt passed setup but correctly refused the still-red
+exporter; after exporter recovered, its third attempt passed the full dependency
+verification. No source rewrite or check bypass was used. Independent accepted
+approval, merge and normal rollout remain outstanding; CodeRabbit success is
+not accepted approval. This does not enroll native storage or activate sizing.
