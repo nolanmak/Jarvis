@@ -939,6 +939,8 @@ fn native_capacity_detail(report:&serde_json::Value)->Option<(bool,String)> {
 
 fn capacity_finding(i:&HealthInputs)->Option<Finding> {
     let waiting=i.resource_capacity_waits.unwrap_or(0);
+    let wait_detail=i.resource_capacity_waits.map(|n|format!("{n} workflow(s) waiting on resource capacity."))
+        .unwrap_or_else(||"Workflow wait count unavailable.".into());
     let fix="Inspect native capacity and the workflow's resource refusal. Free disk and reservation budget are separate limits. Preserve owner holds, reservations and accounting; confirm real workflow progress after any approved recovery.".to_owned();
     if i.resource_capacity_wait_error {
         return Some(Finding{severity:Severity::Alert,code:"capacity-state-unavailable",
@@ -946,11 +948,13 @@ fn capacity_finding(i:&HealthInputs)->Option<Finding> {
     }
     match i.native_state_capacity.as_ref().and_then(native_capacity_detail) {
         Some((true,detail))=>Some(Finding{severity:if waiting>0 {Severity::Alert}else{Severity::Warn},code:"native-state-capacity",
-            detail:format!("{detail} {}",i.resource_capacity_waits.map(|n|format!("{n} workflow(s) waiting on resource capacity.")).unwrap_or_else(||"Workflow wait count unavailable.".into())),fix}),
+            detail:format!("{detail} {wait_detail}"),fix}),
         Some((false,detail)) if waiting>0=>Some(Finding{severity:Severity::Alert,code:"resource-capacity-waiting",
             detail:format!("{waiting} workflow(s) still waiting on resource capacity. {detail} Storage headroom alone does not prove workflow readiness or recovery."),fix}),
+        Some((false,detail)) if i.resource_capacity_waits.is_none()=>Some(Finding{severity:Severity::Warn,code:"capacity-state-unavailable",
+            detail:format!("{wait_detail} {detail} Storage headroom does not establish queue health."),fix}),
         None if waiting>0 || i.native_state_capacity.is_some()=>Some(Finding{severity:if waiting>0 {Severity::Alert}else{Severity::Warn},code:"native-capacity-unobserved",
-            detail:format!("Native capacity observation unavailable; {waiting} observed workflow(s) waiting on resource capacity. No headroom or readiness is established."),fix}),
+            detail:format!("Native capacity observation unavailable. {wait_detail} No headroom or readiness is established."),fix}),
         _=>None,
     }
 }
@@ -1149,6 +1153,21 @@ mod tests {
         assert!(analyze(&input,&Thresholds::default()).iter().any(|f|f.code=="native-capacity-unobserved"));
         input.resource_capacity_wait_error=true;
         assert!(analyze(&input,&Thresholds::default()).iter().any(|f|f.code=="capacity-state-unavailable" && f.severity==Severity::Alert));
+    }
+
+    #[test]
+    fn native_capacity_health_never_turns_missing_queue_evidence_into_zero_waits() {
+        let mut input=healthy();
+        input.native_state_capacity=Some(native_capacity_sample(16*1024u64.pow(3)));
+        let found=analyze(&input,&Thresholds::default());
+        let finding=found.iter().find(|f|f.code=="capacity-state-unavailable")
+            .expect("storage headroom hid the absent protected queue observation");
+        assert_eq!(finding.severity,Severity::Warn);
+        input.native_state_capacity=Some(serde_json::json!({"status":"policy-invalid","live_verified":false}));
+        let found=analyze(&input,&Thresholds::default());
+        let finding=found.iter().find(|f|f.code=="native-capacity-unobserved").unwrap();
+        assert!(finding.detail.contains("Workflow wait count unavailable"),"{}",finding.detail);
+        assert!(!finding.detail.contains("0 observed"),"{}",finding.detail);
     }
 
     #[test]
