@@ -12227,7 +12227,7 @@ mod tests {
 
     // A paid attempt may still be a durable hold (for example CI infrastructure
     // retry). Exercise the real worker settlement and persisted fairness state.
-    async fn assert_deferred_turn_fairness(resumed: bool, billed: bool) {
+    async fn assert_turn_fairness(resumed: bool, billed: bool, held: bool) {
         use super::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let state = tempfile::tempdir().unwrap();
@@ -12251,7 +12251,7 @@ mod tests {
             async move {
                 Ok(RunReport {
                     message: "durable verification retry; candidate preserved".into(),
-                    billed, held: true, resumed,
+                    billed, held, resumed,
                 })
             }
         }, || async { 0 });
@@ -12276,18 +12276,28 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn paid_deferred_pr_updates_resume_debt_without_spending_merge_allowance() {
-        assert_deferred_turn_fairness(true, true).await;
+        assert_turn_fairness(true, true, true).await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn paid_deferred_build_clears_resume_debt() {
-        assert_deferred_turn_fairness(false, true).await;
+        assert_turn_fairness(false, true, true).await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn unpaid_deferred_turn_preserves_resume_debt() {
-        assert_deferred_turn_fairness(true, false).await;
-        assert_deferred_turn_fairness(false, false).await;
+        assert_turn_fairness(true, false, true).await;
+        assert_turn_fairness(false, false, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paid_completed_pr_settles_resume_debt_once() {
+        assert_turn_fairness(true, true, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paid_completed_build_clears_resume_debt() {
+        assert_turn_fairness(false, true, false).await;
     }
 
     // #1705: an infrastructure fault must never exhaust the shipping allowance.
@@ -14357,8 +14367,8 @@ CODEX-REVIEW: lgtm").0);
 
     /// #1532, structural: the two halves of the interleave in `run_once` —
     /// the resume-first block yields its slot when a build is owed, and the
-    /// reserved slot falls back to a resume rather than idling. Plus: the
-    /// debt is accounted exactly once, where the budget is spent.
+    /// reserved slot falls back to a resume rather than idling. Fairness
+    /// settlement is covered by the real worker's paid/held turn tests.
     #[test]
     fn the_reserved_build_slot_yields_to_a_waiting_draft_before_idling() {
         let src = include_str!("self_improve.rs");
@@ -14376,17 +14386,6 @@ CODEX-REVIEW: lgtm").0);
         let idle = none_arm.find("return Ok(RunReport::idle());").expect("the idle exit");
         assert!(fallback < resume && resume < idle, "fall back to a draft, then idle");
 
-        // One debt-accounting site, in the loop's billed arm.
-        let production = &src[..src.find("mod tests {").unwrap()];
-        assert_eq!(production.matches("f.record_billed(").count(), 1);
-        let loop_start = production.find("async fn run_builds<F, T>(").expect("run_builds");
-        let billed = production[loop_start..].find("Ok(r) if r.billed =>").expect("billed arm");
-        let record = production[loop_start..].find("f.record_billed(r.resumed)").expect("debt update");
-        assert!(billed < record, "the debt update follows the billed arm");
-        assert!(
-            !production[loop_start + billed + 1..loop_start + record].contains("Ok(r)"),
-            "the debt update sits inside the billed arm, not a later one"
-        );
     }
 
     #[test]
