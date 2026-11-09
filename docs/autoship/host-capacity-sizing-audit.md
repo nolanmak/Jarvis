@@ -390,3 +390,21 @@ exporter; after exporter recovered, its third attempt passed the full dependency
 verification. No source rewrite or check bypass was used. Independent accepted
 approval, merge and normal rollout remain outstanding; CodeRabbit success is
 not accepted approval. This does not enroll native storage or activate sizing.
+
+
+## Bounded native initrd producer contract (#1932)
+
+Fresh-reader and all 17 mapped seams were checked against main 416f392b's
+native boot_entries/main and shared newc encoder. Two findings were corrected
+and rechecked: the current final seed can be 65 MiB pending separate #1927,
+so the new 128 MiB archive cap is one total ceiling with no 64+64 guarantee;
+held-source reads must reject observed shrink/short EOF as well as growth.
+The closed component bounds encoded data, not whole-launch physical growth,
+aggregate memory, original custody, durable release or activation.
+
+Tests were defined first in jarvis-native-initrd-budget. Four additive-contract
+cases reproduce three missing native refusal assertions plus absence of the
+new shared codec argument. This is not a claimed old enforced-limit defect.
+Production-path/per-category, source mutation/nonregular, output failure,
+compatibility and full suites remain required implementation evidence. No VM,
+credentials, model, production policy or services were changed.

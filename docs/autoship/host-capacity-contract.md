@@ -781,6 +781,11 @@ supervisor `d30dfa6bbdcbca8aa36d87b84fefb382b91f5658`, run declarations
 `73b0fe627e702dab955f39d5e47735ca424c5bf9`. Later source revisions must be
 rechecked rather than inheriting these findings as current evidence.
 
+The independently bounded boot-archive component is scoped in
+[native-initrd-budget-contract.md](native-initrd-budget-contract.md), #1932.
+Fresh-reader/all 17 mapped seam review permits its narrow producer work; it
+does not close whole-launch growth, physical profiles or complete C0/C2.
+
 Required producer behavior before C2 can claim bounded growth:
 
 - Declare complete active peak by filesystem, including simultaneous binary,
