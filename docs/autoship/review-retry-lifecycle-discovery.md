@@ -3,8 +3,8 @@
 Status: source inventory and required tests, **not an implementation-ready
 contract**. Owner #1709 / #1952, scheduling #1706, parent #1703. This discovery
 uses implementation branch head `7d865307b03a0206fb1f1d0764e0e08009a685f0`
-(main base `416f392b17b56b2a43e67a3e430835902387941a`). C1 draft #1954 remains
-unvalidated and unmerged. This document grants no implementation exception.
+(main base `416f392b17b56b2a43e67a3e430835902387941a`). C1 #1954 has published-input hosted GREEN at 3debdb8d and remains
+unmerged; its original native command is in acceptance repair. This document grants no implementation exception.
 
 The [coherent source contract](review-dependency-recovery-contract.md) separates
 successful bounded recovery (C1) from failed observations, unchanged paid
@@ -107,3 +107,14 @@ producers before implementing C2. Full #1952 closure also requires capture/repla
 of PR1944's actual typed request after normal C1 rollout; a made-up source pair
 cannot stand in for that incident. Automatic host capacity and all #1703 live
 acceptance remain separate unfinished requirements.
+
+
+## Working C2 decisions after source recheck
+
+[Working lifecycle contract](review-retry-lifecycle-contract.md) chooses a
+separate failed-observation type and pre-dispatch hold identity, with an explicit
+wake/revalidation matrix. It remains unready for implementation. Both callers
+consult adjudicated amendment before unavailable handling; its complete-role
+validator must remain intact. The existing GitHub operation table is not a
+native observation ledger. Exact native dispatch/result custody and complete
+paid-path admission mapping are the next load-bearing source tasks.
