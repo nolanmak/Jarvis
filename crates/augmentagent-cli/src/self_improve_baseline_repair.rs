@@ -6,20 +6,31 @@ const RECORD_LIMIT:usize=2*1024*1024;
 
 #[derive(Clone,Copy,Debug,Serialize,Deserialize,PartialEq,Eq)]
 #[serde(rename_all="kebab-case")]
-pub(super) enum FailureKind {AlreadyPasses,NotReproduced,UnexpectedFailure}
+pub(in crate::self_improve) enum FailureKind {AlreadyPasses,NotReproduced,UnexpectedFailure}
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub(super) enum Hold {Exhausted,EvidenceUnknown,ContractInvalid}
+pub(super) enum Hold {Exhausted(FailureKind),EvidenceUnknown,ContractInvalid,InfrastructureUnavailable}
 impl Hold {
     pub(super) fn reason(self)->&'static str {
         match self {
-            Self::Exhausted=>"acceptance_verifier_repair_exhausted",
+            Self::Exhausted(_)=>"acceptance_verifier_repair_exhausted",
             Self::EvidenceUnknown=>"acceptance_verifier_evidence_unknown",
             Self::ContractInvalid=>"acceptance_contract_invalid",
+            Self::InfrastructureUnavailable=>"acceptance_verifier_infrastructure_unavailable",
         }
     }
     pub(super) fn action(self)->&'static str {
-        match self {Self::EvidenceUnknown=>"await_original_evidence_recovery",_=>"await_acceptance_input_change"}
+        match self {
+            Self::EvidenceUnknown=>"await_original_evidence_recovery",
+            Self::InfrastructureUnavailable=>"await_verifier_infrastructure_recovery",
+            _=>"await_acceptance_input_change",
+        }
+    }
+    /// The diagnosis the spent budget ended on. Only a harness that actually
+    /// executed and still did not reproduce the reported behavior is evidence
+    /// about the source itself.
+    pub(super) fn exhausted_kind(self)->Option<FailureKind> {
+        match self {Self::Exhausted(kind)=>Some(kind),_=>None}
     }
 }
 impl std::fmt::Display for Hold {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"{}: {}",self.reason(),self.action())}}
@@ -85,9 +96,12 @@ where R:Fn(&str)->Result<Option<String>>, W:Fn(&str,&str)->Result<()>,
             Ok(baseline)=>return Ok((proposal,baseline)),
             Err(error)=> {
                 let Some(failed)=error.downcast_ref::<BaselineNotRed>() else {return Err(error)};
-                let Some(kind)=failed.kind else {return Err(error)}; // infrastructure
+                let (kind,detail)=(failed.kind,failed.detail.clone());
+                // Infrastructure observed nothing about this candidate: keep the
+                // slot and the original context, and name the typed blocker.
+                let Some(kind)=kind else {return Err(error.context(Hold::InfrastructureUnavailable))};
                 let failure=Failure {version:1,epoch:epoch.into(),slot,proposal_sha256,
-                    prior_sha256:failures.last().map(|(_,digest)|digest.clone()),kind,detail:failed.detail.clone()};
+                    prior_sha256:failures.last().map(|(_,digest)|digest.clone()),kind,detail};
                 let raw=serde_json::to_string(&failure)?;
                 ensure!(raw.len()<=RECORD_LIMIT,"baseline failure record exceeds bound");
                 write(&key(epoch,slot),&raw)?;
@@ -95,7 +109,7 @@ where R:Fn(&str)->Result<Option<String>>, W:Fn(&str,&str)->Result<()>,
             },
         }
     }
-    Err(Hold::Exhausted.into())
+    Err(Hold::Exhausted(failures.last().context("exhausted repair lacks a failed observation")?.0.kind).into())
 }
 
 #[cfg(test)]
@@ -147,7 +161,7 @@ mod tests {
             let result=run(&"b".repeat(64),read(&records),write(&records),
                 |slot,cached,_| {assert_eq!(cached,pass==1);async move {Ok(slot)}},
                 |_| {calls.fetch_add(1,Ordering::SeqCst);async {Err::<(),_>(rejected())}}).await;
-            assert_eq!(result.unwrap_err().downcast_ref::<Hold>(),Some(&Hold::Exhausted));
+            assert_eq!(result.unwrap_err().downcast_ref::<Hold>(),Some(&Hold::Exhausted(FailureKind::UnexpectedFailure)));
         }
         assert_eq!(calls.load(Ordering::SeqCst),LIMIT as usize);
         assert_eq!(records.lock().unwrap().len(),LIMIT as usize);
@@ -197,7 +211,27 @@ mod tests {
         let result=run(&"f".repeat(64),|_|Ok(None),|_,_|panic!("infrastructure is not an invalid candidate"),
             |slot,_,_|async move {Ok(slot)},
             |_|async {Err::<(),_>(BaselineNotRed {detail:"infrastructure".into(),kind:None}.into())}).await;
-        assert!(result.unwrap_err().downcast_ref::<BaselineNotRed>().is_some());
+        let error=result.unwrap_err();
+        assert_eq!(error.downcast_ref::<Hold>(),Some(&Hold::InfrastructureUnavailable));
+        assert!(error.downcast_ref::<BaselineNotRed>().is_some(),"original failure context must survive privately");
+    }
+
+    /// #1943 — the spent budget reports the diagnosis it ended on. Only a
+    /// harness that ran and did not reproduce the reported behavior is evidence
+    /// about the source; unavailable infrastructure stays unknown.
+    #[tokio::test]
+    async fn exhaustion_reports_its_final_diagnosis_rather_than_a_bare_budget_code() {
+        let records=Records::default();
+        let result=run(&"d".repeat(64),read(&records),write(&records),|slot,_,_|async move {Ok(slot)},
+            |_|async {Err::<(),_>(BaselineNotRed {detail:"valid harness observed no red".into(),
+                kind:Some(FailureKind::NotReproduced)}.into())}).await;
+        let error=result.unwrap_err();
+        assert_eq!(error.downcast_ref::<Hold>().and_then(|hold|hold.exhausted_kind()),Some(FailureKind::NotReproduced));
+        assert_eq!(error.downcast_ref::<Hold>().unwrap().reason(),"acceptance_verifier_repair_exhausted");
+        let result=run(&"e".repeat(64),read(&records),write(&records),|slot,_,_|async move {Ok(slot)},
+            |_|async {Err::<(),_>(rejected())}).await;
+        assert_eq!(result.unwrap_err().downcast_ref::<Hold>().and_then(|hold|hold.exhausted_kind()),
+            Some(FailureKind::UnexpectedFailure),"a broken fixture is not behavioral evidence");
     }
 
     /// Durability over the real immutable store: a reopened database and a
@@ -219,7 +253,7 @@ mod tests {
                 |key,raw|store.lock().unwrap().record_scope_stage_response(&lease,&binding,key,raw,now+1),
                 |slot,cached,_|async move {assert_eq!(cached,pass==1);Ok(slot)},
                 |_| {observations.fetch_add(1,Ordering::SeqCst);async {Err::<(),_>(rejected())}}).await;
-            assert_eq!(result.unwrap_err().downcast_ref::<Hold>(),Some(&Hold::Exhausted));
+            assert_eq!(result.unwrap_err().downcast_ref::<Hold>(),Some(&Hold::Exhausted(FailureKind::UnexpectedFailure)));
             let store=store.into_inner().unwrap();
             assert_eq!(store.snapshot("owner/repo#1").unwrap().unwrap().model_calls,0);
             assert_eq!(store.query_connection(|conn|Ok(conn.query_row("SELECT COUNT(*) FROM scope_stage_response",[],|row|row.get::<_,u32>(0))?)).unwrap(),LIMIT);

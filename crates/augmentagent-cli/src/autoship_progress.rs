@@ -109,7 +109,8 @@ fn code(value:&str,fallback:&str)->String {
         "merge-allowance-exhausted"|"merge-reconciliation-required"|
         "review_changes_requested"|"ci_failed"|"merge_conflict"|"head_changed"|
         "acceptance_verifier_repair_exhausted"|"acceptance_verifier_evidence_unknown"|
-        "acceptance_contract_invalid"|"await_acceptance_input_change"|"await_original_evidence_recovery"|
+        "acceptance_contract_invalid"|"acceptance_verifier_infrastructure_unavailable"|
+        "await_acceptance_input_change"|"await_original_evidence_recovery"|"await_verifier_infrastructure_recovery"|
         "retry_worker_attempt"|"inspect_workflow"|"await_worker") {value.into()} else {fallback.into()}
 }
 
@@ -132,7 +133,8 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     let initial_verifier_hold=checkpoint.as_ref().is_some_and(|c|c.stage==Stage::Scope && matches!(
         (c.next.reason.as_str(),c.next.action.as_str()),
         ("acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid","await_acceptance_input_change")|
-        ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")));
+        ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
+        ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery")));
     if initial_verifier_hold {kind="blocked".into();}
     if source=="command_attempt_finished" && !initial_verifier_hold {
         if let Some((outcome,why,at))=&attempt {
@@ -199,7 +201,8 @@ mod tests {
     fn initial_verifier_holds_remain_precise_after_command_attempt_finishes() {
         for (reason,action) in [("acceptance_verifier_repair_exhausted","await_acceptance_input_change"),
             ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery"),
-            ("acceptance_contract_invalid","await_acceptance_input_change")] {
+            ("acceptance_contract_invalid","await_acceptance_input_change"),
+            ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery")] {
             let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
             let mut store=WorkflowStore::open(&path).unwrap();
             let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(1),

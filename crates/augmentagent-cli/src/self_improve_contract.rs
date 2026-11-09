@@ -17,6 +17,7 @@ mod amendment;
 mod scope_authority;
 #[path = "self_improve_baseline_repair.rs"]
 mod initial_repair;
+pub(super) use initial_repair::FailureKind;
 #[path = "self_improve_verifier_checkout.rs"]
 pub(super) mod verifier_checkout;
 pub(super) use scope_authority::run as scope_original;
@@ -1113,6 +1114,12 @@ fn initial_scope_error(error:anyhow::Error)->anyhow::Error {
     } else if scope_authority::completed_exhaustion(&error) {
         initial_repair::Hold::ContractInvalid.into()
     } else {error}
+}
+
+/// The diagnosis a spent bounded repair ended on, for callers that route on it.
+/// `None` for every other refusal, including unavailable infrastructure.
+pub(super) fn exhausted_repair(error:&anyhow::Error)->Option<FailureKind> {
+    error.downcast_ref::<initial_repair::Hold>().and_then(|hold|hold.exhausted_kind())
 }
 
 pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,error:&anyhow::Error)->Result<Option<RunReport>> {

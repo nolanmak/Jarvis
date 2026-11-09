@@ -8125,12 +8125,23 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         issue.number, candidate_base, acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria, &workflow_guard).await {
         Ok(prepared) => prepared,
         Err(error) => {
-            if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}
-            if error.downcast_ref::<acceptance::BaselineNotRed>().is_some() {
-                let children=acceptance::readiness::decompose_unverifiable(repo_root,&worktree,&issue,&criteria,&format!("{error:#}"),&mut workflow_guard).await?;
-                if !children.is_empty() {return Ok(RunReport::triage(format!("issue #{}: acceptance split into observable children {:?}",issue.number,children)));}
+            // The bounded independent correction is spent and the registered
+            // harness did execute on the original base without reproducing the
+            // reported behavior: the request as written has no observable red,
+            // which is what the observable decomposition localizes. A broken
+            // fixture, an already-green base or unavailable infrastructure says
+            // nothing about the source, so it holds instead of rewriting the
+            // owner's request.
+            if acceptance::exhausted_repair(&error) == Some(acceptance::FailureKind::NotReproduced) {
+                match acceptance::readiness::decompose_unverifiable(repo_root,&worktree,&issue,&criteria,&format!("{error:#}"),&mut workflow_guard).await {
+                    Ok(children) if !children.is_empty() => return Ok(RunReport::triage(format!("issue #{}: acceptance split into observable children {:?}",issue.number,children))),
+                    Ok(_) => {}
+                    // The spent budget remains the durable blocker; a split that
+                    // cannot be produced holds on it rather than charging a run.
+                    Err(split) => warn!(issue=issue.number,"observable decomposition unavailable: {split:#}"),
+                }
             }
-
+            if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}
             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
             return Err(error).context("independent acceptance registration requires scoped retry");
         }
@@ -15093,6 +15104,64 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(!h.billed);
         assert!(h.is_idle());
         assert_ne!(h.message, IDLE_MSG, "the hold names its reason");
+    }
+
+    /// #1943 — routing for a refused initial acceptance registration. Only a
+    /// spent repair budget whose harness ran and still observed no red may
+    /// rewrite the owner's request into observable children; a broken fixture
+    /// or unavailable infrastructure holds on its typed blocker instead.
+    #[test]
+    fn only_a_spent_not_reproduced_budget_decomposes_a_refused_registration() {
+        let src = include_str!("self_improve.rs");
+        let body = &src[src.find("async fn run_selected(").expect("run_selected")..];
+        let decompose = body.find("decompose_unverifiable(").expect("observable decomposition");
+        let route = body[..decompose]
+            .rfind("acceptance::exhausted_repair(")
+            .expect("decomposition needs the typed repair diagnosis");
+        assert!(
+            body[route..decompose].contains("FailureKind::NotReproduced"),
+            "only a not-reproduced diagnosis may decompose the source"
+        );
+        let hold = body.find("acceptance::hold_initial_error(").expect("typed hold");
+        assert!(
+            decompose < hold,
+            "an exhausted budget must route before the generic hold swallows it"
+        );
+    }
+
+    /// #1943 — a refused registration earns nothing: it never reaches the merge
+    /// dispatch the daily allowance is reserved for, and that dispatch still
+    /// needs the registered contract's own proof of the candidate.
+    #[test]
+    fn a_refused_acceptance_registration_earns_no_shipping_credit() {
+        let src = include_str!("self_improve.rs");
+        let body = &src[src.find("async fn run_selected(").expect("run_selected")..];
+        let refusal = body
+            .find("independent acceptance registration requires scoped retry")
+            .expect("registration refusal");
+        let merge = body.find("OperationKind::MergePr").expect("merge dispatch");
+        let proof = body[..merge]
+            .rfind("acceptance::assert_receipt_current(")
+            .expect("merge needs current acceptance evidence");
+        assert!(refusal < proof, "a refused registration cannot reach the merge gate");
+        assert!(
+            src.contains(".merge_allowance((self.clock)().timestamp_millis(), self.daily_cap)?"),
+            "the loop's shipping allowance gate moved"
+        );
+        for report in [
+            RunReport::held("acceptance verifier infrastructure unavailable".into()),
+            RunReport::triage("acceptance split into observable children".into()),
+        ] {
+            assert!(!report.billed, "a refusal must not charge the cap: {}", report.message);
+        }
+        let gate = include_str!("self_improve_contract.rs");
+        let gate = &gate[gate
+            .find("async fn assert_verifier_receipt_current(")
+            .expect("receipt gate")..];
+        assert!(
+            gate[..gate.find("\n#[cfg(test)]").unwrap_or(gate.len())].contains("candidate_passes("),
+            "the receipt gate stopped proving the candidate against the registered contract"
+        );
     }
 
     // Structural (#931 → #932): the red-main check is the first thing
