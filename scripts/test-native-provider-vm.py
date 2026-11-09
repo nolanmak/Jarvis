@@ -259,6 +259,71 @@ ready.with_name('actual-model-dispatch').write_text('called')
                 vm.runtime_seed(root, None, '.codex/auth.json')
 
 
+class RuntimeSeedBudgetTests(unittest.TestCase):
+    """Final selected home data includes auth, without charging replaced bytes."""
+
+    def seed(self, root, saved, credential=b'{}', preserve=False):
+        home = root / 'generation-a'
+        home.mkdir(mode=0o700)
+        for relative, data in saved.items():
+            target = home / relative
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            vm.atomic(target, data)
+        auth = root / 'controller.json'
+        vm.atomic(auth, credential)
+        complete = {'generation': 'generation-a'}
+        if preserve:
+            complete['auth_generation'] = hashlib.sha256(credential).hexdigest()
+        vm.atomic(root / 'complete.json', json.dumps(complete).encode())
+        return vm.runtime_seed(root, str(auth), '.codex/auth.json')
+
+    def test_inserting_auth_cannot_exceed_home_budget(self):
+        with tempfile.TemporaryDirectory() as name, mock.patch.object(vm, 'MAX_HOME', 8):
+            with self.assertRaisesRegex(ValueError, 'seed exceeds budget'):
+                self.seed(Path(name), {'session': b'12345678'})
+
+    def test_default_64_mib_home_has_no_extra_credential_allowance(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            home = root / 'generation-a'
+            home.mkdir(mode=0o700)
+            with (home / 'session').open('wb') as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.truncate(64 * 1024 * 1024)
+            vm.atomic(root / 'complete.json', b'{"generation":"generation-a"}')
+            auth = root / 'controller.json'
+            vm.atomic(auth, b'{}')
+            with self.assertRaisesRegex(ValueError, 'seed exceeds budget'):
+                vm.runtime_seed(root, str(auth), '.codex/auth.json')
+
+    def test_larger_auth_replacement_cannot_exceed_home_budget(self):
+        with tempfile.TemporaryDirectory() as name, mock.patch.object(vm, 'MAX_HOME', 8):
+            with self.assertRaisesRegex(ValueError, 'seed exceeds budget'):
+                self.seed(Path(name), {'session': b'123456', '.codex/auth.json': b'{}'}, b'{} ')
+
+    def test_auth_insertion_at_exact_home_budget(self):
+        with tempfile.TemporaryDirectory() as name, mock.patch.object(vm, 'MAX_HOME', 8):
+            entries, digest = self.seed(Path(name), {'session': b'123456'})
+            self.assertEqual(dict(entries), {'session': b'123456', '.codex/auth.json': b'{}'})
+            self.assertEqual(sum(len(data) for _, data in entries), 8)
+            self.assertEqual(digest, hashlib.sha256(b'{}').hexdigest())
+
+    def test_smaller_replacement_does_not_double_count_old_auth(self):
+        with tempfile.TemporaryDirectory() as name, mock.patch.object(vm, 'MAX_HOME', 8):
+            entries, _ = self.seed(Path(name), {'session': b'1234', '.codex/auth.json': b'{}  '})
+            self.assertEqual(dict(entries), {'session': b'1234', '.codex/auth.json': b'{}'})
+            self.assertEqual(sum(len(data) for _, data in entries), 6)
+
+    def test_preserved_session_auth_does_not_count_unused_controller_auth(self):
+        with tempfile.TemporaryDirectory() as name, mock.patch.object(vm, 'MAX_HOME', 8):
+            credential = b'{"a":1111}'
+            entries, digest = self.seed(Path(name),
+                {'session': b'123456', '.codex/auth.json': b'{}'}, credential, preserve=True)
+            self.assertEqual(dict(entries), {'session': b'123456', '.codex/auth.json': b'{}'})
+            self.assertEqual(sum(len(data) for _, data in entries), 8)
+            self.assertEqual(digest, hashlib.sha256(credential).hexdigest())
+
+
 class RefreshCheckpointTests(unittest.TestCase):
     def fixture(self, root):
         spec = {'refresh_auth': True, 'provider': 'claude', 'auth_file': str(root / 'claude.json'),

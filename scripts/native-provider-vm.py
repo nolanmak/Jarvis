@@ -453,6 +453,8 @@ def runtime_seed(runtime, auth_file, auth_relative):
         if previous.get('auth_generation') != original or not any(name == auth_relative for name, _ in entries):
             entries = [(name, contents) for name, contents in entries if name != auth_relative]
             entries.append((auth_relative, data))
+    if sum(len(contents) for _, contents in entries) > MAX_HOME:
+        raise ValueError('native runtime seed exceeds budget')
     return entries, original
 
 
