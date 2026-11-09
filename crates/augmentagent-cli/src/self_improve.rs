@@ -20169,9 +20169,15 @@ mod linked_pr_dedup_regressions {
             std::fs::write(&gh, r#"#!/usr/bin/python3
 import json, os, sys
 args = sys.argv[1:]
-assert args[:2] == ['pr', 'list'], args
 with open(os.environ['AUTOSHIP_LINKED_PR_CALLS'], 'a') as stream:
     stream.write(json.dumps(args) + '\n')
+if args[:1] == ['api'] and '/issues?' in args[1]:
+    assert os.environ['AUTOSHIP_LINKED_PR_CASE'] == 'primary-selection', args
+    print(json.dumps([{'number': 42, 'title': 'Correct widget rounding',
+        'body': 'Round widget values consistently.', 'labels': [],
+        'user': {'login': 'fixture-owner'}, 'author_association': 'OWNER'}]
+        if args[1].endswith('page=1') else [])); sys.exit(0)
+assert args[:2] == ['pr', 'list'], args
 if os.environ['AUTOSHIP_LINKED_PR_CASE'] == 'malformed':
     print('{not-json'); sys.exit(0)
 # The old branch-filtered query misses the real authorized linked PR.
@@ -20196,6 +20202,7 @@ print(json.dumps([{'number': 77, 'isDraft': False,
             }
             let name = match case {
                 "primary" => "authorized_linked_pr_suppresses_primary_fresh_work",
+                "primary-selection" => "linked_pr_is_not_returned_by_real_fresh_issue_selector",
                 "remote" => "authorized_linked_pr_suppresses_remote_fresh_work",
                 "malformed" => "malformed_inventory_does_not_authorize_fresh_work",
                 _ => unreachable!(),
@@ -20216,6 +20223,12 @@ print(json.dumps([{'number': 77, 'isDraft': False,
             return;
         }
         let repo = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        if case == "primary-selection" {
+            let result = pick_issue(&repo, true).await;
+            assert!(!matches!(result, Ok(Some(_))),
+                "existing arbitrary-branch linked PR was selected for duplicate fresh scoping");
+            return;
+        }
         let result = if case == "remote" {
             has_open_agent_pr_remote("fixture-owner/repo", &repo, 42).await
         } else { has_open_agent_pr(&repo, 42).await };
@@ -20224,6 +20237,10 @@ print(json.dumps([{'number': 77, 'isDraft': False,
             "{case}: existing linked PR or unknown inventory authorized duplicate fresh work");
     }
 
+    #[tokio::test]
+    async fn linked_pr_is_not_returned_by_real_fresh_issue_selector() {
+        fixture("primary-selection").await;
+    }
     #[tokio::test]
     async fn authorized_linked_pr_suppresses_primary_fresh_work() { fixture("primary").await; }
     #[tokio::test]
