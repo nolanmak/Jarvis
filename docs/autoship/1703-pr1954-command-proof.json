@@ -64,9 +64,16 @@
     "targeted_run": 42673227287,
     "attempt": 2,
     "job": 129350959940,
-    "linux_aggregate": "failure",
+    "linux_aggregate": "rechecking_after_dependency_recovery",
     "cause": "Three required jobs missing during GitHub Actions/Checks API major outage",
-    "provider_incident": "https://www.githubstatus.com/incidents/tp8cghg7tlc4"
+    "provider_incident": "https://www.githubstatus.com/incidents/tp8cghg7tlc4",
+    "provider_incident_status": "monitoring",
+    "provider_actions_status": "operational",
+    "aggregate_recheck": {
+      "attempt": 3,
+      "job": 129368273291,
+      "status": "in_progress"
+    }
   },
   "limits": [
     "Queued command intent can exist before an executing workflow row: execution preflight deferral is not evidence that the durable request was lost.",

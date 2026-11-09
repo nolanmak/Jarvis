@@ -1123,3 +1123,19 @@ native-storage8GiB limit is the cause. No arbitrary limit increase, native
 release, model call, duplicate request or service override followed. The
 command remains durable and its actual admission events remain the spend
 source of truth. Precise preflight observation/reporting still needs closure.
+
+## Required Linux jobs restored after provider recovery
+
+GitHub's official summary updated18:43:24 UTC reports Actions operational
+and the incident monitoring. Only the terminal failed workflows missing
+required Linux jobs were retried on unchanged3debdb8d. Apple Notes attempt3
+(exporter129365695903), bridge attempt3 (129365693482), and router attempt2
+(all five required Linux jobs, including codex-redirect) now pass. MacOS was
+not made a merge requirement.
+
+The failed targeted job was then normally rerun so its required aggregate
+can validate those real results: run42673227287 attempt3/job129368273291 is
+in progress on the same head. No status was manually marked passing and no
+missing check waived. Current-head1758-test code GREEN remains separate
+from the aggregate. PR1954 stays ready/queued and its configured-worker
+capacity refusal remains a separate unresolved execution hold.

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T18:42:37.362724+00:00",
+  "observed_at": "2026-11-09T19:00:40.864895+00:00",
   "parent_issue": 1703,
   "owner_issue": 1709,
   "repair_issue": 1952,
@@ -9,7 +9,7 @@
   "base": "416f392b17b56b2a43e67a3e430835902387941a",
   "head": "9146acb424a52f4e9ef89d28d7bfed0a524eb2f6",
   "branch": "fix/autoship-review-dependency-ranges",
-  "state": "code_green_ready_queued_ci_outage_and_execution_readiness_holds",
+  "state": "code_green_ready_queued_aggregate_rechecking_capacity_hold",
   "change": "Extract unchanged production group adapter behind scripted/native transport interface. Add legacy retained-finding control and two new coherent large-file cases; fixture Rust code is actually compiled/executed before scripted review.",
   "expected_red": [
     "related_large_source_items_reach_one_request_and_reject_the_seeded_defect",
@@ -279,11 +279,74 @@
     "source": "https://www.githubstatus.com/api/v2/summary.json",
     "incident": "https://www.githubstatus.com/incidents/tp8cghg7tlc4",
     "name": "Incident with Actions and Checks API",
-    "reported_actions_status": "major_outage",
-    "reported_incident_status": "investigating",
+    "reported_actions_status": "operational",
+    "reported_incident_status": "monitoring",
     "reported_started_at": "2026-11-09T18:12:37.232Z",
-    "source_updated_at": "2026-11-09T18:24:51.616Z",
-    "retry_policy": "No further blind retries while the provider reports an outage. Recover only terminal failed workflows and recheck the full required Linux aggregate after service recovery; do not waive missing jobs."
+    "source_updated_at": "2026-11-09T18:43:24.591Z",
+    "retry_policy": "After the provider reported operational/monitoring, reran only terminal failed workflows needed to restore missing required Linux jobs. Their required jobs passed; the failed targeted aggregate is now being rerun on the unchanged head."
   },
-  "normal_submission_proof": "1703-pr1954-command-proof.json"
+  "normal_submission_proof": "1703-pr1954-command-proof.json",
+  "post_provider_recovery": {
+    "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+    "rerun_requests": [
+      {
+        "run": 42673227210,
+        "from_attempt": 2,
+        "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+        "rerun_request_exit": 0,
+        "reason": "Provider now reports Actions operational/incident monitoring; restore required jobs absent after workflow startup failure"
+      },
+      {
+        "run": 42673227314,
+        "from_attempt": 2,
+        "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+        "rerun_request_exit": 0,
+        "reason": "Provider now reports Actions operational/incident monitoring; restore required jobs absent after workflow startup failure"
+      },
+      {
+        "run": 42673227179,
+        "from_attempt": 1,
+        "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+        "rerun_request_exit": 0,
+        "reason": "Provider now reports Actions operational/incident monitoring; restore required jobs absent after workflow startup failure"
+      }
+    ],
+    "passed_workflows": [
+      {
+        "run": 42673227210,
+        "attempt": 3,
+        "job": 129365695903,
+        "required_job": "exporter"
+      },
+      {
+        "run": 42673227314,
+        "attempt": 3,
+        "job": 129365693482,
+        "required_job": "bridge-suites"
+      },
+      {
+        "run": 42673227179,
+        "attempt": 2,
+        "required_jobs": [
+          "adapter-compose",
+          "codex-redirect",
+          "dashboard",
+          "installer (ubuntu-latest)",
+          "pinned-gateway"
+        ],
+        "all_required_jobs_passed": true
+      }
+    ],
+    "aggregate_rerun": {
+      "run": 42673227287,
+      "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+      "from_attempt": 2,
+      "rerun_failed_jobs_exit": 0,
+      "reason": "All previously missing required Linux jobs passed after provider recovery; restore required aggregate without waiving it.",
+      "attempt": 3,
+      "job": 129368273291,
+      "observed_status": "in_progress"
+    },
+    "limits": "No current-head full CI pass is claimed before the aggregate completes. MacOS remains informational."
+  }
 }
