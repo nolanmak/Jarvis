@@ -12106,6 +12106,10 @@ mod pr_notes_tests;
 mod progress_tests;
 
 #[cfg(test)]
+#[path = "self_improve_history_lock_tests.rs"]
+mod history_lock_tests;
+
+#[cfg(test)]
 mod tests {
     async fn recovered_git(root:&Path,args:&[&str])->String {
         let out=tokio::process::Command::new("/usr/bin/git")
