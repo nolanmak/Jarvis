@@ -795,3 +795,19 @@ Enforcement and descendant teardown are unverified; no process was killed, no
 lease cleared and no quiescence/released-resource claim is made. This stops
 future work only when the existing controller enforces the pause. It is not a
 worker restart, a repair deployment or a confirmed merge.
+
+## Paid-held fairness: behavioral RED verified and fix pushed
+
+[Exact-head proof](1703-paid-held-fairness-red-proof.json) records tests-only
+eb7b0304, run 42624703591/job129185362626: exactly the paid PR/build hold
+regressions failed with stale persisted (2,3) debt; 1,742 CLI unit tests passed
+and 33 existing tests were ignored. The unpaid-hold control passed. Both cases
+reached the fairness assertion after verifying one turn, compute settlement
+and untouched merge allowance. This is behavioral RED, not a compile failure.
+
+PR1947 now contains implementation 3eb3f586: billed fairness is settled once
+before the held/idle exit, preserving existing compute/confirmed-merge
+accounting. Whitespace and Rust syntax parsing pass. Hosted GREEN run
+42626678480 is live; no passing result, independent approval, merge or rollout
+is claimed yet. Original issue1943 still retains its lease after the accepted
+normal pause, and queued PR1944/1945 remain unpaused and unclaimed.

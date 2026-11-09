@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "parent_issue": 1703,
+  "owner_issue": 1706,
+  "repair_issue": 1946,
+  "pr": 1947,
+  "red": {
+    "head": "eb7b03043ca14af6d7eedd13decf7348dbb43931",
+    "run": 42624703591,
+    "job": 129185362626,
+    "conclusion": "failure",
+    "cli_unit_tests": {
+      "passed": 1742,
+      "failed": 2,
+      "ignored": 33
+    },
+    "expected_failures": [
+      {
+        "test": "self_improve::tests::paid_deferred_build_clears_resume_debt",
+        "actual": [
+          2,
+          3
+        ],
+        "expected": [
+          0,
+          0
+        ]
+      },
+      {
+        "test": "self_improve::tests::paid_deferred_pr_updates_resume_debt_without_spending_merge_allowance",
+        "actual": [
+          2,
+          3
+        ],
+        "expected": [
+          3,
+          3
+        ]
+      }
+    ],
+    "control": "self_improve::tests::unpaid_deferred_turn_preserves_resume_debt",
+    "control_result": "passed",
+    "failure_assertion": "held control flow must not erase a paid turn's fairness settlement",
+    "log_sha256": "fd03b7a60361c0dc98242dae75d63b6474c66ef5542acf8949a7256dddec5b20"
+  },
+  "implementation": {
+    "head": "3eb3f5868c43c1de3598aae92a7a07e5e8cd515a",
+    "change": "Settle billed fairness once before idle/held tick exit; preserve compute settlement and merge accounting.",
+    "whitespace": "passed",
+    "rust_syntax": "passed",
+    "hosted_run": 42626678480,
+    "hosted_state": "in_progress"
+  },
+  "limits": [
+    "Hosted GREEN and independent approval remain pending.",
+    "No local full Rust suite was run; original production VM/build custody was preserved.",
+    "No concurrent consumer, source binding, native runtime, capacity policy, merge credit or production deployment changed.",
+    "Resolved PR classification and broader peer fairness/inactivity remain #1706 requirements.",
+    "Full automatic host sizing and #1703 live acceptance remain incomplete."
+  ]
+}
