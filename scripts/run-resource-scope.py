@@ -65,11 +65,64 @@ def counters(path):
             (line.split() for line in path.read_text().splitlines())}
 
 
+def parse_host_memory(data):
+    """Decode bounded Linux memory facts; malformed evidence is never zero."""
+    try:
+        if type(data) is not bytes or len(data) > 65536:
+            raise ValueError
+        values = {}
+        for line in data.decode('ascii').splitlines():
+            fields = line.split()
+            if not fields or fields[0] not in ('MemTotal:', 'MemAvailable:'):
+                continue
+            key = fields[0]
+            if (key in values or len(fields) != 3 or fields[2] != 'kB'
+                    or not fields[1].isdigit()):
+                raise ValueError
+            value = int(fields[1]) * 1024
+            if value > 2**64 - 1:
+                raise ValueError
+            values[key] = value
+        total = values['MemTotal:']
+        available = values['MemAvailable:']
+        if total == 0 or available > total:
+            raise ValueError
+        return {'total_bytes': total, 'available_bytes': available}
+    except (ValueError, KeyError):
+        raise RuntimeError('host memory observation invalid') from None
+
+
+def read_host_memory():
+    """One host-context read, without worker/freshness or admission authority."""
+    with Path('/proc/meminfo').open('rb') as source:
+        return parse_host_memory(source.read(65537))
+
+
 def available_memory():
-    for line in Path('/proc/meminfo').read_text().splitlines():
-        if line.startswith('MemAvailable:'):
-            return int(line.split()[1]) * 1024
-    raise RuntimeError('host available memory unavailable')
+    return read_host_memory()['available_bytes']
+
+
+def memory_defaults(total_bytes, external_maxima=(), reserve_bytes=None):
+    """M1-M3 planning data only; never changes policy or authorizes a run."""
+    def bounded(value):
+        return type(value) is int and 0 <= value <= 2**64 - 1
+
+    if (not bounded(total_bytes) or total_bytes == 0
+            or type(external_maxima) not in (list, tuple)):
+        raise RuntimeError('host memory planning input invalid')
+    maxima = tuple(external_maxima)
+    if any(value is not None and not bounded(value) for value in maxima):
+        raise RuntimeError('host memory planning input invalid')
+    effective = min([total_bytes, *(value for value in maxima if value is not None)])
+    protected = max(1024**3, effective // 4 + bool(effective % 4))
+    if reserve_bytes is not None:
+        if not bounded(reserve_bytes) or reserve_bytes < protected:
+            raise RuntimeError('host memory protected reserve invalid')
+        protected = reserve_bytes
+    budget = max(0, effective - protected)
+    high = (budget // 10) * 9 + ((budget % 10) * 9) // 10
+    return {'effective_bytes': effective, 'protected_bytes': protected,
+            'memory_max_bytes': budget, 'memory_high_bytes': high}
 
 
 def reclaimable(group):
