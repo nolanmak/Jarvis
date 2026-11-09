@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T21:57:15.165542+00:00",
+  "related_issues": [
+    1943,
+    1952,
+    1955
+  ],
+  "pr": 1956,
+  "status": "ordinary_managed_behavior_probe_complete_not_native_acceptance",
+  "test": "self_improve::workflow::__autoship_receipt_probe_v1::observe",
+  "injected_module_sha256": "a3c663b444a944c833bb9fa81613f875b1ebea9fe6681f7088fb5927feb64f37",
+  "cases": {
+    "baseline": {
+      "source_head": "416f392b17b56b2a43e67a3e430835902387941a",
+      "actual_data": {
+        "actual_provider": "codex",
+        "protected_admissions": 1,
+        "protected_audit_healthy": true,
+        "receipt_linked": false,
+        "workflow_admissions": 1,
+        "workflow_model_calls": 1
+      },
+      "log_sha256": "5c111d05aa0afed716958b5375afc3adf3e8f41e0cc2aec4df1758a24010280d",
+      "test_terminal_summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1774 filtered out; finished in 0.18s"
+    },
+    "candidate": {
+      "source_head": "899e14797e25cf9ad8a6234c00c0eb2548cf5e76",
+      "actual_data": {
+        "actual_provider": "codex",
+        "protected_admissions": 1,
+        "protected_audit_healthy": true,
+        "receipt_linked": true,
+        "workflow_admissions": 1,
+        "workflow_model_calls": 1
+      },
+      "log_sha256": "e8b2d2bc9d935848745f0514677db1c72b39914438f1933c233a6e48c6dca766",
+      "test_terminal_summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1775 filtered out; finished in 0.19s"
+    }
+  },
+  "sandbox_read_experiment": {
+    "kind": "sandbox-source-read-experiment",
+    "production_registration": false,
+    "source_head": "416f392b17b56b2a43e67a3e430835902387941a",
+    "sandbox_sha256": "c9a914b3a3f92dea78f9328f84d7022411dbf102038d00810f24d46ca9f49e12",
+    "exit_code": 0,
+    "observation": {
+      "rust_source": {
+        "bytes": 18219,
+        "readable": true
+      },
+      "tracked_template": {
+        "errno": 13,
+        "readable": false
+      }
+    },
+    "stderr": ""
+  },
+  "limits": [
+    "Both original test runs completed; prior candidate handle is missing and its log records a completed one-test run.",
+    "Exact original committed exports with identical cfg(test) observation module; no live provider or production state.",
+    "The child emitted actual data without a receipt-linked expectation; ordinary Rust test summaries are not the acceptance oracle.",
+    "The sandbox source-read experiment uses the unchanged trusted sandbox with an exported source root. It proves denial of the compile-time template, not that every possible CargoBinary adapter is impossible.",
+    "A later experimental private fixture replaces only probe control-directory lookup with disposable HOME; those later runs and fixture support are separate from the ordinary observations recorded here.",
+    "Not registered baseline evidence, independent review, merge, deployment, complete C2 recovery or restored Autoship."
+  ]
+}

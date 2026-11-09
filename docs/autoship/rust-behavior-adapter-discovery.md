@@ -24,9 +24,12 @@ isolated_observation exposes the Rust toolchain only for Cargo invocations,
 uses a registered/leased target, keeps original source read-only and permits
 writes to its private runtime and target. Expanding Python's PATH is not the
 solution. The verifier checkout exporter consumes all regular committed Git
-blobs, including a tracked public .env.example; it is distinct from the
-builder's filtered view implicated in #1950/#1951. Do not invent a verifier
-prerequisite on that separate builder repair.
+blobs, including a tracked public .env.example. However, exporting a file does
+not grant the child read access: the unchanged sandbox source filter also
+denies .env.example. The measured denial below corrects the earlier claim that
+export alone made this compile-time input usable. This overlaps the input
+conflict in #1950/#1951 but does not establish that merging #1951 fixes original
+baseline compilation or that credential filters should be widened.
 
 ## Existing-mode route to validate before changing the engine
 
@@ -83,3 +86,30 @@ independently pinned adapter and reproduce original-base behavior. No direct
 registration edit, ordinary test-pass waiver, fabricated approval or manual
 merge is authorized. A working recipe may avoid a new backend; that decision
 remains empirical. Full #1703 acceptance remains open.
+
+## Measured original-base / candidate data and sandbox limit
+
+[Private behavioral observation](1703-private-rust-behavior-observation.json)
+records completed managed runs on original416f392b and candidate899e1479. Both
+produce one actual workflow charge and one healthy protected admission event.
+The original reports receipt_linked=false; the candidate reports true. The
+identical cfg(test) module emits values without an expected-answer assertion.
+These are ordinary managed experiments, not enrolled native VerifierReceipts.
+
+A direct run of the unchanged first-party sandbox on the committed baseline
+export reads env_cfg.rs but returns EACCES for .env.example. That source has
+a compile-time include_str of this path. A naive full source copy inside the
+observer therefore fails before reaching the behavior under test. Setup failure
+must not become behavioral RED. Original baseline, production source and
+credential filters remain intact.
+
+The next private experiment carries the exact public template bytes, identical
+on both selected heads, as a hashed support fixture. It copies readable source
+into disposable runtime and restores only that public fixture, then makes the
+copy read-only to the compiler through a nested sandbox. The inner read grant
+is limited to that constructed source copy and toolchain/registry; only separate
+auxiliary scratch and the original managed target remain writable. This is a
+proposal to validate, not an accepted source transformation or production
+capability. Source-copy integrity, frame bounds, mutants and actual sandbox
+results remain required before a handoff. A successful experiment cannot grant
+its own registration, code approval or resource release.
