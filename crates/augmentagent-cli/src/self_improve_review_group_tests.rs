@@ -9,6 +9,7 @@ struct ScriptedGroup {
     typed: bool,
     defect: bool,
     initial_finding: bool,
+    requested_path: String,
     calls: Mutex<usize>,
 }
 fn finding(id: &str, claim: &str) -> aligned::Finding {
@@ -21,7 +22,11 @@ fn finding(id: &str, claim: &str) -> aligned::Finding {
         conflicts_with: BTreeSet::new(),
         repair_rounds: 0,
         repair_target: Some(aligned::RepairTarget::Candidate {
-            paths: BTreeSet::from(["logic.rs".into()]),
+            paths: BTreeSet::from([if id == "panic" {
+                "changed.rs".into()
+            } else {
+                "logic.rs".into()
+            }]),
         }),
     }
 }
@@ -53,7 +58,7 @@ impl GroupTransport for ScriptedGroup {
                     {"path":"logic.rs","criterion_ids":["C1"],"question":"Does application preserve that cap for input 5?","selector":{"kind":"rust_item","name":"apply_limit"}}
                 ]);
             } else {
-                response["missing_paths"] = serde_json::json!(["logic.rs"]);
+                response["missing_paths"] = serde_json::json!([self.requested_path]);
             }
         } else {
             let request: serde_json::Value = serde_json::from_str(prompt)?;
@@ -120,6 +125,16 @@ async fn run_group_case(
     defect: bool,
     initial_finding: bool,
 ) -> (Result<CompletedGroup>, usize) {
+    run_group_path_case(role, typed, large, defect, initial_finding, "logic.rs").await
+}
+async fn run_group_path_case(
+    role: aligned::ReviewRole,
+    typed: bool,
+    large: bool,
+    defect: bool,
+    initial_finding: bool,
+    requested_path: &str,
+) -> (Result<CompletedGroup>, usize) {
     let root = tempfile::tempdir().unwrap();
     git_fixture(root.path(), &["init", "-q"]);
     let padding = if large {
@@ -177,7 +192,15 @@ async fn run_group_case(
             if defect { "8" } else { "3" }
         );
     }
-    git_fixture(root.path(), &["add", "logic.rs", "changed.rs"]);
+    let mut paths = vec!["add", "logic.rs", "changed.rs"];
+    if requested_path != "logic.rs" {
+        let protected = root.path().join(requested_path);
+        std::fs::create_dir_all(protected.parent().unwrap()).unwrap();
+        std::fs::write(protected, "SYNTHETIC_CREDENTIAL_MUST_REMAIN_IN_FIXTURE").unwrap();
+        paths.push(requested_path);
+    }
+    git_fixture(root.path(), &paths);
+
     git_fixture(
         root.path(),
         &[
@@ -237,6 +260,7 @@ async fn run_group_case(
         typed,
         defect,
         initial_finding,
+        requested_path: requested_path.into(),
         calls: Mutex::new(0),
     };
     let result = execute_evidence_group(
@@ -297,5 +321,23 @@ async fn related_large_source_items_allow_a_complete_fixed_group_without_droppin
         assert_eq!(calls, 2);
         assert!(group.findings.is_empty());
         assert_eq!(group.native_sessions.len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn credential_and_control_paths_are_refused_before_a_second_observation() {
+    for path in [
+        ".ssh/credentials.json",
+        ".config/auth.json",
+        "credentials.json",
+        "src/\nsecret.rs",
+    ] {
+        let (result, calls) =
+            run_group_path_case(aligned::ReviewRole::Diff, false, false, false, false, path).await;
+        assert!(result.is_err(), "a denied source cannot complete review");
+        assert_eq!(
+            calls, 1,
+            "protected source {path:?} reached a paid recovery observation"
+        );
     }
 }
