@@ -2882,6 +2882,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_admission_audit_names_the_committed_accounting_receipt() {
+        let dir = repo();
+        let control = control_dir();
+        let path = control.path().join("workflow.db");
+        let guard = WorkflowGuard::acquire_at(&path, Start {
+            repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo",
+            source_issue: Some(77), pr: None, branch: "fixture", contract: "C1",
+            environment: "test",
+        }, millis()).await.unwrap().unwrap();
+        let audit = guard.audit_logger();
+        // Script the existing admission boundary; no provider is launched.
+        audit.model_call_admitted("codex").unwrap();
+        let store = WorkflowStore::open(&path).unwrap();
+        let admissions: Vec<serde_json::Value> = store.events(guard.id()).unwrap()
+            .into_iter().filter(|(_, kind, _, _)| kind == "native_model_admitted")
+            .map(|(_, _, payload, _)| serde_json::from_str(&payload).unwrap()).collect();
+        assert_eq!(admissions.len(), 1);
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls, 1);
+        let receipt = admissions[0]["receipt"].as_str().unwrap();
+        assert!(receipt.starts_with("model-call:"));
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(audit.path()).unwrap()
+            .lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|record| record["kind"] == "model_call_admitted").collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["actual_provider"], "codex");
+        assert_eq!(records[0]["accounting_receipt"].as_str(), Some(receipt),
+            "protected admission must identify the original committed charge");
+        audit.protected_health().unwrap();
+    }
+
+    #[tokio::test]
     async fn ci_gate_reports_meaningful_success_only_after_a_passing_result() {
         for disposition in ["passed","hosted-pending","source-failed","infrastructure-failed"] {
             let directory=repo();let state=control_dir();let path=state.path().join("workflow.db");
