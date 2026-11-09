@@ -848,6 +848,11 @@ impl AuditLogger {
             std::sync::atomic::Ordering::AcqRel,std::sync::atomic::Ordering::Acquire).is_ok(),
             "native bootstrap preparation already attempted; reconcile original launch");Ok(())
     }
+    pub(crate) fn native_bootstrap_construction_current(&self)->anyhow::Result<()> {
+        self.native_preflight_current()?;
+        anyhow::ensure!(self.native_bootstrap_claimed.load(std::sync::atomic::Ordering::Acquire),
+            "native bootstrap construction has not been claimed");Ok(())
+    }
     pub(crate) fn native_preflight_current(&self)->anyhow::Result<()> {
         let current=match self.restricted_admission.read().map_err(|_|anyhow::anyhow!("restricted admission lock poisoned"))?.clone() {
             Some(RestrictedAdmission::NativePreflight(current))=>current,

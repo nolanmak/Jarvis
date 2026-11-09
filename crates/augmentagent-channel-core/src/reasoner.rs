@@ -852,6 +852,12 @@ pub(crate) struct PreparedClaudeInvocation {
     _handoff_hooks: Option<crate::handoff::ClaudeHooks>,
     _voice_mcp_file: Option<tempfile::NamedTempFile>,
 }
+impl PreparedClaudeInvocation {
+    pub(crate) fn validate_preflight_created_paths(&self)->anyhow::Result<()> {
+        if let Some(scope)=&self._scope {scope.validate_preflight_created_paths()?;}
+        Ok(())
+    }
+}
 
 pub struct ClaudeCliReasoner {
     bin: String,
@@ -1214,6 +1220,7 @@ impl ClaudeCliReasoner {
     /// policy/hook asset. Construction never spawns or releases provider input.
     pub(crate) fn prepare_invocation(bin: &str, opts: &ReasonerOpts, fresh_review: bool,
         native_launch: Option<&crate::native_session::Launch>,
+        bootstrap: Option<&crate::native_vm::NativeBootstrap<'_>>,
     ) -> anyhow::Result<PreparedClaudeInvocation> {
         let review_directory = if fresh_review { Some(tempfile::tempdir()?) } else { None };
         let mut args: Vec<String> = vec![
@@ -1245,7 +1252,12 @@ impl ClaudeCliReasoner {
 
         let launch_audit=opts.audit_logger.clone().or_else(default_audit_logger);
         let vm_required = crate::native_vm::required(launch_audit.as_ref());
-        let native_scope = if fresh_review {None}else{crate::autoship_scope::NativeScope::from_opts(opts)?};
+        let native_scope = if fresh_review {None}else{
+            match bootstrap {
+                Some(bootstrap)=>crate::autoship_scope::NativeScope::from_bootstrap_opts(opts,bootstrap)?,
+                None=>crate::autoship_scope::NativeScope::from_opts(opts)?,
+            }
+        };
         let claude_bridge = if native_scope.is_some() {
             Some(crate::codex_tools::ClaudeBridgeLaunch::prepare(opts)?)
         } else { None };
@@ -1413,7 +1425,7 @@ impl ClaudeCliReasoner {
         let PreparedClaudeInvocation { command: cmd, bridge: claude_bridge,
             launch_audit, vm_required, clear_environment, router, routed_model,
             _review_directory, _scope, _handoff_hooks, _voice_mcp_file } =
-            Self::prepare_invocation(&self.bin,opts,fresh_review,native_launch.as_ref())?;
+            Self::prepare_invocation(&self.bin,opts,fresh_review,native_launch.as_ref(),None)?;
         crate::run_resources::check_requirement("claude",launch_audit.as_ref())?;
         // Resolve declaration errors before allocating a native runtime or intent.
         let run_policy = crate::run_resources::declared_policy_for(crate::run_resources::run_kind_for(opts))?;

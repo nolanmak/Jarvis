@@ -22,6 +22,7 @@ pub struct NativeScope {
     policy: PathBuf,
     runtime: PathBuf,
     materialization:Option<std::sync::Arc<crate::autoship_write_scope::ScopeMaterialization>>,
+    bootstrap_creation:Option<crate::native_vm::PreflightScopeCreation>,
 }
 
 fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -50,6 +51,17 @@ fn overlaps(a: &Path, b: &Path) -> bool {
 
 impl NativeScope {
     pub fn from_opts(opts: &crate::ReasonerOpts) -> Result<Option<Self>> {
+        Self::from_opts_mode(opts,None)
+    }
+    pub(crate) fn from_bootstrap_opts(opts:&crate::ReasonerOpts,bootstrap:&crate::native_vm::NativeBootstrap<'_>)->Result<Option<Self>> {
+        bootstrap.check_logger(opts.audit_logger.as_ref().context("bootstrap scope original logger missing")?)?;
+        Self::from_opts_mode(opts,Some(bootstrap))
+    }
+    pub(crate) fn validate_preflight_created_paths(&self)->Result<()> {
+        if let Some(observed)=&self.bootstrap_creation {observed.validate()?;}
+        Ok(())
+    }
+    fn from_opts_mode(opts:&crate::ReasonerOpts,bootstrap:Option<&crate::native_vm::NativeBootstrap<'_>>)->Result<Option<Self>> {
         let requested = opts
             .env
             .iter()
@@ -78,9 +90,11 @@ impl NativeScope {
             .iter()
             .find(|(k, _)| k == "CARGO_TARGET_DIR")
             .map(|(_, p)| PathBuf::from(p));
-        let scope=Self::prepare(worktree,build.as_deref(),&state,&source_config)?;
+        let mut scope=Self::prepare(worktree,build.as_deref(),&state,&source_config)?;
         if let (Some(logger),Some(created))=(opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger),scope.materialization.clone()) {
-            logger.capture_scope_materialization(created)?;
+            if let Some(bootstrap)=bootstrap {
+                scope.bootstrap_creation=Some(bootstrap.observe_scope_creation(&logger,created)?);
+            }else{logger.capture_scope_materialization(created)?;}
         }
         Ok(Some(scope))
     }
@@ -194,6 +208,7 @@ impl NativeScope {
             policy,
             runtime,
             materialization:source_grants.materialization,
+            bootstrap_creation:None,
         })
     }
 

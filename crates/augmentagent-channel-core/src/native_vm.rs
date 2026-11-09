@@ -605,6 +605,9 @@ pub(crate) struct Launch {
 /// Borrowed preparation-only authority from a distinct restricted controller.
 /// It cannot release a command, charge a model or submit provider input.
 pub struct NativeBootstrap<'a> {logger:&'a std::sync::Arc<crate::tool_audit::AuditLogger>}
+#[path="native_preflight_scope.rs"]
+mod preflight_scope;
+pub(crate) use preflight_scope::PreflightScopeCreation;
 impl<'a> NativeBootstrap<'a> {
     pub fn capture(logger:&'a std::sync::Arc<crate::tool_audit::AuditLogger>)->Result<Self> {
         logger.native_bootstrap_available()?;Ok(Self {logger})
@@ -653,7 +656,7 @@ impl<'a> NativeBootstrap<'a> {
         self.check_logger(opts.audit_logger.as_ref().context("native bootstrap original logger missing")?)?;
         self.logger.claim_native_bootstrap()?;
         let bin=std::env::var("CLAUDE_CLI").unwrap_or_else(|_|"claude".into());
-        let invocation=crate::reasoner::ClaudeCliReasoner::prepare_invocation(&bin,opts,false,Some(native))?;
+        let invocation=crate::reasoner::ClaudeCliReasoner::prepare_invocation(&bin,opts,false,Some(native),Some(self))?;
         self.check_logger(opts.audit_logger.as_ref().context("native bootstrap original logger missing")?)?;
         let launch=Launch::prepare_with_admission("claude",opts,&invocation.command,
             invocation.bridge.as_ref().map(|bridge|&bridge.bridge),Some(native),PreparationAdmission::Bootstrap(self))?;
@@ -674,7 +677,10 @@ pub struct ClosedNativeBootstrap {
 mod bootstrap_inspection;
 pub use bootstrap_inspection::ClosedNativeInspection;
 impl ClosedNativeBootstrap {
-    pub fn prepared_record(&self)->Result<PreparedLaunchRecord> {self.launch.prepared_record()}
+    pub fn prepared_record(&self)->Result<PreparedLaunchRecord> {
+        if let Some(invocation)=&self._claude_invocation {invocation.validate_preflight_created_paths()?;}
+        self.launch.prepared_record()
+    }
 }
 enum PreparationAdmission<'a,'b> {Productive,Bootstrap(&'a NativeBootstrap<'b>)}
 impl PreparationAdmission<'_,'_> {
@@ -1351,8 +1357,21 @@ mod tests {
     fn closed_claude_bootstrap_uses_provider_preparation_without_dispatch() {launch_intent_child("bootstrap-claude-provider");}
     #[test]
     fn failed_claude_provider_preparation_consumes_closed_bootstrap_attempt() {launch_intent_child("bootstrap-claude-provider-failed");}
+    #[cfg(target_os="linux")]
     #[test]
     fn closed_claude_bootstrap_uses_registered_scope_without_dispatch() {launch_intent_child("bootstrap-claude-provider-scoped");}
+    #[cfg(target_os="linux")]
+    #[test]
+    fn closed_claude_bootstrap_retains_unqualified_created_paths() {launch_intent_child("bootstrap-claude-provider-materialized");}
+    #[cfg(target_os="linux")]
+    #[test]
+    fn closed_claude_bootstrap_rejects_changed_creation_scope() {launch_intent_child("bootstrap-claude-provider-materialized-scope");}
+    #[cfg(target_os="linux")]
+    #[test]
+    fn closed_claude_bootstrap_rejects_replaced_created_file() {launch_intent_child("bootstrap-claude-provider-materialized-replace");}
+    #[cfg(not(target_os="linux"))]
+    #[test]
+    fn closed_claude_bootstrap_refuses_scope_on_unsupported_host() {launch_intent_child("bootstrap-claude-provider-unsupported");}
     #[test]
     fn closed_native_bootstrap_cannot_promote_metadata_authority() {launch_intent_child("bootstrap-metadata");}
     #[test]
@@ -1412,6 +1431,10 @@ mod tests {
                 else if mode=="bootstrap-claude-provider" {"closed_claude_bootstrap_uses_provider_preparation_without_dispatch"}
                 else if mode=="bootstrap-claude-provider-failed" {"failed_claude_provider_preparation_consumes_closed_bootstrap_attempt"}
                 else if mode=="bootstrap-claude-provider-scoped" {"closed_claude_bootstrap_uses_registered_scope_without_dispatch"}
+                else if mode=="bootstrap-claude-provider-materialized" {"closed_claude_bootstrap_retains_unqualified_created_paths"}
+                else if mode=="bootstrap-claude-provider-materialized-scope" {"closed_claude_bootstrap_rejects_changed_creation_scope"}
+                else if mode=="bootstrap-claude-provider-materialized-replace" {"closed_claude_bootstrap_rejects_replaced_created_file"}
+                else if mode=="bootstrap-claude-provider-unsupported" {"closed_claude_bootstrap_refuses_scope_on_unsupported_host"}
                 else if mode=="bootstrap-metadata" {"closed_native_bootstrap_cannot_promote_metadata_authority"}
                 else if mode=="bootstrap-fenced" {"closed_native_bootstrap_rechecks_original_authority_after_callback"}
                 else if mode=="bootstrap-other-logger" {"closed_native_bootstrap_refuses_different_logger"}
@@ -1529,13 +1552,14 @@ mod tests {
                 crate::audit_chain::AnchoredAudit::new(logger.path().into(),anchors.join("model.json"),&[]).unwrap()
                 .seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"sealed"}))).unwrap();}
             let mut opts=crate::reasoner::triage_opts(None);opts.audit_logger=Some(logger.clone());
-            if mode=="bootstrap-claude-provider-scoped" {
+            if matches!(mode,"bootstrap-claude-provider-scoped"|"bootstrap-claude-provider-unsupported") || mode.starts_with("bootstrap-claude-provider-materialized") {
                 std::env::set_var(crate::state_dir::STATE_HOME_ENV,root.join("application-state"));
                 std::env::set_var("CLAUDE_CONFIG_DIR",root.join("absent-provider-config"));
                 let worktree=root.join("candidate");std::fs::create_dir(&worktree).unwrap();
-                write(&worktree.join("existing.rs"),b"original source\n").unwrap();
+                let declared=if mode.starts_with("bootstrap-claude-provider-materialized") {"new.rs"}else{"existing.rs"};
+                if declared=="existing.rs" {write(&worktree.join(declared),b"original source\n").unwrap();}
                 crate::autoship_write_scope::register(&worktree,&"c".repeat(64),
-                    vec![crate::autoship_write_scope::DeclaredPath{path:"existing.rs".into(),directory:false}],vec![]).unwrap();
+                    vec![crate::autoship_write_scope::DeclaredPath{path:declared.into(),directory:false}],vec![]).unwrap();
                 opts.cwd=Some(worktree.clone());opts.add_dirs=vec![worktree];
                 opts.allowed_tools=vec!["Read".into(),"Write".into(),"Edit".into()];
                 opts.env.push((crate::autoship_scope::SCOPE_ENV.into(),"1".into()));
@@ -1601,12 +1625,14 @@ mod tests {
                     assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);
                     authority.prepare_claude(&opts,&native)
                 }else{authority.prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native))};
-                if matches!(mode,"bootstrap-codex-provider-failed"|"bootstrap-claude-provider-failed") {
-                    let error=result.err().expect("invalid private bridge settings prepared a native launch");
-                    let expected=if provider=="codex" {"unsupported settings"}else{"Claude session ID was not assigned"};
+                if matches!(mode,"bootstrap-codex-provider-failed"|"bootstrap-claude-provider-failed"|"bootstrap-claude-provider-unsupported") {
+                    let error=result.err().expect("refused provider construction unexpectedly prepared a native launch");
+                    let expected=if mode.ends_with("-unsupported") {"native autoship scope is unavailable on this host"}
+                        else if provider=="codex" {"unsupported settings"}else{"Claude session ID was not assigned"};
                     assert!(format!("{error:#}").contains(expected),"provider preparation failed before the intended constructor refusal");
                     assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);
                     opts.settings_json=None;
+                    if mode.ends_with("-unsupported") {opts.env.clear();}
                     if provider=="codex" {
                         assert!(authority.prepare_codex(&opts,"replayed private input",&native).is_err(),"failed provider construction reset the consumed setup");
                     }else{
@@ -1647,12 +1673,31 @@ mod tests {
                         let spec:serde_json::Value=serde_json::from_slice(&std::fs::read(bootstrap.launch._directory.path().join("launch.json")).unwrap()).unwrap();
                         assert_eq!(spec["provider"],"claude");
                         assert!(spec["argv"].as_array().unwrap().iter().any(|arg|arg=="--session-id"));
-                        if mode=="bootstrap-claude-provider-scoped" {
+                        if mode=="bootstrap-claude-provider-scoped" || mode.starts_with("bootstrap-claude-provider-materialized") {
                             let bridge=invocation.bridge.as_ref().expect("guarded Claude preparation omitted its tool bridge");
                             assert!(bridge.config_path.is_file() && bridge.bridge.policy_path.is_file(),"private bridge assets did not survive preparation");
                             assert!(args.iter().any(|arg|arg.contains("mcp__jarvis__Write")));
                             assert!(spec["mcp_argv"].is_array());
-                            assert_eq!(std::fs::read(root.join("candidate/existing.rs")).unwrap(),b"original source\n");
+                            if mode=="bootstrap-claude-provider-scoped" {
+                                assert_eq!(std::fs::read(root.join("candidate/existing.rs")).unwrap(),b"original source\n");
+                            }else{
+                                assert_eq!(std::fs::read(root.join("candidate/new.rs")).unwrap(),b"");
+                                let denied=logger.validate_scope_setup_paths(&root.join("candidate"),&"c".repeat(64),&["new.rs".into()]).unwrap_err();
+                                assert!(format!("{denied:#}").contains("untracked or ignored owner data"),"preflight creation was not refused by the productive source-credit boundary");
+                                let rows:Vec<serde_json::Value>=std::fs::read_to_string(logger.path()).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+                                assert_eq!(rows.iter().filter(|row|row["kind"]=="native_preflight_scope_materialized").count(),1);
+                                assert!(!rows.iter().any(|row|row["kind"]=="scope_setup_materialized"));
+                                if mode.ends_with("-scope") {
+                                    crate::autoship_write_scope::with_registered_scope(&root.join("candidate"),Some(&"c".repeat(64)),&"e".repeat(64),
+                                        vec![crate::autoship_write_scope::DeclaredPath{path:"new.rs".into(),directory:false}],vec![],|_|Ok(())).unwrap();
+                                }else if mode.ends_with("-replace") {
+                                    std::fs::remove_file(root.join("candidate/new.rs")).unwrap();
+                                    write(&root.join("candidate/new.rs"),b"").unwrap();
+                                }else{
+                                    std::fs::write(root.join("candidate/new.rs"),b"changed after preparation").unwrap();
+                                }
+                                assert!(bootstrap.prepared_record().is_err(),"changed created paths remained a current preparation observation");
+                            }
                         }
                         assert!(authority.prepare_claude(&opts,&native).is_err(),"one setup prepared a second Claude invocation");
                         assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);
