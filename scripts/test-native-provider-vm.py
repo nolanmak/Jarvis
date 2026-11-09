@@ -486,11 +486,14 @@ class CredentialRoundtripTests(unittest.TestCase):
             original = {'padding': padding, 'claudeAiOauth': {
                 'accessToken': 'old-access', 'refreshToken': 'old-refresh', 'expiresAt': 1,
                 'scopes': ['inference'], 'subscriptionType': 'max'}}
-            authority, route, client = 'platform.claude.com:443', '/v1/oauth/token', '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+            authority, route = 'platform.claude.com:443', '/v1/oauth/token'
+            # Public native OAuth client identifier, never an issuer credential.
+            client = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
         else:
             original = {'padding': padding, 'tokens': {'access_token': 'old-access',
                 'refresh_token': 'old-refresh', 'id_token': token}, 'last_refresh': 'old'}
-            authority, route, client = 'auth.openai.com:443', '/oauth/token', 'app_EMoamEEZ73f0CkXaXp7hrann'
+            authority, route = 'auth.openai.com:443', '/oauth/token'
+            client = 'app_EMoamEEZ73f0CkXaXp7hrann'
         spec = {'refresh_auth': True, 'provider': provider, 'auth_file': str(root / (provider + '.json')),
                 'credential_directory': str(root), 'auth_relative': 'auth.json'}
         auth = Path(spec['auth_file'])
