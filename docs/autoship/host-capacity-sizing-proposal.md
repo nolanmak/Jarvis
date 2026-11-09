@@ -47,6 +47,9 @@ A machine too small for one required run reports that precise blocker.
 Swap is a pressure signal, not additional physical RAM for admitting guests.
 C0 must distinguish hard minimum demand from maxima and schedulable shares for
 each dimension; a fractional CPU limit must not be mistaken for zero CPUs.
+Raw effective limits and the usable envelope are separate quantities: subtract
+protected headroom exactly once in the envelope, not again from an already net
+limit. C0 must make that convention explicit in fields and worked fixtures.
 
 D3. Use one admission authority for each resource through the existing owners.
 Reuse native admission, the descendant supervisor, storage reservations/leases,
@@ -69,6 +72,9 @@ counted once. Do not deduct its materialized usage from its remaining promise
 without a real producer contract. Native retained demand must join the existing
 build/snapshot accounting before automatic allocation relies on a combined view.
 No second independent native ledger or allocator may decide the same commitment.
+Retained-native commitments outlive a process or daemon restart. Reclaiming a
+process-scoped flock claim cannot release those commitments; C0 must specify
+their durable integration and original checked-retirement release ordering.
 
 D6. Explicit fixed overrides are supported and visibly labelled. They cannot
 exceed effective enclosing hard limits or silently violate protected floors.
@@ -97,16 +103,33 @@ their actual migration protocol; #1913's legacy writer cannot migrate them.
 Durable uncertain publication retains the original candidate until reconciled;
 never recompute a second candidate to hide a lost acknowledgement.
 
-Installer-managed leaf limits are outputs, not immutable inputs of their own
-sizing calculation. Derive them from host/enclosing limits outside that managed
-leaf; preserve external ancestors and explicit operator ceilings as constraints.
+Installer-managed limit scopes are outputs, including both service limits and
+the aggregate runtime slice. Derive their desired values from host/enclosing
+constraints outside the verified managed scopes. Preserve external ancestors and
+explicit operator ceilings as constraints; names or old numeric defaults do not
+prove management provenance. C0 must enumerate the managed scope set, consumers,
+provenance and ordering for each supported installation path.
 Record managed-limit provenance and verify effective limits after installation
-and reload. A legacy 10G leaf cannot perpetuate itself merely by being read as
-the host envelope. Ambiguous legacy provenance stays fixed until a supported
+and reload. A legacy 10G service or managed aggregate slice cannot perpetuate itself merely
+by being read as the host envelope. Ambiguous legacy provenance stays fixed until a supported
 explicit `enable auto` migration records its scope/revision and replay identity.
 The current host's owner request supplies the product authorization; the normal
 authenticated operation and its durable publication record still provide the
 implementation boundary. No new request for an arbitrary byte value is needed.
+Excluding managed output scopes applies only to planning their future configuration.
+Actual launch admission includes every currently enforced kernel limit, including
+managed service and aggregate scopes, until publication/reload and effective
+readback prove the complete change.
+Report desired, published and observed effective limits separately.
+
+Existing deploy snapshots cover database/binary artifacts, not the new capacity
+policy and service migration by assumption. C0/C3 must extend the existing
+retention-managed protocol with compatible capacity/configuration revision
+coverage and safe rollback or roll-forward. Test rollback after a published
+migration and incompatible old binaries. Never restore old credentials, security
+grants, owner controls, charges or retained-session authority merely to undo
+capacity settings; unknown compatibility blocks rollback explicitly. No ad hoc
+backup directories or retention/floor bypasses are permitted.
 
 D9. CLI and private Discord status must show configured mode/overrides, detected
 limits, protected reserves, committed demand, currently admissible work and the
@@ -115,6 +138,14 @@ recovery only from current evidence. Retrying, starting a PID, raising a number,
 passing component tests and merging this feature are not successful shipment.
 No benchmark is requested. #1703's full CLI/Discord/shipment/soak acceptance stays
 in force independently of this capacity feature's tests.
+N owns mapping the new resource/deficit fields into the existing versioned
+health/progress payloads and outbox. C0 must specify that mapping. N also owns
+uncertain-send reconciliation under #1714: keep later updates pending, expose
+delivery uncertainty separately from current capacity, and reconcile remote
+evidence or use the existing explicit owner-resolution path when ambiguous.
+Specify a bounded alert/escalation lifecycle in C0; never silently drop or bypass
+an uncertain send to claim recovery delivered. Delivery failure cannot block
+ordinary execution admission or turn actual capacity progress into fake failure.
 
 ## 3. Verified current code and incident
 
@@ -130,7 +161,9 @@ Current implementation boundaries:
 
 - `scripts/provision-native-vm-probe.py` initializes new policies with fixed
   max_state_bytes=8 GiB and max_sessions=16 when explicit arguments are absent.
-- `scripts/install-autostart.sh` defaults Linux service memory high/max to 8G/10G.
+- `scripts/install-autostart.sh` defaults Linux service memory high/max to 8G/10G;
+  `scripts/ensure-autopr-worker.sh` also creates the aggregate runtime slice with
+  inherited ceilings. Both managed layers need provenance-aware sizing.
 - `native_vm.rs` / `native_state_capacity.rs` own native admission, state locking,
   retained count and policy limits. Their existing check does not join the CLI
   storage ledger or its configured free-space floors.
@@ -165,6 +198,9 @@ resolution, exact sizing/admission equations, native growth producer, lock order
 policy representation/migration and publication/recovery states. Define override,
 shrink/unknown/recovery/hysteresis behavior and each consumer API. Map every
 writer, including unresolved CI cleanup and legacy/bound-owner versions.
+Include versioned reporting payload evolution and owned uncertain-send
+reconciliation/alerting, rather than assuming existing generic progress fields
+already carry per-resource deficits.
 
 Exit: no load-bearing placeholder below remains; worked fixtures specify exact
 outputs and failure states; the spec passes fresh-reader and complete seam audits.
@@ -201,6 +237,9 @@ behavior first. Test new installations on small/large/constrained hosts, explici
 overrides, existing fixed policies, current-host auto enablement, unsupported
 schemas, filesystem loss, mixed versions, and a ceiling below commitments. Crash
 at each file/rename/sync/reload boundary; replay uncertain publication exactly.
+Test capacity/service configuration recovery with the existing deploy snapshot
+format, including old-binary compatibility and preservation of newer security
+revocations/accounting/owner controls.
 
 Exit: supported fresh deployments configure host-derived capacity automatically;
 existing deployments switch only through supported migration and preserve all
@@ -246,7 +285,7 @@ specified and audited:
    original release proof and cross-version compatibility. No inferred discount.
 3. Observation identity, freshness/clock rules, ancestor resolution, coherent
    reads and allocation-lock revalidation, including replace/remount cases.
-   Distinguish installer-managed leaf outputs from immutable enclosing limits;
+   Distinguish all verified installer-managed output scopes from external limits;
    specify provenance, bootstrap order and post-reload readback.
 4. Stable auto/fixed configuration representation; supported legacy and bound-
    owner migration; complete pending/uncertain/applied/effectively-loaded states.
@@ -266,14 +305,30 @@ No claim that a sample excludes all future uncoordinated writes.
 
 Retained state: disk state kept across turns, separate from live execution RAM.
 Effective limit: tightest relevant host/ancestor/operator limit with protected
-headroom accounted for. Commitment: existing authority's declared reserved demand,
+headroom not yet subtracted. Usable envelope: effective limits after the one
+specified headroom/commitment subtraction. Commitment: existing authority's declared reserved demand,
 not current file size or RSS. Auto: deployed sizing/admission behavior; inspect:
 a read-only command showing that behavior. Observation: data, not a launch grant.
 
 ## 7. Tracking and audit status
 
-Dedicated epic and C0-C5 issue links will be recorded here on publication. The
-previous fresh-reader audit covered the superseded read-only proposal. This
-revision incorporates the owner's explicit automatic-default requirement and
-requires a new fresh-reader and seam audit before issue handoff. C0 is the only
-design-ready task; dependent implementation tasks remain blocked as stated.
+Dedicated capacity epic: [#1917](https://github.com/nolanmak/Jarvis/issues/1917), a sub-issue of #1703.
+
+- C0: [#1918](https://github.com/nolanmak/Jarvis/issues/1918) — Contract/design closure.
+- C1: [#1919](https://github.com/nolanmak/Jarvis/issues/1919) — Effective resource discovery.
+- C2: [#1920](https://github.com/nolanmak/Jarvis/issues/1920) — Shared native/build/snapshot admission.
+- C3: [#1921](https://github.com/nolanmak/Jarvis/issues/1921) — Deployment defaults and migration.
+- C4: [#1922](https://github.com/nolanmak/Jarvis/issues/1922) — Runtime adaptation.
+- C5: [#1923](https://github.com/nolanmak/Jarvis/issues/1923) — CLI/Discord visibility and live acceptance.
+
+C0 is design-ready. C1-C5 have native GitHub blocked-by dependencies and remain
+blocked until their predecessors and reviewed contracts satisfy their exits.
+The previous read-only-default proposal is superseded. A fresh-reader review and
+all 56 mapped seams were checked for this issue-plan handoff. Findings were
+resolved in the plan or explicitly assigned to C0; this does not make the
+dependent implementation ready or establish deployment. See the
+[planning audit record](host-capacity-sizing-audit.md).
+
+Documentation review: [PR #1916](https://github.com/nolanmak/Jarvis/pull/1916).
+The document is on that review branch until normal merge; it is not a deployed
+feature or an exception to independent code review and required CI.
