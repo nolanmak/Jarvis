@@ -435,3 +435,20 @@ rename, explicit complete short-write handling, and the remaining pre-existing
 1 MiB credential-output/read round-trip gate. No checkpoint/digest clears the
 new process latch or authorizes native release. Full metadata/growth, original
 custody, schema/migration and productive handoff remain C0/#1703 gates.
+
+Implementation PR #1935 at cef4663d fixes the original publication leak and
+conservatively fences uncertain writes. There are 69 passing local cases,
+including all 15 new storage/publication/actual diagnostic-path faults. No skips,
+VM/model, real credentials or production state changes. The existing hosted
+native suite contains these tests without another CI registry edit. The stale
+export fixture now uses the actual production-private credential-parent mode.
+Hosted verification, independent approval, merge and rollout remain pending.
+
+The remaining credential round-trip gate is now #1936, with a synthetic actual
+begin/sent/commit/read reproduction on main: 900150 bytes → 1162285 bytes,
+committed journal, refused by the 1048576-byte reader. No live issuer was called.
+The future complete producer profile also must inventory direct relay copying,
+Rust helper/spec materialization, interpreter bytecode caches, bounded audit/
+anchor growth and all relevant publication files. These are C0 growth obligations,
+not silently assumed covered by the fixed retained-session charge or these
+atomic/boot/archive component bounds.

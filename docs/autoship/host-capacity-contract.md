@@ -792,7 +792,14 @@ approval and rollout remain pending; it supplies no C/R or productive grant.
 The native publication temporary-storage leak is separately reproduced and
 scoped in [native-atomic-publication-contract.md](native-atomic-publication-contract.md),
 #1934. Its narrow cleanup/fail-stop work does not settle original native custody,
-consumer credential round-trip bounds or whole-launch growth.
+consumer credential round-trip bounds or whole-launch growth. Implementation
+#1935 at cef4663d has 69 passing local cases; its hosted CI, independent review
+and rollout remain pending. The separate round-trip defect is #1936: actual
+synthetic refresh commits 1162285 bytes from a readable 900150-byte original,
+then the 1048576-byte reader refuses it. No live credential/issuer was used.
+The complete growth producer still must cover direct relay copying, Rust
+helper/spec writes, interpreter bytecode cache output and audit/anchor growth;
+none receives an implicit zero peak or a materialized-size rebate.
 
 Required producer behavior before C2 can claim bounded growth:
 

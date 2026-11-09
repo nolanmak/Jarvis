@@ -28,7 +28,8 @@ parent. Source callers retain their original target/credential authorization;
 the helper gains no permission from a name or payload.
 
 A3. Handle short writes until every byte is written (zero/invalid progress refuses);
-flush/fsync the original temporary file, atomically replace the target
+settle the complete unbuffered writes with fsync (there is no user-space flush
+buffer), atomically replace the target
 through the held directory, then fsync the parent before reporting success.
 Never undo a possibly completed replacement or delete the destination on error.
 If replace returns successfully but parent sync fails, report the original
@@ -40,8 +41,8 @@ never infer nonpublication from destination absence or its later digest. Saved J
 current absence or successful later stat does not erase it in this process.
 No auth eligibility, identity, scope, grant or renewal/replay rule is relaxed.
 A separate pre-existing caller issue can serialize refreshed credentials above
-their 1 MiB read limit while under MAX_FRAME; that round-trip bound remains a
-C0 producer/auth gate, not a guarantee from this generic cap.
+their 1 MiB read limit while under MAX_FRAME; that round-trip bound is tracked in
+#1936 and remains a C0 producer/auth gate, not a guarantee from this generic cap.
 
 A4. If failure precedes confirmed replacement, cleanup may unlink only the
 unpublished temporary name while the original nonexported file descriptor remains
@@ -85,7 +86,7 @@ No live credentials, services, policies, permissions or native sessions change.
 
 Use new fixtures through actual atomic entry point. Reproduce repeated failed
 sync/rename file leakage on unchanged main. Check success/private creation,
-prepublication refusal, exact/oversize payload, short/partial write/flush/file
+prepublication refusal, exact/oversize payload, short/partial/zero-progress writes and file
 sync/replace errors, owned cleanup, cleanup refusal, replaced/missing/hardlinked
 temp entries, parent substitution, rename-with-lost-ack and post-replace dir-sync
 failure. Test the actual main diagnostic branch and outer startup entry with
@@ -101,3 +102,18 @@ credential-bound assurance findings were corrected/rechecked, with explicit
 short-write rules. This permits only #1934's bounded producer implementation;
 contract review is not independent code approval. Full C0/C2 and #1703 productive ingress,
 normal rollout, live CLI/Discord and shipment/fault/soak acceptance remain open.
+
+
+Implementation [PR #1935](https://github.com/nolanmak/Jarvis/pull/1935), head
+cef4663d, passes 35 native cases (15 new), gateway 16, native I/O 9 and
+provisioning 9: 69 passing cases, no skips. CI-contract verification and
+whitespace pass. New cases live in the existing hosted native suite. Actual
+main and outer-entry paths use scripted VM/channel boundaries; no live VM,
+provider or real credential is exercised. Source and test worktree are clean.
+Hosted exact-head CI, independent approval, merge and rollout remain pending.
+
+#1936 now has a real synthetic baseline reproduction of the excluded credential
+round-trip defect: 900150-byte input becomes an accepted 1162285-byte committed
+credential, then the 1048576-byte reader refuses it. Its issue retains exact
+writer/reader, issuer-ordering and TDD requirements; this publication component
+does not claim that defect is fixed or raise its read limit.
