@@ -116,3 +116,20 @@ structural mixed-version/startup fencing remain C0 gates. This checkpoint is
 not complete implementation readiness or a full-contract seam audit. The
 separate executable/companion bound correction is implemented in PR #1925,
 with local behavioral red/green evidence; it does not close these wider gates.
+
+The lifecycle checkpoint separates configured mode, desired output, durable
+publication, actual loaded enforcement and current admission. It defines uncertain
+publication replay, resource-projection rollback preserving current authority,
+and runtime adaptation using the existing unpaid reconciliation loop. A managed
+increase needs two matching known observations at least 60 seconds apart; real
+admission uses fresh locked evidence, shrink blocks new work immediately, and
+ordinary contention recovery does not wait for another increase-stability cycle.
+Unchanged resource deficits do not reopen productive hourly attempts.
+
+The author checked these decisions against the updater's existing guarded
+policy-only activation, worker upgrade watch and capped 300-second independent
+reconciliation loop. Fresh-reader review found no new wrong-build/forced-guess
+findings in L1-L7 and confirmed the timing/accounting examples. These are working
+design fixtures, not implemented fake-clock/runtime test results. Final schemas,
+step journal, compatibility/projection matrix and structural startup fence
+remain load-bearing C0 gates before downstream handoff.

@@ -831,7 +831,173 @@ compatibility keeps activation blocked. This section specifies durable balance
 and ordering; it does not yet approve that compatibility protocol or bootstrap
 automatic mode on an existing legacy host.
 
-## 8. Open contract checklist and handoff gate
+## 8. Configured mode, publication and runtime adaptation
+
+L1. Supported fresh Linux deployments persist `mode=auto` by default. Explicit
+caller resource ceilings are recorded as overrides with their provenance, even
+when numerically equal to an old default. Absent arguments are not implicit
+8 GiB/16-session, 8G/10G service or 24 GiB scratch overrides. A supported machine
+that cannot fit a complete run remains configured auto and reports the limiting
+demand. Temporarily unavailable evidence also keeps auto configured with new
+admission blocked. Unsupported activation refuses explicitly; it never silently
+falls back to a fixed policy and calls that automatic sizing.
+
+Existing deployments remain fixed until the supported explicit enable-auto
+operation binds their current policy/scope revisions and management provenance.
+The owner's current request authorizes that supported operation after normal
+review/rollout; it does not require another choice of arbitrary bytes. Preserve
+known explicit ceilings as overrides. Ambiguous legacy properties require the
+operation's explicit, hash-bound adoption of named resource properties; do not
+classify them as installer defaults from their names, headers or numeric values.
+The exact schema and operation/replay encoding remain C0 gates below.
+
+L2. Keep these facts separate in persistent/readback state:
+
+- Configured mode, explicit overrides, policy revision and predecessor digest.
+- Desired derived service/slice/scratch settings and their observation/demand/
+  provenance revision, before any file or service change.
+- Published candidate file identities/digests and operation ID, before reload.
+- Actual loaded worker/daemon/aggregate kernel limits and selected configuration,
+  bound to process birth/boot and the same current operation/revision.
+- Current admission outcome/deficits under those actual limits and live claims.
+
+No scalar `enabled` or `applied` substitutes for all five. A larger desired
+budget is not usable before enforced readback. A configured auto mode with a
+capacity deficit remains blocked, rather than reported fixed, disabled or healthy.
+The complete managed output set includes both services and the shared slice;
+reading only the daemon cannot certify worker activation.
+
+L3. Publication uses the normal retained deploy snapshot and updater. The
+capacity operation record has distinct states `prepared`, `publishing`,
+`publication-uncertain`, `published-awaiting-load`, `loaded`, and `failed-before-write`.
+`prepared` contains the immutable candidate, expected current revisions/hashes,
+affected resource properties and snapshot/compatibility reference. Persist/sync
+`publishing` before the first changed file. A failure after any write/rename/sync
+whose result is unknown becomes `publication-uncertain`, not a fresh failure
+eligible to recompute another candidate.
+
+Reconciliation compares every affected file's original/candidate identities and
+digests while preserving the original operation. If all candidate files are
+durably present, continue to `published-awaiting-load`. A proven untouched source
+set may terminate `failed-before-write`. Partial or contradictory state stays
+uncertain and fences new auto admission until that same operation is reconciled
+through its recorded write plan. The detailed multi-file step journal must be
+specified with the final schema; this state list alone does not authorize
+blindly rewriting an observed mixed set or rolling back authority.
+
+Use existing deployment pin, active-work, memory-pressure and restart-budget
+guards. `scripts/check-for-updates.sh` already distinguishes policy selection
+from executable updates and defers reload at guarded boundaries. Extend that
+path; do not force-restart an active worker from a capacity poll. For configuration
+increases and ordinary recovery, the worker drains to its existing tick/sweep
+boundary. Any migration needing incompatible-writer teardown must satisfy the
+separate S8 positive-quiescence/startup fence before activation.
+
+`loaded` requires current actual worker and daemon receipts plus aggregate
+kernel readback covering the whole candidate. A daemon restart acknowledgement,
+file rename or worker PID alone is insufficient. Missing/mismatched readback
+stays `published-awaiting-load` or uncertain as appropriate; it cannot fabricate
+recovery. Failed delivery of an update has no bearing on publication/admission.
+
+L4. Rollback coverage extends the existing deploy snapshot format with versioned
+capacity resource projections, source property/file identities, provenance and
+compatibility metadata. Capture the relevant resource values, not an assumption
+that today's database/binary snapshot already covers them. Do not create raw
+database copies or separate rollback directories. Snapshot refusal keeps the
+migration unstarted; no retention/floor override.
+
+Rollback is a new checked resource-policy operation using that projection and
+current authority. It is not restoration of an old native/workflow/accounting
+database or an old whole policy containing grants. Preserve current credentials,
+security revocations, native owners, workflow holds and charges. Overlay only
+owned resource properties onto current compatible configuration. Revalidate
+current identities, enclosing constraints and commitments; a snapshot's old
+8 GiB ceiling cannot be imposed over 9 GiB of current retained promises.
+
+Only a binary/configuration combination supporting the current storage/native
+protocol may load this rollback. An incompatible old binary or unknown schema
+compatibility refuses explicitly and requires compatible roll-forward. Never
+erase durable rows or the minimum-protocol fence to make rollback succeed.
+The final compatibility matrix and snapshot projection schema still block C3.
+
+L5. Runtime observation reuses the worker's existing unpaid reconciliation loop,
+whose interval is capped at 300 seconds with missed ticks skipped. Observe at
+startup and on each pass; no additional allocator or independent paid retry loop.
+Every actual allocation still performs its own fresh locked check and never
+waits up to that interval to reject known pressure or a changed identity.
+
+Service/slice desired limits derive from stable host/external constraints and
+validated demand, not noisy MemAvailable/free-byte samples. Live availability
+changes admission and displayed deficits; they do not rewrite service files on
+every tick. Dynamic retained-disk headroom is an observation, not a preallocated
+pool or a new persistent ceiling for every byte of filesystem fluctuation.
+
+L6. Apply shrink immediately to new admission using the smaller current envelope,
+even while an older larger kernel limit is loaded. Preserve existing commitments.
+Do not publish a new managed hard ceiling below its still-live reservations:
+defer that decrease until checked releases make it fit. External/kernel shrink
+may already affect running work; report overcommit/runtime exhaustion truthfully,
+without killing sessions or erasing charges to claim the new size fits.
+
+A desired managed increase needs two consecutive known, identity/policy/demand-
+consistent observations of the same candidate, at least 60 seconds apart on the
+same boot. Unknown, changed candidate, changed revision or intervening shrink
+resets that stability evidence. Then submit one normal updater operation; its
+guard/readback states remain authoritative. Persist the candidate/observation
+identities for deduplication, but restart does not turn old samples into fresh
+increase evidence. Initial supported installation uses its direct checked
+provisioning operation; it does not fabricate two historical samples.
+
+Ordinary admission recovery from transient contention needs the first current
+known sample that fits; the two-sample rule applies to increasing managed
+configuration, not to hiding existing usable capacity for another interval.
+If pressure returns between observation and execution, the fresh original
+allocation guard refuses before paid release. Neither transition is shipment.
+
+L7. A resource wait is reconciled observationally, without reopening a productive
+attempt every hour against unchanged evidence. Preserve its existing protected
+workflow checkpoint, generation, owner controls, demand and binding. Its wake
+fingerprint binds policy/demand/loaded/resource identities plus the typed
+known/unknown/blocked/available outcome for that complete next action; raw
+byte/time churn alone does not change readiness or queue an attempt. Stable
+blocker details remain visible even when no new workflow event is warranted.
+
+When a current outcome becomes available, request ordinary fair scheduling;
+eligible work advances within the parent epic's two reconciliation cycles,
+subject to actual capacity and mandatory checks. Observation is not a direct
+dispatch callback. Holds, pending migration, invalid source/input and provider
+cooldown remain independent predicates. Provider/review/CI retry backoff does
+not get reset by a free-space change. Capacity observation/deferral consumes
+zero paid model calls and zero shipping allowance; model work starts only after
+the existing full execution boundary authorizes it.
+
+### Exact lifecycle/fake-clock fixtures
+
+- Loaded B=12 GiB, new current B=6 GiB and existing complete reservations=6.5
+  GiB: new admission blocks immediately. Loaded limit remains unchanged pending
+  checked releases; no process is killed and no half-GiB charge disappears.
+- A larger candidate at t=0 and t=59 seconds is not increase-eligible; the same
+  bound candidate at t=60 is. Unknown at t=30 resets evidence, so another known
+  sample at t=60 is the first, not the second. A candidate changed at t=59 is
+  also the first sample of the new candidate.
+- Reconciliation at t=0 and t=300 with an unchanged increase candidate satisfies
+  stability. Updater guard refusal leaves desired/published/loaded distinct and
+  queues no second candidate under a new operation ID to evade the guard.
+- Pressure blocked at t=0, known available at t=300: request fair work at that
+  pass without a second recovery sample. It must still pass current admission
+  before paid release. A reappearing deficit at execution yields a capacity
+  outcome with no model call or allowance consumption.
+- Increasing free space by one byte while the complete queued demand remains
+  blocked creates no productive retry. Changing worker identity invalidates
+  old evidence; it cannot itself become a recovery/merge/deployment event.
+- A published policy whose worker has not reloaded stays awaiting load even if
+  the daemon restarted successfully. Restart/reopen during uncertain multi-file
+  publication reconciles the original candidate; it does not reset accounting.
+- A rollback requesting 8 GiB against 9 GiB of retained commitments refuses and
+  leaves configuration/security/accounting intact; rollback to a binary that
+  ignores durable native claims refuses independently of numerical capacity.
+
+## 9. Open contract checklist and handoff gate
 
 Memory equations above are proposed engineering decisions with exact fixtures.
 They require fresh-reader review and source/integration validation before C0
@@ -851,8 +1017,8 @@ this partial document as the completed contract.
   provenance and publication/reload/uncertainty replay states.
 - [ ] P/E: snapshot configuration coverage, compatibility/rollback rules and
   preservation of current security, owner controls and accounting.
-- [ ] R/H: runtime resampling cadence, increase hysteresis, shrink/unknown/recovery
-  semantics, stable reason identifiers and worker effective readback.
+- [ ] R/H: integration validation of section 8's cadence/hysteresis/shrink/recovery
+  decisions, with final stable reason identifiers and worker readback mapping.
 - [ ] H/N: versioned CLI/private Discord payload mapping, privacy classification,
   deduplication, uncertain delivery reconciliation and bounded alert lifecycle.
 - [ ] E: reviewed complete contract plus fresh-reader, conversation and full seam
