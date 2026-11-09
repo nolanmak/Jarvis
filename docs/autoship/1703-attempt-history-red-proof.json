@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "parent_issue": 1703,
+  "owner_issue": 1706,
+  "repair_issue": 1948,
+  "pr": 1949,
+  "red": {
+    "head": "9a3589e1337f09deb2b5e61a89b0c0e65efdf0a3",
+    "run": 42627865221,
+    "job": 129196209301,
+    "conclusion": "failure",
+    "cli_unit_tests": {
+      "passed": 1741,
+      "failed": 3,
+      "ignored": 33
+    },
+    "expected_failures": [
+      "infrastructure_attempt_waits_for_history_lock_and_keeps_peer_update",
+      "readmission_reset_waits_for_history_lock_and_keeps_peer_update",
+      "reasoner_error_waits_for_history_lock_and_keeps_peer_update"
+    ],
+    "assertion": "production writer ignored the shared history lock",
+    "log_sha256": "9368ae22735b61a3d30d5d47c2836f1bdf28000b50bf1b17096d02e1e15060bb"
+  },
+  "implementation": {
+    "head": "388e6202e9790531271e8add9f894b52230121b7",
+    "run": 42630481781,
+    "state": "in_progress",
+    "production_writers": 3,
+    "behavior_tests": 6,
+    "whitespace": "passed",
+    "rust_syntax": "passed"
+  },
+  "limits": [
+    "No hosted GREEN or local full-suite pass claimed yet.",
+    "No concurrent consumer, capacity increase, native state reset, review approval, merge or deployment.",
+    "Fixture SIGKILL is limited to an original disposable test child; it grants no native retirement/release authority.",
+    "All live writer versions must drain/upgrade before enabling concurrent consumption."
+  ]
+}

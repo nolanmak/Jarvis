@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T14:05:28.115680+00:00",
+  "purpose": "Prevent duplicate issue builds while the draft repair PRs are tested, until linked-PR selection is deployed.",
+  "holds": [
+    {
+      "workflow": "nolanmak/jarvis#1946",
+      "request_id": "autoship-protect-repair1946-20261109",
+      "paused": true,
+      "revision": 1,
+      "updated_at_ms": 1794232433583,
+      "workflow_model_admissions": null,
+      "native_owner_rows": 0,
+      "pr": 1947,
+      "pr_alias_workflow": null
+    },
+    {
+      "workflow": "nolanmak/jarvis#1948",
+      "request_id": "autoship-protect-repair1948-20261109",
+      "paused": true,
+      "revision": 1,
+      "updated_at_ms": 1794232436886,
+      "workflow_model_admissions": null,
+      "native_owner_rows": 0,
+      "pr": 1949,
+      "pr_alias_workflow": null
+    }
+  ],
+  "release_condition": "Reassess only if the corresponding PR is closed unmerged and work must return to the issue lane; merged PRs close their source issue. Do not resume an issue into a duplicate build while its PR remains active.",
+  "limits": [
+    "Normal authenticated CLI admission/pause only; no direct database mutations.",
+    "Source-only holds do not confer PR execution or merge approval.",
+    "Native retirement and resource credit are not inferred from pause acceptance."
+  ]
+}

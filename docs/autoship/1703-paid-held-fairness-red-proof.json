@@ -57,5 +57,30 @@
     "No concurrent consumer, source binding, native runtime, capacity policy, merge credit or production deployment changed.",
     "Resolved PR classification and broader peer fairness/inactivity remain #1706 requirements.",
     "Full automatic host sizing and #1703 live acceptance remain incomplete."
-  ]
+  ],
+  "validation_attempts": [
+    {
+      "head": "3eb3f5868c43c1de3598aae92a7a07e5e8cd515a",
+      "run": 42626678480,
+      "job": 129192140928,
+      "conclusion": "failure",
+      "cli_unit_tests": {
+        "passed": 1743,
+        "failed": 1,
+        "ignored": 33
+      },
+      "new_behavior_tests": "all three passed",
+      "failed_test": "self_improve::tests::the_reserved_build_slot_yields_to_a_waiting_draft_before_idling",
+      "failure_kind": "legacy source-layout assertion required accounting inside the old billed arm",
+      "log_sha256": "9d38793b75fdc223dd0a0a5221392eeb426a378e015c8964416ad83b0bc3449d"
+    }
+  ],
+  "latest_implementation": {
+    "head": "1ff444fcb56e113325c7f00c8839b38b3891cf3e",
+    "run": 42629214521,
+    "job": 129200832827,
+    "state": "in_progress",
+    "change": "Replaced only obsolete accounting-layout assertions with real worker completed-paid controls; original rotation checks remain.",
+    "worker_tests": 5
+  }
 }

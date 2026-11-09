@@ -54,5 +54,81 @@
       "reason": "awaiting-worker-claim"
     },
     "limits": "Interactive shell lacks configured worker policy; this is not a diagnosis that the background worker is missing policy. No private worker environment copied, limits changed, request reset or merge performed."
+  },
+  "latest_execution_observation": {
+    "observed_at": "2026-11-09T14:05:28.115680+00:00",
+    "status": {
+      "accepted": true,
+      "allowance": {
+        "available": 5,
+        "cap": 5,
+        "confirmed": 0,
+        "last_merged_at_ms": 1793941353000,
+        "oldest_pending_at_ms": null,
+        "pending": 0,
+        "remaining": 5
+      },
+      "complete": false,
+      "delivery": {
+        "latest_sequence": null,
+        "oldest_pending_at_ms": null,
+        "pending_events": 0,
+        "state": "delivery-confirmed"
+      },
+      "deployment": {
+        "state": "unknown"
+      },
+      "eligible_at_ms": 0,
+      "head": "ca50608c27705d837ed493b0b01331ba4e0fd535",
+      "last_attempt": {
+        "eligible_at_ms": 1794231615234,
+        "finished_at_ms": null,
+        "outcome": "selected",
+        "reason": "worker-attempt-unconfirmed",
+        "selected_at_ms": 1794231315234
+      },
+      "lease": {
+        "active": true,
+        "generation": 1
+      },
+      "merge": {
+        "state": "not-confirmed"
+      },
+      "milestones": {
+        "merged": false,
+        "pr": null
+      },
+      "next_action": "verify_recovered_revision",
+      "owner_control": null,
+      "owner_messages_pending": 0,
+      "pending_merge_evidence": [],
+      "pending_merge_operations": [],
+      "pr_url": "https://github.com/nolanmak/jarvis/pull/1944",
+      "progress_at_ms": 1794231937160,
+      "provider": null,
+      "reason": "interrupted_edits_checkpointed",
+      "repository": "nolanmak/jarvis",
+      "requested_until": "merged",
+      "resources": {
+        "attempts": 1,
+        "model_calls": 5,
+        "tokens": 0,
+        "wall_ms": 1740360
+      },
+      "schema_version": 1,
+      "stage": "verify",
+      "target": {
+        "kind": "pr",
+        "number": 1944
+      },
+      "workflow": "nolanmak/jarvis/pr/1944",
+      "workflow_until": "merged"
+    },
+    "remote_pr_head": "932e8807058b667f165350109d9a22c8936f3127",
+    "limits": [
+      "Selected command receipt, active lease, recorded admissions and candidate checkpoint prove execution progress, not review approval or merge.",
+      "A changed local candidate does not inherit checks from the older published PR head.",
+      "Original command request and workflow were not reset."
+    ]
   }
 }

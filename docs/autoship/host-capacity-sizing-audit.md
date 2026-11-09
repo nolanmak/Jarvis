@@ -811,3 +811,33 @@ accounting. Whitespace and Rust syntax parsing pass. Hosted GREEN run
 42626678480 is live; no passing result, independent approval, merge or rollout
 is claimed yet. Original issue1943 still retains its lease after the accepted
 normal pause, and queued PR1944/1945 remain unpaused and unclaimed.
+
+## Recovery command advances; shared history repair reaches real RED
+
+PR1944's [original command proof](1703-pr1944-command-proof.json) now includes
+its selected durable attempt, active generation-1 lease, five model admissions
+and Verify checkpoint at local candidate ca50608c. Its published head remained
+932e8807 at the observation, so old remote CI does not prove the new candidate.
+The duplicate issue1943 managed processes previously observed are no longer in
+the worker tree; no native-retirement credit or full quiescence is inferred.
+
+The paid-held fix's first implementation run passed all three new behavior
+cases but failed one obsolete source-layout assertion (1,743 passes/one failure,
+33 existing ignored). PR1947 head1ff444fc retains rotation checks and replaces
+only the accounting-layout assertion with completed-paid worker controls. Five
+worker tests now cover six paid/deferred/unpaid cases. Full hosted validation
+42629214521 remains live; this is not a passing full suite.
+
+#1948 is a native child of #1706; draft #1949 tests-only9a3589e1 produced
+[three real writer lock violations](1703-attempt-history-red-proof.json), with
+1,741 other CLI unit passes and 33 existing ignores. Implementation388e6202
+routes all three writers through one original-path lock before reading through
+replacement, with six behavior/failure/crash tests. Hosted42630481781 is live;
+independent approval, merge and rollout remain pending. No consumer is enabled.
+
+[Source-only holds](1703-repair-issue-holds-proof.json) on issue1946/1948 prevent
+the older selector duplicating their active draft PRs while the dedup repair is
+unmerged. They were admitted/paused through the normal CLI and have no shared
+PR alias at observation. Do not resume them while their PR remains active.
+Full capacity, provenance compatibility, targeted PR classification, typed
+identity outcomes and parent live acceptance remain unfinished.
