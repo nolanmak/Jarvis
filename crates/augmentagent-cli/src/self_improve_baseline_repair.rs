@@ -525,4 +525,174 @@ mod tests {
         .to_string();
         assert!(decode(&raw, &"a".repeat(64), 0, None).is_err());
     }
+    fn crash_marker(root: &Path, value: &str) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("observations"))
+            .unwrap();
+        writeln!(file, "{value}").unwrap();
+        file.sync_all().unwrap();
+    }
+
+    async fn crash_fixture(root: &Path, phase: Option<&str>) -> Result<(u32, &'static str)> {
+        use crate::autoship_workflow::{Binding, WorkflowStore};
+        let path = root.join("workflow.db");
+        let binding = Binding {
+            head: "a".repeat(40),
+            contract: "b".repeat(64),
+            evidence_hash: "c".repeat(64),
+        };
+        let mut store = WorkflowStore::open(&path)?;
+        let now = if phase.is_some() {
+            store.register("owner/repo#1", "fixture", binding.clone(), 1)?;
+            2
+        } else {
+            2002
+        };
+        let lease = store
+            .claim("owner/repo#1", "fixture", now, 1000)?
+            .context("fixture lease unavailable")?;
+        let store = Mutex::new(store);
+        let result = run(
+            &"5".repeat(64),
+            |key| {
+                store
+                    .lock()
+                    .unwrap()
+                    .scope_stage_response(&lease, &binding, key, now + 1)
+            },
+            |key, raw| {
+                if phase == Some("before-failure") {
+                    crash_marker(root, "before-failure");
+                    std::process::exit(73);
+                }
+                store.lock().unwrap().record_scope_stage_response(
+                    &lease,
+                    &binding,
+                    key,
+                    raw,
+                    now + 1,
+                )?;
+                if phase == Some("after-failure") {
+                    crash_marker(root, "after-failure");
+                    std::process::exit(73);
+                }
+                Ok(())
+            },
+            |slot, cached, _| {
+                let key = amendment::digest(format!("scripted-proposal-v1:{slot}").as_bytes());
+                let result = (|| -> Result<u32> {
+                    if let Some(raw) = store.lock().unwrap().scope_stage_response(
+                        &lease,
+                        &binding,
+                        &key,
+                        now + 1,
+                    )? {
+                        return Ok(serde_json::from_str(&raw)?);
+                    }
+                    if cached {
+                        return Err(Hold::EvidenceUnknown.into());
+                    }
+                    crash_marker(root, &format!("model:{slot}")); // scripted boundary only
+                    store.lock().unwrap().record_scope_stage_response(
+                        &lease,
+                        &binding,
+                        &key,
+                        &slot.to_string(),
+                        now + 1,
+                    )?;
+                    if phase == Some("after-response") {
+                        crash_marker(root, "after-response");
+                        std::process::exit(73);
+                    }
+                    Ok(slot)
+                })();
+                std::future::ready(result)
+            },
+            |slot| {
+                crash_marker(root, &format!("observe:{slot}"));
+                std::future::ready(if slot == 0 {
+                    Err(rejected())
+                } else {
+                    Ok("scripted current observation; no production permission")
+                })
+            },
+        )
+        .await?;
+        if phase == Some("before-positive-persistence") {
+            crash_marker(root, "positive-returned-without-persistence");
+            std::process::exit(73);
+        }
+        Ok(result)
+    }
+
+    #[tokio::test]
+    async fn original_process_crash_reopens_response_failure_and_unpersisted_success_boundaries() {
+        const ROOT: &str = "AUTOSHIP_INITIAL_REPAIR_CRASH_ROOT";
+        const PHASE: &str = "AUTOSHIP_INITIAL_REPAIR_CRASH_PHASE";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let phase = std::env::var(PHASE).unwrap();
+            crash_fixture(Path::new(&root), Some(&phase)).await.unwrap();
+            panic!("fixture did not reach original crash point");
+        }
+        for phase in [
+            "before-failure",
+            "after-failure",
+            "after-response",
+            "before-positive-persistence",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let output=tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","self_improve::acceptance::initial_repair::tests::original_process_crash_reopens_response_failure_and_unpersisted_success_boundaries"])
+                .env(ROOT,root.path()).env(PHASE,phase).output().await.unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{phase}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result = crash_fixture(root.path(), None).await.unwrap();
+            assert_eq!(result.0, 1);
+            let observations = std::fs::read_to_string(root.path().join("observations")).unwrap();
+            assert_eq!(
+                observations
+                    .lines()
+                    .filter(|line| *line == "model:0")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                observations
+                    .lines()
+                    .filter(|line| *line == "model:1")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                observations
+                    .lines()
+                    .filter(|line| *line == "observe:0")
+                    .count(),
+                if phase == "before-failure" { 2 } else { 1 }
+            );
+            assert_eq!(
+                observations
+                    .lines()
+                    .filter(|line| *line == "observe:1")
+                    .count(),
+                if phase == "before-positive-persistence" {
+                    2
+                } else {
+                    1
+                }
+            );
+            if phase == "before-positive-persistence" {
+                assert!(observations.contains("positive-returned-without-persistence"));
+            } else {
+                assert!(observations.lines().any(|line| line == phase));
+            }
+        }
+    }
 }
