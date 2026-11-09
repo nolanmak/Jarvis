@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T20:46:06.621826+00:00",
+  "observed_at": "2026-11-09T20:51:25.586116+00:00",
   "parent_issue": 1952,
   "component_issue": 1955,
   "pr": 1956,
-  "status": "behavioral_red_observed_implementation_validation_running",
+  "status": "managed_affected_suites_green_hosted_ci_pending",
   "contract_checkpoint": "af744bc7",
   "source_base": "416f392b17b56b2a43e67a3e430835902387941a",
   "behavioral_red": {
@@ -23,14 +23,15 @@
     "limits": "Compiled and executed against unchanged production behavior; scripted admission fixture, no native model or production state."
   },
   "implementation": {
-    "head": "899e1479",
+    "head": "899e14797e25cf9ad8a6234c00c0eb2548cf5e76",
     "production_files": [
       "crates/augmentagent-channel-core/src/tool_audit.rs",
       "crates/augmentagent-cli/src/self_improve_workflow.rs"
     ],
     "additional_test_file": "crates/augmentagent-channel-core/src/process_tree.rs",
-    "validation": "managed core audit suite running; no GREEN claimed",
-    "published_pr_head_at_creation": "2e9b8f0d54c6bca8caa48ae775abd1e11c2af6e0"
+    "validation": "all three managed affected suites passed; hosted targeted job still running",
+    "published_pr_head_at_creation": "2e9b8f0d54c6bca8caa48ae775abd1e11c2af6e0",
+    "published_pr_head": "899e14797e25cf9ad8a6234c00c0eb2548cf5e76"
   },
   "source_queue": {
     "workflow": "nolanmak/jarvis#1955",
@@ -45,5 +46,53 @@
     "Hosted checks, independent code approval, normal merge/updater rollout and real native receipt observation remain pending.",
     "This bounded prerequisite does not close failed-result custody, no-spend holds, automatic host sizing or parent CLI/Discord/merge/fault/soak acceptance.",
     "Original PR1954 command, branch/body, pinned verifier and native runtime were unchanged."
-  ]
+  ],
+  "managed_green": {
+    "head": "899e14797e25cf9ad8a6234c00c0eb2548cf5e76",
+    "runs": [
+      {
+        "suite": "protected_audit",
+        "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib tool_audit::tests -- --nocapture",
+        "managed_exit": 0,
+        "tests_passed": 29,
+        "tests_failed": 0,
+        "tests_ignored": 0,
+        "log_sha256": "0e412de772b8e3645b0e71d0e71d169d03c61d517f0d5e368f477025ab4ec7d9"
+      },
+      {
+        "suite": "supervised_process",
+        "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib process_tree::tests -- --nocapture",
+        "managed_exit": 0,
+        "tests_passed": 21,
+        "tests_failed": 0,
+        "tests_ignored": 1,
+        "log_sha256": "102137dc6f46099cf3c220081090c9eb0774ce2f4e953b6b4ea44ef22cbf0273"
+      },
+      {
+        "suite": "workflow_accounting",
+        "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent self_improve::workflow::tests -- --nocapture",
+        "managed_exit": 0,
+        "tests_passed": 32,
+        "tests_failed": 0,
+        "tests_ignored": 1,
+        "log_sha256": "a35f88eaa2852dc63b34cdc962dd306475b116a060e724f4d740b566fba55f40"
+      }
+    ],
+    "total_passed": 82,
+    "total_failed": 0,
+    "total_existing_ignored": 2,
+    "existing_ignored": [
+      "process_tree::tests::observed_command_boundary_proves_live_then_quiescent_kernel_scope: requires isolated delegated systemd service, real kernel scope, no VM/model.",
+      "self_improve::workflow::tests::cancelled_real_worker_recovers_under_new_lease_and_executes_again: requires isolated delegated cgroup service and declared run resources."
+    ]
+  },
+  "hosted_ci": {
+    "head": "899e14797e25cf9ad8a6234c00c0eb2548cf5e76",
+    "pending_run": 42696309670,
+    "pending_job": 129429109096,
+    "job_state": "in_progress",
+    "active_step": "Targeted crate tests",
+    "required_linux_aggregate": "pending",
+    "independent_approval": false
+  }
 }

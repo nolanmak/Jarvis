@@ -229,3 +229,20 @@ remain to be judged after their load-bearing interfaces are settled. A map is
 not a completed seam audit. The parked schema, native result custody, complete
 paid-path mapping and transaction questions still prevent implementation
 handoff; this checkpoint does not approve code or claim deployed recovery.
+
+
+## Bounded accounting correlation implementation
+
+The separately scoped [receipt producer contract](native-admission-accounting-correlation-contract.md)
+passed fresh/source/all 23 mapped seam checks and is implemented under native
+child #1955 in draft PR #1956. [Test-first proof](1703-admission-accounting-correlation-test-first-proof.json)
+records the runtime missing-field RED before the new API and managed GREEN at
+899e1479: 82 passing affected tests, zero failures and two existing isolated
+systemd cases ignored. Required hosted CI and independent approval/normal
+rollout remain pending.
+
+This returns the original committed accounting receipt into its protected
+admission audit alongside any original resource identity. It does not supply
+native response custody, failed-finding retention, the complete early paid-path
+map, hold/claim/wake transactions or actual restored CLI/Discord/merge behavior.
+The main-source interface observations above remain true until normal rollout.
