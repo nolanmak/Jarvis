@@ -2912,6 +2912,35 @@ async fn file_slices(repo_root: &Path, issue: &Issue, plan: &[Slice], guard: &wo
     slicing::file(repo_root,issue,plan,guard).await
 }
 
+/// Finish an over-cap scope decision after its optional plan has been generated.
+/// Keep the real parent mutation fallback behind the typed child-publication hold.
+async fn finish_scope_refusal(repo:&Path,issue:&Issue,reason:&str,scope_body:&str,plan:&[Slice],
+    guard:&mut workflow::WorkflowGuard,accounting:&workflow::CapacityAccounting)->Result<RunReport> {
+    if let Some(report)=accounting.report()? {return Ok(report);}
+    if plan.len()>=MIN_SLICES {
+        match file_slices(repo,issue,plan,guard).await {
+            Ok(children) if !children.is_empty()=> {
+                guard.transition(crate::autoship_workflow::Stage::Scope,"scope_deferred","retry_scope",chrono::Utc::now().timestamp_millis()+300_000).await?;
+                if let Some(report)=accounting.report()? {return Ok(report);}
+                return Ok(RunReport::triage(format!("issue #{}: oversized — sliced into {} child issues ({})",issue.number,children.len(),
+                    children.iter().map(|n|format!("#{n}")).collect::<Vec<_>>().join(", "))));
+            },
+            Ok(_)=>(),
+            Err(error)=> {
+                if let Some(report)=linked_claims::report(&error) {return Ok(report);}
+                warn!(issue=issue.number,"filing slices failed: {error:#}");
+            },
+        }
+    }
+    guard.require_fresh_issue(repo).await?;
+    guard.transition(crate::autoship_workflow::Stage::Scope,"scope_deferred","retry_scope",chrono::Utc::now().timestamp_millis()+300_000).await?;
+    if let Some(report)=accounting.report()? {return Ok(report);}
+    backoff_comment(repo,issue.number,&format!(
+        "Auto-fix triage: refused before building — {reason}.\n\nThe work itself may be sound; it does not fit the unattended pipeline's bounds (focused diff ≤ 600 lines, no deploy/auth/secret/CI paths). Splitting it into smaller issues usually resolves the size case. Remove the `{GAVE_UP_LABEL}` label to re-triage it (for example if the path is only mentioned as background).\n\nScoping spec, for whoever picks this up:\n\n{}",truncate(scope_body,1500))).await.ok();
+    label_gave_up(repo,issue.number,GIVE_UP_SCOPER_PREDICTS_REFUSAL).await.ok();
+    Ok(RunReport::triage(format!("issue #{}: refused pre-build ({reason}) — labeled out",issue.number)))
+}
+
 /// Stage 3 (#653): read-only QA review of the builder's diff, on the same
 /// stronger tier as the scoper. A rejected review means no PR — it counts as
 /// a failed attempt, exactly like a red verification gate.
@@ -8037,73 +8066,20 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             s.fixable=true;
         }
     }
-    // #843 — the scoper's own predictions, made binding. A refusal here has
-    // spent one cheap Fable call and ~30 seconds; the same refusal after the
-    // build costs a ~20-minute agentic-Opus run. Three of six live runs paid
-    // the expensive version of this exact conclusion.
-    if let Some(sc) = &scope {
-        if let Some(reason) = scope_predicts_refusal(sc) {
-            // #1516 — an honest over-cap estimate on a fixable issue that is
-            // not itself a slice is an epic, not a refusal: split it into
-            // child issues each inside the pipeline's bounds. One
-            // scoping-tier call, unbilled. Guarded paths are never sliced
-            // around, and a not-fixable verdict is not: its objection would
-            // reach none of the children.
-            if sc.fixable && !sc.guarded_paths && !is_slice_body(&issue.body) {
+    // #843/#1516 — plan only unguarded parent issues. The post-scope caller
+    // owns both child publication and the ordinary refusal fallback.
+    if let Some(sc)=&scope {
+        if let Some(reason)=scope_predicts_refusal(sc) {
+            let plan=if sc.fixable && !sc.guarded_paths && !is_slice_body(&issue.body) {
                 workflow_guard.require_fresh_issue(repo_root).await?;
-                let plan = reasoner
-                    .call(&slice_opts(worktree.clone()), &build_slice_prompt(&issue, sc))
-                    .await
-                    .map(|raw| parse_slice_plan(&raw))
-                    .unwrap_or_else(|e| {
-                        warn!(issue = issue.number, "slice planning failed: {e:#}");
-                        Vec::new()
-                    });
-                if plan.len() >= MIN_SLICES {
-                    match file_slices(repo_root, &issue, &plan, &workflow_guard).await {
-                        Ok(children) if !children.is_empty() => {
-                            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
-            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
-            cleanup(worktree, branch, repo_root.to_path_buf()).await;
-                            return Ok(RunReport::triage(format!(
-                                "issue #{}: oversized — sliced into {} child issues ({})",
-                                issue.number,
-                                children.len(),
-                                children.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", ")
-                            )));
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            if let Some(report)=linked_claims::report(&e) {return Ok(report);}
-                            warn!(issue = issue.number, "filing slices failed: {e:#}");
-                        },
-                    }
-                }
-            }
-            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
-            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
-            cleanup(worktree, branch, repo_root.to_path_buf()).await;
-            backoff_comment(
-                repo_root,
-                issue.number,
-                &format!(
-                    "Auto-fix triage: refused before building — {reason}.\n\n\
-                     The work itself may be sound; it does not fit the \
-                     unattended pipeline's bounds (focused diff ≤ 600 lines, \
-                     no deploy/auth/secret/CI paths). Splitting it into \
-                     smaller issues usually resolves the size case. Remove \
-                     the `{GAVE_UP_LABEL}` label to re-triage.\n\n\
-                     Scoping spec, for whoever picks this up:\n\n{}",
-                    truncate(&sc.body, 1500)
-                ),
-            )
-            .await
-            .ok();
-            label_gave_up(repo_root, issue.number, GIVE_UP_SCOPER_PREDICTS_REFUSAL).await.ok();
-            return Ok(RunReport::triage(format!(
-                "issue #{}: refused pre-build ({reason}) — labeled out",
-                issue.number
-            )));
+                reasoner.call(&slice_opts(worktree.clone()),&build_slice_prompt(&issue,sc)).await
+                    .map(|raw|parse_slice_plan(&raw)).unwrap_or_else(|error| {
+                        warn!(issue=issue.number,"slice planning failed: {error:#}");Vec::new()
+                    })
+            } else {Vec::new()};
+            let result=finish_scope_refusal(repo_root,&issue,&reason,&sc.body,&plan,&mut workflow_guard,&capacity_accounting).await;
+            cleanup(worktree,branch,repo_root.to_path_buf()).await;
+            return result;
         }
     }
 
@@ -17659,10 +17635,10 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(hold.contains("prove_current_main") && hold.contains("RunReport::held("), "objective relevance gate");
         assert!(!hold.contains("label_gave_up"), "no model-only human label");
         assert!(!hold.contains("record_attempt("), "an overtaken issue is not an attempt");
-        let slice = body.find("sc.fixable && !sc.guarded_paths && !is_slice_body(&issue.body)").expect("slice guard");
-        let refusal = body.find("GIVE_UP_SCOPER_PREDICTS_REFUSAL").expect("size refusal");
-        assert!(slice < refusal, "slicing is tried before the refusal");
-        assert!(body[slice..refusal].contains("slice_opts(") && body[slice..refusal].contains("file_slices("));
+        assert!(body.contains("sc.fixable && !sc.guarded_paths && !is_slice_body(&issue.body)"));
+        // The actual refusal consumer's hold-versus-parent-mutation behavior is
+        // exercised by pr_appearing_at_child_creation_preserves_plan_and_parent.
+
     }
 
     #[test]
@@ -20271,18 +20247,21 @@ print(json.dumps([{'number': 77, 'isDraft': False,
             }).await.unwrap().unwrap();
             guard.checkpoint(crate::autoship_workflow::Stage::Build,"fixture_dispatch","build",0,&["original-evidence".into()]).await.unwrap();
             let before=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
-            let error=if case=="midflight" {
+            if case=="midflight" {
                 guard.require_fresh_issue(&repo).await.unwrap();
                 std::fs::write(std::env::var_os("AUTOSHIP_LINKED_PR_MARKER").unwrap(),"").unwrap();
-                guard.require_fresh_issue(&repo).await.unwrap_err()
+                let error=guard.require_fresh_issue(&repo).await.unwrap_err();
+                assert_eq!(error.downcast_ref::<linked_claims::Hold>(),Some(&linked_claims::Hold::Claimed));
+                assert!(linked_claims::report(&error).is_some());
             } else {
                 let issue=Issue {number:42,title:"Correct widget rounding".into(),body:"Round widget values consistently.".into(),author:"fixture-owner".into(),author_trusted:true,research_filed:false};
                 let plan=vec![Slice{title:"Round small values".into(),body:"Cover small widget values.".into()},
                     Slice{title:"Round large values".into(),body:"Cover large widget values.".into()}];
-                file_slices(&repo,&issue,&plan,&guard).await.unwrap_err()
-            };
-            assert_eq!(error.downcast_ref::<linked_claims::Hold>(),Some(&linked_claims::Hold::Claimed));
-            assert!(linked_claims::report(&error).is_some());
+                let accounting=guard.capacity_accounting(false).unwrap();
+                let report=finish_scope_refusal(&repo,&issue,"estimated oversized change","original scope",&plan,&mut guard,&accounting).await.unwrap();
+                assert!(report.is_idle());assert!(!report.billed);
+                assert_eq!(report.message,linked_claims::Hold::Claimed.to_string());
+            }
             let after=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
             assert_eq!(after.checkpoint.stage,before.checkpoint.stage);
             assert_eq!(after.checkpoint.binding,before.checkpoint.binding);

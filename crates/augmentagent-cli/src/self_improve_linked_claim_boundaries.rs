@@ -226,7 +226,7 @@ async fn publication_claims_preserve_intents_and_reconcile_original_identity() {
         linked_claims::Hold::Claimed
     };
     assert_eq!(error.downcast_ref::<linked_claims::Hold>(), Some(&hold));
-    let store = crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
+    let mut store = crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
     let after = store.snapshot(guard.id()).unwrap().unwrap();
     assert_eq!(after.checkpoint.stage, before.checkpoint.stage);
     assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
