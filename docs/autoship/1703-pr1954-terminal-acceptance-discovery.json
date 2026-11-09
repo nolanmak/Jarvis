@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T21:03:54.182414+00:00",
+  "workflow": "nolanmak/jarvis/pr/1954",
+  "request_id": "autoship-recovery-pr1954-20261109",
+  "published_pr": {
+    "headRefOid": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+    "mergedAt": null,
+    "state": "OPEN"
+  },
+  "original_attempt": {
+    "eligible_at_ms": 1794251327680,
+    "finished_at_ms": 1794257651612,
+    "outcome": "failed",
+    "reason": "execution-failed",
+    "selected_at_ms": 1794251027680
+  },
+  "native_model_admissions": 13,
+  "current_candidate": "3774813c719e6fa8931cffd99bac123252abb517",
+  "failure": {
+    "reason_before_pause": "acceptance_repair_budget",
+    "next_before_pause": "rescope_acceptance",
+    "worker_error_at": "2026-11-09T20:54:11.627324Z",
+    "error": "alignment_incomplete",
+    "outside_scope": [],
+    "uncovered_criteria": [],
+    "unmapped_hunk": "fec84ce2cc94232593c7ef158f2f2e00fcb0f58fbc2cfed884d17ac19636444f",
+    "reconstructed_location": {
+      "contribution_base": "416f392b17b56b2a43e67a3e430835902387941a",
+      "path": "crates/augmentagent-cli/src/self_improve_review_plan.rs",
+      "header": "@@ -474,33 +439,6 @@ mod tests {",
+      "behavior": "Candidate deletes original immutable source read/credential/path rejection assertions."
+    },
+    "correlation": "Worker error omits workflow ID. PR1954 is the only command completion in that second; reconstructed controller hunk digest matches its preserved candidate."
+  },
+  "verifier_authority": {
+    "decision_at": "2026-11-09T20:54:11.484376+00:00",
+    "approved": false,
+    "reason_summary": "The observer only greps source instead of exercising recovery behavior. No complete revision-2 behavioral adapter proposal was supplied, so amendment was not activated.",
+    "limits": "Negative independent authority decision, not a replacement harness, new behavioral receipt or code approval."
+  },
+  "candidate_diff_observations": {
+    "against_published_input": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+    "removed": [
+      "completed group encoded-size bound",
+      "review identity metadata bound",
+      "actual native identity length/ASCII validation",
+      "fragment exact-limit regression",
+      "immutable source validation assertions in the final unmapped hunk"
+    ],
+    "retained_published_source": "The published PR remains at3debdb8d; do not certify the internal repair candidate with that CI."
+  },
+  "owner_control": {
+    "paused": true,
+    "revision": 1,
+    "at_ms": 1794257773729,
+    "new_model_admissions_observed_after_pause": 0,
+    "current_next_action": "await_quiescence_or_owner_resume",
+    "quiescence": "not established by pause",
+    "last_known_native_controller_pid_2624957_absent": true
+  },
+  "limits": [
+    "The terminal attempt was observed before the pause; no command reset, manual candidate edit, verifier replacement or accounting rollback occurred.",
+    "The known prior native PID is gone; this alone does not establish full original-resource teardown or release.",
+    "Source-only observer counterexample remains separate from the actual final alignment failure.",
+    "Preserve original source/criteria, guards, tests and input history. Correction requires a genuine independent behavioral adapter through normal gates.",
+    "No merge, deployment, automatic capacity sizing or parent acceptance is established."
+  ]
+}

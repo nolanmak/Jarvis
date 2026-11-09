@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T20:14:47.976428+00:00",
+  "observed_at": "2026-11-09T21:03:54.182414+00:00",
   "parent_issue": 1703,
   "owner_issue": 1709,
   "repair_issue": 1952,
@@ -29,22 +29,23 @@
   },
   "workflow_status": {
     "workflow": "nolanmak/jarvis/pr/1954",
-    "stage": "build",
-    "reason": "acceptance_failed",
-    "next_action": "repair_implementation",
-    "eligible_at_ms": 0,
+    "stage": "scope",
+    "reason": "owner-pause-requested",
+    "next_action": "await_quiescence_or_owner_resume",
+    "eligible_at_ms": 1794257951489,
     "complete": false,
     "durable_command_jobs": 1,
     "executing_workflow_record_exists": true,
     "current_attempt_row_count": 1,
     "last_attempt": {
-      "outcome": "selected",
-      "reason": "worker-attempt-unconfirmed",
-      "selected_at_ms": 1794251027680,
-      "finished_at_ms": null
+      "eligible_at_ms": 1794251327680,
+      "finished_at_ms": 1794257651612,
+      "outcome": "failed",
+      "reason": "execution-failed",
+      "selected_at_ms": 1794251027680
     },
-    "active_candidate_head": "a135f8a29936e659b00d361c924353e3904fe422",
-    "actual_native_model_admission_events": 10,
+    "active_candidate_head": "3774813c719e6fa8931cffd99bac123252abb517",
+    "actual_native_model_admission_events": 13,
     "first_native_admission_at_ms": 1794251042483,
     "last_native_admission_at_ms": 1794255284109
   },
@@ -99,7 +100,7 @@
     "No private bot/owner/channel/message/native identifiers, tokens or message content are published.",
     "C2, actual original1944 replay, automatic capacity and full parent live/fault/soak acceptance remain open.",
     "Keep the queued command/PR input and protected verifier state intact; no duplicate issue builder.",
-    "The worker reached verifier_passed/map_alignment, then returned to build/acceptance_failed with ten model admissions. The downstream failure is not yet attributed to a specific alignment/receipt error. No accepted review, candidate CI, merge or deployment is established."
+    "Original attempt is terminal after13 model admissions; the scheduled rescope is normally paused pending correction. No source/verifier/request reset or resource release is inferred."
   ],
   "worker_diagnostic": {
     "worker_error_at_utc": "2026-11-09T18:45:21.450880Z",
@@ -143,5 +144,11 @@
     ],
     "no_retained_env_fixture_or_cargo_profile_changes": true,
     "limit": "Tool mutation requests are not automatically retained candidate edits; this comparison does not prove candidate CI, review or publication."
-  }
+  },
+  "current_owner_control": {
+    "paused": true,
+    "revision": 1,
+    "new_model_admissions_observed_after_pause": 0
+  },
+  "terminal_discovery": "1703-pr1954-terminal-acceptance-discovery.json"
 }
