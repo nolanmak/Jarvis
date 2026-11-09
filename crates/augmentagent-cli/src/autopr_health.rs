@@ -959,8 +959,16 @@ fn capacity_finding(i:&HealthInputs)->Option<Finding> {
     }
 }
 
+/// Both metrics come from one verified worker-selected store; no initialization.
+fn workflow_metrics(config:&crate::autoship_deployment::WorkerWorkflowConfiguration,now:i64)
+    ->anyhow::Result<(crate::autoship_workflow::MergeAllowance,u64)> {
+    let store=crate::autoship_workflow::WorkflowStore::open_read_only(&config.path)?
+        .ok_or_else(||anyhow::anyhow!("worker workflow store is missing"))?;
+    Ok((store.merge_allowance(now,config.daily_cap)?,store.resource_capacity_wait_count()?))
+}
+
 /// Gather everything the rules need from this box.
-pub fn collect(repo_root: &Path) -> HealthInputs {
+pub async fn collect(repo_root: &Path) -> HealthInputs {
     let now = Utc::now();
     let dir = state_dir();
     // #1413 — right after a rotation the live log is nearly empty; the tail
@@ -994,16 +1002,19 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         DISK_DROP_WINDOW_HOURS,
     );
     crate::disk::save_readings(&filesystems, now);
-    let (merge_allowance, merge_allowance_error) = match crate::self_improve::merge_allowance_status() {
-        Ok(status) => (Some(status), None),
-        Err(error) => (None, Some(format!("{error:#}"))),
-    };
-    let native_state_capacity=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").map(|_| {
-        serde_json::to_value(augmentagent_channel_core::native_vm::state_capacity::inspect()).expect("native capacity report serializes")
-    });
-    let (resource_capacity_waits,resource_capacity_wait_error)=match crate::autoship_workflow::WorkflowStore::open_read_only(&crate::autoship_workflow::default_path()) {
-        Ok(Some(store))=>match store.resource_capacity_wait_count() {Ok(count)=>(Some(count),false),Err(_)=>(None,true)},
-        Ok(None)=>(None,false),Err(_)=>(None,true),
+    let (merge_allowance,merge_allowance_error,native_state_capacity,resource_capacity_waits,resource_capacity_wait_error)=
+        match crate::autoship_deployment::worker_workflow_configuration().await {
+        Ok(config)=>{
+            let native=config.native_policy.as_deref().map(|path| {
+                serde_json::to_value(augmentagent_channel_core::native_vm::state_capacity::inspect_at(Some(path)))
+                    .expect("native capacity report serializes")
+            });
+            match workflow_metrics(&config,now.timestamp_millis()) {
+                Ok((allowance,count))=>(Some(allowance),None,native,Some(count),false),
+                Err(_)=>(None,Some("worker workflow metrics unavailable".into()),native,None,true),
+            }
+        }
+        Err(_)=>(None,Some("effective worker configuration unavailable".into()),None,None,true),
     };
     HealthInputs {
         now_or_epoch: Some(now),
@@ -1060,7 +1071,7 @@ pub async fn run(repo_root: &Path, notify: bool, json: bool) -> anyhow::Result<i
         if let Err(error) = &result { cleanup_detail.push_str(&format!("cleanup failed: {error:#}")); }
         tracing::info!(result = ?result, cleanup = %cleanup_detail, "disk pressure reconciliation");
     }
-    let inputs = collect(repo_root);
+    let inputs = collect(repo_root).await;
     let mut findings = analyze(&inputs, &thresholds);
     if let Some(finding) = deployment_finding(&crate::autoship_deployment::inspect(repo_root).await) {
         findings.push(finding);
@@ -1112,6 +1123,26 @@ async fn notify_owner_of(text: &str) {
 mod tests {
     // (tests continue below; the #1030 case is appended at the end)
     use super::*;
+
+    #[test]
+    fn worker_selected_store_supplies_both_allowance_and_capacity_metrics() {
+        use crate::autoship_workflow::{Binding,WorkflowStore};
+        let root=tempfile::tempdir().unwrap();let worker=root.path().join("worker.db");
+        let decoy=root.path().join("observer.db");
+        let mut store=WorkflowStore::open(&worker).unwrap();
+        store.register("owner/repo#1","fix",Binding{head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()},10).unwrap();
+        let lease=store.claim("owner/repo#1","worker",20,60_000).unwrap().unwrap();
+        store.defer_run_capacity(&lease,None,30).unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap();let events=store.events(&lease.workflow).unwrap();
+        let observer=WorkflowStore::open(&decoy).unwrap();assert_eq!(observer.resource_capacity_wait_count().unwrap(),0);
+        let config=crate::autoship_deployment::WorkerWorkflowConfiguration{path:worker,daily_cap:7,native_policy:None};
+        let (allowance,waiting)=workflow_metrics(&config,31).unwrap();
+        assert_eq!(allowance.cap,7);assert_eq!(allowance.confirmed,0);assert_eq!(waiting,1);
+        assert_eq!(store.snapshot(&lease.workflow).unwrap(),before);assert_eq!(store.events(&lease.workflow).unwrap(),events);
+        let absent=root.path().join("missing.db");
+        assert!(workflow_metrics(&crate::autoship_deployment::WorkerWorkflowConfiguration{path:absent.clone(),daily_cap:7,native_policy:None},31).is_err());
+        assert!(!absent.exists(),"health initialized an absent worker store");
+    }
 
     fn native_capacity_sample(budget:u64)->serde_json::Value {
         let gib=1024u64.pow(3);

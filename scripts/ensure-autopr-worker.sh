@@ -136,11 +136,6 @@ Environment=AUGMENTAGENT_AUTOPR_EXTERNAL=1
 {shared_environment}
 Slice=augmentagent-runtime.slice
 ''')
-if (unit_dir/'augmentagent-autopr-health.service').exists():
- write(unit_dir/'augmentagent-autopr-health.service.d/autoship-native-policy.conf',f'''# Managed by ensure-autopr-worker.sh
-[Service]
-{shared_environment}
-''')
 # Validate every destination before changing any managed file. Selection is
 # committed last; manager failures restore the prior units and selection.
 if selection_text is not None:write(selection,selection_text)

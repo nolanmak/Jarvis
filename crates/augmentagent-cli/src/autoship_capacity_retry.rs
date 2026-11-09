@@ -37,7 +37,9 @@ impl WorkflowStore {
     /// Read-only health observation; never claims, wakes or charges work.
     pub fn resource_capacity_wait_count(&self)->Result<u64> {
         let mut statement=self.conn.prepare("SELECT substr(w.checkpoint,1,1048577),length(CAST(w.checkpoint AS BLOB)),COALESCE(c.paused,0)
-            FROM workflow w LEFT JOIN workflow_owner_control c ON c.workflow=w.id ORDER BY w.id LIMIT 1025")?;
+            FROM workflow w LEFT JOIN workflow_owner_control c ON c.workflow=w.id
+            WHERE w.id NOT LIKE 'autoship-observation/%' AND w.id NOT LIKE 'autoship-canary/%'
+            ORDER BY w.id LIMIT 1025")?;
         let rows=statement.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)))?;
         let mut count=0;let mut seen=0;
         for row in rows {
@@ -146,6 +148,11 @@ mod tests {
         let (mut store,lease)=setup(&path);
         assert_eq!(store.resource_capacity_wait_count().unwrap(),0);
         store.defer_run_capacity(&lease,Some(&"a".repeat(64)),30).unwrap();
+        for id in ["autoship-observation/fixture","autoship-canary/fixture"] {
+            store.register(id,"fix",store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint.binding,30).unwrap();
+            let probe=store.claim(id,"probe",30,60_000).unwrap().unwrap();
+            store.defer_run_capacity(&probe,None,31).unwrap();
+        }
         let before=store.snapshot(&lease.workflow).unwrap().unwrap();let events=store.events(&lease.workflow).unwrap();
         let allowance=store.merge_allowance(31,5).unwrap();
         let observer=WorkflowStore::open_read_only(&path).unwrap().unwrap();
