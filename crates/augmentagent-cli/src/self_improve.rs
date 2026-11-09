@@ -20171,6 +20171,14 @@ import json, os, sys
 args = sys.argv[1:]
 with open(os.environ['AUTOSHIP_LINKED_PR_CALLS'], 'a') as stream:
     stream.write(json.dumps(args) + '\n')
+if args[:2] == ['repo', 'view']:
+    print('fixture-owner/repo'); sys.exit(0)
+if args[:2] == ['issue', 'list']:
+    assert os.environ['AUTOSHIP_LINKED_PR_CASE'] == 'remote-selection', args
+    print(json.dumps([{'number': 42, 'title': 'Correct widget rounding',
+        'body': 'Round widget values consistently.',
+        'labels': [{'name': 'agent-fixable'}],
+        'author': {'login': 'fixture-owner'}}])); sys.exit(0)
 if args[:1] == ['api'] and '/issues?' in args[1]:
     assert os.environ['AUTOSHIP_LINKED_PR_CASE'] == 'primary-selection', args
     print(json.dumps([{'number': 42, 'title': 'Correct widget rounding',
@@ -20203,6 +20211,7 @@ print(json.dumps([{'number': 77, 'isDraft': False,
             let name = match case {
                 "primary" => "authorized_linked_pr_suppresses_primary_fresh_work",
                 "primary-selection" => "linked_pr_is_not_returned_by_real_fresh_issue_selector",
+                "remote-selection" => "linked_pr_is_not_returned_by_real_remote_issue_selector",
                 "remote" => "authorized_linked_pr_suppresses_remote_fresh_work",
                 "malformed" => "malformed_inventory_does_not_authorize_fresh_work",
                 _ => unreachable!(),
@@ -20229,6 +20238,19 @@ print(json.dumps([{'number': 77, 'isDraft': False,
                 "existing arbitrary-branch linked PR was selected for duplicate fresh scoping");
             return;
         }
+        if case == "remote-selection" {
+            let store = Store::open(repo.parent().unwrap().join("product-state.db")).unwrap();
+            let configured = AgentRepo {
+                id: "fixture".into(), full_name: "fixture-owner/repo".into(),
+                base_branch: "main".into(), build_cmd: String::new(),
+                blast_radius_extra: String::new(), max_diff_lines: 600,
+                enabled: true, created_at_ms: 0, updated_at_ms: 0,
+            };
+            let result = pick_issue_for_repo(&configured, &repo, &store).await;
+            assert!(!matches!(result, Ok(Some(_))),
+                "existing linked PR was selected by configured-repository fresh work");
+            return;
+        }
         let result = if case == "remote" {
             has_open_agent_pr_remote("fixture-owner/repo", &repo, 42).await
         } else { has_open_agent_pr(&repo, 42).await };
@@ -20240,6 +20262,10 @@ print(json.dumps([{'number': 77, 'isDraft': False,
     #[tokio::test]
     async fn linked_pr_is_not_returned_by_real_fresh_issue_selector() {
         fixture("primary-selection").await;
+    }
+    #[tokio::test]
+    async fn linked_pr_is_not_returned_by_real_remote_issue_selector() {
+        fixture("remote-selection").await;
     }
     #[tokio::test]
     async fn authorized_linked_pr_suppresses_primary_fresh_work() { fixture("primary").await; }
