@@ -472,3 +472,19 @@ producer/consumer repair under C0, not full integration or activation. Initial
 behavioral RED reproduces oversized Claude and Codex commits, unreadable Unicode
 export and a committed marker skipping bounded current-file validation. No live
 credential, issuer, policy or service was exercised.
+
+## Credential round-trip delivery / publication hosted checks
+
+PR #1937 at cd6f34af implements #1936's scoped repair. Behavioral RED reproduces
+both provider oversize commits, Unicode expansion, committed validation bypass
+and Rust's one-byte-over usable declaration. Local GREEN: native 29, gateway 16,
+I/O 9, provisioning 9 and managed Rust readiness 7 = 70 passing, no skips/ignored
+cases. CI contract/whitespace pass. Fault fixtures cover all four checkpoint
+writes for both providers; actual gateway success-header ordering is exercised
+with scripted transport. Hosted CI is running. Independent accepted approval,
+merge and normal rollout remain pending; no live issuer/VM/credential/state or
+policy change occurred. This closes no full capacity/productive ingress gate.
+
+The earlier atomic publication repair #1935 at cef4663d now has all 17 reported
+hosted checks/statuses passing, with no submitted reviews. This is hosted CI
+proof, not independent accepted approval, merge, rollout or live acceptance.
