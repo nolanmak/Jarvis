@@ -1036,3 +1036,21 @@ supplied and all controller groups/roles remain required. The existing real
 recovery test now asserts that label. This final head is pushed but not yet
 validated;7d865307 GREEN is not credited to it. Draft1954, independent approval,
 normal rollout, original1944 replay, C2 and full1703 acceptance remain open.
+
+## Scope-corrected C1 GREEN and final boundary test head
+
+Head7812314e run42670493609/job129345442448 passes1754 CLI unit tests,
+0 failed,33 existing ignored, including the expanded partial-scope assertion.
+The same hosted job remained intact during a shared GitHub quota exhaustion;
+observation resumed after its declared18:20:19 UTC reset and confirmed success.
+No expired observation was treated as a stopped build or reason to restart.
+
+Final test-only head3debdb8d adds the contract's explicit exact/+1 serialized
+request/response/raw-byte and8MiB writer boundaries, plus an actual-adapter
+case requiring every same-name item to fit before another observation. It is
+pushed; run42673227287 is pending. This head has no GREEN claim yet.
+
+Normal CLI dry-run validated PR1954 with exit0/reason target-validated; accepted
+was false as expected for a dry-run, and the PR workflow/event counts stayed
+0/0. This does not queue work or prove native readiness. Independent review,
+normal merge/updater, original1944 replay, C2 and full1703 exits stay open.

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T18:03:34.081478+00:00",
+  "observed_at": "2026-11-09T18:21:49.110269+00:00",
   "parent_issue": 1703,
   "owner_issue": 1709,
   "repair_issue": 1952,
@@ -9,7 +9,7 @@
   "base": "416f392b17b56b2a43e67a3e430835902387941a",
   "head": "9146acb424a52f4e9ef89d28d7bfed0a524eb2f6",
   "branch": "fix/autoship-review-dependency-ranges",
-  "state": "component_green_at_7d865307_final_scope_revision_pending",
+  "state": "implementation_green_final_boundary_tests_pending",
   "change": "Extract unchanged production group adapter behind scripted/native transport interface. Add legacy retained-finding control and two new coherent large-file cases; fixture Rust code is actually compiled/executed before scripted review.",
   "expected_red": [
     "related_large_source_items_reach_one_request_and_reject_the_seeded_defect",
@@ -83,8 +83,8 @@
     "log_sha256": "cd45bb763b68cb706a947ca36bd8c9df8028b6501d25656f6931474199bfef42"
   },
   "implementation": {
-    "head": "7812314e",
-    "state": "final_scope_label_correction_pushed_pending_exact_head_ci",
+    "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+    "state": "final_boundary_tests_pushed_pending_exact_head_ci",
     "changes": [
       "Strict typed incomplete source requests with legacy path compatibility",
       "Exact immutable regular Git Rust items with container headers, or UTF-8 byte intervals",
@@ -95,14 +95,15 @@
       "Move original immutable whole-file regressions through the new production reader",
       "Include inner container attributes with requested members",
       "Cover two-call correction exhaustion, actual identity/static metadata limits, exact request count/question/path bounds, and byte windows across >8MiB immutable blobs with invalid EOF refusal",
-      "Recovery expansion keeps partial group scope because the initial inventory may omit separately streamed caller groups; original controller group/role requirements remain mandatory"
+      "Recovery expansion keeps partial group scope because the initial inventory may omit separately streamed caller groups; original controller group/role requirements remain mandatory",
+      "Add exact/+1 serialized initial/recovery/response/raw-byte/cache-writer limits and actual-adapter refusal before a second observation when all same-name items cannot fit"
     ],
     "local_validation": [
       "rustfmt syntax parse",
       "git diff --check"
     ],
     "green_claimed": false,
-    "run": null
+    "run": 42673227287
   },
   "implementation_validation": [
     {
@@ -144,6 +145,41 @@
       ],
       "scope": "Hosted targeted crate tests and applicable Linux aggregation succeeded. Scripted review adapter fixtures are not native model acceptance.",
       "log_sha256": "0da1b9c8cc53a2d231d83cf0cd23aaaf87b80fe102bfd8a69bd71a074d67c8a5"
+    },
+    {
+      "head": "7812314e0a09d8e65951c9e2764d20ad57bba663",
+      "run": 42670493609,
+      "job": 129345442448,
+      "state": "completed",
+      "conclusion": "success",
+      "cli_unit_result": {
+        "passed": 1754,
+        "failed": 0,
+        "ignored": 33
+      },
+      "scope": "Includes assertion that expanded initial context cannot claim global completeness while caller groups may be streamed separately.",
+      "log_sha256": "0ee3c2b6e2a0733b8d5bc89a935fb26764c3052b38665ed1446f8c265e193675"
     }
-  ]
+  ],
+  "submission_preflight": {
+    "command": "augmentagent autopr run --repo nolanmak/Jarvis --pr 1954 --until merged --request-id autoship-recovery-pr1954-20261109 --dry-run --json",
+    "exit": 0,
+    "dry_run": true,
+    "accepted": false,
+    "reason": "target-validated",
+    "workflow_and_event_counts_before": [
+      0,
+      0
+    ],
+    "workflow_and_event_counts_after": [
+      0,
+      0
+    ],
+    "limits": "Dry-run target validation is not queued execution, native policy readiness, review, merge or deployment."
+  },
+  "observation_quota_wait": {
+    "shared_core_remaining": 0,
+    "reset_unix": 1794248419,
+    "action": "Waited for declared reset and polled the same run; observed success. No token rotation or job restart."
+  }
 }
