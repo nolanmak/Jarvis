@@ -1,0 +1,44 @@
+{
+  "baseline_failure": {
+    "diagnostic": "Generated direct-export fixture failed its own candidate length <= LIMIT precondition before exercising the production bug.",
+    "observed_log_at_utc": "2026-11-09T10:09:27.015660Z",
+    "result": "unexpected_failure",
+    "verifier_id": "roundtrip-bound"
+  },
+  "benchmark_started": false,
+  "capacity_policy_changed": false,
+  "command": "augmentagent autopr run --repo nolanmak/Jarvis --pr 1937 --until merged --request-id autoship-recovery-pr1937-20261109 --json",
+  "deployment_confirmed": false,
+  "first_attempt": {
+    "eligible_at_ms": 1794218987549,
+    "finished_at_ms": 1794218967001,
+    "outcome": "failed",
+    "reason": "execution-failed",
+    "selected_at_ms": 1794218687549
+  },
+  "followups": [
+    1942,
+    1943
+  ],
+  "future_repair_verified": false,
+  "head": "b7b3f15bfd60a56c08ae3030ee1346198b29da0c",
+  "hosted_checks_at_submission": {
+    "reported": 24,
+    "unfinished_or_failed": 0
+  },
+  "merge_confirmed": false,
+  "reason_after_attempt": "acceptance_registration_retry",
+  "recorded_at_utc": "2026-11-09T10:12:48.100135+00:00",
+  "request_id": "autoship-recovery-pr1937-20261109",
+  "resources_after_attempt": {
+    "attempts": 1,
+    "model_calls": 4,
+    "tokens": 0,
+    "wall_ms": 266973
+  },
+  "scope": "First production CLI attempt for PR 1937, not overall restoration",
+  "stage_after_attempt": "scope",
+  "submission_accepted": true,
+  "token_usage_known": false,
+  "workflow": "nolanmak/jarvis/pr/1937"
+}

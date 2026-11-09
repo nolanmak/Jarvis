@@ -531,3 +531,32 @@ produce anchors the current reader would refuse. Fresh-reader and all 19 mapped
 narrow seams were checked; one already-sealed retry ambiguity was resolved and
 rechecked. Separate #1918 implementation exception is required. This is neither
 full physical/memory growth nor production restoration evidence.
+
+## Audit-anchor implementation and production CLI attempt
+
+PR #1941 at 5cc066f1 implements #1940's reviewed narrow serialization bound.
+Managed protected-audit consumers pass 47 cases, no failures, one existing live
+Codex/public-web case intentionally ignored. Six new tests cover actual append/
+seal failure, exact/+1, ordinary temporary/original-object preservation, actual
+short/zero/failing/cumulative writes, prior pending recovery and already-sealed
+proof behavior. A broad fixture assertion initially matched payload_sha256; the
+full rerun passed after checking only the actual record field. CI contract and
+whitespace pass. Hosted CI, independent code approval and rollout remain pending.
+This encoded-file bound does not establish complete physical or memory growth.
+
+#1937 at b7b3f15b now has all 24 reported hosted checks/statuses passing. The
+production autopr run command accepted PR 1937 with its durable request ID;
+the worker claimed it and made four recorded model calls. Its first attempt
+failed at acceptance_registration_retry, before review/merge, because generated
+verifier roundtrip-bound failed its own candidate-size precondition on the
+baseline. See 1703-pr1937-command-proof.json for the bounded receipt. Token
+telemetry is zero/unknown, not a claim of zero model usage. No shipping credit or
+deployment is confirmed, and no benchmark/capacity-policy change was made.
+
+Source tracing separates two follow-ups: #1942 under adoption #1537 covers
+fresh issue dedup that sees only agent-fix branch heads despite authorized linked
+PRs; #1943 under retry #1706 covers invalid independent verifier repair/bounded
+recovery. Existing adoption and one baseline correction already exist; neither
+is falsely described as absent. Those real failures must be repaired through the
+normal authority/review/CI path. Full capacity integration, productive owner
+ingress and #1703 CLI/Discord/merge/fault/soak acceptance remain incomplete.
