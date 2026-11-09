@@ -1184,3 +1184,37 @@ original request and protected verifiers. The command-proof schema now labels
 current_attempt_row_count explicitly: that mutable per-workflow row is not
 a lifetime attempt counter. No review, merge, deployment, automatic capacity
 activation, original1944 replay or full1703 acceptance is claimed.
+
+
+## Registered acceptance observer has a source-only false positive
+
+Read-only inspection of PR1954's original registered observer establishes a
+separate acceptance-quality gap under #1943 / #1710 / #1715. Its three
+requirements describe strict missing_sources validation, exact Rust/UTF-8
+selectors and all-or-refuse recovery. The observer only searches Rust source
+for keywords; it invokes no Rust behavior. Its expected vector is three true
+values. Adding only the comment `// missing_sources RustItem ByteRange all
+requested evidence refuse` to `fn main() {}` satisfies all three predicates.
+
+[Bounded counterexample evidence](1703-pr1954-oracle-vacuity-discovery.json)
+records the registered program digest, requirement text and exact vectors.
+The method interprets only string-membership/Boolean expressions from the
+original Python AST; it does not run the protected program on the host.
+This is a logical false-positive witness, not a native receipt, candidate
+failure diagnosis or production mutation replay. No verifier, workflow,
+branch, request, resource setting or native session was changed.
+
+The active command still reports build/acceptance_failed with seven model
+admissions and an unconfirmed selected attempt. The exact failed receipt
+has not been recovered; do not attribute that failure to a particular
+keyword or conclude that the active subprocess is progressing from a lease.
+Published-input CI remains distinct from native acceptance and candidate CI.
+
+Follow-up belongs to acceptance quality, alongside bounded fixture repair:
+negative controls must distinguish comment-only source, missing behavior and
+invalid setup from actual behavior. Existing hosted behavioral tests are
+useful evidence but do not automatically satisfy an independently registered
+criterion. A reviewed coverage/counterexample contract and original evidence
+lineage are required before implementation; this discovery is not a coding
+handoff, permission to alter an enrolled verifier or permission to bypass
+acceptance. Preserve the active attempt while determining its actual failure.

@@ -65,10 +65,9 @@
     "cli_tests_failed": 0,
     "existing_ignored": 33,
     "targeted_run": 42673227287,
-    "attempt": 2,
-    "job": 129350959940,
+    "attempt": 3,
+    "job": 129368273291,
     "linux_aggregate": "success",
-    "cause": "Three required jobs missing during GitHub Actions/Checks API major outage",
     "provider_incident": "https://www.githubstatus.com/incidents/tp8cghg7tlc4",
     "provider_incident_status": "monitoring",
     "provider_actions_status": "operational",
@@ -81,7 +80,14 @@
     "all_required_ci_green_on_published_input": true,
     "code_tests_passed": 1758,
     "code_tests_failed": 0,
-    "log_sha256": "2afe41a4b12e1f2897fa13e8c19ebd764378af2bc1be7bce693ff8cbee78beaf"
+    "log_sha256": "2afe41a4b12e1f2897fa13e8c19ebd764378af2bc1be7bce693ff8cbee78beaf",
+    "historical_attempt_2": {
+      "attempt": 2,
+      "job": 129350959940,
+      "code_test_step": "success",
+      "linux_aggregate": "failure",
+      "cause": "Three required jobs missing during GitHub Actions/Checks API major outage"
+    }
   },
   "limits": [
     "The initial capacity deferral is historical: the normal worker later admitted native work without any manual request reset or limit change.",

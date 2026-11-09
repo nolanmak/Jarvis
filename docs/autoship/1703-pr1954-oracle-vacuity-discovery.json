@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T20:02:25.867088+00:00",
+  "workflow": "nolanmak/jarvis/pr/1954",
+  "registered_program_sha256": "e9402b21fd0e2f2c8439255c58de03d1e1bc8e060c6963a2ab7509131004f6f2",
+  "registered_requirements": [
+    "Strict incomplete-only `missing_sources` includes literal paths, registered criterion IDs, concrete questions and exact selectors.",
+    "The reviewer can request exact immutable Rust declarations or UTF-8 byte ranges.",
+    "All requested evidence fits together or recovery refuses before another reviewer call."
+  ],
+  "registered_oracle": {
+    "kind": "json",
+    "value": [
+      true,
+      true,
+      true
+    ]
+  },
+  "baseline_receipt_results": [
+    "intended_failure"
+  ],
+  "synthetic_rust_sources": {
+    "empty_program": "fn main() {}\n",
+    "same_program_with_only_a_comment_added": "// missing_sources RustItem ByteRange all requested evidence refuse\nfn main() {}\n"
+  },
+  "observed_predicate_vectors": {
+    "empty_program": [
+      false,
+      false,
+      false
+    ],
+    "same_program_with_only_a_comment_added": [
+      true,
+      true,
+      true
+    ]
+  },
+  "method": "Parse the original pinned Python program AST and interpret only its string-membership/Boolean output expressions. Do not execute the original program or alter the protected verifier.",
+  "limits": [
+    "This is a source-level logical counterexample, not a native VerifierReceipt or production mutation replay.",
+    "No protected verifier, command, branch, resource limit or model session was changed.",
+    "Source-presence predicates cannot establish the three registered runtime-behavior requirements; this does not identify the exact failing candidate receipt."
+  ]
+}
