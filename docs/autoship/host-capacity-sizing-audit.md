@@ -75,3 +75,20 @@ findings in these sections. Shared supervisor scope, managed provenance and
 real-entry-point replacement/shrink/cleanup evidence remain implementation
 validation requirements; PID/FD and storage observations remain open C0 work.
 This checkpoint is not the complete-contract seam audit or C0 closure.
+
+The host task/descriptor checkpoint adds complete role declarations, full host
+task reservations, effective cgroup/global/real-UID constraints, per-process
+descriptor enforcement and a separately labelled system file-table pressure
+check. Guest task/descriptor capabilities are not host reservations. The first
+fresh read found two forced guesses: NPROC's process-local soft threshold versus
+real-UID accounting, and the enabled role universe behind the task/memory ratio.
+Both are resolved explicitly in P2/P3 and rechecked. The descriptor contract also
+requires exact child limit/privilege readback and rejects inherited descriptors
+outside that ceiling. No new wrong-build/forced-guess findings remained in the
+recheck. Native-only role sizing, process-limit and pressure-boundary fixtures
+were independently recomputed; this remains design evidence, not runtime tests.
+
+Read-only deployed unit inspection at this checkpoint reported daemon/worker
+task use 13/5, each TasksMax=2048, NOFILE soft/hard=4096 and NPROC soft/hard=52942.
+It confirms the current separate service limits, not the proposed common
+reservation accounting or its implementation. Nothing was published/reloaded.

@@ -301,7 +301,186 @@ Storage mount/volume identity, logical image checks, filesystem/inode/quota
 support and durable reservation observations must be completed below before C0
 closes. A partial memory/CPU result never claims overall capacity is known.
 
-## 5. Native storage producer: verified boundaries
+O6. Section 5 extends the same identity/clock/read protocol with typed per-scope
+pids.max/current, host task counts and kernel ceilings, the actual launching
+process's soft/hard NPROC and NOFILE, real/effective UID and namespace identity,
+same-real-UID task counts, file-table counters, nr_open, inherited descriptor
+indices, privilege-enforcement readback and the enabled complete role declarations.
+Valid zero ceilings are known exhausted limits; they are not missing data.
+Unlimited NPROC is distinct from an unavailable threshold. Same-UID usage is
+not a substitute for identifying the launcher's own enforced process limit.
+Limits/declarations/identities must agree across passes; use greater task/file
+usage and smaller availability. Newly applied child limits/privilege state are
+verified at the original pre-release boundary rather than trusted from a saved
+JSON report. No overall known result is claimed before storage evidence exists.
+
+## 5. Host tasks and descriptor readiness
+
+P1. Host task demand is the existing run declaration's full `pids` value,
+default 512, not its current number of processes. The cgroup PID controller
+counts kernel tasks/threads, including descendants. Guest processes inside a VM
+are not additional host PIDs; QEMU's host threads and host bridge/build processes
+are. Preserve the guest's separate limits (currently NPROC 128 and NOFILE 256)
+without adding them as host reservations. See
+[kernel PID-controller semantics](https://docs.kernel.org/admin-guide/cgroup-v2.html#pid)
+and `native-provider-vm-guest.py`'s worker limits.
+
+P2. Reserve at least 64 host tasks for managed non-run processes, or their greater
+observed task count. Do not shrink the run's declared task ceiling to make it
+fit. Retain each run's full task reservation until checked descendant cleanup
+removes its resource scope, including an idle closed preflight scope.
+
+For desired managed `TasksMax`, calculate a memory-based upper bound on the
+tasks that the configured role set could admit. Let D be M4's non-run memory
+reservation, A=max(0,B-D), and K=max(role_pids / role_memory_bytes) over every
+enabled role's complete validated declarations. K is an exact rational, not an
+integer truncation. Desired tasks are `D_tasks + floor(A * K)`, capped by each
+finite external `pids.max` less 64 protected tasks, and by
+`min(kernel.threads-max, kernel.pid_max - 1) - 64`. Clamp a negative usable
+ceiling to zero. An explicit operator task ceiling may only lower this result.
+`D_tasks=max(64, observed_nonrun_tasks)`. All arithmetic is checked.
+
+This is a managed ceiling, not a promise to start floor(A/min_memory) runs.
+Changing the enabled role declarations changes the plan revision. Admission
+uses the currently enforced TasksMax until verified reload and cannot spend a
+desired increase. An empty/invalid role set or unavailable required kernel/task
+evidence is unknown; do not fall back to the old 2048 just because it is familiar.
+
+The role universe is the configured routes that can launch under this managed
+aggregate, not every helper executable and not only the selected next workflow:
+
+| Role identifier | Complete declaration producer | Unmodified defaults |
+| --- | --- | --- |
+| `host-text` | `run_resources::declared_policy_for(Text)` when an existing allowed non-native text route is enabled | 1 GiB, 512 host tasks |
+| `host-builder` | `declared_policy_for(Builder)` for an existing allowed host provider with autoship scope | 4 GiB, 512 host tasks |
+| `native-without-build` | `native_vm::Launch::prepare` via `composed_native_policy(policy.memory_mb, 0)` | 4 GiB, 512 host tasks with a 1 GiB native guest |
+| `native-with-build` | Same composition with the actual enabled bridge/build guest demand | 6 GiB, 512 host tasks for 1 GiB native + 4 GiB build + 1 GiB overhead |
+
+Use configured validated overrides and the actual enabled provider/bridge
+composition, not those defaults, in K. An ordinary 1 GiB host-text declaration
+cannot stand in for a native text turn's complete composed ceiling. Disabled
+routes do not contribute; staged but unauthorized routes are not made enabled
+by this table. Helpers inside a run are already part of its declaration and
+do not add another role. A route outside this inventory requires an explicit
+validated declaration before auto activation, never an inferred guest-only size.
+This resource inventory does not authorize new host execution or relax isolation.
+
+P3. Within the common supervisor admission operation, for the actual scope
+chain of the new run, let R_tasks be existing full run declarations plus
+max(64, non-run task use), C_tasks the scope's current observed tasks and
+S_tasks=max(0,R_tasks-C_tasks). Admit only if:
+
+- R_tasks + requested_tasks fits the smaller of current planned and loaded
+  managed aggregate ceilings, and fits every enclosing managed service ceiling
+  using only reservations belonging beneath that service.
+- At each external PID ancestor, its current task count + applicable reservation
+  slack + requested_tasks + 64 fits its finite `pids.max`.
+- Global current tasks + aggregate reservation slack + requested_tasks + 64
+  fits `min(kernel.threads-max, kernel.pid_max - 1)`.
+- For the finite RLIMIT_NPROC inherited by the actual new run, current host
+  tasks charged to its real UID + that UID's managed reservation slack +
+  requested_tasks + 64 fits the child's enforced soft threshold. Same-real-UID
+  processes can have different soft/hard limits; do not invent one UID-wide
+  threshold from the observer's or another service's settings.
+
+The host task count is the total-entities field in
+[/proc/loadavg](https://man7.org/linux/man-pages/man5/proc_loadavg.5.html),
+sampled twice conservatively like other counters. Same-real-UID task accounting must
+cover the applicable host user namespace; an incomplete proc view cannot prove
+that predicate. Initial automatic support requires the existing host systemd
+user-service namespace arrangement with observable enclosing controls. A nested
+namespace/hidden task view that prevents these checks refuses auto activation;
+a temporarily unreadable supported view is recoverably unknown. This profile
+uses an unprivileged nonzero real/effective host UID; exempt root/capability
+arrangements are unsupported auto profiles, not assumed to obey NPROC. Kernel limits
+are constraints, not evidence that their entire numeric range is currently free.
+
+Do not change kernel pid_max/threads-max, RLIMIT_NPROC or operator quotas.
+Unrelated processes can race the observation; the kernel can still refuse a
+later clone. Record such runtime exhaustion truthfully and retain live resource
+accounting through checked cleanup. It consumes no shipping allowance by itself.
+
+### Exact task fixtures
+
+Planning cases enable all four table roles with their unmodified defaults,
+use B=12 GiB, D=512 MiB and D_tasks=64. K=512/GiB comes from `host-text`,
+not the native guest's RAM; A=11.5 GiB. Desired task count before external
+caps is `64 + 11.5*512 = 5952`.
+
+| External PID ceiling | Host raw ceiling | Desired TasksMax |
+| --- | --- | --- |
+| unlimited | 100000 | 5952 |
+| 2048 | 100000 | 1984 |
+| 640 | 100000 | 576 |
+| 512 | 100000 | 448; cannot fit the default run plus non-run reserve |
+
+Admission with planned/loaded=576, R_tasks=C_tasks=64, requested_tasks=512,
+external limit=640 and no competing external tasks fits exactly. Raising current
+external use from 64 to 65 without reducing other reservations refuses: 65+0+512+64
+is 641. With R_tasks=576, C_tasks=100 and another 512-task request, idle reservation
+slack is 476; current low usage does not admit that second request. Missing UID
+accounting under a finite NPROC limit returns unknown rather than dropping it.
+With only default `native-without-build` and `native-with-build` enabled,
+K=128/GiB and the uncapped desired count is `64 + 11.5*128 = 1536`, not 5952.
+If the actual child's soft NPROC is 1000, real-UID task use is 425, slack=0 and
+request=512, the required 1001 refuses even when that child's hard limit and
+a same-UID daemon's soft limit are 10000.
+
+F1. RLIMIT_NOFILE is a per-process descriptor-number ceiling, not a cgroup-wide
+count of file handles. The default host run capability is 4096 descriptors per
+process, matching the existing service default. An explicit larger required
+declaration must be represented in the demand revision; an explicit smaller
+service ceiling cannot silently resize that requirement. Verify the required
+ceiling against the actual service's enforced soft/hard limits and kernel
+`fs.nr_open`; insufficient limits refuse with `descriptor-process-ceiling`.
+Do not raise a kernel or operator limit to make it pass. Supported fresh service
+installation sets both service soft and hard NOFILE to the greatest required
+ceiling among its enabled roles. Before dispatch the trusted run supervisor
+sets both child soft/hard NOFILE to that run's declared ceiling and verifies
+readback. It also sets no-new-privileges and verifies empty effective, permitted
+and ambient host capability sets for the unprivileged child, so raising the
+hard ceiling through later privilege gain is not an accepted execution path.
+Unknown enforcement remains closed. Check inherited descriptor indices as well as the
+read-back limit before paid release: lowering a limit does not close already
+inherited descriptors. Guest NOFILE 256 remains a separate guest capability.
+See [RLIMIT_NOFILE](https://man7.org/linux/man-pages/man2/getrlimit.2.html).
+
+F2. System-wide file handles are a pressure check, not a claimed exclusive pool.
+Observe `fs.file-nr` allocated count and `fs.file-max`, taking the greater allocated
+count and smaller limit in the two samples. Require
+`allocated + required_process_nofile + 4096 <= file_max`; the additional 4096 is
+protected host startup headroom. Ignore the historical unused-handles field,
+which does not increase available capacity. Unknown or overflow refuses new
+admission. Recheck in the existing admission operation; do not add an independent
+FD allocator. See the [kernel file-table interface](https://docs.kernel.org/admin-guide/sysctl/fs.html#file-max-file-nr).
+
+NOFILE does not bound every open file description's lifetime: mappings or
+descriptor transfer can retain references beyond an individual descriptor.
+Therefore do not claim `tasks * NOFILE` as a structural upper bound or reserve
+that invented amount in the storage ledger. F2 establishes current startup
+headroom, not complete future file-table exclusivity. Compensating controls are
+the per-process descriptor ceiling, task/memory bounds, kernel enforcement,
+bounded provider calls, observed exhaustion and checked failure/cleanup. Report
+this residual limit; a later kernel-wide shortage is a runtime capacity failure,
+not successful work. A stronger exclusive file-handle guarantee would require a
+separate enforcement contract and is not claimed by this feature.
+
+### Exact descriptor fixtures
+
+- Required NOFILE=4096, loaded soft=4096, hard=4096, nr_open=1048576 passes the
+  process-ceiling check. Soft=1024, hard=4096 refuses until normal service
+  publication/restart/readback installs the required soft limit.
+- Required NOFILE=4096 with nr_open=2048 refuses; a 256-descriptor guest limit
+  cannot substitute for the host requirement.
+- file_max=100000, allocated=91808, required=4096 fits exactly, preserving 4096.
+  Allocated=91809 refuses with a one-handle deficit. A second sample growing
+  allocated from 90000 to 92000 uses 92000 and refuses with deficit 192.
+- A process already holding descriptor index 5000 while soft/hard read 4096 is
+  not accepted as an enforced 4096-capability startup merely from that readback.
+- Missing file-table counters are unknown, not a fabricated free count. Passing
+  these checks does not independently grant execution or reserve a shipment.
+
+## 6. Native storage producer: verified boundaries
 
 These findings describe the source on the base of documentation PR #1916.
 They are not proof that the current 1 GiB logical session charge bounds physical
@@ -351,7 +530,7 @@ Those are required behaviors, not an approved new ledger format. Exact growth
 budgets, inode/block support, durable representation, writer compatibility,
 lock ordering, publication and release proofs remain C0 work below.
 
-## 6. Open contract checklist and handoff gate
+## 7. Open contract checklist and handoff gate
 
 Memory equations above are proposed engineering decisions with exact fixtures.
 They require fresh-reader review and source/integration validation before C0
@@ -360,8 +539,9 @@ this partial document as the completed contract.
 
 - [ ] R/P: full native storage peak, inode/block limits, shared durable claim
   representation, all-writer compatibility, lock order and crash-safe release.
-- [ ] R: PID/FD demand, sizing and admission fixtures; CPU and memory decisions
-  above need complete-vector integration validation.
+- [ ] R: complete-vector integration validation of memory/CPU/task/descriptor
+  contracts above, including host/guest distinction, shared accounting, finite
+  UID task limits and per-process descriptor enforcement.
 - [ ] R: storage observation identity, filesystem/inode/quota/image support,
   durable reservation visibility and coherent replacement/recovery rules.
   Memory/CPU observation decisions above still require integration validation.
