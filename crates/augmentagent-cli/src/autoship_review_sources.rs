@@ -76,6 +76,12 @@ pub(super) fn validate_selector_wire(value: &serde_json::Value) -> Result<()> {
 mod tests {
     use super::*;
     fn parse(value: serde_json::Value) -> Result<(ReviewPass, Vec<ReviewSourceRequest>)> {
+        parse_modified(value, |_| {})
+    }
+    fn parse_modified(
+        value: serde_json::Value,
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) -> Result<(ReviewPass, Vec<ReviewSourceRequest>)> {
         let binding = ReviewBinding {
             head: "a".repeat(40),
             base: "b".repeat(40),
@@ -100,6 +106,7 @@ mod tests {
         if envelope["missing_sources"][0].is_null() {
             envelope["missing_sources"] = serde_json::Value::Null;
         }
+        mutate(&mut envelope);
         parse_review_pass_with_sources(
             &envelope.to_string(),
             &binding,
@@ -123,6 +130,28 @@ mod tests {
             assert!(!pass.completed);
             assert_eq!(requests.len(), 1);
         }
+    }
+    #[test]
+    fn source_request_limits_and_incomplete_only_envelopes_are_exact() {
+        let good = source(serde_json::json!({"kind":"whole_file"}));
+        let (_, requests) = parse_modified(good.clone(), |e| {
+            e["missing_sources"] = serde_json::json!(vec![good.clone(); 16])
+        })
+        .unwrap();
+        assert_eq!(requests.len(), 16);
+        assert!(parse_modified(good.clone(), |e| e["missing_sources"] =
+            serde_json::json!(vec![good.clone(); 17]))
+        .is_err());
+        for decision in ["approve", "changes_requested"] {
+            assert!(parse_modified(good.clone(), |e| e["decision"] = decision.into()).is_err());
+        }
+        assert!(parse_modified(good.clone(), |e| e["missing_paths"] =
+            serde_json::json!(["src/logic.rs"]))
+        .is_err());
+        let mut boundary = good;
+        boundary["question"] = "q".repeat(4096).into();
+        boundary["path"] = "p".repeat(4096).into();
+        assert!(parse(boundary).is_ok());
     }
     #[test]
     fn strict_source_schema_refuses_ambiguity_unknown_fields_and_invalid_bounds() {
