@@ -1,0 +1,189 @@
+{
+  "schema_version": 1,
+  "parent_issue": 1703,
+  "owner_issue": 1709,
+  "repair_issue": 1952,
+  "scope": "C1 coherent source requests, successful recovery, and boundary with unfinished C2",
+  "reviewed_source_baseline": "416f392b17b56b2a43e67a3e430835902387941a",
+  "source_note": "Documentation branch source ancestor is older; relevant delta is rootmain wrapped-budget classifier/tests, preserved in implementation base.",
+  "fresh_reader": {
+    "initial_findings": 4,
+    "resolved_and_rechecked": 3,
+    "parked_with_owner_trigger_and_closure_cost": 1,
+    "remaining_c1_questions": 0
+  },
+  "seams": [
+    {
+      "id": "S1",
+      "topic": "replacement of multipart approval",
+      "result": "held"
+    },
+    {
+      "id": "S2",
+      "topic": "binding and current/historical identity",
+      "result": "held"
+    },
+    {
+      "id": "S3",
+      "topic": "preserved budget/coverage authorities",
+      "result": "held"
+    },
+    {
+      "id": "S4",
+      "topic": "typed source request schema",
+      "result": "held"
+    },
+    {
+      "id": "S5",
+      "topic": "legacy parser compatibility",
+      "result": "held"
+    },
+    {
+      "id": "S6",
+      "topic": "raw identifier/all-match semantics",
+      "result": "held"
+    },
+    {
+      "id": "S7",
+      "topic": "absolute UTF-8 coordinates",
+      "result": "held"
+    },
+    {
+      "id": "S8",
+      "topic": "initial raw vs rendered evidence",
+      "result": "held"
+    },
+    {
+      "id": "S9",
+      "topic": "initial packing/recovery/planner parity",
+      "result": "held"
+    },
+    {
+      "id": "S10",
+      "topic": "literal immutable Git source policy",
+      "result": "held"
+    },
+    {
+      "id": "S11",
+      "topic": "AST items and companions",
+      "result": "held"
+    },
+    {
+      "id": "S12",
+      "topic": "stream EOF/size/range production",
+      "result": "held"
+    },
+    {
+      "id": "S13",
+      "topic": "source publication/call/cache binding",
+      "result": "held"
+    },
+    {
+      "id": "S14",
+      "topic": "two observations and correction",
+      "result": "held"
+    },
+    {
+      "id": "S15",
+      "topic": "existing resource/canary accounting",
+      "result": "held"
+    },
+    {
+      "id": "S16",
+      "topic": "fresh diagnostics",
+      "result": "held"
+    },
+    {
+      "id": "S17",
+      "topic": "successful finding retention",
+      "result": "held"
+    },
+    {
+      "id": "S18",
+      "topic": "final exact source handoff",
+      "result": "held"
+    },
+    {
+      "id": "S19",
+      "topic": "encoded success record bound",
+      "result": "held"
+    },
+    {
+      "id": "S20",
+      "topic": "static/native identity bounds",
+      "result": "held"
+    },
+    {
+      "id": "S21",
+      "topic": "C1/C2 scope",
+      "result": "held"
+    },
+    {
+      "id": "S22",
+      "topic": "deferred failed-review lifecycle",
+      "result": "held"
+    },
+    {
+      "id": "S23",
+      "topic": "actual episode/publication persistence",
+      "result": "held_after_correction"
+    },
+    {
+      "id": "S24",
+      "topic": "history vs current origin authority",
+      "result": "held"
+    },
+    {
+      "id": "S25",
+      "topic": "unknown native outcomes",
+      "result": "held"
+    },
+    {
+      "id": "S26",
+      "topic": "fresh findings/design response",
+      "result": "held"
+    },
+    {
+      "id": "S27",
+      "topic": "implementation handoff boundaries",
+      "result": "held"
+    },
+    {
+      "id": "S28",
+      "topic": "real adapter RED/GREEN",
+      "result": "held"
+    },
+    {
+      "id": "S29",
+      "topic": "staged coverage matrix",
+      "result": "held"
+    },
+    {
+      "id": "S30",
+      "topic": "actual incident request capture",
+      "result": "held"
+    },
+    {
+      "id": "S31",
+      "topic": "build/review/updater exits",
+      "result": "held"
+    },
+    {
+      "id": "S32",
+      "topic": "parent scope/holds/live acceptance",
+      "result": "held"
+    }
+  ],
+  "seam_correction": {
+    "id": "S23",
+    "finding": "Source-less adoption also persists supplied structured evidence through episode::evaluate; it is not only in-memory.",
+    "resolution": "Documented existing hook and separately retained missing producer/history/wake guarantees; rechecked held."
+  },
+  "seams_checked": 32,
+  "unresolved_c1_seam_findings": 0,
+  "limits": [
+    "Design audit only; no independent code approval or test pass.",
+    "C2 lifecycle, original PR1944 typed dependency capture/replay, normal rollout and parent1703 acceptance remain required.",
+    "No native state/capacity/allowance changed."
+  ]
+}

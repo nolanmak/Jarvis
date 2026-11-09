@@ -941,3 +941,28 @@ Other required Linux jobs and aggregate targeted verdict are still running;
 queue admission is not execution, approval, merge or rollout. No source/body
 churn is planned while this request owns the published candidate. Parent
 automatic capacity, productive ingress, live shipment and soak exits remain open.
+
+## Scoped coherent-source design closed; native fixture/tool mismatch confirmed
+
+The [C1 range/item contract](review-dependency-recovery-contract.md) is ready
+for test-first implementation after [fresh/source/all32 seam checks](1703-review-range-design-audit.json).
+Three fresh findings were resolved, one actual-incident-input gap correctly
+parked until the preserved command emits an actual typed dependency request.
+One seam correction documents the existing episode-evidence persistence hook.
+C2 failed-review history, free deterministic holds and wake semantics remain
+required and unready; no code approval or live recovery is claimed.
+
+#1951's original worker attempt finished after six admissions/~8.2 minutes:
+two baseline observers differ as intended, but the filtered-module Python
+observer cannot find rustc and the CLI observer assumes a binary not built.
+Source inspection confirms only cargo verifier invocations receive the trusted
+Rust toolchain; Python PATH is fixed system-only. This is a fixture/tool-plan
+mismatch owned by #1943, not the intended product bug and not permission to
+expose ambient tools. Original candidate/request/native custody are preserved.
+
+Its remaining hosted legacy-python job failed because the runner lost server
+communication. GitHub supplied that annotation, no failing-test step and no
+job log. Only that job was rerun against unchanged04c29b8d; accepted/queued
+at observation. The [proof](1703-filtered-env-input-proof.json) separates actual
+CLI/bridge GREEN, infrastructure retry and failed native acceptance. No
+required check, review gate or normal updater was bypassed.

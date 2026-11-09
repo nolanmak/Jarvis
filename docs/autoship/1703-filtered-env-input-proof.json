@@ -99,5 +99,33 @@
     "owner_control": null,
     "merge_state": "not-confirmed",
     "latest_reason": "awaiting-worker-claim"
+  },
+  "first_worker_attempt": {
+    "selected_at_ms": 1794239357540,
+    "finished_at_ms": 1794239858365,
+    "outcome": "failed",
+    "reason": "acceptance_registration_retry",
+    "next_action": "rescope_executable_acceptance",
+    "model_admissions": 6,
+    "wall_ms": 489196,
+    "baseline_results": {
+      "filtered-source-module": "unexpected_failure: FileNotFoundError rustc",
+      "inventory": "intended_failure",
+      "cli-env-list": "unexpected_failure: candidate CLI binary not built",
+      "ci-registration": "intended_failure"
+    },
+    "source_policy": "Python invocation PATH is /usr/bin:/bin and does not mount Rust toolchain. Cargo invocation exposes the trusted Rust toolchain. Prebuilt candidate CLI is not guaranteed.",
+    "recovery_owner_issue": 1943,
+    "limits": "No protected verifier edit, source/head change, request reset, merge credit or native retirement inferred."
+  },
+  "hosted_infrastructure_retry": {
+    "run": 42645634622,
+    "failed_job": 129258197709,
+    "job_name": "legacy-python",
+    "annotation": "The hosted runner lost communication with the server.",
+    "logs": "Job log unavailable; no completed failing test step supplied.",
+    "action": "POST rerun only failed job after confirming unchanged PR head04c29b8d; accepted, same run queued.",
+    "rerun_state": "queued_at_observation",
+    "limits": "Runner disconnect is observed; underlying CPU/memory/network cause is not established. Required CI still pending."
   }
 }

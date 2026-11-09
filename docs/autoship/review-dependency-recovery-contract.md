@@ -1,7 +1,8 @@
 # Coherent immutable review dependency recovery — #1952
 
-Status: replacement design, awaiting fresh-reader/source/seam validation. Not
-implementation-ready or activation authority. Owner #1709; parent #1703.
+Status: scoped C1 design ready for test-first implementation after fresh-reader,
+source and all32 mapped seam checks. C2 is not design-ready. This is not code
+approval, rollout or activation authority. Owner #1709; parent #1703.
 Incident identity: [PR1944 receipt](1703-pr1944-review-dependency-proof.json).
 
 ## Problem and outcome
@@ -276,3 +277,19 @@ the relevant review-module delta is the wrapped typed-budget classifier
 context handling and lookalike-string refusal. Other cited producer/parser/
 episode/custody APIs were checked against the current deployment checkout.
 A later main change requires the usual source revalidation before editing.
+
+## Scoped design audit checkpoint
+
+Fresh-reader: four initial forced-guess findings. Canonical selector JSON, raw
+identifier equality and unavailable-source local control flow were resolved
+and rechecked. The unknown PR1944 dependency pair was explicitly parked with
+its first actual typed-response capture/replay trigger and live-closure cost;
+no convenient pair is credited as actual incident evidence.
+
+All32 mapped C1/boundary seams were checked. One stale source assertion (S23)
+was corrected/rechecked: source-less adoption also reaches episode-evidence
+persistence. Final result32 held, zero unresolved C1 seam findings. Primary
+conversation/source comparison preserves the entire #1703 objective, current
+main's wrapped-budget classifier and the C1/C2 staging boundary. Source/
+component/rollout/live exits remain distinct. No implementation test or
+independent code approval is implied by this audit.
