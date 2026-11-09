@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T20:35:45.371374+00:00",
+  "observed_at": "2026-11-09T20:37:04.931650+00:00",
   "parent_issue": 1952,
   "owner_issue": 1709,
-  "status": "design_checks_passed_issue_lane_pending",
+  "status": "scoped_design_ready_for_test_first_implementation",
   "source_head": "416f392b17b56b2a43e67a3e430835902387941a",
   "contract": "native-admission-accounting-correlation-contract.md",
-  "contract_sha256": "4005d4c67211e43eeab90aa4aa05128eeb879237cf2e7662b3e20a1071a6bdd2",
+  "contract_sha256": "fbecce6c54d8ea26050fac632a9ed8292b859abd59abda386ff3e0043288700c",
   "fresh_reader": {
     "completed": true,
     "retained_findings": 0,
@@ -53,10 +53,19 @@
     ],
     "retained_findings": 0
   },
-  "issue_lane": null,
+  "issue_lane": {
+    "issue": 1955,
+    "parent": 1952,
+    "native_parent_child_link_verified": true,
+    "source_workflow": "nolanmak/jarvis#1955",
+    "request_id": "autoship-correlation-source1955-20261109",
+    "source_owner_pause_revision": 1,
+    "source_attempt_rows_observed": 0,
+    "source_model_admissions_observed": 0
+  },
   "limits": [
-    "No implementation handoff until the precise issue lane is recorded.",
     "Design-only audit; no code approval, tests, original-command mutation or production change.",
-    "The bounded receipt extension does not close native result custody, failed-finding retention, no-spend holds, capacity or broader live acceptance."
+    "The bounded receipt extension does not close native result custody, failed-finding retention, no-spend holds, capacity or broader live acceptance.",
+    "Only the bounded receipt-correlation prerequisite is ready for implementation; no source teardown proof is inferred from its pause."
   ]
 }

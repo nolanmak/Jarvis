@@ -1,7 +1,7 @@
 # Native admission accounting receipt correlation — bounded C2 prerequisite
 
-Status: fresh/source/all 23 mapped seam checks passed; precise issue lane
-remains to be recorded before implementation handoff. Under #1952 / #1709 / #1706 / #1703; documentation PR #1916.
+Status: scoped design ready for test-first implementation in #1955 after
+fresh/source/all 23 mapped seam checks. This is not code approval or rollout. Under #1952 / #1709 / #1706 / #1703; documentation PR #1916.
 This scopes one producer interface from the working
 [retry lifecycle contract](review-retry-lifecycle-contract.md). All other C2
 result-custody, schema, entry-path, hold and wake obligations remain open.
@@ -125,8 +125,8 @@ Verify all producer/consumer sides: old/new setter and clone slot, callback
 commit and returned UUID, protected audit encoding/version, resource identity,
 error before launch release, ordinary accounting/quotas, and original command
 ownership. Fresh-reader, conversation/source comparison and every mapped seam
-must complete before coding. This document is a draft and grants no exception
-until those checks and a precise issue lane are recorded.
+must complete before coding. Those checks and the precise #1955 lane are now recorded below. #1955 may
+implement only D1–D6 with T0–T5; broader C2 handoff remains blocked.
 
 
 ## Design checkpoint
@@ -136,6 +136,8 @@ fresh-reader/source and [all 23 mapped seam checks](1703-admission-accounting-co
 No retained mismatch remains. T0 was clarified to require a runtime missing-field
 RED through the existing WorkflowGuard route before adding the new callback API.
 Current-source comparison confirmed the original shared-slot snapshot behavior,
-charge commit and audit-before-launch ordering. The precise issue lane must be
-recorded before test-first coding; this audit is not code approval, rollout or
+charge commit and audit-before-launch ordering. The precise lane is native child #1955 of #1952. Its normal source command
+was queued and paused at owner revision 1 to prevent a duplicate issue builder;
+read-only verification found zero attempt rows and zero model admissions.
+That source hold is not a native teardown receipt. This audit is not code approval, rollout or
 completion of C2/native result custody or parent #1703.
