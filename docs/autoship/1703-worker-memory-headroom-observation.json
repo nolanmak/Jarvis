@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T19:05:58.806338+00:00",
+  "selected_service": "augmentagent-autopr.service",
+  "service_process_and_membership_stable": true,
+  "source": "Current main scripts/run-resource-scope.py::headroom, shared-lock passive read against the selected service aggregate; no self-cgroup emulation.",
+  "reference_envelopes": [
+    {
+      "reference_requested_bytes": 4294967296,
+      "status": "refused_for_reference",
+      "refusal": {
+        "phase": "admission_failed",
+        "exhausted": true,
+        "refusal_code": "host_headroom",
+        "facts": {
+          "requested_bytes": 4294967296,
+          "reservation_slack_bytes": 3867926528,
+          "margin_bytes": 268435456,
+          "required_bytes": 8431329280,
+          "available_bytes": 6377078784
+        }
+      }
+    },
+    {
+      "reference_requested_bytes": 6442450944,
+      "status": "refused_for_reference",
+      "refusal": {
+        "phase": "admission_failed",
+        "exhausted": true,
+        "refusal_code": "aggregate_reservations",
+        "facts": {
+          "requested_bytes": 6442450944,
+          "reserved_bytes": 4772835328,
+          "current_bytes": 2592505856,
+          "reclaimable_bytes": 1687597056,
+          "limit_bytes": 10737418240
+        }
+      }
+    }
+  ],
+  "limits": [
+    "Reference demand vectors are not a captured PR1954 preflight policy/receipt.",
+    "No environment copied, cgroup entered, reservation created, reclaim requested, limit changed, process signalled or storage deleted.",
+    "This read-only observation is not execution authority or proof of native/storage readiness.",
+    "The exact original PR1954 resource refusal remains missing from its durable command status."
+  ],
+  "parent_issue": 1703,
+  "capacity_epic": 1917,
+  "contract_issue": 1918,
+  "related_command_pr": 1954,
+  "source_head": "416f392b17b56b2a43e67a3e430835902387941a",
+  "purpose": "Current host/service demand observation for automatic sizing and precise deferral design; not an active benchmark or a capacity grant."
+}

@@ -1139,3 +1139,26 @@ in progress on the same head. No status was manually marked passing and no
 missing check waived. Current-head1758-test code GREEN remains separate
 from the aggregate. PR1954 stays ready/queued and its configured-worker
 capacity refusal remains a separate unresolved execution hold.
+
+## Passive memory-headroom reference cases on the actual worker
+
+A read-only shared-lock observation at19:05:58 UTC uses current main's
+headroom function against the selected autopr service aggregate. Process
+birth/membership remained stable. This enters no cgroup, copies no environment,
+creates no reservation and performs no reclaim/cleanup/limit change.
+[Raw numeric receipt](1703-worker-memory-headroom-observation.json) carries
+no private paths or native identifiers.
+
+A4GiB reference request is refused for host_headroom: existing reservation
+slack3,867,926,528 bytes plus requested4,294,967,296 plus268,435,456 margin
+requires8,431,329,280 bytes (7.85GiB), versus6,377,078,784 available (5.94GiB).
+A6GiB reference instead fails aggregate_reservations:4,772,835,328 reserved
+plus6,442,450,944 requested exceeds the10,737,418,240-byte service ceiling.
+
+These are deliberately labelled reference vectors, not a captured PR1954
+preflight policy or its original refusal. They establish that unused peaks
+already promised to active runs matter alongside current usage. They do not
+authorize shrinking demand to measured RSS, raising a budget, retiring native
+state, declaring whole-machine capacity or closing C0. Precise worker-side
+preflight observation, automatic host sizing and full profile/accounting/
+publication integration remain open under1917/1918.
