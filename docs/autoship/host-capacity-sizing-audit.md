@@ -214,3 +214,27 @@ documented input order. Exact active-quota profiles, protected typed encoding,
 filesystem identity/support, image/inode/durable balances and complete collector/
 admission integration remain explicit C0 gates. An inactive quota result cannot
 be used to manufacture numeric unlimited capacity or ignore another predicate.
+
+The filesystem checkpoint (O8) separates persisted full ext4 UUID identity from
+current device/mount/namespace/object attachment. It specifies held-path
+revalidation, single-pool alias arithmetic, collision handling, reboot accounting
+rebinding and descriptor-based available-byte/inode counter units. A UUID match
+never supplies source provenance, native custody, execution or cleanup authority.
+The inspector remains separate from admission's mutating CI-hold reconciliation.
+
+The non-root filesystem probe read nonzero 16-byte UUIDs and held-descriptor
+counters on the four current devices without exposing UUIDs, reading raw block
+devices or invoking SET/mount operations. Three disposable predicates confirm
+held-directory stability after replacement, reopened replacement inequality and
+same-filesystem identity despite distinct directory inodes. Pairwise comparisons
+also distinguish the four input devices without collision and recognize a
+repeated repository input. This is not bind-mount, actual worker-namespace,
+statx-attachment, publication-boundary, reboot or complete migration acceptance.
+
+Fresh-reader review found no new hard contradiction. It confirmed that complete
+global inventory revision semantics, descriptor-bearing constructor interfaces,
+root/database/anchor encoding, write profiles and the rest of storage admission
+remain load-bearing C0 gates. Its experiment-polish suggestion to emit pairwise
+input comparisons was implemented; these comparisons do not enlarge the stated
+evidence scope. No production configuration/accounting was modified, and C1-C5
+remain blocked pending complete C0 closure and the final whole-contract audit.

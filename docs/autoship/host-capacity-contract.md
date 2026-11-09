@@ -362,6 +362,114 @@ Quota fixtures for O7:
 - EPERM/EACCES, ENOSYS, EINVAL or an unreadable target remains unknown. None
   authorizes setting quota availability to the filesystem's free bytes.
 
+O8. The first storage identity/counter profile is local ext4 with a nonzero
+16-byte filesystem UUID returned by descriptor-based `FS_IOC_GETFSUUID`, and
+the required descriptor/statx/mount-namespace observations below. This is not
+automatic support for every filesystem that happens to implement that ioctl.
+Missing/incompatible required interfaces return unsupported or unknown as
+appropriate; never guess identity from a pathname, volume label or `df` line.
+No block-device read, UUID setter, mount operation or privileged discovery
+helper is needed. Final producer allocation/metadata profiles remain separate.
+
+Use these two distinct bindings:
+
+- Persisted `FilesystemIdV1 = {kind:"ext4", uuid_hex:<32 lowercase hex digits>}`.
+  This identifies the intended filesystem across ordinary reboot; store it in
+  root membership and commitment components rather than persisting `st_dev` or
+  a mount ID as a reboot-stable identifier. It is descriptive accounting data,
+  not proof of original ownership, source fidelity, execution or release.
+- Live attachment: current boot, actual selected worker's held mount-namespace
+  device/inode identity, filesystem type/full UUID, device major/minor, unique
+  statx mount ID, and each held target directory/file's inode and type. Require
+  the `STATX_MNT_ID_UNIQUE` result mask, not just a numeric field defaulting to
+  zero. Hold original descriptors throughout sampling and publication; each
+  associated canonical path must still resolve to its held object in that
+  actual namespace. A held old descriptor alone does not prove the published
+  path still selects it. The final root/database/anchor binding is additional.
+
+Within one verified boot/worker namespace, paths with the same ext4 UUID and
+same current device contribute to one filesystem balance even when mount IDs
+or directory inodes differ. Mount IDs identify attachments, not separate pools
+of free bytes. The same UUID appearing on different current devices, or one
+device returning contradictory UUID/type, is an identity collision/unstable
+observation: do not merge, double-spend, choose one or mint another filesystem
+ID to obtain capacity. Across reboot, re-resolve the registered canonical root
+and full UUID and verify its original database/anchor binding before attaching
+existing rows to the newly observed device/mount IDs. Do not carry previous-boot
+availability, mount IDs or live grants forward.
+
+Filesystem UUIDs and anchor contents can be copied. Matching them does not
+establish native source provenance or recover original controller/custody
+handles; those checks still govern execution, migration and retirement. Known
+collisions/missing or contradictory roots remain held. This profile does not
+claim to detect every owner-made filesystem clone from metadata alone.
+
+For output roots, resolve and hold the actual intended directory without
+symlink/magic-link substitution and revalidate its path attachment. Discovery
+does not create missing directories. A planned new child is bound to its exact
+held parent plus one validated basename, not an arbitrary nearest existing
+ancestor. Its eventual creation/publication must use that original bound parent
+and verify the resulting child/device before any covered growth/model release.
+Do not let a missing/unmounted output path silently borrow its parent device's
+free space. Full bridge/constructor support for these held bindings remains a
+C0 API/integration gate; converting them back to an unchecked path is not support.
+
+On held descriptors collect `fstatfs` type/identity and `fstatvfs` counters in
+both O3 passes. Counter units are bytes from checked `f_bavail * f_frsize`, and
+available inode count from `f_favail`; use the smaller availability of the two
+passes. Require positive unchanged `f_frsize`, and coherent nonnegative
+`f_bavail <= f_bfree <= f_blocks`, `f_favail <= f_ffree <= f_files` counts.
+Overflow, invalid ordering or a changed identity/size/unit makes that attempt
+unknown/unstable. Zero byte/inode availability is known exhausted, not unknown.
+Do not use `f_bfree` (which may include reserved blocks) as user availability,
+multiply by an assumed 4096, or treat `f_frsize` as a demonstrated future
+allocation-cluster/metadata growth bound. A read-only/incompatible mount does
+not qualify as a writable storage profile from nonzero free counters. Full
+write-profile validation, inode floors/demand and active-quota/image predicates
+remain required in addition to these observations.
+
+The inspector reads the durable root registry and each native balance in
+read-only mode with zero busy wait, validates identity/schema and counts full
+pending/held/release-pending rows. It never deletes claims, reconciles CI holds,
+creates an anchor, imports missing records or marks a row released. Two-pass
+inventory revisions must agree. Actual admission recollects/revalidates this
+inventory under S6's original common lock, including current CI uncertainty
+holds and complete demand. A busy, missing or contradictory registered database
+cannot disappear from the sum. Exact SQL/revision encoding is still a C0 gate.
+
+Identity/counter fixtures:
+
+- Two held directories on one verified filesystem have distinct directory
+  inodes but one UUID/device: one pool; sum distinct demand components once.
+- Bind aliases have distinct attachment IDs but the same verified UUID/device:
+  one pool, with each target's own attachment still checked. Actual bind-mount
+  fixture evidence remains required; the disposable probe tests directories only.
+- A directory is renamed away and another created at its path: the old held
+  descriptor stays internally stable, but path-to-held identity disagrees and
+  the observation cannot authorize publication against the replacement.
+- Reboot changes device/mount IDs with matching registered filesystem and
+  original root/database/anchor: reobserve and rebind accounting only; no saved
+  resource snapshot or original execution/cleanup capability is recreated.
+- `f_bavail=100`, `f_frsize=4096`, `f_favail=10` yields 409600 bytes/10 inodes.
+  A second sample of 90 blocks/9 inodes yields 368640 bytes/9 inodes.
+- An archive path resolves onto the system device after mount loss: its
+  registered UUID disagrees and capacity remains unknown/held, regardless of
+  system-device free bytes. Missing registry/anchor never selects a fresh pool.
+
+Sources: kernel [filesystem UUID UAPI](https://github.com/torvalds/linux/blob/master/include/uapi/linux/fs.h),
+[statx](https://man7.org/linux/man-pages/man2/statx.2.html),
+[statfs](https://man7.org/linux/man-pages/man2/statfs.2.html) and
+[statvfs](https://man7.org/linux/man-pages/man3/statvfs.3.html).
+The non-root probe `probes/storage_filesystem_observation.py` read full UUIDs
+and held-descriptor counters on all four current devices; it emits no raw UUIDs.
+Its three disposable directory replacement/same-filesystem predicates passed.
+These are exploratory CLI/kernel facts, not two-pass worker collection,
+bind-mount/reboot tests, complete storage admission or root-anchor migration.
+The probe also emits pairwise UUID/device equality/collision facts for supplied
+inputs. The four current devices compare distinct with no collision. A repeated
+repository path compares equal in both fields; that alias experiment is still
+not a privileged bind-mount or worker-namespace test.
+
 ## 5. Host tasks and descriptor readiness
 
 P1. Host task demand is the existing run declaration's full `pids` value,
