@@ -92,3 +92,27 @@ Read-only deployed unit inspection at this checkpoint reported daemon/worker
 task use 13/5, each TasksMax=2048, NOFILE soft/hard=4096 and NPROC soft/hard=52942.
 It confirms the current separate service limits, not the proposed common
 reservation accounting or its implementation. Nothing was published/reloaded.
+
+The shared-storage checkpoint specifies one common admission owner, durable
+commitments in each existing native database, a durable per-UID root registry,
+per-filesystem full-demand arithmetic, pending/held/release-pending/released
+lifetime, original-proof release ordering and create/resume/build/snapshot
+fixtures. It includes the Python bridge's sparse-cache/command-storage consumers,
+which do not currently publish Rust shared claims. The native build cache's
+12 GiB demand and 20 GiB scratch floor remain distinct from retained 1 GiB
+session accounting; auto mode must replace its managed 24 GiB aggregate default
+without discarding explicit operator ceilings.
+
+A fresh-reader checkpoint found the proposed arithmetic and lifetime handoffs
+consistent. A continuation-pressure question led the author to require a
+verified remaining-growth bound U, defaulting to the full original component
+when unproven. Targeted recheck confirmed the corrected fixtures and that only
+the qualified original writer may use U; every other writer counts the full
+durable commitment. The author recomputed snapshot integer-byte rounding,
+multi-root/device, concurrent-admission and continuation examples independently.
+
+Final producer bounds, filesystem/identity encoding, SQL/replay/bridge APIs and
+structural mixed-version/startup fencing remain C0 gates. This checkpoint is
+not complete implementation readiness or a full-contract seam audit. The
+separate executable/companion bound correction is implemented in PR #1925,
+with local behavioral red/green evidence; it does not close these wider gates.

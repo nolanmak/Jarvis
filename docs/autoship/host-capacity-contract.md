@@ -560,15 +560,285 @@ C2 must test an old reader, lost locks, reboot and unresolved retirement through
 the actual shared entry points. No production registry or limits were changed
 by this inspection.
 
-## 7. Open contract checklist and handoff gate
+## 7. Shared storage accounting and durable native commitments
+
+S1. Extend the existing admission authority; do not create a second native
+allocator. Move its lock acquisition, claim inventory and CI uncertainty guard
+into a shared channel-core storage module, with CLI adapters for current build,
+snapshot and prune callers. All these callers and native constructors use the
+same per-UID admission lock and arithmetic. The shared module must retain CI
+hold reconciliation before mutating admission, including its exact kernel
+cleanup proof; native admission cannot bypass it because no CLI callback was
+installed. Read-only inspection uses a separate nonmutating inventory API.
+
+The consumer inventory also includes Python `codex-tool-bridge.py`:
+`BuildScratch` currently budgets persistent sparse VM caches, and `CommandStorage`
+holds legacy command/update locks without publishing a Rust reservation. Those
+are not already part of a combined claim total. The original Rust bridge owner
+must adapt those operations to the common authority and carry the original
+storage binding to the actual VM command. Do not implement a second independent
+SQL reader/allocator in Python or accept a policy JSON flag as a held allocation.
+Exact bridge request/descriptor APIs remain C0 work before C2 implementation.
+Auto mode replaces the bridge's managed 24 GiB aggregate scratch-budget default
+with common per-filesystem accounting, rather than leaving another fixed pool
+to block a larger host. Preserve explicit operator scratch ceilings as additional
+constraints, the declared per-cache demand and the existing scratch free-space
+floor (default 20 GiB). Fixed-mode semantics remain unchanged until supported
+migration; ambiguous legacy provenance cannot be guessed from the number 24.
+
+S2. Retained commitments belong in the existing native root database, alongside
+its ownership/retirement records. Add versioned commitment tables there; do not
+copy the same charge into a workflow accounting ledger or treat directory count
+as a second authority. A per-UID durable root registry lets the common admission
+owner discover every participating root, including an unselected old provider
+root. This registry stores root membership/identity, not a second commitment
+balance. Native tree/owner inventories detect missing or contradictory records;
+they cannot silently reconstruct a release or discount a charge.
+
+The registry has one deterministic location under the home directory obtained
+from the operating system's account record for the effective UID:
+`.local/state/augmentagent/storage-roots-v1/`. Ambient HOME/XDG overrides do not
+split this global registry; per-app state remains configurable. Validate held
+owner-private non-symlink registry directories/files. An unavailable or replaced
+account-home/registry is unknown, never an empty inventory. Its native-root
+entries and native database rows survive reboot; the temporary admission lock
+and process claims may be recreated, but cannot supply their persistence.
+
+Each registry entry binds a generated root UUID, canonical root path, original
+root/database/anchor identity, expected native schema revision and filesystem
+identity. The registry is append-before-allocation: publish/sync root membership
+before the first charge or writer. Missing root/database or identity disagreement
+keeps its commitments unknown/held and refuses new shared admission. A selected
+policy changing roots does not unregister the old one. No registry retirement
+is allowed until original checked retirement establishes no remaining native
+commitment or unresolved writer; keep a root tombstone rather than reuse its UUID.
+The exact filesystem/anchor identity encoding is still a storage-observation
+gate below; these fields alone cannot recreate execution or cleanup authority.
+
+S3. Each commitment has a globally unique allocation ID, root UUID, original
+native owner/launch binding, policy and demand revisions, immutable per-filesystem
+byte/inode demand, replay digest and state. Byte counts must be nonnegative
+SQLite integers representable without overflow; unsupported magnitude or a
+checked-sum overflow yields unknown. The native database is the sole durable
+balance for these rows. Version migration and table constraints must reject
+duplicates, changed replay parameters, unbound rows and unknown state values.
+
+There are two distinct commitment kinds:
+
+- `retained`: the full existing 1 GiB logical session charge, from creation until
+  checked retirement and deletion complete. A resume does not create another
+  retained charge. This is an accounting promise, not a demonstrated kernel
+  quota or credit for materialized data.
+- `active-growth`: the producer's complete additional per-filesystem peak for
+  one launch, including state staging and other declared output paths. This
+  charge remains durable after process loss until checked cleanup/publication
+  reconciliation settles it. Section 6's full producer budget is still required;
+  an unverified peak is unknown, never zero or assumed covered by the 1 GiB row.
+
+For a build-enabled native run this includes its declared sparse build-cache
+growth and command scratch/source snapshots, even while the model is thinking.
+The current bridge default is a 12 GiB cache, not the native 1 GiB retained
+charge. Reserve its full declared future growth before releasing that run; do
+not discount sparse materialization or wait until a paid coding turn requests
+its first build. A no-build route does not reserve a nonexistent build cache.
+An existing per-command claim and its original durable parent coverage must be
+correlated by the same allocation/component binding, not counted twice or
+excluded from an unverified caller-supplied ID. Acquiring the build/prune lifetime
+lease for each actual command remains separate from the growth commitment.
+
+States are `pending`, `held`, `release-pending`, `released`. The first three
+count their full immutable demand; only `released` counts zero. Loss of a flock,
+PID exit, daemon restart, age, small file size or a cleanup log changes none of
+these balances. Process-scoped build/snapshot claims keep their existing lifetime;
+CI uncertainty holds still prevent premature reuse of uncertain process claims.
+
+S4. For each actual filesystem f, define:
+
+- F_f: current user-available bytes on the held, verified filesystem, using the
+  smaller coherent observation. This is already net of materialized allocations.
+- H_f: the greatest applicable configured free-space floor of the participating
+  native/build/snapshot paths on f. Preserve the existing 15 GiB default floor
+  and native scratch's default 20 GiB floor where that profile applies, plus
+  any larger explicit floor. Floors are not pooled across devices and are
+  not added repeatedly for aliases of the same filesystem.
+- P_f: sum of other active process claims' full declared growth on f, each
+  allocation ID counted once. An existing build's claim and its parent's inherited
+  claim are one allocation, not two. Never subtract its materialized usage.
+- D_f: sum of every pending/held/release-pending native commitment on f across
+  all registered roots, each allocation ID counted once.
+- Q_f: this operation's new full demand, consisting of the retained charge when
+  creating a session plus its separate active-growth demand. Resume has no new
+  retained charge. Exclude only an original held allocation being replayed with
+  the same immutable digest; a caller-supplied ID cannot hide someone else's row.
+
+An idempotent accounting replay returns the existing charged row with no new
+Q_f; it does not itself permit another physical write. An original writer whose
+live custody/binding is still fully verified may continue within its already
+reserved active peak. Its continuation check excludes only its own active-growth
+component from D_f and instead includes the producer's verified remaining
+physical-growth upper bound U_f for that component; it still counts retained
+rows, other writers and any uncovered new demand. Without a producer proof of
+less remaining growth, U_f is the full original component demand. In particular,
+a directory-size/allocated-block sample alone cannot justify U_f=0. Every other admission
+continues to count that original active-growth row in full. This is original
+lease reuse, not a materialized-usage rebate or a reduction of the durable row.
+Without the original proof, replay remains charged/held and cannot qualify an
+execution path through a serialized allocation ID.
+
+Admission requires `F_f >= H_f + P_f + D_f + Q_f` on every affected filesystem,
+plus the analogous checked inode/quotas and logical-image predicates once their
+profile is specified. If two paths refer to f, count the same allocation once;
+separate components of one operation on f sum into Q_f. The same allocation
+may carry different demand on different filesystems. Archive free space never
+funds growth on a state/build device. An unknown operand makes the result unknown.
+Per-root fixed byte/count overrides and the existing owner/source/authorization
+constraints remain additional predicates. Global headroom never overrides a
+selected root's explicit ceiling.
+
+For a proposed native launch on one state filesystem, the current auto retained
+aggregate envelope across all registered roots is
+`floor(max(0, F_f-H_f-P_f-D_other_f-G_f) / 1 GiB) * 1 GiB`, where
+D_other_f excludes all retained rows but includes unresolved active-growth rows
+and G_f is this launch's new active-growth peak. The existing retained rows
+still consume that envelope; do not add them to the result or apply the whole
+global envelope independently as each root's new policy ceiling. This displayed
+envelope is not pre-reserved as a native pool: only actual rows are committed.
+If a native operation needs multiple filesystems, the full vector predicates
+decide it; one displayed state budget cannot stand in for those checks.
+
+S5. The same arithmetic applies when a builder or snapshot is the new writer:
+its own existing allocation is excluded only for original in-bounds continuation,
+not to evade a new claim. Native D_f remains charged to other writers. A native
+VM command uses the original active-growth component covering its cache/scratch;
+it does not acquire another promise for that same growth. Uncovered paths or
+additional demand require ordinary new admission. Continuing a covered command
+still requires its verified remaining U_f to fit current headroom; the original
+promise does not excuse a known physical deficit after unrelated writes.
+Standalone build peak is
+separate from H_f, as in current
+admission (default 10 GiB growth plus 15 GiB floor). Snapshot peak remains the
+existing raw/compressed overlap formula `2*db_bytes + floor(db_bytes/10) +
+binary_bytes`, added to the applicable floor and other claims. Do not count a
+new writer's peak both inside its floor and again as Q_f. Existing retained
+promises can block an unrelated future build; report that resource deficit rather than
+erase promises, capture the entire theoretical native pool, or promise future
+build capacity that was never reserved. Workflow fairness and checked retirement
+must recover eligible work through the existing scheduler.
+For an already admitted build-enabled native run, S3 has reserved its declared
+cache/scratch peak before model release; subsequent covered commands reuse that
+promise and the existing command-scoped build/prune lease. They do not discover
+an unreserved 12 GiB requirement only after a paid turn has started.
+
+### Exact storage arithmetic fixtures
+
+These are synthetic declared-demand fixtures, not a claim that the native
+producer currently proves G=2 GiB. All values below are GiB; every physical,
+identity, inode, quota and logical-image predicate is otherwise known/pass.
+
+| New operation | F | H | Other P | Existing D | New Q | Result |
+| --- | --- | --- | --- | --- | --- | --- |
+| Native create, retained 1 + active 2 | 39 | 15 | 10 | 8 | 3 | fits; total 36 |
+| Same operation under pressure | 35 | 15 | 10 | 8 | 3 | deficit 1 |
+| Resume, active 2 only | 35 | 15 | 10 | 8 | 2 | fits exactly |
+| New build, growth 10 | 39 | 15 | 0 | 8 | 10 | fits; total 33 |
+| New snapshot, db=2 and binary=0.5 | 28 | 15 | 0 | 8 | 5046586572 bytes | fits; total 29742648524 bytes |
+
+The snapshot row uses integer division of byte counts, not decimal GiB
+arithmetic; its peak is slightly less than 4.7 GiB.
+
+For the first row, the total retained envelope is 12 GiB
+(`39-15-10-2`), with 8 GiB already committed and four retained slots of current
+arithmetic headroom. It is not 20 GiB and reserves none of those four slots yet.
+An unresolved prior 2 GiB active-growth row lowers that envelope to 10 GiB;
+a resume also needs its new active-growth claim despite its existing retained row.
+
+Two native roots each holding 4 GiB on the same device contribute D=8 GiB,
+not 4 or 16. Repeating the state path through an alias changes no total. If a
+launch needs state demand 3 GiB on f and build growth 10 GiB on g, evaluate each
+device independently. With F_g=24, H_g=15 and no other claims, g refuses with
+deficit 1 GiB even if f has 100 GiB spare. Two concurrent new 3 GiB native
+allocations against F=35,H=15,P=10,D=6 serialize: the first fits (34), the second
+observes D=9 and refuses (37). They cannot both consume the same three GiB.
+
+Continuation fixture: F=24,H=15, retained D=8, own original active-growth=2,
+other P=0. With a producer proof that remaining U=1, the still-qualified original
+writer fits exactly at 24. Without that proof U=2 and it refuses at 25. A
+different new native create still counts D=10 and Q=3 and refuses at total 28.
+For a native cache on a separate scratch device with F=24,H=20 and its own
+qualified 12 GiB active component, a verified remaining U=4 fits exactly at 24;
+if all 12 may still be needed, it refuses at 32. A different 12 GiB cache still
+counts that existing full promise and requires 44. The producer proof here is
+a synthetic fixture input, not a claim that current image block counts establish it.
+
+S6. Native creation/replay under the existing root state lock follows this order:
+
+1. Hold existing provisioning lock when changing policy/root membership; hold
+   native state lock for native mutation, then acquire the common storage
+   admission lock. Existing target/snapshot lifetime locks retain their present
+   outer order. The common storage lock never acquires a native state lock,
+   waits for a target/run lock, awaits a VM or invokes network/model work.
+2. Validate registry/root/database identities and current policy/demand/replay
+   binding, reconcile existing uncertainty guards, collect the full inventory
+   and coherent filesystem observations, and evaluate S4 for all devices.
+3. Commit/sync the exact `pending` native rows in the existing root database
+   before authorizing physical growth. Then release the common lock. No local
+   runtime/source/alias publication can precede its charged intent.
+4. Construct the runtime using the existing original ownership/source/input
+   protocol, persist/sync the allocation reference with those native records,
+   then mark its rows `held` under the same state/common-lock order. This
+   cross-store sequence does not grant model execution. Before release, actual
+   resource admission still validates the original source/resource/input handles.
+5. Lost acknowledgement reopens the same allocation/replay digest. It never
+   creates a replacement ID to escape debt. A crash at any intermediate point
+   leaves pending/held full charges; unknown original ownership remains held.
+
+Read-only registry/database scans during common admission take no native state
+lock and have zero SQLite busy wait. Capacity-writing native transactions require
+the common lock, so no cooperating allocation can change mid-scan. A busy or
+invalid database produces a recoverable storage outcome; do not wait while
+holding the global lock or omit that root to obtain a result. Durable database
+transactions require full synchronization and directory synchronization at
+creation/publication boundaries. Exact schema/SQL and replay-record binding must
+be checked by the C0 migration contract before implementation.
+
+S7. Release is a separate, original-proof-consuming operation. Record
+`release-pending` while still charging the full row, obtain the existing native
+qualified retirement/quiescence proof, unlink only the precisely owned artifacts
+through that protocol, sync affected parent directories and complete its durable
+retirement publication. Only then mark the corresponding rows `released` under
+state/common locks. Retained aliases/reference cleanup must precede freeing the
+session row. A successful resumed turn may release that launch's active-growth
+row only after original descendants and temporary growth are checked settled;
+its retained row remains held. Committing a new generation does not itself prove
+all launch scratch/diagnostic writers gone.
+
+Crash between physical deletion and row release overcharges until original
+reconciliation proves the release; it never undercharges. Path absence alone,
+metadata rewritten after losing original handles, a copied completion JSON,
+or an old unqualified legacy retirement record is insufficient release proof.
+No new table, registry field, event or replay ID creates cleanup authority.
+
+S8. Mixed-version/startup fencing is still load-bearing C0 work. In particular,
+old v1 readers delete unlocked process claims before parsing their version, and
+old native admission never consults the shared registry. A new table/row type
+or a documented “upgrade every writer” convention does not structurally fence
+them. Before auto activation, the supported migration must verify the complete
+managed writer set, enforce a compatible minimum version/startup barrier across
+reboot and rollback, and positively settle incompatible active writers. Unknown
+compatibility keeps activation blocked. This section specifies durable balance
+and ordering; it does not yet approve that compatibility protocol or bootstrap
+automatic mode on an existing legacy host.
+
+## 8. Open contract checklist and handoff gate
 
 Memory equations above are proposed engineering decisions with exact fixtures.
 They require fresh-reader review and source/integration validation before C0
 closure. C1-C5 remain blocked; no source implementation is authorized by treating
 this partial document as the completed contract.
 
-- [ ] R/P: full native storage peak, inode/block limits, shared durable claim
-  representation, all-writer compatibility, lock order and crash-safe release.
+- [ ] R/P: full native storage peak, inode/block limits, final SQL/replay/identity
+  encoding, and structural all-writer/startup compatibility. Shared accounting,
+  lock order and release decisions in section 7 still require integration review.
 - [ ] R: complete-vector integration validation of memory/CPU/task/descriptor
   contracts above, including host/guest distinction, shared accounting, finite
   UID task limits and per-process descriptor enforcement.
