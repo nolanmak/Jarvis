@@ -342,5 +342,11 @@ cfg(test), update the crash-child name, and positively verify child execution.
 The extraction keeps formats/namespace/lifetimes; native durable integration,
 full C0 handoff, code approval, deployment and #1703 acceptance remain open.
 
-A managed unchanged-main baseline is running in the named implementation
-worktree. No extraction source edits or production changes have been made.
+Implementation PR #1931 at b4a77220 follows this scoped contract. The managed
+unchanged-main baseline passed 11 cleanup cases; the exact-head combined
+core/CLI run passed 41 selected cases, including all 18 moved tests and actual
+CLI consumers. Crash children verify an execution marker plus original holds.
+The worktree is clean and whitespace checks pass. Hosted targeted/exporter
+setup fails before tests on pinned release download HTTP 504s; remaining CI,
+independent code approval, merge and rollout are unfinished. No production
+policy/session/service changes or native enrollment occurred.

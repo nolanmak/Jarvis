@@ -113,5 +113,11 @@ contract finding was retained. This scoped exception permits #1930 only; it
 does not waive full C0/C2 dependencies or independent code review/CI. Full
 #1703 productive owner ingress and live acceptance remain required.
 
-Implementation evidence is pending. The unchanged-main managed baseline is
-running in jarvis-shared-storage-authority; no extraction code is written yet.
+Implementation PR #1931 at b4a77220 preserves the existing authority and
+adapters. Unchanged-main baseline: 11 cleanup tests pass. Final-head combined
+core/CLI managed run: 41 selected tests pass, none ignored, including all 18
+moved cases, actual CLI consumers and both crash-child branches with execution
+markers. Hosted targeted/exporter setup fails before tests on pinned Deno and
+Python release download HTTP 504s; those gates remain unresolved. Independent
+code approval, merge and rollout remain pending. No native enrollment or live
+capacity change.

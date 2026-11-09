@@ -352,3 +352,9 @@ and all 28 mapped sub-seams were checked, including source counterparts. The
 implementation preserves current semantics and moves checkout ownership tests
 with the authority; it adds no native charges or activation. This scoped
 exception does not unblock full C0/C2, durable native enrollment or deployment.
+
+Implementation [PR #1931](https://github.com/nolanmak/Jarvis/pull/1931) at
+b4a77220 passes 41 selected local core/CLI cases, including all 18 moved tests.
+Hosted verification has unresolved pinned-download HTTP 504 setup failures;
+independent code approval, merge and rollout are pending. This component does
+not deliver native enrollment or activate machine-sized capacity.
