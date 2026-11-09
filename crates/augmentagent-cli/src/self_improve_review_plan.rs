@@ -410,6 +410,12 @@ mod tests {
         );
         String::from_utf8(out.stdout).unwrap().trim().into()
     }
+    async fn immutable_file(root:&Path,head:&str,path:&str)->Result<String> {
+        source_ranges::resolve_review_source_request(root,head,&aligned::ReviewSourceRequest {
+            path:path.into(),criterion_ids:vec!["C1".into()],question:"Read exact immutable source".into(),
+            selector:aligned::ReviewSourceSelector::WholeFile,
+        }).await?.into_values().next().context("whole-file source response missing")
+    }
     #[tokio::test]
     async fn recovery_reads_exact_committed_regular_source_and_improves_empty_request() {
         let root = tempfile::tempdir().unwrap();
