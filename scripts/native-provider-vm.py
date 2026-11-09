@@ -543,8 +543,10 @@ def _native_staging_source(source, limit):
     try:
         initial = os.fstat(fd)
         if (not stat.S_ISREG(initial.st_mode) or initial.st_uid not in (0, os.getuid())
-                or initial.st_mode & 0o022 or initial.st_size > limit):
-            raise ValueError('native staging source is not trusted or exceeds budget')
+                or initial.st_mode & 0o022):
+            raise ValueError('native staging source is not trusted')
+        if initial.st_size > limit:
+            raise ValueError('native staging source exceeds byte budget')
         yield fd
         if (_staging_identity(os.fstat(fd)) != _staging_identity(initial)
                 or _staging_identity(source.stat(follow_symlinks=False)) != _staging_identity(initial)):

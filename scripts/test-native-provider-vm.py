@@ -425,6 +425,7 @@ raise SystemExit(1)
         with tempfile.TemporaryDirectory() as name, mock.patch.object(vm, 'MAX_COMPANION', self.LIMIT):
             root = Path(name); source = root / 'codex'; source.write_bytes(b'provider')
             target = root / 'provider'; target.mkdir(); (target / 'cli').write_bytes(b'provider')
+            (target / 'cli').chmod(0o555)
             runtime = root / 'runtime'; runtime.mkdir(); companion = runtime / 'host'
             companion.write_bytes(b'x' * (self.LIMIT + 1)); companion.chmod(0o400)
             digest = hashlib.sha256(companion.read_bytes()).hexdigest()
@@ -439,9 +440,18 @@ raise SystemExit(1)
                     self.fail('companion must be read with an enforced byte bound')
                 return original(path)
 
-            with mock.patch.object(Path, 'read_bytes', reject_unbounded), self.assertRaises(ValueError):
+            with mock.patch.object(Path, 'read_bytes', reject_unbounded), \
+                    self.assertRaisesRegex(ValueError, '^native staging source exceeds byte budget$'):
                 vm.stage_native_companions(source, runtime, target)
             self.assertFalse((target / 'codex-code-mode-host').exists())
+
+    def test_untrusted_mode_is_distinct_from_size_failure(self):
+        with tempfile.TemporaryDirectory() as name, mock.patch.object(vm, 'MAX_EXECUTABLE', self.LIMIT):
+            root = Path(name); source = root / 'provider'; target = root / 'cli'
+            source.write_bytes(b'x' * (self.LIMIT + 1)); source.chmod(0o722)
+            with self.assertRaisesRegex(ValueError, '^native staging source is not trusted$'):
+                vm.stage_native_executable(source, target)
+            self.assertFalse(target.exists())
 
 
 class RefreshCheckpointTests(unittest.TestCase):
