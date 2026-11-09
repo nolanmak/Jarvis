@@ -1294,6 +1294,21 @@ impl WorkflowGuard {
         )
     }
 
+    pub(super) async fn hold_initial_acceptance(&mut self,reason:&str,action:&str)->Result<()> {
+        self.healthy_lease()?;
+        self.audit_health().await?;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
+        let mut checkpoint=store.snapshot(self.id())?.context("initial acceptance workflow missing")?.checkpoint;
+        anyhow::ensure!(checkpoint.binding==self.binding && matches!(checkpoint.stage,Stage::Intake|Stage::Scope),
+            "initial acceptance hold requires unchanged unenrolled scope");
+        if checkpoint.stage==Stage::Scope && checkpoint.next.reason==reason && checkpoint.next.action==action
+            && checkpoint.next.eligible_at_ms==0 {return Ok(());}
+        checkpoint.stage=Stage::Scope;
+        checkpoint.next=crate::autoship_workflow::NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0};
+        store.checkpoint(&self.lease,&checkpoint,millis())?;
+        Ok(())
+    }
+
     pub(super) fn check_resource_policy(&self) -> Result<()> {
         self.validate_before_side_effect()?;
         augmentagent_channel_core::run_resources::check_requirement("workflow_action", Some(&self.audit))
@@ -3152,4 +3167,38 @@ mod tests {
         assert!(record.wall_ms>0,"actual observed guard lifetime must be accounted");
     }
 
+}
+
+
+#[cfg(test)]
+mod initial_acceptance_hold_tests {
+    use super::*;
+    #[tokio::test]
+    async fn all_initial_source_families_keep_precise_hold_without_false_progress() {
+        for (issue,pr) in [(Some(7),None),(Some(7),Some(42)),(None,Some(42))] {
+            let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
+            std::fs::write(repo.path().join("implementation.py"),"def add(a,b): return a-b\n").unwrap();
+            for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","initial"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
+                let output=tokio::process::Command::new("/usr/bin/git").args(args).current_dir(repo.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
+                assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+            }
+            let path=control.path().join("workflow.db");
+            let mut guard=WorkflowGuard::acquire_fixture(&path,Start {repo_root:repo.path(),worktree:repo.path(),
+                repository:"owner/repo",source_issue:issue,pr,branch:"fixture",contract:"unchanged owner criteria",environment:"fixture"}).await.unwrap().unwrap();
+            guard.hold_initial_acceptance("acceptance_verifier_repair_exhausted","await_acceptance_input_change").await.unwrap();
+            let first=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
+            let events=guard.store.lock().unwrap().events(guard.id()).unwrap().len();
+            guard.hold_initial_acceptance("acceptance_verifier_repair_exhausted","await_acceptance_input_change").await.unwrap();
+            let repeated=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(repeated.progress_at_ms,first.progress_at_ms);
+            assert_eq!(repeated.checkpoint.binding,first.checkpoint.binding);
+            assert_eq!(repeated.checkpoint.next.reason,"acceptance_verifier_repair_exhausted");
+            assert_eq!(guard.store.lock().unwrap().events(guard.id()).unwrap().len(),events);
+            assert_eq!(repeated.model_calls,0);
+            assert_eq!(repeated.tokens,0);
+            guard.hold_initial_acceptance("acceptance_verifier_evidence_unknown","await_original_evidence_recovery").await.unwrap();
+            let unknown=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(unknown.checkpoint.next.action,"await_original_evidence_recovery");
+        }
+    }
 }

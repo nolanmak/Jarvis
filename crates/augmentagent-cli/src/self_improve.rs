@@ -6587,6 +6587,7 @@ async fn resume_draft_pr(
         issue.number, resume_base.trim(), &acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &resumed_criteria, &workflow).await {
         Ok(prepared) => prepared,
         Err(error) => {
+            if let Some(report)=acceptance::hold_initial_error(&mut workflow,&error).await? {return Ok(report);}
             workflow.transition(Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
             return Err(error).context("resume independent acceptance registration requires scoped retry");
         }
@@ -8124,6 +8125,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         issue.number, candidate_base, acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria, &workflow_guard).await {
         Ok(prepared) => prepared,
         Err(error) => {
+            if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}
             if error.downcast_ref::<acceptance::BaselineNotRed>().is_some() {
                 let children=acceptance::readiness::decompose_unverifiable(repo_root,&worktree,&issue,&criteria,&format!("{error:#}"),&mut workflow_guard).await?;
                 if !children.is_empty() {return Ok(RunReport::triage(format!("issue #{}: acceptance split into observable children {:?}",issue.number,children)));}
