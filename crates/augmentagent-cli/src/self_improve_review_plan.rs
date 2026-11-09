@@ -174,7 +174,10 @@ pub(super) async fn recover_sources(
         "instruction":"Sole evidence-recovery observation. All requested exact source is together with the original assigned evidence. Preserve concrete earlier findings. Metadata/indexes are not source coverage. Judge the requested cross-source relationships; return incomplete if a concrete dependency remains. Never infer approval from partial coverage or fabricate a finding from missing context."});
     let mut coherent=all.clone();coherent.extend(files.clone());
     anyhow::ensure!(git(root,&["rev-parse","HEAD"]).await?.trim()==head,"candidate changed before recovery publication");
-    if let Ok(request)=inputs.request(coherent,true,Some(recovery.clone())) {return Ok(request);}
+    // `all` is the initial evidence inventory, not necessarily every streamed
+    // caller group. Expansion supplies more context without asserting global
+    // completeness; the controller still requires all original groups/roles.
+    if let Ok(request)=inputs.request(coherent,false,Some(recovery.clone())) {return Ok(request);}
     if missing.is_empty() {
         for (path,body) in all.iter().filter(|(p,_)|p.starts_with("context:diff:")||p.starts_with("context:callers:")) {
             files.entry(path.clone()).or_insert_with(||body.clone());
@@ -496,6 +499,9 @@ mod tests {
             .await
             .unwrap();
         assert!(retry.prompt.contains("whole callers") && retry.prompt.contains("exact diff"));
+        let expanded:serde_json::Value=serde_json::from_str(&retry.prompt).unwrap();
+        assert!(expanded["review_scope"].as_str().unwrap().starts_with("Partial evidence group"),
+            "expanded initial context cannot claim complete coverage of separately streamed caller groups");
         assert_ne!(retry.coverage.prompt_hash, original.coverage.prompt_hash);
         let retry = recover(
             &inputs,
