@@ -72,6 +72,13 @@ normal completion verifies the same kernel scope is quiescent first. A
 resource refusal before admission can release unused storage only when the
 supervisor has reaped its descendants and never received the launch token.
 
+The Rust admission/reservation authority, coordination directory, CI cleanup
+holds and owned source-checkout storage live in channel-core's `storage_*`
+modules. CLI builders, snapshots and cleanup callers use re-exports of that
+same implementation and lock namespace. Every admission retains mandatory
+original-proof cleanup reconciliation. This extraction does not enroll native
+retained sessions or make ephemeral reservation files durable across reboot.
+
 If teardown cannot be proven, CI preserves its source checkout, controller and
 supervisor receipts. The hold survives controller descriptor loss. Every new
 managed storage admission reconciles abandoned holds under the existing

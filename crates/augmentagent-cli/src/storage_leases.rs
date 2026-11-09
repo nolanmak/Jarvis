@@ -3,7 +3,7 @@
 //! still-held lock inode. The per-user runtime directory expires at logout.
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -32,30 +32,7 @@ impl Drop for Held {
 #[derive(Default)]
 pub struct TargetLeases(Vec<Held>);
 
-pub(crate) fn lock_directory() -> Result<PathBuf> {
-    let uid = unsafe { libc::geteuid() };
-    let runtime = PathBuf::from(format!("/run/user/{uid}"));
-    let base = if std::fs::metadata(&runtime).is_ok_and(|m| m.is_dir() && m.uid() == uid) {
-        runtime
-    } else {
-        PathBuf::from("/tmp")
-    };
-    let directory = base.join(format!("augmentagent-storage-locks-{uid}"));
-    match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    let meta = std::fs::symlink_metadata(&directory)?;
-    if !meta.is_dir()
-        || meta.file_type().is_symlink()
-        || meta.uid() != uid
-        || meta.permissions().mode() & 0o077 != 0
-    {
-        bail!("storage lock directory must be owner-private");
-    }
-    Ok(directory)
-}
+pub(crate) use augmentagent_channel_core::storage_coordination::lock_directory;
 
 impl TargetLeases {
     pub fn inherited_files(&self) -> Result<Vec<File>> {

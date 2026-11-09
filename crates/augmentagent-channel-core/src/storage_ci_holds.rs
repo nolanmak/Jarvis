@@ -1,7 +1,11 @@
 //! Durable CI cleanup ownership. This is a storage fence, never CI success.
-use super::*;
-use std::io::Read;
-use std::os::unix::fs::DirBuilderExt;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,7 +94,7 @@ fn directory() -> Result<PathBuf> {
     if let Some(path) = TEST_DIRECTORY.with(|slot| slot.borrow().clone()) {
         return Ok(path);
     }
-    let path = crate::storage_leases::lock_directory()?.join("ci-cleanup");
+    let path = crate::storage_coordination::lock_directory()?.join("ci-cleanup");
     match std::fs::DirBuilder::new().mode(0o700).create(&path) {
         Ok(()) => (),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
@@ -289,7 +293,7 @@ fn proof(record: &Record) -> Result<serde_json::Value> {
             && identity["boot_id"].as_str() == Some(record.owner.boot.as_str()),
         "CI cleanup owner and resource identities disagree"
     );
-    augmentagent_channel_core::run_resources::verify_quiescent(identity)
+    crate::run_resources::verify_quiescent(identity)
 }
 fn clear(path: &Path, expected: &Record) -> Result<()> {
     anyhow::ensure!(
@@ -375,7 +379,7 @@ pub(crate) fn reconcile_before_admission() -> Result<()> {
 
 /// Read-only. Unknown registry data preserves all sources instead of guessing
 /// which checkout an interrupted controller might still be using.
-pub(crate) fn may_cleanup(path: &Path) -> Result<bool> {
+pub fn may_cleanup(path: &Path) -> Result<bool> {
     Ok(!records()?.iter().any(|(_, record)| {
         record.supervisor.protects(path)
             || record
@@ -387,12 +391,12 @@ pub(crate) fn may_cleanup(path: &Path) -> Result<bool> {
 
 /// Cleanup entry points reconcile abandoned owners themselves, before an old
 /// checkout can prevent the next storage admission from ever being reached.
-pub(crate) fn may_cleanup_after_reconcile(path: &Path) -> Result<bool> {
+pub fn may_cleanup_after_reconcile(path: &Path) -> Result<bool> {
     let _admission = crate::storage_reservations::Admission::lock()?;
     may_cleanup(path)
 }
 
-pub(crate) struct Hold {
+pub struct Hold {
     path: PathBuf,
     record: Record,
     supervisor: Option<tempfile::TempDir>,
@@ -400,7 +404,7 @@ pub(crate) struct Hold {
     live: Option<std::fs::File>,
 }
 impl Hold {
-    pub(crate) fn begin(
+    pub fn begin(
         root: &Path,
         source: &Path,
         session: &Path,
@@ -441,12 +445,12 @@ impl Hold {
             live: Some(live),
         })
     }
-    pub(crate) fn supervisor(&self) -> &Path {
+    pub fn supervisor(&self) -> &Path {
         self.supervisor.as_ref().unwrap().path()
     }
-    pub(crate) fn bind(
+    pub fn bind(
         &mut self,
-        admission: &augmentagent_channel_core::run_resources::CommandAdmission,
+        admission: &crate::run_resources::CommandAdmission,
     ) -> Result<()> {
         self.record.supervisor.unchanged()?;
         for protected in &self.record.protected {
@@ -490,14 +494,14 @@ impl Hold {
         self.record = next;
         Ok(())
     }
-    pub(crate) fn settle(&mut self) -> Result<serde_json::Value> {
+    pub fn settle(&mut self) -> Result<serde_json::Value> {
         let proof = proof(&self.record)?;
         clear(&self.path, &self.record)?;
         self.active = false;
         Ok(proof)
     }
     /// Only a synchronous failed spawn may use this: no child was created.
-    pub(crate) fn not_spawned(&mut self) -> Result<()> {
+    pub fn not_spawned(&mut self) -> Result<()> {
         self.record.supervisor.unchanged()?;
         for protected in &self.record.protected {
             protected.unchanged()?;
@@ -599,6 +603,8 @@ mod tests {
                     &serde_json::json!({"phase":"completed","identity":identity}),
                 );
             }
+            // Positive execution evidence: a zero-match test child exits 0 too.
+            std::fs::write(root.join("crash-helper-ran"), b"original-hold-published").unwrap();
             // Exercise OS descriptor close with no Rust destructors, as at a
             // controller crash. This fixture launches no VM or model.
             std::process::exit(0);
@@ -609,9 +615,10 @@ mod tests {
                     std::fs::write(root.join("provide-proof"), b"yes").unwrap();
                 }
                 let status=std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact","build_storage::ci_holds::tests::controller_process_exit_keeps_unknown_holds_and_reconciles_exact_kernel_proof","--nocapture"])
+                    .args(["--exact","storage_ci_holds::tests::controller_process_exit_keeps_unknown_holds_and_reconciles_exact_kernel_proof","--nocapture"])
                     .env_clear().env("PATH","/usr/bin:/bin").env(ENV,root).status().unwrap();
                 assert!(status.success());
+                assert_eq!(std::fs::read(root.join("crash-helper-ran")).unwrap(), b"original-hold-published");
                 assert_eq!(records().unwrap().len(), 1);
                 let result = reconcile_before_admission();
                 assert_eq!(result.is_ok(), provide_proof);
