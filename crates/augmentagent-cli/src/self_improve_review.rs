@@ -8,36 +8,22 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Typed controller limit: never report evidence collection as provider capacity.
 #[derive(Debug)]
 struct EvidenceBudget(String);
-const CALLER_EVIDENCE_BUDGET: &str = "incomplete caller evidence: ";
 impl std::fmt::Display for EvidenceBudget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{CALLER_EVIDENCE_BUDGET}{}", self.0)
+        write!(f, "incomplete caller evidence: {}", self.0)
     }
 }
 impl std::error::Error for EvidenceBudget {}
-/// A budget refusal keeps its meaning however many `context` layers the review
-/// path wrapped it in, so classify on the whole chain and not the outer error
-/// (#1885: PR #1669 was held as missing reviewer capacity because of one).
-/// The chain holds the wrapping error of a `context`, never the context value
-/// itself, so a budget attached as one is reached by `anyhow` downcasting or,
-/// below a reported cause, by the message it rendered into the chain:
-/// recognizing a budget at every level needs all three inspections.
+/// A budget refusal keeps its meaning however many `context` layers or
+/// `source()` causes the review path wrapped it in, so classify on the whole
+/// chain and not the outer error (#1885: PR #1669 was held as missing reviewer
+/// capacity because of one). Only the typed errors count: an unrelated error
+/// whose message merely reads like a budget is still missing capacity.
+/// `anyhow`'s own downcast also reaches a budget attached as a context value.
 fn is_evidence_budget(error: &anyhow::Error) -> bool {
     error.is::<EvidenceBudget>()
         || error.is::<aligned::RequestBudgetExceeded>()
-        || error.chain().any(is_evidence_budget_cause)
-}
-
-fn is_evidence_budget_cause(cause: &(dyn std::error::Error + 'static)) -> bool {
-    cause.is::<EvidenceBudget>() || cause.is::<aligned::RequestBudgetExceeded>() || renders_evidence_budget(cause)
-}
-
-/// A budget attached as a context value is neither a chain element nor
-/// downcastable once another error reports the wrapping `anyhow` error as its
-/// source; the chain level it rendered into is then all that is left of it.
-fn renders_evidence_budget(cause: &(dyn std::error::Error + 'static)) -> bool {
-    let rendered = cause.to_string();
-    rendered.starts_with(CALLER_EVIDENCE_BUDGET) || rendered == aligned::RequestBudgetExceeded.to_string()
+        || error.chain().any(|cause| cause.is::<EvidenceBudget>() || cause.is::<aligned::RequestBudgetExceeded>())
 }
 
 fn unavailable_from_error(provider: augmentagent_channel_core::ProviderKind, error: anyhow::Error) -> IndependentReview {
@@ -1177,11 +1163,15 @@ mod tests {
 
     #[test]
     fn source_chained_budget_errors_stay_evidence_budget() {
-        let budgets:[fn()->anyhow::Error;2]=[
-            ||anyhow::Error::new(aligned::RequestBudgetExceeded),
-            ||anyhow::Error::new(EvidenceBudget("caller evidence".into()))];
+        // The budget is the typed `source()` of another error. An `anyhow`
+        // error boxed straight into a plain `dyn Error` no longer exposes its
+        // type, and matching its message instead is what QA refused on #1893.
+        type Boxed=Box<dyn std::error::Error+Send+Sync>;
+        let budgets:[fn()->Boxed;2]=[
+            ||Box::new(aligned::RequestBudgetExceeded),
+            ||Box::new(EvidenceBudget("caller evidence".into()))];
         for budget in budgets {
-            let error=anyhow::Error::new(SourcedFailure(budget().into())).context("review group");
+            let error=anyhow::Error::new(SourcedFailure(budget())).context("review group");
             let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
             assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"review-evidence-budget",
                 "a budget refusal reported as the source of a review failure is not missing reviewer capacity");
@@ -1232,21 +1222,25 @@ mod tests {
         }
     }
 
+    /// Text that reads like a budget is not a budget: only the typed errors
+    /// are evidence budgets, so a provider failure that happens to render the
+    /// same message is still missing reviewer capacity.
     #[test]
-    fn context_value_budget_below_a_reported_cause_stays_evidence_budget() {
-        let budgets:[fn()->anyhow::Error;2]=[
-            ||anyhow::anyhow!("serialized review request refused").context(aligned::RequestBudgetExceeded),
-            ||anyhow::anyhow!("inline caller evidence refused").context(EvidenceBudget("bounded caller inventory".into()))];
-        for budget in budgets {
-            let error=anyhow::Error::new(SourcedFailure(budget().into())).context("review group");
-            let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
-            assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"review-evidence-budget",
-                "a budget carried as a context value below a reported cause is not missing reviewer capacity");
+    fn budget_lookalike_messages_stay_reviewer_capacity() {
+        let lookalikes=[
+            EvidenceBudget("caller evidence".into()).to_string(),
+            aligned::RequestBudgetExceeded.to_string()];
+        for text in lookalikes {
+            for error in [
+                anyhow::anyhow!(text.clone()),
+                anyhow::anyhow!("provider down").context(text.clone()),
+                anyhow::Error::new(SourcedFailure(anyhow::anyhow!(text.clone()).into())).context("review group"),
+            ] {
+                let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
+                assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity",
+                    "an untyped error that only reads like {text:?} is not an evidence budget");
+            }
         }
-        let error=anyhow::Error::new(SourcedFailure(anyhow::anyhow!("provider down").context("reviewer request").into())).context("review group");
-        let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
-        assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity",
-            "an unrelated reviewer failure below a reported cause is not an evidence budget");
     }
 
     #[tokio::test]
