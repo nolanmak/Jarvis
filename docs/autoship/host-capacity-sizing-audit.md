@@ -461,3 +461,14 @@ native suite includes all 13 new archive cases. Accepted independent approval,
 merge and normal rollout remain pending; a CodeRabbit status alone is not
 approval. This is archive-component evidence, not original productive ingress,
 complete capacity integration or #1703 deployed acceptance.
+
+## Credential round-trip contract (#1936)
+
+The scoped native-credential-roundtrip-contract.md closes a demonstrated refresh
+writer/reader mismatch. Fresh-reader and all 17 mapped seams were checked;
+UTF-8/Unicode scalar requirements and response-envelope versus constructed-output
+ordering findings were resolved and rechecked. This authorizes only that narrow
+producer/consumer repair under C0, not full integration or activation. Initial
+behavioral RED reproduces oversized Claude and Codex commits, unreadable Unicode
+export and a committed marker skipping bounded current-file validation. No live
+credential, issuer, policy or service was exercised.
