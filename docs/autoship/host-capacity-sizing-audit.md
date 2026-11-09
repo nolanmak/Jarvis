@@ -623,3 +623,28 @@ deployment unproven. No review, CI or merge bypass; no restart of PR1937.
 The separate #1942 guard regressions are in draft #1945 at 97444937, with hosted
 execution pending and no behavior repair or confirmed RED yet. Complete capacity,
 productive owner ingress and parent #1703 live acceptance remain unfinished.
+
+## Linked-PR suppression design audit
+
+The [#1942 contract](linked-pr-issue-dedup-contract.md) now closes strict
+trust/unknown classification, complete outer inventory and nested-reference
+saturation, both remote dispatch/publication paths, pending exact-identity
+reconciliation, precise holds and external-create race limits. Installed gh's
+pinned source confirms that complete outer PR listing does not hydrate nested
+closing-reference pages; saturated trusted connections must be unknown.
+
+Fresh-reader, conversation/source comparison and all 26 mapped narrow seams were
+checked. Red-main's existing safe Resume return was clarified; first-hold timing
+was made exact; an actual oversized-scope catch-all that could relabel a held
+parent was explicitly covered with typed propagation and regression requirements.
+Affected seams and historical observation provenance were rechecked. All 26
+scoped seams hold. This permits only the scoped #1942 repair after original RED,
+not independent code approval or whole capacity/owner/rollout completion.
+
+Draft #1945 at remote 97444937 still awaits original hosted regression execution.
+Local test-only commits also cover the actual primary/remote issue selectors and
+require positive recognition for valid fixtures; they remain unpushed while the
+original immutable-head CI run is live. No behavior fix or passing Rust result
+is claimed. Original active issue1943 and queued PR1944 remain distinct retained
+workflows; the [receipt](1703-linked-pr-dedup-observation.json) records chronology
+and limitations without inferring productive progress from heartbeats.

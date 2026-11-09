@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "purpose": "Chronology and original live observation for linked-PR suppression contract; not proof of deployed repair",
+  "public_github_chronology": [
+    {
+      "kind": "pr",
+      "createdAt": "2026-11-09T09:36:36Z",
+      "number": 1937,
+      "url": "https://github.com/nolanmak/Jarvis/pull/1937"
+    },
+    {
+      "kind": "issue",
+      "createdAt": "2026-11-09T09:48:29Z",
+      "number": 1938,
+      "url": "https://github.com/nolanmak/Jarvis/issues/1938"
+    },
+    {
+      "kind": "issue",
+      "createdAt": "2026-11-09T09:48:46Z",
+      "number": 1939,
+      "url": "https://github.com/nolanmak/Jarvis/issues/1939"
+    },
+    {
+      "kind": "pr",
+      "createdAt": "2026-11-09T10:44:53Z",
+      "number": 1944,
+      "url": "https://github.com/nolanmak/Jarvis/pull/1944"
+    }
+  ],
+  "original_runtime_observation": {
+    "observed_at_utc": "2026-11-09T11:13:22Z",
+    "source": "Read-only SQLite workflow query and host process inspection, recorded in original tool output",
+    "workflow": "nolanmak/jarvis#1943",
+    "pr": null,
+    "generation": 1,
+    "lease_until_ms": 1794223363357,
+    "heartbeat_at_ms": 1794222763357,
+    "progress_at_ms": 1794219755075,
+    "model_calls": 7,
+    "stage": "build",
+    "reason": "criteria_registered",
+    "progress_age_seconds": 3047,
+    "heartbeat_age_seconds": 38,
+    "pr1944_workflow_row_present": false
+  },
+  "supplemental_process_observation": {
+    "source": "Following read-only /proc sample in the same session; exact sample timestamp not recorded",
+    "native_qemu_pid": 3048149,
+    "native_qemu_cpu_seconds": 20.8,
+    "nested_build_qemu_pid": 3308913,
+    "nested_build_qemu_cpu_seconds": 729.84,
+    "nested_build_qemu_rss_kib": 4218208
+  },
+  "limits": [
+    "The current public API recheck corroborates immutable creation times; current PR status is not a historic status snapshot.",
+    "The original runtime observation is historical, not a claim those PIDs, leases or stages remain current.",
+    "Heartbeat and CPU counters do not prove productive model progress, a completed test or authority to terminate/restart.",
+    "The issue1943 attempt started before PR1944 opened; do not label this as an initial-selection miss."
+  ]
+}
