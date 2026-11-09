@@ -314,6 +314,54 @@ usage and smaller availability. Newly applied child limits/privilege state are
 verified at the original pre-release boundary rather than trusted from a saved
 JSON report. No overall known result is claimed before storage evidence exists.
 
+O7. Quota absence is an observed state, not an assumption from `df`, mount-option
+strings, `statvfs` free bytes or a failed quota read. The storage collector queries
+`quotactl_fd(QCMD(Q_GETFMT, type))` for user, group and project quota types on the
+held target filesystem descriptor in both O3 passes. `Q_GETFMT` is read-only and
+requires no special quota privilege; do not use `Q_SYNC`, quota enable/disable,
+or a privileged helper as a discovery substitute. The final implementation uses
+the platform's UAPI binding, not the experiment's x86-64 syscall constant.
+
+For this query, success means quota accounting is active, even if no applicable
+limit has yet been read. `ESRCH` means that type is inactive. Permission failure,
+unsupported syscall/filesystem/type, invalid descriptor or another error is
+unknown, never inactive. A/B quota states/formats must agree. Inactive for all
+three types removes only the quota predicate; physical bytes, inodes, logical
+images and durable commitments still need their own checks. An active type
+requires complete applicable owner/group/project usage, limits, grace and
+identity observations and corresponding admission predicates. Until that active
+profile is specified and implemented, it is unknown; it cannot be ignored merely
+because this host currently has none. Quota enforcement can change after a
+sample: revalidate at admission, preserve kernel enforcement, and report later
+EDQUOT as a runtime resource failure subject to checked recovery.
+
+Sources: [quota descriptor API](https://man7.org/linux/man-pages/man2/quotactl.2.html),
+[Q_GETFMT](https://man7.org/linux/man-pages/man2/Q_GETFMT.2const.html), and the
+kernel's [`check_quotactl_permission`/`quota_getfmt`](https://github.com/torvalds/linux/blob/master/fs/quota/quota.c).
+The read-only experiment `probes/storage_quota_observation.py` returned ESRCH for
+all 12 queries across the current state/build/store/archive devices; separate
+`findmnt` inspection identified ext4. These are live CLI-context samples, not
+deployed-worker observations, an admission receipt, or complete filesystem-profile
+certification. No quota configuration, accounting row or production file changed.
+The recorded input order was repository/state device, `/mnt/build`, `/mnt/store`,
+`/mnt/archive`. The probe emits each held descriptor's device major/minor for
+correlation; it does not assert that positional sample indices are independent
+filesystems. Reproduce from this checkout with
+`python3 docs/autoship/probes/storage_quota_observation.py . /mnt/build /mnt/store /mnt/archive`
+and separately inspect each input using `findmnt -T <input> -o FSTYPE,OPTIONS -n`.
+
+Quota fixtures for O7:
+
+- All three queries return ESRCH in both passes on an otherwise verified
+  filesystem: quota state is known inactive; do not manufacture unlimited
+  physical/image capacity or bypass other predicates.
+- A type returns active format 2 in both passes but applicable quota usage/limits
+  are missing: overall storage remains unknown, even with abundant `f_bavail`.
+- A returns ESRCH and B succeeds: discard and apply O3's bounded resampling,
+  never choose the inactive half of that sample.
+- EPERM/EACCES, ENOSYS, EINVAL or an unreadable target remains unknown. None
+  authorizes setting quota availability to the filesystem's free bytes.
+
 ## 5. Host tasks and descriptor readiness
 
 P1. Host task demand is the existing run declaration's full `pids` value,

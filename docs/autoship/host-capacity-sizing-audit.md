@@ -196,3 +196,21 @@ unexpected legacy-source SHA and executes the exact hashed bytes, and the
 contract explicitly limits temporary/runtime observations instead of presenting
 them as certification of production filesystem profiles. Final pinned legacy
 entry-point and full migration/profile tests remain required.
+
+The quota-observation checkpoint (O7) distinguishes read-only Q_GETFMT success,
+ESRCH inactivity and unknown errors, with both-pass coherence and complete-vector
+requirements. Source verification against the Linux quota API/kernel showed
+Q_GETFMT does not require special quota privilege. The non-root x86-64 probe
+returned ESRCH on all 12 user/group/project queries across the current state,
+build, store and archive devices. Separate mount inspection identified ext4;
+the command/input order and per-descriptor device IDs preserve traceability.
+No quota, policy, accounting or production file was changed. These are current
+CLI samples, not worker grants or a complete storage observation implementation.
+
+Fresh-reader review found no new material contradiction in the checkpoint.
+Two evidence-polish points were resolved: the probe says non-root rather than
+claiming full absence of capabilities, and records device IDs alongside the
+documented input order. Exact active-quota profiles, protected typed encoding,
+filesystem identity/support, image/inode/durable balances and complete collector/
+admission integration remain explicit C0 gates. An inactive quota result cannot
+be used to manufacture numeric unlimited capacity or ignore another predicate.
