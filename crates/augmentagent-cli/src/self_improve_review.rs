@@ -153,6 +153,8 @@ async fn git(root: &Path, args: &[&str]) -> Result<String> {
 
 #[path = "self_improve_review_plan.rs"]
 mod evidence_plan;
+#[path = "self_improve_review_group.rs"]
+mod group_execution;
 #[path = "self_improve_review_callers.rs"]
 mod caller_stream;
 #[path = "self_improve_review_adjudication.rs"]
@@ -742,49 +744,11 @@ async fn run_impl(
                 anyhow::ensure!(!cached.native_sessions.is_empty(),"cached review lacks native observation");
                 cached
             } else {
-            let mut group_hashes=Vec::new();
-            let mut group_sessions=Vec::new();
-            let mut group_recovered=BTreeMap::new();
-            let mut request=original_request.clone();
-            let mut group_review=evidence_plan::GroupReview::default();
-            for recovery_attempt in 0..=1 {
-                opts.session_id = Some(format!("{session}:group-{i}:recovery-{recovery_attempt}"));
-                opts.restrict_env = true;
-                anyhow::ensure!(git(&worktree,&["rev-parse","HEAD"]).await?.trim()==head,"candidate changed before evidence recovery");
-                let (raw,native_id)=augmentagent_channel_core::native_session::fresh_review_scope(provider,
-                    augmentagent_channel_core::model_router::native_reviewer_scope(provider,reasoner.call(&opts,&request.prompt))).await?;
-                let mut shard_actor=actor.clone();shard_actor.session_id=native_id.clone();
-                shard_actor.independent_for(&builders,&origin)?;
-                group_sessions.push(native_id);
-                let parsed=aligned::parse_review_pass_with_missing(&raw,&binding,shard_actor,role,request.coverage.clone(),&contract);
-                let (pass,missing)=match parsed {
-                    Ok(value)=>value,
-                    Err(error) if recovery_attempt==0=>{
-                        request=inputs.request(original_request.files.clone(),false,Some(serde_json::json!({"kind":"structured_review_correction","validation_error":truncate(&format!("{error:#}"),4000),"instruction":"Classify every finding with a nonempty typed repair target. Do not infer a code defect from missing evidence; return incomplete with exact missing_paths when necessary. Preserve all valid findings and the exact candidate binding."})))?;
-                        continue;
-                    }
-                    Err(error)=>return Err(error.context("bounded structured review correction exhausted")),
-                };
-                group_hashes.push(pass.coverage.prompt_hash.clone());
-                if group_review.observe(pass.completed,pass.findings).with_context(||format!("evidence group {i} still needs {missing:?}"))? { break; }
-                request=evidence_plan::recover(&inputs,&worktree,&head,original_request,&evidence_shards,&missing,group_review.pending()).await?;
-                if let Some(workflow)=context.workflow {
-                    workflow.audit_logger().record_controller(serde_json::json!({"actor":"controller","kind":"review_evidence_recovery",
-                        "binding":binding,"group":i,"role":role,"request_hash":request.coverage.prompt_hash,
-                        "supplied_evidence":request.coverage.supplied_files,"missing_paths":missing}))?;
-                }
-                for (path,body) in &request.files {
-                    if path.starts_with("__requested_source__:") {
-                        if let Some(old)=group_recovered.insert(path.clone(),body.clone()) {
-                            anyhow::ensure!(old==*body,"same immutable recovery path has different bytes");
-                        }
-                    }
-                }
-            }
-            let findings=group_review.finish()?;
-            let finding_evidence=if findings.is_empty() {BTreeMap::new()}else{request.files};
-            let completed=CompletedGroup { binding:binding.clone(),role,original_hash:original_request.coverage.prompt_hash.clone(),
-                findings,request_hashes:group_hashes,native_sessions:group_sessions,recovered_files:group_recovered,finding_evidence };
+            let completed=group_execution::execute_evidence_group(group_execution::EvidenceGroupInput {
+                root:&worktree,inputs:&inputs,original_request,evidence_shards:&evidence_shards,
+                actor:&actor,builders:&builders,origin:&origin,role,provider,opts:&opts,
+                group_index:i,workflow:context.workflow,
+            },&group_execution::NativeGroupTransport {reasoner:reasoner.as_ref()}).await?;
             if let Some(guard)=cache_guard {
                 guard.audit_health().await?;
                 guard.record_review_fragment(&fragment_key,&serde_json::to_string(&completed)?)?;
