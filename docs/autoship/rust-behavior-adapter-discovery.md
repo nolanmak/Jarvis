@@ -113,3 +113,29 @@ proposal to validate, not an accepted source transformation or production
 capability. Source-copy integrity, frame bounds, mutants and actual sandbox
 results remain required before a handoff. A successful experiment cannot grant
 its own registration, code approval or resource release.
+
+## Fixture-control checkpoint
+
+[Private fixture controls](1703-private-adapter-fixture-controls.json) record
+one known invalid experiment setup and exact-parser fault checks. The initial
+experiment placed audit control under managed TMPDIR in the writable build
+cache; its own verified private process group was deliberately stopped and the
+managed handle ended with exit1. It was never behavioral RED. The next run
+keeps disposable control outside the target and restores both original
+production source blobs, injecting the observational module only into the
+private runtime copy. That run is not yet terminal at this checkpoint.
+
+Eight parser controls distinguish valid data from absent/duplicate/malformed
+frames, duplicate JSON keys, non-finite values, boolean counters and unknown
+fields. A separate counterexample showed writable-source status still emitted
+as business data. The staged correction refuses that fixture precondition;
+both true and false business values continue to emit actual data. These are
+synthetic parser/setup checks, not a native baseline or code approval.
+
+Source comparison also confirms harness_path admits Python only below
+autoship_verifiers. The exploratory scripts helper is not installable as a
+registered harness. The next staged launcher uses the existing allowed prefix
+and portable Cargo lookup from the controller-supplied PATH. Neither helper
+placement nor tool discovery is waived because a local prototype can run.
+All staged changes must keep the same observation on both heads; an independent
+registered proposal still has to reproduce its own original-base behavior.

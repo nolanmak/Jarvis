@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T22:15:09.877019+00:00",
+  "related_issue": 1943,
+  "status": "experimental_fixture_fault_controls_not_native_acceptance",
+  "initial_sandbox_experiment": {
+    "reason": "known_invalid_control_fixture_inside_managed_cache",
+    "action": "terminated_only_own_private_experiment_process_group",
+    "behavioral_red_claimed": false,
+    "production_workflow_changed": false
+  },
+  "initial_managed_exit": 1,
+  "initial_log_sha256": "66368089ad711b0df72559c570c252ca0919eeb65f4c4b1afc675dc1ca73d060",
+  "frame_controls": {
+    "kind": "private_adapter_frame_parser_controls",
+    "helper_sha256": "d33f376ea64a8efbb8097f1892e97efb45307438b4cea1ea7b303a17bdc0b75c",
+    "parser_suffix_sha256": "23d3c5d3293717c4aaad2afee4ffc2a0af21fee2092da58bbf3c7a7739302a9f",
+    "cases": [
+      {
+        "case": "valid",
+        "valid_behavior_frame": true,
+        "exit_code": 0
+      },
+      {
+        "case": "missing",
+        "valid_behavior_frame": false,
+        "exit_code": 1
+      },
+      {
+        "case": "duplicate",
+        "valid_behavior_frame": false,
+        "exit_code": 1
+      },
+      {
+        "case": "malformed",
+        "valid_behavior_frame": false,
+        "exit_code": 1
+      },
+      {
+        "case": "duplicate_key",
+        "valid_behavior_frame": false,
+        "exit_code": 1
+      },
+      {
+        "case": "non_finite",
+        "valid_behavior_frame": false,
+        "exit_code": 1
+      },
+      {
+        "case": "bool_counter",
+        "valid_behavior_frame": false,
+        "exit_code": 1
+      },
+      {
+        "case": "unknown_field",
+        "valid_behavior_frame": false,
+        "exit_code": 1
+      }
+    ],
+    "all_passed": true,
+    "native_acceptance": false,
+    "limits": "Exercises the exact parser suffix of the experimental helper using synthetic stdout; no Cargo, provider, protected registration or production state."
+  },
+  "source_confinement_precondition_red": {
+    "kind": "private_adapter_fixture_precondition_counterexample",
+    "helper_sha256": "d33f376ea64a8efbb8097f1892e97efb45307438b4cea1ea7b303a17bdc0b75c",
+    "synthetic_source_write_denied": false,
+    "current_parser_exit": 0,
+    "problem": "A valid frame reporting writable fixture source is emitted as business data instead of refusing setup.",
+    "native_acceptance": false,
+    "production_code_changed": false
+  },
+  "source_confinement_precondition_green": {
+    "kind": "private_adapter_setup_precondition_controls",
+    "staged_helper_sha256": "031930e39139e77e292c3a945def0544de2a1d404187bef9c4f794e70b2687e5",
+    "cases": [
+      {
+        "case": "business_true",
+        "exit_code": 0,
+        "emits_behavior_data": true
+      },
+      {
+        "case": "business_false",
+        "exit_code": 0,
+        "emits_behavior_data": true
+      },
+      {
+        "case": "writable_source",
+        "exit_code": 1,
+        "emits_behavior_data": false
+      }
+    ],
+    "all_passed": true,
+    "native_acceptance": false
+  },
+  "current_experiment": {
+    "state": "live_managed_corrected_baseline",
+    "original_exported_production_source_restored": true,
+    "probe_injection": "private runtime copy only",
+    "runtime_control": "disposable directory outside managed target",
+    "model_or_production_state": false
+  },
+  "limits": [
+    "The initial experiment was deliberately stopped only after a known setup error was identified, not because observation timed out. Original live native workflows were unchanged.",
+    "Parser controls execute the exact parsing suffix of the prototype using synthetic child stdout; they do not certify source-copy custody, a native baseline or an end-to-end workflow.",
+    "The proposed source-confinement refusal is staged separately while the running source stays frozen. Its positive and negative business values both emit data; writable-source setup emits no behavioral data.",
+    "The scoper installer permits Python harnesses only under autoship_verifiers, whereas the exploratory helper used scripts. The next staged launcher uses the allowed dedicated path. No installation allowlist is bypassed.",
+    "A portable Cargo lookup from the existing controller-provided PATH is staged. The active experiment retains its original fixed local-tool path.",
+    "Working source-copy, candidate/mutant execution, complete bounded cleanup and independent registration/review remain open. No production patch, capacity setting or enrolled verifier changed."
+  ]
+}
