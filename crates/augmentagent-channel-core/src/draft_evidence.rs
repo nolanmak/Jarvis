@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 const MAX_STEPS: usize = 8;
+const BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 const MAX_CHARS: usize = 64_000;
 const PAGE_CHARS: usize = 8_000;
 
@@ -72,6 +73,32 @@ pub struct EvidenceRead {
     pub result: Value,
 }
 
+/// Which part of the 90-second budget a step belongs to (#1837).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepKind {
+    ModelDecision,
+    Retrieval,
+}
+
+/// The step kind that consumed most of the budget; `None` when nothing ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetConsumer {
+    ModelDecision,
+    Retrieval,
+    None,
+}
+
+/// Measured cost of one step: operation names and outcomes, never source text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepTiming {
+    pub kind: StepKind,
+    pub operation: String,
+    pub elapsed_ms: u64,
+    pub outcome: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceOutcome {
     pub facts: Vec<GroundedFact>,
@@ -82,6 +109,42 @@ pub struct EvidenceOutcome {
     pub elapsed_ms: u64,
     #[serde(default)]
     pub model_decisions: usize,
+    /// Budget telemetry for receipts; not part of the model-visible evidence.
+    #[serde(skip)]
+    pub step_timings: Vec<StepTiming>,
+}
+
+impl EvidenceOutcome {
+    pub fn budget_consumer(&self) -> BudgetConsumer {
+        let total = |kind| {
+            self.step_timings
+                .iter()
+                .filter(|step| step.kind == kind)
+                .map(|step| step.elapsed_ms)
+                .sum::<u64>()
+        };
+        if self.step_timings.is_empty() {
+            BudgetConsumer::None
+        } else if total(StepKind::Retrieval) > total(StepKind::ModelDecision) {
+            BudgetConsumer::Retrieval
+        } else {
+            BudgetConsumer::ModelDecision
+        }
+    }
+
+    fn record(&mut self, kind: StepKind, operation: &str, elapsed_ms: u64, outcome: &str) {
+        self.step_timings.push(StepTiming {
+            kind,
+            operation: operation.to_string(),
+            elapsed_ms,
+            outcome: outcome.to_string(),
+        });
+    }
+}
+
+/// Sub-millisecond steps are still measured work, so round up instead of zero.
+fn measured_ms(started: tokio::time::Instant) -> u64 {
+    started.elapsed().as_micros().div_ceil(1_000) as u64
 }
 
 const CONTRACT: &str = r#"You select evidence for a messaging draft; you do not write or send it.
@@ -99,7 +162,11 @@ Search uses existing Gmail-style message search operators, including with:, in:,
 Only claim facts supported by sources actually read. Cite source IDs exactly. Keep only facts relevant to this draft. Empty/stale searches or exhausted budgets are not evidence of no communication; report material gaps. Never invent links, commitments or dates. Distinguish source timestamps and unknown freshness. If unresolved identity prevents a needed cross-platform join, ask for clarification instead of guessing.
 Index health counts cover stored messages across ALL platforms, not email specifically. After a focused search and one reasonable broadening both return no relevant source, report the missing-source gap unless new evidence supplies a concrete different lookup; do not repeat speculative searches just to exhaust the budget.
 Your final ready decision must preserve unresolved material gaps; complete evidence is not mandatory, honesty is. Do not repeat private source bodies in reasons.
+When budget.final_decision is true there is no time left to read anything else: return ready now from the sources already read and list what remains unverified as gaps. Any other action is discarded.
 "#;
+
+const STOP_GUIDANCE: &str = "If the material source is still unavailable after a focused search and one broadening, return ready with the missing-source gap now. Finish before the remaining budget; never claim that an empty search proves no communication.";
+const FINAL_GUIDANCE: &str = "This is your final decision: return ready now with facts from sources already read, and list what remains unverified as gaps. Never claim that an empty search proves no communication.";
 
 pub async fn gather(
     store: &Store,
@@ -115,6 +182,7 @@ pub async fn gather(
         complete: false,
         elapsed_ms: 0,
         model_decisions: 0,
+        step_timings: Vec::new(),
     };
     let mut readable: BTreeSet<String> =
         seed.messages.iter().map(|m| m.message_id.clone()).collect();
@@ -130,28 +198,47 @@ pub async fn gather(
     let opts = crate::reasoner::draft_opts(CONTRACT.into(), None);
     // Avoid auditing the whole message index for acknowledgements that need no search.
     let mut index_health = None;
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let mut protocol_retries = 0;
-    for _ in 0..MAX_STEPS {
+    // #1837: model calls, not retrieval, spend the budget (~40 s each on live
+    // receipts), so a check that kept searching hit the wall mid-call and lost
+    // everything it had read. A search round costs this decision plus one more
+    // to conclude; when the rest of the budget cannot fit two decisions as slow
+    // as the slowest so far, or no step is left after this one, this decision
+    // must conclude from what has been read.
+    let mut slowest_decision = std::time::Duration::ZERO;
+    for step in 0..MAX_STEPS {
+        let remaining = BUDGET.saturating_sub(started.elapsed());
+        let out_of_time = !slowest_decision.is_zero() && remaining < slowest_decision * 2;
+        let final_decision = out_of_time || step + 1 == MAX_STEPS;
         let prompt =
-            json!({"request":owner_request,"baseline":seed,"retrieval":out.reads,"budget":{"remaining_decisions":MAX_STEPS-out.model_decisions,"remaining_ms":90_000_u128.saturating_sub(started.elapsed().as_millis())},"stop_guidance":"If the material source is still unavailable after a focused search and one broadening, return ready with the missing-source gap now. Finish before the remaining budget; never claim that an empty search proves no communication."}).to_string();
+            json!({"request":owner_request,"baseline":seed,"retrieval":out.reads,"budget":{"remaining_decisions":MAX_STEPS-out.model_decisions,"remaining_ms":remaining.as_millis(),"final_decision":final_decision},"stop_guidance":if final_decision {FINAL_GUIDANCE} else {STOP_GUIDANCE}}).to_string();
         if prompt.chars().count() > MAX_CHARS {
             out.gaps
                 .push("Evidence budget exhausted; context may be incomplete".into());
             break;
         }
-        let remaining = std::time::Duration::from_secs(90).saturating_sub(started.elapsed());
         out.model_decisions += 1;
+        let decided = tokio::time::Instant::now();
         let response = tokio::time::timeout(remaining, reasoner.call(&opts, &prompt)).await;
+        let decision_ms = measured_ms(decided);
+        slowest_decision = slowest_decision.max(decided.elapsed());
         let raw = match response {
             Ok(Ok(raw)) => raw,
             Ok(Err(_)) => {
+                out.record(
+                    StepKind::ModelDecision,
+                    "decision",
+                    decision_ms,
+                    "unavailable",
+                );
                 out.gaps.push(
                     "The evidence model was unavailable; relevant sources remain unverified".into(),
                 );
                 break;
             }
             Err(_) => {
+                out.record(StepKind::ModelDecision, "decision", decision_ms, "timeout");
                 out.gaps.push(
                     "The context check reached its time limit; relevant sources remain unverified"
                         .into(),
@@ -160,8 +247,17 @@ pub async fn gather(
             }
         };
         let decision: EvidenceDecision = match parse_decision(&raw) {
-            Ok(value) => value,
+            Ok(value) => {
+                out.record(StepKind::ModelDecision, "decision", decision_ms, "ok");
+                value
+            }
             Err(error) => {
+                out.record(
+                    StepKind::ModelDecision,
+                    "decision",
+                    decision_ms,
+                    "protocol_error",
+                );
                 out.reads.push(EvidenceRead {operation:"protocol_error".into(),reason:"Retry the decision using exactly one of the documented JSON schemas; no tools were executed".into(),result:json!({"error":error.to_string().chars().take(300).collect::<String>()})});
                 if protocol_retries == 0 {
                     protocol_retries += 1;
@@ -173,6 +269,15 @@ pub async fn gather(
                 break;
             }
         };
+        if final_decision && !matches!(decision, EvidenceDecision::Ready { .. }) {
+            out.gaps.push(if out_of_time {
+                "The context check reached its time limit before more sources could be read; relevant sources remain unverified"
+            } else {
+                "Retrieval step limit reached; evidence review unfinished"
+            }.into());
+            break;
+        }
+        let retrieved = tokio::time::Instant::now();
         let (operation, reason, result) = match decision {
             EvidenceDecision::Ready { facts, gaps } => {
                 if facts.iter().any(|f| {
@@ -266,6 +371,17 @@ pub async fn gather(
                 ("read_wiki".to_string(), reason, result)
             }
         };
+        let outcome = if result.get("error").is_some() {
+            "error"
+        } else {
+            "ok"
+        };
+        out.record(
+            StepKind::Retrieval,
+            &operation,
+            measured_ms(retrieved),
+            outcome,
+        );
         out.reads.push(EvidenceRead {
             operation,
             reason,

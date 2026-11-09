@@ -61,6 +61,11 @@ remainders can be retrieved. Recovery is bounded to eight model decisions,
 90 seconds and a 64,000-character model-input budget. Message and wiki reads
 page 8,000 characters at a time. A tool failure, invalid decision or exhausted
 limit is not a successful empty search; it produces a material context warning.
+Model decisions, not retrieval, spend most of the 90 seconds (#1837). Once the
+remaining time cannot fit two more decisions as slow as the slowest one so far,
+or on the eighth decision, the coordinator marks the decision final: the model
+must answer from the sources already read and list what is still unverified.
+A final decision that asks for more retrieval is discarded with a time-limit gap.
 Attachment references are not treated as attachment contents.
 
 `AUGMENTAGENT_DRAFT_CONTEXT_PLATFORMS=imessage,gmail,whatsapp` stages recovery on
