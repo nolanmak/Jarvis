@@ -2,6 +2,10 @@
 //! deterministic protocol fixtures, never by a CLI or runtime configuration.
 use super::*;
 
+pub(super) const MAX_COMPLETED_GROUP_BYTES: usize =
+    4 * aligned::MAX_PROMPT_BYTES + 12 * aligned::MAX_RESPONSE_BYTES + 64 * 1024;
+const _: () = assert!(MAX_COMPLETED_GROUP_BYTES < 8 * 1024 * 1024);
+
 #[async_trait::async_trait]
 pub(super) trait GroupTransport: Send + Sync {
     async fn observe_group(
@@ -72,6 +76,14 @@ pub(super) async fn execute_evidence_group(
     let contract = inputs.contract;
     let session = &actor.session_id;
     let mut opts = opts.clone();
+    let metadata = serde_json::to_vec(
+        &serde_json::json!({"binding":binding,"actor":actor,"role":role,
+        "original_hash":original_request.coverage.prompt_hash,"request_hashes":["0".repeat(64),"0".repeat(64)]}),
+    )?;
+    if metadata.len() > 32 * 1024 {
+        return Err(EvidenceBudget("review identity metadata exceeds bound".into()).into());
+    }
+
     let mut group_hashes = Vec::new();
     let mut group_sessions = Vec::new();
     let mut group_recovered = BTreeMap::new();
@@ -87,11 +99,17 @@ pub(super) async fn execute_evidence_group(
         let (raw, native_id) = transport
             .observe_group(provider, &opts, &request.prompt)
             .await?;
+        anyhow::ensure!(
+            !native_id.is_empty()
+                && native_id.len() <= 512
+                && native_id.bytes().all(|b| b.is_ascii_graphic()),
+            "invalid actual reviewer native identity"
+        );
         let mut shard_actor = actor.clone();
         shard_actor.session_id = native_id.clone();
         shard_actor.independent_for(builders, origin)?;
         group_sessions.push(native_id);
-        let parsed = aligned::parse_review_pass_with_missing(
+        let parsed = aligned::parse_review_pass_with_sources(
             &raw,
             binding,
             shard_actor,
@@ -102,7 +120,7 @@ pub(super) async fn execute_evidence_group(
         let (pass, missing) = match parsed {
             Ok(value) => value,
             Err(error) if recovery_attempt == 0 => {
-                request=inputs.request(original_request.files.clone(),false,Some(serde_json::json!({"kind":"structured_review_correction","validation_error":truncate(&format!("{error:#}"),4000),"instruction":"Classify every finding with a nonempty typed repair target. Do not infer a code defect from missing evidence; return incomplete with exact missing_paths when necessary. Preserve all valid findings and the exact candidate binding."})))?;
+                request=inputs.request(original_request.files.clone(),false,Some(serde_json::json!({"kind":"structured_review_correction","validation_error":truncate(&format!("{error:#}"),4000),"instruction":"Classify every finding with a nonempty typed repair target. Do not infer a code defect from missing evidence; return incomplete with exact missing_sources requests (path, registered criterion_ids, concrete question, selector kind whole_file/rust_item/bytes) when necessary. Preserve all valid findings and the exact candidate binding."})))?;
                 continue;
             }
             Err(error) => {
@@ -116,7 +134,11 @@ pub(super) async fn execute_evidence_group(
         {
             break;
         }
-        request = evidence_plan::recover(
+        anyhow::ensure!(
+            recovery_attempt == 0,
+            "review evidence remains incomplete after the second observation"
+        );
+        request = evidence_plan::recover_sources(
             inputs,
             worktree,
             head,
@@ -129,7 +151,7 @@ pub(super) async fn execute_evidence_group(
         if let Some(workflow) = workflow {
             workflow.audit_logger().record_controller(serde_json::json!({"actor":"controller","kind":"review_evidence_recovery",
                         "binding":binding,"group":i,"role":role,"request_hash":request.coverage.prompt_hash,
-                        "supplied_evidence":request.coverage.supplied_files,"missing_paths":missing}))?;
+                        "supplied_evidence":request.coverage.supplied_files,"missing_sources":missing}))?;
         }
         for (path, body) in &request.files {
             if path.starts_with("__requested_source__:") {
@@ -158,6 +180,10 @@ pub(super) async fn execute_evidence_group(
         recovered_files: group_recovered,
         finding_evidence,
     };
+    let encoded = serde_json::to_vec(&completed)?;
+    if encoded.len() > MAX_COMPLETED_GROUP_BYTES {
+        return Err(EvidenceBudget("completed review group exceeds encoded bound".into()).into());
+    }
     Ok(completed)
 }
 
