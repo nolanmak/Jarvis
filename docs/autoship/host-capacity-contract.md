@@ -1106,7 +1106,8 @@ durable registry/control plane before publishing the first protocol-2 fence.
 This floor is independent of auto versus fixed sizing. Switching back to fixed
 does not permit an allocator that ignores retained commitments. Once published,
 normal rollback cannot erase the floor, return lock permissions to legacy mode,
-or restore older authority/accounting. Prepare a retained, compatible recovery
+restore legacy directory mode/ACLs, or restore older authority/accounting.
+Prepare a retained, compatible recovery
 binary/configuration through the normal snapshot/updater path first. A failure
 after floor publication is a publication/recovery operation, not an untouched
 failure eligible to re-enable old code.
@@ -1139,17 +1140,37 @@ applications or deliberate owner bypass.
   root's existing `state.lock`, which legacy native admission/retirement opens
   read+write. New native policy format/loader also refuses old code, but this
   inode fence covers a caller that cached a v1 policy before the change.
-- The Python scratch allocator bypasses those lock inodes. Its existing
-  `_open_root` accepts only exact owner mode 0700. The proposed protocol-2
-  scratch-root discriminator is mode 01700 on the same checked directory:
-  owner access remains, while the old allocator refuses before image creation.
-  Compatible code must explicitly validate the new mode rather than silently
-  chmod it back. A private `protocol-2` child holds new image/session paths;
-  its name does not match the legacy Rust sweeper's immediate-child
-  `jarvis-vm-session-` filter. Do not move or rename old live session paths.
-  This fences fresh old Python allocation only: it neither revokes preopened
-  directory descriptors nor fences Rust compute allocation or every cleanup
-  path. Those consumers still require the complete startup/handoff matrix.
+- Scratch/compute allocators bypass those lock inodes. The earlier mode-01700
+  experiment fences Python's exact-0700 root validator, but the Rust compute
+  retention validator masks with 0777 and therefore accepts its sticky bit.
+  The revised candidate applies mode 01710 plus an exact Linux POSIX access ACL
+  to each participating scratch authority root and compute-artifact authority
+  root, not merely their common parent. ACL entries are owner=rwx, owning
+  group=none, mask=x, other=none, with no named entries or default ACL. The mode
+  group bits reflect the mask, while effective non-owner permissions remain
+  none. Python's exact-0700 and Rust's masked-0700 predicates both reject this
+  format. This is a fresh-client discriminator, not inode access revocation.
+  [ACL semantics](https://man7.org/linux/man-pages/man5/acl.5.html) and the
+  [Linux xattr layout](https://github.com/torvalds/linux/blob/master/include/uapi/linux/posix_acl_xattr.h)
+  define these separate mode/mask/effective-permission properties.
+- Publish the access ACL through the original held directory descriptor first
+  (producing mode 0710 with no effective group access), then add sticky mode
+  01710 and sync/read back the exact inode/mode/ACL. Setting group-search mode
+  before its restrictive ACL would create an access window and is forbidden.
+  Require an owned legacy-private root with no custom/named/default ACL to
+  enter this supported migration; unsupported ACLs or uncertain readback hold
+  activation. Do not clear an operator's existing ACL, fall back to 0700/01700,
+  or apply a relaxed private-directory rule to unrelated paths. Compatible code
+  must validate this exact bound root format before each operation. Full
+  compiled Rust/bridge entry-point and filesystem-profile acceptance remains
+  required; a source predicate is not complete allocator acceptance.
+- Keep configured authority-root paths bound to those fenced original inodes.
+  Compatible code selects a private `protocol-2` data child internally through
+  the original root; do not advertise an unfenced 0700 child as the legacy
+  allocator root. Its name avoids the old immediate-child session/task sweeps.
+  Do not move/rename old live data. The format does not revoke preopened
+  descriptors or stop a writer already past its validator, nor cover every
+  cleanup/export path. Those still require the complete startup/handoff matrix.
 - Guard both legacy global lock-directory selections (`/run/user/UID` and its
   `/tmp` fallback), or refuse activation if either cannot be safely fenced.
   New compatible clients use one bound coordination namespace and refuse a
@@ -1250,6 +1271,14 @@ neither an old snapshot nor a mode toggle resets it.
   A deliberately preopened directory descriptor remains usable. Both locations
   pass, and no VM image is created. This tests only the legacy root validator,
   not compatible allocation, Rust sweeping, or complete migration readiness.
+- The revised ACL probe `probes/storage_compat_acl.py /tmp /mnt/build /mnt/store`
+  passed eight predicates at each of three disposable roots: intermediate
+  0710/ACL and final 01710/ACL readback, actual old Python rejection before allocation, no allocator writes,
+  the pinned Rust source-mode predicate's rejection, and owner descriptor writes
+  remaining possible. It pins both source digests and explicitly reports that
+  no compiled Rust entry point ran. Group/other denial follows the exact ACL
+  and kernel access algorithm; the probe did not impersonate another UID.
+  No production/cache directory permissions changed and no image was created.
 - A retained preopened legacy descriptor/controller prevents handoff even if its
   model count is zero or its run-child cgroup is empty. Fence installation alone
   cannot mark that case loaded/compatible.

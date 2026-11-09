@@ -287,3 +287,38 @@ current-worker admission evidence. Existing complete-vector, common accounting,
 observation/provenance, SQL/migration/rollback, original handoff and projection
 integration gates remain open. No production setting, reservation, retained
 session, model call or shipping allowance was changed by these design checks.
+
+The allocator-fence checkpoint corrects the earlier 01700 feasibility limit:
+Rust compute retention masks permissions with 0777, so a sticky bit alone does
+not reject it. S9's revised candidate fences both scratch and compute authority
+roots using mode 01710 plus an exact access ACL (owner rwx, group none, mask x,
+other none), with no named/default ACL. It preserves effective owner-only access
+while both pinned legacy permission predicates reject the new root format.
+ACL publication precedes sticky chmod; exact intermediate/final readback is
+required. Configured authority-root paths remain fenced; v2 child selection is
+internal, and old data paths are not moved.
+
+`probes/storage_compat_acl.py /tmp /mnt/build /mnt/store` passed 24 narrow checks
+across three private disposable roots, including intermediate 0710/ACL readback,
+final 01710/ACL readback, actual old Python rejection before allocation and
+owner descriptor writes remaining possible. The script pins/executes the exact
+hashed bridge bytes and pins the Rust retention source. Its Rust result is a
+source-predicate evaluation, explicitly not a compiled Rust invocation. Effective
+non-owner denial follows the checked ACL and documented kernel algorithm; no
+other-UID impersonation test was run. No image or production permission changed.
+
+Fresh-reader/source checkpoint review found no new feasibility overclaim. It
+confirmed that retained `Lease::retain/discard` descriptors and artifact exports
+bypass fresh root validation, so original handoff and complete consumer/startup
+coverage still govern migration. Final import must account for existing caches,
+compute usage and task records without omission/duplication. Compiled Rust/new
+client acceptance, actual profile integration, SQL/journal formats and the
+positive handoff producer remain explicit C0 gates. The optional intermediate
+readback improvement was implemented and the disposable experiment rerun.
+
+Separate read-only source tracing of #1758 at `49535c2e` confirmed that owner
+metadata recovery returns guarded-setup readiness and has no productive caller
+for `inspect_owner_bootstrap`. Scope materialization retains descriptive original
+creation handles, not complete all-writer custody. The ACL experiment supplies
+neither productive source/resource/input qualification nor a replacement grant;
+that constructor and normal owner-ingress work remain required under #1703.
