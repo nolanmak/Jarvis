@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T22:43:19.300941+00:00",
+  "related_issue": 1943,
+  "status": "v3_link_failure_v4_live_not_native_acceptance",
+  "v3": {
+    "managed_exit": 1,
+    "child_exit": 2,
+    "status": "unexpected_fixture_link_failure",
+    "missing_symbol": "OrtGetApiBase",
+    "reason": "offline private Cargo home has no linked ONNX Runtime; no ORT_LIB_PATH/cache read grant",
+    "behavioral_red": false,
+    "correction": "observation-only ort/alternative-backend feature with exact package selection, no lock/source/host-cache grant change"
+  },
+  "v3_log_sha256": "d6a0176daea949aee7bd3b1de9d5fb80fc51ac8ccff68c753ff95e2d60e25f2e",
+  "alternative_profile_resolution": {
+    "kind": "offline_locked_feature_resolution",
+    "features": [
+      {
+        "name": "ort",
+        "features": [
+          "alternative-backend",
+          "download-binaries",
+          "ndarray",
+          "std",
+          "tls-rustls",
+          "tls-rustls-no-provider"
+        ]
+      },
+      {
+        "name": "ort-sys",
+        "features": [
+          "__tls",
+          "disable-linking",
+          "download-binaries",
+          "std",
+          "tls-rustls",
+          "tls-rustls-no-provider"
+        ]
+      }
+    ],
+    "source_or_lock_changed": false,
+    "runtime_backend_initialized": false,
+    "behavioral_observation_executed": false
+  },
+  "exact_package_selection": "ort v2.0.0-rc.13 [alternative-backend,download-binaries,ndarray,std,tls-rustls,tls-rustls-no-provider]\n\u2514\u2500\u2500 augmentagent-embeddings v0.1.0 (<own-worktree>/crates/augmentagent-embeddings) [default]\n    \u2514\u2500\u2500 augmentagent-cli v0.1.0 (<own-worktree>/crates/augmentagent-cli) []\n",
+  "v4": {
+    "state": "live_original_base_experiment",
+    "support_files": [
+      {
+        "path": "crates/augmentagent-cli/src/bin/autoship_receipt_observer.rs",
+        "bytes": 183,
+        "sha256": "8ff32c9b6b37f3678ede8f0f532d498e361700f10e3a8839ed0c3a26bf5f6dc3"
+      },
+      {
+        "path": "autoship_verifiers/issue_1955/observe.py",
+        "bytes": 5912,
+        "sha256": "c551991ff7ca8aa4eb138052f07ed847819d3b18dedefbad430948417209bc1a"
+      },
+      {
+        "path": "autoship_verifiers/issue_1955/workflow_probe.rs",
+        "bytes": 2814,
+        "sha256": "cf2034444924ac0068e51c4233bd36215137cdbdda1736a58a6060a61c02f396"
+      },
+      {
+        "path": "autoship_verifiers/issue_1955/public_env_template.txt",
+        "bytes": 26521,
+        "sha256": "e3452397d5d0ab9c3dd8a0069031b298de312c73a151baa05b91fc41731a0a51"
+      }
+    ],
+    "profile": "Inner Cargo test selects augmentagent-cli and augmentagent-embeddings with ort/alternative-backend, dev/test incremental=false, debug0, jobs1, offline/locked.",
+    "production_source_and_lock_changed": false,
+    "normal_production_or_hosted_profile_changed": false,
+    "business_observation_observed": false
+  },
+  "limits": [
+    "The original-base private experiment ended with an ORT link/setup failure, never intended behavioral RED.",
+    "Offline/locked feature resolution and exact selected-package Cargo tree succeeded, proving the alternative-backend/disable-linking graph without new dependency or lock changes. This is not execution of the Rust probe.",
+    "No ONNX backend is initialized by the proposed receipt probe; the alternative backend is an observation-only compilation profile. It is not embeddings validation and must never become the installed or hosted release profile.",
+    "Four separately pinned readable files preserve the exact same public template and probe bytes. Their compiled behavior remains unproven until the current run returns actual data.",
+    "Native registration, independent complete-contract review, merge, updater rollout and full #1703 acceptance remain open."
+  ]
+}

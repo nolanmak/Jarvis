@@ -1,11 +1,15 @@
 # Review retry lifecycle — working C2 contract
 
 Status: working decisions, **not implementation-ready**. Under #1952 / #1709,
-with scheduling #1706, private reporting #1715 and parent #1703.
+with scheduling #1706, private reporting #1714, acceptance #1715 and parent #1703.
 [Source inventory](review-retry-lifecycle-discovery.md) remains the provenance
 for the incident. C1 PR #1954 at 3debdb8d has published-input hosted GREEN;
-its original native command is still in acceptance repair. This document
-neither changes that attempt nor grants an implementation exception.
+its original native attempt is terminal after 13 model admissions and the
+workflow is normally paused with no active lease. The published head remains
+unmerged. [Terminal discovery](1703-pr1954-terminal-acceptance-discovery.json)
+records the rejected assertion-deletion hunk and inadequate keyword observer.
+A pause is not teardown proof. This document changes neither the preserved
+request/evidence nor any implementation gate.
 
 ## Decisions settled from source inspection
 

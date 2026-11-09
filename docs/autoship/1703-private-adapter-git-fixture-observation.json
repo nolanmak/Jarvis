@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-09T23:05:02.846827+00:00",
+  "related_issue": 1943,
+  "status": "v4_compiled_fixture_git_failed_v5_live",
+  "v4": {
+    "managed_exit": 1,
+    "child_exit": 2,
+    "status": "unexpected_synthetic_git_setup_failure",
+    "compiled_and_linked_cli_test": true,
+    "actual_tests_passed": 0,
+    "actual_tests_failed": 1,
+    "failed_precondition": "Git add cannot obtain random bytes under the existing sandbox; actual replay confirms denied /dev/urandom but working getrandom.",
+    "canonical_git_replay": {
+      "kind": "same_nested_sandbox_canonical_git_fixture",
+      "exit": 0,
+      "observation": {
+        "steps": [
+          {
+            "operation": "read-tree",
+            "exit": 0,
+            "stderr": ""
+          },
+          {
+            "operation": "rev-parse",
+            "exit": 0,
+            "stderr": ""
+          },
+          {
+            "operation": "status",
+            "exit": 0,
+            "stderr": ""
+          },
+          {
+            "operation": "diff",
+            "exit": 0,
+            "stderr": ""
+          },
+          {
+            "operation": "merge-base",
+            "exit": 0,
+            "stderr": ""
+          },
+          {
+            "operation": "fsck",
+            "exit": 0,
+            "stderr": ""
+          }
+        ],
+        "getrandom_available": true,
+        "urandom_readable": false,
+        "canonical_git_fixture_valid": true
+      },
+      "stderr": ""
+    },
+    "behavioral_red": false
+  },
+  "v4_log_sha256": "88c2108d527a18b712f1f65ea40e1eed308669afe3b46d1bd9e96a56ae6ee792",
+  "same_policy_git_failure": {
+    "kind": "same_nested_sandbox_synthetic_git_replay",
+    "exit": 0,
+    "steps": [
+      {
+        "operation": "init",
+        "exit": 0,
+        "stderr": ""
+      },
+      {
+        "operation": "add",
+        "exit": 128,
+        "stderr": "error: unable to get random bytes for temporary file: Permission denied\nerror: insufficient permission for adding an object to repository database .git/objects\nerror: code.txt: failed to insert into database\nerror: unable to index file 'code.txt'\nfatal: adding files failed\n"
+      }
+    ],
+    "stderr": ""
+  },
+  "same_policy_deterministic_git_fixture": {
+    "kind": "same_nested_sandbox_canonical_git_fixture",
+    "exit": 0,
+    "observation": {
+      "steps": [
+        {
+          "operation": "read-tree",
+          "exit": 0,
+          "stderr": ""
+        },
+        {
+          "operation": "rev-parse",
+          "exit": 0,
+          "stderr": ""
+        },
+        {
+          "operation": "status",
+          "exit": 0,
+          "stderr": ""
+        },
+        {
+          "operation": "diff",
+          "exit": 0,
+          "stderr": ""
+        },
+        {
+          "operation": "merge-base",
+          "exit": 0,
+          "stderr": ""
+        },
+        {
+          "operation": "fsck",
+          "exit": 0,
+          "stderr": ""
+        }
+      ],
+      "getrandom_available": true,
+      "urandom_readable": false,
+      "canonical_git_fixture_valid": true
+    },
+    "stderr": ""
+  },
+  "v5": {
+    "state": "live_original_base_experiment",
+    "business_observation_suffix_unchanged": true,
+    "probe_sha256": "87cd59e020e73c083d43b6d49740fac36eeb97e80102bc4774ec900fbe9153c9",
+    "helper_sha256": "8f89d032c63141adf394a8c479514f4968d3a385ff8fc5a8d983c367447390eb",
+    "setup": "Canonical SHA1/zlib empty tree and commit, real git init/read-tree/fsck; original WorkflowGuard and receipt comparison unchanged.",
+    "production_source_lock_or_sandbox_grants_changed": false
+  },
+  "limits": [
+    "V4 compiled and linked the CLI test under the unchanged per-file limit and offline alternative-backend observation profile; its one selected test failed in Git setup before business observation.",
+    "Exact nested-policy replay proves git add requires random bytes unavailable through /dev/urandom. getrandom remains available; no additional device/file grant was made.",
+    "Canonical Git fixture passes read-tree, rev-parse, clean status, diff, merge-base and strict fsck under the exact same two sandbox policies. This is fixture precondition evidence, not receipt behavior.",
+    "V5 Rust fragment parses through rustfmt; its actual original-base/candidate business data, independent registration/review, merge/rollout and full #1703 live acceptance remain unproven.",
+    "Prepared PR1956 body is stale/unsubmitted; only the latest readable recipe should inform a new body after actual behavioral evidence."
+  ]
+}

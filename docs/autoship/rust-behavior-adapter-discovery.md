@@ -160,3 +160,62 @@ source. These controls do not establish execution of the Rust behavior.
 The new original-base run is live at this checkpoint. Original/candidate/mutant
 behavior, bounded teardown and independent complete-contract reproduction
 remain required before treating the worked proposal as accepted evidence.
+
+## Offline link dependency and observation-only profile
+
+The [no-incremental baseline experiment](1703-private-adapter-offline-link-observation.json)
+passed the prior compiler graph limit, then failed linking OrtGetApiBase. The
+CLI test binary includes an ONNX dependency whose native runtime is absent in
+the offline private Cargo environment. No behavioral probe ran.
+
+Locked offline Cargo metadata and the exact CLI/embeddings package selection
+resolve ort/alternative-backend to ort-sys/disable-linking without changing
+source or Cargo.lock. The dynamic-loading alternative would need an unlocked
+libloading dependency and was not selected. The new private experiment uses
+the supported alternative-backend feature only to compile the receipt probe,
+which never initializes or calls embeddings. Original production and required
+hosted profiles are unchanged; this does not validate embeddings. Source and
+file limits, offline/locked mode, no incremental, debug0 and one job remain.
+
+The recipe now carries the Rust launcher, Python helper, observational Rust
+module and exact public template as four separately pinned readable files in
+controller-supported paths. Module/template bytes match the prior decoded
+fixtures exactly. The current original-base run is live; neither this packaging
+nor its profile is accepted evidence until actual behavior is observed and
+the independent scoper reproduces a complete owner contract.
+
+## Separate C1 provider-boundary gate
+
+Source discovery shows run_impl constructs build_workflow_pinned even when
+context.workflow is None. workflow_entry_for checks declared native credentials
+and an executable-compatible provider runtime. Replacing CODEX_CLI alone does
+not satisfy those preconditions. The verifier sandbox also denies setpgid and
+setsid; supervised provider spawning under it must not be assumed to work.
+These are source-derived constraints, not an observed provider execution.
+
+Original416f392b embeds the review-group loop;9146acb4 extracts it, and published
+3debdb8d uses the extracted adapter. A C1 recipe must identify and validate any
+test-only provider instrumentation on the original baseline and candidate,
+preserve the actual review/recovery behavior and all source guards, and report
+scripted fixture observations without creating production reviewer evidence.
+Do not silently substitute9146 as the original baseline, or present the C2
+receipt observer as C1 verification. Original #1954 remains paused and preserved.
+
+## Git fixture under the unchanged sandbox
+
+The [four-file/profile experiment](1703-private-adapter-git-fixture-observation.json)
+compiled and linked the CLI test, then failed its synthetic Git setup before
+receipt accounting. An exact nested-policy replay identifies git add: it cannot
+obtain temporary-object randomness through denied /dev/urandom. The getrandom
+syscall remains available. No device read grant or sandbox widening was made.
+
+A deterministic canonical SHA1/zlib Git fixture passes real Git read-tree,
+rev-parse, clean status, diff, merge-base and strict fsck under the same two
+policies. The new private Rust probe seeds those synthetic tree/commit objects
+and validates the real repository before using the unchanged WorkflowGuard and
+business-observation suffix. It adds no production dependency or lock change.
+Its Rust fragment parses through rustfmt. The new original-base run is live;
+this fixture validation is not an observed receipt result or native baseline.
+The prepared PR1956 body is stale and unsubmitted; the latest readable recipe
+still needs actual behavioral evidence and independent complete-contract
+construction/reproduction. Original #1954 and the broader goal remain open.

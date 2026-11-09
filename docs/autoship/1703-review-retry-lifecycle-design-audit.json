@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T20:24:52.563856+00:00",
+  "observed_at": "2026-11-09T23:05:02.845549+00:00",
   "issue": 1952,
   "component": "C2 review retry lifecycle",
   "status": "working_contract_not_implementation_ready",
@@ -28,15 +28,132 @@
       "WorkflowGuard installs a shared final dispatch observer and a separate provider-only model-accounting observer.",
       "fresh_review_scope returns actual native identity only on success; in-memory uncertainty does not establish durable result custody.",
       "Fresh native session drop can mark runtime retired; later normal pruning can remove completed state before an outer caller persists its result."
+    ],
+    "current_checkpoint_corrections": [
+      "Reporting owner is #1714; #1715 owns deployed acceptance/soak, verified through current GitHub issue titles.",
+      "Original PR1954 command is terminal/failed with 13 model admissions and normally paused, no active lease; normal status rechecked. Pause is not teardown proof.",
+      "Unavailable constructor has structured=None; recorded_verdict returnsNone; both consumers apply adjudicated amendment before unavailable handling; issue resume records structured/previous first, adoption sets previous/conditional verdict then episode evaluation.",
+      "episode::evaluate persists supplied structured data regardless of available; current consumers are not failed-fact storage hooks.",
+      "Adjudicated contract validator requires three unique complete roles, equal complete coverage/bindings, independent native final authority and distinct reviewer sessions.",
+      "The resume/adoption/episode consumer files are unchanged between main416f392b and published C1 3debdb8d."
+    ],
+    "additional_source_checks": [
+      "current_review_history returns an empty vector if owner messages are pending; this inventory ambiguity is corrected. Epoch invalidation raises event floor and clears current indexes while preserving events.",
+      "episode_review_at_head reads only current_review_history and the requested head; verify_fresh_review_origin requires current exact binding.",
+      "record_review_fragment checks 64-hex key, <=8MiB payload, current lease/binding, audit generation and immutable existing payload inside an Immediate transaction. C1 changes only its boundary test.",
+      "Published C1 execute_evidence_group validates native identity/independence and parses the bound response before GroupReview::observe and recover_sources; completed fragment caching follows successful group return.",
+      "fresh_review_scope early await-error returns no result/native handle; NativeSession Drop retires paths; prune_and_count can remove unlocked owned retired/completed state.",
+      "These checks do not complete the exhaustive paid-path map, native result-custody protocol, legacy migration, atomic claim transactions or reporting fixtures."
     ]
   },
   "seam_pass": {
-    "mapping_status": "mapped",
+    "mapping_status": "mapped_with_design_consistency_judgments",
     "mapped_seams": 39,
     "map": "1703-review-retry-lifecycle-seam-map.md",
-    "judgments_completed": false,
-    "seam_judgments_completed": 0,
-    "handoff_audit_completed": false
+    "judgments_completed": true,
+    "seam_judgments_completed": 39,
+    "handoff_audit_completed": false,
+    "checked_seams": [
+      "S1",
+      "S2",
+      "S3",
+      "S4",
+      "S5",
+      "S6",
+      "S7",
+      "S8",
+      "S9",
+      "S10",
+      "S11",
+      "S12",
+      "S13",
+      "S14",
+      "S15",
+      "S16",
+      "S17",
+      "S18",
+      "S19",
+      "S20",
+      "S21",
+      "S22",
+      "S23",
+      "S24",
+      "S25",
+      "S26",
+      "S27",
+      "S28",
+      "S29",
+      "S30",
+      "S31",
+      "S32",
+      "S33",
+      "S34",
+      "S35",
+      "S36",
+      "S37",
+      "S38",
+      "S39"
+    ],
+    "unchecked_seams": [],
+    "deduplicated_findings": [
+      {
+        "id": "C2-linked-partial-structured-prescription",
+        "seams": [
+          "S2",
+          "S4",
+          "S6"
+        ],
+        "kind": "false_join",
+        "severity": "wrong_build",
+        "old_linked_instruction": "IndependentReview can remain available=false with structured partial evidence; reuse existing structured hook.",
+        "conflict": "C2 D1/D3 require a separate non-approval type and historical-facts reader, excluded from current structured consumers.",
+        "resolution": "Replaced C1 C2-integration prescription with explicit D1/D3 supersession, current-consumer inventory, separate storage/reader ownership and unchanged implementation gates.",
+        "recheck": "Both narrow design auditors re-read the changed C1 section and C2 pair; S1-S6 hold. No surviving mismatch found."
+      }
+    ],
+    "consistent_boundaries_after_recheck": [
+      "S1",
+      "S2",
+      "S3",
+      "S4",
+      "S5",
+      "S6",
+      "S7",
+      "S8",
+      "S9",
+      "S10",
+      "S11",
+      "S12",
+      "S13",
+      "S14",
+      "S15",
+      "S16",
+      "S17",
+      "S18",
+      "S19",
+      "S20",
+      "S21",
+      "S22",
+      "S23",
+      "S24",
+      "S25",
+      "S26",
+      "S27",
+      "S28",
+      "S29",
+      "S30",
+      "S31",
+      "S32",
+      "S33",
+      "S34",
+      "S35",
+      "S36",
+      "S37",
+      "S38",
+      "S39"
+    ],
+    "judgment_scope": "Specification consistency at each stated working boundary only. Exact schema/producer/custody/claim/projection interfaces remain explicit handoff gates; these are not implementation or production guarantees.",
+    "review_method": "Three design-only readers, groups of up to three mapped seams; inherited available model, not unavailable Sonnet. No implementation/code approval delegated."
   },
   "remaining_gates": [
     "Exact durable native dispatch/result/resource correlation and crash ordering.",
@@ -50,5 +167,24 @@
     "Design audit is not implementation, code approval, model admission, retirement/release authority, review authority or restoration.",
     "No source implementation, production settings, original command or protected verifier was changed.",
     "All seam judgments remain required before implementation handoff."
-  ]
+  ],
+  "fresh_reader_r2": {
+    "completed": true,
+    "scope": "complete C2 contract/discovery pair; design-only",
+    "new_undisclosed_findings_in_pair": 0,
+    "parked_gate_groups": 5,
+    "parked_gates": "Native result custody/correlation; bounded observation lifecycle; hold/claim/dispatch transactions; complete early-input/paid-path map; compatible projections/acceptance."
+  },
+  "spec_hashes_at_s1_s6_recheck": {
+    "review-retry-lifecycle-contract.md": "fcf14d69ca38f32761a95060f80df785cc62b0d3d738a81bec23780a49d8ea25",
+    "review-retry-lifecycle-discovery.md": "1037697605d80627865af8b998bbdae72e5f257b923e3c30a722279d5d00625e",
+    "review-dependency-recovery-contract.md": "397a9cc68d2c726a2b67e8179e728431748ec8db939acde803e202cd1645afb0",
+    "1703-review-retry-lifecycle-seam-map.md": "c7f9747e4d80a03b8b71ac1b974c92e34df6465b1b40cffa5376c11dfb1a542b"
+  },
+  "spec_hashes_at_full_design_consistency_pass": {
+    "review-retry-lifecycle-contract.md": "fcf14d69ca38f32761a95060f80df785cc62b0d3d738a81bec23780a49d8ea25",
+    "review-retry-lifecycle-discovery.md": "c737b7cad6e6aad107c7c95e8083de836dbfe24cb5a89866e0c93fafd3edce52",
+    "review-dependency-recovery-contract.md": "397a9cc68d2c726a2b67e8179e728431748ec8db939acde803e202cd1645afb0",
+    "1703-review-retry-lifecycle-seam-map.md": "c7f9747e4d80a03b8b71ac1b974c92e34df6465b1b40cffa5376c11dfb1a542b"
+  }
 }

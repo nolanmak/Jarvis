@@ -1,10 +1,16 @@
 # Review retry lifecycle: source discovery for #1952 C2
 
 Status: source inventory and required tests, **not an implementation-ready
-contract**. Owner #1709 / #1952, scheduling #1706, parent #1703. This discovery
+contract**. Owner #1709 / #1952, scheduling #1706, private reporting #1714,
+acceptance #1715, parent #1703. This discovery
 uses implementation branch head `7d865307b03a0206fb1f1d0764e0e08009a685f0`
 (main base `416f392b17b56b2a43e67a3e430835902387941a`). C1 #1954 has published-input hosted GREEN at 3debdb8d and remains
-unmerged; its original native command is in acceptance repair. This document grants no implementation exception.
+unmerged; its original attempt is terminal after 13 model admissions, and its
+workflow is normally paused without an active lease. See the
+[terminal discovery](1703-pr1954-terminal-acceptance-discovery.json). The original
+request, charges, published input, candidate history and pinned verifier remain
+preserved. A pause does not prove teardown. This document grants no
+implementation exception.
 
 The [coherent source contract](review-dependency-recovery-contract.md) separates
 successful bounded recovery (C1) from failed observations, unchanged paid
@@ -35,8 +41,8 @@ all requested items. No benchmark, approval bypass or allowance reset applies.
    that separation; partial facts must not become a publication verdict.
 4. `autoship_review_epoch.rs::invalidate` advances a workflow event floor and
    clears current review, fragment and ready indexes. It preserves historical
-   workflow events. `current_review_history` ignores pending owner messages,
-   reads only after the floor, stops at generation/owner boundaries and requires
+   workflow events. `current_review_history` returns no current
+   review history while owner messages are pending, reads only after the floor, stops at generation/owner boundaries and requires
    the exact current checkpoint binding. `episode_review_at_head` uses that
    current-authority reader. Neither is a historical-fact import API. Do not
    weaken them or `verify_fresh_review_origin` to make old evidence visible.

@@ -200,16 +200,27 @@ outcome uncertainty, lost results and cache-publish failure cannot be promoted
 into successful observations, resource release or retry authority. Diagnostic
 runs must retain fresh actual observations and immutable reservations.
 
-Source inspection identifies the existing integration points for C2:
-IndependentReview can remain available=false with structured partial evidence;
-recorded_verdict then returns None. Issue-backed resume already records
-structured receipts before handling unavailable. Source-less adoption sets its in-memory previous value and records a
-publication verdict only when recorded_verdict is Some; its subsequent
-episode::evaluate also records any supplied structured evidence under
-episode-evidence-* even if available=false. Reuse that existing hook rather
-than inventing a duplicate store. It does not prove the failed-recovery
-producer currently returns structured partial evidence, or establish its
-restoration/wake lifecycle.
+C2 representation amendment: the working
+[retry lifecycle contract](review-retry-lifecycle-contract.md) D1/D3 supersedes
+the earlier suggestion to reuse structured partial ReviewEvidence. Failed
+observations must use a separate non-approval type and historical-facts reader,
+never structured, completed review fragments, current review history or a
+publication verdict. Their exact schemas, custody and transactions remain
+C2 handoff gates; this amendment grants no implementation exception.
+
+Existing consumer behavior explains the separation. Both resume/adoption
+consult adjudicated amendment before unavailable handling, and the validator
+requires complete roles, coverage and independent final authority. Issue-backed
+resume records supplied structured receipts before handling unavailable.
+Source-less adoption sets its previous value when structured exists and records
+a publication verdict only when recorded_verdict is Some. Its subsequent
+episode::evaluate persists supplied structured evidence as episode-evidence-*
+even when available=false. These are current structured-evidence consumers,
+not storage hooks for failed facts. Unavailable remains available=false,
+recorded_verdict=None and approved=false; do not weaken complete-review
+validation to accommodate partial facts. Reuse existing workflow store/audit
+ownership through the separate non-approval representation and reader, not
+by feeding historical packets to those structured consumers.
 Review-epoch invalidation deletes current indexes/fragments but preserves
 workflow_event history. current_review_history intentionally only authorizes
 the current binding/epoch. verify_fresh_review_origin also intentionally

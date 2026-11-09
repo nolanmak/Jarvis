@@ -1,20 +1,20 @@
 # Review retry lifecycle seam map
 
-Status: design-only map of specification boundaries. This contains no seam judgments, ranking, code approval, or claim of implementation readiness.
+Status: design-only map of specification boundaries. Judgments are tracked separately in 1703-review-retry-lifecycle-design-audit.json. This map grants no code approval or implementation readiness.
 
 S1 — provenance / scope
-A: Contract status: “Under #1952 / #1709,” with scheduling #1706, reporting #1715 and parent #1703.
+A: Contract status: “Under #1952 / #1709,” with scheduling #1706, reporting #1714, acceptance #1715 and parent #1703.
 B: Discovery status: “Owner #1709 / #1952, scheduling #1706, parent #1703”; contract status: discovery “remains the provenance for the incident.”
 Crosses: issue ownership, parent dependencies, and incident provenance between the two documents.
 
 S2 — amendment / implementation readiness
 A: Discovery, “Working C2 decisions after source recheck”: the contract “chooses a separate failed-observation type and pre-dispatch hold identity.”
 B: Contract D1–D7; contract closing paragraph: “closes the representation and pre-dispatch placement choices”; both statuses: “not implementation-ready.”
-Crosses: source-discovery conclusions become working decisions while unresolved interface obligations remain handoff gates.
+Crosses: source-discovery conclusions become working decisions while unresolved interface obligations remain handoff gates; the linked C1 C2-integration prescription must agree with D1/D3.
 
 S3 — outer boundary / C1 and incident closure
 A: Discovery introduction: the coherent source contract “separates successful bounded recovery (C1)” from C2.
-B: Both statuses: C1 #1954 has hosted GREEN but its “original native command is … in acceptance repair”; discovery closing: full #1952 closure requires “capture/replay of PR1944’s actual typed request after normal C1 rollout”; discovery boundary 1: “C1’s in-attempt GroupReview retention does not close this seam.”
+B: Both statuses: C1 #1954 has published-input hosted GREEN but its original native attempt is terminal after 13 model admissions and the workflow is normally paused without an active lease; discovery closing: full #1952 closure requires “capture/replay of PR1944’s actual typed request after normal C1 rollout”; discovery boundary 1: “C1’s in-attempt GroupReview retention does not close this seam.”
 Crosses: C1 recovery results, C2 lifecycle obligations, rollout order, original command repair, and incident-specific replay.
 
 S4 — shared term / failed observation versus review authority
