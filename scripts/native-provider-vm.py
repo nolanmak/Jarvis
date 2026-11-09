@@ -30,6 +30,8 @@ import datetime
 
 MAX_FRAME = 2 * 1024 * 1024
 MAX_HOME = 64 * 1024 * 1024
+MAX_EXECUTABLE = 512 * 1024 * 1024
+MAX_COMPANION = 128 * 1024 * 1024
 
 
 
@@ -526,6 +528,15 @@ def validate_runtime(path):
         raise ValueError('undeclared runtime file')
 
 
+def stage_native_executable(executable, destination):
+    executable = Path(executable)
+    info = executable.stat()
+    if not executable.is_absolute() or info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022 or info.st_size > MAX_EXECUTABLE:
+        raise ValueError('native executable is not trusted or exceeds budget')
+    shutil.copyfile(executable, destination)
+    Path(destination).chmod(0o555)
+
+
 def stage_native_companions(executable, guest_runtime, destination):
     executable = Path(executable)
     if executable.resolve().name != 'codex':
@@ -545,7 +556,7 @@ def stage_native_companions(executable, guest_runtime, destination):
     if source.is_symlink() or not source.resolve().is_relative_to(runtime) or declared.get(str(relative)) != entry.get('sha256'):
         raise ValueError('Codex runtime companion is not manifested')
     data = source.read_bytes()
-    if len(data) > 128 * 1024**2 or hashlib.sha256(data).hexdigest() != entry['sha256']:
+    if len(data) > MAX_COMPANION or hashlib.sha256(data).hexdigest() != entry['sha256']:
         raise ValueError('Codex runtime companion digest changed')
     target = Path(destination) / entry['name']
     with open(target, 'xb') as stream:
@@ -586,11 +597,7 @@ def main(spec_path):
         binary = private / 'provider'
         binary.mkdir()
         executable = Path(spec['executable'])
-        info = executable.stat()
-        if not executable.is_absolute() or info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022 or info.st_size > 512 * 1024 * 1024:
-            raise ValueError('native executable is not trusted or exceeds budget')
-        shutil.copyfile(executable, binary / 'cli')
-        (binary / 'cli').chmod(0o555)
+        stage_native_executable(executable, binary / 'cli')
         stage_native_companions(executable, spec['guest_runtime'], binary)
         assets = spec.get('assets', [])
         if len(assets) > 32:
