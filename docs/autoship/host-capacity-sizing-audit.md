@@ -520,3 +520,14 @@ fixture. Recheck resolved the finding. All 53 seams are inventoried, not claimed
 reviewed. Whole C0/full seam review, final schemas, writer/startup handoff, security
 supersession, control-plane growth, snapshot and process receipt contracts still
 block integration and activation.
+
+## Audit-anchor byte producer contract (#1940)
+
+The audit-anchor-budget-contract.md component closes the anchor writer/reader
+size mismatch without changing 64 MiB limits or authority. Actual managed
+AnchoredAudit append/seal regressions fail on unchanged main 416f392b; all five
+existing audit-chain tests pass. The log-sized escaped payload and seal callback
+produce anchors the current reader would refuse. Fresh-reader and all 19 mapped
+narrow seams were checked; one already-sealed retry ambiguity was resolved and
+rechecked. Separate #1918 implementation exception is required. This is neither
+full physical/memory growth nor production restoration evidence.
