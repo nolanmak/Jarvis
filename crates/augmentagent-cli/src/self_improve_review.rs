@@ -340,7 +340,7 @@ fn immutable_write_findings_from_audit(root:&Path,prepared:&acceptance::Prepared
 pub(super) async fn diagnostic_call_bound(worktree:&Path, issue:&ReviewSubject<'_>, prepared:&acceptance::PreparedAcceptance,reference:&acceptance::CandidateReceiptReference)->Result<u64> {
     let snapshot=candidate_snapshot(worktree).await?;
     let caller_symbols=caller_discovery_symbols(worktree,&snapshot,Some(&prepared.proposal.files)).await?;
-    let callers=complete_caller_evidence_for_symbols(worktree,&snapshot.head,&caller_symbols).await?;
+    let (callers,caller_plan)=complete_or_streamed_callers(worktree,&snapshot.head,&caller_symbols).await?;
     let mut contract:BTreeMap<_,_>=prepared.proposal.contract.criteria.iter().map(|c|(c.id.clone(),c.requirement.clone())).collect();
     anyhow::ensure!(!contract.contains_key("REGRESSION"),"reserved criterion collision");
     contract.insert("REGRESSION".into(),REGRESSION_REQUIREMENT.into());
@@ -353,9 +353,21 @@ pub(super) async fn diagnostic_call_bound(worktree:&Path, issue:&ReviewSubject<'
     let subject=format!("{}\n{}",issue.title,issue.body);
     let controller=controller_acceptance_context(prepared,Some(reference))?;
     let inputs=evidence_plan::Inputs {binding:&binding,issue:&subject,contract:&contract,prior:&[],system_bytes,controller_acceptance:Some(&controller)};
-    let mut shards=supplied_shards(&snapshot.files,&snapshot.diff,&callers,&snapshot.source_identities);add_controller_sources(&mut shards,prepared);
+    let caller_context=caller_plan.as_ref().map(|plan|plan.review_context()).unwrap_or(callers);
+    let mut shards=supplied_shards(&snapshot.files,&snapshot.diff,&caller_context,&snapshot.source_identities);add_controller_sources(&mut shards,prepared);
     let requests=inputs.pack_initial(&shards,caller_plan.is_none())?;
     planned_review_calls(worktree,&inputs,&requests,caller_plan.as_ref()).await
+}
+
+async fn complete_or_streamed_callers(worktree:&Path,head:&str,symbols:&BTreeSet<String>)->Result<(String,Option<caller_stream::Plan>)> {
+    match complete_caller_evidence_for_symbols(worktree,head,symbols).await {
+        Ok(inline)=>Ok((inline,None)),
+        Err(error) if error.downcast_ref::<EvidenceBudget>().is_some()=>{
+            let plan=caller_stream::Plan::collect_symbols(worktree,head,symbols.clone()).await?;
+            Ok((plan.manifest.clone(),Some(plan)))
+        }
+        Err(error)=>Err(error),
+    }
 }
 
 async fn planned_review_calls(worktree:&Path,inputs:&evidence_plan::Inputs<'_>,
@@ -666,14 +678,7 @@ async fn run_impl(
         .acceptance_evidence
         .map(|(_, receipt)| receipt.binding.contract_hash.clone())
         .unwrap_or(aligned::digest(&serde_json::to_vec(&contract)?));
-    let (callers,caller_plan)=match complete_caller_evidence_for_symbols(&worktree,&head,&caller_symbols).await {
-        Ok(inline)=>(inline,None),
-        Err(error) if error.downcast_ref::<EvidenceBudget>().is_some()=>{
-            let plan=caller_stream::Plan::collect_symbols(&worktree,&head,caller_symbols.clone()).await?;
-            (plan.manifest.clone(),Some(plan))
-        }
-        Err(error)=>return Err(error),
-    };
+    let (callers,caller_plan)=complete_or_streamed_callers(&worktree,&head,&caller_symbols).await?;
     let rubric = review_calibration::active()?;
     let controller_context=context.acceptance_evidence.map(|(prepared,reference)|controller_acceptance_context(prepared,Some(reference))).transpose()?;
     let guarded_attempts=if let (Some(guard),Some((prepared,_)))=(context.workflow,context.acceptance_evidence) {immutable_write_findings(&worktree,guard,prepared).await?}else{Vec::new()};
