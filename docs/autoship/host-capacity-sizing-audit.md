@@ -452,3 +452,12 @@ Rust helper/spec materialization, interpreter bytecode caches, bounded audit/
 anchor growth and all relevant publication files. These are C0 growth obligations,
 not silently assumed covered by the fixed retained-session charge or these
 atomic/boot/archive component bounds.
+
+
+## Bounded archive hosted verification
+
+All 32 reported hosted checks/statuses on #1933 pass at c60a7ae1. The hosted
+native suite includes all 13 new archive cases. Accepted independent approval,
+merge and normal rollout remain pending; a CodeRabbit status alone is not
+approval. This is archive-component evidence, not original productive ingress,
+complete capacity integration or #1703 deployed acceptance.

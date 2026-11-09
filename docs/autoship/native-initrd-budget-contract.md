@@ -90,5 +90,5 @@ because JARVIS_TEST_VM_CONFIG was unselected. Real sparse overflow refuses befor
 payload reads; FIFO, observed mutation/shrink/short EOF, compressed prewrite
 refusal, exclusive 0600 output, fsync failure and actual main routing are covered.
 The test suite is registered in hosted bridge-suites. CI-contract verification
-and whitespace pass. Hosted exact-head CI, independent approval and normal
-rollout remain pending; no live VM/model or capacity activation is proved.
+and whitespace pass. All 32 current-head hosted checks/statuses pass; independent approval and normal
+merge/updater rollout remain pending; no live VM/model or capacity activation is proved.
