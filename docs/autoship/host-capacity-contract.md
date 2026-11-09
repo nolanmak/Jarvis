@@ -502,6 +502,14 @@ Source: `scripts/native-provider-vm.py` (`runtime_seed`, `boot_entries`,
 `scripts/native-provider-vm-guest.py`, and
 `crates/augmentagent-channel-core/src/native_state_capacity.rs`.
 
+The existing executable/companion byte-limit violations are tracked separately
+in [#1924](https://github.com/nolanmak/Jarvis/issues/1924), with the TDD fix in
+[PR #1925](https://github.com/nolanmak/Jarvis/pull/1925), source `d603891f`.
+Five behavioral failures reproduce against the unchanged-copy extraction
+`5e562e03`; the native-provider suite (31 tests) and provisioning suite (9 tests)
+pass with bounded descriptor streaming. That fix is under review, not deployed
+or proof of complete native growth/custody. It does not close C0/C2.
+
 Inspected Git blobs: native host `8611d1722f3117a126c704c32567739c3454c839`,
 supervisor `d30dfa6bbdcbca8aa36d87b84fefb382b91f5658`, run declarations
 `73b0fe627e702dab955f39d5e47735ca424c5bf9`. Later source revisions must be
@@ -529,6 +537,28 @@ Required producer behavior before C2 can claim bounded growth:
 Those are required behaviors, not an approved new ledger format. Exact growth
 budgets, inode/block support, durable representation, writer compatibility,
 lock ordering, publication and release proofs remain C0 work below.
+
+### Existing shared-authority boundary and reboot lifetime
+
+Source inspection identifies two requirements for the remaining shared-storage
+contract. `storage_reservations.rs` lives in the CLI and its admission operation
+also invokes CLI `build_storage_ci_holds.rs` reconciliation. Native constructors
+live in channel-core, which cannot import the CLI. Lift the existing common
+admission/claim/cleanup-fence implementation into the shared lower layer and
+keep CLI adapters; do not duplicate its lock/scan arithmetic in native admission
+or omit the CI uncertainty fence. Exact public/opaque APIs remain C0 work.
+
+`storage_leases::lock_directory()` uses `/run/user/UID` or `/tmp`. Those are
+temporary coordination locations, not durable retained-session accounting.
+Retained commitments must persist outside them and be reconciled by the same
+admission authority before writers restart after reboot. Existing flock claims
+cannot supply that lifetime: the v1 reader deletes unlocked records before
+parsing their version. Merely writing a v2 native row into that directory is
+therefore unsafe for both reboot and old-reader compatibility. C0 must define
+the persistent backing, compatibility/startup fence and original release proof;
+C2 must test an old reader, lost locks, reboot and unresolved retirement through
+the actual shared entry points. No production registry or limits were changed
+by this inspection.
 
 ## 7. Open contract checklist and handoff gate
 
