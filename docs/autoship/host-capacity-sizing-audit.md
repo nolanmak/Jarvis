@@ -763,3 +763,20 @@ workspace and resource authorities before enabling concurrent execution. No
 whole-run timeout, VM interruption, second supervisor or original-work reset was
 applied. This records a live reproduction; it does not claim RED/GREEN test or
 implementation completion.
+
+## Queued PR lane source audit and first behavioral regression
+
+[Working command-lane contract](command-pr-lane-contract.md) reuses the existing
+resume lane rather than discarding a fresh issue continuation. Fresh-reader,
+conversation/source and all nine mapped seams were checked. Actual source
+revealed controller-path provenance drift, unflocked shared attempt-history
+writes, PR result misclassification/paid-held fairness omission, and an untyped
+source identity error. They explicitly block concurrent consumer activation.
+
+#1946 is a native child of #1706. Draft PR #1947 adds three production-worker
+fake-clock regressions at tests-only eb7b0304. Two behavioral failures are expected
+on unchanged settlement, but the hosted run has not yet proved that RED. The
+fixtures inspect durable FairSched, DailyCounter and merge allowance after one
+actual scheduler turn, distinguishing paid PR/build holds from unpaid holds.
+This bounded test-first repair does not enable concurrency or claim autosizing,
+independent approval, merge, deployment or live queue recovery.
