@@ -571,3 +571,24 @@ one-correction behavior in the actual preparation path and its managed CLI RED
 fails because a second independent correction is unreachable. The closed scoped
 contract allows implementation while complete capacity/owner/live requirements
 remain unfinished. Code approval/hosted CI/normal rollout are still required.
+
+## Initial verifier repair draft implementation
+
+Draft #1944 at 932e8807 implements #1943's reviewed workflow coordinator. Rejected
+records use stable epoch/slot keys, exact proposal/predecessor identity and the
+existing immutable store; known failures use cache-only proposal lookup. The
+current executor alone supplies positive evidence. Fresh/resume/source-less
+callers preserve typed holds; narrow progress projection codes retain them after
+command completion. Tests include real store reopen, original-process crash
+boundaries, missing committed responses, strict lineage, hold idempotence and
+public progress; passing results remain unproven pending hosted validation.
+
+Local managed RED at 2ba400d2 reproduced the one-correction dead end. The first
+implementation compile caught a fixture field mismatch, corrected to evidence_hash.
+A subsequent managed run waited on the actual worker VM's disk leases; only the
+exact own waiting manage-parent process was cancelled before compilation. No VM,
+cache, limit or production control was changed to bypass admission. Hosted CI at
+the current draft head is running; CI-contract/whitespace pass. Independent code
+approval, rollout and original-command live recovery remain pending. #1941's
+separate audit-bound patch now has all 16 reported hosted checks/statuses passing,
+without code approval or rollout. Full capacity/owner/live acceptance remains open.
