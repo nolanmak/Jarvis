@@ -70,12 +70,24 @@
   },
   "limits": [
     "Queued command intent can exist before an executing workflow row: execution preflight deferral is not evidence that the durable request was lost.",
-    "The worker has deferred preflight with execution-readiness-blocked. Its precise underlying resource/provider/deployment cause has not yet been established; do not guess from an operator-shell probe.",
+    "Worker diagnostics establish the workflow-resource capacity class at the time of this deferred command. Exact exhausted resource/inequality remains unrecorded; an operator-shell inspection is not worker execution authority.",
     "Acceptance is queued intent, not productive execution, native readiness, accepted review, merge or deployment.",
     "Code tests are GREEN; full required CI remains blocked. All merge gates remain enforced.",
     "A confirmed private route receipt proves transport confirmation, not owner reading or Discord coding follow-up.",
     "No private bot/owner/channel/message/native identifiers, tokens or message content are published.",
     "C2, original PR1944 replay, automatic capacity and parent live/fault/soak exits remain open.",
     "Preserve the original queued PR1954 branch/body/request; do not reset or create a duplicate issue builder."
-  ]
+  ],
+  "worker_diagnostic": {
+    "worker_error_at_utc": "2026-11-09T18:45:21.450880Z",
+    "outer_reason": "execution-readiness-blocked",
+    "resource_reason": "workflow-resource:capacity-exhausted",
+    "source": "Configured autopr worker stderr, read through its existing regular-file descriptor without altering offsets.",
+    "correlation": "The PR1954 preflight deferral is the only command completion in that worker-log second; row finished at1794249921432ms. The log omits workflow identity, so the association is time-correlated rather than an explicit identity receipt.",
+    "not_established": [
+      "Specific resource/host/ancestor/aggregate refusal detail",
+      "Whether additional future native retained-storage checks would pass",
+      "Permission to increase a limit or release a reservation"
+    ]
+  }
 }

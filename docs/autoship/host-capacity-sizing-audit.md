@@ -1108,3 +1108,18 @@ explicit; it is not merge permission. No Linux/privacy/node-release or
 independent-review gate was waived. Preserve this command/PR input and the
 source1953 hold. C2, original1944 replay, automatic capacity and all full1703
 acceptance remain unfinished.
+
+### PR1954 deferred readiness: configured-worker capacity observation
+
+At18:45:21.450880 UTC the configured worker logged
+execution-readiness-blocked: workflow-resource:capacity-exhausted. PR1954's
+preflight deferral finished at1794249921432ms and is the only command
+completion in that second. This is a time-correlated worker diagnostic, not
+an explicit per-workflow resource receipt. The class is established; the
+underlying host/ancestor/aggregate resource inequality remains unknown.
+
+This is distinct from GitHub's Actions outage and from assuming the retained
+native-storage8GiB limit is the cause. No arbitrary limit increase, native
+release, model call, duplicate request or service override followed. The
+command remains durable and its actual admission events remain the spend
+source of truth. Precise preflight observation/reporting still needs closure.
