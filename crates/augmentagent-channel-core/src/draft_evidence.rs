@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 const MAX_STEPS: usize = 8;
+const BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 const MAX_CHARS: usize = 64_000;
 const PAGE_CHARS: usize = 8_000;
 
@@ -142,7 +143,7 @@ impl EvidenceOutcome {
 }
 
 /// Sub-millisecond steps are still measured work, so round up instead of zero.
-fn measured_ms(started: std::time::Instant) -> u64 {
+fn measured_ms(started: tokio::time::Instant) -> u64 {
     started.elapsed().as_micros().div_ceil(1_000) as u64
 }
 
@@ -161,7 +162,11 @@ Search uses existing Gmail-style message search operators, including with:, in:,
 Only claim facts supported by sources actually read. Cite source IDs exactly. Keep only facts relevant to this draft. Empty/stale searches or exhausted budgets are not evidence of no communication; report material gaps. Never invent links, commitments or dates. Distinguish source timestamps and unknown freshness. If unresolved identity prevents a needed cross-platform join, ask for clarification instead of guessing.
 Index health counts cover stored messages across ALL platforms, not email specifically. After a focused search and one reasonable broadening both return no relevant source, report the missing-source gap unless new evidence supplies a concrete different lookup; do not repeat speculative searches just to exhaust the budget.
 Your final ready decision must preserve unresolved material gaps; complete evidence is not mandatory, honesty is. Do not repeat private source bodies in reasons.
+When budget.final_decision is true there is no time left to read anything else: return ready now from the sources already read and list what remains unverified as gaps. Any other action is discarded.
 "#;
+
+const STOP_GUIDANCE: &str = "If the material source is still unavailable after a focused search and one broadening, return ready with the missing-source gap now. Finish before the remaining budget; never claim that an empty search proves no communication.";
+const FINAL_GUIDANCE: &str = "This is your final decision: return ready now with facts from sources already read, and list what remains unverified as gaps. Never claim that an empty search proves no communication.";
 
 pub async fn gather(
     store: &Store,
@@ -193,25 +198,40 @@ pub async fn gather(
     let opts = crate::reasoner::draft_opts(CONTRACT.into(), None);
     // Avoid auditing the whole message index for acknowledgements that need no search.
     let mut index_health = None;
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let mut protocol_retries = 0;
-    for _ in 0..MAX_STEPS {
+    // #1837: model calls, not retrieval, spend the budget (~40 s each on live
+    // receipts), so a check that kept searching hit the wall mid-call and lost
+    // everything it had read. A search round costs this decision plus one more
+    // to conclude; when the rest of the budget cannot fit two decisions as slow
+    // as the slowest so far, or no step is left after this one, this decision
+    // must conclude from what has been read.
+    let mut slowest_decision = std::time::Duration::ZERO;
+    for step in 0..MAX_STEPS {
+        let remaining = BUDGET.saturating_sub(started.elapsed());
+        let out_of_time = !slowest_decision.is_zero() && remaining < slowest_decision * 2;
+        let final_decision = out_of_time || step + 1 == MAX_STEPS;
         let prompt =
-            json!({"request":owner_request,"baseline":seed,"retrieval":out.reads,"budget":{"remaining_decisions":MAX_STEPS-out.model_decisions,"remaining_ms":90_000_u128.saturating_sub(started.elapsed().as_millis())},"stop_guidance":"If the material source is still unavailable after a focused search and one broadening, return ready with the missing-source gap now. Finish before the remaining budget; never claim that an empty search proves no communication."}).to_string();
+            json!({"request":owner_request,"baseline":seed,"retrieval":out.reads,"budget":{"remaining_decisions":MAX_STEPS-out.model_decisions,"remaining_ms":remaining.as_millis(),"final_decision":final_decision},"stop_guidance":if final_decision {FINAL_GUIDANCE} else {STOP_GUIDANCE}}).to_string();
         if prompt.chars().count() > MAX_CHARS {
             out.gaps
                 .push("Evidence budget exhausted; context may be incomplete".into());
             break;
         }
-        let remaining = std::time::Duration::from_secs(90).saturating_sub(started.elapsed());
         out.model_decisions += 1;
-        let decided = std::time::Instant::now();
+        let decided = tokio::time::Instant::now();
         let response = tokio::time::timeout(remaining, reasoner.call(&opts, &prompt)).await;
         let decision_ms = measured_ms(decided);
+        slowest_decision = slowest_decision.max(decided.elapsed());
         let raw = match response {
             Ok(Ok(raw)) => raw,
             Ok(Err(_)) => {
-                out.record(StepKind::ModelDecision, "decision", decision_ms, "unavailable");
+                out.record(
+                    StepKind::ModelDecision,
+                    "decision",
+                    decision_ms,
+                    "unavailable",
+                );
                 out.gaps.push(
                     "The evidence model was unavailable; relevant sources remain unverified".into(),
                 );
@@ -249,7 +269,15 @@ pub async fn gather(
                 break;
             }
         };
-        let retrieved = std::time::Instant::now();
+        if final_decision && !matches!(decision, EvidenceDecision::Ready { .. }) {
+            out.gaps.push(if out_of_time {
+                "The context check reached its time limit before more sources could be read; relevant sources remain unverified"
+            } else {
+                "Retrieval step limit reached; evidence review unfinished"
+            }.into());
+            break;
+        }
+        let retrieved = tokio::time::Instant::now();
         let (operation, reason, result) = match decision {
             EvidenceDecision::Ready { facts, gaps } => {
                 if facts.iter().any(|f| {

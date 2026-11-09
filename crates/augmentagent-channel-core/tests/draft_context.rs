@@ -227,7 +227,13 @@ async fn receipt_times_every_step_and_names_the_budget_consumer_on_each_platform
         schemas.push(
             steps
                 .iter()
-                .map(|step| step.as_object().unwrap().keys().cloned().collect::<Vec<_>>())
+                .map(|step| {
+                    step.as_object()
+                        .unwrap()
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
                 .collect::<Vec<_>>(),
         );
     }
@@ -259,7 +265,10 @@ async fn budget_timeout_blames_the_model_decision_and_keeps_the_card_warning() {
     .unwrap();
     assert!(!context.evidence.complete);
     assert_eq!(context.evidence.step_timings.len(), 1);
-    assert_eq!(context.evidence.step_timings[0].kind, StepKind::ModelDecision);
+    assert_eq!(
+        context.evidence.step_timings[0].kind,
+        StepKind::ModelDecision
+    );
     assert_eq!(context.evidence.step_timings[0].outcome, "timeout");
     assert_eq!(
         context.evidence.budget_consumer(),
@@ -662,4 +671,117 @@ fn slack_trigger_uses_source_time_for_the_history_cutoff() {
         ["m00", "m01"]
     );
     assert!(!seed.gaps.iter().any(|g| g.contains("timestamp")));
+}
+
+/// A slow model (#1837: live decisions take ~40 s) that keeps searching
+/// until the coordinator tells it the decision is final.
+struct SearchesUntilFinal {
+    delay: std::time::Duration,
+    obeys_final: bool,
+    prompts: std::sync::Mutex<Vec<serde_json::Value>>,
+}
+#[async_trait::async_trait]
+impl augmentagent_channel_core::Reasoner for SearchesUntilFinal {
+    async fn call(
+        &self,
+        _opts: &augmentagent_channel_core::ReasonerOpts,
+        prompt: &str,
+    ) -> anyhow::Result<String> {
+        let prompt: serde_json::Value = serde_json::from_str(prompt).unwrap();
+        let last = prompt["budget"]["final_decision"] == true;
+        self.prompts.lock().unwrap().push(prompt);
+        tokio::time::sleep(self.delay).await;
+        Ok(if last && self.obeys_final {
+            serde_json::json!({"action":"ready","facts":[],"gaps":["The invite was not found in the sources read"]})
+        } else {
+            serde_json::json!({"action":"search","query":"invite","reason":"look for the invite"})
+        }
+        .to_string())
+    }
+}
+fn searches_until_final(obeys_final: bool) -> SearchesUntilFinal {
+    SearchesUntilFinal {
+        delay: std::time::Duration::from_secs(40),
+        obeys_final,
+        prompts: std::sync::Mutex::new(Vec::new()),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_decisions_conclude_before_the_budget_instead_of_timing_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("db")).unwrap();
+    let seed = load_seed(&store, &message(1), None).unwrap();
+    let agent = searches_until_final(true);
+    let evidence = augmentagent_channel_core::draft_evidence::gather(
+        &store,
+        &agent,
+        &seed,
+        "not seeing an invite for today",
+        None,
+    )
+    .await;
+    // 40 s + 40 s fits; a third 40 s decision would not, so the second one is
+    // the last and the check finishes with its gap instead of at the wall.
+    assert!(evidence.complete, "{:?}", evidence.gaps);
+    assert_eq!(evidence.model_decisions, 2);
+    assert_eq!(evidence.reads.len(), 1, "the first search still ran");
+    assert!(evidence.gaps.iter().any(|g| g.contains("invite")));
+    assert!(!evidence.gaps.iter().any(|g| g.contains("time limit")));
+    let prompts = agent.prompts.lock().unwrap();
+    assert_eq!(prompts[0]["budget"]["final_decision"], false);
+    assert_eq!(prompts[1]["budget"]["final_decision"], true);
+    assert!(prompts[1]["stop_guidance"]
+        .as_str()
+        .unwrap()
+        .contains("final decision"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_final_decision_that_asks_for_more_retrieval_is_not_executed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("db")).unwrap();
+    let seed = load_seed(&store, &message(1), None).unwrap();
+    let agent = searches_until_final(false);
+    let evidence = augmentagent_channel_core::draft_evidence::gather(
+        &store,
+        &agent,
+        &seed,
+        "not seeing an invite for today",
+        None,
+    )
+    .await;
+    assert!(!evidence.complete);
+    assert_eq!(
+        evidence.model_decisions, 2,
+        "no third call started at the wall"
+    );
+    assert_eq!(evidence.reads.len(), 1, "the discarded search never ran");
+    assert!(evidence.elapsed_ms < 90_000, "{}", evidence.elapsed_ms);
+    assert!(evidence.gaps.iter().any(|g| g.contains("time limit")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn fast_decisions_keep_searching_until_the_last_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("db")).unwrap();
+    let seed = load_seed(&store, &message(1), None).unwrap();
+    let mut agent = searches_until_final(true);
+    agent.delay = std::time::Duration::from_secs(1);
+    let evidence = augmentagent_channel_core::draft_evidence::gather(
+        &store,
+        &agent,
+        &seed,
+        "not seeing an invite for today",
+        None,
+    )
+    .await;
+    assert!(evidence.complete, "{:?}", evidence.gaps);
+    assert_eq!(evidence.model_decisions, 8);
+    assert_eq!(evidence.reads.len(), 7);
+    let prompts = agent.prompts.lock().unwrap();
+    assert!(prompts[..7]
+        .iter()
+        .all(|p| p["budget"]["final_decision"] == false));
+    assert_eq!(prompts[7]["budget"]["final_decision"], true);
 }
