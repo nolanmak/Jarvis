@@ -18,7 +18,7 @@ class ContractTests(unittest.TestCase):
    self.assertTrue(all(row[:3]==['test','-p','augmentagent-cli'] for row in rows))
    self.assertIn('--bin',rows[0]);self.assertIn('--test-threads=1',rows[0])
    self.assertEqual({rows[1][i+1] for i,a in enumerate(rows[1]) if a=='--test'},
-                    {'autoship_commands_cli','autoship_resolution_cli','autoship_submit_cli'})
+                    {'autoship_commands_cli','autoship_resolution_cli','autoship_submit_cli','env_key_snapshot_cli'})
  def fixture(self,root,body='printf ok',matrix=None):
   workflows=root/'.github/workflows';workflows.mkdir(parents=True);source=workflows/'test.yml';source.write_text('fixture')
   job={'runs-on':'${{ matrix.os }}' if matrix else 'ubuntu-latest','steps':[{'command_id':'test/check/0'}]}
