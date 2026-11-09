@@ -512,6 +512,17 @@ permission false positive was reproduced and corrected with a precise size
 refusal assertion. That fix is under review, not deployed
 or proof of complete native growth/custody. It does not close C0/C2.
 
+The aggregate home-seed violation is tracked in
+[#1926](https://github.com/nolanmak/Jarvis/issues/1926) and fixed separately in
+[PR #1927](https://github.com/nolanmak/Jarvis/pull/1927), source `4a958e57`.
+Three overflow regressions fail on main `416f392b`, including the real 64 MiB
+boundary. Final selected home bytes are checked after credential selection;
+exact fit, smaller replacement and preserved refreshed auth remain supported.
+All 26 native-provider and nine provisioning tests pass locally. CI, independent
+review and rollout remain pending. This bounds final seed data, not metadata,
+combined initrd inputs/peak, interrupted-launch accumulation or whole-launch
+physical growth. Those C0/C2 obligations remain open.
+
 Inspected Git blobs: native host `8611d1722f3117a126c704c32567739c3454c839`,
 supervisor `d30dfa6bbdcbca8aa36d87b84fefb382b91f5658`, run declarations
 `73b0fe627e702dab955f39d5e47735ca424c5bf9`. Later source revisions must be
