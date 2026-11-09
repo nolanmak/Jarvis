@@ -98,6 +98,9 @@ if 'show' in sys.argv:
             self.assertIn('--dry-run true',(units/'augmentagent-autopr.service').read_text())
             # Explicit policy selection persists independently of installer env,
             # and both service processes receive the same final environment file.
+            health_unit=units/'augmentagent-autopr-health.service'
+            health_unit.write_text('[Service]\nExecStart=/usr/bin/true\n')
+            health_before=health_unit.read_bytes()
             policy=base/'private profile.json'
             policy.write_text(json.dumps({'version':1,'providers':{'claude':{'refresh_auth':False},'codex':{'refresh_auth':False}}}))
             policy.chmod(0o600)
@@ -118,8 +121,13 @@ if 'show' in sys.argv:
                 'literal policy path must not glob-match a neighboring filename')
             shared='EnvironmentFile=-'+pattern.replace('%','%%')
             self.assertIn(shared,dropin.read_text())
+            health_dropin=units/'augmentagent-autopr-health.service.d/autoship-native-policy.conf'
+            self.assertIn(shared,health_dropin.read_text(),'health must inspect the explicitly selected worker policy')
+            self.assertNotIn('ExecStart=',health_dropin.read_text())
+            self.assertNotIn('SYNTHETIC=',health_dropin.read_text(),'copy only the shared policy declaration')
+            self.assertEqual(health_unit.read_bytes(),health_before,'preserve the existing health unit')
             # Validate both artifacts before changing either mode or units.
-            before_units={p:p.read_bytes() for p in [units/'augmentagent-autopr.service',dropin,selection]}
+            before_units={p:p.read_bytes() for p in [units/'augmentagent-autopr.service',dropin,selection,health_dropin]}
             memory_bytes=artifacts[1].read_bytes()
             foreign=base/'foreign-executable';foreign.write_bytes(memory_bytes);foreign.chmod(0o775)
             for kind in ['symlink','fifo','non-executable']:

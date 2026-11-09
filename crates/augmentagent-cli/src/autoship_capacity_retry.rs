@@ -34,6 +34,21 @@ fn previous(tx:&Transaction<'_>,workflow:&str,generation:i64,now:i64)->Result<Op
     Ok(Some(prior))
 }
 impl WorkflowStore {
+    /// Read-only health observation; never claims, wakes or charges work.
+    pub fn resource_capacity_wait_count(&self)->Result<u64> {
+        let mut statement=self.conn.prepare("SELECT substr(w.checkpoint,1,1048577),length(CAST(w.checkpoint AS BLOB)),COALESCE(c.paused,0)
+            FROM workflow w LEFT JOIN workflow_owner_control c ON c.workflow=w.id ORDER BY w.id LIMIT 1025")?;
+        let rows=statement.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)))?;
+        let mut count=0;let mut seen=0;
+        for row in rows {
+            let (raw,size,paused)=row?;seen+=1;
+            ensure!(seen<=1024 && (0..=1048576).contains(&size) && matches!(paused,0|1),"capacity health evidence exceeds bound or is invalid");
+            let cp:Checkpoint=serde_json::from_str(&raw)?;cp.binding.validate()?;
+            if paused==0 && active(cp.stage) && cp.next.reason=="resource_capacity" && cp.next.action=="await_capacity" {count+=1;}
+        }
+        Ok(count)
+    }
+
     /// Actual protected capacity observer only. No failure changes shipping
     /// allowance, paid accounting, evidence, owner intent or the progress clock.
     pub fn defer_run_capacity(&mut self,lease:&Lease,native_fingerprint:Option<&str>,now:i64)->Result<i64> {
@@ -124,6 +139,29 @@ mod tests {
         cp.stage=Stage::Verify;cp.evidence=vec!["protected-receipt".into()];store.checkpoint(&lease,&cp,21).unwrap();
         store.charge(&lease,"original-work",ResourceCharge{model_calls:2,..Default::default()},25).unwrap();
         (store,lease)
+    }
+    #[test]
+    fn capacity_health_count_is_read_only_and_preserves_holds_and_accounting() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        assert_eq!(store.resource_capacity_wait_count().unwrap(),0);
+        store.defer_run_capacity(&lease,Some(&"a".repeat(64)),30).unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();let events=store.events(&lease.workflow).unwrap();
+        let allowance=store.merge_allowance(31,5).unwrap();
+        let observer=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+        assert_eq!(observer.resource_capacity_wait_count().unwrap(),1);drop(observer);
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);
+        assert_eq!(store.events(&lease.workflow).unwrap(),events);assert_eq!(store.merge_allowance(31,5).unwrap(),allowance);
+        store.set_owner_pause(&lease.workflow,"owner",0,true,32).unwrap();
+        assert_eq!(store.resource_capacity_wait_count().unwrap(),0);
+        store.set_owner_pause(&lease.workflow,"owner",1,false,33).unwrap();
+        for stage in [Stage::Held,Stage::Merged,Stage::Retired,Stage::Merge] {
+            let mut cp=before.checkpoint.clone();cp.stage=stage;
+            store.conn.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",params![lease.workflow,serde_json::to_string(&cp).unwrap()]).unwrap();
+            assert_eq!(store.resource_capacity_wait_count().unwrap(),0);
+        }
+        store.conn.execute("UPDATE workflow SET checkpoint='broken' WHERE id=?1",[&lease.workflow]).unwrap();
+        assert!(store.resource_capacity_wait_count().is_err(),"corrupt evidence must not appear as zero waits");
     }
     #[test]
     fn native_capacity_backoff_survives_restarts_heads_and_duplicate_observations() {

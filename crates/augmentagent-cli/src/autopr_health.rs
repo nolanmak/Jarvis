@@ -67,8 +67,8 @@ const PROVIDER_HOLD_FRESH_MINS: i64 = 90;
 /// growth rule (the timer runs every 2 h; three missed runs is a gap).
 const DISK_DROP_WINDOW_HOURS: f64 = 6.0;
 
-/// Everything the rules judge. Absent evidence is `None`, which never fires a
-/// rule: a missing log is a reason to stay quiet, not to cry wolf.
+/// Everything the rules judge. Absent log evidence usually stays quiet;
+/// a known resource wait with unavailable capacity evidence remains visible.
 #[derive(Debug, Clone, Default)]
 pub struct HealthInputs {
     pub now_or_epoch: Option<DateTime<Utc>>,
@@ -128,6 +128,11 @@ pub struct HealthInputs {
     /// Confirmed autonomous merges and separately held dispatch capacity.
     pub merge_allowance: Option<crate::autoship_workflow::MergeAllowance>,
     pub merge_allowance_error: Option<String>,
+    /// Fresh local observation only; never execution or cleanup authority.
+    pub native_state_capacity: Option<serde_json::Value>,
+    /// Active, unpaused workflows waiting on resource admission.
+    pub resource_capacity_waits: Option<u64>,
+    pub resource_capacity_wait_error: bool,
     /// #1214 — open `agent-gave-up` issues grouped by reason code.
     pub gave_up_by_reason: Option<Vec<(String, u32)>>,
 }
@@ -198,6 +203,8 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         // Everything below measures a running daemon; don't pile on.
         return out;
     }
+
+    if let Some(finding)=capacity_finding(i) {out.push(finding);}
 
     if let Some(last) = i.last_reasoner_poll {
         let age = mins_since(now, last);
@@ -912,6 +919,42 @@ fn running_binary(repo_root: &Path) -> (Option<(PathBuf, PathBuf)>, Vec<String>)
     (pair, dropins)
 }
 
+/// Project numeric capacity measurements without private paths or native IDs.
+fn native_capacity_detail(report:&serde_json::Value)->Option<(bool,String)> {
+    if report["live_verified"]!=false {return None;}
+    let status=report["status"].as_str()?;
+    if !matches!(status,"capacity-observed"|"capacity-exhausted") {return None;}
+    let retained=report["retained_sessions"].as_u64()?;
+    let additional=report["additional_sessions"].as_u64()?;
+    let required=report["required_reserved_bytes"].as_u64()?;
+    let budget=report["max_state_bytes"].as_u64()?;
+    let free=report["filesystem_available_bytes"].as_u64()?;
+    let blockers=report["blockers"].as_array()?.iter().map(|value|value.as_str()).collect::<Option<Vec<_>>>()?;
+    if blockers.iter().any(|b|!matches!(*b,"session-count"|"reserved-bytes"|"stored-bytes"|"filesystem-free-bytes"))
+        || (status=="capacity-exhausted")==blockers.is_empty() {return None;}
+    let gib=1024u64.pow(3) as f64;
+    Some((!blockers.is_empty(),format!("{retained} retained + {additional} additional native sessions require {:.2} GiB reservations against {:.2} GiB budget; {:.2} GiB filesystem available; storage blockers: {}.",
+        required as f64/gib,budget as f64/gib,free as f64/gib,if blockers.is_empty(){"none".into()}else{blockers.join(", ")})))
+}
+
+fn capacity_finding(i:&HealthInputs)->Option<Finding> {
+    let waiting=i.resource_capacity_waits.unwrap_or(0);
+    let fix="Inspect native capacity and the workflow's resource refusal. Free disk and reservation budget are separate limits. Preserve owner holds, reservations and accounting; confirm real workflow progress after any approved recovery.".to_owned();
+    if i.resource_capacity_wait_error {
+        return Some(Finding{severity:Severity::Alert,code:"capacity-state-unavailable",
+            detail:"Protected workflow capacity waits could not be read; no healthy queue count is established.".into(),fix});
+    }
+    match i.native_state_capacity.as_ref().and_then(native_capacity_detail) {
+        Some((true,detail))=>Some(Finding{severity:if waiting>0 {Severity::Alert}else{Severity::Warn},code:"native-state-capacity",
+            detail:format!("{detail} {}",i.resource_capacity_waits.map(|n|format!("{n} workflow(s) waiting on resource capacity.")).unwrap_or_else(||"Workflow wait count unavailable.".into())),fix}),
+        Some((false,detail)) if waiting>0=>Some(Finding{severity:Severity::Alert,code:"resource-capacity-waiting",
+            detail:format!("{waiting} workflow(s) still waiting on resource capacity. {detail} Storage headroom alone does not prove workflow readiness or recovery."),fix}),
+        None if waiting>0 || i.native_state_capacity.is_some()=>Some(Finding{severity:if waiting>0 {Severity::Alert}else{Severity::Warn},code:"native-capacity-unobserved",
+            detail:format!("Native capacity observation unavailable; {waiting} observed workflow(s) waiting on resource capacity. No headroom or readiness is established."),fix}),
+        _=>None,
+    }
+}
+
 /// Gather everything the rules need from this box.
 pub fn collect(repo_root: &Path) -> HealthInputs {
     let now = Utc::now();
@@ -951,6 +994,13 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         Ok(status) => (Some(status), None),
         Err(error) => (None, Some(format!("{error:#}"))),
     };
+    let native_state_capacity=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").map(|_| {
+        serde_json::to_value(augmentagent_channel_core::native_vm::state_capacity::inspect()).expect("native capacity report serializes")
+    });
+    let (resource_capacity_waits,resource_capacity_wait_error)=match crate::autoship_workflow::WorkflowStore::open_read_only(&crate::autoship_workflow::default_path()) {
+        Ok(Some(store))=>match store.resource_capacity_wait_count() {Ok(count)=>(Some(count),false),Err(_)=>(None,true)},
+        Ok(None)=>(None,false),Err(_)=>(None,true),
+    };
     HealthInputs {
         now_or_epoch: Some(now),
         daemon_active: daemon_active(),
@@ -984,6 +1034,9 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         policy_held_drafts: crate::self_improve::policy_held_drafts(),
         merge_allowance,
         merge_allowance_error,
+        native_state_capacity,
+        resource_capacity_waits,
+        resource_capacity_wait_error,
         gave_up_by_reason: crate::self_improve::gave_up_breakdown_live(repo_root),
     }
 }
@@ -1055,6 +1108,48 @@ async fn notify_owner_of(text: &str) {
 mod tests {
     // (tests continue below; the #1030 case is appended at the end)
     use super::*;
+
+    fn native_capacity_sample(budget:u64)->serde_json::Value {
+        let gib=1024u64.pow(3);
+        serde_json::json!({"status":if budget<9*gib {"capacity-exhausted"}else{"capacity-observed"},
+            "live_verified":false,"retained_sessions":8,"additional_sessions":1,"max_sessions":16,
+            "session_reserved_bytes":gib,"required_reserved_bytes":9*gib,"max_state_bytes":budget,
+            "stored_bytes":4096,"filesystem_available_bytes":100*gib,
+            "blockers":if budget<9*gib {vec!["reserved-bytes"]}else{vec![]}})
+    }
+
+    #[test]
+    fn native_capacity_health_distinguishes_budget_from_ample_disk_space() {
+        let mut input=healthy();input.native_state_capacity=Some(native_capacity_sample(8*1024u64.pow(3)));
+        input.resource_capacity_waits=Some(3);
+        let findings=analyze(&input,&Thresholds::default());
+        let finding=findings.iter().find(|f|f.code=="native-state-capacity").expect("logical native budget exhaustion was invisible");
+        assert_eq!(finding.severity,Severity::Alert);
+        for text in ["9.00 GiB","8.00 GiB","100.00 GiB","3 workflow"] {assert!(finding.detail.contains(text),"{text}: {}",finding.detail);}
+        assert!(!findings.iter().any(|f|f.code=="disk-low"));
+    }
+
+    #[test]
+    fn native_capacity_health_keeps_waits_unproven_after_headroom_changes() {
+        let mut input=healthy();input.native_state_capacity=Some(native_capacity_sample(16*1024u64.pow(3)));
+        input.resource_capacity_waits=Some(3);
+        assert!(analyze(&input,&Thresholds::default()).iter().any(|f|f.code=="resource-capacity-waiting"));
+        input.resource_capacity_waits=Some(0);
+        assert!(analyze(&input,&Thresholds::default()).is_empty());
+        input.native_state_capacity=Some(native_capacity_sample(8*1024u64.pow(3)));
+        let finding=analyze(&input,&Thresholds::default()).into_iter().find(|f|f.code=="native-state-capacity").unwrap();
+        assert_eq!(finding.severity,Severity::Warn,"unused headroom is not a proven stalled workflow");
+    }
+
+    #[test]
+    fn native_capacity_health_reports_unavailable_observations_and_queue_errors() {
+        let mut input=healthy();input.resource_capacity_waits=Some(3);
+        assert!(analyze(&input,&Thresholds::default()).iter().any(|f|f.code=="native-capacity-unobserved"));
+        input.native_state_capacity=Some(serde_json::json!({"status":"observation-unavailable","live_verified":false}));
+        assert!(analyze(&input,&Thresholds::default()).iter().any(|f|f.code=="native-capacity-unobserved"));
+        input.resource_capacity_wait_error=true;
+        assert!(analyze(&input,&Thresholds::default()).iter().any(|f|f.code=="capacity-state-unavailable" && f.severity==Severity::Alert));
+    }
 
     #[test]
     fn policy_hold_is_distinct_from_stale_and_disappears_for_closed_pr() {
@@ -1169,6 +1264,9 @@ mod tests {
             policy_held_drafts: vec![],
             merge_allowance: None,
             merge_allowance_error: None,
+            native_state_capacity: None,
+            resource_capacity_waits: None,
+            resource_capacity_wait_error: false,
             gave_up_by_reason: None,
         }
     }

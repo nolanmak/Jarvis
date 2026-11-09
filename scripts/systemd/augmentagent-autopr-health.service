@@ -8,6 +8,7 @@ After=network-online.target
 Type=oneshot
 WorkingDirectory=%h/AugmentAgent
 EnvironmentFile=-%h/AugmentAgent/.env
+EnvironmentFile=-%h/.config/augmentagent/autoship-native.env
 # Out of process on purpose: a wedged or dead daemon cannot report itself.
 ExecStart=%h/AugmentAgent/target/release/augmentagent autopr-health --notify
 # A finding exits 1; that is a report, not a unit failure.
