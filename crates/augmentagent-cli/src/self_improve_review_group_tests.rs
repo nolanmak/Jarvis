@@ -341,3 +341,172 @@ async fn credential_and_control_paths_are_refused_before_a_second_observation() 
         );
     }
 }
+
+struct ProtocolSequence {
+    responses: Mutex<std::collections::VecDeque<serde_json::Value>>,
+    calls: Mutex<usize>,
+    native_id: String,
+}
+#[async_trait::async_trait]
+impl GroupTransport for ProtocolSequence {
+    async fn observe_group(
+        &self,
+        _: augmentagent_channel_core::ProviderKind,
+        _: &augmentagent_channel_core::ReasonerOpts,
+        prompt: &str,
+    ) -> Result<(String, String)> {
+        *self.calls.lock().unwrap() += 1;
+        let mut response = self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected extra observation");
+        if let Some(raw) = response.as_str() {
+            return Ok((raw.into(), self.native_id.clone()));
+        }
+        response["binding"] = serde_json::from_str::<serde_json::Value>(prompt)?["binding"].clone();
+        Ok((response.to_string(), self.native_id.clone()))
+    }
+}
+async fn bounded_protocol_case(
+    actor_session: &str,
+    native_id: &str,
+    responses: Vec<serde_json::Value>,
+) -> (Result<CompletedGroup>, usize) {
+    let root = tempfile::tempdir().unwrap();
+    git_fixture(root.path(), &["init", "-q"]);
+    std::fs::write(root.path().join("source.rs"), "fn source() {}\n").unwrap();
+    git_fixture(root.path(), &["add", "."]);
+    git_fixture(
+        root.path(),
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "protocol fixture",
+        ],
+    );
+    let head = git_fixture(root.path(), &["rev-parse", "HEAD"]);
+    let binding = aligned::ReviewBinding {
+        head: head.clone(),
+        base: head,
+        environment_id: "fixture".into(),
+        contract_hash: "c".repeat(64),
+        evidence_hash: "d".repeat(64),
+    };
+    let contract = BTreeMap::from([("C1".into(), "Keep source correct".into())]);
+    let inputs = evidence_plan::Inputs {
+        binding: &binding,
+        issue: "Protocol bounds",
+        contract: &contract,
+        prior: &[],
+        system_bytes: 1024,
+        controller_acceptance: None,
+    };
+    let original = inputs
+        .request(
+            BTreeMap::from([("source.rs".into(), "fn source() {}\n".into())]),
+            false,
+            None,
+        )
+        .unwrap();
+    let actor = aligned::Actor {
+        provider: "codex".into(),
+        backend: "native".into(),
+        model: "fixture".into(),
+        session_id: actor_session.into(),
+    };
+    let builders = [aligned::Actor {
+        provider: "claude".into(),
+        backend: "native".into(),
+        model: "fixture".into(),
+        session_id: "fixture-writer".into(),
+    }];
+    let origin = aligned::ReviewOrigin::RecordedBuilders;
+    let opts = codex_review_opts(root.path().to_path_buf(), "Protocol fixture");
+    let transport = ProtocolSequence {
+        responses: Mutex::new(responses.into()),
+        calls: Mutex::new(0),
+        native_id: native_id.into(),
+    };
+    let result = execute_evidence_group(
+        EvidenceGroupInput {
+            root: root.path(),
+            inputs: &inputs,
+            original_request: &original,
+            evidence_shards: &original.files,
+            actor: &actor,
+            builders: &builders,
+            origin: &origin,
+            role: aligned::ReviewRole::Diff,
+            provider: augmentagent_channel_core::ProviderKind::Codex,
+            opts: &opts,
+            group_index: 0,
+            workflow: None,
+        },
+        &transport,
+    )
+    .await;
+    let calls = *transport.calls.lock().unwrap();
+    (result, calls)
+}
+#[tokio::test]
+async fn malformed_then_incomplete_cannot_read_another_dependency_or_call_again() {
+    let (result,calls)=bounded_protocol_case("fixture-reviewer","actual-native-session",vec![
+        serde_json::json!("not a structured review"),
+        serde_json::json!({"decision":"incomplete","findings":[],"missing_sources":[{"path":"absent.rs","criterion_ids":["C1"],"question":"Need absent source","selector":{"kind":"whole_file"}}]}),
+    ]).await;
+    assert_eq!(calls, 2);
+    assert!(format!(
+        "{:#}",
+        result.err().expect("review must remain unavailable")
+    )
+    .contains("remains incomplete after the second observation"));
+    let (result, calls) = bounded_protocol_case(
+        "fixture-reviewer",
+        "actual-native-session",
+        vec![
+            serde_json::json!("not a structured review"),
+            serde_json::json!({"decision":"approve","findings":[]}),
+        ],
+    )
+    .await;
+    assert!(result.is_ok());
+    assert_eq!(calls, 2);
+}
+#[tokio::test]
+async fn native_identity_limits_and_static_metadata_are_enforced_at_dispatch() {
+    let approved = serde_json::json!({"decision":"approve","findings":[]});
+    for invalid in [
+        String::new(),
+        "line\nbreak".into(),
+        "α".into(),
+        "n".repeat(513),
+    ] {
+        let (result, calls) =
+            bounded_protocol_case("fixture-reviewer", &invalid, vec![approved.clone()]).await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+    let (result, calls) =
+        bounded_protocol_case("fixture-reviewer", &"n".repeat(512), vec![approved.clone()]).await;
+    assert_eq!(calls, 1);
+    assert_eq!(result.unwrap().native_sessions, ["n".repeat(512)]);
+    let (result, calls) = bounded_protocol_case(
+        &"s".repeat(32 * 1024),
+        "actual-native-session",
+        vec![approved],
+    )
+    .await;
+    assert!(is_evidence_budget(
+        &result.err().expect("review must remain unavailable")
+    ));
+    assert_eq!(
+        calls, 0,
+        "oversized static metadata must not reach the model transport"
+    );
+}
