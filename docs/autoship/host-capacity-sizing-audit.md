@@ -1162,3 +1162,25 @@ authorize shrinking demand to measured RSS, raising a budget, retiring native
 state, declaring whole-machine capacity or closing C0. Precise worker-side
 preflight observation, automatic host sizing and full profile/accounting/
 publication integration remain open under1917/1918.
+
+## Final published-input CI GREEN and native worker execution
+
+On3debdb8d, targeted run42673227287 attempt3/job129368273291 succeeds,
+including1758 CLI tests,0 failed,33 existing ignored and the full required
+Linux aggregate. All14 reported CheckRuns pass, with no failed/pending
+CheckRun. This is not an independent native review verdict.
+
+Fresh normal status now shows PR1954 at build/acceptance_failed with
+repair_implementation next, after seven native model admission events.
+The original protected audit records six Codex and one Claude admissions.
+The worker moved beyond its initial free preflight hold without changing
+limits or resubmitting the command. Its original resource records include
+4GiB and6GiB admitted envelopes within the10GiB service aggregate. The earlier
+reference refusals cannot be promoted into a permanent policy prohibition.
+
+The active worker candidate fcc76249 is distinct from published input3debdb8d;
+input CI does not certify that candidate. Preserve the active branch, body,
+original request and protected verifiers. The command-proof schema now labels
+current_attempt_row_count explicitly: that mutable per-workflow row is not
+a lifetime attempt counter. No review, merge, deployment, automatic capacity
+activation, original1944 replay or full1703 acceptance is claimed.

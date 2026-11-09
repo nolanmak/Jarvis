@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T19:00:40.864895+00:00",
+  "observed_at": "2026-11-09T19:29:47.899660+00:00",
   "parent_issue": 1703,
   "owner_issue": 1709,
   "repair_issue": 1952,
@@ -9,7 +9,7 @@
   "base": "416f392b17b56b2a43e67a3e430835902387941a",
   "head": "9146acb424a52f4e9ef89d28d7bfed0a524eb2f6",
   "branch": "fix/autoship-review-dependency-ranges",
-  "state": "code_green_ready_queued_aggregate_rechecking_capacity_hold",
+  "state": "published_input_required_ci_green_native_worker_acceptance_repair",
   "change": "Extract unchanged production group adapter behind scripted/native transport interface. Add legacy retained-finding control and two new coherent large-file cases; fixture Rust code is actually compiled/executed before scripted review.",
   "expected_red": [
     "related_large_source_items_reach_one_request_and_reject_the_seeded_defect",
@@ -56,10 +56,9 @@
     "limits": "Receipt is owner intent, not native quiescence or resource-release proof."
   },
   "limits": [
-    "Final code tests are GREEN; the required Linux aggregate is not. No complete CI pass or accepted independent review is claimed.",
-    "Ready-for-review and normal queue submission may proceed with the infrastructure hold explicit; neither may waive CI or authorize a merge.",
-    "Scripted adapter tests do not prove actual native model review or original PR1944 incident acceptance.",
-    "Independent review, normal merge/updater rollout, actual1944 replay, C2 and all parent1703 live exits remain required."
+    "Full required CI is GREEN on published input3debdb8d; an active unpublished worker candidate is a distinct validation subject.",
+    "Native worker model admissions and acceptance repair are real progress, not accepted independent review, autonomous merge or rollout.",
+    "C2, actual original1944 replay, automatic host sizing and all parent live/fault/soak exits remain unfinished."
   ],
   "additional_red": {
     "head": "b4605e45bca46277b8cfc6ff2249bd535069c6ca",
@@ -85,7 +84,7 @@
   },
   "implementation": {
     "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
-    "state": "final_code_tests_green_required_ci_infrastructure_hold",
+    "state": "published_input_required_ci_green_worker_candidate_requires_own_validation",
     "changes": [
       "Strict typed incomplete source requests with legacy path compatibility",
       "Exact immutable regular Git Rust items with container headers, or UTF-8 byte intervals",
@@ -103,10 +102,10 @@
       "rustfmt syntax parse",
       "git diff --check"
     ],
-    "green_claimed": false,
+    "green_claimed": true,
     "run": 42673227287,
     "code_tests_green": true,
-    "all_required_ci_green": false
+    "all_required_ci_green": true
   },
   "implementation_validation": [
     {
@@ -190,6 +189,23 @@
       ],
       "cause": "Missing jobs in finished workflows with public Internal server error annotations; GitHub status reports an active major Actions/Checks API outage.",
       "log_sha256": "63103ab9622264f4b98631d25c32dec39075d6da3409bff578d17c7c1cd31f89"
+    },
+    {
+      "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+      "run": 42673227287,
+      "attempt": 3,
+      "job": 129368273291,
+      "state": "completed",
+      "conclusion": "success",
+      "targeted_crate_tests": "success",
+      "linux_aggregation": "success",
+      "cli_unit_result": {
+        "passed": 1758,
+        "failed": 0,
+        "ignored": 33
+      },
+      "reported_successful_check_runs": 14,
+      "log_sha256": "2afe41a4b12e1f2897fa13e8c19ebd764378af2bc1be7bce693ff8cbee78beaf"
     }
   ],
   "submission_preflight": {
@@ -345,7 +361,8 @@
       "reason": "All previously missing required Linux jobs passed after provider recovery; restore required aggregate without waiving it.",
       "attempt": 3,
       "job": 129368273291,
-      "observed_status": "in_progress"
+      "observed_status": "completed",
+      "conclusion": "success"
     },
     "limits": "No current-head full CI pass is claimed before the aggregate completes. MacOS remains informational."
   }

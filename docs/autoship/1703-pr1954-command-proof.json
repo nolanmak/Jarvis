@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T18:48:22.281598+00:00",
+  "observed_at": "2026-11-09T19:29:47.899660+00:00",
   "parent_issue": 1703,
   "owner_issue": 1709,
   "repair_issue": 1952,
@@ -29,30 +29,33 @@
   },
   "workflow_status": {
     "workflow": "nolanmak/jarvis/pr/1954",
-    "stage": "queued",
-    "reason": "execution-readiness-blocked",
-    "next_action": "retry_worker_attempt",
-    "eligible_at_ms": 1794250217593,
+    "stage": "build",
+    "reason": "acceptance_failed",
+    "next_action": "repair_implementation",
+    "eligible_at_ms": 0,
     "complete": false,
     "durable_command_jobs": 1,
-    "executing_workflow_record_exists": false,
-    "command_attempts": 1,
+    "executing_workflow_record_exists": true,
+    "current_attempt_row_count": 1,
     "last_attempt": {
-      "outcome": "deferred",
-      "reason": "execution-readiness-blocked",
-      "selected_at_ms": 1794249917593,
-      "finished_at_ms": 1794249921432
+      "outcome": "selected",
+      "reason": "worker-attempt-unconfirmed",
+      "selected_at_ms": 1794251027680,
+      "finished_at_ms": null
     },
-    "actual_native_model_admission_events": 0
+    "active_candidate_head": "fcc76249b444b6267eb7107b0480ee339633035f",
+    "actual_native_model_admission_events": 7,
+    "first_native_admission_at_ms": 1794251042483,
+    "last_native_admission_at_ms": 1794251242870
   },
   "private_progress": {
-    "latest_actual_sequence": 2,
+    "latest_actual_sequence": 6,
     "current_route_receipts": [
       {
         "state": "confirmed",
-        "count": 2,
-        "last_sequence": 2,
-        "last_confirmed_at_ms": 1794249949142
+        "count": 5,
+        "last_sequence": 6,
+        "last_confirmed_at_ms": 1794251268609
       }
     ]
   },
@@ -64,7 +67,7 @@
     "targeted_run": 42673227287,
     "attempt": 2,
     "job": 129350959940,
-    "linux_aggregate": "rechecking_after_dependency_recovery",
+    "linux_aggregate": "success",
     "cause": "Three required jobs missing during GitHub Actions/Checks API major outage",
     "provider_incident": "https://www.githubstatus.com/incidents/tp8cghg7tlc4",
     "provider_incident_status": "monitoring",
@@ -72,18 +75,25 @@
     "aggregate_recheck": {
       "attempt": 3,
       "job": 129368273291,
-      "status": "in_progress"
-    }
+      "status": "completed",
+      "conclusion": "success"
+    },
+    "all_required_ci_green_on_published_input": true,
+    "code_tests_passed": 1758,
+    "code_tests_failed": 0,
+    "log_sha256": "2afe41a4b12e1f2897fa13e8c19ebd764378af2bc1be7bce693ff8cbee78beaf"
   },
   "limits": [
-    "Queued command intent can exist before an executing workflow row: execution preflight deferral is not evidence that the durable request was lost.",
-    "Worker diagnostics establish the workflow-resource capacity class at the time of this deferred command. Exact exhausted resource/inequality remains unrecorded; an operator-shell inspection is not worker execution authority.",
-    "Acceptance is queued intent, not productive execution, native readiness, accepted review, merge or deployment.",
-    "Code tests are GREEN; full required CI remains blocked. All merge gates remain enforced.",
-    "A confirmed private route receipt proves transport confirmation, not owner reading or Discord coding follow-up.",
+    "The initial capacity deferral is historical: the normal worker later admitted native work without any manual request reset or limit change.",
+    "Current attempt rows are mutable per workflow and are not a lifetime attempt count; native_model_admitted events are the admission-count evidence.",
+    "Actual model admissions prove dispatched model work, not seven completed repairs or an accepted review.",
+    "Required CI GREEN applies to published input3debdb8d, not automatically to the worker active candidate head or future publication.",
+    "The workflow is in acceptance implementation repair, not merged/deployed; independent review and new-candidate validation remain required.",
+    "Private receipt confirmations establish transport, not owner reading or owner Discord coding initiation/follow-up.",
+    "Reference memory probes do not authorize admission/release and do not close automatic host sizing.",
     "No private bot/owner/channel/message/native identifiers, tokens or message content are published.",
-    "C2, original PR1944 replay, automatic capacity and parent live/fault/soak exits remain open.",
-    "Preserve the original queued PR1954 branch/body/request; do not reset or create a duplicate issue builder."
+    "C2, actual original1944 replay, automatic capacity and full parent live/fault/soak acceptance remain open.",
+    "Keep the queued command/PR input and protected verifier state intact; no duplicate issue builder."
   ],
   "worker_diagnostic": {
     "worker_error_at_utc": "2026-11-09T18:45:21.450880Z",
@@ -96,5 +106,26 @@
       "Whether additional future native retained-storage checks would pass",
       "Permission to increase a limit or release a reservation"
     ]
+  },
+  "initial_preflight_observation": {
+    "observed_at": "2026-11-09T18:48:22.281598+00:00",
+    "workflow_status": {
+      "workflow": "nolanmak/jarvis/pr/1954",
+      "stage": "queued",
+      "reason": "execution-readiness-blocked",
+      "next_action": "retry_worker_attempt",
+      "eligible_at_ms": 1794250217593,
+      "complete": false,
+      "durable_command_jobs": 1,
+      "executing_workflow_record_exists": false,
+      "last_attempt": {
+        "outcome": "deferred",
+        "reason": "execution-readiness-blocked",
+        "selected_at_ms": 1794249917593,
+        "finished_at_ms": 1794249921432
+      },
+      "actual_native_model_admission_events": 0,
+      "current_attempt_row_count": 1
+    }
   }
 }
