@@ -4,31 +4,17 @@ use std::collections::BTreeSet;
 
 pub(super) const FIELDS: &str = "number,headRefName,headRefOid,baseRefName,isCrossRepository,headRepositoryOwner,author,closingIssuesReferences";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Hold {
-    Claimed,
-    Unknown,
-}
-impl Hold {
-    pub(super) fn reason(self) -> &'static str {
-        match self {
-            Self::Claimed => "linked_pr_claim_exists",
-            Self::Unknown => "linked_pr_inventory_unknown",
-        }
-    }
-    pub(super) fn action(self) -> &'static str {
-        match self {
-            Self::Claimed => "reconcile_existing_pr",
-            Self::Unknown => "retry_github_inventory",
-        }
+pub(super) use crate::autoship_workflow::submission::LinkedPrBlocker as Hold;
+
+/// Keep ordinary authorization failures authoritative; add only fixed deferred
+/// command context to this observer's typed failures.
+pub(super) fn command_error(error:anyhow::Error)->anyhow::Error {
+    if error.downcast_ref::<targeted::CommandFailure>().is_some() {return error;}
+    match error.downcast_ref::<Hold>().copied() {
+        Some(hold)=>error.context(targeted::CommandFailure {code:3,reason:hold.command_reason()}),
+        None=>error,
     }
 }
-impl std::fmt::Display for Hold {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.reason(), self.action())
-    }
-}
-impl std::error::Error for Hold {}
 
 pub(super) fn report(error: &anyhow::Error) -> Option<RunReport> {
     error
@@ -288,4 +274,19 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn command_context_defers_known_blockers_without_overriding_authorization() {
+        for hold in [Hold::Claimed,Hold::Unknown] {
+            let error=command_error(hold.into());
+            let command=error.downcast_ref::<targeted::CommandFailure>().unwrap();
+            assert_eq!(command.code,3);assert_eq!(command.reason,hold.command_reason());
+            assert_eq!(error.downcast_ref::<Hold>(),Some(&hold));
+        }
+        let error=command_error(anyhow::Error::from(Hold::Unknown)
+            .context(targeted::CommandFailure{code:2,reason:"target-authorization-failed"}));
+        let command=error.downcast_ref::<targeted::CommandFailure>().unwrap();
+        assert_eq!(command.code,2);assert_eq!(command.reason,"target-authorization-failed");
+        assert!(Hold::from_code("private_unrecognized_value").is_none());
+    }
+
 }

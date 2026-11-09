@@ -58,6 +58,9 @@ mod adopted_execution;
 mod adoption;
 #[path = "self_improve_linked_claims.rs"]
 mod linked_claims;
+#[cfg(test)]
+#[path = "self_improve_linked_claim_boundaries.rs"]
+mod linked_claim_boundaries;
 #[path = "self_improve_policy_hold.rs"]
 mod policy_hold;
 #[path = "self_improve_legacy_readmission.rs"]
@@ -7893,9 +7896,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     }
 
     match has_open_agent_pr(repo_root,issue.number).await {
-        Ok(true)=>return Ok(RunReport::held(linked_claims::Hold::Claimed.to_string())),
+        Ok(true)=>return Err(linked_claims::Hold::Claimed.into()),
         Ok(false)=>(),
-        Err(_)=>return Ok(RunReport::held(linked_claims::Hold::Unknown.to_string())),
+        Err(_)=>return Err(linked_claims::Hold::Unknown.into()),
     }
     let branch = format!("{BRANCH_PREFIX}{}", issue.number);
     let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Issue(issue.number)).await?;

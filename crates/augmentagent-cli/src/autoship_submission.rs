@@ -3,6 +3,33 @@
 //! provider or grants publication authority; dispatch must enforce its policy.
 use super::*;
 
+/// Shared fixed blocker vocabulary for observation errors and read-only status.
+/// These values describe deferral; they grant no ownership or execution authority.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(crate) enum LinkedPrBlocker { Claimed, Unknown }
+impl LinkedPrBlocker {
+    pub(crate) fn reason(self)->&'static str {
+        match self {Self::Claimed=>"linked_pr_claim_exists",Self::Unknown=>"linked_pr_inventory_unknown"}
+    }
+    pub(crate) fn action(self)->&'static str {
+        match self {Self::Claimed=>"reconcile_existing_pr",Self::Unknown=>"retry_github_inventory"}
+    }
+    pub(crate) fn command_reason(self)->&'static str {
+        match self {Self::Claimed=>"linked-pr-claim-exists",Self::Unknown=>"linked-pr-inventory-unknown"}
+    }
+    pub(crate) fn from_code(code:&str)->Option<Self> {
+        match code {
+            "linked-pr-claim-exists"|"linked_pr_claim_exists"|"target-pr-reconciliation-required"=>Some(Self::Claimed),
+            "linked-pr-inventory-unknown"|"linked_pr_inventory_unknown"=>Some(Self::Unknown),
+            _=>None,
+        }
+    }
+}
+impl std::fmt::Display for LinkedPrBlocker {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"{}: {}",self.reason(),self.action())}
+}
+impl std::error::Error for LinkedPrBlocker {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Milestone {

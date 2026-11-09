@@ -134,6 +134,9 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
         if let Some((outcome,why,at))=&attempt {
             kind=if outcome=="progress" {"worker-progress"} else {"retry-scheduled"}.into();
             reason=code(why,"worker-attempt-finished");action="inspect_workflow".into();eligible=Some(*at);
+            if let Some(blocker)=submission::LinkedPrBlocker::from_code(why) {
+                kind="blocked".into();reason=blocker.reason().into();action=blocker.action().into();
+            }
         }
     }
     let control:Option<bool>=tx.query_row("SELECT paused FROM workflow_owner_control WHERE workflow=?1",[workflow],|r|r.get(0)).optional()?;
@@ -330,6 +333,32 @@ mod tests {
             assert_eq!(latest.merge_state,"not-confirmed");
             assert_eq!(WorkflowStore::open(&path).unwrap().progress_events(&id).unwrap(),events);
             store.set_owner_pause(&id,"owner",0,true,7).unwrap();
+            assert_eq!(store.progress_events(&id).unwrap().last().unwrap().reason,"owner-pause-requested");
+        }
+    }
+
+    #[test]
+    fn linked_pr_precheckpoint_attempts_project_precise_cli_and_private_blockers() {
+        for (attempt_reason,reason,action) in [
+            ("linked-pr-claim-exists","linked_pr_claim_exists","reconcile_existing_pr"),
+            ("target-pr-reconciliation-required","linked_pr_claim_exists","reconcile_existing_pr"),
+            ("linked-pr-inventory-unknown","linked_pr_inventory_unknown","retry_github_inventory")] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+            let mut store=WorkflowStore::open(&path).unwrap();
+            let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(1),provider:None,until:submission::Milestone::Merged};
+            let id=store.submit_authorized("request","owner",&request,1).unwrap().workflow;
+            store.next_command_job("owner/repo",2).unwrap().unwrap();
+            assert!(store.finish_command_attempt(&id,2,submission::AttemptOutcome::Deferred,attempt_reason,3).unwrap());
+            assert!(store.snapshot(&id).unwrap().is_none(),"a status blocker must not manufacture execution state");
+            let latest=store.progress_events(&id).unwrap().pop().unwrap();
+            assert_eq!(latest.kind,"blocked");assert_eq!(latest.reason,reason);assert_eq!(latest.next_action,action);
+            let (exit,body)=crate::autoship_commands::status(&path,&id,4,5);
+            assert_eq!(exit,3);assert_eq!(body["stage"],"queued");
+            assert_eq!(body["reason"],reason);assert_eq!(body["next_action"],action);
+            assert_eq!(body["worker"]["state"],"unknown");assert_eq!(body["merge"]["state"],"not-confirmed");
+            store.set_owner_pause(&id,"owner",0,true,5).unwrap();
+            let (_,paused)=crate::autoship_commands::status(&path,&id,6,5);
+            assert_eq!(paused["reason"],"owner-pause-requested");assert_eq!(paused["next_action"],"await_owner_resume");
             assert_eq!(store.progress_events(&id).unwrap().last().unwrap().reason,"owner-pause-requested");
         }
     }
