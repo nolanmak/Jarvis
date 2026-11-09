@@ -504,10 +504,12 @@ Source: `scripts/native-provider-vm.py` (`runtime_seed`, `boot_entries`,
 
 The existing executable/companion byte-limit violations are tracked separately
 in [#1924](https://github.com/nolanmak/Jarvis/issues/1924), with the TDD fix in
-[PR #1925](https://github.com/nolanmak/Jarvis/pull/1925), source `d603891f`.
+[PR #1925](https://github.com/nolanmak/Jarvis/pull/1925), source `dbc7ef09`.
 Five behavioral failures reproduce against the unchanged-copy extraction
-`5e562e03`; the native-provider suite (31 tests) and provisioning suite (9 tests)
-pass with bounded descriptor streaming. That fix is under review, not deployed
+`5e562e03`; the native-provider suite (32 tests under umask 0002) and provisioning
+suite (9 tests) pass with bounded descriptor streaming. A companion-test
+permission false positive was reproduced and corrected with a precise size
+refusal assertion. That fix is under review, not deployed
 or proof of complete native growth/custody. It does not close C0/C2.
 
 Inspected Git blobs: native host `8611d1722f3117a126c704c32567739c3454c839`,
