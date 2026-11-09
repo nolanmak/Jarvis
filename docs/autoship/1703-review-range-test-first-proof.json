@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-09T16:45:07.141590+00:00",
+  "observed_at": "2026-11-09T17:33:23.321625+00:00",
   "parent_issue": 1703,
   "owner_issue": 1709,
   "repair_issue": 1952,
@@ -9,7 +9,7 @@
   "base": "416f392b17b56b2a43e67a3e430835902387941a",
   "head": "9146acb424a52f4e9ef89d28d7bfed0a524eb2f6",
   "branch": "fix/autoship-review-dependency-ranges",
-  "state": "draft_tests_first",
+  "state": "draft_implementation_hosted_validation_pending",
   "change": "Extract unchanged production group adapter behind scripted/native transport interface. Add legacy retained-finding control and two new coherent large-file cases; fixture Rust code is actually compiled/executed before scripted review.",
   "expected_red": [
     "related_large_source_items_reach_one_request_and_reject_the_seeded_defect",
@@ -18,8 +18,19 @@
   "control": "legacy_whole_file_recovery_keeps_original_findings_after_later_approval",
   "hosted_validation": {
     "run": 42657183954,
-    "state": "in_progress",
-    "conclusion": null
+    "job": 129298696372,
+    "state": "completed",
+    "conclusion": "failure",
+    "cli_unit_result": {
+      "passed": 1742,
+      "failed": 2,
+      "ignored": 33
+    },
+    "intended_failures": [
+      "related_large_source_items_reach_one_request_and_reject_the_seeded_defect",
+      "related_large_source_items_allow_a_complete_fixed_group_without_dropping_scope"
+    ],
+    "legacy_control": "passed"
   },
   "local_attempt": {
     "original_session": 77462,
@@ -45,8 +56,46 @@
     "limits": "Receipt is owner intent, not native quiescence or resource-release proof."
   },
   "limits": [
-    "No automated RED until hosted compiler/tests execute and the intended assertions fail.",
-    "No source-recovery implementation, review approval, native replay, merge or rollout claimed.",
+    "Scripted adapter tests do not prove native/model review or actual PR1944 incident acceptance.",
+    "Implementation is pending hosted compile/tests, independent review, merge and normal updater rollout.",
     "C2 failed-history/free holds/wake, actual original PR1944 dependency capture and full1703 exits remain required."
-  ]
+  ],
+  "additional_red": {
+    "head": "b4605e45bca46277b8cfc6ff2249bd535069c6ca",
+    "run": 42659850506,
+    "attempt": 2,
+    "job": 129318437805,
+    "state": "completed",
+    "conclusion": "failure",
+    "cli_unit_result": {
+      "passed": 1742,
+      "failed": 3,
+      "ignored": 33
+    },
+    "intended_failures": [
+      "related_large_source_items_reach_one_request_and_reject_the_seeded_defect",
+      "related_large_source_items_allow_a_complete_fixed_group_without_dropping_scope",
+      "credential_and_control_paths_are_refused_before_a_second_observation"
+    ],
+    "legacy_control": "passed",
+    "separate_integration_failure": "code_mode_compute::caught_bad_request_still_fails_cli_and_report_redacts_source: observed Null instead of Number(1); not credited as source-recovery RED",
+    "first_attempt": "setup-deno HTTP500 before tests, not behavioral RED",
+    "log_sha256": "cd45bb763b68cb706a947ca36bd8c9df8028b6501d25656f6931474199bfef42"
+  },
+  "implementation": {
+    "head": "11495e1f",
+    "state": "pushed_draft_pending_hosted_compile_and_tests",
+    "changes": [
+      "Strict typed incomplete source requests with legacy path compatibility",
+      "Exact immutable regular Git Rust items with container headers, or UTF-8 byte intervals",
+      "One coherent recovery preserves original evidence, all requested dependencies and earlier findings",
+      "Half-budget initial packing with exact source metadata and byte coordinates",
+      "Two observations, bounded identities/completed encoding, shared diagnostic reservation packing"
+    ],
+    "local_validation": [
+      "rustfmt syntax parse",
+      "git diff --check"
+    ],
+    "green_claimed": false
+  }
 }

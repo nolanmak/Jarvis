@@ -991,3 +991,20 @@ attempt2). All currently reported statuses/checks pass, but its first actual
 native attempt still failed acceptance registration from unsupported fixture
 tool/binary assumptions. No accepted independent review, merge, main rollout
 or parent live recovery is inferred from CI success.
+
+## Coherent-source actual RED and implementation checkpoint
+
+The original tests-first head9146acb4 completed with1742 CLI unit passes,
+two intended coherent-source failures and33 existing ignored cases. The
+legacy retained-finding control passed. Headb4605e45 attempt2 adds the
+protected-path failure:1742 passed,3 failed,33 ignored. Its first attempt
+failed during Deno installation before tests; an unrelated code-mode
+integration assertion also failed on attempt2. Neither is counted as
+source-recovery RED. Exact run/job and log hash are in the updated proof.
+
+Draft1954 now contains implementation11495e1f: strict typed requests, immutable
+item/byte lookup, coherent recovery, source-coordinate packing and bounded
+observations/cache encoding. Rustfmt syntax parsing and whitespace checks
+pass; hosted compile/tests are pending. Native incident replay, independent
+review, merge, normal rollout and C2 remain open. This is no capacity
+activation or autoship restoration claim.
