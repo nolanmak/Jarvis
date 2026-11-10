@@ -26,7 +26,7 @@ async fn queued_research_requests_a_spoken_acknowledgment_without_waiting_for_re
         let _ = ws.next().await.unwrap().unwrap();
         ws.send(started()).await.unwrap();
         ws.send(Message::Text(
-            json!({"type":"session.delegation.created","offset_ms":10,
+            json!({"type":"session.delegation.created","event_id":"delegated-research","offset_ms":10,
             "delegation":{"id":"research","type":"delegation","target":"client"}})
             .to_string()
             .into(),
