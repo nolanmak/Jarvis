@@ -146,3 +146,8 @@ a new request ID to evade its recorded receipt, or spend models to reconstruct
 the missing trusted inputs. Exact typed results and receipt transitions remain
 implementation gates; this inventory does not introduce another ingress engine
 or override the existing owner-turn/final-dispatch guards.
+
+
+## Native identity retention source clarification
+
+A follow-up source read at main `4ebb2b74` confirms that `Lease::observe` writes the actual observed ID into `NativeSession::State.id` immediately. `Lease::Drop` can mark that state uncertain without clearing its ID. The loss boundary is therefore the current `fresh_review_scope` return/lifetime interface and durable publication ordering: its early `await?` exposes neither the failed outcome/session handle to its caller, and later `NativeSession::Drop` retires registered paths. Do not invent a replacement native ID or change observation semantics on the assumption that failure erases the already observed ID. A complete custody interface still needs original accounting/resource correlation, bounded durable response/source storage, uncertainty reconciliation and retirement fencing before activation. This source clarification supplies none of those missing authorities.
