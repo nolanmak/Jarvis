@@ -1,0 +1,238 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-10T02:26:05.813425+00:00",
+  "status": "Fresh candidate eight-case private replay passed; identical original replay running",
+  "candidate_head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+  "original_head": "416f392b17b56b2a43e67a3e430835902387941a",
+  "recipe": "1703-c1-eight-case-worked-recipe.json",
+  "probe_sha256": "0fdf5c579d1cde935106f4894ca459aacb676aba29aa85c8d3db5ad0cebc4c6d",
+  "files_sha256": {
+    "crates/augmentagent-auth/src/bin/autoship_review_observer.rs": "02f1c9993e9c9c82cbb1e9ea19c92c6f1787c5fcba497fd585ca9cfda776a234",
+    "autoship_verifiers/issue_1943/observe.py": "ed7eeae5115f5419f08abf0ed804794a185de8af67f43eda2ee1f4976d5abe26",
+    "autoship_verifiers/issue_1943/review_probe.rs": "0fdf5c579d1cde935106f4894ca459aacb676aba29aa85c8d3db5ad0cebc4c6d",
+    "autoship_verifiers/issue_1943/public_env_template.txt": "e3452397d5d0ab9c3dd8a0069031b298de312c73a151baa05b91fc41731a0a51"
+  },
+  "candidate": {
+    "process_exit": 0,
+    "inner_entry_exit": 0,
+    "log_sha256": "305d20ce4a7ff5f3423e9102696ebfb831be03beb817cf90e89a85ff79ce1369",
+    "actual": {
+      "cases": [
+        {
+          "adapter_completed": true,
+          "adjudication_recorded": false,
+          "adjudicator_calls": 0,
+          "approved": true,
+          "case": "control",
+          "completed_roles": 3,
+          "executed_values": [
+            [
+              3,
+              5,
+              3
+            ],
+            [
+              3,
+              5,
+              3
+            ],
+            [
+              3,
+              5,
+              3
+            ]
+          ],
+          "recovery_calls": 3,
+          "refusal_kind": null,
+          "scripted_calls": 6,
+          "source_file_bytes": 620103,
+          "upheld_rulings": 0
+        },
+        {
+          "adapter_completed": true,
+          "adjudication_recorded": true,
+          "adjudicator_calls": 1,
+          "approved": false,
+          "case": "defect",
+          "completed_roles": 3,
+          "executed_values": [
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ]
+          ],
+          "recovery_calls": 3,
+          "refusal_kind": null,
+          "scripted_calls": 7,
+          "source_file_bytes": 620100,
+          "upheld_rulings": 1
+        },
+        {
+          "adapter_completed": true,
+          "adjudication_recorded": false,
+          "adjudicator_calls": 0,
+          "approved": true,
+          "case": "bytes-control",
+          "completed_roles": 3,
+          "executed_values": [
+            [
+              3,
+              5,
+              3
+            ],
+            [
+              3,
+              5,
+              3
+            ],
+            [
+              3,
+              5,
+              3
+            ]
+          ],
+          "recovery_calls": 3,
+          "refusal_kind": null,
+          "scripted_calls": 6,
+          "source_file_bytes": 620103,
+          "upheld_rulings": 0
+        },
+        {
+          "adapter_completed": true,
+          "adjudication_recorded": true,
+          "adjudicator_calls": 1,
+          "approved": false,
+          "case": "bytes-defect",
+          "completed_roles": 3,
+          "executed_values": [
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ]
+          ],
+          "recovery_calls": 3,
+          "refusal_kind": null,
+          "scripted_calls": 7,
+          "source_file_bytes": 620100,
+          "upheld_rulings": 1
+        },
+        {
+          "adapter_completed": false,
+          "adjudication_recorded": null,
+          "adjudicator_calls": 0,
+          "approved": null,
+          "case": "combined-budget",
+          "completed_roles": null,
+          "executed_values": [],
+          "recovery_calls": 0,
+          "refusal_kind": "evidence-budget",
+          "scripted_calls": 1,
+          "source_file_bytes": 620103,
+          "upheld_rulings": null
+        },
+        {
+          "adapter_completed": false,
+          "adjudication_recorded": null,
+          "adjudicator_calls": 0,
+          "approved": null,
+          "case": "approval-source",
+          "completed_roles": null,
+          "executed_values": [],
+          "recovery_calls": 0,
+          "refusal_kind": "invalid-source-decision",
+          "scripted_calls": 2,
+          "source_file_bytes": 620103,
+          "upheld_rulings": null
+        },
+        {
+          "adapter_completed": false,
+          "adjudication_recorded": null,
+          "adjudicator_calls": 0,
+          "approved": null,
+          "case": "selector-extra",
+          "completed_roles": null,
+          "executed_values": [],
+          "recovery_calls": 0,
+          "refusal_kind": "invalid-selector-fields",
+          "scripted_calls": 2,
+          "source_file_bytes": 620103,
+          "upheld_rulings": null
+        },
+        {
+          "adapter_completed": false,
+          "adjudication_recorded": null,
+          "adjudicator_calls": 0,
+          "approved": null,
+          "case": "unknown-criterion",
+          "completed_roles": null,
+          "executed_values": [],
+          "recovery_calls": 0,
+          "refusal_kind": "invalid-source-criteria",
+          "scripted_calls": 2,
+          "source_file_bytes": 620103,
+          "upheld_rulings": null
+        }
+      ],
+      "code_source_read_only": true,
+      "fixture_source_read_only": true,
+      "synthetic_protocol_only": true
+    },
+    "complete_external_oracle_match": true,
+    "source_preservation": {
+      "head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+      "same_original_regular_files": 1679,
+      "original_prefix_preserved_hook_files": [
+        "crates/augmentagent-cli/src/autoship_review.rs",
+        "crates/augmentagent-cli/src/autoship_review_tests.rs",
+        "crates/augmentagent-cli/src/self_improve.rs",
+        "crates/augmentagent-cli/src/self_improve_review.rs"
+      ],
+      "intentionally_omitted_control_files": [
+        ".claude/settings.json"
+      ],
+      "unexpected_changes": [],
+      "limits": "Source preservation only, not a test result or native authority."
+    }
+  },
+  "original": {
+    "state": "running"
+  },
+  "registered": false,
+  "limits": [
+    "Manual driver uses the supported CargoBinary invocation shape and unchanged sandbox; this is not production isolated_observation, native resource admission or registry attestation.",
+    "Synthetic scripted provider observations grant no native provider, independent acceptance/review, merge or deployment authority.",
+    "Full guard/cache/crash/diagnostic matrix and normal independent amendment remain open; original PR1954 source/body/request/pinned verifier, failed native history and pause are preserved."
+  ]
+}
