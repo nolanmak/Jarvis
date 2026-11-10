@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "parent_issue": 1706,
+  "epic": 1703,
+  "workflow": "nolanmak/jarvis/pr/1956",
+  "worker_rejection_at_utc": "2026-11-10T00:16:48.688633Z",
+  "stored_reason": "target-authorization-failed",
+  "actual_adjacent_worker_error": {
+    "class": "github-rest-rate-limit",
+    "http_status": 403
+  },
+  "interactive_bucket_observation": {
+    "core_remaining": 0,
+    "core_reset_epoch": 1794270173,
+    "graphql_remaining": 4879,
+    "graphql_reset_epoch": 1794271800
+  },
+  "limits": [
+    "The original worker quota error was independently observed; no service environment or credentials were copied.",
+    "Interactive REST/GraphQL buckets are separate observations, not service recovery proof.",
+    "No access revocation inferred, command reset, token hopping or extra worker performed.",
+    "Resource diagnostics #1957/#1958 do not implement quota/auth classification; that existing #1706/#1712 contract remains open."
+  ]
+}

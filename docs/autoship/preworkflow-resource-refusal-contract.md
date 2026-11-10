@@ -46,3 +46,10 @@ Design checkpoint: fresh-reader, conversation/source comparison and all 12 mappe
 ## Source and test baseline
 
 Original main is `416f392b17b56b2a43e67a3e430835902387941a`. The local regression adds an equivalent extraction of the existing worker completion classification into `finish_selected_command_attempt` so the test exercises the production consumer rather than reproducing its mapping. It retains the original outcome/priority/fenced store calls; no diagnostic transport or storage fix is included in that test baseline. A failing assertion, not compilation failure or source grep, is required before claiming RED.
+
+
+## Implementation candidate checkpoint
+
+PR [#1958](https://github.com/nolanmak/Jarvis/pull/1958) at `e7d43a3eeb000f84cd4b4a026a9d0e7e89b1b8ae` implements this reporting boundary. [Test-first proof](1703-preworkflow-resource-refusal-test-first-proof.json) records the original missing-metric RED, two additional compatibility/privacy REDs and final 271 passing affected cases (two existing ignored), including all 11 new cases. A broader local run passed 1,744 cases but failed six local-phone Unix socket tests; unchanged main reproduced all six identical SUN_LEN failures. This is not a full local-suite pass.
+
+The implementation preserves the old fingerprint when no resource observation exists and returns a fixed safe diagnostic for invalid stored observations. Required hosted CI, independent exact-head code approval, normal rollout and actual command/private delivery remain pending. Automatic capacity and full recovery are not claimed.

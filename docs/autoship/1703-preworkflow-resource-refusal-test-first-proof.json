@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "issue": 1957,
+  "pull_request": 1958,
+  "parent": 1706,
+  "epic": 1703,
+  "candidate_head": "e7d43a3eeb000f84cd4b4a026a9d0e7e89b1b8ae",
+  "original_main": "416f392b17b56b2a43e67a3e430835902387941a",
+  "first_red": {
+    "head": "c83c015a",
+    "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent preworkflow_resource_refusal_survives_worker_completion_and_reopen -- --exact self_improve::targeted::resource_tests::preworkflow_resource_refusal_survives_worker_completion_and_reopen --nocapture",
+    "managed_exit": 1,
+    "cargo_exit": 101,
+    "passed": 0,
+    "failed": 1,
+    "ignored": 0,
+    "assertion": "Expected host_headroom after worker completion/reopen; actual null",
+    "baseline_qualification": "Includes an equivalent extraction of original worker completion classification and the test; not an unchanged-file baseline."
+  },
+  "additional_red": {
+    "head": "e6cea7ad",
+    "passed": 7,
+    "failed": 2,
+    "failures": [
+      "legacy progress fingerprint changed without a resource observation",
+      "rejected stored-field name escaped through status error"
+    ]
+  },
+  "final_affected_green": {
+    "head": "e7d43a3eeb000f84cd4b4a026a9d0e7e89b1b8ae",
+    "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent -- autoship_ self_improve::targeted --nocapture",
+    "managed_exit": 0,
+    "passed": 271,
+    "failed": 0,
+    "ignored": 2,
+    "new_cases": 11
+  },
+  "broader_local_suite": {
+    "head": "68b99b4e",
+    "passed": 1744,
+    "failed": 6,
+    "ignored": 33,
+    "failure_family": "local-phone Unix socket path must be shorter than SUN_LEN",
+    "full_pass_claimed": false
+  },
+  "unchanged_main_reproduction": {
+    "head": "416f392b17b56b2a43e67a3e430835902387941a",
+    "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent local_phone -- --nocapture",
+    "managed_exit": 1,
+    "cargo_exit": 101,
+    "passed": 0,
+    "failed": 6,
+    "ignored": 0,
+    "failure_family": "same six local-phone SUN_LEN fixture failures"
+  },
+  "checks": {
+    "ci_contract": true,
+    "privacy_scan": true,
+    "whitespace": true,
+    "required_hosted_ci": "pending",
+    "independent_code_approval": "pending",
+    "normal_rollout": "pending",
+    "live_command_private_delivery": "unverified"
+  },
+  "limits": [
+    "No production resource policy, capacity, native session, allowance or service was changed.",
+    "Observation data is not admission, live-readiness, teardown, merge or rollout authority.",
+    "Automatic host sizing #1917, review retry/custody, productive owner ingress and full #1703 live/fault/soak acceptance remain open."
+  ]
+}
