@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-10T02:26:05.813425+00:00",
-  "status": "Fresh candidate eight-case private replay passed; identical original replay running",
+  "observed_at": "2026-11-10T02:35:19.381535+00:00",
+  "status": "Fresh private eight-case original/candidate paired replay completed; original differs and candidate matches the complete external oracle; not registered",
   "candidate_head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
   "original_head": "416f392b17b56b2a43e67a3e430835902387941a",
   "recipe": "1703-c1-eight-case-worked-recipe.json",
@@ -227,12 +227,166 @@
     }
   },
   "original": {
-    "state": "running"
+    "process_exit": 0,
+    "inner_entry_exit": 0,
+    "log_sha256": "48846a51f6c353aee7d9b64fc8eeded953b565b38dd8e587dc351d698a02967b",
+    "actual": {
+      "cases": [
+        {
+          "adapter_completed": false,
+          "adjudication_recorded": null,
+          "adjudicator_calls": 0,
+          "approved": null,
+          "case": "control",
+          "completed_roles": null,
+          "executed_values": [],
+          "recovery_calls": 0,
+          "refusal_kind": "typed-source-protocol-unsupported",
+          "scripted_calls": 2,
+          "source_file_bytes": 620103,
+          "upheld_rulings": null
+        },
+        {
+          "adapter_completed": false,
+          "adjudication_recorded": null,
+          "adjudicator_calls": 0,
+          "approved": null,
+          "case": "defect",
+          "completed_roles": null,
+          "executed_values": [],
+          "recovery_calls": 0,
+          "refusal_kind": "typed-source-protocol-unsupported",
+          "scripted_calls": 2,
+          "source_file_bytes": 620100,
+          "upheld_rulings": null
+        },
+        {
+          "adapter_completed": false,
+          "adjudication_recorded": null,
+          "adjudicator_calls": 0,
+          "approved": null,
+          "case": "bytes-control",
+          "completed_roles": null,
+          "executed_values": [],
+          "recovery_calls": 0,
+          "refusal_kind": "typed-source-protocol-unsupported",
+          "scripted_calls": 2,
+          "source_file_bytes": 620103,
+          "upheld_rulings": null
+        },
+        {
+          "adapter_completed": false,
+          "adjudication_recorded": null,
+          "adjudicator_calls": 0,
+          "approved": null,
+          "case": "bytes-defect",
+          "completed_roles": null,
+          "executed_values": [],
+          "recovery_calls": 0,
+          "refusal_kind": "typed-source-protocol-unsupported",
+          "scripted_calls": 2,
+          "source_file_bytes": 620100,
+          "upheld_rulings": null
+        },
+        {
+          "adapter_completed": false,
+          "adjudication_recorded": null,
+          "adjudicator_calls": 0,
+          "approved": null,
+          "case": "combined-budget",
+          "completed_roles": null,
+          "executed_values": [],
+          "recovery_calls": 0,
+          "refusal_kind": "typed-source-protocol-unsupported",
+          "scripted_calls": 2,
+          "source_file_bytes": 620103,
+          "upheld_rulings": null
+        },
+        {
+          "adapter_completed": false,
+          "adjudication_recorded": null,
+          "adjudicator_calls": 0,
+          "approved": null,
+          "case": "approval-source",
+          "completed_roles": null,
+          "executed_values": [],
+          "recovery_calls": 0,
+          "refusal_kind": "typed-source-protocol-unsupported",
+          "scripted_calls": 2,
+          "source_file_bytes": 620103,
+          "upheld_rulings": null
+        },
+        {
+          "adapter_completed": false,
+          "adjudication_recorded": null,
+          "adjudicator_calls": 0,
+          "approved": null,
+          "case": "selector-extra",
+          "completed_roles": null,
+          "executed_values": [],
+          "recovery_calls": 0,
+          "refusal_kind": "typed-source-protocol-unsupported",
+          "scripted_calls": 2,
+          "source_file_bytes": 620103,
+          "upheld_rulings": null
+        },
+        {
+          "adapter_completed": false,
+          "adjudication_recorded": null,
+          "adjudicator_calls": 0,
+          "approved": null,
+          "case": "unknown-criterion",
+          "completed_roles": null,
+          "executed_values": [],
+          "recovery_calls": 0,
+          "refusal_kind": "typed-source-protocol-unsupported",
+          "scripted_calls": 2,
+          "source_file_bytes": 620103,
+          "upheld_rulings": null
+        }
+      ],
+      "code_source_read_only": true,
+      "fixture_source_read_only": true,
+      "synthetic_protocol_only": true
+    },
+    "complete_external_oracle_match": false,
+    "source_preservation": {
+      "head": "416f392b17b56b2a43e67a3e430835902387941a",
+      "same_original_regular_files": 1675,
+      "original_prefix_preserved_hook_files": [
+        "crates/augmentagent-cli/src/autoship_review.rs",
+        "crates/augmentagent-cli/src/autoship_review_tests.rs",
+        "crates/augmentagent-cli/src/self_improve.rs",
+        "crates/augmentagent-cli/src/self_improve_review.rs"
+      ],
+      "intentionally_omitted_control_files": [
+        ".claude/settings.json"
+      ],
+      "unexpected_changes": [],
+      "limits": "Source preservation only; baseline behavioral result and native authority remain separate."
+    }
   },
   "registered": false,
   "limits": [
     "Manual driver uses the supported CargoBinary invocation shape and unchanged sandbox; this is not production isolated_observation, native resource admission or registry attestation.",
     "Synthetic scripted provider observations grant no native provider, independent acceptance/review, merge or deployment authority.",
     "Full guard/cache/crash/diagnostic matrix and normal independent amendment remain open; original PR1954 source/body/request/pinned verifier, failed native history and pause are preserved."
-  ]
+  ],
+  "native_workflow_separation": {
+    "status_observed_at": "2026-11-10T02:29:17.029292+00:00",
+    "workflow": "nolanmak/jarvis/pr/1954",
+    "paused": true,
+    "owner_pause_revision": 1,
+    "lease_active": false,
+    "internal_candidate": "3774813c719e6fa8931cffd99bac123252abb517",
+    "experiment_candidate": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+    "limits": "Experiments measure the published source, not the failed internal candidate that removed guard assertions. No result approves that internal candidate. Normal correction must preserve/restore the original guards and independently verify the actual next exact head without resetting the original history or accounting."
+  },
+  "identical_four_pinned_files_confirmed": true,
+  "comparison": {
+    "original_matches": false,
+    "candidate_matches": true,
+    "expected_object_location": "1703-c1-eight-case-worked-recipe.json:illustrative_external_oracle",
+    "expectation_authority": "Illustrative external controller comparison only; not independent acceptance, review or amendment authority."
+  }
 }
