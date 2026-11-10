@@ -7661,7 +7661,10 @@ fn finish_selected_command_attempt(
             },
         }
     };
-    store.finish_command_attempt(id, selected_at, outcome, reason, now)
+    let observation = if outcome == AttemptOutcome::Deferred && reason == "execution-readiness-blocked" {
+        result.as_ref().err().and_then(|error| error.downcast_ref::<crate::autoship_workflow::resource_refusal::Observation>())
+    } else { None };
+    store.finish_command_attempt_observed(id, selected_at, outcome, reason, now, observation)
 }
 
 /// Drive one self-improvement attempt. `dry_run` stops before opening the PR
