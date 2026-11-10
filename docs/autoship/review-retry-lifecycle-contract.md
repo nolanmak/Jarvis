@@ -228,22 +228,28 @@ it does not claim the remaining interfaces are ready. No benchmark is active.
 [Design audit receipt](1703-review-retry-lifecycle-design-audit.json) records the
 fresh-reader/source passes. A cross-document recording-hook contradiction was
 corrected and rechecked; the explicit unpaid-claim/eligibility/paid-episode
-terminology was independently rechecked. [All 39 mapped seams](1703-review-retry-lifecycle-seam-map.md)
-remain to be judged after their load-bearing interfaces are settled. A map is
-not a completed seam audit. The parked schema, native result custody, complete
-paid-path mapping and transaction questions still prevent implementation
-handoff; this checkpoint does not approve code or claim deployed recovery.
+terminology was independently rechecked. The receipt records completed design
+consistency judgments for [all 39 mapped seams](1703-review-retry-lifecycle-seam-map.md),
+with no unchecked mapped seams. Those judgments concern the stated working
+boundaries; the implementation handoff audit is not complete. The parked schema,
+native result custody, complete paid-path mapping and transaction questions still
+prevent implementation handoff. Settle those load-bearing interfaces and rerun
+the handoff audit before dependent coding. This checkpoint does not approve code
+or claim deployed recovery.
 
 
 ## Bounded accounting correlation implementation
 
 The separately scoped [receipt producer contract](native-admission-accounting-correlation-contract.md)
 passed fresh/source/all 23 mapped seam checks and is implemented under native
-child #1955 in draft PR #1956. [Test-first proof](1703-admission-accounting-correlation-test-first-proof.json)
+child #1955 in PR #1956. [Test-first proof](1703-admission-accounting-correlation-test-first-proof.json)
 records the runtime missing-field RED before the new API and managed GREEN at
 899e1479: 82 passing affected tests, zero failures and two existing isolated
-systemd cases ignored. Required hosted CI and independent approval/normal
-rollout remain pending.
+systemd cases ignored. The same receipt records all 15 reported hosted check runs
+successful at the full pinned head. Independent acceptance/code approval and
+normal rollout remain pending. The durable command is queued; the newer
+[worker repository-identity incident](1703-github-identity-outage-observation.json)
+must not be confused with a fresh capacity measurement from an older attempt.
 
 This returns the original committed accounting receipt into its protected
 admission audit alongside any original resource identity. It does not supply

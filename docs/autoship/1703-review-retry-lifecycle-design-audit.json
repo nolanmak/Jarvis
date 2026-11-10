@@ -205,5 +205,17 @@
     "review-retry-lifecycle-discovery.md": "80d33cebeb6399d6e084f1f673100191f76fc48a15db0ed68eb3eef6b64744eb",
     "review-dependency-recovery-contract.md": "397a9cc68d2c726a2b67e8179e728431748ec8db939acde803e202cd1645afb0",
     "1703-review-retry-lifecycle-seam-map.md": "c7f9747e4d80a03b8b71ac1b974c92e34df6465b1b40cffa5376c11dfb1a542b"
+  },
+  "recording_status_correction_20261110": {
+    "observed_at": "2026-11-10T02:37:07.689695+00:00",
+    "scope": "Recording/status correction only; no D1-D7 decision or load-bearing interface changed.",
+    "seam_status": "39 design-consistency judgments completed; implementation handoff audit remains incomplete.",
+    "hosted_ci_source": "1703-admission-accounting-correlation-test-first-proof.json:hosted_ci",
+    "hosted_head": "899e14797e25cf9ad8a6234c00c0eb2548cf5e76",
+    "hosted_all_reported_checkruns_success": true,
+    "independent_approval": false,
+    "rollout": false,
+    "current_contract_sha256": "637ddf3f0a59c351c6eb834278d5068fdaab3375974bc28b41ab7e14df16195c",
+    "remaining_gates_unchanged": true
   }
 }
