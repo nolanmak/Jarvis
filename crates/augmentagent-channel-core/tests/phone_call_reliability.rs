@@ -614,7 +614,7 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool, gap: Option<GapRec
         assert_eq!(ids[0], ids[1]);
     }
     assert!(!store.phone_provider_call(&call.id).unwrap().stop_requested);
-    ws.send(wire(json!({"event":"stop","sequenceNumber":"99","streamSid":"MZ-test","stop":{"accountSid":"AC-test","callSid":"CA00000000000000000000000000000001"}}))).await.unwrap();
+    ws.send(wire(json!({"event":"stop","sequenceNumber":"3","streamSid":"MZ-test","stop":{"accountSid":"AC-test","callSid":"CA00000000000000000000000000000001"}}))).await.unwrap();
     peer_task.await.unwrap();
     if let Some(task) = busy_task {
         task.await.unwrap();
