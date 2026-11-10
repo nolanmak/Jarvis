@@ -52,6 +52,26 @@
         "strict_source_schema_refuses_ambiguity_unknown_fields_and_invalid_bounds"
       ],
       "evidence": "Test declarations exist at the pinned published candidate; this inventory does not claim fresh execution."
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "42e81b85bf83697d4e36eeac3eb4e696a532cad4fca0ec5fe9039f0cc93cf6ad",
+      "test_names": [
+        "review_fragment_writer_accepts_exact_limit_and_refuses_extra_byte_without_publication",
+        "completed_review_fragments_survive_restart_but_never_become_approvals",
+        "crash_releases_sqlite_transaction_without_partial_publication"
+      ],
+      "evidence": "Selected existing test declarations at the pinned candidate, not fresh execution. The storage-level restart/SQLite tests do not establish end-to-end full-review cache/crash safety."
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_review_tests.rs",
+      "sha256": "ec0cbd9394abdde10798d7bbf38eec46607fcd9778394aebd8c20d7f8975fec6",
+      "test_names": [
+        "review_response_accepts_exact_byte_limit_and_refuses_one_more",
+        "diagnostic_origin_never_authorizes_shipping_even_with_clean_completed_reviews",
+        "cached_receipts_cannot_bypass_typed_repair_routing"
+      ],
+      "evidence": "Selected existing test declarations at the pinned candidate, not fresh execution. The storage-level restart/SQLite tests do not establish end-to-end full-review cache/crash safety."
     }
   ],
   "requirement_mapping": [
@@ -104,6 +124,24 @@
         "initial_half_budget_preserves_unicode_source_coordinates_without_omission"
       ],
       "fresh_packaged_execution": "not established by this inventory"
+    },
+    {
+      "requirement": "exact-response-and-fragment-writer-limits",
+      "tests": [
+        "review_response_accepts_exact_byte_limit_and_refuses_one_more",
+        "review_fragment_writer_accepts_exact_limit_and_refuses_extra_byte_without_publication"
+      ],
+      "fresh_packaged_execution": "not established by this inventory"
+    },
+    {
+      "requirement": "cache-diagnostic-and-crash-boundaries",
+      "tests": [
+        "completed_review_fragments_survive_restart_but_never_become_approvals",
+        "crash_releases_sqlite_transaction_without_partial_publication",
+        "diagnostic_origin_never_authorizes_shipping_even_with_clean_completed_reviews",
+        "cached_receipts_cannot_bypass_typed_repair_routing"
+      ],
+      "fresh_packaged_execution": "not established; these storage/authority tests are narrower than full-adapter interrupted review and replay"
     }
   ],
   "separate_open_requirements": [

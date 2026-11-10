@@ -1,5 +1,5 @@
 {
-  "status": "Untrusted worked recipe; fresh private candidate replay passed; fresh original replay in progress; not registered.",
+  "status": "Untrusted worked recipe; fresh private original/candidate replay completed; not registered.",
   "invocation": {
     "kind": "cargo_binary",
     "package": "augmentagent-auth",

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "observed_at": "2026-11-10T01:59:54.070225+00:00",
-  "status": "Fresh private candidate replay passed; original replay pending",
+  "observed_at": "2026-11-10T02:07:10.245002+00:00",
+  "status": "Fresh private original/candidate paired replay completed; original differs and candidate matches complete external oracle; not registered",
   "candidate_head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
   "original_head": "416f392b17b56b2a43e67a3e430835902387941a",
   "probe_sha256": "155902acaf6ff2430d4e3e682dc787068079728cab0839a3af8c8fb57bb7661b",
@@ -111,13 +111,71 @@
     }
   },
   "original": {
-    "state": "running",
-    "managed_session_id": 80581
+    "process_exit": 0,
+    "inner_entry_exit": 0,
+    "log_sha256": "149c2e7af36053ffd8cded59930c20f53542a762182620ba3f4e62000ce6445a",
+    "actual": {
+      "cases": [
+        {
+          "adapter_completed": false,
+          "adjudication_recorded": null,
+          "adjudicator_calls": 0,
+          "approved": null,
+          "case": "control",
+          "completed_roles": null,
+          "executed_values": [],
+          "recovery_calls": 0,
+          "refusal_kind": "typed-source-protocol-unsupported",
+          "scripted_calls": 2,
+          "source_file_bytes": 620103,
+          "upheld_rulings": null
+        },
+        {
+          "adapter_completed": false,
+          "adjudication_recorded": null,
+          "adjudicator_calls": 0,
+          "approved": null,
+          "case": "defect",
+          "completed_roles": null,
+          "executed_values": [],
+          "recovery_calls": 0,
+          "refusal_kind": "typed-source-protocol-unsupported",
+          "scripted_calls": 2,
+          "source_file_bytes": 620100,
+          "upheld_rulings": null
+        }
+      ],
+      "code_source_read_only": true,
+      "fixture_source_read_only": true,
+      "synthetic_protocol_only": true
+    },
+    "complete_external_oracle_match": false,
+    "source_preservation": {
+      "original_head": "416f392b17b56b2a43e67a3e430835902387941a",
+      "same_original_regular_files": 1675,
+      "original_prefix_preserved_hook_files": [
+        "crates/augmentagent-cli/src/autoship_review.rs",
+        "crates/augmentagent-cli/src/autoship_review_tests.rs",
+        "crates/augmentagent-cli/src/self_improve.rs",
+        "crates/augmentagent-cli/src/self_improve_review.rs"
+      ],
+      "intentionally_omitted_control_or_environment_files": [
+        ".claude/settings.json"
+      ],
+      "unexpected_changes": []
+    }
   },
   "registered": false,
   "limits": [
     "Manual private driver uses the supported CargoBinary invocation shape and unchanged kernel sandbox; it does not execute production isolated_observation, registry attestation or native resource admission.",
     "Synthetic scripted provider observations establish no native provider, review approval, merge authority, rollout or host-capacity recovery.",
     "Only the paired coherent control/defect cases are in this recipe; the separate guard inventory is not a fresh execution claim."
-  ]
+  ],
+  "comparison": {
+    "original_matches": false,
+    "candidate_matches": true,
+    "expected_object_location": "1703-c1-readable-behavior-recipe.json:illustrative_external_oracle",
+    "expectation_authority": "Illustrative external controller comparison only; not independent contract approval"
+  },
+  "identical_four_pinned_files_confirmed": true
 }
