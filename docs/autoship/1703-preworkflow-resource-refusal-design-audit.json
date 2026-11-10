@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "issue": 1957,
+  "parent": 1706,
+  "epic": 1703,
+  "source_head": "416f392b17b56b2a43e67a3e430835902387941a",
+  "passes": {
+    "fresh_reader": true,
+    "conversation_source_comparison": true,
+    "mapped_seams": 12,
+    "checked_seams": 12
+  },
+  "initial_findings": {
+    "count": 6,
+    "resolved_and_rechecked": 6,
+    "topics": [
+      "attempt identity/fence",
+      "sanitized schema",
+      "dedup versus numeric freshness",
+      "visibility/retirement",
+      "write-side schema transition",
+      "structured observation transport"
+    ]
+  },
+  "seams": [
+    {
+      "boundary": "controller \u2192 readiness",
+      "design_consistent": true
+    },
+    {
+      "boundary": "readiness \u2192 resource error",
+      "design_consistent": true
+    },
+    {
+      "boundary": "error \u2192 completion",
+      "design_consistent": true
+    },
+    {
+      "boundary": "selection \u2192 storage fence",
+      "design_consistent": true
+    },
+    {
+      "boundary": "completion \u2192 atomic progress",
+      "design_consistent": true
+    },
+    {
+      "boundary": "storage \u2192 shared status",
+      "design_consistent": true
+    },
+    {
+      "boundary": "status \u2192 CLI",
+      "design_consistent": true
+    },
+    {
+      "boundary": "status \u2192 private status",
+      "design_consistent": true
+    },
+    {
+      "boundary": "progress \u2192 private delivery",
+      "design_consistent": true
+    },
+    {
+      "boundary": "dedup \u2192 state/event/delivery split",
+      "design_consistent": true
+    },
+    {
+      "boundary": "write initialization \u2192 writable schema",
+      "design_consistent": true
+    },
+    {
+      "boundary": "legacy store \u2192 read-only compatibility",
+      "design_consistent": true
+    }
+  ],
+  "audit_scope": "Design-only readers; requested Sonnet model unavailable, inherited model used. No code implementation/review delegated.",
+  "implementation_proven": false,
+  "hosted_ci_proven": false,
+  "independent_code_approval": false,
+  "deployed": false
+}
