@@ -1,0 +1,236 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-10T01:39:55.677553+00:00",
+  "epic": 1703,
+  "adapter_issue": 1943,
+  "original_pr": 1954,
+  "baseline_head": "416f392b17b56b2a43e67a3e430835902387941a",
+  "candidate_head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+  "same_probe_sha256": "5319b0c566122db61756b8e8af9107035a530098d9836e97e6811350342bd923",
+  "baseline": {
+    "cases": [
+      {
+        "adapter_completed": false,
+        "adjudication_recorded": null,
+        "adjudicator_calls": 0,
+        "approved": null,
+        "case": "control",
+        "completed_roles": null,
+        "executed_values": [],
+        "recovery_calls": 0,
+        "refusal_kind": "typed-source-protocol-unsupported",
+        "scripted_calls": 2,
+        "source_file_bytes": 620103,
+        "upheld_rulings": null
+      },
+      {
+        "adapter_completed": false,
+        "adjudication_recorded": null,
+        "adjudicator_calls": 0,
+        "approved": null,
+        "case": "defect",
+        "completed_roles": null,
+        "executed_values": [],
+        "recovery_calls": 0,
+        "refusal_kind": "typed-source-protocol-unsupported",
+        "scripted_calls": 2,
+        "source_file_bytes": 620100,
+        "upheld_rulings": null
+      }
+    ],
+    "code_source_read_only": true,
+    "fixture_source_read_only": true,
+    "synthetic_protocol_only": true
+  },
+  "candidate": {
+    "cases": [
+      {
+        "adapter_completed": true,
+        "adjudication_recorded": false,
+        "adjudicator_calls": 0,
+        "approved": true,
+        "case": "control",
+        "completed_roles": 3,
+        "executed_values": [
+          [
+            3,
+            5,
+            3
+          ],
+          [
+            3,
+            5,
+            3
+          ],
+          [
+            3,
+            5,
+            3
+          ]
+        ],
+        "recovery_calls": 3,
+        "refusal_kind": null,
+        "scripted_calls": 6,
+        "source_file_bytes": 620103,
+        "upheld_rulings": 0
+      },
+      {
+        "adapter_completed": true,
+        "adjudication_recorded": true,
+        "adjudicator_calls": 1,
+        "approved": false,
+        "case": "defect",
+        "completed_roles": 3,
+        "executed_values": [
+          [
+            3,
+            5,
+            8
+          ],
+          [
+            3,
+            5,
+            8
+          ],
+          [
+            3,
+            5,
+            8
+          ],
+          [
+            3,
+            5,
+            8
+          ]
+        ],
+        "recovery_calls": 3,
+        "refusal_kind": null,
+        "scripted_calls": 7,
+        "source_file_bytes": 620100,
+        "upheld_rulings": 1
+      }
+    ],
+    "code_source_read_only": true,
+    "fixture_source_read_only": true,
+    "synthetic_protocol_only": true
+  },
+  "illustrative_external_oracle": {
+    "expected": {
+      "cases": [
+        {
+          "case": "control",
+          "adapter_completed": true,
+          "approved": true,
+          "refusal_kind": null,
+          "source_file_bytes": 620103,
+          "scripted_calls": 6,
+          "recovery_calls": 3,
+          "adjudicator_calls": 0,
+          "executed_values": [
+            [
+              3,
+              5,
+              3
+            ],
+            [
+              3,
+              5,
+              3
+            ],
+            [
+              3,
+              5,
+              3
+            ]
+          ],
+          "completed_roles": 3,
+          "adjudication_recorded": false,
+          "upheld_rulings": 0
+        },
+        {
+          "case": "defect",
+          "adapter_completed": true,
+          "approved": false,
+          "refusal_kind": null,
+          "source_file_bytes": 620100,
+          "scripted_calls": 7,
+          "recovery_calls": 3,
+          "adjudicator_calls": 1,
+          "executed_values": [
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ]
+          ],
+          "completed_roles": 3,
+          "adjudication_recorded": true,
+          "upheld_rulings": 1
+        }
+      ],
+      "fixture_source_read_only": true,
+      "code_source_read_only": true,
+      "synthetic_protocol_only": true
+    },
+    "baseline_match": false,
+    "candidate_match": true,
+    "registered": false,
+    "location": "Controller outside observed process; expectations are absent from the Rust probe"
+  },
+  "fixture": {
+    "defect": {
+      "root": "/tmp/autoship-sealed-runtime-02rc2xym/runtime/full-review-baseline-fixture",
+      "base": "51f86d5f57dae806feabca0ec17d50d6a6e931ce",
+      "head": "f2b32a88bc1bb4e74cd7d4ec85f9c80640ba9cc2",
+      "source_bytes": 620100,
+      "source_sha256": "8a625780f8b2301fd838bc9214a1ab38f691b05d6ce1122c1423e95102eea9e4"
+    },
+    "control": {
+      "base": "91f7f3d67fe910085af4d81c79e9dae0c8a97227",
+      "head": "02d6bea294071c6f2fbf954991fddbce45b15778",
+      "source_bytes": 620103
+    }
+  },
+  "scope": {
+    "production_path": "Actual run_inner review/recovery plus final-authority adapter, original immutable Git snapshots and actual validation routines",
+    "scripted_transport": "Only provider construction substituted in private cfg(test); real fresh-review session protocol and synthetic availability fixture",
+    "executable_behavior": "Only actual source bytes delivered in recovery/final-adjudication prompts are compiled/executed; no source-keyword or finding-presence substitute",
+    "original_evidence": "The scripted recovery consumer requires every original evidence entry with identical bytes",
+    "source_read_only": true,
+    "guard_assertions_removed": false,
+    "source_identity": {
+      "verified": 1679,
+      "hook_original_prefixes_verified": [
+        "crates/augmentagent-cli/src/autoship_review.rs",
+        "crates/augmentagent-cli/src/autoship_review_tests.rs",
+        "crates/augmentagent-cli/src/self_improve.rs",
+        "crates/augmentagent-cli/src/self_improve_review.rs"
+      ],
+      "omitted_control_configuration": [
+        ".claude/settings.json"
+      ]
+    },
+    "replay": "Same Rust probe and wrapping invocation/profile, original/candidate materialized in turn; fresh disposable HOME per run. Not a fresh full registered-entry replay."
+  },
+  "not_proven": [
+    "Real provider/native VM, actual model admissions or kernel VM teardown",
+    "Completed-cache/crash/budget/path-exclusion matrix under this private profile",
+    "Fresh full CargoBinary entry/export replay and independently registered replacement verifier",
+    "Independent code approval, original PR1954 amendment, merge, normal rollout or restored Autoship"
+  ]
+}
