@@ -251,3 +251,12 @@ owns the business oracle. The repository privacy scanner passes all four exact
 proposed bodies; hosted gitleaks and all required exact-head CI remain mandatory.
 A successful local prototype is not a registered VerifierReceipt or merge
 permission. #1954 remains paused and original #1703 exits remain open.
+
+
+## Controlled provider seam on original source (2026-11-10)
+
+[Transport-only observation](1703-private-review-transport-observation.json) now demonstrates two scripted provider calls through the actual fresh-review session protocol, with two distinct observed IDs and a positive copied-source read-only check. The original 416f392b review file matches its Git blob before private cfg(test) instrumentation. A local test namespace substitutes the provider factory with FallbackReasoner::for_tests; production method bodies and native-session/router checks remain unchanged. A synthetic, non-usable availability file lives only under the disposable HOME. No real provider CLI, credential policy or registered native review/merge authority is established.
+
+The first attempt used the wrong Rust module name and selected zero tests; frame validation refused it. The corrected filter reached the actual router and failed its absent-auth-availability check before the scripted callback. Both are setup failures, not behavioral RED. The third run supplies only a private synthetic availability fixture and succeeds. Correct test path is `self_improve::aligned_review::__autoship_review_transport_v1::observe_transport`.
+
+The corrected runs reuse the first run's materialized source and compiled test with the same two unchanged Landlock/seccomp policies, offline/locked Cargo profile and existing managed target. This is not a fresh full-program rebuild/replay claim. The initial probe does not exercise run_inner, source recovery, candidate/caller coverage, cross-item behavior, cache/crash guards or final authority. Those remain necessary before proposing a replacement C1 acceptance recipe. Original #1954 request, published source, pinned verifier and failed native history remain preserved/paused. C2 custody/holds and full host capacity/owner ingress/live recovery remain open.

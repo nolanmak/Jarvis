@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-10T00:51:23.877781+00:00",
+  "epic": 1703,
+  "adapter_issue": 1943,
+  "retry_lifecycle_issue": 1952,
+  "base": "416f392b17b56b2a43e67a3e430835902387941a",
+  "original_review_source_sha256": "3b944e7337ce0c7c3b927e1c0ecc08dcc2306be9583713568d09b02f76eca4dd",
+  "test_probe_sha256": "c10ee2be5e00aa2c3c52c19ddc7962c3d465ee5d17379a03d4f74ea24a72652c",
+  "data": {
+    "distinct_observed_ids": 2,
+    "fixture_source_read_only": true,
+    "synthetic_protocol_only": true,
+    "transport_calls": 2
+  },
+  "attempts": [
+    {
+      "version": 1,
+      "terminal": true,
+      "exit_code": 1,
+      "classification": "setup failure: incorrect test module filter selected zero tests; no frame"
+    },
+    {
+      "version": 2,
+      "terminal": true,
+      "exit_code": 1,
+      "classification": "setup failure: real router refused missing Codex authentication availability before scripted callback"
+    },
+    {
+      "version": 3,
+      "terminal": true,
+      "exit_code": 0,
+      "classification": "valid controlled-transport observation"
+    }
+  ],
+  "fixture": {
+    "factory_injection": "Private cfg(test) local namespace reexports the real core and substitutes only build_workflow_pinned with FallbackReasoner::for_tests and one Scripted provider.",
+    "auth_availability": "Synthetic non-usable auth.json under disposable HOME; no real credential/provider policy copied; original router/auth logic retained.",
+    "session_protocol": "Actual native_session::fresh_review_scope/current_for/begin/observe/finish with clearly synthetic IDs; data publishes count only.",
+    "confinement": "Same two unchanged production Landlock/seccomp profiles; copied Rust source is read-only.",
+    "replay": "V2/V3 reuse V1 materialized source and compiled test under both original sandbox policies and original Cargo profile flags; only filter and synthetic availability fixture changed.",
+    "compilation": "Offline/locked, dev/test debuginfo zero and incremental disabled, one job, observation-only ort/alternative-backend.",
+    "managed_target": "Existing session worktree cache; no new/unregistered target or resource-floor override."
+  },
+  "native_registered_verifier": false,
+  "real_native_provider_or_review_proof": false,
+  "c1_behavior_acceptance": false,
+  "c2_implementation_readiness": false,
+  "remaining": [
+    "Full production review/recovery path with committed >512KiB fixture and two related distant items in one recovery prompt.",
+    "Actual cross-item behavior and final-authority source consumption, plus all existing guards/budgets/tests.",
+    "Normal independent registration/review/rollout; original PR1954 request, published input, verifier and native attempt remain preserved and paused."
+  ]
+}
