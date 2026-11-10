@@ -53,3 +53,10 @@ Original main is `416f392b17b56b2a43e67a3e430835902387941a`. The local regressio
 PR [#1958](https://github.com/nolanmak/Jarvis/pull/1958) at `e7d43a3eeb000f84cd4b4a026a9d0e7e89b1b8ae` implements this reporting boundary. [Test-first proof](1703-preworkflow-resource-refusal-test-first-proof.json) records the original missing-metric RED, two additional compatibility/privacy REDs and final 271 passing affected cases (two existing ignored), including all 11 new cases. A broader local run passed 1,744 cases but failed six local-phone Unix socket tests; unchanged main reproduced all six identical SUN_LEN failures. This is not a full local-suite pass.
 
 The implementation preserves the old fingerprint when no resource observation exists and returns a fixed safe diagnostic for invalid stored observations. Required hosted CI, independent exact-head code approval, normal rollout and actual command/private delivery remain pending. Automatic capacity and full recovery are not claimed.
+
+
+## Hosted verification and normal command
+
+All 16 reported hosted checks/statuses pass at `e7d43a3e`. Targeted run `42727633885`, job `129537246068`, confirms core 694 passed/15 ignored and CLI 1,752 passed/33 ignored, with zero failures; all 11 new cases appear individually. The no-secret no-op and CodeRabbit success do not establish independent code approval.
+
+The [normal command proof](1703-pr1958-command-proof.json) records one accepted Codex-pinned PR-target request, then a selected readiness deferral before an execution workflow exists. The command and public source remain preserved. No merge or rollout has occurred. This does not close full capacity or recovery.

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-10T00:43:14.725068+00:00",
+  "parent_issue": 1703,
+  "issue": 1957,
+  "pr": 1958,
+  "head": "e7d43a3eeb000f84cd4b4a026a9d0e7e89b1b8ae",
+  "command": "augmentagent autopr run --repo nolanmak/Jarvis --pr 1958 --provider codex --until merged --request-id autoship-recovery-pr1958-20261109 --json",
+  "submission": {
+    "accepted": true,
+    "complete": false,
+    "reason": "queued",
+    "request_id": "autoship-recovery-pr1958-20261109",
+    "workflow": "nolanmak/jarvis/pr/1958",
+    "provider": "codex",
+    "joined": false
+  },
+  "status": {
+    "stage": "queued",
+    "reason": "execution-readiness-blocked",
+    "last_attempt": {
+      "eligible_at_ms": 1794271547546,
+      "finished_at_ms": 1794271251470,
+      "outcome": "deferred",
+      "reason": "execution-readiness-blocked",
+      "selected_at_ms": 1794271247546
+    },
+    "lease": {
+      "active": false
+    },
+    "merge": {
+      "state": "not-confirmed"
+    },
+    "next_action": "retry_worker_attempt"
+  },
+  "limits": [
+    "Normal CLI acceptance and a selected deferred attempt are not model execution, independent code approval, merge or rollout.",
+    "No request reset, owner impersonation, source edit after submission, manual merge, capacity change or copied service environment.",
+    "Independent review, normal rollout and live CLI/private delivery remain unverified."
+  ]
+}

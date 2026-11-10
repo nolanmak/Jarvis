@@ -57,7 +57,7 @@
     "ci_contract": true,
     "privacy_scan": true,
     "whitespace": true,
-    "required_hosted_ci": "pending",
+    "required_hosted_ci": "all 16 reported checks/statuses success at exact candidate head",
     "independent_code_approval": "pending",
     "normal_rollout": "pending",
     "live_command_private_delivery": "unverified"
@@ -66,5 +66,23 @@
     "No production resource policy, capacity, native session, allowance or service was changed.",
     "Observation data is not admission, live-readiness, teardown, merge or rollout authority.",
     "Automatic host sizing #1917, review retry/custody, productive owner ingress and full #1703 live/fault/soak acceptance remain open."
-  ]
+  ],
+  "hosted_exact_head": {
+    "head": "e7d43a3eeb000f84cd4b4a026a9d0e7e89b1b8ae",
+    "run_id": 42727633885,
+    "job_id": 129537246068,
+    "conclusion": "success",
+    "core_unit": {
+      "passed": 694,
+      "failed": 0,
+      "ignored": 15
+    },
+    "cli_unit": {
+      "passed": 1752,
+      "failed": 0,
+      "ignored": 33
+    },
+    "new_cases_individually_confirmed": 11,
+    "accepted_independent_review": false
+  }
 }
