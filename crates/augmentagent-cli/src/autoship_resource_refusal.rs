@@ -190,7 +190,7 @@ impl Observation {
 
     pub fn decode(raw: &str) -> anyhow::Result<Self> {
         anyhow::ensure!(raw.len() <= LIMIT, "resource observation exceeds bound");
-        Ok(serde_json::from_str(raw)?)
+        serde_json::from_str(raw).map_err(|_| anyhow::anyhow!("invalid resource observation"))
     }
 
     pub fn identity(&self) -> Value {
@@ -652,25 +652,65 @@ mod tests {
     }
     #[test]
     fn commands_without_resource_observations_keep_the_legacy_progress_fingerprint() {
-        use sha2::{Digest,Sha256};
-        let dir=tempfile::tempdir().unwrap();let (store,id)=selected(&dir.path().join("workflow.db"));
-        let event=store.progress_events(&id).unwrap().pop().unwrap();
-        let expected=format!("{:x}",Sha256::digest(serde_json::to_vec(&(&event.kind,event.stage,&event.reason,
-            &event.next_action,&event.evidence_digest,&event.actual_provider,&event.actual_provider_role)).unwrap()));
-        let actual:String=store.conn.query_row("SELECT fingerprint FROM workflow_progress_state WHERE workflow=?1",[&id],|row|row.get(0)).unwrap();
-        assert_eq!(actual,expected,"schema upgrade would resend an unchanged existing blocker");
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let (store, id) = selected(&dir.path().join("workflow.db"));
+        let event = store.progress_events(&id).unwrap().pop().unwrap();
+        let expected = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    &event.kind,
+                    event.stage,
+                    &event.reason,
+                    &event.next_action,
+                    &event.evidence_digest,
+                    &event.actual_provider,
+                    &event.actual_provider_role
+                ))
+                .unwrap()
+            )
+        );
+        let actual: String = store
+            .conn
+            .query_row(
+                "SELECT fingerprint FROM workflow_progress_state WHERE workflow=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            actual, expected,
+            "schema upgrade would resend an unchanged existing blocker"
+        );
     }
 
     #[test]
     fn corrupt_stored_observation_cannot_leak_untrusted_field_names_in_status_errors() {
-        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");let (store,id)=selected(&path);
-        assert!(finish(&store,&id,2,&Observation::capture(&readiness()).unwrap()));
-        let mut invalid=serde_json::to_value(Observation::capture(&readiness()).unwrap()).unwrap();
-        invalid["PRIVATE_untrusted_field"]=json!(1);
-        store.conn.execute("UPDATE command_resource_refusal SET payload=?2 WHERE workflow=?1",rusqlite::params![id,invalid.to_string()]).unwrap();
-        let (code,status)=crate::autoship_commands::status(&path,&id,4,5);
-        assert_eq!(code,4);
-        assert!(!status.to_string().contains("PRIVATE"),"invalid stored receipt leaked its rejected field: {status}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workflow.db");
+        let (store, id) = selected(&path);
+        assert!(finish(
+            &store,
+            &id,
+            2,
+            &Observation::capture(&readiness()).unwrap()
+        ));
+        let mut invalid =
+            serde_json::to_value(Observation::capture(&readiness()).unwrap()).unwrap();
+        invalid["PRIVATE_untrusted_field"] = json!(1);
+        store
+            .conn
+            .execute(
+                "UPDATE command_resource_refusal SET payload=?2 WHERE workflow=?1",
+                rusqlite::params![id, invalid.to_string()],
+            )
+            .unwrap();
+        let (code, status) = crate::autoship_commands::status(&path, &id, 4, 5);
+        assert_eq!(code, 4);
+        assert!(
+            !status.to_string().contains("PRIVATE"),
+            "invalid stored receipt leaked its rejected field: {status}"
+        );
     }
-
 }

@@ -160,7 +160,13 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
         super::submission::read_command_attempt(tx, workflow)?.and_then(|attempt| attempt.resource_observation())
     } else { None };
     let resource_identity = resource_refusal.as_ref().map(|value| value.observation.identity());
-    let fingerprint=format!("{:x}",Sha256::digest(serde_json::to_vec(&(&kind,stage,&reason,&action,&evidence_digest,&actual_provider,&actual_provider_role,&resource_identity))?));
+    let fingerprint_input = if resource_identity.is_some() {
+        serde_json::to_vec(&(&kind,stage,&reason,&action,&evidence_digest,&actual_provider,&actual_provider_role,&resource_identity))?
+    } else {
+        // Preserve the deployed fingerprint for all pre-existing projections.
+        serde_json::to_vec(&(&kind,stage,&reason,&action,&evidence_digest,&actual_provider,&actual_provider_role))?
+    };
+    let fingerprint=format!("{:x}",Sha256::digest(fingerprint_input));
     let changed=previous.as_ref().is_none_or(|p|p.1!=fingerprint);
     let sequence=previous.as_ref().map_or(1,|p|p.0+i64::from(changed));
     let progress=Progress {workflow:workflow.into(),sequence,kind,stage,reason,next_action:action,eligible_at_ms:eligible,
