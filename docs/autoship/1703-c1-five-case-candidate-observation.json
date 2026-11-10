@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-10T02:18:08.754038+00:00",
+  "candidate_head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+  "probe_sha256": "0d06bcaebd3feaac0f776e87e69febe42166422facf167c204b86f6e99c00fc4",
+  "files_sha256": {
+    "crates/augmentagent-auth/src/bin/autoship_review_observer.rs": "02f1c9993e9c9c82cbb1e9ea19c92c6f1787c5fcba497fd585ca9cfda776a234",
+    "autoship_verifiers/issue_1943/observe.py": "af44685e3e3a94186c8b4d66f7d84120bb5396a0c66a9333aeea3e7cb57e311d",
+    "autoship_verifiers/issue_1943/review_probe.rs": "0d06bcaebd3feaac0f776e87e69febe42166422facf167c204b86f6e99c00fc4",
+    "autoship_verifiers/issue_1943/public_env_template.txt": "e3452397d5d0ab9c3dd8a0069031b298de312c73a151baa05b91fc41731a0a51"
+  },
+  "recipe": "1703-c1-five-case-worked-recipe.json",
+  "candidate": {
+    "process_exit": 0,
+    "inner_entry_exit": 0,
+    "log_sha256": "20731f1b96663ab45b58acfea77be0857df44b1cee230d78cb0c6949f81a98dc",
+    "actual": {
+      "cases": [
+        {
+          "adapter_completed": true,
+          "adjudication_recorded": false,
+          "adjudicator_calls": 0,
+          "approved": true,
+          "case": "control",
+          "completed_roles": 3,
+          "executed_values": [
+            [
+              3,
+              5,
+              3
+            ],
+            [
+              3,
+              5,
+              3
+            ],
+            [
+              3,
+              5,
+              3
+            ]
+          ],
+          "recovery_calls": 3,
+          "refusal_kind": null,
+          "scripted_calls": 6,
+          "source_file_bytes": 620103,
+          "upheld_rulings": 0
+        },
+        {
+          "adapter_completed": true,
+          "adjudication_recorded": true,
+          "adjudicator_calls": 1,
+          "approved": false,
+          "case": "defect",
+          "completed_roles": 3,
+          "executed_values": [
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ]
+          ],
+          "recovery_calls": 3,
+          "refusal_kind": null,
+          "scripted_calls": 7,
+          "source_file_bytes": 620100,
+          "upheld_rulings": 1
+        },
+        {
+          "adapter_completed": true,
+          "adjudication_recorded": false,
+          "adjudicator_calls": 0,
+          "approved": true,
+          "case": "bytes-control",
+          "completed_roles": 3,
+          "executed_values": [
+            [
+              3,
+              5,
+              3
+            ],
+            [
+              3,
+              5,
+              3
+            ],
+            [
+              3,
+              5,
+              3
+            ]
+          ],
+          "recovery_calls": 3,
+          "refusal_kind": null,
+          "scripted_calls": 6,
+          "source_file_bytes": 620103,
+          "upheld_rulings": 0
+        },
+        {
+          "adapter_completed": true,
+          "adjudication_recorded": true,
+          "adjudicator_calls": 1,
+          "approved": false,
+          "case": "bytes-defect",
+          "completed_roles": 3,
+          "executed_values": [
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ]
+          ],
+          "recovery_calls": 3,
+          "refusal_kind": null,
+          "scripted_calls": 7,
+          "source_file_bytes": 620100,
+          "upheld_rulings": 1
+        },
+        {
+          "adapter_completed": false,
+          "adjudication_recorded": null,
+          "adjudicator_calls": 0,
+          "approved": null,
+          "case": "combined-budget",
+          "completed_roles": null,
+          "executed_values": [],
+          "recovery_calls": 0,
+          "refusal_kind": "evidence-budget",
+          "scripted_calls": 1,
+          "source_file_bytes": 620103,
+          "upheld_rulings": null
+        }
+      ],
+      "code_source_read_only": true,
+      "fixture_source_read_only": true,
+      "synthetic_protocol_only": true
+    },
+    "complete_external_oracle_match": true
+  },
+  "original_exact_program_replay": false,
+  "registered": false,
+  "limits": [
+    "Fresh manual supported-invocation-shaped entry under unchanged sandbox, not production isolated_observation, native provider/resource/registry attestation, independent review or merge authority.",
+    "The earlier two-case exact paired original/candidate comparison is separate evidence, not the original observation for this five-case program.",
+    "The next eight-case recipe includes these five cases plus strict malformed-response refusals; its exact paired replay remains pending.",
+    "Full guard/cache/crash/native acceptance, automatic host capacity, owner ingress and parent rollout/acceptance remain open."
+  ]
+}

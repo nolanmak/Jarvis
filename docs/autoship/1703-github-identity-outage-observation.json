@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-10T02:18:08.754038+00:00",
+  "main_head_at_source_inspection": "4ebb2b74",
+  "worker": {
+    "unit": "augmentagent-autopr.service",
+    "service_state": "active/running",
+    "observed_warning": "command queue identity unavailable; normal polling remains active",
+    "sample_times_utc": [
+      "2026-11-10T02:15:43.291979Z",
+      "2026-11-10T02:16:13.297329Z"
+    ],
+    "source": "Existing service regular stderr descriptor, offset-preserving bounded read with exact timestamp/level/logger filter.",
+    "queue_statuses": {
+      "nolanmak/jarvis/pr/1956": {
+        "stage": "queued",
+        "merge": "not-confirmed",
+        "last_attempt_selected_at_ms": 1794272567579,
+        "last_attempt_reason": "execution-readiness-blocked"
+      },
+      "nolanmak/jarvis/pr/1958": {
+        "stage": "queued",
+        "merge": "not-confirmed",
+        "last_attempt_selected_at_ms": 1794272508555,
+        "last_attempt_reason": "execution-readiness-blocked"
+      }
+    }
+  },
+  "source_explanation": {
+    "polling": "self_improve.rs::AutoPrLoop::run retries repository identity on the 30-second command wake-up. If identity is unavailable it continues waiting and does not select the due command from that wake-up.",
+    "identity": "self_improve_workflow.rs::canonical_repository calls gh repo view for nameWithOwner and refuses failed/noncanonical responses.",
+    "limits": "Regular scheduled polling is a separate lane. This observation does not prove every lane is stopped."
+  },
+  "interactive_auth": {
+    "default_login": "nolanmak",
+    "observed_http_status": 401,
+    "owner_restore_question": "Already pending; no token requested in chat or alternate account used."
+  },
+  "inference": "Interactive auth failure is a plausible cause of the worker repository-identity failure. The service credential environment and failing gh stderr were not inspected; shared credential cause is not independently established.",
+  "actions": [
+    "Preserved existing queued jobs and original paused PR1954; no reset, duplicate submission, token rotation, account switch, service restart or bypass.",
+    "Continue independent local validation while the owner restores or clarifies the existing login."
+  ],
+  "limits": [
+    "The older execution-readiness status is not a current resource metric. Do not report capacity-exhausted as the present worker cause from that stale row.",
+    "No GitHub write, merge or rollout is established."
+  ]
+}
