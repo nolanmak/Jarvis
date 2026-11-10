@@ -16,6 +16,56 @@ fn started() -> Message {
 }
 
 #[tokio::test]
+async fn queued_research_requests_a_spoken_acknowledgment_without_waiting_for_results() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/", listener.local_addr().unwrap());
+    let (sent, received) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(tcp).await.unwrap();
+        let _ = ws.next().await.unwrap().unwrap();
+        ws.send(started()).await.unwrap();
+        ws.send(Message::Text(
+            json!({"type":"session.delegation.created","offset_ms":10,
+            "delegation":{"id":"research","type":"delegation","target":"client"}})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let update: Value =
+            serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        sent.send(update).unwrap();
+        // Deliberately never complete the research. Acknowledgment must not
+        // depend on either backend results or provider context receipts.
+        std::future::pending::<()>().await;
+    });
+    let mut connection = LiveConnection::connect_to(&endpoint, "synthetic-key", "Speak briefly.")
+        .await
+        .unwrap();
+    assert!(matches!(
+        connection.next().await.unwrap(),
+        LiveInput::Delegation { .. }
+    ));
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        connection.acknowledge_queued("research"),
+    )
+    .await
+    .expect("accepted research must be acknowledged immediately")
+    .unwrap();
+    let update = received.await.unwrap();
+    server.abort();
+    let _ = server.await;
+    assert_eq!(
+        update["type"], "session.commentary.append",
+        "silent thinking cancels automatic speech and leaves the caller waiting"
+    );
+    assert_eq!(update["delegation_id"], "research");
+    assert!(!update["content"].as_str().unwrap().trim().is_empty());
+}
+
+#[tokio::test]
 async fn socket_handshake_startup_audio_and_final_usage() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}/", listener.local_addr().unwrap());
@@ -211,7 +261,8 @@ async fn secure_connection_reports_tls_failure_without_panicking() {
     });
     let result = tokio::spawn(async move {
         LiveConnection::connect_test(&endpoint, "synthetic-key", "silent").await
-    }).await;
+    })
+    .await;
     server.abort();
     assert!(result.is_ok(), "TLS provider selection panicked");
     assert!(matches!(result.unwrap(), Err(LiveError::ConnectionLost)));
