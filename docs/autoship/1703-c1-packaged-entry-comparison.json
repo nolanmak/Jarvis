@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-10T01:59:54.070225+00:00",
+  "status": "Fresh private candidate replay passed; original replay pending",
+  "candidate_head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+  "original_head": "416f392b17b56b2a43e67a3e430835902387941a",
+  "probe_sha256": "155902acaf6ff2430d4e3e682dc787068079728cab0839a3af8c8fb57bb7661b",
+  "files_sha256": {
+    "crates/augmentagent-auth/src/bin/autoship_review_observer.rs": "02f1c9993e9c9c82cbb1e9ea19c92c6f1787c5fcba497fd585ca9cfda776a234",
+    "autoship_verifiers/issue_1943/observe.py": "83af9bc9c6ea4defb933aba4f09a6d4cb7c11c77cc719117e603aaf697463c74",
+    "autoship_verifiers/issue_1943/review_probe.rs": "155902acaf6ff2430d4e3e682dc787068079728cab0839a3af8c8fb57bb7661b",
+    "autoship_verifiers/issue_1943/public_env_template.txt": "e3452397d5d0ab9c3dd8a0069031b298de312c73a151baa05b91fc41731a0a51"
+  },
+  "invocation": {
+    "kind": "cargo_binary",
+    "package": "augmentagent-auth",
+    "bin": "autoship_review_observer",
+    "args": []
+  },
+  "candidate": {
+    "process_exit": 0,
+    "inner_entry_exit": 0,
+    "log_sha256": "e78b03b19943f5921cb2955a21fee9a0ca006eda9fd045123f3ea5ade3d71db0",
+    "actual": {
+      "cases": [
+        {
+          "adapter_completed": true,
+          "adjudication_recorded": false,
+          "adjudicator_calls": 0,
+          "approved": true,
+          "case": "control",
+          "completed_roles": 3,
+          "executed_values": [
+            [
+              3,
+              5,
+              3
+            ],
+            [
+              3,
+              5,
+              3
+            ],
+            [
+              3,
+              5,
+              3
+            ]
+          ],
+          "recovery_calls": 3,
+          "refusal_kind": null,
+          "scripted_calls": 6,
+          "source_file_bytes": 620103,
+          "upheld_rulings": 0
+        },
+        {
+          "adapter_completed": true,
+          "adjudication_recorded": true,
+          "adjudicator_calls": 1,
+          "approved": false,
+          "case": "defect",
+          "completed_roles": 3,
+          "executed_values": [
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ],
+            [
+              3,
+              5,
+              8
+            ]
+          ],
+          "recovery_calls": 3,
+          "refusal_kind": null,
+          "scripted_calls": 7,
+          "source_file_bytes": 620100,
+          "upheld_rulings": 1
+        }
+      ],
+      "code_source_read_only": true,
+      "fixture_source_read_only": true,
+      "synthetic_protocol_only": true
+    },
+    "complete_external_oracle_match": true,
+    "source_preservation": {
+      "candidate_head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+      "same_original_regular_files": 1679,
+      "original_prefix_preserved_hook_files": [
+        "crates/augmentagent-cli/src/autoship_review.rs",
+        "crates/augmentagent-cli/src/autoship_review_tests.rs",
+        "crates/augmentagent-cli/src/self_improve.rs",
+        "crates/augmentagent-cli/src/self_improve_review.rs"
+      ],
+      "intentionally_omitted_control_or_environment_files": [
+        ".claude/settings.json"
+      ],
+      "unexpected_changes": [],
+      "scope": "Fresh candidate replay copied source; source checks do not establish runtime guard coverage or native approval."
+    }
+  },
+  "original": {
+    "state": "running",
+    "managed_session_id": 80581
+  },
+  "registered": false,
+  "limits": [
+    "Manual private driver uses the supported CargoBinary invocation shape and unchanged kernel sandbox; it does not execute production isolated_observation, registry attestation or native resource admission.",
+    "Synthetic scripted provider observations establish no native provider, review approval, merge authority, rollout or host-capacity recovery.",
+    "Only the paired coherent control/defect cases are in this recipe; the separate guard inventory is not a fresh execution claim."
+  ]
+}

@@ -275,3 +275,12 @@ Discovery correction: the review module has its own direct read-only Git subproc
 Setup failures before the final pair are retained in local experiment context: an import ambiguity caused by the private factory namespace, a semantic compiler missing TMPDIR (linker attempted denied /tmp), and a stripped unsupported DB override that reused an old private lease. The fixes preserve the original tests via explicit real-core import, set only the compiler's allowed scratch directory, and use fresh allowed private HOME instead of altering environment policy or old fixture leases. These are setup failures, not candidate behavioral RED.
 
 Remaining: preserve every original criterion/guard and complete the full case/budget/cache/crash matrix, build a readable worked recipe and replay its actual supported entry/export, then obtain normal independent registration/amendment/review. Original PR1954 source, body, pinned verifier, failed attempt and pause remain intact. No code approval, merge, rollout, C2 handoff or restored capacity is claimed.
+
+
+## Fresh private packaged entry replay
+
+The [readable four-file recipe](1703-c1-readable-behavior-recipe.json) uses the supported `cargo_binary` shape with a small `augmentagent-auth` launcher. The launcher invokes a bounded Python observer; the observer compiles and executes the full CLI review adapter test. This avoids initially building the CLI default dependency profile solely to launch that observer. It changes no Cargo manifest or lockfile.
+
+The [candidate replay evidence](1703-c1-packaged-entry-comparison.json) records a fresh candidate export and fresh private runtime through the unchanged first-party kernel sandbox, then the actual full-adapter control/defect observations under the inner read-only profile. The complete actual JSON matches the external illustrative oracle. The same recipe is now being replayed against a fresh original export.
+
+The [guard inventory](1703-c1-guard-test-inventory.json) maps six requirements to exact test declarations at the published candidate. It does not claim those tests have run under this packaged profile. Full cache/crash/budget/diagnostic coverage, native resource/registry attestation, normal independent amendment and registration remain open. The manual private driver is not production `isolated_observation` and creates no native acceptance or merge authority. Original PR1954 remains preserved and paused.

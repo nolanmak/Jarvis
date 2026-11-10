@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-10T01:58:38.145666+00:00",
+  "candidate_head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+  "original_head": "416f392b17b56b2a43e67a3e430835902387941a",
+  "status": "Source inventory; not completed acceptance or independent review",
+  "test_inventory": [
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_review_group_tests.rs",
+      "sha256": "070c7cb7d5bc511bde7122c144e22e047cf4cca753fb7c3cd947430e4a1110ae",
+      "test_names": [
+        "legacy_whole_file_recovery_keeps_original_findings_after_later_approval",
+        "related_large_source_items_reach_one_request_and_reject_the_seeded_defect",
+        "related_large_source_items_allow_a_complete_fixed_group_without_dropping_scope",
+        "credential_and_control_paths_are_refused_before_a_second_observation",
+        "malformed_then_incomplete_cannot_read_another_dependency_or_call_again",
+        "native_identity_limits_and_static_metadata_are_enforced_at_dispatch",
+        "all_matching_requested_items_must_fit_before_another_observation"
+      ],
+      "evidence": "Test declarations exist at the pinned published candidate; this inventory does not claim fresh execution."
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_review_plan.rs",
+      "sha256": "21a46dad46f773760002e1b7cac2387051718fbc2c0efcb2dc8e7a1fd5f54f25",
+      "test_names": [
+        "streamed_batch_never_claims_whole_candidate_completion",
+        "small_complete_candidate_is_one_call_with_disjoint_namespaces",
+        "escaped_unicode_is_lossless_and_every_actual_request_is_bounded",
+        "incomplete_recovery_preserves_findings_and_cannot_gain_third_attempt",
+        "recovery_reads_exact_committed_regular_source_and_improves_empty_request",
+        "exact_serialized_initial_and_recovery_request_limits_include_system_bytes",
+        "initial_half_budget_preserves_unicode_source_coordinates_without_omission"
+      ],
+      "evidence": "Test declarations exist at the pinned published candidate; this inventory does not claim fresh execution."
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_review_source_ranges.rs",
+      "sha256": "2540d1dc7d13c2e15c0672f5c9da5bdecf6eaf2e452e4f981f0a4ef161b593de",
+      "test_names": [
+        "immutable_byte_windows_reject_symlinks_and_non_utf8_boundaries",
+        "raw_names_duplicates_and_container_attributes_are_exact_source",
+        "byte_window_can_cross_large_blob_batches_but_cannot_hide_invalid_eof"
+      ],
+      "evidence": "Test declarations exist at the pinned published candidate; this inventory does not claim fresh execution."
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_review_sources.rs",
+      "sha256": "b5ba0e7bbbd768cbd3ce27b20a4a86b6af05f202336a4c3c5517e567e67a4c21",
+      "test_names": [
+        "all_exact_selector_shapes_are_accepted_as_incomplete_data",
+        "source_request_limits_and_incomplete_only_envelopes_are_exact",
+        "strict_source_schema_refuses_ambiguity_unknown_fields_and_invalid_bounds"
+      ],
+      "evidence": "Test declarations exist at the pinned published candidate; this inventory does not claim fresh execution."
+    }
+  ],
+  "requirement_mapping": [
+    {
+      "requirement": "coherent-original-and-related-source",
+      "tests": [
+        "related_large_source_items_reach_one_request_and_reject_the_seeded_defect",
+        "related_large_source_items_allow_a_complete_fixed_group_without_dropping_scope"
+      ],
+      "fresh_packaged_execution": "not established by this inventory"
+    },
+    {
+      "requirement": "strict-source-and-path-policy",
+      "tests": [
+        "credential_and_control_paths_are_refused_before_a_second_observation",
+        "strict_source_schema_refuses_ambiguity_unknown_fields_and_invalid_bounds",
+        "immutable_byte_windows_reject_symlinks_and_non_utf8_boundaries"
+      ],
+      "fresh_packaged_execution": "not established by this inventory"
+    },
+    {
+      "requirement": "immutable-items-and-complete-stream",
+      "tests": [
+        "raw_names_duplicates_and_container_attributes_are_exact_source",
+        "byte_window_can_cross_large_blob_batches_but_cannot_hide_invalid_eof"
+      ],
+      "fresh_packaged_execution": "not established by this inventory"
+    },
+    {
+      "requirement": "two-observation-and-retained-findings",
+      "tests": [
+        "incomplete_recovery_preserves_findings_and_cannot_gain_third_attempt",
+        "malformed_then_incomplete_cannot_read_another_dependency_or_call_again"
+      ],
+      "fresh_packaged_execution": "not established by this inventory"
+    },
+    {
+      "requirement": "actual-request-and-identity-bounds",
+      "tests": [
+        "native_identity_limits_and_static_metadata_are_enforced_at_dispatch",
+        "all_matching_requested_items_must_fit_before_another_observation",
+        "exact_serialized_initial_and_recovery_request_limits_include_system_bytes"
+      ],
+      "fresh_packaged_execution": "not established by this inventory"
+    },
+    {
+      "requirement": "complete-initial-scope",
+      "tests": [
+        "streamed_batch_never_claims_whole_candidate_completion",
+        "initial_half_budget_preserves_unicode_source_coordinates_without_omission"
+      ],
+      "fresh_packaged_execution": "not established by this inventory"
+    }
+  ],
+  "separate_open_requirements": [
+    "Execute the exact packaged observer from fresh original and candidate exports with the same recipe, then compare actual output outside the observer.",
+    "Complete full role/caller coverage, exact response/cache writer limits, diagnostic parity, completed-cache binding/reuse and crash boundaries; group fixture tests do not prove these runtime paths.",
+    "Validate actual native isolated-observation registration, input attestations, resource admission, custody and cleanup; the private manual driver does not establish them.",
+    "Preserve original PR1954 source/body/request/pinned verifier, terminal attempt, pause and all original guards; do not activate an invented replacement approval.",
+    "Normal independent amendment/review, merge and updater rollout; automatic host capacity, productive owner ingress and full epic acceptance remain open."
+  ]
+}
