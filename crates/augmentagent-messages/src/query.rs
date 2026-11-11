@@ -659,14 +659,17 @@ pub fn plan(
 
     let conversation_clause = |sql: &mut Sql, handles: &[String]| {
         let list = sql.in_list(handles);
+        // #1980 — collect the person's conversations once (index seeks on
+        // the handle), then take every message in them. A per-row EXISTS
+        // here scanned the whole index and took minutes on a large store.
         sql.filters.push(format!(
-            "((NOT EXISTS(SELECT 1 FROM linkedin_archive_messages known WHERE known.stored_id=mi.message_id) \
-              AND EXISTS(SELECT 1 FROM message_index peer \
+            "((mi.message_id IN (SELECT own.messageId FROM message_index peer \
                 JOIN emails pe ON pe.messageId=peer.message_id \
-                JOIN emails own ON own.messageId=mi.message_id \
-                WHERE peer.platform=mi.platform AND peer.conversation_id=mi.conversation_id \
-                AND pe.accountEntityId IS own.accountEntityId \
-                AND (peer.sender_handle IN ({list}) OR peer.counterpart_handle IN ({list})))) OR \
+                JOIN message_index m2 ON m2.conversation_id=peer.conversation_id AND m2.platform=peer.platform \
+                JOIN emails own ON own.messageId=m2.message_id \
+                WHERE (peer.sender_handle IN ({list}) OR peer.counterpart_handle IN ({list})) \
+                AND pe.accountEntityId IS own.accountEntityId) \
+              AND NOT EXISTS(SELECT 1 FROM linkedin_archive_messages known WHERE known.stored_id=mi.message_id)) OR \
              (mi.platform='linkedin' AND EXISTS(SELECT 1 FROM linkedin_archive_messages am \
               JOIN linkedin_archive_participants ap ON ap.account=am.account AND ap.conversation=am.conversation \
               WHERE am.stored_id=mi.message_id AND ('linkedin:' || ap.urn) IN ({list}))))"
@@ -1612,6 +1615,28 @@ mod tests {
         let r = resp(&s, "with:alex");
         let keys: Vec<&str> = r.ambiguous[0].candidates.iter().map(|c| c.key.as_str()).collect();
         assert!(!keys.contains(&"instagram:321"), "pages answer; labels are a fallback only");
+    }
+
+    #[test]
+    fn with_person_seeks_by_handle_instead_of_scanning_the_index() {
+        let (_d, _w, s) = fixture();
+        for q in ["with:\"alex kim\"", "with:sam"] {
+            let plan_rows: Vec<String> = s
+                .with_conn(|c| {
+                    let query = parse_at(q, NOW).unwrap();
+                    let (sql, _, params, _, _) = plan(c, &query, 20, 0)?;
+                    let bound: Vec<&dyn augmentagent_store::rusqlite::ToSql> = params
+                        .iter()
+                        .map(|p| p as &dyn augmentagent_store::rusqlite::ToSql)
+                        .collect();
+                    let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                    let rows = stmt.query_map(bound.as_slice(), |r| r.get::<_, String>(3))?;
+                    rows.collect()
+                })
+                .unwrap();
+            let joined = plan_rows.join(" | ");
+            assert!(!joined.contains("SCAN mi"), "{q}: {joined}");
+        }
     }
 
     #[test]
