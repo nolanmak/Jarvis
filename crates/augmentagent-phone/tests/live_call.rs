@@ -567,7 +567,7 @@ async fn slow_live_task_gets_one_truthful_delay_notice_but_ready_work_does_not()
     let f=fixture().await;let mut call=LiveCall::new(f.service.clone(),&f.id,"session-test").unwrap();
     call.event(&transcript()).unwrap();let LiveAction::Queued{task_id,..}=call.event(&delegation()).unwrap() else {panic!("task expected")};
     assert!(call.delay_notice().unwrap().is_none());tokio::time::advance(std::time::Duration::from_secs(10)).await;
-    let notice=call.delay_notice().unwrap().expect("a genuinely slow live task needs an honest delay update");assert_eq!(notice.delegation_id,"del-test");assert!(notice.result.contains("queued"));
+    let notice=call.delay_notice().unwrap().expect("a genuinely slow live task needs an honest delay update");assert_eq!(notice.delegation_id,"del-test");assert!(notice.result.contains("haven't started"));
     assert!(call.delay_notice().unwrap().is_none(),"progress is bounded, not a repeated keepalive");
     f.store.phone_finish_dispatch(&f.id,&task_id,"Synthetic deadline Tuesday at 5 PM.").unwrap();
     assert!(call.delay_notice().unwrap().is_none());assert_eq!(call.pending_results().unwrap().len(),1);
@@ -607,4 +607,19 @@ async fn source_gap_is_one_progress_notice_and_cannot_block_the_final_result() {
     call.track_reply("final-result", "del-test").unwrap();
     call.event(&LiveInput::CommentaryAccepted { client_event_id: "final-result".into() }).unwrap();
     assert!(call.pending_results().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_running_work_gets_a_conversational_update_without_an_invented_eta() {
+    let f=fixture().await;
+    let mut call=LiveCall::new(f.service.clone(),&f.id,"session-test").unwrap();
+    call.event(&transcript()).unwrap();
+    let LiveAction::Queued { task_id, .. }=call.event(&delegation()).unwrap() else { panic!("task expected") };
+    assert!(f.store.phone_start_dispatch(&f.id,&task_id).unwrap());
+    tokio::time::advance(std::time::Duration::from_secs(10)).await;
+    let notice=call.delay_notice().unwrap().unwrap();
+    assert!(notice.result.contains("still working"));
+    assert!(!notice.result.contains("minutes") && !notice.result.contains("verified findings"));
+    assert!(call.pending_results().unwrap().is_empty());
+    assert!(call.delay_notice().unwrap().is_none());
 }
