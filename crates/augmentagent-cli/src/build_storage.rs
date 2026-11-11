@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 // #1930 — the CI cleanup fence is shared storage authority, not a CLI-local
 // concern: it now lives beside the admission lock it gates in channel-core.
-pub(crate) use augmentagent_channel_core::storage_ci_holds as ci_holds;
+pub(crate) use augmentagent_channel_core::build_storage_ci_holds as ci_holds;
 
 const MARKER: &str = ".augmentagent-target.json";
 const CACHE_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n";
@@ -108,9 +108,11 @@ impl Lease {
     pub async fn protect_targets(&mut self, roots: &[PathBuf]) -> Result<()> {
         let until = tokio::time::Instant::now() + Duration::from_secs(300);
         loop {
-            if let Some(targets) =
-                crate::storage_leases::TargetLeases::try_cache_roots(roots, None)?
-            {
+            if let Some(targets) = crate::storage_leases::TargetLeases::try_cache_roots(
+                roots,
+                None,
+                &crate::disk::profile_dirs,
+            )? {
                 self.targets = targets;
                 return Ok(());
             }

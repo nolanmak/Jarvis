@@ -617,7 +617,7 @@ mod tests {
                     std::fs::write(root.join("provide-proof"), b"yes").unwrap();
                 }
                 let status=std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact","storage_ci_holds::tests::controller_process_exit_keeps_unknown_holds_and_reconciles_exact_kernel_proof","--nocapture"])
+                    .args(["--exact","build_storage_ci_holds::tests::controller_process_exit_keeps_unknown_holds_and_reconciles_exact_kernel_proof","--nocapture"])
                     .env_clear().env("PATH","/usr/bin:/bin").env(ENV,root).status().unwrap();
                 assert!(status.success());
                 assert_eq!(records().unwrap().len(), 1);

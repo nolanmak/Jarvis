@@ -125,8 +125,11 @@ mod deploy_snapshot;
 mod snapshot_refs;
 mod disk;
 mod build_storage;
-mod storage_leases;
-mod storage_reservations;
+// #1930 — the storage admission authority, its growth ledger and its
+// directory leases belong to channel-core. This binary consumes those exact
+// types, so its build gate and the Autoship capacity paths outside it admit
+// against one lock namespace and one CI cleanup fence.
+pub use augmentagent_channel_core::{storage_leases, storage_reservations};
 mod autoship_worker;
 mod doctor;
 mod env_cfg;

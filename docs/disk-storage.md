@@ -72,15 +72,20 @@ normal completion verifies the same kernel scope is quiescent first. A
 resource refusal before admission can release unused storage only when the
 supervisor has reaped its descendants and never received the launch token.
 
-One shared implementation backs admission itself. channel-core owns the
-per-user coordination directory, the admission lock taken inside it
-(`storage_coordination`) and the mandatory CI cleanup reconciliation that lock
-performs (`storage_ci_holds`), so an Autoship capacity path outside the CLI
-admits against the same namespace and the same cleanup authority instead of
-starting a second one. The CLI layers its growth-reservation ledger and
-physical-directory leases on that lock rather than opening its own, and every
-admission still reconciles abandoned holds using the original admission proof.
-Sharing admission does not enroll native retained sessions or make ephemeral
+One shared implementation backs the whole of admission. channel-core owns the
+per-user coordination directory, the admission lock taken inside it and the
+physical-directory leases that live in it (`storage_coordination`, published as
+`storage_leases`), the mandatory CI cleanup reconciliation that lock performs
+(`build_storage_ci_holds`), the growth-reservation ledger layered on it
+(`storage_reservations`) and the ownership fence for controller-private source
+checkouts (`storage_checkout`). An Autoship capacity path outside the CLI
+therefore admits against the same namespace, the same ledger and the same
+cleanup authority instead of starting a second one. The CLI re-exports those
+types rather than defining its own, and keeps only what is specific to it:
+the build gate's disk inventory, the committed Git export, the independently
+pinned harness overlay and contract validation. Every admission still
+reconciles abandoned holds using the original admission proof. Sharing
+admission does not enroll native retained sessions or make ephemeral
 reservation files durable across reboot.
 
 If teardown cannot be proven, CI preserves its source checkout, controller and

@@ -218,7 +218,11 @@ fn prune_at(
         }
         let target = path.join("target");
         let _target_lease = if target.exists() {
-            let lease = crate::storage_leases::TargetLeases::try_cache_roots(&[target], None)?;
+            let lease = crate::storage_leases::TargetLeases::try_cache_roots(
+                &[target],
+                None,
+                &crate::disk::profile_dirs,
+            )?;
             if lease.is_none() {
                 report.outcome = "kept: build target lease is active".into();
                 reports.push(report);
