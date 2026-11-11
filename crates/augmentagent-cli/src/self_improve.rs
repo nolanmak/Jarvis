@@ -9475,7 +9475,11 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             truncate(&merge_note, 300)
         ))
         .await;
-        workflow_guard.transition(crate::autoship_workflow::Stage::Reconcile, "draft_published", "resume", chrono::Utc::now().timestamp_millis()).await?;
+        if let Some(why @ ReviewUnavailable::MainAdvanced { .. }) = &independent.why_unavailable {
+            checkpoint_unavailable_review(&mut workflow_guard, why, chrono::Utc::now().timestamp_millis()).await?;
+        } else {
+            workflow_guard.transition(crate::autoship_workflow::Stage::Reconcile, "draft_published", "resume", chrono::Utc::now().timestamp_millis()).await?;
+        }
         workflow_guard.finish()?;
         return Ok(RunReport::built(format!(
             "issue #{}: draft PR opened — {pr_url}",

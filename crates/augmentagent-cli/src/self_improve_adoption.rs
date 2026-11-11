@@ -175,15 +175,19 @@ pub(super) fn episode_retries(
         let Some(snapshot) = store.snapshot(&id)? else {
             continue;
         };
+        let main_changed = snapshot.checkpoint.stage == crate::autoship_workflow::Stage::Reconcile
+            && snapshot.checkpoint.next.reason == "review_main_changed"
+            && snapshot.checkpoint.next.action == "reconcile_main";
         if snapshot.lease_until_ms <= now
             && snapshot.checkpoint.next.eligible_at_ms <= now
-            && matches!(
+            && !store.owner_control(&id)?.is_some_and(|control| control.paused)
+            && (main_changed || matches!(
                 snapshot.checkpoint.next.action.as_str(),
                 "rescope_remaining_findings"
                     | "complete_review_or_adjudication"
                     | "retry_adjudicated_amendment"
                     | "verify_new_revision" | "migrate_behavioral_oracle" | "retry_behavioral_oracle_migration" | "await_capacity"
-            )
+            ))
         {
             result.insert(candidate.pr);
         }
