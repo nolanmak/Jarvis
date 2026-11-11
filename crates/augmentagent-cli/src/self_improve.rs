@@ -2634,6 +2634,10 @@ fn spec_from_scope(scope: Option<&ScopeOutcome>) -> Option<String> {
         .filter(|b| !b.is_empty())
 }
 
+fn acceptance_owner_request(_issue:&Issue,scope_prompt:&str)->String {
+    scope_prompt.to_owned()
+}
+
 fn continue_after_scope_refusal(scope:&mut ScopeOutcome,owner_request:&str) {
     // Readiness may overrule a binary scoping refusal, but that changes only
     // permission to continue. Its diagnostic body and planning criteria must
@@ -2655,6 +2659,21 @@ fn initial_acceptance_inputs<'a>(scope:Option<&'a ScopeOutcome>,owner_request:&'
 #[cfg(test)]
 mod acceptance_source_tests {
     use super::*;
+    #[test]
+    fn fixable_guidance_cannot_hide_an_owner_constraint_from_acceptance() {
+        let owner="Return the arithmetic sum. Never change the audit journal.";
+        let scope=parse_scope_output("VERDICT: fixable\nCOMPLEXITY: medium\nCRITERIA:\n- Return the arithmetic sum.\n\nFix addition.");
+        let (spec,criteria)=initial_acceptance_inputs(Some(&scope),owner);
+        assert!(spec.contains(owner),"acceptance lost an owner constraint omitted from the scoper's spec and criteria");
+        assert!(spec.contains(&scope.body));
+        assert_eq!(criteria,scope.criteria);
+    }
+    #[test]
+    fn acceptance_owner_request_excludes_scoping_instructions_and_retry_context() {
+        let issue=Issue {number:7,title:"Fix addition".into(),body:"Preserve the audit journal.".into(),author:"owner".into(),author_trusted:true,research_filed:false};
+        let prompt=format!("{}\nIndependent grounded readiness decisions: fixture decision\nMerged context: fixture change",build_scope_prompt(&issue,Some("fixture retry diagnostic")));
+        assert_eq!(acceptance_owner_request(&issue,&prompt),"GitHub issue #7: Fix addition\n\nPreserve the audit journal.");
+    }
     #[test]
     fn overruled_refusal_preserves_owner_requirements_through_the_real_handoff() {
         let owner="Keep rejected contracts from spending again; preserve owner pauses and original charges.";
@@ -8071,6 +8090,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     scope_prompt.push_str(&merged_since_section(
         &merged_since_filed(repo_root, &worktree, issue.number).await,
     ));
+    let owner_request=acceptance_owner_request(&issue,&scope_prompt);
     let mut scope = match acceptance::scope_original(&worktree, &repository, &workflow_guard, &scope_prompt)
         .await
     {
@@ -8103,7 +8123,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             // Material external decisions were handled by independent
             // readiness before this specification. A binary model objection
             // cannot replace that authority with a routine human-only label.
-            continue_after_scope_refusal(s,&scope_prompt);
+            continue_after_scope_refusal(s,&owner_request);
         }
     }
     // #843 — the scoper's own predictions, made binding. A refusal here has
@@ -8177,7 +8197,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     // #1012 — written before any code exists, so they are the one target in
     // this pipeline the builder did not also author. Empty when the scoping
     // pass failed or emitted no block, which changes nothing downstream.
-    let (acceptance_scope,mut criteria)=initial_acceptance_inputs(scope.as_ref(),&scope_prompt);
+    let (acceptance_scope,mut criteria)=initial_acceptance_inputs(scope.as_ref(),&owner_request);
 
     let acceptance_control = acceptance::control_directories(&repository, workflow_guard.id())?.workflow_acceptance;
     let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
