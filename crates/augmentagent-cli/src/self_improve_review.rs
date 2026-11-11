@@ -1508,6 +1508,10 @@ mod tests {
                 assert!(store.command_queue_due("owner/repo", now + 300_000).unwrap());
             } else { assert!(!store.has_command_jobs().unwrap()); }
             assert_eq!(fixture_git(dir.path(), &["rev-parse", "HEAD"]), candidate);
+            assert!(!store.has_due_main_reconciliation(None, now + 299_999).unwrap());
+            assert!(store.has_due_main_reconciliation(None, now + 300_000).unwrap());
+            assert!(store.has_due_main_reconciliation(Some("owner/repo"), now + 300_000).unwrap());
+            assert!(!store.has_due_main_reconciliation(Some("owner/repo_extra"), now + 300_000).unwrap());
             let pr = adoption::AdoptedPr { repository: "owner/repo".into(), pr: 42, source_issue: Some(7),
                 branch: "fix/fixture".into(), head: candidate.clone(), base: "main".into(), author: "owner".into(),
                 title: "fixture".into(), body: "original owner contract".into(), dependency: adoption::Dependency::Main };
@@ -1521,6 +1525,7 @@ mod tests {
             assert_eq!(adoption::select_linked_with_retries(&candidates, &ledger, 1, &Default::default(), None, 0, &retries).unwrap().0, 42);
             store.set_owner_pause(&id, "github:owner", 0, true, now).unwrap();
             assert!(adoption::episode_retries(&state, &candidates, now + 300_000).unwrap().is_empty());
+            assert!(!store.has_due_main_reconciliation(None, now + 300_000).unwrap());
             store.set_owner_pause(&id, "github:owner", 1, false, now).unwrap();
             let lease = store.claim_productive(&id, "later-worker", now + 300_000, 100_000).unwrap().unwrap();
             let mut unrelated = store.snapshot(&id).unwrap().unwrap().checkpoint;
@@ -1529,6 +1534,7 @@ mod tests {
             store.release(&lease, now + 300_000).unwrap();
             assert!(adoption::episode_retries(&state, &candidates, now + 300_000).unwrap().is_empty(),
                 "a generic reconcile action cannot bypass the same-day paid-attempt fence");
+            assert!(!store.has_due_main_reconciliation(None, now + 300_000).unwrap());
         }
     }
 

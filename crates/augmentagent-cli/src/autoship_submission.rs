@@ -173,6 +173,28 @@ impl WorkflowStore {
         Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM command_job)", [], |row| row.get(0))?)
     }
 
+    /// Wake hint over existing controller checkpoints, never a new job or grant.
+    /// A missing repository is only the initial local hint; dispatch resolves and
+    /// rechecks the canonical repository and all existing execution fences.
+    pub fn has_due_main_reconciliation(&self, repository: Option<&str>, now: i64) -> Result<bool> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow')", [], |row| row.get(0))?;
+        if !exists { return Ok(false); }
+        let controls: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_control')", [], |row| row.get(0))?;
+        let mut sql = String::from("SELECT EXISTS(SELECT 1 FROM workflow w WHERE w.pr IS NOT NULL
+            AND w.lease_until<=?2 AND json_extract(w.checkpoint,'$.next.eligible_at_ms')<=?2
+            AND json_extract(w.checkpoint,'$.stage')='reconcile'
+            AND json_extract(w.checkpoint,'$.next.reason')='review_main_changed'
+            AND json_extract(w.checkpoint,'$.next.action')='reconcile_main'
+            AND (?1 IS NULL OR instr(w.id,?1||'#')=1 OR instr(w.id,?1||'/pr/')=1)");
+        if controls {
+            sql.push_str(" AND NOT EXISTS(SELECT 1 FROM workflow_owner_control c WHERE c.workflow=w.id AND c.paused=1)");
+        }
+        sql.push(')');
+        Ok(self.conn.query_row(&sql, params![repository.map(str::to_ascii_lowercase), now], |row| row.get(0))?)
+    }
+
     /// Read-only wake-up hint. The selecting transaction and execution leases
     /// must still recheck eligibility; this cannot authorize or reserve work.
     pub fn command_queue_due(&self, repository: &str, now: i64) -> Result<bool> {

@@ -12111,10 +12111,12 @@ impl AutoPrLoop {
                     _ = tokio::time::sleep_until(next_tick) => break,
                     _ = queue_timer.tick(), if !self.dry_run => {
                         // Retry unavailable identity on subsequent polls. No network
-                        // lookup is needed while the durable command queue is empty.
+                        // lookup is needed while commands and due main dependencies are absent.
                         if self.command_repository.is_none() {
                             let queued = crate::autoship_workflow::WorkflowStore::open_read_only(&self.workflow_path)
-                                .and_then(|store| store.map(|s| s.has_command_jobs()).transpose());
+                                .and_then(|store| store.map(|s| -> Result<bool> {
+                                    Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?)
+                                }).transpose());
                             match queued {
                                 Ok(Some(true)) => {},
                                 Ok(_) => continue,
@@ -12128,8 +12130,12 @@ impl AutoPrLoop {
                             }
                         }
                         let due = crate::autoship_workflow::WorkflowStore::open_read_only(&self.workflow_path)
-                            .and_then(|store| store.map(|store| store.command_queue_due(
-                                self.command_repository.as_deref().unwrap(), (self.clock)().timestamp_millis()))
+                            .and_then(|store| store.map(|store| -> Result<bool> {
+                                let repository = self.command_repository.as_deref().unwrap();
+                                let now = (self.clock)().timestamp_millis();
+                                Ok(store.command_queue_due(repository, now)?
+                                    || store.has_due_main_reconciliation(Some(repository), now)?)
+                            })
                                 .transpose().map(|due| due.unwrap_or(false)));
                         match due {
                             Ok(true) => break,
