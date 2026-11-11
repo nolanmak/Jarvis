@@ -445,7 +445,7 @@ pub(super) async fn work_once_mode(repo: &Path, id: &str, mode: ExecutionMode) -
         pr.source_issue = Some(issue);
     }
     if let Resolved::Issue(issue) = &selected {
-        if has_open_agent_pr(repo, issue.number).await? {
+        if has_open_agent_pr(repo, issue.number).await.map_err(linked_claims::command_error)? {
             return Err(anyhow::anyhow!("target issue has an unbound or unverified PR; reconcile or select that PR")
                 .context(CommandFailure {code:3, reason:"target-pr-reconciliation-required"}));
         }
@@ -470,7 +470,7 @@ pub(super) async fn work_once_mode(repo: &Path, id: &str, mode: ExecutionMode) -
             Lane::Combined,
             run_selected(repo, false, Some(selected), mode),
         )
-        .await
+        .await.map_err(linked_claims::command_error)
 }
 
 pub(super) async fn execute_pr(

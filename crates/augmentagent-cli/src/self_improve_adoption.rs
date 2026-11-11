@@ -31,6 +31,17 @@ impl AdoptedPr {
     }
 }
 
+/// Existing permissive canonical source mapping, shared with fresh-work suppression.
+/// Callers requiring completeness must validate metadata before invoking it.
+pub(super) fn source_references(row:&serde_json::Value,repository:&str)->Vec<u64> {
+    row.get("closingIssuesReferences").and_then(|v|v.as_array()).into_iter().flatten()
+        .filter_map(|issue| {
+            let number=issue.get("number")?.as_u64().filter(|n|*n>0)?;
+            let url=issue.get("url")?.as_str()?;
+            url.eq_ignore_ascii_case(&format!("https://github.com/{repository}/issues/{number}")).then_some(number)
+        }).collect()
+}
+
 /// Only GitHub's explicit same-repository flag and a trusted PR author authorize
 /// adoption. Branch names and model-written approval prose supply no authority.
 pub(super) fn authorized(
@@ -61,20 +72,7 @@ pub(super) fn authorized(
             if branch.is_empty() || head.is_empty() || base.is_empty() {
                 return None;
             }
-            let references: Vec<u64> = row
-                .get("closingIssuesReferences")
-                .and_then(|v| v.as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|issue| {
-                    let number = issue.get("number")?.as_u64().filter(|n| *n > 0)?;
-                    let url = issue.get("url")?.as_str()?;
-                    (url.eq_ignore_ascii_case(&format!(
-                        "https://github.com/{repository}/issues/{number}"
-                    )))
-                    .then_some(number)
-                })
-                .collect();
+            let references = source_references(row, repository);
             // Multiple sources require an explicit contract decision; never guess
             // which issue to retire. Legacy harness branches retain their mapping.
             let source_issue = match references.as_slice() {
@@ -343,6 +341,7 @@ pub(super) async fn revise(
     prompt: &str,
 ) -> Result<String> {
     let worktree = opts.cwd.as_deref().context("revision worktree missing")?;
+    workflow.require_fresh_issue(worktree).await?;
     let origin = origin_for_candidate(worktree, Some(workflow)).await?;
     if origin.is_imported() {
         // Normal dispatch records actual mutation providers. Imported unknown

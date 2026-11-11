@@ -117,7 +117,8 @@ fn code(value:&str,fallback:&str)->String {
         "review_main_changed"|"reconcile_main"|"resume_deferred"|"resume_preserved_work"|"resume_preserved_pr"|
         "draft_published"|"resume"|"adopted_review_pending"|"adopted_execution_retry"|
         "owner_execution_retry_pending"|"reconcile_runtime_retirement"|"owner_execution_retry_requested"|"resume_started"|
-        "retry_worker_attempt"|"inspect_workflow"|"await_worker") {value.into()} else {fallback.into()}
+        "retry_worker_attempt"|"inspect_workflow"|"await_worker"|
+        "linked_pr_claim_exists"|"linked_pr_inventory_unknown"|"reconcile_existing_pr"|"retry_github_inventory") {value.into()} else {fallback.into()}
 }
 
 pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Result<()> {
@@ -136,6 +137,8 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     let mut action=checkpoint.as_ref().map_or_else(||"claim_workflow".into(),|c|code(&c.next.action,"inspect_workflow"));
     let mut eligible=checkpoint.as_ref().map(|c|c.next.eligible_at_ms);
     let attempt:Option<(String,String,i64)>=tx.query_row("SELECT outcome,reason,eligible_at FROM command_attempt WHERE workflow=?1 AND finished_at IS NOT NULL",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let linked_hold=checkpoint.as_ref().is_some_and(|c|matches!(c.next.reason.as_str(),"linked_pr_claim_exists"|"linked_pr_inventory_unknown"));
+    if linked_hold {kind="blocked".into();}
     let initial_verifier_hold=checkpoint.as_ref().is_some_and(|c|c.stage==Stage::Scope && matches!(
         (c.next.reason.as_str(),c.next.action.as_str()),
         ("acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid","await_acceptance_input_change")|
@@ -145,16 +148,19 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
         matches!(c.stage,Stage::Held|Stage::Review|Stage::Reconcile) && super::is_review_hold_reason(&c.next.reason));
     let main_wait=checkpoint.as_ref().is_some_and(|c|c.stage==Stage::Reconcile
         && c.next.reason=="review_main_changed" && c.next.action=="reconcile_main");
-    if initial_verifier_hold || typed_review_hold {kind="blocked".into();}
+    if initial_verifier_hold || typed_review_hold || linked_hold {kind="blocked".into();}
     let generic_attempt=attempt.as_ref().is_some_and(|(outcome,why,_)|
         (outcome=="progress" && why=="workflow-progressed") || (outcome=="deferred" && why=="workflow-held"));
     // A successful wrapper return cannot replace the checkpoint's blocker or
     // backoff. A distinct current execution failure still has its own outcome.
-    let preserve_checkpoint=initial_verifier_hold || (generic_attempt && (stage==Some(Stage::Held) || typed_review_hold || main_wait));
+    let preserve_checkpoint=linked_hold || initial_verifier_hold || (generic_attempt && (stage==Some(Stage::Held) || typed_review_hold || main_wait));
     if source=="command_attempt_finished" && !preserve_checkpoint {
         if let Some((outcome,why,at))=&attempt {
             kind=if outcome=="progress" {"worker-progress"} else {"retry-scheduled"}.into();
             reason=code(why,"worker-attempt-finished");action="inspect_workflow".into();eligible=Some(*at);
+            if let Some(blocker)=submission::LinkedPrBlocker::from_code(why) {
+                kind="blocked".into();reason=blocker.reason().into();action=blocker.action().into();
+            }
         }
     }
     let control:Option<bool>=tx.query_row("SELECT paused FROM workflow_owner_control WHERE workflow=?1",[workflow],|r|r.get(0)).optional()?;
@@ -436,6 +442,58 @@ mod tests {
         assert!(store.pending_progress(11,22).unwrap().is_empty());
         assert_eq!(store.progress_delivery(&id).unwrap().pending_events,0);
         assert_eq!(store.progress_events(&id).unwrap().len(),2);
+    }
+
+    #[test]
+    fn linked_pr_blockers_survive_command_finish_without_false_progress() {
+        for (reason,action) in [("linked_pr_claim_exists","reconcile_existing_pr"),
+            ("linked_pr_inventory_unknown","retry_github_inventory")] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+            let mut store=WorkflowStore::open(&path).unwrap();
+            let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(1),provider:None,until:submission::Milestone::Merged};
+            let id=store.submit_authorized("request","owner",&request,1).unwrap().workflow;
+            store.next_command_job("owner/repo",2).unwrap().unwrap();
+            store.register(&id,"fix/one",Binding {head:"head-a".into(),contract:"contract-a".into(),evidence_hash:"dependency-a".into()},3).unwrap();
+            let lease=store.claim(&id,"worker",4,10000).unwrap().unwrap();
+            let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+            checkpoint.stage=Stage::Build;checkpoint.next=NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:300005};
+            store.checkpoint(&lease,&checkpoint,5).unwrap();
+            let before=store.progress_events(&id).unwrap();
+            assert!(store.finish_command_attempt(&id,2,submission::AttemptOutcome::Deferred,"workflow-held",6).unwrap());
+            let events=store.progress_events(&id).unwrap();assert_eq!(events,before);
+            let latest=events.last().unwrap();assert_eq!(latest.kind,"blocked");
+            assert_eq!(latest.reason,reason);assert_eq!(latest.next_action,action);
+            assert_eq!(latest.merge_state,"not-confirmed");
+            assert_eq!(WorkflowStore::open(&path).unwrap().progress_events(&id).unwrap(),events);
+            store.set_owner_pause(&id,"owner",0,true,7).unwrap();
+            assert_eq!(store.progress_events(&id).unwrap().last().unwrap().reason,"owner-pause-requested");
+        }
+    }
+
+    #[test]
+    fn linked_pr_precheckpoint_attempts_project_precise_cli_and_private_blockers() {
+        for (attempt_reason,reason,action) in [
+            ("linked-pr-claim-exists","linked_pr_claim_exists","reconcile_existing_pr"),
+            ("target-pr-reconciliation-required","linked_pr_claim_exists","reconcile_existing_pr"),
+            ("linked-pr-inventory-unknown","linked_pr_inventory_unknown","retry_github_inventory")] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+            let mut store=WorkflowStore::open(&path).unwrap();
+            let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(1),provider:None,until:submission::Milestone::Merged};
+            let id=store.submit_authorized("request","owner",&request,1).unwrap().workflow;
+            store.next_command_job("owner/repo",2).unwrap().unwrap();
+            assert!(store.finish_command_attempt(&id,2,submission::AttemptOutcome::Deferred,attempt_reason,3).unwrap());
+            assert!(store.snapshot(&id).unwrap().is_none(),"a status blocker must not manufacture execution state");
+            let latest=store.progress_events(&id).unwrap().pop().unwrap();
+            assert_eq!(latest.kind,"blocked");assert_eq!(latest.reason,reason);assert_eq!(latest.next_action,action);
+            let (exit,body)=crate::autoship_commands::status(&path,&id,4,5);
+            assert_eq!(exit,3);assert_eq!(body["stage"],"queued");
+            assert_eq!(body["reason"],reason);assert_eq!(body["next_action"],action);
+            assert_eq!(body["worker"]["state"],"unknown");assert_eq!(body["merge"]["state"],"not-confirmed");
+            store.set_owner_pause(&id,"owner",0,true,5).unwrap();
+            let (_,paused)=crate::autoship_commands::status(&path,&id,6,5);
+            assert_eq!(paused["reason"],"owner-pause-requested");assert_eq!(paused["next_action"],"await_owner_resume");
+            assert_eq!(store.progress_events(&id).unwrap().last().unwrap().reason,"owner-pause-requested");
+        }
     }
 
 }

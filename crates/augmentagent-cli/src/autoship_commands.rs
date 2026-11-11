@@ -81,12 +81,13 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
             // execution/head/worker-liveness evidence at this point.
             // A failed attempt is still retryable. Only authoritative workflow
             // state may turn it into a terminal workflow failure.
+            let blocker=attempt.as_ref().and_then(|attempt|crate::autoship_workflow::submission::LinkedPrBlocker::from_code(&attempt.reason));
             let code=if paused || attempt.is_some() {3} else {0};
             return Ok(Some((code, json!({"schema_version":1,"workflow":workflow,
                 "repository":command.repository,"target":command.target,
                 "accepted":true,"complete":false,"stage":"queued",
-                "reason":if paused {"owner-pause-requested"} else {attempt.as_ref().map_or("awaiting-worker-claim",|a|a.reason.as_str())},
-                "next_action":if paused {"await_owner_resume"} else if attempt.is_some() {"retry_worker_attempt"} else {"claim_workflow"},
+                "reason":if paused {"owner-pause-requested"} else if let Some(blocker)=blocker {blocker.reason()} else {attempt.as_ref().map_or("awaiting-worker-claim",|a|a.reason.as_str())},
+                "next_action":if paused {"await_owner_resume"} else if let Some(blocker)=blocker {blocker.action()} else if attempt.is_some() {"retry_worker_attempt"} else {"claim_workflow"},
                 "owner_messages_pending":owner_messages_pending,"owner_control":owner_control,"delivery":delivery,
                 "eligible_at_ms":attempt.as_ref().map(|a|a.eligible_at_ms),"head":null,
                 "resource_refusal":if paused {None} else {attempt.as_ref().and_then(|a|a.resource_observation())},"last_attempt":attempt,

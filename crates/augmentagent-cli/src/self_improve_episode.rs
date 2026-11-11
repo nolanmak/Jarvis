@@ -315,6 +315,7 @@ pub(super) async fn session_for(
                 "scope_dispatch",
                 &details.to_string(),
             )?;
+            workflow.require_fresh_issue(root).await?;
             let plan = augmentagent_channel_core::native_session::FreshBuilderSessions::new().scope(reasoner.call(&opts,&format!("Re-scope repair for this immutable contract and candidate. Read source and return the smallest implementation plan; do not weaken verifiers.\n{prompt}"))).await?;
             details["plan"] = serde_json::json!(truncate(&plan, 16000));
             workflow.checkpoint_episode_dispatch(
