@@ -121,6 +121,32 @@ use owned deployment artifacts and the normal guarded deployment path; retain
 pending workflow/runtime evidence and do not introduce an executable override.
 
 
+## Review-held triage
+
+Read the workflow's current state before requesting another attempt:
+
+```sh
+augmentagent autopr status --workflow WORKFLOW --json
+```
+
+| Recorded reason | Meaning and recovery |
+| --- | --- |
+| `no-reviewer-capacity` | Reviewer selection found no eligible serving provider. Inspect the declared providers and cooldowns. |
+| `review-evidence-budget` | Typed evidence collection or request limits were exceeded. Decompose the evidence within the existing bounds. |
+| `review-recovery-required` | A selected review failed to complete. Inspect the protected controller error and repair its recorded cause before retrying. |
+
+A review hold does not establish whether model work was billed. Inspect the
+workflow's resource counters and confirmed-merge allowance separately. Historical
+hold reasons remain historical records; a new deployment does not rewrite them.
+
+After repairing an internal execution failure, authenticated `autopr resume
+--workflow WORKFLOW` can queue recovery of the preserved attempt. Use the
+installation's native/resource policy selection; an unconfigured shell can
+report `policy-missing` while the services have a valid selection. An accepted
+resume can still require runtime retirement reconciliation before execution.
+Acceptance, cleanup, model progress, and a confirmed merge are separate results.
+Preserve unrelated owner pauses and inspect the resulting status.
+
 ## Observed deployment, 2026-10-26
 
 The normal updater deployed `c17ef74eefea6be6324778fad3522150c356902a`
