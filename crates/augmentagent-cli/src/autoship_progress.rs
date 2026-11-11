@@ -126,7 +126,7 @@ fn code(value:&str,fallback:&str)->String {
 }
 
 pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Result<()> {
-    if !matches!(source,"registered"|"checkpoint"|"autonomous_merge_confirmed"|"command_queued"|"command_attempt_finished"|"owner_control_changed"|"native_model_admitted") {return Ok(());}
+    if !matches!(source,"registered"|"checkpoint"|"autonomous_merge_confirmed"|"command_queued"|"command_attempt_finished"|"owner_control_changed"|"native_model_admitted"|"resource_capacity_retry") {return Ok(());}
     let previous:Option<(i64,String,bool)>=tx.query_row("SELECT sequence,fingerprint,terminal FROM workflow_progress_state WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     if previous.as_ref().is_some_and(|p|p.2) {return Ok(());}
     super::delivery::apply_default(tx,workflow,now)?;
