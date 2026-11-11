@@ -19,6 +19,8 @@ pub struct Progress {
     pub deployment_state:String,
     pub evidence_digest:String,
     pub observed_at_ms:i64,
+    #[serde(default)]
+    pub resource_refusal:Option<super::resource_refusal::AttemptObservation>,
 }
 #[derive(Debug,Clone,Serialize,Deserialize)]
 pub struct DeliveryStatus {
@@ -61,7 +63,8 @@ impl WorkflowStore {
         if blocked {return Ok(None);}
         let progress:Progress=serde_json::from_str(&raw)?;
         let nonce=format!("{:x}",Sha256::digest(serde_json::to_vec(&(workflow,origin.bot,origin.owner,origin.channel,sequence))?))[..24].to_string();
-        let content=format!("Autoship {workflow} · update {sequence}: {}. Stage: {:?}. Reason: {}. Next: {} (eligible at: {:?}). PR: {:?}. Requested provider: {:?}; actual provider: {} ({}). Merge: {}. Deployment: {}. Evidence digest: {}. [autoship:{nonce}]",
+        let resource = progress.resource_refusal.as_ref().map(|value| format!(" {}.", value.render())).unwrap_or_default();
+        let content=format!("Autoship {workflow} · update {sequence}: {}. Stage: {:?}. Reason: {}. Next: {} (eligible at: {:?}). PR: {:?}. Requested provider: {:?}; actual provider: {} ({}). Merge: {}. Deployment: {}. Evidence digest: {}.{resource} [autoship:{nonce}]",
             progress.kind,progress.stage,progress.reason,progress.next_action,progress.eligible_at_ms,progress.pr,progress.requested_provider,progress.actual_provider.as_deref().unwrap_or("unknown"),progress.actual_provider_role.as_deref().unwrap_or("unknown"),progress.merge_state,progress.deployment_state,progress.evidence_digest);
         ensure!(content.chars().count()<=1900,"progress message exceeds Discord bound");
         tx.execute("INSERT INTO workflow_progress_delivery(workflow,bot,owner,channel,sequence,nonce,content,state,dispatched_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'uncertain',?8)",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence,nonce,content,now])?;
@@ -174,12 +177,22 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
         let reviewer=value["reviewer"].as_bool().context("native provider role missing")?;
         (provider,Some(if reviewer {"reviewer"}else{"workflow"}.into()))
     }else{(None,None)};
-    let fingerprint=format!("{:x}",Sha256::digest(serde_json::to_vec(&(&kind,stage,&reason,&action,&evidence_digest,&actual_provider,&actual_provider_role))?));
+    let resource_refusal = if !terminal && control != Some(true) && reason == "execution-readiness-blocked" {
+        super::submission::read_command_attempt(tx, workflow)?.and_then(|attempt| attempt.resource_observation())
+    } else { None };
+    let resource_identity = resource_refusal.as_ref().map(|value| value.observation.identity());
+    let fingerprint_input = if resource_identity.is_some() {
+        serde_json::to_vec(&(&kind,stage,&reason,&action,&evidence_digest,&actual_provider,&actual_provider_role,&resource_identity))?
+    } else {
+        // Preserve the deployed fingerprint for all pre-existing projections.
+        serde_json::to_vec(&(&kind,stage,&reason,&action,&evidence_digest,&actual_provider,&actual_provider_role))?
+    };
+    let fingerprint=format!("{:x}",Sha256::digest(fingerprint_input));
     let changed=previous.as_ref().is_none_or(|p|p.1!=fingerprint);
     let sequence=previous.as_ref().map_or(1,|p|p.0+i64::from(changed));
     let progress=Progress {workflow:workflow.into(),sequence,kind,stage,reason,next_action:action,eligible_at_ms:eligible,
         pr:snapshot.and_then(|s|s.1),requested_provider,actual_provider,actual_provider_role,
-        merge_state:if confirmed {"observed-autonomous-merge"} else if external_merge {"observed-external-merge"} else {"not-confirmed"}.into(),deployment_state:"unknown".into(),evidence_digest,observed_at_ms:now};
+        merge_state:if confirmed {"observed-autonomous-merge"} else if external_merge {"observed-external-merge"} else {"not-confirmed"}.into(),deployment_state:"unknown".into(),evidence_digest,observed_at_ms:now,resource_refusal};
     let payload=serde_json::to_string(&progress)?;
     if changed {tx.execute("INSERT INTO workflow_progress_event(workflow,sequence,payload,created_at) VALUES(?1,?2,?3,?4)",params![workflow,sequence,payload,now])?;}
     tx.execute("INSERT INTO workflow_progress_state VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workflow) DO UPDATE SET sequence=excluded.sequence,fingerprint=excluded.fingerprint,terminal=excluded.terminal,payload=excluded.payload",params![workflow,sequence,fingerprint,terminal,payload])?;

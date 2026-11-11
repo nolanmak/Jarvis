@@ -7759,6 +7759,38 @@ async fn workflow_builder(repo: &Path, target: crate::autoship_workflow::submiss
         .context("requested builder has no eligible native runtime or credentials")
 }
 
+/// Settle the selected scheduling turn without changing its execution result.
+fn finish_selected_command_attempt(
+    store: &crate::autoship_workflow::WorkflowStore,
+    id: &str,
+    selected_at: i64,
+    result: &Result<RunReport>,
+    now: i64,
+) -> Result<bool> {
+    use crate::autoship_workflow::submission::AttemptOutcome;
+    let paused = store.owner_control(id)?.is_some_and(|control| control.paused);
+    let unauthorized = result.as_ref().err()
+        .and_then(|error| error.downcast_ref::<targeted::CommandFailure>())
+        .is_some_and(|failure| failure.code == 2);
+    let (outcome, reason) = if paused && !unauthorized {
+        (AttemptOutcome::Deferred, "owner-pause-requested")
+    } else {
+        match result {
+            Ok(report) if report.is_idle() => (AttemptOutcome::Deferred, "workflow-deferred"),
+            Ok(_) => (AttemptOutcome::Progress, "workflow-progressed"),
+            Err(error) => match error.downcast_ref::<targeted::CommandFailure>() {
+                Some(failure) if failure.code == 2 => (AttemptOutcome::Rejected, failure.reason),
+                Some(failure) if failure.code == 3 => (AttemptOutcome::Deferred, failure.reason),
+                _ => (AttemptOutcome::Failed, "execution-failed"),
+            },
+        }
+    };
+    let observation = if outcome == AttemptOutcome::Deferred && reason == "execution-readiness-blocked" {
+        result.as_ref().err().and_then(|error| error.downcast_ref::<crate::autoship_workflow::resource_refusal::Observation>())
+    } else { None };
+    store.finish_command_attempt_observed(id, selected_at, outcome, reason, now, observation)
+}
+
 /// Drive one self-improvement attempt. `dry_run` stops before opening the PR
 /// (prints what it would do) so the loop can be exercised safely.
 pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
@@ -7773,22 +7805,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             let next = crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
                 .next_command_job(&repository, selected_at)?;
             if let Some(id) = next {
-                use crate::autoship_workflow::submission::AttemptOutcome;
                 let result = targeted::work_once_mode(repo_root, &id, targeted::ExecutionMode::Background).await;
-                let paused=crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
-                    .owner_control(&id)?.is_some_and(|control|control.paused);
-                let unauthorized=result.as_ref().err().and_then(|error|error.downcast_ref::<targeted::CommandFailure>()).is_some_and(|failure|failure.code==2);
-                let (outcome,reason) = if paused && !unauthorized {(AttemptOutcome::Deferred,"owner-pause-requested")} else {match &result {
-                    Ok(report) if report.is_idle() => (AttemptOutcome::Deferred,"workflow-deferred"),
-                    Ok(_) => (AttemptOutcome::Progress,"workflow-progressed"),
-                    Err(error) => match error.downcast_ref::<targeted::CommandFailure>() {
-                        Some(failure) if failure.code==2 => (AttemptOutcome::Rejected,failure.reason),
-                        Some(failure) if failure.code==3 => (AttemptOutcome::Deferred,failure.reason),
-                        _ => (AttemptOutcome::Failed,"execution-failed"),
-                    },
-                }};
-                crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
-                    .finish_command_attempt(&id,selected_at,outcome,reason,chrono::Utc::now().timestamp_millis())?;
+                finish_selected_command_attempt(
+                    &crate::autoship_workflow::WorkflowStore::open(&workflow::path())?,
+                    &id, selected_at, &result, chrono::Utc::now().timestamp_millis(),
+                )?;
                 // One job's rejected target is that job's outcome (recorded
                 // above with its retry backoff), not a failed tick: the next
                 // turn still serves other work.
