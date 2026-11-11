@@ -2634,6 +2634,10 @@ fn spec_from_scope(scope: Option<&ScopeOutcome>) -> Option<String> {
         .filter(|b| !b.is_empty())
 }
 
+fn continue_after_scope_refusal(scope:&mut ScopeOutcome,_owner_request:&str) {
+    scope.fixable=true;
+}
+
 fn initial_acceptance_inputs<'a>(scope:Option<&'a ScopeOutcome>,owner_request:&'a str)->(&'a str,Vec<String>) {
     // A refusal is diagnostic context, never a substitute owner requirement
     // (#955). Keep the first-pass build policy, but enroll acceptance against
@@ -2646,6 +2650,17 @@ fn initial_acceptance_inputs<'a>(scope:Option<&'a ScopeOutcome>,owner_request:&'
 #[cfg(test)]
 mod acceptance_source_tests {
     use super::*;
+    #[test]
+    fn overruled_refusal_preserves_owner_requirements_through_the_real_handoff() {
+        let owner="Keep rejected contracts from spending again; preserve owner pauses and original charges.";
+        let mut scope=parse_scope_output("VERDICT: not-fixable\nCOMPLEXITY: hard\nCRITERIA:\n- Split this into two design increments.\n\nThis needs a planning split.");
+        continue_after_scope_refusal(&mut scope,owner);
+        assert!(scope.fixable,"readiness still permits the first-pass build");
+        let (spec,criteria)=initial_acceptance_inputs(Some(&scope),owner);
+        assert_eq!(spec,owner,"the continuation retained the refusal instead of the owner request");
+        assert!(criteria.is_empty(),"refusal planning steps became acceptance criteria");
+        assert_eq!(spec_from_scope(Some(&scope)).as_deref(),Some(owner));
+    }
     #[test]
     fn first_pass_refusal_is_not_an_acceptance_spec_or_requirement() {
         let scope=parse_scope_output("VERDICT: not-fixable\nCOMPLEXITY: hard\nCRITERIA:\n- Split this into smaller increments before implementation.\n\nRequires a design split; this is a refusal reason.");
@@ -8083,7 +8098,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             // Material external decisions were handled by independent
             // readiness before this specification. A binary model objection
             // cannot replace that authority with a routine human-only label.
-            s.fixable=true;
+            continue_after_scope_refusal(s,&scope_prompt);
         }
     }
     // #843 — the scoper's own predictions, made binding. A refusal here has
