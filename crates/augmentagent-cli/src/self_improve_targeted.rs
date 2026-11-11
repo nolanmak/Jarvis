@@ -72,8 +72,15 @@ pub(crate) async fn authorize_command(repo: &Path, request: &Request) -> Result<
 
 pub(crate) async fn authorize_repository(repo:&Path,repository:&str)->Result<String> {
     authorized_repository_name(repo,repository).await?;
-    let actor = read(repo, &["api", "user", "--jq", ".login"]).await?;
-    let actor = actor.trim();
+    // Repository identity and permissions above already use authenticated
+    // GraphQL. REST has a separate quota; exhausting it must not turn a valid
+    // owner control into a misleading authentication refusal.
+    let raw = read(repo, &["api", "graphql", "-f",
+        "query=query AutoshipViewer { viewer { login } }"]).await?;
+    let identity: serde_json::Value = serde_json::from_str(&raw)
+        .context("invalid authenticated GitHub identity response")?;
+    let actor = identity["data"]["viewer"]["login"].as_str()
+        .context("authenticated GitHub actor unavailable")?.trim();
     anyhow::ensure!(!actor.is_empty() && actor.len() <= 100 && actor.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'), "invalid authenticated GitHub actor");
     Ok(format!("github:{}", actor.to_ascii_lowercase()))
 }
