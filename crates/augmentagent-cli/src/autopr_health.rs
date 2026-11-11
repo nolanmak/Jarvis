@@ -465,10 +465,17 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                      loop cannot vouch for any model's review of it"
                 }
                 "reviewer-latched" => "reviewer latched: nothing to do, it retries after the reset",
-                _ => {
+                "review-evidence-budget" => {
+                    "review evidence exceeds its bounded budget: decompose the evidence before retrying"
+                }
+                "review-recovery-required" => {
+                    "review evidence or controller recovery required: inspect the protected failure before retrying"
+                }
+                "no-reviewer-capacity" => {
                     "no reviewer capacity: check `augmentagent doctor` and \
                      `augmentagent reasoner-selftest`"
                 }
+                _ => "review unavailable: inspect the recorded controller blocker before retrying",
             };
             if !fixes.contains(&fix) {
                 fixes.push(fix);
@@ -482,8 +489,7 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
             },
             code: "review-held",
             detail: format!(
-                "the loop is not wedged: these drafts are held, unbilled, because no \
-                 independent review is possible: {which}. Drafts remain queued for recovery; \
+                "these drafts are awaiting independent review completion: {which}. Drafts remain queued for recovery; \
                  waits of {budget} days or more are escalated."
             ),
             fix: fixes.join(". "),
@@ -1683,8 +1689,8 @@ mod tests {
         }
         assert!(held.detail.contains("waiting 2 days"), "the wait is visible: {}", held.detail);
         assert!(
-            held.detail.contains("not wedged") && held.detail.contains("unbilled"),
-            "say plainly that nothing is broken or spent: {}",
+            held.detail.contains("awaiting independent review") && !held.detail.contains("unbilled"),
+            "a review hold cannot establish whether model work was spent: {}",
             held.detail
         );
         for fix in ["human", "reasoner-selftest"] {

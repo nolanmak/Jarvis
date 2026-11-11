@@ -18,7 +18,7 @@ impl std::error::Error for EvidenceBudget {}
 /// `source()` causes the review path wrapped it in, so classify on the whole
 /// chain and not the outer error (#1885: PR #1669 was held as missing reviewer
 /// capacity because of one). Only the typed errors count: an unrelated error
-/// whose message merely reads like a budget is still missing capacity.
+/// whose message merely reads like a budget still requires review recovery.
 /// `anyhow`'s own downcast also reaches a budget attached as a context value.
 fn is_evidence_budget(error: &anyhow::Error) -> bool {
     error.is::<EvidenceBudget>()
@@ -30,7 +30,7 @@ fn unavailable_from_error(provider: augmentagent_channel_core::ProviderKind, err
     IndependentReview::unavailable(if is_evidence_budget(&error) {
         ReviewUnavailable::EvidenceBudget { detail: format!("{error:#}") }
     } else {
-        ReviewUnavailable::NoCapacity { reviewers: vec![provider], detail: format!("aligned review needs recovery: {error:#}") }
+        ReviewUnavailable::RecoveryRequired { detail: format!("aligned review by {} needs recovery: {error:#}", provider.name()) }
     })
 }
 
