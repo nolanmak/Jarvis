@@ -93,7 +93,8 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
         ensure!(!principal.is_empty() && principal.len()<=256 && principal.bytes().all(|b|b.is_ascii_graphic()),"invalid owner principal");
         let checkpoint:Option<String>=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[workflow],|r|r.get(0)).optional()?;
         let queued:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM command_job WHERE workflow=?1)",[workflow],|r|r.get(0))?;
-        ensure!(checkpoint.is_some() || queued,"unknown workflow");
+        let adopted:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM adopted_pr WHERE repository || '/pr/' || pr = ?1)",[workflow],|r|r.get(0))?;
+        ensure!(checkpoint.is_some() || queued || adopted,"unknown workflow");
         if let Some(checkpoint)=checkpoint {
             ensure!(!matches!(serde_json::from_str::<Checkpoint>(&checkpoint)?.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot change owner control");
         }

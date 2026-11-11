@@ -4,6 +4,8 @@ pub(crate) mod wait;
 pub(crate) mod work_command;
 #[path = "autoship_control_command.rs"]
 pub(crate) mod control_command;
+#[path = "autoship_target_reconcile.rs"]
+pub(crate) mod target_reconcile;
 #[path = "autoship_run_command.rs"]
 pub(crate) mod run_command;
 #[path = "autoship_merge_recovery.rs"]
