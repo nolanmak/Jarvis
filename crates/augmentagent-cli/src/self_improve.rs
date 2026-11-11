@@ -3989,6 +3989,9 @@ enum ReviewUnavailable {
     /// This does not establish that a provider is missing or at capacity.
     /// The protected detail preserves the failure without publishing it.
     RecoveryRequired { detail: String },
+    /// Immutable review capture observed a main commit outside the candidate.
+    /// Integration can be queued without granting review or merge authority.
+    MainAdvanced { candidate: String, main: String, detail: String },
     /// Every independent reviewer is on a quota cooldown: `(provider, reset)`.
     Latched {
         until: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>,
@@ -4120,6 +4123,7 @@ impl ReviewUnavailable {
             Self::Latched { .. } => "reviewer-latched",
             Self::EvidenceBudget { .. } => "review-evidence-budget",
             Self::RecoveryRequired { .. } => "review-recovery-required",
+            Self::MainAdvanced { .. } => "review-main-advanced",
         }
     }
 
@@ -4158,6 +4162,7 @@ impl ReviewUnavailable {
             ),
             Self::EvidenceBudget { .. } => "complete caller evidence exceeds the bounded review budget".into(),
             Self::RecoveryRequired { .. } => "independent review did not complete; controller recovery required".into(),
+            Self::MainAdvanced { .. } => "main advanced; integration and fresh verification required".into(),
             Self::Latched { until } => {
                 // Soonest reset first: that is when the draft can move again.
                 let mut until = until.clone();
@@ -4184,7 +4189,7 @@ impl ReviewUnavailable {
     fn log_line(&self) -> String {
         match self {
             Self::ProvenanceUnverifiable { error } => format!("{} ({error})", self.headline()),
-            Self::NoCapacity { detail, .. } | Self::EvidenceBudget { detail } | Self::RecoveryRequired { detail } if !detail.is_empty() => {
+            Self::NoCapacity { detail, .. } | Self::EvidenceBudget { detail } | Self::RecoveryRequired { detail } | Self::MainAdvanced { detail, .. } if !detail.is_empty() => {
                 format!("{} ({detail})", self.headline())
             }
             _ => self.headline(),
@@ -5926,6 +5931,9 @@ fn unreviewable_plan(
         };
     }
     let advice = match why {
+        ReviewUnavailable::MainAdvanced { .. } => {
+            "The controller queued preserved work for integration with current main and fresh verification. No approval or code rejection has been recorded."
+        }
         ReviewUnavailable::RecoveryRequired { .. } => {
             "Inspect the protected controller failure and repair the recorded review blocker before retrying. No approval or code rejection has been recorded."
         }
@@ -6170,11 +6178,20 @@ fn unreviewable_drafts_in(path: &Path) -> Vec<(u64, String, String, u32)> {
 
 async fn checkpoint_unavailable_review(
     workflow: &mut workflow::WorkflowGuard,
-    _why: &ReviewUnavailable,
-    _now: i64,
-) -> Result<bool> {
-    workflow.transition(crate::autoship_workflow::Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
-    Ok(false)
+    why: &ReviewUnavailable,
+    now: i64,
+) -> Result<()> {
+    use crate::autoship_workflow::Stage;
+    if let ReviewUnavailable::MainAdvanced { candidate, main, .. } = why {
+        anyhow::ensure!(workflow.binding().head == *candidate, "main dependency belongs to a different candidate");
+        anyhow::ensure!(workflow.pending_operations()?.is_empty(), "pending publication must reconcile before main integration");
+        workflow.validate_binding(&workflow.binding().clone()).await?;
+        workflow.audit_logger().record_controller(serde_json::json!({"actor":"controller",
+            "kind":"review_main_dependency_changed","candidate":candidate,"observed_main":main}))?;
+        workflow.transition(Stage::Reconcile, "review_main_changed", "reconcile_main", now.saturating_add(300_000)).await
+    } else {
+        workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await
+    }
 }
 
 /// #1037 — act on a draft that cannot be reviewed: record the day, say why on
@@ -7212,9 +7229,7 @@ async fn resume_draft_pr(
                     if !dry_run {
                         workflow.push(branch).await?;
                     }
-                    if checkpoint_unavailable_review(&mut workflow, &why, chrono::Utc::now().timestamp_millis()).await? {
-                        return Ok(RunReport::built(format!("PR #{pr}: current main requires integration and fresh verification; preserved work queued")));
-                    }
+                    checkpoint_unavailable_review(&mut workflow, &why, chrono::Utc::now().timestamp_millis()).await?;
                     return Ok(hold_unreviewable(
                         repo_root,
                         pr,

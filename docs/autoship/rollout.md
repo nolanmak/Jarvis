@@ -134,6 +134,7 @@ augmentagent autopr status --workflow WORKFLOW --json
 | `no-reviewer-capacity` | Reviewer selection found no eligible serving provider. Inspect the declared providers and cooldowns. |
 | `review-evidence-budget` | Typed evidence collection or request limits were exceeded. Decompose the evidence within the existing bounds. |
 | `review-recovery-required` | A selected review failed to complete. Inspect the protected controller error and repair its recorded cause before retrying. |
+| `review-main-advanced` | Main advanced outside the captured candidate. The original workflow queues integration and fresh verification with a five-minute backoff; existing owner holds and unresolved operations still prevent dispatch. |
 
 A review hold does not establish whether model work was billed. Inspect the
 workflow's resource counters and confirmed-merge allowance separately. Historical
