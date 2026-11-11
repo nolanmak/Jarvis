@@ -6190,7 +6190,7 @@ async fn checkpoint_unavailable_review(
             "kind":"review_main_dependency_changed","candidate":candidate,"observed_main":main}))?;
         workflow.transition(Stage::Reconcile, "review_main_changed", "reconcile_main", now.saturating_add(300_000)).await
     } else {
-        workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await
+        workflow.transition(Stage::Held, why.code(), "resume_preserved_work", 0).await
     }
 }
 
@@ -9478,7 +9478,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         if let Some(why @ ReviewUnavailable::MainAdvanced { .. }) = &independent.why_unavailable {
             checkpoint_unavailable_review(&mut workflow_guard, why, chrono::Utc::now().timestamp_millis()).await?;
         } else {
-            workflow_guard.transition(crate::autoship_workflow::Stage::Reconcile, "draft_published", "resume", chrono::Utc::now().timestamp_millis()).await?;
+            workflow_guard.transition(crate::autoship_workflow::Stage::Reconcile,
+                independent.why_unavailable.as_ref().map_or("draft_published", ReviewUnavailable::code),
+                "resume", chrono::Utc::now().timestamp_millis()).await?;
         }
         workflow_guard.finish()?;
         return Ok(RunReport::built(format!(

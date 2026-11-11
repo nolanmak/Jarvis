@@ -57,6 +57,31 @@ impl Inputs<'_> {
             files,
         })
     }
+    /// Reuse immutable candidate/controller source already captured for this
+    /// review. This neither resolves a new dependency nor adds an observation.
+    pub fn format_correction(&self, original:&Request, all:&BTreeMap<String,String>,
+        correction:serde_json::Value)->Result<Request> {
+        let sources=all.iter().filter(|(key,_)|key.starts_with("source:") || key.starts_with("controller_source:"));
+        let mut raw_bytes=original.files.iter().fold(0usize,|n,(key,body)|n.saturating_add(key.len()).saturating_add(body.len()));
+        for (key,body) in sources.clone() {
+            if let Some(old)=original.files.get(key) {
+                anyhow::ensure!(old==body,"captured correction source labels collide");
+            } else {raw_bytes=raw_bytes.saturating_add(key.len()).saturating_add(body.len());}
+        }
+        // Raw bytes are only a lower bound; the actual serialized constructor
+        // below still accounts for escaping, metadata and the system prompt.
+        if raw_bytes<=aligned::MAX_PROMPT_BYTES {
+            let mut coherent=original.files.clone();
+            coherent.extend(sources.map(|(key,body)|(key.clone(),body.clone())));
+            match self.request(coherent,false,Some(correction.clone())) {
+                Ok(request)=>return Ok(request),
+                Err(error) if error.chain().any(|cause|cause.is::<EvidenceBudget>() || cause.is::<aligned::RequestBudgetExceeded>())=>{},
+                Err(error)=>return Err(error),
+            }
+        }
+        self.request(original.files.clone(),false,Some(correction))
+    }
+
     pub fn pack_initial(&self,shards:&BTreeMap<String,String>,complete:bool)->Result<Vec<Request>> {
         let initial=Inputs {binding:self.binding,issue:self.issue,contract:self.contract,prior:self.prior,
             system_bytes:self.system_bytes.checked_add(aligned::MAX_PROMPT_BYTES/2).context("initial review budget overflow")?,

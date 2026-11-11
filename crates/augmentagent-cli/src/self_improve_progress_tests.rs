@@ -329,6 +329,7 @@ else: raise Exception('unexpected call '+repr(a))
         }
         files.insert("scripts/ci-contract.json".into(), policy_raw.into());
         files.insert("scripts/ci-contract.py".into(), include_str!("../../../scripts/ci-contract.py").into());
+        files.insert("scripts/ci-apt-install.py".into(), include_str!("../../../scripts/ci-apt-install.py").into());
         std::fs::write(root.join("hosted-policy.json"), serde_json::to_vec(&serde_json::json!({
             "contract":policy,"files":files
         })).unwrap()).unwrap();

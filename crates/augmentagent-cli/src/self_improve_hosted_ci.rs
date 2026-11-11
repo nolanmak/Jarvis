@@ -7,6 +7,7 @@ use serde_json::Value;
 const READER: &str = include_str!("../../../scripts/autoship-hosted-ci.py");
 const CONTRACT: &str = include_str!("../../../scripts/ci-contract.json");
 const RUNNER: &[u8] = include_bytes!("../../../scripts/ci-contract.py");
+const APT_INSTALLER: &[u8] = include_bytes!("../../../scripts/ci-apt-install.py");
 
 #[derive(Debug)]
 pub(super) struct AwaitingHostedCi;
@@ -65,6 +66,7 @@ pub(super) async fn preflight(
     for (path, expected) in [
         ("scripts/ci-contract.py", RUNNER),
         ("scripts/ci-contract.json", CONTRACT.as_bytes()),
+        ("scripts/ci-apt-install.py", APT_INSTALLER),
     ] {
         let bytes = shared_ci::git(root, &["show", &format!("{tree}:{path}")]).await?;
         anyhow::ensure!(
@@ -97,6 +99,7 @@ async fn observe_with(
     let request = serde_json::json!({"gh":gh,"repository":repository,"pr":pr,"head":head,
         "contract":serde_json::from_str::<Value>(CONTRACT)?,
         "policy_files":{"scripts/ci-contract.py":format!("{:x}",Sha256::digest(RUNNER)),
+            "scripts/ci-apt-install.py":format!("{:x}",Sha256::digest(APT_INSTALLER)),
             "scripts/ci-contract.json":format!("{:x}",Sha256::digest(CONTRACT.as_bytes()))}});
     let mut child = Command::new("/usr/bin/python3")
         .args(["-I", "-c", READER])

@@ -89,6 +89,7 @@ pub(super) async fn execute_evidence_group(
     let mut group_recovered = BTreeMap::new();
     let mut request = original_request.clone();
     let mut group_review = evidence_plan::GroupReview::default();
+    let mut first_validation_error=None;
     for recovery_attempt in 0..=1 {
         opts.session_id = Some(format!("{session}:group-{i}:recovery-{recovery_attempt}"));
         opts.restrict_env = true;
@@ -120,13 +121,30 @@ pub(super) async fn execute_evidence_group(
         let (pass, missing) = match parsed {
             Ok(value) => value,
             Err(error) if recovery_attempt == 0 => {
-                request=inputs.request(original_request.files.clone(),false,Some(serde_json::json!({"kind":"structured_review_correction","validation_error":truncate(&format!("{error:#}"),4000),"instruction":"Classify every finding with a nonempty typed repair target. Do not infer a code defect from missing evidence; return incomplete with exact missing_sources requests (path, registered criterion_ids, concrete question, selector kind whole_file/rust_item/bytes) when necessary. Preserve all valid findings and the exact candidate binding."})))?;
+                first_validation_error=Some(truncate(&format!("{error:#}"),4000));
+                request=inputs.format_correction(original_request,evidence_shards,serde_json::json!({"kind":"structured_review_correction","validation_error":first_validation_error.as_deref(),"instruction":"Classify every finding with a nonempty typed repair target. Do not infer a code defect from missing evidence; return incomplete with exact missing_sources requests (path, registered criterion_ids, concrete question, selector kind whole_file/rust_item/bytes) when necessary. Preserve all valid findings and the exact candidate binding. Already-captured candidate and controller sources may accompany the original assigned evidence; this remains partial coverage and the sole correction observation."}))?;
+                if let Some(workflow)=workflow {
+                    workflow.audit_logger().record_controller(serde_json::json!({"actor":"controller","kind":"review_format_correction",
+                        "binding":binding,"group":i,"role":role,"validation_error":first_validation_error.as_deref(),
+                        "original_request_hash":original_request.coverage.prompt_hash,"request_hash":request.coverage.prompt_hash,
+                        "supplied_entry_count":request.files.len()}))?;
+                }
                 continue;
             }
             Err(error) => {
                 return Err(error.context("bounded structured review correction exhausted"))
             }
         };
+        if recovery_attempt==1 && !pass.completed {
+            if let Some(workflow)=workflow {
+                // Diagnostic data only: no completed fragment, approval or
+                // failed-result replay authority is created by this record.
+                workflow.audit_logger().record_controller(serde_json::json!({"actor":"controller","kind":"review_group_incomplete",
+                    "binding":binding,"group":i,"role":role,"request_hash":request.coverage.prompt_hash,
+                    "native_session":group_sessions.last(),"first_validation_error":first_validation_error.as_deref(),
+                    "missing_sources":missing}))?;
+            }
+        }
         group_hashes.push(pass.coverage.prompt_hash.clone());
         if group_review
             .observe(pass.completed, pass.findings)
@@ -136,7 +154,8 @@ pub(super) async fn execute_evidence_group(
         }
         anyhow::ensure!(
             recovery_attempt == 0,
-            "review evidence remains incomplete after the second observation"
+            "review evidence remains incomplete after the second observation (group={i}, role={role:?}, first_validation_error={:?}, missing_sources={missing:?})",
+            first_validation_error.as_deref()
         );
         request = evidence_plan::recover_sources(
             inputs,
