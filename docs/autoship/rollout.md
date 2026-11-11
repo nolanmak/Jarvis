@@ -148,7 +148,8 @@ A review hold does not establish whether model work was billed. Inspect the
 workflow's resource counters and confirmed-merge allowance separately. Historical
 hold reasons remain historical records; a new deployment does not rewrite them.
 
-Hosted APT setup retries a confirmed Ubuntu mirror DNS failure once against
+Hosted APT setup requests IPv4 on hosted runners and retries a confirmed Ubuntu
+mirror DNS failure once against
 `https://mirrors.edge.kernel.org/ubuntu/`, using the runner's Ubuntu suite and
 archive signature keyring. Temporary source options apply only to that retry;
 host DNS and source files stay unchanged. Signature, lock, package and subsequent
