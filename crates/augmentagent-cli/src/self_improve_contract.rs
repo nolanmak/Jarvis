@@ -1844,11 +1844,33 @@ pub(super) async fn verify_with_repair(
     .await
 }
 
+async fn validate_candidate_scope(
+    worktree: &Path,
+    allowed_paths: &[crate::autoship_contract::PathScope],
+) -> Result<()> {
+    let diff = trusted_git(worktree, &["diff", "origin/main...HEAD"]).await?;
+    ensure!(
+        blast_radius_hit_in_diff(&diff).is_none(),
+        "acceptance repair touched a guarded path"
+    );
+    let paths = trusted_git(worktree, &["diff", "--name-only", "origin/main...HEAD"]).await?;
+    for path in paths.lines() {
+        ensure!(
+            allowed_paths
+                .iter()
+                .any(|scope| scope.contains(path)),
+            "candidate path outside independently registered scope: {path}"
+        );
+    }
+    Ok(())
+}
+
 async fn verify_repaired_candidate(
-    _worktree: &Path,
-    _allowed_paths: &[crate::autoship_contract::PathScope],
+    worktree: &Path,
+    allowed_paths: &[crate::autoship_contract::PathScope],
     verify: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
+    validate_candidate_scope(worktree, allowed_paths).await?;
     verify.await
 }
 
@@ -1984,23 +2006,7 @@ pub(super) async fn verify_with_repair_for(
     }
     for round in 0..=2 {
         recovery::commit_candidate_named(worktree, &format!("fix: {title} ({source})")).await?;
-        let diff = trusted_git(worktree, &["diff", "origin/main...HEAD"]).await?;
-        ensure!(
-            blast_radius_hit_in_diff(&diff).is_none(),
-            "acceptance repair touched a guarded path"
-        );
-        let paths = trusted_git(worktree, &["diff", "--name-only", "origin/main...HEAD"]).await?;
-        for path in paths.lines() {
-            ensure!(
-                prepared
-                    .proposal
-                    .contract
-                    .allowed_paths
-                    .iter()
-                    .any(|scope| scope.contains(path)),
-                "candidate path outside independently registered scope: {path}"
-            );
-        }
+        validate_candidate_scope(worktree, &prepared.proposal.contract.allowed_paths).await?;
         let verified = async {
             let mut reference =
                 verify_and_persist_candidate(worktree, prepared, control, &worker_roots(worktree), &workflow.audit_logger())
