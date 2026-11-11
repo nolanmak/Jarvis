@@ -89,6 +89,11 @@ mod tests {
                         assert_eq!((after.model_calls,after.tokens),(3,700));
                         assert_eq!(store.owner_control(&id).unwrap(),Some(pause));
                         assert_eq!(store.command_request(&id).unwrap().is_some(),command);
+                        let progress=store.progress_events(&id).unwrap();
+                        let terminal=progress.last().unwrap();
+                        assert_eq!(terminal.kind,if case=="closed" {"retired"}else{"merged"},
+                            "preserved owner pause obscured actual terminal completion");
+                        assert_eq!(terminal.reason,if case=="closed" {"target_closed"}else{"external-merge-observed"});
                         let terminal_events=store.events(&id).unwrap();
                         apply(&root,&path,"owner/repo/pr/42").await.unwrap();
                         assert_eq!(store.snapshot(&id).unwrap().unwrap(),after);
