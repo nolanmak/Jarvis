@@ -29,12 +29,24 @@
   "regression_tests_first_head": "a020559d997d99d9331b761cbf6f222486ba53e7",
   "tests_only_hosted_run": 42955761033,
   "tests_only_hosted_result": "still pending at implementation publication; not claimed as completed hosted RED",
-  "implementation_head": "34613595418a7f250732b97d93b75934c506588c",
+  "implementation_head": "db7d88ebfa762cc7858cec2e76e681cc4f60b938",
   "behavior": "Read typed authenticated GraphQL viewer login after existing repository identity/write permission checks. Preserve actor validation and reject unavailable/null identity.",
-  "hosted_validation": "pending",
+  "hosted_validation": "pending after integration of main including PR1988",
   "limits": [
     "No autonomous merge established by this repair.",
     "REST availability remains necessary for operations that read REST-only target/CI evidence.",
     "Account-wide API request consumption has not been attributed to a specific process."
-  ]
+  ],
+  "green_run": 42957911709,
+  "green_job": 130317397461,
+  "rollout_drain": {
+    "workflow": "nolanmak/jarvis/pr/1931",
+    "joined_existing": true,
+    "owner_pause_revision": 1,
+    "paused_at_ms": 1794370484892,
+    "model_calls_at_pause": 4,
+    "active_lease_at_observation": true,
+    "quiescence": "unverified",
+    "next": "Verify normal worker reload and resume this operator-created pause after readiness matches; preserve original charges and candidate."
+  }
 }

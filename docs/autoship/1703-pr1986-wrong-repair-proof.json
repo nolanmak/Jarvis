@@ -26,11 +26,18 @@
   "corrective_repair": {
     "pr": 1988,
     "head": "b30fee4483cf8aaf97e128f02951004fac7a9c11",
-    "hosted_validation": "pending",
+    "hosted_validation": "all checks passed",
     "behavior": "Assert measured consumer and persisted attribution, plus deterministic model/retrieval/tie cases; production unchanged.",
     "run": 42956050355,
     "job": 130311383116,
-    "ready_for_review": true
+    "ready_for_review": true,
+    "merged_at_utc": "2026-11-11T04:14:04Z",
+    "main_commit": "930e3e6b6251c06ec204e60fcd041bdc70d48e7f",
+    "merge_kind": "manual protected merge; zero autonomous credit",
+    "draft_context_tests_passed": 19,
+    "cli_tests_passed": 1748,
+    "cli_tests_ignored": 33,
+    "log_sha256": "8bab73eca67b8b3d454b908b871fa3eb3c5246ec44ff3ef6fffd723a55e261f4"
   },
   "deployment": {
     "main_and_built_stamp": "bbff7cb97f14ba95305705e800056c4228c15ac8",
@@ -39,5 +46,6 @@
     "state": "worker finishing active PR1931; readiness mismatch remains; no forced restart"
   },
   "reviewer_readiness": "Read-only current CLI report declares native Codex available. Earlier PR body reports unavailable; current service-context failure not confirmed.",
-  "autonomous_shipping": "unproven; allowance confirmed0 remaining5 at observation"
+  "autonomous_shipping": "unproven; allowance confirmed0 remaining5 at observation",
+  "snapshot": "20261111T041233Z-autoship-receipt-auth-1988-1990"
 }
