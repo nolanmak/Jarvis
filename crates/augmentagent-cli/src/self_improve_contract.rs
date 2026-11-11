@@ -1109,15 +1109,107 @@ fn install_candidate_harness(candidate: &Path, prepared: &PreparedAcceptance) ->
 
 fn initial_scope_error(error:anyhow::Error)->anyhow::Error {
     if error.downcast_ref::<crate::autoship_workflow::MissingScopeResponse>().is_some() {
-        initial_repair::Hold::EvidenceUnknown.into()
+        error.context(initial_repair::Hold::EvidenceUnknown)
     } else if scope_authority::completed_exhaustion(&error) {
-        initial_repair::Hold::ContractInvalid.into()
+        error.context(initial_repair::Hold::ContractInvalid)
     } else {error}
+}
+
+#[cfg(test)]
+mod initial_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn initial_scope_classification_retains_typed_private_cause() {
+        let error=initial_scope_error(anyhow::Error::new(scope_authority::CompletedInvalid("synthetic private validation detail".into())).context("proposal correction"));
+        assert_eq!(error.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::ContractInvalid));
+        assert!(error.downcast_ref::<scope_authority::CompletedInvalid>().is_some(),"classification discarded the original validation type");
+        assert!(format!("{error:#}").contains("synthetic private validation detail"));
+        let missing=initial_scope_error(crate::autoship_workflow::MissingScopeResponse.into());
+        assert!(missing.downcast_ref::<crate::autoship_workflow::MissingScopeResponse>().is_some());
+        assert_eq!(missing.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown));
+    }
+
+    async fn fixture()->(tempfile::TempDir,tempfile::TempDir,workflow::WorkflowGuard) {
+        let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::write(repo.path().join("implementation.py"),"def add(a,b): return a-b\n").unwrap();
+        for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","initial"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
+            let output=tokio::process::Command::new("/usr/bin/git").args(args).current_dir(repo.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
+            assert!(output.status.success());
+        }
+        let guard=workflow::WorkflowGuard::acquire_fixture(&control.path().join("workflow.db"),workflow::Start {
+            repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",source_issue:Some(7),pr:None,
+            branch:"fixture",contract:"original owner requirements",environment:"fixture",
+        }).await.unwrap().unwrap();
+        (repo,control,guard)
+    }
+
+    #[tokio::test]
+    async fn initial_private_diagnostics_are_durable_deduplicated_and_absent_from_public_progress() {
+        let (_repo,control,mut guard)=fixture().await;
+        let private="PRIVATE_DIAGNOSTIC_SENTINEL: original source selection failed";
+        let error=initial_scope_error(anyhow::Error::new(scope_authority::CompletedInvalid(private.into())).context("original correction context"));
+        let first=hold_initial_error(&mut guard,&error).await.unwrap().unwrap();
+        let path=control.path().join("workflow.db");
+        let conn=rusqlite::Connection::open(&path).unwrap();
+        let rows=conn.query_row("SELECT count(*),min(response) FROM scope_stage_response",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?))).unwrap();
+        assert_eq!(rows.0,1,"typed hold lost its private diagnostic");
+        let diagnostic:serde_json::Value=serde_json::from_str(&rows.1.unwrap()).unwrap();
+        assert!(diagnostic["diagnostic"].as_str().unwrap().contains(private));
+        assert!(diagnostic["diagnostic"].as_str().unwrap().contains("original correction context"));
+        let events:i64=conn.query_row("SELECT count(*) FROM workflow_event",[],|r|r.get(0)).unwrap();
+        let progress:i64=conn.query_row("SELECT progress_at FROM workflow WHERE id=?1",[guard.id()],|r|r.get(0)).unwrap();
+        let second=hold_initial_error(&mut guard,&error).await.unwrap().unwrap();
+        assert_eq!(first.message,second.message);
+        assert_eq!(first.message,initial_repair::Hold::ContractInvalid.to_string());
+        assert!(!first.message.contains("PRIVATE_DIAGNOSTIC_SENTINEL"));
+        assert_eq!(conn.query_row("SELECT count(*) FROM workflow_event",[],|r|r.get::<_,i64>(0)).unwrap(),events);
+        assert_eq!(conn.query_row("SELECT progress_at FROM workflow WHERE id=?1",[guard.id()],|r|r.get::<_,i64>(0)).unwrap(),progress);
+        let public:String=conn.query_row("SELECT group_concat(payload) FROM workflow_progress_event",[],|r|r.get(0)).unwrap();
+        assert!(!public.contains("PRIVATE_DIAGNOSTIC_SENTINEL"));
+        let id=guard.id().to_string();guard.finish().unwrap();drop(conn);
+        let reopened=rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(reopened.query_row("SELECT count(*) FROM scope_stage_response",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(reopened.query_row("SELECT model_calls FROM workflow WHERE id=?1",[id],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    #[tokio::test]
+    async fn initial_private_diagnostic_write_failure_keeps_hold_and_safe_error() {
+        for oversized in [false,true] {
+            let (_repo,control,mut guard)=fixture().await;
+            let conn=rusqlite::Connection::open(control.path().join("workflow.db")).unwrap();
+            if !oversized {conn.execute_batch("CREATE TRIGGER deny_private_diagnostic BEFORE INSERT ON scope_stage_response BEGIN SELECT RAISE(ABORT,'private store unavailable'); END;").unwrap();}
+            let private=if oversized {"PRIVATE_DIAGNOSTIC_SENTINEL".repeat(100_000)} else {"PRIVATE_DIAGNOSTIC_SENTINEL".into()};
+            let error=initial_scope_error(scope_authority::CompletedInvalid(private).into());
+            let failed=hold_initial_error(&mut guard,&error).await;
+            assert!(failed.is_err(),"failed retention was reported as successfully held with diagnostics");
+            let failure=failed.err().unwrap();
+            assert_eq!(failure.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown));
+            assert!(!format!("{failure:#}").contains("PRIVATE_DIAGNOSTIC_SENTINEL"));
+            let reason:String=conn.query_row("SELECT json_extract(checkpoint,'$.next.reason') FROM workflow WHERE id=?1",[guard.id()],|r|r.get(0)).unwrap();
+            assert_eq!(reason,"acceptance_contract_invalid");
+            assert_eq!(conn.query_row("SELECT model_calls FROM workflow WHERE id=?1",[guard.id()],|r|r.get::<_,i64>(0)).unwrap(),0);
+        }
+    }
 }
 
 pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,error:&anyhow::Error)->Result<Option<RunReport>> {
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
+    // Record the safe hold first: loss of private diagnostic storage cannot
+    // make the workflow runnable or publish the underlying source/output.
     workflow.hold_initial_acceptance(hold.reason(),hold.action()).await?;
+    let diagnostic=format!("{error:#}");
+    let key=amendment::digest(&serde_json::to_vec(&(
+        "initial-acceptance-diagnostic-v1",workflow.id(),workflow.binding(),hold.reason(),
+        amendment::digest(diagnostic.as_bytes()),
+    ))?);
+    let record=serde_json::json!({"version":1,"kind":"initial_acceptance_diagnostic",
+        "workflow":workflow.id(),"binding":workflow.binding(),"reason":hold.reason(),"diagnostic":diagnostic});
+    // The immutable writer owns the existing 2 MiB bound and binding/lease
+    // checks. Exact replays create no new row/event; no clock or generation
+    // enters the identity. Failed retention exposes only a fixed safe type.
+    workflow.record_scope_stage_response(&key,&serde_json::to_string(&record)?)
+        .map_err(|_|anyhow::Error::from(initial_repair::Hold::EvidenceUnknown))?;
     Ok(Some(RunReport::held(hold.to_string())))
 }
 
