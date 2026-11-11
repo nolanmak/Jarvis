@@ -1407,6 +1407,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn main_advance_is_typed_through_context_and_source_wrapping() {
+        for depth in 0..3 {
+            let dir = candidate_fixture();
+            let candidate = fixture_git(dir.path(), &["rev-parse", "HEAD"]);
+            fixture_git(dir.path(), &["checkout", "--detach", "origin/main"]);
+            std::fs::write(dir.path().join("new-main.rs"), "fn shipped() {}\n").unwrap();
+            fixture_git(dir.path(), &["add", "."]);
+            fixture_git(dir.path(), &["commit", "-qm", "main advances"]);
+            let main = fixture_git(dir.path(), &["rev-parse", "HEAD"]);
+            fixture_git(dir.path(), &["update-ref", "refs/remotes/origin/main", &main]);
+            fixture_git(dir.path(), &["checkout", "--detach", &candidate]);
+            let mut error = candidate_snapshot(dir.path()).await.err().unwrap();
+            for layer in 0..depth { error = wrap_review_failure(error, layer); }
+            let review = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex, error);
+            let why = review.why_unavailable.unwrap();
+            assert_eq!(why.code(), "review-main-advanced");
+            assert!(!why.permanent());
+            assert!(why.log_line().contains(&candidate) && why.log_line().contains(&main));
+            assert!(!why.headline().contains(&candidate));
+        }
+        let lookalike = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,
+            anyhow::anyhow!("main advanced beyond candidate; integrate current main before review"));
+        assert_eq!(lookalike.why_unavailable.unwrap().code(), "review-recovery-required");
+    }
+
+    #[tokio::test]
+    async fn main_advance_queues_original_workflow_without_resetting_work_or_charges() {
+        use crate::autoship_workflow::{WorkflowStore, ResourceCharge, Stage};
+        use crate::autoship_workflow::submission::{Request, Target, Milestone};
+        let dir = candidate_fixture();
+        let candidate = fixture_git(dir.path(), &["rev-parse", "HEAD"]);
+        fixture_git(dir.path(), &["checkout", "--detach", "origin/main"]);
+        std::fs::write(dir.path().join("new-main.rs"), "fn shipped() {}\n").unwrap();
+        fixture_git(dir.path(), &["add", "."]);
+        fixture_git(dir.path(), &["commit", "-qm", "main advances"]);
+        fixture_git(dir.path(), &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        fixture_git(dir.path(), &["checkout", "--detach", &candidate]);
+        let error = candidate_snapshot(dir.path()).await.err().unwrap();
+        let why = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex, error)
+            .why_unavailable.unwrap();
+        let control = tempfile::Builder::new().prefix("main-advance-control-").tempdir_in("/tmp").unwrap();
+        let state = control.path().join("workflow.db");
+        let mut guard = workflow::WorkflowGuard::acquire_fixture(&state, workflow::Start {
+            repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo", source_issue: Some(7),
+            pr: Some(42), branch: "fix/fixture", contract: "original owner contract", environment: "fixture",
+        }).await.unwrap().unwrap();
+        guard.checkpoint(Stage::Review, "verified", "review", 0, &["original-immutable-pin".into()]).await.unwrap();
+        let id = guard.id().to_owned();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut store = WorkflowStore::open(&state).unwrap();
+        store.charge(&guard.merge_lease().unwrap(), "original-paid-work", ResourceCharge {
+            model_calls: 7, tokens: 42, wall_ms: 10,
+        }, now).unwrap();
+        store.submit_authorized("original-command", "github:owner", &Request {
+            repository: "owner/repo".into(), target: Target::Pr(42), provider: None, until: Milestone::Merged,
+        }, now).unwrap();
+        let before = store.snapshot(&id).unwrap().unwrap();
+        let allowance = serde_json::to_value(store.merge_allowance(now, 5).unwrap()).unwrap();
+        let queued = checkpoint_unavailable_review(&mut guard, &why, now).await.unwrap();
+        let after = store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(after.checkpoint.stage, Stage::Reconcile, "a changed main must not require another owner resume");
+        assert!(queued);
+        assert_eq!(after.checkpoint.next.reason, "review_main_changed");
+        assert_eq!(after.checkpoint.next.action, "reconcile_main");
+        assert_eq!(after.checkpoint.next.eligible_at_ms, now + 300_000);
+        assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
+        assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
+        assert_eq!((after.model_calls, after.tokens), (7, 42));
+        assert_eq!(serde_json::to_value(store.merge_allowance(now, 5).unwrap()).unwrap(), allowance);
+        guard.finish().unwrap();
+        assert!(!store.command_queue_due("owner/repo", now + 299_999).unwrap());
+        assert!(store.command_queue_due("owner/repo", now + 300_000).unwrap());
+        assert_eq!(fixture_git(dir.path(), &["rev-parse", "HEAD"]), candidate);
+    }
+
+    #[tokio::test]
     async fn caller_evidence_preserves_all_matches_and_full_files_beyond_old_hit_cap() {
         let dir = candidate_fixture();
         for i in 0..20 {

@@ -6168,6 +6168,15 @@ fn unreviewable_drafts_in(path: &Path) -> Vec<(u64, String, String, u32)> {
         .collect()
 }
 
+async fn checkpoint_unavailable_review(
+    workflow: &mut workflow::WorkflowGuard,
+    _why: &ReviewUnavailable,
+    _now: i64,
+) -> Result<bool> {
+    workflow.transition(crate::autoship_workflow::Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
+    Ok(false)
+}
+
 /// #1037 — act on a draft that cannot be reviewed: record the day, say why on
 /// the PR, stand down when the verdict cannot change or the budget is spent.
 async fn hold_unreviewable(
@@ -7203,7 +7212,9 @@ async fn resume_draft_pr(
                     if !dry_run {
                         workflow.push(branch).await?;
                     }
-                    workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
+                    if checkpoint_unavailable_review(&mut workflow, &why, chrono::Utc::now().timestamp_millis()).await? {
+                        return Ok(RunReport::built(format!("PR #{pr}: current main requires integration and fresh verification; preserved work queued")));
+                    }
                     return Ok(hold_unreviewable(
                         repo_root,
                         pr,
