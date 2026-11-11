@@ -75,7 +75,8 @@
     "stage": "held",
     "reason": "adopted_execution_retry",
     "controller_failure": "acceptance repair touched a guarded path",
-    "candidate_added_path": "autoship_verifiers/observe.py"
+    "candidate_added_path": "autoship_verifiers/observe.py",
+    "diagnostic_correction": "The observer path alone is not a blast-radius match. The full PR diff includes scripts/autoship-deployment-readiness.py, which matches the existing deploy path guard. This observed refusal does not establish post-repair verification ordering."
   },
   "worked_untrusted_recipe": {
     "invocation": {

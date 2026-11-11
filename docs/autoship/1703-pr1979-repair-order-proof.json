@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1983,
+  "pull_request": 1979,
+  "observed_at_utc": "2026-11-11T01:39:17.367330+00:00",
+  "regression": {
+    "name": "self_improve::acceptance::repair_gate_tests::repair_scope_is_checked_before_verification_runs",
+    "fixture": "Real temporary Git repositories and the production post-repair helper; lazy callback counts verification execution. Allowed edit executes once; unregistered implementation/observer edits execute zero times. An allowed-list deployment path is independently refused by the guard.",
+    "baseline_head": "509439308047a63c470cfe1453e860572a6b9483",
+    "run": 42936128482,
+    "job": 130246536059,
+    "url": "https://github.com/nolanmak/Jarvis/actions/runs/42936128482/job/130246536059",
+    "result": "intended behavioral failure",
+    "failure": "unwrap_err called on Ok: the unregistered edit reached verification",
+    "other_cli_passed": 1741,
+    "existing_ignored": 33,
+    "log_sha256": "4ff2a87d3a7252c2f2ebb220ebf2090033a0ec2ccdbf2c3c3916c4fdd7488093"
+  },
+  "fix": {
+    "head": "4bfb6ae88c5cc4452cd47e7a88aed2235955a20a",
+    "path": "crates/augmentagent-cli/src/self_improve_contract.rs",
+    "behavior": "Reuse existing guarded-path and independently registered allowed-path validation immediately before awaiting repaired-candidate verification, and at the existing round-start location.",
+    "run": 42940409364,
+    "result": "pending"
+  },
+  "local_attempt": {
+    "command": "scripts/cargo-managed.sh test -p augmentagent-cli repair_scope_is_checked_before_verification_runs",
+    "result": "storage admission refused while another build held the lease; Cargo never started",
+    "behavioral_result": null
+  },
+  "completion": {
+    "independent_approval": false,
+    "merged": false,
+    "deployed": false,
+    "production_acceptance": false
+  },
+  "limits": [
+    "This addresses validation ordering, not initial harness compilation or independent review source-budget recovery.",
+    "No owner hold, verifier, merge allowance, lease or required CI was bypassed.",
+    "A passing component test is not full autoship restoration."
+  ],
+  "diagnostic_origin": {
+    "pull_request": 1978,
+    "controller_failure": "acceptance repair touched a guarded path",
+    "correction": "This failure does not prove post-repair gate ordering. Its full candidate includes scripts/autoship-deployment-readiness.py, which matches the existing deploy path guard. The added observer path alone is not a blast-radius match."
+  },
+  "first_corrected_run": {
+    "head": "b4cf17995c4d7e61b11b6433422271e27c692917",
+    "run": 42938360687,
+    "job": 130253910256,
+    "result": "failed fixture expectation",
+    "error": "autoship_verifiers/observe.py: candidate path outside independently registered scope",
+    "meaning": "The validator correctly refused the unregistered observer. The fixture wrongly expected the guarded-path error.",
+    "other_cli_passed": 1741,
+    "existing_ignored": 33,
+    "log_sha256": "598e8c55c4e73a13bfd04ec3bec47ae41364fbf1ba7b83c96888fbed1fc85861"
+  }
+}
