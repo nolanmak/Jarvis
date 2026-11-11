@@ -18,7 +18,10 @@ r=pathlib.Path(os.environ['FIXTURE']);a=sys.argv[1:]
 s=json.loads((r/'scenario.json').read_text())
 with (r/'calls').open('a') as f: f.write(json.dumps(a)+'\n')
 if a[:2]==['repo','view']: print(s.get('permission','WRITE') if 'viewerPermission' in a else 'owner/repo')
-elif a[:2]==['api','user']: print(s.get('actor','owner'))
+elif a[:2]==['api','user']:
+ print('API rate limit exceeded',file=sys.stderr);sys.exit(1)
+elif a[:2]==['api','graphql'] and 'query=query AutoshipViewer { viewer { login } }' in a:
+ print(json.dumps({'data':{'viewer':{'login':s.get('actor','owner')}}}))
 elif a[:2]==['api','repos/owner/repo/issues/7']:
  print(json.dumps({'number':7,'state':s.get('state','open'),'html_url':'https://github.com/owner/repo/issues/7','title':'Fix arithmetic','body':'Fix addition','user':{'login':'owner'},'author_association':'OWNER'}))
 elif a[:2]==['api','repos/owner/repo/pulls/42']:
