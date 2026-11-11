@@ -487,6 +487,25 @@ pub(super) async fn execute_pr(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_target_reconciliation_preserves_unresolved_operations() {
+        use crate::autoship_workflow::{Binding,OperationKind,WorkflowStore,Stage};
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let id="owner/repo/pr/42";
+        let binding=Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
+        let now=chrono::Utc::now().timestamp_millis();
+        store.register(id,"fixture",binding.clone(),now).unwrap();
+        let lease=store.claim(id,"original",now,60_000).unwrap().unwrap();
+        let operation=store.begin_operation(&lease,OperationKind::Push,&binding,now).unwrap();
+        store.release(&lease,now).unwrap();
+        let before=store.snapshot(id).unwrap().unwrap();
+        assert!(!super::settle_outside_target(&path,id,Stage::Retired,"target_closed","github:pr:42:closed-unmerged".into()).unwrap(),
+            "terminal observation discarded an unresolved remote side effect");
+        assert_eq!(store.snapshot(id).unwrap().unwrap(),before);
+        assert_eq!(store.pending_operations(id).unwrap().len(),1);
+        assert_eq!(store.pending_operations(id).unwrap()[0].id,operation.id);
+    }
     use super::*;
     use crate::autoship_workflow::submission::Milestone;
     use std::os::unix::fs::PermissionsExt;

@@ -141,6 +141,23 @@ pub(super) fn require_dispatch(conn:&Connection,workflow:&str)->Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn manual_target_reconciliation_can_pause_known_adoption_without_starting_it() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let id=pr_workflow_id("owner/repo",42).unwrap();
+        assert!(store.set_owner_pause(&id,"github:owner",0,true,1).is_err(),"unknown targets are not implicit registrations");
+        store.observe_adoption("owner/repo",42,"head","{}",2).unwrap();
+        let pause=store.set_owner_pause(&id,"github:owner",0,true,3).unwrap();
+        assert!(pause.paused);
+        assert!(store.snapshot(&id).unwrap().is_none());
+        assert!(store.command_request(&id).unwrap().is_none());
+        store.register(&id,"fixture",binding(),4).unwrap();
+        assert!(store.claim_productive(&id,"worker",5,1000).unwrap().is_none());
+        let state=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!((state.attempts,state.model_calls,state.tokens),(0,0,0));
+        assert_eq!(store.owner_control(&id).unwrap(),Some(pause));
+    }
     fn binding()->Binding {Binding {head:"head".into(),contract:"owner-contract".into(),evidence_hash:"proof".into()}}
     fn request(n:u64)->submission::Request {submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(n),provider:None,until:submission::Milestone::Merged}}
 
