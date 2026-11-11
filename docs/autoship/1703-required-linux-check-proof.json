@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "observed_at_utc": "2026-11-11T02:37:46.354488+00:00",
+  "repository": "nolanmak/Jarvis",
+  "branch": "main",
+  "endpoint": "repos/nolanmak/Jarvis/branches/main/protection/required_status_checks",
+  "before": {
+    "strict": true,
+    "checks": [
+      {
+        "context": "privacy",
+        "app_id": 15368
+      },
+      {
+        "context": "node-release",
+        "app_id": 15368
+      }
+    ]
+  },
+  "after": {
+    "strict": true,
+    "checks": [
+      {
+        "context": "privacy",
+        "app_id": 15368
+      },
+      {
+        "context": "node-release",
+        "app_id": 15368
+      },
+      {
+        "context": "targeted",
+        "app_id": 15368
+      }
+    ]
+  },
+  "effect": "The Linux aggregate is now required alongside privacy and node-release. Strict up-to-date protection remains enabled. No macOS context was added.",
+  "verification": "GitHub GraphQL on PR1978 at09353524 reports all three contexts isRequired=true; targeted is currently in progress while privacy/node-release succeeded. The actual check-run app IDs were separately verified as15368.",
+  "mutation_scope": "Only the required-status-check endpoint was patched; both existing checks and strict=true were retained. No force/admin merge override was used.",
+  "restoration": false
+}

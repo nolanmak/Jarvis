@@ -3,7 +3,7 @@
   "epic": 1703,
   "issue": 1983,
   "pull_request": 1979,
-  "observed_at_utc": "2026-11-11T02:15:59.604891+00:00",
+  "observed_at_utc": "2026-11-11T02:37:46.354488+00:00",
   "regression": {
     "name": "self_improve::acceptance::repair_gate_tests::repair_scope_is_checked_before_verification_runs",
     "fixture": "Real temporary Git repositories and the production post-repair helper; lazy callback counts verification execution. Allowed edit executes once; unregistered implementation/observer edits execute zero times. An allowed-list deployment path is independently refused by the guard.",
@@ -188,7 +188,7 @@
   },
   "review_followup": {
     "head": "46d8dcf74ed03557ab136366ee4e4384c31f746a",
-    "state": "tests only; hosted behavioral RED pending; implementation not yet applied",
+    "state": "two intended behavioral RED failures confirmed; implementation applied; new integrated-head GREEN pending",
     "run": 42943808949,
     "job": 130271641592,
     "findings": [
@@ -203,6 +203,24 @@
         "regression": "scope_rejection_uses_bounded_repair_then_durable_rescope"
       }
     ],
-    "fixture_limits": "Real temporary Git repositories and WorkflowGuard/store; empty provider pool prevents paid/native calls. Durable budget/spend states and preserved rejected source are asserted. This is not live autonomous review or a registered verifier."
-  }
+    "fixture_limits": "Real temporary Git repositories and WorkflowGuard/store; empty provider pool prevents paid/native calls. Durable budget/spend states and preserved rejected source are asserted. This is not live autonomous review or a registered verifier.",
+    "red_result": {
+      "passed": 1742,
+      "failed": 2,
+      "ignored": 33,
+      "failures": [
+        "rename returned Ok and reached verification",
+        "actual repair entry remained at Review instead of entering Build/bounded recovery"
+      ],
+      "log_sha256": "97be98ca4d51e0fb6050e70fbc9f362092ccf70fa33af3dadb04d2a4d4b1dca0"
+    },
+    "implementation_head": "6146bffed6b419124e7d67f4e31697e646ff1f3d",
+    "integration_head": "1f0a3ca754557261770d34a24d6c589cb09f98df",
+    "main_integrated": "e873050904145347c9b3ee2ff1f17dec7c3d0a7e",
+    "green_run": 42946110266,
+    "green_job": 130279196866,
+    "green_result": "pending",
+    "implementation": "Typed scope rejection skips CI/infra/verifier-amendment classification and uses the existing bounded repair/re-scope flow. Both old and new rename paths are checked with --no-renames. Rejected post-repair candidates continue to the next bounded round without verification. No extra alignment budget is granted for scope rejection."
+  },
+  "current_head": "1f0a3ca754557261770d34a24d6c589cb09f98df"
 }
