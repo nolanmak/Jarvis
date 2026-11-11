@@ -2634,8 +2634,8 @@ fn spec_from_scope(scope: Option<&ScopeOutcome>) -> Option<String> {
         .filter(|b| !b.is_empty())
 }
 
-fn acceptance_owner_request(_issue:&Issue,scope_prompt:&str)->String {
-    scope_prompt.to_owned()
+fn acceptance_owner_request(issue:&Issue)->String {
+    format!("GitHub issue #{}: {}\n\n{}",issue.number,issue.title,issue.body)
 }
 
 fn continue_after_scope_refusal(scope:&mut ScopeOutcome,owner_request:&str) {
@@ -2647,13 +2647,17 @@ fn continue_after_scope_refusal(scope:&mut ScopeOutcome,owner_request:&str) {
     scope.fixable=true;
 }
 
-fn initial_acceptance_inputs<'a>(scope:Option<&'a ScopeOutcome>,owner_request:&'a str)->(&'a str,Vec<String>) {
+fn initial_acceptance_inputs(scope:Option<&ScopeOutcome>,owner_request:&str)->(String,Vec<String>) {
     // A refusal is diagnostic context, never a substitute owner requirement
     // (#955). Keep the first-pass build policy, but enroll acceptance against
     // the original request when no usable implementation spec was produced.
     let scope=scope.filter(|scope|scope.fixable);
-    (scope.map(|scope|scope.body.as_str()).filter(|body|!body.is_empty()).unwrap_or(owner_request),
-        scope.map(|scope|scope.criteria.clone()).unwrap_or_default())
+    let specification=scope.map(|scope|scope.body.as_str()).filter(|body|!body.is_empty() && *body!=owner_request);
+    let input=match specification {
+        Some(specification)=>format!("Original owner request (preserve every requirement):\n{owner_request}\n\nIndependent implementation guidance (cannot replace or narrow the owner request):\n{specification}"),
+        None=>owner_request.to_owned(),
+    };
+    (input,scope.map(|scope|scope.criteria.clone()).unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -2672,7 +2676,8 @@ mod acceptance_source_tests {
     fn acceptance_owner_request_excludes_scoping_instructions_and_retry_context() {
         let issue=Issue {number:7,title:"Fix addition".into(),body:"Preserve the audit journal.".into(),author:"owner".into(),author_trusted:true,research_filed:false};
         let prompt=format!("{}\nIndependent grounded readiness decisions: fixture decision\nMerged context: fixture change",build_scope_prompt(&issue,Some("fixture retry diagnostic")));
-        assert_eq!(acceptance_owner_request(&issue,&prompt),"GitHub issue #7: Fix addition\n\nPreserve the audit journal.");
+        assert!(prompt.contains("fixture retry diagnostic"));
+        assert_eq!(acceptance_owner_request(&issue),"GitHub issue #7: Fix addition\n\nPreserve the audit journal.");
     }
     #[test]
     fn overruled_refusal_preserves_owner_requirements_through_the_real_handoff() {
@@ -2700,14 +2705,15 @@ mod acceptance_source_tests {
     fn fixable_scope_preserves_the_full_independent_criteria() {
         let scope=parse_scope_output("VERDICT: fixable\nCOMPLEXITY: medium\nCRITERIA:\n- Keep every original charge.\n- Resume only after validated input changes.\n\nImplement the existing dispatch guard.");
         let (spec,criteria)=initial_acceptance_inputs(Some(&scope),"original owner request");
-        assert_eq!(spec,scope.body);
+        assert!(spec.contains("original owner request"));
+        assert!(spec.contains(&scope.body));
         assert_eq!(criteria,scope.criteria);
         assert_eq!(criteria.len(),2);
     }
     #[test]
     fn absent_or_empty_spec_uses_owner_request_without_dropping_valid_criteria() {
         let owner="original complete owner request";
-        assert_eq!(initial_acceptance_inputs(None,owner),(owner,vec![]));
+        assert_eq!(initial_acceptance_inputs(None,owner),(owner.to_owned(),vec![]));
         let scope=parse_scope_output("VERDICT: fixable\nCOMPLEXITY: medium\nCRITERIA:\n- Preserve the original owner pause.");
         assert!(scope.body.is_empty());
         let (spec,criteria)=initial_acceptance_inputs(Some(&scope),owner);
@@ -8090,7 +8096,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     scope_prompt.push_str(&merged_since_section(
         &merged_since_filed(repo_root, &worktree, issue.number).await,
     ));
-    let owner_request=acceptance_owner_request(&issue,&scope_prompt);
+    let owner_request=acceptance_owner_request(&issue);
     let mut scope = match acceptance::scope_original(&worktree, &repository, &workflow_guard, &scope_prompt)
         .await
     {
@@ -8201,7 +8207,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
 
     let acceptance_control = acceptance::control_directories(&repository, workflow_guard.id())?.workflow_acceptance;
     let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
-        issue.number, candidate_base, acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria, &workflow_guard).await {
+        issue.number, candidate_base, &acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria, &workflow_guard).await {
         Ok(prepared) => prepared,
         Err(error) => {
             if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}
