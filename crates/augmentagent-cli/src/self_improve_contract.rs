@@ -1928,6 +1928,137 @@ mod repair_gate_tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn renamed_repair_checks_the_original_path_before_verification() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        trusted_git(root, &["init", "-q"]).await.unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/unregistered.rs"), "original contents\n").unwrap();
+        trusted_git(root, &["add", "."]).await.unwrap();
+        trusted_git(root, &[
+            "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "-qm", "base",
+        ]).await.unwrap();
+        trusted_git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"])
+            .await.unwrap();
+        trusted_git(root, &["mv", "src/unregistered.rs", "src/allowed.rs"])
+            .await.unwrap();
+        trusted_git(root, &[
+            "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "-qm", "rename repair",
+        ]).await.unwrap();
+        let mut calls = 0;
+        let result = verify_repaired_candidate(
+            root, &[PathScope::File("src/allowed.rs".into())], async {
+                calls += 1;
+                Ok(())
+            },
+        ).await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("src/unregistered.rs"), "{error}");
+        assert_eq!(calls, 0, "renaming an unregistered source must not reach verification");
+    }
+
+    #[tokio::test]
+    async fn scope_rejection_uses_bounded_repair_then_durable_rescope() {
+        use crate::autoship_contract::{Criterion, Verifier, VerifierCommand};
+        use crate::autoship_workflow::{Stage, WorkflowStore};
+        for spent in [0, 3] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path();
+            let control = tempfile::tempdir().unwrap();
+            trusted_git(root, &["init", "-q"]).await.unwrap();
+            std::fs::create_dir(root.join("autoship_verifiers")).unwrap();
+            let adapter = "autoship_verifiers/observe.py";
+            std::fs::write(root.join(adapter), "print(0)\n").unwrap();
+            trusted_git(root, &["add", "."]).await.unwrap();
+            trusted_git(root, &[
+                "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                "commit", "-qm", "base",
+            ]).await.unwrap();
+            let base = actual_head(root).await.unwrap();
+            trusted_git(root, &["update-ref", "refs/remotes/origin/main", &base])
+                .await.unwrap();
+            let proposal = ContractProposal {
+                contract: AcceptanceContract {
+                    schema_version: 1, revision: 1, issue: Some(42), pull_request: None,
+                    criteria: vec![Criterion { id: "ready".into(),
+                        requirement: "Return ready for the documented input".into(),
+                        verifier_ids: vec!["observe".into()] }],
+                    allowed_paths: vec![PathScope::File("src/allowed.rs".into()),
+                        PathScope::File(adapter.into())],
+                    verifiers: vec![Verifier { id: "observe".into(),
+                        command: VerifierCommand::BlackBox {
+                            invocation: crate::autoship_contract::BehaviorInvocation::PythonScript {
+                                file: adapter.into(), args: vec![],
+                            }, oracle: crate::autoship_contract::OutputOracle::Json {
+                                value: serde_json::json!(1),
+                            },
+                        }, pinned_files: vec![adapter.into()],
+                        failure_witness: "observed behavior differs".into() }],
+                },
+                files: [(adapter.into(), "print(0)\n".into())].into(),
+            };
+            let registration = RegisteredContract::register(
+                root, proposal.contract.clone(), base, "fixture-v1".into(),
+            ).unwrap();
+            let mut prepared = PreparedAcceptance {
+                proposal, baseline: BaselineEvidence { registration, receipts: vec![] },
+            };
+            std::fs::create_dir(root.join("src")).unwrap();
+            // A source name containing "disk" must not classify a known
+            // scope rejection as a storage/infrastructure failure.
+            std::fs::write(root.join("src/disk.rs"), "preserved rejected repair\n").unwrap();
+            trusted_git(root, &["add", "."]).await.unwrap();
+            trusted_git(root, &[
+                "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                "commit", "-qm", "outside registered scope",
+            ]).await.unwrap();
+            let database = control.path().join("workflow.db");
+            let mut guard = workflow::WorkflowGuard::acquire_fixture(&database, workflow::Start {
+                repo_root: root, worktree: root, repository: "owner/repo",
+                source_issue: Some(42), pr: None, branch: "fixture",
+                contract: prepared.baseline.registration.contract_hash(), environment: "fixture-v1",
+            }).await.unwrap().unwrap();
+            guard.checkpoint(Stage::Review, "candidate_ready", "run_verifier", 0, &[])
+                .await.unwrap();
+            let epoch = amendment::digest(&serde_json::to_vec(&(
+                prepared.baseline.registration.contract_hash(),
+                prepared.baseline.registration.baseline_head(),
+                prepared.baseline.registration.candidate_environment_id(),
+            )).unwrap());
+            for _ in 0..spent {
+                assert!(guard.admit_epoch_attempt("acceptance_repair", &epoch, 3).unwrap());
+            }
+            let reasoner = FallbackReasoner::for_tests(vec![],
+                augmentagent_channel_core::CooldownLatch::at(control.path().join("cooldowns.json")));
+            let result = verify_with_repair_for(&reasoner, AcceptanceSource::Issue(42),
+                "fixture", root, &mut prepared, control.path(), &mut guard).await;
+            assert!(result.is_err());
+            let store = WorkflowStore::open(&database).unwrap();
+            let after = store.snapshot(guard.id()).unwrap().unwrap();
+            if spent == 0 {
+                assert_eq!(after.checkpoint.stage, Stage::Build);
+                assert_eq!(after.checkpoint.next.reason, "acceptance_failed");
+                assert_eq!(after.checkpoint.next.action, "repair_implementation");
+            } else {
+                assert_eq!(after.checkpoint.stage, Stage::Scope);
+                assert_eq!(after.checkpoint.next.reason, "acceptance_repair_budget");
+                assert_eq!(after.checkpoint.next.action, "rescope_acceptance");
+            }
+            let attempts: u32 = store.query_connection(|connection| Ok(connection.query_row(
+                "SELECT attempts FROM bounded_attempt WHERE workflow=?1 AND purpose='acceptance_repair' AND binding=?2",
+                rusqlite::params![guard.id(), format!("epoch:{epoch}")], |row| row.get(0),
+            )?)).unwrap();
+            assert_eq!(attempts, if spent == 0 {1} else {3});
+            assert_eq!(after.model_calls, 0, "empty fixture provider pool must never spend");
+            assert_eq!(std::fs::read_to_string(root.join("src/disk.rs")).unwrap(),
+                "preserved rejected repair\n", "recovery must preserve rejected source/history");
+            guard.finish().unwrap();
+        }
+    }
 }
 
 pub(super) async fn verify_with_repair_for(
