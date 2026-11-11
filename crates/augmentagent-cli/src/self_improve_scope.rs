@@ -250,6 +250,10 @@ async fn run_inner(root:&Path,repository:&str,workflow:&workflow::WorkflowGuard,
 pub(super) struct CompletedInvalid(pub String);
 impl std::fmt::Display for CompletedInvalid {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{write!(f,"independent scope exhausted bounded completed-response retries: {}",self.0)}}
 impl std::error::Error for CompletedInvalid {}
+pub(super) fn completed_exhaustion(error:&anyhow::Error)->bool {
+    error.downcast_ref::<CompletedInvalid>().is_some() || error.downcast_ref::<SourceSelectionExhausted>().is_some()
+}
+
 fn cached_completed_generation<T>(read:impl Fn(bool,u32)->Result<Option<String>>,validate:impl Fn(&str)->Result<T>)->Result<Option<T>> {
     for correction in [false,true] {
         for attempt in 0..2 {

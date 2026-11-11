@@ -22,22 +22,40 @@ pub(crate) async fn apply(repo:&Path,path:&Path,id:&str,paused:bool)->(i32,Value
     };
     let number=target["number"].as_u64().unwrap();
     let canonical=(||->anyhow::Result<String> {
-        if target["kind"]=="pr" {Ok(store.resolve_pr(&repository,number)?.unwrap_or(crate::autoship_workflow::pr_workflow_id(&repository,number)?))}
-        else {crate::autoship_workflow::workflow_id(&repository,number)}
+        let canonical=if target["kind"]=="pr" {store.resolve_pr(&repository,number)?.unwrap_or(crate::autoship_workflow::pr_workflow_id(&repository,number)?)}
+        else {crate::autoship_workflow::workflow_id(&repository,number)?};
+        anyhow::ensure!(super::target(&canonical)?.0==repository,"workflow alias repository differs");
+        Ok(canonical)
     })();
     let id=match canonical {Ok(id)=>id,Err(e)=>return failure(id,4,"workflow-state-unavailable",e)};
     let request=match store.command_request(&id) {
-        Ok(Some(request))=>request,
-        Ok(None)=>return failure(&id,2,"workflow-not-found","no durable command job"),
+        Ok(request)=>request,
         Err(e)=>return failure(&id,4,"workflow-state-unavailable",e),
     };
+    if request.is_none() {
+        match store.snapshot(&id) {
+            Ok(Some(_))=>{},
+            Ok(None)=>return failure(&id,2,"workflow-not-found","no durable workflow or command job"),
+            Err(e)=>return failure(&id,4,"workflow-state-unavailable",e),
+        }
+    }
     let revision=match store.owner_control(&id) {Ok(control)=>control.map_or(0,|c|c.revision),Err(e)=>return failure(&id,4,"workflow-state-unavailable",e)};
     drop(store);
-    let principal=match crate::self_improve::targeted::authorize_command(repo,&request).await {
+    // Automatic workflows have no command policy. Control their existing
+    // registration without creating an execution request, pin or milestone.
+    let authorization=match &request {
+        Some(request)=>crate::self_improve::targeted::authorize_command(repo,request).await,
+        None=>crate::self_improve::targeted::authorize_repository(repo,&repository).await,
+    };
+    let principal=match authorization {
         Ok(actor)=>actor,Err(e)=>return failure(&id,2,"target-authorization-failed",e),
     };
     if !paused {
-        if let Err(e)=crate::self_improve::targeted::command_readiness(repo,&request).await {
+        let readiness=match &request {
+            Some(request)=>crate::self_improve::targeted::command_readiness(repo,request).await,
+            None=>crate::self_improve::targeted::control_readiness(repo).await,
+        };
+        if let Err(e)=readiness {
             return failure(&id,3,"execution-readiness-blocked",format!("{e:#}"));
         }
     }

@@ -837,7 +837,7 @@ impl WorkflowGuard {
         let store = self.store.clone();
         let lease = self.lease.clone();
         let observational = self.repository.starts_with("autoship-observation/") || self.repository.starts_with("autoship-canary/");
-        self.audit.set_model_call_observer(Arc::new(move |provider| {
+        self.audit.set_correlated_model_call_observer(Arc::new(move |provider| {
             anyhow::ensure!(!capacity_flag.load(Ordering::SeqCst), "resource_capacity: await_capacity checkpoint retained");
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
             anyhow::ensure!(!matches!(store.snapshot(&lease.workflow)?.context("workflow missing")?.checkpoint.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot admit another model call");
@@ -849,7 +849,8 @@ impl WorkflowGuard {
             let actual=match provider {"codex"=>Some(durable::submission::Provider::Codex),"claude"=>Some(durable::submission::Provider::Claude),_=>None};
             store.charge_admitted_model(&lease,&receipt,millis(),observational.then(observation_call_cap),
                 bounded.as_ref().map(|b|(b.purpose.as_str(),&b.binding,b.limit)),actual,
-                augmentagent_channel_core::native_session::is_fresh_review())
+                augmentagent_channel_core::native_session::is_fresh_review())?;
+            Ok(receipt)
         }))
     }
     /// Builder identity is checked independently of audit binding so reviewer
@@ -1292,6 +1293,21 @@ impl WorkflowGuard {
             serde_json::json!({"decision_id":decision_id,"approved":approved,
             "receipt_sha256":format!("{:x}", Sha256::digest(receipt.as_bytes()))}),
         )
+    }
+
+    pub(super) async fn hold_initial_acceptance(&mut self,reason:&str,action:&str)->Result<()> {
+        self.healthy_lease()?;
+        self.audit_health().await?;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
+        let mut checkpoint=store.snapshot(self.id())?.context("initial acceptance workflow missing")?.checkpoint;
+        anyhow::ensure!(checkpoint.binding==self.binding && matches!(checkpoint.stage,Stage::Intake|Stage::Scope),
+            "initial acceptance hold requires unchanged unenrolled scope");
+        if checkpoint.stage==Stage::Scope && checkpoint.next.reason==reason && checkpoint.next.action==action
+            && checkpoint.next.eligible_at_ms==0 {return Ok(());}
+        checkpoint.stage=Stage::Scope;
+        checkpoint.next=crate::autoship_workflow::NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0};
+        store.checkpoint(&self.lease,&checkpoint,millis())?;
+        Ok(())
     }
 
     pub(super) fn check_resource_policy(&self) -> Result<()> {
@@ -2882,6 +2898,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_admission_audit_names_the_committed_accounting_receipt() {
+        let dir = repo();
+        let control = control_dir();
+        let path = control.path().join("workflow.db");
+        let guard = WorkflowGuard::acquire_at(&path, Start {
+            repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo",
+            source_issue: Some(77), pr: None, branch: "fixture", contract: "C1",
+            environment: "test",
+        }, millis()).await.unwrap().unwrap();
+        let audit = guard.audit_logger();
+        // Script the existing admission boundary; no provider is launched.
+        audit.model_call_admitted("codex").unwrap();
+        let store = WorkflowStore::open(&path).unwrap();
+        let admissions: Vec<serde_json::Value> = store.events(guard.id()).unwrap()
+            .into_iter().filter(|(_, kind, _, _)| kind == "native_model_admitted")
+            .map(|(_, _, payload, _)| serde_json::from_str(&payload).unwrap()).collect();
+        assert_eq!(admissions.len(), 1);
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls, 1);
+        let receipt = admissions[0]["receipt"].as_str().unwrap();
+        assert!(receipt.starts_with("model-call:"));
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(audit.path()).unwrap()
+            .lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|record| record["kind"] == "model_call_admitted").collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["actual_provider"], "codex");
+        assert_eq!(records[0]["accounting_receipt"].as_str(), Some(receipt),
+            "protected admission must identify the original committed charge");
+        audit.protected_health().unwrap();
+    }
+
+    #[tokio::test]
     async fn ci_gate_reports_meaningful_success_only_after_a_passing_result() {
         for disposition in ["passed","hosted-pending","source-failed","infrastructure-failed"] {
             let directory=repo();let state=control_dir();let path=state.path().join("workflow.db");
@@ -3152,4 +3199,43 @@ mod tests {
         assert!(record.wall_ms>0,"actual observed guard lifetime must be accounted");
     }
 
+}
+
+
+#[cfg(test)]
+mod initial_acceptance_hold_tests {
+    use super::*;
+    #[tokio::test]
+    async fn all_initial_source_families_keep_precise_hold_without_false_progress() {
+        for (issue,pr) in [(Some(7),None),(Some(7),Some(42)),(None,Some(42))] {
+            let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
+            std::fs::write(repo.path().join("implementation.py"),"def add(a,b): return a-b\n").unwrap();
+            for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","initial"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
+                let output=tokio::process::Command::new("/usr/bin/git").args(args).current_dir(repo.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
+                assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+            }
+            let path=control.path().join("workflow.db");
+            let mut guard=WorkflowGuard::acquire_fixture(&path,Start {repo_root:repo.path(),worktree:repo.path(),
+                repository:"owner/repo",source_issue:issue,pr,branch:"fixture",contract:"unchanged owner criteria",environment:"fixture"}).await.unwrap().unwrap();
+            guard.hold_initial_acceptance("acceptance_verifier_repair_exhausted","await_acceptance_input_change").await.unwrap();
+            let first=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
+            let events=guard.store.lock().unwrap().events(guard.id()).unwrap().len();
+            guard.hold_initial_acceptance("acceptance_verifier_repair_exhausted","await_acceptance_input_change").await.unwrap();
+            let repeated=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(repeated.progress_at_ms,first.progress_at_ms);
+            assert_eq!(repeated.checkpoint.binding,first.checkpoint.binding);
+            assert_eq!(repeated.checkpoint.next.reason,"acceptance_verifier_repair_exhausted");
+            assert_eq!(guard.store.lock().unwrap().events(guard.id()).unwrap().len(),events);
+            assert_eq!(repeated.model_calls,0);
+            assert_eq!(repeated.tokens,0);
+            guard.hold_initial_acceptance("acceptance_verifier_evidence_unknown","await_original_evidence_recovery").await.unwrap();
+            let unknown=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(unknown.checkpoint.next.action,"await_original_evidence_recovery");
+            guard.hold_initial_acceptance("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery").await.unwrap();
+            let infrastructure=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(infrastructure.checkpoint.next.reason,"acceptance_verifier_infrastructure_unavailable");
+            assert_eq!(infrastructure.checkpoint.next.action,"await_verifier_infrastructure_recovery");
+            assert_eq!(infrastructure.model_calls,0);
+        }
+    }
 }

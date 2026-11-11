@@ -260,6 +260,9 @@ elif a[:2]==['pr','checks']:
 
 elif a[:2]==['api','graphql']:
     fields=dict(value.split('=',1) for i,value in enumerate(a) if i>0 and a[i-1]=='-f')
+    if fields['query'].startswith('query AutoshipViewer'):
+        print(json.dumps(dict(data=dict(viewer=dict(login='fixture-owner')))))
+        sys.exit(0)
     if fields['query'].startswith('query AutoshipDirectMergePolicy'):
         print(json.dumps(dict(data=dict(repository=dict(mergeQueue=None)))))
         sys.exit(0)
