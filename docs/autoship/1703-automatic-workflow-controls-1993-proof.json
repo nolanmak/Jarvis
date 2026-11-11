@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1992,
+  "pull_request": 1993,
+  "head": "95abafa6e40c35d190495475fbf44ac7b6e0e5fd",
+  "observed_at_utc": "2026-11-11T06:37:49.110492+00:00",
+  "defect": "Owner pause incorrectly required a CLI command admission even for an existing registered automatic workflow.",
+  "red": {
+    "source_commit": "503a9971e59f3f172e9df5f21d9890d2533d02a0",
+    "method": "Actual deployed CLI with isolated state and mock GitHub transport; registered workflow, no command job.",
+    "exit_code": 2,
+    "reason": "workflow-not-found",
+    "error": "no durable command job",
+    "production_mutation": false,
+    "provider_calls": 0
+  },
+  "tests_first_commit": "bc4f6bf5",
+  "managed_validation": {
+    "suite": "autoship_submit_cli",
+    "passed": 20,
+    "failed": 0,
+    "includes": "Automatic workflow, canonical PR alias, revoked access, unready resume, unchanged execution/accounting and no new command admission."
+  },
+  "hosted": {
+    "run": 42970687753,
+    "job": 130358205190,
+    "state": "success",
+    "cli_units_passed": 1760,
+    "cli_units_failed": 0,
+    "cli_units_ignored": 33,
+    "submission_integration_passed": 20,
+    "log_sha256": "832b2d1ad5d24f30899fd9cabd3e57da363c27394d8f749f7586bb8c071b9ba6"
+  },
+  "rollout": {
+    "state": "verified on both running services",
+    "snapshot": "20261111T061343Z-autoship-automatic-controls-1993",
+    "main_and_built_stamp": "44bef06ef9f5cbe30f11ed45e6759fc5edce9853",
+    "executable_sha256": "bdb80e73ac8f5643f342714461b0a31c453010aab82bf8603dfcac921e3f0e87",
+    "configuration_sha256": "55a4880360525f8b799dab8c433a109c315a97edacfcfddcc838fedd5ed400a0",
+    "daemon_pid": 837562,
+    "worker_pid": 869393,
+    "deployment_matches": true,
+    "manual_daemon_restart": false
+  },
+  "scope_limits": [
+    "An accepted pause records intent; it does not certify in-flight teardown.",
+    "No new provider pin, command job, milestone, model allowance or autonomous merge credit.",
+    "This control fix does not demonstrate autonomous shipping recovery."
+  ],
+  "merge": {
+    "commit": "44bef06ef9f5cbe30f11ed45e6759fc5edce9853",
+    "merged_at": "2026-11-11T06:26:57Z",
+    "kind": "manual protected merge",
+    "autonomous_credit": 0
+  },
+  "live_cli_control": {
+    "source_commit": "44bef06ef9f5cbe30f11ed45e6759fc5edce9853",
+    "executable_sha256": "bdb80e73ac8f5643f342714461b0a31c453010aab82bf8603dfcac921e3f0e87",
+    "observed_at_utc": "2026-11-11T06:36:09.789330+00:00",
+    "workflow": "nolanmak/jarvis#1981",
+    "before": {
+      "checkpoint_sha256": "58b0557b9ec89d881440167c7ed12cd78fc73d369ed51509a25de0dff29b79ca",
+      "model_calls": 21,
+      "tokens": 0,
+      "wall_ms": 916784,
+      "reason": "acceptance_contract_invalid",
+      "stage": "scope",
+      "command_jobs": 0,
+      "owner_control": null
+    },
+    "both_service_executables_match": true,
+    "deployment_matches": true,
+    "pause_revision": 1,
+    "resume_accepted": true,
+    "after": {
+      "checkpoint_sha256": "58b0557b9ec89d881440167c7ed12cd78fc73d369ed51509a25de0dff29b79ca",
+      "model_calls": 21,
+      "tokens": 0,
+      "wall_ms": 916784,
+      "reason": "acceptance_contract_invalid",
+      "stage": "scope",
+      "command_jobs": 0,
+      "owner_control": [
+        2,
+        0
+      ]
+    },
+    "verified": true,
+    "new_command_jobs": 0,
+    "new_model_calls": 0,
+    "original_acceptance_hold_preserved": true,
+    "autonomous_merge_credit": 0
+  },
+  "private_progress_delivery": {
+    "sequence": 7,
+    "state": "confirmed",
+    "confirmed_at_ms": 1794379000200,
+    "scope": "Coalesced control/progress update receipt, not proof of a productive Discord coding session."
+  },
+  "remaining_failure": {
+    "workflow": "nolanmak/jarvis/pr/1931",
+    "reason": "acceptance_repair_budget",
+    "behavioral_verifier_passed": true,
+    "alignment": "five unmapped hunks, no outside-scope changes or uncovered criteria in the reported failure",
+    "model_calls": 12,
+    "autonomous_merge": false
+  }
+}
