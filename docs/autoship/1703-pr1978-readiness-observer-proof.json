@@ -80,11 +80,34 @@
   "worked_untrusted_recipe": {
     "invocation": {
       "kind": "python_script",
-      "path": "autoship_verifiers/observe.py",
-      "args": []
+      "args": [],
+      "file": "autoship_verifiers/observe.py"
     },
     "files": {
       "autoship_verifiers/observe.py": "import importlib.util\nimport json\nimport sys\nimport tempfile\nfrom pathlib import Path\n\nsys.path.insert(0, str(Path.cwd()))\nspec = importlib.util.spec_from_file_location('deployment', Path.cwd() / 'scripts' / 'autoship-deployment-readiness.py')\nm = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(m)\n\n\ndef observe(mode):\n    with tempfile.TemporaryDirectory() as temporary:\n        root = Path(temporary)\n        old = root / 'provider-old'\n        new = root / 'provider-new'\n        old.write_bytes(b'old provider executable')\n        new.write_bytes(b'new provider executable')\n        old.chmod(0o755)\n        new.chmod(0o755)\n        link = root / 'provider'\n        calls = []\n\n        def point_at(target):\n            link.unlink(missing_ok=True)\n            link.symlink_to(target)\n\n        point_at(old)\n        original_selected = m.selected\n        original_snapshot = m.snapshot\n        original_birth = m.birth\n        original_boot = m.boot\n        try:\n            m.selected = lambda selection: (root / 'policy.json', 'selection', 'policy', {'providers': {'claude': {}}})\n            m.birth = lambda pid: 'birth'\n            m.boot = lambda: 'boot'\n\n            def snapshot(role, pid, binary, binary_sha, policy, policy_sha, declaration, receipts):\n                calls.append(role)\n                if mode == 'persistent-provider' and role == 'daemon':\n                    point_at(old)\n                provider = m.provider_hash({'CLAUDE_CLI': str(link)}, 'CLAUDE_CLI', 'claude', root)\n                if role == 'daemon' and mode in ('transient', 'persistent-provider'):\n                    point_at(new)\n                if mode == 'configuration':\n                    configuration = role\n                else:\n                    configuration = provider\n                return {'status': 'configuration-observed', 'pid': pid, 'birth': 'birth', 'configuration_sha256': configuration, 'provider_executable_sha256': {'claude': provider}}\n\n            m.snapshot = snapshot\n            report = m.inspect('/usr/bin/true', root / 'selection', root / 'receipts', lambda role: 1)\n            return [report['status'], report['matches'], len(calls)]\n        finally:\n            m.selected = original_selected\n            m.snapshot = original_snapshot\n            m.birth = original_birth\n            m.boot = original_boot\n\n\nprint(json.dumps([observe('transient'), observe('persistent-provider'), observe('configuration')]))\n"
+    },
+    "pinned_files": [
+      "autoship_verifiers/observe.py"
+    ],
+    "oracle": {
+      "kind": "json",
+      "value": [
+        [
+          "configuration-matched",
+          true,
+          4
+        ],
+        [
+          "effective-configuration-mismatch",
+          false,
+          4
+        ],
+        [
+          "effective-configuration-mismatch",
+          false,
+          2
+        ]
+      ]
     }
   },
   "validation_scope": "Manual first-party Linux sandbox replay against the exact tracked readiness script blobs. The fixture swaps a real symlink and hashes its target. It supplies synthetic service snapshots to the real inspect function. Expectations were compared outside the observer.",
