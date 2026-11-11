@@ -1457,49 +1457,79 @@ mod tests {
     async fn main_advance_queues_original_workflow_without_resetting_work_or_charges() {
         use crate::autoship_workflow::{WorkflowStore, ResourceCharge, Stage};
         use crate::autoship_workflow::submission::{Request, Target, Milestone};
-        let dir = candidate_fixture();
-        let candidate = fixture_git(dir.path(), &["rev-parse", "HEAD"]);
-        fixture_git(dir.path(), &["checkout", "--detach", "origin/main"]);
-        std::fs::write(dir.path().join("new-main.rs"), "fn shipped() {}\n").unwrap();
-        fixture_git(dir.path(), &["add", "."]);
-        fixture_git(dir.path(), &["commit", "-qm", "main advances"]);
-        fixture_git(dir.path(), &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-        fixture_git(dir.path(), &["checkout", "--detach", &candidate]);
-        let error = candidate_snapshot(dir.path()).await.err().unwrap();
-        let why = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex, error)
-            .why_unavailable.unwrap();
-        let control = tempfile::Builder::new().prefix("main-advance-control-").tempdir_in("/tmp").unwrap();
-        let state = control.path().join("workflow.db");
-        let mut guard = workflow::WorkflowGuard::acquire_fixture(&state, workflow::Start {
-            repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo", source_issue: Some(7),
-            pr: Some(42), branch: "fix/fixture", contract: "original owner contract", environment: "fixture",
-        }).await.unwrap().unwrap();
-        guard.checkpoint(Stage::Review, "verified", "review", 0, &["original-immutable-pin".into()]).await.unwrap();
-        let id = guard.id().to_owned();
-        let now = chrono::Utc::now().timestamp_millis();
-        let mut store = WorkflowStore::open(&state).unwrap();
-        store.charge(&guard.merge_lease().unwrap(), "original-paid-work", ResourceCharge {
-            model_calls: 7, tokens: 42, wall_ms: 10,
-        }, now).unwrap();
-        store.submit_authorized("original-command", "github:owner", &Request {
-            repository: "owner/repo".into(), target: Target::Pr(42), provider: None, until: Milestone::Merged,
-        }, now).unwrap();
-        let before = store.snapshot(&id).unwrap().unwrap();
-        let allowance = serde_json::to_value(store.merge_allowance(now, 5).unwrap()).unwrap();
-        checkpoint_unavailable_review(&mut guard, &why, now).await.unwrap();
-        let after = store.snapshot(&id).unwrap().unwrap();
-        assert_eq!(after.checkpoint.stage, Stage::Reconcile, "a changed main must not require another owner resume");
-        assert_eq!(after.checkpoint.next.reason, "review_main_changed");
-        assert_eq!(after.checkpoint.next.action, "reconcile_main");
-        assert_eq!(after.checkpoint.next.eligible_at_ms, now + 300_000);
-        assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
-        assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
-        assert_eq!((after.model_calls, after.tokens), (7, 42));
-        assert_eq!(serde_json::to_value(store.merge_allowance(now, 5).unwrap()).unwrap(), allowance);
-        guard.finish().unwrap();
-        assert!(!store.command_queue_due("owner/repo", now + 299_999).unwrap());
-        assert!(store.command_queue_due("owner/repo", now + 300_000).unwrap());
-        assert_eq!(fixture_git(dir.path(), &["rev-parse", "HEAD"]), candidate);
+        for command in [false, true] {
+            let dir = candidate_fixture();
+            let candidate = fixture_git(dir.path(), &["rev-parse", "HEAD"]);
+            fixture_git(dir.path(), &["checkout", "--detach", "origin/main"]);
+            std::fs::write(dir.path().join("new-main.rs"), "fn shipped() {}\n").unwrap();
+            fixture_git(dir.path(), &["add", "."]);
+            fixture_git(dir.path(), &["commit", "-qm", "main advances"]);
+            fixture_git(dir.path(), &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+            fixture_git(dir.path(), &["checkout", "--detach", &candidate]);
+            let error = candidate_snapshot(dir.path()).await.err().unwrap();
+            let why = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex, error)
+                .why_unavailable.unwrap();
+            let control = tempfile::Builder::new().prefix("main-advance-control-").tempdir_in("/tmp").unwrap();
+            let state = control.path().join("workflow.db");
+            let mut guard = workflow::WorkflowGuard::acquire_fixture(&state, workflow::Start {
+                repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo", source_issue: Some(7),
+                pr: if command { Some(42) } else { None }, branch: "fix/fixture", contract: "original owner contract", environment: "fixture",
+            }).await.unwrap().unwrap();
+            guard.checkpoint(Stage::Review, "verified", "review", 0, &["original-immutable-pin".into()]).await.unwrap();
+            let id = guard.id().to_owned();
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut store = WorkflowStore::open(&state).unwrap();
+            let lease = guard.merge_lease().unwrap();
+            store.attach_pr_in_repo(&lease, "owner/repo", 42, now).unwrap();
+            assert_eq!(id, if command { "owner/repo/pr/42" } else { "owner/repo#7" });
+            store.charge(&lease, "original-paid-work", ResourceCharge {
+                model_calls: 7, tokens: 42, wall_ms: 10,
+            }, now).unwrap();
+            if command {
+                store.submit_authorized("original-command", "github:owner", &Request {
+                    repository: "owner/repo".into(), target: Target::Pr(42), provider: None, until: Milestone::Merged,
+                }, now).unwrap();
+            }
+            let before = store.snapshot(&id).unwrap().unwrap();
+            let allowance = serde_json::to_value(store.merge_allowance(now, 5).unwrap()).unwrap();
+            checkpoint_unavailable_review(&mut guard, &why, now).await.unwrap();
+            let after = store.snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.checkpoint.stage, Stage::Reconcile, "a changed main must not require another owner resume");
+            assert_eq!(after.checkpoint.next.reason, "review_main_changed");
+            assert_eq!(after.checkpoint.next.action, "reconcile_main");
+            assert_eq!(after.checkpoint.next.eligible_at_ms, now + 300_000);
+            assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
+            assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
+            assert_eq!((after.model_calls, after.tokens), (7, 42));
+            assert_eq!(serde_json::to_value(store.merge_allowance(now, 5).unwrap()).unwrap(), allowance);
+            guard.finish().unwrap();
+            if command {
+                assert!(!store.command_queue_due("owner/repo", now + 299_999).unwrap());
+                assert!(store.command_queue_due("owner/repo", now + 300_000).unwrap());
+            } else { assert!(!store.has_command_jobs().unwrap()); }
+            assert_eq!(fixture_git(dir.path(), &["rev-parse", "HEAD"]), candidate);
+            let pr = adoption::AdoptedPr { repository: "owner/repo".into(), pr: 42, source_issue: Some(7),
+                branch: "fix/fixture".into(), head: candidate.clone(), base: "main".into(), author: "owner".into(),
+                title: "fixture".into(), body: "original owner contract".into(), dependency: adoption::Dependency::Main };
+            let candidates = [pr];
+            assert!(adoption::episode_retries(&state, &candidates, now + 299_999).unwrap().is_empty());
+            let retries = adoption::episode_retries(&state, &candidates, now + 300_000).unwrap();
+            assert!(retries.contains(&42), "automatic source-issue selection must recognize this dependency wake");
+            let mut ledger = AttemptLedger::default();
+            ledger.mark(1, 7);
+            assert!(adoption::select_linked_with_retries(&candidates, &ledger, 1, &Default::default(), None, 0, &Default::default()).is_none());
+            assert_eq!(adoption::select_linked_with_retries(&candidates, &ledger, 1, &Default::default(), None, 0, &retries).unwrap().0, 42);
+            store.set_owner_pause(&id, "github:owner", 0, true, now).unwrap();
+            assert!(adoption::episode_retries(&state, &candidates, now + 300_000).unwrap().is_empty());
+            store.set_owner_pause(&id, "github:owner", 1, false, now).unwrap();
+            let lease = store.claim_productive(&id, "later-worker", now + 300_000, 100_000).unwrap().unwrap();
+            let mut unrelated = store.snapshot(&id).unwrap().unwrap().checkpoint;
+            unrelated.next.reason = "resume_started".into();
+            store.checkpoint(&lease, &unrelated, now + 300_000).unwrap();
+            store.release(&lease, now + 300_000).unwrap();
+            assert!(adoption::episode_retries(&state, &candidates, now + 300_000).unwrap().is_empty(),
+                "a generic reconcile action cannot bypass the same-day paid-attempt fence");
+        }
     }
 
     #[tokio::test]
