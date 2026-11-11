@@ -3611,16 +3611,26 @@ enum ParkReason {
     QaUnavailable(String),
     /// The gate stayed red after the repair budget; its output.
     GateRed(String),
+    /// Untouched inherited CI policy needs a merge from reviewed main.
+    MainPolicyReconciliation(String),
     /// Still over the size cap after the shrink budget; the line count.
     Oversize(usize),
 }
 
 impl ParkReason {
+    fn from_gate_error(error: &anyhow::Error) -> Self {
+        match error.downcast_ref::<hosted_ci::MainPolicyReconciliation>() {
+            Some(dependency) => Self::MainPolicyReconciliation(dependency.main.clone()),
+            None => Self::GateRed(format!("{error:#}")),
+        }
+    }
+
     fn headline(&self) -> String {
         match self {
             Self::QaReject(_) => "QA review still requested changes after the revision budget".into(),
             Self::QaUnavailable(_) => "the QA reviewer could not run".into(),
             Self::GateRed(_) => "the verification gate stayed red after the repair budget".into(),
+            Self::MainPolicyReconciliation(_) => "the retained candidate needs reviewed-main policy reconciliation".into(),
             Self::Oversize(n) => format!("the diff is {n} lines, over the {MAX_DIFF_LINES}-line cap"),
         }
     }
@@ -3632,6 +3642,7 @@ impl ParkReason {
             Self::QaReject(notes) => qa_findings_comment(notes),
             Self::QaUnavailable(e) => format!("Reviewer error:\n```\n{}\n```", truncate(e, 1000)),
             Self::GateRed(out) => format!("Gate output:\n```\n{}\n```", truncate(out, 2500)),
+            Self::MainPolicyReconciliation(main) => format!("Merge reviewed main {main}, then rerun verification and independent review. No CI approval is recorded."),
             Self::Oversize(_) => String::new(),
         };
         format!(
@@ -3650,6 +3661,7 @@ impl ParkReason {
                 "- verification gate: passed on the reviewed diff (the full suite runs again before any merge)".into()
             }
             Self::GateRed(_) => "- verification gate: FAILED (output in the park comment)".into(),
+            Self::MainPolicyReconciliation(_) => "- verification gate: pending reviewed-main reconciliation; no CI pass".into(),
             Self::Oversize(_) => "- verification gate: not run on this diff (over the size cap)".into(),
         }
     }
@@ -3820,7 +3832,9 @@ async fn find_resumable_draft(
     // Re-evaluate policy freely before reserving any billed resume attempt.
     policy_hold::filter(repo_root, &mut adopted, dry_run).await;
     let ledger = AttemptLedger::load(&attempt_ledger_path());
-    let retries = adoption::episode_retries(&workflow::path(), &adopted, chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+    let now=chrono::Utc::now().timestamp_millis();
+    let mut retries = adoption::episode_retries(&workflow::path(), &adopted, now).unwrap_or_default();
+    retries.extend(adoption::policy_reconciliation_retries(repo_root,&workflow::path(),&adopted,now).await.unwrap_or_default());
     let select = |cursor| {
         adoption::select_linked_with_retries(&adopted, &ledger, utc_day_now(), &gave_up, only, cursor, &retries)
     };
@@ -4799,6 +4813,13 @@ impl CiGateResult {
             // Publication can proceed. Do not clear infrastructure history or
             // record verification_gate_passed before GitHub has tested the head.
             return Ok(Ok(()));
+        }
+        if let Some(dependency)=error.downcast_ref::<hosted_ci::MainPolicyReconciliation>() {
+            if workflow.pr()?.is_some() {
+                let eligible_at_ms=workflow.defer_main_policy_reconciliation(&dependency.main).await?;
+                workflow.finish_ci_deferral()?;
+                return Err(CiInfrastructureDeferred{workflow:workflow.id().to_owned(),eligible_at_ms}.into());
+            }
         }
         // Capacity has its own durable recovery and accounting boundary.
         if workflow.audit_logger().resource_capacity_seen() {
@@ -6722,6 +6743,9 @@ async fn resume_draft_pr(
     let (base_ok, resume_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
     anyhow::ensure!(base_ok, "resume acceptance baseline unavailable");
     let acceptance_scope = format!("Issue #{}: {}\n{}\n{}", issue.number, issue.title, issue.body, pr_body);
+    // Leave the legacy parked status before any paid preparation. If that
+    // preparation fails, the unchanged old policy cannot buy another wake.
+    workflow.transition(Stage::Reconcile, "resume_started", "reconcile_main", 0).await?;
     let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
         issue.number, resume_base.trim(), &acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &resumed_criteria, &workflow).await {
         Ok(prepared) => prepared,
@@ -6735,7 +6759,7 @@ async fn resume_draft_pr(
         if !resumed_criteria.contains(&criterion.requirement) { resumed_criteria.push(criterion.requirement.clone()); }
     }
     workflow.bind_acceptance(&prepared_acceptance)?;
-    workflow.transition(Stage::Reconcile, "resume_started", "reconcile_main", 0).await?;
+
     // An interrupted edit is valuable recovery state. Never reset it implicitly.
     let (status_ok, status, _) = run("git", &["status", "--porcelain"], &worktree).await?;
     anyhow::ensure!(status_ok, "cannot inspect preserved worktree");
@@ -8527,6 +8551,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         // so a run never spends more revision calls than it could before.
         let mut gate_result = verification_gate(&worktree, &workflow_guard.audit_logger()).await.for_workflow(&mut workflow_guard).await?;
         while let Err(gate_err) = &gate_result {
+            if gate_err.is::<hosted_ci::MainPolicyReconciliation>() { break; }
             if workflow_guard.audit_logger().resource_capacity_seen() { return Err(gate_result.unwrap_err()); }
             if let Some(report)=capacity_accounting.report()? {return Ok(report);}
             let gate_text = format!("{gate_err:#}");
@@ -8585,6 +8610,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             }
         }
         if let Err(gate_err) = gate_result {
+            if gate_err.is::<hosted_ci::MainPolicyReconciliation>() {
+                break 'stages Some(ParkReason::from_gate_error(&gate_err));
+            }
             warn!(
                 issue = issue.number,
                 "verification gate failed: {gate_err:#}"
@@ -9000,7 +9028,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             let record = match &pending {
                 ParkReason::Oversize(lines2) => rec(FailureKind::GuardRefusal, "revise:size", &format!("diff is {lines2} lines (cap {MAX_DIFF_LINES})"), &paths, n),
                 ParkReason::GateRed(out) => { let (kind, detail) = gate_outcome(out); rec(kind, "revise:gate", &detail, &paths, n) }
-                ParkReason::QaReject(_) | ParkReason::QaUnavailable(_) => unreachable!("only guards are pending"),
+                ParkReason::QaReject(_) | ParkReason::QaUnavailable(_) | ParkReason::MainPolicyReconciliation(_) => unreachable!("only guards are pending"),
             };
             if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(repo_root, issue.number, Some(record)).await.unwrap_or_else(|_| Tally::uncounted());
@@ -9465,7 +9493,11 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             reason.headline()
         ))
         .await;
-        workflow_guard.transition(crate::autoship_workflow::Stage::Reconcile, "draft_parked", "resume", chrono::Utc::now().timestamp_millis()).await?;
+        if let ParkReason::MainPolicyReconciliation(main)=reason {
+            workflow_guard.defer_main_policy_reconciliation(main).await?;
+        } else {
+            workflow_guard.transition(crate::autoship_workflow::Stage::Reconcile, "draft_parked", "resume", chrono::Utc::now().timestamp_millis()).await?;
+        }
         workflow_guard.finish()?;
         return Ok(RunReport::built(format!(
             "issue #{}: parked as draft PR ({}) — {pr_url}",

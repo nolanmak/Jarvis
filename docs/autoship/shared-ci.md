@@ -25,6 +25,29 @@ rejects unsynchronized metadata and new unclassified automation. Shared command
 changes trigger every path-filtered validation workflow. Rust embeds the runner
 and JSON contract; the updater rebuild predicate covers both files.
 
+## Retained branches and reviewed policy
+
+Publication compares the staged workflow and command-policy files with the
+controller's embedded pins. A retained branch can contain an untouched older
+policy after reviewed main advances. If main matches the embedded policy and
+the candidate's policy inventory, modes and objects still match its merge base,
+this is a main-reconciliation dependency. It does not enter model gate repair
+or mint a passing CI receipt. A new draft records `review_main_changed` /
+`reconcile_main`; an existing PR defers through that same fenced recovery path.
+
+Older drafts parked as `draft_parked` may receive the same-day reconciliation
+opportunity only when immutable Git objects prove that inherited drift, the
+known head and PR alias agree, the lease/backoff permit it, and owner controls
+permit dispatch. This observation edits neither workflow state nor accounting.
+Resume leaves the legacy parked status before paid preparation, preventing the
+same old status from repeatedly reopening an unchanged failed attempt.
+
+Actual candidate policy edits remain refused. A policy mismatch cannot be
+classified as inherited when main differs from the running controller; that
+requires reviewed rollout. Neither path accepts a
+candidate-edited manifest as authority; normal main integration, executable
+acceptance, independent review and applicable hosted checks remain required.
+
 ## Local controller interface
 
 The trusted controller supplies its embedded runner and contract through

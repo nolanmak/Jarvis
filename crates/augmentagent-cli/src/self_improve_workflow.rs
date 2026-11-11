@@ -1457,6 +1457,33 @@ impl WorkflowGuard {
         Ok(())
     }
 
+    pub(super) async fn defer_main_policy_reconciliation(&mut self, main: &str) -> Result<i64> {
+        anyhow::ensure!(
+            matches!(main.len(), 40 | 64) && main.bytes().all(|c| c.is_ascii_hexdigit()),
+            "invalid main policy dependency"
+        );
+        self.validate_before_side_effect()?;
+        self.audit_health().await?;
+        anyhow::ensure!(
+            self.pending_operations()?.is_empty(),
+            "pending publication must reconcile before main integration"
+        );
+        let eligible = millis().saturating_add(300_000);
+        self.audit_event(
+            "hosted_ci_main_dependency",
+            serde_json::json!({"observed_main":main,"shipping_authority":false}),
+        )?;
+        self.checkpoint(
+            Stage::Reconcile,
+            "review_main_changed",
+            "reconcile_main",
+            eligible,
+            &[],
+        )
+        .await?;
+        Ok(eligible)
+    }
+
     pub(super) async fn defer_verification_infrastructure(&mut self,error:&anyhow::Error)->Result<Option<i64>> {
         let message=format!("{error:#}");
         let Some(code)=infra_failure_reason(&message) else {return Ok(None);};
@@ -1588,8 +1615,9 @@ impl WorkflowGuard {
     pub(super) fn finish_ci_deferral(&mut self) -> Result<()> {
         let checkpoint = self.store.lock().map_err(|_|anyhow::anyhow!("workflow retry store poisoned"))?
             .snapshot(self.id())?.context("retry workflow missing")?.checkpoint;
-        anyhow::ensure!(checkpoint.next.reason == "verification_infrastructure_retry"
-            && checkpoint.next.action == "retry_verification", "no durable CI deferral to release");
+        anyhow::ensure!(matches!((checkpoint.next.reason.as_str(),checkpoint.next.action.as_str()),
+            ("verification_infrastructure_retry","retry_verification") | ("review_main_changed","reconcile_main")),
+            "no durable CI deferral to release");
         self.release_after_teardown()
     }
 
@@ -3215,6 +3243,66 @@ mod tests {
         assert!(guard.audit_logger().model_call_admitted("codex").is_err());assert!(guard.validate_before_side_effect().is_err());
         assert!(guard.finish().is_err());
         assert!(store.claim_productive(&id,"too-early",after.checkpoint.next.eligible_at_ms-1,60_000).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn published_policy_dependency_defers_before_the_model_repair_boundary() {
+        let dir = repo();
+        let control = control_dir();
+        let path = control.path().join("workflow.db");
+        let mut guard = WorkflowGuard::acquire_at(
+            &path,
+            Start {
+                repo_root: dir.path(),
+                worktree: dir.path(),
+                repository: "owner/repo",
+                source_issue: Some(713),
+                pr: Some(42),
+                branch: "fixture",
+                contract: "C1",
+                environment: "test",
+            },
+            millis(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        guard.audit_logger().model_call_admitted("claude").unwrap();
+        let id = guard.id().to_owned();
+        let before = WorkflowStore::open(&path)
+            .unwrap()
+            .snapshot(&id)
+            .unwrap()
+            .unwrap();
+        let error = CiGateResult(Err(hosted_ci::MainPolicyReconciliation {
+            main: "b".repeat(40),
+        }
+        .into()))
+        .for_workflow(&mut guard)
+        .await
+        .unwrap_err();
+        assert!(
+            error.is::<CiInfrastructureDeferred>(),
+            "policy drift leaked into the repairable inner result: {error:#}"
+        );
+        let mut store = WorkflowStore::open(&path).unwrap();
+        let after = store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(after.checkpoint.stage, Stage::Reconcile);
+        assert_eq!(after.checkpoint.next.reason, "review_main_changed");
+        assert_eq!(after.checkpoint.next.action, "reconcile_main");
+        assert!(after.checkpoint.next.eligible_at_ms > millis());
+        assert_eq!(after.model_calls, before.model_calls);
+        assert_eq!(after.tokens, before.tokens);
+        assert!(store
+            .claim_productive(
+                &id,
+                "too-early",
+                after.checkpoint.next.eligible_at_ms - 1,
+                60_000
+            )
+            .unwrap()
+            .is_none());
+        guard.finish().unwrap();
     }
 
     #[tokio::test]
