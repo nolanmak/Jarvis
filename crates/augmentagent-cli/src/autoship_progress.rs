@@ -113,6 +113,7 @@ fn code(value:&str,fallback:&str)->String {
         "review_changes_requested"|"ci_failed"|"merge_conflict"|"head_changed"|"target_closed"|
         "acceptance_verifier_repair_exhausted"|"acceptance_verifier_evidence_unknown"|
         "acceptance_contract_invalid"|"acceptance_verifier_infrastructure_unavailable"|
+        "readiness_assessment_invalid"|"await_readiness_input_change"|
         "await_acceptance_input_change"|"await_original_evidence_recovery"|"await_verifier_infrastructure_recovery"|
         "review_main_changed"|"reconcile_main"|"resume_deferred"|"resume_preserved_work"|"resume_preserved_pr"|
         "draft_published"|"resume"|"adopted_review_pending"|"adopted_execution_retry"|
@@ -142,6 +143,7 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     let initial_verifier_hold=checkpoint.as_ref().is_some_and(|c|c.stage==Stage::Scope && matches!(
         (c.next.reason.as_str(),c.next.action.as_str()),
         ("acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid","await_acceptance_input_change")|
+        ("readiness_assessment_invalid","await_readiness_input_change")|
         ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
         ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery")));
     let typed_review_hold=checkpoint.as_ref().is_some_and(|c|
@@ -337,7 +339,8 @@ mod tests {
     }
     #[test]
     fn initial_verifier_holds_remain_precise_after_command_attempt_finishes() {
-        for (reason,action) in [("acceptance_verifier_repair_exhausted","await_acceptance_input_change"),
+        for (reason,action) in [("readiness_assessment_invalid","await_readiness_input_change"),
+            ("acceptance_verifier_repair_exhausted","await_acceptance_input_change"),
             ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery"),
             ("acceptance_contract_invalid","await_acceptance_input_change"),
             ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery")] {

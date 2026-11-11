@@ -261,7 +261,8 @@ pub(super) async fn resume(
                         || checkpoint.next.action.starts_with("retry_")
                         || matches!(
                             checkpoint.next.action.as_str(),
-                            "verify_new_revision"
+                            "await_readiness_input_change"
+                                | "verify_new_revision"
                                 | "rescope_acceptance"
                                 | "repair_verifier_definition"
                                 | "complete_review_or_adjudication"
