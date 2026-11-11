@@ -125,10 +125,8 @@ mod deploy_snapshot;
 mod snapshot_refs;
 mod disk;
 mod build_storage;
-// #1930 — the storage admission authority, its physical-directory leases and
-// the reservation ledger live in channel-core so writers outside this binary
-// admit against the same lock namespace. The CLI consumes the same types.
-pub use augmentagent_channel_core::{storage_leases, storage_reservations};
+mod storage_leases;
+mod storage_reservations;
 mod autoship_worker;
 mod doctor;
 mod env_cfg;

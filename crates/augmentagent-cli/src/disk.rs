@@ -315,9 +315,26 @@ fn read_unit(dir: &Path, now: SystemTime) -> Option<UnitRecord> {
 // Scan (filesystem).
 // ---------------------------------------------------------------------------
 
-/// The lease authority decides which directories are build output, so the gate
-/// measures exactly the set it locks.
-pub use augmentagent_channel_core::storage_leases::profile_dirs;
+/// Profile dirs (`debug`, `release`, `<triple>/debug`, …) under a target
+/// root: any dir holding `deps/` or `incremental/`.
+pub fn profile_dirs(target_root: &Path) -> Vec<PathBuf> {
+    let is_profile = |p: &Path| p.join("deps").is_dir() || p.join("incremental").is_dir();
+    let mut out = Vec::new();
+    for child in read_dir_paths(target_root) {
+        // The gate owns tmp/ as scratch. Its test fixtures are not profiles,
+        // and following their links could discover an unrelated target.
+        if child.file_name().is_some_and(|name| name == "tmp") || !child.is_dir() {
+            continue;
+        }
+        if is_profile(&child) {
+            out.push(child);
+        } else {
+            out.extend(read_dir_paths(&child).into_iter().filter(|p| p.is_dir() && is_profile(p)));
+        }
+    }
+    out.sort();
+    out
+}
 
 fn read_dir_paths(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)

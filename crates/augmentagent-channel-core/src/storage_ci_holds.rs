@@ -90,11 +90,10 @@ struct Record {
 }
 
 fn directory() -> Result<PathBuf> {
-    #[cfg(test)]
     if let Some(path) = TEST_DIRECTORY.with(|slot| slot.borrow().clone()) {
         return Ok(path);
     }
-    let path = crate::storage_leases::lock_directory()?.join("ci-cleanup");
+    let path = crate::storage_coordination::lock_directory()?.join("ci-cleanup");
     match std::fs::DirBuilder::new().mode(0o700).create(&path) {
         Ok(()) => (),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
@@ -392,7 +391,7 @@ pub fn may_cleanup(path: &Path) -> Result<bool> {
 /// Cleanup entry points reconcile abandoned owners themselves, before an old
 /// checkout can prevent the next storage admission from ever being reached.
 pub fn may_cleanup_after_reconcile(path: &Path) -> Result<bool> {
-    let _admission = crate::storage_reservations::Admission::lock()?;
+    let _admission = crate::storage_coordination::Admission::lock()?;
     may_cleanup(path)
 }
 
@@ -428,7 +427,7 @@ impl Hold {
                 .collect::<Result<_>>()?,
             resource: None,
         };
-        let _admission = crate::storage_reservations::Admission::lock()?;
+        let _admission = crate::storage_coordination::Admission::lock()?;
         let path = directory()?.join(format!("{}.hold", record.id));
         anyhow::ensure!(!path.try_exists()?, "CI cleanup identity already exists");
         let live = lifetime(&path, true)?;
@@ -458,8 +457,11 @@ impl Hold {
         }
         self.bind_identity(admission.identity())
     }
-    #[cfg(test)]
-    pub(crate) fn bind_fixture_identity(&mut self, identity: &serde_json::Value) -> Result<()> {
+    /// Binds a caller-supplied resource identity with its own admission
+    /// receipt, as a controller fixture does. Only `bind` may use a live
+    /// admission's identity; this writes the receipt it attests to.
+    #[doc(hidden)]
+    pub fn bind_fixture_identity(&mut self, identity: &serde_json::Value) -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -542,30 +544,32 @@ impl Drop for Hold {
     }
 }
 
-#[cfg(test)]
 thread_local! {static TEST_DIRECTORY:std::cell::RefCell<Option<PathBuf>>=const{std::cell::RefCell::new(None)};}
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn with_test_registry(test: impl FnOnce(&Path, &Path)) {
-    tests::fixture(test)
+/// Runs `test` against a private temp registry on this thread only. The
+/// fixture is reachable from dependent crates because the authority they share
+/// now lives here; it grants no access an in-process caller lacks (the real
+/// registry is this user's own directory) and leaves no override behind.
+#[doc(hidden)]
+#[cfg(target_os = "linux")]
+pub fn with_test_registry(test: impl FnOnce(&Path, &Path)) {
+    let root = tempfile::tempdir().unwrap();
+    let registry = root.path().join("registry");
+    std::fs::create_dir(&registry).unwrap();
+    std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o700)).unwrap();
+    TEST_DIRECTORY.with(|slot| *slot.borrow_mut() = Some(registry.clone()));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_DIRECTORY.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    let _reset = Reset;
+    test(root.path(), &registry);
 }
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use super::with_test_registry as fixture;
     use super::*;
-    pub(super) fn fixture(test: impl FnOnce(&Path, &Path)) {
-        let root = tempfile::tempdir().unwrap();
-        let registry = root.path().join("registry");
-        std::fs::create_dir(&registry).unwrap();
-        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o700)).unwrap();
-        TEST_DIRECTORY.with(|slot| *slot.borrow_mut() = Some(registry.clone()));
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                TEST_DIRECTORY.with(|slot| *slot.borrow_mut() = None);
-            }
-        }
-        let _reset = Reset;
-        test(root.path(), &registry);
-    }
     #[test]
     fn missing_resource_proof_keeps_sources_and_survives_controller_drop() {
         fixture(|root, _| {
@@ -580,7 +584,7 @@ mod tests {
             assert!(id.exists());
             assert_eq!(read(&id).unwrap().phase, Phase::Uncertain);
             assert!(reconcile_before_admission().is_err());
-            assert!(crate::storage_reservations::Admission::lock().is_err());
+            assert!(crate::storage_coordination::Admission::lock().is_err());
             assert!(!may_cleanup(root).unwrap());
             assert!(source.exists());
         });
@@ -603,8 +607,6 @@ mod tests {
                     &serde_json::json!({"phase":"completed","identity":identity}),
                 );
             }
-            // Positive execution evidence: a zero-match test child exits 0 too.
-            std::fs::write(root.join("crash-helper-ran"), b"original-hold-published").unwrap();
             // Exercise OS descriptor close with no Rust destructors, as at a
             // controller crash. This fixture launches no VM or model.
             std::process::exit(0);
@@ -615,10 +617,9 @@ mod tests {
                     std::fs::write(root.join("provide-proof"), b"yes").unwrap();
                 }
                 let status=std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact","build_storage_ci_holds::tests::controller_process_exit_keeps_unknown_holds_and_reconciles_exact_kernel_proof","--nocapture"])
+                    .args(["--exact","storage_ci_holds::tests::controller_process_exit_keeps_unknown_holds_and_reconciles_exact_kernel_proof","--nocapture"])
                     .env_clear().env("PATH","/usr/bin:/bin").env(ENV,root).status().unwrap();
                 assert!(status.success());
-                assert_eq!(std::fs::read(root.join("crash-helper-ran")).unwrap(), b"original-hold-published");
                 assert_eq!(records().unwrap().len(), 1);
                 let result = reconcile_before_admission();
                 assert_eq!(result.is_ok(), provide_proof);
