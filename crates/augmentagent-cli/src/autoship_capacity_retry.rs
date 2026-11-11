@@ -33,6 +33,20 @@ fn previous(tx:&Transaction<'_>,workflow:&str,generation:i64,now:i64)->Result<Op
         && serde_json::to_value(&prior)?==serde_json::from_str::<serde_json::Value>(&raw)?,"invalid capacity retry history");
     Ok(Some(prior))
 }
+
+/// Observation for command progress only, never admission or an early wake.
+/// The checkpoint is the caller's same-transaction workflow projection.
+pub(super) fn command_attempt_wait(tx:&Transaction<'_>,workflow:&str,checkpoint:&Checkpoint,
+    selected_at:i64,now:i64)->Result<Option<i64>> {
+    if selected_at<0 || now<selected_at || !active(checkpoint.stage)
+        || checkpoint.next.reason!="resource_capacity" || checkpoint.next.action!="await_capacity"
+        || owner_control::read(tx,workflow)?.is_some_and(|control|control.paused) {return Ok(None);}
+    let generation:i64=tx.query_row("SELECT generation FROM workflow WHERE id=?1",[workflow],|r|r.get(0))?;
+    let Some(retry)=previous(tx,workflow,generation,now)? else{return Ok(None)};
+    Ok((retry.generation==generation && retry.failed_at_ms>=selected_at
+        && retry.binding==checkpoint.binding && retry.eligible_at_ms==checkpoint.next.eligible_at_ms)
+        .then_some(retry.eligible_at_ms))
+}
 impl WorkflowStore {
     /// Compatibility name; use the bounded canonical observation.
     pub fn capacity_wait_count(&self)->Result<u64> { self.resource_capacity_wait_count() }

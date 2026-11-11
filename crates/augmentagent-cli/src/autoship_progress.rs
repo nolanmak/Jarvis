@@ -136,7 +136,7 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     let mut reason=checkpoint.as_ref().map_or_else(||"awaiting-worker-claim".into(),|c|code(&c.next.reason,"workflow-state-changed"));
     let mut action=checkpoint.as_ref().map_or_else(||"claim_workflow".into(),|c|code(&c.next.action,"inspect_workflow"));
     let mut eligible=checkpoint.as_ref().map(|c|c.next.eligible_at_ms);
-    let attempt:Option<(String,String,i64)>=tx.query_row("SELECT outcome,reason,eligible_at FROM command_attempt WHERE workflow=?1 AND finished_at IS NOT NULL",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let attempt:Option<(i64,String,String,i64)>=tx.query_row("SELECT selected_at,outcome,reason,eligible_at FROM command_attempt WHERE workflow=?1 AND finished_at IS NOT NULL",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let linked_hold=checkpoint.as_ref().is_some_and(|c|matches!(c.next.reason.as_str(),"linked_pr_claim_exists"|"linked_pr_inventory_unknown"));
     if linked_hold {kind="blocked".into();}
     let initial_verifier_hold=checkpoint.as_ref().is_some_and(|c|c.stage==Stage::Scope && matches!(
@@ -149,17 +149,28 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     let main_wait=checkpoint.as_ref().is_some_and(|c|c.stage==Stage::Reconcile
         && c.next.reason=="review_main_changed" && c.next.action=="reconcile_main");
     if initial_verifier_hold || typed_review_hold || linked_hold {kind="blocked".into();}
-    let generic_attempt=attempt.as_ref().is_some_and(|(outcome,why,_)|
+    let generic_attempt=attempt.as_ref().is_some_and(|(_,outcome,why,_)|
         (outcome=="progress" && why=="workflow-progressed") || (outcome=="deferred" && why=="workflow-held"));
     // A successful wrapper return cannot replace the checkpoint's blocker or
     // backoff. A distinct current execution failure still has its own outcome.
     let preserve_checkpoint=linked_hold || initial_verifier_hold || (generic_attempt && (stage==Some(Stage::Held) || typed_review_hold || main_wait));
+    let capacity=checkpoint.as_ref().filter(|c|c.next.reason=="resource_capacity" && c.next.action=="await_capacity"
+        && !matches!(c.stage,Stage::Held|Stage::Merged|Stage::Retired|Stage::Merge));
+    if capacity.is_some() {kind="blocked".into();}
     if source=="command_attempt_finished" && !preserve_checkpoint {
-        if let Some((outcome,why,at))=&attempt {
-            kind=if outcome=="progress" {"worker-progress"} else {"retry-scheduled"}.into();
-            reason=code(why,"worker-attempt-finished");action="inspect_workflow".into();eligible=Some(*at);
-            if let Some(blocker)=submission::LinkedPrBlocker::from_code(why) {
-                kind="blocked".into();reason=blocker.reason().into();action=blocker.action().into();
+        if let Some((selected,outcome,why,at))=&attempt {
+            let wait=if matches!(outcome.as_str(),"deferred"|"failed"|"progress")
+                && matches!(why.as_str(),"workflow-deferred"|"execution-failed"|"workflow-progressed") {
+                match capacity {Some(cp)=>super::capacity_retry::command_attempt_wait(tx,workflow,cp,*selected,now)?,None=>None}
+            }else{None};
+            if let Some(due)=wait {
+                kind="blocked".into();reason="resource_capacity".into();action="await_capacity".into();eligible=Some(due);
+            } else {
+                kind=if outcome=="progress" {"worker-progress"} else {"retry-scheduled"}.into();
+                reason=code(why,"worker-attempt-finished");action="inspect_workflow".into();eligible=Some(*at);
+                if let Some(blocker)=submission::LinkedPrBlocker::from_code(why) {
+                    kind="blocked".into();reason=blocker.reason().into();action=blocker.action().into();
+                }
             }
         }
     }
@@ -212,6 +223,97 @@ mod tests {
         let mut store=WorkflowStore::open(path).unwrap();
         store.register("owner/repo#1","fix/one",Binding {head:"head-a".into(),contract:"contract-a".into(),evidence_hash:"dependency-a".into()},1).unwrap();
         let lease=store.claim("owner/repo#1","worker",2,10000).unwrap().unwrap();(store,lease)
+    }
+    fn queued_capacity(path:&Path)->(WorkflowStore,Lease,super::super::discord_ingress::DiscordOrigin) {
+        let mut store=WorkflowStore::open(path).unwrap();
+        let origin=super::super::discord_ingress::DiscordOrigin{bot:11,owner:22,channel:33,message:44};
+        let request=submission::Request{repository:"owner/repo".into(),target:submission::Target::Issue(1),
+            provider:Some(submission::Provider::Codex),until:submission::Milestone::Merged};
+        let id=store.submit_discord_authorized(&origin,&request,&"a".repeat(64),1).unwrap().admission.workflow;
+        assert_eq!(store.next_command_job("owner/repo",10).unwrap().as_deref(),Some(id.as_str()));
+        store.register(&id,"fix/one",Binding{head:"head-a".into(),contract:"contract-a".into(),evidence_hash:"dependency-a".into()},11).unwrap();
+        let lease=store.claim(&id,"worker",12,60_000).unwrap().unwrap();
+        (store,lease,origin)
+    }
+
+    #[test]
+    fn command_completion_preserves_current_capacity_blocker_for_private_updates() {
+        for (outcome,reason) in [(submission::AttemptOutcome::Deferred,"workflow-deferred"),
+            (submission::AttemptOutcome::Failed,"execution-failed"),
+            (submission::AttemptOutcome::Progress,"workflow-progressed")] {
+            let root=tempfile::tempdir().unwrap();let path=root.path().join("state.db");
+            let (mut store,lease,origin)=queued_capacity(&path);
+            let before=store.snapshot(&lease.workflow).unwrap().unwrap();let allowance=store.merge_allowance(19,5).unwrap();
+            let fingerprint="b".repeat(64);
+            let due=store.defer_run_capacity(&lease,Some(&fingerprint),20).unwrap();
+            let projected=store.progress_events(&lease.workflow).unwrap();
+            assert!(store.finish_command_attempt(&lease.workflow,10,outcome,reason,21).unwrap());
+            let events=store.progress_events(&lease.workflow).unwrap();let last=events.last().unwrap();
+            assert_eq!(last.reason,"resource_capacity","command completion hid the actual protected resource refusal");
+            assert_eq!(last.kind,"blocked");assert_eq!(last.next_action,"await_capacity");assert_eq!(last.eligible_at_ms,Some(due));
+            assert_eq!(events.len(),projected.len(),"unchanged blocker generated a duplicate update");
+            assert_eq!(last.requested_provider,Some(submission::Provider::Codex));assert_eq!(last.actual_provider,None);
+            assert_eq!(last.merge_state,"not-confirmed");assert_eq!(last.deployment_state,"unknown");
+            let after=store.snapshot(&lease.workflow).unwrap().unwrap();
+            assert_eq!(after.progress_at_ms,before.progress_at_ms);assert_eq!(after.model_calls,before.model_calls);
+            assert_eq!(after.generation,before.generation);assert_eq!(store.merge_allowance(22,5).unwrap(),allowance);
+            let sequence=last.sequence;drop(store);
+            let mut store=WorkflowStore::open(&path).unwrap();
+            assert_eq!(store.progress_events(&lease.workflow).unwrap(),events);
+            assert!(store.pending_progress(origin.bot,origin.owner).unwrap().iter().any(|(o,w,s)|o.channel==33 && w==&lease.workflow && *s==sequence));
+            let (_,content)=store.claim_progress(&origin,&lease.workflow,sequence,22).unwrap().unwrap();
+            assert!(content.contains("resource_capacity") && content.contains("await_capacity"));
+            assert!(!content.contains(&fingerprint),"private native fingerprint escaped into a message");
+        }
+    }
+
+    #[test]
+    fn command_completion_does_not_reuse_an_earlier_attempt_capacity_refusal() {
+        let root=tempfile::tempdir().unwrap();let (mut store,lease,_)=queued_capacity(&root.path().join("state.db"));
+        let due=store.defer_run_capacity(&lease,None,20).unwrap();
+        store.finish_command_attempt(&lease.workflow,10,submission::AttemptOutcome::Deferred,"workflow-deferred",21).unwrap();
+        store.release(&lease,22).unwrap();
+        assert!(store.next_command_job("owner/repo",due).unwrap().is_none(),"normal work retains its deliberate fairness turn");
+        assert_eq!(store.next_command_job("owner/repo",due).unwrap().as_deref(),Some(lease.workflow.as_str()));
+        store.finish_command_attempt(&lease.workflow,due,submission::AttemptOutcome::Failed,"execution-failed",due+1).unwrap();
+        let last=store.progress_events(&lease.workflow).unwrap().pop().unwrap();
+        assert_eq!(last.reason,"execution-failed");assert_eq!(last.kind,"retry-scheduled");
+    }
+
+    #[test]
+    fn capacity_progress_preserves_pause_authorization_and_changed_context_priority() {
+        for case in ["pause","authorization","readiness","binding","generation","missing-retry"] {
+            let root=tempfile::tempdir().unwrap();let (mut store,lease,_)=queued_capacity(&root.path().join("state.db"));
+            let due=store.defer_run_capacity(&lease,None,20).unwrap();
+            let mut completed_at=22;
+            let mut outcome=submission::AttemptOutcome::Failed;let mut reason="execution-failed";
+            let expected=match case {
+                "pause"=>{store.set_owner_pause(&lease.workflow,"owner",0,true,21).unwrap();"owner-pause-requested"},
+                "authorization"=>{outcome=submission::AttemptOutcome::Rejected;reason="target-authorization-failed";reason},
+                "readiness"=>{outcome=submission::AttemptOutcome::Deferred;reason="execution-readiness-blocked";reason},
+                "binding"=>{let mut cp=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;cp.binding.head="changed-head".into();store.checkpoint(&lease,&cp,21).unwrap();reason},
+                "generation"=>{store.release(&lease,21).unwrap();assert!(store.claim(&lease.workflow,"successor",due,60_000).unwrap().is_some());completed_at=due+1;reason},
+                _=>{store.conn.execute("DELETE FROM workflow_event WHERE kind='resource_capacity_retry'",[]).unwrap();reason},
+            };
+            store.finish_command_attempt(&lease.workflow,10,outcome,reason,completed_at).unwrap();
+            let last=store.progress_events(&lease.workflow).unwrap().pop().unwrap();
+            assert_eq!(last.reason,expected,"{case}: stale capacity metadata hid the newer outcome");
+            if case=="pause" {assert!(store.owner_control(&lease.workflow).unwrap().unwrap().paused);assert_eq!(last.next_action,"await_owner_resume");}
+        }
+    }
+
+    #[test]
+    fn capacity_update_projection_failure_does_not_commit_command_completion() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("state.db");let (mut store,lease,_)=queued_capacity(&path);
+        store.defer_run_capacity(&lease,None,20).unwrap();
+        let attempt=serde_json::to_value(store.command_attempt(&lease.workflow).unwrap()).unwrap();let events=store.progress_events(&lease.workflow).unwrap();
+        store.conn.execute_batch("CREATE TRIGGER deny_capacity_projection BEFORE UPDATE ON workflow_progress_state BEGIN SELECT RAISE(ABORT,'fixture unavailable'); END;").unwrap();
+        assert!(store.finish_command_attempt(&lease.workflow,10,submission::AttemptOutcome::Deferred,"workflow-deferred",21).is_err());
+        assert_eq!(serde_json::to_value(store.command_attempt(&lease.workflow).unwrap()).unwrap(),attempt);assert_eq!(store.progress_events(&lease.workflow).unwrap(),events);
+        store.conn.execute_batch("DROP TRIGGER deny_capacity_projection").unwrap();drop(store);
+        let store=WorkflowStore::open(&path).unwrap();
+        assert!(store.finish_command_attempt(&lease.workflow,10,submission::AttemptOutcome::Deferred,"workflow-deferred",22).unwrap());
+        assert_eq!(store.progress_events(&lease.workflow).unwrap().last().unwrap().reason,"resource_capacity");
     }
     #[test]
     fn progress_is_ordered_durable_and_deduplicates_unchanged_blockers() {
