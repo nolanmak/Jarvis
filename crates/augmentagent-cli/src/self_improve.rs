@@ -3989,6 +3989,9 @@ enum ReviewUnavailable {
     /// This does not establish that a provider is missing or at capacity.
     /// The protected detail preserves the failure without publishing it.
     RecoveryRequired { detail: String },
+    /// Immutable review capture observed a main commit outside the candidate.
+    /// Integration can be queued without granting review or merge authority.
+    MainAdvanced { candidate: String, main: String, detail: String },
     /// Every independent reviewer is on a quota cooldown: `(provider, reset)`.
     Latched {
         until: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>,
@@ -4120,6 +4123,7 @@ impl ReviewUnavailable {
             Self::Latched { .. } => "reviewer-latched",
             Self::EvidenceBudget { .. } => "review-evidence-budget",
             Self::RecoveryRequired { .. } => "review-recovery-required",
+            Self::MainAdvanced { .. } => "review-main-advanced",
         }
     }
 
@@ -4158,6 +4162,7 @@ impl ReviewUnavailable {
             ),
             Self::EvidenceBudget { .. } => "complete caller evidence exceeds the bounded review budget".into(),
             Self::RecoveryRequired { .. } => "independent review did not complete; controller recovery required".into(),
+            Self::MainAdvanced { .. } => "main advanced; integration and fresh verification required".into(),
             Self::Latched { until } => {
                 // Soonest reset first: that is when the draft can move again.
                 let mut until = until.clone();
@@ -4184,7 +4189,7 @@ impl ReviewUnavailable {
     fn log_line(&self) -> String {
         match self {
             Self::ProvenanceUnverifiable { error } => format!("{} ({error})", self.headline()),
-            Self::NoCapacity { detail, .. } | Self::EvidenceBudget { detail } | Self::RecoveryRequired { detail } if !detail.is_empty() => {
+            Self::NoCapacity { detail, .. } | Self::EvidenceBudget { detail } | Self::RecoveryRequired { detail } | Self::MainAdvanced { detail, .. } if !detail.is_empty() => {
                 format!("{} ({detail})", self.headline())
             }
             _ => self.headline(),
@@ -5926,6 +5931,9 @@ fn unreviewable_plan(
         };
     }
     let advice = match why {
+        ReviewUnavailable::MainAdvanced { .. } => {
+            "The controller queued preserved work for integration with current main and fresh verification. No approval or code rejection has been recorded."
+        }
         ReviewUnavailable::RecoveryRequired { .. } => {
             "Inspect the protected controller failure and repair the recorded review blocker before retrying. No approval or code rejection has been recorded."
         }
@@ -6166,6 +6174,24 @@ fn unreviewable_drafts_in(path: &Path) -> Vec<(u64, String, String, u32)> {
         .filter(|(_, r)| !r.stood_down)
         .filter_map(|(pr, r)| Some((pr.parse().ok()?, r.code, r.reason, r.days.len() as u32)))
         .collect()
+}
+
+async fn checkpoint_unavailable_review(
+    workflow: &mut workflow::WorkflowGuard,
+    why: &ReviewUnavailable,
+    now: i64,
+) -> Result<()> {
+    use crate::autoship_workflow::Stage;
+    if let ReviewUnavailable::MainAdvanced { candidate, main, .. } = why {
+        anyhow::ensure!(workflow.binding().head == *candidate, "main dependency belongs to a different candidate");
+        anyhow::ensure!(workflow.pending_operations()?.is_empty(), "pending publication must reconcile before main integration");
+        workflow.validate_binding(&workflow.binding().clone()).await?;
+        workflow.audit_logger().record_controller(serde_json::json!({"actor":"controller",
+            "kind":"review_main_dependency_changed","candidate":candidate,"observed_main":main}))?;
+        workflow.transition(Stage::Reconcile, "review_main_changed", "reconcile_main", now.saturating_add(300_000)).await
+    } else {
+        workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await
+    }
 }
 
 /// #1037 — act on a draft that cannot be reviewed: record the day, say why on
@@ -7203,7 +7229,7 @@ async fn resume_draft_pr(
                     if !dry_run {
                         workflow.push(branch).await?;
                     }
-                    workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
+                    checkpoint_unavailable_review(&mut workflow, &why, chrono::Utc::now().timestamp_millis()).await?;
                     return Ok(hold_unreviewable(
                         repo_root,
                         pr,
@@ -9449,7 +9475,11 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             truncate(&merge_note, 300)
         ))
         .await;
-        workflow_guard.transition(crate::autoship_workflow::Stage::Reconcile, "draft_published", "resume", chrono::Utc::now().timestamp_millis()).await?;
+        if let Some(why @ ReviewUnavailable::MainAdvanced { .. }) = &independent.why_unavailable {
+            checkpoint_unavailable_review(&mut workflow_guard, why, chrono::Utc::now().timestamp_millis()).await?;
+        } else {
+            workflow_guard.transition(crate::autoship_workflow::Stage::Reconcile, "draft_published", "resume", chrono::Utc::now().timestamp_millis()).await?;
+        }
         workflow_guard.finish()?;
         return Ok(RunReport::built(format!(
             "issue #{}: draft PR opened — {pr_url}",
@@ -12081,10 +12111,12 @@ impl AutoPrLoop {
                     _ = tokio::time::sleep_until(next_tick) => break,
                     _ = queue_timer.tick(), if !self.dry_run => {
                         // Retry unavailable identity on subsequent polls. No network
-                        // lookup is needed while the durable command queue is empty.
+                        // lookup is needed while commands and due main dependencies are absent.
                         if self.command_repository.is_none() {
                             let queued = crate::autoship_workflow::WorkflowStore::open_read_only(&self.workflow_path)
-                                .and_then(|store| store.map(|s| s.has_command_jobs()).transpose());
+                                .and_then(|store| store.map(|s| -> Result<bool> {
+                                    Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?)
+                                }).transpose());
                             match queued {
                                 Ok(Some(true)) => {},
                                 Ok(_) => continue,
@@ -12098,8 +12130,12 @@ impl AutoPrLoop {
                             }
                         }
                         let due = crate::autoship_workflow::WorkflowStore::open_read_only(&self.workflow_path)
-                            .and_then(|store| store.map(|store| store.command_queue_due(
-                                self.command_repository.as_deref().unwrap(), (self.clock)().timestamp_millis()))
+                            .and_then(|store| store.map(|store| -> Result<bool> {
+                                let repository = self.command_repository.as_deref().unwrap();
+                                let now = (self.clock)().timestamp_millis();
+                                Ok(store.command_queue_due(repository, now)?
+                                    || store.has_due_main_reconciliation(Some(repository), now)?)
+                            })
                                 .transpose().map(|due| due.unwrap_or(false)));
                         match due {
                             Ok(true) => break,
@@ -12260,6 +12296,50 @@ mod tests {
         assert!(blast_radius_hit_in_diff(&recovered_revision_diff(p).await.unwrap()).is_none(),"ordinary recovered adapter should remain checkpointable");
         recovered_git(p,&["commit","-qm","checkpoint ordinary adapter"]).await;recovered_git(p,&["merge","--no-edit","origin/main"]).await;
         assert!(blast_radius_hit_in_diff(&recovered_git(p,&["diff","origin/main","HEAD"]).await).is_some(),"final PR guard lost the original protected change");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_main_dependency_wakes_automatic_worker_without_a_command_job() {
+        use crate::autoship_workflow::{WorkflowStore, Binding, Checkpoint, NextAction, Stage};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for case in ["ready", "other-repository", "generic-reconcile", "delayed", "owner-paused"] {
+            let state = tempfile::tempdir().unwrap();
+            let mut worker = AutoPrLoop::for_tests("/nonexistent".into(), 5, state.path());
+            worker.dry_run = false;
+            worker.command_repository = Some("owner/repo".into());
+            worker.clock = Arc::new(|| chrono::DateTime::from_timestamp_millis(1_000).unwrap());
+            let path = worker.workflow_path.clone();
+            let stop = tokio_util::sync::CancellationToken::new();
+            let timer_stop = stop.clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let submitted = async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let repository = if case == "other-repository" { "owner/repo_extra" } else { "owner/repo" };
+                let id = crate::autoship_workflow::workflow_id(repository, 7).unwrap();
+                let binding = Binding {head: "a".repeat(40), contract: "c".repeat(64), evidence_hash: "e".repeat(64)};
+                let mut store = WorkflowStore::open(&path).unwrap();
+                store.register(&id, "fix/fixture", binding.clone(), 0).unwrap();
+                let lease = store.claim(&id, "original-worker", 0, 1).unwrap().unwrap();
+                store.attach_pr_in_repo(&lease, repository, 42, 0).unwrap();
+                store.checkpoint(&lease, &Checkpoint {stage: Stage::Reconcile, binding, evidence: vec![], next: NextAction {
+                    reason: if case == "generic-reconcile" { "resume_started" } else { "review_main_changed" }.into(),
+                    action: "reconcile_main".into(), eligible_at_ms: if case == "delayed" {2_000} else {1_000},
+                }}, 0).unwrap();
+                store.release(&lease, 0).unwrap();
+                if case == "owner-paused" { store.set_owner_pause(&id, "owner", 0, true, 0).unwrap(); }
+                assert!(!store.has_command_jobs().unwrap());
+                tokio::time::sleep(std::time::Duration::from_secs(26)).await;
+                timer_stop.cancel();
+            };
+            let run = worker.run_with(stop, move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { Ok(RunReport::idle()) }
+            }, || async {0});
+            let (result, ()) = tokio::join!(run, submitted);
+            result.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(case == "ready"), "{case}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

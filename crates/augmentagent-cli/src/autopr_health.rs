@@ -471,6 +471,9 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                 "review-recovery-required" => {
                     "review evidence or controller recovery required: inspect the protected failure before retrying"
                 }
+                "review-main-advanced" => {
+                    "main advanced: preserved work is queued for integration and fresh verification"
+                }
                 "no-reviewer-capacity" => {
                     "no reviewer capacity: check `augmentagent doctor` and \
                      `augmentagent reasoner-selftest`"

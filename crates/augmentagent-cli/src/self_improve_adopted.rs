@@ -385,6 +385,13 @@ async fn execute(
             },
         )
         .await;
+        if let Some(why @ ReviewUnavailable::MainAdvanced { .. }) = &review.why_unavailable {
+            guard.push(&pr.branch).await?;
+            checkpoint_unavailable_review(guard, why, chrono::Utc::now().timestamp_millis()).await?;
+            return Ok(RunReport::built(format!(
+                "PR #{}: preserved work queued for integration with current main and fresh verification", pr.pr
+            )));
+        }
         if let Some(structured) = &review.structured {
             if acceptance::apply_adjudicated_amendment(
                 reasoner,
