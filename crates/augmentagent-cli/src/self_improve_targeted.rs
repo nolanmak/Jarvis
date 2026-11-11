@@ -496,6 +496,15 @@ mod tests {
             };
             let issue = serde_json::json!({"number":7,"state":"open","html_url":"https://github.com/owner/repo/issues/7","title":"Fix addition","body":"Correct arithmetic","user":{"login":"owner"},"author_association":"OWNER"});
             scenario(serde_json::json!({"permission":"WRITE","issue":issue}));
+            assert_eq!(authorize_command(&root, &request).await.unwrap(), "github:owner",
+                "REST quota exhaustion must not invalidate authenticated GraphQL identity");
+            for actor in ["", "null", "owner/other", "owner\nother"] {
+                scenario(serde_json::json!({"permission":"WRITE","issue":issue,"actor":actor}));
+                assert!(authorize_command(&root, &request).await.is_err(), "invalid actor {actor:?}");
+            }
+            scenario(serde_json::json!({"permission":"READ","issue":issue}));
+            assert!(authorize_command(&root, &request).await.is_err(), "read-only access cannot authorize controls");
+            scenario(serde_json::json!({"permission":"WRITE","issue":issue}));
             let Resolved::Issue(selected) = resolve(&root, &request).await.unwrap() else {
                 panic!("wrong target kind")
             };
@@ -723,7 +732,9 @@ root=pathlib.Path(os.environ['AUTOSHIP_TARGET_RESOLUTION_FIXTURE'])
 a=sys.argv[1:];s=json.loads((root/'scenario.json').read_text())
 if a[:2]==['repo','view']:
  print(s['permission'] if 'viewerPermission' in a else 'owner/repo')
-elif a[:2]==['api','user']: print('owner')
+elif a[:2]==['api','user']:
+ print('API rate limit exceeded',file=sys.stderr);sys.exit(1)
+elif a[:2]==['api','graphql']: print(s.get('actor','owner'))
 elif a[:2]==['pr','list']: print('[]')
 elif a[:1]==['api'] and a[1]=='repos/owner/repo/issues/7':print(json.dumps(s['issue']))
 elif a[:2]==['pr','view'] and a[2]=='42':print(json.dumps(s['pr']))
@@ -842,6 +853,7 @@ root=pathlib.Path(os.environ['AUTOSHIP_TARGET_LIFECYCLE_FIXTURE'])
 a=sys.argv[1:];s=json.loads((root/'scenario.json').read_text())
 if a[:2]==['repo','view']: print(s['permission'] if 'viewerPermission' in a else 'owner/repo')
 elif a[:2]==['api','user']: print('owner')
+elif a[:2]==['api','graphql']: print('owner')
 elif a[:2]==['pr','list']: print('[]')
 elif a[:1]==['api'] and a[1].startswith('repos/owner/repo/issues/'): print(json.dumps(s['issues'][a[1].rsplit('/',1)[1]]))
 elif a[:2]==['pr','view']: print(json.dumps(s['prs'][a[2]]))
