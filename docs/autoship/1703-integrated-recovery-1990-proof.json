@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "observed_at_utc": "2026-11-11T04:43:06.791978+00:00",
+  "pull_request": 1990,
+  "head": "d4bbc25e938e31b6420a88e1249108c666daa0c5",
+  "scope": [
+    "Authenticated GraphQL viewer for owner controls; original repository/write/actor checks retained.",
+    "Restore reviewed bounded initial verifier coordinator and original crash/reopen coverage from PR1944; preserve infrastructure holds and refuse automatic issue rewriting on failed registration.",
+    "Preserve fixed target_closed reason in future private progress projections; retain immutable historical events."
+  ],
+  "hosted": {
+    "run": 42960178919,
+    "job": 130324678448,
+    "state": "in_progress at last observation",
+    "head_frozen": true,
+    "prior_failure": {
+      "head": "db7d88ebfa762cc7858cec2e76e681cc4f60b938",
+      "job": 130317397461,
+      "cli_units_passed": 1748,
+      "integration_failures": 18,
+      "cause": "CLI submission test transport did not implement GraphQL viewer; fixture corrected, assertions retained."
+    }
+  },
+  "verifier_recovery": {
+    "issue": 1943,
+    "original_reviewed_head": "932e8807058b667f165350109d9a22c8936f3127",
+    "drifted_native_head": "3c00c759017ed2718de114c0b7e8df17e5346415",
+    "original_crash_tests_restored": true,
+    "original_scope_restored": true,
+    "native_workflow_paused_revision": 1,
+    "native_model_calls_preserved": 11,
+    "old_pr": 1944,
+    "old_pr_state": "draft until integrated recovery lands; no independent merge of drifted head",
+    "remaining": "Exact integrated validation, final review, normal rollout and original PR1937 command re-observation."
+  },
+  "terminal_projection": {
+    "workflow": "nolanmak/jarvis#1986",
+    "checkpoint_reason": "target_closed",
+    "progress_reason": "workflow-state-changed",
+    "kind": "retired",
+    "stage": "retired"
+  },
+  "deployed": {
+    "main_and_built_stamp": "930e3e6b6251c06ec204e60fcd041bdc70d48e7f",
+    "observed_at": "2026-11-11T04:19:15Z",
+    "both_service_executables_match": true,
+    "executable_sha256": "b3b7dfa241d6171037cd421b57681fdac3f9ea99a0ad1f7b69299103ad2663db",
+    "configuration_matches": true,
+    "native_roles_declared_available": true,
+    "new_inference_verification": false,
+    "native_retained_sessions": 3,
+    "next_native_reserved_bytes": 4294967296,
+    "native_state_budget_bytes": 8589934592,
+    "capacity_blockers": []
+  },
+  "terminal_reconciliation": {
+    "1978": {
+      "stage": "Merged",
+      "reason": "external_merge_reconciled",
+      "model_calls_preserved": 6,
+      "builder_ran": false,
+      "autonomous_credit": 0
+    },
+    "1986": {
+      "stage": "Retired",
+      "reason": "target_closed",
+      "model_calls_preserved": 13,
+      "builder_ran": false,
+      "autonomous_credit": 0
+    }
+  },
+  "operator_controls": {
+    "1931": {
+      "pause_revision": 1,
+      "model_calls_preserved": 4,
+      "lease_active_at_043920Z": false,
+      "next": "Resume this operator-created pause after the integrated rollout matches and the preserved candidate is inspected."
+    },
+    "1944": {
+      "pause_revision": 1,
+      "model_calls_preserved": 11,
+      "next": "After recovery is on main, close superseded PR and settle original workflow through supported controls without new model work."
+    },
+    "1954": "Original owner pause remains unchanged."
+  },
+  "autonomous_shipping": {
+    "confirmed_today_at_last_read": 0,
+    "remaining_allowance": 5,
+    "restoration": "not proven"
+  },
+  "backup": "20261111T041233Z-autoship-receipt-auth-1988-1990",
+  "limits": [
+    "No protected acceptance evidence was rewritten or fabricated.",
+    "No native budget, merge allowance, source family, or old model accounting was reset.",
+    "Full automatic host sizing, C2 custody, productive Discord follow-ups and five autonomous shipments remain unfinished."
+  ]
+}
