@@ -3206,6 +3206,39 @@ mod tests {
 mod initial_acceptance_hold_tests {
     use super::*;
     #[tokio::test]
+    async fn unchanged_initial_acceptance_wait_does_not_claim_again_after_restart_or_day_change() {
+        for (issue,pr) in [(Some(7),None),(Some(7),Some(42)),(None,Some(42))] {
+            let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
+            std::fs::write(repo.path().join("implementation.py"),"def add(a,b): return a-b\n").unwrap();
+            for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","initial"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
+                let output=tokio::process::Command::new("/usr/bin/git").args(args).current_dir(repo.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
+                assert!(output.status.success());
+            }
+            let path=control.path().join("workflow.db");
+            let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",
+                source_issue:issue,pr,branch:"fixture",contract:"unchanged owner criteria",environment:"fixture"};
+            let now=millis();
+            let mut guard=WorkflowGuard::acquire_at(&path,start(),now).await.unwrap().unwrap();
+            guard.hold_initial_acceptance("acceptance_verifier_repair_exhausted","await_acceptance_input_change").await.unwrap();
+            let id=guard.id().to_owned();guard.finish().unwrap();
+            let before=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+            let original=before.snapshot(&id).unwrap().unwrap();
+            let events=before.events(&id).unwrap();drop(before);
+            for offset in [1000,86_400_000,2*86_400_000] {
+                let next=WorkflowGuard::acquire_at(&path,start(),now+offset).await.unwrap();
+                assert!(next.is_none(),"unchanged acceptance-input wait was reclaimed: issue={issue:?}, pr={pr:?}");
+                let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+                let after=store.snapshot(&id).unwrap().unwrap();
+                assert_eq!(after.attempts,original.attempts);
+                assert_eq!(after.model_calls,original.model_calls);
+                assert_eq!(after.tokens,original.tokens);
+                assert_eq!(after.checkpoint,original.checkpoint);
+                assert_eq!(store.events(&id).unwrap(),events);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn all_initial_source_families_keep_precise_hold_without_false_progress() {
         for (issue,pr) in [(Some(7),None),(Some(7),Some(42)),(None,Some(42))] {
             let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
