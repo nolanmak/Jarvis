@@ -34,7 +34,7 @@ jobs:
       protected_patterns: ${{ steps.load.outputs.patterns }}
       has_secret: ${{ steps.secret.outputs.present }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
       - id: secret
@@ -67,7 +67,7 @@ jobs:
       BRANCH_NAME: ${{ needs.gate.outputs.branch_name }}
       PROTECTED_PATTERNS: ${{ needs.gate.outputs.protected_patterns }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -84,7 +84,7 @@ jobs:
       - name: Claude fix
         id: claude
         continue-on-error: true
-        uses: anthropics/claude-code-action@925afb53776cf1a2b738c6bdbed37b4d4000ef13 # v1
+        uses: anthropics/claude-code-action@c0949c50a78c1ec8ce2647db36629b870e715d0c # v1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -107,7 +107,7 @@ jobs:
       ISSUE_NUM: ${{ needs.gate.outputs.issue_number }}
       BRANCH_NAME: ${{ needs.gate.outputs.branch_name }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.BRANCH_NAME }}
           fetch-depth: 0
