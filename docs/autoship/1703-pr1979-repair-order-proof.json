@@ -222,5 +222,31 @@
     "green_result": "pending",
     "implementation": "Typed scope rejection skips CI/infra/verifier-amendment classification and uses the existing bounded repair/re-scope flow. Both old and new rename paths are checked with --no-renames. Rejected post-repair candidates continue to the next bounded round without verification. No extra alignment budget is granted for scope rejection."
   },
-  "current_head": "1f0a3ca754557261770d34a24d6c589cb09f98df"
+  "current_head": "1f0a3ca754557261770d34a24d6c589cb09f98df",
+  "latest_verified_state": {
+    "observed_at_utc": "2026-11-11T03:52:11.350718+00:00",
+    "head": "83edbe9cbe5d930e6efe9477e603d96af3b898e7",
+    "green_run": 42948775706,
+    "green_job": 130287851844,
+    "cli": {
+      "passed": 1748,
+      "failed": 0,
+      "ignored": 33
+    },
+    "green_log_sha256": "d0513cca3c75bbf91ef2df0649e35ca600d2172bfb0ef70acad0f34cc7eeeccf",
+    "resource_declared_red_replay": {
+      "head": "b29936a1b2f36fc4044097f245b2c0a4e61c6b3e",
+      "run": 42949581704,
+      "job": 130290483196,
+      "passed": 1742,
+      "intended_failures": 2,
+      "ignored": 33,
+      "log_sha256": "a0951dcd710b49399dc41842099c1869f15ec94ab739bcee121df826325e88f3",
+      "detail": "Rename reached verifier; rejected original candidate failed to reach bounded repair even after declaring required run resources."
+    },
+    "snapshot": "20261111T032742Z-autoship-repair-1979",
+    "merged_at": "2026-11-11T03:30:31Z",
+    "main_commit": "bbff7cb97f14ba95305705e800056c4228c15ac8",
+    "merge_kind": "manual protected merge; zero autonomous allowance credit"
+  }
 }

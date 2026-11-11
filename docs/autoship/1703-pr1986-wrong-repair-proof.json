@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "observed_at_utc": "2026-11-11T03:52:11.358182+00:00",
+  "issue": 1986,
+  "epic": 1703,
+  "baseline_run": 42945091495,
+  "failure_location": "crates/augmentagent-channel-core/tests/draft_context.rs:211",
+  "actual": "Retrieval",
+  "expected": "ModelDecision",
+  "failure_log_sha256": "1f15231de747a20703116da8b32b4de4b04998825e6346e661806eeb614bd22e",
+  "incorrect_repair": {
+    "pr": 1987,
+    "head": "375613695c0cb1c7432d46536f1080cd1eecbb09",
+    "files": [
+      "crates/augmentagent-channel-core/src/bin/autoship_case.rs",
+      "crates/augmentagent-channel-core/src/surface_turn.rs",
+      "crates/augmentagent-channel-core/tests/surface_turn.rs"
+    ],
+    "workflow": "nolanmak/jarvis#1986",
+    "paused": true,
+    "pause_revision": 1,
+    "model_calls_preserved": 13,
+    "active_lease_at_observation": false
+  },
+  "corrective_repair": {
+    "pr": 1988,
+    "head": "b76ed8ea6a1f54f694947520721a8c6b49905f49",
+    "hosted_validation": "pending",
+    "behavior": "Assert measured consumer and persisted attribution, plus deterministic model/retrieval/tie cases; production unchanged."
+  },
+  "deployment": {
+    "main_and_built_stamp": "bbff7cb97f14ba95305705e800056c4228c15ac8",
+    "daemon_sha256": "afc4116b6294d0651291d514df233525c7c8da2c568b4bddc2c864b066bebf3c",
+    "worker_sha256": "fde55e651d09d3f605c66262b3b6eb2a482a3aff37beaae13ca8e6d2abeffb51",
+    "state": "worker finishing active PR1931; readiness mismatch remains; no forced restart"
+  },
+  "reviewer_readiness": "Read-only current CLI report declares native Codex available. Earlier PR body reports unavailable; current service-context failure not confirmed.",
+  "autonomous_shipping": "unproven; allowance confirmed0 remaining5 at observation"
+}
