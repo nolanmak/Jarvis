@@ -1317,7 +1317,7 @@ pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Wri
 
     let mut reports = Vec::new();
     for root in &roots {
-        let target_lease = crate::storage_leases::TargetLeases::try_cache_roots(std::slice::from_ref(&root.path), held);
+        let target_lease = crate::storage_leases::TargetLeases::try_cache_roots(std::slice::from_ref(&root.path), held, &profile_dirs);
         let lease_error = target_lease.as_ref().err().map(|error| format!("cannot verify target lease: {error:#}"));
         let busy = if lease_error.is_some() {
             lease_error.as_deref()
