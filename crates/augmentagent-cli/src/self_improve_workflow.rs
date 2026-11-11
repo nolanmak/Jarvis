@@ -837,7 +837,7 @@ impl WorkflowGuard {
         let store = self.store.clone();
         let lease = self.lease.clone();
         let observational = self.repository.starts_with("autoship-observation/") || self.repository.starts_with("autoship-canary/");
-        self.audit.set_model_call_observer(Arc::new(move |provider| {
+        self.audit.set_correlated_model_call_observer(Arc::new(move |provider| {
             anyhow::ensure!(!capacity_flag.load(Ordering::SeqCst), "resource_capacity: await_capacity checkpoint retained");
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
             anyhow::ensure!(!matches!(store.snapshot(&lease.workflow)?.context("workflow missing")?.checkpoint.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot admit another model call");
@@ -849,7 +849,8 @@ impl WorkflowGuard {
             let actual=match provider {"codex"=>Some(durable::submission::Provider::Codex),"claude"=>Some(durable::submission::Provider::Claude),_=>None};
             store.charge_admitted_model(&lease,&receipt,millis(),observational.then(observation_call_cap),
                 bounded.as_ref().map(|b|(b.purpose.as_str(),&b.binding,b.limit)),actual,
-                augmentagent_channel_core::native_session::is_fresh_review())
+                augmentagent_channel_core::native_session::is_fresh_review())?;
+            Ok(receipt)
         }))
     }
     /// Builder identity is checked independently of audit binding so reviewer
@@ -2894,6 +2895,37 @@ mod tests {
         let progress=store.progress_events(guard.id()).unwrap();
         assert_eq!(progress.last().unwrap().requested_provider,None);
         assert_eq!(progress.last().unwrap().actual_provider.as_deref(),Some("codex"),"native admission must project the provider that actually ran, independently of the requested pin");
+    }
+
+    #[tokio::test]
+    async fn model_admission_audit_names_the_committed_accounting_receipt() {
+        let dir = repo();
+        let control = control_dir();
+        let path = control.path().join("workflow.db");
+        let guard = WorkflowGuard::acquire_at(&path, Start {
+            repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo",
+            source_issue: Some(77), pr: None, branch: "fixture", contract: "C1",
+            environment: "test",
+        }, millis()).await.unwrap().unwrap();
+        let audit = guard.audit_logger();
+        // Script the existing admission boundary; no provider is launched.
+        audit.model_call_admitted("codex").unwrap();
+        let store = WorkflowStore::open(&path).unwrap();
+        let admissions: Vec<serde_json::Value> = store.events(guard.id()).unwrap()
+            .into_iter().filter(|(_, kind, _, _)| kind == "native_model_admitted")
+            .map(|(_, _, payload, _)| serde_json::from_str(&payload).unwrap()).collect();
+        assert_eq!(admissions.len(), 1);
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls, 1);
+        let receipt = admissions[0]["receipt"].as_str().unwrap();
+        assert!(receipt.starts_with("model-call:"));
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(audit.path()).unwrap()
+            .lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|record| record["kind"] == "model_call_admitted").collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["actual_provider"], "codex");
+        assert_eq!(records[0]["accounting_receipt"].as_str(), Some(receipt),
+            "protected admission must identify the original committed charge");
+        audit.protected_health().unwrap();
     }
 
     #[tokio::test]

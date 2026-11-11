@@ -301,7 +301,7 @@ pub fn default_audit_log_path() -> PathBuf {
 pub struct AuditLogger {
     path: PathBuf,
     model_call_observer:
-        Arc<std::sync::Mutex<Option<Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>>>>,
+        Arc<std::sync::Mutex<Option<Arc<dyn Fn(&str) -> anyhow::Result<Option<String>> + Send + Sync>>>>,
     dispatch_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>>,
     run_resources_required: Arc<std::sync::atomic::AtomicBool>,
     native_runtime_owner: Arc<std::sync::Mutex<Option<crate::native_vm::RuntimeOwner>>>,
@@ -446,10 +446,21 @@ impl AuditLogger {
         &self,
         observer: Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>,
     ) -> anyhow::Result<()> {
-        *self
-            .model_call_observer
-            .lock()
-            .map_err(|_| anyhow::anyhow!("model accounting lock poisoned"))? = Some(observer);
+        *self.model_call_observer.lock()
+            .map_err(|_| anyhow::anyhow!("model accounting lock poisoned"))? =
+            Some(Arc::new(move |provider| { observer(provider)?; Ok(None) }));
+        Ok(())
+    }
+
+    /// Return the receipt already committed by the accounting authority.
+    /// This replaces the same observer slot as the compatibility setter.
+    pub fn set_correlated_model_call_observer(
+        &self,
+        observer: Arc<dyn Fn(&str) -> anyhow::Result<String> + Send + Sync>,
+    ) -> anyhow::Result<()> {
+        *self.model_call_observer.lock()
+            .map_err(|_| anyhow::anyhow!("model accounting lock poisoned"))? =
+            Some(Arc::new(move |provider| observer(provider).map(Some)));
         Ok(())
     }
 
@@ -469,14 +480,24 @@ impl AuditLogger {
             .lock()
             .map_err(|_| anyhow::anyhow!("model accounting lock poisoned"))?
             .clone();
-        if let Some(observer) = observer {
-            observer(provider)?;
+        let accounting_receipt = match observer {
+            Some(observer) => observer(provider)?,
+            None => None,
+        };
+        if let Some(receipt) = &accounting_receipt {
+            anyhow::ensure!(!receipt.is_empty() && receipt.len() <= 512
+                && receipt.bytes().all(|byte| byte.is_ascii_graphic()),
+                "invalid model accounting receipt");
         }
         if self.anchored.is_some() {
             let mut record=serde_json::json!({"actor":"controller","kind":"model_call_admitted","actual_provider":provider});
             if let Some(identity)=identity {
                 record["admission_schema_version"]=2.into();
                 record["resource_identity"]=identity.clone();
+            }
+            if let Some(receipt) = accounting_receipt {
+                record["accounting_schema_version"] = 1.into();
+                record["accounting_receipt"] = receipt.into();
             }
             self.record_controller(record)?;
         }
@@ -1384,6 +1405,153 @@ mod tests {
         let anchor = dir.path().join("anchors/workflow.json");
         let logger = AuditLogger::protected(log.clone(), anchor.clone(), &[]).unwrap();
         (dir, logger, log, anchor)
+    }
+
+    fn model_admission_rows(log: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(log).unwrap_or_default().lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| row["kind"] == "model_call_admitted").collect()
+    }
+
+    #[test]
+    fn model_admission_retains_the_exact_accounting_and_resource_receipts() {
+        let (_dir, logger, log, _anchor) = protected_fixture();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        logger.set_model_call_observer(Arc::new(|_| panic!("replaced observer ran"))).unwrap();
+        logger.set_correlated_model_call_observer(Arc::new(move |provider| {
+            assert_eq!(provider, "codex");
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("synthetic-charge-17".into())
+        })).unwrap();
+        let identity = serde_json::json!({"scope": "synthetic-scope", "limits": {"memory_max_bytes": 1024}});
+        logger.model_call_admitted_in_scope("codex", &identity).unwrap();
+        let rows = model_admission_rows(&log);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["accounting_receipt"], "synthetic-charge-17");
+        assert_eq!(rows[0]["accounting_schema_version"], 1);
+        assert_eq!(rows[0]["resource_identity"], identity);
+        assert_eq!(rows[0]["admission_schema_version"], 2);
+        assert_eq!(rows[0]["actual_provider"], "codex");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        logger.protected_health().unwrap();
+    }
+
+    #[test]
+    fn model_admission_legacy_and_unbound_callbacks_do_not_invent_correlation() {
+        let (_dir, logger, log, _anchor) = protected_fixture();
+        logger.model_call_admitted("codex").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        logger.set_model_call_observer(Arc::new(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })).unwrap();
+        logger.model_call_admitted("claude").unwrap();
+        let rows = model_admission_rows(&log);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["actual_provider"], "codex");
+        assert_eq!(rows[1]["actual_provider"], "claude");
+        for row in rows {
+            assert!(row.get("accounting_receipt").is_none());
+            assert!(row.get("accounting_schema_version").is_none());
+            assert!(row.get("resource_identity").is_none());
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        logger.protected_health().unwrap();
+    }
+
+    #[test]
+    fn model_admission_replacement_and_clones_share_one_snapshot_slot() {
+        let (_dir, logger, log, _anchor) = protected_fixture();
+        let clone = logger.clone();
+        let (started, captured) = std::sync::mpsc::channel();
+        let (released, resume) = std::sync::mpsc::channel();
+        let resume = std::sync::Mutex::new(resume);
+        logger.set_correlated_model_call_observer(Arc::new(move |_| {
+            started.send(()).unwrap();
+            resume.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5))?;
+            Ok("captured-charge".into())
+        })).unwrap();
+        let active = std::thread::spawn(move || clone.model_call_admitted("codex"));
+        captured.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        // Replacement must not need the mutex held by an executing callback.
+        let replacement = logger.clone();
+        let (changed, observed) = std::sync::mpsc::channel();
+        let setter = std::thread::spawn(move || {
+            replacement.set_correlated_model_call_observer(Arc::new(|_| Ok("next-charge".into()))).unwrap();
+            changed.send(()).unwrap();
+        });
+        let replaced_before_release = observed.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+        released.send(()).unwrap();
+        active.join().unwrap().unwrap();
+        setter.join().unwrap();
+        assert!(replaced_before_release, "callback retained the observer mutex");
+        logger.model_call_admitted("codex").unwrap();
+        logger.set_model_call_observer(Arc::new(|_| Ok(()))).unwrap();
+        logger.model_call_admitted("codex").unwrap();
+        let rows = model_admission_rows(&log);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["accounting_receipt"], "captured-charge");
+        assert_eq!(rows[1]["accounting_receipt"], "next-charge");
+        assert!(rows[2].get("accounting_receipt").is_none());
+        logger.protected_health().unwrap();
+    }
+
+    #[test]
+    fn model_admission_rejects_invalid_receipts_without_undoing_the_callback() {
+        for receipt in [String::new(), "r".repeat(513), "has space".into(),
+            "line\nbreak".into(), "tab\tbreak".into(), "nul\0byte".into(), "café".into()] {
+            let (_dir, logger, log, _anchor) = protected_fixture();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = calls.clone();
+            logger.set_correlated_model_call_observer(Arc::new(move |_| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(receipt.clone())
+            })).unwrap();
+            assert!(logger.model_call_admitted("codex").is_err());
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(model_admission_rows(&log).is_empty());
+            logger.protected_health().unwrap();
+        }
+        for bytes in [1, 512] {
+            let (_dir, logger, log, _anchor) = protected_fixture();
+            let receipt = "r".repeat(bytes);
+            let returned = receipt.clone();
+            logger.set_correlated_model_call_observer(Arc::new(move |_| Ok(returned.clone()))).unwrap();
+            logger.model_call_admitted("codex").unwrap();
+            assert_eq!(model_admission_rows(&log)[0]["accounting_receipt"], receipt);
+            logger.protected_health().unwrap();
+        }
+    }
+
+    #[test]
+    fn model_admission_callback_and_audit_failures_do_not_publish_success() {
+        let (_dir, logger, log, _anchor) = protected_fixture();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        logger.set_correlated_model_call_observer(Arc::new(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("synthetic accounting refusal")
+        })).unwrap();
+        assert!(logger.model_call_admitted("codex").is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(model_admission_rows(&log).is_empty());
+        logger.protected_health().unwrap();
+
+        let (_dir, logger, log, _anchor) = protected_fixture();
+        logger.record_controller(serde_json::json!({"kind": "synthetic-start"})).unwrap();
+        std::fs::remove_file(&log).unwrap();
+        std::fs::create_dir(&log).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        logger.set_correlated_model_call_observer(Arc::new(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("already-committed-charge".into())
+        })).unwrap();
+        assert!(logger.model_call_admitted("codex").is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(logger.protected_health().is_err());
     }
 
     #[tokio::test]
