@@ -1423,6 +1423,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_unavailability_checkpoint_retains_typed_cause_without_private_details() {
+        use crate::autoship_workflow::{WorkflowStore, Stage};
+        let dir=candidate_fixture();
+        let control=tempfile::Builder::new().prefix("review-cause-control-").tempdir_in("/tmp").unwrap();
+        let state=control.path().join("workflow.db");
+        let mut guard=workflow::WorkflowGuard::acquire_fixture(&state,workflow::Start {
+            repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(7),
+            pr:Some(42),branch:"fix/fixture",contract:"original owner contract",environment:"fixture",
+        }).await.unwrap().unwrap();
+        guard.checkpoint(Stage::Review,"verified","review",0,&["original-pin".into()]).await.unwrap();
+        let id=guard.id().to_owned();let store=WorkflowStore::open(&state).unwrap();
+        let before=store.snapshot(&id).unwrap().unwrap();
+        let why=ReviewUnavailable::RecoveryRequired {detail:"private reviewer response".into()};
+        checkpoint_unavailable_review(&mut guard,&why,chrono::Utc::now().timestamp_millis()).await.unwrap();
+        let after=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(after.checkpoint.stage,Stage::Held);
+        assert_eq!(after.checkpoint.next.reason,why.code(),"typed review cause was lost at the producer");
+        assert_eq!(after.checkpoint.next.action,"resume_preserved_work");
+        assert_eq!(after.checkpoint.binding,before.checkpoint.binding);
+        assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+        assert_eq!(after.model_calls,before.model_calls);
+        assert!(!serde_json::to_string(&store.progress_events(&id).unwrap()).unwrap().contains("private reviewer"));
+        guard.finish().unwrap();
+    }
+
+    #[tokio::test]
     async fn main_advance_is_typed_through_context_and_source_wrapping() {
         for depth in 0..3 {
             let dir = candidate_fixture();

@@ -341,6 +341,7 @@ async fn execute(
         .map(|c| c.requirement.clone())
         .collect();
     let mut previous = None;
+    let mut last_review_unavailable: Option<&'static str>;
     let mut round = 0;
     let mut native_sessions = None;
     loop {
@@ -385,6 +386,7 @@ async fn execute(
             },
         )
         .await;
+        last_review_unavailable = review.why_unavailable.as_ref().map(ReviewUnavailable::code);
         if let Some(why @ ReviewUnavailable::MainAdvanced { .. }) = &review.why_unavailable {
             guard.push(&pr.branch).await?;
             checkpoint_unavailable_review(guard, why, chrono::Utc::now().timestamp_millis()).await?;
@@ -614,7 +616,7 @@ async fn execute(
     guard
         .transition(
             Stage::Review,
-            "adopted_review_pending",
+            last_review_unavailable.unwrap_or("adopted_review_pending"),
             "resume_preserved_pr",
             chrono::Utc::now().timestamp_millis() + 300_000,
         )
