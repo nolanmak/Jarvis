@@ -8928,6 +8928,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                     let (_ok, names2, _) =
                         run("git", &["diff", "--cached", "--name-only", candidate_base], &worktree).await?;
                     if let Err(gate_err) = gate_for_round(&worktree, &names2, &workflow_guard.audit_logger()).await.for_workflow(&mut workflow_guard).await? {
+                        if gate_err.is::<hosted_ci::MainPolicyReconciliation>() {
+                            break 'stages Some(ParkReason::from_gate_error(&gate_err));
+                        }
                         warn!(issue = issue.number, "post-revision gate failed: {gate_err:#}");
                         // #873 — a red gate gets a repair round while budget
                         // remains: red→fix is the other half of TDD, and a
@@ -9107,6 +9110,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             // ships — or even lands as a PR claiming workspace-pass — gets the
             // FULL suite exactly once here.
             if let Err(gate_err) = verification_gate(&worktree, &workflow_guard.audit_logger()).await.for_workflow(&mut workflow_guard).await? {
+                if gate_err.is::<hosted_ci::MainPolicyReconciliation>() {
+                    break 'stages Some(ParkReason::from_gate_error(&gate_err));
+                }
                 warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
                 if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:final-gate", &detail, &diff_touched_paths(&full_after), lines) })).await.unwrap_or_else(|_| Tally::uncounted());
@@ -20178,6 +20184,27 @@ mod iterate_not_delete_tests {
         }
         assert!(body.contains("ParkReason::GateRed("));
         assert!(body.contains("ParkReason::Oversize("));
+    }
+
+    #[test]
+    fn every_fresh_gate_routes_main_policy_before_repair_or_failed_attempts() {
+        // Architectural coverage supplements the real Git-policy and fenced
+        // workflow regressions: no later gate may bypass that typed routing.
+        let body=run_once_src();let mut checked=0;
+        for (_,tail) in body.match_indices("if let Err(gate_err) =").map(|(at,_)|(at,&body[at+"if let Err(gate_err) =".len()..])) {
+            let tail=tail.trim_start();
+            if !tail.starts_with("gate_for_round(") && !tail.starts_with("verification_gate(") {continue;}
+            let effect=["gate_findings(","record_attempt(","preexisting_on_main("]
+                .iter().filter_map(|name|tail.find(*name)).min().expect("late gate must classify its outcome");
+            let guard=tail.find("MainPolicyReconciliation").expect("late gate lost its reconciliation route");
+            assert!(guard<effect,"late gate can spend repair/attempt budget before routing inherited policy");checked+=1;
+        }
+        assert!(checked>=2,"post-revision and final gates must both be covered");
+        let error:anyhow::Error=hosted_ci::MainPolicyReconciliation{main:"b".repeat(40)}.into();
+        let parked=ParkReason::from_gate_error(&error);
+        assert!(matches!(parked,ParkReason::MainPolicyReconciliation(_)));
+        assert!(parked.verification().contains("pending reviewed-main reconciliation"));
+        assert!(!parked.headline().contains("repair budget"));
     }
 
     #[test]
