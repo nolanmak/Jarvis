@@ -83,6 +83,26 @@ class EvidenceTests(unittest.TestCase):
  def evaluate(self):
   with patch.object(hosted.subprocess,'run',return_value=subprocess.CompletedProcess([],0,json.dumps(self.required),'')):
    return hosted.evaluate(self.request,self.api)
+ def test_multiple_workflows_share_one_fresh_run_inventory(self):
+  other='.github/workflows/other.yml'
+  self.contract['workflows'][other]=copy.deepcopy(self.contract['workflows'][self.path])
+  self.runs.append({**self.runs[0],'id':11,'path':other})
+  original=self.api.pages
+  def pages(endpoint,key=None):
+   if '/jobs?' in endpoint and '/11/' in endpoint:
+    self.calls.append(endpoint)
+    return [{**j,'id':j['id']+10,'run_id':11} for j in self.jobs]
+   if '/actions/runs?' in endpoint:
+    self.calls.append(endpoint)
+    return self.runs
+   return original(endpoint,key)
+  self.api.pages=pages
+  evidence=self.evaluate()
+  self.assertEqual(evidence['state'],'passed')
+  self.assertEqual(len(evidence['receipts']),2)
+  inventories=[c for c in self.calls if '/runs?' in c and '/jobs?' not in c]
+  self.assertEqual(inventories,[f'repos/o/r/actions/runs?head_sha={self.head}&event=pull_request'])
+
  def test_complete_current_head_passes(self):
   evidence=self.evaluate();self.assertEqual(evidence['state'],'passed');self.assertEqual(evidence['head'],self.head)
   self.assertEqual(len(evidence['receipts']),1)
@@ -162,6 +182,24 @@ class EvidenceTests(unittest.TestCase):
  def test_mismatched_job_run_holds(self):
   self.jobs[0]['run_id']=99
   with self.assertRaisesRegex(ValueError,'identity'):self.evaluate()
+
+class RunInventoryPaginationTests(unittest.TestCase):
+ def test_filtered_search_limit_and_incomplete_inventory_hold(self):
+  for total,rows in [(1001,100),(101,99),(99,100)]:
+   with self.subTest(total=total,rows=rows):
+    api=hosted.GitHub('fake-gh')
+    api.api=lambda endpoint: {'total_count':total,'workflow_runs':[{'id':i} for i in range(rows)]}
+    with self.assertRaisesRegex(ValueError,'inventory|pagination'):
+     api.pages('repos/o/r/actions/runs?head_sha='+'a'*40,'workflow_runs')
+ def test_complete_inventory_uses_all_pages(self):
+  api=hosted.GitHub('fake-gh');calls=[]
+  def page(endpoint):
+   calls.append(endpoint)
+   first=endpoint.endswith('page=1')
+   return {'total_count':101,'workflow_runs':[{'id':i} for i in range(100)] if first else [{'id':100}]}
+  api.api=page
+  self.assertEqual(len(api.pages('repos/o/r/actions/runs?head_sha='+'a'*40,'workflow_runs')),101)
+  self.assertEqual(len(calls),2)
 
 class WorkflowSecurityTests(unittest.TestCase):
  def test_all_pr_and_push_validation_jobs_are_read_only_and_secret_free(self):
