@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "observed_at_utc": "2026-11-11T01:42:55.297190+00:00",
+  "source_head": "4ebb2b745c62476ad08571dea008307f2235a986",
+  "checks": [
+    {
+      "command": "python3 scripts/tests/autoship_hosted_ci_test.py",
+      "exit_code": 0,
+      "passed": 31,
+      "scope": "Hosted status classification, head/attempt freshness, Linux/macOS queue behavior and PR/push workflow secret/token checks."
+    },
+    {
+      "command": "python3 scripts/tests/ci_contract_test.py",
+      "exit_code": 0,
+      "passed": 23,
+      "scope": "Declared workflow coverage, policy identity and CI contract validation."
+    },
+    {
+      "command": "python3 scripts/ci-contract.py verify",
+      "exit_code": 0,
+      "result": {
+        "valid": true,
+        "changed": []
+      }
+    }
+  ],
+  "workflow_hashes": {
+    ".github/workflows/apple-notes.yml": "270e8963e6bccb79b614b5d7ce427dc2acf048a35fcffbd785448dfb985e97aa",
+    ".github/workflows/autonomous-code-scanner.yml": "350b8a4deee9e416c7e655a047f5996a7674a4ec7d244c19d200d7947e32fde0",
+    ".github/workflows/bridge-suites.yml": "26f54edc2167585d49c090cef230adcbe01b1446837b7774902aa27206f3c589",
+    ".github/workflows/browser-sidecar.yml": "87e41b4f96e11df3a21002d3037ba5a5b01365bb13178404338727802780b884",
+    ".github/workflows/claude-pr-review.yml": "b521074adf27fe11f80bf50318e6be062daaa8710515f67108dd4c089bd1fe13",
+    ".github/workflows/computer-use.yml": "69f681dbdc1f324a5a8d1f6954ae5fe390776c12b2a9e9c08aa33329deeb07e5",
+    ".github/workflows/dashboard-sessions.yml": "822f8454dc2b2d539f39d9eaa98ebef7d482164a170d5ce033fb0af7cce78020",
+    ".github/workflows/discord-voice.yml": "8aba8fae6b9c654e6231d84d6946d7db74316e4f59a4f2889dd56be6b88a90b6",
+    ".github/workflows/imessage.yml": "45bd14cc7294eaa0ed7b95d328b49ab3fdd0e0332b20215d0531d1a4baef49ac",
+    ".github/workflows/issue-to-pr.yml": "c9b351c41ade38928a1a84a3d746002aafc128756fc6b2165f96d5ff8b243f6d",
+    ".github/workflows/macos.yml": "126818c3f84ed3caa3d2956465d6e939228a80f444461e3322dda80763659709",
+    ".github/workflows/model-router.yml": "ffbcc8a8e6eeca7844f9961ffe53fd5d1d25552eaec49e4164e9e62ca3bb31e6",
+    ".github/workflows/no-gmail-authors.yml": "c9f617a7630fdad3b58946f28cac9e31a8585314cc1187eb2dceedc4e8a1b292",
+    ".github/workflows/platform.yml": "7248f86279e003dfdf68ee204157b85764b675e36faede980e845ceca9556c38",
+    ".github/workflows/privacy.yml": "bece4043820dd1f33e7a47514e8a59a19eeb1328e88aca52ab310202f336ccf9",
+    ".github/workflows/rust-cache.yml": "cac07b6c4b9ee594f3805919f66dfcbbe24fa8d26628eba23df06ffeeff2c57f",
+    ".github/workflows/rust.yml": "b00d51b98305ea47a34aad48cf01bb0f3fdb62e9ba09c8672fc3245b9947563e",
+    ".github/workflows/targeted.yml": "128251cc59f3505804322522dcd7d4632f3a639ef3d3c008de3e4c3e6839b416"
+  },
+  "findings": [
+    "All 18 tracked workflows are represented in the current CI contract.",
+    "Every workflow with pull_request or push events passes the existing no-secret-reference, read-only-permission, no-pull_request_target, and checkout-without-persisted-credentials checks.",
+    "The legacy issue-to-pr workflow references a model secret but has issues/workflow_dispatch triggers, not pull_request/push. The scanner has schedule/workflow_dispatch triggers. These are not PR validation jobs."
+  ],
+  "limits": [
+    "This is a current checked-in workflow/contract audit, not proof of autonomous merge, deployment, or full epic acceptance.",
+    "It does not assert GitHub organization/repository environment settings or secret inventories were audited.",
+    "Future workflow changes need current policy and security validation; this receipt grants no authority."
+  ]
+}
