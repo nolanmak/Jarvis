@@ -227,6 +227,37 @@ mod tests {
     }
 
     #[test]
+    fn review_hold_survives_generic_attempt_completion_without_private_details() {
+        for reason in ["review-recovery-required", "review-evidence-budget", "reviewer-latched"] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+            let mut store=WorkflowStore::open(&path).unwrap();
+            let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Pr(42),
+                provider:None,until:submission::Milestone::Merged};
+            let id=store.submit_authorized("request","owner",&request,1).unwrap().workflow;
+            store.next_command_job("owner/repo",2).unwrap().unwrap();
+            store.register(&id,"fix/one",Binding {head:"head-a".into(),contract:"contract-a".into(),evidence_hash:"dependency-a".into()},3).unwrap();
+            let lease=store.claim(&id,"worker",4,10000).unwrap().unwrap();
+            let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+            checkpoint.stage=Stage::Held;checkpoint.next=NextAction {reason:reason.into(),action:"resume_preserved_work".into(),eligible_at_ms:500};
+            checkpoint.evidence=vec!["private provider response must not be published".into()];
+            store.checkpoint(&lease,&checkpoint,5).unwrap();
+            let before=store.progress_events(&id).unwrap();
+            store.finish_command_attempt(&id,2,submission::AttemptOutcome::Progress,"workflow-progressed",6).unwrap();
+            let after=store.progress_events(&id).unwrap();
+            let latest=after.last().unwrap();
+            assert_eq!(latest.kind,"blocked","attempt completion hid the hold");
+            assert_eq!(latest.reason,reason);
+            assert_eq!(latest.next_action,"resume_preserved_work");
+            assert_eq!(latest.eligible_at_ms,Some(500));
+            assert_eq!(after,before,"generic attempt outcome must not add a misleading update");
+            assert_eq!(latest.actual_provider,None);
+            assert_eq!(latest.merge_state,"not-confirmed");
+            assert!(!serde_json::to_string(&after).unwrap().contains("private provider"));
+            assert_eq!(WorkflowStore::open(&path).unwrap().progress_events(&id).unwrap(),after);
+        }
+    }
+
+    #[test]
     fn projection_failure_rolls_back_checkpoint_and_audit() {
         let dir=tempfile::tempdir().unwrap();let (mut store,lease)=setup(&dir.path().join("state.db"));
         let before=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;

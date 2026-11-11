@@ -146,7 +146,10 @@ mod tests {
 
     #[test]
     fn owner_resume_retries_only_quiescent_internal_execution_failures() {
-        for (reason,action) in [("adopted_execution_retry","resume_preserved_pr"),("resume_deferred","resume_preserved_work")] {
+        for (reason,action) in [("adopted_execution_retry","resume_preserved_pr"),("resume_deferred","resume_preserved_work"),
+            ("review-recovery-required","resume_preserved_work"),("review-evidence-budget","resume_preserved_work"),
+            ("reviewer-latched","resume_preserved_work"),("no-reviewer-capacity","resume_preserved_work"),
+            ("provenance-unknown","resume_preserved_work")] {
             for blocker in ["none","lease","native","operation"] {
                 let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
                 let id=store.submit_authorized("request","github:owner",&request(1),1).unwrap().workflow;
