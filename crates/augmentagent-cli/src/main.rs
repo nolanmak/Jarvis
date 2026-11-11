@@ -8152,6 +8152,18 @@ async fn run_socialapi_dm(
         }
         return Ok(());
     }
+    // #1982 — a card Instagram will refuse is a wasted draft: say so now,
+    // with the draft and an app link, instead of failing at approve time.
+    if let Some(w) =
+        augmentagent_channel_socialapi::window::ReplyWindow::for_conversation(&store, &conversation_id)
+            .filter(|w| w.is_closed(chrono::Utc::now()))
+    {
+        anyhow::bail!(augmentagent_channel_socialapi::window::window_closed_message(
+            &w.with,
+            Some(w.closes_at()),
+            &draft,
+        ));
+    }
     // Synthetic id: this is an operator-initiated draft, not an ingested
     // message, so there is no platform message id to key on. `compose:`
     // mirrors the gmail convention and can never collide with a real one.
@@ -14269,12 +14281,37 @@ impl ReplyApprover {
                     .account_entity_id
                     .clone()
                     .filter(|a| !a.is_empty() && a != augmentagent_channel_socialapi::PLATFORM);
+                // #1982 — Instagram refuses replies 24 h after the person's
+                // last message. Don't spend the send; explain and hand back
+                // the draft with a link to reply in the app.
+                use augmentagent_channel_socialapi::window;
+                let reply_window = window::ReplyWindow::for_conversation(&self.store, target);
+                if let Some(w) = reply_window.as_ref().filter(|w| w.is_closed(chrono::Utc::now())) {
+                    let msg = window::window_closed_message(&w.with, Some(w.closes_at()), body);
+                    let _ = self.store.update_action_status(action_id, ActionStatus::Error, None, Some(&msg));
+                    return ApprovalActionOutcome::Failed { message: msg };
+                }
                 let req = augmentagent_channel_socialapi::DmSendRequest {
                     text: body.to_string(),
                     account_id,
                     attachment_url: None,
                 };
-                client.send_dm(target, &req).await
+                match client.send_dm(target, &req).await {
+                    Err(e) if window::is_window_closed_error(&format!("{e:#}")) => {
+                        let with = reply_window
+                            .as_ref()
+                            .map(|w| w.with.clone())
+                            .unwrap_or_else(|| action.email.from.split(" <").next().unwrap_or("").to_string());
+                        let msg = window::window_closed_message(
+                            &with,
+                            reply_window.as_ref().map(|w| w.closes_at()),
+                            body,
+                        );
+                        let _ = self.store.update_action_status(action_id, ActionStatus::Error, None, Some(&msg));
+                        return ApprovalActionOutcome::Failed { message: msg };
+                    }
+                    other => other,
+                }
             }
             other => {
                 return ApprovalActionOutcome::Failed {
@@ -24283,6 +24320,9 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod linkedin_approval_tests;
+
+#[cfg(test)]
+mod socialapi_window_tests;
 
 /// Production read-command dispatch, with reader construction kept outside so
 /// command parsing and routing can be exercised against a local HTTP fixture.
