@@ -208,15 +208,30 @@ async fn receipt_times_every_step_and_names_the_budget_consumer_on_each_platform
             ]
         );
         assert!(timings.iter().all(|s| s.elapsed_ms > 0), "{timings:?}");
-        assert_eq!(
-            context.evidence.budget_consumer(),
-            BudgetConsumer::ModelDecision
-        );
+        // Filesystem retrieval can take longer than the scripted model on a
+        // loaded runner. Attribute the receipt to the measured work rather
+        // than assuming a 20 ms model delay must dominate real I/O.
+        let model_ms: u64 = timings
+            .iter()
+            .filter(|s| s.kind == StepKind::ModelDecision)
+            .map(|s| s.elapsed_ms)
+            .sum();
+        let retrieval_ms: u64 = timings
+            .iter()
+            .filter(|s| s.kind == StepKind::Retrieval)
+            .map(|s| s.elapsed_ms)
+            .sum();
+        let (expected_consumer, expected_label) = if retrieval_ms > model_ms {
+            (BudgetConsumer::Retrieval, "retrieval")
+        } else {
+            (BudgetConsumer::ModelDecision, "model_decision")
+        };
+        assert_eq!(context.evidence.budget_consumer(), expected_consumer);
         let raw = persisted_receipt(&store, &context, &incoming);
         assert!(!raw.contains("SYNTHETIC_PRIVATE_MESSAGE_BODY"));
         assert!(!raw.contains("SYNTHETIC_WIKI_BODY"));
         let receipt: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(receipt["budget_consumer"], "model_decision");
+        assert_eq!(receipt["budget_consumer"], expected_label);
         let steps = receipt["step_timings"].as_array().unwrap().clone();
         assert_eq!(steps.len(), 5);
         assert!(steps.iter().all(|step| {
@@ -241,6 +256,44 @@ async fn receipt_times_every_step_and_names_the_budget_consumer_on_each_platform
         schemas[0], schemas[1],
         "iMessage and email receipts share one telemetry schema"
     );
+}
+
+#[test]
+fn receipt_attributes_budget_to_measured_work_including_slow_retrieval() {
+    use augmentagent_channel_core::draft_evidence::{
+        BudgetConsumer, EvidenceOutcome, StepKind, StepTiming,
+    };
+    for (model, retrieval, expected) in [
+        ([20, 20, 20], [100, 1], BudgetConsumer::Retrieval),
+        ([20, 20, 20], [1, 1], BudgetConsumer::ModelDecision),
+        ([20, 20, 20], [30, 30], BudgetConsumer::ModelDecision),
+    ] {
+        let step = |kind, operation: &str, elapsed_ms| StepTiming {
+            kind,
+            operation: operation.into(),
+            elapsed_ms,
+            outcome: "ok".into(),
+        };
+        let evidence = EvidenceOutcome {
+            facts: vec![],
+            gaps: vec![],
+            reads: vec![],
+            complete: true,
+            elapsed_ms: model.iter().chain(&retrieval).sum(),
+            model_decisions: 3,
+            step_timings: vec![
+                step(StepKind::ModelDecision, "decision", model[0]),
+                step(StepKind::Retrieval, "search_wiki", retrieval[0]),
+                step(StepKind::ModelDecision, "decision", model[1]),
+                step(StepKind::Retrieval, "read_wiki", retrieval[1]),
+                step(StepKind::ModelDecision, "decision", model[2]),
+            ],
+        };
+        assert_eq!(evidence.budget_consumer(), expected);
+        // Persistence is covered by the real workflow test above; fixed
+        // durations here exercise both consumers and the tie rule without I/O
+        // speed deciding which branch this test covers.
+    }
 }
 
 #[tokio::test(start_paused = true)]
