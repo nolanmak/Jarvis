@@ -3199,6 +3199,11 @@ mod initial_acceptance_hold_tests {
             guard.hold_initial_acceptance("acceptance_verifier_evidence_unknown","await_original_evidence_recovery").await.unwrap();
             let unknown=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
             assert_eq!(unknown.checkpoint.next.action,"await_original_evidence_recovery");
+            guard.hold_initial_acceptance("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery").await.unwrap();
+            let infrastructure=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(infrastructure.checkpoint.next.reason,"acceptance_verifier_infrastructure_unavailable");
+            assert_eq!(infrastructure.checkpoint.next.action,"await_verifier_infrastructure_recovery");
+            assert_eq!(infrastructure.model_calls,0);
         }
     }
 }

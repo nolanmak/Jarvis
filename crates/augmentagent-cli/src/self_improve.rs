@@ -8126,11 +8126,6 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         Ok(prepared) => prepared,
         Err(error) => {
             if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}
-            if error.downcast_ref::<acceptance::BaselineNotRed>().is_some() {
-                let children=acceptance::readiness::decompose_unverifiable(repo_root,&worktree,&issue,&criteria,&format!("{error:#}"),&mut workflow_guard).await?;
-                if !children.is_empty() {return Ok(RunReport::triage(format!("issue #{}: acceptance split into observable children {:?}",issue.number,children)));}
-            }
-
             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
             return Err(error).context("independent acceptance registration requires scoped retry");
         }

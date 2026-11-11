@@ -17,6 +17,7 @@ pub(super) enum Hold {
     Exhausted,
     EvidenceUnknown,
     ContractInvalid,
+    InfrastructureUnavailable,
 }
 impl Hold {
     pub(super) fn reason(self) -> &'static str {
@@ -24,11 +25,13 @@ impl Hold {
             Self::Exhausted => "acceptance_verifier_repair_exhausted",
             Self::EvidenceUnknown => "acceptance_verifier_evidence_unknown",
             Self::ContractInvalid => "acceptance_contract_invalid",
+            Self::InfrastructureUnavailable => "acceptance_verifier_infrastructure_unavailable",
         }
     }
     pub(super) fn action(self) -> &'static str {
         match self {
             Self::EvidenceUnknown => "await_original_evidence_recovery",
+            Self::InfrastructureUnavailable => "await_verifier_infrastructure_recovery",
             _ => "await_acceptance_input_change",
         }
     }
@@ -147,8 +150,8 @@ where
                     return Err(error);
                 };
                 let Some(kind) = failed.kind else {
-                    return Err(error);
-                }; // infrastructure
+                    return Err(error.context(Hold::InfrastructureUnavailable));
+                }; // retain infrastructure identity without consuming a slot
                 let failure = Failure {
                     version: 1,
                     epoch: epoch.into(),
@@ -362,10 +365,15 @@ mod tests {
             },
         )
         .await;
-        assert!(result
-            .unwrap_err()
-            .downcast_ref::<BaselineNotRed>()
-            .is_some());
+        let error = result.unwrap_err();
+        assert!(
+            error.downcast_ref::<BaselineNotRed>().is_some(),
+            "private cause is retained"
+        );
+        assert_eq!(
+            error.downcast_ref::<Hold>(),
+            Some(&Hold::InfrastructureUnavailable)
+        );
     }
 
     #[test]
