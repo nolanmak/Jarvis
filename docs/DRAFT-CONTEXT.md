@@ -80,6 +80,43 @@ receipt retention is thirty days, while receipts attached to unresolved
 approvals remain available. Revision receipts retain their own evidence and
 previous owner instructions are read from the existing revision history.
 
+## Revisions: edit first (#2012)
+
+Most revisions are direct edits ("remove that line", "don't say perfect",
+"shorter", or a sentence whose content the owner wrote in the instruction), so a
+revision no longer starts with the 90-second evidence check. The first call is
+the edit itself. It gets the previous draft, all owner instructions, the
+refreshed thread (`load_latest_seed`) and the sources the original draft's
+receipt actually read. Those sources are re-read now from the store and wiki,
+which takes milliseconds; a wiki page whose hash changed is listed in
+`changed_sources`. The edit call has no tools, and it either returns the revised
+text or one line `NEEDS_CONTEXT: <what to look up>`.
+
+- `revised`: the draft is persisted after one model call, with a receipt where
+  `mode: "revision_edit"` and `evidence_mode: "skipped"`. No context warning is added.
+- `NEEDS_CONTEXT`: the evidence loop runs with that need as its request, under
+  `AUGMENTAGENT_REVISION_EVIDENCE_BUDGET_SECS` (default 25 s), and then one
+  redraft follows. If the source still isn't found, the card names the specific
+  need ("Couldn't verify: …") instead of the generic time-limit notice. The
+  receipt records `evidence_mode` as `gathered` or `timeout`.
+- An empty or malformed answer is retried once. If it fails again, or the edit
+  call errors, the revision falls back to the pre-#2012 path
+  (`evidence_mode: "fallback"`) instead of failing the card.
+
+`AUGMENTAGENT_REVISION_EDIT_FIRST=off` restores evidence-then-redraft for every
+revision. Every revision logs one `revise timings` line with `evidence_mode`,
+`seed_ms`, `rehydrate_ms`, `edit_ms`, `evidence_ms`, `redraft_ms`,
+`gate_wait_ms` and `total_ms`.
+
+Revisions run inside `cli_gate::run_interactive`. The reasoner CLI gate keeps
+`AUGMENTAGENT_REASONER_INTERACTIVE_RESERVE` permits (default 1, `0` disables,
+and at least one permit always stays shared) that only owner-interactive calls
+may take. Total concurrency is still `AUGMENTAGENT_REASONER_MAX_INFLIGHT`.
+Inside that scope, time spent queued for a permit is recorded as its own
+`gate_wait` step and is not counted as `model_decision`. A Claude call dropped
+before its result (a caller's timeout or the watchdog) still writes a
+`token-usage.jsonl` row with `outcome: "unfinished"`.
+
 ## Integration and validation status
 
 This is an implementation matrix, not a declaration of completed acceptance.
@@ -95,7 +132,7 @@ Update the validation column with actual results before release.
 | SocialAPI incoming DMs | Evidence before draft; existing image input retained | Existing adapter library regressions passed; CI verifies merged head |
 | Telegram bot replies | Evidence before draft; bot delivery unchanged | Existing adapter library regressions passed; CI verifies merged head |
 | Owner ask | Shared context command and receipt attachment | CLI context/attachment isolation passed; actual-model evidence-present/missing test passed |
-| Revise (email, iMessage, Slack, Discord, LinkedIn, SocialAPI, Telegram) | Shared evidence recovery and accumulated feedback | Shared refresh/accumulated-feedback regression passed; routing regression in CI |
+| Revise (email, iMessage, Slack, Discord, LinkedIn, SocialAPI, Telegram) | Edit-first call; evidence only on `NEEDS_CONTEXT` (#2012); accumulated feedback | `channel-core/tests/revision_edit_first.rs` (16) + CLI revise regressions (42) passed |
 | iMessage groups | Opted-in groups draft with a higher triage bar and send by `chat_guid` (#1738) | `channel-imessage` group reply tests |
 | WhatsApp groups | Existing adapter rejects group auto-drafts; unchanged | Existing group/own-echo regression tests |
 | Slack/Discord subscribed channels | Shared context follows existing subscription policy; participant membership is not inferred from sender | Audience uncertainty is explicit; no claim of private-DM semantics |

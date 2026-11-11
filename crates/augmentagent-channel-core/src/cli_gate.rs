@@ -36,6 +36,37 @@ use tracing::{info, warn};
 
 pub const DEFAULT_MAX_INFLIGHT: usize = 4;
 pub const ENV_MAX_INFLIGHT: &str = "AUGMENTAGENT_REASONER_MAX_INFLIGHT";
+/// #2012 — permits held back for owner-interactive work (default 1, always
+/// leaving at least one shared permit). `0` disables the reserve.
+pub const ENV_INTERACTIVE_RESERVE: &str = "AUGMENTAGENT_REASONER_INTERACTIVE_RESERVE";
+pub const DEFAULT_INTERACTIVE_RESERVE: usize = 1;
+
+/// Marks the calls an owner is waiting on, and adds up their permit waits.
+/// A task-local rather than a `ReasonerOpts` field: priority belongs to the
+/// request, not the preset, and every provider's gate reads it the same way.
+#[derive(Default)]
+struct CallScope {
+    gate_wait_ms: AtomicU64,
+}
+
+tokio::task_local! {
+    static INTERACTIVE: Arc<CallScope>;
+}
+
+/// Run `future` as owner-interactive work: its CLI calls may use the reserved
+/// permits, and [`scope_gate_wait_ms`] reports how long they queued.
+pub async fn run_interactive<F: std::future::Future>(future: F) -> F::Output {
+    INTERACTIVE.scope(Arc::new(CallScope::default()), future).await
+}
+
+/// Total permit wait inside the current [`run_interactive`] scope, if any.
+pub fn scope_gate_wait_ms() -> Option<u64> {
+    INTERACTIVE.try_with(|scope| scope.gate_wait_ms.load(Ordering::Relaxed)).ok()
+}
+
+fn in_interactive_scope() -> bool {
+    INTERACTIVE.try_with(|_| ()).is_ok()
+}
 /// How long one call may sit queued in silence, and the floor between lines.
 const QUEUED_WARN_EVERY: Duration = Duration::from_secs(60);
 /// Sweep-period ceiling (see [`CliGate::sweep_holds`]).
@@ -60,7 +91,10 @@ struct Held {
 }
 
 pub struct CliGate {
+    /// Shared permits: `capacity - reserve`.
     sem: Arc<Semaphore>,
+    /// Interactive-only permits (#2012); `None` when the reserve is zero.
+    reserved: Option<Arc<Semaphore>>,
     capacity: usize,
     held: Mutex<HashMap<u64, Held>>,
     next_id: AtomicU64,
@@ -80,9 +114,17 @@ pub struct CliGate {
 
 impl CliGate {
     pub fn new(capacity: usize) -> Self {
+        Self::with_reserve(capacity, 0)
+    }
+
+    /// A gate of `capacity` permits, `reserve` of them only for callers inside
+    /// [`run_interactive`]. The reserve is clamped so one permit stays shared.
+    pub fn with_reserve(capacity: usize, reserve: usize) -> Self {
         let capacity = capacity.max(1);
+        let reserve = reserve.min(capacity - 1);
         Self {
-            sem: Arc::new(Semaphore::new(capacity)),
+            sem: Arc::new(Semaphore::new(capacity - reserve)),
+            reserved: (reserve > 0).then(|| Arc::new(Semaphore::new(reserve))),
             capacity,
             held: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
@@ -102,8 +144,10 @@ impl CliGate {
         static GLOBAL: OnceLock<Arc<CliGate>> = OnceLock::new();
         Arc::clone(GLOBAL.get_or_init(|| {
             let capacity = parse_capacity(std::env::var(ENV_MAX_INFLIGHT).ok().as_deref());
-            info!(capacity, "reasoner CLI gate armed ({ENV_MAX_INFLIGHT})");
-            let mut gate = CliGate::new(capacity);
+            let reserve =
+                parse_reserve(std::env::var(ENV_INTERACTIVE_RESERVE).ok().as_deref(), capacity);
+            info!(capacity, reserve, "reasoner CLI gate armed ({ENV_MAX_INFLIGHT})");
+            let mut gate = CliGate::with_reserve(capacity, reserve);
             gate.snapshot_to = Some(snapshot_path());
             Arc::new(gate)
         }))
@@ -160,7 +204,22 @@ impl CliGate {
         // so every `warn_every`, not only when it gives up — the freeze never
         // queued more callers than the gate is wide, so #898's depth-gated
         // warning stayed silent. Reusing the future keeps its FIFO place.
-        let acquire = Arc::clone(&self.sem).acquire_owned();
+        let shared = Arc::clone(&self.sem).acquire_owned();
+        let reserved = self
+            .reserved
+            .as_ref()
+            .filter(|_| in_interactive_scope())
+            .map(|r| Arc::clone(r).acquire_owned());
+        // An interactive caller takes whichever permit frees first.
+        let acquire = async move {
+            match reserved {
+                Some(reserved) => tokio::select! {
+                    granted = shared => granted,
+                    granted = reserved => granted,
+                },
+                None => shared.await,
+            }
+        };
         tokio::pin!(acquire);
         let granted = loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -178,6 +237,11 @@ impl CliGate {
         };
         // Uncount first, or the published `waiting` includes this caller.
         drop(queued);
+        let _ = INTERACTIVE.try_with(|scope| {
+            scope
+                .gate_wait_ms
+                .fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed)
+        });
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (provider, caller) = (provider.to_string(), caller.to_string());
         let (since, budget) = (Instant::now(), max_wait);
@@ -361,6 +425,12 @@ fn parse_capacity(raw: Option<&str>) -> usize {
         .max(1)
 }
 
+fn parse_reserve(raw: Option<&str>, capacity: usize) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_INTERACTIVE_RESERVE)
+        .min(capacity.saturating_sub(1))
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -462,5 +532,71 @@ mod tests {
         assert_eq!(parse_capacity(Some("0")), 1, "never a zero-capacity gate");
         assert_eq!(parse_capacity(Some("lots")), DEFAULT_MAX_INFLIGHT);
         assert_eq!(CliGate::new(0).capacity(), 1);
+    }
+
+    /// #2012 — an owner waiting on a revision is never queued behind
+    /// background work, and background work can never take the reserved slot.
+    #[tokio::test(start_paused = true)]
+    async fn interactive_reserve_is_only_for_interactive_callers() {
+        let gate = Arc::new(CliGate::with_reserve(2, 1));
+        assert_eq!(gate.capacity(), 2);
+        let bg = gate.acquire_timed("t", "triage", BUDGET).await.unwrap();
+        let refused = gate.acquire_timed("t", "triage", Duration::from_millis(50)).await;
+        assert!(refused.is_err(), "background must not take the reserved permit");
+        let owner = run_interactive(gate.acquire_timed("t", "draft", Duration::from_millis(50)))
+            .await
+            .expect("the reserved permit serves the owner at once");
+        assert_eq!(gate.in_flight(), 2, "total concurrency never exceeds capacity");
+        drop((bg, owner));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interactive_callers_also_use_the_shared_pool() {
+        let gate = Arc::new(CliGate::with_reserve(3, 1));
+        let a = run_interactive(gate.acquire_timed("t", "draft", BUDGET)).await.unwrap();
+        let b = run_interactive(gate.acquire_timed("t", "draft", BUDGET)).await.unwrap();
+        let c = run_interactive(gate.acquire_timed("t", "draft", BUDGET)).await.unwrap();
+        assert_eq!(gate.in_flight(), 3);
+        assert!(run_interactive(gate.acquire_timed("t", "draft", Duration::from_millis(50)))
+            .await
+            .is_err());
+        drop((a, b, c));
+    }
+
+    #[tokio::test]
+    async fn a_single_slot_gate_reserves_nothing() {
+        let gate = Arc::new(CliGate::with_reserve(1, 1));
+        let bg = gate.acquire_timed("t", "triage", Duration::from_millis(50)).await;
+        assert!(bg.is_ok(), "capacity 1 must not starve background work");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interactive_scope_records_time_spent_waiting_for_a_permit() {
+        let gate = Arc::new(CliGate::new(1));
+        let held = gate.acquire_timed("t", "triage", BUDGET).await.unwrap();
+        let waiter = Arc::clone(&gate);
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(held);
+        });
+        let waited = run_interactive(async move {
+            let _permit = waiter.acquire_timed("t", "draft", BUDGET).await.unwrap();
+            scope_gate_wait_ms()
+        })
+        .await;
+        release.await.unwrap();
+        let waited = waited.expect("inside an interactive scope");
+        assert!((10_000..=10_100).contains(&waited), "{waited}");
+        assert_eq!(scope_gate_wait_ms(), None, "outside any scope");
+    }
+
+    #[test]
+    fn interactive_reserve_parsing_is_defensive() {
+        assert_eq!(parse_reserve(None, 4), 1);
+        assert_eq!(parse_reserve(Some("2"), 4), 2);
+        assert_eq!(parse_reserve(Some("9"), 4), 3, "always leaves one shared slot");
+        assert_eq!(parse_reserve(Some("0"), 4), 0);
+        assert_eq!(parse_reserve(Some("x"), 4), 1);
+        assert_eq!(parse_reserve(None, 1), 0);
     }
 }
