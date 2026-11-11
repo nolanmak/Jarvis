@@ -107,7 +107,7 @@ fn code(value:&str,fallback:&str)->String {
         "workflow-progressed"|"owner-pause-requested"|"owner-resume-accepted"|
         "await_owner_resume"|"claim_workflow"|"awaiting-worker-claim"|
         "merge-allowance-exhausted"|"merge-reconciliation-required"|
-        "review_changes_requested"|"ci_failed"|"merge_conflict"|"head_changed"|
+        "review_changes_requested"|"ci_failed"|"merge_conflict"|"head_changed"|"target_closed"|
         "acceptance_verifier_repair_exhausted"|"acceptance_verifier_evidence_unknown"|
         "acceptance_contract_invalid"|"acceptance_verifier_infrastructure_unavailable"|
         "await_acceptance_input_change"|"await_original_evidence_recovery"|"await_verifier_infrastructure_recovery"|
