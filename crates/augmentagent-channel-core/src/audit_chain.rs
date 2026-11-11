@@ -91,13 +91,9 @@ fn canonical_destination(path: &Path) -> Result<PathBuf> {
 }
 impl AnchoredAudit {
     /// Writer registration and sealing share this cross-process ingress gate.
-    /// The callback must persist its ticket before releasing the anchor lock.
+    /// The callback must persist its ticket before releasing the generation lock.
     pub(crate) fn with_open_generation<T>(&self,register:impl FnOnce()->Result<T>)->Result<T> {
-        let lock_path=self.anchor.with_extension("lock");
-        ensure!(lock_path!=self.anchor && lock_path!=self.log,"audit lock path collision");
-        let lock=private_open(&lock_path,false)?;
-        #[cfg(unix)]
-        ensure!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX)}==0,"audit lock failed");
+        let _lock=self.lock_generation()?;
         if self.anchor.exists() {
             let file=private_open(&self.anchor,false)?;
             ensure!(file.metadata()?.len()<=LIMIT,"anchor exceeds budget");
@@ -125,6 +121,19 @@ impl AnchoredAudit {
         }
         Ok(Self { log, anchor })
     }
+    /// Writers and sealers serialize on the log, the generation's stable inode.
+    /// The anchor cannot hold the lock because every save replaces it by
+    /// rename, and a sidecar lock file would leave a mutable non-evidence file
+    /// in the directory that must contain the archived anchor alone.
+    fn lock_generation(&self) -> Result<File> {
+        let lock = private_open(&self.log, true)?;
+        #[cfg(unix)]
+        ensure!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0,
+            "audit lock failed"
+        );
+        Ok(lock)
+    }
     fn save(&self, anchor: &Anchor) -> Result<()> {
         let parent = self.anchor.parent().unwrap();
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
@@ -137,17 +146,7 @@ impl AnchoredAudit {
     /// Appends under a cross-process lock; a durable pending intent permits
     /// replay after a daemon crash without accepting loss of committed rows.
     pub fn append(&self, record: serde_json::Value) -> Result<()> {
-        let lock_path = self.anchor.with_extension("lock");
-        ensure!(
-            lock_path != self.anchor && lock_path != self.log,
-            "audit lock path collision"
-        );
-        let lock = private_open(&lock_path, false)?;
-        #[cfg(unix)]
-        ensure!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0,
-            "audit lock failed"
-        );
+        let _lock = self.lock_generation()?;
         self.append_locked(record)
     }
     /// Validate without replaying uncertain records, then atomically prevent all
@@ -155,10 +154,8 @@ impl AnchoredAudit {
     /// same lock as writers. A retry returns the identical immutable proof.
     pub fn seal_for_recovery<F>(&self, validate: F) -> Result<serde_json::Value>
     where F: FnOnce(&[serde_json::Value]) -> Result<serde_json::Value> {
-        let lock = private_open(&self.anchor.with_extension("lock"), false)?;
-        #[cfg(unix)]
-        ensure!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0, "audit lock failed");
         ensure!(self.anchor.exists() && self.log.exists(), "recovery requires existing audit evidence");
+        let _lock = self.lock_generation()?;
         let file = private_open(&self.anchor, false)?;
         ensure!(file.metadata()?.len() <= LIMIT, "anchor exceeds budget");
         let mut anchor: Anchor = serde_json::from_reader(file)?;
@@ -298,8 +295,10 @@ mod tests {
         assert!(result.is_err(),"accepted an append whose pending anchor cannot be recovered");
         assert_eq!(fs::read(&sink.log).unwrap(),log_before);
         assert_eq!(fs::read(&sink.anchor).unwrap(),anchor_before);
-        assert_eq!(fs::read_dir(sink.anchor.parent().unwrap()).unwrap().count(),2,
-            "oversized pending serialization leaked a temporary");
+        let entries:Vec<_>=fs::read_dir(sink.anchor.parent().unwrap()).unwrap()
+            .map(|entry|entry.unwrap().path()).collect();
+        assert_eq!(entries,vec![sink.anchor.clone()],
+            "oversized pending serialization left non-anchor files beside the anchor");
         sink.append(serde_json::json!({"kind":"after-refusal"})).unwrap();
     }
 
@@ -313,7 +312,7 @@ mod tests {
         assert!(result.is_err(),"saved a sealed anchor its own reader refuses");
         assert_eq!(fs::read(&sink.log).unwrap(),log_before);
         assert_eq!(fs::read(&sink.anchor).unwrap(),anchor_before);
-        assert_eq!(fs::read_dir(sink.anchor.parent().unwrap()).unwrap().count(),2);
+        assert_eq!(fs::read_dir(sink.anchor.parent().unwrap()).unwrap().count(),1);
         assert!(sink.seal_for_recovery(|_|Ok(serde_json::json!({"closed":true}))).is_ok());
     }
 
