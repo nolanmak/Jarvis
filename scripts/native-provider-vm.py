@@ -186,19 +186,129 @@ def private_bytes(path, maximum):
         return stream.read(maximum + 1)
 
 
+class AtomicPublicationUncertain(OSError):
+    def __init__(self):
+        super().__init__('native atomic publication uncertain')
+
+
+class _AtomicPublisher:
+    """One original helper's bounded publication and conservative failure fence."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._uncertain = False
+
+    @staticmethod
+    def _parent_current(parent, descriptor, original):
+        try:
+            held = os.fstat(descriptor)
+            current = parent.lstat()
+            identity = lambda info: (info.st_dev, info.st_ino, info.st_uid, info.st_mode)
+            return (stat.S_ISDIR(held.st_mode) and stat.S_ISDIR(current.st_mode)
+                    and held.st_uid == os.getuid() and not held.st_mode & 0o077
+                    and identity(held) == original and identity(current) == original)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _original_temporary(parent_fd, name, descriptor, original):
+        held = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        identity = lambda info: (info.st_dev, info.st_ino, info.st_uid, info.st_gid)
+        return (identity(held) == original and identity(current) == original
+                and stat.S_ISREG(held.st_mode) and stat.S_ISREG(current.st_mode)
+                and held.st_uid == os.getuid() and held.st_nlink == current.st_nlink == 1
+                and not held.st_mode & 0o077 and not current.st_mode & 0o077)
+
+    def publish(self, path, data):
+        with self._lock:
+            if self._uncertain:
+                raise AtomicPublicationUncertain()
+            if not isinstance(data, bytes) or len(data) > MAX_FRAME:
+                raise ValueError('native atomic payload exceeds byte budget')
+            path = Path(path)
+            parent_fd = temporary_fd = None
+            name = None
+            replaced = False
+            primary = None
+            try:
+                parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                info = os.fstat(parent_fd)
+                parent_identity = (info.st_dev, info.st_ino, info.st_uid, info.st_mode)
+                if not self._parent_current(path.parent, parent_fd, parent_identity):
+                    self._uncertain = True
+                    raise AtomicPublicationUncertain()
+                for _ in range(16):
+                    candidate = '.native-atomic-' + uuid.uuid4().hex
+                    try:
+                        temporary_fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                               0o600, dir_fd=parent_fd)
+                        name = candidate
+                        break
+                    except FileExistsError:
+                        continue
+                if temporary_fd is None:
+                    raise OSError('native atomic temporary creation unavailable')
+                info = os.fstat(temporary_fd)
+                temporary_identity = (info.st_dev, info.st_ino, info.st_uid, info.st_gid)
+                os.fchmod(temporary_fd, 0o600)
+                offset = 0
+                while offset < len(data):
+                    chunk = memoryview(data)[offset:offset + 65536]
+                    written = os.write(temporary_fd, chunk)
+                    if type(written) is not int or not 0 < written <= len(chunk):
+                        raise OSError('native atomic write made invalid progress')
+                    offset += written
+                # Writes above are unbuffered; fsync settles the complete payload.
+                os.fsync(temporary_fd)
+                if not self._parent_current(path.parent, parent_fd, parent_identity):
+                    self._uncertain = True
+                    raise AtomicPublicationUncertain()
+                if (not self._original_temporary(parent_fd, name, temporary_fd, temporary_identity)
+                        or os.fstat(temporary_fd).st_size != len(data)):
+                    self._uncertain = True
+                    raise AtomicPublicationUncertain()
+                os.replace(name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                replaced = True
+                os.fsync(parent_fd)
+                if not self._parent_current(path.parent, parent_fd, parent_identity):
+                    self._uncertain = True
+                    raise AtomicPublicationUncertain()
+            except BaseException as error:
+                primary = error
+                if replaced:
+                    self._uncertain = True
+                elif temporary_fd is not None:
+                    try:
+                        if (not self._parent_current(path.parent, parent_fd, parent_identity)
+                                or not self._original_temporary(parent_fd, name, temporary_fd, temporary_identity)):
+                            self._uncertain = True
+                        else:
+                            os.unlink(name, dir_fd=parent_fd)
+                            os.fsync(parent_fd)
+                            if not self._parent_current(path.parent, parent_fd, parent_identity):
+                                self._uncertain = True
+                    except BaseException:
+                        self._uncertain = True
+                raise
+            finally:
+                close_error = None
+                for descriptor in (temporary_fd, parent_fd):
+                    if descriptor is not None:
+                        try:
+                            os.close(descriptor)
+                        except OSError as error:
+                            self._uncertain = True
+                            close_error = close_error or error
+                if close_error is not None and primary is None:
+                    raise close_error
+
+
+_atomic_publisher = _AtomicPublisher()
+
+
 def atomic(path, data):
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-        name = Path(stream.name)
-        os.fchmod(stream.fileno(), 0o600)
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(name, path)
-    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    try:
-        os.fsync(parent_fd)
-    finally:
-        os.close(parent_fd)
+    return _atomic_publisher.publish(path, data)
+
 
 
 def safe_relative(raw):
@@ -985,19 +1095,27 @@ def main(spec_path):
                 print(json.dumps({'native_gateway_failures': gateway.guest_failures, 'native_gateway_host_failures': gateway.host_failures}), file=sys.stderr, flush=True)
             return exit_code
         except Exception:
-            print(json.dumps({'native_host_failure_state': {'phase': phase, 'frames': frame_counts,
-                'admitted': admitted, 'quiescent': quiescence is not None, 'export_bytes': exported,
-                'export_files': len(received), 'partial_export': active_export is not None,
-                'guest_exit_code': exit_code, 'qemu_exit_code': process.poll()}}), file=sys.stderr, flush=True)
-            if gateway is not None:
-                # Retained observation is diagnostic only: no generation publication,
-                # complete.json, or successful launch authority follows this path.
-                atomic(Path(spec_path).parent / 'failed-gateway-observation.json', json.dumps({
-                    'version': 1, 'diagnostic_only': True,
-                    'launch_sha256': hashlib.sha256(private_bytes(Path(spec_path), 2 * 1024 * 1024)).hexdigest(),
-                    'gateway_transport': gateway.transport_receipt()}).encode())
-            if gateway is not None and (gateway.guest_failures or gateway.host_failures):
-                print(json.dumps({'native_gateway_failures': gateway.guest_failures, 'native_gateway_host_failures': gateway.host_failures}), file=sys.stderr, flush=True)
+            try:
+                print(json.dumps({'native_host_failure_state': {'phase': phase, 'frames': frame_counts,
+                    'admitted': admitted, 'quiescent': quiescence is not None, 'export_bytes': exported,
+                    'export_files': len(received), 'partial_export': active_export is not None,
+                    'guest_exit_code': exit_code, 'qemu_exit_code': process.poll()}}), file=sys.stderr, flush=True)
+                if gateway is not None:
+                    # Retained observation is diagnostic only: no generation publication,
+                    # complete.json, or successful launch authority follows this path.
+                    try:
+                        atomic(Path(spec_path).parent / 'failed-gateway-observation.json', json.dumps({
+                            'version': 1, 'diagnostic_only': True,
+                            'launch_sha256': hashlib.sha256(private_bytes(Path(spec_path), 2 * 1024 * 1024)).hexdigest(),
+                            'gateway_transport': gateway.transport_receipt()}).encode())
+                    except Exception:
+                        # Diagnostic loss cannot replace the original launch failure.
+                        print(json.dumps({'native_diagnostic_publication_failed': True}), file=sys.stderr, flush=True)
+
+                if gateway is not None and (gateway.guest_failures or gateway.host_failures):
+                    print(json.dumps({'native_gateway_failures': gateway.guest_failures, 'native_gateway_host_failures': gateway.host_failures}), file=sys.stderr, flush=True)
+            except Exception:
+                pass  # Diagnostics never replace the original launch error.
             raise
         finally:
             if gateway is not None:
@@ -1020,9 +1138,9 @@ def main(spec_path):
                 os.close(credential_lock)
 
 
-if __name__ == '__main__':
+def entry(spec_path):
     try:
-        raise SystemExit(main(sys.argv[1]))
+        return main(spec_path)
     except Exception as error:
         # Only a fixed exception category is safe; messages may contain secrets.
         category = type(error).__name__
@@ -1031,16 +1149,23 @@ if __name__ == '__main__':
         diagnostic = {'native_vm_failure': category}
         if isinstance(error, OSError) and isinstance(error.errno, int):
             diagnostic['errno'] = error.errno
-        ready = os.environ.get('JARVIS_NATIVE_VM_READY')
-        if ready and not Path(ready).exists():
-            failure = Path(ready).with_name('vm-startup-failure.json')
-            if not failure.exists():
-                # Fixed category/errno only: no exception messages, paths,
-                # credentials or provider payloads cross this receipt boundary.
-                try:
-                    atomic(failure, json.dumps(dict(diagnostic, phase='native_setup_failed')).encode())
-                except OSError:
-                    pass
-        print(json.dumps(diagnostic), file=sys.stderr)
-        print('Native VM boundary unavailable; launch terminated without host fallback.', file=sys.stderr)
-        raise SystemExit(126)
+        try:
+            ready = os.environ.get('JARVIS_NATIVE_VM_READY')
+            if ready and not Path(ready).exists():
+                failure = Path(ready).with_name('vm-startup-failure.json')
+                if not failure.exists():
+                    # Fixed category/errno only: no exception messages, paths,
+                    # credentials or provider payloads cross this receipt boundary.
+                    try:
+                        atomic(failure, json.dumps(dict(diagnostic, phase='native_setup_failed')).encode())
+                    except Exception:
+                        pass
+            print(json.dumps(diagnostic), file=sys.stderr)
+            print('Native VM boundary unavailable; launch terminated without host fallback.', file=sys.stderr)
+        except Exception:
+            pass  # Missing diagnostic delivery is not successful native work.
+        return 126
+
+
+if __name__ == '__main__':
+    raise SystemExit(entry(sys.argv[1] if len(sys.argv) > 1 else None))

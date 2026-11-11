@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Local admission tests: no VM, credentials, provider calls or cgroup changes."""
 import importlib.util
+import contextlib
+import io
+from types import SimpleNamespace
 import json
 import os
 from pathlib import Path
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -20,6 +24,7 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('native_vm', HERE / 'native-provider-vm.py')
 vm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(vm)
+native = vm
 
 
 class NativeVmTests(unittest.TestCase):
@@ -629,7 +634,7 @@ os.kill(os.getpid(),signal.SIGKILL)
                 original = vm.private_bytes(Path(spec['auth_file']), 1024 * 1024)
                 checkpoint = vm.RefreshCheckpoint(spec, lock)
                 checkpoint.begin(self.request, self.entry, self.body); checkpoint.sent()
-                staging = root / 'staging'; (staging / '.claude').mkdir(parents=True)
+                staging = root / 'staging'; (staging / '.claude').mkdir(mode=0o700, parents=True)
                 stale_export = json.loads(original)
                 stale_export['claudeAiOauth'].update(accessToken='guest-access', refreshToken='guest-refresh')
                 vm.atomic(staging / spec['auth_relative'], json.dumps(stale_export).encode())
@@ -734,6 +739,289 @@ os.kill(os.getpid(),signal.SIGKILL)
                     self.assertEqual(any(frame['type'] == 'gateway_error' for frame in frames), scenario != 'success')
                 finally:
                     host.close(); os.close(lock)
+
+
+class AtomicPublicationTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(); self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name); self.root = self.base / 'parent'; self.root.mkdir(mode=0o700)
+        self.target = self.root / 'receipt'; self.target.write_bytes(b'original'); self.target.chmod(0o600)
+        if hasattr(native, '_AtomicPublisher'):
+            patch = mock.patch.object(native, '_atomic_publisher', native._AtomicPublisher())
+            patch.start(); self.addCleanup(patch.stop)
+
+    def debris(self):
+        return [p for p in self.root.iterdir() if p != self.target]
+
+    def test_repeated_file_sync_failure_cleans_original_temporary_files(self):
+        original_sync = os.fsync
+        error = OSError('synthetic file sync failure')
+        def refusing(fd):
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                raise error
+            return original_sync(fd)
+        for _ in range(4):
+            with mock.patch.object(native.os, 'fsync', side_effect=refusing):
+                with self.assertRaises(OSError) as raised:
+                    native.atomic(self.target, b'x' * 65536)
+                self.assertIs(raised.exception, error)
+        self.assertEqual(self.debris(), [])
+        self.assertEqual(self.target.read_bytes(), b'original')
+        native.atomic(self.target, b'next')
+        self.assertEqual(self.target.read_bytes(), b'next')
+
+    def test_repeated_rename_failure_cleans_original_temporary_files(self):
+        for _ in range(4):
+            with mock.patch.object(native.os, 'replace', side_effect=OSError('synthetic replace failure')):
+                with self.assertRaises(OSError):
+                    native.atomic(self.target, b'x' * 65536)
+        self.assertEqual(self.debris(), [])
+        self.assertEqual(self.target.read_bytes(), b'original')
+
+    def test_payload_cap_refuses_before_mutating_any_file(self):
+        native.atomic(self.target, b'x' * (2 * 1024 * 1024))
+        before = self.target.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'budget'):
+            native.atomic(self.target, before + b'x')
+        self.assertEqual(self.target.read_bytes(), before)
+        self.assertEqual(self.debris(), [])
+
+    def test_success_creates_private_file_and_complete_bytes(self):
+        observed_modes = []
+        original_open = os.open
+        def opening(path, flags, *args, **kwargs):
+            fd = original_open(path, flags, *args, **kwargs)
+            if flags & os.O_CREAT:
+                observed_modes.append(stat.S_IMODE(os.fstat(fd).st_mode))
+            return fd
+        previous = os.umask(0)
+        try:
+            with mock.patch.object(native.os, 'open', side_effect=opening):
+                native.atomic(self.target, b'complete replacement')
+        finally:
+            os.umask(previous)
+        self.assertEqual(observed_modes, [0o600])
+        self.assertEqual(self.target.read_bytes(), b'complete replacement')
+        self.assertEqual(self.debris(), [])
+
+    def test_unlink_failure_latches_before_any_additional_target(self):
+        error = OSError('primary sync failure')
+        with mock.patch.object(native.os, 'fsync', side_effect=error), \
+             mock.patch.object(native.os, 'unlink', side_effect=PermissionError('cleanup refused')):
+            with self.assertRaises(OSError) as raised:
+                native.atomic(self.target, b'uncertain')
+            self.assertIs(raised.exception, error)
+        debris = self.debris(); self.assertEqual(len(debris), 1)
+        with self.assertRaisesRegex(OSError, '^native atomic publication uncertain$'):
+            native.atomic(self.root / 'another-target', b'new')
+        self.assertEqual(self.debris(), debris)
+        self.assertEqual(self.target.read_bytes(), b'original')
+
+    def test_observed_substitution_missing_and_hardlink_are_preserved(self):
+        for effect in ('replacement', 'missing', 'hardlink'):
+            with self.subTest(effect=effect):
+                publisher = native._AtomicPublisher()
+                with mock.patch.object(native, '_atomic_publisher', publisher):
+                    error = OSError('primary sync failure')
+                    def mutate(fd):
+                        if stat.S_ISDIR(os.fstat(fd).st_mode):
+                            return
+                        temp = next(p for p in self.root.iterdir() if p != self.target)
+                        if effect == 'replacement':
+                            temp.rename(self.root / 'retained-original'); temp.write_bytes(b'foreign')
+                        elif effect == 'missing':
+                            temp.unlink()
+                        else:
+                            os.link(temp, self.root / 'alias')
+                        raise error
+                    with mock.patch.object(native.os, 'fsync', side_effect=mutate):
+                        with self.assertRaises(OSError) as raised:
+                            native.atomic(self.target, b'creator data')
+                        self.assertIs(raised.exception, error)
+                    before = sorted((p.name, p.read_bytes()) for p in self.debris())
+                    with self.assertRaisesRegex(OSError, '^native atomic publication uncertain$'):
+                        native.atomic(self.target, b'must refuse')
+                    self.assertEqual(sorted((p.name, p.read_bytes()) for p in self.debris()), before)
+                    if effect == 'replacement':
+                        self.assertTrue(any(data == b'foreign' for _, data in before))
+                    if effect == 'hardlink':
+                        self.assertEqual((self.root / 'alias').stat().st_nlink, 2)
+                    for path in self.debris():
+                        path.unlink()
+
+    def test_replace_lost_ack_keeps_published_bytes_and_fences_all_writes(self):
+        original_replace = os.replace
+        error = OSError('lost acknowledgment')
+        def replaced(*args, **kwargs):
+            original_replace(*args, **kwargs)
+            raise error
+        with mock.patch.object(native.os, 'replace', side_effect=replaced):
+            with self.assertRaises(OSError) as raised:
+                native.atomic(self.target, b'published')
+            self.assertIs(raised.exception, error)
+        self.assertEqual(self.target.read_bytes(), b'published')
+        with self.assertRaisesRegex(OSError, '^native atomic publication uncertain$'):
+            native.atomic(self.target, b'rollback forbidden')
+        self.assertEqual(self.target.read_bytes(), b'published')
+
+    def test_parent_sync_failure_never_rolls_back_the_replacement(self):
+        original_sync = os.fsync
+        def refusing(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError('parent sync failed')
+            return original_sync(fd)
+        with mock.patch.object(native.os, 'fsync', side_effect=refusing):
+            with self.assertRaises(OSError):
+                native.atomic(self.target, b'published')
+        self.assertEqual(self.target.read_bytes(), b'published')
+        with self.assertRaisesRegex(OSError, '^native atomic publication uncertain$'):
+            native.atomic(self.root / 'other', b'new')
+        self.assertEqual(self.debris(), [])
+
+    def test_parent_substitution_cannot_publish_into_the_new_parent(self):
+        moved = self.base / 'retained-parent'
+        def replacing(fd):
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                self.root.rename(moved); self.root.mkdir(mode=0o700)
+                self.target.write_bytes(b'foreign parent')
+        with mock.patch.object(native.os, 'fsync', side_effect=replacing):
+            with self.assertRaises(Exception):
+                native.atomic(self.target, b'new')
+        self.assertEqual(self.target.read_bytes(), b'foreign parent')
+        self.assertEqual((moved / 'receipt').read_bytes(), b'original')
+        with self.assertRaisesRegex(OSError, '^native atomic publication uncertain$'):
+            native.atomic(self.target, b'no')
+
+    def test_partial_writes_complete_and_invalid_progress_preserves_destination(self):
+        original_write = os.write
+        with mock.patch.object(native.os, 'write', side_effect=lambda fd, data: original_write(fd, data[:7])):
+            native.atomic(self.target, b'a' * 101)
+        self.assertEqual(self.target.read_bytes(), b'a' * 101)
+        for result in (0, None, -1, 1000000):
+            with mock.patch.object(native.os, 'write', return_value=result):
+                with self.assertRaisesRegex(OSError, 'invalid progress'):
+                    native.atomic(self.target, b'must not replace')
+            self.assertEqual(self.target.read_bytes(), b'a' * 101)
+            self.assertEqual(self.debris(), [])
+
+    def test_pre_replace_substitution_is_not_published(self):
+        original_sync = os.fsync
+        def substitute(fd):
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                temp = self.debris()[0]
+                temp.rename(self.root / 'retained-original'); temp.write_bytes(b'foreign')
+            else:
+                original_sync(fd)
+        with mock.patch.object(native.os, 'fsync', side_effect=substitute):
+            with self.assertRaisesRegex(OSError, '^native atomic publication uncertain$'):
+                native.atomic(self.target, b'creator')
+        self.assertEqual(self.target.read_bytes(), b'original')
+        self.assertTrue(any(p.read_bytes() == b'foreign' for p in self.debris()))
+
+    def test_outer_entry_remains_sanitized_when_startup_receipt_is_fenced(self):
+        with mock.patch.object(native.os, 'fsync', side_effect=OSError('storage refused')), \
+             mock.patch.object(native.os, 'unlink', side_effect=OSError('cleanup refused')):
+            with self.assertRaises(OSError):
+                native.atomic(self.target, b'pending')
+        before = self.debris()
+        private = 'PRIVATE-CREDENTIAL-PAYLOAD'
+        stderr = io.StringIO()
+        with mock.patch.object(native, 'main', side_effect=OSError(5, private)), \
+             mock.patch.dict(os.environ, {'JARVIS_NATIVE_VM_READY': str(self.root / 'ready')}), \
+             contextlib.redirect_stderr(stderr):
+            self.assertEqual(native.entry(self.root / 'spec'), 126)
+        self.assertNotIn(private, stderr.getvalue())
+        self.assertNotIn('Traceback', stderr.getvalue())
+        self.assertIn('"native_vm_failure": "OSError"', stderr.getvalue())
+        self.assertFalse((self.root / 'vm-startup-failure.json').exists())
+        self.assertEqual(self.debris(), before)
+
+    def test_outer_entry_diagnostic_stream_failure_still_returns_126(self):
+        broken = mock.Mock(); broken.write.side_effect = OSError('diagnostic stream unavailable')
+        with mock.patch.object(native, 'main', side_effect=OSError(5, 'PRIVATE-PAYLOAD')), \
+             mock.patch.dict(os.environ, {'JARVIS_NATIVE_VM_READY': str(self.root / 'ready')}), \
+             mock.patch.object(native.sys, 'stderr', broken):
+            self.assertEqual(native.entry(self.root / 'spec'), 126)
+        self.assertTrue(broken.write.called)
+
+    def test_main_diagnostic_refusal_does_not_mask_original_parent_sync_failure(self):
+        codec_spec = importlib.util.spec_from_file_location('atomic_codec', HERE / 'codex-build-vm.py')
+        codec = importlib.util.module_from_spec(codec_spec); codec_spec.loader.exec_module(codec)
+        binary = self.root / 'cli'; binary.write_bytes(b'synthetic'); binary.chmod(0o755)
+        state = self.root / 'session'; state.mkdir(mode=0o700)
+        config = {'busybox': str(binary), 'modules': [], 'library_dir': '/synthetic/lib', 'module_dir': '/synthetic/modules'}
+        request = {'version': 1, 'guest_runtime': str(self.root / 'runtime'), 'runtime_config': 'fixture',
+                   'memory_mb': 1024, 'session_directory': str(state), 'auth_relative': 'auth.json',
+                   'executable': str(binary), 'gateway': {}, 'argv': ['synthetic'], 'environment': {}}
+        source = self.root / 'spec'; source.write_bytes(b'{}'); source.chmod(0o600)
+        original_sync = os.fsync
+        error = OSError('PRIMARY-PUBLICATION-ERROR')
+        def refusing(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise error
+            return original_sync(fd)
+        process = mock.Mock(); process.poll.return_value = None
+        gateway = mock.Mock(); gateway.guest_failures = []; gateway.host_failures = []
+        gateway.transport_receipt.return_value = {'version': 1, 'exchanges': [], 'overflow': False, 'host_failures': []}
+        gateway_module = SimpleNamespace(provision=lambda *a: ({}, []), HostGateway=lambda *a, **kw: gateway)
+        channel = mock.Mock(); channel.receive.return_value = iter([{'type': 'ready'}])
+        stderr = io.StringIO()
+        with mock.patch.object(native, 'module', side_effect=lambda name, filename: codec if filename == 'codex-build-vm.py' else gateway_module), \
+             mock.patch.object(native, 'private_json', return_value=request), \
+             mock.patch.object(native, 'validate_runtime'), \
+             mock.patch.object(codec.Runtime, 'load', return_value=SimpleNamespace(config=config)), \
+             mock.patch.object(codec, 'qemu_command', return_value=['synthetic', '-serial', 'null']), \
+             mock.patch.object(native, 'credential_use', return_value=None), \
+             mock.patch.object(native, 'runtime_seed', return_value=([], None)), \
+             mock.patch.object(native, 'stage_native_companions'), \
+             mock.patch.object(native.subprocess, 'Popen', return_value=process), \
+             mock.patch.object(native.socket, 'socket'), \
+             mock.patch.object(native, 'Channel', return_value=channel), \
+             mock.patch.object(native.os, 'fsync', side_effect=refusing), \
+             mock.patch.dict(os.environ, {'JARVIS_NATIVE_VM_READY': str(self.root / 'ready'),
+                                         'JARVIS_NATIVE_VM_CONTINUE': str(self.root / 'continue')}), \
+             contextlib.redirect_stderr(stderr):
+            with self.assertRaises(OSError) as raised:
+                native.main(source)
+            self.assertIs(raised.exception, error)
+        self.assertEqual((self.root / 'ready').read_bytes(), b'ready\n')
+        self.assertFalse((state / 'complete.json').exists())
+        self.assertFalse((self.root / 'failed-gateway-observation.json').exists())
+        self.assertIn('native_diagnostic_publication_failed', stderr.getvalue())
+        self.assertNotIn('PRIMARY-PUBLICATION-ERROR', stderr.getvalue())
+        gateway.close.assert_called_once()
+
+    def test_concurrent_second_writer_cannot_allocate_after_uncertainty(self):
+        entered, proceed = threading.Event(), threading.Event()
+        original_sync = os.fsync
+        created = []
+        original_open = os.open
+        def opening(path, flags, *args, **kwargs):
+            fd = original_open(path, flags, *args, **kwargs)
+            if flags & os.O_CREAT:
+                created.append(fd)
+            return fd
+        def refusing(fd):
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                entered.set(); self.assertTrue(proceed.wait(2))
+            raise OSError('storage sync uncertain')
+        outcomes = []
+        def publish(path):
+            try:
+                native.atomic(path, b'data')
+            except Exception as error:
+                outcomes.append(error)
+        with mock.patch.object(native.os, 'open', side_effect=opening), \
+             mock.patch.object(native.os, 'fsync', side_effect=refusing):
+            first = threading.Thread(target=publish, args=(self.target,)); first.start()
+            self.assertTrue(entered.wait(1))
+            second = threading.Thread(target=publish, args=(self.root / 'other',)); second.start()
+            proceed.set(); first.join(2); second.join(2)
+            self.assertFalse(first.is_alive()); self.assertFalse(second.is_alive())
+        self.assertEqual(len(created), 1)
+        self.assertEqual(len(outcomes), 2)
+        self.assertTrue(any(str(error) == 'native atomic publication uncertain' for error in outcomes))
+        self.assertTrue(any(type(error) is OSError and str(error) == 'storage sync uncertain' for error in outcomes))
 
 
 if __name__ == '__main__':
