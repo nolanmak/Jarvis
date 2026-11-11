@@ -1,0 +1,689 @@
+{
+  "schema_version": 1,
+  "observed_at_utc": "2026-11-11T10:57:34.764447+00:00",
+  "status": "Paired v3 actual current-controller isolated_observation completed with canonical path disjointness guard; fixture-only, unregistered",
+  "controller_head": "eec975e9e6329e1b329c5199f7a5a77cec760385",
+  "controller_test_hook_sha256": "58031c21e4f4208e0edb3fd207919adc249550c58a3aba0d94a7af5e70dbdf16",
+  "controller_original_production_bodies_unchanged": true,
+  "recipe": "1703-c1-eighteen-case-managed-v3-recipe.json",
+  "files_sha256": {
+    "crates/augmentagent-auth/src/bin/autoship_review_observer.rs": "02f1c9993e9c9c82cbb1e9ea19c92c6f1787c5fcba497fd585ca9cfda776a234",
+    "autoship_verifiers/issue_1943/observe.py": "f6119a47d1c4af5e7ac5be6557469a65bc133a95998c6a916e8bdc7b8e237c63",
+    "autoship_verifiers/issue_1943/review_probe.rs": "c31b1f71a4bbab60d707b652dd2f93bd34be2d80d1dab81fc1a0fa4f077fa6c5",
+    "autoship_verifiers/issue_1943/public_env_template.txt": "e3452397d5d0ab9c3dd8a0069031b298de312c73a151baa05b91fc41731a0a51"
+  },
+  "original_head": "416f392b17b56b2a43e67a3e430835902387941a",
+  "candidate_head": "3debdb8d7ca24bb60087acaa6e10d10c6746318c",
+  "actual_production_function": "self_improve::acceptance::isolated_observation",
+  "cargo_invocation": {
+    "kind": "cargo_binary",
+    "package": "augmentagent-auth",
+    "bin": "autoship_review_observer",
+    "args": []
+  },
+  "selected_parent_test_passed": true,
+  "command_exit": 0,
+  "complete_pair_marker_observed": true,
+  "log_sha256": "b50f135c7a87505de5c9e7bf3d85bcf2d7da31a649fc1dca6b823cb220faeea3",
+  "results": {
+    "candidate": {
+      "frame": {
+        "actual": {
+          "cases": [
+            {
+              "adapter_completed": true,
+              "adjudication_recorded": false,
+              "adjudicator_calls": 0,
+              "approved": true,
+              "case": "control",
+              "completed_roles": 3,
+              "executed_values": [
+                [
+                  3,
+                  5,
+                  3
+                ],
+                [
+                  3,
+                  5,
+                  3
+                ],
+                [
+                  3,
+                  5,
+                  3
+                ]
+              ],
+              "recovery_calls": 3,
+              "refusal_kind": null,
+              "scripted_calls": 6,
+              "source_file_bytes": 620103,
+              "upheld_rulings": 0
+            },
+            {
+              "adapter_completed": true,
+              "adjudication_recorded": true,
+              "adjudicator_calls": 1,
+              "approved": false,
+              "case": "defect",
+              "completed_roles": 3,
+              "executed_values": [
+                [
+                  3,
+                  5,
+                  8
+                ],
+                [
+                  3,
+                  5,
+                  8
+                ],
+                [
+                  3,
+                  5,
+                  8
+                ],
+                [
+                  3,
+                  5,
+                  8
+                ]
+              ],
+              "recovery_calls": 3,
+              "refusal_kind": null,
+              "scripted_calls": 7,
+              "source_file_bytes": 620100,
+              "upheld_rulings": 1
+            },
+            {
+              "adapter_completed": true,
+              "adjudication_recorded": false,
+              "adjudicator_calls": 0,
+              "approved": true,
+              "case": "bytes-control",
+              "completed_roles": 3,
+              "executed_values": [
+                [
+                  3,
+                  5,
+                  3
+                ],
+                [
+                  3,
+                  5,
+                  3
+                ],
+                [
+                  3,
+                  5,
+                  3
+                ]
+              ],
+              "recovery_calls": 3,
+              "refusal_kind": null,
+              "scripted_calls": 6,
+              "source_file_bytes": 620103,
+              "upheld_rulings": 0
+            },
+            {
+              "adapter_completed": true,
+              "adjudication_recorded": true,
+              "adjudicator_calls": 1,
+              "approved": false,
+              "case": "bytes-defect",
+              "completed_roles": 3,
+              "executed_values": [
+                [
+                  3,
+                  5,
+                  8
+                ],
+                [
+                  3,
+                  5,
+                  8
+                ],
+                [
+                  3,
+                  5,
+                  8
+                ],
+                [
+                  3,
+                  5,
+                  8
+                ]
+              ],
+              "recovery_calls": 3,
+              "refusal_kind": null,
+              "scripted_calls": 7,
+              "source_file_bytes": 620100,
+              "upheld_rulings": 1
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "combined-budget",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "evidence-budget",
+              "scripted_calls": 1,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "approval-source",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "invalid-source-decision",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "selector-extra",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "invalid-selector-fields",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "unknown-criterion",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "invalid-source-criteria",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "denied-env",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "source-denied",
+              "scripted_calls": 1,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "denied-control",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "source-denied",
+              "scripted_calls": 1,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "absent-source",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "source-absent",
+              "scripted_calls": 1,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "absent-item",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "item-absent",
+              "scripted_calls": 1,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "bad-byte-end",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "byte-range-outside",
+              "scripted_calls": 1,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "utf8-boundary",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "byte-range-split-utf8",
+              "scripted_calls": 1,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "invalid-tail",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "source-invalid-utf8",
+              "scripted_calls": 1,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "symlink",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "source-not-regular",
+              "scripted_calls": 1,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "second-incomplete",
+              "completed_roles": null,
+              "executed_values": [
+                [
+                  3,
+                  5,
+                  3
+                ]
+              ],
+              "recovery_calls": 1,
+              "refusal_kind": "recovery-incomplete",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "malformed-then-incomplete",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "recovery-incomplete",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            }
+          ],
+          "code_source_read_only": true,
+          "fixture_source_read_only": true,
+          "synthetic_protocol_only": true
+        },
+        "exit_code": 0,
+        "interrupted": false,
+        "output_complete": true,
+        "required_resource_logger": true,
+        "side": "candidate"
+      },
+      "external_match": true,
+      "resource": {
+        "protected_log_sha256": "eb0880bb14041f4781fab1fe2c884806c1af0085c2026acc771a3ab703e0b537",
+        "required_marker_present": true,
+        "admission_rows": 1,
+        "completion_rows": 1,
+        "admission_completion_identity_equal": true,
+        "original_boot_host_match": true,
+        "completed_exhausted": false,
+        "original_scope_exists_after_completion": false
+      }
+    },
+    "baseline": {
+      "frame": {
+        "actual": {
+          "cases": [
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "control",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "defect",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620100,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "bytes-control",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "bytes-defect",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620100,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "combined-budget",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "approval-source",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "selector-extra",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "unknown-criterion",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "denied-env",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "denied-control",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "absent-source",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "absent-item",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "bad-byte-end",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "utf8-boundary",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "invalid-tail",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "symlink",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "second-incomplete",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            },
+            {
+              "adapter_completed": false,
+              "adjudication_recorded": null,
+              "adjudicator_calls": 0,
+              "approved": null,
+              "case": "malformed-then-incomplete",
+              "completed_roles": null,
+              "executed_values": [],
+              "recovery_calls": 0,
+              "refusal_kind": "typed-source-protocol-unsupported",
+              "scripted_calls": 2,
+              "source_file_bytes": 620103,
+              "upheld_rulings": null
+            }
+          ],
+          "code_source_read_only": true,
+          "fixture_source_read_only": true,
+          "synthetic_protocol_only": true
+        },
+        "exit_code": 0,
+        "interrupted": false,
+        "output_complete": true,
+        "required_resource_logger": true,
+        "side": "baseline"
+      },
+      "external_match": false,
+      "resource": {
+        "protected_log_sha256": "430c8664d233a45fd42d7e4caaa164a497137fa3b99e6e0c695a787f0445fe49",
+        "required_marker_present": true,
+        "admission_rows": 1,
+        "completion_rows": 1,
+        "admission_completion_identity_equal": true,
+        "original_boot_host_match": true,
+        "completed_exhausted": false,
+        "original_scope_exists_after_completion": false
+      }
+    }
+  },
+  "source_environment": {
+    "original_export_root_outside_target": true,
+    "managed_runtime_inside_target_tmp": true,
+    "copied_source_and_fixtures_disjoint_from_writable_debug_profile": true,
+    "inner_writes": [
+      "explicit auxiliary scratch",
+      "same registered target debug profile"
+    ],
+    "registry_checks": "Actual function executes registry attestation before and after each Cargo observation; both returned successfully. Individual registry digest receipts are not persisted by this existing function.",
+    "profile": "Pinned inner CLI observer: offline/locked, one build job, dev/test debuginfo0 and incremental disabled, ort/alternative-backend without embeddings execution. Outer Cargo uses the existing production debug0/one-job policy. Parent test artifact uses the managed wrapper; parent incremental mode is not claimed disabled.",
+    "canonical_disjointness_precheck": "Exact protected and writable roots are canonicalized and rejected on equality or either ancestry relationship before inner compilation; nine separate actual-function controls passed."
+  },
+  "registered": false,
+  "model_calls_requested": 0,
+  "autonomous_merge_credit": 0,
+  "limits": [
+    "This invokes the actual observation function with required protected resource logging and exact owned data, not the complete production contract registration/export/receipt path.",
+    "Scripted provider and fresh-origin observations remain synthetic fixture data; no actual native provider/review/merge authority is established.",
+    "Full C1 guard/cache/crash/diagnostic matrix, independent complete amendment/registration/review, preserved original incident input replay and rollout remain required.",
+    "Original PR1954 request/body/pinned verifier/failed internal candidate/history/charges/owner pause remain unchanged."
+  ]
+}

@@ -1,5 +1,5 @@
 {
-  "status": "Unregistered managed recipe v3; explicit canonical disjointness check staged and tested; not yet replayed through production entry.",
+  "status": "Unregistered managed recipe v3; canonical disjointness guard and paired actual production observation completed; not native approval.",
   "invocation": {
     "kind": "cargo_binary",
     "package": "augmentagent-auth",
@@ -361,7 +361,7 @@
   "probe_sha256": "c31b1f71a4bbab60d707b652dd2f93bd34be2d80d1dab81fc1a0fa4f077fa6c5",
   "source_of_expectations": "Controller only; the observer emits actual data.",
   "validation_limits": [
-    "V3 is staged, unregistered construction data. Its exact canonical path guard has nine actual-function controls and a focused fresh-reader recheck; a full v3 production replay is not yet established.",
+    "V3 is staged, unregistered construction data. Its exact canonical path guard has nine actual-function controls and a focused fresh-reader recheck; a paired v3 actual production observation is recorded in 1703-c1-firstparty-v3-observation-comparison.json.",
     "The separate v2 production comparison proves its exact files on a measured disjoint layout, not this new helper hash or arbitrary runtime placement.",
     "The actual canonical check must reject every ancestor/equality relation between writable and protected roots before inner Cargo; no model output or runtime assertion substitutes for that setup gate.",
     "Full C1 guard/cache/crash/diagnostic coverage, independent complete amendment/registration/review and original incident replay remain open; original PR1954 controls and history remain unchanged."

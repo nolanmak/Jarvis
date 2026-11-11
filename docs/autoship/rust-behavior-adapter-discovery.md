@@ -417,3 +417,12 @@ The running version-two inputs were frozen throughout; their completed result
 cannot certify the new helper hash. V3's own production replay, the remaining
 full C1 matrix and normal independent amendment remain open. No original owner
 pause, enrolled verifier, source/history, charge or permission changed.
+
+
+### November 11: canonical layout guard completes paired production observation
+
+The managed v3 recipe completed both observations through current main's actual `isolated_observation` function. The candidate matched the external 18-case fixture oracle; the unchanged original produced 18 valid observations which differed. Both runs denied copied-code and fixture writes, required protected resource logging, admitted and completed the same resource identity without exhaustion, and left no resource scope after completion. The selected parent test passed with both frames and the complete-pair marker. Exact results and hashes are in `1703-c1-firstparty-v3-observation-comparison.json`.
+
+This resolves the pending v3 replay in the previous checkpoint. The earlier v1 writable-source counterexample and v2 correction remain retained. These are scripted protocol fixtures through the actual observation function, not a registered contract, full production receipt path, independent native approval, or autonomous merge. The original incident inputs, history, charges, and owner pause remain preserved.
+
+PR #2000 integrates the public C1 source-recovery component onto main after #1997 without changing the original PR #1954 or its held attempt. Fresh CI and rollout verification remain pending at this checkpoint. The next adjacent repair is truthful review-failure classification: an adapter failure must not claim missing provider capacity, and health cannot infer an unbilled run from a review hold alone.
