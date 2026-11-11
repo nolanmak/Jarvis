@@ -252,9 +252,9 @@ impl LiveCall {
             else {
                 continue;
             };
-            let phase = match job.state.as_str() {
-                "queued" => "still queued",
-                "running" => "still running",
+            let progress = match job.state.as_str() {
+                "queued" => "I haven't started on that yet, but I have your request. I'll let you know when I have something.",
+                "running" => "I'm still working on that. I'll let you know as soon as I have an answer.",
                 _ => continue,
             };
             match self.service.store.phone_claim_attention_notice(&self.call_id, &self.session_id, task) {
@@ -269,7 +269,7 @@ impl LiveCall {
                 continue;
             }
             *notified = true;
-            return Ok(Some(PhoneLiveResult{delegation_id:delegation.clone(),result:format!("The task is {phase}; I don't have its verified findings yet. We can keep talking while it finishes.")}));
+            return Ok(Some(PhoneLiveResult{delegation_id:delegation.clone(),result:progress.into()}));
         }
         Ok(None)
     }

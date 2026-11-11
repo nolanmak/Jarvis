@@ -15,7 +15,7 @@
 use std::collections::BTreeSet;
 
 use augmentagent_store::rusqlite::types::Value as SqlValue;
-use augmentagent_store::rusqlite::{Connection, Row};
+use augmentagent_store::rusqlite::{params, Connection, Row};
 use serde::Serialize;
 
 use crate::fts::{self, Term, BM25};
@@ -176,7 +176,7 @@ pub fn parse_at(input: &str, now_ms: i64) -> Result<Query, ParseError> {
                     "in" => {
                         let list = value
                             .split(',')
-                            .map(|s| s.trim().to_ascii_lowercase())
+                            .map(|s| canonical_platform(&s.trim().to_ascii_lowercase()))
                             .filter(|s| !s.is_empty());
                         if negated {
                             q.not_platforms.extend(list);
@@ -382,7 +382,7 @@ impl PersonRef {
                 let handles = if m.kind == MatchKind::Handle && !m.resolved {
                     vec![m.key.clone()]
                 } else {
-                    people::handles_for(c, &m.key)?
+                    expand_social_usernames(c, people::handles_for(c, &m.key)?)?
                 };
                 Ok(Ok((handles, m.resolved)))
             }
@@ -477,14 +477,163 @@ fn person_refs(c: &Connection, q: &Query) -> augmentagent_store::rusqlite::Resul
                 .map(|r| (r, Slot::Sender)),
         );
     for (reference, slot) in listed {
+        let mut matches = resolve_people_and_members(c, reference)?;
+        if matches.is_empty() {
+            // #1980 — no page claims this name; try social sender labels.
+            matches = label_matches(c, reference)?;
+        }
         refs.push(PersonRef {
-            matches: resolve_people_and_members(c, reference)?,
+            matches,
             reference: reference.clone(),
             slot,
         });
     }
     narrow_to_households(c, &mut refs)?;
     Ok(refs)
+}
+
+/// #1980 — `in:` spellings agents reach for, folded to one name.
+fn canonical_platform(p: &str) -> String {
+    match p {
+        "ig" => "instagram",
+        "x" => "twitter",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Networks SocialAPI.ai fronts, as `in:` name → the handle prefixes its
+/// rows carry (`instagram:<id>`, `x:<id>`). Those rows are stored under
+/// `platform = socialapi`, so `in:instagram` has to look at the handle.
+const SOCIALAPI_NETWORKS: [(&str, &[&str]); 2] = [
+    ("instagram", &["instagram:"]),
+    ("twitter", &["x:", "twitter:"]),
+];
+
+/// `(…)` matching any of `platforms`. Plain names compare `mi.platform`;
+/// a SocialAPI network also matches SocialAPI rows by handle prefix.
+fn platform_clause(sql: &mut Sql, platforms: &[String]) -> String {
+    let list = sql.in_list(platforms);
+    let mut any = vec![format!("mi.platform IN ({list})")];
+    for (name, prefixes) in SOCIALAPI_NETWORKS {
+        if !platforms.iter().any(|p| p == name) {
+            continue;
+        }
+        for prefix in prefixes {
+            let mark = sql.bind(format!("{prefix}%"));
+            any.push(format!(
+                "(mi.platform = 'socialapi' AND (mi.sender_handle LIKE {mark} \
+                 OR mi.counterpart_handle LIKE {mark}))"
+            ));
+        }
+    }
+    format!("({})", any.join(" OR "))
+}
+
+/// Platforms whose index rows name the other party only by a network
+/// handle plus a display label (no wiki identity written at ingest).
+const LABELLED_SOCIAL_PLATFORMS: [&str; 6] =
+    ["socialapi", "instagram", "twitter", "linkedin", "telegram", "slack"];
+
+/// Shortest bare name allowed to prefix-match a sender label.
+const MIN_LABEL_PREFIX: usize = 3;
+
+/// #1980 — a page declares `instagram: <username>`, but SocialAPI rows key
+/// the sender by numeric id and keep the username as `sender_label`. Add
+/// every numeric handle whose label is one of the page's usernames.
+fn expand_social_usernames(
+    c: &Connection,
+    mut handles: Vec<String>,
+) -> augmentagent_store::rusqlite::Result<Vec<String>> {
+    let mut stmt = c.prepare(
+        "SELECT DISTINCT sender_handle FROM message_index \
+         WHERE platform = 'socialapi' AND sender_handle LIKE ?1 \
+         AND lower(sender_label) = ?2",
+    )?;
+    let mut extra = Vec::new();
+    for h in &handles {
+        let Some((network, user)) = h.split_once(':') else { continue };
+        let Some((_, prefixes)) = SOCIALAPI_NETWORKS
+            .iter()
+            .find(|(name, _)| *name == network)
+        else {
+            continue;
+        };
+        let user = user.trim().trim_start_matches('@').to_lowercase();
+        if user.is_empty() || user.bytes().all(|b| b.is_ascii_digit()) {
+            continue; // already the numeric id
+        }
+        for prefix in *prefixes {
+            for row in stmt.query_map(params![format!("{prefix}%"), user], |r| r.get::<_, String>(0))? {
+                extra.push(row?);
+            }
+        }
+    }
+    for h in extra {
+        if !handles.contains(&h) {
+            handles.push(h);
+        }
+    }
+    Ok(handles)
+}
+
+/// #1980 — a bare name no page claims: match social DM senders by label
+/// (exact username or display name first, then a username prefix or a
+/// whole word of the display name). Distinct senders, newest first.
+fn label_matches(
+    c: &Connection,
+    reference: &str,
+) -> augmentagent_store::rusqlite::Result<Vec<PersonMatch>> {
+    let needle = reference.trim().to_lowercase();
+    if needle.is_empty() || needle == crate::handles::ME || needle.contains(':') {
+        return Ok(Vec::new());
+    }
+    let plats = LABELLED_SOCIAL_PLATFORMS
+        .iter()
+        .map(|p| format!("'{p}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut stmt = c.prepare(&format!(
+        "SELECT sender_handle, sender_label, conversation_title, MAX(ts_ms) FROM message_index \
+         WHERE platform IN ({plats}) AND from_me = 0 AND conv_kind = 'dm' \
+         AND sender_handle NOT LIKE 'raw:%' \
+         GROUP BY sender_handle ORDER BY MAX(ts_ms) DESC"
+    ))?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let (mut exact, mut loose) = (Vec::new(), Vec::new());
+    for row in rows {
+        let (handle, label, title) = row?;
+        let names: Vec<String> = [label, title]
+            .into_iter()
+            .flatten()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let Some(display) = names.first().cloned() else { continue };
+        let m = PersonMatch {
+            key: handle,
+            name: Some(display),
+            kind: MatchKind::Handle,
+            resolved: false,
+            last_seen: None,
+        };
+        if names.iter().any(|n| *n == needle) {
+            exact.push(m);
+        } else if needle.chars().count() >= MIN_LABEL_PREFIX
+            && names.iter().any(|n| {
+                n.starts_with(&needle) || n.split_whitespace().any(|w| w == needle)
+            })
+        {
+            loose.push(m);
+        }
+    }
+    Ok(if exact.is_empty() { loose } else { exact })
 }
 
 /// Build the SQL for a parsed query. Every value is bound.
@@ -510,14 +659,17 @@ pub fn plan(
 
     let conversation_clause = |sql: &mut Sql, handles: &[String]| {
         let list = sql.in_list(handles);
+        // #1980 — collect the person's conversations once (index seeks on
+        // the handle), then take every message in them. A per-row EXISTS
+        // here scanned the whole index and took minutes on a large store.
         sql.filters.push(format!(
-            "((NOT EXISTS(SELECT 1 FROM linkedin_archive_messages known WHERE known.stored_id=mi.message_id) \
-              AND EXISTS(SELECT 1 FROM message_index peer \
+            "((mi.message_id IN (SELECT own.messageId FROM message_index peer \
                 JOIN emails pe ON pe.messageId=peer.message_id \
-                JOIN emails own ON own.messageId=mi.message_id \
-                WHERE peer.platform=mi.platform AND peer.conversation_id=mi.conversation_id \
-                AND pe.accountEntityId IS own.accountEntityId \
-                AND (peer.sender_handle IN ({list}) OR peer.counterpart_handle IN ({list})))) OR \
+                JOIN message_index m2 ON m2.conversation_id=peer.conversation_id AND m2.platform=peer.platform \
+                JOIN emails own ON own.messageId=m2.message_id \
+                WHERE (peer.sender_handle IN ({list}) OR peer.counterpart_handle IN ({list})) \
+                AND pe.accountEntityId IS own.accountEntityId) \
+              AND NOT EXISTS(SELECT 1 FROM linkedin_archive_messages known WHERE known.stored_id=mi.message_id)) OR \
              (mi.platform='linkedin' AND EXISTS(SELECT 1 FROM linkedin_archive_messages am \
               JOIN linkedin_archive_participants ap ON ap.account=am.account AND ap.conversation=am.conversation \
               WHERE am.stored_id=mi.message_id AND ('linkedin:' || ap.urn) IN ({list}))))"
@@ -547,12 +699,12 @@ pub fn plan(
         sql.filters.push("mi.from_me = 1".into());
     }
     if !q.platforms.is_empty() {
-        let list = sql.in_list(&q.platforms);
-        sql.filters.push(format!("mi.platform IN ({list})"));
+        let clause = platform_clause(&mut sql, &q.platforms);
+        sql.filters.push(clause);
     }
     if !q.not_platforms.is_empty() {
-        let list = sql.in_list(&q.not_platforms);
-        sql.filters.push(format!("mi.platform NOT IN ({list})"));
+        let clause = platform_clause(&mut sql, &q.not_platforms);
+        sql.filters.push(format!("NOT {clause}"));
     }
     if !q.kinds.is_empty() {
         let list = sql.in_list(&q.kinds);
@@ -1345,6 +1497,146 @@ mod tests {
         assert_eq!(r.unresolved, ["nobody@example.net"]);
         assert!(r.hits.is_empty());
         assert!(r.ambiguous.is_empty());
+    }
+
+    // ---- #1980: SocialAPI (Instagram) DMs -----------------------------------
+
+    /// SocialAPI DM rows: the index keys the sender by the network's numeric
+    /// id, while a wiki page declares the username. `page` is spliced into
+    /// `people/` when non-empty.
+    fn social(page: &str) -> (tempfile::TempDir, tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let wiki = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(wiki.path().join("people")).unwrap();
+        if !page.is_empty() {
+            std::fs::write(wiki.path().join("people/jane-doe.md"), page).unwrap();
+        }
+        put_social(&store, "ig1", "janedoe_ig <socialapi:instagram:123>", "conv-j", "Instagram", "janedoe_ig", "loved the trip");
+        put_social(&store, "xd1", "pat <socialapi:x:789>", "conv-p", "X", "pat", "see you friday");
+        drain(&store, 100, Duration::ZERO).unwrap();
+        crate::people::resolve_people(&store, wiki.path()).unwrap();
+        (dir, wiki, store)
+    }
+
+    fn put_social(s: &Store, id: &str, from: &str, conv: &str, label: &str, with: &str, body: &str) {
+        s.upsert_email(&Email {
+            message_id: id.into(),
+            thread_id: Some(conv.into()),
+            from: from.into(),
+            to: String::new(),
+            cc: String::new(),
+            attachments: vec![],
+            subject: format!("[{label} DM from {with}]"),
+            body: body.into(),
+            date: "2025-12-05T10:00:00Z".into(),
+            account_entity_id: Some("acc-1".into()),
+            platform: "socialapi".into(),
+            kind: "dm".into(),
+        })
+        .unwrap();
+    }
+
+    fn sorted_ids(r: &SearchResponse) -> Vec<String> {
+        let mut v: Vec<String> = r.hits.iter().map(|h| h.message_id.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn page_declaring_an_instagram_username_finds_dms_keyed_by_numeric_id() {
+        let (_d, _w, s) = social(
+            "---\nkind: person\nname: Jane Doe\nidentities:\n  instagram: JaneDoe_IG\n---\n",
+        );
+        for q in ["with:jane", "with:\"jane doe\"", "from:jane"] {
+            let r = resp(&s, q);
+            assert!(r.ambiguous.is_empty(), "{q}: {:?}", r.ambiguous);
+            assert_eq!(sorted_ids(&r), ["ig1"], "{q}");
+            assert!(r.unresolved.is_empty(), "{q}: the page backs it");
+        }
+    }
+
+    #[test]
+    fn unmatched_name_falls_back_to_the_social_sender_label() {
+        let (_d, _w, s) = social("");
+        let r = resp(&s, "with:jane");
+        assert_eq!(sorted_ids(&r), ["ig1"], "prefix of the username");
+        assert_eq!(r.unresolved, ["jane"], "no wiki page backs the match");
+        assert_eq!(sorted_ids(&resp(&s, "with:janedoe_ig")), ["ig1"], "exact username");
+        assert_eq!(sorted_ids(&resp(&s, "from:JaneDoe_ig")), ["ig1"]);
+        assert!(resp(&s, "with:ja").hits.is_empty(), "too short to prefix-match");
+        assert!(resp(&s, "with:nobody").hits.is_empty());
+    }
+
+    #[test]
+    fn display_name_word_matches_and_exact_username_beats_prefix() {
+        let (_d, _w, s) = social("");
+        put_social(&s, "ig2", "Jane Smith <socialapi:instagram:456>", "conv-s", "Instagram", "Jane Smith", "hi");
+        put_social(&s, "ig3", "janedoe_ig2 <socialapi:instagram:999>", "conv-z", "Instagram", "janedoe_ig2", "yo");
+        drain(&s, 100, Duration::ZERO).unwrap();
+        assert_eq!(sorted_ids(&resp(&s, "with:smith")), ["ig2"], "whole word of a display name");
+        assert_eq!(sorted_ids(&resp(&s, "with:janedoe_ig")), ["ig1"], "exact label wins over prefix");
+    }
+
+    #[test]
+    fn several_label_matches_are_ambiguous_never_a_silent_pick() {
+        let (_d, _w, s) = social("");
+        put_social(&s, "ig2", "janet.w <socialapi:instagram:456>", "conv-w", "Instagram", "janet.w", "hey");
+        drain(&s, 100, Duration::ZERO).unwrap();
+        let r = resp(&s, "with:jane");
+        assert!(r.hits.is_empty());
+        assert_eq!(r.ambiguous.len(), 1);
+        let mut keys: Vec<&str> = r.ambiguous[0].candidates.iter().map(|c| c.key.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, ["instagram:123", "instagram:456"]);
+        // A candidate key is a valid follow-up query.
+        assert_eq!(sorted_ids(&resp(&s, "with:instagram:456")), ["ig2"]);
+    }
+
+    #[test]
+    fn in_instagram_selects_socialapi_instagram_rows() {
+        let (_d, _w, s) = social("");
+        assert_eq!(sorted_ids(&resp(&s, "in:instagram")), ["ig1"]);
+        assert_eq!(sorted_ids(&resp(&s, "in:ig trip")), ["ig1"]);
+        assert_eq!(sorted_ids(&resp(&s, "in:x")), ["xd1"]);
+        assert_eq!(sorted_ids(&resp(&s, "in:socialapi")), ["ig1", "xd1"]);
+        assert_eq!(sorted_ids(&resp(&s, "-in:instagram")), ["xd1"]);
+        assert_eq!(resp(&s, "in:ig").interpreted_as.platforms, ["instagram"]);
+    }
+
+    #[test]
+    fn a_name_backed_by_a_page_never_pulls_in_label_matches() {
+        let (_d, _w, s) = fixture();
+        put_social(&s, "ig9", "alexk_ig <socialapi:instagram:321>", "conv-a", "Instagram", "alexk_ig", "hello");
+        drain(&s, 100, Duration::ZERO).unwrap();
+        let mut got = ids(&s, "with:\"alex kim\"");
+        got.sort();
+        assert_eq!(got, ["a1", "d1", "d2", "g1", "t1", "t2"]);
+        let r = resp(&s, "with:alex");
+        let keys: Vec<&str> = r.ambiguous[0].candidates.iter().map(|c| c.key.as_str()).collect();
+        assert!(!keys.contains(&"instagram:321"), "pages answer; labels are a fallback only");
+    }
+
+    #[test]
+    fn with_person_seeks_by_handle_instead_of_scanning_the_index() {
+        let (_d, _w, s) = fixture();
+        for q in ["with:\"alex kim\"", "with:sam"] {
+            let plan_rows: Vec<String> = s
+                .with_conn(|c| {
+                    let query = parse_at(q, NOW).unwrap();
+                    let (sql, _, params, _, _) = plan(c, &query, 20, 0)?;
+                    let bound: Vec<&dyn augmentagent_store::rusqlite::ToSql> = params
+                        .iter()
+                        .map(|p| p as &dyn augmentagent_store::rusqlite::ToSql)
+                        .collect();
+                    let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                    let rows = stmt.query_map(bound.as_slice(), |r| r.get::<_, String>(3))?;
+                    rows.collect()
+                })
+                .unwrap();
+            let joined = plan_rows.join(" | ");
+            assert!(!joined.contains("SCAN mi"), "{q}: {joined}");
+        }
     }
 
     #[test]

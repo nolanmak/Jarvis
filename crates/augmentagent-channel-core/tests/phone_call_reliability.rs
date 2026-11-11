@@ -320,9 +320,23 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool, gap: Option<GapRec
                 ws.send(wire(json!({"type":"session.closed","reason":"close_requested","session":{"id":"live-integration"},"usage":{"seconds":3.}}))).await.unwrap();
                 break;
             }
-            if v["type"] == "session.thinking.append" {
+            assert_ne!(v["type"], "session.thinking.append", "accepted work must request speech instead of cancelling the automatic acknowledgment silently");
+            if v["type"] == "session.commentary.append"
+                && v["content"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("Got it."))
+            {
                 queued_acks += 1;
-                assert_eq!(v["content"], "");
+                ws.send(wire(
+                    json!({"type":"session.commentary.appended","client_event_id":v["event_id"]}),
+                ))
+                .await
+                .unwrap();
+                ws.send(wire(
+                    json!({"type":"session.output_audio.delta","delta":STANDARD.encode([137;160])}),
+                ))
+                .await
+                .unwrap();
                 continue;
             }
             if v["type"] != "session.commentary.append" {
@@ -402,7 +416,7 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool, gap: Option<GapRec
         assert_eq!(answered, 2);
         assert_eq!(
             queued_acks, 2,
-            "exactly one application-owned quiet acknowledgment per delegation"
+            "exactly one application-owned spoken acknowledgment per delegation"
         );
         assert_eq!(rejected, slow || gap == Some(GapReceipt::Rejected));
     });
@@ -496,6 +510,23 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool, gap: Option<GapRec
         .await
         .expect("source or native work must start");
     let start = tokio::time::Instant::now();
+    let acknowledgment = tokio::time::timeout(Duration::from_secs(1), ws.next())
+        .await
+        .expect("caller must hear that research was accepted before backend completion")
+        .unwrap()
+        .unwrap();
+    let acknowledgment: Value = serde_json::from_str(acknowledgment.to_text().unwrap()).unwrap();
+    assert_eq!(
+        acknowledgment["media"]["payload"],
+        STANDARD.encode([137; 160])
+    );
+    let mark: Value =
+        serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    ws.send(wire(
+        json!({"event":"mark","sequenceNumber":"2","streamSid":"MZ-test","mark":mark["mark"]}),
+    ))
+    .await
+    .unwrap();
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(if slow { 94 } else { 2 })).await;
     if slow {
@@ -529,6 +560,20 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool, gap: Option<GapRec
         tokio::time::resume();
     }
     for expected in [140, 141] {
+        if expected == 141 {
+            let acknowledgment = tokio::time::timeout(Duration::from_secs(1), ws.next())
+                .await
+                .expect("follow-up research also needs a spoken acknowledgment")
+                .unwrap()
+                .unwrap();
+            let acknowledgment: Value =
+                serde_json::from_str(acknowledgment.to_text().unwrap()).unwrap();
+            assert_eq!(
+                acknowledgment["media"]["payload"],
+                STANDARD.encode([137; 160])
+            );
+            let _ = ws.next().await.unwrap().unwrap();
+        }
         let frame=tokio::time::timeout(Duration::from_secs(1),ws.next()).await.expect("useful attention facts must reach the call by three seconds without waiting for full native completion").unwrap().unwrap();
         assert!(
             matches!(frame, Message::Text(_)),
@@ -569,7 +614,7 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool, gap: Option<GapRec
         assert_eq!(ids[0], ids[1]);
     }
     assert!(!store.phone_provider_call(&call.id).unwrap().stop_requested);
-    ws.send(wire(json!({"event":"stop","sequenceNumber":"2","streamSid":"MZ-test","stop":{"accountSid":"AC-test","callSid":"CA00000000000000000000000000000001"}}))).await.unwrap();
+    ws.send(wire(json!({"event":"stop","sequenceNumber":"3","streamSid":"MZ-test","stop":{"accountSid":"AC-test","callSid":"CA00000000000000000000000000000001"}}))).await.unwrap();
     peer_task.await.unwrap();
     if let Some(task) = busy_task {
         task.await.unwrap();
