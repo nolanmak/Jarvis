@@ -28,9 +28,24 @@ def dns_failure(output):
     return not re.search(r'NO_PUBKEY|not signed|signatures? (?:could|couldn|were|could not)|Hash Sum mismatch|Certificate verification failed', output, re.I)
 
 
-def install(packages, *, run=subprocess.run, root=Path('/'), architecture=None):
+def install(packages, *, run=subprocess.run, root=Path('/'), architecture=None, installed=None):
     if not packages or any(not re.fullmatch(r'[a-z0-9][a-z0-9+.\-]*(?::[a-z0-9]+)?', p) for p in packages):
         raise ValueError('expected explicit APT package names')
+    if installed is None:
+        inventory = subprocess.run(['dpkg-query', '-W', '-f=${binary:Package}\t${Status}\n', *packages],
+                                   capture_output=True, text=True, timeout=30)
+        # dpkg-query exits 1 when some packages are missing; valid installed
+        # rows still describe the others. Errors never imply presence.
+        installed = set()
+        for line in inventory.stdout.splitlines():
+            package, _, status = line.partition('\t')
+            if status == 'install ok installed':
+                installed.add(package)
+                installed.add(package.split(':', 1)[0])
+    packages = [package for package in packages if package not in installed]
+    if not packages:
+        print('All required CI APT packages are already installed', flush=True)
+        return 0
     common = ['sudo', 'apt-get', '-o', 'Acquire::Retries=0',
               '-o', 'Acquire::http::Timeout=20', '-o', 'Acquire::https::Timeout=20',
               '-o', 'APT::Update::Error-Mode=any',

@@ -13,7 +13,7 @@ class AptInstallTests(unittest.TestCase):
         cls.module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.module)
 
-    def exercise(self, results):
+    def exercise(self, results, packages=None, installed=None):
         calls = []
         sources = []
         def run(args, **kwargs):
@@ -30,7 +30,7 @@ class AptInstallTests(unittest.TestCase):
             key = root / 'usr/share/keyrings/ubuntu-archive-keyring.gpg'
             key.parent.mkdir(parents=True)
             key.write_bytes(b'test-keyring')
-            code = self.module.install(['poppler-utils'], run=run, root=root, architecture='amd64')
+            code = self.module.install(packages or ['poppler-utils'], run=run, root=root, architecture='amd64', installed=installed or set())
         return code, calls, sources
 
     def test_primary_success_never_changes_sources(self):
@@ -38,6 +38,15 @@ class AptInstallTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(calls), 2)
         self.assertFalse(sources)
+
+    def test_installed_packages_are_preserved_without_update_or_downgrade(self):
+        code, calls, _ = self.exercise([], installed={'poppler-utils'})
+        self.assertEqual((code, calls), (0, []))
+        code, calls, _ = self.exercise([(0, ''), (0, '')],
+                                      packages=['poppler-utils', 'python3-yaml'], installed={'python3-yaml'})
+        self.assertEqual(code, 0)
+        self.assertIn('poppler-utils', calls[-1])
+        self.assertNotIn('python3-yaml', calls[-1])
 
     def test_dns_failure_uses_one_signed_isolated_fallback(self):
         code, calls, sources = self.exercise([
