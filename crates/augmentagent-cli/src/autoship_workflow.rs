@@ -234,9 +234,6 @@ impl WorkflowStore {
     pub fn scope_stage_response(&mut self,lease:&Lease,binding:&Binding,key:&str,now:i64)->Result<Option<String>> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
         let value=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,key],|r|r.get(0)).optional()?;
-        // An absent row the audit trail says was recorded is unknown evidence,
-        // never a free slot. A payload we cannot parse leaves the same doubt,
-        // so it withholds every absent key rather than guessing.
         if value.is_none() {
             let malformed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND NOT json_valid(payload))",[&lease.workflow],|row|row.get(0))?;
             if malformed {return Err(MissingScopeResponse.into());}

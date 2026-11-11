@@ -3167,11 +3167,23 @@ mod tests {
         assert!(record.wall_ms>0,"actual observed guard lifetime must be accounted");
     }
 
+}
+
+
+#[cfg(test)]
+mod initial_acceptance_hold_tests {
+    use super::*;
     #[tokio::test]
     async fn all_initial_source_families_keep_precise_hold_without_false_progress() {
         for (issue,pr) in [(Some(7),None),(Some(7),Some(42)),(None,Some(42))] {
-            let dir=repo();let control=control_dir();
-            let mut guard=WorkflowGuard::acquire_fixture(&control.path().join("workflow.db"),Start {repo_root:dir.path(),worktree:dir.path(),
+            let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
+            std::fs::write(repo.path().join("implementation.py"),"def add(a,b): return a-b\n").unwrap();
+            for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","initial"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
+                let output=tokio::process::Command::new("/usr/bin/git").args(args).current_dir(repo.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
+                assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+            }
+            let path=control.path().join("workflow.db");
+            let mut guard=WorkflowGuard::acquire_fixture(&path,Start {repo_root:repo.path(),worktree:repo.path(),
                 repository:"owner/repo",source_issue:issue,pr,branch:"fixture",contract:"unchanged owner criteria",environment:"fixture"}).await.unwrap().unwrap();
             guard.hold_initial_acceptance("acceptance_verifier_repair_exhausted","await_acceptance_input_change").await.unwrap();
             let first=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
@@ -3182,10 +3194,11 @@ mod tests {
             assert_eq!(repeated.checkpoint.binding,first.checkpoint.binding);
             assert_eq!(repeated.checkpoint.next.reason,"acceptance_verifier_repair_exhausted");
             assert_eq!(guard.store.lock().unwrap().events(guard.id()).unwrap().len(),events);
-            assert_eq!(repeated.model_calls,0);assert_eq!(repeated.tokens,0);
+            assert_eq!(repeated.model_calls,0);
+            assert_eq!(repeated.tokens,0);
             guard.hold_initial_acceptance("acceptance_verifier_evidence_unknown","await_original_evidence_recovery").await.unwrap();
-            assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap().checkpoint.next.action,"await_original_evidence_recovery");
+            let unknown=guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(unknown.checkpoint.next.action,"await_original_evidence_recovery");
         }
     }
-
 }

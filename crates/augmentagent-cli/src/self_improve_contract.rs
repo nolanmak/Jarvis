@@ -17,7 +17,6 @@ mod amendment;
 mod scope_authority;
 #[path = "self_improve_baseline_repair.rs"]
 mod initial_repair;
-pub(super) use initial_repair::FailureKind;
 #[path = "self_improve_verifier_checkout.rs"]
 pub(super) mod verifier_checkout;
 pub(super) use scope_authority::run as scope_original;
@@ -1116,12 +1115,6 @@ fn initial_scope_error(error:anyhow::Error)->anyhow::Error {
     } else {error}
 }
 
-/// The diagnosis a spent bounded repair ended on, for callers that route on it.
-/// `None` for every other refusal, including unavailable infrastructure.
-pub(super) fn exhausted_repair(error:&anyhow::Error)->Option<FailureKind> {
-    error.downcast_ref::<initial_repair::Hold>().and_then(|hold|hold.exhausted_kind())
-}
-
 pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,error:&anyhow::Error)->Result<Option<RunReport>> {
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
     workflow.hold_initial_acceptance(hold.reason(),hold.action()).await?;
@@ -1136,9 +1129,6 @@ async fn initial_baseline_candidates(root:&Path,source:AcceptanceSource,base:&st
     let environment=environment_id(root)?;
     let epoch=amendment::digest(&serde_json::to_vec(&("initial-baseline-repair-v1",workflow.id(),
         &workflow.binding().contract,source,base,&environment,scope,required_criteria))?);
-    // Slot 1 keeps the pre-repair correction key so a workflow interrupted
-    // under the single-correction scheme replays its saved response instead of
-    // paying for a new one.
     let legacy=amendment::digest(format!("{source}|{base}|{environment}|{}",serde_json::to_string(required_criteria)?).as_bytes());
     let epoch_ref=epoch.as_str();let legacy_ref=legacy.as_str();
     initial_repair::run(&epoch,
