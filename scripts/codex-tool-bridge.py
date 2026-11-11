@@ -337,8 +337,9 @@ class CommandStorage:
     Descendant supervisors inherit the locked descriptor. Closing our copy
     cannot release it while a canceled VM is still being reaped.
     """
-    def __init__(self, config, scratch):
+    def __init__(self, config, scratch, read_only=False):
         self.config, self.scratch, self.fd = config, Path(scratch), None
+        self.read_only = read_only
         self.fds = []
         self.identities = {}
 
@@ -365,7 +366,15 @@ class CommandStorage:
                 # pretend to publish a Rust storage reservation.
                 deadline = time.monotonic() + 300
                 for name in ('disk-update.lock', path.name):
-                    fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
+                    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+                    if not self.read_only:
+                        flags |= os.O_CREAT
+                    try:
+                        fd = os.open(name, flags, 0o600, dir_fd=parent)
+                    except FileNotFoundError:
+                        if self.read_only:
+                            continue  # Actual admission still creates/rechecks the lease.
+                        raise
                     self.fds.append(fd)
                     info = os.fstat(fd)
                     if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
@@ -377,10 +386,10 @@ class CommandStorage:
                             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                             break
                         except BlockingIOError:
-                            if time.monotonic() >= deadline:
+                            if self.read_only or time.monotonic() >= deadline:
                                 raise Readiness('build_storage_busy')
                             time.sleep(0.1)
-                self.fd = self.fds[-1]
+                self.fd = self.fds[-1] if self.fds else None
                 # The global build descriptor remains first in the supervisor
                 # protocol; both descriptions survive controller cancellation.
                 self.fds.reverse()
@@ -1818,7 +1827,13 @@ class Policy:
             admission = self.command_storage.get('admission_bytes')
             if type(floor) is not int or type(admission) is not int or floor < 0 or admission < floor:
                 raise Denied('invalid command storage policy')
-        return self._scratch.preflight(admission)
+        report = self._scratch.preflight(admission)
+        if self.command_storage is not None:
+            # Observe existing global leases without creating files or waiting
+            # behind another build before the model has even been admitted.
+            with CommandStorage(self.command_storage, self._scratch.root, read_only=True):
+                pass
+        return report
 
     def run_command(self, command, timeout=None):
         # #1041: the runner is decided before anything executes. It leads the

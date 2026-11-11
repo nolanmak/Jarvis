@@ -49,7 +49,9 @@ With the opt-out set it warns that builds run on the host.
 Protected Claude and Codex calls whose tool policy permits builds inspect the
 bridge's disk requirements before native launch and model-call admission.
 This read-only check uses the same bridge policy as execution and creates no
-scratch image. Read-only tool policies do not require build scratch capacity.
+scratch image. It also probes existing shared build/update lease files without
+creating them or waiting for a busy lease. Read-only tool policies do not require
+build scratch capacity.
 Actual commands still recheck admission under the normal storage leases.
 
 A new VM cache must leave enough room for the shared build admission reserve.

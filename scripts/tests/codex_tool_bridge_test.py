@@ -3007,6 +3007,21 @@ class BuildScratchTests(unittest.TestCase):
         self.assertEqual(list(self.scratch.iterdir()), [])
         self.assertEqual(self.calls, [])
 
+    def test_preflight_observes_busy_shared_lease_without_creating_lock_files(self):
+        config = {'lock': str(Path(self.temp.name) / 'disk-build.lock'),
+                  'floor_bytes': 0, 'admission_bytes': 0}
+        policy = self.policy(command_storage=config)
+        before = set(Path(self.temp.name).iterdir())
+        policy.preflight_builds()
+        self.assertEqual(set(Path(self.temp.name).iterdir()), before)
+        with bridge.CommandStorage(config, self.scratch):
+            with self.assertRaises(bridge.Readiness) as raised:
+                policy.preflight_builds()
+            self.assertEqual(raised.exception.category, 'build_storage_busy')
+        self.assertTrue(policy.preflight_builds()['ready'])
+        self.assertIsNone(policy._scratch.session)
+        self.assertEqual(self.calls, [])
+
     def test_preflight_preserves_read_only_profiles_with_no_build_requirements(self):
         policy = self.policy(allowed_tools=['Read'], build_scratch_dir=None)
         self.assertEqual(policy.preflight_builds(), {'ready': True, 'builds_required': False})
