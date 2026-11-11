@@ -275,7 +275,11 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        assert!(String::from_utf8_lossy(&result.stderr).contains("Ran 31 tests"));
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let count = stderr.lines().find_map(|line| {
+            line.strip_prefix("Ran ")?.split_whitespace().next()?.parse::<usize>().ok()
+        }).expect("hosted policy suite did not report a test count");
+        assert!(count >= 37, "hosted policy coverage unexpectedly shrank: {stderr}");
     }
     #[test]
     fn timestamped_job_logs_retain_failed_test_and_package_identity() {

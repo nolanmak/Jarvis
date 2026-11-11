@@ -18,7 +18,10 @@ r=pathlib.Path(os.environ['FIXTURE']);a=sys.argv[1:]
 s=json.loads((r/'scenario.json').read_text())
 with (r/'calls').open('a') as f: f.write(json.dumps(a)+'\n')
 if a[:2]==['repo','view']: print(s.get('permission','WRITE') if 'viewerPermission' in a else 'owner/repo')
-elif a[:2]==['api','user']: print(s.get('actor','owner'))
+elif a[:2]==['api','user']:
+ print('API rate limit exceeded',file=sys.stderr);sys.exit(1)
+elif a[:2]==['api','graphql'] and 'query=query AutoshipViewer { viewer { login } }' in a:
+ print(json.dumps({'data':{'viewer':{'login':s.get('actor','owner')}}}))
 elif a[:2]==['api','repos/owner/repo/issues/7']:
  print(json.dumps({'number':7,'state':s.get('state','open'),'html_url':'https://github.com/owner/repo/issues/7','title':'Fix arithmetic','body':'Fix addition','user':{'login':'owner'},'author_association':'OWNER'}))
 elif a[:2]==['api','repos/owner/repo/pulls/42']:
@@ -114,6 +117,38 @@ fn owner_control_audit_failure_rolls_back_pause_and_reports_storage_failure() {
     assert_eq!(refused["accepted"],false);assert_eq!(refused["reason"],"workflow-state-unavailable");
     assert!(body(status(root.path(),id),0)["owner_control"].is_null());
     assert_eq!(conn.query_row("SELECT count(*) FROM workflow_owner_control",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+}
+
+#[test]
+fn owner_can_pause_registered_automatic_workflow_without_submitting_a_command() {
+    let root=fixture();
+    let admitted=body(run(root.path(),&[]),0);
+    let id=admitted["workflow"].as_str().unwrap();
+    seed_pr_milestone(root.path(),id,false);
+    let conn=rusqlite::Connection::open(root.path().join("state/workflow.db")).unwrap();
+    // Bootstrap the schema through the public CLI, then represent an automatic
+    // workflow: registered execution state, no command admission or policy.
+    conn.execute("DELETE FROM command_request",[]).unwrap();
+    conn.execute("DELETE FROM command_job",[]).unwrap();
+    conn.execute("INSERT INTO pr_alias VALUES('owner/repo/pr/42',?1)",[id]).unwrap();
+    conn.execute("UPDATE workflow SET model_calls=7,tokens=123,wall_ms=456 WHERE id=?1",[id]).unwrap();
+    let before:(String,i64,i64,i64)=conn.query_row("SELECT checkpoint,model_calls,tokens,wall_ms FROM workflow WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    let paused=body(control(root.path(),"pause","owner/repo/pr/42"),0);
+    assert_eq!(paused["workflow"],id);
+    assert_eq!(paused["owner_control"]["paused"],true);
+    assert_eq!(paused["owner_control"]["revision"],1);
+    assert_eq!(paused["worker_enforcement"],"unverified");
+    let resumed=body(control(root.path(),"resume",id),3);
+    assert_eq!(resumed["reason"],"execution-readiness-blocked");
+    std::fs::write(root.path().join("scenario.json"),r#"{"permission":"READ"}"#).unwrap();
+    assert_eq!(body(control(root.path(),"pause",id),2)["reason"],"target-authorization-failed");
+    assert_eq!(body(control(root.path(),"resume",id),2)["reason"],"target-authorization-failed");
+    assert_eq!(conn.query_row("SELECT checkpoint,model_calls,tokens,wall_ms FROM workflow WHERE id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?))).unwrap(),before);
+    for table in ["command_job","command_request"] {
+        assert_eq!(conn.query_row(&format!("SELECT count(*) FROM {table}"),[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+    assert_eq!(conn.query_row("SELECT revision FROM workflow_owner_control WHERE workflow=?1",[id],|r|r.get::<_,i64>(0)).unwrap(),1);
+    assert_eq!(body(control(root.path(),"pause","owner/repo#999"),2)["reason"],"workflow-not-found");
 }
 #[test]
 fn dry_run_and_unauthorized_targets_create_no_state() {

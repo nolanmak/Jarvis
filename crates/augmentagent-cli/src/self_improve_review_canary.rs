@@ -564,7 +564,7 @@ mod tests {
         let control=dir.path().join("control");
         std::fs::create_dir(&root).unwrap(); std::fs::create_dir(&control).unwrap();
         let (prepared,reference)=prepare_fixture_kind(&root,&control,840,true,&test_resource_audit(&control)).await.unwrap();
-        let call_bound=aligned_review::diagnostic_call_bound(&root,&aligned_review::ReviewSubject {title:"Correct integer addition",body:CRITERION},&prepared).await.unwrap();
+        let call_bound=aligned_review::diagnostic_call_bound(&root,&aligned_review::ReviewSubject {title:"Correct integer addition",body:CRITERION},&prepared,&reference).await.unwrap();
         assert_eq!(call_bound,8,"packed fixture reserves three reviews, one recovery each, and adjudicator plus correction");
         assert!(call_bound<=12,"complete native probe, including adjudicator correction, must fit the default observation budget: {call_bound}");
         assert!(reference.alignment.is_none());

@@ -298,7 +298,7 @@ async fn execute(
     let control = acceptance::control_directories(&pr.repository, guard.id())?.workflow_acceptance;
     let (ok, base, error) = run("git", &["merge-base", "origin/main", "HEAD"], worktree).await?;
     anyhow::ensure!(ok, "cannot resolve adopted acceptance baseline: {error}");
-    let mut prepared = acceptance::prepare_acceptance_for(
+    let mut prepared = match acceptance::prepare_acceptance_for(
         repo,
         worktree,
         &control,
@@ -310,7 +310,13 @@ async fn execute(
         &[],
         guard,
     )
-    .await?;
+    .await {
+        Ok(prepared)=>prepared,
+        Err(error)=> {
+            if let Some(report)=acceptance::hold_initial_error(guard,&error).await? {return Ok(report);}
+            return Err(error);
+        },
+    };
     guard.bind_acceptance(&prepared)?;
     // Preserve interrupted edits before integrating either upstream. The pinned
     // verifier and full gate judge every recovered or conflict-resolution edit.
@@ -379,6 +385,13 @@ async fn execute(
             },
         )
         .await;
+        if let Some(why @ ReviewUnavailable::MainAdvanced { .. }) = &review.why_unavailable {
+            guard.push(&pr.branch).await?;
+            checkpoint_unavailable_review(guard, why, chrono::Utc::now().timestamp_millis()).await?;
+            return Ok(RunReport::built(format!(
+                "PR #{}: preserved work queued for integration with current main and fresh verification", pr.pr
+            )));
+        }
         if let Some(structured) = &review.structured {
             if acceptance::apply_adjudicated_amendment(
                 reasoner,

@@ -260,6 +260,9 @@ elif a[:2]==['pr','checks']:
 
 elif a[:2]==['api','graphql']:
     fields=dict(value.split('=',1) for i,value in enumerate(a) if i>0 and a[i-1]=='-f')
+    if fields['query'].startswith('query AutoshipViewer'):
+        print(json.dumps(dict(data=dict(viewer=dict(login='fixture-owner')))))
+        sys.exit(0)
     if fields['query'].startswith('query AutoshipDirectMergePolicy'):
         print(json.dumps(dict(data=dict(repository=dict(mergeQueue=None)))))
         sys.exit(0)
@@ -288,12 +291,13 @@ elif a[0]=='api' and any(part in a[1] for part in ['/contents/','/actions/','/pu
     elif '/contents/' in path:
         name=path.split('/contents/',1)[1]
         print(json.dumps(dict(type='file',encoding='base64',content=base64.b64encode(policy['files'][name].encode()).decode())))
-    elif '/actions/workflows/' in path:
-        workflow='.github/workflows/'+urllib.parse.unquote(path.split('/actions/workflows/',1)[1].split('/runs')[0])
-        run=1000+workflow_paths.index(workflow)
-        # Real GitHub can report queued while Linux passed and macOS waits.
-        print(json.dumps(dict(workflow_runs=[dict(id=run,run_attempt=1,status='queued',head_sha=s['head'],
-            event='pull_request',path=workflow,repository=dict(full_name=repository),pull_requests=[dict(number=20)])])))
+    elif path.endswith('/actions/runs'):
+        # The repository inventory is fresh and complete for the exact head.
+        # GitHub can report queued while Linux passed and macOS waits.
+        runs=[dict(id=1000+i,run_attempt=1,status='queued',head_sha=s['head'],
+            event='pull_request',path=workflow,repository=dict(full_name=repository),pull_requests=[dict(number=20)])
+            for i,workflow in enumerate(workflow_paths)]
+        print(json.dumps(dict(total_count=len(runs),workflow_runs=runs)))
     elif '/actions/runs/' in path and path.endswith('/jobs'):
         run=int(path.split('/actions/runs/',1)[1].split('/')[0]);workflow=workflow_paths[run-1000]
         names=reader.expected_jobs(policy['contract'],['src/synthetic.rs'],'pull_request').get(workflow,set())

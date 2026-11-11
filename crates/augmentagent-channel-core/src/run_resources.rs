@@ -221,7 +221,15 @@ pub(crate) fn admission_failed(
     logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
     phase: &str,
 ) -> Result<()> {
-    let observation = serde_json::json!({"phase":phase,"exhausted":true});
+    admission_failed_observation(provider,logger,serde_json::json!({"phase":phase,"exhausted":true}))
+}
+
+/// Preserve controller-observed capacity details without exposing policy paths.
+pub(crate) fn admission_failed_observation(
+    provider: &str,
+    logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
+    observation: serde_json::Value,
+) -> Result<()> {
     if let Some(logger) = logger.filter(|logger| logger.is_protected()) {
         logger.resource_capacity_exhausted(&observation)?;
         logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_observation","provider":provider,"observation":observation}))?;

@@ -283,18 +283,12 @@ impl LiveSession {
     pub(crate) fn forget_commentary(&mut self, event_id: &str) {
         self.commentary_commands.remove(event_id);
     }
-    /// One queued silent update cancels pending provider auto-acknowledgments
-    /// using its documented contract; it does not guarantee audible silence.
-    pub(crate) fn thinking(&mut self, delegation_id: &str) -> Result<Value, LiveError> {
-        self.check_deadline()?;
-        if self.state != LiveState::Active {
-            return Err(LiveError::State);
-        }
-        if !self.delegations.contains_key(delegation_id) {
-            return Err(LiveError::Protocol);
-        }
-        Ok(
-            json!({"type":"session.thinking.append","event_id":uuid::Uuid::new_v4().to_string(),"delegation_id":delegation_id,"content":""}),
+    /// Request a short spoken acknowledgment after durable task acceptance.
+    /// This is independent from final-result receipts and promises no ETA.
+    pub(crate) fn queued_acknowledgment(&mut self, delegation_id: &str) -> Result<Value, LiveError> {
+        self.commentary(
+            delegation_id,
+            "Got it. I'll look into that and get back to you.",
         )
     }
     pub fn close(&mut self) -> Result<Value, LiveError> {

@@ -149,7 +149,7 @@ impl LiveConnection {
         &mut self,
         delegation_id: &str,
     ) -> Result<(), LiveError> {
-        let event = self.session.thinking(delegation_id)?;
+        let event = self.session.queued_acknowledgment(delegation_id)?;
         self.send(event).await
     }
     pub(crate) fn prepare_commentary(

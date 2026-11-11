@@ -273,7 +273,13 @@ async fn send_action(connection: &mut crate::live_connection::LiveConnection, ac
         LiveAction::QueueFull {delegation_id} => {
             connection.commentary(&delegation_id,"Please tell the caller the task queue is at capacity. No task was started for this request. We can keep talking.").await?;
         }
-        LiveAction::Queued {delegation_id,..} => {connection.acknowledge_queued(&delegation_id).await?;}
+        LiveAction::Queued {delegation_id,..} => {
+            match connection.acknowledge_queued(&delegation_id).await {
+                Ok(()) => {},
+                Err(LiveError::Capacity) => tracing::warn!("phone acknowledgment skipped at context capacity; backend and final result remain independent"),
+                Err(error) => return Err(error),
+            }
+        }
         LiveAction::None => {}
     }
     Ok(())

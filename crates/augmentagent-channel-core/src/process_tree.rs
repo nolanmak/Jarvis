@@ -17,12 +17,17 @@ pub(crate) struct ProcessGroup {
     resource_required: bool,
     vm_preflight: bool,
     resource_observed: AtomicBool,
+    release_attempted: AtomicBool,
+    fresh_native_session: Option<crate::native_vm::FreshUnreleasedRuntime>,
     resource_audit: std::sync::Mutex<Option<(String,Arc<crate::tool_audit::AuditLogger>)>>,
     resource_admission: std::sync::Mutex<Option<serde_json::Value>>,
     _directory: Option<tempfile::TempDir>,
 }
 
 impl ProcessGroup {
+    pub(crate) fn with_fresh_native_session(mut self,fresh:Option<crate::native_vm::FreshUnreleasedRuntime>)->Self {
+        self.fresh_native_session=fresh;self
+    }
     pub(crate) fn bind_resource_audit(&self, provider:&str, logger:Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
         if let Some(logger)=logger { *self.resource_audit.lock().map_err(|_|anyhow::anyhow!("resource audit lock poisoned"))?=Some((provider.into(),logger.clone())); }
         Ok(())
@@ -103,6 +108,10 @@ impl ProcessGroup {
         } }
         // Publish only complete, synced admission bytes. Both the supervisor
         // and native VM can observe this path immediately after creation.
+        // From the first publication attempt, cancellation or any error may
+        // hide a released model. Never clear this flag or infer nonrelease
+        // from a missing/partial acknowledgement afterwards.
+        self.release_attempted.store(true,Ordering::SeqCst);
         let mut proceed=tempfile::NamedTempFile::new_in(self.receipt.parent().ok_or_else(||std::io::Error::other("admission directory missing"))?)?;
         proceed.write_all(b"admitted\n")?;
         proceed.as_file().sync_all()?;
@@ -181,6 +190,21 @@ impl Drop for ProcessGroup {
         let mut clean=processes_settled;
         if clean { if let Some(marker)=&self.active_request { clean=retire_request(marker,&self.receipt).is_ok(); } }
         self.clean.store(clean,Ordering::SeqCst);
+        if clean && !self.release_attempted.load(Ordering::SeqCst) {
+            let absent=|name:&str|self.receipt.with_file_name(name).symlink_metadata()
+                .is_err_and(|error|error.kind()==std::io::ErrorKind::NotFound);
+            if absent("launch-continue") && absent("vm-dispatch-intent") {
+                if let Some(fresh)=self.fresh_native_session.take() {
+                    if fresh.reclaim().is_err() {tracing::warn!("unreleased native runtime retained for recovery");}
+                    else if let Ok(audit)=self.resource_audit.lock() {
+                        if let Some((provider,logger))=audit.as_ref() {
+                            let _=logger.record_controller(serde_json::json!({"kind":"native_unreleased_session_reclaimed","provider":provider,
+                                "reason":"original_fresh_launch_unreleased_and_reaped","diagnostic_only":true}));
+                        }
+                    }
+                }
+            }
+        }
         if !clean {
             // Retain private correlation evidence for restart recovery. A log
             // line or a finished supervisor PID cannot prove subtree teardown.
@@ -679,7 +703,7 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
     };
     let id = child.id().expect("newly spawned child has a pid") as libc::pid_t;
     clean.store(false, Ordering::SeqCst);
-    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), resource_admission:std::sync::Mutex::new(None), _directory: owned_directory }))
+    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false),release_attempted:AtomicBool::new(!admission),fresh_native_session:None, resource_audit:std::sync::Mutex::new(None), resource_admission:std::sync::Mutex::new(None), _directory: owned_directory }))
 }
 
 #[cfg(test)]
@@ -708,7 +732,7 @@ mod tests {
             });
             let clean=Arc::new(AtomicBool::new(false));
             let group=ProcessGroup{id,receipt,clean:clean.clone(),active_request:None,
-                resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),
+                resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),release_attempted:AtomicBool::new(false),fresh_native_session:None,
                 resource_audit:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
             drop(group);writer.join().unwrap();
             assert!(clean.load(Ordering::SeqCst),"receipt existence was mistaken for completed publication");
@@ -738,7 +762,7 @@ mod tests {
         std::fs::write(directory.path().join("launch-ready"),b"ready").unwrap();
         let group=ProcessGroup {id:i32::MAX,receipt,clean:Arc::new(AtomicBool::new(false)),
             active_request:None,resource_required:true,vm_preflight:false,
-            resource_observed:AtomicBool::new(false),resource_audit:std::sync::Mutex::new(None),
+            resource_observed:AtomicBool::new(false),release_attempted:AtomicBool::new(false),fresh_native_session:None,resource_audit:std::sync::Mutex::new(None),
             resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
         assert!(group.verified_quiescence().is_err(),"a file without admission is not authority");
         group.admit_command("verification",None).await.unwrap();
@@ -1007,9 +1031,15 @@ mod tests {
         let log=directory.path().join("logs/audit.jsonl");
         let logger=Arc::new(crate::tool_audit::AuditLogger::protected(log.clone(),directory.path().join("anchors/audit.json"),&[]).unwrap());
         let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));let billed=count.clone();
-        logger.set_model_call_observer(Arc::new(move |_|{billed.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
-        let command=Command::new("/usr/bin/true");
+        let mut command=Command::new("/usr/bin/python3");
+        command.args(["-I", "-c", "import json,pathlib,sys; rows=[json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]; assert any(row.get('kind') == 'model_call_admitted' and row.get('accounting_receipt') == 'synthetic-charge-17' for row in rows)"]).arg(&log);
         let (mut child,mut group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        let proceed=group.receipt.with_file_name("launch-continue");
+        logger.set_correlated_model_call_observer(Arc::new(move |_| {
+            assert!(!proceed.exists(), "provider released before accounting");
+            billed.fetch_add(1,Ordering::SeqCst);
+            Ok("synthetic-charge-17".into())
+        })).unwrap();
         // Exercise the real supervisor admission boundary with a disposable
         // controller receipt. This tests correlation, not kernel quiescence.
         let identity=serde_json::json!({"host_sha256":"synthetic-host","boot_id":"synthetic-boot",
@@ -1026,6 +1056,8 @@ mod tests {
             "model admission has no binding to the resource scope whose quiescence will be verified");
         assert_eq!(model["admission_schema_version"],2);
         assert_eq!(model["actual_provider"],resource["provider"]);
+        assert_eq!(model["accounting_receipt"],"synthetic-charge-17");
+        assert_eq!(model["accounting_schema_version"],1);
         assert_eq!(count.load(Ordering::SeqCst),1);
     }
 
@@ -1078,20 +1110,43 @@ mod tests {
 
     #[tokio::test]
     async fn denied_model_admission_never_dispatches_waiting_provider() {
+        for failure in ["callback", "receipt", "audit"] {
         let directory=tempfile::tempdir().unwrap();
         let effect=directory.path().join("provider-effect");
         let mut command=Command::new("/usr/bin/python3");
         command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('executed')"]).arg(&effect);
-        let logger=Arc::new(crate::tool_audit::AuditLogger::new(directory.path().join("audit")));
-        logger.set_model_call_observer(Arc::new(|_|anyhow::bail!("synthetic budget denied"))).unwrap();
+        for name in ["logs", "anchors"] {std::fs::create_dir(directory.path().join(name)).unwrap();}
+        let log=directory.path().join("logs/audit.jsonl");
+        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(log.clone(),directory.path().join("anchors/audit.json"),&[]).unwrap());
+        if failure=="audit" {
+            logger.record_controller(serde_json::json!({"kind":"synthetic-start"})).unwrap();
+            std::fs::remove_file(&log).unwrap();std::fs::create_dir(&log).unwrap();
+        }
+        let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));let observed=count.clone();
+        logger.set_correlated_model_call_observer(Arc::new(move |_| {
+            observed.fetch_add(1,Ordering::SeqCst);
+            match failure {
+                "callback"=>anyhow::bail!("synthetic budget denied"),
+                "receipt"=>Ok(String::new()),
+                _=>Ok("already-committed-charge".into()),
+            }
+        })).unwrap();
         let clean=Arc::new(AtomicBool::new(true));
         let (mut child,group)=spawn_admitted(&command,true,clean.clone(),None,false).unwrap();
         let error=group.admit_model("codex",Some(&logger)).await.unwrap_err();
-        assert!(error.to_string().contains("synthetic budget denied"));
+        if failure=="callback" {assert!(error.to_string().contains("synthetic budget denied"));}
+        if failure=="receipt" {assert!(error.to_string().contains("invalid model accounting receipt"));}
+        assert!(!group.receipt.with_file_name("launch-continue").exists());
         drop(group);
         child.wait().await.unwrap();
         assert!(clean.load(Ordering::SeqCst));
         assert!(!effect.exists());
+        assert_eq!(count.load(Ordering::SeqCst),1,"admission failure must not undo the callback");
+        if log.is_file() {
+            let rows=std::fs::read_to_string(log).unwrap();
+            assert!(!rows.lines().map(|line|serde_json::from_str::<serde_json::Value>(line).unwrap()).any(|row|row["kind"]=="model_call_admitted"));
+        }
+        }
     }
 
     #[tokio::test]

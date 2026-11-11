@@ -1433,7 +1433,16 @@ fn criteria_pr_section(criteria: &[String]) -> String {
 fn required_criteria_from_pr_body(body: &str) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut in_block = false;
-    for line in body.lines() {
+    // The controller writes its criteria section after the summary, plan and
+    // review notes, so the last heading is the authoritative one. An earlier
+    // heading is quoted text: #1893's summary echoed the issue body (and the
+    // scoper prompt after it), and the resume refused on that prose.
+    let lines: Vec<&str> = body.lines().collect();
+    let start = lines
+        .iter()
+        .rposition(|line| line.trim().starts_with("## Acceptance criteria"))
+        .unwrap_or(0);
+    for line in &lines[start..] {
         let t = line.trim();
         if t.starts_with("## Acceptance criteria") {
             in_block = true;
@@ -2625,6 +2634,94 @@ fn spec_from_scope(scope: Option<&ScopeOutcome>) -> Option<String> {
         .filter(|b| !b.is_empty())
 }
 
+fn acceptance_owner_request(issue:&Issue)->String {
+    format!("GitHub issue #{}: {}\n\n{}",issue.number,issue.title,issue.body)
+}
+
+fn continue_after_scope_refusal(scope:&mut ScopeOutcome,owner_request:&str) {
+    // Readiness may overrule a binary scoping refusal, but that changes only
+    // permission to continue. Its diagnostic body and planning criteria must
+    // not become either the builder specification or acceptance requirements.
+    scope.body=owner_request.to_owned();
+    scope.criteria.clear();
+    scope.fixable=true;
+}
+
+fn initial_acceptance_inputs(scope:Option<&ScopeOutcome>,owner_request:&str)->(String,Vec<String>) {
+    // A refusal is diagnostic context, never a substitute owner requirement
+    // (#955). Keep the first-pass build policy, but enroll acceptance against
+    // the original request when no usable implementation spec was produced.
+    let scope=scope.filter(|scope|scope.fixable);
+    let specification=scope.map(|scope|scope.body.as_str()).filter(|body|!body.is_empty() && *body!=owner_request);
+    let input=match specification {
+        Some(specification)=>format!("Original owner request (preserve every requirement):\n{owner_request}\n\nIndependent implementation guidance (cannot replace or narrow the owner request):\n{specification}"),
+        None=>owner_request.to_owned(),
+    };
+    (input,scope.map(|scope|scope.criteria.clone()).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod acceptance_source_tests {
+    use super::*;
+    #[test]
+    fn fixable_guidance_cannot_hide_an_owner_constraint_from_acceptance() {
+        let owner="Return the arithmetic sum. Never change the audit journal.";
+        let scope=parse_scope_output("VERDICT: fixable\nCOMPLEXITY: medium\nCRITERIA:\n- Return the arithmetic sum.\n\nFix addition.");
+        let (spec,criteria)=initial_acceptance_inputs(Some(&scope),owner);
+        assert!(spec.contains(owner),"acceptance lost an owner constraint omitted from the scoper's spec and criteria");
+        assert!(spec.contains(&scope.body));
+        assert_eq!(criteria,scope.criteria);
+    }
+    #[test]
+    fn acceptance_owner_request_excludes_scoping_instructions_and_retry_context() {
+        let issue=Issue {number:7,title:"Fix addition".into(),body:"Preserve the audit journal.".into(),author:"owner".into(),author_trusted:true,research_filed:false};
+        let prompt=format!("{}\nIndependent grounded readiness decisions: fixture decision\nMerged context: fixture change",build_scope_prompt(&issue,Some("fixture retry diagnostic")));
+        assert!(prompt.contains("fixture retry diagnostic"));
+        assert_eq!(acceptance_owner_request(&issue),"GitHub issue #7: Fix addition\n\nPreserve the audit journal.");
+    }
+    #[test]
+    fn overruled_refusal_preserves_owner_requirements_through_the_real_handoff() {
+        let owner="Keep rejected contracts from spending again; preserve owner pauses and original charges.";
+        let mut scope=parse_scope_output("VERDICT: not-fixable\nCOMPLEXITY: hard\nCRITERIA:\n- Split this into two design increments.\n\nThis needs a planning split.");
+        continue_after_scope_refusal(&mut scope,owner);
+        assert!(scope.fixable,"readiness still permits the first-pass build");
+        let (spec,criteria)=initial_acceptance_inputs(Some(&scope),owner);
+        assert_eq!(spec,owner,"the continuation retained the refusal instead of the owner request");
+        assert!(criteria.is_empty(),"refusal planning steps became acceptance criteria");
+        assert_eq!(spec_from_scope(Some(&scope)).as_deref(),Some(owner));
+    }
+    #[test]
+    fn first_pass_refusal_is_not_an_acceptance_spec_or_requirement() {
+        let scope=parse_scope_output("VERDICT: not-fixable\nCOMPLEXITY: hard\nCRITERIA:\n- Split this into smaller increments before implementation.\n\nRequires a design split; this is a refusal reason.");
+        assert!(!scope.fixable);
+        assert!(!may_label_out(&[]),"the first-pass owner build policy remains unchanged");
+        assert!(spec_from_scope(Some(&scope)).is_none());
+        let owner="Owner request: prevent unchanged rejected contracts from spending another model call; preserve charges and owner pauses.";
+        let (spec,criteria)=initial_acceptance_inputs(Some(&scope),owner);
+        assert_eq!(spec,owner,"refusal replaced the owner request at acceptance registration");
+        assert!(criteria.is_empty(),"a refusal's proposed next action became a product requirement");
+    }
+    #[test]
+    fn fixable_scope_preserves_the_full_independent_criteria() {
+        let scope=parse_scope_output("VERDICT: fixable\nCOMPLEXITY: medium\nCRITERIA:\n- Keep every original charge.\n- Resume only after validated input changes.\n\nImplement the existing dispatch guard.");
+        let (spec,criteria)=initial_acceptance_inputs(Some(&scope),"original owner request");
+        assert!(spec.contains("original owner request"));
+        assert!(spec.contains(&scope.body));
+        assert_eq!(criteria,scope.criteria);
+        assert_eq!(criteria.len(),2);
+    }
+    #[test]
+    fn absent_or_empty_spec_uses_owner_request_without_dropping_valid_criteria() {
+        let owner="original complete owner request";
+        assert_eq!(initial_acceptance_inputs(None,owner),(owner.to_owned(),vec![]));
+        let scope=parse_scope_output("VERDICT: fixable\nCOMPLEXITY: medium\nCRITERIA:\n- Preserve the original owner pause.");
+        assert!(scope.body.is_empty());
+        let (spec,criteria)=initial_acceptance_inputs(Some(&scope),owner);
+        assert_eq!(spec,owner);
+        assert_eq!(criteria,scope.criteria);
+    }
+}
+
 /// #955 — may a not-fixable scoping verdict label this issue out for good?
 ///
 /// Since #803 the scoper reads the prior-attempts digest, and one failed
@@ -3407,7 +3504,26 @@ fn resume_may_merge(qa_ok: bool, independent_approved: bool) -> bool {
 /// last QA verdict on this work, so a re-review judges whether its findings
 /// were resolved instead of re-scoping from nothing (the #889 rule, applied
 /// to QA).
-fn qa_review_prompt(issue: &Issue, summary: &str, prior: Option<&str>) -> String {
+/// QA sees the controller's pinned acceptance harness in the diff. It is
+/// registered independently before the build, adjudicated separately, and the
+/// builder is forbidden to change it, so a QA reject of it can never be
+/// repaired: #1893 was parked because QA called its pinned verifier "an
+/// unrelated artifact that must not ship". QA gets the same mutation boundary
+/// the independent reviewer does.
+fn qa_pinned_boundary(pinned: &[&str]) -> String {
+    if pinned.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\nController-pinned acceptance harness (immutable to the builder): {}. \
+         These files were registered independently before the build as the executable \
+         acceptance contract and ship with the change by design; they are judged by the \
+         controller's own adjudication, not by this review. Do not request their removal \
+         or edits. Review the product change against the issue.",
+        pinned.join(", ")
+    )
+}
+fn qa_review_prompt(issue: &Issue, summary: &str, prior: Option<&str>, pinned: &[&str]) -> String {
     let prior = prior
         .map(|p| {
             format!(
@@ -3421,11 +3537,12 @@ fn qa_review_prompt(issue: &Issue, summary: &str, prior: Option<&str>) -> String
         "GitHub issue #{}: {}\n\n{}\n\nBuilder's summary of its change:\n{}{prior}\n\n\
          The change under review is `git diff origin/main...HEAD` (committed \
          work) plus `git diff --cached` (staged work); read both. \
-         Review the worktree's diff now and output your verdict.",
+         Review the worktree's diff now and output your verdict.{}",
         issue.number,
         issue.title,
         truncate(&issue.body, 2000),
-        truncate(summary, 1000)
+        truncate(summary, 1000),
+        qa_pinned_boundary(pinned)
     )
 }
 
@@ -3868,6 +3985,13 @@ enum ReviewUnavailable {
     /// Controller evidence exceeds a bounded request/collection budget. This is
     /// incomplete evidence, not a provider outage or a code rejection.
     EvidenceBudget { detail: String },
+    /// A reviewer was selected, but the review adapter could not finish.
+    /// This does not establish that a provider is missing or at capacity.
+    /// The protected detail preserves the failure without publishing it.
+    RecoveryRequired { detail: String },
+    /// Immutable review capture observed a main commit outside the candidate.
+    /// Integration can be queued without granting review or merge authority.
+    MainAdvanced { candidate: String, main: String, detail: String },
     /// Every independent reviewer is on a quota cooldown: `(provider, reset)`.
     Latched {
         until: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>,
@@ -3998,6 +4122,8 @@ impl ReviewUnavailable {
             Self::AllReviewersBuiltIt | Self::NoCapacity { .. } => "no-reviewer-capacity",
             Self::Latched { .. } => "reviewer-latched",
             Self::EvidenceBudget { .. } => "review-evidence-budget",
+            Self::RecoveryRequired { .. } => "review-recovery-required",
+            Self::MainAdvanced { .. } => "review-main-advanced",
         }
     }
 
@@ -4035,6 +4161,8 @@ impl ReviewUnavailable {
                 names(reviewers)
             ),
             Self::EvidenceBudget { .. } => "complete caller evidence exceeds the bounded review budget".into(),
+            Self::RecoveryRequired { .. } => "independent review did not complete; controller recovery required".into(),
+            Self::MainAdvanced { .. } => "main advanced; integration and fresh verification required".into(),
             Self::Latched { until } => {
                 // Soonest reset first: that is when the draft can move again.
                 let mut until = until.clone();
@@ -4061,7 +4189,7 @@ impl ReviewUnavailable {
     fn log_line(&self) -> String {
         match self {
             Self::ProvenanceUnverifiable { error } => format!("{} ({error})", self.headline()),
-            Self::NoCapacity { detail, .. } | Self::EvidenceBudget { detail } if !detail.is_empty() => {
+            Self::NoCapacity { detail, .. } | Self::EvidenceBudget { detail } | Self::RecoveryRequired { detail } | Self::MainAdvanced { detail, .. } if !detail.is_empty() => {
                 format!("{} ({detail})", self.headline())
             }
             _ => self.headline(),
@@ -4179,6 +4307,21 @@ fn independent_reviewer_candidates(
 /// can serve it. A non-Codex approval still never unlocks the Codex-only
 /// opt-ins (receipt override, `hard` band) — see
 /// [`IndependentReview::codex_approved`].
+/// How long a freshly started worker waits before its first tick: the rest
+/// of the interval since the previous tick started, or the full interval when
+/// no tick has ever been recorded (a new install, or tests).
+fn first_tick_delay(last_start: Option<std::time::SystemTime>, now: std::time::SystemTime,
+    interval: std::time::Duration) -> std::time::Duration {
+    match last_start {
+        None => interval,
+        Some(started) => match now.duration_since(started) {
+            Ok(elapsed) => interval.saturating_sub(elapsed),
+            // A stamp in the future (clock change) is not trusted.
+            Err(_) => interval,
+        },
+    }
+}
+
 fn reviewer_pool() -> Vec<augmentagent_channel_core::ProviderKind> {
     reviewer_pool_from(std::env::var("AUGMENTAGENT_AUTOPR_REVIEWERS").ok().as_deref())
 }
@@ -4327,7 +4470,7 @@ pub(crate) fn build_scope_prompt(issue: &Issue, prior: Option<&str>) -> String {
         issue.title,
         issue.body,
         prior_attempts_section(prior)
-    ) + "\n" + acceptance::CONTRACT_PROMPT
+    )
 }
 
 fn prior_attempts_section(prior: Option<&str>) -> String {
@@ -4648,6 +4791,9 @@ impl CiGateResult {
             return Err(error);
         }
         if let Some(eligible_at_ms) = workflow.defer_verification_infrastructure(&error).await? {
+            // The classified code alone ("acceptance verifier infrastructure")
+            // never said what failed; keep the underlying error in the log.
+            warn!(workflow = workflow.id(), eligible_at_ms, "verification infrastructure deferred: {error:#}");
             // The gate future has returned. Record a checked release, not
             // a task drop, so the five-minute retry is not lease-blocked.
             workflow.finish_ci_deferral()?;
@@ -5785,6 +5931,12 @@ fn unreviewable_plan(
         };
     }
     let advice = match why {
+        ReviewUnavailable::MainAdvanced { .. } => {
+            "The controller queued preserved work for integration with current main and fresh verification. No approval or code rejection has been recorded."
+        }
+        ReviewUnavailable::RecoveryRequired { .. } => {
+            "Inspect the protected controller failure and repair the recorded review blocker before retrying. No approval or code rejection has been recorded."
+        }
         ReviewUnavailable::EvidenceBudget { .. } => {
             "The candidate needs bounded evidence decomposition before independent review can finish. No approval or code rejection has been recorded."
         }
@@ -5815,8 +5967,11 @@ fn unreviewable_plan(
              for another review attempt; a provider outage does not reject the code."
         )),
         stand_down: None,
+        // Local log/report only: carry the detail (which reviewer check
+        // failed). The public PR comment above keeps the headline.
         message: format!(
-            "PR #{pr}: independent review unavailable, {headline}; still draft, day {days} waiting for recovery{cost}"
+            "PR #{pr}: independent review unavailable, {}; still draft, day {days} waiting for recovery{cost}",
+            why.log_line()
         ),
     }
 }
@@ -6019,6 +6174,24 @@ fn unreviewable_drafts_in(path: &Path) -> Vec<(u64, String, String, u32)> {
         .filter(|(_, r)| !r.stood_down)
         .filter_map(|(pr, r)| Some((pr.parse().ok()?, r.code, r.reason, r.days.len() as u32)))
         .collect()
+}
+
+async fn checkpoint_unavailable_review(
+    workflow: &mut workflow::WorkflowGuard,
+    why: &ReviewUnavailable,
+    now: i64,
+) -> Result<()> {
+    use crate::autoship_workflow::Stage;
+    if let ReviewUnavailable::MainAdvanced { candidate, main, .. } = why {
+        anyhow::ensure!(workflow.binding().head == *candidate, "main dependency belongs to a different candidate");
+        anyhow::ensure!(workflow.pending_operations()?.is_empty(), "pending publication must reconcile before main integration");
+        workflow.validate_binding(&workflow.binding().clone()).await?;
+        workflow.audit_logger().record_controller(serde_json::json!({"actor":"controller",
+            "kind":"review_main_dependency_changed","candidate":candidate,"observed_main":main}))?;
+        workflow.transition(Stage::Reconcile, "review_main_changed", "reconcile_main", now.saturating_add(300_000)).await
+    } else {
+        workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await
+    }
 }
 
 /// #1037 — act on a draft that cannot be reviewed: record the day, say why on
@@ -6537,6 +6710,7 @@ async fn resume_draft_pr(
         issue.number, resume_base.trim(), &acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &resumed_criteria, &workflow).await {
         Ok(prepared) => prepared,
         Err(error) => {
+            if let Some(report)=acceptance::hold_initial_error(&mut workflow,&error).await? {return Ok(report);}
             workflow.transition(Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
             return Err(error).context("resume independent acceptance registration requires scoped retry");
         }
@@ -6994,7 +7168,7 @@ async fn resume_draft_pr(
         let reviewed_binding = workflow.binding().clone();
         let review_attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
         let (qa_ok, qa_notes) = match reasoner
-            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, prior_qa.as_deref()))
+            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, prior_qa.as_deref(), &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>()))
             .await
         {
             Ok(r) => parse_review_output(&r),
@@ -7055,7 +7229,7 @@ async fn resume_draft_pr(
                     if !dry_run {
                         workflow.push(branch).await?;
                     }
-                    workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
+                    checkpoint_unavailable_review(&mut workflow, &why, chrono::Utc::now().timestamp_millis()).await?;
                     return Ok(hold_unreviewable(
                         repo_root,
                         pr,
@@ -7957,6 +8131,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     scope_prompt.push_str(&merged_since_section(
         &merged_since_filed(repo_root, &worktree, issue.number).await,
     ));
+    let owner_request=acceptance_owner_request(&issue);
     let mut scope = match acceptance::scope_original(&worktree, &repository, &workflow_guard, &scope_prompt)
         .await
     {
@@ -7989,7 +8164,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             // Material external decisions were handled by independent
             // readiness before this specification. A binary model objection
             // cannot replace that authority with a routine human-only label.
-            s.fixable=true;
+            continue_after_scope_refusal(s,&owner_request);
         }
     }
     // #843 — the scoper's own predictions, made binding. A refusal here has
@@ -8063,22 +8238,14 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     // #1012 — written before any code exists, so they are the one target in
     // this pipeline the builder did not also author. Empty when the scoping
     // pass failed or emitted no block, which changes nothing downstream.
-    let mut criteria: Vec<String> = scope
-        .as_ref()
-        .map(|s| s.criteria.clone())
-        .unwrap_or_default();
+    let (acceptance_scope,mut criteria)=initial_acceptance_inputs(scope.as_ref(),&owner_request);
 
     let acceptance_control = acceptance::control_directories(&repository, workflow_guard.id())?.workflow_acceptance;
-    let acceptance_scope = scope.as_ref().map(|scope| scope.body.as_str()).unwrap_or(&scope_prompt);
     let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
-        issue.number, candidate_base, acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria, &workflow_guard).await {
+        issue.number, candidate_base, &acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria, &workflow_guard).await {
         Ok(prepared) => prepared,
         Err(error) => {
-            if error.downcast_ref::<acceptance::BaselineNotRed>().is_some() {
-                let children=acceptance::readiness::decompose_unverifiable(repo_root,&worktree,&issue,&criteria,&format!("{error:#}"),&mut workflow_guard).await?;
-                if !children.is_empty() {return Ok(RunReport::triage(format!("issue #{}: acceptance split into observable children {:?}",issue.number,children)));}
-            }
-
+            if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}
             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
             return Err(error).context("independent acceptance registration requires scoped retry");
         }
@@ -8476,7 +8643,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         // and the revised diff is QA'd again before Stage 4 sees it. Runs
         // before the dry-run exit so dry runs exercise the full pipeline.
         match reasoner
-            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None))
+            .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None, &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>()))
             .await
         {
             Ok(r) => (qa_ok, review_notes) = parse_review_output(&r),
@@ -8565,7 +8732,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                         pending_guard = Some(ParkReason::Oversize(lines));
                         continue;
                     }
-                    let qa = reasoner.call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None)).await?;
+                    let qa = reasoner.call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None, &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>())).await?;
                     (qa_ok, review_notes) = parse_review_output(&qa);
                     workflow_guard.transition(crate::autoship_workflow::Stage::Review, "amended_candidate_verified", "review", 0).await?;
                     independent = Some(independent_review_with_context(reasoner.as_ref(), &issue, worktree.clone(), &criteria,
@@ -8777,7 +8944,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                     // previous findings, before Stage 4 is asked about it.
                     let prior_qa = review_notes.clone();
                     match reasoner
-                        .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, Some(&prior_qa)))
+                        .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, Some(&prior_qa), &prepared_acceptance.proposal.files.keys().map(String::as_str).collect::<Vec<_>>()))
                         .await
                     {
                         Ok(r) => (qa_ok, review_notes) = parse_review_output(&r),
@@ -9308,7 +9475,11 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             truncate(&merge_note, 300)
         ))
         .await;
-        workflow_guard.transition(crate::autoship_workflow::Stage::Reconcile, "draft_published", "resume", chrono::Utc::now().timestamp_millis()).await?;
+        if let Some(why @ ReviewUnavailable::MainAdvanced { .. }) = &independent.why_unavailable {
+            checkpoint_unavailable_review(&mut workflow_guard, why, chrono::Utc::now().timestamp_millis()).await?;
+        } else {
+            workflow_guard.transition(crate::autoship_workflow::Stage::Reconcile, "draft_published", "resume", chrono::Utc::now().timestamp_millis()).await?;
+        }
         workflow_guard.finish()?;
         return Ok(RunReport::built(format!(
             "issue #{}: draft PR opened — {pr_url}",
@@ -11913,10 +12084,23 @@ impl AutoPrLoop {
             "auto-PR loop started (#630/#653): polling open issues (self-triage, no label gate)"
         );
         let counter_path = self.counter_path.clone();
+        let tick_stamp = counter_path.with_file_name("autopr-last-tick-start");
         let mut queue_timer = tokio::time::interval(std::time::Duration::from_secs(30));
         queue_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut first = true;
         loop {
-            let next_tick = tokio::time::Instant::now() + self.interval;
+            // The worker restarts to load every deploy. Waiting a full
+            // interval after each start meant deploys arriving every 25-60
+            // minutes starved build ticks (2026-11-05). Keep the cadence
+            // across restarts instead: the first wait is measured from the
+            // previous tick's start, never shorter than nothing.
+            let wait = if std::mem::take(&mut first) {
+                first_tick_delay(std::fs::metadata(&tick_stamp).and_then(|m| m.modified()).ok(),
+                    std::time::SystemTime::now(), self.interval)
+            } else {
+                self.interval
+            };
+            let next_tick = tokio::time::Instant::now() + wait;
             loop {
                 self.upgrade_boundary()?;
                 tokio::select! {
@@ -11927,10 +12111,12 @@ impl AutoPrLoop {
                     _ = tokio::time::sleep_until(next_tick) => break,
                     _ = queue_timer.tick(), if !self.dry_run => {
                         // Retry unavailable identity on subsequent polls. No network
-                        // lookup is needed while the durable command queue is empty.
+                        // lookup is needed while commands and due main dependencies are absent.
                         if self.command_repository.is_none() {
                             let queued = crate::autoship_workflow::WorkflowStore::open_read_only(&self.workflow_path)
-                                .and_then(|store| store.map(|s| s.has_command_jobs()).transpose());
+                                .and_then(|store| store.map(|s| -> Result<bool> {
+                                    Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?)
+                                }).transpose());
                             match queued {
                                 Ok(Some(true)) => {},
                                 Ok(_) => continue,
@@ -11944,8 +12130,12 @@ impl AutoPrLoop {
                             }
                         }
                         let due = crate::autoship_workflow::WorkflowStore::open_read_only(&self.workflow_path)
-                            .and_then(|store| store.map(|store| store.command_queue_due(
-                                self.command_repository.as_deref().unwrap(), (self.clock)().timestamp_millis()))
+                            .and_then(|store| store.map(|store| -> Result<bool> {
+                                let repository = self.command_repository.as_deref().unwrap();
+                                let now = (self.clock)().timestamp_millis();
+                                Ok(store.command_queue_due(repository, now)?
+                                    || store.has_due_main_reconciliation(Some(repository), now)?)
+                            })
                                 .transpose().map(|due| due.unwrap_or(false)));
                         match due {
                             Ok(true) => break,
@@ -11975,6 +12165,7 @@ impl AutoPrLoop {
                 }
                 let reservation = DailyCounter::update(&counter_path,
                     |counter| Ok(counter.begin_attempt(started_day)))?;
+                let _ = std::fs::write(&tick_stamp, b"");
                 let outcome = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => {
@@ -12016,6 +12207,12 @@ impl AutoPrLoop {
                     // Transient controller or network failures retry next tick.
                     Err(e) => {
                         warn!("auto-PR tick failed: {e:#}");
+                        // A bare OS error ("File exists (os error 17)") names no
+                        // operation. With RUST_LIB_BACKTRACE=1 the worker records
+                        // where it was raised, so the failing step is findable.
+                        if e.backtrace().status() == std::backtrace::BacktraceStatus::Captured {
+                            warn!(backtrace = %e.backtrace(), "auto-PR tick failure origin");
+                        }
                         break;
                     }
                 }
@@ -12099,6 +12296,50 @@ mod tests {
         assert!(blast_radius_hit_in_diff(&recovered_revision_diff(p).await.unwrap()).is_none(),"ordinary recovered adapter should remain checkpointable");
         recovered_git(p,&["commit","-qm","checkpoint ordinary adapter"]).await;recovered_git(p,&["merge","--no-edit","origin/main"]).await;
         assert!(blast_radius_hit_in_diff(&recovered_git(p,&["diff","origin/main","HEAD"]).await).is_some(),"final PR guard lost the original protected change");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_main_dependency_wakes_automatic_worker_without_a_command_job() {
+        use crate::autoship_workflow::{WorkflowStore, Binding, Checkpoint, NextAction, Stage};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for case in ["ready", "other-repository", "generic-reconcile", "delayed", "owner-paused"] {
+            let state = tempfile::tempdir().unwrap();
+            let mut worker = AutoPrLoop::for_tests("/nonexistent".into(), 5, state.path());
+            worker.dry_run = false;
+            worker.command_repository = Some("owner/repo".into());
+            worker.clock = Arc::new(|| chrono::DateTime::from_timestamp_millis(1_000).unwrap());
+            let path = worker.workflow_path.clone();
+            let stop = tokio_util::sync::CancellationToken::new();
+            let timer_stop = stop.clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let submitted = async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let repository = if case == "other-repository" { "owner/repo_extra" } else { "owner/repo" };
+                let id = crate::autoship_workflow::workflow_id(repository, 7).unwrap();
+                let binding = Binding {head: "a".repeat(40), contract: "c".repeat(64), evidence_hash: "e".repeat(64)};
+                let mut store = WorkflowStore::open(&path).unwrap();
+                store.register(&id, "fix/fixture", binding.clone(), 0).unwrap();
+                let lease = store.claim(&id, "original-worker", 0, 1).unwrap().unwrap();
+                store.attach_pr_in_repo(&lease, repository, 42, 0).unwrap();
+                store.checkpoint(&lease, &Checkpoint {stage: Stage::Reconcile, binding, evidence: vec![], next: NextAction {
+                    reason: if case == "generic-reconcile" { "resume_started" } else { "review_main_changed" }.into(),
+                    action: "reconcile_main".into(), eligible_at_ms: if case == "delayed" {2_000} else {1_000},
+                }}, 0).unwrap();
+                store.release(&lease, 0).unwrap();
+                if case == "owner-paused" { store.set_owner_pause(&id, "owner", 0, true, 0).unwrap(); }
+                assert!(!store.has_command_jobs().unwrap());
+                tokio::time::sleep(std::time::Duration::from_secs(26)).await;
+                timer_stop.cancel();
+            };
+            let run = worker.run_with(stop, move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { Ok(RunReport::idle()) }
+            }, || async {0});
+            let (result, ()) = tokio::join!(run, submitted);
+            result.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(case == "ready"), "{case}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -14253,6 +14494,19 @@ CODEX-REVIEW: lgtm").0);
     }
 
     #[test]
+    fn a_restarted_worker_keeps_its_tick_cadence() {
+        use std::time::{Duration, SystemTime};
+        let now = SystemTime::now();
+        let interval = Duration::from_secs(1800);
+        assert_eq!(first_tick_delay(None, now, interval), interval, "no history: full interval");
+        assert_eq!(first_tick_delay(Some(now - Duration::from_secs(600)), now, interval), Duration::from_secs(1200));
+        assert_eq!(first_tick_delay(Some(now - Duration::from_secs(4000)), now, interval), Duration::ZERO,
+            "overdue after a restart: tick at once");
+        assert_eq!(first_tick_delay(Some(now + Duration::from_secs(60)), now, interval), interval,
+            "a future stamp is not trusted");
+    }
+
+    #[test]
     fn revise_is_on_by_default_and_disableable() {
         // Pin the env either way (#838's lesson: never read ambient state).
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -16365,6 +16619,10 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn resume_required_criteria_refuse_an_unparsed_section_instead_of_using_a_prefix() {
         assert!(required_criteria_from_pr_body("## Acceptance criteria\n- first required behavior\n  wrapped owner requirement\n- later required behavior").is_err());
+        let quoted = "## Summary\n## Acceptance criteria\n- quoted from the issue\n\nProduce the verdict header now.\n\n\
+                      ## Acceptance criteria (from the scoping pass)\n- controller criterion\n## Verification\n- gate: passed";
+        assert_eq!(required_criteria_from_pr_body(quoted).unwrap(), vec!["controller criterion".to_string()],
+            "the controller's own (last) criteria section is authoritative over quoted text");
     }
 
     /// Generated scope summaries retain their historical display limits. Owner
@@ -19707,16 +19965,20 @@ mod iterate_not_delete_tests {
             author_trusted: true,
             research_filed: false,
         };
-        let first = qa_review_prompt(&issue, "summary", None);
+        let first = qa_review_prompt(&issue, "summary", None, &[]);
         assert!(first.contains("GitHub issue #7"));
         assert!(!first.contains("Previous QA findings"));
-        let again = qa_review_prompt(&issue, "summary", Some("missing test at a.rs:3"));
+        let again = qa_review_prompt(&issue, "summary", Some("missing test at a.rs:3"), &[]);
         assert!(again.contains("Previous QA findings"));
         assert!(again.contains("missing test at a.rs:3"));
         // Resume reviews committed work, the fresh lane staged work.
         assert!(
             first.contains("git diff origin/main...HEAD") && first.contains("git diff --cached")
         );
+        assert!(!first.contains("Controller-pinned"), "no harness, no boundary text");
+        let pinned = qa_review_prompt(&issue, "summary", None, &["autoship_verifiers/observe.py"]);
+        assert!(pinned.contains("Controller-pinned acceptance harness (immutable to the builder): autoship_verifiers/observe.py"));
+        assert!(pinned.contains("Do not request their removal"));
     }
 
     /// Every revision invalidates old evidence and requires all review roles anew.

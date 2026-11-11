@@ -33,6 +33,8 @@ pub(crate) mod discord_controls;
 pub(crate) mod owner_control;
 #[path = "autoship_verification_retry.rs"]
 mod verification_retry;
+#[path = "autoship_capacity_retry.rs"]
+mod capacity_retry;
 pub use verification_retry::VerificationDomain;
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
@@ -198,6 +200,13 @@ fn observation_capacity(conn: &Connection, now_ms: i64, required: u64, cap: u64,
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClaimPurpose { General, Productive, MergeReconciliation }
 
+#[derive(Debug)]
+pub(crate) struct MissingScopeResponse;
+impl std::fmt::Display for MissingScopeResponse {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"committed scope response evidence unavailable")}
+}
+impl std::error::Error for MissingScopeResponse {}
+
 pub struct WorkflowStore {
     conn: Connection,
 }
@@ -224,7 +233,14 @@ impl WorkflowStore {
 
     pub fn scope_stage_response(&mut self,lease:&Lease,binding:&Binding,key:&str,now:i64)->Result<Option<String>> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
-        let value=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,key],|r|r.get(0)).optional()?;tx.commit()?;Ok(value)
+        let value=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,key],|r|r.get(0)).optional()?;
+        if value.is_none() {
+            let malformed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND NOT json_valid(payload))",[&lease.workflow],|row|row.get(0))?;
+            if malformed {return Err(MissingScopeResponse.into());}
+            let recorded:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='scope_stage_response_recorded' AND json_extract(payload,'$.key')=?2)",params![lease.workflow,key],|row|row.get(0))?;
+            if recorded {return Err(MissingScopeResponse.into());}
+        }
+        tx.commit()?;Ok(value)
     }
     pub fn record_scope_stage_response(&mut self,lease:&Lease,binding:&Binding,key:&str,response:&str,now:i64)->Result<()> {
         ensure!(key.len()==64 && response.len()<=2*1024*1024,"invalid bounded scope response");
@@ -351,6 +367,8 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS discord_control_frontier (
                 bot TEXT NOT NULL, owner TEXT NOT NULL, workflow TEXT NOT NULL REFERENCES command_job(workflow),
                 message TEXT NOT NULL, PRIMARY KEY(bot,owner,workflow));
+            CREATE TABLE IF NOT EXISTS native_capacity_probe_cursor (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1), last_workflow TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS command_schedule (
                 workflow TEXT PRIMARY KEY REFERENCES command_job(workflow),
                 attempted_at INTEGER NOT NULL, eligible_at INTEGER NOT NULL);
@@ -2156,6 +2174,18 @@ mod tests {
     }
 
     #[test]
+    fn review_fragment_writer_accepts_exact_limit_and_refuses_extra_byte_without_publication() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+        let (mut store,lease)=setup(&path);let key="b".repeat(64);let other="c".repeat(64);
+        let payload="a".repeat(8*1024*1024);
+        store.record_review_fragment(&lease,&binding(),&key,&payload,25).unwrap();
+        assert_eq!(store.review_fragment(&lease,&binding(),&key,26).unwrap().as_deref(),Some(payload.as_str()));
+        assert!(store.record_review_fragment(&lease,&binding(),&other,&(payload+"a"),27).is_err());
+        assert!(store.review_fragment(&lease,&binding(),&other,28).unwrap().is_none());
+        assert!(store.current_reviews(&lease.workflow).unwrap().is_empty());
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,0);
+    }
+    #[test]
     fn completed_review_fragments_survive_restart_but_never_become_approvals() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
         let (mut store,old)=setup(&path);let key="a".repeat(64);
@@ -2420,6 +2450,17 @@ mod tests {
         assert_eq!(store.scope_stage_response(&new,&binding(),&key,1022).unwrap().as_deref(),Some("synthetic output"));
         assert!(store.scope_stage_response(&old,&binding(),&key,1022).is_err());
         assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM review",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    #[test]
+    fn missing_committed_scope_response_is_unknown_not_an_unused_slot() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let (mut store,lease)=setup(&path);
+        let key="a".repeat(64);let unused="b".repeat(64);
+        store.record_scope_stage_response(&lease,&binding(),&key,"original completed response",31).unwrap();
+        store.conn.execute("DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,key]).unwrap();
+        assert!(store.scope_stage_response(&lease,&binding(),&key,32).unwrap_err().downcast_ref::<MissingScopeResponse>().is_some());
+        assert!(store.scope_stage_response(&lease,&binding(),&unused,32).unwrap().is_none());
+        assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM review",[],|row|row.get::<_,u32>(0)).unwrap(),0);
     }
 
     #[test]

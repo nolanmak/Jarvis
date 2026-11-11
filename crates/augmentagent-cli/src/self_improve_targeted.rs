@@ -72,8 +72,15 @@ pub(crate) async fn authorize_command(repo: &Path, request: &Request) -> Result<
 
 pub(crate) async fn authorize_repository(repo:&Path,repository:&str)->Result<String> {
     authorized_repository_name(repo,repository).await?;
-    let actor = read(repo, &["api", "user", "--jq", ".login"]).await?;
-    let actor = actor.trim();
+    // Repository identity and permissions above already use authenticated
+    // GraphQL. REST has a separate quota; exhausting it must not turn a valid
+    // owner control into a misleading authentication refusal.
+    let raw = read(repo, &["api", "graphql", "-f",
+        "query=query AutoshipViewer { viewer { login } }"]).await?;
+    let identity: serde_json::Value = serde_json::from_str(&raw)
+        .context("invalid authenticated GitHub identity response")?;
+    let actor = identity["data"]["viewer"]["login"].as_str()
+        .context("authenticated GitHub actor unavailable")?.trim();
     anyhow::ensure!(!actor.is_empty() && actor.len() <= 100 && actor.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'), "invalid authenticated GitHub actor");
     Ok(format!("github:{}", actor.to_ascii_lowercase()))
 }
@@ -87,6 +94,10 @@ pub(crate) async fn validate_command(repo: &Path, request: &Request) -> Result<(
 /// execution preflight inside that worker, including provider/resource gates.
 pub(crate) async fn command_readiness(repo:&Path,request:&Request)->Result<()> {
     request.normalized()?;
+    control_readiness(repo).await
+}
+
+pub(crate) async fn control_readiness(repo:&Path)->Result<()> {
     crate::autoship_deployment::inspect(repo).await.preflight()
 }
 
@@ -496,6 +507,15 @@ mod tests {
             };
             let issue = serde_json::json!({"number":7,"state":"open","html_url":"https://github.com/owner/repo/issues/7","title":"Fix addition","body":"Correct arithmetic","user":{"login":"owner"},"author_association":"OWNER"});
             scenario(serde_json::json!({"permission":"WRITE","issue":issue}));
+            assert_eq!(authorize_command(&root, &request).await.unwrap(), "github:owner",
+                "REST quota exhaustion must not invalidate authenticated GraphQL identity");
+            for actor in [serde_json::json!(""), serde_json::Value::Null, serde_json::json!("owner/other"), serde_json::json!("owner\nother")] {
+                scenario(serde_json::json!({"permission":"WRITE","issue":issue,"actor":actor}));
+                assert!(authorize_command(&root, &request).await.is_err(), "invalid actor {actor:?}");
+            }
+            scenario(serde_json::json!({"permission":"READ","issue":issue}));
+            assert!(authorize_command(&root, &request).await.is_err(), "read-only access cannot authorize controls");
+            scenario(serde_json::json!({"permission":"WRITE","issue":issue}));
             let Resolved::Issue(selected) = resolve(&root, &request).await.unwrap() else {
                 panic!("wrong target kind")
             };
@@ -723,7 +743,9 @@ root=pathlib.Path(os.environ['AUTOSHIP_TARGET_RESOLUTION_FIXTURE'])
 a=sys.argv[1:];s=json.loads((root/'scenario.json').read_text())
 if a[:2]==['repo','view']:
  print(s['permission'] if 'viewerPermission' in a else 'owner/repo')
-elif a[:2]==['api','user']: print('owner')
+elif a[:2]==['api','user']:
+ print('API rate limit exceeded',file=sys.stderr);sys.exit(1)
+elif a[:2]==['api','graphql']: print(json.dumps({'data':{'viewer':{'login':s.get('actor','owner')}}}))
 elif a[:2]==['pr','list']: print('[]')
 elif a[:1]==['api'] and a[1]=='repos/owner/repo/issues/7':print(json.dumps(s['issue']))
 elif a[:2]==['pr','view'] and a[2]=='42':print(json.dumps(s['pr']))
@@ -816,6 +838,10 @@ else:raise Exception('unexpected request '+repr(a))
             for id in [&ids[1], &ids[2]] {
                 assert_eq!(stage(id).stage, Stage::Retired, "{id}");
                 assert_eq!(stage(id).next.reason, "target_closed", "{id}");
+                let events = store.progress_events(id).unwrap();
+                let terminal = events.last().expect("closed target has durable progress");
+                assert_eq!(terminal.kind, "retired");
+                assert_eq!(terminal.reason, "target_closed", "private updates preserve the actual terminal blocker");
             }
             assert!(reports[1].is_ok() && reports[2].is_ok(), "{reports:?}");
             // A genuinely foreign identity still refuses, but only that job.
@@ -842,6 +868,7 @@ root=pathlib.Path(os.environ['AUTOSHIP_TARGET_LIFECYCLE_FIXTURE'])
 a=sys.argv[1:];s=json.loads((root/'scenario.json').read_text())
 if a[:2]==['repo','view']: print(s['permission'] if 'viewerPermission' in a else 'owner/repo')
 elif a[:2]==['api','user']: print('owner')
+elif a[:2]==['api','graphql']: print(json.dumps({'data':{'viewer':{'login':'owner'}}}))
 elif a[:2]==['pr','list']: print('[]')
 elif a[:1]==['api'] and a[1].startswith('repos/owner/repo/issues/'): print(json.dumps(s['issues'][a[1].rsplit('/',1)[1]]))
 elif a[:2]==['pr','view']: print(json.dumps(s['prs'][a[2]]))

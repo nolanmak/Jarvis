@@ -1244,8 +1244,55 @@ pub fn run_prune_locked(repo_root: &Path, opts: &Options, out: &mut dyn Write, a
     run_prune_with_leases(repo_root, opts, out, admission, None)
 }
 
+/// Days an unmanaged Cargo cache must sit untouched before `disk prune`
+/// adopts it as abandoned (`AUGMENTAGENT_ADOPT_UNMANAGED_DAYS`, default 7).
+fn adopt_unmanaged_days() -> f64 {
+    std::env::var("AUGMENTAGENT_ADOPT_UNMANAGED_DAYS").ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|d| d.is_finite() && *d >= 1.0)
+        .unwrap_or(7.0)
+}
+
+/// The unmanaged caches safe to adopt: idle at least `days` by their newest
+/// write, and not in use by any running process. A cache whose idle time could
+/// not be measured is never adopted.
+fn stale_unmanaged(caches: &[crate::build_storage::UnmanagedCache], days: f64,
+    in_use: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+    caches.iter()
+        .filter(|c| c.idle_days.is_some_and(|idle| idle >= days) && !in_use(&c.path))
+        .map(|c| c.path.clone())
+        .collect()
+}
+
+/// Unmanaged caches were only ever reported, so an abandoned ad-hoc target sat
+/// forever until someone ran `disk register --abandoned` by hand (89 GB across
+/// three of them on 2026-11-08). A discovering prune now adopts the stale ones,
+/// and the same run reclaims them as orphaned registered targets.
+fn adopt_stale_unmanaged(repo_root: &Path, procs: Option<&[BuildProc]>, dry_run: bool) {
+    let Some(procs) = procs else { return };
+    let resolve = |p: &Path| std::fs::canonicalize(p).ok();
+    let days = adopt_unmanaged_days();
+    let stale = stale_unmanaged(&unmanaged_caches(repo_root, true), days,
+        |path| root_in_use(path, procs, &resolve));
+    let Ok(state) = crate::build_storage::state_dir() else { return };
+    for path in stale {
+        if dry_run {
+            tracing::info!(path = %path.display(), days, "would adopt stale unmanaged cache");
+            continue;
+        }
+        match crate::build_storage::register_abandoned(repo_root, &path, &state) {
+            Ok(_) => tracing::info!(path = %path.display(), days, "adopted stale unmanaged cache as abandoned"),
+            Err(error) => tracing::warn!(path = %path.display(), "could not adopt unmanaged cache: {error:#}"),
+        }
+    }
+}
+
 pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Write, admission: bool,
     held: Option<&crate::storage_leases::TargetLeases>) -> Result<()> {
+    let procs = build_procs();
+    if opts.roots.is_empty() && !admission {
+        adopt_stale_unmanaged(repo_root, procs.as_deref(), opts.dry_run);
+    }
     let roots: Vec<Root> = if opts.roots.is_empty() {
         let extra = extra_roots_from(
             &std::env::var("AUGMENTAGENT_PRUNE_TARGET_DIRS").unwrap_or_default(),
@@ -1263,7 +1310,6 @@ pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Wri
             })
             .collect()
     };
-    let procs = build_procs();
     let lane_busy = lane_locks().iter().any(|l| lock_is_held(l));
     let resolve = |p: &Path| std::fs::canonicalize(p).ok();
     let policy = Policy::from_env();
@@ -1341,6 +1387,15 @@ pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Wri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_measured_idle_caches_nobody_is_using_are_adopted() {
+        let cache = |p: &str, idle: Option<f64>| crate::build_storage::UnmanagedCache { path: PathBuf::from(p), bytes: 1, idle_days: idle };
+        let caches = [cache("/b/old", Some(31.0)), cache("/b/fresh", Some(2.0)), cache("/b/unmeasured", None),
+            cache("/b/busy", Some(40.0)), cache("/b/edge", Some(7.0))];
+        let picked = stale_unmanaged(&caches, 7.0, |p| p == Path::new("/b/busy"));
+        assert_eq!(picked, vec![PathBuf::from("/b/old"), PathBuf::from("/b/edge")]);
+    }
 
     fn cand(path: &str, mb: u64, idle: f64, kind: Kind) -> Candidate {
         Candidate { path: PathBuf::from(path), bytes: mb * 1024 * 1024, idle_days: idle, kind }
