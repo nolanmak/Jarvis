@@ -128,11 +128,10 @@ impl AnchoredAudit {
         }
         Ok(Self { log, anchor })
     }
-    /// One lock for every writer and sealer, beside the log: the anchor's own
-    /// directory must end up holding the archived anchor alone, so a refused
-    /// save leaves nothing there but the settled evidence it replaces.
+    /// Keep the persistent anchor lock namespace used by existing writers.
+    /// Moving it during rollout would let old and new writers bypass each other.
     fn lock_path(&self) -> Result<PathBuf> {
-        let path = self.log.with_extension("lock");
+        let path = self.anchor.with_extension("lock");
         ensure!(
             path != self.log && path != self.anchor,
             "audit lock path collision"
@@ -323,22 +322,49 @@ mod tests {
         assert!(sink.seal_for_recovery(|_| Ok(serde_json::json!({}))).is_err());
     }
     #[test]
+    fn append_coordinates_with_the_existing_anchor_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_dir, sink) = setup();
+        let lock = private_open(&sink.anchor.with_extension("lock"), false).unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = sink.append(serde_json::json!({"payload":"new writer"}));
+            done_tx.send(result.is_ok()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = done_rx.recv_timeout(Duration::from_millis(200));
+        let completed_early = early.is_ok();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+        let succeeded = early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        thread.join().unwrap();
+        assert!(!completed_early, "new writer bypassed the existing persistent anchor lock");
+        assert!(succeeded);
+    }
+
+    #[test]
     fn refuses_oversized_anchors_and_keeps_settled_evidence_usable() {
         let (_dir, sink) = setup();
         sink.append(serde_json::json!({"payload":"settled"})).unwrap();
         let log = fs::read(&sink.log).unwrap();
         let anchor = fs::read(&sink.anchor).unwrap();
+        let anchor_dir = sink.anchor.parent().unwrap();
+        let entries = || fs::read_dir(anchor_dir).unwrap()
+            .map(|entry| entry.unwrap().file_name()).collect::<std::collections::BTreeSet<_>>();
+        let original_entries = entries();
         // The log line fits the budget; escaping it into the anchor doubles it.
         let oversized = "\\".repeat(22 * 1024 * 1024);
         assert!(sink.append(serde_json::json!({"payload":oversized})).is_err());
         assert_eq!(fs::read(&sink.log).unwrap(), log);
         assert_eq!(fs::read(&sink.anchor).unwrap(), anchor);
-        let anchor_dir = sink.anchor.parent().unwrap();
-        assert_eq!(fs::read_dir(anchor_dir).unwrap().count(), 1, "leaked a file beside the anchor");
+        assert_eq!(entries(), original_entries, "leaked a file beside the anchor");
         sink.append(serde_json::json!({"payload":"smaller"})).unwrap();
         let oversized = "v".repeat(LIMIT as usize);
         assert!(sink.seal_for_recovery(|_| Ok(serde_json::json!({"oversized":oversized}))).is_err());
-        assert_eq!(fs::read_dir(anchor_dir).unwrap().count(), 1, "leaked a file beside the anchor");
+        assert_eq!(entries(), original_entries, "leaked a file beside the anchor");
         let proof = sink.seal_for_recovery(|_| Ok(serde_json::json!({"quiescent":true}))).unwrap();
         assert_eq!(proof["validation"], serde_json::json!({"quiescent":true}));
     }
