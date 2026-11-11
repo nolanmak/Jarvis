@@ -7,7 +7,7 @@ ROOT=Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('shared_ci',ROOT/'scripts/ci-contract.py');ci=importlib.util.module_from_spec(spec);spec.loader.exec_module(ci)
 class ContractTests(unittest.TestCase):
  def test_autoship_cli_suites_execute_as_separate_cargo_commands(self):
-  body=json.loads((ROOT/'scripts/ci-contract.json').read_text())['commands']['rust/cli/6']['body']
+  body=json.loads((ROOT/'scripts/ci-contract.json').read_text())['commands']['rust/cli/7']['body']
   with tempfile.TemporaryDirectory() as directory:
    root=Path(directory);cargo=root/'cargo';calls=root/'calls'
    cargo.write_text('#!'+sys.executable+'\nimport json,os,sys\nwith open(os.environ["CALLS"],"a") as f:f.write(json.dumps(sys.argv[1:])+"\\n")\n');cargo.chmod(0o700)
@@ -18,7 +18,7 @@ class ContractTests(unittest.TestCase):
    self.assertTrue(all(row[:3]==['test','-p','augmentagent-cli'] for row in rows))
    self.assertIn('--bin',rows[0]);self.assertIn('--test-threads=1',rows[0])
    self.assertEqual({rows[1][i+1] for i,a in enumerate(rows[1]) if a=='--test'},
-                    {'autoship_commands_cli','autoship_resolution_cli','autoship_submit_cli'})
+                    {'autoship_commands_cli','autoship_resolution_cli','autoship_submit_cli','env_key_snapshot_cli'})
  def fixture(self,root,body='printf ok',matrix=None):
   workflows=root/'.github/workflows';workflows.mkdir(parents=True);source=workflows/'test.yml';source.write_text('fixture')
   job={'runs-on':'${{ matrix.os }}' if matrix else 'ubuntu-latest','steps':[{'command_id':'test/check/0'}]}
@@ -31,7 +31,7 @@ class ContractTests(unittest.TestCase):
   with patch.object(ci,'prerequisite_check',return_value=[]):
    plan=ci.plan(c,self.args(ROOT,changed_file=['scripts/ci-contract.json'],probe_prerequisites=True,vm_runtime=True))
   rows={row['command_id']:row for row in plan['checks'] if row.get('platform')=='linux' and 'command_id' in row}
-  for identifier in ['browser-sidecar/synthetic-page/2','browser-sidecar/synthetic-page/3','rust/pdf/5','rust/pdf/6','rust/pdf/10','rust/pdf/14','model-router/adapter-compose/1','model-router/pinned-gateway/2','model-router/codex-redirect/2','model-router/codex-redirect/4','computer-use/browser/6','platform/platform/36','privacy/privacy/4']:
+  for identifier in ['browser-sidecar/synthetic-page/2','browser-sidecar/synthetic-page/3','rust/pdf/5','rust/pdf/6','rust/pdf/10','rust/pdf/14','model-router/adapter-compose/1','model-router/pinned-gateway/2','model-router/codex-redirect/2','model-router/codex-redirect/4','computer-use/browser/6','platform/platform/36','privacy/privacy/5']:
    self.assertEqual(rows[identifier]['status'],'remote_required',identifier)
   for identifier in ['rust/pdf/7','rust/pdf/8','rust/pdf/9','model-router/codex-redirect/3','model-router/installer/3','computer-use/browser/8']:
    self.assertEqual(rows[identifier]['status'],'ready',identifier)

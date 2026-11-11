@@ -1,65 +1,40 @@
 //! Cross-process allocation accounting. Writers hold their reservation flock
-//! until all subprocesses stop. A short admission lock makes measuring space
-//! and publishing a new reservation atomic across XDG state directories.
-use std::fs::{File, OpenOptions};
+//! until all subprocesses stop. The shared admission lock makes measuring
+//! space and publishing a new reservation atomic across XDG state directories.
+//! #1930 — this ledger is shared: the CLI build gate and the Autoship capacity
+//! paths outside it publish into one set of claims, so neither can hand out
+//! headroom the other already reserved.
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug)]
-pub struct Busy(pub String);
-impl std::fmt::Display for Busy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "storage busy: {}", self.0)
-    }
-}
-impl std::error::Error for Busy {}
+use crate::storage_coordination::{self as coordination, lock_directory, open_private};
 
-fn open_private(path: &Path, create_new: bool) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW);
-    if create_new {
-        options.create_new(true);
-    } else {
-        options.create(true).truncate(false);
-    }
-    let file = options.open(path)?;
-    let m = file.metadata()?;
-    if !m.is_file() || m.uid() != unsafe { libc::geteuid() } || m.permissions().mode() & 0o077 != 0
-    {
-        bail!("storage coordination file must be owner-private");
-    }
-    Ok(file)
-}
+pub use crate::storage_coordination::Busy;
 
-pub struct Admission(File);
+/// The growth-budget ledger layered on the shared admission lock: holding this
+/// is proof that the one storage admission, and its CI cleanup reconciliation,
+/// belong to this writer.
+pub struct Admission {
+    /// Held until this value drops, which releases the shared lock.
+    _shared: coordination::Admission,
+}
 impl Admission {
     pub fn lock() -> Result<Self> {
-        let path = crate::storage_leases::lock_directory()?.join("admission.lock");
-        let file = open_private(&path, false)?;
-        // Every operation inside this lock is synchronous; never await a
-        // target lock or child process while holding it.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let admission=Self(file);
-        crate::build_storage::ci_holds::reconcile_before_admission()
-            .map_err(|error|Busy(format!("unverified CI cleanup prevents storage admission: {error:#}")))?;
-        Ok(admission)
+        Ok(Self {
+            _shared: coordination::Admission::lock()?,
+        })
     }
 
     pub fn claims(&self, exclude: Option<&str>) -> Result<Claims> {
         let mut claims = Vec::new();
-        for entry in std::fs::read_dir(crate::storage_leases::lock_directory()?)? {
+        for entry in std::fs::read_dir(lock_directory()?)? {
             let path = entry?.path();
             if path.extension().and_then(|s| s.to_str()) != Some("reservation") {
                 continue;
@@ -103,11 +78,6 @@ impl Admission {
             claims.push(record);
         }
         Ok(Claims(claims))
-    }
-}
-impl Drop for Admission {
-    fn drop(&mut self) {
-        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -204,9 +174,15 @@ impl Reservation {
         Ok(result)
     }
     pub fn inherited_file(&self) -> Result<File> {
-        let file = self.file.try_clone()?;
-        self.exported.store(true, std::sync::atomic::Ordering::Release);
+        let file=self.uncommitted_file()?;
+        self.commit_export();
         Ok(file)
+    }
+    /// Duplicate for a not-yet-started worker without changing Drop behavior.
+    pub fn uncommitted_file(&self)->Result<File> {Ok(self.file.try_clone()?)}
+    /// Preserve the reservation until the worker's final descriptor closes.
+    pub fn commit_export(&self) {
+        self.exported.store(true,std::sync::atomic::Ordering::Release);
     }
     pub fn id(&self) -> &str {
         &self.id
@@ -216,7 +192,7 @@ impl Reservation {
     }
     pub fn path_for(id: &str) -> Result<PathBuf> {
         uuid::Uuid::parse_str(id).context("invalid parent storage reservation")?;
-        Ok(crate::storage_leases::lock_directory()?.join(format!("{id}.reservation")))
+        Ok(lock_directory()?.join(format!("{id}.reservation")))
     }
     pub fn proof_mode(id: &str, state: &Path) -> Result<bool> {
         let claim: Claim = serde_json::from_slice(&std::fs::read(Self::path_for(id)?)?)?;
@@ -263,6 +239,23 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1930 — a writer outside the CLI binary publishes into the same ledger
+    /// the build gate reads, so its growth is charged against one budget.
+    #[test]
+    fn claims_published_outside_the_cli_are_visible_to_every_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let admission = Admission::lock().unwrap();
+        let mut reservation = Reservation::new(&admission, root.path(), false).unwrap();
+        reservation
+            .publish(&admission, &[root.path().to_path_buf()], 4096)
+            .unwrap();
+        assert!(reservation.path.starts_with(lock_directory().unwrap()));
+        let claims = admission.claims(None).unwrap();
+        assert!(claims.reserved_on(root.path()).unwrap() >= 4096);
+        assert!(claims.has_normal_writer(root.path()).unwrap());
+    }
+
     #[test]
     fn snapshot_peak_is_reserved_without_attesting_a_normal_writer() {
         let root = tempfile::tempdir().unwrap();

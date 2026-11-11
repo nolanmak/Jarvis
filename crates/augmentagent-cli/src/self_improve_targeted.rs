@@ -138,13 +138,20 @@ fn preflight_selected_resources(state:&Path,pr:Option<&adoption::AdoptedPr>,
                         // Shared CI acquires its build-only R reservation at
                         // launch. A subsequent native repair independently
                         // acquires the full native+build reservation before spend.
-                        return resources.declaration_preflight();
+                        return observed_resource_preflight(resources, resources.declaration_preflight());
                     }
                 }
             }
         }
     }
-    resources.preflight()
+    observed_resource_preflight(resources, resources.preflight())
+}
+
+fn observed_resource_preflight(resources: &augmentagent_channel_core::run_resources::Readiness, result: Result<()>) -> Result<()> {
+    result.map_err(|error| match crate::autoship_workflow::resource_refusal::Observation::capture(resources) {
+        Some(observation) => error.context(observation),
+        None => error,
+    })
 }
 
 #[cfg(test)]
@@ -492,7 +499,7 @@ pub(super) async fn work_once_mode(repo: &Path, id: &str, mode: ExecutionMode) -
         pr.source_issue = Some(issue);
     }
     if let Resolved::Issue(issue) = &selected {
-        if has_open_agent_pr(repo, issue.number).await? {
+        if has_open_agent_pr(repo, issue.number).await.map_err(linked_claims::command_error)? {
             return Err(anyhow::anyhow!("target issue has an unbound or unverified PR; reconcile or select that PR")
                 .context(CommandFailure {code:3, reason:"target-pr-reconciliation-required"}));
         }
@@ -517,7 +524,7 @@ pub(super) async fn work_once_mode(repo: &Path, id: &str, mode: ExecutionMode) -
             Lane::Combined,
             run_selected(repo, false, Some(selected), mode),
         )
-        .await
+        .await.map_err(linked_claims::command_error)
 }
 
 pub(super) async fn execute_pr(

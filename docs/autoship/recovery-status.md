@@ -34,8 +34,11 @@ milestones and blockers; do not restart the canceled benchmark campaign.
   and hosted dependency setup. The normal updater deployed commit `227d27f1`
   on November 11; both running service executable hashes matched the release
   artifact in the 16:14 UTC readback. This is a dated rollout observation.
-- #2016 tracks unchanged acceptance-input waits being reclaimed without useful
-  progress. Waiting for changed input must not become repeated paid attempts.
+- #2020 merged the #2019 fix for #2016: productive claims hold unchanged initial
+  acceptance-input waits. It also added authenticated `autopr reconcile-target`
+  for targets merged or closed outside autoship, preserving owner controls,
+  accounting and unresolved operations. Terminal state queues native retirement;
+  it does not certify teardown. Verify the deployed build before using it.
 - #1917 remains the automatic host-capacity epic. Native retained-state storage
   reservations and host memory are different limits. Neither free disk nor the
   old fixed retained-state budget is evidence of automatic RAM sizing.

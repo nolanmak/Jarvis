@@ -318,6 +318,7 @@ async fn authority(
     let reasoner=&reasoner;let opts=&opts;let origin=&origin;
     let (decision,session)=authority_response(root,&head,expected_contract,prompt,|request|async move {
         origin.validate(&actual_head(root).await?)?;
+        workflow.require_fresh_issue(root).await?;
         let answer=augmentagent_channel_core::native_session::fresh_review_scope(provider,
             augmentagent_channel_core::model_router::native_reviewer_scope(provider,reasoner.call(opts,&request))).await?;
         origin.validate(&actual_head(root).await?)?;

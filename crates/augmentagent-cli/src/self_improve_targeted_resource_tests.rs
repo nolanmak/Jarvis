@@ -139,3 +139,55 @@ async fn live_verification_preflight_under_builder_pressure_is_read_only()->Resu
     }))?)?;
     Ok(())
 }
+
+
+#[test]
+fn preworkflow_resource_refusal_survives_worker_completion_and_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("workflow.db");
+    let mut store = WorkflowStore::open(&path).unwrap();
+    let request = Request {repository:"owner/repo".into(), target:Target::Pr(42),
+        provider:None, until:Milestone::Merged};
+    let id = store.submit_authorized("resource-observation", "github:owner", &request, 1).unwrap().workflow;
+    assert_eq!(store.next_command_job("owner/repo", 2).unwrap().as_deref(), Some(id.as_str()));
+    let resources = builder_capacity();
+    let error = preflight_selected_resources(&path, None, &resources, 3)
+        .context(CommandFailure {code:3, reason:"execution-readiness-blocked"}).unwrap_err();
+    assert!(format!("{error:#}").contains("workflow-resource:capacity-exhausted"));
+    let result = Err(error);
+    assert!(super::super::finish_selected_command_attempt(&store, &id, 2, &result, 4).unwrap());
+    drop(store);
+    let store = WorkflowStore::open_read_only(&path).unwrap().unwrap();
+    assert!(store.snapshot(&id).unwrap().is_none(), "reporting registered execution");
+    let (code, status) = crate::autoship_commands::status(&path, &id, 5, 5);
+    assert_eq!(code, 3);
+    assert_eq!(status["reason"], "execution-readiness-blocked");
+    assert_eq!(status["last_attempt"]["resource_refusal"]["refusal"]["refusal_code"],
+        "host_headroom", "worker completion lost the original resource metric: {status}");
+    assert_eq!(status["last_attempt"]["resource_refusal"]["refusal"]["facts"]["required_bytes"],
+        6710886400_u64);
+    let progress = serde_json::to_value(store.progress_events(&id).unwrap().last().unwrap()).unwrap();
+    assert_eq!(progress["resource_refusal"]["observation"], status["last_attempt"]["resource_refusal"]);
+    assert_eq!(progress["resource_refusal"]["selected_at_ms"], 2);
+}
+
+#[test]
+fn resource_receipt_cannot_override_pause_or_authorization_priority() {
+    for unauthorized in [false,true] {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let request=Request {repository:"owner/repo".into(),target:Target::Pr(42),provider:None,until:Milestone::Merged};
+        let id=store.submit_authorized("priority","github:owner",&request,1).unwrap().workflow;
+        store.next_command_job("owner/repo",2).unwrap().unwrap();
+        store.set_owner_pause(&id,"github:owner",0,true,3).unwrap();
+        let error=preflight_selected_resources(&path,None,&builder_capacity(),4).unwrap_err()
+            .context(CommandFailure {code:if unauthorized {2}else{3},reason:if unauthorized {"target-authorization-failed"}else{"execution-readiness-blocked"}});
+        super::super::finish_selected_command_attempt(&store,&id,2,&Err(error),5).unwrap();
+        let attempt=store.command_attempt(&id).unwrap().unwrap();
+        assert!(attempt.resource_refusal.is_none());
+        assert_eq!(attempt.reason,if unauthorized {"target-authorization-failed"}else{"owner-pause-requested"});
+        let (_,status)=crate::autoship_commands::status(&path,&id,6,5);
+        assert!(status["resource_refusal"].is_null());
+        let progress=store.progress_events(&id).unwrap();assert!(progress.last().unwrap().resource_refusal.is_none());
+    }
+}

@@ -2120,8 +2120,22 @@ mod repair_gate_tests {
         const CHILD: &str = "AUTOSHIP_SCOPE_REPAIR_RESOURCE_FIXTURE_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let isolated = tempfile::tempdir().unwrap();
+            // The linked-PR guard must observe a complete empty inventory;
+            // this repair fixture has no authority to query a real repository.
+            use std::os::unix::fs::PermissionsExt;
+            let github = isolated.path().join("github.py");
+            std::fs::write(&github, r#"#!/usr/bin/python3
+import sys
+args=sys.argv[1:]
+assert args[:2]==['pr','list'] and args[args.index('--repo')+1]=='owner/repo', args
+assert args[args.index('--state')+1]=='open', args
+print('[]')
+"#).unwrap();
+            std::fs::set_permissions(&github, std::fs::Permissions::from_mode(0o700)).unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "self_improve::acceptance::repair_gate_tests::scope_rejection_uses_bounded_repair_then_durable_rescope", "--nocapture"])
+                .env("GH_BIN", github)
+                .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS", "owner")
                 .env(CHILD, "1")
                 .env("AUGMENTAGENT_RUN_RESOURCES", "1")
                 .env("XDG_STATE_HOME", isolated.path().join("state"))
@@ -2241,6 +2255,7 @@ pub(super) async fn verify_with_repair_for(
     control: &Path,
     workflow: &mut workflow::WorkflowGuard,
 ) -> Result<CandidateReceiptReference> {
+    workflow.require_fresh_issue(worktree).await?;
     source.validate()?;
     ensure!(
         prepared.proposal.contract.source()? == source,
@@ -2298,6 +2313,7 @@ pub(super) async fn verify_with_repair_for(
                 bail!("legacy verifier migration requires a valid independently red behavioral oracle");
             }
             Err(error) => {
+                if linked_claims::report(&error).is_some() {return Err(error);}
                 workflow
                     .transition(
                         crate::autoship_workflow::Stage::Scope,
@@ -2356,6 +2372,7 @@ pub(super) async fn verify_with_repair_for(
                 return Ok(reference);
             }
             Err(error) => {
+                if linked_claims::report(&error).is_some() {return Err(error);}
                 if workflow.audit_logger().resource_capacity_seen() { return Err(error); }
                 let scope_rejected = error.is::<CandidateScopeViolation>();
                 // No verifier ran for a scope rejection. Keep its typed cause

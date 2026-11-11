@@ -1,8 +1,22 @@
 {
   "commands": {
-    "apple-notes/exporter/2": {
+    "apple-notes/exporter/1": {
+      "body": "set -euo pipefail\npython3 scripts/ci-apt-install.py libbz2-dev libffi-dev liblzma-dev libsqlite3-dev libssl-dev zlib1g-dev\npython3 scripts/ci-pinned-tools.py python39\n",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pinned-tool-release"
+      ]
+    },
+    "apple-notes/exporter/3": {
       "body": "python3 -m unittest discover -s scripts/apple-notes/tests -v",
       "shell": "bash"
+    },
+    "apple-notes/exporter/4": {
+      "body": "python3 scripts/ci-pinned-tools.py python39 --verify-source",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pinned-tool-release"
+      ]
     },
     "bridge-suites/bridge-suites/1": {
       "body": "python3 scripts/ci-apt-install.py poppler-utils libseccomp2 ripgrep python3-packaging python3-yaml openssl\n",
@@ -13,7 +27,7 @@
       "shell": "bash"
     },
     "bridge-suites/bridge-suites/3": {
-      "body": "set -euo pipefail\nfor suite in codex_tool_bridge_test codex_command_sandbox_test \\\n             codex_build_vm_test build_dependency_proxy_test \\\n             code_mode_compute_test compute_initialization_test compute_package_fixture_test \\\n             qa_code_mode_compute_test compute_ci_test compute_receipt_test; do\n  test -f \"scripts/tests/$suite.py\" || { echo \"missing suite: $suite\" >&2; exit 1; }\ndone\n",
+      "body": "set -euo pipefail\nfor suite in codex_tool_bridge_test codex_command_sandbox_test               codex_build_vm_test build_dependency_proxy_test               code_mode_compute_test compute_initialization_test compute_package_fixture_test               qa_code_mode_compute_test compute_ci_test compute_receipt_test; do\n  test -f \"scripts/tests/$suite.py\" || { echo \"missing suite: $suite\" >&2; exit 1; }\ndone\n",
       "shell": "bash"
     },
     "bridge-suites/bridge-suites/4": {
@@ -21,11 +35,11 @@
       "shell": "bash"
     },
     "bridge-suites/bridge-suites/5": {
-      "body": "python3 scripts/test-native-provider-gateway.py\npython3 scripts/test-native-provider-vm.py\npython3 scripts/test-native-provider-io.py\npython3 scripts/test-native-provider-codex-auth-probe.py\npython3 scripts/test-native-provider-claude-auth-probe.py\npython3 scripts/test-autoship-native-acceptance-probe.py\npython3 scripts/test-autoship-github-acceptance.py\npython3 scripts/test-native-probe-routing.py\npython3 scripts/test-provision-native-vm.py\npython3 scripts/tests/native_runtime_reconcile_test.py\npython3 scripts/tests/updater_native_runtime_test.py\npython3 scripts/tests/updater_policy_activation_test.py\npython3 scripts/tests/run_resource_readiness_test.py\npython3 scripts/tests/autoship_deployment_readiness_test.py\npython3 scripts/tests/run_resource_scope_test.py\n",
+      "body": "python3 scripts/test-native-provider-gateway.py\npython3 scripts/test-native-provider-vm.py\npython3 scripts/test-native-initrd-budget.py\npython3 scripts/test-native-provider-io.py\npython3 scripts/test-native-provider-codex-auth-probe.py\npython3 scripts/test-native-provider-claude-auth-probe.py\npython3 scripts/test-autoship-native-acceptance-probe.py\npython3 scripts/test-autoship-github-acceptance.py\npython3 scripts/test-native-probe-routing.py\npython3 scripts/test-provision-native-vm.py\npython3 scripts/test-native-capacity-policy.py\npython3 scripts/tests/native_runtime_reconcile_test.py\npython3 scripts/tests/updater_native_runtime_test.py\npython3 scripts/tests/updater_policy_activation_test.py\npython3 scripts/tests/run_resource_readiness_test.py\npython3 scripts/tests/autoship_deployment_readiness_test.py\npython3 scripts/tests/run_resource_scope_test.py\n",
       "shell": "bash"
     },
     "bridge-suites/bridge-suites/6": {
-      "body": "bash scripts/tests/agent-pr-verify-gate.test.sh\nbash scripts/tests/cargo-target-guard.test.sh\npython3 scripts/ci-contract.py verify\npython3 scripts/tests/ci_contract_test.py\npython3 scripts/tests/ci_apt_install_test.py\npython3 scripts/tests/ci_targeted_test.py\npython3 scripts/tests/ci_hosted_space_test.py\n\npython3 scripts/tests/ci_build_vm_test.py\n",
+      "body": "bash scripts/tests/agent-pr-verify-gate.test.sh\nbash scripts/tests/cargo-target-guard.test.sh\npython3 scripts/ci-contract.py verify\npython3 scripts/tests/ci_contract_test.py\npython3 scripts/tests/ci_apt_install_test.py\npython3 scripts/tests/ci_pinned_tools_test.py\npython3 scripts/tests/ci_targeted_test.py\npython3 scripts/tests/ci_hosted_space_test.py\n\npython3 scripts/tests/ci_build_vm_test.py\n",
       "shell": "bash"
     },
     "browser-sidecar/synthetic-page/2": {
@@ -47,7 +61,7 @@
       "shell": "bash"
     },
     "computer-use/browser/3": {
-      "body": "python3 ../../scripts/ci-apt-install.py --playwright-deps chrome\nnpx --no-install playwright install chrome\n",
+      "body": "python3 ../../scripts/ci-apt-install.py --playwright-deps chrome\nnpx --no-install playwright install chrome",
       "shell": "bash",
       "vm_provisioning": [
         "browser-binary-runtime"
@@ -118,7 +132,14 @@
       "body": "npm audit --omit=optional --audit-level=high",
       "shell": "bash"
     },
-    "imessage/exporter/2": {
+    "imessage/exporter/1": {
+      "body": "set -euo pipefail\npython3 scripts/ci-apt-install.py libbz2-dev libffi-dev liblzma-dev libsqlite3-dev libssl-dev zlib1g-dev\npython3 scripts/ci-pinned-tools.py python39\n",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pinned-tool-release"
+      ]
+    },
+    "imessage/exporter/3": {
       "body": "python3 -m unittest discover -s scripts/imessage/tests -v",
       "shell": "bash"
     },
@@ -575,14 +596,14 @@
       "body": "bash scripts/check-no-personal-data.sh --tracked",
       "shell": "bash"
     },
-    "privacy/privacy/3": {
-      "body": "set -euo pipefail\nurl=https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz\ncurl --fail --location --silent --show-error \"$url\" -o \"$RUNNER_TEMP/gitleaks.tar.gz\"\necho \"551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/gitleaks.tar.gz\" | sha256sum --check\ntar -xzf \"$RUNNER_TEMP/gitleaks.tar.gz\" -C \"$RUNNER_TEMP\" gitleaks\n",
+    "privacy/privacy/4": {
+      "body": "python3 scripts/ci-pinned-tools.py gitleaks\n",
       "shell": "bash",
       "vm_provisioning": [
         "gitleaks-release"
       ]
     },
-    "privacy/privacy/4": {
+    "privacy/privacy/5": {
       "body": "set -euo pipefail\nmkdir \"$RUNNER_TEMP/release-source\"\ngit archive HEAD | tar -x -C \"$RUNNER_TEMP/release-source\"\n\"$RUNNER_TEMP/gitleaks\" dir \"$RUNNER_TEMP/release-source\" --redact=100 --no-banner\n",
       "shell": "bash",
       "vm_provisioning": [
@@ -590,13 +611,17 @@
       ]
     },
     "rust/agents/10": {
+      "body": "python3 scripts/ci-apt-install.py fonts-liberation poppler-utils\n",
+      "shell": "bash"
+    },
+    "rust/agents/11": {
       "body": "python3 scripts/pdf-runtime.py",
       "shell": "bash",
       "vm_provisioning": [
         "pdf-python-runtime"
       ]
     },
-    "rust/agents/11": {
+    "rust/agents/12": {
       "body": "cargo test -p augmentagent-approval-discord -p augmentagent-channel-core -p augmentagent-store --locked",
       "shell": "bash"
     },
@@ -620,9 +645,12 @@
       "body": "cargo test -p augmentagent-cli --bin augmentagent model_switch_sequence_tests::discord_model_switch_sequence_uses_one_audited_harness -- --nocapture",
       "shell": "bash"
     },
-    "rust/agents/9": {
-      "body": "python3 scripts/ci-apt-install.py fonts-liberation poppler-utils\n",
-      "shell": "bash"
+    "rust/agents/8": {
+      "body": "python3 scripts/ci-pinned-tools.py deno",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pinned-tool-release"
+      ]
     },
     "rust/channels/10": {
       "body": "cargo test -p augmentagent-store --lib finance_evidence\ncargo test -p augmentagent-channel-core --lib finance_allowlist\n",
@@ -717,65 +745,79 @@
       "shell": "bash"
     },
     "rust/cli/10": {
+      "body": "bash scripts/ci-code-mode.sh",
+      "shell": "bash"
+    },
+    "rust/cli/11": {
       "body": "bash scripts/tests/updater-rebuild-trigger.test.sh",
       "shell": "bash"
     },
-    "rust/cli/4": {
+    "rust/cli/3": {
+      "body": "python3 scripts/ci-pinned-tools.py deno",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pinned-tool-release"
+      ]
+    },
+    "rust/cli/5": {
       "body": "python3 scripts/ci-apt-install.py fonts-liberation poppler-utils python3-yaml\n",
       "shell": "bash"
     },
-    "rust/cli/5": {
+    "rust/cli/6": {
       "body": "python3 scripts/pdf-runtime.py",
       "shell": "bash",
       "vm_provisioning": [
         "pdf-python-runtime"
       ]
     },
-    "rust/cli/6": {
-      "body": "bash scripts/ci-hosted-space.sh\ncargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1\ncargo test -p augmentagent-cli --test autoship_commands_cli --test autoship_resolution_cli --test autoship_submit_cli --locked\n",
+    "rust/cli/7": {
+      "body": "bash scripts/ci-hosted-space.sh\ncargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1\ncargo test -p augmentagent-cli --test autoship_commands_cli --test autoship_resolution_cli --test autoship_submit_cli --test env_key_snapshot_cli --locked\n",
       "shell": "bash",
       "vm_provisioning": [
         "pdf-python-runtime"
       ]
     },
-    "rust/cli/7": {
+    "rust/cli/8": {
       "body": "python3 scripts/ci-apt-install.py python3-packaging\n",
       "shell": "bash"
     },
-    "rust/cli/8": {
+    "rust/cli/9": {
       "body": "python3 -m unittest scripts.tests.compute_ci_test scripts.tests.compute_receipt_test -v",
       "shell": "bash"
     },
-    "rust/cli/9": {
-      "body": "bash scripts/ci-code-mode.sh",
-      "shell": "bash"
+    "rust/legacy-python/1": {
+      "body": "set -euo pipefail\npython3 scripts/ci-apt-install.py libbz2-dev libffi-dev liblzma-dev libsqlite3-dev libssl-dev zlib1g-dev\npython3 scripts/ci-pinned-tools.py python39\n",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pinned-tool-release"
+      ]
     },
     "rust/legacy-python/10": {
+      "body": "cargo test -p augmentagent-cli --test whatsapp_history_cli",
+      "shell": "bash"
+    },
+    "rust/legacy-python/11": {
       "body": "cargo test -p augmentagent-channel-core --lib ask_opts_registers_memory_mcp_server_and_recall_tools",
       "shell": "bash"
     },
-    "rust/legacy-python/4": {
+    "rust/legacy-python/5": {
       "body": "cargo test -p augmentagent-channel-apple-notes",
       "shell": "bash"
     },
-    "rust/legacy-python/5": {
+    "rust/legacy-python/6": {
       "body": "cargo test -p augmentagent-cli --test apple_notes_cli",
       "shell": "bash"
     },
-    "rust/legacy-python/6": {
+    "rust/legacy-python/7": {
       "body": "cargo clippy -p augmentagent-channel-apple-notes --all-targets --no-deps -- -D warnings",
       "shell": "bash"
     },
-    "rust/legacy-python/7": {
+    "rust/legacy-python/8": {
       "body": "python3 -m unittest discover -s scripts/whatsapp/tests -v",
       "shell": "bash"
     },
-    "rust/legacy-python/8": {
-      "body": "cargo test -p augmentagent-channel-whatsapp-history -p augmentagent-channel-imessage -p augmentagent-mcp-memory",
-      "shell": "bash"
-    },
     "rust/legacy-python/9": {
-      "body": "cargo test -p augmentagent-cli --test whatsapp_history_cli",
+      "body": "cargo test -p augmentagent-channel-whatsapp-history -p augmentagent-channel-imessage -p augmentagent-mcp-memory",
       "shell": "bash"
     },
     "rust/macos-check/3": {
@@ -898,6 +940,10 @@
       "shell": "bash"
     },
     "targeted/targeted/10": {
+      "body": "bash scripts/ci-hosted-space.sh\npython3 scripts/ci-targeted.py test --plan \"$RUNNER_TEMP/targeted-plan.json\"\n",
+      "shell": "bash"
+    },
+    "targeted/targeted/11": {
       "body": "python3 scripts/ci-targeted.py wait --plan \"$RUNNER_TEMP/targeted-plan.json\" --base \"${CI_CONTRACT_BASE}\" --head \"${CI_CONTRACT_HEAD}\"\n",
       "shell": "bash"
     },
@@ -905,23 +951,26 @@
       "body": "python3 scripts/ci-targeted.py plan --base \"${CI_CONTRACT_BASE}\" --head \"${CI_CONTRACT_HEAD}\" --out \"$RUNNER_TEMP/targeted-plan.json\"\n",
       "shell": "bash"
     },
-    "targeted/targeted/5": {
+    "targeted/targeted/4": {
+      "body": "python3 scripts/ci-pinned-tools.py deno",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pinned-tool-release"
+      ]
+    },
+    "targeted/targeted/6": {
       "body": "python3 scripts/ci-apt-install.py fonts-liberation poppler-utils python3-yaml\n",
       "shell": "bash"
     },
-    "targeted/targeted/6": {
+    "targeted/targeted/7": {
       "body": "python3 scripts/pdf-runtime.py",
       "shell": "bash",
       "vm_provisioning": [
         "pdf-python-runtime"
       ]
     },
-    "targeted/targeted/8": {
-      "body": "go build -mod=readonly -trimpath -o \"$RUNNER_TEMP/wa-sidecar\" .\necho \"AUGMENTAGENT_WA_SIDECAR_TEST_BIN=$RUNNER_TEMP/wa-sidecar\" >> \"$GITHUB_ENV\"\n",
-      "shell": "bash"
-    },
     "targeted/targeted/9": {
-      "body": "bash scripts/ci-hosted-space.sh\npython3 scripts/ci-targeted.py test --plan \"$RUNNER_TEMP/targeted-plan.json\"\n",
+      "body": "go build -mod=readonly -trimpath -o \"$RUNNER_TEMP/wa-sidecar\" .\necho \"AUGMENTAGENT_WA_SIDECAR_TEST_BIN=$RUNNER_TEMP/wa-sidecar\" >> \"$GITHUB_ENV\"\n",
       "shell": "bash"
     }
   },
@@ -943,7 +992,9 @@
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
             "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
+            "scripts/tests/ci_contract_test.py",
+            "scripts/ci-pinned-tools.py",
+            "scripts/tests/ci_pinned_tools_test.py"
           ]
         }
       },
@@ -958,19 +1009,29 @@
               }
             },
             {
+              "command_id": "apple-notes/exporter/1",
+              "name": "Provision verified Python 3.9 compatibility runtime",
+              "timeout-minutes": 5
+            },
+            {
               "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
               "with": {
-                "python-version": "3.9"
+                "python-version": "3.9.25"
               }
             },
             {
-              "command_id": "apple-notes/exporter/2"
+              "command_id": "apple-notes/exporter/3"
+            },
+            {
+              "command_id": "apple-notes/exporter/4",
+              "name": "Verify pinned Python source fallback",
+              "timeout-minutes": 5
             }
           ]
         }
       },
       "role": "validation",
-      "sha256": "270e8963e6bccb79b614b5d7ce427dc2acf048a35fcffbd785448dfb985e97aa"
+      "sha256": "5bc76db36b34f9f211d6005a854a53fbca8659bb336b124c47aec3fd91b479b1"
     },
     ".github/workflows/autonomous-code-scanner.yml": {
       "reason": "scheduled autonomous scanner and issue reporting",
@@ -1053,7 +1114,9 @@
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
             "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
+            "scripts/tests/ci_contract_test.py",
+            "scripts/ci-pinned-tools.py",
+            "scripts/tests/ci_pinned_tools_test.py"
           ]
         },
         "push": {
@@ -1070,7 +1133,9 @@
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
             "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
+            "scripts/tests/ci_contract_test.py",
+            "scripts/ci-pinned-tools.py",
+            "scripts/tests/ci_pinned_tools_test.py"
           ]
         }
       },
@@ -1115,7 +1180,7 @@
         }
       },
       "role": "validation",
-      "sha256": "87e41b4f96e11df3a21002d3037ba5a5b01365bb13178404338727802780b884"
+      "sha256": "4aaf54389a43b36713c1fbf1f6edbf7acbb889dd5ebf956e6c08c37d272ef965"
     },
     ".github/workflows/claude-pr-review.yml": {
       "reason": "optional comment-only external review",
@@ -1140,7 +1205,9 @@
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
             "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
+            "scripts/tests/ci_contract_test.py",
+            "scripts/ci-pinned-tools.py",
+            "scripts/tests/ci_pinned_tools_test.py"
           ]
         }
       },
@@ -1206,7 +1273,7 @@
         }
       },
       "role": "validation",
-      "sha256": "69f681dbdc1f324a5a8d1f6954ae5fe390776c12b2a9e9c08aa33329deeb07e5"
+      "sha256": "7b708b2869c8634de732babe20cf127b01348bc2325a997533f5d76d50e9cc33"
     },
     ".github/workflows/dashboard-sessions.yml": {
       "defaults": {},
@@ -1283,7 +1350,9 @@
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
             "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
+            "scripts/tests/ci_contract_test.py",
+            "scripts/ci-pinned-tools.py",
+            "scripts/tests/ci_pinned_tools_test.py"
           ]
         },
         "push": {
@@ -1298,7 +1367,9 @@
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
             "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
+            "scripts/tests/ci_contract_test.py",
+            "scripts/ci-pinned-tools.py",
+            "scripts/tests/ci_pinned_tools_test.py"
           ]
         }
       },
@@ -1342,7 +1413,7 @@
         }
       },
       "role": "validation",
-      "sha256": "8aba8fae6b9c654e6231d84d6946d7db74316e4f59a4f2889dd56be6b88a90b6"
+      "sha256": "2d73f657173af44ceaed93529f3cc1cb489dc7c32d3f7660bdb5034031d68f81"
     },
     ".github/workflows/imessage.yml": {
       "defaults": {},
@@ -1355,7 +1426,9 @@
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
             "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
+            "scripts/tests/ci_contract_test.py",
+            "scripts/ci-pinned-tools.py",
+            "scripts/tests/ci_pinned_tools_test.py"
           ]
         }
       },
@@ -1370,19 +1443,24 @@
               }
             },
             {
+              "command_id": "imessage/exporter/1",
+              "name": "Provision verified Python 3.9 compatibility runtime",
+              "timeout-minutes": 5
+            },
+            {
               "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
               "with": {
-                "python-version": "3.9"
+                "python-version": "3.9.25"
               }
             },
             {
-              "command_id": "imessage/exporter/2"
+              "command_id": "imessage/exporter/3"
             }
           ]
         }
       },
       "role": "validation",
-      "sha256": "45bd14cc7294eaa0ed7b95d328b49ab3fdd0e0332b20215d0531d1a4baef49ac"
+      "sha256": "a1688061546408f7835a0a4948b980ed12459dedadba9ecff3f3868d891e4e1b"
     },
     ".github/workflows/issue-to-pr.yml": {
       "reason": "issue-driven implementation and publication, not PR validation",
@@ -1416,7 +1494,9 @@
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
             "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
+            "scripts/tests/ci_contract_test.py",
+            "scripts/ci-pinned-tools.py",
+            "scripts/tests/ci_pinned_tools_test.py"
           ]
         },
         "push": {
@@ -1781,7 +1861,7 @@
         }
       },
       "role": "validation",
-      "sha256": "126818c3f84ed3caa3d2956465d6e939228a80f444461e3322dda80763659709"
+      "sha256": "c20d234daa6a7a5a807c5e21565af4a4c09ff35742cf645b23648c89a924bf11"
     },
     ".github/workflows/model-router.yml": {
       "defaults": {},
@@ -1813,7 +1893,9 @@
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
             "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
+            "scripts/tests/ci_contract_test.py",
+            "scripts/ci-pinned-tools.py",
+            "scripts/tests/ci_pinned_tools_test.py"
           ]
         },
         "push": {
@@ -1845,7 +1927,9 @@
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
             "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
+            "scripts/tests/ci_contract_test.py",
+            "scripts/ci-pinned-tools.py",
+            "scripts/tests/ci_pinned_tools_test.py"
           ]
         }
       },
@@ -2003,7 +2087,7 @@
         }
       },
       "role": "validation",
-      "sha256": "ffbcc8a8e6eeca7844f9961ffe53fd5d1d25552eaec49e4164e9e62ca3bb31e6"
+      "sha256": "b5e498f8b8a5e91cb16e0e8d7e3ace842b7677b4e4418fe1c55f11057d85ea8a"
     },
     ".github/workflows/no-gmail-authors.yml": {
       "defaults": {},
@@ -2047,7 +2131,9 @@
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
             "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
+            "scripts/tests/ci_contract_test.py",
+            "scripts/ci-pinned-tools.py",
+            "scripts/tests/ci_pinned_tools_test.py"
           ]
         },
         "push": {
@@ -2249,7 +2335,7 @@
         }
       },
       "role": "validation",
-      "sha256": "7248f86279e003dfdf68ee204157b85764b675e36faede980e845ceca9556c38"
+      "sha256": "7d0cdc75761ba085806989ee56c43f3afd92e396db227305be85038e42e26f6f"
     },
     ".github/workflows/privacy.yml": {
       "defaults": {},
@@ -2311,12 +2397,19 @@
               "name": "Check tracked files, including templates"
             },
             {
-              "command_id": "privacy/privacy/3",
+              "uses": "actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff",
+              "with": {
+                "cache": false,
+                "go-version": "1.27.1"
+              }
+            },
+            {
+              "command_id": "privacy/privacy/4",
               "name": "Install pinned secret scanner",
               "shell": "bash"
             },
             {
-              "command_id": "privacy/privacy/4",
+              "command_id": "privacy/privacy/5",
               "name": "Scan exactly the release tree",
               "shell": "bash"
             }
@@ -2324,7 +2417,7 @@
         }
       },
       "role": "validation",
-      "sha256": "bece4043820dd1f33e7a47514e8a59a19eeb1328e88aca52ab310202f336ccf9"
+      "sha256": "3f504dfae00685432887a4b327ed1d1c38818e643037f3320a766a6051fc0c46"
     },
     ".github/workflows/rust-cache.yml": {
       "reason": "main-branch Rust dependency cache warming, not PR validation",
@@ -2346,7 +2439,9 @@
             "scripts/ci-contract.py",
             "scripts/ci-contract.json",
             "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
+            "scripts/tests/ci_contract_test.py",
+            "scripts/ci-pinned-tools.py",
+            "scripts/tests/ci_pinned_tools_test.py"
           ]
         },
         "push": {
@@ -2408,21 +2503,25 @@
               "name": "Switch one Discord channel through Qwen, GLM, and Codex"
             },
             {
+              "command_id": "rust/agents/8",
+              "name": "Provision verified pinned Deno"
+            },
+            {
               "uses": "denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed",
               "with": {
                 "deno-version": "2.7.14"
               }
             },
             {
-              "command_id": "rust/agents/9",
+              "command_id": "rust/agents/10",
               "name": "Install PDF fonts and poppler"
             },
             {
-              "command_id": "rust/agents/10",
+              "command_id": "rust/agents/11",
               "name": "Provision the pinned PDF runtime"
             },
             {
-              "command_id": "rust/agents/11",
+              "command_id": "rust/agents/12",
               "name": "Discord voice crates"
             }
           ],
@@ -2631,30 +2730,26 @@
               }
             },
             {
+              "command_id": "rust/cli/3",
+              "name": "Provision verified pinned Deno"
+            },
+            {
               "uses": "denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed",
               "with": {
                 "deno-version": "2.7.14"
               }
             },
             {
-              "command_id": "rust/cli/4",
+              "command_id": "rust/cli/5",
               "name": "Install PDF fonts and poppler"
             },
             {
-              "command_id": "rust/cli/5",
+              "command_id": "rust/cli/6",
               "name": "Provision the pinned PDF runtime"
             },
             {
-              "command_id": "rust/cli/6",
-              "name": "CLI binary tests"
-            },
-            {
               "command_id": "rust/cli/7",
-              "env": {
-                "JARVIS_TEST_COMPUTE_PIP": "",
-                "JARVIS_TEST_VM_CONFIG": ""
-              },
-              "name": "Install trusted host parser"
+              "name": "CLI binary tests"
             },
             {
               "command_id": "rust/cli/8",
@@ -2662,7 +2757,7 @@
                 "JARVIS_TEST_COMPUTE_PIP": "",
                 "JARVIS_TEST_VM_CONFIG": ""
               },
-              "name": "Validate CI refusal behavior"
+              "name": "Install trusted host parser"
             },
             {
               "command_id": "rust/cli/9",
@@ -2670,10 +2765,18 @@
                 "JARVIS_TEST_COMPUTE_PIP": "",
                 "JARVIS_TEST_VM_CONFIG": ""
               },
-              "name": "Rust, CLI and Deno contracts"
+              "name": "Validate CI refusal behavior"
             },
             {
               "command_id": "rust/cli/10",
+              "env": {
+                "JARVIS_TEST_COMPUTE_PIP": "",
+                "JARVIS_TEST_VM_CONFIG": ""
+              },
+              "name": "Rust, CLI and Deno contracts"
+            },
+            {
+              "command_id": "rust/cli/11",
               "env": {
                 "JARVIS_TEST_COMPUTE_PIP": "",
                 "JARVIS_TEST_VM_CONFIG": ""
@@ -2697,9 +2800,14 @@
               }
             },
             {
+              "command_id": "rust/legacy-python/1",
+              "name": "Provision verified Python 3.9 compatibility runtime",
+              "timeout-minutes": 5
+            },
+            {
               "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
               "with": {
-                "python-version": "3.9"
+                "python-version": "3.9.25"
               }
             },
             {
@@ -2720,31 +2828,31 @@
               }
             },
             {
-              "command_id": "rust/legacy-python/4",
+              "command_id": "rust/legacy-python/5",
               "name": "Apple Notes channel"
             },
             {
-              "command_id": "rust/legacy-python/5",
+              "command_id": "rust/legacy-python/6",
               "name": "Apple Notes CLI"
             },
             {
-              "command_id": "rust/legacy-python/6",
+              "command_id": "rust/legacy-python/7",
               "name": "Apple Notes lint"
             },
             {
-              "command_id": "rust/legacy-python/7",
+              "command_id": "rust/legacy-python/8",
               "name": "WhatsApp exporter"
             },
             {
-              "command_id": "rust/legacy-python/8",
+              "command_id": "rust/legacy-python/9",
               "name": "WhatsApp history, iMessage and memory crates"
             },
             {
-              "command_id": "rust/legacy-python/9",
+              "command_id": "rust/legacy-python/10",
               "name": "WhatsApp history CLI"
             },
             {
-              "command_id": "rust/legacy-python/10",
+              "command_id": "rust/legacy-python/11",
               "name": "Memory MCP recall tools"
             }
           ],
@@ -3023,7 +3131,7 @@
         }
       },
       "role": "validation",
-      "sha256": "b00d51b98305ea47a34aad48cf01bb0f3fdb62e9ba09c8672fc3245b9947563e"
+      "sha256": "6a03425098d8ed81bcfa0e28901b00509e339c0b76bafc6965df224f71d1e1fc"
     },
     ".github/workflows/targeted.yml": {
       "defaults": {},
@@ -3068,17 +3176,21 @@
               "name": "Plan which crates this change can affect"
             },
             {
+              "command_id": "targeted/targeted/4",
+              "name": "Provision verified pinned Deno"
+            },
+            {
               "uses": "denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed",
               "with": {
                 "deno-version": "2.7.14"
               }
             },
             {
-              "command_id": "targeted/targeted/5",
+              "command_id": "targeted/targeted/6",
               "name": "Install PDF fonts and poppler"
             },
             {
-              "command_id": "targeted/targeted/6",
+              "command_id": "targeted/targeted/7",
               "name": "Provision the pinned PDF runtime"
             },
             {
@@ -3089,7 +3201,7 @@
               }
             },
             {
-              "command_id": "targeted/targeted/8",
+              "command_id": "targeted/targeted/9",
               "env": {
                 "GOMAXPROCS": 2
               },
@@ -3097,11 +3209,11 @@
               "working-directory": "sidecars/wa-sidecar"
             },
             {
-              "command_id": "targeted/targeted/9",
+              "command_id": "targeted/targeted/10",
               "name": "Targeted crate tests"
             },
             {
-              "command_id": "targeted/targeted/10",
+              "command_id": "targeted/targeted/11",
               "env": {
                 "GH_TOKEN": "${{ github.token }}",
                 "PR_NUMBER": "${{ github.event.pull_request.number }}"
@@ -3113,7 +3225,7 @@
         }
       },
       "role": "validation",
-      "sha256": "128251cc59f3505804322522dcd7d4632f3a639ef3d3c008de3e4c3e6839b416"
+      "sha256": "d13808c4bf72eb670c0039c815f488c58d636ef97ab8e0df0c40c9c5659dc175"
     }
   }
 }
