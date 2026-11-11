@@ -10,7 +10,6 @@ import json
 import re
 import subprocess
 import sys
-import urllib.parse
 
 
 def match_path(path, pattern):
@@ -126,13 +125,31 @@ class GitHub:
 
     def pages(self, endpoint, key=None):
         rows = []
+        total = None
         for page in range(1, 101):
             data = self.api(endpoint + ('&' if '?' in endpoint else '?') + f'per_page=100&page={page}')
             batch = data[key] if key else data
             if not isinstance(batch, list):
                 raise ValueError('invalid GitHub page')
             rows.extend(batch)
-            if len(batch) < 100:
+            if key == 'workflow_runs':
+                # Filtered Actions searches expose at most 1,000 runs. A
+                # partial inventory cannot establish the newest run per policy.
+                observed = data.get('total_count')
+                if type(observed) is not int or not 0 <= observed <= 1000:
+                    raise ValueError('workflow run inventory exceeds bounded search')
+                if total is not None and total != observed:
+                    raise ValueError('workflow run inventory changed during pagination')
+                total = observed
+                ids = [row.get('id') for row in rows]
+                if (any(type(i) is not int or i <= 0 for i in ids)
+                        or len(set(ids)) != len(ids) or len(rows) > total):
+                    raise ValueError('workflow run inventory inconsistent')
+                if len(rows) == total:
+                    return rows
+                if len(batch) < 100:
+                    raise ValueError('workflow run inventory incomplete')
+            elif len(batch) < 100:
                 return rows
         raise ValueError('GitHub evidence pagination incomplete')
 
@@ -195,10 +212,11 @@ def evaluate(request, github):
     pending = False
     receipts = []
     inventory = expected if pull else expected_jobs(contract, [], event)
+    # One fresh, complete inventory serves every workflow in this observation.
+    # Results are never persisted or reused as a passing merge receipt.
+    all_runs = github.pages(f'{prefix}/actions/runs?head_sha={head}&event={event}', 'workflow_runs')
     for path, names in sorted(inventory.items()):
-        workflow = urllib.parse.quote(path.rsplit('/', 1)[1], safe='')
-        runs = github.pages(f'{prefix}/actions/workflows/{workflow}/runs?head_sha={head}&event={event}', 'workflow_runs')
-        runs = [r for r in runs if run_matches(r, repository, head, event, path)
+        runs = [r for r in all_runs if run_matches(r, repository, head, event, path)
                 and (not pull or any(p.get('number') == pr for p in r.get('pull_requests', [])))
                 and (pull or r.get('head_branch') == 'main')]
         if not runs:

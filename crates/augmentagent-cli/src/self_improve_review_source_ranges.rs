@@ -162,6 +162,16 @@ impl<'ast> Visit<'ast> for ItemRanges<'_> {
         }
     }
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        // A requested type includes the implementation of that exact receiver,
+        // not just its data declaration. Do not match names nested in generic
+        // arguments (Wrapper<Foo> is not an implementation of Foo).
+        if let syn::Type::Path(receiver) = item.self_ty.as_ref() {
+            if receiver.qself.is_none() {
+                if let Some(segment) = receiver.path.segments.last() {
+                    self.collect_requested_item(&segment.ident, item.span());
+                }
+            }
+        }
         let previous =
             self.push_source_container(item.span(), item.brace_token.span.open(), &item.attrs);
         syn::visit::visit_item_impl(self, item);
@@ -301,7 +311,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join("logic.rs"),
-            "// αβ\nfn cap() -> u32 { 3 }\n",
+            "// αβ\nfn cap() -> u32 { 3 }\nstruct AnchoredAudit;\nimpl AnchoredAudit {\nfn append(&self) {}\n}\n",
         )
         .unwrap();
         std::os::unix::fs::symlink("logic.rs", root.path().join("link.rs")).unwrap();
@@ -373,7 +383,37 @@ mod tests {
             .values()
             .any(|body| body.contains("fn cap() -> u32 { 3 }")));
         assert!(!files.values().any(|body| body.contains("poison")));
+        request.selector = aligned::ReviewSourceSelector::RustItem { name: "AnchoredAudit".into() };
+        let files = resolve_review_source_request(root.path(), &head, &request).await.unwrap();
+        let text = files.values().cloned().collect::<Vec<_>>().join("");
+        assert!(text.contains("struct AnchoredAudit"));
+        assert!(text.contains("impl AnchoredAudit"));
+        assert!(text.contains("fn append"));
+        assert!(!text.contains("poison"));
     }
+    #[test]
+    fn requested_type_includes_its_inherent_and_trait_implementations() {
+        let source = "#[cfg(any())]\nmod nested {\nstruct AnchoredAudit<T>(T);\nimpl<T> AnchoredAudit<T> {\nfn append(&self) { }\n}\nimpl<T> Drop for AnchoredAudit<T> {\nfn drop(&mut self) { }\n}\nstruct Other;\nimpl Other {\nfn unrelated(&self) { }\n}\nimpl<T> Wrapper<AnchoredAudit<T>> {\nfn wrong_receiver(&self) { }\n}\n}\n";
+        let ranges = requested_item_ranges(source, "AnchoredAudit").unwrap();
+        let text = ranges.into_iter().map(|range| &source[range]).collect::<Vec<_>>().join("");
+        for required in ["#[cfg(any())]", "mod nested", "struct AnchoredAudit", "impl<T> AnchoredAudit", "fn append", "Drop for AnchoredAudit", "fn drop"] {
+            assert!(text.contains(required), "missing type evidence: {required}");
+        }
+        assert!(!text.contains("unrelated"));
+        assert!(!text.contains("wrong_receiver"));
+    }
+
+    #[test]
+    fn qualified_and_raw_type_receivers_keep_exact_implementation_source() {
+        let source = "struct r#type;\nimpl crate::r#type {\nfn append(&self) {}\n}\nimpl Drop for crate::r#type {\nfn drop(&mut self) {}\n}\n";
+        let ranges = requested_item_ranges(source, "r#type").unwrap();
+        let text = ranges.into_iter().map(|range| &source[range]).collect::<Vec<_>>().join("");
+        assert!(text.contains("impl crate::r#type"));
+        assert!(text.contains("Drop for crate::r#type"));
+        assert!(text.contains("fn append"));
+        assert!(text.contains("fn drop"));
+    }
+
     #[test]
     fn raw_names_duplicates_and_container_attributes_are_exact_source() {
         let source="#[cfg(any())]\nmod first {\n#![allow(dead_code)]\nstruct Foo;\nimpl Foo\nwhere Foo: Sized\n{\n#![allow(unused)]\n#[inline]\nfn r#cap() -> u32 { 3 }\n}\n}\nmod second {\nfn cap() -> u32 { 4 }\n}\n";
