@@ -1120,6 +1120,39 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_group_is_review_recovery_not_provider_capacity() {
+        for depth in 0..3 {
+            let mut group = evidence_plan::GroupReview::default();
+            assert!(!group.observe(false, vec![]).unwrap());
+            let mut error = group.finish().unwrap_err();
+            for layer in 0..depth {
+                error = error.context(format!("private review context {layer}"));
+            }
+            let review = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex, error);
+            let why = review.why_unavailable.as_ref().unwrap();
+            assert_eq!(why.code(), "review-recovery-required");
+            assert!(!why.permanent());
+            assert!(!why.headline().contains("capacity"));
+            assert!(!why.headline().contains("private review context"));
+            assert!(why.log_line().contains("incomplete group cannot authorize coverage"));
+            let plan = unreviewable_plan(71000, 70994, why, 1, false);
+            assert!(!plan.billed && plan.stand_down.is_none());
+            let comment = plan.wait_comment.unwrap();
+            assert!(comment.contains("No approval or code rejection"));
+            assert!(!comment.contains("reasoner-selftest"));
+        }
+    }
+
+    #[test]
+    fn exhausted_group_is_review_recovery_not_provider_capacity() {
+        let mut group = evidence_plan::GroupReview::default();
+        assert!(!group.observe(false, vec![]).unwrap());
+        let error = group.observe(false, vec![]).unwrap_err();
+        let review = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex, error);
+        assert_eq!(review.why_unavailable.unwrap().code(), "review-recovery-required");
+    }
+
+    #[test]
     fn oversized_review_wire_is_evidence_budget_not_provider_capacity() {
         let binding=aligned::ReviewBinding {head:"a".repeat(40),base:"b".repeat(40),
             environment_id:"environment".into(),contract_hash:"c".repeat(64),evidence_hash:"d".repeat(64)};
@@ -1151,7 +1184,7 @@ mod tests {
             let mut error=anyhow::anyhow!("provider down");
             for layer in 0..depth {error=error.context(format!("review layer {layer}"));}
             let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
-            assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity",
+            assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"review-recovery-required",
                 "an unrelated reviewer failure wrapped in {depth} context layers is not an evidence budget");
         }
     }
@@ -1184,7 +1217,7 @@ mod tests {
         }
         let error=anyhow::Error::new(SourcedFailure(anyhow::anyhow!("provider down").into()));
         let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
-        assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity",
+        assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"review-recovery-required",
             "an unrelated reviewer failure is not an evidence budget whatever reports it");
     }
 
@@ -1211,7 +1244,7 @@ mod tests {
             let mut error=anyhow::anyhow!("provider down");
             for level in 0..depth {error=wrap_review_failure(error,level);}
             let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
-            assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity",
+            assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"review-recovery-required",
                 "an unrelated reviewer failure {depth} chain levels down is not an evidence budget");
         }
     }
@@ -1230,9 +1263,9 @@ mod tests {
 
     /// Text that reads like a budget is not a budget: only the typed errors
     /// are evidence budgets, so a provider failure that happens to render the
-    /// same message is still missing reviewer capacity.
+    /// same message still requires review recovery without claiming a budget.
     #[test]
-    fn budget_lookalike_messages_stay_reviewer_capacity() {
+    fn budget_lookalike_messages_require_review_recovery() {
         let lookalikes=[
             EvidenceBudget("caller evidence".into()).to_string(),
             aligned::RequestBudgetExceeded.to_string()];
@@ -1243,7 +1276,7 @@ mod tests {
                 anyhow::Error::new(SourcedFailure(anyhow::anyhow!(text.clone()).into())).context("review group"),
             ] {
                 let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
-                assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity",
+                assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"review-recovery-required",
                     "an untyped error that only reads like {text:?} is not an evidence budget");
             }
         }

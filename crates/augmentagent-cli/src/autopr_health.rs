@@ -1620,6 +1620,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn review_hold_billing_is_independent_of_provider_capacity() {
+        let i = HealthInputs {
+            unreviewable_drafts: vec![(1941, "no-reviewer-capacity".into(), "review did not complete".into(), 1)],
+            ..healthy()
+        };
+        let findings = analyze(&i, &Thresholds::default());
+        let held = findings.iter().find(|f| f.code == "review-held").unwrap();
+        assert!(!held.detail.contains("unbilled"), "a review hold does not establish whether model work was billed: {}", held.detail);
+    }
+
+    #[test]
+    fn review_evidence_holds_do_not_prescribe_provider_capacity_repairs() {
+        for code in ["review-evidence-budget", "review-recovery-required"] {
+            let i = HealthInputs {
+                unreviewable_drafts: vec![(1941, code.into(), "review evidence needs recovery".into(), 1)],
+                ..healthy()
+            };
+            let findings = analyze(&i, &Thresholds::default());
+            let held = findings.iter().find(|f| f.code == "review-held").unwrap();
+            assert!(held.fix.contains("evidence"), "{}", held.fix);
+            assert!(!held.fix.contains("capacity"), "{}", held.fix);
+            assert!(!held.fix.contains("reasoner-selftest"), "{}", held.fix);
+            assert!(!held.detail.contains("unbilled"), "the review hold has no billing evidence: {}", held.detail);
+        }
+    }
+
     /// #1037 C6 — a draft the loop cannot get independently reviewed looks,
     /// from outside, like a wedged loop: a PR that never moves and ticks that
     /// end with nothing. It is neither wedged nor spending, and the watchdog
