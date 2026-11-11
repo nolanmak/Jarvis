@@ -33,6 +33,94 @@ MAX_HOME = 64 * 1024 * 1024
 MAX_EXECUTABLE = 512 * 1024 * 1024
 MAX_COMPANION = 128 * 1024 * 1024
 
+MAX_BOOT_ARCHIVE_BYTES = 128 * 1024 * 1024
+MAX_BOOT_IMAGE_BYTES = 129 * 1024 * 1024
+
+
+def boot_source_bytes(path, maximum):
+    """Snapshot one declared regular source within remaining archive capacity."""
+    if type(maximum) is not int or maximum < 0:
+        raise ValueError('invalid native initrd byte budget')
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        raise ValueError('native initrd source unavailable') from None
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError('native initrd source is not regular')
+        if before.st_size > maximum:
+            raise ValueError('native initrd source exceeds byte budget')
+        data = bytearray()
+        while True:
+            block = os.read(fd, min(65536, maximum - len(data) + 1))
+            if not block:
+                break
+            data.extend(block)
+            if len(data) > maximum:
+                raise ValueError('native initrd source exceeds byte budget')
+        after = os.fstat(fd)
+        identity = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+                                 info.st_gid, info.st_nlink, info.st_size,
+                                 info.st_mtime_ns, info.st_ctime_ns)
+        if len(data) != before.st_size or identity(before) != identity(after):
+            raise ValueError('native initrd source changed during read')
+        return bytes(data)
+    except OSError:
+        raise ValueError('native initrd source unavailable') from None
+    finally:
+        os.close(fd)
+
+
+def boot_entry_bytes(name, data):
+    if not isinstance(name, str) or '\0' in name or not isinstance(data, bytes):
+        raise ValueError('invalid native initrd entry')
+    header = 110 + len(name.encode()) + 1
+    return (header + 3) // 4 * 4 + (len(data) + 3) // 4 * 4
+
+
+class BootEntries(list):
+    """Charge actual newc metadata/alignment while retaining the trailer room."""
+    def __init__(self):
+        super().__init__()
+        self.encoded_bytes = boot_entry_bytes('TRAILER!!!', b'')
+        if self.encoded_bytes > MAX_BOOT_ARCHIVE_BYTES:
+            raise ValueError('native initrd exceeds byte budget')
+
+    def append(self, entry):
+        size = boot_entry_bytes(entry[0], entry[2])
+        if self.encoded_bytes + size > MAX_BOOT_ARCHIVE_BYTES:
+            raise ValueError('native initrd exceeds byte budget')
+        super().append(entry)
+        self.encoded_bytes += size
+
+    def extend(self, entries):
+        for entry in entries:
+            self.append(entry)
+
+    def append_input(self, name, mode, source):
+        if isinstance(source, os.PathLike):
+            remaining = MAX_BOOT_ARCHIVE_BYTES - self.encoded_bytes - boot_entry_bytes(name, b'')
+            if remaining < 0:
+                raise ValueError('native initrd exceeds byte budget')
+            data = boot_source_bytes(source, remaining // 4 * 4)
+        else:
+            data = source
+        self.append((name, mode, data, 0, 0))
+
+
+def write_boot_image(path, entries, encoder):
+    # The shared codec checks actual encoded and compressed bytes, independently
+    # of pre-reading accounting. No output path is opened until both bounds pass.
+    image = encoder(entries, max_bytes=MAX_BOOT_ARCHIVE_BYTES, max_image_bytes=MAX_BOOT_IMAGE_BYTES)
+    if not isinstance(image, bytes) or len(image) > MAX_BOOT_IMAGE_BYTES:
+        raise ValueError('native compressed initrd exceeds byte budget')
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(descriptor, 'wb') as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        stream.write(image)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 class BoundedWriter:
@@ -461,7 +549,7 @@ def runtime_seed(runtime, auth_file, auth_relative):
 
 
 def boot_entries(config, job, seed, guest_source, gateway_source, cert_entries):
-    entries = []
+    entries = BootEntries()
     directories = ('bootstrap', 'dev', 'proc', 'sys', 'tmp', 'modules', 'usr', 'etc', 'native',
                    'home', 'home/worker', 'workspace', 'seed', 'root', 'root/control',
                    'run', 'run/native-provider-gateway')
@@ -469,14 +557,14 @@ def boot_entries(config, job, seed, guest_source, gateway_source, cert_entries):
         mode = 0o700 if name.startswith('root') else 0o1777 if name == 'tmp' else 0o755
         entries.append((name, stat.S_IFDIR | mode, b'', 0, 0))
     entries.append(('dev/console', stat.S_IFCHR | 0o600, b'', 5, 1))
-    entries.append(('bootstrap/busybox', stat.S_IFREG | 0o755, Path(config['busybox']).read_bytes(), 0, 0))
+    entries.append_input('bootstrap/busybox', stat.S_IFREG | 0o755, Path(config['busybox']))
     for name in ('sh', 'mount', 'ip', 'insmod', 'poweroff', 'mkdir'):
         entries.append(('bootstrap/' + name, stat.S_IFLNK | 0o777, b'busybox', 0, 0))
     for name in ('bin', 'sbin', 'lib', 'lib64'):
         entries.append((name, stat.S_IFLNK | 0o777, ('usr/' + name).encode(), 0, 0))
     commands = []
     for index, raw in enumerate(config['modules']):
-        entries.append((f'modules/{index}.ko', stat.S_IFREG | 0o400, Path(raw).read_bytes(), 0, 0))
+        entries.append_input(f'modules/{index}.ko', stat.S_IFREG | 0o400, Path(raw))
         commands.append(f'insmod /modules/{index}.ko || poweroff -f')
     # Only this process-specific seed enters the guest; no host directory is
     # exported for writable home state. Runtime exports are bounded frames.
@@ -489,11 +577,9 @@ def boot_entries(config, job, seed, guest_source, gateway_source, cert_entries):
                 seen.add(str(parent))
         entries.append((str(path), stat.S_IFREG | 0o600, data, 0, 0))
     entries.extend(cert_entries)
-    entries.extend([
-        ('root/job.json', stat.S_IFREG | 0o400, json.dumps(job).encode(), 0, 0),
-        ('root/guest.py', stat.S_IFREG | 0o400, guest_source, 0, 0),
-        ('root/native_provider_gateway.py', stat.S_IFREG | 0o400, gateway_source, 0, 0),
-    ])
+    entries.append(('root/job.json', stat.S_IFREG | 0o400, json.dumps(job).encode(), 0, 0))
+    entries.append_input('root/guest.py', stat.S_IFREG | 0o400, guest_source)
+    entries.append_input('root/native_provider_gateway.py', stat.S_IFREG | 0o400, gateway_source)
     boot = '#!/bootstrap/sh\nexport PATH=/bootstrap:/usr/bin:/bin\nmount -t devtmpfs devtmpfs /dev\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\n' + '\n'.join(commands) + '''
 mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev runtime /usr || poweroff -f
 mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev provider /native || poweroff -f
@@ -701,10 +787,10 @@ def main(spec_path):
         guest_config, certificates = gateway_module.provision(spec['gateway'], private)
         job = {'argv': spec['argv'], 'environment': spec['environment'], 'uid': os.getuid(), 'gid': os.getgid(),
                'gateway': guest_config, 'mcp': bool(spec.get('mcp_argv')), 'auth_relative': spec['auth_relative']}
-        entries = boot_entries(config, job, seed, Path(__file__).with_name('native-provider-vm-guest.py').read_bytes(),
-                               Path(__file__).with_name('native-provider-gateway.py').read_bytes(), certificates)
+        entries = boot_entries(config, job, seed, Path(__file__).with_name('native-provider-vm-guest.py'),
+                               Path(__file__).with_name('native-provider-gateway.py'), certificates)
         image = private / 'initrd.gz'
-        image.write_bytes(vm.initrd(entries))
+        write_boot_image(image, entries, vm.initrd)
         command = vm.qemu_command(config, image, [('runtime', Path(spec['guest_runtime']), True), ('provider', binary, True)], None)
         command[command.index('-serial') + 1] = 'null'
         command.extend(['-device', 'virtio-serial-pci', '-chardev',
