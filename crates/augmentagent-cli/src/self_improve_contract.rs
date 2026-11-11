@@ -1844,22 +1844,31 @@ pub(super) async fn verify_with_repair(
     .await
 }
 
+#[derive(Debug)]
+struct CandidateScopeViolation(String);
+impl std::fmt::Display for CandidateScopeViolation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for CandidateScopeViolation {}
+
 async fn validate_candidate_scope(
     worktree: &Path,
     allowed_paths: &[crate::autoship_contract::PathScope],
 ) -> Result<()> {
-    let diff = trusted_git(worktree, &["diff", "origin/main...HEAD"]).await?;
+    let diff = trusted_git(worktree, &["diff", "--no-renames", "origin/main...HEAD"]).await?;
     ensure!(
         blast_radius_hit_in_diff(&diff).is_none(),
-        "acceptance repair touched a guarded path"
+        CandidateScopeViolation("acceptance repair touched a guarded path".into())
     );
-    let paths = trusted_git(worktree, &["diff", "--name-only", "origin/main...HEAD"]).await?;
+    let paths = trusted_git(worktree, &["diff", "--no-renames", "--name-only", "origin/main...HEAD"]).await?;
     for path in paths.lines() {
         ensure!(
             allowed_paths
                 .iter()
                 .any(|scope| scope.contains(path)),
-            "candidate path outside independently registered scope: {path}"
+            CandidateScopeViolation(format!("candidate path outside independently registered scope: {path}"))
         );
     }
     Ok(())
@@ -2141,8 +2150,8 @@ pub(super) async fn verify_with_repair_for(
     }
     for round in 0..=2 {
         recovery::commit_candidate_named(worktree, &format!("fix: {title} ({source})")).await?;
-        validate_candidate_scope(worktree, &prepared.proposal.contract.allowed_paths).await?;
         let verified = async {
+            validate_candidate_scope(worktree, &prepared.proposal.contract.allowed_paths).await?;
             let mut reference =
                 verify_and_persist_candidate(worktree, prepared, control, &worker_roots(worktree), &workflow.audit_logger())
                     .await?;
@@ -2186,15 +2195,20 @@ pub(super) async fn verify_with_repair_for(
             }
             Err(error) => {
                 if workflow.audit_logger().resource_capacity_seen() { return Err(error); }
-                let error=if transient_verifier_infrastructure(&format!("{error:#}")) {
-                    error.context("acceptance infrastructure unavailable")
-                } else {error};
-                let error=match CiGateResult(Err(error)).for_workflow(workflow).await? {
-                    Err(error)=>error,
-                    Ok(())=>unreachable!("failed acceptance check became passing"),
+                let scope_rejected = error.is::<CandidateScopeViolation>();
+                // No verifier ran for a scope rejection. Keep its typed cause
+                // out of CI classification, including paths named `disk.rs`.
+                let error = if scope_rejected { error } else {
+                    let error=if transient_verifier_infrastructure(&format!("{error:#}")) {
+                        error.context("acceptance infrastructure unavailable")
+                    } else {error};
+                    match CiGateResult(Err(error)).for_workflow(workflow).await? {
+                        Err(error)=>error,
+                        Ok(())=>unreachable!("failed acceptance check became passing"),
+                    }
                 };
                 let detail = format!("{error:#}");
-                if round < 2 {
+                if round < 2 && !scope_rejected {
                     if let Some(amended) = amendment::try_amend(
                         reasoner, source, title, worktree, prepared, control, workflow, &detail,
                         false, None,
@@ -2211,7 +2225,7 @@ pub(super) async fn verify_with_repair_for(
                     .split(crate::self_improve::alignment::UNMAPPED_LOCATIONS)
                     .next()
                     .unwrap_or(&detail);
-                let infrastructure = classified.contains("infrastructure_failure")
+                let infrastructure = !scope_rejected && (classified.contains("infrastructure_failure")
                     || classified.contains("toolchain")
                     || classified.contains("environment changed")
                     || classified.contains("disk")
@@ -2220,7 +2234,7 @@ pub(super) async fn verify_with_repair_for(
                     || classified.contains("alignment transport")
                     || classified.contains("constraint authority unavailable")
                     || classified.contains("constraint authority invalid structured response")
-                    || classified.contains("alignment invalid structured response");
+                    || classified.contains("alignment invalid structured response"));
                 if infrastructure {
                     CiGateResult(Err(error.context("acceptance infrastructure unavailable")))
                         .for_workflow(workflow).await??;
@@ -2238,27 +2252,31 @@ pub(super) async fn verify_with_repair_for(
                 // narrowing turn: it now knows exactly which change to drop.
                 let repair_admitted = round < 2
                     && (workflow.admit_epoch_attempt("acceptance_repair", &repair_epoch, 3)?
-                        || (only_unmapped_hunks_named(&detail)
+                        || (!scope_rejected && only_unmapped_hunks_named(&detail)
                             && workflow.admit_epoch_attempt("alignment_narrowing", &repair_epoch, 2)?));
                 if !repair_admitted {
-                    if let Some(amended) = amendment::try_amend(
-                        reasoner, source, title, worktree, prepared, control, workflow, &detail,
-                        true, None,
-                    )
-                    .await?
-                    {
-                        *prepared = amended;
-                        workflow
-                            .transition(
-                                crate::autoship_workflow::Stage::Verify,
-                                "verifier_amended",
-                                "verify_new_revision",
-                                0,
-                            )
-                            .await?;
-                        return Err(error).context(
-                            "independently amended verifier ready for next verification episode",
-                        );
+                    // Invalid implementation paths do not authorize changing
+                    // the pinned verifier or expanding its registered scope.
+                    if !scope_rejected {
+                        if let Some(amended) = amendment::try_amend(
+                            reasoner, source, title, worktree, prepared, control, workflow, &detail,
+                            true, None,
+                        )
+                        .await?
+                        {
+                            *prepared = amended;
+                            workflow
+                                .transition(
+                                    crate::autoship_workflow::Stage::Verify,
+                                    "verifier_amended",
+                                    "verify_new_revision",
+                                    0,
+                                )
+                                .await?;
+                            return Err(error).context(
+                                "independently amended verifier ready for next verification episode",
+                            );
+                        }
                     }
                     workflow
                         .transition(
@@ -2293,7 +2311,7 @@ pub(super) async fn verify_with_repair_for(
                 recovery::commit_candidate_named(worktree, &format!("fix: {title} ({source})")).await?;
                 // A repair can affect code outside the selected regression test.
                 // It must re-earn the normal gate before any review sees it.
-                verify_repaired_candidate(
+                match verify_repaired_candidate(
                     worktree,
                     &prepared.proposal.contract.allowed_paths,
                     async {
@@ -2304,7 +2322,13 @@ pub(super) async fn verify_with_repair_for(
                         Ok(())
                     },
                 )
-                .await?;
+                .await {
+                    Ok(()) => {}
+                    // The next bounded round handles this rejection through
+                    // the same durable repair budget, without verifying it.
+                    Err(error) if error.is::<CandidateScopeViolation>() => continue,
+                    Err(error) => return Err(error),
+                }
             }
         }
     }
