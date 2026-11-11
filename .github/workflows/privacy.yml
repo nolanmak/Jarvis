@@ -25,12 +25,16 @@ jobs:
       - name: Check tracked files, including templates
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id privacy/privacy/2"
 
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.27.1'
+          cache: false
       - name: Install pinned secret scanner
         shell: bash
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id privacy/privacy/3"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id privacy/privacy/4"
       - name: Scan exactly the release tree
         shell: bash
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id privacy/privacy/4"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id privacy/privacy/5"
   node-release:
     runs-on: ubuntu-latest
     steps:

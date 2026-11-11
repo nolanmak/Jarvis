@@ -204,9 +204,15 @@ impl Reservation {
         Ok(result)
     }
     pub fn inherited_file(&self) -> Result<File> {
-        let file = self.file.try_clone()?;
-        self.exported.store(true, std::sync::atomic::Ordering::Release);
+        let file=self.uncommitted_file()?;
+        self.commit_export();
         Ok(file)
+    }
+    /// Duplicate for a not-yet-started command, without changing Drop behavior.
+    pub(crate) fn uncommitted_file(&self)->Result<File> {Ok(self.file.try_clone()?)}
+    /// Once a worker exists, preserve its reservation until its last FD closes.
+    pub(crate) fn commit_export(&self) {
+        self.exported.store(true,std::sync::atomic::Ordering::Release);
     }
     pub fn id(&self) -> &str {
         &self.id

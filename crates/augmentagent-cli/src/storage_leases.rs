@@ -59,11 +59,20 @@ pub(crate) fn lock_directory() -> Result<PathBuf> {
 
 impl TargetLeases {
     pub fn inherited_files(&self) -> Result<Vec<File>> {
-        self.0.iter().map(|held| {
-            let file = held.file.try_clone()?;
-            held.exported.store(true, Ordering::Release);
-            Ok(file)
-        }).collect()
+        let files=self.uncommitted_files()?;
+        self.commit_export();
+        Ok(files)
+    }
+
+    /// Prepare duplicate descriptions without claiming a worker received them.
+    /// The command owner commits synchronously at the OS spawn boundary.
+    pub(crate) fn uncommitted_files(&self)->Result<Vec<File>> {
+        self.0.iter().map(|held|held.file.try_clone().map_err(Into::into)).collect()
+    }
+
+    /// Monotonic: a failed concurrent attempt must never undo a real export.
+    pub(crate) fn commit_export(&self) {
+        for held in &self.0 {held.exported.store(true,Ordering::Release);}
     }
 
     pub fn directory_fd(&self, root: &Path) -> Result<i32> {

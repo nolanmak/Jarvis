@@ -51,13 +51,15 @@ jobs:
       # Same prerequisites the full suites give these crates' tests: Deno for
       # Code Mode, the pinned PDF runtime and fonts for document rendering,
       # and disk headroom for the snapshot tests.
+      - name: Provision verified pinned Deno
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id targeted/targeted/4"
       - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
         with:
           deno-version: 2.7.14
       - name: Install PDF fonts and poppler
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id targeted/targeted/5"
-      - name: Provision the pinned PDF runtime
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id targeted/targeted/6"
+      - name: Provision the pinned PDF runtime
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id targeted/targeted/7"
       # The WhatsApp channel's real-sidecar contract test skips without it.
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
@@ -67,11 +69,11 @@ jobs:
         working-directory: sidecars/wa-sidecar
         env:
           GOMAXPROCS: 2
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id targeted/targeted/8"
-      - name: Targeted crate tests
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id targeted/targeted/9"
+      - name: Targeted crate tests
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id targeted/targeted/10"
       - name: Every other applicable Linux check for this head
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id targeted/targeted/10 --input-base \"${{ github.event.pull_request.base.sha }}\" --input-head \"${{ github.event.pull_request.head.sha }}\""
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id targeted/targeted/11 --input-base \"${{ github.event.pull_request.base.sha }}\" --input-head \"${{ github.event.pull_request.head.sha }}\""

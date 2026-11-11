@@ -8,6 +8,8 @@ on:
       - "scripts/ci-contract.json"
       - "scripts/ci-contract-sync.py"
       - "scripts/tests/ci_contract_test.py"
+      - "scripts/ci-pinned-tools.py"
+      - "scripts/tests/ci_pinned_tools_test.py"
 permissions:
   contents: read
 # Superseded PR heads cancel; non-PR runs retain distinct queue slots.
@@ -23,7 +25,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Provision verified Python 3.9 compatibility runtime
+        timeout-minutes: 5
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id imessage/exporter/1"
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.9'
-      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id imessage/exporter/2"
+          python-version: '3.9.25'
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id imessage/exporter/3"
