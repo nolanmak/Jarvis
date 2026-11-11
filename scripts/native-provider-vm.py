@@ -12,6 +12,7 @@ import fcntl
 import uuid
 import importlib.util
 import json
+import math
 import os
 import queue
 from pathlib import Path
@@ -30,8 +31,15 @@ import datetime
 
 MAX_FRAME = 2 * 1024 * 1024
 MAX_HOME = 64 * 1024 * 1024
+
+
 MAX_EXECUTABLE = 512 * 1024 * 1024
 MAX_COMPANION = 128 * 1024 * 1024
+
+
+MAX_CREDENTIAL_BYTES = 1024 * 1024
+
+
 
 MAX_BOOT_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_BOOT_IMAGE_BYTES = 129 * 1024 * 1024
@@ -186,6 +194,8 @@ def private_bytes(path, maximum):
         return stream.read(maximum + 1)
 
 
+
+
 class AtomicPublicationUncertain(OSError):
     def __init__(self):
         super().__init__('native atomic publication uncertain')
@@ -304,6 +314,44 @@ class _AtomicPublisher:
 
 
 _atomic_publisher = _AtomicPublisher()
+
+
+def credential_bytes(path):
+    data = private_bytes(path, MAX_CREDENTIAL_BYTES)
+    # The file may grow after the pre-read stat.
+    if len(data) > MAX_CREDENTIAL_BYTES:
+        raise ValueError('native credential exceeds byte budget')
+    return data
+
+
+def credential_json(data):
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate credential JSON field')
+            result[key] = value
+        return result
+    def invalid_constant(_):
+        raise ValueError('nonfinite credential JSON number')
+    value = json.loads(data.decode('utf-8'), object_pairs_hook=unique_object,
+                       parse_constant=invalid_constant)
+    def valid_scalars(item):
+        if isinstance(item, str):
+            item.encode('utf-8', errors='strict')
+        elif isinstance(item, dict):
+            for key, child in item.items():
+                valid_scalars(key)
+                valid_scalars(child)
+        elif isinstance(item, list):
+            for child in item:
+                valid_scalars(child)
+        elif isinstance(item, float) and not math.isfinite(item):
+            raise ValueError('nonfinite credential JSON number')
+    valid_scalars(value)
+    return value
+
+
 
 
 def atomic(path, data):
@@ -458,13 +506,14 @@ def refresh_auth(spec, generation, original_digest, held_lock=None):
     lock_fd = held_lock if held_lock is not None else credential_use(spec)
     auth = Path(spec['auth_file'])
     try:
-        current = private_bytes(auth, 1024 * 1024)
+        current = credential_bytes(auth)
         if hashlib.sha256(current).hexdigest() != original_digest:
             return  # Independently refreshed controller credentials always win.
-        candidate = private_bytes(generation / safe_relative(spec['auth_relative']), 1024 * 1024)
-        updated = refreshed_credential(json.loads(current), json.loads(candidate), spec['provider'])
-        if updated != json.loads(current):
-            atomic(auth, json.dumps(updated, separators=(',', ':')).encode())
+        candidate = credential_bytes(generation / safe_relative(spec['auth_relative']))
+        original = credential_json(current)
+        updated = refreshed_credential(original, credential_json(candidate), spec['provider'])
+        if updated != original:
+            atomic(auth, candidate)
     finally:
         if held_lock is None:
             os.close(lock_fd)
@@ -489,9 +538,10 @@ class RefreshCheckpoint:
         if not self.journal.exists():
             return
         record = json.loads(private_bytes(self.journal, 2 * 1024 * 1024))
+        current = credential_bytes(Path(self.spec['auth_file']))
+        credential_json(current)
         if record['state'] == 'committed':
             return
-        current = private_bytes(Path(self.spec['auth_file']), 1024 * 1024)
         digest = hashlib.sha256(current).hexdigest()
         if record.get('result_digest') == digest:
             atomic(self.journal, json.dumps({'state': 'committed', 'result_digest': digest}).encode())
@@ -551,8 +601,8 @@ class RefreshCheckpoint:
             raise ValueError('credential refresh already in progress')
         try:
             self.recover()
-            self.current = private_bytes(Path(self.spec['auth_file']), 1024 * 1024)
-            original = json.loads(self.current)
+            self.current = credential_bytes(Path(self.spec['auth_file']))
+            original = credential_json(self.current)
             container, token = ('claudeAiOauth', 'refreshToken') if self.spec['provider'] == 'claude' else ('tokens', 'refresh_token')
             if 'scope' in data and (not isinstance(data['scope'], str) or set(data['scope'].split()) != set(original[container]['scopes'])):
                 raise ValueError('refresh request changes credential scope')
@@ -576,8 +626,8 @@ class RefreshCheckpoint:
         data = json.loads(response)
         if not isinstance(data, dict):
             raise ValueError('invalid refresh response schema')
-        original = json.loads(self.current)
-        updated = json.loads(self.current)
+        original = credential_json(self.current)
+        updated = credential_json(self.current)
         if self.spec['provider'] == 'claude':
             tokens = updated['claudeAiOauth']
             tokens['accessToken'] = data['access_token']
@@ -597,9 +647,11 @@ class RefreshCheckpoint:
                 updated['last_refresh'] = datetime.datetime.fromtimestamp(received_at_ms / 1000, datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
         refreshed_credential(original, updated, self.spec['provider'])
         target = Path(self.spec['auth_file'])
-        if private_bytes(target, 1024 * 1024) != self.current:
+        if credential_bytes(target) != self.current:
             raise ValueError('credential changed during refresh checkpoint')
-        encoded = json.dumps(updated, separators=(',', ':')).encode()
+        encoded = json.dumps(updated, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode('utf-8')
+        if len(encoded) > MAX_CREDENTIAL_BYTES:
+            raise ValueError('native credential exceeds byte budget')
         record['result_digest'] = hashlib.sha256(encoded).hexdigest()
         atomic(self.journal, json.dumps(record).encode())
         atomic(target, encoded)
@@ -644,8 +696,8 @@ def runtime_seed(runtime, auth_file, auth_relative):
                 entries.append((str(item.relative_to(home)), data))
     original = None
     if auth_file:
-        data = private_bytes(Path(auth_file), 1024 * 1024)
-        json.loads(data)
+        data = credential_bytes(Path(auth_file))
+        credential_json(data)
         original = hashlib.sha256(data).hexdigest()
         previous = private_json(runtime / 'complete.json') if (runtime / 'complete.json').exists() else {}
         # Preserve an OAuth refresh produced inside this isolated conversation.

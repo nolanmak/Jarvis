@@ -741,6 +741,8 @@ os.kill(os.getpid(),signal.SIGKILL)
                     host.close(); os.close(lock)
 
 
+
+
 class AtomicPublicationTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(); self.addCleanup(self.temporary.cleanup)
@@ -1022,6 +1024,263 @@ class AtomicPublicationTests(unittest.TestCase):
         self.assertEqual(len(outcomes), 2)
         self.assertTrue(any(str(error) == 'native atomic publication uncertain' for error in outcomes))
         self.assertTrue(any(type(error) is OSError and str(error) == 'storage sync uncertain' for error in outcomes))
+
+
+
+
+class CredentialRoundtripTests(unittest.TestCase):
+    limit = 1024 * 1024
+
+    def fixture(self, root, provider, padding=''):
+        token = 'header.' + base64.urlsafe_b64encode(b'{"sub":"same","iss":"issuer","aud":"client"}').decode().rstrip('=') + '.signature'
+        if provider == 'claude':
+            original = {'padding': padding, 'claudeAiOauth': {
+                'accessToken': 'old-access', 'refreshToken': 'old-refresh', 'expiresAt': 1,
+                'scopes': ['inference'], 'subscriptionType': 'max'}}
+            authority, route = 'platform.claude.com:443', '/v1/oauth/token'
+            # Public native OAuth client identifier, never an issuer credential.
+            client = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+        else:
+            original = {'padding': padding, 'tokens': {'access_token': 'old-access',
+                'refresh_token': 'old-refresh', 'id_token': token}, 'last_refresh': 'old'}
+            authority, route = 'auth.openai.com:443', '/oauth/token'
+            client = 'app_EMoamEEZ73f0CkXaXp7hrann'
+        spec = {'refresh_auth': True, 'provider': provider, 'auth_file': str(root / (provider + '.json')),
+                'credential_directory': str(root), 'auth_relative': 'auth.json'}
+        auth = Path(spec['auth_file'])
+        vm.atomic(auth, json.dumps(original, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
+        request = {'authority': authority, 'method': 'POST', 'path': route}
+        body = json.dumps({'grant_type': 'refresh_token', 'refresh_token': 'old-refresh', 'client_id': client}).encode()
+        return spec, original, request, body
+
+    def test_oversized_rotation_stays_received_and_blocks_reissue_for_both_providers(self):
+        for provider in ('claude', 'codex'):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
+                spec, original, request, body = self.fixture(Path(directory), provider, 'p' * 900000)
+                auth = Path(spec['auth_file']); before = auth.read_bytes()
+                response = json.dumps({'access_token': 'a' * 131072, 'refresh_token': 'r' * 131072,
+                                       'expires_in': 3600, 'scope': 'inference'}).encode()
+                lock = vm.credential_use(spec)
+                try:
+                    checkpoint = vm.RefreshCheckpoint(spec, lock)
+                    self.assertTrue(checkpoint.begin(request, {'tls': True, 'allow_loopback': False}, body))
+                    checkpoint.sent()
+                    try:
+                        with self.assertRaises(ValueError):
+                            checkpoint.commit(response, 1000)
+                    finally:
+                        checkpoint.end()
+                    record = json.loads(checkpoint.journal.read_bytes())
+                    self.assertEqual(record['state'], 'received')
+                    self.assertNotIn('result_digest', record)
+                    self.assertEqual(record['received_at_ms'], 1000)
+                    self.assertEqual(base64.b64decode(record['response']), response)
+                    self.assertEqual(auth.read_bytes(), before)
+                    for _ in range(2):
+                        with self.assertRaises(ValueError):
+                            checkpoint.begin(request, {'tls': True, 'allow_loopback': False}, body)
+                        with self.assertRaises(ValueError):
+                            vm.RefreshCheckpoint(spec, lock)
+                        self.assertEqual(auth.read_bytes(), before)
+                        self.assertEqual(json.loads(checkpoint.journal.read_bytes()), record)
+                finally:
+                    os.close(lock)
+
+    def test_direct_unicode_export_remains_readable_without_ascii_expansion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec, original, _, _ = self.fixture(root, 'claude', 'é' * 200000)
+            auth = Path(spec['auth_file']); before = auth.read_bytes()
+            updated = json.loads(before)
+            updated['claudeAiOauth']['accessToken'] = 'new-access'
+            candidate = json.dumps(updated, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+            self.assertLess(len(candidate), self.limit)
+            self.assertGreater(len(json.dumps(updated).encode()), self.limit)
+            generation = root / 'generation'; generation.mkdir(mode=0o700)
+            vm.atomic(generation / 'auth.json', candidate)
+            vm.refresh_auth(spec, generation, hashlib.sha256(before).hexdigest())
+            self.assertEqual(vm.private_bytes(auth, self.limit), candidate)
+            self.assertEqual(json.loads(auth.read_bytes()), updated)
+
+    def test_checkpoint_exact_encoded_boundary_and_one_byte_excess(self):
+        for provider in ('claude', 'codex'):
+            for excess in (0, 1):
+                with self.subTest(provider=provider, excess=excess), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    spec, original, request, body = self.fixture(root, provider)
+                    updated = json.loads(json.dumps(original))
+                    if provider == 'claude':
+                        updated['claudeAiOauth'].update(accessToken='new-access', refreshToken='new-refresh', expiresAt=3601000)
+                    else:
+                        updated['tokens'].update(access_token='new-access', refresh_token='new-refresh')
+                        updated['last_refresh'] = '1970-01-01T00:00:01Z'
+                    padding = 'p' * (self.limit + excess - len(json.dumps(updated, separators=(',', ':')).encode()))
+                    original['padding'] = padding; updated['padding'] = padding
+                    expected = json.dumps(updated, separators=(',', ':')).encode()
+                    self.assertEqual(len(expected), self.limit + excess)
+                    auth = Path(spec['auth_file'])
+                    before = json.dumps(original, separators=(',', ':')).encode()
+                    self.assertLessEqual(len(before), self.limit)
+                    vm.atomic(auth, before)
+                    lock = vm.credential_use(spec)
+                    try:
+                        checkpoint = vm.RefreshCheckpoint(spec, lock)
+                        checkpoint.begin(request, {'tls': True, 'allow_loopback': False}, body); checkpoint.sent()
+                        response = b'{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}'
+                        try:
+                            if excess:
+                                with self.assertRaises(ValueError): checkpoint.commit(response, 1000)
+                            else:
+                                checkpoint.commit(response, 1000)
+                        finally:
+                            checkpoint.end()
+                        self.assertEqual(auth.read_bytes(), before if excess else expected)
+                        self.assertEqual(json.loads(checkpoint.journal.read_bytes())['state'], 'received' if excess else 'committed')
+                        if not excess:
+                            vm.RefreshCheckpoint(spec, lock)
+                            self.assertEqual(vm.runtime_seed(root / 'runtime', str(auth), 'auth.json')[0], [('auth.json', expected)])
+                    finally:
+                        os.close(lock)
+
+    def test_direct_export_rejects_ambiguous_or_non_utf8_json_without_mutation(self):
+        for variant in ('duplicate', 'nan', 'overflow', 'surrogate', 'utf16', 'utf32'):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                spec, original, _, _ = self.fixture(root, 'claude')
+                auth = Path(spec['auth_file']); before = auth.read_bytes()
+                updated = json.loads(before); updated['claudeAiOauth']['accessToken'] = 'new-access'
+                valid = json.dumps(updated)
+                if variant == 'duplicate': candidate = valid.replace('"padding": ""', '"padding":"forged","padding":""').encode()
+                elif variant == 'nan': candidate = valid.replace('"expiresAt": 1', '"expiresAt": NaN').encode()
+                elif variant == 'overflow': candidate = valid.replace('"expiresAt": 1', '"expiresAt": 1e9999').encode()
+                elif variant == 'surrogate': candidate = valid.replace('new-access', 'new-\\ud800').encode()
+                else: candidate = valid.encode('utf-16' if variant == 'utf16' else 'utf-32')
+                generation = root / 'generation'; generation.mkdir(mode=0o700)
+                vm.atomic(generation / 'auth.json', candidate)
+                with self.assertRaises(ValueError):
+                    vm.refresh_auth(spec, generation, hashlib.sha256(before).hexdigest())
+                self.assertEqual(auth.read_bytes(), before)
+
+    def test_growing_credential_read_is_rejected_after_actual_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'auth.json'
+            path.write_bytes(b'{}'); path.chmod(0o600)
+            stream = mock.MagicMock()
+            descriptor = os.open(path, os.O_RDONLY)
+            stream.__enter__.return_value = stream
+            stream.fileno.return_value = descriptor
+            stream.read.return_value = b'p' * (self.limit + 1)
+            try:
+                with mock.patch.object(vm.os, 'open', return_value=descriptor), mock.patch.object(vm.os, 'fdopen', return_value=stream):
+                    with self.assertRaises(ValueError): vm.credential_bytes(path)
+                stream.read.assert_called_once_with(self.limit + 1)
+            finally:
+                os.close(descriptor)
+
+    def test_gateway_oversize_receipt_blocks_success_and_reissue(self):
+        gateway_spec = importlib.util.spec_from_file_location('roundtrip_gateway', HERE / 'native-provider-gateway.py')
+        gateway = importlib.util.module_from_spec(gateway_spec); gateway_spec.loader.exec_module(gateway)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec, _, request, body = self.fixture(root, 'claude', 'p' * 900000)
+            auth = Path(spec['auth_file']); before = auth.read_bytes()
+            lock = vm.credential_use(spec)
+            checkpoint = vm.RefreshCheckpoint(spec, lock)
+            policy = {'version': 1, 'authorities': [{'authority': request['authority'], 'tls': True,
+                'allow_loopback': False, 'routes': [{'path_prefix': request['path'], 'exact': True,
+                'methods': ['POST'], 'websocket': False}]}]}
+            frames = []
+            host = gateway.HostGateway(policy, frames.append, refresh_checkpoint=checkpoint)
+            response = mock.Mock(status=200)
+            response.getheaders.return_value = [('Content-Type', 'application/json')]
+            response.read.return_value = json.dumps({'access_token': 'a' * 131072,
+                'refresh_token': 'r' * 131072, 'expires_in': 3600}).encode()
+            try:
+                with mock.patch.object(gateway, 'safe_socket', return_value=mock.Mock()) as connect, mock.patch.object(gateway.http.client, 'HTTPResponse', return_value=response):
+                    state = gateway.State(); state.queue.put({'type': 'gateway_data', 'decoded': body}); state.queue.put({'type': 'gateway_end'})
+                    host.serve('test', state, dict(request, id='test'))
+                self.assertEqual(connect.return_value.sendall.call_count, 1)
+                self.assertTrue(any(frame['type'] == 'gateway_error' for frame in frames))
+                self.assertFalse(any(frame['type'] in ('gateway_headers', 'gateway_data', 'gateway_end') for frame in frames))
+                self.assertEqual(json.loads(checkpoint.journal.read_bytes())['state'], 'received')
+                self.assertEqual(auth.read_bytes(), before)
+                with self.assertRaises(ValueError): checkpoint.begin(request, {'tls': True, 'allow_loopback': False}, body)
+            finally:
+                host.close(); os.close(lock)
+
+    def test_checkpoint_write_failures_preserve_lineage_and_recover_without_rotation(self):
+        for provider in ('claude', 'codex'):
+            for fail_at in (1, 2, 3, 4):
+                with self.subTest(provider=provider, fail_at=fail_at), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    spec, _, request, body = self.fixture(root, provider)
+                    auth = Path(spec['auth_file']); before = auth.read_bytes()
+                    response = b'{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}'
+                    lock = vm.credential_use(spec)
+                    try:
+                        checkpoint = vm.RefreshCheckpoint(spec, lock)
+                        checkpoint.begin(request, {'tls': True, 'allow_loopback': False}, body); checkpoint.sent()
+                        real_atomic = vm.atomic
+                        calls = []
+                        def failing_atomic(path, data):
+                            calls.append(path)
+                            if len(calls) == fail_at: raise OSError('synthetic publication failure')
+                            real_atomic(path, data)
+                        try:
+                            with mock.patch.object(vm, 'atomic', side_effect=failing_atomic):
+                                with self.assertRaises(OSError): checkpoint.commit(response, 1000)
+                        finally:
+                            checkpoint.end()
+                        self.assertEqual(len(calls), fail_at)
+                        record = json.loads(checkpoint.journal.read_bytes())
+                        self.assertEqual(record['state'], 'pending' if fail_at == 1 else 'received')
+                        self.assertEqual(auth.read_bytes() == before, fail_at <= 3)
+                        if fail_at == 1:
+                            with self.assertRaises(ValueError): vm.RefreshCheckpoint(spec, lock)
+                            self.assertEqual(auth.read_bytes(), before)
+                        else:
+                            self.assertEqual(record['received_at_ms'], 1000)
+                            self.assertEqual(base64.b64decode(record['response']), response)
+                            vm.RefreshCheckpoint(spec, lock)
+                            updated = json.loads(auth.read_bytes())
+                            if provider == 'claude':
+                                self.assertEqual(updated['claudeAiOauth']['expiresAt'], 3601000)
+                                self.assertEqual(updated['claudeAiOauth']['refreshToken'], 'new-refresh')
+                            else:
+                                self.assertEqual(updated['last_refresh'], '1970-01-01T00:00:01Z')
+                                self.assertEqual(updated['tokens']['refresh_token'], 'new-refresh')
+                            committed = auth.read_bytes()
+                            vm.RefreshCheckpoint(spec, lock)
+                            self.assertEqual(auth.read_bytes(), committed)
+                            self.assertEqual(json.loads(checkpoint.journal.read_bytes())['state'], 'committed')
+                    finally:
+                        os.close(lock)
+
+    def test_unchanged_direct_export_does_not_publish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec, original, _, _ = self.fixture(root, 'claude')
+            auth = Path(spec['auth_file']); before = auth.read_bytes()
+            generation = root / 'generation'; generation.mkdir(mode=0o700)
+            vm.atomic(generation / 'auth.json', json.dumps(original, indent=2).encode())
+            with mock.patch.object(vm, 'atomic', side_effect=AssertionError('unexpected publication')):
+                vm.refresh_auth(spec, generation, hashlib.sha256(before).hexdigest())
+            self.assertEqual(auth.read_bytes(), before)
+
+    def test_committed_marker_cannot_make_oversized_legacy_credential_readable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec, _, _, _ = self.fixture(root, 'claude')
+            auth = Path(spec['auth_file'])
+            vm.atomic(auth, json.dumps({'padding': 'p' * self.limit}).encode())
+            vm.atomic(auth.with_name(auth.name + '.refresh-checkpoint.json'), b'{"state":"committed","result_digest":"old"}')
+            lock = vm.credential_use(spec)
+            try:
+                with self.assertRaises(ValueError):
+                    vm.RefreshCheckpoint(spec, lock)
+            finally:
+                os.close(lock)
+
 
 
 if __name__ == '__main__':
