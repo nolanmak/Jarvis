@@ -59,7 +59,7 @@ class AptInstallTests(unittest.TestCase):
         self.assertEqual((code, len(calls)), (0, 4))
 
     def test_non_dns_and_mixed_security_errors_do_not_fallback(self):
-        for output in ['E: Unable to locate package bogus', "Temporary failure resolving 'archive.ubuntu.com'\nE: The repository is not signed.", "Temporary failure resolving 'archive.ubuntu.com'\nE: Could not get lock /var/lib/dpkg/lock"]:
+        for output in ['E: Unable to locate package bogus', "Temporary failure resolving 'archive.ubuntu.com'\nE: The repository is not signed.", "Temporary failure resolving 'archive.ubuntu.com'\nE: Could not get lock /var/lib/dpkg/lock", "Temporary failure resolving 'archive.ubuntu.com'\nE: Failed to fetch https://example.invalid/package 404 Not Found"]:
             with self.subTest(output=output):
                 code, calls, sources = self.exercise([(100, output)])
                 self.assertEqual((code, len(calls), sources), (100, 1, []))

@@ -148,6 +148,13 @@ A review hold does not establish whether model work was billed. Inspect the
 workflow's resource counters and confirmed-merge allowance separately. Historical
 hold reasons remain historical records; a new deployment does not rewrite them.
 
+Hosted APT setup retries a confirmed Ubuntu mirror DNS failure once against
+`https://mirrors.edge.kernel.org/ubuntu/`, using the runner's Ubuntu suite and
+archive signature keyring. Temporary source options apply only to that retry;
+host DNS and source files stay unchanged. Signature, lock, package and subsequent
+fallback failures remain failures. The installer is part of the controller's
+pinned CI policy, so changing it requires the normal controller rollout.
+
 After repairing an internal execution failure, authenticated `autopr resume
 --workflow WORKFLOW` can queue recovery of the preserved attempt. Use the
 installation's native/resource policy selection; an unconfigured shell can

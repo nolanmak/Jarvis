@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Install CI packages, with one signed Ubuntu mirror fallback for DNS failures.
+
+Temporary APT source options apply only to the fallback commands. Host source
+files, signature keys and system DNS configuration are never changed.
+"""
+import argparse
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import tempfile
+
+
+def dns_failure(output):
+    if not re.search(r'Temporary failure resolving|Could not resolve', output):
+        return False
+    # A mixed error must not turn a signature, lock or package failure into a
+    # mirror retry. Only APT's DNS/fetch aggregation diagnostics are eligible.
+    for line in output.splitlines():
+        if line.startswith('E: Failed to fetch ') and not re.search(r'Temporary failure resolving|Could not resolve', line):
+            return False
+        if line.startswith('E:') and not any(text in line for text in (
+            'Failed to fetch ', 'Some index files failed to download',
+            'Unable to fetch some archives')):
+            return False
+    return not re.search(r'NO_PUBKEY|not signed|signatures? (?:could|couldn|were|could not)|Hash Sum mismatch|Certificate verification failed', output, re.I)
+
+
+def install(packages, *, run=subprocess.run, root=Path('/'), architecture=None):
+    if not packages or any(not re.fullmatch(r'[a-z0-9][a-z0-9+.\-]*(?::[a-z0-9]+)?', p) for p in packages):
+        raise ValueError('expected explicit APT package names')
+    common = ['sudo', 'apt-get', '-o', 'Acquire::Retries=0',
+              '-o', 'Acquire::http::Timeout=20', '-o', 'Acquire::https::Timeout=20',
+              '-o', 'APT::Update::Error-Mode=any',
+              '-o', 'Acquire::AllowInsecureRepositories=false',
+              '-o', 'Acquire::AllowDowngradeToInsecureRepositories=false',
+              '-o', 'APT::Get::AllowUnauthenticated=false']
+
+    def execute(options):
+        for action in [['update'], ['install', '-y', '--no-install-recommends', *packages]]:
+            result = run([*common, *options, *action], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, text=True, timeout=600)
+            print(result.stdout, end='', flush=True)
+            if result.returncode:
+                return result
+        return result
+
+    result = execute([])
+    if not result.returncode or not dns_failure(result.stdout):
+        return result.returncode
+
+    release = {}
+    for line in (root / 'etc/os-release').read_text().splitlines():
+        if '=' in line:
+            key, value = line.split('=', 1)
+            values = shlex.split(value)
+            release[key] = values[0] if len(values) == 1 else ''
+    suite = release.get('VERSION_CODENAME')
+    keyring = root / 'usr/share/keyrings/ubuntu-archive-keyring.gpg'
+    if architecture is None:
+        architecture = subprocess.check_output(['dpkg', '--print-architecture'], text=True).strip()
+    if release.get('ID') != 'ubuntu' or suite not in ('noble', 'resolute') or architecture not in ('amd64', 'amd64v3') or not keyring.is_file():
+        print('DNS fallback unavailable: unsupported Ubuntu suite/architecture or missing archive keyring', flush=True)
+        return result.returncode
+
+    print('APT DNS failure: retrying once against kernel.org with Ubuntu archive signatures required', flush=True)
+    with tempfile.TemporaryDirectory(prefix='jarvis-ci-apt-') as directory:
+        # The unprivileged _apt downloader needs read/traverse permission.
+        os.chmod(directory, 0o755)
+        source = Path(directory) / 'ubuntu.sources'
+        source.write_text(f'Types: deb\nURIs: https://mirrors.edge.kernel.org/ubuntu/\n'
+                          f'Suites: {suite} {suite}-updates {suite}-security {suite}-backports\n'
+                          f'Components: main restricted universe multiverse\n'
+                          f'Architectures: {architecture}\nSigned-By: {keyring}\n')
+        source.chmod(0o644)
+        return execute(['-o', f'Dir::Etc::sourcelist={source}',
+                        '-o', 'Dir::Etc::sourceparts=-']).returncode
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('packages', nargs='+')
+    raise SystemExit(install(parser.parse_args().packages))
