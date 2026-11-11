@@ -697,3 +697,121 @@ async fn a_host_signal_interrupts_a_discord_turn_without_wedging_the_channel() {
 async fn a_host_signal_interrupts_a_slack_turn_without_wedging_the_thread() {
     a_host_signal_interrupts_without_wedging(slack("C00000010", Some("1700000000.001000"))).await;
 }
+
+// #1986 — a slow turn is attributed from its own log lines: every timing event
+// carries the time the turn was received (not a later re-read of the clock) and
+// names what spent the conversation's budget.
+type TimingEvent = std::collections::BTreeMap<String, String>;
+
+#[derive(Default)]
+struct TimingLog(Mutex<Vec<(String, TimingEvent)>>);
+
+impl TimingLog {
+    fn event(&self, message: &str) -> TimingEvent {
+        let events = self.0.lock().unwrap();
+        events
+            .iter()
+            .find(|(recorded, _)| recorded.as_str() == message)
+            .map(|(_, fields)| fields.clone())
+            .unwrap_or_else(|| {
+                panic!(
+                    "no {message:?} event in {:?}",
+                    events.iter().map(|(m, _)| m).collect::<Vec<_>>()
+                )
+            })
+    }
+}
+
+struct TimingFields(TimingEvent);
+
+impl tracing::field::Visit for TimingFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_string(), format!("{value:?}"));
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_u128(&mut self, field: &tracing::field::Field, value: u128) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+}
+
+impl tracing::Subscriber for TimingLog {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = TimingFields(TimingEvent::new());
+        event.record(&mut fields);
+        if let Some(message) = fields.0.remove("message") {
+            self.0.lock().unwrap().push((message, fields.0));
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+async fn timing_events_name_the_receipt_and_the_budget_consumer(chat: SurfaceConversationRef) {
+    let (_dir, store) = store();
+    let provider = RecordingNativeProvider::new(ProviderKind::Claude);
+    let turn = SurfaceTurnRef::new(chat.clone(), "t:timing").unwrap();
+    let log = Arc::new(TimingLog::default());
+    let guard = tracing::subscriber::set_default(Arc::clone(&log));
+    answered(run(&store, &provider, &turn, "", "how long did that take?", None, None).await.unwrap());
+    drop(guard);
+
+    let platform = chat.account().platform().as_str();
+    let label = if platform == "discord" { "Discord" } else { "surface" };
+    let dispatched = log.event(&format!("{label} native turn handler dispatched"));
+    let completed = log.event(&format!("{label} native turn timing"));
+
+    let consumer = format!("{platform}:claude");
+    for (message, event) in [("dispatch", &dispatched), ("completion", &completed)] {
+        let received = event
+            .get("received_at_ms")
+            .unwrap_or_else(|| panic!("{message} event has no receipt time: {event:?}"));
+        assert!(received.parse::<u128>().is_ok(), "{message}: {received:?}");
+        assert_eq!(
+            event.get("budget_consumer").map(String::as_str),
+            Some(consumer.as_str()),
+            "{message} event must name what spent the budget: {event:?}"
+        );
+    }
+    assert_eq!(
+        dispatched["received_at_ms"], completed["received_at_ms"],
+        "completion logging must reuse the original receipt time"
+    );
+    assert!(
+        dispatched["received_at_ms"].parse::<u128>().unwrap()
+            <= dispatched["handler_dispatched_at_ms"].parse::<u128>().unwrap(),
+        "the turn is received before it is dispatched: {dispatched:?}"
+    );
+    // The existing per-platform event shapes are unchanged.
+    for field in ["answer_completed_at_ms", "native_submitted_at_ms", "first_text_output_at_ms"] {
+        assert!(completed.contains_key(field), "{field} missing from {completed:?}");
+    }
+    if platform == "discord" {
+        assert_eq!(completed.get("guild").map(String::as_str), Some(chat.account().account_id()));
+    } else {
+        assert_eq!(completed.get("platform").map(String::as_str), Some(platform));
+    }
+}
+
+#[tokio::test]
+async fn discord_timing_events_name_the_receipt_and_the_budget_consumer() {
+    timing_events_name_the_receipt_and_the_budget_consumer(discord_channel()).await;
+}
+
+#[tokio::test]
+async fn slack_timing_events_name_the_receipt_and_the_budget_consumer() {
+    timing_events_name_the_receipt_and_the_budget_consumer(slack(
+        "C00000011",
+        Some("1700000000.001100"),
+    ))
+    .await;
+}

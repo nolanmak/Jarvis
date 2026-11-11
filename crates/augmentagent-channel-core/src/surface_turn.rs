@@ -251,6 +251,9 @@ where
 {
     let turn = request.turn;
     let chat = turn.conversation();
+    // Read the clock before the queue: a turn that waited for an earlier one
+    // must be attributed from when it arrived, not from when it got the queue.
+    let received_at_ms = now_ms();
     // Text and phone enter through different transport queues. Serialize at
     // their common native-session boundary before reading the binding or
     // claiming a turn, so a second input resumes the first input's session.
@@ -321,12 +324,21 @@ where
         chat.account().account_id(),
         chat.conversation_id(),
     );
+    // Who spent this conversation's turn budget: the provider that ran it, on
+    // the surface that owns the shared queue.
+    let budget_consumer = format!(
+        "{}:{}",
+        chat.account().platform().as_str(),
+        provider.name()
+    );
     if discord {
         tracing::info!(turn_id = %turn_id, guild = %account, channel = %conversation,
+            received_at_ms, budget_consumer = %budget_consumer,
             handler_dispatched_at_ms, "Discord native turn handler dispatched");
     } else {
         tracing::info!(turn_id = %turn_id, platform = chat.account().platform().as_str(),
             account = %account, conversation = %conversation, thread = ?chat.thread_id(),
+            received_at_ms, budget_consumer = %budget_consumer,
             handler_dispatched_at_ms, "surface native turn handler dispatched");
     }
     let run = CURRENT.scope(Arc::clone(&session), answer(prompt));
@@ -341,12 +353,14 @@ where
     let answer_completed_at_ms = now_ms();
     if discord {
         tracing::info!(turn_id = %turn_id, guild = %account, channel = %conversation,
+            received_at_ms, budget_consumer = %budget_consumer,
             ?handler_dispatched_at_ms, ?answer_completed_at_ms,
             native_submitted_at_ms = ?session.native_submitted_at_ms(),
             first_text_output_at_ms = ?session.first_text_output_at_ms(),
             "Discord native turn timing");
     } else {
         tracing::info!(turn_id = %turn_id, platform = chat.account().platform().as_str(),
+            received_at_ms, budget_consumer = %budget_consumer,
             ?handler_dispatched_at_ms, ?answer_completed_at_ms, cancelled = answered.is_none(),
             native_submitted_at_ms = ?session.native_submitted_at_ms(),
             first_text_output_at_ms = ?session.first_text_output_at_ms(),
