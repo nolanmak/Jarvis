@@ -58,6 +58,13 @@ pub enum Stage {
     Merged,
 }
 
+/// Exact controller review causes shared by safe progress projection and the
+/// existing explicit owner-retry path. This never grants review or merge approval.
+pub(crate) fn is_review_hold_reason(reason: &str) -> bool {
+    matches!(reason, "provenance-unknown" | "no-reviewer-capacity" | "reviewer-latched"
+        | "review-evidence-budget" | "review-recovery-required")
+}
+
 /// Stable identity survives branch renames and changed heads. Repository must
 /// be the canonical owner/name returned by the trusted repository adapter.
 pub fn workflow_id(repo: &str, issue: u64) -> Result<String> {
@@ -199,6 +206,47 @@ fn observation_capacity(conn: &Connection, now_ms: i64, required: u64, cap: u64,
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClaimPurpose { General, Productive, MergeReconciliation }
+
+#[cfg(test)]
+mod acceptance_input_wait_claim_tests {
+    use super::*;
+    #[test]
+    fn acceptance_input_wait_claim_is_atomic_and_preserves_charges_and_guards() {
+        for reason in ["acceptance_verifier_repair_exhausted","acceptance_contract_invalid"] {
+            for change in ["head","contract","environment"] {
+                let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+                let mut store=WorkflowStore::open(&path).unwrap();
+                let binding=Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"environment".into()};
+                store.register("owner/repo#1","fixture",binding.clone(),1).unwrap();
+                let mut stale=WorkflowStore::open(&path).unwrap();
+                let setup=store.claim("owner/repo#1","first",2,1000).unwrap().unwrap();
+                store.charge(&setup,"prior-paid-work",ResourceCharge {model_calls:3,tokens:700,wall_ms:5},3).unwrap();
+                let mut checkpoint=store.snapshot(&setup.workflow).unwrap().unwrap().checkpoint;
+                checkpoint.stage=Stage::Scope;
+                checkpoint.next=NextAction {reason:reason.into(),action:"await_acceptance_input_change".into(),eligible_at_ms:0};
+                store.checkpoint(&setup,&checkpoint,4).unwrap();store.release(&setup,5).unwrap();
+                let before=store.snapshot(&setup.workflow).unwrap().unwrap();let events=store.events(&setup.workflow).unwrap();
+                for now in [6,86_400_001,2*86_400_000] {
+                    assert!(stale.claim_productive_for_binding(&setup.workflow,"stale-reader",now,1000,&binding).unwrap().is_none());
+                    assert!(stale.claim_productive(&setup.workflow,"unbound-reader",now,1000).unwrap().is_none());
+                    assert_eq!(store.snapshot(&setup.workflow).unwrap().unwrap(),before);
+                    assert_eq!(store.events(&setup.workflow).unwrap(),events);
+                }
+                let mut changed=binding.clone();
+                match change {"head"=>changed.head="new-head".into(),"contract"=>changed.contract="new-contract".into(),_=>changed.evidence_hash="new-environment".into()}
+                store.set_owner_pause(&setup.workflow,"owner",0,true,3*86_400_000).unwrap();
+                assert!(stale.claim_productive_for_binding(&setup.workflow,"paused",3*86_400_000+1,1000,&changed).unwrap().is_none());
+                store.set_owner_pause(&setup.workflow,"owner",1,false,3*86_400_000+2).unwrap();
+                let next=stale.claim_productive_for_binding(&setup.workflow,"changed-input",3*86_400_000+3,1000,&changed).unwrap().unwrap();
+                assert!(store.claim_productive_for_binding(&setup.workflow,"racer",3*86_400_000+4,1000,&changed).unwrap().is_none());
+                let after=store.snapshot(&setup.workflow).unwrap().unwrap();
+                assert_eq!((after.model_calls,after.tokens,after.wall_ms),(3,700,5));
+                assert_eq!(after.attempts,before.attempts+1);
+                stale.release(&next,3*86_400_000+5).unwrap();
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct MissingScopeResponse;
@@ -713,13 +761,21 @@ impl WorkflowStore {
     /// Free merge reconciliation preserves command holds and merge ceilings.
     /// Eligibility and ownership are checked atomically with the new lease.
     pub fn claim_reconciliation(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64) -> Result<Option<Lease>> {
-        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::MergeReconciliation)
+        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::MergeReconciliation, None)
     }
 
     /// Productive workers cannot restart command holds or spend models on work
     /// awaiting free reconciliation. A stale preview cannot authorize a claim.
     pub fn claim_productive(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64) -> Result<Option<Lease>> {
-        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::Productive)
+        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::Productive, None)
+    }
+
+    /// A changed input binding may re-enter ordinary admission. Checking the
+    /// current checkpoint and that binding shares the claim transaction.
+    pub(crate) fn claim_productive_for_binding(&mut self, workflow:&str, owner:&str,
+        now_ms:i64, ttl_ms:i64, binding:&Binding)->Result<Option<Lease>> {
+        binding.validate()?;
+        self.claim_inner(workflow,owner,now_ms,ttl_ms,ClaimPurpose::Productive,Some(binding))
     }
 
     pub fn claim(
@@ -729,10 +785,10 @@ impl WorkflowStore {
         now_ms: i64,
         ttl_ms: i64,
     ) -> Result<Option<Lease>> {
-        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::General)
+        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::General, None)
     }
 
-    fn claim_inner(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64, purpose: ClaimPurpose) -> Result<Option<Lease>> {
+    fn claim_inner(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64, purpose: ClaimPurpose, binding:Option<&Binding>) -> Result<Option<Lease>> {
         ensure!(
             !owner.is_empty() && ttl_ms > 0,
             "owner and positive lease ttl required"
@@ -752,6 +808,13 @@ impl WorkflowStore {
             bail!("unknown workflow");
         };
         let cp: Checkpoint = serde_json::from_str(&raw)?;
+        let awaiting_input=cp.stage==Stage::Scope && matches!(
+            (cp.next.reason.as_str(),cp.next.action.as_str()),
+            ("acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid","await_acceptance_input_change"));
+        if purpose==ClaimPurpose::Productive && awaiting_input
+            && binding.is_none_or(|binding|binding==&cp.binding) {
+            return Ok(None);
+        }
         // Pending owner cleanup owns this generation until checked retirement
         // settles the retry. Even free recovery must not fence that intent.
         if cp.stage == Stage::Held && cp.next.reason == "owner_execution_retry_pending" {

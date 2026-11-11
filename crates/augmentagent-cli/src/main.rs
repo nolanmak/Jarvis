@@ -1139,6 +1139,8 @@ enum AutoprOp {
     Pause(autoship_commands::control_command::Args),
     /// Clear only the explicit owner pause after access and readiness checks.
     Resume(autoship_commands::control_command::Args),
+    /// Observe an externally merged/closed target without starting model work.
+    ReconcileTarget(autoship_commands::target_reconcile::Args),
     /// Execute one admitted workflow attempt through the normal gates.
     Work(autoship_commands::work_command::WorkArgs),
     /// Durably submit an explicit issue or PR; acceptance does not mean execution.
@@ -3160,6 +3162,9 @@ async fn main() -> Result<()> {
     }
     if let Cmd::Autopr { op: AutoprOp::Work(ref args) } = cli.cmd {
         std::process::exit(autoship_commands::work_command::run(args).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::ReconcileTarget(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::target_reconcile::run(args).await);
     }
     if let Cmd::Autopr { op: AutoprOp::Pause(ref args) } = cli.cmd {
         std::process::exit(autoship_commands::control_command::run(args,true).await);
@@ -5788,6 +5793,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache { .. } } => unreachable!("cache maintenance precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::ResolveMerge { .. } } => unreachable!("merge resolution precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::ReconcileTarget(..) } => unreachable!("target reconciliation precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Work(..) } => unreachable!("work execution precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Pause(..)|AutoprOp::Resume(..) } => unreachable!("owner control precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Run(..) } => unreachable!("submission precedes application database initialization"),

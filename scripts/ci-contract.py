@@ -77,7 +77,7 @@ def condition(value,osname):
     if value=="runner.os == 'macOS'":return osname=='darwin'
     raise ValueError('unresolved job/step condition '+str(value))
 
-def host_setup(body):return bool(re.search(r'\b(sudo|apt-get|brew install)\b|playwright\s+install(?:-deps)?\b|--with-deps',body))
+def host_setup(body):return bool(re.search(r'\b(sudo|apt-get|brew install)\b|ci-apt-install\.py\b|playwright\s+install(?:-deps)?\b|--with-deps',body))
 
 def tool_prerequisites(steps,target):
     result=[]
@@ -108,7 +108,7 @@ def prerequisite_check(requirements,root):
         if requirement['kind']=='system_setup':
             # Verify declared apt packages read-only. Never sudo/install locally.
             bodies=requirement['body'].replace('\\\n',' ')
-            match=re.search(r'apt-get\s+(?:-[\w=]+\s+)*install\s+([^\n]+)',bodies)
+            match=re.search(r'(?:apt-get\s+(?:-[\w=]+\s+)*install\s+|python3\s+scripts/ci-apt-install\.py\s+)([^\n]+)',bodies)
             if not match:
                 if re.search(r'playwright\s+install(?:-deps)?\s+(?:--with-deps\s+)?chrome\b',bodies):
                     import shutil

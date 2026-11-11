@@ -91,6 +91,15 @@ class ContractTests(unittest.TestCase):
     self.assertEqual(ci.plan(c,self.args(root,probe_prerequisites=True))['checks'][0]['status'],'prerequisite_hold')
    c=self.fixture_body(c,'sudo apt-get install -y private-package')
    self.assertEqual(ci.plan(c,self.args(root))['checks'][0]['status'],'remote_required')
+ def test_ci_apt_helper_is_setup_and_only_probed_locally(self):
+  body='python3 scripts/ci-apt-install.py poppler-utils python3-yaml'
+  self.assertTrue(ci.host_setup(body))
+  requirements=ci.tool_prerequisites([{'_body':body}],'linux')
+  self.assertEqual(len(requirements),1)
+  with patch.object(ci.subprocess,'run',return_value=subprocess.CompletedProcess([],0,'install ok installed','')) as run:
+   self.assertEqual(ci.prerequisite_check(requirements,ROOT),[])
+   self.assertEqual([call.args[0][-1] for call in run.call_args_list],['poppler-utils','python3-yaml'])
+   self.assertTrue(all(call.args[0][0]=='dpkg-query' for call in run.call_args_list))
  def fixture_body(self,c,body):c['commands']['test/check/0']['body']=body;return c
  def test_shared_step_executes_same_body_env_and_directory(self):
   with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as d:

@@ -152,6 +152,9 @@ async fn select_from_inventory(repo:&Path,candidates:Vec<adoption::AdoptedPr>,dr
         let id = store.as_ref().map(|store|store.resolve_pr(&candidate.repository,candidate.pr)).transpose()?.flatten()
             .unwrap_or(candidate.workflow_id()?);
         let snapshot=store.as_ref().map(|store|store.snapshot(&id)).transpose()?.flatten();
+        if store.as_ref().map(|store|store.owner_control(&id)).transpose()?.flatten().is_some_and(|control|control.paused) {
+            continue;
+        }
         if !workflow_available(snapshot.as_ref(), now) {
             continue;
         }
@@ -341,6 +344,7 @@ async fn execute(
         .map(|c| c.requirement.clone())
         .collect();
     let mut previous = None;
+    let mut last_review_unavailable: Option<&'static str>;
     let mut round = 0;
     let mut native_sessions = None;
     loop {
@@ -385,6 +389,7 @@ async fn execute(
             },
         )
         .await;
+        last_review_unavailable = review.why_unavailable.as_ref().map(ReviewUnavailable::code);
         if let Some(why @ ReviewUnavailable::MainAdvanced { .. }) = &review.why_unavailable {
             guard.push(&pr.branch).await?;
             checkpoint_unavailable_review(guard, why, chrono::Utc::now().timestamp_millis()).await?;
@@ -614,7 +619,7 @@ async fn execute(
     guard
         .transition(
             Stage::Review,
-            "adopted_review_pending",
+            last_review_unavailable.unwrap_or("adopted_review_pending"),
             "resume_preserved_pr",
             chrono::Utc::now().timestamp_millis() + 300_000,
         )
@@ -942,6 +947,17 @@ mod tests {
 #[cfg(test)]
 mod fairness_tests {
     use super::*;
+    #[tokio::test]
+    async fn manual_target_reconciliation_pause_excludes_never_started_adoption() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");let fair=dir.path().join("fair.json");
+        let mut store=WorkflowStore::open(&path).unwrap();let paused=candidate(10);let id=paused.workflow_id().unwrap();
+        store.observe_adoption(&paused.repository,paused.pr,&paused.head,&serde_json::to_string(&paused).unwrap(),1).unwrap();
+        store.set_owner_pause(&id,"github:owner",0,true,2).unwrap();drop(store);
+        let chosen=select_from_inventory(dir.path(),vec![paused,candidate(20)],true,&path,&fair).await.unwrap().unwrap();
+        assert_eq!(chosen.pr,20);
+        assert!(WorkflowStore::open_read_only(&path).unwrap().unwrap().snapshot(&id).unwrap().is_none());
+        assert!(!fair.exists());
+    }
     fn candidate(pr: u64) -> adoption::AdoptedPr {
         adoption::AdoptedPr {
             repository: "owner/repo".into(),

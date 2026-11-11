@@ -98,7 +98,7 @@ impl WorkflowStore {
 fn code(value:&str,fallback:&str)->String {
     // Keep this vocabulary explicit. Syntactically plausible tokens can still
     // contain credentials or private content from an upstream failure.
-    if matches!(value,
+    if super::is_review_hold_reason(value) || matches!(value,
         "registered"|"scope"|"ci_pending"|"await_checks"|"await_capacity"|"complete"|
         "reverify"|"reverify_candidate"|"inputs_changed"|"protected_acceptance_stale"|
         "remote_merge_observed"|"resource_capacity"|"checks_pending"|"review_pending"|
@@ -111,6 +111,9 @@ fn code(value:&str,fallback:&str)->String {
         "acceptance_verifier_repair_exhausted"|"acceptance_verifier_evidence_unknown"|
         "acceptance_contract_invalid"|"acceptance_verifier_infrastructure_unavailable"|
         "await_acceptance_input_change"|"await_original_evidence_recovery"|"await_verifier_infrastructure_recovery"|
+        "review_main_changed"|"reconcile_main"|"resume_deferred"|"resume_preserved_work"|"resume_preserved_pr"|
+        "draft_published"|"resume"|"adopted_review_pending"|"adopted_execution_retry"|
+        "owner_execution_retry_pending"|"reconcile_runtime_retirement"|"owner_execution_retry_requested"|"resume_started"|
         "retry_worker_attempt"|"inspect_workflow"|"await_worker") {value.into()} else {fallback.into()}
 }
 
@@ -135,8 +138,17 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
         ("acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid","await_acceptance_input_change")|
         ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
         ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery")));
-    if initial_verifier_hold {kind="blocked".into();}
-    if source=="command_attempt_finished" && !initial_verifier_hold {
+    let typed_review_hold=checkpoint.as_ref().is_some_and(|c|
+        matches!(c.stage,Stage::Held|Stage::Review|Stage::Reconcile) && super::is_review_hold_reason(&c.next.reason));
+    let main_wait=checkpoint.as_ref().is_some_and(|c|c.stage==Stage::Reconcile
+        && c.next.reason=="review_main_changed" && c.next.action=="reconcile_main");
+    if initial_verifier_hold || typed_review_hold {kind="blocked".into();}
+    let generic_attempt=attempt.as_ref().is_some_and(|(outcome,why,_)|
+        (outcome=="progress" && why=="workflow-progressed") || (outcome=="deferred" && why=="workflow-held"));
+    // A successful wrapper return cannot replace the checkpoint's blocker or
+    // backoff. A distinct current execution failure still has its own outcome.
+    let preserve_checkpoint=initial_verifier_hold || (generic_attempt && (stage==Some(Stage::Held) || typed_review_hold || main_wait));
+    if source=="command_attempt_finished" && !preserve_checkpoint {
         if let Some((outcome,why,at))=&attempt {
             kind=if outcome=="progress" {"worker-progress"} else {"retry-scheduled"}.into();
             reason=code(why,"worker-attempt-finished");action="inspect_workflow".into();eligible=Some(*at);
@@ -147,6 +159,11 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     else if source=="owner_control_changed" {kind="resume-requested".into();reason="owner-resume-accepted".into();action="await_worker".into();}
     let external_merge=checkpoint.as_ref().is_some_and(|c|c.stage==Stage::Merged && c.next.reason=="external_merge_reconciled");
     let terminal=confirmed || external_merge || stage==Some(Stage::Retired);
+    if stage==Some(Stage::Retired) {
+        kind="retired".into();
+        reason=checkpoint.as_ref().map_or_else(||"workflow-state-changed".into(),|c|code(&c.next.reason,"workflow-state-changed"));
+        action="complete".into();eligible=None;
+    }
     if external_merge {kind="merged".into();reason="external-merge-observed".into();action="complete".into();eligible=None;}
     if confirmed {stage=Some(Stage::Merged);kind="merged".into();reason="autonomous-merge-confirmed".into();action="inspect_deployment".into();eligible=None;}
     let evidence=checkpoint.as_ref().map(|c|(&c.binding,&c.evidence,&c.next.reason,&c.next.action));
@@ -224,6 +241,76 @@ mod tests {
             assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,0);
             assert_eq!(WorkflowStore::open(&path).unwrap().progress_events(&id).unwrap(),events);
         }
+    }
+
+    #[test]
+    fn review_hold_survives_generic_attempt_completion_without_private_details() {
+        for reason in ["review-recovery-required", "review-evidence-budget", "reviewer-latched"] {
+          for (outcome, attempt_reason) in [(submission::AttemptOutcome::Progress,"workflow-progressed"),
+              (submission::AttemptOutcome::Deferred,"workflow-held")] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+            let mut store=WorkflowStore::open(&path).unwrap();
+            let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Pr(42),
+                provider:None,until:submission::Milestone::Merged};
+            let id=store.submit_authorized("request","owner",&request,1).unwrap().workflow;
+            store.next_command_job("owner/repo",2).unwrap().unwrap();
+            store.register(&id,"fix/one",Binding {head:"head-a".into(),contract:"contract-a".into(),evidence_hash:"dependency-a".into()},3).unwrap();
+            let lease=store.claim(&id,"worker",4,10000).unwrap().unwrap();
+            let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+            checkpoint.stage=Stage::Held;checkpoint.next=NextAction {reason:reason.into(),action:"resume_preserved_work".into(),eligible_at_ms:500};
+            checkpoint.evidence=vec!["private provider response must not be published".into()];
+            store.checkpoint(&lease,&checkpoint,5).unwrap();
+            let before=store.progress_events(&id).unwrap();
+            store.finish_command_attempt(&id,2,outcome,attempt_reason,6).unwrap();
+            let after=store.progress_events(&id).unwrap();
+            let latest=after.last().unwrap();
+            assert_eq!(latest.kind,"blocked","attempt completion hid the hold");
+            assert_eq!(latest.reason,reason);
+            assert_eq!(latest.next_action,"resume_preserved_work");
+            assert_eq!(latest.eligible_at_ms,Some(500));
+            assert_eq!(after,before,"generic attempt outcome must not add a misleading update");
+            assert_eq!(latest.actual_provider,None);
+            assert_eq!(latest.merge_state,"not-confirmed");
+            assert!(!serde_json::to_string(&after).unwrap().contains("private provider"));
+            assert_eq!(WorkflowStore::open(&path).unwrap().progress_events(&id).unwrap(),after);
+          }
+        }
+    }
+
+    #[test]
+    fn distinct_current_execution_failure_is_not_hidden_by_an_older_review_hold() {
+        let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Pr(42),provider:None,until:submission::Milestone::Merged};
+        let id=store.submit_authorized("request","owner",&request,1).unwrap().workflow;
+        store.next_command_job("owner/repo",2).unwrap().unwrap();
+        store.register(&id,"fix/one",Binding {head:"head-a".into(),contract:"contract-a".into(),evidence_hash:"dependency-a".into()},3).unwrap();
+        let lease=store.claim(&id,"worker",4,10000).unwrap().unwrap();
+        let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+        checkpoint.stage=Stage::Held;checkpoint.next=NextAction {reason:"review-recovery-required".into(),action:"resume_preserved_work".into(),eligible_at_ms:500};
+        store.checkpoint(&lease,&checkpoint,5).unwrap();
+        store.finish_command_attempt(&id,2,submission::AttemptOutcome::Deferred,"execution-readiness-blocked",600).unwrap();
+        let latest=store.progress_events(&id).unwrap().pop().unwrap();
+        assert_eq!(latest.kind,"retry-scheduled");assert_eq!(latest.reason,"execution-readiness-blocked");
+        assert_eq!(latest.eligible_at_ms,Some(store.command_attempt(&id).unwrap().unwrap().eligible_at_ms));
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint,checkpoint);
+    }
+
+    #[test]
+    fn generic_completion_preserves_main_dependency_backoff() {
+        let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Pr(42),provider:None,until:submission::Milestone::Merged};
+        let id=store.submit_authorized("request","owner",&request,1).unwrap().workflow;
+        store.next_command_job("owner/repo",2).unwrap().unwrap();
+        store.register(&id,"fix/one",Binding {head:"head-a".into(),contract:"contract-a".into(),evidence_hash:"dependency-a".into()},3).unwrap();
+        let lease=store.claim(&id,"worker",4,10000).unwrap().unwrap();
+        let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+        checkpoint.stage=Stage::Reconcile;checkpoint.next=NextAction {reason:"review_main_changed".into(),action:"reconcile_main".into(),eligible_at_ms:1000};
+        store.checkpoint(&lease,&checkpoint,5).unwrap();let before=store.progress_events(&id).unwrap();
+        store.finish_command_attempt(&id,2,submission::AttemptOutcome::Progress,"workflow-progressed",600).unwrap();
+        let after=store.progress_events(&id).unwrap();assert_eq!(after,before);
+        let latest=after.last().unwrap();assert_eq!(latest.reason,"review_main_changed");
+        assert_eq!(latest.next_action,"reconcile_main");assert_eq!(latest.eligible_at_ms,Some(1000));
+        assert_eq!(latest.merge_state,"not-confirmed");
     }
 
     #[test]

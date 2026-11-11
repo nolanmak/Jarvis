@@ -544,3 +544,98 @@ async fn all_matching_requested_items_must_fit_before_another_observation() {
         "a fitting subset must never reach a recovery observation"
     );
 }
+
+struct CorrectionCandidateContext {
+    calls: Mutex<usize>,
+    defect: bool,
+    sources: BTreeMap<String,String>,
+}
+#[async_trait::async_trait]
+impl GroupTransport for CorrectionCandidateContext {
+    async fn observe_group(&self, _provider: augmentagent_channel_core::ProviderKind,
+        opts: &augmentagent_channel_core::ReasonerOpts, prompt: &str) -> Result<(String, String)> {
+        let mut calls=self.calls.lock().unwrap();*calls+=1;
+        assert!(*calls<=2,"format correction must not acquire another observation");
+        if *calls==1 {return Ok(("not a structured review".into(),"native-fixture-first".into()));}
+        let request:serde_json::Value=serde_json::from_str(prompt)?;
+        assert_eq!(request["evidence_recovery"]["kind"],"structured_review_correction");
+        assert!(request["full_file_evidence"]["original-scope"].as_str().unwrap().contains("original assigned evidence"));
+        assert!(prompt.len()+opts.system_prompt.len()<=aligned::MAX_PROMPT_BYTES);
+        let source=request["full_file_evidence"].as_object().unwrap().values()
+            .map(|v|v.as_str().unwrap()).collect::<Vec<_>>().join("\n");
+        assert!(!source.contains("uncommitted poison"));
+        let files=request["full_file_evidence"].as_object().unwrap();
+        let any_source=self.sources.keys().any(|key|files.contains_key(key));
+        if any_source {
+            for (key,body) in &self.sources {
+                assert_eq!(files.get(key).and_then(|value|value.as_str()),Some(body.as_str()),"optional captured source must be complete and byte-exact");
+            }
+        }
+        let supplied=self.sources.keys().all(|key|files.contains_key(key));
+        let mut response=serde_json::json!({"binding":request["binding"],"decision":"incomplete","findings":[]});
+        if supplied {
+            assert!(source.contains("pinned observer fixture"));
+            assert!(request["review_scope"].as_str().unwrap().starts_with("Partial evidence group"));
+            if self.defect {
+                assert!(source.contains("input + policy_limit()"));
+                response["decision"]="changes_requested".into();
+                response["findings"]=serde_json::json!([finding("cap-overflow","apply_limit exceeds the configured policy cap")]);
+            } else {
+                assert!(source.contains("input.min(policy_limit())"));
+                response["decision"]="approve".into();
+            }
+        } else {
+            response["missing_sources"]=serde_json::json!([{"path":"logic.rs","criterion_ids":["C1"],
+                "question":"Need actual implementation to judge the assigned caller", "selector":{"kind":"whole_file"}}]);
+        }
+        Ok((response.to_string(),"native-fixture-second".into()))
+    }
+}
+
+#[tokio::test]
+async fn malformed_first_observation_reuses_captured_candidate_in_the_same_bounded_correction() {
+    for case in ["approve","defect","over-budget","escaped-over-budget"] {
+        let root=tempfile::tempdir().unwrap();git_fixture(root.path(),&["init","-q"]);
+        let padding=if case=="escaped-over-budget" {"\\".repeat(aligned::MAX_PROMPT_BYTES/2+4096)}
+            else {"x".repeat(if case=="over-budget" {aligned::MAX_PROMPT_BYTES+4096}else{4096})};
+        let implementation=if case=="defect" {"input + policy_limit()"}else{"input.min(policy_limit())"};
+        let source=format!("pub fn policy_limit() -> i32 {{ 3 }}\n/*{padding}*/\npub fn apply_limit(input:i32) -> i32 {{ {implementation} }}\n");
+        std::fs::write(root.path().join("logic.rs"),&source).unwrap();
+        git_fixture(root.path(),&["add","logic.rs"]);
+        git_fixture(root.path(),&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","captured source"]);
+        let head=git_fixture(root.path(),&["rev-parse","HEAD"]);
+        let identity=snapshot_source_identity(root.path(),&head,"logic.rs",source.len()).await.unwrap();
+        let mut all=supplied_shards(&BTreeMap::from([("logic.rs".into(),source)]),"","",
+            &BTreeMap::from([("logic.rs".into(),identity)]));
+        all.insert("controller_source:\"observer.rs\"#part-0".into(),"// pinned observer fixture\nfn observe() {}\n".into());
+        // Optional caller inventory cannot crowd already-captured source out of
+        // the sole correction. The original assigned caller remains mandatory.
+        all.insert("context:callers:part-0".into(),"m".repeat(aligned::MAX_PROMPT_BYTES));
+        std::fs::write(root.path().join("logic.rs"),"uncommitted poison").unwrap();
+        let binding=aligned::ReviewBinding {head:head.clone(),base:head,environment_id:"fixture".into(),
+            contract_hash:"c".repeat(64),evidence_hash:"d".repeat(64)};
+        let contract=BTreeMap::from([("C1".into(),"Honor the configured cap".into())]);
+        let opts=codex_review_opts(root.path().to_path_buf(),"Scripted correction fixture");
+        let inputs=evidence_plan::Inputs {binding:&binding,issue:"Review caller",contract:&contract,prior:&[],
+            system_bytes:opts.system_prompt.len(),controller_acceptance:None};
+        let original=inputs.request(BTreeMap::from([("original-scope".into(),
+            format!("// original assigned evidence\n/*{}*/\nfn caller() {{}}\n","a".repeat(64*1024)))]),false,None).unwrap();
+        let actor=aligned::Actor {provider:"codex".into(),backend:"native".into(),model:"fixture".into(),session_id:"declared-review-actor".into()};
+        let builders=[aligned::Actor {provider:"claude".into(),backend:"native".into(),model:"fixture".into(),session_id:"fixture-builder".into()}];
+        let sources=all.iter().filter(|(key,_)|key.starts_with("source:") || key.starts_with("controller_source:"))
+            .map(|(key,body)|(key.clone(),body.clone())).collect();
+        let transport=CorrectionCandidateContext {calls:Mutex::new(0),defect:case=="defect",sources};
+        let result=execute_evidence_group(EvidenceGroupInput {root:root.path(),inputs:&inputs,
+            original_request:&original,evidence_shards:&all,actor:&actor,builders:&builders,
+            origin:&aligned::ReviewOrigin::RecordedBuilders,role:aligned::ReviewRole::Diff,
+            provider:augmentagent_channel_core::ProviderKind::Codex,opts:&opts,group_index:0,workflow:None},&transport).await;
+        assert_eq!(*transport.calls.lock().unwrap(),2);
+        if matches!(case,"over-budget"|"escaped-over-budget") {
+            assert!(result.is_err(),"oversized optional source cannot authorize completion");
+        } else {
+            let completed=result.expect("available captured source must reach the bounded correction");
+            assert_eq!(completed.native_sessions.len(),2);
+            assert_eq!(completed.findings.len(),usize::from(case=="defect"));
+        }
+    }
+}

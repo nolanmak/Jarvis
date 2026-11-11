@@ -35,7 +35,11 @@ pub(crate) async fn apply(repo:&Path,path:&Path,id:&str,paused:bool)->(i32,Value
     if request.is_none() {
         match store.snapshot(&id) {
             Ok(Some(_))=>{},
-            Ok(None)=>return failure(&id,2,"workflow-not-found","no durable workflow or command job"),
+            Ok(None)=>match store.adopted_pr(&repository,number) {
+                Ok(Some(_)) if target["kind"]=="pr"=>{},
+                Ok(_)=>return failure(&id,2,"workflow-not-found","no durable workflow, command job or known adoption"),
+                Err(e)=>return failure(&id,4,"workflow-state-unavailable",e),
+            },
             Err(e)=>return failure(&id,4,"workflow-state-unavailable",e),
         }
     }

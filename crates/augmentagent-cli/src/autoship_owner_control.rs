@@ -76,7 +76,8 @@ fn retry_checkpoint(tx:&Transaction<'_>,workflow:&str,now:i64,require_retired:bo
     // Both controller paths preserve work after an internal execution refusal.
     // Owner intent only requeues normal revalidation; it grants no approval.
     let original=matches!((checkpoint.next.reason.as_str(),checkpoint.next.action.as_str()),
-        ("adopted_execution_retry","resume_preserved_pr") | ("resume_deferred","resume_preserved_work"));
+        ("adopted_execution_retry","resume_preserved_pr") | ("resume_deferred","resume_preserved_work"))
+        || (super::is_review_hold_reason(&checkpoint.next.reason) && checkpoint.next.action=="resume_preserved_work");
     let pending=checkpoint.next.reason=="owner_execution_retry_pending" && checkpoint.next.action=="reconcile_runtime_retirement"
         && tx.query_row("SELECT EXISTS(SELECT 1 FROM owner_execution_retry WHERE workflow=?1 AND generation=?2 AND binding=?3 AND state IN ('pending','superseded'))",params![workflow,generation,serde_json::to_string(&checkpoint.binding)?],|r|r.get::<_,bool>(0))?;
     if checkpoint.stage!=Stage::Held || (!original && !pending) {return Ok(None);}
@@ -93,7 +94,8 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
         ensure!(!principal.is_empty() && principal.len()<=256 && principal.bytes().all(|b|b.is_ascii_graphic()),"invalid owner principal");
         let checkpoint:Option<String>=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[workflow],|r|r.get(0)).optional()?;
         let queued:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM command_job WHERE workflow=?1)",[workflow],|r|r.get(0))?;
-        ensure!(checkpoint.is_some() || queued,"unknown workflow");
+        let adopted:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM adopted_pr WHERE repository || '/pr/' || pr = ?1)",[workflow],|r|r.get(0))?;
+        ensure!(checkpoint.is_some() || queued || adopted,"unknown workflow");
         if let Some(checkpoint)=checkpoint {
             ensure!(!matches!(serde_json::from_str::<Checkpoint>(&checkpoint)?.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot change owner control");
         }
@@ -141,12 +143,32 @@ pub(super) fn require_dispatch(conn:&Connection,workflow:&str)->Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn manual_target_reconciliation_can_pause_known_adoption_without_starting_it() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let id=pr_workflow_id("owner/repo",42).unwrap();
+        assert!(store.set_owner_pause(&id,"github:owner",0,true,1).is_err(),"unknown targets are not implicit registrations");
+        store.observe_adoption("owner/repo",42,"head","{}",2).unwrap();
+        let pause=store.set_owner_pause(&id,"github:owner",0,true,3).unwrap();
+        assert!(pause.paused);
+        assert!(store.snapshot(&id).unwrap().is_none());
+        assert!(store.command_request(&id).unwrap().is_none());
+        store.register(&id,"fixture",binding(),4).unwrap();
+        assert!(store.claim_productive(&id,"worker",5,1000).unwrap().is_none());
+        let state=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!((state.attempts,state.model_calls,state.tokens),(0,0,0));
+        assert_eq!(store.owner_control(&id).unwrap(),Some(pause));
+    }
     fn binding()->Binding {Binding {head:"head".into(),contract:"owner-contract".into(),evidence_hash:"proof".into()}}
     fn request(n:u64)->submission::Request {submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(n),provider:None,until:submission::Milestone::Merged}}
 
     #[test]
     fn owner_resume_retries_only_quiescent_internal_execution_failures() {
-        for (reason,action) in [("adopted_execution_retry","resume_preserved_pr"),("resume_deferred","resume_preserved_work")] {
+        for (reason,action) in [("adopted_execution_retry","resume_preserved_pr"),("resume_deferred","resume_preserved_work"),
+            ("review-recovery-required","resume_preserved_work"),("review-evidence-budget","resume_preserved_work"),
+            ("reviewer-latched","resume_preserved_work"),("no-reviewer-capacity","resume_preserved_work"),
+            ("provenance-unknown","resume_preserved_work")] {
             for blocker in ["none","lease","native","operation"] {
                 let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
                 let id=store.submit_authorized("request","github:owner",&request(1),1).unwrap().workflow;
@@ -195,7 +217,8 @@ mod tests {
     #[test]
     fn owner_resume_preserves_unrelated_and_mismatched_held_checkpoints() {
         for (reason,action) in [("security-hold","resume_preserved_work"),("owner-hold","resume_preserved_work"),
-            ("resume_deferred","await_owner_approval"),("adopted_execution_retry","resume_preserved_work")] {
+            ("resume_deferred","await_owner_approval"),("adopted_execution_retry","resume_preserved_work"),
+            ("review-recovery-required","await_owner_approval"),("review-recovery-required","resume_preserved_pr")] {
             let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
             let id=store.submit_authorized("request","github:owner",&request(1),1).unwrap().workflow;
             store.register(&id,"candidate",binding(),2).unwrap();
