@@ -1,0 +1,93 @@
+{
+  "original_head": "4ebb2b745c62476ad08571dea008307f2235a986",
+  "candidate_head": "4d73a29c452bc155f3002685772c9825aa460e84",
+  "observer_sha256": "9be8ea695bc49a9800f61faeda0d86e223857893c9bbaea6ced5fad904ec3c77",
+  "external_expected": [
+    [
+      "configuration-matched",
+      true,
+      4
+    ],
+    [
+      "effective-configuration-mismatch",
+      false,
+      4
+    ],
+    [
+      "effective-configuration-mismatch",
+      false,
+      2
+    ]
+  ],
+  "observations": {
+    "original": {
+      "exit": 0,
+      "actual": [
+        [
+          "effective-configuration-mismatch",
+          false,
+          2
+        ],
+        [
+          "effective-configuration-mismatch",
+          false,
+          2
+        ],
+        [
+          "effective-configuration-mismatch",
+          false,
+          2
+        ]
+      ],
+      "matches_external_expected": false
+    },
+    "candidate": {
+      "exit": 0,
+      "actual": [
+        [
+          "configuration-matched",
+          true,
+          4
+        ],
+        [
+          "effective-configuration-mismatch",
+          false,
+          4
+        ],
+        [
+          "effective-configuration-mismatch",
+          false,
+          2
+        ]
+      ],
+      "matches_external_expected": true
+    }
+  },
+  "schema_version": 1,
+  "pr": 1978,
+  "workflow": "nolanmak/jarvis/pr/1978",
+  "published_head": "4d73a29c452bc155f3002685772c9825aa460e84",
+  "rejected_internal_head": "28dcb0ab4286a7dfc34c545217f4e49e628889f6",
+  "native_attempt": {
+    "selected_at_ms": 1794358176367,
+    "finished_at_ms": 1794358418172,
+    "outcome": "failed",
+    "stage": "held",
+    "reason": "adopted_execution_retry",
+    "controller_failure": "acceptance repair touched a guarded path",
+    "candidate_added_path": "autoship_verifiers/observe.py"
+  },
+  "worked_untrusted_recipe": {
+    "invocation": {
+      "kind": "python_script",
+      "path": "autoship_verifiers/observe.py",
+      "args": []
+    },
+    "files": {
+      "autoship_verifiers/observe.py": "import importlib.util\nimport json\nimport sys\nimport tempfile\nfrom pathlib import Path\n\nsys.path.insert(0, str(Path.cwd()))\nspec = importlib.util.spec_from_file_location('deployment', Path.cwd() / 'scripts' / 'autoship-deployment-readiness.py')\nm = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(m)\n\n\ndef observe(mode):\n    with tempfile.TemporaryDirectory() as temporary:\n        root = Path(temporary)\n        old = root / 'provider-old'\n        new = root / 'provider-new'\n        old.write_bytes(b'old provider executable')\n        new.write_bytes(b'new provider executable')\n        old.chmod(0o755)\n        new.chmod(0o755)\n        link = root / 'provider'\n        calls = []\n\n        def point_at(target):\n            link.unlink(missing_ok=True)\n            link.symlink_to(target)\n\n        point_at(old)\n        original_selected = m.selected\n        original_snapshot = m.snapshot\n        original_birth = m.birth\n        original_boot = m.boot\n        try:\n            m.selected = lambda selection: (root / 'policy.json', 'selection', 'policy', {'providers': {'claude': {}}})\n            m.birth = lambda pid: 'birth'\n            m.boot = lambda: 'boot'\n\n            def snapshot(role, pid, binary, binary_sha, policy, policy_sha, declaration, receipts):\n                calls.append(role)\n                if mode == 'persistent-provider' and role == 'daemon':\n                    point_at(old)\n                provider = m.provider_hash({'CLAUDE_CLI': str(link)}, 'CLAUDE_CLI', 'claude', root)\n                if role == 'daemon' and mode in ('transient', 'persistent-provider'):\n                    point_at(new)\n                if mode == 'configuration':\n                    configuration = role\n                else:\n                    configuration = provider\n                return {'status': 'configuration-observed', 'pid': pid, 'birth': 'birth', 'configuration_sha256': configuration, 'provider_executable_sha256': {'claude': provider}}\n\n            m.snapshot = snapshot\n            report = m.inspect('/usr/bin/true', root / 'selection', root / 'receipts', lambda role: 1)\n            return [report['status'], report['matches'], len(calls)]\n        finally:\n            m.selected = original_selected\n            m.snapshot = original_snapshot\n            m.birth = original_birth\n            m.boot = original_boot\n\n\nprint(json.dumps([observe('transient'), observe('persistent-provider'), observe('configuration')]))\n"
+    }
+  },
+  "validation_scope": "Manual first-party Linux sandbox replay against the exact tracked readiness script blobs. The fixture swaps a real symlink and hashes its target. It supplies synthetic service snapshots to the real inspect function. Expectations were compared outside the observer.",
+  "native_registration": false,
+  "remaining": "Independent acceptance authority must review and register any corrected verifier through the normal amendment path. Preserve the original attempt and protect verifier paths from implementation repair. Normal review, hosted CI, merge and deployment remain pending."
+}
