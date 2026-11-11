@@ -312,6 +312,11 @@ async fn target_lifecycle(repo: &Path, repository: &str, target: Target) -> Resu
 /// Returns false when another owner holds the workflow lease.
 fn settle_outside_target(path: &Path, id: &str, stage: crate::autoship_workflow::Stage,
     reason: &str, evidence: String) -> Result<bool> {
+    settle_outside_target_expected(path,id,stage,reason,evidence,None)
+}
+
+fn settle_outside_target_expected(path:&Path,id:&str,stage:crate::autoship_workflow::Stage,
+    reason:&str,evidence:String,expected:Option<&crate::autoship_workflow::Snapshot>)->Result<bool> {
     use crate::autoship_workflow::{Binding, NextAction, WorkflowStore};
     let now = chrono::Utc::now().timestamp_millis();
     let mut store = WorkflowStore::open(path)?;
@@ -320,7 +325,14 @@ fn settle_outside_target(path: &Path, id: &str, stage: crate::autoship_workflow:
         store.register(id, "unbound", Binding {head:"unbound".into(),
             contract:"target-settled-outside-autoship".into(), evidence_hash:"none".into()}, now)?;
     }
+    if !store.pending_operations(id)?.is_empty() || store.merge_reconciliation_needed(id)? {return Ok(false);}
     let Some(lease) = store.claim(id, "autoship-target-lifecycle", now, 60_000)? else { return Ok(false); };
+    let current=store.snapshot(id)?.context("workflow disappeared")?;
+    if expected.is_some_and(|before|before.generation.checked_add(1)!=Some(current.generation)
+        || before.checkpoint.binding!=current.checkpoint.binding || before.pr!=current.pr)
+        || !store.pending_operations(id)?.is_empty() || store.merge_reconciliation_needed(id)? {
+        store.release(&lease,now)?;return Ok(false);
+    }
     let mut checkpoint = store.snapshot(id)?.context("workflow disappeared")?.checkpoint;
     checkpoint.stage = stage;
     checkpoint.next = NextAction {reason: reason.into(), action: "complete".into(), eligible_at_ms: 0};
@@ -330,6 +342,48 @@ fn settle_outside_target(path: &Path, id: &str, stage: crate::autoship_workflow:
     settled?;
     info!(workflow = id, ?stage, reason, "autoship command target settled outside the loop");
     Ok(true)
+}
+
+/// Owner maintenance only: observe terminal remote state without productive
+/// admission, a command job, model calls or autonomous merge attribution.
+pub(crate) async fn reconcile_terminal_target(repo:&Path,path:&Path,id:&str,
+    repository:&str,target:Target)->Result<()> {
+    use crate::autoship_workflow::{Stage,WorkflowStore};
+    authorize_repository(repo,repository).await
+        .context(CommandFailure {code:2,reason:"target-authorization-failed"})?;
+    let store=WorkflowStore::open_read_only(path)?.context("workflow state unavailable")?;
+    let before=store.snapshot(id)?.context(CommandFailure {code:2,reason:"workflow-not-found"})?;
+    let target=before.pr.map(Target::Pr).unwrap_or(target);
+    if before.lease_until_ms>chrono::Utc::now().timestamp_millis()
+        || !store.pending_operations(id)?.is_empty() || store.merge_reconciliation_needed(id)? {
+        return Err(anyhow::anyhow!("active lease or unresolved operation; original evidence retained")
+            .context(CommandFailure {code:3,reason:"workflow-reconciliation-held"}));
+    }
+    drop(store);
+    let lifecycle=target_lifecycle(repo,repository,target).await
+        .context(CommandFailure {code:3,reason:"target-state-unavailable"})?;
+    let (stage,reason,evidence)=match lifecycle {
+        Lifecycle::Open=>return Err(anyhow::anyhow!("target is still open; no work was dispatched")
+            .context(CommandFailure {code:3,reason:"target-still-open"})),
+        Lifecycle::Closed=>(Stage::Retired,"target_closed",match target {
+            Target::Pr(n)=>format!("github:pr:{n}:closed-unmerged"),
+            Target::Issue(n)=>format!("github:issue:{n}:closed"),
+        }),
+        Lifecycle::Merged(commit)=>{
+            let Target::Pr(pr)=target else {anyhow::bail!("merged target is not a PR")};
+            (Stage::Merged,"external_merge_reconciled",format!("github:pr:{pr}:merged-externally:{commit}"))
+        },
+    };
+    if before.checkpoint.stage==stage {return Ok(());}
+    if matches!(before.checkpoint.stage,Stage::Merged|Stage::Retired) {
+        return Err(anyhow::anyhow!("terminal workflow and current target disagree; history retained")
+            .context(CommandFailure {code:3,reason:"terminal-target-conflict"}));
+    }
+    if !settle_outside_target_expected(path,id,stage,reason,evidence,Some(&before))? {
+        return Err(anyhow::anyhow!("workflow changed, leased, delayed or awaiting operation recovery")
+            .context(CommandFailure {code:3,reason:"workflow-reconciliation-held"}));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -494,6 +548,25 @@ pub(super) async fn execute_pr(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_target_reconciliation_preserves_unresolved_operations() {
+        use crate::autoship_workflow::{Binding,OperationKind,WorkflowStore,Stage};
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let id="owner/repo/pr/42";
+        let binding=Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
+        let now=chrono::Utc::now().timestamp_millis();
+        store.register(id,"fixture",binding.clone(),now).unwrap();
+        let lease=store.claim(id,"original",now,60_000).unwrap().unwrap();
+        let operation=store.begin_operation(&lease,OperationKind::Push,&binding,now).unwrap();
+        store.release(&lease,now).unwrap();
+        let before=store.snapshot(id).unwrap().unwrap();
+        assert!(!super::settle_outside_target(&path,id,Stage::Retired,"target_closed","github:pr:42:closed-unmerged".into()).unwrap(),
+            "terminal observation discarded an unresolved remote side effect");
+        assert_eq!(store.snapshot(id).unwrap().unwrap(),before);
+        assert_eq!(store.pending_operations(id).unwrap().len(),1);
+        assert_eq!(store.pending_operations(id).unwrap()[0].id,operation.id);
+    }
     use super::*;
     use crate::autoship_workflow::submission::Milestone;
     use std::os::unix::fs::PermissionsExt;

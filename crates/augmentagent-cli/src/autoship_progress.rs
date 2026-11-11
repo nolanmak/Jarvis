@@ -179,6 +179,11 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     else if source=="owner_control_changed" {kind="resume-requested".into();reason="owner-resume-accepted".into();action="await_worker".into();}
     let external_merge=checkpoint.as_ref().is_some_and(|c|c.stage==Stage::Merged && c.next.reason=="external_merge_reconciled");
     let terminal=confirmed || external_merge || stage==Some(Stage::Retired);
+    if stage==Some(Stage::Retired) {
+        kind="retired".into();
+        reason=checkpoint.as_ref().map_or_else(||"workflow-state-changed".into(),|c|code(&c.next.reason,"workflow-state-changed"));
+        action="complete".into();eligible=None;
+    }
     if external_merge {kind="merged".into();reason="external-merge-observed".into();action="complete".into();eligible=None;}
     if confirmed {stage=Some(Stage::Merged);kind="merged".into();reason="autonomous-merge-confirmed".into();action="inspect_deployment".into();eligible=None;}
     let evidence=checkpoint.as_ref().map(|c|(&c.binding,&c.evidence,&c.next.reason,&c.next.action));

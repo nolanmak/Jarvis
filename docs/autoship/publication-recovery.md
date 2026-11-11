@@ -28,3 +28,25 @@ history visibility is a remaining limit of the remote API, not something a local
 receipt proves impossible. All attempts and discovered identities remain in the
 protected event history. Unknown or incomplete history is a reconciliation
 failure, never evidence that creation is safe.
+
+## Manual PR completion and dispatch holds
+
+An authenticated owner can pause a known PR adoption before its first workflow
+or command job starts. `autopr pause --workflow OWNER/REPO/pr/NUMBER --json`
+records dispatch intent without creating an execution request. Pause remains
+separate from active-child teardown and is retained after terminal observation.
+
+After manually merging or closing a registered target, run:
+
+```sh
+augmentagent autopr reconcile-target --workflow OWNER/REPO/pr/NUMBER --json
+```
+
+This checks current repository authority and the remote target identity/state.
+It records an external merge as manual completion or retires a closed target;
+no model, build or merge mutation runs and no autonomous allowance is debited.
+The normal native-retirement outbox receives terminal owners. Its queued status
+is not teardown proof: verify the worker's checked retirement separately.
+Open targets, active leases, changed bindings and unresolved side effects stay
+held with their original evidence. Never clear a pause, create a dummy command
+job or edit SQLite rows to make this maintenance possible.

@@ -94,7 +94,8 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
         ensure!(!principal.is_empty() && principal.len()<=256 && principal.bytes().all(|b|b.is_ascii_graphic()),"invalid owner principal");
         let checkpoint:Option<String>=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[workflow],|r|r.get(0)).optional()?;
         let queued:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM command_job WHERE workflow=?1)",[workflow],|r|r.get(0))?;
-        ensure!(checkpoint.is_some() || queued,"unknown workflow");
+        let adopted:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM adopted_pr WHERE repository || '/pr/' || pr = ?1)",[workflow],|r|r.get(0))?;
+        ensure!(checkpoint.is_some() || queued || adopted,"unknown workflow");
         if let Some(checkpoint)=checkpoint {
             ensure!(!matches!(serde_json::from_str::<Checkpoint>(&checkpoint)?.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot change owner control");
         }
@@ -142,6 +143,23 @@ pub(super) fn require_dispatch(conn:&Connection,workflow:&str)->Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn manual_target_reconciliation_can_pause_known_adoption_without_starting_it() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let id=pr_workflow_id("owner/repo",42).unwrap();
+        assert!(store.set_owner_pause(&id,"github:owner",0,true,1).is_err(),"unknown targets are not implicit registrations");
+        store.observe_adoption("owner/repo",42,"head","{}",2).unwrap();
+        let pause=store.set_owner_pause(&id,"github:owner",0,true,3).unwrap();
+        assert!(pause.paused);
+        assert!(store.snapshot(&id).unwrap().is_none());
+        assert!(store.command_request(&id).unwrap().is_none());
+        store.register(&id,"fixture",binding(),4).unwrap();
+        assert!(store.claim_productive(&id,"worker",5,1000).unwrap().is_none());
+        let state=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!((state.attempts,state.model_calls,state.tokens),(0,0,0));
+        assert_eq!(store.owner_control(&id).unwrap(),Some(pause));
+    }
     fn binding()->Binding {Binding {head:"head".into(),contract:"owner-contract".into(),evidence_hash:"proof".into()}}
     fn request(n:u64)->submission::Request {submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(n),provider:None,until:submission::Milestone::Merged}}
 

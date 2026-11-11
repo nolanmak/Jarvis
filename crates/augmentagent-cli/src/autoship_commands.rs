@@ -4,6 +4,8 @@ pub(crate) mod wait;
 pub(crate) mod work_command;
 #[path = "autoship_control_command.rs"]
 pub(crate) mod control_command;
+#[path = "autoship_target_reconcile.rs"]
+pub(crate) mod target_reconcile;
 #[path = "autoship_run_command.rs"]
 pub(crate) mod run_command;
 #[path = "autoship_merge_recovery.rs"]
@@ -129,6 +131,7 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
             crate::autoship_workflow::submission::Milestone::Merged=>merged,
             crate::autoship_workflow::submission::Milestone::Pr=>pr_ready.is_some() && !recovery_needed && snapshot.checkpoint.stage != Stage::Retired,
         };
+        let pause_blocks=paused && !complete && !recovery_needed && snapshot.checkpoint.stage!=Stage::Retired;
         let code = if complete {0} else if paused || recovery_needed || matches!(snapshot.checkpoint.stage, Stage::Held | Stage::AwaitChecks | Stage::Merged) {
             3
         } else {
@@ -141,8 +144,8 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
             code,
             json!({"schema_version":1,"workflow":workflow,"repository":repository,"target":target,
             "accepted":true,"complete":complete,"head":snapshot.checkpoint.binding.head,
-            "stage":snapshot.checkpoint.stage,"reason":if paused && !complete && !recovery_needed {"owner-pause-requested"} else {&snapshot.checkpoint.next.reason},
-            "next_action":if paused && !complete && !recovery_needed {"await_quiescence_or_owner_resume"} else {&snapshot.checkpoint.next.action},"eligible_at_ms":snapshot.checkpoint.next.eligible_at_ms,
+            "stage":snapshot.checkpoint.stage,"reason":if pause_blocks {"owner-pause-requested"} else {&snapshot.checkpoint.next.reason},
+            "next_action":if pause_blocks {"await_quiescence_or_owner_resume"} else {&snapshot.checkpoint.next.action},"eligible_at_ms":snapshot.checkpoint.next.eligible_at_ms,
             "owner_messages_pending":owner_messages_pending,"owner_control":owner_control,"delivery":delivery,
             "provider":command.as_ref().and_then(|c| c.provider),"workflow_until":command.as_ref().map(|c| c.until),"pr_url":pr_url,
             "requested_until":milestone,"milestones":{"pr":pr_ready,"merged":merged},
