@@ -7686,8 +7686,8 @@ pub struct RunReport {
     pub message: String,
     /// True when the builder ran. Only these consume daily budget.
     pub billed: bool,
-    /// #931 — idle-class with a reason: the tick ends here, unbilled, and
-    /// the loop does not spin through its triage burst.
+    /// #931 — idle-class with a reason: the tick ends here without spinning
+    /// through its triage burst. Prior paid work remains independently billed.
     held: bool,
     /// #1532 — this run resumed a sitting draft rather than building a new
     /// issue, so the fair-scheduling debt counter can tell them apart.
@@ -12182,16 +12182,18 @@ impl AutoPrLoop {
                     counter.settle_reservation(&reservation, completed_day, billed);
                     Ok(counter.runs_today(completed_day))
                 })?;
+                // A durable retry may be both paid and held. Settle its
+                // fairness before idle/held controls whether this tick stops.
+                // Keep one debt-accounting site next to compute settlement:
+                // paid resumes owe the issue lane a turn; paid builds settle up.
+                if let Ok(report) = &outcome {
+                    if report.billed {
+                        FairSched::update_persist(&self.fair_path, |fair| fair.record_billed(report.resumed));
+                    }
+                }
                 match outcome {
                     Ok(r) if r.is_idle() => break,
                     Ok(r) if r.billed => {
-                        // The reservation was settled against the actual completion day.
-                        // #1532 — the single debt-accounting site, next to the
-                        // one that spends the budget: a billed resume owes the
-                        // new-issue lane a slot, a billed build settles up.
-                        // Persisted, so it survives the post-merge daemon
-                        // restart exactly as the run count does (#814).
-                        FairSched::update_persist(&self.fair_path, |f| f.record_billed(r.resumed));
                         info!(attempts_today=runs_today, merge_cap=self.daily_cap, "auto-PR: {r}");
                         break;
                     }
@@ -12394,6 +12396,81 @@ mod tests {
             let (result,())=tokio::join!(run,timer);result.unwrap();
             assert_eq!(calls.load(Ordering::SeqCst),0);
         }
+    }
+
+    // A paid attempt may still be a durable hold (for example CI infrastructure
+    // retry). Exercise the real worker settlement and persisted fairness state.
+    async fn assert_turn_fairness(resumed: bool, billed: bool, held: bool) {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let mut worker = AutoPrLoop::for_tests("/nonexistent".into(), 5, state.path());
+        worker.interval = std::time::Duration::from_secs(1);
+        let now = chrono::Utc::now();
+        worker.clock = Arc::new(move || now);
+        FairSched::update_persist(&worker.fair_path, |fair| {
+            fair.resumes_since_build = 2;
+            fair.resume_reservations_since_build = 3;
+        });
+        let fair_path = worker.fair_path.clone();
+        let counter_path = worker.counter_path.clone();
+        let workflow_path = worker.workflow_path.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let timer_stop = stop.clone();
+        let run = worker.run_with(stop, move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok(RunReport {
+                    message: "durable verification retry; candidate preserved".into(),
+                    billed, held, resumed,
+                })
+            }
+        }, || async { 0 });
+        let timer = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            timer_stop.cancel();
+        };
+        let (result, ()) = tokio::join!(run, timer);
+        result.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "fixture must settle exactly one attempt");
+        assert_eq!(DailyCounter::load(&counter_path).runs_today(utc_day_of(now)), if billed { 1 } else { 0 },
+            "compute spend must remain attributable even when work is held");
+        let allowance = crate::autoship_workflow::WorkflowStore::open(&workflow_path).unwrap()
+            .merge_allowance(now.timestamp_millis(), 5).unwrap();
+        assert_eq!(allowance.confirmed, 0);
+        assert_eq!(allowance.available, 5, "a paid retry is not a merged PR");
+        let fair = FairSched::load(&fair_path);
+        let expected = if billed { if resumed { (3, 3) } else { (0, 0) } } else { (2, 3) };
+        assert_eq!((fair.resumes_since_build, fair.resume_reservations_since_build), expected,
+            "held control flow must not erase a paid turn's fairness settlement");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paid_deferred_pr_updates_resume_debt_without_spending_merge_allowance() {
+        assert_turn_fairness(true, true, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paid_deferred_build_clears_resume_debt() {
+        assert_turn_fairness(false, true, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unpaid_deferred_turn_preserves_resume_debt() {
+        assert_turn_fairness(true, false, true).await;
+        assert_turn_fairness(false, false, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paid_completed_pr_settles_resume_debt_once() {
+        assert_turn_fairness(true, true, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paid_completed_build_clears_resume_debt() {
+        assert_turn_fairness(false, true, false).await;
     }
 
     // #1705: an infrastructure fault must never exhaust the shipping allowance.
@@ -14463,8 +14540,8 @@ CODEX-REVIEW: lgtm").0);
 
     /// #1532, structural: the two halves of the interleave in `run_once` —
     /// the resume-first block yields its slot when a build is owed, and the
-    /// reserved slot falls back to a resume rather than idling. Plus: the
-    /// debt is accounted exactly once, where the budget is spent.
+    /// reserved slot falls back to a resume rather than idling. Fairness
+    /// settlement is covered by the real worker's paid/held turn tests.
     #[test]
     fn the_reserved_build_slot_yields_to_a_waiting_draft_before_idling() {
         let src = include_str!("self_improve.rs");
@@ -14482,17 +14559,6 @@ CODEX-REVIEW: lgtm").0);
         let idle = none_arm.find("return Ok(RunReport::idle());").expect("the idle exit");
         assert!(fallback < resume && resume < idle, "fall back to a draft, then idle");
 
-        // One debt-accounting site, in the loop's billed arm.
-        let production = &src[..src.find("mod tests {").unwrap()];
-        assert_eq!(production.matches("f.record_billed(").count(), 1);
-        let loop_start = production.find("async fn run_builds<F, T>(").expect("run_builds");
-        let billed = production[loop_start..].find("Ok(r) if r.billed =>").expect("billed arm");
-        let record = production[loop_start..].find("f.record_billed(r.resumed)").expect("debt update");
-        assert!(billed < record, "the debt update follows the billed arm");
-        assert!(
-            !production[loop_start + billed + 1..loop_start + record].contains("Ok(r)"),
-            "the debt update sits inside the billed arm, not a later one"
-        );
     }
 
     #[test]
