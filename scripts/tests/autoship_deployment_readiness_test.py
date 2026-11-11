@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 spec=importlib.util.spec_from_file_location('deployment',Path(__file__).parents[1]/'autoship-deployment-readiness.py')
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 
@@ -60,7 +61,7 @@ class DeploymentTests(unittest.TestCase):
                 'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'policy_sha256':m.digest(policy.read_bytes()),'dry_run':False,'external':True,
                 'config':{'AUGMENTAGENT_AUTOPR':'1','HOME':str(root),'PATH':'/usr/bin:/bin','AUGMENTAGENT_NATIVE_VM_POLICY':str(policy),
                           'CLAUDE_CLI':'/usr/bin/true','CODEX_CLI':'/usr/bin/true','AUGMENTAGENT_RUN_RESOURCES':'1'}} for role,child in children.items()}
-            for case in ('matched','worker-missing-policy','drift','stale','missing-receipt','public','wrong-binary','dry-run','secret-field','changed-policy','worker-stopped','state-drift','route-drift'):
+            for case in ('matched','provider-update','worker-missing-policy','drift','stale','missing-receipt','public','wrong-binary','dry-run','secret-field','changed-policy','worker-stopped','state-drift','route-drift'):
                 with self.subTest(case=case):
                     current=json.loads(json.dumps(values))
                     if case=='worker-missing-policy':current['worker']['config'].pop('AUGMENTAGENT_NATIVE_VM_POLICY')
@@ -72,6 +73,11 @@ class DeploymentTests(unittest.TestCase):
                     if case=='stale':current['worker']['birth']='0'
                     if case=='dry-run':current['worker']['dry_run']=True
                     if case=='secret-field':current['worker']['config']['API_KEY']='do-not-output-this-value'
+                    provider = root/'claude'
+                    if case=='provider-update':
+                        provider.symlink_to('/usr/bin/true')
+                        for value in current.values():
+                            value['config']['CLAUDE_CLI']=str(provider)
                     for role,value in current.items():write(receipts/(role+'.json'),value)
                     if case=='missing-receipt':(receipts/'worker.json').unlink()
                     if case=='public':(receipts/'worker.json').chmod(0o644)
@@ -82,8 +88,17 @@ class DeploymentTests(unittest.TestCase):
                         calls.append(role)
                         if case=='changed-policy' and len(calls)==4:write(policy,{'version':1,'providers':{'claude':{},'codex':{}},'changed':True})
                         return 0 if case=='worker-stopped' and role=='worker' else children[role].pid
-                    report=m.inspect(expected,selection,receipts,pid_for)
-                    self.assertEqual(report['matches'],case=='matched',report)
+                    snapshot=m.snapshot
+                    def snapshot_during_update(role,*args):
+                        result=snapshot(role,*args)
+                        if case=='provider-update' and role=='daemon' and provider.readlink()==Path('/usr/bin/true'):
+                            replacement=root/'new-claude'
+                            replacement.symlink_to('/usr/bin/false')
+                            replacement.replace(provider)
+                        return result
+                    with patch.object(m,'snapshot',side_effect=snapshot_during_update):
+                        report=m.inspect(expected,selection,receipts,pid_for)
+                    self.assertEqual(report['matches'],case in ('matched','provider-update'),report)
                     self.assertFalse(report['live_verified'])
                     if case=='matched':self.assertEqual(report['status'],'configuration-matched')
                     if case=='worker-missing-policy':self.assertEqual(report['services']['worker']['status'],'policy-not-selected')
