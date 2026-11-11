@@ -1972,6 +1972,21 @@ mod repair_gate_tests {
 
     #[tokio::test]
     async fn scope_rejection_uses_bounded_repair_then_durable_rescope() {
+        const CHILD: &str = "AUTOSHIP_SCOPE_REPAIR_RESOURCE_FIXTURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let isolated = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "self_improve::acceptance::repair_gate_tests::scope_rejection_uses_bounded_repair_then_durable_rescope", "--nocapture"])
+                .env(CHILD, "1")
+                .env("AUGMENTAGENT_RUN_RESOURCES", "1")
+                .env("XDG_STATE_HOME", isolated.path().join("state"))
+                .output().unwrap();
+            assert!(output.status.success(), "{}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout)
+                .contains("test result: ok. 1 passed; 0 failed;"));
+            return;
+        }
         use crate::autoship_contract::{Criterion, Verifier, VerifierCommand};
         use crate::autoship_workflow::{Stage, WorkflowStore};
         for spent in [0, 3] {
@@ -2046,14 +2061,15 @@ mod repair_gate_tests {
             let result = verify_with_repair_for(&reasoner, AcceptanceSource::Issue(42),
                 "fixture", root, &mut prepared, control.path(), &mut guard).await;
             assert!(result.is_err());
+            let detail = format!("{:#}", result.err().unwrap());
             let store = WorkflowStore::open(&database).unwrap();
             let after = store.snapshot(guard.id()).unwrap().unwrap();
             if spent == 0 {
-                assert_eq!(after.checkpoint.stage, Stage::Build);
+                assert_eq!(after.checkpoint.stage, Stage::Build, "spent={spent}: {detail}");
                 assert_eq!(after.checkpoint.next.reason, "acceptance_failed");
                 assert_eq!(after.checkpoint.next.action, "repair_implementation");
             } else {
-                assert_eq!(after.checkpoint.stage, Stage::Scope);
+                assert_eq!(after.checkpoint.stage, Stage::Scope, "spent={spent}: {detail}");
                 assert_eq!(after.checkpoint.next.reason, "acceptance_repair_budget");
                 assert_eq!(after.checkpoint.next.action, "rescope_acceptance");
             }
