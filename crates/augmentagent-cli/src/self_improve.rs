@@ -9715,9 +9715,9 @@ async fn record_attempt(repo_root: &Path, issue: u64, rec: Option<AttemptRecord>
     let rec = rec.unwrap_or_else(AttemptRecord::unspecified);
     {
         let path = attempt_history_path();
-        let mut history = AttemptHistory::load(&path);
-        history.push(issue, rec.clone());
-        history.save(&path);
+        if let Err(error) = AttemptHistory::update_persist(&path, |history| history.push(issue, rec.clone())) {
+            warn!(path = %path.display(), "could not update attempt history: {error:#}");
+        }
     }
     // #803 — a harness failure is remembered (above) but never charged: no
     // GitHub marker (the marker-derived count and the gave-up decision stay
@@ -10139,9 +10139,9 @@ pub(crate) async fn readmit(
                 // Per issue, not batched after the loop: a bail mid-walk must
                 // not leave an already-unlabelled issue with stale records.
                 let path = attempt_history_path();
-                let mut history = AttemptHistory::load(&path);
-                history.remove(&[*n]);
-                history.save(&path);
+                if let Err(error) = AttemptHistory::update_persist(&path, |history| history.remove(&[*n])) {
+                    warn!(path = %path.display(), "could not reset attempt history: {error:#}");
+                }
             }
         }
     }
@@ -11596,7 +11596,7 @@ struct AttemptHistory {
 }
 
 impl AttemptHistory {
-    /// The live file, else the `.bak` left by the previous [`save`](Self::save)
+    /// The live file, else the `.bak` left by the previous [`persist`](Self::persist)
     /// — a daemon killed mid-write must not cost every issue its context.
     fn load(path: &Path) -> Self {
         let parse = |p: &Path| {
@@ -11637,36 +11637,64 @@ impl AttemptHistory {
         }
     }
 
-    /// Atomic replace: serialize to `<path>.tmp`, keep the previous file as
-    /// `<path>.bak`, then rename the temp over the live file. A crash at any
-    /// point leaves either the old or the new file readable, never a torn one.
-    /// Best-effort like [`DailyCounter::save`]: a failure costs context, not
-    /// the run.
-    fn save(&self, path: &Path) {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+    /// One companion inode protects the complete read/edit/replace operation.
+    /// Never unlink it or proceed unlocked after an inspection/lock failure.
+    /// The closure is synchronous: no model or GitHub await holds this lock.
+    fn update_persist(path: &Path, edit: impl FnOnce(&mut Self)) -> Result<()> {
+        use std::os::{fd::AsRawFd, unix::fs::{MetadataExt, OpenOptionsExt}};
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        anyhow::ensure!(path.file_name().is_some(), "history filename missing");
+        let mut name = path.as_os_str().to_owned();
+        name.push(".lock");
+        let lock_path = PathBuf::from(name);
+        let file = std::fs::OpenOptions::new().read(true).write(true)
+            .create(true).truncate(false).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&lock_path)?;
+        let identity = file.metadata()?;
+        anyhow::ensure!(identity.is_file() && identity.nlink() == 1
+            && identity.uid() == unsafe { libc::geteuid() } && identity.mode() & 0o077 == 0,
+            "history lock is not an owner-private original regular file");
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 { break; }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted { return Err(error.into()); }
         }
-        let bytes = match serde_json::to_vec(self) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("could not serialize attempt history: {e}");
-                return;
-            }
-        };
+        let current = std::fs::symlink_metadata(&lock_path)?;
+        anyhow::ensure!(current.is_file() && current.dev() == identity.dev()
+            && current.ino() == identity.ino() && current.nlink() == 1,
+            "history lock identity changed; history preserved");
+        let mut history = Self::load(path);
+        edit(&mut history);
+        history.persist(path)
+    }
+
+    /// Atomic replacement is inside update_persist's original-path lock.
+    /// Preserve the existing backup recovery and best-effort caller semantics.
+    fn persist(&self, path: &Path) -> Result<()> {
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)?;
+        }
+        let bytes = serde_json::to_vec(self)?;
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
-        if let Err(e) = std::fs::write(&tmp, bytes) {
-            warn!(path = %tmp.display(), "could not write attempt history: {e}");
-            return;
-        }
+        std::fs::write(&tmp, bytes).context("write attempt history temporary")?;
         if path.exists() {
             let _ = std::fs::copy(path, Self::bak_path(path));
         }
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            warn!(path = %path.display(), "could not replace attempt history: {e}");
+        if let Err(error) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
+            return Err(error).context("replace attempt history");
         }
+        Ok(())
+    }
+
+    /// Unlocked fixture seeding only. Every production writer uses the full
+    /// locked update rather than publishing a previously loaded snapshot.
+    #[cfg(test)]
+    fn save(&self, path: &Path) {
+        self.persist(path).expect("seed disposable attempt history");
     }
 
     /// The "Prior attempts" digest for `issue`, or `None` when there are none.
@@ -11795,9 +11823,9 @@ fn note_current_issue(issue: u64) {
 /// provider is down there is nothing to bound: no builder runs.
 fn record_reasoner_error(issue: u64, rec: AttemptRecord) {
     let path = attempt_history_path();
-    let mut history = AttemptHistory::load(&path);
-    history.push(issue, rec);
-    history.save(&path);
+    if let Err(error) = AttemptHistory::update_persist(&path, |history| history.push(issue, rec)) {
+        warn!(path = %path.display(), "could not record reasoner history: {error:#}");
+    }
 }
 
 /// The hidden marker comment keeps its `<!-- self-improve-attempt -->` prefix
@@ -12235,6 +12263,10 @@ mod pr_notes_tests;
 #[cfg(test)]
 #[path = "self_improve_progress_tests.rs"]
 mod progress_tests;
+
+#[cfg(test)]
+#[path = "self_improve_history_lock_tests.rs"]
+mod history_lock_tests;
 
 #[cfg(test)]
 mod tests {
