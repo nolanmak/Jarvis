@@ -375,6 +375,18 @@ mod tests {
         assert!(!files.values().any(|body| body.contains("poison")));
     }
     #[test]
+    fn requested_type_includes_its_inherent_and_trait_implementations() {
+        let source = "#[cfg(any())]\nmod nested {\nstruct AnchoredAudit<T>(T);\nimpl<T> AnchoredAudit<T> {\nfn append(&self) { }\n}\nimpl<T> Drop for AnchoredAudit<T> {\nfn drop(&mut self) { }\n}\nstruct Other;\nimpl Other {\nfn unrelated(&self) { }\n}\nimpl<T> Wrapper<AnchoredAudit<T>> {\nfn wrong_receiver(&self) { }\n}\n}\n";
+        let ranges = requested_item_ranges(source, "AnchoredAudit").unwrap();
+        let text = ranges.into_iter().map(|range| &source[range]).collect::<Vec<_>>().join("");
+        for required in ["#[cfg(any())]", "mod nested", "struct AnchoredAudit", "impl<T> AnchoredAudit", "fn append", "Drop for AnchoredAudit", "fn drop"] {
+            assert!(text.contains(required), "missing type evidence: {required}");
+        }
+        assert!(!text.contains("unrelated"));
+        assert!(!text.contains("wrong_receiver"));
+    }
+
+    #[test]
     fn raw_names_duplicates_and_container_attributes_are_exact_source() {
         let source="#[cfg(any())]\nmod first {\n#![allow(dead_code)]\nstruct Foo;\nimpl Foo\nwhere Foo: Sized\n{\n#![allow(unused)]\n#[inline]\nfn r#cap() -> u32 { 3 }\n}\n}\nmod second {\nfn cap() -> u32 { 4 }\n}\n";
         for name in ["cap", "r#cap"] {
