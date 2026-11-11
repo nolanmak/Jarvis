@@ -1844,6 +1844,66 @@ pub(super) async fn verify_with_repair(
     .await
 }
 
+async fn verify_repaired_candidate(
+    _worktree: &Path,
+    _allowed_paths: &[crate::autoship_contract::PathScope],
+    verify: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    verify.await
+}
+
+#[cfg(test)]
+mod repair_gate_tests {
+    use super::*;
+    use crate::autoship_contract::PathScope;
+
+    #[tokio::test]
+    async fn repair_scope_is_checked_before_verification_runs() {
+        for (path, expected_error) in [
+            ("src/allowed.rs", None),
+            ("src/unregistered.rs", Some("outside independently registered scope")),
+            ("autoship_verifiers/observe.py", Some("touched a guarded path")),
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path();
+            trusted_git(root, &["init", "-q"]).await.unwrap();
+            let commit = |message| async move {
+                trusted_git(root, &[
+                    "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                    "commit", "-qm", message, "--allow-empty",
+                ]).await.unwrap();
+            };
+            commit("base").await;
+            trusted_git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"])
+                .await
+                .unwrap();
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "fixture\n").unwrap();
+            trusted_git(root, &["add", "--", path]).await.unwrap();
+            commit("repair").await;
+            let mut calls = 0;
+            let result = verify_repaired_candidate(
+                root,
+                &[PathScope::File("src/allowed.rs".into())],
+                async {
+                    calls += 1;
+                    Ok(())
+                },
+            )
+            .await;
+            if let Some(expected_error) = expected_error {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(expected_error), "{path}: {error}");
+                assert_eq!(calls, 0, "{path}");
+            } else {
+                result.unwrap();
+                assert_eq!(calls, 1, "{path}");
+            }
+        }
+    }
+}
+
 pub(super) async fn verify_with_repair_for(
     reasoner: &FallbackReasoner,
     source: AcceptanceSource,
@@ -2092,7 +2152,18 @@ pub(super) async fn verify_with_repair_for(
                 recovery::commit_candidate_named(worktree, &format!("fix: {title} ({source})")).await?;
                 // A repair can affect code outside the selected regression test.
                 // It must re-earn the normal gate before any review sees it.
-                verification_gate(worktree, &workflow.audit_logger()).await.for_workflow(workflow).await??;
+                verify_repaired_candidate(
+                    worktree,
+                    &prepared.proposal.contract.allowed_paths,
+                    async {
+                        verification_gate(worktree, &workflow.audit_logger())
+                            .await
+                            .for_workflow(workflow)
+                            .await??;
+                        Ok(())
+                    },
+                )
+                .await?;
             }
         }
     }
