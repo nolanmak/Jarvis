@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "component_pr": 1995,
+  "main_commit": "af490d0444ac79577a55b485c744e3fd47a5dd2d",
+  "component_merge": "normal protected manual squash; zero autonomous merge credit",
+  "hosted": {
+    "run": 42977332728,
+    "job": 130379346242,
+    "core_passed": 699,
+    "cli_passed": 1764,
+    "log_sha256": "9508b3e9d7d7d2f4c1374d33769bd1dc6d4f2038cf1d865b01e54885020479a5"
+  },
+  "rollout": {
+    "both_roles_match": true,
+    "executable_sha256": "ab689bd24950acde636ed6a202e2d1a8cd64392ac15c3d35f1d370ac65b496a3",
+    "configuration_sha256": "55a4880360525f8b799dab8c433a109c315a97edacfcfddcc838fedd5ed400a0"
+  },
+  "actual_original_admission_readback": {
+    "source_commit": "af490d0444ac79577a55b485c744e3fd47a5dd2d",
+    "observed_at_utc": "2026-11-11T07:56:28.112358+00:00",
+    "new_protected_admissions_linked": 2,
+    "matches": [
+      {
+        "workflow": "nolanmak/jarvis/pr/1935",
+        "receipt_sha256": "ff427b84be311a37e98a441c5ee1cc07cb4eee10c1e02368fdbae9b066c1864e",
+        "committed_charge_rows": 1,
+        "protected_accounting_schema_version": 1,
+        "resource_identity_present": true,
+        "actual_provider": "codex",
+        "charge_at_ms": 1794383714800
+      },
+      {
+        "workflow": "nolanmak/jarvis/pr/1935",
+        "receipt_sha256": "1dc46dfa9f3a3624a82321754babac65800fd3a80e9cdbcbee3bbaab6d155839",
+        "committed_charge_rows": 1,
+        "protected_accounting_schema_version": 1,
+        "resource_identity_present": true,
+        "actual_provider": "codex",
+        "charge_at_ms": 1794383735989
+      }
+    ],
+    "model_calls_initiated_by_this_probe": 0,
+    "scope": "Readback of existing production native admission events joined to original committed workflow receipts. This does not prove result custody, independent review approval or autonomous merge."
+  },
+  "remaining": [
+    "Independent accepted final code approval was not established by CodeRabbit success; the service reported review rate limiting.",
+    "Natural production creation of the new private initial-error diagnostic has not been separately observed.",
+    "This does not prove native result custody, complete C2 or an autonomous merge."
+  ]
+}

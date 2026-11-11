@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "component_pr": 1997,
+  "source_head": "bbd8969ef430e19515f3338c1de182863da06fda",
+  "main_commit": "eec975e9e6329e1b329c5199f7a5a77cec760385",
+  "merged_at_utc": "2026-11-11T09:05:56Z",
+  "merge_kind": "normal protected manual squash; no admin bypass",
+  "deployed": true,
+  "deployment_observed_at_utc": "2026-11-11T09:09:07.433429+00:00",
+  "deployed_executable_sha256": "30e4047f06bb3c56583610602554c164ee79232a98ccf2e0998ecdf67bf6ff30",
+  "deployment_matches": true,
+  "roles": {
+    "daemon": {
+      "executable_sha256": "30e4047f06bb3c56583610602554c164ee79232a98ccf2e0998ecdf67bf6ff30",
+      "configuration_sha256": "55a4880360525f8b799dab8c433a109c315a97edacfcfddcc838fedd5ed400a0",
+      "status": "configuration-observed"
+    },
+    "worker": {
+      "executable_sha256": "30e4047f06bb3c56583610602554c164ee79232a98ccf2e0998ecdf67bf6ff30",
+      "configuration_sha256": "55a4880360525f8b799dab8c433a109c315a97edacfcfddcc838fedd5ed400a0",
+      "status": "configuration-observed"
+    }
+  },
+  "managed_broad": {
+    "head": "cd733386afe61ce5d09f751207f23aa5c207338d",
+    "passed": 630,
+    "failed": 0,
+    "ignored_existing": 25
+  },
+  "managed_final_owner_input": {
+    "head": "bbd8969ef430e19515f3338c1de182863da06fda",
+    "passed": 6,
+    "failed": 0
+  },
+  "logs_sha256": {
+    "autoship-scope-format-red.log": "0155b8314a3dd790346fe848abac98384c906169a0ccbebae012c6a9462531a0",
+    "autoship-refusal-handoff-red.log": "ef251dc5dc550c054530cb60585dd2a70d45e67dc500481f8a281147974e36f4",
+    "autoship-owner-source-red.log": "b93b6f1265b38061e92026733594f624f75171cdbf1bf2f63afe3f03882ed4db",
+    "autoship-1997-final-green.log": "248fa83863269800a487dbfa158f7460403c6cb341c119c61e935515f0b5184e",
+    "autoship-owner-source-green.log": "300a0829b7c3f50f868d35c9c2a5a32860bd4a7b1427ac67595dc1359a566444"
+  },
+  "hosted": {
+    "run": 42990022279,
+    "job": 130420446352,
+    "head": "bbd8969ef430e19515f3338c1de182863da06fda",
+    "all_checks_success": true,
+    "cli_passed": 1774,
+    "cli_failed": 0,
+    "cli_ignored_existing": 33,
+    "log_sha256": "84efb3b8cf51a63950b37e52da97bdb9ed801641a1fa30ed01ea0916190d4d45",
+    "new_regressions_explicit_ok": true,
+    "core_passed": 699,
+    "core_failed": 0,
+    "core_ignored_existing": 15
+  },
+  "paid_retry_containment": {
+    "workflow": "nolanmak/jarvis#1981",
+    "owner_pause_revision": 3,
+    "model_calls_at_pause": 24,
+    "model_calls_readback": 24,
+    "original_work_and_accounting_preserved": true,
+    "resume_unproven": true
+  },
+  "autonomous_merge_credit": 0,
+  "full_autoship_acceptance_complete": false,
+  "remaining": [
+    {
+      "issue": 1996,
+      "requirement": "Fence unchanged rejected initial inputs before paid redispatch"
+    },
+    {
+      "issue": 1998,
+      "requirement": "Independently establish full owner-request behavioral coverage before new enrollment"
+    },
+    {
+      "issue": 1999,
+      "requirement": "Coordinate GitHub quota holds and bound repeated evidence reads"
+    },
+    {
+      "issue": 1953,
+      "requirement": "Resolve independent review source-recovery evidence; preserve original #1954 owner hold"
+    },
+    {
+      "issue": 1917,
+      "requirement": "Automatic effective host-based capacity sizing and supported activation"
+    }
+  ],
+  "limits": [
+    "Complete original request is supplied to the proposer; independent semantic completeness is not established by prompt input alone.",
+    "Both running roles match the build; this is not proof of an autonomous merge or productive owner Discord session.",
+    "Final-head accepted independent CodeRabbit code approval has not been established by its success status."
+  ]
+}

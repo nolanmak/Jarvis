@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "workflow": "nolanmak/jarvis/pr/1956",
+  "public_target": "closed unmerged; original component folded into #1995",
+  "settled_at_utc": "2026-11-11T08:40:42Z",
+  "supported_command": "augmentagent autopr work --once --workflow nolanmak/jarvis/pr/1956 --json",
+  "stage": "retired",
+  "reason": "target_closed",
+  "model_calls_before": 17,
+  "model_calls_after": 17,
+  "autonomous_merge_credit": 0,
+  "allowance_available": 5,
+  "terminal_update": {
+    "sequence": 16,
+    "destination_receipts_confirmed": 1,
+    "confirmed_at_ms": 1794386452570
+  },
+  "original_source_issue_1955_owner_pause_preserved": true,
+  "scope": "Closed-target settlement and confirmed private update; no approval, native merge or capacity activation."
+}
