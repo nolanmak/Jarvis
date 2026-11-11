@@ -2,8 +2,113 @@
 //! staged substitutions, symlinks, bytecode or dependency search directories.
 use super::*;
 pub(in crate::self_improve) const EXPORTER: &str = include_str!("../../../scripts/autoship-verifier-checkout.py");
-pub(in crate::self_improve) use augmentagent_channel_core::storage_checkout::{allocate, OwnedCheckout};
-
+/// Stable source pathname preserves Cargo dependency fingerprints. Contents are
+/// nevertheless reconstructed on every run; nothing is trusted as a source cache.
+pub(in crate::self_improve) struct OwnedCheckout {
+    path: PathBuf,
+    owner: PathBuf,
+    identity: Vec<u8>,
+    _lock: std::fs::File,
+}
+impl OwnedCheckout {
+    pub(in crate::self_improve) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+impl Drop for OwnedCheckout {
+    fn drop(&mut self) {
+        augmentagent_channel_core::storage_checkout::release(&self.path, &self.owner, &self.identity);
+        // Closing only this descriptor leaves flock held by an unrelated
+        // fork until exec closes its inherited copy. Cleanup has completed,
+        // so explicitly release the shared open-file-description lock now.
+        use std::os::fd::AsRawFd;
+        unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN); }
+    }
+}
+pub(in crate::self_improve) fn allocate(parent: &Path, head: &str, contract: &str) -> Result<OwnedCheckout> {
+    use std::io::Write;
+    use std::os::unix::{
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        io::AsRawFd,
+    };
+    let container = parent.canonicalize()?.join("augmentagent-verifier-sources");
+    match std::fs::DirBuilder::new().mode(0o700).create(&container) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error.into()),
+    }
+    let meta = std::fs::symlink_metadata(&container)?;
+    ensure!(
+        meta.is_dir()
+            && !meta.file_type().is_symlink()
+            && meta.uid() == unsafe { libc::geteuid() }
+            && meta.mode() & 0o077 == 0,
+        "verifier source container is not private controller storage"
+    );
+    let identity =
+        serde_json::to_vec(&serde_json::json!({"version":1,"head":head,"contract":contract}))?;
+    let key = amendment::digest(&identity);
+    let path = container.join(&key);
+    let owner = container.join(format!("{key}.owner.json"));
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(container.join(format!("{key}.lock")))?;
+    let meta = lock.metadata()?;
+    ensure!(
+        meta.is_file()
+            && meta.nlink() == 1
+            && meta.uid() == unsafe { libc::geteuid() }
+            && meta.mode() & 0o077 == 0,
+        "invalid verifier source lock"
+    );
+    ensure!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "committed verifier source admission busy"
+    );
+    if path.try_exists()? {
+        ensure!(crate::build_storage::ci_holds::may_cleanup_after_reconcile(&path)?,
+            "verifier source has an unresolved CI cleanup hold; preserved");
+        let prior: serde_json::Value = private_json(&owner)?;
+        ensure!(
+            serde_json::to_vec(&prior)? == identity,
+            "unowned verifier source directory cannot be cleaned"
+        );
+        let meta = std::fs::symlink_metadata(&path)?;
+        ensure!(
+            meta.is_dir()
+                && !meta.file_type().is_symlink()
+                && meta.uid() == unsafe { libc::geteuid() }
+                && meta.mode() & 0o077 == 0,
+            "unowned verifier source path cannot be cleaned"
+        );
+        std::fs::remove_dir_all(&path)?;
+    }
+    if owner.exists() {
+        let prior: serde_json::Value = private_json(&owner)?;
+        ensure!(
+            serde_json::to_vec(&prior)? == identity,
+            "verifier source ownership mismatch"
+        );
+    } else {
+        let mut file = tempfile::NamedTempFile::new_in(&container)?;
+        file.write_all(&identity)?;
+        file.as_file().sync_all()?;
+        file.persist_noclobber(&owner)
+            .map_err(|error| error.error)?;
+    }
+    std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+    std::fs::File::open(&container)?.sync_all()?;
+    Ok(OwnedCheckout {
+        path,
+        owner,
+        identity,
+        _lock: lock,
+    })
+}
 pub(super) async fn materialize(
     root: &Path,
     head: &str,
@@ -88,4 +193,52 @@ pub(super) async fn materialize(
         "candidate changed while exporting verifier source"
     );
     Ok(source)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn released_checkout_unlocks_even_when_a_fork_inherits_its_descriptor() {
+        let parent = tempfile::tempdir().unwrap();
+        let checkout = allocate(parent.path(), "head", "contract").unwrap();
+        // A duplicate references the same open file description, as an
+        // unrelated child temporarily does between fork and exec.
+        let inherited = checkout._lock.try_clone().unwrap();
+        drop(checkout);
+        let replacement = allocate(parent.path(), "head", "contract")
+            .expect("completed checkout must release admission before every inherited descriptor closes");
+        drop(replacement);
+        drop(inherited);
+    }
+
+    #[test]
+    fn stable_owned_path_is_recreated_and_foreign_paths_are_not_deleted() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let first = allocate(parent.path(), "head", "contract").unwrap();
+        let path = first.path.clone();
+        let owner = first.owner.clone();
+        let identity = first.identity.clone();
+        std::fs::write(path.join("stale-ignored-cache"), b"poison").unwrap();
+        drop(first);
+        assert!(!path.exists());
+        let second = allocate(parent.path(), "head", "contract").unwrap();
+        assert_eq!(second.path, path);
+        assert!(!second.path.join("stale-ignored-cache").exists());
+        drop(second);
+        // Simulate a crash after the controller ownership receipt was durable.
+        std::fs::write(&owner, &identity).unwrap();
+        std::fs::set_permissions(&owner, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(path.join("partial-export"), b"partial").unwrap();
+        let recovered = allocate(parent.path(), "head", "contract").unwrap();
+        assert!(!recovered.path.join("partial-export").exists());
+        drop(recovered);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("foreign"), b"keep").unwrap();
+        assert!(allocate(parent.path(), "head", "contract").is_err());
+        assert_eq!(std::fs::read(path.join("foreign")).unwrap(), b"keep");
+    }
 }

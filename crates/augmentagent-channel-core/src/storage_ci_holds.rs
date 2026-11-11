@@ -392,7 +392,7 @@ pub fn may_cleanup(path: &Path) -> Result<bool> {
 /// Cleanup entry points reconcile abandoned owners themselves, before an old
 /// checkout can prevent the next storage admission from ever being reached.
 pub fn may_cleanup_after_reconcile(path: &Path) -> Result<bool> {
-    let _admission = crate::storage_reservations::Admission::lock()?;
+    let _admission = crate::storage_reservations::AdmissionLock::lock()?;
     may_cleanup(path)
 }
 
@@ -428,7 +428,7 @@ impl Hold {
                 .collect::<Result<_>>()?,
             resource: None,
         };
-        let _admission = crate::storage_reservations::Admission::lock()?;
+        let _admission = crate::storage_reservations::AdmissionLock::lock()?;
         let path = directory()?.join(format!("{}.hold", record.id));
         anyhow::ensure!(!path.try_exists()?, "CI cleanup identity already exists");
         let live = lifetime(&path, true)?;
@@ -580,7 +580,7 @@ mod tests {
             assert!(id.exists());
             assert_eq!(read(&id).unwrap().phase, Phase::Uncertain);
             assert!(reconcile_before_admission().is_err());
-            assert!(crate::storage_reservations::Admission::lock().is_err());
+            assert!(crate::storage_reservations::AdmissionLock::lock().is_err());
             assert!(!may_cleanup(root).unwrap());
             assert!(source.exists());
         });
