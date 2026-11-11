@@ -548,6 +548,7 @@ async fn all_matching_requested_items_must_fit_before_another_observation() {
 struct CorrectionCandidateContext {
     calls: Mutex<usize>,
     defect: bool,
+    sources: BTreeMap<String,String>,
 }
 #[async_trait::async_trait]
 impl GroupTransport for CorrectionCandidateContext {
@@ -563,7 +564,14 @@ impl GroupTransport for CorrectionCandidateContext {
         let source=request["full_file_evidence"].as_object().unwrap().values()
             .map(|v|v.as_str().unwrap()).collect::<Vec<_>>().join("\n");
         assert!(!source.contains("uncommitted poison"));
-        let supplied=source.contains("fn policy_limit()") && source.contains("fn apply_limit(");
+        let files=request["full_file_evidence"].as_object().unwrap();
+        let any_source=self.sources.keys().any(|key|files.contains_key(key));
+        if any_source {
+            for (key,body) in &self.sources {
+                assert_eq!(files.get(key).and_then(|value|value.as_str()),Some(body.as_str()),"optional captured source must be complete and byte-exact");
+            }
+        }
+        let supplied=self.sources.keys().all(|key|files.contains_key(key));
         let mut response=serde_json::json!({"binding":request["binding"],"decision":"incomplete","findings":[]});
         if supplied {
             assert!(source.contains("pinned observer fixture"));
@@ -586,9 +594,10 @@ impl GroupTransport for CorrectionCandidateContext {
 
 #[tokio::test]
 async fn malformed_first_observation_reuses_captured_candidate_in_the_same_bounded_correction() {
-    for case in ["approve","defect","over-budget"] {
+    for case in ["approve","defect","over-budget","escaped-over-budget"] {
         let root=tempfile::tempdir().unwrap();git_fixture(root.path(),&["init","-q"]);
-        let padding="x".repeat(if case=="over-budget" {aligned::MAX_PROMPT_BYTES+4096}else{4096});
+        let padding=if case=="escaped-over-budget" {"\\".repeat(aligned::MAX_PROMPT_BYTES/2+4096)}
+            else {"x".repeat(if case=="over-budget" {aligned::MAX_PROMPT_BYTES+4096}else{4096})};
         let implementation=if case=="defect" {"input + policy_limit()"}else{"input.min(policy_limit())"};
         let source=format!("pub fn policy_limit() -> i32 {{ 3 }}\n/*{padding}*/\npub fn apply_limit(input:i32) -> i32 {{ {implementation} }}\n");
         std::fs::write(root.path().join("logic.rs"),&source).unwrap();
@@ -613,13 +622,15 @@ async fn malformed_first_observation_reuses_captured_candidate_in_the_same_bound
             format!("// original assigned evidence\n/*{}*/\nfn caller() {{}}\n","a".repeat(64*1024)))]),false,None).unwrap();
         let actor=aligned::Actor {provider:"codex".into(),backend:"native".into(),model:"fixture".into(),session_id:"declared-review-actor".into()};
         let builders=[aligned::Actor {provider:"claude".into(),backend:"native".into(),model:"fixture".into(),session_id:"fixture-builder".into()}];
-        let transport=CorrectionCandidateContext {calls:Mutex::new(0),defect:case=="defect"};
+        let sources=all.iter().filter(|(key,_)|key.starts_with("source:") || key.starts_with("controller_source:"))
+            .map(|(key,body)|(key.clone(),body.clone())).collect();
+        let transport=CorrectionCandidateContext {calls:Mutex::new(0),defect:case=="defect",sources};
         let result=execute_evidence_group(EvidenceGroupInput {root:root.path(),inputs:&inputs,
             original_request:&original,evidence_shards:&all,actor:&actor,builders:&builders,
             origin:&aligned::ReviewOrigin::RecordedBuilders,role:aligned::ReviewRole::Diff,
             provider:augmentagent_channel_core::ProviderKind::Codex,opts:&opts,group_index:0,workflow:None},&transport).await;
         assert_eq!(*transport.calls.lock().unwrap(),2);
-        if case=="over-budget" {
+        if matches!(case,"over-budget"|"escaped-over-budget") {
             assert!(result.is_err(),"oversized optional source cannot authorize completion");
         } else {
             let completed=result.expect("available captured source must reach the bounded correction");
