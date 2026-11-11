@@ -465,10 +465,17 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                      loop cannot vouch for any model's review of it"
                 }
                 "reviewer-latched" => "reviewer latched: nothing to do, it retries after the reset",
-                _ => {
+                "review-evidence-budget" => {
+                    "review evidence exceeds its bounded budget: decompose the evidence before retrying"
+                }
+                "review-recovery-required" => {
+                    "review evidence or controller recovery required: inspect the protected failure before retrying"
+                }
+                "no-reviewer-capacity" => {
                     "no reviewer capacity: check `augmentagent doctor` and \
                      `augmentagent reasoner-selftest`"
                 }
+                _ => "review unavailable: inspect the recorded controller blocker before retrying",
             };
             if !fixes.contains(&fix) {
                 fixes.push(fix);
@@ -482,8 +489,7 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
             },
             code: "review-held",
             detail: format!(
-                "the loop is not wedged: these drafts are held, unbilled, because no \
-                 independent review is possible: {which}. Drafts remain queued for recovery; \
+                "these drafts are awaiting independent review completion: {which}. Drafts remain queued for recovery; \
                  waits of {budget} days or more are escalated."
             ),
             fix: fixes.join(". "),
@@ -1620,6 +1626,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn review_hold_billing_is_independent_of_provider_capacity() {
+        let i = HealthInputs {
+            unreviewable_drafts: vec![(1941, "no-reviewer-capacity".into(), "review did not complete".into(), 1)],
+            ..healthy()
+        };
+        let findings = analyze(&i, &Thresholds::default());
+        let held = findings.iter().find(|f| f.code == "review-held").unwrap();
+        assert!(!held.detail.contains("unbilled"), "a review hold does not establish whether model work was billed: {}", held.detail);
+    }
+
+    #[test]
+    fn review_evidence_holds_do_not_prescribe_provider_capacity_repairs() {
+        for code in ["review-evidence-budget", "review-recovery-required"] {
+            let i = HealthInputs {
+                unreviewable_drafts: vec![(1941, code.into(), "review evidence needs recovery".into(), 1)],
+                ..healthy()
+            };
+            let findings = analyze(&i, &Thresholds::default());
+            let held = findings.iter().find(|f| f.code == "review-held").unwrap();
+            assert!(held.fix.contains("evidence"), "{}", held.fix);
+            assert!(!held.fix.contains("capacity"), "{}", held.fix);
+            assert!(!held.fix.contains("reasoner-selftest"), "{}", held.fix);
+            assert!(!held.detail.contains("unbilled"), "the review hold has no billing evidence: {}", held.detail);
+        }
+    }
+
     /// #1037 C6 — a draft the loop cannot get independently reviewed looks,
     /// from outside, like a wedged loop: a PR that never moves and ticks that
     /// end with nothing. It is neither wedged nor spending, and the watchdog
@@ -1656,8 +1689,8 @@ mod tests {
         }
         assert!(held.detail.contains("waiting 2 days"), "the wait is visible: {}", held.detail);
         assert!(
-            held.detail.contains("not wedged") && held.detail.contains("unbilled"),
-            "say plainly that nothing is broken or spent: {}",
+            held.detail.contains("awaiting independent review") && !held.detail.contains("unbilled"),
+            "a review hold cannot establish whether model work was spent: {}",
             held.detail
         );
         for fix in ["human", "reasoner-selftest"] {

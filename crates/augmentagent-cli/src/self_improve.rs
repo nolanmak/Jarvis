@@ -3985,6 +3985,10 @@ enum ReviewUnavailable {
     /// Controller evidence exceeds a bounded request/collection budget. This is
     /// incomplete evidence, not a provider outage or a code rejection.
     EvidenceBudget { detail: String },
+    /// A reviewer was selected, but the review adapter could not finish.
+    /// This does not establish that a provider is missing or at capacity.
+    /// The protected detail preserves the failure without publishing it.
+    RecoveryRequired { detail: String },
     /// Every independent reviewer is on a quota cooldown: `(provider, reset)`.
     Latched {
         until: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>,
@@ -4115,6 +4119,7 @@ impl ReviewUnavailable {
             Self::AllReviewersBuiltIt | Self::NoCapacity { .. } => "no-reviewer-capacity",
             Self::Latched { .. } => "reviewer-latched",
             Self::EvidenceBudget { .. } => "review-evidence-budget",
+            Self::RecoveryRequired { .. } => "review-recovery-required",
         }
     }
 
@@ -4152,6 +4157,7 @@ impl ReviewUnavailable {
                 names(reviewers)
             ),
             Self::EvidenceBudget { .. } => "complete caller evidence exceeds the bounded review budget".into(),
+            Self::RecoveryRequired { .. } => "independent review did not complete; controller recovery required".into(),
             Self::Latched { until } => {
                 // Soonest reset first: that is when the draft can move again.
                 let mut until = until.clone();
@@ -4178,7 +4184,7 @@ impl ReviewUnavailable {
     fn log_line(&self) -> String {
         match self {
             Self::ProvenanceUnverifiable { error } => format!("{} ({error})", self.headline()),
-            Self::NoCapacity { detail, .. } | Self::EvidenceBudget { detail } if !detail.is_empty() => {
+            Self::NoCapacity { detail, .. } | Self::EvidenceBudget { detail } | Self::RecoveryRequired { detail } if !detail.is_empty() => {
                 format!("{} ({detail})", self.headline())
             }
             _ => self.headline(),
@@ -5920,6 +5926,9 @@ fn unreviewable_plan(
         };
     }
     let advice = match why {
+        ReviewUnavailable::RecoveryRequired { .. } => {
+            "Inspect the protected controller failure and repair the recorded review blocker before retrying. No approval or code rejection has been recorded."
+        }
         ReviewUnavailable::EvidenceBudget { .. } => {
             "The candidate needs bounded evidence decomposition before independent review can finish. No approval or code rejection has been recorded."
         }
