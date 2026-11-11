@@ -108,6 +108,9 @@ fn code(value:&str,fallback:&str)->String {
         "await_owner_resume"|"claim_workflow"|"awaiting-worker-claim"|
         "merge-allowance-exhausted"|"merge-reconciliation-required"|
         "review_changes_requested"|"ci_failed"|"merge_conflict"|"head_changed"|
+        "acceptance_verifier_repair_exhausted"|"acceptance_verifier_evidence_unknown"|
+        "acceptance_contract_invalid"|"acceptance_verifier_infrastructure_unavailable"|
+        "await_acceptance_input_change"|"await_original_evidence_recovery"|"await_verifier_infrastructure_recovery"|
         "retry_worker_attempt"|"inspect_workflow"|"await_worker") {value.into()} else {fallback.into()}
 }
 
@@ -127,7 +130,13 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     let mut action=checkpoint.as_ref().map_or_else(||"claim_workflow".into(),|c|code(&c.next.action,"inspect_workflow"));
     let mut eligible=checkpoint.as_ref().map(|c|c.next.eligible_at_ms);
     let attempt:Option<(String,String,i64)>=tx.query_row("SELECT outcome,reason,eligible_at FROM command_attempt WHERE workflow=?1 AND finished_at IS NOT NULL",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    if source=="command_attempt_finished" {
+    let initial_verifier_hold=checkpoint.as_ref().is_some_and(|c|c.stage==Stage::Scope && matches!(
+        (c.next.reason.as_str(),c.next.action.as_str()),
+        ("acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid","await_acceptance_input_change")|
+        ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery")|
+        ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery")));
+    if initial_verifier_hold {kind="blocked".into();}
+    if source=="command_attempt_finished" && !initial_verifier_hold {
         if let Some((outcome,why,at))=&attempt {
             kind=if outcome=="progress" {"worker-progress"} else {"retry-scheduled"}.into();
             reason=code(why,"worker-attempt-finished");action="inspect_workflow".into();eligible=Some(*at);
@@ -188,6 +197,35 @@ mod tests {
         assert!(events.windows(2).all(|e|e[1].sequence==e[0].sequence+1));drop(store);
         assert_eq!(WorkflowStore::open(&path).unwrap().progress_events(&lease.workflow).unwrap(),events);
     }
+    #[test]
+    fn initial_verifier_holds_remain_precise_after_command_attempt_finishes() {
+        for (reason,action) in [("acceptance_verifier_repair_exhausted","await_acceptance_input_change"),
+            ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery"),
+            ("acceptance_contract_invalid","await_acceptance_input_change"),
+            ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery")] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+            let mut store=WorkflowStore::open(&path).unwrap();
+            let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(1),
+                provider:None,until:submission::Milestone::Merged};
+            let id=store.submit_authorized("request","owner",&request,1).unwrap().workflow;
+            store.next_command_job("owner/repo",2).unwrap().unwrap();
+            store.register(&id,"fix/one",Binding {head:"head-a".into(),contract:"contract-a".into(),evidence_hash:"dependency-a".into()},3).unwrap();
+            let lease=store.claim(&id,"worker",4,10000).unwrap().unwrap();
+            let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+            checkpoint.stage=Stage::Scope;checkpoint.next=NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0};
+            store.checkpoint(&lease,&checkpoint,5).unwrap();
+            let before=store.progress_events(&id).unwrap();
+            store.finish_command_attempt(&id,2,submission::AttemptOutcome::Deferred,"workflow-held",6).unwrap();
+            let events=store.progress_events(&id).unwrap();
+            assert_eq!(events,before,"generic attempt finish must not replace or duplicate the precise hold");
+            let latest=events.last().unwrap();
+            assert_eq!(latest.kind,"blocked");assert_eq!(latest.reason,reason);assert_eq!(latest.next_action,action);
+            assert_eq!(latest.merge_state,"not-confirmed");
+            assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,0);
+            assert_eq!(WorkflowStore::open(&path).unwrap().progress_events(&id).unwrap(),events);
+        }
+    }
+
     #[test]
     fn projection_failure_rolls_back_checkpoint_and_audit() {
         let dir=tempfile::tempdir().unwrap();let (mut store,lease)=setup(&dir.path().join("state.db"));
