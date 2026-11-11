@@ -1,0 +1,371 @@
+{
+  "status": "Untrusted 18-case worked recipe; fresh private original/candidate replay completed; original differs/candidate matches external oracle; not registered.",
+  "invocation": {
+    "kind": "cargo_binary",
+    "package": "augmentagent-auth",
+    "bin": "autoship_review_observer",
+    "args": []
+  },
+  "pinned_files": [
+    "crates/augmentagent-auth/src/bin/autoship_review_observer.rs",
+    "autoship_verifiers/issue_1943/observe.py",
+    "autoship_verifiers/issue_1943/review_probe.rs",
+    "autoship_verifiers/issue_1943/public_env_template.txt"
+  ],
+  "files": {
+    "crates/augmentagent-auth/src/bin/autoship_review_observer.rs": "use std::process::{Command, Stdio};\nfn main() {\n    let status = Command::new(\"/usr/bin/python3\")\n        .args([\"-I\", \"autoship_verifiers/issue_1943/observe.py\"])\n        .stdin(Stdio::null()).status().expect(\"behavior observer interpreter\");\n    std::process::exit(status.code().unwrap_or(125));\n}\n",
+    "autoship_verifiers/issue_1943/observe.py": "TEMPLATE_SHA='e3452397d5d0ab9c3dd8a0069031b298de312c73a151baa05b91fc41731a0a51'\nTEST='self_improve::aligned_review::__autoship_full_review_v2::observe_candidate'\nimport os,sys,json,pathlib,shutil,stat,hashlib,subprocess,selectors,time\nCARGO=shutil.which('cargo')\nif not CARGO:raise RuntimeError('controller Cargo path unavailable')\nCARGO_BIN=str(pathlib.Path(CARGO).parent)\nsource=pathlib.Path.cwd(); runtime=pathlib.Path(os.environ['TMPDIR']); copied=runtime/'source';aux=runtime/'aux'\nif (source/'.git').exists():raise RuntimeError('requires controller materialized export')\ncopied.mkdir();aux.mkdir();(aux/'home').mkdir();(aux/'cargo').mkdir()\ncount=total=0\nfor directory,dirs,files in os.walk(source,followlinks=False):\n relative=pathlib.Path(directory).relative_to(source)\n dirs[:]=[d for d in dirs if d not in {'.git','.codex','.claude','.ssh','.gnupg','.aws','.azure'} and not d.startswith('.env')]\n for d in dirs:\n  p=pathlib.Path(directory)/d\n  if p.is_symlink(): raise RuntimeError('symlink directory')\n  (copied/relative/d).mkdir()\n for name in files:\n  if name=='.env' or name.startswith('.env.'): continue\n  p=pathlib.Path(directory)/name; info=p.lstat()\n  if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1: raise RuntimeError('nonprivate regular input')\n  count+=1;total+=info.st_size\n  if count>100000 or total>512*1024*1024: raise RuntimeError('copy bound')\n  shutil.copyfile(p,copied/relative/name)\n# Exact committed public support fixture; same bytes and pinned hash for both heads.\nfixture=(source/'autoship_verifiers/issue_1943/public_env_template.txt').read_bytes()\nif len(fixture)>128*1024:raise RuntimeError('public fixture bound')\nif hashlib.sha256(fixture).hexdigest()!=TEMPLATE_SHA: raise RuntimeError('fixture hash')\n(copied/'.env.example').write_bytes(fixture)\n\nprobe=(source/'autoship_verifiers/issue_1943/review_probe.rs').read_bytes()\nif len(probe)>128*1024 or hashlib.sha256(probe).hexdigest()!='c31b1f71a4bbab60d707b652dd2f93bd34be2d80d1dab81fc1a0fa4f077fa6c5':raise RuntimeError('probe identity')\nwith (copied/'crates/augmentagent-cli/src/self_improve_review.rs').open('ab') as f:f.write(probe)\nwith (copied/'crates/augmentagent-cli/src/self_improve.rs').open('ab') as f:f.write(b'\\n#[cfg(test)]\\npub(crate) fn __autoship_fixture_reasoner(provider: ::augmentagent_channel_core::ProviderKind)->Option<std::sync::Arc<::augmentagent_channel_core::FallbackReasoner>> {aligned_review::__autoship_full_review_v2::factory(provider)}\\n')\nwith (copied/'crates/augmentagent-cli/src/autoship_review.rs').open('ab') as f:f.write(b'\\n#[cfg(test)]\\nmod augmentagent_channel_core {pub use ::augmentagent_channel_core::*;pub fn build_workflow_pinned(provider:ProviderKind)->Option<std::sync::Arc<FallbackReasoner>>{crate::self_improve::__autoship_fixture_reasoner(provider)}}\\n')\nwith (copied/'crates/augmentagent-cli/src/autoship_review_tests.rs').open('ab') as f:f.write(b'\\n// Test namespace qualification only: original guards retain the real core.\\nuse ::augmentagent_channel_core;\\n')\n# These are synthetic inputs, not oracle expectations. Git objects are canonical,\n# avoiding Git's /dev/urandom-dependent staging path inside the sealed observer.\nimport zlib\nfixtures=[]\nfor label,body in [('control','input.min(policy_limit())'),('baseline','input + policy_limit()')]:\n directory=runtime/('full-review-'+label+'-fixture');directory.mkdir(mode=0o700);fixtures.append(directory)\n gd=directory/'.git';(gd/'objects').mkdir(parents=True);(gd/'refs/heads').mkdir(parents=True);(gd/'refs/remotes/origin').mkdir(parents=True)\n (gd/'HEAD').write_text('ref: refs/heads/main\\n');(gd/'config').write_text('[core]\\nrepositoryformatversion = 0\\nfilemode = true\\nbare = false\\nlogallrefupdates = false\\n')\n def obj(kind,payload):\n  raw=(kind+' '+str(len(payload))).encode()+b'\\0'+payload;sha=hashlib.sha1(raw).hexdigest();p=gd/'objects'/sha[:2]/sha[2:];p.parent.mkdir(exist_ok=True);p.write_bytes(zlib.compress(raw));return sha\n def tree(files):return obj('tree',b''.join((b'120000 ' if name=='link.rs' else b'100644 ')+name.encode()+b'\\0'+bytes.fromhex(obj('blob',payload)) for name,payload in sorted(files.items())))\n def commit(tree,parent=None):return obj('commit',('tree '+tree+'\\n'+('parent '+parent+'\\n' if parent else '')+'author Fixture <fixture@invalid> 1 +0000\\ncommitter Fixture <fixture@invalid> 1 +0000\\n\\nsynthetic\\n').encode())\n logic=('pub fn policy_limit() -> u64 { 3 }\\n'+'// unrelated immutable padding\\n'*20000+'pub fn apply_limit(input: u64) -> u64 { '+body+' }\\n').encode()\n files={'.env':b'SYNTHETIC ONLY\\n','.mcp.json':b'{}\\n','utf8.txt':'\u00e9x\\n'.encode(),'bad_tail.data':b'abcdef\\xff','link.rs':b'logic.rs','changed.rs':b'// original assigned evidence\\npub fn proposed_input() -> u64 { 0 }\\n','logic.rs':logic};base=commit(tree(files));files['changed.rs']=b'// original assigned evidence\\npub fn proposed_input() -> u64 { 5 }\\n';head=commit(tree(files),base)\n (gd/'refs/remotes/origin/main').write_text(base+'\\n');(gd/'refs/heads/main').write_text(head+'\\n')\n for name,payload in files.items():\n  if name=='link.rs':(directory/name).symlink_to(payload.decode())\n  else:(directory/name).write_bytes(payload)\n for args in [['read-tree','HEAD'],['fsck','--strict']]:\n  result=subprocess.run(['/usr/bin/git','--no-replace-objects',*args],cwd=directory,stdin=subprocess.DEVNULL,capture_output=True,timeout=10)\n  if result.returncode or len(result.stdout)+len(result.stderr)>65536:raise RuntimeError('canonical Git fixture setup')\n if subprocess.check_output(['/usr/bin/git','status','--porcelain','--untracked-files=all'],cwd=directory,timeout=10):raise RuntimeError('unclean Git fixture')\n# The only authentication-shaped file is synthetic and exists in a private\n# writable HOME; no provider CLI is in this fixture's reasoner chain.\nfixture_home=aux/'home/.codex';fixture_home.mkdir(mode=0o700)\nfixture_auth=fixture_home/'auth.json';fixture_auth.write_text(json.dumps({'fixture_only':True,'tokens':{'access_token':'synthetic-not-a-credential'}}));fixture_auth.chmod(0o600)\n\nreads=[str(copied),*[str(path) for path in fixtures]]\nfor name in ['registry','git']:\n p=pathlib.Path(os.environ['CARGO_HOME'])/name\n if p.exists():\n  resolved=p.resolve();(aux/'cargo'/name).symlink_to(resolved);reads.append(str(resolved))\nfor p in [pathlib.Path(os.environ['RUSTUP_HOME'])/'toolchains',pathlib.Path(os.environ['RUSTUP_HOME'])/'settings.toml',pathlib.Path(CARGO_BIN)]:\n if p.exists():reads.append(str(p))\nsandbox=source/'scripts/codex-command-sandbox.py'\nif hashlib.sha256(sandbox.read_bytes()).hexdigest()!='c9a914b3a3f92dea78f9328f84d7022411dbf102038d00810f24d46ca9f49e12':raise RuntimeError('sandbox helper identity')\npolicy=aux/'policy.json';policy.write_text(json.dumps({'cwd':str(copied),'read_roots':[],'write_roots':[str(aux),os.environ['CARGO_TARGET_DIR']],'runtime_reads':reads}));policy.chmod(0o600)\nenv=dict(os.environ);env.update(HOME=str(aux/'home'),CARGO_HOME=str(aux/'cargo'),TMPDIR=str(aux))\nargs=['/usr/bin/python3','-I',str(source/'scripts/codex-command-sandbox.py'),str(policy),CARGO,'--offline','--config','profile.dev.debug=0','--config','profile.test.debug=0','--config','profile.dev.incremental=false','--config','profile.test.incremental=false','--config','build.jobs=1','test','--locked','-p','augmentagent-cli','-p','augmentagent-embeddings','--features','ort/alternative-backend','--bin','augmentagent',TEST,'--','--exact','--nocapture']\nchild=subprocess.Popen(args,env=env,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE)\nselector=selectors.DefaultSelector();selector.register(child.stdout,selectors.EVENT_READ,'stdout');selector.register(child.stderr,selectors.EVENT_READ,'stderr')\nstreams={'stdout':bytearray(),'stderr':bytearray()};deadline=time.monotonic()+900;total=0\ntry:\n while selector.get_map():\n  if time.monotonic()>deadline:raise RuntimeError('observer timeout')\n  for key,_ in selector.select(timeout=min(1,max(0,deadline-time.monotonic()))):\n   block=os.read(key.fileobj.fileno(),65536)\n   if not block:selector.unregister(key.fileobj);key.fileobj.close();continue\n   total+=len(block)\n   if total>8*1024*1024:raise RuntimeError('output limit')\n   streams[key.data].extend(block)\n code=child.wait(timeout=max(0.01,deadline-time.monotonic()))\nfinally:\n selector.close()\n if child.poll() is None:child.kill();child.wait()\nif code:\n sys.stderr.buffer.write(streams['stderr'][-10000:]);sys.stderr.buffer.write(streams['stdout'][-1000:]);raise SystemExit(2)\nframes=[line[len(b'AUTOSHIP_PROBE_DATA_V1='):] for line in bytes(streams['stdout']).splitlines() if line.startswith(b'AUTOSHIP_PROBE_DATA_V1=')]\nif len(frames)!=1:raise RuntimeError('frame count')\ndef unique_object(pairs):\n obj={}\n for key,value in pairs:\n  if key in obj:raise RuntimeError('duplicate JSON key')\n  obj[key]=value\n return obj\ndef invalid_constant(value):raise RuntimeError('non-finite JSON')\ndata=json.loads(frames[0],object_pairs_hook=unique_object,parse_constant=invalid_constant)\nkeys={'cases','fixture_source_read_only','code_source_read_only','synthetic_protocol_only'}\nif not isinstance(data,dict) or set(data)!=keys:raise RuntimeError('observation schema')\nif any(type(data[key]) is not bool or data[key] is not True for key in ['fixture_source_read_only','code_source_read_only','synthetic_protocol_only']):raise RuntimeError('confinement precondition')\nif not isinstance(data['cases'],list) or len(data['cases'])!=18 or {case.get('case') for case in data['cases']}!={'unknown-criterion', 'second-incomplete', 'utf8-boundary', 'combined-budget', 'invalid-tail', 'selector-extra', 'denied-control', 'bytes-defect', 'control', 'denied-env', 'symlink', 'bad-byte-end', 'absent-item', 'malformed-then-incomplete', 'absent-source', 'defect', 'approval-source', 'bytes-control'}:raise RuntimeError('case schema')\nfor case in data['cases']:\n if set(case)!={'case','adapter_completed','approved','refusal_kind','source_file_bytes','scripted_calls','recovery_calls','adjudicator_calls','executed_values','completed_roles','adjudication_recorded','upheld_rulings'}:raise RuntimeError('case fields')\n if any(type(case[key]) is not int or case[key]<0 for key in ['source_file_bytes','scripted_calls','recovery_calls','adjudicator_calls']):raise RuntimeError('counter schema')\n if type(case['adapter_completed']) is not bool:raise RuntimeError('completion schema')\n if any(case[key] is not None and type(case[key]) is not bool for key in ['approved','adjudication_recorded']):raise RuntimeError('optional boolean schema')\n if case['completed_roles'] is not None and (type(case['completed_roles']) is not int or case['completed_roles']<0):raise RuntimeError('role schema')\n if case['refusal_kind'] is not None and case['refusal_kind'] not in {'typed-source-protocol-unsupported','evidence-budget','invalid-source-decision','invalid-selector-fields','invalid-source-criteria','source-denied','source-absent','item-absent','byte-range-outside','byte-range-split-utf8','source-invalid-utf8','source-not-regular','recovery-incomplete'}:raise RuntimeError('refusal schema')\n if case['upheld_rulings'] is not None and (type(case['upheld_rulings']) is not int or case['upheld_rulings']<0):raise RuntimeError('ruling schema')\n if not isinstance(case['executed_values'],list) or len(case['executed_values'])>32 or any(not isinstance(row,list) or len(row)!=3 or any(type(value) is not int or value<0 or value>2**64-1 for value in row) for row in case['executed_values']):raise RuntimeError('executable-data schema')\nprint(json.dumps(data,sort_keys=True,allow_nan=False))\n",
+    "autoship_verifiers/issue_1943/review_probe.rs": "\n#[cfg(test)]\nmod augmentagent_channel_core {\n    pub use ::augmentagent_channel_core::*;\n    pub fn build_workflow_pinned(provider:ProviderKind)->Option<std::sync::Arc<FallbackReasoner>> {\n        super::__autoship_full_review_v2::factory(provider)\n    }\n}\n#[cfg(test)]\npub(crate) mod __autoship_full_review_v2 {\n    use super::*;\n    use std::sync::{Mutex,OnceLock};\n    static SERIAL:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);\n    #[derive(Default)]\n    struct State {mode: &'static str,calls:usize,recovery_calls:usize,adjudicator_calls:usize,initial:BTreeMap<String,BTreeMap<String,String>>,values:Vec<[u64;3]>}\n    fn state()->&'static Mutex<State>{static STATE:OnceLock<Mutex<State>>=OnceLock::new();STATE.get_or_init(||Mutex::new(State::default()))}\n    struct Scripted;\n    pub(crate) fn factory(provider: ::augmentagent_channel_core::ProviderKind)->Option<std::sync::Arc<::augmentagent_channel_core::FallbackReasoner>> {\n        if provider!=::augmentagent_channel_core::ProviderKind::Codex{return None;}\n        Some(std::sync::Arc::new(::augmentagent_channel_core::FallbackReasoner::for_tests(\n            vec![(provider,std::sync::Arc::new(Scripted))],::augmentagent_channel_core::cooldown::CooldownLatch::at(\n                std::path::PathBuf::from(std::env::var_os(\"TMPDIR\").unwrap()).join(\"full-semantic-synthetic-cooldowns.json\")))))\n    }\n    fn collect(value:&serde_json::Value,out:&mut BTreeMap<String,String>,depth:usize)->Result<()> {\n        anyhow::ensure!(depth<20,\"fixture evidence nesting bound\");\n        match value {\n            serde_json::Value::Object(map)=>for (key,value) in map {\n                if key.starts_with(\"__requested_source__:\") || (key.starts_with(\"source:\") && key.contains(\"\\\"changed.rs\\\"\")) {\n                    if let Some(body)=value.as_str(){\n                        if let Some(old)=out.insert(key.clone(),body.into()){anyhow::ensure!(old==body,\"same source key changed\");}\n                    }\n                }\n                collect(value,out,depth+1)?;\n            },\n            serde_json::Value::Array(values)=>for value in values {collect(value,out,depth+1)?;},\n            serde_json::Value::String(text) if text.starts_with('{') || text.starts_with('[')=>{\n                if let Ok(parsed)=serde_json::from_str::<serde_json::Value>(text){collect(&parsed,out,depth+1)?;}\n            },\n            _=>(),\n        }\n        Ok(())\n    }\n    async fn execute_supplied_source(value:&serde_json::Value,serial:usize)->Result<[u64;3]> {\n        let mut source=BTreeMap::new();collect(value,&mut source,0)?;\n        anyhow::ensure!(source.keys().filter(|key|key.starts_with(\"__requested_source__:\")).count()>=2,\"both actual related item ranges must reach this request\");\n        let code=source.values().cloned().collect::<Vec<_>>().join(\"\\n\");\n        anyhow::ensure!(code.len()<128*1024,\"fixture compiled-source bound\");\n        let aux=std::path::PathBuf::from(std::env::var_os(\"TMPDIR\").unwrap());\n        let input=aux.join(format!(\"actual-related-source-{serial}.rs\"));let executable=aux.join(format!(\"actual-related-source-{serial}\"));\n        std::fs::write(&input,format!(\"{code}\\nfn main() {{let cap=policy_limit();let input=proposed_input();let actual=apply_limit(input);println!(\\\"{{}} {{}} {{}}\\\",cap,input,actual);}}\\n\"))?;\n        let mut compile=tokio::process::Command::new(\"rustc\");\n        compile.args([\"--edition=2021\",\"--crate-name\",\"synthetic_related_source\",\"-C\",\"debuginfo=0\"]).arg(&input).arg(\"-o\").arg(&executable)\n            .env_clear().env(\"TMPDIR\",&aux).env(\"PATH\",std::env::var_os(\"PATH\").context(\"controller compiler PATH missing\")?).env(\"RUSTUP_HOME\",std::env::var_os(\"RUSTUP_HOME\").unwrap()).env(\"HOME\",std::env::var_os(\"HOME\").unwrap()).kill_on_drop(true);\n        let output=tokio::time::timeout(std::time::Duration::from_secs(30),compile.output()).await??;\n        anyhow::ensure!(output.status.success(),\"actual supplied source did not compile: {}\",String::from_utf8_lossy(&output.stderr));\n        let mut command=tokio::process::Command::new(executable);command.env_clear().kill_on_drop(true);\n        let output=tokio::time::timeout(std::time::Duration::from_secs(5),command.output()).await??;\n        anyhow::ensure!(output.status.success() && output.stdout.len()<=256,\"actual supplied-source execution failed\");\n        let words=std::str::from_utf8(&output.stdout)?.split_whitespace().map(str::parse::<u64>).collect::<std::result::Result<Vec<_>,_>>()?;\n        anyhow::ensure!(words.len()==3,\"actual supplied-source result schema\");\n        Ok([words[0],words[1],words[2]])\n    }\n    #[async_trait::async_trait]\n    impl ::augmentagent_channel_core::Reasoner for Scripted {\n        async fn call(&self,opts:&::augmentagent_channel_core::ReasonerOpts,prompt:&str)->Result<String> {\n            anyhow::ensure!(opts.restrict_env,\"environment restriction lost\");\n            anyhow::ensure!(prompt.len()+opts.system_prompt.len()<=aligned::MAX_PROMPT_BYTES,\"actual request exceeds bound\");\n            let request:serde_json::Value=serde_json::from_str(prompt)?;\n            let serial=SERIAL.fetch_add(1,std::sync::atomic::Ordering::SeqCst);anyhow::ensure!(serial<64,\"fixture observation count bound\");\n            {let mut state=state().lock().unwrap();state.calls+=1;}\n            let response=if request.get(\"candidate_evidence\").is_some() && request.get(\"findings\").is_some() {\n                let values=execute_supplied_source(&request,serial).await?;\n                let mut rulings=serde_json::Map::new();\n                for finding in request[\"findings\"].as_array().context(\"adjudication findings absent\")? {\n                    let id=finding[\"id\"].as_str().context(\"finding ID absent\")?;\n                    let ruling=if values[2]>values[0] {serde_json::json!({\"decision\":\"uphold\",\"evidence\":format!(\"Actual supplied-source execution: cap {}, input {}, value {}\",values[0],values[1],values[2]),\"repair_criterion\":\"Assert apply_limit(proposed_input()) <= policy_limit()\"})}\n                        else {serde_json::json!({\"decision\":\"dismiss\",\"evidence\":format!(\"Actual supplied-source execution: cap {}, input {}, value {}\",values[0],values[1],values[2]),\"rationale\":\"The supplied implementation preserves the cap\"})};\n                    rulings.insert(id.into(),ruling);\n                }\n                {let mut state=state().lock().unwrap();state.adjudicator_calls+=1;state.values.push(values);}\n                serde_json::json!({\"binding\":request[\"binding\"],\"rulings\":rulings})\n            } else {\n                let files: BTreeMap<String,String>=serde_json::from_value(request[\"full_file_evidence\"].clone())?;\n                let session=opts.session_id.as_deref().context(\"real group session absent\")?;\n                let group=session.rsplit_once(\":recovery-\").map(|pair|pair.0).context(\"real recovery attempt label absent\")?.to_owned();\n                if !files.keys().any(|key|key.starts_with(\"__requested_source__:\")) {\n                    state().lock().unwrap().initial.entry(group).or_insert(files);\n                    let mode = state().lock().unwrap().mode;\n                    let selectors = match mode {\n                        \"bytes-control\" => vec![serde_json::json!({\"kind\":\"bytes\",\"start_byte\":0,\"end_byte\":35}),serde_json::json!({\"kind\":\"bytes\",\"start_byte\":620035,\"end_byte\":620103})],\n                        \"bytes-defect\" => vec![serde_json::json!({\"kind\":\"bytes\",\"start_byte\":0,\"end_byte\":35}),serde_json::json!({\"kind\":\"bytes\",\"start_byte\":620035,\"end_byte\":620100})],\n                        \"budget\" => vec![serde_json::json!({\"kind\":\"bytes\",\"start_byte\":0,\"end_byte\":280000}),serde_json::json!({\"kind\":\"bytes\",\"start_byte\":280000,\"end_byte\":560000})],\n                        \"absent-item\" => vec![serde_json::json!({\"kind\":\"rust_item\",\"name\":\"never_present_item\"})],\n                        \"bad-byte-end\" => vec![serde_json::json!({\"kind\":\"bytes\",\"start_byte\":620100,\"end_byte\":620200})],\n                        \"utf8-boundary\" => vec![serde_json::json!({\"kind\":\"bytes\",\"start_byte\":1,\"end_byte\":2})],\n                        \"invalid-tail\" => vec![serde_json::json!({\"kind\":\"bytes\",\"start_byte\":0,\"end_byte\":2})],\n                        \"denied-env\"|\"denied-control\"|\"absent-source\"|\"symlink\" => vec![serde_json::json!({\"kind\":\"whole_file\"})],\n                        _ => vec![serde_json::json!({\"kind\":\"rust_item\",\"name\":\"policy_limit\"}),serde_json::json!({\"kind\":\"rust_item\",\"name\":\"apply_limit\"})],\n                    };\n                    let path=match mode {\"denied-env\"=>\".env\",\"denied-control\"=>\".mcp.json\",\"absent-source\"=>\"absent.rs\",\"utf8-boundary\"=>\"utf8.txt\",\"invalid-tail\"=>\"bad_tail.data\",\"symlink\"=>\"link.rs\",_=>\"logic.rs\"};\n                    let missing: Vec<_> = selectors.into_iter().map(|selector| serde_json::json!({\"path\":path,\"criterion_ids\":[\"C1\"],\"question\":\"Judge the proposed input using this dependency together with the other requested dependency and all original evidence\",\"selector\":selector})).collect();\n                    let mut response=serde_json::json!({\"binding\":request[\"binding\"],\"decision\":\"incomplete\",\"findings\":[],\"missing_sources\":missing});\n                    match mode {\n                        \"approval-source\" => response[\"decision\"]=\"approve\".into(),\n                        \"selector-extra\" => response[\"missing_sources\"][0][\"selector\"][\"unexpected\"]=true.into(),\n                        \"unknown-criterion\" => response[\"missing_sources\"][0][\"criterion_ids\"]=serde_json::json!([\"UNKNOWN\"]),\n                        \"malformed-then-incomplete\" if state().lock().unwrap().calls==1 => response=serde_json::json!({\"not_a_review\":\"format correction is required\"}),\n                        _ => (),\n                    }\n                    response\n                } else {\n                    {let state=state().lock().unwrap();let original=state.initial.get(&group).context(\"initial evidence was not recorded\")?;\n                     anyhow::ensure!(original.iter().all(|(key,body)|files.get(key)==Some(body)),\"coherent recovery dropped or changed original assigned evidence\");}\n                    let values=execute_supplied_source(&request,serial).await?;\n                    {let mut state=state().lock().unwrap();state.recovery_calls+=1;state.values.push(values);}\n                    let findings=if values[2]>values[0] {serde_json::json!([{\"id\":\"cap-violation\",\"criterion_id\":\"C1\",\"evidence_hash\":aligned::digest(&serde_json::to_vec(&values)?),\n                        \"claim\":format!(\"Actual cap {}, proposed input {}, applied value {}\",values[0],values[1],values[2]),\"requested_change\":\"Preserve the configured cap for the actual proposed input\",\"conflicts_with\":[],\"repair_rounds\":0,\"repair_target\":{\"kind\":\"candidate\",\"paths\":[\"logic.rs\"]}}])} else {serde_json::json!([])};\n                    if state().lock().unwrap().mode==\"second-incomplete\" {\n                        serde_json::json!({\"binding\":request[\"binding\"],\"decision\":\"incomplete\",\"findings\":[],\"missing_sources\":[{\"path\":\"logic.rs\",\"criterion_ids\":[\"C1\"],\"question\":\"A third observation must not be dispatched\",\"selector\":{\"kind\":\"whole_file\"}}]})\n                    } else {                    serde_json::json!({\"binding\":request[\"binding\"],\"decision\":if findings.as_array().unwrap().is_empty(){\"approve\"}else{\"changes_requested\"},\"findings\":findings})}\n                }\n            };\n            let native=::augmentagent_channel_core::native_session::current_for(::augmentagent_channel_core::ProviderKind::Codex)?.context(\"real fresh-review protocol absent\")?;\n            let mut lease=native.begin(::augmentagent_channel_core::ProviderKind::Codex)?;lease.observe(&format!(\"synthetic-c1-only-{serial}\"))?;lease.finish()?;\n            Ok(response.to_string())\n        }\n    }\n    #[tokio::test]\n    async fn observe_candidate() {\n        let mut cases=Vec::new();\n        for (label,name,mode) in [\n            (\"control\",\"full-review-control-fixture\",\"item\"),\n            (\"defect\",\"full-review-baseline-fixture\",\"item\"),\n            (\"bytes-control\",\"full-review-control-fixture\",\"bytes-control\"),\n            (\"bytes-defect\",\"full-review-baseline-fixture\",\"bytes-defect\"),\n            (\"combined-budget\",\"full-review-control-fixture\",\"budget\"),\n            (\"approval-source\",\"full-review-control-fixture\",\"approval-source\"),\n            (\"selector-extra\",\"full-review-control-fixture\",\"selector-extra\"),\n            (\"unknown-criterion\",\"full-review-control-fixture\",\"unknown-criterion\"),\n            (\"denied-env\",\"full-review-control-fixture\",\"denied-env\"),\n            (\"denied-control\",\"full-review-control-fixture\",\"denied-control\"),\n            (\"absent-source\",\"full-review-control-fixture\",\"absent-source\"),\n            (\"absent-item\",\"full-review-control-fixture\",\"absent-item\"),\n            (\"bad-byte-end\",\"full-review-control-fixture\",\"bad-byte-end\"),\n            (\"utf8-boundary\",\"full-review-control-fixture\",\"utf8-boundary\"),\n            (\"invalid-tail\",\"full-review-control-fixture\",\"invalid-tail\"),\n            (\"symlink\",\"full-review-control-fixture\",\"symlink\"),\n            (\"second-incomplete\",\"full-review-control-fixture\",\"second-incomplete\"),\n            (\"malformed-then-incomplete\",\"full-review-control-fixture\",\"malformed-then-incomplete\")\n        ] {\n            *state().lock().unwrap()=State {mode,..State::default()};\n            let root=std::path::PathBuf::from(std::env::var_os(\"TMPDIR\").unwrap()).parent().unwrap().join(name);\n            let source_bytes=root.join(\"logic.rs\").metadata().unwrap().len();assert!(source_bytes>512*1024);\n            assert!(std::fs::OpenOptions::new().write(true).open(root.join(\"logic.rs\")).is_err(),\"fixture source must remain read-only\");\n            assert!(std::fs::OpenOptions::new().write(true).open(std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\")).join(\"src/self_improve_review.rs\")).is_err(),\"code source must remain read-only\");\n            let head=git(&root,&[\"rev-parse\",\"HEAD\"]).await.unwrap().trim().to_owned();\n            let binding=crate::autoship_workflow::Binding {head:head.clone(),contract:\"synthetic-original-contract\".into(),evidence_hash:\"synthetic-origin-reservation\".into()};\n            let mut store=crate::autoship_workflow::WorkflowStore::open(&crate::autoship_workflow::default_path()).unwrap();\n            let now=chrono::Utc::now().timestamp_millis();let id=format!(\"fixture/c1-{label}#1\");\n            store.register(&id,\"synthetic-review\",binding.clone(),now).unwrap();let lease=store.claim(&id,\"synthetic-fixture\",now+1,3600000).unwrap().unwrap();\n            let receipt=store.issue_fresh_review_origin(&lease,&binding,now+2).unwrap();\n            let origin=aligned::ReviewOrigin::FreshSession {workflow_id:id,candidate_head:head,contract_hash:binding.contract,evidence_hash:binding.evidence_hash,receipt};\n            let criteria=vec![\"The proposed input must not exceed the immutable policy cap after application\".to_owned()];\n            let subject=ReviewSubject {title:\"Synthetic coherent-source review\",body:\"Judge the proposed input using both immutable related declarations\"};\n            let context=ReviewContext {qa_ok:true,qa_notes:\"synthetic QA\",repair_round:2,previous:None,environment_id:\"synthetic-only\",adjudication_attempts_already_made:0,workflow:None,acceptance_evidence:None};\n            let result=run_inner(::augmentagent_channel_core::ProviderKind::Codex,&[],&subject,root,&criteria,context,origin).await;\n            let (completed,approved,roles,adjudication,refusal)=match &result {\n                Ok(review)=>(review.available,Some(review.approved()),review.structured.as_ref().map(|e|e.passes.len()),review.structured.as_ref().map(|e|e.adjudication.is_some()),serde_json::Value::Null),\n                Err(error) if is_evidence_budget(error)=>(false,None,None,None,serde_json::json!(\"evidence-budget\")),\n                Err(error)=>{let message=format!(\"{error:#}\");\n                    let refusal=if message.contains(\"unknown field\") && message.contains(\"missing_sources\") {\"typed-source-protocol-unsupported\"}\n                        else if message.contains(\"source requests require an incomplete decision and an array\") {\"invalid-source-decision\"}\n                        else if message.contains(\"source selector fields differ from its kind\") {\"invalid-selector-fields\"}\n                        else if message.contains(\"invalid source question criteria\") {\"invalid-source-criteria\"}\n                        else if message.contains(\"requested source path is not admitted\") {\"source-denied\"}\n                        else if message.contains(\"caller evidence path is not one immutable source file\") {\"source-absent\"}\n                        else if message.contains(\"requested Rust item is absent\") {\"item-absent\"}\n                        else if message.contains(\"source interval outside immutable blob\") {\"byte-range-outside\"}\n                        else if message.contains(\"source interval splits a UTF-8 character\") {\"byte-range-split-utf8\"}\n                        else if message.contains(\"caller evidence is not strict UTF-8\") {\"source-invalid-utf8\"}\n                        else if message.contains(\"caller evidence must be a regular tracked source file\") {\"source-not-regular\"}\n                        else if message.contains(\"review evidence dependency unresolved after bounded recovery\") || message.contains(\"review evidence remains incomplete after the second observation\") || message.contains(\"incomplete group cannot authorize coverage\") {\"recovery-incomplete\"}\n                        else {panic!(\"unexpected setup/adapter failure: {message}\")};\n                    (false,None,None,None,serde_json::json!(refusal))},\n            };\n            let state=state().lock().unwrap();\n            cases.push(serde_json::json!({\"case\":label,\"adapter_completed\":completed,\"approved\":approved,\"refusal_kind\":refusal,\"source_file_bytes\":source_bytes,\n                \"scripted_calls\":state.calls,\"recovery_calls\":state.recovery_calls,\"adjudicator_calls\":state.adjudicator_calls,\"executed_values\":state.values,\n                \"completed_roles\":roles,\"adjudication_recorded\":adjudication,\n                \"upheld_rulings\":result.as_ref().ok().and_then(|review|review.structured.as_ref()).map(|evidence|evidence.adjudication.as_ref().map_or(0,|receipt|receipt.rulings.values().filter(|ruling|matches!(ruling,aligned::Ruling::Uphold{..})).count()))}));\n        }\n        println!(\"AUTOSHIP_PROBE_DATA_V1={}\",serde_json::json!({\"cases\":cases,\"fixture_source_read_only\":true,\"code_source_read_only\":true,\"synthetic_protocol_only\":true}));\n    }\n}\n",
+    "autoship_verifiers/issue_1943/public_env_template.txt": "# Optional local 9Router account routing: run scripts/install-model-router.py,\n# then open Settings -> Models & accounts. Both processes use this same file.\n# Default: $XDG_CONFIG_HOME/augmentagent/model-router.json (or ~/.config/...).\n# AUGMENTAGENT_MODEL_ROUTER_CONFIG=/absolute/private/path/model-router.json\n\n# =============================================================================\n# AugmentAgent environment \u2014 copy to `.env` (gitignored) and fill in.\n# Linux daemon host. Values here are PLACEHOLDERS only \u2014 never commit secrets.\n#\n# Gating philosophy: every channel that can post/DM/act on a real account is\n# INERT until explicitly armed below. Defaults are safe (off / dry).\n# =============================================================================\n\n# --- Core API keys -----------------------------------------------------------\nGROQ_API_KEY=\nCEREBRAS_API_KEY=\nCOMPOSIO_API_KEY=\n# Dashboard login key. Empty => the dashboard generates one, stores it, and\n# prints it once on first start. e.g. `openssl rand -hex 32`.\nAUGMENTAGENT_API_KEY=\n# 1 => failed drafts never file GitHub issues through `gh`. Keep 1 unless\n# `gh` is logged in to YOUR fork.\nAUGMENTAGENT_GH_DISABLE=1\n# Linux installer manages this through the daemon unit. Keep unset for manual\n# or macOS serving; it selects the independent worker without enabling auto-PR.\n# AUGMENTAGENT_AUTOPR_EXTERNAL=1\n# Mistral OCR (#939): stage-2 fallback for scanned (image-only) PDF\n# attachments \u2014 Discord drops, `gmail get-attachment`, `doc extract`. Unset \u21d2\n# the OCR stage is skipped and the extraction reports \"OCR unavailable\"\n# instead of a silent blank. Keyring-first like the other provider keys.\nMISTRAL_API_KEY=\n# AUGMENTAGENT_MISTRAL_OCR_MODEL=mistral-ocr-latest\n# AUGMENTAGENT_MISTRAL_BASE_URL=https://api.mistral.ai\n# SocialAPI.ai \u2014 managed social-account posting/engagement (#238). Auto-masked.\nSOCIALAPI_API_KEY=\n# CCat / SeaCat decision gate. Disabled by default. When enabled, only the\n# comma-separated remote names listed below are treated as public and gated.\n# The key is keyring-first at runtime; this env fallback is for local hosts.\nSEACAT_API_KEY=\n# Separate 32+ byte owner secret used to sign one-time CCAP push receipts.\n# Generate once with `openssl rand -hex 32`; never share it with an agent.\nCCAT_APPROVAL_SIGNING_KEY=\nAUGMENTAGENT_CCAT_ENABLED=false\nAUGMENTAGENT_CCAT_PUBLIC_REMOTES=\n# Private JSONL from a labelled CCat evaluation. The public-push hook requires\n# >=100 examples and zero false allows; see scripts/ccat-calibrate.py.\nAUGMENTAGENT_CCAT_CALIBRATION_REPORT=\n# OPTIONAL (#248, default OFF): expose SocialAPI.ai's MCP server to the draft\n# reasoner as a STRICTLY READ-ONLY drafting aid (fetch comment/thread context).\n# A PreToolUse hook fail-closes any write/send/reply/post/dm/delete tool. Set\n# to 1/true/yes/on to enable. Leave unset for unchanged behavior.\n# AUGMENTAGENT_SOCIALAPI_MCP_READONLY=\n# Optional override for the SocialAPI MCP endpoint (defaults to the v1 /mcp path).\n# AUGMENTAGENT_SOCIALAPI_MCP_URL=\n\n# --- Discord (approval + notification surface \u2014 REQUIRED) --------------------\n# Without Discord creds the agent still polls, but CANNOT surface approval\n# cards, #58 engagement previews, self-improve approval prompts, or nudges \u2014\n# every approval-gated feature is dark. Provision with:\n#   augmentagent discord login --creds-json <file>\n# or place the creds JSON at the path the systemd unit exports via\n# AUGMENTAGENT_DISCORD_CREDS (default: ~/.config/augmentagent/discord-creds.json).\nDISCORD_BOT_TOKEN=\nDISCORD_CHANNEL_ID=\n# Also carries the source-watchdog alarm (#1463): a data-source store cold past\n# WATCHDOG_ALARM_AGE_S posts here, throttled to one message per\n# WATCHDOG_ALARM_NOTIFY_INTERVAL_S (default 86400) per app.\nDISCORD_WEBHOOK_URL=\n# Requires MESSAGE CONTENT intent enabled for the bot in the Discord dev portal.\nDISCORD_QUERY_CHANNEL_ID=        # optional \u2014 defaults to DISCORD_CHANNEL_ID\nDISCORD_ALLOWED_USER_ID=         # your Discord user ID; others are ignored\nDISCORD_APPROVAL_TIMEOUT_SECS=3600\n\n# --- Auto-update signature gate (security #298) ---------------------------\n# Applies ONLY to the legacy TS updater (src/index.ts) and the dashboard's\n# GitHub-webhook deploy. scripts/check-for-updates.sh (the systemd timer) does\n# NOT verify signatures \u2014 point it only at your own fork.\n# The auto-updater pulls/builds/restarts the revision on origin/main every 5 min\n# on a credential-bearing host. To prevent deploying spoofed/unverified code, the\n# target revision MUST be cryptographically signed by an allowlisted (owner) key\n# before any pull/build/restart. The git author field is NOT trusted.\n#\n# Path to an SSH/GPG allowed-signers file containing the owner's public key. This\n# is the trust anchor. Used via `git -c gpg.ssh.allowedSignersFile=...` for\n# verify-tag / verify-commit. If unset, git's already-configured signer trust is\n# used (a warning is logged).\nAUGMENTAGENT_UPDATE_ALLOWED_SIGNERS=\n# Require a valid owner signature before auto-deploying (default: enforce).\n# Set to \"false\" ONLY if you cannot sign releases; this disables the gate.\nAUGMENTAGENT_UPDATE_REQUIRE_SIGNATURE=true\n\n# --- Dashboard ---------------------------------------------------------------\nDASHBOARD_PORT=3000\nIMPORTANT_SENDERS=email1@example.com,email2@example.com\n\n# --- Dev-tool webhooks (#49) -------------------------------------------------\nGITHUB_WEBHOOK_SECRET=           # openssl rand -hex 32\n\n# --- Daily research pipeline (augmentagent research) -------------------------\n# Pulls recent arXiv AI/agent papers + latest leapmodel commits, compares them\n# against our agent process via a SWAPPABLE LLM driver, files GitHub issues for\n# the top gaps, and posts a digest to Discord. All keys optional (defaults shown).\n# RESEARCH_LLM_CMD reads a prompt on stdin and returns {\"gaps\":[\u2026]} on stdout;\n# swap it for `codex exec`, `ollama run <model>`, or any OpenAI-compatible shim.\nRESEARCH_LLM_CMD=\"claude -p --output-format json\"\nRESEARCH_ARXIV_CATEGORIES=cs.AI,cs.MA,cs.CL,cs.LG\nRESEARCH_KEYWORDS=\"agent,tool use,multi-agent,rag,planning,reflection,memory,llm,reasoning\"\nRESEARCH_MAX_PAPERS=15            # cap papers/day after keyword rank+dedup\nRESEARCH_MAX_ISSUES=3            # cap auto-filed issues/day (--max-issues overrides)\nRESEARCH_GH_REPO=                 # owner/repo of YOUR fork; never upstream\n# RESEARCH_FETCH_BATCH=100       # arXiv entries pulled before filtering\n\n# --- Reasoner provider chain & model tiers (#655/#658) -----------------------\n# Every value below is COMMENTED OUT and shows the built-in default, so an\n# unedited copy behaves exactly like a checkout with none of this set. #658\n# also asked for CLAUDE.md, but that file is host-local operator notes with\n# operator PII and is deliberately untracked (.gitignore, #305) \u2014 so it can\n# carry no shared docs, and this block plus README.md stand in for it.\n#\n# The chain the reasoner walks, in order; the first success wins. Default is\n# claude alone \u2014 failover is opt-in. A provider only ever serves calls its\n# capability class allows: Claude and Codex support full-agentic workflows;\n# Codex uses the scoped, guarded tool bridge (docs/CODEX-FALLBACK.md).\n# Cerebras is text-only; Gemini also supports read-only file tools.\n# Put codex first to use it as primary, or use codex alone without Claude.\n# Unknown names are skipped with a warning (and flagged by `doctor`).\n# AUGMENTAGENT_REASONER_CHAIN=claude\n#\n# Per-provider tier -> model map. Presets ask for a tier (Quality for triage /\n# drafts / digest / ask, Fast for parsers and classifiers); these cells decide\n# which concrete model each provider runs for it. Swap a model without a\n# rebuild by uncommenting a cell.\n# AUGMENTAGENT_MODEL_CLAUDE_QUALITY=claude-opus-4-8\n# AUGMENTAGENT_MODEL_CLAUDE_FAST=claude-haiku-4-5-20251001\n# AUGMENTAGENT_MODEL_CODEX_QUALITY=gpt-5.6-terra\n# AUGMENTAGENT_MODEL_CODEX_FAST=gpt-5.6-luna\n# AUGMENTAGENT_MODEL_GEMINI_QUALITY=gemini-3.1-pro-preview\n# AUGMENTAGENT_MODEL_GEMINI_FAST=gemini-3.7-flash\n# AUGMENTAGENT_MODEL_CEREBRAS_QUALITY=gpt-oss-120b\n# AUGMENTAGENT_MODEL_CEREBRAS_FAST=gemma-4-31b\n#\n# Cerebras retires model families several times a year, so `augmentagent\n# doctor --deep` checks its catalog for the two pins above \u2014 but only while\n# cerebras is actually named in the chain.\n# AUGMENTAGENT_CEREBRAS_BASE_URL=https://api.cerebras.ai/v1\n#\n# One live round trip through the chain, printing the providers, the active\n# cooldown latches and the response:  augmentagent reasoner-selftest\n\n# --- Rust runtime knobs ------------------------------------------------------\nRUST_LOG=info\n# CLAUDE_CLI=claude              # override path to the `claude` binary\n# AUGMENTAGENT_DB=./data.db      # defaults to ./data.db\n# NOTE: the encrypted sparsebundle vault is macOS-only and NOT used on this\n# Linux host \u2014 vault-mount.sh is a no-op here. (Linux-only deployment.)\n\n# --- Codex build-VM scratch admission limits (#1092) -------------------------\n# Read from the DAEMON environment only (never a task/profile env or the model)\n# and carried to the bridge in its private policy. A new build session is\n# admitted only within these limits. Values are integer GiB; unset or blank\n# falls back to the default, but a value that is present and out-of-range or\n# unparseable fails closed (doctor's `build_scratch` check flags them) \u2014 never\n# silently defaulted or clamped. On this host the defaults admit one session at\n# a time: the 24 GiB budget would by itself fit two 12 GiB images, but the\n# free-space rule is binding (a second concurrent session needs more free space\n# than the volume has). The scratch volume (default /mnt/build/codex-vm) is\n# shared with the auto-PR gate cache: if AUGMENTAGENT_GATE_CACHE_MAX_MB grows\n# the cache, less free space is left for build sessions. See docs/BUILD-VM.md.\n# AUGMENTAGENT_BUILD_SCRATCH_HEADROOM_GIB=20   # free space kept after admitting a session (min 4)\n# AUGMENTAGENT_BUILD_SCRATCH_IMAGE_CAP_GIB=12  # per-session build-cache image cap (min 10)\n# AUGMENTAGENT_BUILD_SCRATCH_BUDGET_GIB=24     # total build-cache budget across sessions (>= image cap)\n\n# --- Automated git commit identity (#118 \u2014 daemon self-improve/wiki commits) -\n# Neutral default if unset: \"AugmentAgent <augmentagent@localhost>\".\n# Also used for private KB-mirror sync commits (epic #474).\nAUGMENTAGENT_GIT_AUTHOR_NAME=\nAUGMENTAGENT_GIT_AUTHOR_EMAIL=\n\n# --- Private knowledge-base mirror (epic #474) ---\n# `wiki/` is its own git repo backed by a PRIVATE GitHub repo so the owner\n# can browse/edit the KB from anywhere. Bootstrap once with\n# `scripts/kb-mirror-bootstrap.sh [repo-name]`; ongoing sync runs via the\n# augmentagent-wiki-sync.timer systemd unit. Auth is the ambient `gh`\n# login (no token here). The sync itself needs nothing here \u2014 the remote is\n# stored in wiki/.git/config and commit identity comes from the git-author\n# vars above.\n#\n# AUGMENTAGENT_WIKI_REMOTE: optional. The KB repo as a full URL or an\n# `owner/repo` slug. Only used to render the dashboard's \"Knowledge base\"\n# link (#479); leave unset to hide the link.\nAUGMENTAGENT_WIKI_REMOTE=\n\n# --- Web-fetch sidecar (layered URL fetcher) ---\n# Layer order: http \u2192 render (headless Playwright) \u2192 firecrawl \u2192 brightdata.\n# Each provider layer is skipped if its key is unset. The local HTTP + render\n# layers always run, so a basic install has zero new external deps.\n# FETCH_SOCKET=                  # override the sidecar Unix-socket path\n# FIRECRAWL_API_KEY=             # https://firecrawl.dev \u2014 falls back when local render fails\n# BRIGHTDATA_API_KEY=            # https://brightdata.com \u2014 final fallback for anti-bot sites\n# BRIGHTDATA_ZONE=               # bright data Unlocker zone name; required alongside the key\n# FETCH_DRY_PROVIDERS=1          # set to 1 to skip real Firecrawl / Bright Data calls (testing)\n\n# --- Claude Intercept (optional, local MITM proxy at ~/claude_intercept) ---\n# CLAUDE_INTERCEPT_CLI=          # override path to the intercept CLI (default ~/claude_intercept/src/cli.js)\n\n# =============================================================================\n# CHANNEL ARMING GATES \u2014 all default OFF. Un-gating each also needs the live\n# credential (cookies / token) and, where noted, a one-time validation run.\n# =============================================================================\n\n# --- Instagram (#50/#76/#112/#119/#128) --------------------------------------\n# Browser-driven feed/carousel/reel/story posting + DM. Approval-gated, hard\n# daily quota. Set true ONLY after `instagram validate` passes on a live\n# session (needs IG session cookies via the browser sidecar).\nINSTAGRAM_REAL_ACCOUNT_ENABLED=false\n\n# --- Twitter / X (#14/#107/#126/#129) ----------------------------------------\n# No live x.com call happens unless you pass `--allow-live`. Final sign-off:\n#   augmentagent twitter validate --allow-live true   (needs auth_token + ct0)\n# AUGMENTAGENT_TWITTER_BASE_URL=   # testing only \u2014 mock/capture-proxy override\n\n# --- Deft / Deftform (#116/#121/#127) ----------------------------------------\n# Inert until BOTH are set. Then register the webhook in the Deftform portal:\n#   POST https://<host>/webhooks/deft/<AUGMENTAGENT_DEFT_WEBHOOK_SECRET>\n# and capture a live submission to validate the envelope (docs/deft-protocol.md \u00a74).\nAUGMENTAGENT_DEFT_ENABLED=\nAUGMENTAGENT_DEFT_WEBHOOK_SECRET=   # openssl rand -hex 32 (carried in URL path)\n\n# --- WhatsApp (#12/#102/#110) ------------------------------------------------\n# Triple ban-risk gate. Also needs the whatsmeow sidecar QR-paired.\nAUGMENTAGENT_WHATSAPP_CONTROL_ENABLED=\nAUGMENTAGENT_WHATSAPP_CONTROL_CHAT=   # the single designated control chat id\n\n# --- Telegram bot (#74/#91) --------------------------------------------------\nAUGMENTAGENT_TELEGRAM_OWNER_CHAT_ID=\n# AUGMENTAGENT_TELEGRAM_BOT_AUTH=   # file fallback for headless/CI (else keyring)\n\n# --- LinkedIn posting (#13/#51/#109) -----------------------------------------\n# First 3 posts require a second confirmation; set to clear that guard.\nAUGMENTAGENT_LINKEDIN_POST_CONFIRM=   # =yes to confirm\n\n# =============================================================================\n# OPT-IN FEATURE FLAGS \u2014 off by default; safe to enable incrementally.\n# =============================================================================\n\n# --- Ask-detection resolvers (#35/#115/#120/#130) ----------------------------\n# off (default) | shadow (Haiku telemetry, no draft injection) | live\nAUGMENTAGENT_ASK_RESOLVE=off\nAUGMENTAGENT_ASK_RESOLVE_MIN_CONFIDENCE=0.7\n# Each live resolver also self-gates on its own flag (no flag \u21d2 no-op):\nAUGMENTAGENT_ASK_RESOLVE_SCHEDULING=\nAUGMENTAGENT_ASK_RESOLVE_CALENDLY=\nAUGMENTAGENT_ASK_RESOLVE_SHARE_DOC=\nAUGMENTAGENT_ASK_RESOLVE_INTRO=\nAUGMENTAGENT_ASK_RESOLVE_MEETING_LINK=\nAUGMENTAGENT_CALENDLY_URL=        # used by the calendly resolver\nAUGMENTAGENT_MEETING_LINK=        # static Zoom/Meet/Teams link fallback\n\n# --- Drafting (#106) ---------------------------------------------------------\nAUGMENTAGENT_THREAD_AWARE=        # DEFAULT-ON (#450); =0 to draft without thread history\nAUGMENTAGENT_DRAFT_ARCHETYPES=    # =1 draft archetypes\n# AUGMENTAGENT_MAX_PENDING_DRAFTS \u2014 REMOVED in #450. It downgraded Reply\u2192Flag\n# (no draft at all) once the queue passed a cap, and because the queue could not\n# drain on its own it became a permanent kill switch for drafting. Volume is now\n# controlled at the source: bulk senders never reach the draft phase (#451) and\n# answered cards retire themselves (#449).\nAUGMENTAGENT_STALE_DRAFT_DAYS=7      # hourly sweep expires pending older than this\n\n# --- Approval-queue hygiene (#449) -------------------------------------------\n# Watches the SENT folder so a reply you write in Gmail web/mobile retires the\n# pending approval card on that thread. DEFAULT-ON; =0 disables (and the\n# carousel will then keep showing mail you have already answered).\nAUGMENTAGENT_OUTBOUND_OBSERVER=\nAUGMENTAGENT_OUTBOUND_OBSERVER_INTERVAL_SECS=   # default 300\n\n# --- Contacts / CRM ingestion (#61/#62/#64/#113) -----------------------------\n# AUGMENTAGENT_CARDDAV_URL=\n# AUGMENTAGENT_CARDDAV_USER=\n# AUGMENTAGENT_CARDDAV_PASS=\nAUGMENTAGENT_DEFAULT_REGION=US    # E.164 phone normalization default region\n\n# Journal privacy (#1055): extra excluded topics (comma-separated, exact\n# case-insensitive match) on top of the built-ins (password variants + the\n# lock emoji). Entries in an excluded topic are consumed but never stored.\n# AUGMENTAGENT_JOURNAL_EXCLUDE_TOPICS=\n\n# --- iMessage history bundle (#882) ------------------------------------------\n# Private iMessage bundle directory (does not need to be a Git repository).\n# Exporter + macOS scheduler: scripts/imessage/; setup: docs/IMESSAGE.md.\n# Existing private Git bundles still auto-pull. Absent = feature off.\n# AUGMENTAGENT_IMESSAGE_REPO_DIR=\n# Optional S3 bucket/prefix holding the bundle's attachment files (#888).\n# Also the ask-mode `imessage fetch-attachment` allowlist; setting the bucket forwards AWS_* into the ask env.\n# AUGMENTAGENT_IMESSAGE_S3_BUCKET=\n# AUGMENTAGENT_IMESSAGE_S3_PREFIX=conversations/\n# Auto-merge duplicate contacts: a `*_at_contact` stub whose phone/email sits on\n# exactly ONE person page is merged without an approval card, and one Discord\n# digest lists what merged. Pairs you rejected stay rejected; a survivor named\n# after a bare phone number still gets a card. Default off (card per pair).\n# AUGMENTAGENT_AUTO_MERGE_CONTACTS=true\n\n# --- WhatsApp Desktop conversation history ----------------------------------\n# Private bundle directory: plain folder or existing private Git checkout.\n# The daemon pulls Git feeds and imports history on startup/every 30 minutes.\n# No live WhatsApp pairing, triage, or outbound sends are enabled by this setting.\n# Exporter + macOS scheduler: scripts/whatsapp/; setup: docs/WHATSAPP-HISTORY.md.\n# AUGMENTAGENT_WHATSAPP_HISTORY_DIR=\n\n# --- Apple Notes bundle (#1062) --------------------------------------------\n# Private git checkout produced by scripts/apple-notes/ (setup: docs/APPLE-NOTES.md).\n# The daemon pulls it and imports new/edited/deleted notes every 30 minutes into\n# searchable history (platform \"apple_notes\"). Absent = feature off.\n# AUGMENTAGENT_APPLE_NOTES_REPO_DIR=\n# Optional private S3 bucket/prefix holding the bundle's attachment files (#1061),\n# uploaded by `scripts/apple-notes/sync.py --s3-bucket` under an IAM profile that\n# may only write there. Also the ask-mode `apple-notes fetch-attachment` allowlist;\n# setting the bucket forwards AWS_* into the ask env. Absent = the verb reports\n# \"not configured\" and makes no network call.\n# AUGMENTAGENT_APPLE_NOTES_S3_BUCKET=\n# AUGMENTAGENT_APPLE_NOTES_S3_PREFIX=notes/\n\n# --- Discord history (#1054) -------------------------------------------------\n# Opt-in: sync Discord messages into searchable conversation history (no model\n# calls). Needs `augmentagent discord login`. Runs every ~4 h in the daemon;\n# `augmentagent discord history-sync` runs it now. Setup: docs/DISCORD-HISTORY.md.\n# 1 = include your DMs and group DMs.\n# AUGMENTAGENT_DISCORD_EXPORT_DMS=0\n# Comma-separated server (guild) ids whose readable text channels are included.\n# Find ids with `augmentagent discord list-guilds`.\n# AUGMENTAGENT_DISCORD_EXPORT_GUILDS=\n\n# 1 = send new iMessage/WhatsApp history messages and new/edited Apple Notes through LLM wiki capture\n# (one Haiku call per changed conversation per poll). Default off: rows stay searchable.\n# AUGMENTAGENT_HISTORY_WIKI_CAPTURE=0\n\n# =============================================================================\n# MULTI-TENANT (#101) \u2014 per-Discord-server isolated agents.\n# See docs/MULTI-TENANT.md (Phase D runbook). Each tenant sets its own\n# DISCORD_CHANNEL_ID + Composio Drive OAuth; runs with `--no-email`.\n# =============================================================================\n\n# --- Wix Events calendar mirror (#633) ---------------------------------------\n# Mirrors upcoming Meetup group events onto a Wix Events calendar. CREATE ONLY \u2014\n# the job never updates or deletes. Key: https://manage.wix.com/account/api-keys\n# with Wix Events \"Manage Events\" + \"Read Events\".\n# AUGMENTAGENT_WIX_API_KEY=\n# AUGMENTAGENT_WIX_SITE_ID=\n# AUGMENTAGENT_WIX_MEETUP_GROUPS=philadelphia-entrepreneur   # comma-separated slugs\n# Luma calendars to mirror (comma-separated cal-\u2026 ids). Auth-free ICS feed;\n# find the id in any event page's __NEXT_DATA__ as \"api_id\":\"cal-\u2026\".\n# AUGMENTAGENT_WIX_LUMA_CALENDARS=cal-wtGdKVWfiMGaxqD\nAUGMENTAGENT_WIX_SYNC_DRY_RUN=1              # plan only unless --yes\nAUGMENTAGENT_WIX_SYNC_MAX_PER_RUN=5          # cap creations per run\nAUGMENTAGENT_WIX_SYNC_REQUIRE_APPROVAL=1     # a timer can only ever plan\nAUGMENTAGENT_WIX_TIMEZONE=America/New_York\n\n# --- Heartbeat (#1317) \u2014 see docs/HEARTBEAT.md ---\n# A periodic open-ended check-in against <wiki>/HEARTBEAT.md. Silent unless\n# something needs you; skipped (no model call) when the checklist is missing\n# or empty. Off unless enabled.\nAUGMENTAGENT_HEARTBEAT_ENABLED=0\n# AUGMENTAGENT_HEARTBEAT_INTERVAL=30m          # 5m floor\n# AUGMENTAGENT_HEARTBEAT_ACTIVE_HOURS=08:00-22:00   # unset = all day; may cross midnight\n# AUGMENTAGENT_HEARTBEAT_TZ=America/New_York   # unset = host local time\n# AUGMENTAGENT_HEARTBEAT_DAILY_CAP=6           # max notices per rolling 24h\n# AUGMENTAGENT_HEARTBEAT_TIMEOUT_SECS=300      # one model call's budget\n\n# --- FlyOnTheWall meeting transcripts (#915) ---\n# A read-only clone of the private transcript repo FlyOnTheWall auto-pushes to.\n# `transcripts sync` fast-forwards it and ingests new meetings; the ask agent\n# also gets read access so it can grep what was actually said.\nAUGMENTAGENT_TRANSCRIPTS_DIR=\n# Your own address(es), comma-separated; every one is excluded from any\n# meeting roster (you can be invited under a work domain, a personal gmail,\n# and the export account all at once).\nAUGMENTAGENT_MY_EMAIL=\n\n# Plaid personal finance. Trial accounts use production; sandbox is fake data.\nPLAID_CLIENT_ID=\nPLAID_SECRET=\nPLAID_ENV=production\n# Item access tokens are stored in Linux Secret Service, never in the wiki.\n\n# --- Disk hygiene for build output (#1406) \u2014 see docs/disk-storage.md ----------------\n# `augmentagent disk prune` (daily timer) removes build output no compile has\n# needed lately; it never touches a target dir a running build is using.\n# AUGMENTAGENT_PRUNE_ARTIFACT_DAYS=7       # days without a compile needing a unit\n# AUGMENTAGENT_PRUNE_INCREMENTAL_DAYS=2    # idle days for an incremental/ session\n# AUGMENTAGENT_PRUNE_TARGET_DIRS=          # extra target dirs, colon-separated\n# AUGMENTAGENT_GATE_MIN_FREE_GB=15         # final free-space reserve; monitored during builds\n# AUGMENTAGENT_BUILD_GROWTH_GB=10          # additional peak growth reserved before build admission\n# AUGMENTAGENT_BUILD_PARENT=              # session cache parent; wrapper prefers writable /mnt/build\n# AUGMENTAGENT_GATE_CACHE_MAX_MB=20000     # shared cache cap, enforced under the storage lease\n# AUGMENTAGENT_GATE_CACHE_STALE_DAYS=3     # idle days before a cap trim takes an artifact\n# AUGMENTAGENT_DEPLOY_MAX_GB=8             # owner's snapshot budget; over it, oldest unprotected snapshots are evicted (agents: never raise it to pass a refusal)\n# AUGMENTAGENT_DEPLOY_KEEP=2               # deploy snapshots / rollback binaries kept regardless of age\n# AUGMENTAGENT_DEPLOY_SNAPSHOT_DIR=        # where `deploy snapshot` writes (default: the data dir)\n# AUGMENTAGENT_ACTION_BODY_RETENTION_DAYS=30 # days a terminal action keeps its own copy of the email body (0 disables)\n# AUGMENTAGENT_LOG_ROTATE_MB=50            # rotate a state-dir log at this size (or monthly)\n# AUGMENTAGENT_LOG_KEEP_MONTHS=3           # months a rotated log is kept locally\n# AUGMENTAGENT_OPS_ARCHIVE_REMOTE=         # owner/repo of a PRIVATE GitHub repo for rotated logs; unset = off\n\n# Optional: pin the Composio auth config used when connecting a toolkit from the\n# dashboard (COMPOSIO_AUTH_CONFIG_<TOOLKIT>, e.g. GMAIL, GOOGLECALENDAR,\n# GOOGLEDRIVE). Point it at an auth config backed by your own Google OAuth app\n# so tool calls count against Composio's full plan allowance instead of the\n# smaller managed-app allowance.\n#COMPOSIO_AUTH_CONFIG_GMAIL=\n\n# Direct Google access (#1573): connect Gmail through your OWN Google OAuth\n# client and skip Composio for those mailboxes entirely. In Google Cloud:\n# enable the Gmail, Calendar, Drive and People APIs; set the OAuth consent\n# screen to External + In production (Testing expires refresh tokens after 7\n# days); create a \"Web application\" client whose authorized redirect URI is\n# http://localhost:<DASHBOARD_PORT>/oauth/google/callback. With both set, the\n# dashboard's \"Add Gmail\" goes through Google; each connected mailbox's refresh\n# token is kept in the private credential store. See docs/google-oauth.md.\n#GOOGLE_OAUTH_CLIENT_ID=\n#GOOGLE_OAUTH_CLIENT_SECRET=\n# Optional: an https origin that reaches this dashboard from other devices (a\n# Tailscale Serve hostname, a reverse proxy). When set, Google consents redirect\n# to <origin>/oauth/google/callback \u2014 register that URI on the OAuth client too \u2014\n# so a connect can be approved from a phone. Unset = localhost only.\n#AUGMENTAGENT_PUBLIC_URL=\n# Optional: pin the exact redirect URI instead (overrides the two derivations\n# above). Must be registered on the OAuth client byte for byte.\n#GOOGLE_OAUTH_REDIRECT_URI=\n\n# Optional: Gmail inbound poll cadence for `serve` (seconds, default 300).\n#AUGMENTAGENT_GMAIL_POLL_SECS=300\n\n# Optional incoming calls to the configured Twilio number. PIN: 4\u201312 digits.\n# These three settings also accept `augmentagent env set KEY VALUE` (restart required).\n#AUGMENTAGENT_PHONE_INBOUND_PIN=\n#AUGMENTAGENT_PHONE_INBOUND_PLATFORM=discord\n#AUGMENTAGENT_PHONE_INBOUND_ACCOUNT=\n\n# Trusted-contact autonomy (#1833). Only the value `on` enables it; read once\n# at startup (pause live with `augmentagent trust pause-all`). The trusted\n# people live in config/trusted-contacts.toml (written by `augmentagent trust`);\n# set AUGMENTAGENT_TRUSTED_CONTACTS to use another path. Heartbeat outreach to\n# full-tier contacts also needs AUGMENTAGENT_AUTONOMY=on.\nAUGMENTAGENT_AUTONOMY=off\nAUGMENTAGENT_TRUSTED_CONTACTS=\nAUGMENTAGENT_HEARTBEAT_OUTREACH=off\n# Email outreach goes out from the mailbox that last received mail from the\n# contact; this picks one (address or entity id) when none has.\nAUGMENTAGENT_OUTREACH_GMAIL_ACCOUNT=\n"
+  },
+  "illustrative_external_oracle": {
+    "cases": [
+      {
+        "case": "control",
+        "adapter_completed": true,
+        "approved": true,
+        "refusal_kind": null,
+        "source_file_bytes": 620103,
+        "scripted_calls": 6,
+        "recovery_calls": 3,
+        "adjudicator_calls": 0,
+        "executed_values": [
+          [
+            3,
+            5,
+            3
+          ],
+          [
+            3,
+            5,
+            3
+          ],
+          [
+            3,
+            5,
+            3
+          ]
+        ],
+        "completed_roles": 3,
+        "adjudication_recorded": false,
+        "upheld_rulings": 0
+      },
+      {
+        "case": "defect",
+        "adapter_completed": true,
+        "approved": false,
+        "refusal_kind": null,
+        "source_file_bytes": 620100,
+        "scripted_calls": 7,
+        "recovery_calls": 3,
+        "adjudicator_calls": 1,
+        "executed_values": [
+          [
+            3,
+            5,
+            8
+          ],
+          [
+            3,
+            5,
+            8
+          ],
+          [
+            3,
+            5,
+            8
+          ],
+          [
+            3,
+            5,
+            8
+          ]
+        ],
+        "completed_roles": 3,
+        "adjudication_recorded": true,
+        "upheld_rulings": 1
+      },
+      {
+        "case": "bytes-control",
+        "adapter_completed": true,
+        "approved": true,
+        "refusal_kind": null,
+        "source_file_bytes": 620103,
+        "scripted_calls": 6,
+        "recovery_calls": 3,
+        "adjudicator_calls": 0,
+        "executed_values": [
+          [
+            3,
+            5,
+            3
+          ],
+          [
+            3,
+            5,
+            3
+          ],
+          [
+            3,
+            5,
+            3
+          ]
+        ],
+        "completed_roles": 3,
+        "adjudication_recorded": false,
+        "upheld_rulings": 0
+      },
+      {
+        "case": "bytes-defect",
+        "adapter_completed": true,
+        "approved": false,
+        "refusal_kind": null,
+        "source_file_bytes": 620100,
+        "scripted_calls": 7,
+        "recovery_calls": 3,
+        "adjudicator_calls": 1,
+        "executed_values": [
+          [
+            3,
+            5,
+            8
+          ],
+          [
+            3,
+            5,
+            8
+          ],
+          [
+            3,
+            5,
+            8
+          ],
+          [
+            3,
+            5,
+            8
+          ]
+        ],
+        "completed_roles": 3,
+        "adjudication_recorded": true,
+        "upheld_rulings": 1
+      },
+      {
+        "case": "combined-budget",
+        "adapter_completed": false,
+        "approved": null,
+        "refusal_kind": "evidence-budget",
+        "source_file_bytes": 620103,
+        "scripted_calls": 1,
+        "recovery_calls": 0,
+        "adjudicator_calls": 0,
+        "executed_values": [],
+        "completed_roles": null,
+        "adjudication_recorded": null,
+        "upheld_rulings": null
+      },
+      {
+        "case": "approval-source",
+        "adapter_completed": false,
+        "approved": null,
+        "refusal_kind": "invalid-source-decision",
+        "source_file_bytes": 620103,
+        "scripted_calls": 2,
+        "recovery_calls": 0,
+        "adjudicator_calls": 0,
+        "executed_values": [],
+        "completed_roles": null,
+        "adjudication_recorded": null,
+        "upheld_rulings": null
+      },
+      {
+        "case": "selector-extra",
+        "adapter_completed": false,
+        "approved": null,
+        "refusal_kind": "invalid-selector-fields",
+        "source_file_bytes": 620103,
+        "scripted_calls": 2,
+        "recovery_calls": 0,
+        "adjudicator_calls": 0,
+        "executed_values": [],
+        "completed_roles": null,
+        "adjudication_recorded": null,
+        "upheld_rulings": null
+      },
+      {
+        "case": "unknown-criterion",
+        "adapter_completed": false,
+        "approved": null,
+        "refusal_kind": "invalid-source-criteria",
+        "source_file_bytes": 620103,
+        "scripted_calls": 2,
+        "recovery_calls": 0,
+        "adjudicator_calls": 0,
+        "executed_values": [],
+        "completed_roles": null,
+        "adjudication_recorded": null,
+        "upheld_rulings": null
+      },
+      {
+        "adapter_completed": false,
+        "adjudication_recorded": null,
+        "adjudicator_calls": 0,
+        "approved": null,
+        "completed_roles": null,
+        "executed_values": [],
+        "recovery_calls": 0,
+        "scripted_calls": 1,
+        "source_file_bytes": 620103,
+        "upheld_rulings": null,
+        "case": "denied-env",
+        "refusal_kind": "source-denied"
+      },
+      {
+        "adapter_completed": false,
+        "adjudication_recorded": null,
+        "adjudicator_calls": 0,
+        "approved": null,
+        "completed_roles": null,
+        "executed_values": [],
+        "recovery_calls": 0,
+        "scripted_calls": 1,
+        "source_file_bytes": 620103,
+        "upheld_rulings": null,
+        "case": "denied-control",
+        "refusal_kind": "source-denied"
+      },
+      {
+        "adapter_completed": false,
+        "adjudication_recorded": null,
+        "adjudicator_calls": 0,
+        "approved": null,
+        "completed_roles": null,
+        "executed_values": [],
+        "recovery_calls": 0,
+        "scripted_calls": 1,
+        "source_file_bytes": 620103,
+        "upheld_rulings": null,
+        "case": "absent-source",
+        "refusal_kind": "source-absent"
+      },
+      {
+        "adapter_completed": false,
+        "adjudication_recorded": null,
+        "adjudicator_calls": 0,
+        "approved": null,
+        "completed_roles": null,
+        "executed_values": [],
+        "recovery_calls": 0,
+        "scripted_calls": 1,
+        "source_file_bytes": 620103,
+        "upheld_rulings": null,
+        "case": "absent-item",
+        "refusal_kind": "item-absent"
+      },
+      {
+        "adapter_completed": false,
+        "adjudication_recorded": null,
+        "adjudicator_calls": 0,
+        "approved": null,
+        "completed_roles": null,
+        "executed_values": [],
+        "recovery_calls": 0,
+        "scripted_calls": 1,
+        "source_file_bytes": 620103,
+        "upheld_rulings": null,
+        "case": "bad-byte-end",
+        "refusal_kind": "byte-range-outside"
+      },
+      {
+        "adapter_completed": false,
+        "adjudication_recorded": null,
+        "adjudicator_calls": 0,
+        "approved": null,
+        "completed_roles": null,
+        "executed_values": [],
+        "recovery_calls": 0,
+        "scripted_calls": 1,
+        "source_file_bytes": 620103,
+        "upheld_rulings": null,
+        "case": "utf8-boundary",
+        "refusal_kind": "byte-range-split-utf8"
+      },
+      {
+        "adapter_completed": false,
+        "adjudication_recorded": null,
+        "adjudicator_calls": 0,
+        "approved": null,
+        "completed_roles": null,
+        "executed_values": [],
+        "recovery_calls": 0,
+        "scripted_calls": 1,
+        "source_file_bytes": 620103,
+        "upheld_rulings": null,
+        "case": "invalid-tail",
+        "refusal_kind": "source-invalid-utf8"
+      },
+      {
+        "adapter_completed": false,
+        "adjudication_recorded": null,
+        "adjudicator_calls": 0,
+        "approved": null,
+        "completed_roles": null,
+        "executed_values": [],
+        "recovery_calls": 0,
+        "scripted_calls": 1,
+        "source_file_bytes": 620103,
+        "upheld_rulings": null,
+        "case": "symlink",
+        "refusal_kind": "source-not-regular"
+      },
+      {
+        "adapter_completed": false,
+        "adjudication_recorded": null,
+        "adjudicator_calls": 0,
+        "approved": null,
+        "completed_roles": null,
+        "executed_values": [
+          [
+            3,
+            5,
+            3
+          ]
+        ],
+        "recovery_calls": 1,
+        "scripted_calls": 2,
+        "source_file_bytes": 620103,
+        "upheld_rulings": null,
+        "case": "second-incomplete",
+        "refusal_kind": "recovery-incomplete"
+      },
+      {
+        "adapter_completed": false,
+        "adjudication_recorded": null,
+        "adjudicator_calls": 0,
+        "approved": null,
+        "completed_roles": null,
+        "executed_values": [],
+        "recovery_calls": 0,
+        "scripted_calls": 2,
+        "source_file_bytes": 620103,
+        "upheld_rulings": null,
+        "case": "malformed-then-incomplete",
+        "refusal_kind": "recovery-incomplete"
+      }
+    ],
+    "fixture_source_read_only": true,
+    "code_source_read_only": true,
+    "synthetic_protocol_only": true
+  },
+  "registered": false,
+  "probe_sha256": "c31b1f71a4bbab60d707b652dd2f93bd34be2d80d1dab81fc1a0fa4f077fa6c5",
+  "source_of_expectations": "Written C1 requirements and prior eight-case oracle, compared outside the observer by the controller; illustrative, not an independently registered oracle.",
+  "validation_limits": [
+    "Manual driver uses the supported CargoBinary invocation shape and unchanged sandbox; this is not production isolated_observation, native resource admission or registry attestation.",
+    "Synthetic scripted provider observations grant no native provider, independent acceptance/review, merge or deployment authority.",
+    "Full guard/cache/crash/diagnostic matrix and normal independent amendment remain open; original PR1954 source/body/request/pinned verifier, failed native history and pause are preserved.",
+    "The 18-case expansion covers eight source-production refusals and two exhausted-recovery paths; full cache/crash/diagnostic/native-metadata and exact encoded-bound coverage remain open.",
+    "Error-message refusal labels are version-bound to the pinned original/published heads; unknown errors refuse as setup failures. They are not a public implementation error ABI.",
+    "A separate current-controller production observation/resource test is running; no result from it is claimed here."
+  ]
+}

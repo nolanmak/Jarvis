@@ -1,0 +1,453 @@
+{
+  "schema_version": 1,
+  "status": "Mapping only; no seam judgments or handoff approval",
+  "inputs": [
+    "review-dependency-recovery-contract.md",
+    "1703-c1-eight-case-worked-recipe.json",
+    "1703-c1-guard-test-inventory.json"
+  ],
+  "seam_count": 88,
+  "judged": false,
+  "seams": [
+    {
+      "id": "S1",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: Contract status: \u201cscoped C1 design ready for test-first implementation.\u201d  \nB: Contract staged delivery: \u201cC1 is the D1\u2013D7 coherent-source protocol/producer/packing component\u201d; readiness: \u201cgeneric C1 TDD/handoff\u201d; audit: \u201cSource/component/rollout/live exits remain distinct\u201d; recipe status: \u201cUntrusted eight-case worked recipe\u201d; inventory status: \u201cnot completed acceptance or independent review.\u201d  \nCrosses: Meaning and authority of C1 readiness, construction evidence, acceptance, review and live completion."
+    },
+    {
+      "id": "S2",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: Contract header: \u201cOwner #1709; parent #1703\u201d; \u201cIncident identity: PR1944 receipt.\u201d  \nB: `1703-pr1944-review-dependency-proof.json`; staged delivery: \u201cC2 remains required in #1952/#1709/#1706\u201d; readiness: \u201cSource issue1952 remains held\u201d; inventory open requirements: \u201cPreserve original PR1954 source/body/request/pinned verifier.\u201d  \nCrosses: Issue ownership, parent objectives and preserved incident/attempt identities."
+    },
+    {
+      "id": "S3",
+      "kind": "Decision  ",
+      "sides_and_crossing": "A: Contract problem: multipart proposal \u201cwas rejected \u2026 it must not be implemented.\u201d  \nB: D1: \u201cNo \u2026 per-part state or approval authority\u201d; D6: \u201cNo partial approval union\u201d; D7: \u201cNo growing parent/part graph\u201d; staged delivery: \u201cdoes not introduce multipart recovery.\u201d  \nCrosses: Exclusion of independent shard approvals and parent/part recovery state from C1."
+    },
+    {
+      "id": "S4",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: Contract outcome: \u201call requested dependencies together with its original assigned evidence.\u201d  \nB: D4: \u201cAll original assigned files/context and every requested dependency/question must fit together\u201d; D6: \u201cdo not pay for a known-incomplete subset\u201d; readiness: \u201crecovery must supply both together with original evidence\u201d; recipe probe: \u201ccoherent recovery dropped or changed original assigned evidence\u201d; inventory mapping: \u201ccoherent-original-and-related-source.\u201d  \nCrosses: Completeness of the original-plus-requested evidence set."
+    },
+    {
+      "id": "S5",
+      "kind": "Decision  ",
+      "sides_and_crossing": "A: D1: \u201cPreserve exact head/base/contract/evidence and native independence.\u201d  \nB: D5: \u201cbound head\u201d; D7: \u201ccurrent binding checks\u201d; staged delivery: \u201ccurrent binding/epoch\u201d; recipe probe constructs `Binding` and `ReviewOrigin::FreshSession`; inventory open requirements include \u201ccompleted-cache binding/reuse.\u201d  \nCrosses: Immutable review identity and binding through source production, observations, persistence and reuse."
+    },
+    {
+      "id": "S6",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: D1: \u201cMAX_PROMPT_BYTES (512 KiB), MAX_RESPONSE_BYTES (128 KiB).\u201d  \nB: Problem: \u201c524,288 bytes\u201d; D4: initial \u201cMAX_PROMPT_BYTES/2\u201d and recovery \u201cfull MAX_PROMPT_BYTES\u201d; D5: raw-range allocation limit; D7: encoded-record formula; recipe probe checks `prompt.len()+opts.system_prompt.len()`; inventory maps exact request and response limits.  \nCrosses: Byte limits, units and actual serialized request/response accounting."
+    },
+    {
+      "id": "S7",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: D1: \u201cthree-role coverage, all initial candidate/caller byte coverage.\u201d  \nB: D3: \u201cfull role coverage\u201d; D4: \u201cevery group required for every role\u201d; readiness: \u201cfull candidate/caller initial coverage\u201d; recipe output: `completed_roles`; inventory: \u201ccomplete-initial-scope\u201d and \u201cComplete full role/caller coverage.\u201d  \nCrosses: Required roles, original scope and completion reporting."
+    },
+    {
+      "id": "S8",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: D2: \u201cmissing_sources is an array of at most16 objects.\u201d  \nB: D5 consumes source requests; D6 determines recovery eligibility; recipe probe emits `missing_sources`; inventory source tests include `all_exact_selector_shapes_are_accepted_as_incomplete_data`.  \nCrosses: Typed reviewer requests from response parser to recovery producer."
+    },
+    {
+      "id": "S9",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: D2: requests contain literal `path`, `criterion_ids`, `question` and one selector.  \nB: D4 requires \u201cevery requested dependency/question\u201d; D7 says \u201cQuestion criteria guide evidence selection/review only\u201d; recipe probe emits `criterion_ids:[\"C1\"]` and the joint-review question; inventory includes `invalid-source-criteria` coverage through strict-schema mapping.  \nCrosses: Request scope, registered criteria and review questions."
+    },
+    {
+      "id": "S10",
+      "kind": "Decision  ",
+      "sides_and_crossing": "A: D2: \u201cReject \u2026 source requests on approve/changes_requested.\u201d  \nB: D6: \u201cA valid first incomplete response may produce one coherent recovery call\u201d; recipe `approval-source` changes `decision` to `\"approve\"`; illustrative oracle reports `\"invalid-source-decision\"`; inventory test: `source_request_limits_and_incomplete_only_envelopes_are_exact`.  \nCrosses: Decision-dependent permission to request source."
+    },
+    {
+      "id": "S11",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: D2: \u201cKeep legacy missing_paths as whole-file requests\u201d; preserve \u201cold public parser wrapper.\u201d  \nB: D2: \u201cnew production parser returns typed requests\u201d; wrapper \u201cmust reject a typed range/item request\u201d; inventory test: `legacy_whole_file_recovery_keeps_original_findings_after_later_approval`.  \nCrosses: Legacy caller compatibility and typed-request conversion/rejection."
+    },
+    {
+      "id": "S12",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: D2 canonical selector JSON: nested `selector` with `\"kind\"`.  \nB: D2: \u201cdeny_unknown_fields tagged enum\u201d; recipe `selector-extra` adds `\"unexpected\"`; recipe refusal classifier matches \u201csource selector fields differ from its kind\u201d; inventory: `strict_source_schema_refuses_ambiguity_unknown_fields_and_invalid_bounds`.  \nCrosses: Selector shape, nesting, kind-specific fields and strict rejection."
+    },
+    {
+      "id": "S13",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: D2: \u201cValidate the request name using syn::parse_str::<syn::Ident>.\u201d  \nB: D5: \u201cReuse syn::parse_file and Visit already used by self_improve_review_symbols.rs\u201d; inventory test: `raw_names_duplicates_and_container_attributes_are_exact_source`.  \nCrosses: Existing `syn` parser APIs and Rust identifier/item interpretation."
+    },
+    {
+      "id": "S14",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: D2: \u201cfoo and r#foo match each other in both directions\u201d; \u201cExact case matters.\u201d  \nB: D5: \u201cCollect all matching\u201d declarations and preserve exact source; readiness: \u201craw identifiers\u201d; inventory test: `raw_names_duplicates_and_container_attributes_are_exact_source`.  \nCrosses: Lookup identity versus original source spelling."
+    },
+    {
+      "id": "S15",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: D2 bytes: \u201cstart_byte inclusive and end_byte exclusive\u201d; \u201cstrict UTF-8 boundaries.\u201d  \nB: D3: \u201cexact UTF-8 byte offsets\u201d; D5: literal path and \u201cabsolute byte interval\u201d; recipe byte modes use explicit intervals; inventory tests cover Unicode coordinates and non-UTF-8 boundaries.  \nCrosses: Coordinate system, interval semantics and UTF-8 validity."
+    },
+    {
+      "id": "S16",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: D3: candidate and direct caller chunks carry \u201cimmutable path/revision/OID/size metadata.\u201d  \nB: D5 resolves immutable blobs; readiness requires \u201cexact requests and source/companions\u201d; inventory planner tests include \u201cdisjoint_namespaces\u201d and \u201cunicode_source_coordinates.\u201d  \nCrosses: Source identity and raw-coordinate metadata from initial producers to reviewers and planners."
+    },
+    {
+      "id": "S17",
+      "kind": "Decision  ",
+      "sides_and_crossing": "A: D3: historical/context bodies use \u201coffsets into that rendered body, its body hash and bound base/head identities.\u201d  \nB: D3: \u201cThey are not addressable candidate source ranges\u201d; D5: resolve at \u201cbound head\u201d; readiness: \u201cUTF-8/newline/byte offsets.\u201d  \nCrosses: Rendered evidence coordinates versus recoverable raw candidate coordinates."
+    },
+    {
+      "id": "S18",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: D3: \u201ccandidate_snapshot currently prepends a deletion explanation\u201d; caller context is \u201cserialized JSON containing files.\u201d  \nB: Existing `candidate_snapshot` and inline caller-context serializers; D3 preserves their bodies as \u201crendered historical/context evidence.\u201d  \nCrosses: Existing producer representations and new labels/coordinate metadata."
+    },
+    {
+      "id": "S19",
+      "kind": "Decision  ",
+      "sides_and_crossing": "A: D3: \u201crecovery continues to resolve candidate head only.\u201d  \nB: D3: deleted paths are \u201cunavailable\u201d; D5 excludes \u201canother revision\u201d; D6 aborts unavailable dependencies; inventory mapping: \u201cstrict-source-and-path-policy.\u201d  \nCrosses: Deletion/base evidence versus candidate-head recovery authority."
+    },
+    {
+      "id": "S20",
+      "kind": "Decision  ",
+      "sides_and_crossing": "A: D3: symlink text \u201cmay remain initial diff evidence\u201d without recovery permission.  \nB: D5 rejects \u201csymlink, submodule, directory\u201d; readiness covers \u201cunsupported Git entries\u201d; inventory test: `immutable_byte_windows_reject_symlinks_and_non_utf8_boundaries`.  \nCrosses: Initial diff evidence eligibility versus recovery source eligibility."
+    },
+    {
+      "id": "S21",
+      "kind": "Decision  ",
+      "sides_and_crossing": "A: D3: \u201cNo function index is required\u201d; unknown names are not approximated.  \nB: D5: \u201cNo match \u2026 typed unavailable evidence\u201d; bytes remain available for \u201cambiguous sources\u201d; D6 unavailable handling.  \nCrosses: Reviewer item identification, exact lookup and unavailable-source behavior."
+    },
+    {
+      "id": "S22",
+      "kind": "Decision  ",
+      "sides_and_crossing": "A: D4: initial packing uses \u201cat most MAX_PROMPT_BYTES/2 including system\u201d and all serialized fields.  \nB: D4 fast path and lossless partial groups; D6 uses \u201cD4\u2019s actual initial groups\u201d; inventory tests cover initial half budget and exact serialized limits.  \nCrosses: Initial packing policy into group count, coverage and budget accounting."
+    },
+    {
+      "id": "S23",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: D4: \u201cDiagnostic and production planners use this same packing/count.\u201d  \nB: D6: `worst_case_calls` is \u201c6*initial_groups+2\u201d; readiness: \u201cVerify diagnostic planner/reservation\u201d; inventory open requirement: \u201cdiagnostic parity.\u201d  \nCrosses: Shared group planning into diagnostic and production reservation/call calculations."
+    },
+    {
+      "id": "S24",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: D5: \u201cReuse the existing no-replace-objects Git reader, literal tree lookup and credential/control-path policy.\u201d  \nB: Existing Git reader and tree/path policy; recipe fixture setup invokes `/usr/bin/git --no-replace-objects`; inventory test: `recovery_reads_exact_committed_regular_source_and_improves_empty_request`.  \nCrosses: Immutable object lookup and replacement-object exclusion."
+    },
+    {
+      "id": "S25",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: D5: \u201cregular tracked blob\u201d; reject denied paths, binary and invalid UTF-8.  \nB: D2: requests are \u201cnever tools or host filesystem permission\u201d; D5 retains `requested_evidence` exclusions; D6 unavailable behavior; inventory credential/control and immutable-source tests.  \nCrosses: Source admissibility and path policy across parsing, production and recovery."
+    },
+    {
+      "id": "S26",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: D5: \u201cretain requested_evidence\u2019s stronger control-character and credential-directory exclusions.\u201d  \nB: Existing `requested_evidence` producer/policy; recipe copy filters exclude `.git`, `.codex`, `.claude`, `.ssh`, `.gnupg`, `.aws`, `.azure` and `.env` paths; inventory: `credential_and_control_paths_are_refused_before_a_second_observation`.  \nCrosses: Existing protected-path rules and fixture/source isolation policies."
+    },
+    {
+      "id": "S27",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: D5: rust-item parsing permits \u201cat most8 MiB of source.\u201d  \nB: D5: matches \u201cexisting bounded inline caller working set\u201d; byte streaming uses \u201c8 MiB/256-entry batches\u201d; D7 separately references the \u201cexisting8 MiB fragment-writer limit.\u201d  \nCrosses: Distinct uses of the 8 MiB value: item working set, streaming batches and encoded record limit."
+    },
+    {
+      "id": "S28",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: D5 enumerates supported AST declaration kinds.  \nB: D2 `rust_item` selector; D5 excludes fields, variants, patterns and invocations; readiness covers \u201cmacro/impl/module context\u201d; inventory test: `raw_names_duplicates_and_container_attributes_are_exact_source`.  \nCrosses: Selector names into the supported Rust declaration collector."
+    },
+    {
+      "id": "S29",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: D5: \u201cwhole lines spanning each exact AST item\u201d; enclosing headers, attributes and where clauses are \u201crequired context.\u201d  \nB: D4 requires every dependency to fit; D7 stores exact ranges; readiness requires \u201csource/companions\u201d; inventory raw-name/container-context test.  \nCrosses: AST spans and container companions into bounded reviewer evidence."
+    },
+    {
+      "id": "S30",
+      "kind": "Decision  ",
+      "sides_and_crossing": "A: D5: \u201cA duplicate name supplies all matches together or refuses budget.\u201d  \nB: D5 deduplicates identical/overlapping ranges; D4 disallows fitting subsets; inventory test: `all_matching_requested_items_must_fit_before_another_observation`.  \nCrosses: Multiple matching declarations, range deduplication and all-or-refuse packing."
+    },
+    {
+      "id": "S31",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: D5: no match, parse failure or excessive item working set becomes \u201ctyped unavailable evidence.\u201d  \nB: D6: abort before observation two; size refusals use `EvidenceBudget`; readiness: \u201cabsent/malformed source.\u201d  \nCrosses: Producer lookup outcomes into recovery control flow and error typing."
+    },
+    {
+      "id": "S32",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: D5 bytes \u201creuse caller_stream\u2019s strict UTF-8/complete-EOF producer.\u201d  \nB: Existing `caller_stream`; inventory test: `byte_window_can_cross_large_blob_batches_but_cannot_hide_invalid_eof`.  \nCrosses: Existing stream validation and batching into byte-range extraction."
+    },
+    {
+      "id": "S33",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: D5: \u201cDrain the original immutable stream,\u201d verify size and child success, then publish.  \nB: D5: \u201cOnly fully validated reads can become supplied evidence\u201d; D6: \u201cPartial source is not published\u201d; inventory complete-stream test.  \nCrosses: Full-stream validation into publication of requested intervals."
+    },
+    {
+      "id": "S34",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: D5: verify HEAD \u201cbefore recovery publication and before the call.\u201d  \nB: D1 binding preservation; D7 completion requires \u201ccurrent binding checks\u201d; inventory open requirement: \u201ccompleted-cache binding/reuse.\u201d  \nCrosses: Repository binding checks around evidence publication, dispatch and completion."
+    },
+    {
+      "id": "S35",
+      "kind": "Decision  ",
+      "sides_and_crossing": "A: D6: \u201cmaximum two reviewer observations per original group.\u201d  \nB: D6 format correction consumes observation two; second response completes or stays incomplete; recipe invalid cases report two scripted calls; inventory tests cover malformed-then-incomplete and no third attempt.  \nCrosses: Observation budget across normal responses, format correction and source recovery."
+    },
+    {
+      "id": "S36",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: D6: denied/unknown/malformed/unavailable dependency aborts before observation two.  \nB: Existing `run_impl` and `unavailable_from_error`; output is \u201cavailable=false\u201d without completion, cache approval or merge authority; inventory credential/control-path test.  \nCrosses: Source failure into outer unavailable-review projection."
+    },
+    {
+      "id": "S37",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: D6: size refusal uses existing typed `EvidenceBudget`.  \nB: Source baseline: preserve wrapped typed-budget classifier \u201c(#1885)\u201d with source-chain/context handling and lookalike refusal; recipe probe calls `is_evidence_budget(error)`; oracle reports `\"evidence-budget\"`.  \nCrosses: Typed error identity through wrapping and observer classification."
+    },
+    {
+      "id": "S38",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: D6: \u201cGroupReview retains valid findings\u201d during successful construction.  \nB: D7 preserves original and recovery findings; staged delivery repeats successful retention; readiness requires \u201coriginal findings\u201d; inventory legacy and incomplete-recovery retention tests.  \nCrosses: Finding retention within an attempt and forwarding through successful completion."
+    },
+    {
+      "id": "S39",
+      "kind": "Decision  ",
+      "sides_and_crossing": "A: D6: \u201cgeneric outer failure projection or failed-finding persistence \u2026 explicit C2 exits.\u201d  \nB: Staged delivery lists failed-history retention, unchanged paid retries and failure projection; inventory limits preserve \u201cfailed native history\u201d and leave acceptance open.  \nCrosses: C1 successful-path scope versus C2 failure-history/lifecycle work."
+    },
+    {
+      "id": "S40",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: D6: \u201cNative quota/resource charging and immutable canary reservation remain unchanged.\u201d  \nB: D1 current admission/storage authorities; staged delivery current actual-charge paths; recipe limits exclude \u201cnative resource admission\u201d; inventory open requirement names registration, resource admission, custody and cleanup.  \nCrosses: Existing admission, charging, reservation and custody authorities."
+    },
+    {
+      "id": "S41",
+      "kind": "Decision  ",
+      "sides_and_crossing": "A: D6: diagnostic runs require \u201cfresh actual observations.\u201d  \nB: Staged delivery retains \u201cfresh actual observations and immutable reservations\u201d; inventory test: `diagnostic_origin_never_authorizes_shipping_even_with_clean_completed_reviews`; open requirement: \u201cdiagnostic parity.\u201d  \nCrosses: Diagnostic freshness, fragment reuse restrictions and shipping authority."
+    },
+    {
+      "id": "S42",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: D7: store ranges in \u201cexisting recovered-source namespace\u201d and `finding_evidence`.  \nB: D7 forwards bytes through `final_source_evidence` and final-authority selection; recipe collector recognizes `\"__requested_source__:\"`; readiness verifies actual-source consumption by final authority.  \nCrosses: Recovered bytes from source map into findings and adjudication evidence."
+    },
+    {
+      "id": "S43",
+      "kind": "Decision  ",
+      "sides_and_crossing": "A: D7: \u201cNeither source hashes nor questions are findings or verdicts.\u201d  \nB: Outcome says coverage/index/source/CI cannot become a verdict; recipe findings use computed values plus `evidence_hash`; recipe limits deny independent review authority.  \nCrosses: Evidence identifiers and observations versus review/adjudication decisions."
+    },
+    {
+      "id": "S44",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: D7: normal completion has \u201cat most two requests/responses.\u201d  \nB: D6 observation cap; D7 bound \u201c4*MAX_PROMPT_BYTES + 12*MAX_RESPONSE_BYTES +64 KiB\u201d; production serialization boundary; inventory response/fragment-limit mapping.  \nCrosses: Observation count and duplication assumptions into the encoded success-record bound."
+    },
+    {
+      "id": "S45",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: D7: check bound below the \u201cexisting8 MiB fragment-writer limit\u201d at production serialization.  \nB: Existing fragment writer; inventory test: `review_fragment_writer_accepts_exact_limit_and_refuses_extra_byte_without_publication`.  \nCrosses: Encoded review record into existing storage admission/publication."
+    },
+    {
+      "id": "S46",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: D7: static binding/actor/model/role/original-hash metadata plus hashes must fit \u201c32 KiB\u201d before dispatch.  \nB: D7 leaves \u201c64 KiB metadata remainder\u201d; inventory test: `native_identity_limits_and_static_metadata_are_enforced_at_dispatch`; readiness requires exact cache budgets and escaping.  \nCrosses: Static metadata validation into call admission and encoded-record budgeting."
+    },
+    {
+      "id": "S47",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: D7: actual native IDs are nonempty ASCII graphics, at most \u201c512 bytes\u201d; VM caps \u201c256 bytes.\u201d  \nB: D7 invalid IDs are transport/protocol failures; recipe uses `native_session::current_for`, `lease.observe` and synthetic IDs; inventory native-identity dispatch test.  \nCrosses: Exact native identity, transport validity and observation completion."
+    },
+    {
+      "id": "S48",
+      "kind": "Amendment  ",
+      "sides_and_crossing": "A: Staged delivery: retry lifecycle contract \u201cD1/D3 supersedes the earlier suggestion to reuse structured partial ReviewEvidence.\u201d  \nB: `review-retry-lifecycle-contract.md`; staged delivery requires \u201cseparate non-approval type and historical-facts reader.\u201d  \nCrosses: Later C2 representation amendment replacing partial structured-review reuse."
+    },
+    {
+      "id": "S49",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: Staged delivery describes resume/adoption checking adjudicated amendment before unavailable handling.  \nB: Existing resume/adoption consumers, complete-review validator and issue-backed supplied-receipt persistence.  \nCrosses: Structured review representation into consumer ordering and authority validation."
+    },
+    {
+      "id": "S50",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: Staged delivery: source-less adoption sets previous from structured and records verdict when `recorded_verdict` is `Some`.  \nB: Existing `episode::evaluate` persists `episode-evidence-*` even when `available=false`; scoped audit says this source assertion was corrected.  \nCrosses: Structured unavailable results into episode history and publication behavior."
+    },
+    {
+      "id": "S51",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: Staged delivery: unavailable means `available=false`, `recorded_verdict=None`, `approved=false`.  \nB: D6 unavailable projection; recipe records `adapter_completed`, nullable `approved`, roles and adjudication; illustrative oracle represents unsuccessful cases with null result fields.  \nCrosses: Unavailable result semantics and observer serialization."
+    },
+    {
+      "id": "S52",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: Staged delivery: epoch invalidation deletes current indexes/fragments but preserves `workflow_event`.  \nB: Existing `current_review_history` and `verify_fresh_review_origin` require current binding/epoch; separate historical reader contract is required.  \nCrosses: Current review authority versus historical event/finding access."
+    },
+    {
+      "id": "S53",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Readiness: first verify source/API assumptions, fresh-reader findings and \u201cevery mapped C1 seam.\u201d  \nB: Status requires fresh-reader/source/all32 checks; scoped audit reports \u201cFinal result32 held\u201d; staged delivery makes mapped checks prerequisites for implementation.  \nCrosses: Design-audit outputs into implementation handoff readiness."
+    },
+    {
+      "id": "S54",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Readiness: scripted provider through \u201creal production review/recovery adapter\u201d and immutable Git source \u201c>512 KiB.\u201d  \nB: Recipe `observe_candidate` calls `run_inner`; Python builds immutable fixtures; inventory maps coherent-source tests.  \nCrosses: Generic C1 test scenario into executable observer and test inventory."
+    },
+    {
+      "id": "S55",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Readiness: seeded cross-item defect must yield `changes_requested`; record current failure as RED.  \nB: Recipe control uses `input.min(policy_limit())`, defect uses `input + policy_limit()`; probe generates findings from actual supplied-source execution; oracle records differing completion/approval data.  \nCrosses: Synthetic cross-item behavior into reviewer decisions and before/after observations."
+    },
+    {
+      "id": "S56",
+      "kind": "Decision  ",
+      "sides_and_crossing": "A: Readiness: PR1944 v1 has no actual item pair/question; \u201cDo not invent one and credit it as incident acceptance.\u201d  \nB: Actual typed request/group/metadata must be captured from the first preserved normal attempt; recipe labels `synthetic_protocol_only`; inventory preserves original PR1954 materials.  \nCrosses: Synthetic construction evidence versus actual incident-resolution input and acceptance."
+    },
+    {
+      "id": "S57",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Readiness: owner \u201cmust capture and replay that input, then establish actual independent completion.\u201d  \nB: Staged delivery requires rollout and preserved PR1944 exercise; readiness says unresolved fitting failure leaves incident open; inventory requires independent amendment/review, merge and updater rollout.  \nCrosses: Implemented component into live incident replay and closure."
+    },
+    {
+      "id": "S58",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: Readiness: \u201cManaged wrapper or immutable hosted CI only.\u201d  \nB: Recipe invocation is `cargo_binary`; embedded observer locates controller Cargo and launches offline, locked tests with debug/incremental disabled and one build job; inventory asks for exact packaged observer execution.  \nCrosses: Repository build/storage execution policy into observer/build invocation."
+    },
+    {
+      "id": "S59",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: Source baseline pins main `416f392b17b56b2a43e67a3e430835902387941a` and requires later source revalidation.  \nB: Inventory `original_head` uses that identity; `candidate_head` is `3debdb8d7ca24bb60087acaa6e10d10c6746318c`; recipe describes original/candidate replay.  \nCrosses: Source baseline, published candidate and replay input identities."
+    },
+    {
+      "id": "S60",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Recipe `invocation`: package `augmentagent-auth`, binary `autoship_review_observer`, no arguments.  \nB: Embedded binary invokes `/usr/bin/python3 -I autoship_verifiers/issue_1943/observe.py`, null stdin and propagated exit status.  \nCrosses: Controller CargoBinary invocation into the Python observer."
+    },
+    {
+      "id": "S61",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: Recipe `pinned_files` lists binary, observer, probe and public template.  \nB: Recipe `files` contains those bodies; observer checks template/probe/sandbox SHA-256 identities; top-level `probe_sha256` repeats probe identity.  \nCrosses: Packaged file identity across manifest, embedded source and runtime verification."
+    },
+    {
+      "id": "S62",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Observer requires a \u201ccontroller materialized export\u201d without `.git`.  \nB: Copy loop requires private regular singly linked files, rejects symlink directories, limits file count/total bytes, excludes control/credential paths; inventory requests fresh original/candidate exports.  \nCrosses: Controller-exported source into private observer source materialization."
+    },
+    {
+      "id": "S63",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Observer pins the public template and writes copied `.env.example`.  \nB: Embedded template describes placeholder-only values, inert channel gates and runtime configuration; recipe says identical bytes/hash are used \u201cfor both heads.\u201d  \nCrosses: Public configuration fixture into both replay builds without using runtime `.env`."
+    },
+    {
+      "id": "S64",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Observer appends pinned `review_probe.rs` to `self_improve_review.rs`.  \nB: Observer appends fixture factory to `self_improve.rs`, build override to `autoship_review.rs`, and namespace qualification to `autoship_review_tests.rs`; probe exports `factory`.  \nCrosses: Injected test-only provider wiring across production review modules and existing tests."
+    },
+    {
+      "id": "S65",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: Observer constructs Git blobs/trees/commits using SHA-1, zlib and canonical object bodies.  \nB: `/usr/bin/git` runs `read-tree HEAD`, `fsck --strict` and clean-status verification; probe obtains HEAD through repository `git` helper.  \nCrosses: Synthetic object creation into Git-valid immutable repositories consumed by the real adapter."
+    },
+    {
+      "id": "S66",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Observer fixtures contain changed `changed.rs` plus distant `policy_limit`/`apply_limit` in `logic.rs`.  \nB: Probe requests those two item names or explicit byte windows; `execute_supplied_source` compiles them with `proposed_input`; oracle reports source sizes `620103`/`620100`.  \nCrosses: Fixture contents and exact layout into item/byte requests and executable observations."
+    },
+    {
+      "id": "S67",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: Observer creates private synthetic `HOME/.codex/auth.json`.  \nB: Probe uses a scripted Codex `FallbackReasoner::for_tests`; recipe comment says \u201cno provider CLI is in this fixture\u2019s reasoner chain\u201d; limits deny native provider authority.  \nCrosses: Authentication-shaped fixture and provider selection without live provider execution."
+    },
+    {
+      "id": "S68",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Observer constructs sandbox policy with read roots/runtime reads and write roots for auxiliary data and target output.  \nB: Pinned `scripts/codex-command-sandbox.py`; Cargo/Rust toolchains and caches; probe asserts fixture/code writes fail and emits read-only flags.  \nCrosses: Controller sandbox policy into build/runtime confinement and reported preconditions."
+    },
+    {
+      "id": "S69",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: Observer relies on `TMPDIR`, `CARGO_HOME`, `CARGO_TARGET_DIR`, `RUSTUP_HOME` and controller Cargo location.  \nB: Probe derives fixture roots, compiler PATH, HOME, Rustup environment and writable auxiliary paths from those values.  \nCrosses: Controller runtime environment into fixture placement, build dependencies and executable source checking."
+    },
+    {
+      "id": "S70",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Observer invokes exact test `self_improve::aligned_review::__autoship_full_review_v2::observe_candidate`.  \nB: Probe defines that Tokio test; Cargo command selects packages/features/binary with `--exact --nocapture`.  \nCrosses: Packaged test name and build selection into the injected observer entrypoint."
+    },
+    {
+      "id": "S71",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Observer bounds subprocess duration to 900 seconds and aggregate output to 8 MiB.  \nB: Child Cargo/test process; cleanup kills unfinished child; nonzero exit returns captured stderr/stdout tails and exit code 2.  \nCrosses: Build/test lifecycle into observer completion, output and failure handling."
+    },
+    {
+      "id": "S72",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Probe `factory` supports `ProviderKind::Codex` and returns `FallbackReasoner::for_tests`.  \nB: `Reasoner::call` requires restricted environment, request/system size bound and a serial observation count below 64; native-session lease is begun, observed and finished.  \nCrosses: Test reasoner construction into production request dispatch and synthetic native-session observations."
+    },
+    {
+      "id": "S73",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: Probe recognizes reviewer requests by `full_file_evidence` and adjudication by `candidate_evidence` plus `findings`.  \nB: Collector traverses nested JSON/JSON strings for `source:` and `__requested_source__:` keys; recovered reviewer and final adjudicator calls consume those bytes.  \nCrosses: Production serialized evidence shape and source namespaces into observer extraction."
+    },
+    {
+      "id": "S74",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Probe derives group identity by splitting session IDs at `\":recovery-\"`.  \nB: Initial source maps are stored by group; recovery compares every original key/body before execution.  \nCrosses: Production session naming into original/recovery pairing and evidence-preservation checks."
+    },
+    {
+      "id": "S75",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Probe `execute_supplied_source` compiles collected bytes with Rust 2021 and executes a generated main.  \nB: `rustc`, process timeouts, cleared environment, output bound and three-`u64` result schema; reviewer/adjudicator compare actual value to cap.  \nCrosses: Delivered evidence bytes into executable behavior, findings and adjudication rulings."
+    },
+    {
+      "id": "S76",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Probe creates `cap-violation` findings with criterion `C1`, evidence hash and candidate repair target.  \nB: Adjudication iterates finding IDs and returns `uphold`/`dismiss` rulings bound to the request; output counts upheld rulings from structured adjudication.  \nCrosses: Reviewer finding identity and actual source into final-authority rulings and observation counters."
+    },
+    {
+      "id": "S77",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Probe registers workflow, claims lease and calls `issue_fresh_review_origin`.  \nB: Existing `WorkflowStore`, default store path, `ReviewOrigin::FreshSession` and `run_inner`; context includes synthetic QA, repair round and no previous/workflow acceptance evidence.  \nCrosses: Synthetic workflow custody and fresh-origin receipt into real adapter admission."
+    },
+    {
+      "id": "S78",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: Probe case list has `control`, `defect`, `bytes-control`, `bytes-defect`, `combined-budget`, `approval-source`, `selector-extra`, `unknown-criterion`.  \nB: Scripted mode selection, Python exact case-set validation and `illustrative_external_oracle.cases` use the same labels.  \nCrosses: Eight case identities across stimulus, emitted observations, schema validation and external expectations."
+    },
+    {
+      "id": "S79",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Probe maps adapter results/errors into completion, approval, roles, adjudication and refusal fields.  \nB: Python validates exact case keys, field types, nonnegative counters and refusal vocabulary; illustrative oracle provides the same fields.  \nCrosses: Adapter output/error projection into serialized observation data and comparison inputs."
+    },
+    {
+      "id": "S80",
+      "kind": "Outer  ",
+      "sides_and_crossing": "A: Probe error classifier recognizes exact contextual messages for unsupported protocol, decision, selector and criteria failures.  \nB: Production parser/adapter error wording; Python permits `\"typed-source-protocol-unsupported\"`, `\"invalid-source-decision\"`, `\"invalid-selector-fields\"` and `\"invalid-source-criteria\"`.  \nCrosses: Production error strings into observer refusal categories."
+    },
+    {
+      "id": "S81",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Probe emits one `AUTOSHIP_PROBE_DATA_V1=` JSON frame.  \nB: Observer requires exactly one matching frame, rejects duplicate keys/nonfinite constants and validates top-level keys/precondition flags before printing canonical JSON.  \nCrosses: Test stdout protocol into controller-consumable observation output."
+    },
+    {
+      "id": "S82",
+      "kind": "Decision  ",
+      "sides_and_crossing": "A: Recipe: \u201csource_of_expectations\u201d: \u201cController only; the observer emits actual data.\u201d  \nB: `illustrative_external_oracle`; inventory open requirement: compare actual output \u201coutside the observer.\u201d  \nCrosses: Separation of measured observer data from expected results and comparison authority."
+    },
+    {
+      "id": "S83",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: Recipe: `\"registered\": false`; manual driver is \u201cnot production isolated_observation \u2026 or registry attestation.\u201d  \nB: Inventory open requirement: validate \u201cactual native isolated-observation registration, input attestations, resource admission, custody and cleanup.\u201d  \nCrosses: Manual packaged replay versus production observation registration and attestation."
+    },
+    {
+      "id": "S84",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: Inventory entries pin source paths and SHA-256 values with declared test names.  \nB: `requirement_mapping.tests` references those declarations; entries state \u201cdoes not claim fresh execution\u201d; mapping says fresh packaged execution is \u201cnot established by this inventory.\u201d  \nCrosses: Source-declaration inventory into requirement mapping and execution-evidence status."
+    },
+    {
+      "id": "S85",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Inventory maps eight requirement groups to named tests.  \nB: Contract GREEN matrix requires source policy, coherent context, exact limits, coverage, findings, observation caps, cache/crash/diagnostic/native identity behavior; recipe validation limits leave \u201cFull guard/cache/crash/diagnostic matrix\u201d open.  \nCrosses: Contract acceptance requirements into declared tests and remaining execution gates."
+    },
+    {
+      "id": "S86",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: Inventory storage tests cover fragment limit, restart and SQLite crash transaction behavior.  \nB: Inventory states these do not establish \u201cend-to-end full-review cache/crash safety\u201d; mapping calls them narrower than \u201cfull-adapter interrupted review and replay\u201d; contract requires completed-cache/crash/binding behavior.  \nCrosses: Storage-level test scope versus full-adapter cache and crash acceptance scope."
+    },
+    {
+      "id": "S87",
+      "kind": "Handoff  ",
+      "sides_and_crossing": "A: Inventory open requirements preserve original PR1954 materials, terminal attempt, pause and guards.  \nB: Recipe validation limits preserve \u201coriginal PR1954 source/body/request/pinned verifier, failed native history and pause\u201d; normal independent amendment/review remains open.  \nCrosses: Existing paused attempt and verifier custody into any later reviewed replacement or amendment."
+    },
+    {
+      "id": "S88",
+      "kind": "Shared term  ",
+      "sides_and_crossing": "A: Contract parent exits: automatic capacity, productive CLI/Discord sessions, five autonomous merges and fault/unattended acceptance.  \nB: Inventory open requirements: \u201cautomatic host capacity, productive owner ingress and full epic acceptance remain open\u201d; recipe observations grant no merge/deployment authority.  \nCrosses: Scoped C1 evidence versus full #1703 operational acceptance."
+    }
+  ]
+}

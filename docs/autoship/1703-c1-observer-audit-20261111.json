@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "observed_at_utc": "2026-11-11T09:56:49.883900+00:00",
+  "mode": "spec-interrogation checkpoint; fresh reader and root source comparison, mapping only for Pass C",
+  "findings": [
+    {
+      "kind": "false join",
+      "boundary": "D6 malformed response versus source-production failure",
+      "resolution": "Clarified existing response correction may consume observation two; parsed source failures refuse before an extra observation; no third call.",
+      "fresh_reader_recheck": "resolved"
+    },
+    {
+      "kind": "silent contract dependency",
+      "boundary": "Worked recipe message-based refusal labels versus public C1 contract",
+      "resolution": "Explicitly version-bound to pinned heads; unknown errors are setup failures; no new public error ABI and new source shapes require independent reconstruction.",
+      "fresh_reader_recheck": "resolved"
+    }
+  ],
+  "mapped_seams": 88,
+  "all_seams_judged": false,
+  "full_handoff_ready": false,
+  "map": "1703-c1-eight-case-seam-map-20261111.json",
+  "additional_18_case_inputs_audited_as_complete": false,
+  "original_pr1954_owner_pause_preserved": true,
+  "registered_acceptance_or_code_approval": false
+}

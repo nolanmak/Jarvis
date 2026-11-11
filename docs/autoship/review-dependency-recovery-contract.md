@@ -142,6 +142,15 @@ then start another recovery call. The second response must complete the
 assigned group or leave it incomplete. If any requested dependency is denied,
 unknown, unsupported, malformed, outside its ranges or otherwise unavailable,
 abort before observation two; do not pay for a known-incomplete subset.
+Here the dependency failures are source-production failures after a response
+has passed structured validation: for example, an absent item, an inadmissible
+path, malformed Rust source, a range outside the actual immutable blob or
+invalid source UTF-8. An invalid response envelope, unknown selector field or
+unregistered criterion ID is instead a structured-format error and may consume
+the existing second observation for correction. If that correction returns a
+valid but still-incomplete response, no source-recovery call or third
+observation is permitted. These distinctions preserve the existing correction
+budget; they do not add another retry.
 Return through existing run_impl error/unavailable_from_error handling, with
 available=false and no completed group, cache approval or merge authority.
 Size/working-set refusal uses existing typed EvidenceBudget; other producer

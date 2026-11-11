@@ -301,3 +301,63 @@ The identical eight-case recipe completed against a fresh original export. Each 
 
 
 The current PR1954 durable status was rechecked after the eight-case candidate run: owner pause revision1 remains, no active lease, and the failed internal candidate remains `3774813c719e6fa8931cffd99bac123252abb517`. Every private candidate observation here measures published `3debdb8d7ca24bb60087acaa6e10d10c6746318c`, which retains the original guards. These are different heads. The experiment supplies no authority for the failed internal candidate; normal correction must preserve/restore the original assertions and independently verify the actual next exact head while retaining original history/accounting.
+
+## Worked-observer audit and next guard cases (November 11)
+
+A fresh-reader audit identified two boundaries to make explicit. D6 now
+distinguishes response-format validation from source-production failure. The
+former can consume the existing second observation for correction; the latter
+must refuse before another observation. A corrected second response that still
+needs source cannot cause a third call. The eight-case invalid-selector and
+unknown-criterion observations exercise format correction, not permission to
+read invalid source.
+
+The worked observer's refusal labels are version-bound projections of known
+errors on the two pinned source heads. They are not a new public error ABI or
+an owner requirement that every compliant implementation emit those strings.
+The existing typed evidence-budget classification remains authoritative for
+that category. An unrecognized error makes the observer refuse as a fixture
+failure; it must not be converted to ordinary business data or behavioral RED.
+A changed source/error shape therefore requires independent reconstruction and
+baseline validation of the eventual pinned adapter. A universal observation
+backend cannot inherit these message matches as stable error typing.
+
+The next private recipe adds source-policy, missing-source/item, byte-boundary,
+non-UTF-8-stream and symlink cases, plus still-incomplete second observations.
+Its expected answers remain outside the observer. Source exports omit the
+existing excluded control configuration and the denied `.env.example`; the
+separately pinned public template is checked byte-for-byte against each original
+Git blob and restored only in the private copied source. No read grant changes.
+These runs are construction experiments. Full cache/crash/diagnostic coverage,
+production observation/registry/resource custody and independent amendment
+remain open under #1943/#1953. The new 88-seam map is an inventory, not 88 passed
+checks or a new handoff approval.
+
+## Eighteen-case paired construction result
+
+The [extended readable recipe](1703-c1-eighteen-case-worked-recipe.json) and
+[paired observation](1703-c1-eighteen-case-entry-comparison.json) now complete
+fresh private original/published-candidate executions with the same four pinned
+files. Both entry processes exit successfully and produce valid complete JSON.
+The original differs from the external illustrative oracle; the candidate
+matches all 18 cases. An earlier baseline launcher filename error is retained
+as a setup failure and is excluded from this behavioral comparison.
+
+Eight new source-production cases refuse after one scripted observation, with
+no source-recovery call or approval: credential/control paths, absent file/item,
+out-of-range bytes, a split UTF-8 character, an invalid UTF-8 suffix outside the
+requested prefix, and a symlink. Two new cases stop at two observations without
+approval: recovery still incomplete, and format correction followed by an
+incomplete response. The original item/byte control and defect cases still
+complete all three roles and independently execute the actual supplied source
+at final adjudication. The valid control approves; the seeded defect does not.
+
+The [fresh audit record](1703-c1-observer-audit-20261111.json) records the two
+resolved wording findings and the unjudged 88-seam map of the earlier inputs.
+It does not claim a full audit of the extended recipe. A separate test of the
+current controller's actual `isolated_observation`, required protected resource
+logger and registry checks is running in a bounded temporary delegated unit.
+That result, full guard/cache/crash/diagnostic coverage and normal independent
+amendment are not established by this manual paired replay. Original #1954
+source, pinned verifier, failed internal candidate, charges and pause remain
+preserved.
