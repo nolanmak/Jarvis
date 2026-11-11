@@ -61,11 +61,12 @@ class DeploymentTests(unittest.TestCase):
                 'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'policy_sha256':m.digest(policy.read_bytes()),'dry_run':False,'external':True,
                 'config':{'AUGMENTAGENT_AUTOPR':'1','HOME':str(root),'PATH':'/usr/bin:/bin','AUGMENTAGENT_NATIVE_VM_POLICY':str(policy),
                           'CLAUDE_CLI':'/usr/bin/true','CODEX_CLI':'/usr/bin/true','AUGMENTAGENT_RUN_RESOURCES':'1'}} for role,child in children.items()}
-            for case in ('matched','provider-update','worker-missing-policy','drift','stale','missing-receipt','public','wrong-binary','dry-run','secret-field','changed-policy','worker-stopped','state-drift','route-drift'):
+            for case in ('matched','provider-update','provider-drift','worker-missing-policy','drift','stale','missing-receipt','public','wrong-binary','dry-run','secret-field','changed-policy','worker-stopped','state-drift','route-drift'):
                 with self.subTest(case=case):
                     current=json.loads(json.dumps(values))
                     if case=='worker-missing-policy':current['worker']['config'].pop('AUGMENTAGENT_NATIVE_VM_POLICY')
                     if case=='drift':current['worker']['config']['AUGMENTAGENT_RUN_PIDS']='8'
+                    if case=='provider-drift':current['worker']['config']['CLAUDE_CLI']='/usr/bin/false'
                     if case=='state-drift':current['worker']['config']['XDG_STATE_HOME']=str(root/'elsewhere')
                     if case=='route-drift':
                         route=root/'router.json';write(route,{'mode':'direct','api_key':'do-not-output-this-value'})
@@ -103,7 +104,8 @@ class DeploymentTests(unittest.TestCase):
                     if case=='matched':self.assertEqual(report['status'],'configuration-matched')
                     if case=='worker-missing-policy':self.assertEqual(report['services']['worker']['status'],'policy-not-selected')
                     if case=='worker-stopped':self.assertTrue(report['expected_active'])
-                    if case in ('drift','state-drift','route-drift'):self.assertEqual(report['status'],'effective-configuration-mismatch')
+                    if case in ('drift','state-drift','route-drift','provider-drift'):self.assertEqual(report['status'],'effective-configuration-mismatch')
+                    if case in ('provider-update','provider-drift'):self.assertEqual(len(calls),8)
                     if case=='stale':self.assertEqual(report['services']['worker']['status'],'process-receipt-stale')
                     if case=='wrong-binary':self.assertEqual(report['services']['worker']['status'],'executable-mismatch')
                     if case=='changed-policy':self.assertEqual(report['status'],'selection-changed')
