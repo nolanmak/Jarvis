@@ -3,7 +3,7 @@
   "epic": 1703,
   "issue": 1983,
   "pull_request": 1979,
-  "observed_at_utc": "2026-11-11T01:57:54.586642+00:00",
+  "observed_at_utc": "2026-11-11T02:15:59.604891+00:00",
   "regression": {
     "name": "self_improve::acceptance::repair_gate_tests::repair_scope_is_checked_before_verification_runs",
     "fixture": "Real temporary Git repositories and the production post-repair helper; lazy callback counts verification execution. Allowed edit executes once; unregistered implementation/observer edits execute zero times. An allowed-list deployment path is independently refused by the guard.",
@@ -25,7 +25,7 @@
     "result": "hosted exact-head job and individual test/aggregate steps succeeded",
     "job": 130260584597,
     "url": "https://github.com/nolanmak/Jarvis/actions/runs/42940409364/job/130260584597",
-    "raw_log": "pending REST API quota reset at 2026-11-11T02:11:59Z; no exact passing count claimed",
+    "raw_log": "downloaded after REST quota recovery",
     "check_evidence": {
       "baseRefOid": "4ebb2b745c62476ad08571dea008307f2235a986",
       "checks": [
@@ -143,7 +143,14 @@
         "crates/augmentagent-cli/src/self_improve_contract.rs"
       ]
     },
-    "coverage_reason": "The exact base/head planner selects targeted CLI binary and integration tests plus affected autonomy/core/Slack suites. The new regression is an ordinary non-ignored CLI unit test. GitHub reports the planning, Targeted crate tests and Every other applicable Linux check steps individually successful. Raw final-run log and exact counts are not yet downloaded."
+    "coverage_reason": "Exact successful job log now confirms the regression and full CLI binary result. This applies to 4bfb6ae8 only, not the later review regressions.",
+    "raw_log_sha256": "962ee3bfc95441d323da5ea59500dd16c664aa0c68de8dbc62eb13e6aff9f072",
+    "cli_result": {
+      "passed": 1742,
+      "failed": 0,
+      "ignored": 33,
+      "regression": "self_improve::acceptance::repair_gate_tests::repair_scope_is_checked_before_verification_runs ... ok"
+    }
   },
   "local_attempt": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli repair_scope_is_checked_before_verification_runs",
@@ -155,8 +162,8 @@
     "merged": false,
     "deployed": false,
     "production_acceptance": false,
-    "ready_for_review": true,
-    "native_submission": "not yet submitted; actor authorization uses REST and current core quota is exhausted. Preserve the original intended request ID for first actual submission after recovery."
+    "ready_for_review": false,
+    "native_submission": "not submitted; draft again for verified review findings"
   },
   "limits": [
     "This addresses validation ordering, not initial harness compilation or independent review source-budget recovery.",
@@ -178,5 +185,24 @@
     "other_cli_passed": 1741,
     "existing_ignored": 33,
     "log_sha256": "598e8c55c4e73a13bfd04ec3bec47ae41364fbf1ba7b83c96888fbed1fc85861"
+  },
+  "review_followup": {
+    "head": "46d8dcf74ed03557ab136366ee4e4384c31f746a",
+    "state": "tests only; hosted behavioral RED pending; implementation not yet applied",
+    "run": 42943808949,
+    "job": 130271641592,
+    "findings": [
+      {
+        "url": "https://github.com/nolanmak/Jarvis/pull/1979#discussion_r4532942660",
+        "claim": "Rename detection can hide the old unregistered source path from --name-only.",
+        "regression": "renamed_repair_checks_the_original_path_before_verification"
+      },
+      {
+        "url": "https://github.com/nolanmak/Jarvis/pull/1979#discussion_r4532942673",
+        "claim": "A scope-rejected candidate can be encountered on resume before reaching bounded correction/re-scope handling.",
+        "regression": "scope_rejection_uses_bounded_repair_then_durable_rescope"
+      }
+    ],
+    "fixture_limits": "Real temporary Git repositories and WorkflowGuard/store; empty provider pool prevents paid/native calls. Durable budget/spend states and preserved rejected source are asserted. This is not live autonomous review or a registered verifier."
   }
 }

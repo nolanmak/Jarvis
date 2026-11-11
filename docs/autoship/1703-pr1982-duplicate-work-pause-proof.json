@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "observed_at_utc": "2026-11-11T02:15:59.605287+00:00",
+  "workflow": "nolanmak/jarvis#1982",
+  "existing_public_pr": {
+    "number": 1984,
+    "url": "https://github.com/nolanmak/Jarvis/pull/1984",
+    "head": "16c966f26b4119b1712937f801083c3b57333898",
+    "created_at_utc": "2026-11-11T02:01:17Z",
+    "attribution": "Other owner coding session; not recorded as this native workflow PR or an autonomous merge."
+  },
+  "first_pause": {
+    "accepted": false,
+    "reason": "workflow-not-found",
+    "detail": "Automatic lane registered a workflow but no durable command job; CLI control required a command job."
+  },
+  "supported_join": {
+    "request_id": "autoship-control-existing-1982-20261111",
+    "accepted": true,
+    "joined": true,
+    "new_workflow_created": false
+  },
+  "pause": {
+    "accepted": true,
+    "principal": "github:nolanmak",
+    "revision": 1,
+    "updated_at_ms": 1794363249504,
+    "model_calls_before": 12,
+    "model_calls_after": 12,
+    "allowance_remaining": 5,
+    "quiescence": "unverified",
+    "worker_enforcement": "unverified"
+  },
+  "rollout_snapshot": {
+    "label": "autoship-repair-1978-1979",
+    "result": "refused",
+    "reason": "storage busy: build lease is held; retry admission",
+    "snapshot_created": false,
+    "limits_overridden": false,
+    "inflight_builder_stopped_manually": false
+  },
+  "remaining": [
+    "Observe real build/lease teardown before claiming work stopped or storage released.",
+    "Preserve this pause while the existing PR is handled; do not start a replacement issue attempt or reset its charges.",
+    "After external completion, reconcile the original workflow through supported controls, respecting any newer owner revision.",
+    "The command-only control gap and missing linked-PR dedup remain production defects; this operational join/pause does not implement those fixes."
+  ]
+}
