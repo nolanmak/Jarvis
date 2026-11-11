@@ -17,23 +17,28 @@ use std::{
 
 const LIMIT: u64 = 64 * 1024 * 1024;
 
-// Bound the serialized representation, including a pending line's second
-// layer of JSON escaping. Do not allocate a complete encoded anchor first.
-struct BoundedAnchorWriter<'a,W:Write+?Sized> {
-    writer:&'a mut W,
-    remaining:usize,
+/// Bounds the encoded anchor as it is written: a pending log line is escaped a
+/// second time on the way in, so the anchor can outgrow the budget even when
+/// that line fits. Refuse during the write, never after buffering an encode.
+struct BoundedWriter<W: Write> {
+    writer: W,
+    remaining: u64,
 }
-impl<W:Write+?Sized> Write for BoundedAnchorWriter<'_,W> {
-    fn write(&mut self,bytes:&[u8])->std::io::Result<usize> {
-        if bytes.len()>self.remaining {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
-                "audit anchor exceeds workflow budget"));
+impl<W: Write> Write for BoundedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() as u64 > self.remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "audit anchor exceeds workflow budget",
+            ));
         }
-        let written=self.writer.write(bytes)?;
-        self.remaining-=written;
+        let written = self.writer.write(bytes)?;
+        self.remaining -= written as u64;
         Ok(written)
     }
-    fn flush(&mut self)->std::io::Result<()> {self.writer.flush()}
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
 }
 #[derive(Debug)]
 pub(crate) struct GenerationSealed;
@@ -91,9 +96,11 @@ fn canonical_destination(path: &Path) -> Result<PathBuf> {
 }
 impl AnchoredAudit {
     /// Writer registration and sealing share this cross-process ingress gate.
-    /// The callback must persist its ticket before releasing the generation lock.
+    /// The callback must persist its ticket before releasing the audit lock.
     pub(crate) fn with_open_generation<T>(&self,register:impl FnOnce()->Result<T>)->Result<T> {
-        let _lock=self.lock_generation()?;
+        let lock=private_open(&self.lock_path()?,false)?;
+        #[cfg(unix)]
+        ensure!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX)}==0,"audit lock failed");
         if self.anchor.exists() {
             let file=private_open(&self.anchor,false)?;
             ensure!(file.metadata()?.len()<=LIMIT,"anchor exceeds budget");
@@ -121,23 +128,27 @@ impl AnchoredAudit {
         }
         Ok(Self { log, anchor })
     }
-    /// Writers and sealers serialize on the log, the generation's stable inode.
-    /// The anchor cannot hold the lock because every save replaces it by
-    /// rename, and a sidecar lock file would leave a mutable non-evidence file
-    /// in the directory that must contain the archived anchor alone.
-    fn lock_generation(&self) -> Result<File> {
-        let lock = private_open(&self.log, true)?;
-        #[cfg(unix)]
+    /// One lock for every writer and sealer, beside the log: the anchor's own
+    /// directory must end up holding the archived anchor alone, so a refused
+    /// save leaves nothing there but the settled evidence it replaces.
+    fn lock_path(&self) -> Result<PathBuf> {
+        let path = self.log.with_extension("lock");
         ensure!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0,
-            "audit lock failed"
+            path != self.log && path != self.anchor,
+            "audit lock path collision"
         );
-        Ok(lock)
+        Ok(path)
     }
     fn save(&self, anchor: &Anchor) -> Result<()> {
         let parent = self.anchor.parent().unwrap();
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-        serde_json::to_writer(BoundedAnchorWriter {writer:temp.as_file_mut(),remaining:LIMIT as usize}, anchor)?;
+        serde_json::to_writer(
+            BoundedWriter {
+                writer: temp.as_file_mut(),
+                remaining: LIMIT,
+            },
+            anchor,
+        )?;
         temp.as_file().sync_all()?;
         temp.persist(&self.anchor).map_err(|e| e.error)?;
         File::open(parent)?.sync_all()?;
@@ -146,7 +157,12 @@ impl AnchoredAudit {
     /// Appends under a cross-process lock; a durable pending intent permits
     /// replay after a daemon crash without accepting loss of committed rows.
     pub fn append(&self, record: serde_json::Value) -> Result<()> {
-        let _lock = self.lock_generation()?;
+        let lock = private_open(&self.lock_path()?, false)?;
+        #[cfg(unix)]
+        ensure!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0,
+            "audit lock failed"
+        );
         self.append_locked(record)
     }
     /// Validate without replaying uncertain records, then atomically prevent all
@@ -154,8 +170,10 @@ impl AnchoredAudit {
     /// same lock as writers. A retry returns the identical immutable proof.
     pub fn seal_for_recovery<F>(&self, validate: F) -> Result<serde_json::Value>
     where F: FnOnce(&[serde_json::Value]) -> Result<serde_json::Value> {
+        let lock = private_open(&self.lock_path()?, false)?;
+        #[cfg(unix)]
+        ensure!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0, "audit lock failed");
         ensure!(self.anchor.exists() && self.log.exists(), "recovery requires existing audit evidence");
-        let _lock = self.lock_generation()?;
         let file = private_open(&self.anchor, false)?;
         ensure!(file.metadata()?.len() <= LIMIT, "anchor exceeds budget");
         let mut anchor: Anchor = serde_json::from_reader(file)?;
@@ -303,6 +321,26 @@ mod tests {
         corrupted[2] ^= 1;
         fs::write(&sink.log, corrupted).unwrap();
         assert!(sink.seal_for_recovery(|_| Ok(serde_json::json!({}))).is_err());
+    }
+    #[test]
+    fn refuses_oversized_anchors_and_keeps_settled_evidence_usable() {
+        let (_dir, sink) = setup();
+        sink.append(serde_json::json!({"payload":"settled"})).unwrap();
+        let log = fs::read(&sink.log).unwrap();
+        let anchor = fs::read(&sink.anchor).unwrap();
+        // The log line fits the budget; escaping it into the anchor doubles it.
+        let oversized = "\\".repeat(22 * 1024 * 1024);
+        assert!(sink.append(serde_json::json!({"payload":oversized})).is_err());
+        assert_eq!(fs::read(&sink.log).unwrap(), log);
+        assert_eq!(fs::read(&sink.anchor).unwrap(), anchor);
+        let anchor_dir = sink.anchor.parent().unwrap();
+        assert_eq!(fs::read_dir(anchor_dir).unwrap().count(), 1, "leaked a file beside the anchor");
+        sink.append(serde_json::json!({"payload":"smaller"})).unwrap();
+        let oversized = "v".repeat(LIMIT as usize);
+        assert!(sink.seal_for_recovery(|_| Ok(serde_json::json!({"oversized":oversized}))).is_err());
+        assert_eq!(fs::read_dir(anchor_dir).unwrap().count(), 1, "leaked a file beside the anchor");
+        let proof = sink.seal_for_recovery(|_| Ok(serde_json::json!({"quiescent":true}))).unwrap();
+        assert_eq!(proof["validation"], serde_json::json!({"quiescent":true}));
     }
     #[test]
     fn detects_old_record_rewrite_and_committed_truncation() {
