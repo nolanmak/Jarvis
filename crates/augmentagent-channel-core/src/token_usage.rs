@@ -294,6 +294,7 @@ pub struct UnfinishedCallGuard {
     class: crate::providers::CapabilityClass,
     started: std::time::Instant,
     armed: bool,
+    observed_usage: Option<TokenUsage>,
 }
 
 impl UnfinishedCallGuard {
@@ -304,7 +305,12 @@ impl UnfinishedCallGuard {
         class: crate::providers::CapabilityClass,
         started: std::time::Instant,
     ) -> Self {
-        Self { logger, provider, model: model.into(), class, started, armed: true }
+        Self { logger, provider, model: model.into(), class, started, armed: true, observed_usage: None }
+    }
+
+    /// Retain the latest cumulative report if execution later yields or aborts.
+    pub fn observe_usage(&mut self, usage: TokenUsage) {
+        self.observed_usage = Some(usage);
     }
 
     /// The call reached a result; its own row (if any) is the record.
@@ -322,7 +328,7 @@ impl Drop for UnfinishedCallGuard {
             self.provider,
             std::mem::take(&mut self.model),
             self.class,
-            TokenUsage::default(),
+            self.observed_usage.unwrap_or_default(),
             self.started,
         );
         record.outcome = Some("unfinished".into());
@@ -807,6 +813,61 @@ mod tests {
     /// #2012 — a call whose future is dropped before its result (the caller's
     /// timeout, the watchdog, a cancel) still leaves a row, so the slowest
     /// calls are not the ones missing from the log.
+    #[test]
+    fn unfinished_calls_keep_the_last_report_without_duplicate_accounting() {
+        for provider in [
+            crate::providers::ProviderKind::Codex,
+            crate::providers::ProviderKind::Claude,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("usage.jsonl");
+            let logger = Arc::new(UsageLogger::new(path.clone()));
+            let mut call = UnfinishedCallGuard::new(
+                logger.clone(),
+                provider,
+                "synthetic",
+                crate::providers::CapabilityClass::TextOnly,
+                std::time::Instant::now(),
+            );
+            call.observe_usage(TokenUsage {
+                input: 5,
+                ..Default::default()
+            });
+            call.observe_usage(TokenUsage {
+                input: 9,
+                output: 1,
+                ..Default::default()
+            });
+            drop(call);
+            let rows: Vec<UsageRecord> = std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].usage.total(), 10);
+            assert_eq!(rows[0].outcome.as_deref(), Some("unfinished"));
+            let mut finished = UnfinishedCallGuard::new(
+                logger,
+                provider,
+                "synthetic",
+                crate::providers::CapabilityClass::TextOnly,
+                std::time::Instant::now(),
+            );
+            finished.observe_usage(TokenUsage {
+                input: 99,
+                ..Default::default()
+            });
+            finished.finish();
+            drop(finished);
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap().lines().count(),
+                1,
+                "normal caller owns its single usage append"
+            );
+        }
+    }
+
     #[test]
     fn an_unfinished_call_still_writes_a_usage_row() {
         let dir = tempfile::tempdir().unwrap();

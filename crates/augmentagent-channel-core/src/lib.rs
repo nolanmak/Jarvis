@@ -17,6 +17,7 @@ pub mod cli_gate;
 pub mod code_mode;
 pub mod codex;
 pub mod codex_tools;
+mod native_tool_readiness;
 pub mod cooldown;
 pub mod decision;
 pub mod draft_context;

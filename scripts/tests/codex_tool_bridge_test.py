@@ -2976,6 +2976,57 @@ class BuildScratchTests(unittest.TestCase):
         policy.run_command('cargo build')
         self.assertEqual(len(self.calls), 1)
 
+    def test_preflight_accounts_for_shared_reserve_after_cache_without_allocating(self):
+        gib = 1024**3
+        policy = self.policy(command_storage={
+            'lock': str(Path(self.temp.name) / 'disk-build.lock'),
+            'floor_bytes': 15*gib, 'admission_bytes': 25*gib})
+        policy._scratch.cache_bytes = 12*gib
+        policy._scratch.headroom_bytes = 20*gib
+        policy._scratch.statvfs = self.fake_statvfs(free_bytes=36*gib)
+        with self.assertRaises(bridge.Readiness) as raised:
+            policy.preflight_builds()
+        self.assertEqual(raised.exception.category, 'build_storage_reserve')
+        with self.assertRaises(bridge.Readiness) as actual:
+            policy.run_command('cargo build')
+        self.assertEqual(actual.exception.category, raised.exception.category)
+        reply = bridge.Server(policy).dispatch({'method': 'tools/call',
+            'params': {'name': 'Bash', 'arguments': {'command': 'cargo build'}}})
+        self.assertTrue(reply['isError'])
+        evidence = json.loads(reply['content'][1]['text'].split(':', 1)[1])
+        self.assertEqual(evidence, {'category': 'build_storage_reserve',
+            'available_bytes': 36*gib, 'required_bytes': 37*gib})
+        self.assertIsNone(policy._scratch.session)
+        self.assertEqual(list(self.scratch.iterdir()), [])
+        self.assertEqual(self.calls, [])
+        policy._scratch.statvfs = self.fake_statvfs(free_bytes=37*gib)
+        report = policy.preflight_builds()
+        self.assertTrue(report['ready'])
+        self.assertEqual(report['required_bytes'], 37*gib)
+        self.assertIsNone(policy._scratch.session)
+        self.assertEqual(list(self.scratch.iterdir()), [])
+        self.assertEqual(self.calls, [])
+
+    def test_preflight_observes_busy_shared_lease_without_creating_lock_files(self):
+        config = {'lock': str(Path(self.temp.name) / 'disk-build.lock'),
+                  'floor_bytes': 0, 'admission_bytes': 0}
+        policy = self.policy(command_storage=config)
+        before = set(Path(self.temp.name).iterdir())
+        policy.preflight_builds()
+        self.assertEqual(set(Path(self.temp.name).iterdir()), before)
+        with bridge.CommandStorage(config, self.scratch):
+            with self.assertRaises(bridge.Readiness) as raised:
+                policy.preflight_builds()
+            self.assertEqual(raised.exception.category, 'build_storage_busy')
+        self.assertTrue(policy.preflight_builds()['ready'])
+        self.assertIsNone(policy._scratch.session)
+        self.assertEqual(self.calls, [])
+
+    def test_preflight_preserves_read_only_profiles_with_no_build_requirements(self):
+        policy = self.policy(allowed_tools=['Read'], build_scratch_dir=None)
+        self.assertEqual(policy.preflight_builds(), {'ready': True, 'builds_required': False})
+        self.assertEqual(self.calls, [])
+
     def test_admission_holds_an_exclusive_lock_on_the_scratch_root(self):
         import fcntl, os
         policy = self.policy()

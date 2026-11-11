@@ -49,8 +49,9 @@ class Readiness(Denied):
                                 'bounds (see docs/BUILD-VM.md).',
     }
 
-    def __init__(self, category, path=None, detail=''):
+    def __init__(self, category, path=None, detail='', observation=None):
         self.category = category
+        self.observation = observation or {}
         # Only operator-provisioned paths and sizes are substituted, never secrets.
         message = self.MESSAGES[category].format(path=path if path is not None else '(not configured)', detail=detail)
         super().__init__('JARVIS_READINESS:' + category + ' ' + message)
@@ -226,7 +227,32 @@ class BuildScratch:
             raise Readiness('build_scratch_space', self.root,
                 f'{free / gib:.1f} GiB free; needs {needed / gib:.1f} GiB: {self.headroom_bytes / gib:.0f} GiB '
                 f'headroom, {outstanding / gib:.1f} GiB other sessions may still grow, '
-                f'{retained / gib:.1f} GiB reserved for compute, {self.cache_bytes / gib:.0f} GiB for this cache')
+                f'{retained / gib:.1f} GiB reserved for compute, {self.cache_bytes / gib:.0f} GiB for this cache',
+                observation={'available_bytes': free, 'required_bytes': needed})
+        return {'available_bytes': free, 'required_bytes': needed}
+
+    def preflight(self, admission_bytes=0):
+        """Read-only forecast; actual admission still rechecks under its lease."""
+        import fcntl
+        root_fd = self._open_root()
+        try:
+            try:
+                fcntl.flock(root_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Readiness('build_storage_busy') from None
+            observed = self._require_space(root_fd)
+            vfs = self.statvfs(root_fd)
+            free = vfs.f_bavail * vfs.f_frsize
+            # A newly allocated cache must not consume the space required by
+            # the shared build gate on the next command in this model turn.
+            required = max(observed['required_bytes'], admission_bytes + self.cache_bytes)
+            if free < required:
+                raise Readiness('build_storage_reserve',
+                    observation={'available_bytes': free, 'required_bytes': required})
+            return {'ready': True, 'builds_required': True,
+                    'available_bytes': free, 'required_bytes': required}
+        finally:
+            os.close(root_fd)
 
     def open(self):
         import secrets
@@ -311,8 +337,9 @@ class CommandStorage:
     Descendant supervisors inherit the locked descriptor. Closing our copy
     cannot release it while a canceled VM is still being reaped.
     """
-    def __init__(self, config, scratch):
+    def __init__(self, config, scratch, read_only=False):
         self.config, self.scratch, self.fd = config, Path(scratch), None
+        self.read_only = read_only
         self.fds = []
         self.identities = {}
 
@@ -339,7 +366,15 @@ class CommandStorage:
                 # pretend to publish a Rust storage reservation.
                 deadline = time.monotonic() + 300
                 for name in ('disk-update.lock', path.name):
-                    fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
+                    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+                    if not self.read_only:
+                        flags |= os.O_CREAT
+                    try:
+                        fd = os.open(name, flags, 0o600, dir_fd=parent)
+                    except FileNotFoundError:
+                        if self.read_only:
+                            continue  # Actual admission still creates/rechecks the lease.
+                        raise
                     self.fds.append(fd)
                     info = os.fstat(fd)
                     if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
@@ -351,10 +386,10 @@ class CommandStorage:
                             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                             break
                         except BlockingIOError:
-                            if time.monotonic() >= deadline:
+                            if self.read_only or time.monotonic() >= deadline:
                                 raise Readiness('build_storage_busy')
                             time.sleep(0.1)
-                self.fd = self.fds[-1]
+                self.fd = self.fds[-1] if self.fds else None
                 # The global build descriptor remains first in the supervisor
                 # protocol; both descriptions survive controller cancellation.
                 self.fds.reverse()
@@ -375,8 +410,10 @@ class CommandStorage:
                 raise Denied('storage lease inode changed')
         required = self.config['floor_bytes'] if required is None else required
         vfs = os.statvfs(self.scratch)
-        if vfs.f_bavail * vfs.f_frsize < required:
-            raise Readiness('build_storage_reserve')
+        available = vfs.f_bavail * vfs.f_frsize
+        if available < required:
+            raise Readiness('build_storage_reserve',
+                observation={'available_bytes': available, 'required_bytes': required})
 
     def __exit__(self, *_):
         # Close only: inherited supervisor/QEMU copies retain both locks.
@@ -1774,6 +1811,30 @@ class Policy:
         """The command's process (host or VM) is about to start."""
         self._command_started = True
 
+    def preflight_builds(self):
+        builds = any(tokens and (Path(tokens[0]).name in ('cargo', 'npm', 'npx')
+                     or tokens[0] in ('scripts/cargo-managed.sh', './scripts/cargo-managed.sh'))
+                     for tokens, _ in self.command_patterns)
+        if not builds:
+            return {'ready': True, 'builds_required': False}
+        if self.build_runner is None:
+            raise Readiness('build_vm_unavailable')
+        if self.build_runner == 'host':
+            return {'ready': True, 'builds_required': True}
+        admission = 0
+        if self.command_storage is not None:
+            floor = self.command_storage.get('floor_bytes')
+            admission = self.command_storage.get('admission_bytes')
+            if type(floor) is not int or type(admission) is not int or floor < 0 or admission < floor:
+                raise Denied('invalid command storage policy')
+        report = self._scratch.preflight(admission)
+        if self.command_storage is not None:
+            # Observe existing global leases without creating files or waiting
+            # behind another build before the model has even been admitted.
+            with CommandStorage(self.command_storage, self._scratch.root, read_only=True):
+                pass
+        return report
+
     def run_command(self, command, timeout=None):
         # #1041: the runner is decided before anything executes. It leads the
         # outcome, so truncation cannot drop it, and it is attached to any
@@ -1789,6 +1850,8 @@ class Policy:
             timeout = self.build_timeout if build else COMMAND_TIMEOUT_DEFAULT
         try:
             if runner == 'vm' and self.command_storage is not None:
+                if self._scratch.session is None:
+                    self.preflight_builds()
                 with CommandStorage(self.command_storage, self._scratch.root) as storage:
                     self._active_command_storage = storage
                     try:
@@ -2717,7 +2780,16 @@ class Server:
                 return {'isError': True, 'content': [{'type': 'text', 'text':
                     'An earlier operation has an uncertain outcome. Use read-only tools to inspect current state. '
                     'Do not repeat or start external changes until that outcome is reconciled.'}]}
-            except (Readiness, SearchLimit) as error:
+            except Readiness as error:
+                content = [{'type': 'text', 'text': runner_prefix(error) + str(error)}]
+                numbers = {key: value for key, value in error.observation.items()
+                           if key in ('available_bytes', 'required_bytes')
+                           and type(value) is int and 0 <= value <= 2**64-1}
+                if numbers:
+                    content.append({'type': 'text', 'text': 'JARVIS_READINESS_EVIDENCE:' +
+                                    json.dumps({'category': error.category, **numbers}, sort_keys=True)})
+                return {'isError': True, 'content': content}
+            except SearchLimit as error:
                 return {'isError': True, 'content': [{'type': 'text', 'text': runner_prefix(error) + str(error)}]}
             except (Denied, KeyError, TypeError, UnicodeError, OSError, ValueError,
                     RecursionError, MemoryError) as error:
@@ -2926,7 +2998,22 @@ def serve(config_path):
 
 if __name__ == '__main__':
     import sys
-    if len(sys.argv) == 3 and sys.argv[1] in ('--handoff-status', '--handoff-reconcile'):
+    if len(sys.argv) == 3 and sys.argv[1] == '--inspect-build-readiness':
+        policy = None
+        try:
+            policy = Policy(json.loads(Path(sys.argv[2]).read_text()))
+            print(json.dumps(policy.preflight_builds()))
+        except Readiness as error:
+            numbers = {key: value for key, value in error.observation.items()
+                       if key in ('available_bytes', 'required_bytes')
+                       and type(value) is int and 0 <= value <= 2**64-1}
+            print(json.dumps({'ready': False, 'category': error.category, **numbers}))
+        except Exception:
+            print(json.dumps({'ready': False, 'category': 'mcp_start'}))
+        finally:
+            if policy is not None:
+                policy.close()
+    elif len(sys.argv) == 3 and sys.argv[1] in ('--handoff-status', '--handoff-reconcile'):
         try:
             journal = HandoffJournal(sys.argv[2])
             if sys.argv[1] == '--handoff-status':

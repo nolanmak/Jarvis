@@ -132,7 +132,7 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
             crate::autoship_workflow::submission::Milestone::Pr=>pr_ready.is_some() && !recovery_needed && snapshot.checkpoint.stage != Stage::Retired,
         };
         let pause_blocks=paused && !complete && !recovery_needed && snapshot.checkpoint.stage!=Stage::Retired;
-        let code = if complete {0} else if paused || recovery_needed || matches!(snapshot.checkpoint.stage, Stage::Held | Stage::AwaitChecks | Stage::Merged) {
+        let code = if complete {0} else if paused || recovery_needed || snapshot.checkpoint.next.action=="await_capacity" || matches!(snapshot.checkpoint.stage, Stage::Held | Stage::AwaitChecks | Stage::Merged) {
             3
         } else {
             0
@@ -155,7 +155,7 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
             "lease":{"active":snapshot.lease_until_ms > now,"generation":snapshot.generation},
             "progress_at_ms":snapshot.progress_at_ms,
             "resource_refusal":if paused || merged || snapshot.checkpoint.stage==Stage::Retired {None} else {attempt.as_ref().and_then(|a|a.resource_observation())},
-            "last_attempt":attempt}),
+            "tool_capacity_refusal":store.tool_capacity_refusal(workflow,now)?,"last_attempt":attempt}),
         )))
     })();
     match observed {
@@ -207,6 +207,10 @@ pub fn run_status(workflow: &str, json_output: bool) -> i32 {
         );
         if let Some(resource) = crate::autoship_workflow::resource_refusal::render_status(&body) {
             println!("{resource}");
+        }
+        if let Some(resource)=body.get("tool_capacity_refusal").cloned().and_then(|value|
+            serde_json::from_value::<crate::autoship_workflow::tool_capacity::ToolCapacityRefusal>(value).ok()) {
+            println!("{}",resource.render());
         }
         if body["allowance"].is_object() {
             println!("Confirmed auto-merges today: {}; remaining: {}; pending capacity holds: {}; available: {}",
