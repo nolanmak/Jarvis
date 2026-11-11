@@ -151,3 +151,55 @@ or override the existing owner-turn/final-dispatch guards.
 ## Native identity retention source clarification
 
 A follow-up source read at main `4ebb2b74` confirms that `Lease::observe` writes the actual observed ID into `NativeSession::State.id` immediately. `Lease::Drop` can mark that state uncertain without clearing its ID. The loss boundary is therefore the current `fresh_review_scope` return/lifetime interface and durable publication ordering: its early `await?` exposes neither the failed outcome/session handle to its caller, and later `NativeSession::Drop` retires registered paths. Do not invent a replacement native ID or change observation semantics on the assumption that failure erases the already observed ID. A complete custody interface still needs original accounting/resource correlation, bounded durable response/source storage, uncertainty reconciliation and retirement fencing before activation. This source clarification supplies none of those missing authorities.
+
+
+## Main 4ebb2b74 paid-path source map
+
+This source pass identifies the production entry families and their early paid
+work. It does not define a hold schema, settle native response custody, or make
+the C2 contract implementation-ready. The paths below were read at full main
+`4ebb2b745c62476ad08571dea008307f2235a986`; line numbers are only discovery aids.
+
+| Entry family | Existing ownership before first paid work | Early paid work that a deterministic hold must precede |
+| --- | --- | --- |
+| Worker fresh issue / explicit issue command | `self_improve.rs::run_selected` prepares the candidate, computes source/environment/issue contract, acquires `WorkflowGuard`, binds builder, and records `trusted_request_acquired` | `readiness::assess`, original scoping, optional slicing, initial acceptance construction, then builder. Checking only before the final independent review misses these calls. |
+| Issue-backed draft resume / explicit linked PR | `resume_draft_pr` authenticates/import-preflights, locks and prepares the preserved candidate, acquires its workflow and binds builder | `prepare_acceptance` runs before reconciliation, verification repair and the paid QA calls near lines 7047 onward. A same-input hold must be checked before preparation, not after QA. |
+| Source-less adopted PR / explicit unlinked PR | `self_improve_adopted.rs::resume` acquires workflow at the preserved PR and binds builder before `execute` | `readiness::assess_pr` precedes acceptance construction; conflict repair uses `adoption::revise`; acceptance repair and independent review follow. A hold inside `aligned_review::run_for_subject` is too late. |
+| Acceptance repair and amendment | Existing caller supplies its acquired guard and prepared registration | `self_improve_contract::verify_with_repair_for` can call independent `amendment::try_amend`, builder `adoption::revise`, then verification again. A new loop round or amendment proposal cannot silently create a new paid episode. |
+| Review / alignment / final adjudication | Existing caller supplies the workflow audit and immutable subject binding | `self_improve_review::execute_evidence_group`, `self_improve_alignment`, `self_improve_adjudication_windows` and constraint learning each enter fresh native reviewer scopes. A successful call boundary still does not supply failed-result custody. |
+| Episode re-scope / review repair | Existing guarded candidate and epoch are passed by the owning pipeline | `self_improve_episode` can call a fresh builder for re-scope; adoption's `revise` wraps the builder's storage-aware call. These are paid calls inside the episode, not independent free wake attempts. |
+| Productive owner follow-up | The store has owner-turn claiming, revision fences and conversation readers | Main has no production consumer of `claim_owner_turn`/`WorkflowGuard::acquire_owner_turn`; observed consumers outside definitions are tests. There is no current productive Discord coding path to certify. #1713 must wire this path through the same early hold and final dispatch fences when implemented. |
+
+The shared launch fence is installed by
+`self_improve_workflow::WorkflowGuard::install_model_accounting` at guard
+acquisition. Its dispatch observer obtains the current stored binding and calls
+`WorkflowStore::validate_dispatch`, which validates lease/binding and owner-turn
+permission. That does not currently inspect a C2 deterministic-input hold or
+prove that an asynchronous request was built from the same semantic inputs as a
+future wake claim. The future claim interface must carry/revalidate those inputs;
+snapshotting whatever binding is current at launch is not that proof.
+
+The model observer separately performs terminal-workflow, capacity and bounded
+purpose checks before `charge_admitted_model`. Storage-aware builder calls do
+not substitute for these checks. Every separately built reasoner must retain the
+workflow audit through `bind_builder` or `bind_reasoner`. The initial receipt
+correlation change in #1956 remains a prerequisite; it does not itself add a C2
+hold or return failed reviewer results.
+
+Two boundaries must stay explicit in the complete implementation map:
+
+- The legacy multi-repository approval-broker lane (`process_one_repo`, near
+  line 10565) deliberately uses `build_reasoner` without an Autoship
+  `WorkflowGuard`. It cannot be presented as a guarded C2 retry or used to evade
+  a preserved workflow's hold/accounting. Its existing approval-broker policy
+  is distinct; any future convergence must preserve both authorities.
+- Calibration and native acceptance/probe paths are diagnostic/observational
+  entry points with their own workflow and immutable call reservations. Their
+  model calls are not production wake evidence. Test-only calls and the
+  `Github::call` transport methods are not model dispatches.
+
+Remaining R/S handoff work is to bind exact trusted pre-dispatch key producers
+and legacy-unknown behavior to every row, specify the early read-only decision
+and final claim consumption transaction together with R/P, and test actual call
+counts through these entry points. This table does not claim those interfaces
+or their crash/race tests are complete.
