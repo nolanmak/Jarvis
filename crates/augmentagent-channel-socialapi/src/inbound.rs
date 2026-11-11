@@ -852,6 +852,15 @@ impl<R: Reasoner + 'static> SocialApiDmChannel<R> {
             return Ok(false);
         }
 
+        // #2014 — hold the draft to the register the sender writes in (their
+        // DM is the only recipient-authored evidence in hand) and carry a
+        // mismatch to the card. Advisory: the card is still posted and
+        // Approve still sends.
+        let (draft, register) =
+            augmentagent_approval_discord::register::attach_dm_register_warning([dm.text.as_str()], &draft);
+        if let Some(note) = &register {
+            warn!(dm = %email.message_id, "socialapi dm draft register mismatch: {note}");
+        }
         let action_id = self.store.log_action(
             &email.message_id,
             email.thread_id.as_deref(),
@@ -1004,6 +1013,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingBroker {
         posts: std::sync::Mutex<Vec<String>>,
+        /// Draft bodies exactly as the cards showed them (#2014).
+        drafts: std::sync::Mutex<Vec<String>>,
     }
     #[async_trait]
     impl ApprovalBroker for RecordingBroker {
@@ -1011,9 +1022,10 @@ mod tests {
             &self,
             action_id: &str,
             _: &Email,
-            _: &str,
+            draft: &str,
         ) -> Result<(), ApprovalError> {
             self.posts.lock().unwrap().push(action_id.to_string());
+            self.drafts.lock().unwrap().push(draft.to_string());
             Ok(())
         }
         async fn post_flag_notice(&self, _: &Email, _: &str) -> Result<(), ApprovalError> {
@@ -1974,5 +1986,75 @@ mod tests {
         assert_eq!(sender_handle(&msg), "ig_12345");
         msg.sender_name = "jane".into();
         assert_eq!(sender_handle(&msg), "jane");
+    }
+
+    // ---- #2014: the register check reaches the DM card ----
+
+    /// A sender who writes in standard capitalization.
+    const CAPITALIZES: &str = "Hi, I wanted to check in on the proposal. Does Thursday still work?";
+    const LOWERCASE_DRAFT: &str = "hey, sending it tonight. thursday still works";
+
+    /// The register warning the card carried as metadata, plus the text the
+    /// send path would ship. Asserts the rendered embed shows the warning —
+    /// the owner-visible surface, not just the draft metadata.
+    async fn carded(inbound: &str, draft: &'static str) -> (Option<String>, String) {
+        let (store, _f) = tmp_store();
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"genuine question"}"#,
+            draft,
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = channel(Arc::clone(&store), reasoner, Arc::clone(&broker), false);
+        let mut payload = dm_payload("instagram");
+        payload.text = inbound.to_string();
+        assert!(ch.handle_dm(payload).await.unwrap(), "a register mismatch must never cost the card");
+        let card_draft = broker.drafts.lock().unwrap()[0].clone();
+        let (action_id, status, _) = store.latest_action_for_message("m1").unwrap().unwrap();
+        assert_eq!(status, ActionStatus::Pending.as_str());
+        let action = store.get_action_with_email(&action_id).unwrap().unwrap();
+        let stored = action.action.draft_body.clone().unwrap();
+        // Approve re-hashes the stored draft and refuses a card that no
+        // longer matches it, so the warning rides on both or on neither.
+        assert_eq!(
+            augmentagent_approval_discord::interaction::draft_revision(&stored),
+            augmentagent_approval_discord::interaction::draft_revision(&card_draft),
+        );
+        let (_, warning) = augmentagent_approval_discord::split_register(&card_draft);
+        if warning.is_some() {
+            let card = serde_json::to_value(augmentagent_approval_discord::approval_message(
+                &action_id, &action.email, &card_draft, 0,
+            )).unwrap().to_string();
+            assert!(card.contains("Register") && card.contains("register mismatch"), "{card}");
+            println!("socialapi_register_mismatch_warning_visible");
+            println!("socialapi_register_mismatch_card_pending");
+        }
+        (warning, augmentagent_approval_discord::strip_assumes_for_send(&stored))
+    }
+
+    /// #2014: the sender capitalizes and the reply came out all-lowercase.
+    /// Only the email path checked that, so the DM shipped unflagged.
+    #[tokio::test]
+    async fn register_warning_is_visible_on_a_mismatched_dm_card() {
+        let (warning, sent) = carded(CAPITALIZES, LOWERCASE_DRAFT).await;
+        let warning = warning.expect("the card carries the register warning");
+        assert!(warning.contains("the recipient writes in standard"), "{warning}");
+        assert_eq!(sent, LOWERCASE_DRAFT, "advisory only: the drafted text still ships");
+        println!("socialapi_register_mismatch_approval_eligible");
+    }
+
+    /// An owner override this turn (#1107), a draft that mirrors the sender,
+    /// and a DM with nothing sentence-shaped to classify warn about nothing.
+    #[tokio::test]
+    async fn register_warning_is_suppressed_by_an_override_or_thin_evidence() {
+        for (inbound, draft) in [
+            (CAPITALIZES, "register: lowercase (you asked)\nsending it tonight"),
+            (CAPITALIZES, "Sending it tonight. Thursday works."),
+            ("ok", LOWERCASE_DRAFT),
+        ] {
+            let (warning, _) = carded(inbound, draft).await;
+            assert!(warning.is_none(), "{draft}: {warning:?}");
+        }
+        println!("socialapi_register_owner_override_suppressed");
+        println!("socialapi_register_matching_or_insufficient_suppressed");
     }
 }

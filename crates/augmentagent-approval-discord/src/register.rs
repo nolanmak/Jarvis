@@ -26,6 +26,10 @@
 //! Call sites: Discord replies via `attachments::prepare_answer_delivery`
 //! and `/loop` results in `loops.rs`; email bodies via `gmail compose|
 //! update-draft|send-now` in `main.rs`, refused before any Gmail write.
+//! The DM compose paths (iMessage/WhatsApp bundles, socialapi, LinkedIn) run
+//! the recipient-sample half through [`attach_dm_register_warning`], which
+//! only annotates the approval card: a mismatch there warns and still sends
+//! (#2014).
 
 use std::fmt;
 
@@ -395,6 +399,60 @@ pub fn audit_draft_against_sample(sample: &str, draft: &str) -> Option<String> {
     contradiction("the recipient writes in", declared, &paragraphs)
 }
 
+/// The advisory register warning for a drafted DM (#2014): the recipient's
+/// own recent messages are classified and the draft held to *their* casing —
+/// the check the Gmail path runs against `--reply-to-body`, and which no DM
+/// path ran.
+///
+/// `samples` must be recipient-authored text only: the owner's own turns say
+/// nothing about the register the recipient writes in. Insufficient evidence
+/// yields `None`, so an owner-started compose with no message from the other
+/// side is never guessed at, and an owner override this turn
+/// (`register: lowercase (you asked)`, #1107) is not second-guessed. A receipt
+/// that merely classifies is dropped from the audited prose, since its
+/// lowercase keyword is evidence for nothing.
+pub fn dm_register_warning<'a>(
+    samples: impl IntoIterator<Item = &'a str>,
+    draft: &str,
+) -> Option<String> {
+    let lead = draft.trim_start_matches(['\r', '\n']);
+    let (first, rest) = lead.split_once('\n').unwrap_or((lead, ""));
+    if is_owner_override_receipt(first) {
+        return None;
+    }
+    let prose = if is_register_receipt(first) { rest } else { lead };
+    let sample = samples
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    audit_draft_against_sample(&sample, prose)
+}
+
+/// [`dm_register_warning`], attached to the draft as card-only metadata
+/// (#2014). Returns the draft to persist and post — unchanged when there is
+/// nothing to warn about — plus the warning itself, for the caller's log.
+///
+/// The marker rides AHEAD of any needs-input marker (which the card renderer
+/// truncates at), and callers must store and card the same returned string so
+/// Approve still matches the draft it was shown. Nothing here refuses.
+pub fn attach_dm_register_warning<'a>(
+    samples: impl IntoIterator<Item = &'a str>,
+    draft: &str,
+) -> (String, Option<String>) {
+    let (prose, needs) = crate::layout::split_needs_input(draft);
+    let Some(warning) = dm_register_warning(samples, &prose) else {
+        return (draft.to_string(), None);
+    };
+    let asks: Vec<(String, String)> = needs.into_iter().map(|n| (n.kind, n.text)).collect();
+    let marked = crate::layout::append_needs_input_marker(
+        &crate::layout::append_register_warning(&prose, &warning),
+        &asks,
+    );
+    (marked, Some(warning))
+}
+
 /// Notes for a reply or body: each `register:` receipt is checked against
 /// every paragraph of the draft under it. A fenced block that is not under
 /// a receipt is skipped whole, so a code example quoting the receipt format
@@ -698,6 +756,53 @@ mod tests {
             ));
             assert_eq!(notes.len(), 1, "{draft:?}: {notes:?}");
         }
+    }
+
+    /// #2014: the DM paths hold a draft to the recipient's own casing and
+    /// carry the mismatch as card metadata. Advisory, so the draft itself is
+    /// untouched apart from the marker, and an owner override or thin
+    /// evidence warns about nothing.
+    #[test]
+    fn issue_2014_dm_drafts_are_held_to_the_recipients_casing() {
+        let standard = "Hi, I wanted to check in on the proposal. Does Thursday still work?";
+        let lower = "hey casey, sending it tonight. thursday still works";
+        let mirrored = "Sending it tonight. Thursday works.";
+        let note = dm_register_warning([standard], lower).expect("mismatch");
+        assert!(note.contains("the recipient writes in standard"), "{note}");
+
+        // Mirroring casing, the owner's own turns as the only samples, and no
+        // sample at all each decide nothing. Nor is an owner override this
+        // turn second-guessed, and an ordinary receipt is dropped from the
+        // prose rather than read as a lowercase sentence.
+        for (samples, draft) in [
+            (vec![standard], mirrored),
+            (vec!["ok", "see you"], lower),
+            (vec![], lower),
+            (vec![standard], &*format!("register: lowercase (you asked)\n{lower}")),
+            (vec![standard], "register: standard (she capitalizes), mirroring\nSending it tonight."),
+        ] {
+            assert!(dm_register_warning(samples, draft).is_none(), "{draft}");
+        }
+
+        // The warning rides as card-only metadata: the marked draft splits
+        // back to the drafted text and ships without a trace of it.
+        let (marked, carried) = attach_dm_register_warning([standard], lower);
+        assert_eq!(carried.as_deref(), Some(note.as_str()));
+        assert_eq!(crate::layout::split_register(&marked), (lower.to_string(), Some(note.clone())));
+        assert_eq!(crate::layout::strip_assumes_for_send(&marked), lower);
+
+        // A needs-input marker stays last, so the card still decodes both.
+        let asked = crate::layout::append_needs_input_marker(
+            lower,
+            &[("scheduling".to_string(), "which Thursday".to_string())],
+        );
+        let (marked, _) = attach_dm_register_warning([standard], &asked);
+        let (human, needs) = crate::layout::split_needs_input(&marked);
+        assert_eq!(needs.len(), 1);
+        assert_eq!(crate::layout::split_register(&human).1.as_deref(), Some(note.as_str()));
+
+        // Nothing to warn about ⇒ byte-identical draft.
+        assert_eq!(attach_dm_register_warning([standard], mirrored).0, mirrored);
     }
 
     /// URL/handle/brand sentence starts, greetings, sign-offs, list items

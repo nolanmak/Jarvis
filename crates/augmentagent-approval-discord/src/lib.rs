@@ -62,6 +62,9 @@ pub use layout::{
 // #785: the drafter emits the assumed-facts marker; the channel splits it off
 // the Gmail body and the card renders it as the "⚠ Assumes" field.
 pub use layout::{append_assumes_marker, split_assumes, strip_assumes_for_send};
+// #2014: the DM compose paths attach the register warning via
+// `register::attach_dm_register_warning`; the card renders it as "⚠️ Register".
+pub use layout::{append_register_warning, split_register};
 // #501 — scheduled-notice layout, for brokers/tests outside this crate.
 pub use layout::{scheduled_notice_message, schedule_modal, SCHEDULE_CUSTOM_VALUE};
 pub use layout::reminder_buttons;
