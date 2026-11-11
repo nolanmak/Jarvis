@@ -153,6 +153,10 @@ async fn git(root: &Path, args: &[&str]) -> Result<String> {
 
 #[path = "self_improve_review_plan.rs"]
 mod evidence_plan;
+#[path="self_improve_review_source_ranges.rs"]
+mod source_ranges;
+#[path = "self_improve_review_group.rs"]
+mod group_execution;
 #[path = "self_improve_review_callers.rs"]
 mod caller_stream;
 #[path = "self_improve_review_adjudication.rs"]
@@ -184,21 +188,36 @@ fn chunks(text: &str, budget: usize) -> Vec<&str> {
     result
 }
 
-fn supplied_shards(files:&BTreeMap<String,String>,diff:&str,callers:&str)->BTreeMap<String,String> {
-    let mut evidence_shards = BTreeMap::new();
-    for (path, body) in files {
-        for (i, chunk) in chunks(body, 96 * 1024).into_iter().enumerate() {
-            evidence_shards.insert(format!("source:{}#part-{i}",serde_json::to_string(path).expect("serialize source path")), chunk.to_owned());
+fn supplied_shards(files:&BTreeMap<String,String>,diff:&str,callers:&str,
+    identities:&BTreeMap<String,serde_json::Value>)->BTreeMap<String,String> {
+    let mut shards=BTreeMap::new();
+    for (path,body) in files {
+        let identity=identities.get(path).cloned().unwrap_or_else(||serde_json::json!({
+            "kind":"rendered_source_context","path":path,"rendered_sha256":aligned::digest(body.as_bytes()),"rendered_bytes":body.len()}));
+        let marker=if identity["kind"].as_str()==Some("candidate_regular_source") {"bytes"}else{"rendered-bytes"};
+        let identity=serde_json::to_string(&identity).expect("serialize owned source identity");
+        let mut offset=0usize;
+        for chunk in chunks(body,96*1024) {
+            let end=offset+chunk.len();shards.insert(format!("source:{identity}#{marker}-{offset}-{end}"),chunk.into());offset=end;
         }
     }
-    for (i, chunk) in chunks(diff, 96 * 1024).into_iter().enumerate() {
-        evidence_shards.insert(format!("context:diff:part-{i}"), chunk.to_owned());
-    }
-    for (i, chunk) in chunks(callers, 96 * 1024).into_iter().enumerate() {
-        evidence_shards.insert(format!("context:callers:part-{i}"), chunk.to_owned());
-    }
-    evidence_shards
+    for (i,body) in chunks(diff,96*1024).into_iter().enumerate() {shards.insert(format!("context:diff:part-{i}"),body.into());}
+    for (i,body) in chunks(callers,96*1024).into_iter().enumerate() {shards.insert(format!("context:callers:part-{i}"),body.into());}
+    shards
 }
+
+async fn snapshot_source_identity(root:&Path,head:&str,path:&str,bytes:usize)->Result<serde_json::Value> {
+    let tree=git(root,&["--literal-pathspecs","ls-tree","-z",head,"--",path]).await?;
+    let rows:Vec<_>=tree.split('\0').filter(|row|!row.is_empty()).collect();
+    anyhow::ensure!(rows.len()==1,"candidate source identity is not one tracked object");
+    let (metadata,name)=rows[0].split_once('\t').context("candidate source metadata missing")?;
+    let fields:Vec<_>=metadata.split_whitespace().collect();
+    anyhow::ensure!(fields.len()==3 && name==path,"candidate source identity changed");
+    let regular=matches!(fields[0],"100644"|"100755") && fields[1]=="blob";
+    Ok(serde_json::json!({"kind":if regular {"candidate_regular_source"}else{"candidate_nonregular_context"},
+        "path":path,"revision":head,"blob_oid":fields[2],"mode":fields[0],"bytes":bytes}))
+}
+
 fn controller_acceptance_context(prepared:&acceptance::PreparedAcceptance, reference:Option<&acceptance::CandidateReceiptReference>)->Result<serde_json::Value> {
     let candidate=if let Some(reference)=reference {
         let bytes=std::fs::read(&reference.artifact)?;
@@ -317,10 +336,11 @@ fn immutable_write_findings_from_audit(root:&Path,prepared:&acceptance::Prepared
     Ok(findings)
 }
 
-pub(super) async fn diagnostic_call_bound(worktree:&Path, issue:&ReviewSubject<'_>, prepared:&acceptance::PreparedAcceptance)->Result<u64> {
+#[cfg(test)]
+pub(super) async fn diagnostic_call_bound(worktree:&Path, issue:&ReviewSubject<'_>, prepared:&acceptance::PreparedAcceptance,reference:&acceptance::CandidateReceiptReference)->Result<u64> {
     let snapshot=candidate_snapshot(worktree).await?;
     let caller_symbols=caller_discovery_symbols(worktree,&snapshot,Some(&prepared.proposal.files)).await?;
-    let callers=complete_caller_evidence_for_symbols(worktree,&snapshot.head,&caller_symbols).await?;
+    let (callers,caller_plan)=complete_or_streamed_callers(worktree,&snapshot.head,&caller_symbols).await?;
     let mut contract:BTreeMap<_,_>=prepared.proposal.contract.criteria.iter().map(|c|(c.id.clone(),c.requirement.clone())).collect();
     anyhow::ensure!(!contract.contains_key("REGRESSION"),"reserved criterion collision");
     contract.insert("REGRESSION".into(),REGRESSION_REQUIREMENT.into());
@@ -331,11 +351,35 @@ pub(super) async fn diagnostic_call_bound(worktree:&Path, issue:&ReviewSubject<'
     let rubric=review_calibration::active()?.prompt();
     let system_bytes=evidence_plan::ROLES.iter().map(|role|evidence_plan::system_prompt(*role,&rubric).len()).max().unwrap();
     let subject=format!("{}\n{}",issue.title,issue.body);
-    let controller=controller_acceptance_context(prepared,None)?;
+    let controller=controller_acceptance_context(prepared,Some(reference))?;
     let inputs=evidence_plan::Inputs {binding:&binding,issue:&subject,contract:&contract,prior:&[],system_bytes,controller_acceptance:Some(&controller)};
-    let mut shards=supplied_shards(&snapshot.files,&snapshot.diff,&callers);add_controller_sources(&mut shards,prepared);
-    let requests=inputs.pack(&shards)?;
-    evidence_plan::worst_case_calls(requests.len())
+    let caller_context=caller_plan.as_ref().map(|plan|plan.review_context()).unwrap_or(callers);
+    let mut shards=supplied_shards(&snapshot.files,&snapshot.diff,&caller_context,&snapshot.source_identities);add_controller_sources(&mut shards,prepared);
+    let requests=inputs.pack_initial(&shards,caller_plan.is_none())?;
+    planned_review_calls(worktree,&inputs,&requests,caller_plan.as_ref()).await
+}
+
+async fn complete_or_streamed_callers(worktree:&Path,head:&str,symbols:&BTreeSet<String>)->Result<(String,Option<caller_stream::Plan>)> {
+    match complete_caller_evidence_for_symbols(worktree,head,symbols).await {
+        Ok(inline)=>Ok((inline,None)),
+        Err(error) if error.downcast_ref::<EvidenceBudget>().is_some()=>{
+            let plan=caller_stream::Plan::collect_symbols(worktree,head,symbols.clone()).await?;
+            Ok((plan.manifest.clone(),Some(plan)))
+        }
+        Err(error)=>Err(error),
+    }
+}
+
+async fn planned_review_calls(worktree:&Path,inputs:&evidence_plan::Inputs<'_>,
+    requests:&[evidence_plan::Request],callers:Option<&caller_stream::Plan>)->Result<u64> {
+    let mut groups=requests.len();
+    if let Some(plan)=callers {
+        let mut stream=plan.stream(worktree);
+        while let Some(batch)=stream.next_batch().await? {
+            groups=groups.checked_add(inputs.pack_initial(&batch,false)?.len()).context("review group count overflow")?;
+        }
+    }
+    evidence_plan::worst_case_calls(groups)
 }
 
 struct CandidateSnapshot {
@@ -344,6 +388,7 @@ struct CandidateSnapshot {
     diff: String,
     required: BTreeSet<String>,
     files: BTreeMap<String, String>,
+    source_identities: BTreeMap<String,serde_json::Value>,
 }
 
 async fn caller_discovery_symbols(
@@ -411,6 +456,7 @@ async fn candidate_snapshot(worktree: &Path) -> Result<CandidateSnapshot> {
         .collect();
     anyhow::ensure!(!required.is_empty(), "candidate has no diff against main");
     let mut files = BTreeMap::new();
+    let mut source_identities=BTreeMap::new();
     for path in &required {
         let spec = format!("{head}:{path}");
         let (exists, content, _) = git_output(&worktree, &["show", &spec]).await?;
@@ -425,6 +471,10 @@ async fn candidate_snapshot(worktree: &Path) -> Result<CandidateSnapshot> {
                 git(&worktree, &["show", &old]).await?
             )
         };
+        let identity=if exists {snapshot_source_identity(worktree,&head,path,content.len()).await?} else {
+            serde_json::json!({"kind":"rendered_deleted_context","path":path,"base":base,"head":head,
+                "rendered_sha256":aligned::digest(content.as_bytes()),"rendered_bytes":content.len()})};
+        source_identities.insert(path.clone(),identity);
         files.insert(path.clone(), content);
     }
     Ok(CandidateSnapshot {
@@ -433,6 +483,7 @@ async fn candidate_snapshot(worktree: &Path) -> Result<CandidateSnapshot> {
         diff,
         required,
         files,
+        source_identities,
     })
 }
 
@@ -576,6 +627,7 @@ async fn run_impl(
         diff,
         required,
         files,
+        source_identities,
     } = snapshot;
     let mut contract: BTreeMap<String, String> =
         if let Some((prepared, reference)) = context.acceptance_evidence {
@@ -626,14 +678,7 @@ async fn run_impl(
         .acceptance_evidence
         .map(|(_, receipt)| receipt.binding.contract_hash.clone())
         .unwrap_or(aligned::digest(&serde_json::to_vec(&contract)?));
-    let (callers,caller_plan)=match complete_caller_evidence_for_symbols(&worktree,&head,&caller_symbols).await {
-        Ok(inline)=>(inline,None),
-        Err(error) if error.downcast_ref::<EvidenceBudget>().is_some()=>{
-            let plan=caller_stream::Plan::collect_symbols(&worktree,&head,caller_symbols.clone()).await?;
-            (plan.manifest.clone(),Some(plan))
-        }
-        Err(error)=>return Err(error),
-    };
+    let (callers,caller_plan)=complete_or_streamed_callers(&worktree,&head,&caller_symbols).await?;
     let rubric = review_calibration::active()?;
     let controller_context=context.acceptance_evidence.map(|(prepared,reference)|controller_acceptance_context(prepared,Some(reference))).transpose()?;
     let guarded_attempts=if let (Some(guard),Some((prepared,_)))=(context.workflow,context.acceptance_evidence) {immutable_write_findings(&worktree,guard,prepared).await?}else{Vec::new()};
@@ -671,22 +716,18 @@ async fn run_impl(
     // Large files are fully delivered in bounded shards. Coverage is the union
     // of successful shard requests, never a model-supplied percentage.
     let caller_context=caller_plan.as_ref().map(|plan|plan.review_context()).unwrap_or_else(||callers.clone());
-    let mut evidence_shards = supplied_shards(&files,&diff,&caller_context);
+    let mut evidence_shards = supplied_shards(&files,&diff,&caller_context,&source_identities);
     if let Some((prepared,_))=context.acceptance_evidence {add_controller_sources(&mut evidence_shards,prepared);}
     let subject=format!("{}\n{}",issue.title,issue.body);
     let rubric_prompt=rubric.prompt();
     let system_bytes=evidence_plan::ROLES.iter().map(|role|evidence_plan::system_prompt(*role,&rubric_prompt).len()).max().unwrap();
     let inputs=evidence_plan::Inputs {binding:&binding,issue:&subject,contract:&contract,prior:&prior,system_bytes,controller_acceptance:controller_context.as_ref()};
-    let requests=inputs.pack_scope(&evidence_shards,caller_plan.is_none())?;
+    let requests=inputs.pack_initial(&evidence_shards,caller_plan.is_none())?;
     if let Some(allow_shipping)=observation_priority {
         let workflow=context.workflow.context("diagnostic budget requires workflow")?;
         workflow.check_resource_policy()?;
-        let mut groups=requests.len();
-        if let Some(plan)=&caller_plan {
-            let mut stream=plan.stream(&worktree);
-            while let Some(batch)=stream.next_batch().await? { groups+=inputs.pack_scope(&batch,false)?.len(); }
-        }
-        if !workflow.reserve_canary_calls(evidence_plan::worst_case_calls(groups)?,allow_shipping)? {
+        let calls=planned_review_calls(&worktree,&inputs,&requests,caller_plan.as_ref()).await?;
+        if !workflow.reserve_canary_calls(calls,allow_shipping)? {
             return Err(review_canary::CanaryDeferred.into());
         }
     }
@@ -730,61 +771,26 @@ async fn run_impl(
         loop {
         for original_request in &batch_requests {
             let i=group_index; group_index+=1;
-            let fragment_key=aligned::digest(&serde_json::to_vec(&(&binding,role,&actor.provider,&actor.model,&opts.system_prompt,&original_request.coverage.prompt_hash))?);
+            let fragment_key=aligned::digest(&serde_json::to_vec(&("review-source-ranges-v1",&binding,role,&actor.provider,&actor.model,&opts.system_prompt,&original_request.coverage.prompt_hash))?);
             let cached=cache_guard.map(|guard|guard.review_fragment(&fragment_key)).transpose()?.flatten();
             let group=if let Some(raw)=cached {
+                anyhow::ensure!(raw.len()<=group_execution::MAX_COMPLETED_GROUP_BYTES,"cached review exceeds encoded bound");
                 let cached:CompletedGroup=serde_json::from_str(&raw)?;
+                anyhow::ensure!(cached.native_sessions.len()<=2,"cached group exceeds observation bound");
                 anyhow::ensure!(cached.binding==binding && cached.original_hash==original_request.coverage.prompt_hash && cached.role==role,
                     "review fragment binding mismatch");
                 for native_id in &cached.native_sessions {
+                    anyhow::ensure!(!native_id.is_empty() && native_id.len()<=512 && native_id.bytes().all(|b|b.is_ascii_graphic()),"invalid cached native identity");
                     let mut actual=actor.clone(); actual.session_id=native_id.clone(); actual.independent_for(&builders,&origin)?;
                 }
                 anyhow::ensure!(!cached.native_sessions.is_empty(),"cached review lacks native observation");
                 cached
             } else {
-            let mut group_hashes=Vec::new();
-            let mut group_sessions=Vec::new();
-            let mut group_recovered=BTreeMap::new();
-            let mut request=original_request.clone();
-            let mut group_review=evidence_plan::GroupReview::default();
-            for recovery_attempt in 0..=1 {
-                opts.session_id = Some(format!("{session}:group-{i}:recovery-{recovery_attempt}"));
-                opts.restrict_env = true;
-                anyhow::ensure!(git(&worktree,&["rev-parse","HEAD"]).await?.trim()==head,"candidate changed before evidence recovery");
-                let (raw,native_id)=augmentagent_channel_core::native_session::fresh_review_scope(provider,
-                    augmentagent_channel_core::model_router::native_reviewer_scope(provider,reasoner.call(&opts,&request.prompt))).await?;
-                let mut shard_actor=actor.clone();shard_actor.session_id=native_id.clone();
-                shard_actor.independent_for(&builders,&origin)?;
-                group_sessions.push(native_id);
-                let parsed=aligned::parse_review_pass_with_missing(&raw,&binding,shard_actor,role,request.coverage.clone(),&contract);
-                let (pass,missing)=match parsed {
-                    Ok(value)=>value,
-                    Err(error) if recovery_attempt==0=>{
-                        request=inputs.request(original_request.files.clone(),false,Some(serde_json::json!({"kind":"structured_review_correction","validation_error":truncate(&format!("{error:#}"),4000),"instruction":"Classify every finding with a nonempty typed repair target. Do not infer a code defect from missing evidence; return incomplete with exact missing_paths when necessary. Preserve all valid findings and the exact candidate binding."})))?;
-                        continue;
-                    }
-                    Err(error)=>return Err(error.context("bounded structured review correction exhausted")),
-                };
-                group_hashes.push(pass.coverage.prompt_hash.clone());
-                if group_review.observe(pass.completed,pass.findings).with_context(||format!("evidence group {i} still needs {missing:?}"))? { break; }
-                request=evidence_plan::recover(&inputs,&worktree,&head,original_request,&evidence_shards,&missing,group_review.pending()).await?;
-                if let Some(workflow)=context.workflow {
-                    workflow.audit_logger().record_controller(serde_json::json!({"actor":"controller","kind":"review_evidence_recovery",
-                        "binding":binding,"group":i,"role":role,"request_hash":request.coverage.prompt_hash,
-                        "supplied_evidence":request.coverage.supplied_files,"missing_paths":missing}))?;
-                }
-                for (path,body) in &request.files {
-                    if path.starts_with("__requested_source__:") {
-                        if let Some(old)=group_recovered.insert(path.clone(),body.clone()) {
-                            anyhow::ensure!(old==*body,"same immutable recovery path has different bytes");
-                        }
-                    }
-                }
-            }
-            let findings=group_review.finish()?;
-            let finding_evidence=if findings.is_empty() {BTreeMap::new()}else{request.files};
-            let completed=CompletedGroup { binding:binding.clone(),role,original_hash:original_request.coverage.prompt_hash.clone(),
-                findings,request_hashes:group_hashes,native_sessions:group_sessions,recovered_files:group_recovered,finding_evidence };
+            let completed=group_execution::execute_evidence_group(group_execution::EvidenceGroupInput {
+                root:&worktree,inputs:&inputs,original_request,evidence_shards:&evidence_shards,
+                actor:&actor,builders:&builders,origin:&origin,role,provider,opts:&opts,
+                group_index:i,workflow:context.workflow,
+            },&group_execution::NativeGroupTransport {reasoner:reasoner.as_ref()}).await?;
             if let Some(guard)=cache_guard {
                 guard.audit_health().await?;
                 guard.record_review_fragment(&fragment_key,&serde_json::to_string(&completed)?)?;
@@ -838,7 +844,7 @@ async fn run_impl(
         }
         let next=match &mut stream { Some(stream)=>stream.next_batch().await?,None=>None };
         let Some(batch)=next else {break;};
-        batch_requests=inputs.pack_scope(&batch,false)?;
+        batch_requests=inputs.pack_initial(&batch,false)?;
         }
         let mut findings = deduplicate_findings(findings)?;
         for finding in &mut findings {
@@ -1275,7 +1281,7 @@ mod tests {
             assert!(exists,"this replay expects the published candidate's changed sources");files.insert(path.clone(),body);
         }
         let snapshot=CandidateSnapshot {head:binding.head.clone(),base:binding.base.clone(),
-            diff:git(&root,&["diff","--binary",&binding.base,&binding.head,"--"]).await.unwrap(),required,files};
+            diff:git(&root,&["diff","--binary",&binding.base,&binding.head,"--"]).await.unwrap(),required,files,source_identities:BTreeMap::new()};
         let mut pins=BTreeMap::new();
         for (path,sha) in input["controller_acceptance"]["pinned_source_hashes"].as_object().unwrap() {
             let body=git(&root,&["show",&format!("{}:{path}",binding.head)]).await.unwrap();
@@ -1284,7 +1290,7 @@ mod tests {
         let symbols=caller_discovery_symbols(&root,&snapshot,Some(&pins)).await.unwrap();
         let callers=complete_caller_evidence_for_symbols(&root,&binding.head,&symbols).await.unwrap();
         let caller_data:serde_json::Value=serde_json::from_str(&callers).unwrap();
-        let mut shards=supplied_shards(&snapshot.files,&snapshot.diff,&callers);add_controller_source_files(&mut shards,&pins);
+        let mut shards=supplied_shards(&snapshot.files,&snapshot.diff,&callers,&snapshot.source_identities);add_controller_source_files(&mut shards,&pins);
         let contract:BTreeMap<String,String>=serde_json::from_value(input["acceptance_criteria"].clone()).unwrap();
         let prior:Vec<aligned::Finding>=serde_json::from_value(input["unresolved_findings"].clone()).unwrap();
         // The original request was near 512 KiB including its actual system

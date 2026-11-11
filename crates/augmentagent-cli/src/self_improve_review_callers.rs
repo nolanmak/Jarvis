@@ -12,6 +12,7 @@ pub(super) struct Blob {
     path: String,
     oid: String,
     bytes: usize,
+    revision: String,
 }
 #[derive(Clone)]
 pub(super) struct Plan {
@@ -43,16 +44,22 @@ impl Plan {
             let oid=fields[2].to_owned();
             anyhow::ensure!(matches!(oid.len(),40|64) && oid.bytes().all(|b|b.is_ascii_hexdigit()),"invalid caller blob identity");
             let bytes=git(root,&["cat-file","-s",&oid]).await?.trim().parse()?;
-            manifest_bytes=manifest_bytes.checked_add(path.len()+oid.len()+64).context("caller inventory overflow")?;
+            let blob=Blob {path,oid,bytes,revision:head.into()};
+            manifest_bytes=manifest_bytes.checked_add(serde_json::to_vec(&blob)?.len()).context("caller inventory overflow")?;
             anyhow::ensure!(manifest_bytes<=BATCH_BYTES,"caller metadata exceeds bounded inventory; no incomplete inventory accepted");
-            blobs.push(Blob {path,oid,bytes});
+            blobs.push(blob);
         }
         let manifest=serde_json::to_string(&serde_json::json!({
             "lookup":lookup,
             "symbols":symbols,"source_manifest_only":blobs,
             "delivery":"Every listed immutable blob is separately streamed through every review role; this manifest is not source coverage."
         }))?;
+        anyhow::ensure!(manifest.len()<=BATCH_BYTES,"serialized caller inventory exceeds bound");
         Ok(Self {manifest,blobs})
+    }
+    pub(super) fn single_source_identity(&self)->Result<(&str,&str,usize)> {
+        anyhow::ensure!(self.blobs.len()==1,"requested source plan is not one blob");
+        let blob=&self.blobs[0];Ok((&blob.path,&blob.oid,blob.bytes))
     }
     pub fn review_context(&self) -> String {
         serde_json::json!({"caller_manifest_sha256":aligned::digest(self.manifest.as_bytes()),"files":self.blobs.len(),
@@ -111,7 +118,7 @@ impl Stream<'_> {
                 let body=String::from_utf8(active.remaining[..valid].to_vec())?;
                 let end=active.offset.checked_add(valid).context("caller source size overflow")?;
                 anyhow::ensure!(end<=active.blob.bytes,"immutable caller blob grew");
-                let key=format!("caller:{}#bytes-{}-{end}",serde_json::to_string(&active.blob.path)?,active.offset);
+                let key=format!("caller:{}#bytes-{}-{end}",serde_json::to_string(&active.blob)?,active.offset);
                 result.insert(key,body);
                 active.offset=end;
                 active.remaining.drain(..valid);
