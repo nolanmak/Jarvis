@@ -1884,7 +1884,8 @@ mod repair_gate_tests {
         for (path, expected_error) in [
             ("src/allowed.rs", None),
             ("src/unregistered.rs", Some("outside independently registered scope")),
-            ("autoship_verifiers/observe.py", Some("touched a guarded path")),
+            ("autoship_verifiers/observe.py", Some("outside independently registered scope")),
+            ("src/deploy.rs", Some("touched a guarded path")),
         ] {
             let fixture = tempfile::tempdir().unwrap();
             let root = fixture.path();
@@ -1907,7 +1908,10 @@ mod repair_gate_tests {
             let mut calls = 0;
             let result = verify_repaired_candidate(
                 root,
-                &[PathScope::File("src/allowed.rs".into())],
+                &[
+                    PathScope::File("src/allowed.rs".into()),
+                    PathScope::File("src/deploy.rs".into()),
+                ],
                 async {
                     calls += 1;
                     Ok(())
