@@ -58,6 +58,13 @@ pub enum Stage {
     Merged,
 }
 
+/// Exact controller review causes shared by safe progress projection and the
+/// existing explicit owner-retry path. This never grants review or merge approval.
+pub(crate) fn is_review_hold_reason(reason: &str) -> bool {
+    matches!(reason, "provenance-unknown" | "no-reviewer-capacity" | "reviewer-latched"
+        | "review-evidence-budget" | "review-recovery-required")
+}
+
 /// Stable identity survives branch renames and changed heads. Repository must
 /// be the canonical owner/name returned by the trusted repository adapter.
 pub fn workflow_id(repo: &str, issue: u64) -> Result<String> {

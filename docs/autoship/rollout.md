@@ -136,9 +136,24 @@ augmentagent autopr status --workflow WORKFLOW --json
 | `review-recovery-required` | A selected review failed to complete. Inspect the protected controller error and repair its recorded cause before retrying. |
 | `review-main-advanced` | Main advanced outside the captured candidate. The original workflow queues integration and fresh verification with a five-minute backoff. Automatic selection recognizes this dependency wake within the same day, and the short queue poll notices eligible work without requiring a CLI job. Existing owner holds and unresolved operations still prevent dispatch. |
 
+Private progress retains the typed review blocker when a worker wrapper finishes.
+A resume acknowledgement is still intent, and can wait for native retirement or
+another admission guard. If a format correction remains incomplete, inspect the
+protected role/group/validation diagnostic before another paid attempt. The
+controller can reuse already-captured candidate and pinned source in that same
+bounded correction; the two-observation limit remains unchanged. Diagnostics do
+not establish failed-result replay or independent approval.
+
 A review hold does not establish whether model work was billed. Inspect the
 workflow's resource counters and confirmed-merge allowance separately. Historical
 hold reasons remain historical records; a new deployment does not rewrite them.
+
+Hosted APT setup retries a confirmed Ubuntu mirror DNS failure once against
+`https://mirrors.edge.kernel.org/ubuntu/`, using the runner's Ubuntu suite and
+archive signature keyring. Temporary source options apply only to that retry;
+host DNS and source files stay unchanged. Signature, lock, package and subsequent
+fallback failures remain failures. The installer is part of the controller's
+pinned CI policy, so changing it requires the normal controller rollout.
 
 After repairing an internal execution failure, authenticated `autopr resume
 --workflow WORKFLOW` can queue recovery of the preserved attempt. Use the
