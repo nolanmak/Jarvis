@@ -834,6 +834,10 @@ else:raise Exception('unexpected request '+repr(a))
             for id in [&ids[1], &ids[2]] {
                 assert_eq!(stage(id).stage, Stage::Retired, "{id}");
                 assert_eq!(stage(id).next.reason, "target_closed", "{id}");
+                let events = store.progress_events(id).unwrap();
+                let terminal = events.last().expect("closed target has durable progress");
+                assert_eq!(terminal.kind, "retired");
+                assert_eq!(terminal.reason, "target_closed", "private updates preserve the actual terminal blocker");
             }
             assert!(reports[1].is_ok() && reports[2].is_ok(), "{reports:?}");
             // A genuinely foreign identity still refuses, but only that job.
