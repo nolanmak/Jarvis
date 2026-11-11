@@ -10,7 +10,7 @@
 //!
 //! Canonical key set comes from `.env.example` at the repo root. We try a
 //! runtime read first (so a re-deployed `.env.example` is picked up without a
-//! rebuild) and fall back to an `include_str!`-embedded copy so an installed
+//! rebuild) and fall back to an embedded key-only snapshot so an installed
 //! binary running from `/usr/local/bin` outside the repo still reports a
 //! useful key list.
 //!
@@ -25,10 +25,12 @@ use clap::Subcommand;
 use serde_json::json;
 use std::collections::BTreeMap;
 
-/// Embedded snapshot of `.env.example` so the binary still has a key list
+/// Embedded key-only snapshot so the binary still has a canonical key list
 /// when it runs outside the repo (systemd unit, /usr/local/bin install). The
 /// runtime file at `./.env.example` takes precedence when present.
-const EMBEDDED_DOTENV_EXAMPLE: &str = include_str!("../../../.env.example");
+#[path = "env_key_snapshot.rs"]
+mod env_key_snapshot;
+use env_key_snapshot::EMBEDDED_DOTENV_EXAMPLE;
 
 /// Substrings (case-insensitive) that mark a key as secret for masking.
 /// Sourced from the issue spec — kept here as a single source of truth so the
@@ -196,7 +198,7 @@ pub fn parse_dotenv_keys(blob: &str) -> Vec<String> {
 
 /// Canonical key set sourced from `.env.example`. Prefers a runtime read at
 /// `./.env.example` (so deployed boxes get the latest list without rebuild);
-/// falls back to the `include_str!`-embedded snapshot when the file isn't
+/// falls back to the embedded public key-only snapshot when the file isn't
 /// reachable (binary invoked outside the repo dir).
 pub fn canonical_keys() -> Vec<String> {
     let blob = std::fs::read_to_string(".env.example")

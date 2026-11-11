@@ -1,7 +1,11 @@
 //! Durable CI cleanup ownership. This is a storage fence, never CI success.
-use super::*;
-use std::io::Read;
-use std::os::unix::fs::DirBuilderExt;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,11 +90,10 @@ struct Record {
 }
 
 fn directory() -> Result<PathBuf> {
-    #[cfg(test)]
     if let Some(path) = TEST_DIRECTORY.with(|slot| slot.borrow().clone()) {
         return Ok(path);
     }
-    let path = crate::storage_leases::lock_directory()?.join("ci-cleanup");
+    let path = crate::storage_coordination::lock_directory()?.join("ci-cleanup");
     match std::fs::DirBuilder::new().mode(0o700).create(&path) {
         Ok(()) => (),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
@@ -289,7 +292,7 @@ fn proof(record: &Record) -> Result<serde_json::Value> {
             && identity["boot_id"].as_str() == Some(record.owner.boot.as_str()),
         "CI cleanup owner and resource identities disagree"
     );
-    augmentagent_channel_core::run_resources::verify_quiescent(identity)
+    crate::run_resources::verify_quiescent(identity)
 }
 fn clear(path: &Path, expected: &Record) -> Result<()> {
     anyhow::ensure!(
@@ -375,7 +378,7 @@ pub(crate) fn reconcile_before_admission() -> Result<()> {
 
 /// Read-only. Unknown registry data preserves all sources instead of guessing
 /// which checkout an interrupted controller might still be using.
-pub(crate) fn may_cleanup(path: &Path) -> Result<bool> {
+pub fn may_cleanup(path: &Path) -> Result<bool> {
     Ok(!records()?.iter().any(|(_, record)| {
         record.supervisor.protects(path)
             || record
@@ -387,12 +390,12 @@ pub(crate) fn may_cleanup(path: &Path) -> Result<bool> {
 
 /// Cleanup entry points reconcile abandoned owners themselves, before an old
 /// checkout can prevent the next storage admission from ever being reached.
-pub(crate) fn may_cleanup_after_reconcile(path: &Path) -> Result<bool> {
-    let _admission = crate::storage_reservations::Admission::lock()?;
+pub fn may_cleanup_after_reconcile(path: &Path) -> Result<bool> {
+    let _admission = crate::storage_coordination::Admission::lock()?;
     may_cleanup(path)
 }
 
-pub(crate) struct Hold {
+pub struct Hold {
     path: PathBuf,
     record: Record,
     supervisor: Option<tempfile::TempDir>,
@@ -400,7 +403,7 @@ pub(crate) struct Hold {
     live: Option<std::fs::File>,
 }
 impl Hold {
-    pub(crate) fn begin(
+    pub fn begin(
         root: &Path,
         source: &Path,
         session: &Path,
@@ -424,7 +427,7 @@ impl Hold {
                 .collect::<Result<_>>()?,
             resource: None,
         };
-        let _admission = crate::storage_reservations::Admission::lock()?;
+        let _admission = crate::storage_coordination::Admission::lock()?;
         let path = directory()?.join(format!("{}.hold", record.id));
         anyhow::ensure!(!path.try_exists()?, "CI cleanup identity already exists");
         let live = lifetime(&path, true)?;
@@ -441,12 +444,12 @@ impl Hold {
             live: Some(live),
         })
     }
-    pub(crate) fn supervisor(&self) -> &Path {
+    pub fn supervisor(&self) -> &Path {
         self.supervisor.as_ref().unwrap().path()
     }
-    pub(crate) fn bind(
+    pub fn bind(
         &mut self,
-        admission: &augmentagent_channel_core::run_resources::CommandAdmission,
+        admission: &crate::run_resources::CommandAdmission,
     ) -> Result<()> {
         self.record.supervisor.unchanged()?;
         for protected in &self.record.protected {
@@ -454,8 +457,11 @@ impl Hold {
         }
         self.bind_identity(admission.identity())
     }
-    #[cfg(test)]
-    pub(crate) fn bind_fixture_identity(&mut self, identity: &serde_json::Value) -> Result<()> {
+    /// Binds a caller-supplied resource identity with its own admission
+    /// receipt, as a controller fixture does. Only `bind` may use a live
+    /// admission's identity; this writes the receipt it attests to.
+    #[doc(hidden)]
+    pub fn bind_fixture_identity(&mut self, identity: &serde_json::Value) -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -490,14 +496,14 @@ impl Hold {
         self.record = next;
         Ok(())
     }
-    pub(crate) fn settle(&mut self) -> Result<serde_json::Value> {
+    pub fn settle(&mut self) -> Result<serde_json::Value> {
         let proof = proof(&self.record)?;
         clear(&self.path, &self.record)?;
         self.active = false;
         Ok(proof)
     }
     /// Only a synchronous failed spawn may use this: no child was created.
-    pub(crate) fn not_spawned(&mut self) -> Result<()> {
+    pub fn not_spawned(&mut self) -> Result<()> {
         self.record.supervisor.unchanged()?;
         for protected in &self.record.protected {
             protected.unchanged()?;
@@ -538,30 +544,32 @@ impl Drop for Hold {
     }
 }
 
-#[cfg(test)]
 thread_local! {static TEST_DIRECTORY:std::cell::RefCell<Option<PathBuf>>=const{std::cell::RefCell::new(None)};}
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn with_test_registry(test: impl FnOnce(&Path, &Path)) {
-    tests::fixture(test)
+/// Runs `test` against a private temp registry on this thread only. The
+/// fixture is reachable from dependent crates because the authority they share
+/// now lives here; it grants no access an in-process caller lacks (the real
+/// registry is this user's own directory) and leaves no override behind.
+#[doc(hidden)]
+#[cfg(target_os = "linux")]
+pub fn with_test_registry(test: impl FnOnce(&Path, &Path)) {
+    let root = tempfile::tempdir().unwrap();
+    let registry = root.path().join("registry");
+    std::fs::create_dir(&registry).unwrap();
+    std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o700)).unwrap();
+    TEST_DIRECTORY.with(|slot| *slot.borrow_mut() = Some(registry.clone()));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_DIRECTORY.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    let _reset = Reset;
+    test(root.path(), &registry);
 }
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use super::with_test_registry as fixture;
     use super::*;
-    pub(super) fn fixture(test: impl FnOnce(&Path, &Path)) {
-        let root = tempfile::tempdir().unwrap();
-        let registry = root.path().join("registry");
-        std::fs::create_dir(&registry).unwrap();
-        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o700)).unwrap();
-        TEST_DIRECTORY.with(|slot| *slot.borrow_mut() = Some(registry.clone()));
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                TEST_DIRECTORY.with(|slot| *slot.borrow_mut() = None);
-            }
-        }
-        let _reset = Reset;
-        test(root.path(), &registry);
-    }
     #[test]
     fn missing_resource_proof_keeps_sources_and_survives_controller_drop() {
         fixture(|root, _| {
@@ -576,7 +584,7 @@ mod tests {
             assert!(id.exists());
             assert_eq!(read(&id).unwrap().phase, Phase::Uncertain);
             assert!(reconcile_before_admission().is_err());
-            assert!(crate::storage_reservations::Admission::lock().is_err());
+            assert!(crate::storage_coordination::Admission::lock().is_err());
             assert!(!may_cleanup(root).unwrap());
             assert!(source.exists());
         });
@@ -609,7 +617,7 @@ mod tests {
                     std::fs::write(root.join("provide-proof"), b"yes").unwrap();
                 }
                 let status=std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact","build_storage::ci_holds::tests::controller_process_exit_keeps_unknown_holds_and_reconciles_exact_kernel_proof","--nocapture"])
+                    .args(["--exact","build_storage_ci_holds::tests::controller_process_exit_keeps_unknown_holds_and_reconciles_exact_kernel_proof","--nocapture"])
                     .env_clear().env("PATH","/usr/bin:/bin").env(ENV,root).status().unwrap();
                 assert!(status.success());
                 assert_eq!(records().unwrap().len(), 1);

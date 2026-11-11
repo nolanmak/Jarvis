@@ -139,6 +139,7 @@ async fn call(
     system: &str,
     prompt: &str,
 ) -> Result<String> {
+    workflow.require_fresh_issue(root).await?;
     workflow.check_resource_policy()?;
     let reasoner = augmentagent_channel_core::build_workflow_pinned(provider).context("pinned native provider is unavailable")?;
     let mut opts = codex_review_opts(root.to_path_buf(), system);

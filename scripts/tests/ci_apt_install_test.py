@@ -21,7 +21,8 @@ class AptInstallTests(unittest.TestCase):
             for arg in args:
                 if arg.startswith('Dir::Etc::sourcelist='):
                     sources.append(Path(arg.split('=', 1)[1]).read_text())
-            code, output = results[len(calls)-1]
+            response = results[len(calls)-1]
+            code, output = response(args) if callable(response) else response
             return subprocess.CompletedProcess(args, code, output)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -62,6 +63,19 @@ class AptInstallTests(unittest.TestCase):
         self.assertEqual(sources[0], sources[1])
         for call in calls:
             self.assertIn('APT::Get::AllowUnauthenticated=false', call)
+
+    def test_dns_failure_with_unrouted_ipv6_recovers_without_weakening_mixed_error_gate(self):
+        dns = "E: Failed to fetch https://archive.ubuntu.com/dists/resolute/InRelease Temporary failure resolving 'archive.ubuntu.com'\n"
+        ipv6 = "E: Failed to fetch https://security.ubuntu.com/dists/resolute-security/InRelease Cannot initiate the connection to security.ubuntu.com:443 (2620:2d:4000:1::102). - connect (101: Network is unreachable)\n"
+        # Real hosted APT output mixed DNS and an unavailable IPv6 route. Keep
+        # refusing that mixed output; request the working IP family instead.
+        self.assertFalse(self.module.dns_failure(dns + ipv6))
+        def primary(args):
+            return 100, dns if 'Acquire::ForceIPv4=true' in args else dns + ipv6
+        code, calls, sources = self.exercise([primary, (0, ''), (0, '')])
+        self.assertEqual(code, 0, 'unrouted IPv6 prevented the bounded signed DNS fallback')
+        self.assertEqual(len(calls), 3)
+        self.assertIn('Signed-By:', sources[0])
 
     def test_install_dns_failure_also_recovers(self):
         code, calls, _ = self.exercise([(0, ''), (100, "Temporary failure resolving 'security.ubuntu.com'"), (0, ''), (0, '')])

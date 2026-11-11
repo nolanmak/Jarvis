@@ -12,6 +12,7 @@ import fcntl
 import uuid
 import importlib.util
 import json
+import math
 import os
 import queue
 from pathlib import Path
@@ -31,6 +32,103 @@ import datetime
 MAX_FRAME = 2 * 1024 * 1024
 MAX_HOME = 64 * 1024 * 1024
 
+
+MAX_EXECUTABLE = 512 * 1024 * 1024
+MAX_COMPANION = 128 * 1024 * 1024
+
+
+MAX_CREDENTIAL_BYTES = 1024 * 1024
+
+
+
+MAX_BOOT_ARCHIVE_BYTES = 128 * 1024 * 1024
+MAX_BOOT_IMAGE_BYTES = 129 * 1024 * 1024
+
+
+def boot_source_bytes(path, maximum):
+    """Snapshot one declared regular source within remaining archive capacity."""
+    if type(maximum) is not int or maximum < 0:
+        raise ValueError('invalid native initrd byte budget')
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        raise ValueError('native initrd source unavailable') from None
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError('native initrd source is not regular')
+        if before.st_size > maximum:
+            raise ValueError('native initrd source exceeds byte budget')
+        data = bytearray()
+        while True:
+            block = os.read(fd, min(65536, maximum - len(data) + 1))
+            if not block:
+                break
+            data.extend(block)
+            if len(data) > maximum:
+                raise ValueError('native initrd source exceeds byte budget')
+        after = os.fstat(fd)
+        identity = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+                                 info.st_gid, info.st_nlink, info.st_size,
+                                 info.st_mtime_ns, info.st_ctime_ns)
+        if len(data) != before.st_size or identity(before) != identity(after):
+            raise ValueError('native initrd source changed during read')
+        return bytes(data)
+    except OSError:
+        raise ValueError('native initrd source unavailable') from None
+    finally:
+        os.close(fd)
+
+
+def boot_entry_bytes(name, data):
+    if not isinstance(name, str) or '\0' in name or not isinstance(data, bytes):
+        raise ValueError('invalid native initrd entry')
+    header = 110 + len(name.encode()) + 1
+    return (header + 3) // 4 * 4 + (len(data) + 3) // 4 * 4
+
+
+class BootEntries(list):
+    """Charge actual newc metadata/alignment while retaining the trailer room."""
+    def __init__(self):
+        super().__init__()
+        self.encoded_bytes = boot_entry_bytes('TRAILER!!!', b'')
+        if self.encoded_bytes > MAX_BOOT_ARCHIVE_BYTES:
+            raise ValueError('native initrd exceeds byte budget')
+
+    def append(self, entry):
+        size = boot_entry_bytes(entry[0], entry[2])
+        if self.encoded_bytes + size > MAX_BOOT_ARCHIVE_BYTES:
+            raise ValueError('native initrd exceeds byte budget')
+        super().append(entry)
+        self.encoded_bytes += size
+
+    def extend(self, entries):
+        for entry in entries:
+            self.append(entry)
+
+    def append_input(self, name, mode, source):
+        if isinstance(source, os.PathLike):
+            remaining = MAX_BOOT_ARCHIVE_BYTES - self.encoded_bytes - boot_entry_bytes(name, b'')
+            if remaining < 0:
+                raise ValueError('native initrd exceeds byte budget')
+            data = boot_source_bytes(source, remaining // 4 * 4)
+        else:
+            data = source
+        self.append((name, mode, data, 0, 0))
+
+
+def write_boot_image(path, entries, encoder):
+    # The shared codec checks actual encoded and compressed bytes, independently
+    # of pre-reading accounting. No output path is opened until both bounds pass.
+    image = encoder(entries, max_bytes=MAX_BOOT_ARCHIVE_BYTES, max_image_bytes=MAX_BOOT_IMAGE_BYTES)
+    if not isinstance(image, bytes) or len(image) > MAX_BOOT_IMAGE_BYTES:
+        raise ValueError('native compressed initrd exceeds byte budget')
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(descriptor, 'wb') as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        stream.write(image)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 class BoundedWriter:
@@ -96,19 +194,169 @@ def private_bytes(path, maximum):
         return stream.read(maximum + 1)
 
 
+
+
+class AtomicPublicationUncertain(OSError):
+    def __init__(self):
+        super().__init__('native atomic publication uncertain')
+
+
+class _AtomicPublisher:
+    """One original helper's bounded publication and conservative failure fence."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._uncertain = False
+
+    @staticmethod
+    def _parent_current(parent, descriptor, original):
+        try:
+            held = os.fstat(descriptor)
+            current = parent.lstat()
+            identity = lambda info: (info.st_dev, info.st_ino, info.st_uid, info.st_mode)
+            return (stat.S_ISDIR(held.st_mode) and stat.S_ISDIR(current.st_mode)
+                    and held.st_uid == os.getuid() and not held.st_mode & 0o077
+                    and identity(held) == original and identity(current) == original)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _original_temporary(parent_fd, name, descriptor, original):
+        held = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        identity = lambda info: (info.st_dev, info.st_ino, info.st_uid, info.st_gid)
+        return (identity(held) == original and identity(current) == original
+                and stat.S_ISREG(held.st_mode) and stat.S_ISREG(current.st_mode)
+                and held.st_uid == os.getuid() and held.st_nlink == current.st_nlink == 1
+                and not held.st_mode & 0o077 and not current.st_mode & 0o077)
+
+    def publish(self, path, data):
+        with self._lock:
+            if self._uncertain:
+                raise AtomicPublicationUncertain()
+            if not isinstance(data, bytes) or len(data) > MAX_FRAME:
+                raise ValueError('native atomic payload exceeds byte budget')
+            path = Path(path)
+            parent_fd = temporary_fd = None
+            name = None
+            replaced = False
+            primary = None
+            try:
+                parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                info = os.fstat(parent_fd)
+                parent_identity = (info.st_dev, info.st_ino, info.st_uid, info.st_mode)
+                if not self._parent_current(path.parent, parent_fd, parent_identity):
+                    self._uncertain = True
+                    raise AtomicPublicationUncertain()
+                for _ in range(16):
+                    candidate = '.native-atomic-' + uuid.uuid4().hex
+                    try:
+                        temporary_fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                               0o600, dir_fd=parent_fd)
+                        name = candidate
+                        break
+                    except FileExistsError:
+                        continue
+                if temporary_fd is None:
+                    raise OSError('native atomic temporary creation unavailable')
+                info = os.fstat(temporary_fd)
+                temporary_identity = (info.st_dev, info.st_ino, info.st_uid, info.st_gid)
+                os.fchmod(temporary_fd, 0o600)
+                offset = 0
+                while offset < len(data):
+                    chunk = memoryview(data)[offset:offset + 65536]
+                    written = os.write(temporary_fd, chunk)
+                    if type(written) is not int or not 0 < written <= len(chunk):
+                        raise OSError('native atomic write made invalid progress')
+                    offset += written
+                # Writes above are unbuffered; fsync settles the complete payload.
+                os.fsync(temporary_fd)
+                if not self._parent_current(path.parent, parent_fd, parent_identity):
+                    self._uncertain = True
+                    raise AtomicPublicationUncertain()
+                if (not self._original_temporary(parent_fd, name, temporary_fd, temporary_identity)
+                        or os.fstat(temporary_fd).st_size != len(data)):
+                    self._uncertain = True
+                    raise AtomicPublicationUncertain()
+                os.replace(name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                replaced = True
+                os.fsync(parent_fd)
+                if not self._parent_current(path.parent, parent_fd, parent_identity):
+                    self._uncertain = True
+                    raise AtomicPublicationUncertain()
+            except BaseException as error:
+                primary = error
+                if replaced:
+                    self._uncertain = True
+                elif temporary_fd is not None:
+                    try:
+                        if (not self._parent_current(path.parent, parent_fd, parent_identity)
+                                or not self._original_temporary(parent_fd, name, temporary_fd, temporary_identity)):
+                            self._uncertain = True
+                        else:
+                            os.unlink(name, dir_fd=parent_fd)
+                            os.fsync(parent_fd)
+                            if not self._parent_current(path.parent, parent_fd, parent_identity):
+                                self._uncertain = True
+                    except BaseException:
+                        self._uncertain = True
+                raise
+            finally:
+                close_error = None
+                for descriptor in (temporary_fd, parent_fd):
+                    if descriptor is not None:
+                        try:
+                            os.close(descriptor)
+                        except OSError as error:
+                            self._uncertain = True
+                            close_error = close_error or error
+                if close_error is not None and primary is None:
+                    raise close_error
+
+
+_atomic_publisher = _AtomicPublisher()
+
+
+def credential_bytes(path):
+    data = private_bytes(path, MAX_CREDENTIAL_BYTES)
+    # The file may grow after the pre-read stat.
+    if len(data) > MAX_CREDENTIAL_BYTES:
+        raise ValueError('native credential exceeds byte budget')
+    return data
+
+
+def credential_json(data):
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate credential JSON field')
+            result[key] = value
+        return result
+    def invalid_constant(_):
+        raise ValueError('nonfinite credential JSON number')
+    value = json.loads(data.decode('utf-8'), object_pairs_hook=unique_object,
+                       parse_constant=invalid_constant)
+    def valid_scalars(item):
+        if isinstance(item, str):
+            item.encode('utf-8', errors='strict')
+        elif isinstance(item, dict):
+            for key, child in item.items():
+                valid_scalars(key)
+                valid_scalars(child)
+        elif isinstance(item, list):
+            for child in item:
+                valid_scalars(child)
+        elif isinstance(item, float) and not math.isfinite(item):
+            raise ValueError('nonfinite credential JSON number')
+    valid_scalars(value)
+    return value
+
+
+
+
 def atomic(path, data):
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-        name = Path(stream.name)
-        os.fchmod(stream.fileno(), 0o600)
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(name, path)
-    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    try:
-        os.fsync(parent_fd)
-    finally:
-        os.close(parent_fd)
+    return _atomic_publisher.publish(path, data)
+
 
 
 def safe_relative(raw):
@@ -258,13 +506,14 @@ def refresh_auth(spec, generation, original_digest, held_lock=None):
     lock_fd = held_lock if held_lock is not None else credential_use(spec)
     auth = Path(spec['auth_file'])
     try:
-        current = private_bytes(auth, 1024 * 1024)
+        current = credential_bytes(auth)
         if hashlib.sha256(current).hexdigest() != original_digest:
             return  # Independently refreshed controller credentials always win.
-        candidate = private_bytes(generation / safe_relative(spec['auth_relative']), 1024 * 1024)
-        updated = refreshed_credential(json.loads(current), json.loads(candidate), spec['provider'])
-        if updated != json.loads(current):
-            atomic(auth, json.dumps(updated, separators=(',', ':')).encode())
+        candidate = credential_bytes(generation / safe_relative(spec['auth_relative']))
+        original = credential_json(current)
+        updated = refreshed_credential(original, credential_json(candidate), spec['provider'])
+        if updated != original:
+            atomic(auth, candidate)
     finally:
         if held_lock is None:
             os.close(lock_fd)
@@ -289,9 +538,10 @@ class RefreshCheckpoint:
         if not self.journal.exists():
             return
         record = json.loads(private_bytes(self.journal, 2 * 1024 * 1024))
+        current = credential_bytes(Path(self.spec['auth_file']))
+        credential_json(current)
         if record['state'] == 'committed':
             return
-        current = private_bytes(Path(self.spec['auth_file']), 1024 * 1024)
         digest = hashlib.sha256(current).hexdigest()
         if record.get('result_digest') == digest:
             atomic(self.journal, json.dumps({'state': 'committed', 'result_digest': digest}).encode())
@@ -351,8 +601,8 @@ class RefreshCheckpoint:
             raise ValueError('credential refresh already in progress')
         try:
             self.recover()
-            self.current = private_bytes(Path(self.spec['auth_file']), 1024 * 1024)
-            original = json.loads(self.current)
+            self.current = credential_bytes(Path(self.spec['auth_file']))
+            original = credential_json(self.current)
             container, token = ('claudeAiOauth', 'refreshToken') if self.spec['provider'] == 'claude' else ('tokens', 'refresh_token')
             if 'scope' in data and (not isinstance(data['scope'], str) or set(data['scope'].split()) != set(original[container]['scopes'])):
                 raise ValueError('refresh request changes credential scope')
@@ -376,8 +626,8 @@ class RefreshCheckpoint:
         data = json.loads(response)
         if not isinstance(data, dict):
             raise ValueError('invalid refresh response schema')
-        original = json.loads(self.current)
-        updated = json.loads(self.current)
+        original = credential_json(self.current)
+        updated = credential_json(self.current)
         if self.spec['provider'] == 'claude':
             tokens = updated['claudeAiOauth']
             tokens['accessToken'] = data['access_token']
@@ -397,9 +647,11 @@ class RefreshCheckpoint:
                 updated['last_refresh'] = datetime.datetime.fromtimestamp(received_at_ms / 1000, datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
         refreshed_credential(original, updated, self.spec['provider'])
         target = Path(self.spec['auth_file'])
-        if private_bytes(target, 1024 * 1024) != self.current:
+        if credential_bytes(target) != self.current:
             raise ValueError('credential changed during refresh checkpoint')
-        encoded = json.dumps(updated, separators=(',', ':')).encode()
+        encoded = json.dumps(updated, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode('utf-8')
+        if len(encoded) > MAX_CREDENTIAL_BYTES:
+            raise ValueError('native credential exceeds byte budget')
         record['result_digest'] = hashlib.sha256(encoded).hexdigest()
         atomic(self.journal, json.dumps(record).encode())
         atomic(target, encoded)
@@ -444,8 +696,8 @@ def runtime_seed(runtime, auth_file, auth_relative):
                 entries.append((str(item.relative_to(home)), data))
     original = None
     if auth_file:
-        data = private_bytes(Path(auth_file), 1024 * 1024)
-        json.loads(data)
+        data = credential_bytes(Path(auth_file))
+        credential_json(data)
         original = hashlib.sha256(data).hexdigest()
         previous = private_json(runtime / 'complete.json') if (runtime / 'complete.json').exists() else {}
         # Preserve an OAuth refresh produced inside this isolated conversation.
@@ -453,11 +705,13 @@ def runtime_seed(runtime, auth_file, auth_relative):
         if previous.get('auth_generation') != original or not any(name == auth_relative for name, _ in entries):
             entries = [(name, contents) for name, contents in entries if name != auth_relative]
             entries.append((auth_relative, data))
+    if sum(len(contents) for _, contents in entries) > MAX_HOME:
+        raise ValueError('native runtime seed exceeds budget')
     return entries, original
 
 
 def boot_entries(config, job, seed, guest_source, gateway_source, cert_entries):
-    entries = []
+    entries = BootEntries()
     directories = ('bootstrap', 'dev', 'proc', 'sys', 'tmp', 'modules', 'usr', 'etc', 'native',
                    'home', 'home/worker', 'workspace', 'seed', 'root', 'root/control',
                    'run', 'run/native-provider-gateway')
@@ -465,14 +719,14 @@ def boot_entries(config, job, seed, guest_source, gateway_source, cert_entries):
         mode = 0o700 if name.startswith('root') else 0o1777 if name == 'tmp' else 0o755
         entries.append((name, stat.S_IFDIR | mode, b'', 0, 0))
     entries.append(('dev/console', stat.S_IFCHR | 0o600, b'', 5, 1))
-    entries.append(('bootstrap/busybox', stat.S_IFREG | 0o755, Path(config['busybox']).read_bytes(), 0, 0))
+    entries.append_input('bootstrap/busybox', stat.S_IFREG | 0o755, Path(config['busybox']))
     for name in ('sh', 'mount', 'ip', 'insmod', 'poweroff', 'mkdir'):
         entries.append(('bootstrap/' + name, stat.S_IFLNK | 0o777, b'busybox', 0, 0))
     for name in ('bin', 'sbin', 'lib', 'lib64'):
         entries.append((name, stat.S_IFLNK | 0o777, ('usr/' + name).encode(), 0, 0))
     commands = []
     for index, raw in enumerate(config['modules']):
-        entries.append((f'modules/{index}.ko', stat.S_IFREG | 0o400, Path(raw).read_bytes(), 0, 0))
+        entries.append_input(f'modules/{index}.ko', stat.S_IFREG | 0o400, Path(raw))
         commands.append(f'insmod /modules/{index}.ko || poweroff -f')
     # Only this process-specific seed enters the guest; no host directory is
     # exported for writable home state. Runtime exports are bounded frames.
@@ -485,11 +739,9 @@ def boot_entries(config, job, seed, guest_source, gateway_source, cert_entries):
                 seen.add(str(parent))
         entries.append((str(path), stat.S_IFREG | 0o600, data, 0, 0))
     entries.extend(cert_entries)
-    entries.extend([
-        ('root/job.json', stat.S_IFREG | 0o400, json.dumps(job).encode(), 0, 0),
-        ('root/guest.py', stat.S_IFREG | 0o400, guest_source, 0, 0),
-        ('root/native_provider_gateway.py', stat.S_IFREG | 0o400, gateway_source, 0, 0),
-    ])
+    entries.append(('root/job.json', stat.S_IFREG | 0o400, json.dumps(job).encode(), 0, 0))
+    entries.append_input('root/guest.py', stat.S_IFREG | 0o400, guest_source)
+    entries.append_input('root/native_provider_gateway.py', stat.S_IFREG | 0o400, gateway_source)
     boot = '#!/bootstrap/sh\nexport PATH=/bootstrap:/usr/bin:/bin\nmount -t devtmpfs devtmpfs /dev\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\n' + '\n'.join(commands) + '''
 mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev runtime /usr || poweroff -f
 mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev provider /native || poweroff -f
@@ -526,13 +778,101 @@ def validate_runtime(path):
         raise ValueError('undeclared runtime file')
 
 
+def _staging_identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+@contextlib.contextmanager
+def _native_staging_source(source, limit):
+    source = Path(source)
+    if not source.is_absolute():
+        raise ValueError('native staging source must be absolute')
+    # NONBLOCK prevents a substituted FIFO from blocking before fstat rejects it.
+    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        initial = os.fstat(fd)
+        if (not stat.S_ISREG(initial.st_mode) or initial.st_uid not in (0, os.getuid())
+                or initial.st_mode & 0o022):
+            raise ValueError('native staging source is not trusted')
+        if initial.st_size > limit:
+            raise ValueError('native staging source exceeds byte budget')
+        yield fd
+        if (_staging_identity(os.fstat(fd)) != _staging_identity(initial)
+                or _staging_identity(source.stat(follow_symlinks=False)) != _staging_identity(initial)):
+            raise ValueError('native staging source changed')
+    finally:
+        os.close(fd)
+
+
+def _native_staging_chunks(fd, limit):
+    remaining = limit
+    while True:
+        chunk = os.read(fd, min(64 * 1024, remaining + 1))
+        if not chunk:
+            return
+        if len(chunk) > remaining:
+            raise ValueError('native staging source exceeds byte budget')
+        remaining -= len(chunk)
+        yield chunk
+
+
+def _native_staging_digest(source, limit):
+    digest = hashlib.sha256()
+    with _native_staging_source(source, limit) as fd:
+        for chunk in _native_staging_chunks(fd, limit):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _stage_native_file(source, destination, limit, expected_digest=None):
+    destination = Path(destination)
+    target_fd = None
+    created = None
+    try:
+        with _native_staging_source(source, limit) as source_fd:
+            target_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            created = os.fstat(target_fd)
+            digest = hashlib.sha256()
+            for chunk in _native_staging_chunks(source_fd, limit):
+                digest.update(chunk)
+                pending = memoryview(chunk)
+                while pending:
+                    count = os.write(target_fd, pending)
+                    if count <= 0:
+                        raise OSError('native staging write made no progress')
+                    pending = pending[count:]
+            if expected_digest is not None and digest.hexdigest() != expected_digest:
+                raise ValueError('Codex runtime companion digest changed')
+        os.fchmod(target_fd, 0o555)
+    except BaseException:
+        if created is not None:
+            # The private launch directory has no guest writers during staging.
+            # Never remove a preexisting or visibly replaced destination.
+            try:
+                current = destination.lstat()
+                if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                    destination.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        if target_fd is not None:
+            os.close(target_fd)
+
+
+def stage_native_executable(executable, destination):
+    _stage_native_file(executable, destination, MAX_EXECUTABLE)
+
+
 def stage_native_companions(executable, guest_runtime, destination):
     executable = Path(executable)
     if executable.resolve().name != 'codex':
         return
     runtime = Path(guest_runtime)
     manifest = json.loads((runtime / 'manifest.json').read_text())
-    digest = hashlib.sha256((Path(destination) / 'cli').read_bytes()).hexdigest()
+    digest = _native_staging_digest(Path(destination) / 'cli', MAX_EXECUTABLE)
     entries = manifest.get('native_companions', {}).get(digest)
     if not isinstance(entries, list) or len(entries) != 1:
         raise ValueError('Codex runtime companion missing for executable digest; reprovision runtime')
@@ -544,13 +884,8 @@ def stage_native_companions(executable, guest_runtime, destination):
     source = runtime / relative
     if source.is_symlink() or not source.resolve().is_relative_to(runtime) or declared.get(str(relative)) != entry.get('sha256'):
         raise ValueError('Codex runtime companion is not manifested')
-    data = source.read_bytes()
-    if len(data) > 128 * 1024**2 or hashlib.sha256(data).hexdigest() != entry['sha256']:
-        raise ValueError('Codex runtime companion digest changed')
     target = Path(destination) / entry['name']
-    with open(target, 'xb') as stream:
-        stream.write(data)
-        os.fchmod(stream.fileno(), 0o555)
+    _stage_native_file(source, target, MAX_COMPANION, entry['sha256'])
 
 
 def main(spec_path):
@@ -586,11 +921,7 @@ def main(spec_path):
         binary = private / 'provider'
         binary.mkdir()
         executable = Path(spec['executable'])
-        info = executable.stat()
-        if not executable.is_absolute() or info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022 or info.st_size > 512 * 1024 * 1024:
-            raise ValueError('native executable is not trusted or exceeds budget')
-        shutil.copyfile(executable, binary / 'cli')
-        (binary / 'cli').chmod(0o555)
+        stage_native_executable(executable, binary / 'cli')
         stage_native_companions(executable, spec['guest_runtime'], binary)
         assets = spec.get('assets', [])
         if len(assets) > 32:
@@ -618,10 +949,10 @@ def main(spec_path):
         guest_config, certificates = gateway_module.provision(spec['gateway'], private)
         job = {'argv': spec['argv'], 'environment': spec['environment'], 'uid': os.getuid(), 'gid': os.getgid(),
                'gateway': guest_config, 'mcp': bool(spec.get('mcp_argv')), 'auth_relative': spec['auth_relative']}
-        entries = boot_entries(config, job, seed, Path(__file__).with_name('native-provider-vm-guest.py').read_bytes(),
-                               Path(__file__).with_name('native-provider-gateway.py').read_bytes(), certificates)
+        entries = boot_entries(config, job, seed, Path(__file__).with_name('native-provider-vm-guest.py'),
+                               Path(__file__).with_name('native-provider-gateway.py'), certificates)
         image = private / 'initrd.gz'
-        image.write_bytes(vm.initrd(entries))
+        write_boot_image(image, entries, vm.initrd)
         command = vm.qemu_command(config, image, [('runtime', Path(spec['guest_runtime']), True), ('provider', binary, True)], None)
         command[command.index('-serial') + 1] = 'null'
         command.extend(['-device', 'virtio-serial-pci', '-chardev',
@@ -816,19 +1147,27 @@ def main(spec_path):
                 print(json.dumps({'native_gateway_failures': gateway.guest_failures, 'native_gateway_host_failures': gateway.host_failures}), file=sys.stderr, flush=True)
             return exit_code
         except Exception:
-            print(json.dumps({'native_host_failure_state': {'phase': phase, 'frames': frame_counts,
-                'admitted': admitted, 'quiescent': quiescence is not None, 'export_bytes': exported,
-                'export_files': len(received), 'partial_export': active_export is not None,
-                'guest_exit_code': exit_code, 'qemu_exit_code': process.poll()}}), file=sys.stderr, flush=True)
-            if gateway is not None:
-                # Retained observation is diagnostic only: no generation publication,
-                # complete.json, or successful launch authority follows this path.
-                atomic(Path(spec_path).parent / 'failed-gateway-observation.json', json.dumps({
-                    'version': 1, 'diagnostic_only': True,
-                    'launch_sha256': hashlib.sha256(private_bytes(Path(spec_path), 2 * 1024 * 1024)).hexdigest(),
-                    'gateway_transport': gateway.transport_receipt()}).encode())
-            if gateway is not None and (gateway.guest_failures or gateway.host_failures):
-                print(json.dumps({'native_gateway_failures': gateway.guest_failures, 'native_gateway_host_failures': gateway.host_failures}), file=sys.stderr, flush=True)
+            try:
+                print(json.dumps({'native_host_failure_state': {'phase': phase, 'frames': frame_counts,
+                    'admitted': admitted, 'quiescent': quiescence is not None, 'export_bytes': exported,
+                    'export_files': len(received), 'partial_export': active_export is not None,
+                    'guest_exit_code': exit_code, 'qemu_exit_code': process.poll()}}), file=sys.stderr, flush=True)
+                if gateway is not None:
+                    # Retained observation is diagnostic only: no generation publication,
+                    # complete.json, or successful launch authority follows this path.
+                    try:
+                        atomic(Path(spec_path).parent / 'failed-gateway-observation.json', json.dumps({
+                            'version': 1, 'diagnostic_only': True,
+                            'launch_sha256': hashlib.sha256(private_bytes(Path(spec_path), 2 * 1024 * 1024)).hexdigest(),
+                            'gateway_transport': gateway.transport_receipt()}).encode())
+                    except Exception:
+                        # Diagnostic loss cannot replace the original launch failure.
+                        print(json.dumps({'native_diagnostic_publication_failed': True}), file=sys.stderr, flush=True)
+
+                if gateway is not None and (gateway.guest_failures or gateway.host_failures):
+                    print(json.dumps({'native_gateway_failures': gateway.guest_failures, 'native_gateway_host_failures': gateway.host_failures}), file=sys.stderr, flush=True)
+            except Exception:
+                pass  # Diagnostics never replace the original launch error.
             raise
         finally:
             if gateway is not None:
@@ -851,9 +1190,9 @@ def main(spec_path):
                 os.close(credential_lock)
 
 
-if __name__ == '__main__':
+def entry(spec_path):
     try:
-        raise SystemExit(main(sys.argv[1]))
+        return main(spec_path)
     except Exception as error:
         # Only a fixed exception category is safe; messages may contain secrets.
         category = type(error).__name__
@@ -862,16 +1201,23 @@ if __name__ == '__main__':
         diagnostic = {'native_vm_failure': category}
         if isinstance(error, OSError) and isinstance(error.errno, int):
             diagnostic['errno'] = error.errno
-        ready = os.environ.get('JARVIS_NATIVE_VM_READY')
-        if ready and not Path(ready).exists():
-            failure = Path(ready).with_name('vm-startup-failure.json')
-            if not failure.exists():
-                # Fixed category/errno only: no exception messages, paths,
-                # credentials or provider payloads cross this receipt boundary.
-                try:
-                    atomic(failure, json.dumps(dict(diagnostic, phase='native_setup_failed')).encode())
-                except OSError:
-                    pass
-        print(json.dumps(diagnostic), file=sys.stderr)
-        print('Native VM boundary unavailable; launch terminated without host fallback.', file=sys.stderr)
-        raise SystemExit(126)
+        try:
+            ready = os.environ.get('JARVIS_NATIVE_VM_READY')
+            if ready and not Path(ready).exists():
+                failure = Path(ready).with_name('vm-startup-failure.json')
+                if not failure.exists():
+                    # Fixed category/errno only: no exception messages, paths,
+                    # credentials or provider payloads cross this receipt boundary.
+                    try:
+                        atomic(failure, json.dumps(dict(diagnostic, phase='native_setup_failed')).encode())
+                    except Exception:
+                        pass
+            print(json.dumps(diagnostic), file=sys.stderr)
+            print('Native VM boundary unavailable; launch terminated without host fallback.', file=sys.stderr)
+        except Exception:
+            pass  # Missing diagnostic delivery is not successful native work.
+        return 126
+
+
+if __name__ == '__main__':
+    raise SystemExit(entry(sys.argv[1] if len(sys.argv) > 1 else None))

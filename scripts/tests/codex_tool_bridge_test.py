@@ -26,6 +26,76 @@ requires_sandbox = capabilities.requirement(SANDBOX_UNAVAILABLE)
 requires_poppler = capabilities.requirement(POPPLER_UNAVAILABLE)
 
 
+class FilteredEnvInputTests(unittest.TestCase):
+    def test_real_embedded_schema_compiles_after_source_filtering(self):
+        import os
+        import shutil
+        import uuid
+        wrapper = os.environ.get('AUGMENTAGENT_TEST_CARGO_WRAPPER')
+        if not wrapper and os.environ.get('GITHUB_ACTIONS') != 'true':
+            self.skipTest('local Rust fixture requires AUGMENTAGENT_TEST_CARGO_WRAPPER')
+        runner = [wrapper] if wrapper else [shutil.which('cargo') or 'cargo']
+        repo = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory(prefix='autoship-env-input-') as temporary:
+            base = Path(temporary)
+            work = base / 'work'
+            crate = work / 'crates/augmentagent-cli'
+            source = crate / 'src'
+            source.mkdir(parents=True)
+            nonce = uuid.uuid4().hex
+            package = 'autoship-env-input-probe-' + nonce
+            (crate / 'Cargo.toml').write_text(
+                '[package]\nname="' + package + '"\nversion="0.0.0"\nedition="2021"\n[workspace]\n')
+            module = repo / 'crates/augmentagent-cli/src/env_key_snapshot.rs'
+            (source / module.name).write_bytes(module.read_bytes())
+            asset = repo / 'crates/augmentagent-cli/src/env_keys.txt'
+            if asset.exists():
+                (source / asset.name).write_bytes(asset.read_bytes())
+            (source / 'lib.rs').write_text("""
+mod env_key_snapshot;
+pub fn fallback_schema() -> &'static str { env_key_snapshot::EMBEDDED_DOTENV_EXAMPLE }
+#[test]
+fn real_fallback_has_canonical_keys() {
+    let keys = fallback_schema();
+    assert!(keys.contains("GROQ_API_KEY="));
+    assert!(keys.contains("DISCORD_BOT_TOKEN="));
+    assert!(keys.contains("DASHBOARD_PORT="));
+}
+""")
+            (work / '.env.example').write_text(
+                'GROQ_API_KEY=\nDISCORD_BOT_TOKEN=\nDASHBOARD_PORT=\n')
+            (work / '.env').write_text('SYNTHETIC_PRIVATE=not-for-the-source-view\n')
+            (work / '.env.local').write_text('SYNTHETIC_LOCAL=not-for-the-source-view\n')
+            environment = dict(os.environ, CARGO_PROFILE_DEV_DEBUG='0', CARGO_PROFILE_TEST_DEBUG='0')
+            def compile_fixture(directory):
+                return subprocess.run(
+                    [*runner, 'test', '--lib', '--offline', '--manifest-path',
+                     str(directory / 'crates/augmentagent-cli/Cargo.toml')],
+                    cwd=repo, env=environment, capture_output=True, text=True)
+            # Different package identities force both real Rust compilations;
+            # the registered local target stays shared and owned by this worktree.
+            control = base / 'control'
+            shutil.copytree(work, control)
+            manifest = control / 'crates/augmentagent-cli/Cargo.toml'
+            manifest.write_text(manifest.read_text().replace(package, 'autoship-env-control-' + nonce))
+            complete = compile_fixture(control)
+            self.assertEqual(complete.returncode, 0,
+                             'full-source control must compile before diagnosing filtering:\n' + complete.stderr)
+            policy = bridge.Policy({'cwd': str(work), 'read_roots': [str(work)],
+                                    'write_roots': [], 'allowed_tools': ['Read']})
+            try:
+                snapshot = bridge.BuildSnapshot(policy, base / 'snapshot')
+                self.assertFalse((snapshot.root / '.env').exists())
+                self.assertFalse((snapshot.root / '.env.local').exists())
+                self.assertFalse((snapshot.root / '.env.example').exists())
+                filtered = compile_fixture(snapshot.root)
+                self.assertEqual(filtered.returncode, 0,
+                                 'real embedded schema cannot compile in the filtered source view:\n'
+                                 + filtered.stderr)
+            finally:
+                policy.close()
+
+
 class ToolPolicyTests(unittest.TestCase):
     def setUp(self):
         # Every policy owns session resources, including when an assertion or

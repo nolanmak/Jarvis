@@ -74,7 +74,7 @@ def generate(root=ROOT):
             for name,paths in config.value:
                 if name.value!='paths':continue
                 present=[item.value for item in paths.value]
-                missing=[v for v in ['scripts/ci-contract.py','scripts/ci-contract.json','scripts/ci-contract-sync.py','scripts/tests/ci_contract_test.py'] if v not in present]
+                missing=[v for v in ['scripts/ci-contract.py','scripts/ci-contract.json','scripts/ci-contract-sync.py','scripts/tests/ci_contract_test.py','scripts/ci-pinned-tools.py','scripts/tests/ci_pinned_tools_test.py'] if v not in present]
                 if missing:
                     indent=' '*(paths.value[0].start_mark.column-2)
                     extra.append((raw.rfind('\n',0,paths.end_mark.index)+1,''.join(indent+'- '+json.dumps(v)+'\n' for v in missing)))

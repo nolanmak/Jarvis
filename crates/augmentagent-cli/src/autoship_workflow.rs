@@ -9,6 +9,8 @@ use std::{path::Path, time::Duration};
 
 #[path = "autoship_merge_allowance.rs"]
 mod merge_allowance;
+#[path = "autoship_resource_refusal.rs"]
+pub(crate) mod resource_refusal;
 #[path = "autoship_progress.rs"]
 pub(crate) mod progress;
 #[path = "autoship_delivery.rs"]
@@ -458,6 +460,9 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS command_attempt (
                 workflow TEXT PRIMARY KEY REFERENCES command_job(workflow), selected_at INTEGER NOT NULL,
                 finished_at INTEGER, outcome TEXT NOT NULL, reason TEXT NOT NULL, eligible_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS command_resource_refusal (
+                workflow TEXT PRIMARY KEY REFERENCES command_attempt(workflow), selected_at INTEGER NOT NULL,
+                payload TEXT NOT NULL CHECK(length(payload)<=1024));
             CREATE TABLE IF NOT EXISTS command_lane_turn (
                 repository TEXT PRIMARY KEY, yield_normal INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS command_client_intent (

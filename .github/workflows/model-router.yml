@@ -27,6 +27,8 @@ on:
       - "scripts/ci-contract.json"
       - "scripts/ci-contract-sync.py"
       - "scripts/tests/ci_contract_test.py"
+      - "scripts/ci-pinned-tools.py"
+      - "scripts/tests/ci_pinned_tools_test.py"
   push:
     branches: [main]
     paths:
@@ -55,6 +57,8 @@ on:
       - "scripts/ci-contract.json"
       - "scripts/ci-contract-sync.py"
       - "scripts/tests/ci_contract_test.py"
+      - "scripts/ci-pinned-tools.py"
+      - "scripts/tests/ci_pinned_tools_test.py"
 permissions:
   contents: read
 # Superseded PR heads cancel; non-PR runs retain distinct queue slots.

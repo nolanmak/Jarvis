@@ -148,7 +148,8 @@ A review hold does not establish whether model work was billed. Inspect the
 workflow's resource counters and confirmed-merge allowance separately. Historical
 hold reasons remain historical records; a new deployment does not rewrite them.
 
-Hosted APT setup retries a confirmed Ubuntu mirror DNS failure once against
+Hosted APT setup requests IPv4 on hosted runners and retries a confirmed Ubuntu
+mirror DNS failure once against
 `https://mirrors.edge.kernel.org/ubuntu/`, using the runner's Ubuntu suite and
 archive signature keyring. Temporary source options apply only to that retry;
 host DNS and source files stay unchanged. Signature, lock, package and subsequent
@@ -162,6 +163,35 @@ report `policy-missing` while the services have a valid selection. An accepted
 resume can still require runtime retirement reconciliation before execution.
 Acceptance, cleanup, model progress, and a confirmed merge are separate results.
 Preserve unrelated owner pauses and inspect the resulting status.
+
+## Capacity waits in health readback
+
+After verifying the deployed build and worker, run:
+
+```sh
+augmentagent autopr-health --json
+```
+
+`resource-capacity-waiting` or `native-capacity-unobserved` is an ALERT for active durable
+`resource_capacity` / `await_capacity` checkpoints. A running worker, recent
+manual merge or provider-hold warning does not clear it. Owner-paused, held,
+terminal and diagnostic-only workflows are excluded. The count describes the
+persisted wait; available capacity still needs normal worker reconciliation.
+
+`capacity-state-unavailable` is an ALERT when the running worker's effective
+configuration or selected workflow store cannot be verified. Health reads the
+worker's private process-bound post-bootstrap receipt and opens that workflow
+store read-only, using the same selected database and daily cap for capacity and
+merge accounting. Missing or stale evidence does not select or create another
+workflow database. Capacity ALERTs make the command exit 1. Native retained-state measurements are descriptive storage observations, not host-memory sizing or execution authority.
+
+Health observation does not claim, wake or prune workflows or spend shipping
+allowance. Inspect the worker's selected capacity and ownership evidence through
+its configured delegated resource context. A readiness probe from an ordinary
+shell may lack delegation without proving the worker lacks it. Restore supported
+capacity or complete verified ownership recovery; preserve owner holds, retained
+sessions and budgets while the underlying cause is unresolved.
+
 
 ## Observed deployment, 2026-10-26
 

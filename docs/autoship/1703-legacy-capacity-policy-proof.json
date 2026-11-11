@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "main_base": "cbafe3216e36df1c254ef4b42139854192a5e1d1",
+  "change": "Add an explicit owner capacity-policy preview/apply command for the legacy store used on current main. Preserve all retained native state and resource declarations.",
+  "sources": {
+    "scripts/native-capacity-policy.py": "ccad0177e6680e16ac29b39a26548f77e63c2d143153f978be513ca200bc2ef1",
+    "scripts/test-native-capacity-policy.py": "d105968837a7480deb96e811de00cada0183e5a766036446a862565d62e75b63",
+    "scripts/ci-contract.json": "3a7e679b7d464cf7b27e25764d6a85ff2c88ecd620e8ae5e9f76c0e6ada4b651"
+  },
+  "evidence": {
+    "missing_api_red": {
+      "log": "/tmp/autoship-1703-legacy-capacity-red-20261108.log",
+      "sha256": "0c087b17eace91fd0a96754874b213d94575e17902bb9c0a833aa6c4927af83c"
+    },
+    "directory_sync_red": {
+      "log": "/tmp/autoship-1703-legacy-capacity-sync-red-20261108.log",
+      "sha256": "952c46474adab7aa99bddb3a24cf5ec49063cc6da5d57243b77d16fced4f6d29"
+    },
+    "lost_rename_red": {
+      "log": "/tmp/autoship-1703-legacy-capacity-rename-red-20261108.log",
+      "sha256": "5ec350fb829f498ab584bd35c539d9adb2fb00cdd1298f922524d8219c1106e6"
+    },
+    "final": {
+      "log": "/tmp/autoship-1703-capacity-confirmation-final-20261108.log",
+      "sha256": "247af5f9a3c922a33558c89ff4a924c04bb614dec5a70eadcb5e83cc30a13d0d"
+    },
+    "ci_contract": {
+      "log": "/tmp/autoship-1703-capacity-confirmation-ci-contract-20261108.log",
+      "sha256": "1fcd8adc4acb63af0b5e509b74bf265814e8740f51cb37ae9a44e7ac3039a20f"
+    },
+    "temporary_identity_red": {
+      "log": "/tmp/autoship-1703-legacy-capacity-temp-red-20261108.log",
+      "sha256": "662940295498b900e6f5c641509936c2995981c11188e7e0084e1fc19b394edc"
+    },
+    "replay_replacement_red": {
+      "log": "/tmp/autoship-1703-capacity-replay-replacement-red-20261108.log",
+      "sha256": "c06623ea41f59b7cc165240c9595e2092b1bbc8c4ff122e80b264022e75dee96"
+    },
+    "original_lock_red": {
+      "log": "/tmp/autoship-1703-capacity-original-lock-red-20261108.log",
+      "sha256": "9a9b478bd5391dd7fd03a73f8140c2de6aaf5887b2063985bbd13e5b393f05b3"
+    },
+    "wal_preview_red": {
+      "log": "/tmp/autoship-1703-capacity-wal-preview-red-20261108.log",
+      "sha256": "62c8a83364ff8ff2008d5d78ae8dbfab65b8c41321b56613f08df91f50475599"
+    },
+    "docstrings_final": {
+      "log": "/tmp/autoship-1703-capacity-docstrings-final-20261108.log",
+      "sha256": "9e6599172e9fc38d47f3f981237fda980f28e6887aa277386bcdad7a0a9735d4"
+    },
+    "docstrings_ast": {
+      "log": "/tmp/autoship-1703-capacity-docstrings-ast-proof-20261108.json",
+      "sha256": "7e286b35800c04c767a65a5a7d5deb13b93b300d906e88260f9898b0428befae"
+    },
+    "hosted_bridge_before_docstrings": {
+      "log": "/tmp/autoship-1913-hosted-bridge-6f620ce3-20261108.log",
+      "sha256": "73040554ed55c4122e6d18614cdcdd61d07a99886c4e1bc0617fbed52d2235f9"
+    },
+    "audit_regressions_red": {
+      "log": "/tmp/autoship-1703-capacity-audit-red-20261108.log",
+      "sha256": "85de2a991d0a52b26e824ebf48c27f0614cb96d976287f52ab5c39d230105412"
+    },
+    "audit_regressions_green": {
+      "log": "/tmp/autoship-1703-capacity-audit-green-20261108.log",
+      "sha256": "ed3a8bb308c3028c1052d32e14fa5a399c42fb2aa2f4f966266c676ea8e2a0fe"
+    },
+    "audit_ci_contract": {
+      "log": "/tmp/autoship-1703-capacity-audit-ci-contract-20261108.log",
+      "sha256": "45e94cf68f38fdf5522b7231cb17e639c9584f7de5308b13eb22fe6c5215b478"
+    }
+  },
+  "validation": {
+    "capacity_tests_passed": 28,
+    "ci_contract_tests_passed": 23,
+    "ci_contract_verify_passed": true,
+    "failed": 0,
+    "live_read_only_preview_succeeded": true,
+    "live_policy_applied": false,
+    "wal_preview_observation": "Default SQLite mode=ro created WAL/SHM files on a WAL-mode fixture with no sidecars. The command now refuses sidecars and uses the unix-none read-only VFS under its original StateLock; it never ignores WAL with immutable=1.",
+    "hosted_bridge_passed_head": "6f620ce3d101ec61da99fb7cd35a6004e0d57bf2",
+    "hosted_bridge_run": "https://github.com/nolanmak/Jarvis/actions/runs/42536255231",
+    "post_docstring_hosted_checks": "pending",
+    "function_docstrings_added_without_behavior_change": true,
+    "audit_followup_hosted_checks": "pending",
+    "audit_seams_checked": 28,
+    "audit_findings_resolved": [
+      "Exact stored legacy DDL and complete sqlite_master object allowlist",
+      "Confirmation binds approved bytes to the held synced policy inode",
+      "All error JSON includes both false authorization flags",
+      "Cleanup and descriptor-close errors preserve publication outcome",
+      "CLI apply/replay, refusal, unavailable and uncertain exit projections",
+      "Document cooperative-writer boundary and late replacement uncertainty"
+    ]
+  },
+  "limits": [
+    "Main native_vm::Launch::prepare reads policy on each attempt. The newer TransferBinding/authority-epoch protocol in draft #1758 is not present in the inspected live schema; its migration constraint must not be attributed to the old live limiter.",
+    "The live preview classified the selected store as legacy-schema and left the policy at 8GiB. A 16GiB target was inspected as an option, not chosen or authorized.",
+    "Apply refuses positive binding-aware markers, unfamiliar ledger schema, busy/missing/unsafe original locks, stale reviewed hashes and non-increases. It does not create an epoch, migrate bindings or repair missing historical authority.",
+    "Legacy-schema classification is based on the original private ledger shape. It is not a complete retained-session custody or quiescence proof, and it grants no deletion or reservation credit.",
+    "Actual apply, idempotent replay and all publication failures were tested only on private fixtures. No live policy, session, daemon, allowance, owner hold or deployment changed.",
+    "Core owner integration, modern binding transition, independent review, main/updater rollout and original live CLI/Discord/shipment/fault/soak acceptance remain incomplete.",
+    "Private permissions and flock require cooperating owner-controlled metadata writers; they are not atomic protection against arbitrary same-UID pathname replacement. Temporary cleanup is best effort."
+  ],
+  "deployed": false,
+  "goal_complete": false,
+  "followup_base_head": "965ef63f84cf245a2c92a4133ffd1ae7c7ff239c"
+}

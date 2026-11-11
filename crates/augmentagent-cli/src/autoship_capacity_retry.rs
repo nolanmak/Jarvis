@@ -33,7 +33,48 @@ fn previous(tx:&Transaction<'_>,workflow:&str,generation:i64,now:i64)->Result<Op
         && serde_json::to_value(&prior)?==serde_json::from_str::<serde_json::Value>(&raw)?,"invalid capacity retry history");
     Ok(Some(prior))
 }
+
+/// Observation for command progress only, never admission or an early wake.
+/// The checkpoint is the caller's same-transaction workflow projection.
+pub(super) fn command_attempt_wait(tx:&Transaction<'_>,workflow:&str,checkpoint:&Checkpoint,
+    selected_at:i64,now:i64)->Result<Option<i64>> {
+    if selected_at<0 || now<selected_at || !active(checkpoint.stage)
+        || checkpoint.next.reason!="resource_capacity" || checkpoint.next.action!="await_capacity"
+        || owner_control::read(tx,workflow)?.is_some_and(|control|control.paused) {return Ok(None);}
+    let generation:i64=tx.query_row("SELECT generation FROM workflow WHERE id=?1",[workflow],|r|r.get(0))?;
+    let Some(retry)=previous(tx,workflow,generation,now)? else{return Ok(None)};
+    Ok((retry.generation==generation && retry.failed_at_ms>=selected_at
+        && retry.binding==checkpoint.binding && retry.eligible_at_ms==checkpoint.next.eligible_at_ms)
+        .then_some(retry.eligible_at_ms))
+}
 impl WorkflowStore {
+    /// Compatibility name; use the bounded canonical observation.
+    pub fn capacity_wait_count(&self)->Result<u64> { self.resource_capacity_wait_count() }
+    /// Read-only health observation; never claims, wakes or charges work.
+    pub fn resource_capacity_wait_count(&self)->Result<u64> {
+        let started=std::time::Instant::now();let budget=std::time::Duration::from_secs(2);
+        let mut statement=self.conn.prepare("SELECT substr(w.checkpoint,1,1048577),length(CAST(w.checkpoint AS BLOB)),COALESCE(c.paused,0)
+            FROM workflow w LEFT JOIN workflow_owner_control c ON c.workflow=w.id
+            WHERE w.id NOT LIKE 'autoship-observation/%' AND w.id NOT LIKE 'autoship-canary/%'
+            ORDER BY w.id")?;
+        let rows=statement.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)))?;
+        // Stream bounded checkpoints through the canonical parser. A SQL-only
+        // candidate filter would silently hide malformed non-waiting history.
+        // Bound actual waits separately from historical rows and elapsed work.
+        let mut count=0;
+        for row in rows {
+            ensure!(started.elapsed()<budget,"capacity health observation exceeded its time budget");
+            let (raw,size,paused)=row?;
+            ensure!((0..=1048576).contains(&size) && matches!(paused,0|1),"capacity health evidence exceeds bound or is invalid");
+            let cp:Checkpoint=serde_json::from_str(&raw)?;cp.binding.validate()?;
+            if paused==0 && active(cp.stage) && cp.next.reason=="resource_capacity" && cp.next.action=="await_capacity" {
+                count+=1;ensure!(count<=1024,"capacity health wait count exceeds bound");
+            }
+        }
+        ensure!(started.elapsed()<budget,"capacity health observation exceeded its time budget");
+        Ok(count)
+    }
+
     /// Actual protected capacity observer only. No failure changes shipping
     /// allowance, paid accounting, evidence, owner intent or the progress clock.
     pub fn defer_run_capacity(&mut self,lease:&Lease,native_fingerprint:Option<&str>,now:i64)->Result<i64> {
@@ -115,6 +156,37 @@ impl WorkflowStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capacity_health_reads_persisted_waits_without_recovery_or_charges() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        assert_eq!(store.capacity_wait_count().unwrap(),0);
+        store.defer_run_capacity(&lease,Some(&"a".repeat(64)),30).unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap();
+        let events=store.events(&lease.workflow).unwrap();
+        let allowance=store.merge_allowance(31,5).unwrap();
+        let reader=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+        assert_eq!(reader.capacity_wait_count().unwrap(),1);
+        assert_eq!(reader.snapshot(&lease.workflow).unwrap(),before);
+        assert_eq!(store.events(&lease.workflow).unwrap(),events);
+        assert_eq!(store.merge_allowance(31,5).unwrap(),allowance);
+        let mut cp=before.unwrap().checkpoint;cp.stage=Stage::Held;
+        store.checkpoint(&lease,&cp,32).unwrap();
+        assert_eq!(reader.capacity_wait_count().unwrap(),0);
+    }
+    #[test]
+    fn capacity_health_excludes_owner_pauses_and_reappears_after_resume() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        store.defer_run_capacity(&lease,Some(&"a".repeat(64)),30).unwrap();
+        let checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        store.set_owner_pause(&lease.workflow,"github:owner",0,true,31).unwrap();
+        assert_eq!(store.capacity_wait_count().unwrap(),0,"owner pause was reported as an active capacity blocker");
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint,checkpoint);
+        store.set_owner_pause(&lease.workflow,"github:owner",1,false,32).unwrap();
+        assert_eq!(store.capacity_wait_count().unwrap(),1);
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint,checkpoint);
+    }
     fn setup(path:&Path)->(WorkflowStore,Lease) {
         let mut store=WorkflowStore::open(path).unwrap();
         let binding=Binding{head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
@@ -124,6 +196,56 @@ mod tests {
         cp.stage=Stage::Verify;cp.evidence=vec!["protected-receipt".into()];store.checkpoint(&lease,&cp,21).unwrap();
         store.charge(&lease,"original-work",ResourceCharge{model_calls:2,..Default::default()},25).unwrap();
         (store,lease)
+    }
+    #[test]
+    fn capacity_health_count_is_read_only_and_preserves_holds_and_accounting() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        assert_eq!(store.resource_capacity_wait_count().unwrap(),0);
+        store.defer_run_capacity(&lease,Some(&"a".repeat(64)),30).unwrap();
+        for id in ["autoship-observation/fixture","autoship-canary/fixture"] {
+            store.register(id,"fix",store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint.binding,30).unwrap();
+            let probe=store.claim(id,"probe",30,60_000).unwrap().unwrap();
+            store.defer_run_capacity(&probe,None,31).unwrap();
+        }
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();let events=store.events(&lease.workflow).unwrap();
+        let allowance=store.merge_allowance(31,5).unwrap();
+        let observer=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+        assert_eq!(observer.resource_capacity_wait_count().unwrap(),1);drop(observer);
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);
+        assert_eq!(store.events(&lease.workflow).unwrap(),events);assert_eq!(store.merge_allowance(31,5).unwrap(),allowance);
+        store.set_owner_pause(&lease.workflow,"owner",0,true,32).unwrap();
+        assert_eq!(store.resource_capacity_wait_count().unwrap(),0);
+        store.set_owner_pause(&lease.workflow,"owner",1,false,33).unwrap();
+        for stage in [Stage::Held,Stage::Merged,Stage::Retired,Stage::Merge] {
+            let mut cp=before.checkpoint.clone();cp.stage=stage;
+            store.conn.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",params![lease.workflow,serde_json::to_string(&cp).unwrap()]).unwrap();
+            assert_eq!(store.resource_capacity_wait_count().unwrap(),0);
+        }
+        store.conn.execute("UPDATE workflow SET checkpoint='broken' WHERE id=?1",[&lease.workflow]).unwrap();
+        assert!(store.resource_capacity_wait_count().is_err(),"corrupt evidence must not appear as zero waits");
+    }
+    #[test]
+    fn capacity_health_bound_counts_waits_without_expiring_on_terminal_history() {
+        let root=tempfile::tempdir().unwrap();let (mut store,lease)=setup(&root.path().join("state.db"));
+        store.defer_run_capacity(&lease,None,30).unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();let events=store.events(&lease.workflow).unwrap();
+        let mut terminal=before.checkpoint.clone();terminal.stage=Stage::Merged;
+        let terminal_raw=serde_json::to_string(&terminal).unwrap();
+        store.conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<2048)
+            INSERT INTO workflow(id,branch,checkpoint,heartbeat_at,progress_at)
+            SELECT 'owner/repo#history-'||x,'fixture',?1,1,1 FROM n",[&terminal_raw]).unwrap();
+        assert_eq!(store.resource_capacity_wait_count().unwrap(),1,"unrelated historical rows exhausted the candidate bound");
+        for corrupted in ["broken","{}",r#"{"stage":"merged"}"#] {
+            store.conn.execute("UPDATE workflow SET checkpoint=?1 WHERE id='owner/repo#history-1'",[corrupted]).unwrap();
+            assert!(store.resource_capacity_wait_count().is_err(),"corrupt history became a healthy zero count: {corrupted}");
+            store.conn.execute("UPDATE workflow SET checkpoint=?1 WHERE id='owner/repo#history-1'",[&terminal_raw]).unwrap();
+        }
+        store.conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1024)
+            INSERT INTO workflow(id,branch,checkpoint,heartbeat_at,progress_at)
+            SELECT 'owner/repo#candidate-'||x,'fixture',?1,1,1 FROM n",[serde_json::to_string(&before.checkpoint).unwrap()]).unwrap();
+        assert!(store.resource_capacity_wait_count().is_err(),"more than 1024 actual waits must stay bounded");
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);assert_eq!(store.events(&lease.workflow).unwrap(),events);
     }
     #[test]
     fn native_capacity_backoff_survives_restarts_heads_and_duplicate_observations() {

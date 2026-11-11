@@ -50,6 +50,35 @@ their private scratch-image ownership and aggregate growth reservations; they
 check the configured admission/free-space floor before and during execution.
 The bridge, descendant supervisor, and QEMU share the locked descriptor, so
 canceling a model cannot unlock storage before its build descendants exit.
+Managed `disk build` commands also inherit the actual global, target and
+reservation lock descriptions through `JARVIS_STORAGE_LEASE_FD` and
+`JARVIS_STORAGE_LEASE_FDS`. Trusted brokers must forward that exact descriptor
+set to their supervisor and VM, rather than reopening lock paths. Canceling the
+manager cannot release a surviving descendant's inherited exclusions; failed
+spawn closes the exported duplicates without retaining a nonexistent worker.
+
+Python brokers must explicitly forward the open descriptors through each
+`subprocess.Popen` hop; its default descriptor handling closes them even when
+lease environment metadata is inherited:
+
+```python
+raw = (os.environ.get("JARVIS_STORAGE_LEASE_FDS")
+       or os.environ.get("JARVIS_STORAGE_LEASE_FD", ""))
+fds = tuple(int(value) for value in raw.split(",") if value)
+child = subprocess.Popen(argv, pass_fds=fds)
+```
+
+This example inherits the matching environment as well. A broker that constructs
+its own child environment must preserve the descriptor metadata with those same
+open descriptions. Missing or stale descriptors must refuse launch; clearing the
+metadata or reopening lock paths does not preserve the original lease. Exercise
+broker tests through the managed wrapper, including controller death and
+verification that the lease stays held until descendant cleanup completes.
+
+For managed `disk build` commands, export ownership commits when the OS spawn
+succeeds, before waiting for the worker. Cancellation while waiting preserves
+that export. A later failed spawn cannot reset an earlier worker's ownership.
+
 Repository `cargo-managed.sh` tool requests map to managed Cargo inside the VM;
 they never execute a candidate-controlled host wrapper. Deterministic host gates
 and explicit host/legacy builders retain verified target leases and parent-proof
@@ -71,6 +100,22 @@ A completed process or cleanup log alone does not release that ownership:
 normal completion verifies the same kernel scope is quiescent first. A
 resource refusal before admission can release unused storage only when the
 supervisor has reaped its descendants and never received the launch token.
+
+One shared implementation backs the whole of admission. channel-core owns the
+per-user coordination directory, the admission lock taken inside it and the
+physical-directory leases that live in it (`storage_coordination`, published as
+`storage_leases`), the mandatory CI cleanup reconciliation that lock performs
+(`build_storage_ci_holds`), the growth-reservation ledger layered on it
+(`storage_reservations`) and the ownership fence for controller-private source
+checkouts (`storage_checkout`). An Autoship capacity path outside the CLI
+therefore admits against the same namespace, the same ledger and the same
+cleanup authority instead of starting a second one. The CLI re-exports those
+types rather than defining its own, and keeps only what is specific to it:
+the build gate's disk inventory, the committed Git export, the independently
+pinned harness overlay and contract validation. Every admission still
+reconciles abandoned holds using the original admission proof. Sharing
+admission does not enroll native retained sessions or make ephemeral
+reservation files durable across reboot.
 
 If teardown cannot be proven, CI preserves its source checkout, controller and
 supervisor receipts. The hold survives controller descriptor loss. Every new

@@ -10,8 +10,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[path = "build_storage_ci_holds.rs"]
-pub(crate) mod ci_holds;
+// #1930 — the CI cleanup fence is shared storage authority, not a CLI-local
+// concern: it now lives beside the admission lock it gates in channel-core.
+pub(crate) use augmentagent_channel_core::build_storage_ci_holds as ci_holds;
 
 const MARKER: &str = ".augmentagent-target.json";
 const CACHE_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n";
@@ -35,16 +36,25 @@ impl Lease {
     /// Duplicates share the flock open description; unlike /proc reopening,
     /// they retain storage/prune exclusion if the controller dies first.
     pub fn inherited_files(&self) -> Result<Vec<std::fs::File>> {
-        let mut files = vec![self.file.try_clone()?];
-        files.extend(self.targets.inherited_files()?);
-        if let Some(exclusion) = &self.ci_update_exclusion {
-            files.push(exclusion.try_clone()?);
-        }
-        if let Some(reservation) = &self.reservation {
-            files.push(reservation.inherited_file()?);
-        }
-        self.exported.store(true, std::sync::atomic::Ordering::Release);
+        let files=self.uncommitted_files()?;
+        self.commit_export();
         Ok(files)
+    }
+
+    /// Prepare an internal command attempt; no handles have escaped to a worker.
+    fn uncommitted_files(&self)->Result<Vec<std::fs::File>> {
+        let mut files=vec![self.file.try_clone()?];
+        files.extend(self.targets.uncommitted_files()?);
+        if let Some(exclusion)=&self.ci_update_exclusion {files.push(exclusion.try_clone()?);}
+        if let Some(reservation)=&self.reservation {files.push(reservation.uncommitted_file()?);}
+        Ok(files)
+    }
+
+    /// Commit only after a worker exists. Never reset another export's state.
+    fn commit_export(&self) {
+        self.targets.commit_export();
+        if let Some(reservation)=&self.reservation {reservation.commit_export();}
+        self.exported.store(true,std::sync::atomic::Ordering::Release);
     }
 
     pub fn parent_proof(&self, target: &Path) -> Result<String> {
@@ -107,9 +117,11 @@ impl Lease {
     pub async fn protect_targets(&mut self, roots: &[PathBuf]) -> Result<()> {
         let until = tokio::time::Instant::now() + Duration::from_secs(300);
         loop {
-            if let Some(targets) =
-                crate::storage_leases::TargetLeases::try_cache_roots(roots, None)?
-            {
+            if let Some(targets) = crate::storage_leases::TargetLeases::try_cache_roots(
+                roots,
+                None,
+                &crate::disk::profile_dirs,
+            )? {
                 self.targets = targets;
                 return Ok(());
             }
@@ -684,10 +696,13 @@ fn verify_parent_lease(_target: &Path, _proof: &str) -> Result<()> {
     bail!("nested managed builds require native parent-lease evidence; use cargo directly inside the enclosing managed build")
 }
 
+/// Launch a managed command with original storage descriptions, committing
+/// worker ownership at OS spawn while retaining pressure/cancellation watches.
 pub async fn run_command(target: &Path, command: &[String], lease: Option<&Lease>, update: bool) -> Result<()> {
+    use std::os::unix::process::CommandExt;
     let scratch = std::fs::canonicalize(target)?.join(if update { ".augmentagent-update-tmp" } else { "tmp" });
     std::fs::create_dir_all(&scratch)?;
-    let mut process = tokio::process::Command::new(&command[0]);
+    let mut process = std::process::Command::new(&command[0]);
     process
         .args(&command[1..])
         .env_clear()
@@ -696,19 +711,39 @@ pub async fn run_command(target: &Path, command: &[String], lease: Option<&Lease
         .env("TMPDIR", &scratch)
         .env("CARGO_PROFILE_DEV_DEBUG", "0")
         .env("CARGO_PROFILE_TEST_DEBUG", "0")
-        .kill_on_drop(true)
         .process_group(0);
+    // These are real dup/fork-inherited open descriptions, never path reopens.
+    // Keep them alive until wait/cancellation has dropped this command. Trusted
+    // VM brokers can pass this same set through their supervisor to QEMU.
+    let inherited_files=lease.map(Lease::uncommitted_files).transpose()?.unwrap_or_default();
     if let Some(lease) = lease {
         process.env(PARENT_LEASE_ENV, lease.parent_proof(target)?);
+        let descriptors:Vec<_>=inherited_files.iter().map(AsRawFd::as_raw_fd).collect();
+        let first=descriptors.first().context("managed command storage descriptor missing")?;
+        process.env("JARVIS_STORAGE_LEASE_FD",first.to_string())
+            .env("JARVIS_STORAGE_LEASE_FDS",descriptors.iter().map(ToString::to_string).collect::<Vec<_>>().join(","));
+        unsafe {process.pre_exec(move || {
+            for fd in &descriptors {
+                let flags=libc::fcntl(*fd,libc::F_GETFD);
+                if flags<0 || libc::fcntl(*fd,libc::F_SETFD,flags & !libc::FD_CLOEXEC)<0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });}
     }
+    // Use the actual OS spawn boundary: async process wrapping may fail after
+    // a process was created. No await or fallible work separates spawn and the
+    // monotonic export commit. Failed spawn leaves all prior states untouched.
     let mut child = process.spawn()?;
+    if let Some(lease)=lease {lease.commit_export();}
     struct Group(u32);
     impl Drop for Group {
         fn drop(&mut self) {
             unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) };
         }
     }
-    let _group = Group(child.id().context("managed build has no pid")?);
+    let _group = Group(child.id());
     let completion = async {
         let parent_alive = async {
             loop {
@@ -719,7 +754,7 @@ pub async fn run_command(target: &Path, command: &[String], lease: Option<&Lease
             Ok::<(), anyhow::Error>(())
         };
         tokio::select! {
-            result = child.wait() => Ok(result?),
+            result = tokio::task::spawn_blocking(move ||child.wait()) => Ok(result??),
             _ = tokio::signal::ctrl_c() => bail!("managed build interrupted"),
             result = parent_alive => { result?; bail!("parent storage lease lost") },
         }
@@ -1891,6 +1926,143 @@ mod inherited_ci_storage_tests {
         std::os::unix::fs::symlink(&target, state.path().join("disk-update.lock")).unwrap();
         assert!(ci_update_exclusion(state.path()).is_err());
         assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");
+    }
+
+    /// Failed exec must ignore incidental fork/dup holders when no worker exists.
+    #[tokio::test]
+    async fn failed_managed_spawn_releases_exported_storage_descriptions() {
+        let state=tempfile::tempdir().unwrap();let cache=tempfile::tempdir().unwrap();
+        let mut lease=Lease::try_at(state.path()).unwrap().unwrap();
+        lease.ci_update_exclusion=Some(ci_update_exclusion(state.path()).unwrap());
+        lease.protect_targets(&[cache.path().to_owned()]).await.unwrap();
+        // Real dup descriptions reproduce an unrelated thread's fork/exec
+        // window, which must not keep a failed command's lease exported.
+        let incidental_global=lease.file.try_clone().unwrap();
+        let incidental_update=lease.ci_update_exclusion.as_ref().unwrap().try_clone().unwrap();
+        let target_fd=unsafe {libc::fcntl(lease.targets.directory_fd(cache.path()).unwrap(),libc::F_DUPFD_CLOEXEC,3)};
+        assert!(target_fd>=0);
+        let incidental_target=unsafe {<std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(target_fd)};
+        let missing=cache.path().join("missing-command").to_str().unwrap().to_owned();
+        assert!(run_command(cache.path(),&[missing],Some(&lease),false).await.is_err());
+        drop(lease);
+        assert!(Lease::try_at(state.path()).unwrap().is_some(),"failed spawn leaked global exclusion");
+        assert!(ci_update_exclusion(state.path()).is_ok(),"failed spawn leaked updater exclusion");
+        assert!(crate::storage_leases::TargetLeases::try_directory(cache.path()).unwrap().is_some(),"failed spawn leaked target exclusion");
+        drop((incidental_global,incidental_update,incidental_target));
+    }
+
+    /// Parent-proof refusal cannot commit an attempt that never reached spawn.
+    #[tokio::test]
+    async fn failed_managed_parent_proof_leaves_export_uncommitted() {
+        let state=tempfile::tempdir().unwrap();let cache=tempfile::tempdir().unwrap();
+        let unprotected=tempfile::tempdir().unwrap();
+        let mut lease=Lease::try_at(state.path()).unwrap().unwrap();
+        lease.protect_targets(&[cache.path().to_owned()]).await.unwrap();
+        let incidental=lease.file.try_clone().unwrap();
+        let error=run_command(unprotected.path(),&["/usr/bin/true".into()],Some(&lease),false).await.unwrap_err();
+        assert!(format!("{error:#}").contains("target is not protected"),"wrong refusal boundary: {error:#}");
+        drop(lease);
+        assert!(Lease::try_at(state.path()).unwrap().is_some(),"parent-proof failure exported global exclusion");
+        assert!(crate::storage_leases::TargetLeases::try_directory(cache.path()).unwrap().is_some());
+        drop(incidental);
+    }
+
+    /// A failed attempt must preserve descriptions explicitly exported earlier.
+    #[tokio::test]
+    async fn failed_managed_spawn_preserves_an_earlier_export() {
+        let state=tempfile::tempdir().unwrap();let cache=tempfile::tempdir().unwrap();
+        let mut lease=Lease::try_at(state.path()).unwrap().unwrap();
+        lease.ci_update_exclusion=Some(ci_update_exclusion(state.path()).unwrap());
+        lease.protect_targets(&[cache.path().to_owned()]).await.unwrap();
+        let worker=lease.inherited_files().unwrap();
+        let missing=cache.path().join("missing-command").to_str().unwrap().to_owned();
+        assert!(run_command(cache.path(),&[missing],Some(&lease),false).await.is_err());
+        drop(lease);
+        assert!(Lease::try_at(state.path()).unwrap().is_none());
+        assert!(ci_update_exclusion(state.path()).is_err());
+        assert!(crate::storage_leases::TargetLeases::try_directory(cache.path()).unwrap().is_none());
+        drop(worker);
+        assert!(Lease::try_at(state.path()).unwrap().is_some());
+        assert!(ci_update_exclusion(state.path()).is_ok());
+        assert!(crate::storage_leases::TargetLeases::try_directory(cache.path()).unwrap().is_some());
+    }
+
+    /// A real detached worker retains exclusions after its manager is canceled.
+    #[tokio::test]
+    async fn managed_command_exports_leases_before_manager_cancellation() {
+        let state=std::sync::Arc::new(tempfile::tempdir().unwrap());let cache=std::sync::Arc::new(tempfile::tempdir().unwrap());
+        let mut lease=Lease::try_at(state.path()).unwrap().unwrap();
+        lease.ci_update_exclusion=Some(ci_update_exclusion(state.path()).unwrap());
+        lease.protect_targets(&[cache.path().to_owned()]).await.unwrap();
+        let ready=cache.path().join("descendant-ready");let stop=cache.path().join("stop-descendant");
+        struct Stop {path:PathBuf,state:std::sync::Arc<tempfile::TempDir>,cache:std::sync::Arc<tempfile::TempDir>}
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                let _=std::fs::write(&self.path,b"stop");
+                // A panic must not remove/recycle fixture inodes while the
+                // detached child still owns their exported leases. Its own
+                // hard deadline is 15s; wait for all three actual exclusions.
+                let deadline=std::time::Instant::now()+Duration::from_secs(20);
+                loop {
+                    let owner=Lease::try_at(self.state.path()).ok().flatten();
+                    let updater=ci_update_exclusion(self.state.path()).ok();
+                    let target=crate::storage_leases::TargetLeases::try_directory(self.cache.path()).ok().flatten();
+                    if owner.is_some() && updater.is_some() && target.is_some() {return;}
+                    if std::time::Instant::now()>=deadline {
+                        // Preserve private test evidence rather than unlinking
+                        // a possibly live namespace. This is a fixture failure.
+                        eprintln!("test child storage cleanup did not finish; preserving {} and {}",self.state.path().display(),self.cache.path().display());
+                        std::mem::forget(self.state.clone());std::mem::forget(self.cache.clone());return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        let _stop=Stop {path:stop.clone(),state:state.clone(),cache:cache.clone()};
+        let code=r#"
+import os,sys,time
+from pathlib import Path
+ready,stop=map(Path,sys.argv[1:])
+def publish(value):
+    pending=ready.with_name(ready.name+'.pending')
+    pending.write_text(value)
+    os.replace(pending,ready)
+fds=[int(value) for value in os.environ.get('JARVIS_STORAGE_LEASE_FDS','').split(',') if value]
+if len(fds)<4:
+    publish('missing exported storage descriptors')
+    raise SystemExit(86)
+assert os.environ.get('JARVIS_STORAGE_LEASE_FD')==str(fds[0])
+for fd in fds: os.fstat(fd)
+if os.fork()==0:
+    os.setsid()
+    publish(str(os.getpid()))
+    deadline=time.monotonic()+15
+    while not stop.exists() and time.monotonic()<deadline: time.sleep(0.005)
+    os._exit(0)
+while True: time.sleep(1)
+"#;
+        let command=vec!["/usr/bin/python3".into(),"-I".into(),"-c".into(),code.into(),ready.to_str().unwrap().into(),stop.to_str().unwrap().into()];
+        let target=cache.path().to_path_buf();
+        let task=tokio::spawn(async move {run_command(&target,&command,Some(&lease),false).await});
+        let deadline=std::time::Instant::now()+Duration::from_secs(5);
+        while !ready.exists() && !task.is_finished() && std::time::Instant::now()<deadline {tokio::time::sleep(Duration::from_millis(5)).await;}
+        let actual=std::fs::read_to_string(&ready).unwrap_or_else(|_|"no ready child".into());
+        task.abort();let _=task.await;
+        assert!(actual.parse::<u32>().is_ok(),"actual managed command did not receive its storage descriptors: {actual}");
+        assert!(Lease::try_at(state.path()).unwrap().is_none(),"manager cancellation released the descendant's global exclusion");
+        assert!(ci_update_exclusion(state.path()).is_err(),"manager cancellation released the descendant's updater exclusion");
+        assert!(crate::storage_leases::TargetLeases::try_directory(cache.path()).unwrap().is_none(),"manager cancellation released the descendant's physical target");
+        std::fs::write(&stop,b"stop").unwrap();
+        let deadline=std::time::Instant::now()+Duration::from_secs(5);
+        loop {
+            if let Some(lease)=Lease::try_at(state.path()).unwrap() {
+                assert!(ci_update_exclusion(state.path()).is_ok());
+                assert!(crate::storage_leases::TargetLeases::try_directory(cache.path()).unwrap().is_some());
+                drop(lease);break;
+            }
+            assert!(std::time::Instant::now()<deadline,"original descendant did not release storage after stopping");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     #[tokio::test]

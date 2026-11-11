@@ -28,7 +28,15 @@ elif a[:2]==['api','repos/owner/repo/pulls/42']:
  print(json.dumps({'number':42,'node_id':'PR_42','merged':s.get('merged',True),'head':{'sha':'a'*40},'base':{'repo':{'full_name':'owner/repo'}},'merge_commit_sha':'c'*40,'merged_by':{'login':'owner'},'merged_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}))
 elif a[:2]==['api','repos/owner/repo/git/commits/'+'c'*40]:
  print(json.dumps({'sha':'c'*40,'message':'Autoship-Receipt: v1:op-42:'+'f'*64}))
-elif a[:2]==['pr','list']: print(json.dumps([{'number':42,'isCrossRepository':False,'headRepositoryOwner':{'login':'owner'}}] if s.get('open_pr') else []))
+elif a[:2]==['pr','list']:
+ if s.get('fail_pr_inventory'): sys.exit(1)
+ if s.get('malformed_pr_inventory'): print('{bad-json'); sys.exit(0)
+ if s.get('incomplete_pr_metadata'): print(json.dumps([{'number':42,'isCrossRepository':False,'headRepositoryOwner':{'login':'owner'}}])); sys.exit(0)
+ rows=[{'number':number,'isCrossRepository':s.get('fork',False),'headRepositoryOwner':{'login':'owner'},
+        'headRefName':'feature/fix','headRefOid':s.get('head','a'*40),'baseRefName':'main',
+        'author':{'login':s.get('pr_author','owner')},
+        'closingIssuesReferences':[{'number':issue,'url':'https://github.com/owner/repo/issues/'+str(issue)} for issue in s.get('closing',[7])]} for number in ([42,43] if s.get('multiple_prs') else [42])]
+ print(json.dumps(rows if s.get('open_pr') else []))
 elif a[:3]==['pr','view','42']:
  if s.get('stall_head') and 'number,url,headRefOid' in a: time.sleep(5)
  print(json.dumps({'number':42,'state':s.get('pr_state','OPEN'),'url':'https://github.com/owner/repo/pull/42','headRefName':'feature/fix','headRefOid':s.get('head','a'*40),'baseRefName':'main','isCrossRepository':s.get('fork',False),'author':{'login':'owner'},'title':'Fix arithmetic','body':'Fix addition','closingIssuesReferences':[]}))
@@ -373,6 +381,37 @@ fn work_once_does_not_duplicate_an_unbound_existing_pr() {
     assert_eq!(result["reason"], "target-pr-reconciliation-required");
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert!(!root.path().join(".self-improve-worktrees").exists());
+}
+
+#[test]
+fn work_once_unknown_inventory_is_deferred_before_runtime_without_state_mutation() {
+    for scenario in [r#"{"malformed_pr_inventory":true}"#,r#"{"incomplete_pr_metadata":true}"#,r#"{"fail_pr_inventory":true}"#] {
+        let root=fixture();body(run(root.path(),&["--request-id","unknown-inventory"]),0);
+        std::fs::write(root.path().join("scenario.json"),scenario).unwrap();
+        let path=root.path().join("state/workflow.db");let before=std::fs::read(&path).unwrap();
+        let result=body(work(root.path(),"owner/repo#7"),3);
+        assert_eq!(result["reason"],"linked-pr-inventory-unknown");
+        assert_eq!(result["accepted"],true);assert_eq!(result["complete"],false);
+        assert_eq!(std::fs::read(&path).unwrap(),before);
+        assert!(!root.path().join(".self-improve-worktrees").exists());
+        assert!(!root.path().join("data.db").exists());
+    }
+}
+
+#[test]
+fn work_once_claim_ambiguity_does_not_choose_a_pr_and_forks_cannot_claim() {
+    for (scenario,reason) in [
+        (r#"{"open_pr":true,"multiple_prs":true}"#,"target-pr-reconciliation-required"),
+        (r#"{"open_pr":true,"closing":[7,8]}"#,"target-pr-reconciliation-required"),
+        (r#"{"open_pr":true,"fork":true}"#,"execution-readiness-blocked"),
+        (r#"{"open_pr":true,"pr_author":"stranger"}"#,"execution-readiness-blocked")] {
+        let root=fixture();body(run(root.path(),&["--request-id","claim-classification"]),0);
+        std::fs::write(root.path().join("scenario.json"),scenario).unwrap();
+        let path=root.path().join("state/workflow.db");let before=std::fs::read(&path).unwrap();
+        let result=body(work(root.path(),"owner/repo#7"),3);assert_eq!(result["reason"],reason);
+        assert_eq!(std::fs::read(&path).unwrap(),before);
+        assert!(!root.path().join(".self-improve-worktrees").exists());
+    }
 }
 
 #[test]

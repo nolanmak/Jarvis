@@ -1310,6 +1310,37 @@ impl WorkflowGuard {
         Ok(())
     }
 
+    /// A fresh issue must not keep spending once an authorized linked PR exists.
+    /// PR-bound recovery uses its original independent execution authority.
+    pub(super) async fn require_fresh_issue(&self,repo:&Path)->Result<()> {
+        self.validate_before_side_effect()?;
+        if self.pr()?.is_some() {return Ok(());}
+        let Some((_,number))=self.id().rsplit_once('#') else {return Ok(())};
+        let issue=number.parse::<u64>()?;
+        if let Err(error)=linked_claims::require_absence(repo,self.repository(),issue).await {
+            if let Some(hold)=error.downcast_ref::<linked_claims::Hold>() {
+                self.hold_linked_claim(*hold).await?;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn hold_linked_claim(&self,hold:linked_claims::Hold)->Result<()> {
+        self.healthy_lease()?;
+        self.audit_health().await?;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
+        let mut checkpoint=store.snapshot(self.id())?.context("fresh issue workflow missing")?.checkpoint;
+        anyhow::ensure!(checkpoint.binding==self.binding
+            && !matches!(checkpoint.stage,Stage::Merged|Stage::Retired),"fresh claim hold binding/stage changed");
+        if checkpoint.next.reason==hold.reason() && checkpoint.next.action==hold.action() {return Ok(());}
+        checkpoint.next=crate::autoship_workflow::NextAction {
+            reason:hold.reason().into(),action:hold.action().into(),eligible_at_ms:millis()+300_000,
+        };
+        store.checkpoint(&self.lease,&checkpoint,millis())?;
+        Ok(())
+    }
+
     pub(super) fn check_resource_policy(&self) -> Result<()> {
         self.validate_before_side_effect()?;
         augmentagent_channel_core::run_resources::check_requirement("workflow_action", Some(&self.audit))
@@ -3197,6 +3228,34 @@ mod tests {
         let id=guard.id().to_owned(); guard.finish().unwrap();
         let record=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
         assert!(record.wall_ms>0,"actual observed guard lifetime must be accounted");
+    }
+
+    #[tokio::test]
+    async fn linked_claim_hold_preserves_current_stage_evidence_progress_and_first_eligibility() {
+        for stage in [Stage::Scope,Stage::Build,Stage::Publish] {
+            for hold in [linked_claims::Hold::Claimed,linked_claims::Hold::Unknown] {
+                let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");
+                let mut guard=WorkflowGuard::acquire_at(&path,Start{repo_root:dir.path(),worktree:dir.path(),
+                    repository:"owner/repo",source_issue:Some(77),pr:None,branch:"fixture",contract:"C1",environment:"rust-a"},millis()).await.unwrap().unwrap();
+                guard.checkpoint(stage,"fixture_dispatch","fixture",0,&["original-evidence".into()]).await.unwrap();
+                let before=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                let first=millis();guard.hold_linked_claim(hold).await.unwrap();
+                let after=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                assert_eq!(after.checkpoint.stage,before.checkpoint.stage);
+                assert_eq!(after.checkpoint.binding,before.checkpoint.binding);
+                assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+                assert_eq!(after.progress_at_ms,before.progress_at_ms);
+                assert_eq!(after.model_calls,before.model_calls);
+                assert_eq!(after.checkpoint.next.reason,hold.reason());
+                assert_eq!(after.checkpoint.next.action,hold.action());
+                assert!(after.checkpoint.next.eligible_at_ms>=first+300_000);
+                guard.hold_linked_claim(hold).await.unwrap();
+                let repeated=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                assert_eq!(repeated.checkpoint,after.checkpoint);
+                assert_eq!(repeated.progress_at_ms,after.progress_at_ms);
+                guard.finish().unwrap();
+            }
+        }
     }
 
 }

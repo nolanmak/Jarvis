@@ -3,6 +3,33 @@
 //! provider or grants publication authority; dispatch must enforce its policy.
 use super::*;
 
+/// Shared fixed blocker vocabulary for observation errors and read-only status.
+/// These values describe deferral; they grant no ownership or execution authority.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(crate) enum LinkedPrBlocker { Claimed, Unknown }
+impl LinkedPrBlocker {
+    pub(crate) fn reason(self)->&'static str {
+        match self {Self::Claimed=>"linked_pr_claim_exists",Self::Unknown=>"linked_pr_inventory_unknown"}
+    }
+    pub(crate) fn action(self)->&'static str {
+        match self {Self::Claimed=>"reconcile_existing_pr",Self::Unknown=>"retry_github_inventory"}
+    }
+    pub(crate) fn command_reason(self)->&'static str {
+        match self {Self::Claimed=>"linked-pr-claim-exists",Self::Unknown=>"linked-pr-inventory-unknown"}
+    }
+    pub(crate) fn from_code(code:&str)->Option<Self> {
+        match code {
+            "linked-pr-claim-exists"|"linked_pr_claim_exists"|"target-pr-reconciliation-required"=>Some(Self::Claimed),
+            "linked-pr-inventory-unknown"|"linked_pr_inventory_unknown"=>Some(Self::Unknown),
+            _=>None,
+        }
+    }
+}
+impl std::fmt::Display for LinkedPrBlocker {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"{}: {}",self.reason(),self.action())}
+}
+impl std::error::Error for LinkedPrBlocker {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Milestone {
@@ -132,28 +159,59 @@ pub struct CommandAttempt {
     pub outcome: AttemptOutcome,
     pub reason: String,
     pub eligible_at_ms: i64,
+    #[serde(default)]
+    pub resource_refusal: Option<super::resource_refusal::Observation>,
+}
+
+impl CommandAttempt {
+    pub fn resource_observation(&self) -> Option<super::resource_refusal::AttemptObservation> {
+        if self.outcome != AttemptOutcome::Deferred || self.reason != "execution-readiness-blocked" { return None; }
+        Some(super::resource_refusal::AttemptObservation {
+            selected_at_ms: self.selected_at_ms, finished_at_ms: self.finished_at_ms?,
+            observation: self.resource_refusal.clone()?,
+        })
+    }
+}
+
+pub(super) fn read_command_attempt(conn: &Connection, workflow: &str) -> Result<Option<CommandAttempt>> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='command_attempt')",
+        [], |row| row.get(0))?;
+    if !exists { return Ok(None); }
+    let raw: Option<(i64,Option<i64>,String,String,i64)> = conn.query_row(
+        "SELECT selected_at,finished_at,outcome,reason,eligible_at FROM command_attempt WHERE workflow=?1",
+        [workflow], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional()?;
+    let receipt_table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='command_resource_refusal')",
+        [], |row| row.get(0))?;
+    raw.map(|(selected_at_ms,finished_at_ms,outcome,reason,eligible_at_ms)| {
+        let payload: Option<String> = if receipt_table { conn.query_row(
+            "SELECT payload FROM command_resource_refusal WHERE workflow=?1 AND selected_at=?2",
+            params![workflow,selected_at_ms], |row|row.get(0)).optional()? } else { None };
+        Ok(CommandAttempt { selected_at_ms,finished_at_ms,
+            outcome:serde_json::from_value(serde_json::Value::String(outcome))?,reason,eligible_at_ms,
+            resource_refusal:payload.map(|raw|super::resource_refusal::Observation::decode(&raw)).transpose()? })
+    }).transpose()
 }
 
 impl WorkflowStore {
     /// Read-only and compatible with pre-attempt stores. A selection receipt
     /// is historical evidence, never proof of a currently live worker.
     pub fn command_attempt(&self, workflow: &str) -> Result<Option<CommandAttempt>> {
-        let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='command_attempt')",
-            [], |row| row.get(0))?;
-        if !exists { return Ok(None); }
-        let raw: Option<(i64,Option<i64>,String,String,i64)> = self.conn.query_row(
-            "SELECT selected_at,finished_at,outcome,reason,eligible_at FROM command_attempt WHERE workflow=?1",
-            [workflow], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional()?;
-        raw.map(|(selected_at_ms,finished_at_ms,outcome,reason,eligible_at_ms)| Ok(CommandAttempt {
-            selected_at_ms,finished_at_ms,outcome:serde_json::from_value(serde_json::Value::String(outcome))?,reason,eligible_at_ms
-        })).transpose()
+        read_command_attempt(&self.conn, workflow)
     }
 
     /// A late result cannot overwrite a newer selected attempt. Keep bounded
     /// machine reasons only; provider output and credentials never belong here.
     pub fn finish_command_attempt(&self, workflow: &str, selected_at: i64, outcome: AttemptOutcome,
         reason: &str, now: i64) -> Result<bool> {
+        self.finish_command_attempt_observed(workflow, selected_at, outcome, reason, now, None)
+    }
+
+    pub fn finish_command_attempt_observed(&self, workflow: &str, selected_at: i64, outcome: AttemptOutcome,
+        reason: &str, now: i64, observation: Option<&super::resource_refusal::Observation>) -> Result<bool> {
+        ensure!(observation.is_none() || (outcome == AttemptOutcome::Deferred && reason == "execution-readiness-blocked"),
+            "resource observation requires readiness deferral");
         ensure!(outcome != AttemptOutcome::Selected, "attempt outcome is not terminal");
         ensure!(!reason.is_empty() && reason.len()<=128 && reason.bytes().all(|b|b.is_ascii_lowercase() || b==b'-'), "invalid attempt reason");
         let outcome=serde_json::to_value(outcome)?;
@@ -161,7 +219,14 @@ impl WorkflowStore {
         let changed=tx.execute("UPDATE command_attempt SET finished_at=?3,outcome=?4,reason=?5
             WHERE workflow=?1 AND selected_at=?2 AND finished_at IS NULL",
             params![workflow,selected_at,now,outcome.as_str().unwrap(),reason])? == 1;
-        if changed {super::progress::project(&tx,workflow,"command_attempt_finished",now)?;}
+        if changed {
+            tx.execute("DELETE FROM command_resource_refusal WHERE workflow=?1", [workflow])?;
+            if let Some(observation) = observation {
+                tx.execute("INSERT INTO command_resource_refusal(workflow,selected_at,payload) VALUES(?1,?2,?3)",
+                    params![workflow,selected_at,serde_json::to_string(observation)?])?;
+            }
+            super::progress::project(&tx,workflow,"command_attempt_finished",now)?;
+        }
         tx.commit()?;Ok(changed)
     }
 
@@ -228,6 +293,7 @@ impl WorkflowStore {
             &due_command_sql(&tx)?,
             params![repository,now], |row| row.get(0)).optional()?;
         if let Some(id) = &id {
+            tx.execute("DELETE FROM command_resource_refusal WHERE workflow=?1", [id])?;
             tx.execute("INSERT INTO command_schedule(workflow,attempted_at,eligible_at) VALUES(?1,?2,?3)
                 ON CONFLICT(workflow) DO UPDATE SET attempted_at=excluded.attempted_at,eligible_at=excluded.eligible_at",
                 params![id,now,now.saturating_add(300_000)])?;
