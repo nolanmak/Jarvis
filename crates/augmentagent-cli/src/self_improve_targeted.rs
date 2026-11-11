@@ -94,6 +94,10 @@ pub(crate) async fn validate_command(repo: &Path, request: &Request) -> Result<(
 /// execution preflight inside that worker, including provider/resource gates.
 pub(crate) async fn command_readiness(repo:&Path,request:&Request)->Result<()> {
     request.normalized()?;
+    control_readiness(repo).await
+}
+
+pub(crate) async fn control_readiness(repo:&Path)->Result<()> {
     crate::autoship_deployment::inspect(repo).await.preflight()
 }
 
