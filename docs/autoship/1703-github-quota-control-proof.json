@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1989,
+  "pull_request": 1990,
+  "observed_at_utc": "2026-11-11T04:07:13.586617+00:00",
+  "authenticated_identity": {
+    "viewer": "nolanmak",
+    "repository": "nolanmak/Jarvis",
+    "viewerPermission": "ADMIN",
+    "transport": "authenticated GraphQL"
+  },
+  "rest_core": {
+    "remaining": 0,
+    "reset_epoch": 1794370406,
+    "last_observed_failure_at_utc": "2026-11-11T04:01:31Z"
+  },
+  "cli_red": {
+    "returncode": 2,
+    "response": {
+      "accepted": false,
+      "complete": false,
+      "error": "target lookup failed: API rate limit exceeded\n",
+      "reason": "target-authorization-failed",
+      "schema_version": 1
+    },
+    "fixture": "isolated HOME and GH_BIN; repository ADMIN and GraphQL viewer valid; REST viewer refuses quota; no provider or network calls"
+  },
+  "regression_tests_first_head": "a020559d997d99d9331b761cbf6f222486ba53e7",
+  "tests_only_hosted_run": 42955761033,
+  "tests_only_hosted_result": "still pending at implementation publication; not claimed as completed hosted RED",
+  "implementation_head": "34613595418a7f250732b97d93b75934c506588c",
+  "behavior": "Read typed authenticated GraphQL viewer login after existing repository identity/write permission checks. Preserve actor validation and reject unavailable/null identity.",
+  "hosted_validation": "pending",
+  "limits": [
+    "No autonomous merge established by this repair.",
+    "REST availability remains necessary for operations that read REST-only target/CI evidence.",
+    "Account-wide API request consumption has not been attributed to a specific process."
+  ]
+}

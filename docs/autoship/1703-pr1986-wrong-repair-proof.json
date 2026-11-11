@@ -20,13 +20,17 @@
     "paused": true,
     "pause_revision": 1,
     "model_calls_preserved": 13,
-    "active_lease_at_observation": false
+    "active_lease_at_observation": false,
+    "closed_at_utc": "2026-11-11T04:03:05Z"
   },
   "corrective_repair": {
     "pr": 1988,
-    "head": "b76ed8ea6a1f54f694947520721a8c6b49905f49",
+    "head": "b30fee4483cf8aaf97e128f02951004fac7a9c11",
     "hosted_validation": "pending",
-    "behavior": "Assert measured consumer and persisted attribution, plus deterministic model/retrieval/tie cases; production unchanged."
+    "behavior": "Assert measured consumer and persisted attribution, plus deterministic model/retrieval/tie cases; production unchanged.",
+    "run": 42956050355,
+    "job": 130311383116,
+    "ready_for_review": true
   },
   "deployment": {
     "main_and_built_stamp": "bbff7cb97f14ba95305705e800056c4228c15ac8",
