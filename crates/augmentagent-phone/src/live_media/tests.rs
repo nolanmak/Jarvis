@@ -772,16 +772,15 @@ async fn completed_slow_result_survives_rejected_delegation_and_answers_followup
     backend.await.unwrap();
 }
 
-// Quiet delegation acknowledgments and bounded delay notices are control
-// traffic. They cannot count as the useful audio/result required by fixtures.
+// Spoken acknowledgments and bounded delay updates cannot count as the
+// useful findings required by these fixtures.
 async fn next_non_progress<S>(ws:&mut tokio_tungstenite::WebSocketStream<S>)->Option<Result<Message,tokio_tungstenite::tungstenite::Error>>
 where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin {
     loop {
         let frame=ws.next().await?;
         if let Ok(Message::Text(text))=&frame {
             if let Ok(v)=serde_json::from_str::<serde_json::Value>(text) {
-                if v["type"]=="session.thinking.append" {assert_eq!(v["content"],"");continue;}
-                if v["type"]=="session.commentary.append" && v["content"].as_str().is_some_and(|s|s.contains("I don't have its verified findings yet")) {
+                if v["type"]=="session.commentary.append" && v["content"].as_str().is_some_and(|s|s.starts_with("Got it.") || s.starts_with("I'm still working") || s.starts_with("I haven't started")) {
                     ws.send(Message::Text(json!({"type":"session.commentary.appended","client_event_id":v["event_id"]}).to_string().into())).await.unwrap();
                     continue;
                 }
@@ -789,4 +788,32 @@ where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin {
         }
         return Some(frame);
     }
+}
+
+#[tokio::test]
+async fn acknowledgment_capacity_does_not_close_the_conversation() {
+    use crate::{live_call::LiveAction, live_connection::LiveConnection, live_session::LiveInput};
+    let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/", peer.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (tcp, _) = peer.accept().await.unwrap();
+        let mut ws = accept_async(tcp).await.unwrap();
+        let _ = ws.next().await.unwrap().unwrap();
+        ws.send(Message::Text(json!({"type":"session.started","session":{"id":"capacity","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
+        ws.send(Message::Text(json!({"type":"session.delegation.created","event_id":"delegated","offset_ms":10,"delegation":{"id":"research","type":"delegation","target":"client"}}).to_string().into())).await.unwrap();
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if v["type"] == "session.input_audio.append" {
+                ws.send(Message::Text(json!({"type":"session.output_audio.delta","delta":v["audio"]}).to_string().into())).await.unwrap();
+                break;
+            }
+        }
+    });
+    let mut connection = LiveConnection::connect_test(&endpoint,"synthetic-key","Speak briefly.").await.unwrap();
+    assert!(matches!(connection.next().await.unwrap(),LiveInput::Delegation { .. }));
+    for _ in 0..128 { connection.prepare_commentary(Some("research"),"Synthetic context").unwrap(); }
+    super::send_action(&mut connection,LiveAction::Queued { task_id:"task".into(),delegation_id:"research".into() }).await.unwrap();
+    connection.send_audio(&[255;160]).await.unwrap();
+    assert!(matches!(connection.next().await.unwrap(),LiveInput::Audio(audio) if audio==vec![255;160]));
+    server.await.unwrap();
 }
