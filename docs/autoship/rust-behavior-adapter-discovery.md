@@ -361,3 +361,59 @@ That result, full guard/cache/crash/diagnostic coverage and normal independent
 amendment are not established by this manual paired replay. Original #1954
 source, pinned verifier, failed internal candidate, charges and pause remain
 preserved.
+
+## Managed-runtime overlap and corrected nested policy
+
+The first current-controller entry exposed a portability failure in the manual
+recipe. Managed `TMPDIR` is inside the registered target. Consequently, the
+observer's copied code and synthetic fixtures also sit below that target, and
+its old nested whole-target write grant admitted writes to those copies.
+[The measured overlap](1703-c1-managed-source-overlap-observation.json) records
+successful write-only opens under the exact two kernel policies. No bytes were
+written or truncated. The owned temporary unit was stopped before it returned
+a complete behavior observation; no unit processes remained. Its normal stop
+exit code is explicitly not a passing test or behavioral RED. This does not
+demonstrate writable access to the original exported PR source.
+
+The [corrected managed recipe](1703-c1-eighteen-case-managed-recipe.json) grants
+inner writes only to explicit auxiliary scratch and the existing target's
+debug profile. It refuses a symlinked/escaped profile and disables the root
+rustc-info cache for that nested Cargo invocation. It creates no new target
+and preserves offline/locked mode, the source checks and all kernel limits.
+The same two-layer capability probe now refuses copied-code/fixture writes;
+a small locked offline Cargo check succeeds using that exact registered
+target. Those small probes alone do not establish full C1 behavior. The paired
+current-controller observation described below supplies a separate result.
+The earlier manual recipe is retained only as historical construction data
+and must not be promoted into a production proposal without this correction.
+
+## Paired current-controller observation result
+
+The [completed comparison](1703-c1-firstparty-observation-comparison.json)
+invokes the current controller's actual `isolated_observation` for both frozen
+version-two inputs. The selected parent test and both observations complete
+successfully, with complete uninterrupted JSON. The candidate matches all 18
+external expected cases; the original differs with valid unsupported-protocol
+observations. Each actual Cargo observation passes the existing registry
+attestation calls before and after execution. The existing function does not
+persist those individual registry digest receipts, so none is invented here.
+
+Each separate protected resource log contains one required-resource marker,
+one admission and one non-exhausted completion with the same original kernel
+identity. Original boot/host identities match; both command scope paths are
+gone after completion. This is actual command-resource execution, not native
+model or review approval. The test calls the observation function directly;
+it does not exercise complete independent contract registration, pinned-export
+materialization and receipt construction. Those normal gates remain required.
+
+A fresh reader also identified the need to enforce layout rather than assume
+that every controller places runtime outside `target/debug`. The staged
+[version-three recipe](1703-c1-eighteen-case-managed-v3-recipe.json) resolves
+every protected/writable root strictly and refuses equality or ancestry in
+either direction before inner Cargo. [Nine actual-function controls](1703-c1-managed-layout-controls.json)
+cover both normal layouts, overlaps, symlink aliases, sibling-prefix names and
+missing paths. The focused fresh-reader recheck found that boundary resolved.
+The running version-two inputs were frozen throughout; their completed result
+cannot certify the new helper hash. V3's own production replay, the remaining
+full C1 matrix and normal independent amendment remain open. No original owner
+pause, enrolled verifier, source/history, charge or permission changed.

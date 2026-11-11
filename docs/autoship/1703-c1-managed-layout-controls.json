@@ -1,0 +1,64 @@
+{
+  "cases": [
+    {
+      "case": "normal-managed-layout",
+      "allowed": true,
+      "expected": true
+    },
+    {
+      "case": "outside-target-runtime",
+      "allowed": true,
+      "expected": true
+    },
+    {
+      "case": "runtime-below-debug",
+      "allowed": false,
+      "expected": false
+    },
+    {
+      "case": "write-root-inside-source",
+      "allowed": false,
+      "expected": false
+    },
+    {
+      "case": "exact-source-write-root",
+      "allowed": false,
+      "expected": false
+    },
+    {
+      "case": "writable-parent-of-fixture",
+      "allowed": false,
+      "expected": false
+    },
+    {
+      "case": "similar-prefix-is-disjoint",
+      "allowed": true,
+      "expected": true
+    },
+    {
+      "case": "symlink-alias-of-writable-root",
+      "allowed": false,
+      "expected": false
+    },
+    {
+      "case": "missing-root-is-unknown",
+      "allowed": false,
+      "expected": false
+    }
+  ],
+  "actual_function_from_pinned_helper": true,
+  "function_sha256": "e8522a6a5a14a7fbe4287cebd0baa1a11aa91c49d2865db81be5c0305fdd1d8d",
+  "helper_sha256": "f6119a47d1c4af5e7ac5be6557469a65bc133a95998c6a916e8bdc7b8e237c63",
+  "full_v3_replay": false,
+  "registered": false,
+  "schema_version": 1,
+  "observed_at_utc": "2026-11-11T10:20:13.655752+00:00",
+  "recipe": "1703-c1-eighteen-case-managed-v3-recipe.json",
+  "focused_fresh_reader_recheck": "Finding resolved: strict canonical path comparisons cover equality and ancestry both directions before inner Cargo; hashes match.",
+  "full_handoff_approved": false,
+  "native_acceptance_approved": false,
+  "limits": [
+    "Pure path controls execute the exact extracted helper function; they are not a complete production-entry or kernel replay of v3.",
+    "V2 production replay uses frozen inputs and a measured disjoint layout; its result cannot certify arbitrary runtime layouts."
+  ]
+}

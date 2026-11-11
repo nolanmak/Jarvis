@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "observed_at_utc": "2026-11-11T10:12:51.930615+00:00",
+  "status": "V1 overlap measured; V2 corrected paired production observation completed on disjoint layout; V3 generic layout precheck staged",
+  "controller_head": "eec975e9e6329e1b329c5199f7a5a77cec760385",
+  "manual_recipe": "1703-c1-eighteen-case-worked-recipe.json",
+  "mechanism": "Production observation runtime inherits managed TMPDIR inside the target. The old nested policy granted write access to that entire target, covering copied code and synthetic source below it.",
+  "old_actual_two_layer_capability": {
+    "copied_code_write_open_allowed": true,
+    "fixture_source_write_open_allowed": true
+  },
+  "capability_method": "Exact current outer plus exact inner kernel policies; O_WRONLY open then close only, no data write/truncate; no observer approval.",
+  "source_bytes_written_or_truncated": false,
+  "old_production_entry": {
+    "completed": false,
+    "selected_test_completed": false,
+    "owned_unit_stopped_for_confirmed_fixture_error": true,
+    "remaining_owned_unit_processes_after_stop": [],
+    "unit_command_exit": 0,
+    "unit_command_exit_does_not_establish_test_pass": true,
+    "log_sha256": "b52c6a69d210a0b358d4b2be31ba1c6be3ae206ee33374f831ff651a51880d1e"
+  },
+  "narrow_actual_two_layer_capability": {
+    "actual": {
+      "copied_code_write_open_allowed": false,
+      "fixture_source_write_open_allowed": false,
+      "debug_lock_write_open_allowed": true
+    },
+    "exit": 0,
+    "write_scope": "only original managed debug profile plus explicit auxiliary scratch",
+    "same_outer_actual_policy": true,
+    "source_or_fixture_bytes_written": false,
+    "cargo_build_success_not_yet_tested": true
+  },
+  "small_registered_target_cargo_probe": {
+    "process_exit": 0,
+    "cargo_exit": 0,
+    "locked": true,
+    "offline": true,
+    "same_registered_target": true,
+    "source_write_open_allowed": [
+      false,
+      false
+    ],
+    "write_roots": [
+      "explicit auxiliary scratch",
+      "original managed target debug profile"
+    ],
+    "rustc_info_cache_disabled": true,
+    "log_sha256": "b33043f1fc13772e34f72d007ed400e78d4a5cfa9198c8057f0a46b52bcf2b14"
+  },
+  "corrected_recipe": "1703-c1-eighteen-case-managed-recipe.json",
+  "corrected_helper_sha256": "1e34b90d617f7c01eb8d9c1bc2d8e1eaac36d316de3474b803ce0aefc819fa4b",
+  "full_corrected_replay_complete": true,
+  "registered": false,
+  "autonomous_merge_credit": 0,
+  "limits": [
+    "The stopped call supplied no complete behavior observation or registered acceptance receipt.",
+    "The overlap concerns this proposed copied-source recipe, not a demonstrated write grant to the original exported PR source.",
+    "Kernel capability and small Cargo success are narrower than complete C1 behavior and production registry/resource/result validation.",
+    "Original PR1954 source/request/verifier/history/charges/pause remain untouched."
+  ],
+  "corrected_replay": "1703-c1-firstparty-observation-comparison.json",
+  "general_layout_precheck": {
+    "recipe": "1703-c1-eighteen-case-managed-v3-recipe.json",
+    "control_proof": "1703-c1-managed-layout-controls.json",
+    "production_replayed": false
+  }
+}
