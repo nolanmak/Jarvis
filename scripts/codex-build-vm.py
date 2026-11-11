@@ -73,10 +73,16 @@ class Runtime:
         return instance
 
 
-def initrd(entries, max_bytes=None):
-    """Build newc directly: no root-owned device nodes needed on the host."""
-    if max_bytes is not None and (type(max_bytes) is not int or max_bytes <= 0):
-        raise Unavailable('invalid VM initrd byte budget')
+def initrd(entries, max_bytes=None, max_image_bytes=None):
+    """Build newc directly: no root-owned device nodes needed on the host.
+
+    The optional ceilings bound the uncompressed archive and the compressed
+    image at their actual encoded sizes, so a caller that boots untrusted-sized
+    inputs never relies on its own pre-read accounting.
+    """
+    for budget in (max_bytes, max_image_bytes):
+        if budget is not None and (type(budget) is not int or budget <= 0):
+            raise Unavailable('invalid VM initrd byte budget')
     archive = bytearray()
     for inode, (name, mode, data, major, minor) in enumerate([*entries, ('TRAILER!!!', 0, b'', 0, 0)], 1):
         encoded = name.encode() + b'\0'
@@ -90,7 +96,10 @@ def initrd(entries, max_bytes=None):
         archive.extend(b'\0' * (-len(archive) % 4))
         archive.extend(data)
         archive.extend(b'\0' * (-len(archive) % 4))
-    return gzip.compress(bytes(archive), mtime=0)
+    image = gzip.compress(bytes(archive), mtime=0)
+    if max_image_bytes is not None and len(image) > max_image_bytes:
+        raise Unavailable('VM compressed initrd exceeds byte budget')
+    return image
 
 
 GUEST_RUNNER = dependency_proxy.GUEST_PROXY + r'''

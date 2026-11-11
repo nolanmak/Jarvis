@@ -108,9 +108,9 @@ class BootEntries(list):
 
 
 def write_boot_image(path, entries, encoder):
-    # The shared codec checks actual encoded bytes, independently of pre-reading
-    # accounting. No output path is opened until both bounds pass.
-    image = encoder(entries, max_bytes=MAX_BOOT_ARCHIVE_BYTES)
+    # The shared codec checks actual encoded and compressed bytes, independently
+    # of pre-reading accounting. No output path is opened until both bounds pass.
+    image = encoder(entries, max_bytes=MAX_BOOT_ARCHIVE_BYTES, max_image_bytes=MAX_BOOT_IMAGE_BYTES)
     if not isinstance(image, bytes) or len(image) > MAX_BOOT_IMAGE_BYTES:
         raise ValueError('native compressed initrd exceeds byte budget')
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -119,7 +119,6 @@ def write_boot_image(path, entries, encoder):
         stream.write(image)
         stream.flush()
         os.fsync(stream.fileno())
-
 
 
 class BoundedWriter:
@@ -574,9 +573,7 @@ def boot_entries(config, job, seed, guest_source, gateway_source, cert_entries):
                 seen.add(str(parent))
         entries.append((str(path), stat.S_IFREG | 0o600, data, 0, 0))
     entries.extend(cert_entries)
-    entries.extend([
-        ('root/job.json', stat.S_IFREG | 0o400, json.dumps(job).encode(), 0, 0),
-    ])
+    entries.append(('root/job.json', stat.S_IFREG | 0o400, json.dumps(job).encode(), 0, 0))
     entries.append_input('root/guest.py', stat.S_IFREG | 0o400, guest_source)
     entries.append_input('root/native_provider_gateway.py', stat.S_IFREG | 0o400, gateway_source)
     boot = '#!/bootstrap/sh\nexport PATH=/bootstrap:/usr/bin:/bin\nmount -t devtmpfs devtmpfs /dev\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\n' + '\n'.join(commands) + '''
