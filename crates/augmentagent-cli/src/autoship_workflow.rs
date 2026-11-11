@@ -2174,6 +2174,18 @@ mod tests {
     }
 
     #[test]
+    fn review_fragment_writer_accepts_exact_limit_and_refuses_extra_byte_without_publication() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+        let (mut store,lease)=setup(&path);let key="b".repeat(64);let other="c".repeat(64);
+        let payload="a".repeat(8*1024*1024);
+        store.record_review_fragment(&lease,&binding(),&key,&payload,25).unwrap();
+        assert_eq!(store.review_fragment(&lease,&binding(),&key,26).unwrap().as_deref(),Some(payload.as_str()));
+        assert!(store.record_review_fragment(&lease,&binding(),&other,&(payload+"a"),27).is_err());
+        assert!(store.review_fragment(&lease,&binding(),&other,28).unwrap().is_none());
+        assert!(store.current_reviews(&lease.workflow).unwrap().is_empty());
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,0);
+    }
+    #[test]
     fn completed_review_fragments_survive_restart_but_never_become_approvals() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
         let (mut store,old)=setup(&path);let key="a".repeat(64);

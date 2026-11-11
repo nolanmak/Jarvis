@@ -2137,7 +2137,8 @@ mod repair_gate_tests {
         for spent in [0, 3] {
             let fixture = tempfile::tempdir().unwrap();
             let root = fixture.path();
-            let control = tempfile::tempdir().unwrap();
+            // Managed TMPDIR is writable build storage, never audit authority.
+            let control = tempfile::tempdir_in("/tmp").unwrap();
             trusted_git(root, &["init", "-q"]).await.unwrap();
             std::fs::create_dir(root.join("autoship_verifiers")).unwrap();
             let adapter = "autoship_verifiers/observe.py";
