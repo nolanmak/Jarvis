@@ -124,7 +124,7 @@ def service_pid(role):
 def workflow_store_configuration(receipts,pid_for=service_pid):
     """Observe the live worker's post-bootstrap receipt, never initial environ.
 
-    Return only store-resolution inputs; this grants no workflow authority.
+    Return store-resolution inputs and the selected policy path, never authority.
     Missing/stale worker evidence refuses instead of selecting another store.
     """
     try:
@@ -134,17 +134,25 @@ def workflow_store_configuration(receipts,pid_for=service_pid):
         if proc.stat().st_uid!=os.getuid():raise Refused('process-owner-mismatch')
         identity=birth(pid);cwd=(proc/'cwd').resolve(strict=True)
         raw=private(receipts/'worker.json');value=json.loads(raw)
-        if (value.get('version')!=1 or value.get('role')!='worker' or value.get('pid')!=pid
+        if (type(value.get('version')) is not int or value['version']!=1 or value.get('role')!='worker' or value.get('pid')!=pid
                 or value.get('birth')!=identity or value.get('boot_id')!=boot()
                 or value.get('dry_run') is not False):raise Refused('worker-receipt-unverified')
         config=value.get('config')
         if not isinstance(config,dict) or not set(config)<=KEYS or any(not isinstance(v,str) for v in config.values()):
             raise Refused('worker-receipt-invalid')
+        # Version-1 collectors did not all capture HOME. Without an explicit
+        # database/absolute state path, absence is ambiguous rather than proof
+        # that the running worker chose the observer's fallback directory.
+        if (value['version']==1 and 'HOME' not in config
+                and not config.get('AUGMENTAGENT_AUTOPR_WORKFLOW_DB')
+                and not Path(config.get('XDG_STATE_HOME','')).is_absolute()):
+            raise Refused('worker-store-resolution-unverified')
         if (pid_for('worker')!=pid or birth(pid)!=identity or (proc/'cwd').resolve(strict=True)!=cwd
                 or private(receipts/'worker.json')!=raw):raise Refused('process-changed')
         return {'cwd':str(cwd),'workflow_db':config.get('AUGMENTAGENT_AUTOPR_WORKFLOW_DB'),
                 'state_home':config.get('XDG_STATE_HOME'),'home':config.get('HOME'),
-                'daily_cap':config.get('AUGMENTAGENT_AUTOPR_DAILY_CAP')}
+                'daily_cap':config.get('AUGMENTAGENT_AUTOPR_DAILY_CAP'),
+                'native_policy':config.get('AUGMENTAGENT_NATIVE_VM_POLICY')}
     except (OSError,ValueError,subprocess.SubprocessError):
         raise Refused('worker-configuration-unavailable') from None
 

@@ -23,11 +23,19 @@ class DeploymentTests(unittest.TestCase):
             self.addCleanup(lambda:child.poll() is None and (child.terminate(),child.wait()))
             value={'version':1,'role':'worker','pid':child.pid,'birth':birth(child.pid),'boot_id':m.boot(),
                 'dry_run':False,'config':{'HOME':str(root/'worker-home'),'XDG_STATE_HOME':str(root/'worker-state'),
-                    'AUGMENTAGENT_AUTOPR':'1','AUGMENTAGENT_AUTOPR_WORKFLOW_DB':'worker.db','AUGMENTAGENT_AUTOPR_DAILY_CAP':'7'}}
+                    'AUGMENTAGENT_AUTOPR':'1','AUGMENTAGENT_AUTOPR_WORKFLOW_DB':'worker.db','AUGMENTAGENT_AUTOPR_DAILY_CAP':'7','AUGMENTAGENT_NATIVE_VM_POLICY':'native/policy.json'}}
             path=receipts/'worker.json';write(path,value);before=path.read_bytes()
-            expected={'cwd':str(root),'workflow_db':'worker.db','state_home':str(root/'worker-state'),'home':str(root/'worker-home'),'daily_cap':'7'}
+            expected={'cwd':str(root),'workflow_db':'worker.db','state_home':str(root/'worker-state'),'home':str(root/'worker-home'),'daily_cap':'7','native_policy':'native/policy.json'}
             self.assertEqual(m.workflow_store_configuration(receipts,lambda role:child.pid),expected)
             self.assertEqual(path.read_bytes(),before)
+            for version in (0,2,3,True,'2'):
+                current=json.loads(before);current['version']=version;write(path,current)
+                with self.subTest(version=version),self.assertRaises(m.Refused):m.workflow_store_configuration(receipts,lambda role:child.pid)
+            current=json.loads(before)
+            for key in ('HOME','XDG_STATE_HOME','AUGMENTAGENT_AUTOPR_WORKFLOW_DB'):current['config'].pop(key,None)
+            write(path,current)
+            with self.assertRaises(m.Refused):m.workflow_store_configuration(receipts,lambda role:child.pid)
+            write(path,value)
             for fault in ('birth','public','secret','changed-process'):
                 current=json.loads(before)
                 if fault=='birth':current['birth']='stale'
