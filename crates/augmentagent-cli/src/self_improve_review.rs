@@ -42,10 +42,10 @@ fn is_evidence_budget(error: &anyhow::Error) -> bool {
 fn unavailable_from_error(provider: augmentagent_channel_core::ProviderKind, error: anyhow::Error) -> IndependentReview {
     let advanced = error.downcast_ref::<MainAdvanced>()
         .or_else(|| error.chain().find_map(|cause| cause.downcast_ref::<MainAdvanced>()));
-    IndependentReview::unavailable(if let Some(advanced) = advanced {
-        ReviewUnavailable::MainAdvanced { candidate: advanced.candidate.clone(), main: advanced.main.clone(), detail: format!("{error:#}") }
-    } else if is_evidence_budget(&error) {
+    IndependentReview::unavailable(if is_evidence_budget(&error) {
         ReviewUnavailable::EvidenceBudget { detail: format!("{error:#}") }
+    } else if let Some(advanced) = advanced {
+        ReviewUnavailable::MainAdvanced { candidate: advanced.candidate.clone(), main: advanced.main.clone(), detail: format!("{error:#}") }
     } else {
         ReviewUnavailable::RecoveryRequired { detail: format!("aligned review by {} needs recovery: {error:#}", provider.name()) }
     })
