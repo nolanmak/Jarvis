@@ -2634,7 +2634,12 @@ fn spec_from_scope(scope: Option<&ScopeOutcome>) -> Option<String> {
         .filter(|b| !b.is_empty())
 }
 
-fn continue_after_scope_refusal(scope:&mut ScopeOutcome,_owner_request:&str) {
+fn continue_after_scope_refusal(scope:&mut ScopeOutcome,owner_request:&str) {
+    // Readiness may overrule a binary scoping refusal, but that changes only
+    // permission to continue. Its diagnostic body and planning criteria must
+    // not become either the builder specification or acceptance requirements.
+    scope.body=owner_request.to_owned();
+    scope.criteria.clear();
     scope.fixable=true;
 }
 
@@ -4429,7 +4434,7 @@ pub(crate) fn build_scope_prompt(issue: &Issue, prior: Option<&str>) -> String {
         issue.title,
         issue.body,
         prior_attempts_section(prior)
-    ) + "\n" + acceptance::CONTRACT_PROMPT
+    )
 }
 
 fn prior_attempts_section(prior: Option<&str>) -> String {
