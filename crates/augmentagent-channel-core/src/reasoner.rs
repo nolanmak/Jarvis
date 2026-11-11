@@ -1246,6 +1246,7 @@ impl ClaudeCliReasoner {
             Some(crate::codex_tools::ClaudeBridgeLaunch::prepare(opts)?)
         } else { None };
         if let Some(bridge) = &claude_bridge {
+            bridge.bridge.preflight_builds("claude",launch_audit.as_ref()).await?;
             args.extend(bridge.args());
         } else {
             args.push("--allowedTools".into());
@@ -1484,15 +1485,28 @@ impl ClaudeCliReasoner {
                 observed_usage = Some(u);
             }
             tools_ran = tools_ran || line_has_tool_use(&line);
+            let mut tool_readiness=None;
             if audit_active {
-                audit_stream_line(
+                tool_readiness=audit_stream_line_with_readiness(
                     &line,
                     &mut pending_tool_uses,
                     &audit_session,
                     routed_model.as_ref().or(opts.model.as_ref()).map(String::as_str),
                     audit_logger.as_ref(),
                     opts.audit_notifier.as_ref(),
+                    audit_logger.as_ref().is_some_and(|logger|logger.is_protected()),
                 );
+            }
+            if let Some(refused)=tool_readiness {
+                // The supervisor owns detached descendants and publishes the
+                // same checked cleanup receipt used by watchdog/caller aborts.
+                // Do not turn a capacity refusal into another provider retry.
+                drop(process_group);
+                let _=tokio::time::timeout(std::time::Duration::from_secs(4),child.wait()).await;
+                pending_tool_uses.clear();
+                if let Some(logger)=&audit_logger {logger.drain_checked().await?;}
+                refused.fail("claude",audit_logger.as_ref())?;
+                return Err(CallError::Other(anyhow::anyhow!("native tool readiness refused")));
             }
             match serde_json::from_str::<StreamEvent>(&line) {
                 Ok(StreamEvent::Assistant { message }) => {
@@ -1637,6 +1651,7 @@ impl ClaudeCliReasoner {
 /// neither a slow disk nor a flaky Discord HTTP call ever blocks the
 /// reasoner's reply path — the swap-in semantics here have to match the
 /// inline loop, including the high-risk gate around the notifier.
+#[cfg(test)]
 pub(crate) fn audit_stream_line(
     line: &str,
     pending: &mut HashMap<String, (String, serde_json::Value, Option<crate::tool_audit::AuditWriteGuard>)>,
@@ -1645,6 +1660,19 @@ pub(crate) fn audit_stream_line(
     logger: Option<&Arc<AuditLogger>>,
     notifier: Option<&Arc<dyn AuditNotifier>>,
 ) {
+    let _=audit_stream_line_with_readiness(line,pending,session_id,model,logger,notifier,false);
+}
+
+fn audit_stream_line_with_readiness(
+    line: &str,
+    pending: &mut HashMap<String, (String, serde_json::Value, Option<crate::tool_audit::AuditWriteGuard>)>,
+    session_id: &str,
+    model: Option<&str>,
+    logger: Option<&Arc<AuditLogger>>,
+    notifier: Option<&Arc<dyn AuditNotifier>>,
+    stop_on_readiness:bool,
+) -> Option<crate::native_tool_readiness::Refusal> {
+    let mut refused=None;
     for ev in parse_stream_event(line) {
         crate::phone_timing::claude_event(&ev);
         match ev {
@@ -1665,6 +1693,9 @@ pub(crate) fn audit_stream_line(
                     debug!("tool-audit: unmatched tool_result id={id}");
                     continue;
                 };
+                if stop_on_readiness && refused.is_none() {
+                    refused=crate::native_tool_readiness::Refusal::tool(&name,is_error,&content);
+                }
                 let mut record = build_audit_record(
                     crate::providers::ProviderKind::Claude,
                     chrono::Utc::now().to_rfc3339(),
@@ -1701,6 +1732,7 @@ pub(crate) fn audit_stream_line(
             }
         }
     }
+    refused
 }
 
 /// #1404 — the `claude` CLI reports a refused or failed API request as a
@@ -5253,6 +5285,76 @@ mod failover_error_tests {
     // ---- #898: process-global cap on concurrent CLI subprocesses ----
 
     const RESULT_OK: &str = r#"echo '{"type":"result","result":"ok"}'"#;
+
+    #[tokio::test]
+    async fn protected_claude_yields_on_first_build_readiness_refusal_preserving_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let edited = dir.path().join("candidate.txt");
+        let repeated = dir.path().join("repeated");
+        let use_event = serde_json::json!({"type":"assistant","message":{"content":[{
+            "type":"tool_use","id":"blocked-build","name":"mcp__jarvis__Bash","input":{"command":"cargo test"}}]}});
+        let result_event = serde_json::json!({"type":"user","message":{"content":[{
+            "type":"tool_result","tool_use_id":"blocked-build","is_error":true,
+            "content":"JARVIS_READINESS:build_scratch_space PRIVATE_DIAGNOSTIC_MUST_NOT_ESCAPE"}]}});
+        let body=format!("cat >/dev/null\nprintf edited > \"$SYNTHETIC_CANDIDATE\"\nprintf '%s\\n' '{}' '{}'\nsleep 2\nprintf repeated > \"$SYNTHETIC_REPEATED\"\n{RESULT_OK}\n",use_event,result_event);
+        let bin = stub_cli(&dir, "fake-claude-tool-capacity", &body);
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let logger = Arc::new(
+            AuditLogger::protected(
+                dir.path().join("logs/audit.jsonl"),
+                dir.path().join("anchors/anchor.json"),
+                &[],
+            )
+            .unwrap(),
+        );
+        let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = admitted.clone();
+        logger
+            .set_model_call_observer(Arc::new(move |_| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }))
+            .unwrap();
+        let mut opts = dummy_opts();
+        opts.audit_logger = Some(logger.clone());
+        opts.env = vec![
+            (
+                "SYNTHETIC_CANDIDATE".into(),
+                edited.to_string_lossy().into(),
+            ),
+            (
+                "SYNTHETIC_REPEATED".into(),
+                repeated.to_string_lossy().into(),
+            ),
+        ];
+        let reasoner = ClaudeCliReasoner {
+            bin,
+            gate: Arc::new(CliGate::new(1)),
+        };
+        let error = reasoner
+            .call(&opts, "synthetic implementation")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<ReasonerError>(),
+                Some(ReasonerError::ResourceCapacity { .. })
+            ),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read_to_string(edited).unwrap(), "edited");
+        assert!(
+            !repeated.exists(),
+            "provider continued retrying after the trusted capacity refusal"
+        );
+        assert_eq!(
+            admitted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "spent admission remains charged; no retry"
+        );
+        assert!(!format!("{error:#}").contains("PRIVATE_DIAGNOSTIC"));
+        logger.drain_checked().await.unwrap();
+    }
 
     #[tokio::test]
     async fn claude_voice_mcp_grant_is_in_private_config_file_not_process_args() {

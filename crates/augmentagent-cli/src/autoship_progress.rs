@@ -21,6 +21,8 @@ pub struct Progress {
     pub observed_at_ms:i64,
     #[serde(default)]
     pub resource_refusal:Option<super::resource_refusal::AttemptObservation>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub tool_capacity_refusal:Option<super::tool_capacity::ToolCapacityRefusal>,
 }
 #[derive(Debug,Clone,Serialize,Deserialize)]
 pub struct DeliveryStatus {
@@ -64,7 +66,8 @@ impl WorkflowStore {
         let progress:Progress=serde_json::from_str(&raw)?;
         let nonce=format!("{:x}",Sha256::digest(serde_json::to_vec(&(workflow,origin.bot,origin.owner,origin.channel,sequence))?))[..24].to_string();
         let resource = progress.resource_refusal.as_ref().map(|value| format!(" {}.", value.render())).unwrap_or_default();
-        let content=format!("Autoship {workflow} · update {sequence}: {}. Stage: {:?}. Reason: {}. Next: {} (eligible at: {:?}). PR: {:?}. Requested provider: {:?}; actual provider: {} ({}). Merge: {}. Deployment: {}. Evidence digest: {}.{resource} [autoship:{nonce}]",
+        let tool_capacity=progress.tool_capacity_refusal.as_ref().map(|value|format!(" {}.",value.render())).unwrap_or_default();
+        let content=format!("Autoship {workflow} · update {sequence}: {}. Stage: {:?}. Reason: {}. Next: {} (eligible at: {:?}). PR: {:?}. Requested provider: {:?}; actual provider: {} ({}). Merge: {}. Deployment: {}. Evidence digest: {}.{resource}{tool_capacity} [autoship:{nonce}]",
             progress.kind,progress.stage,progress.reason,progress.next_action,progress.eligible_at_ms,progress.pr,progress.requested_provider,progress.actual_provider.as_deref().unwrap_or("unknown"),progress.actual_provider_role.as_deref().unwrap_or("unknown"),progress.merge_state,progress.deployment_state,progress.evidence_digest);
         ensure!(content.chars().count()<=1900,"progress message exceeds Discord bound");
         tx.execute("INSERT INTO workflow_progress_delivery(workflow,bot,owner,channel,sequence,nonce,content,state,dispatched_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'uncertain',?8)",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence,nonce,content,now])?;
@@ -205,7 +208,12 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
         super::submission::read_command_attempt(tx, workflow)?.and_then(|attempt| attempt.resource_observation())
     } else { None };
     let resource_identity = resource_refusal.as_ref().map(|value| value.observation.identity());
-    let fingerprint_input = if resource_identity.is_some() {
+    let tool_capacity_refusal=if !terminal && control!=Some(true) && reason=="resource_capacity" {
+        match checkpoint.as_ref() {Some(cp)=>super::capacity_retry::current_tool_refusal(tx,workflow,cp,now)?,None=>None}
+    }else{None};
+    let fingerprint_input = if tool_capacity_refusal.is_some() {
+        serde_json::to_vec(&(&kind,stage,&reason,&action,&evidence_digest,&actual_provider,&actual_provider_role,&resource_identity,&tool_capacity_refusal))?
+    }else if resource_identity.is_some() {
         serde_json::to_vec(&(&kind,stage,&reason,&action,&evidence_digest,&actual_provider,&actual_provider_role,&resource_identity))?
     } else {
         // Preserve the deployed fingerprint for all pre-existing projections.
@@ -216,7 +224,7 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     let sequence=previous.as_ref().map_or(1,|p|p.0+i64::from(changed));
     let progress=Progress {workflow:workflow.into(),sequence,kind,stage,reason,next_action:action,eligible_at_ms:eligible,
         pr:snapshot.and_then(|s|s.1),requested_provider,actual_provider,actual_provider_role,
-        merge_state:if confirmed {"observed-autonomous-merge"} else if external_merge {"observed-external-merge"} else {"not-confirmed"}.into(),deployment_state:"unknown".into(),evidence_digest,observed_at_ms:now,resource_refusal};
+        merge_state:if confirmed {"observed-autonomous-merge"} else if external_merge {"observed-external-merge"} else {"not-confirmed"}.into(),deployment_state:"unknown".into(),evidence_digest,observed_at_ms:now,resource_refusal,tool_capacity_refusal};
     let payload=serde_json::to_string(&progress)?;
     if changed {tx.execute("INSERT INTO workflow_progress_event(workflow,sequence,payload,created_at) VALUES(?1,?2,?3,?4)",params![workflow,sequence,payload,now])?;}
     tx.execute("INSERT INTO workflow_progress_state VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workflow) DO UPDATE SET sequence=excluded.sequence,fingerprint=excluded.fingerprint,terminal=excluded.terminal,payload=excluded.payload",params![workflow,sequence,fingerprint,terminal,payload])?;
@@ -252,7 +260,10 @@ mod tests {
             let (mut store,lease,origin)=queued_capacity(&path);
             let before=store.snapshot(&lease.workflow).unwrap().unwrap();let allowance=store.merge_allowance(19,5).unwrap();
             let fingerprint="b".repeat(64);
-            let due=store.defer_run_capacity(&lease,Some(&fingerprint),20).unwrap();
+            let observation=serde_json::json!({"phase":"native_tool_build_storage_reserve","exhausted":true,
+                "tool_readiness":{"category":"build_storage_reserve","execution_started":false},"available_bytes":25,"required_bytes":37,"private":"MUST_NOT_ESCAPE"});
+            let refusal=super::tool_capacity::ToolCapacityRefusal::capture(&observation).unwrap();
+            let due=store.defer_run_capacity_observation(&lease,Some(&fingerprint),Some(&refusal),20).unwrap();
             let projected=store.progress_events(&lease.workflow).unwrap();
             assert!(store.finish_command_attempt(&lease.workflow,10,outcome,reason,21).unwrap());
             let events=store.progress_events(&lease.workflow).unwrap();let last=events.last().unwrap();
@@ -271,6 +282,8 @@ mod tests {
             let (_,content)=store.claim_progress(&origin,&lease.workflow,sequence,22).unwrap().unwrap();
             assert!(content.contains("resource_capacity") && content.contains("await_capacity"));
             assert!(!content.contains(&fingerprint),"private native fingerprint escaped into a message");
+            assert!(content.contains("build_storage_reserve") && content.contains("available 25 bytes, required 37 bytes"));
+            assert!(!content.contains("MUST_NOT_ESCAPE"));
         }
     }
 

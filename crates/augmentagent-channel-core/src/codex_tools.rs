@@ -268,6 +268,71 @@ fn choose_policy_base_dir(runtime_dir: Option<std::ffi::OsString>) -> PathBuf {
 }
 
 impl BridgeLaunch {
+    /// Observe the same private bridge policy before a required model can run.
+    /// The helper neither creates a VM cache nor starts a command/MCP server.
+    pub(crate) async fn preflight_builds(
+        &self,
+        provider: &str,
+        logger: Option<&std::sync::Arc<crate::tool_audit::AuditLogger>>,
+    ) -> anyhow::Result<()> {
+        if !logger.is_some_and(|logger| logger.run_resources_required()) {
+            return Ok(());
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Report {
+            ready: bool,
+            builds_required: Option<bool>,
+            category: Option<String>,
+            available_bytes: Option<u64>,
+            required_bytes: Option<u64>,
+        }
+        let script = self
+            .native_cwd
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("bridge directory unavailable"))?
+            .join("tool-bridge.py");
+        let mut command = tokio::process::Command::new("/usr/bin/python3");
+        command
+            .args([
+                std::ffi::OsStr::new("-I"),
+                script.as_os_str(),
+                std::ffi::OsStr::new("--inspect-build-readiness"),
+                self.policy_path.as_os_str(),
+            ])
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(3), command.output())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .filter(|output| output.status.success() && output.stdout.len() <= 4096);
+        let report = output
+            .as_ref()
+            .and_then(|output| serde_json::from_slice::<Report>(&output.stdout).ok());
+        if let Some(report) = report {
+            if report.ready {
+                let _ = report.builds_required;
+                return Ok(());
+            }
+            if let Some(refusal) = report.category.as_deref().and_then(|category| {
+                crate::native_tool_readiness::Refusal::category(
+                    category,
+                    report.available_bytes,
+                    report.required_bytes,
+                )
+            }) {
+                return refusal.fail(provider, logger);
+            }
+        }
+        Err(crate::reasoner::ReasonerError::Local {
+            message: format!("{provider}: native build readiness evidence unavailable"),
+        }
+        .into())
+    }
+
     pub fn prepare(opts: &ReasonerOpts, directory: &Path) -> anyhow::Result<Self> {
         Self::prepare_with_write_mode(opts, directory, false)
     }
@@ -1236,5 +1301,79 @@ mod tests {
         for opts in [crate::reasoner::triage_opts(Some(temp.path().into())), crate::reasoner::resume_opts(temp.path().into())] {
             assert!(read_allowances(&opts).is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod required_build_preflight_tests {
+    use super::*;
+    #[tokio::test]
+    async fn required_build_preflight_refuses_before_model_admission_and_allocates_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        for name in ["work", "launch", "scratch", "logs"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+        }
+        std::fs::set_permissions(
+            root.path().join("scratch"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let mut opts = ReasonerOpts::pinned(crate::providers::ModelTier::Fast, "");
+        opts.cwd = Some(root.path().join("work"));
+        opts.allowed_tools = vec!["Bash(cargo *)".into()];
+        let bridge = BridgeLaunch::prepare(&opts, &root.path().join("launch")).unwrap();
+        let mut policy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&bridge.policy_path).unwrap()).unwrap();
+        let config = root.path().join("runtime.json");
+        std::fs::write(&config, "{}").unwrap();
+        policy["build_vm_config"] = serde_json::json!(config);
+        policy["build_runner"] = "vm".into();
+        policy["build_scratch_dir"] = serde_json::json!(root.path().join("scratch"));
+        policy["build_scratch_limits"] = serde_json::json!({"headroom_bytes":1024u64.pow(3)*1_048_576,
+            "cache_bytes":1024u64.pow(3)*12,"budget_bytes":1024u64.pow(3)*64});
+        std::fs::write(&bridge.policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+        let logger = std::sync::Arc::new(
+            crate::tool_audit::AuditLogger::protected(
+                root.path().join("logs/audit.jsonl"),
+                root.path().join("anchors/anchor.json"),
+                &[],
+            )
+            .unwrap(),
+        );
+        logger.require_run_resources().unwrap();
+        let error = bridge
+            .preflight_builds("codex", Some(&logger))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<crate::reasoner::ReasonerError>(),
+                Some(crate::reasoner::ReasonerError::ResourceCapacity { .. })
+            ),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path().join("scratch"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let log = std::fs::read_to_string(root.path().join("logs/audit.jsonl")).unwrap();
+        assert!(log.contains("native_tool_build_scratch_space"));
+        assert!(!log.contains("model_call_admitted"));
+        // The same unavailable scratch is irrelevant to evidence-only scopes.
+        policy["allowed_tools"] = serde_json::json!(["Read"]);
+        std::fs::write(&bridge.policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+        bridge
+            .preflight_builds("codex", Some(&logger))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(root.path().join("scratch"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 }

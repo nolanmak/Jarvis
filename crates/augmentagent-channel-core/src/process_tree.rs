@@ -1177,7 +1177,10 @@ mod tests {
         let helper = directory.path().join("supervisor.py");
         std::fs::write(&helper, include_bytes!("../../../scripts/provider-supervisor.py")).unwrap();
         begin_request(Some(&journal), &receipt).unwrap();
-        let mut controller = Command::new("python3");
+        let mut controller = Command::new("/usr/bin/python3");
+        // This fixture owns its supervisor; an outer managed build's admission
+        // or resource variables must not create a second admission protocol.
+        controller.env_clear().env("PATH", "/usr/bin:/bin");
         controller.args(["-I", "-c", "import subprocess,sys,time; subprocess.Popen(sys.argv[1:]); time.sleep(30)",
             "python3", "-I"]).arg(&helper).arg(&receipt)
             .args(["sh", "-c", "setsid sh -c 'printf \"ready\\n\"; sleep 0.5; printf escaped > \"$1\"' sh \"$1\" & wait", "sh"])

@@ -35,6 +35,8 @@ pub(crate) mod discord_controls;
 pub(crate) mod owner_control;
 #[path = "autoship_verification_retry.rs"]
 mod verification_retry;
+#[path = "autoship_tool_capacity.rs"]
+pub(crate) mod tool_capacity;
 #[path = "autoship_capacity_retry.rs"]
 mod capacity_retry;
 pub use verification_retry::VerificationDomain;

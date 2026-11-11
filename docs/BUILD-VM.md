@@ -44,6 +44,32 @@ access comes only from a per-user ACL entry such as the login-seat grant, not
 from the owner, the `kvm` group entry under the ACL mask, or other bits), or `ok`.
 With the opt-out set it warns that builds run on the host.
 
+### Autoship capacity refusal (#2025)
+
+Protected Claude and Codex calls whose tool policy permits builds inspect the
+bridge's disk requirements before native launch and model-call admission.
+This read-only check uses the same bridge policy as execution and creates no
+scratch image. Read-only tool policies do not require build scratch capacity.
+Actual commands still recheck admission under the normal storage leases.
+
+A new VM cache must leave enough room for the shared build admission reserve.
+The forecast takes the larger of the scratch requirement and the shared reserve
+plus the new cache size. With the default 25 GiB shared admission reserve and
+12 GiB cache, the latter requires 37 GiB free before allocation. Concurrent
+writers can still cause a later refusal; this check does not reserve disk space.
+
+On the first trusted Jarvis Bash readiness refusal during a protected turn,
+the controller stops that provider through its existing supervised cleanup path.
+Disk-space and storage-lease refusals become capacity dependencies with a precise
+`native_tool_<category>` phase and bounded byte counts when available. The
+current wait is also exposed as `tool_capacity_refusal` in CLI JSON status and
+durable progress, and rendered in text status and bound Discord updates. Invalid
+execution configuration remains a local error. The model does not repeatedly
+retry the same unavailable tool inside that turn. Existing edits, charged model
+calls and uncertain-effect fences are preserved; normal workflow admission can
+retry after capacity recovers. This does not change GitHub CI merge requirements
+or enable a host fallback.
+
 ### Build scratch, persistence and timeout (#1036)
 
 Rust dependencies can use native artifacts outside Cargo's registry. In

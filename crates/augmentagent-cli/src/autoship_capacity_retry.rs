@@ -8,6 +8,8 @@ struct Retry {
     generation:i64,
     binding:Binding,
     native_fingerprint:Option<String>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    tool_refusal:Option<super::tool_capacity::ToolCapacityRefusal>,
     failures:u32,
     failed_at_ms:i64,
     eligible_at_ms:i64,
@@ -19,7 +21,7 @@ fn fingerprint_valid(value:&str)->bool {
     value.len()==64 && value.bytes().all(|b|matches!(b,b'0'..=b'9'|b'a'..=b'f'))
 }
 fn active(stage:Stage)->bool { !matches!(stage,Stage::Held|Stage::Merged|Stage::Retired|Stage::Merge) }
-fn previous(tx:&Transaction<'_>,workflow:&str,generation:i64,now:i64)->Result<Option<Retry>> {
+fn previous(tx:&Connection,workflow:&str,generation:i64,now:i64)->Result<Option<Retry>> {
     let row:Option<(String,i64,i64)>=tx.query_row("SELECT payload,generation,at_ms FROM workflow_event WHERE workflow=?1 AND kind='resource_capacity_retry' ORDER BY seq DESC LIMIT 1",
         [workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let Some((raw,recorded_generation,recorded_at))=row else{return Ok(None)};
@@ -31,6 +33,7 @@ fn previous(tx:&Transaction<'_>,workflow:&str,generation:i64,now:i64)->Result<Op
         && (prior.native_fingerprint.is_some() || prior.failures==1)
         && prior.eligible_at_ms==prior.failed_at_ms.saturating_add(delay(prior.failures,prior.native_fingerprint.is_some()))
         && serde_json::to_value(&prior)?==serde_json::from_str::<serde_json::Value>(&raw)?,"invalid capacity retry history");
+    if let Some(refusal)=&prior.tool_refusal {refusal.validate()?;}
     Ok(Some(prior))
 }
 
@@ -47,7 +50,21 @@ pub(super) fn command_attempt_wait(tx:&Transaction<'_>,workflow:&str,checkpoint:
         && retry.binding==checkpoint.binding && retry.eligible_at_ms==checkpoint.next.eligible_at_ms)
         .then_some(retry.eligible_at_ms))
 }
+pub(super) fn current_tool_refusal(conn:&Connection,workflow:&str,checkpoint:&Checkpoint,now:i64)
+    ->Result<Option<super::tool_capacity::ToolCapacityRefusal>> {
+    if !active(checkpoint.stage) || checkpoint.next.reason!="resource_capacity" || checkpoint.next.action!="await_capacity"
+        || owner_control::read(conn,workflow)?.is_some_and(|control|control.paused) {return Ok(None);}
+    let generation:i64=conn.query_row("SELECT generation FROM workflow WHERE id=?1",[workflow],|r|r.get(0))?;
+    let Some(retry)=previous(conn,workflow,generation,now)? else{return Ok(None)};
+    Ok((retry.generation==generation && retry.binding==checkpoint.binding && retry.eligible_at_ms==checkpoint.next.eligible_at_ms)
+        .then_some(retry.tool_refusal).flatten())
+}
 impl WorkflowStore {
+    pub fn tool_capacity_refusal(&self,workflow:&str,now:i64)->Result<Option<super::tool_capacity::ToolCapacityRefusal>> {
+        let Some(snapshot)=self.snapshot(workflow)? else{return Ok(None)};
+        current_tool_refusal(&self.conn,workflow,&snapshot.checkpoint,now)
+    }
+
     /// Compatibility name; use the bounded canonical observation.
     pub fn capacity_wait_count(&self)->Result<u64> { self.resource_capacity_wait_count() }
     /// Read-only health observation; never claims, wakes or charges work.
@@ -78,6 +95,12 @@ impl WorkflowStore {
     /// Actual protected capacity observer only. No failure changes shipping
     /// allowance, paid accounting, evidence, owner intent or the progress clock.
     pub fn defer_run_capacity(&mut self,lease:&Lease,native_fingerprint:Option<&str>,now:i64)->Result<i64> {
+        self.defer_run_capacity_observation(lease,native_fingerprint,None,now)
+    }
+    pub fn defer_run_capacity_observation(&mut self,lease:&Lease,native_fingerprint:Option<&str>,
+        tool_refusal:Option<&super::tool_capacity::ToolCapacityRefusal>,now:i64)->Result<i64> {
+        if let Some(refusal)=tool_refusal {refusal.validate()?;}
+
         ensure!(now>=0 && native_fingerprint.is_none_or(fingerprint_valid),"invalid capacity failure identity");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx,lease,now)?;
@@ -88,14 +111,14 @@ impl WorkflowStore {
         }
         let prior=previous(&tx,&lease.workflow,lease.generation,now)?;
         if let Some(prior)=&prior {
-            if prior.generation==lease.generation && prior.binding==cp.binding && prior.native_fingerprint.as_deref()==native_fingerprint
+            if prior.generation==lease.generation && prior.binding==cp.binding && prior.native_fingerprint.as_deref()==native_fingerprint && prior.tool_refusal.as_ref()==tool_refusal
                 && cp.next.reason=="resource_capacity" && cp.next.action=="await_capacity" && cp.next.eligible_at_ms==prior.eligible_at_ms {
                 return Ok(prior.eligible_at_ms);
             }
         }
         let failures=if native_fingerprint.is_some() {prior.as_ref().filter(|p|p.native_fingerprint.as_deref()==native_fingerprint)
             .map(|p|if p.generation==lease.generation {p.failures}else{p.failures.saturating_add(1)}).unwrap_or(1)}else{1};
-        let retry=Retry{version:1,generation:lease.generation,binding:cp.binding.clone(),native_fingerprint:native_fingerprint.map(str::to_owned),failures,
+        let retry=Retry{version:1,generation:lease.generation,binding:cp.binding.clone(),native_fingerprint:native_fingerprint.map(str::to_owned),tool_refusal:tool_refusal.cloned(),failures,
             failed_at_ms:now,eligible_at_ms:now.saturating_add(delay(failures,native_fingerprint.is_some()))};
         cp.next=NextAction{reason:"resource_capacity".into(),action:"await_capacity".into(),eligible_at_ms:retry.eligible_at_ms};
         let raw=serde_json::to_string(&cp)?;

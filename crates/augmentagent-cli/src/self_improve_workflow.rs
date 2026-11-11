@@ -830,7 +830,8 @@ impl WorkflowGuard {
                 && observation["native_state"]["status"]=="capacity-exhausted" {
                 observation["native_state"]["capacity_fingerprint"].as_str()
             }else{None};
-            store.defer_run_capacity(&capacity_lease,fingerprint,millis())?;
+            let tool_refusal=durable::tool_capacity::ToolCapacityRefusal::capture(observation);
+            store.defer_run_capacity_observation(&capacity_lease,fingerprint,tool_refusal.as_ref(),millis())?;
             Ok(())
         }))?;
         let capacity_flag = self.capacity_exhausted.clone();
@@ -3214,6 +3215,30 @@ mod tests {
         assert!(guard.audit_logger().model_call_admitted("codex").is_err());assert!(guard.validate_before_side_effect().is_err());
         assert!(guard.finish().is_err());
         assert!(store.claim_productive(&id,"too-early",after.checkpoint.next.eligible_at_ms-1,60_000).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn native_tool_capacity_observer_keeps_precise_blocker_after_restart() {
+        let dir=repo();let control=control_dir();let path=control.path().join("workflow.db");
+        let start=Start{repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(712),pr:None,branch:"fixture",contract:"C1",environment:"test"};
+        let guard=WorkflowGuard::acquire_at(&path,start,millis()).await.unwrap().unwrap();
+        guard.audit_logger().model_call_admitted("claude").unwrap();
+        let before=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        let observation=serde_json::json!({"phase":"native_tool_build_storage_reserve","exhausted":true,
+            "tool_readiness":{"category":"build_storage_reserve","execution_started":false},
+            "available_bytes":25,"required_bytes":37,"private":"MUST_NOT_ESCAPE"});
+        guard.audit_logger().resource_capacity_exhausted(&observation).unwrap();
+        let id=guard.id().to_owned();assert!(guard.finish().is_err());
+        let mut store=WorkflowStore::open(&path).unwrap();let after=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(after.checkpoint.next.reason,"resource_capacity");assert_eq!(after.checkpoint.next.action,"await_capacity");
+        assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.progress_at_ms,before.progress_at_ms);
+        assert_eq!(after.checkpoint.binding,before.checkpoint.binding);assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+        assert!(store.claim_productive(&id,"early",after.checkpoint.next.eligible_at_ms-1,60_000).unwrap().is_none());
+        let events=store.progress_events(&id).unwrap();let progress=serde_json::to_value(events.last().unwrap()).unwrap();
+        assert_eq!(progress["tool_capacity_refusal"],serde_json::json!({"category":"build_storage_reserve","execution_started":false,"available_bytes":25,"required_bytes":37}));
+        assert!(!progress.to_string().contains("MUST_NOT_ESCAPE"));
+        let (code,status)=crate::autoship_commands::status(&path,&id,millis(),5);
+        assert_eq!(code,3);assert_eq!(status["tool_capacity_refusal"],progress["tool_capacity_refusal"]);
     }
 
     #[tokio::test]
