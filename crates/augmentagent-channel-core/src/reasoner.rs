@@ -1451,6 +1451,15 @@ impl ClaudeCliReasoner {
         // It costs nothing to read and is the only measurement of what this
         // daemon actually spends, so capture it as the stream goes by.
         let call_started = std::time::Instant::now();
+        // #2012 — a caller that drops this future (the evidence budget, the
+        // watchdog) still leaves a usage row; disarmed once a result lands.
+        let mut unfinished = crate::token_usage::UnfinishedCallGuard::new(
+            crate::token_usage::UsageLogger::global(),
+            crate::providers::ProviderKind::Claude,
+            routed_model.clone().or_else(|| opts.model.clone()).unwrap_or_else(|| "(inherited)".into()),
+            crate::providers::classify(opts),
+            call_started,
+        );
         let mut observed_usage: Option<crate::token_usage::TokenUsage> = None;
         crate::triage_capture::start(&audit_session,routed_model.as_ref().or(opts.model.as_ref()).map(String::as_str).unwrap_or(""),router.is_none());
 
@@ -1509,6 +1518,7 @@ impl ClaudeCliReasoner {
                 Err(e) => debug!("stream-json parse skip: {e} line={line}"),
             }
         }
+        unfinished.finish();
         let final_text = select_final_text(&text_blocks, result_text.as_deref(), capture);
         // #1001 — record what the call cost. Best effort by construction: the
         // logger swallows its own IO errors, so accounting can never fail a

@@ -139,6 +139,10 @@ pub struct UsageRecord {
     pub usage: TokenUsage,
     #[serde(default)]
     pub duration_ms: u64,
+    /// `Some("unfinished")` when the call ended before a result (#2012);
+    /// absent on completed calls, so their rows keep the old shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 impl UsageRecord {
@@ -159,6 +163,7 @@ impl UsageRecord {
             class: format!("{class:?}"),
             usage,
             duration_ms: started.elapsed().as_millis() as u64,
+            outcome: None,
         }
     }
 
@@ -275,6 +280,53 @@ impl UsageLogger {
         // lock is released, so retention can never delay or reorder a write.
         drop(_guard);
         self.maybe_prune();
+    }
+}
+
+/// Writes an `outcome: "unfinished"` row on drop unless [`finish`] ran: a
+/// call cancelled by its caller's timeout otherwise leaves no trace (#2012).
+///
+/// [`finish`]: UnfinishedCallGuard::finish
+pub struct UnfinishedCallGuard {
+    logger: Arc<UsageLogger>,
+    provider: crate::providers::ProviderKind,
+    model: String,
+    class: crate::providers::CapabilityClass,
+    started: std::time::Instant,
+    armed: bool,
+}
+
+impl UnfinishedCallGuard {
+    pub fn new(
+        logger: Arc<UsageLogger>,
+        provider: crate::providers::ProviderKind,
+        model: impl Into<String>,
+        class: crate::providers::CapabilityClass,
+        started: std::time::Instant,
+    ) -> Self {
+        Self { logger, provider, model: model.into(), class, started, armed: true }
+    }
+
+    /// The call reached a result; its own row (if any) is the record.
+    pub fn finish(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnfinishedCallGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut record = UsageRecord::for_call(
+            self.provider,
+            std::mem::take(&mut self.model),
+            self.class,
+            TokenUsage::default(),
+            self.started,
+        );
+        record.outcome = Some("unfinished".into());
+        self.logger.append(&record);
     }
 }
 
@@ -493,6 +545,7 @@ mod tests {
                 reasoning_output: 0,
             },
             duration_ms: 1234,
+            outcome: None,
         })
         .unwrap()
     }
@@ -749,5 +802,40 @@ mod tests {
             Some(v) => std::env::set_var("AUGMENTAGENT_TOKEN_USAGE_LOG", v),
             None => std::env::remove_var("AUGMENTAGENT_TOKEN_USAGE_LOG"),
         }
+    }
+
+    /// #2012 — a call whose future is dropped before its result (the caller's
+    /// timeout, the watchdog, a cancel) still leaves a row, so the slowest
+    /// calls are not the ones missing from the log.
+    #[test]
+    fn an_unfinished_call_still_writes_a_usage_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = Arc::new(UsageLogger::new(dir.path().join("usage.jsonl")));
+        let started = std::time::Instant::now();
+        drop(UnfinishedCallGuard::new(
+            Arc::clone(&logger),
+            crate::providers::ProviderKind::Claude,
+            "claude-opus-4-8",
+            crate::providers::CapabilityClass::TextOnly,
+            started,
+        ));
+        let mut finished = UnfinishedCallGuard::new(
+            Arc::clone(&logger),
+            crate::providers::ProviderKind::Claude,
+            "claude-opus-4-8",
+            crate::providers::CapabilityClass::TextOnly,
+            started,
+        );
+        finished.finish();
+        drop(finished);
+        let raw = std::fs::read_to_string(logger.path()).unwrap();
+        let rows: Vec<serde_json::Value> =
+            raw.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows.len(), 1, "{raw}");
+        assert_eq!(rows[0]["outcome"], "unfinished");
+        assert_eq!(rows[0]["model"], "claude-opus-4-8");
+        assert_eq!(rows[0]["output"], 0);
+        // Finished rows keep their old shape: no outcome key at all.
+        assert!(!rec("2026-01-01T00:00:00Z", "m", 1, 1).contains("outcome"));
     }
 }
