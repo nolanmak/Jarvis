@@ -259,6 +259,201 @@ ready.with_name('actual-model-dispatch').write_text('called')
                 vm.runtime_seed(root, None, '.codex/auth.json')
 
 
+class NativeStagingTests(unittest.TestCase):
+    LIMIT = 8192
+
+    def mutate_after_validation(self, source, mutation):
+        """Change the real source after the production validator observed it."""
+        original_stat, original_fstat = Path.stat, os.fstat
+        initial = original_stat(source)
+        changed = []
+
+        def observed(info):
+            if (info.st_dev, info.st_ino) == (initial.st_dev, initial.st_ino) and not changed:
+                changed.append(True)
+                mutation()
+            return info
+
+        def path_stat(path, *args, **kwargs):
+            return observed(original_stat(path, *args, **kwargs))
+
+        def fd_stat(fd):
+            return observed(original_fstat(fd))
+
+        return changed, mock.patch.object(Path, 'stat', path_stat), mock.patch.object(vm.os, 'fstat', fd_stat)
+
+    def test_executable_exact_limit_and_oversize(self):
+        with tempfile.TemporaryDirectory() as name, mock.patch.object(vm, 'MAX_EXECUTABLE', self.LIMIT):
+            root = Path(name); source = root / 'provider'; target = root / 'cli'
+            source.write_bytes(b'x' * self.LIMIT); source.chmod(0o700)
+            vm.stage_native_executable(source, target)
+            self.assertEqual(target.read_bytes(), source.read_bytes())
+            self.assertEqual(target.stat().st_mode & 0o777, 0o555)
+            target.unlink(); source.write_bytes(b'x' * (self.LIMIT + 1))
+            with self.assertRaises(ValueError):
+                vm.stage_native_executable(source, target)
+            self.assertFalse(target.exists())
+
+    def test_executable_growth_after_validation_stays_bounded(self):
+        with tempfile.TemporaryDirectory() as name, mock.patch.object(vm, 'MAX_EXECUTABLE', self.LIMIT):
+            root = Path(name); source = root / 'provider'; target = root / 'cli'
+            source.write_bytes(b'x' * 4096); source.chmod(0o700)
+            changed, path_stat, fd_stat = self.mutate_after_validation(
+                source, lambda: source.write_bytes(b'x' * (self.LIMIT * 2)))
+            with path_stat, fd_stat, self.assertRaises(ValueError):
+                vm.stage_native_executable(source, target)
+            self.assertTrue(changed)
+            self.assertFalse(target.exists(), 'failed staging must remove its own incomplete copy')
+
+    def test_executable_replacement_after_validation_refuses(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); source = root / 'provider'; target = root / 'cli'
+            source.write_bytes(b'original'); source.chmod(0o700)
+            replacement = root / 'replacement'; replacement.write_bytes(b'replaced'); replacement.chmod(0o700)
+            changed, path_stat, fd_stat = self.mutate_after_validation(
+                source, lambda: os.replace(replacement, source))
+            with path_stat, fd_stat, self.assertRaises(ValueError):
+                vm.stage_native_executable(source, target)
+            self.assertTrue(changed)
+            self.assertFalse(target.exists())
+
+    def test_executable_preserves_preexisting_destination(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); source = root / 'provider'; target = root / 'cli'
+            source.write_bytes(b'provider'); source.chmod(0o700); target.write_bytes(b'keep')
+            with self.assertRaises(FileExistsError):
+                vm.stage_native_executable(source, target)
+            self.assertEqual(target.read_bytes(), b'keep')
+
+    def test_executable_symlink_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); source = root / 'provider'; target = root / 'cli'
+            source.write_bytes(b'provider'); source.chmod(0o700)
+            alias = root / 'alias'; alias.symlink_to(source)
+            with self.assertRaises((ValueError, OSError)):
+                vm.stage_native_executable(alias, target)
+            self.assertFalse(target.exists())
+
+    def test_growth_during_copy_never_writes_over_budget(self):
+        with tempfile.TemporaryDirectory() as name, mock.patch.object(vm, 'MAX_EXECUTABLE', self.LIMIT):
+            root = Path(name); source = root / 'provider'; target = root / 'cli'
+            source.write_bytes(b'x' * 4096); source.chmod(0o700)
+            original_read, original_write, original_fstat = os.read, os.write, os.fstat
+            source_identity = source.stat()
+            changed, peak = [], []
+
+            def read(fd, size):
+                data = original_read(fd, size)
+                info = original_fstat(fd)
+                if (info.st_dev, info.st_ino) == (source_identity.st_dev, source_identity.st_ino) and not changed:
+                    changed.append(True)
+                    with source.open('ab') as stream:
+                        stream.write(b'y' * self.LIMIT * 2)
+                return data
+
+            def write(fd, data):
+                count = original_write(fd, data)
+                peak.append(original_fstat(fd).st_size)
+                self.assertLessEqual(peak[-1], self.LIMIT, 'do not overrun then delete the evidence')
+                return count
+
+            with mock.patch.object(vm.os, 'read', read), mock.patch.object(vm.os, 'write', write):
+                with self.assertRaises(ValueError):
+                    vm.stage_native_executable(source, target)
+            self.assertTrue(changed); self.assertTrue(peak)
+            self.assertFalse(target.exists())
+
+    def test_observed_same_size_source_edit_refuses(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); source = root / 'provider'; target = root / 'cli'
+            source.write_bytes(b'original'); source.chmod(0o700)
+            timestamp = source.stat().st_mtime_ns
+
+            def edit():
+                source.write_bytes(b'modified')
+                os.utime(source, ns=(timestamp + 1000000000, timestamp + 1000000000))
+
+            changed, path_stat, fd_stat = self.mutate_after_validation(source, edit)
+            with path_stat, fd_stat, self.assertRaises(ValueError):
+                vm.stage_native_executable(source, target)
+            self.assertTrue(changed); self.assertFalse(target.exists())
+
+    def test_partial_writes_complete_and_zero_write_cleans_up(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); source = root / 'provider'; target = root / 'cli'
+            source.write_bytes(b'provider binary'); source.chmod(0o700)
+            original_write = os.write
+            with mock.patch.object(vm.os, 'write', lambda fd, data: original_write(fd, data[:3])):
+                vm.stage_native_executable(source, target)
+            self.assertEqual(target.read_bytes(), source.read_bytes())
+            target.unlink()
+            with mock.patch.object(vm.os, 'write', return_value=0), self.assertRaises(OSError):
+                vm.stage_native_executable(source, target)
+            self.assertFalse(target.exists())
+
+    def test_failed_copy_preserves_replaced_destination(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); source = root / 'provider'; target = root / 'cli'
+            source.write_bytes(b'provider binary'); source.chmod(0o700)
+            original_write = os.write
+
+            def fail_after_replacement(fd, data):
+                original_write(fd, data)
+                target.unlink(); target.write_bytes(b'keep replacement')
+                raise OSError('injected write failure')
+
+            with mock.patch.object(vm.os, 'write', fail_after_replacement), self.assertRaises(OSError):
+                vm.stage_native_executable(source, target)
+            self.assertEqual(target.read_bytes(), b'keep replacement')
+
+    def test_fifo_source_refuses_without_blocking(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); source = root / 'fifo'; target = root / 'cli'; os.mkfifo(source, 0o600)
+            code = '''import importlib.util,sys
+s=importlib.util.spec_from_file_location('native',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
+try: m.stage_native_executable(sys.argv[2],sys.argv[3])
+except (ValueError,OSError): raise SystemExit(0)
+raise SystemExit(1)
+'''
+            result = subprocess.run([sys.executable, '-I', '-c', code,
+                                     str(HERE / 'native-provider-vm.py'), str(source), str(target)],
+                                    timeout=5, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertFalse(target.exists())
+
+    def test_companion_size_is_checked_without_unbounded_read(self):
+        with tempfile.TemporaryDirectory() as name, mock.patch.object(vm, 'MAX_COMPANION', self.LIMIT):
+            root = Path(name); source = root / 'codex'; source.write_bytes(b'provider')
+            target = root / 'provider'; target.mkdir(); (target / 'cli').write_bytes(b'provider')
+            (target / 'cli').chmod(0o555)
+            runtime = root / 'runtime'; runtime.mkdir(); companion = runtime / 'host'
+            companion.write_bytes(b'x' * (self.LIMIT + 1)); companion.chmod(0o400)
+            digest = hashlib.sha256(companion.read_bytes()).hexdigest()
+            (runtime / 'manifest.json').write_text(json.dumps({
+                'files': [{'path': 'host', 'sha256': digest}],
+                'native_companions': {hashlib.sha256(b'provider').hexdigest(): [
+                    {'path': 'host', 'name': 'codex-code-mode-host', 'sha256': digest}]}}))
+            original = Path.read_bytes
+
+            def reject_unbounded(path):
+                if path == companion:
+                    self.fail('companion must be read with an enforced byte bound')
+                return original(path)
+
+            with mock.patch.object(Path, 'read_bytes', reject_unbounded), \
+                    self.assertRaisesRegex(ValueError, '^native staging source exceeds byte budget$'):
+                vm.stage_native_companions(source, runtime, target)
+            self.assertFalse((target / 'codex-code-mode-host').exists())
+
+    def test_untrusted_mode_is_distinct_from_size_failure(self):
+        with tempfile.TemporaryDirectory() as name, mock.patch.object(vm, 'MAX_EXECUTABLE', self.LIMIT):
+            root = Path(name); source = root / 'provider'; target = root / 'cli'
+            source.write_bytes(b'x' * (self.LIMIT + 1)); source.chmod(0o722)
+            with self.assertRaisesRegex(ValueError, '^native staging source is not trusted$'):
+                vm.stage_native_executable(source, target)
+            self.assertFalse(target.exists())
+
+
 class RefreshCheckpointTests(unittest.TestCase):
     def fixture(self, root):
         spec = {'refresh_auth': True, 'provider': 'claude', 'auth_file': str(root / 'claude.json'),

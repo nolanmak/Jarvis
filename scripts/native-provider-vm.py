@@ -30,6 +30,8 @@ import datetime
 
 MAX_FRAME = 2 * 1024 * 1024
 MAX_HOME = 64 * 1024 * 1024
+MAX_EXECUTABLE = 512 * 1024 * 1024
+MAX_COMPANION = 128 * 1024 * 1024
 
 
 
@@ -526,13 +528,101 @@ def validate_runtime(path):
         raise ValueError('undeclared runtime file')
 
 
+def _staging_identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+@contextlib.contextmanager
+def _native_staging_source(source, limit):
+    source = Path(source)
+    if not source.is_absolute():
+        raise ValueError('native staging source must be absolute')
+    # NONBLOCK prevents a substituted FIFO from blocking before fstat rejects it.
+    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        initial = os.fstat(fd)
+        if (not stat.S_ISREG(initial.st_mode) or initial.st_uid not in (0, os.getuid())
+                or initial.st_mode & 0o022):
+            raise ValueError('native staging source is not trusted')
+        if initial.st_size > limit:
+            raise ValueError('native staging source exceeds byte budget')
+        yield fd
+        if (_staging_identity(os.fstat(fd)) != _staging_identity(initial)
+                or _staging_identity(source.stat(follow_symlinks=False)) != _staging_identity(initial)):
+            raise ValueError('native staging source changed')
+    finally:
+        os.close(fd)
+
+
+def _native_staging_chunks(fd, limit):
+    remaining = limit
+    while True:
+        chunk = os.read(fd, min(64 * 1024, remaining + 1))
+        if not chunk:
+            return
+        if len(chunk) > remaining:
+            raise ValueError('native staging source exceeds byte budget')
+        remaining -= len(chunk)
+        yield chunk
+
+
+def _native_staging_digest(source, limit):
+    digest = hashlib.sha256()
+    with _native_staging_source(source, limit) as fd:
+        for chunk in _native_staging_chunks(fd, limit):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _stage_native_file(source, destination, limit, expected_digest=None):
+    destination = Path(destination)
+    target_fd = None
+    created = None
+    try:
+        with _native_staging_source(source, limit) as source_fd:
+            target_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            created = os.fstat(target_fd)
+            digest = hashlib.sha256()
+            for chunk in _native_staging_chunks(source_fd, limit):
+                digest.update(chunk)
+                pending = memoryview(chunk)
+                while pending:
+                    count = os.write(target_fd, pending)
+                    if count <= 0:
+                        raise OSError('native staging write made no progress')
+                    pending = pending[count:]
+            if expected_digest is not None and digest.hexdigest() != expected_digest:
+                raise ValueError('Codex runtime companion digest changed')
+        os.fchmod(target_fd, 0o555)
+    except BaseException:
+        if created is not None:
+            # The private launch directory has no guest writers during staging.
+            # Never remove a preexisting or visibly replaced destination.
+            try:
+                current = destination.lstat()
+                if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                    destination.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        if target_fd is not None:
+            os.close(target_fd)
+
+
+def stage_native_executable(executable, destination):
+    _stage_native_file(executable, destination, MAX_EXECUTABLE)
+
+
 def stage_native_companions(executable, guest_runtime, destination):
     executable = Path(executable)
     if executable.resolve().name != 'codex':
         return
     runtime = Path(guest_runtime)
     manifest = json.loads((runtime / 'manifest.json').read_text())
-    digest = hashlib.sha256((Path(destination) / 'cli').read_bytes()).hexdigest()
+    digest = _native_staging_digest(Path(destination) / 'cli', MAX_EXECUTABLE)
     entries = manifest.get('native_companions', {}).get(digest)
     if not isinstance(entries, list) or len(entries) != 1:
         raise ValueError('Codex runtime companion missing for executable digest; reprovision runtime')
@@ -544,13 +634,8 @@ def stage_native_companions(executable, guest_runtime, destination):
     source = runtime / relative
     if source.is_symlink() or not source.resolve().is_relative_to(runtime) or declared.get(str(relative)) != entry.get('sha256'):
         raise ValueError('Codex runtime companion is not manifested')
-    data = source.read_bytes()
-    if len(data) > 128 * 1024**2 or hashlib.sha256(data).hexdigest() != entry['sha256']:
-        raise ValueError('Codex runtime companion digest changed')
     target = Path(destination) / entry['name']
-    with open(target, 'xb') as stream:
-        stream.write(data)
-        os.fchmod(stream.fileno(), 0o555)
+    _stage_native_file(source, target, MAX_COMPANION, entry['sha256'])
 
 
 def main(spec_path):
@@ -586,11 +671,7 @@ def main(spec_path):
         binary = private / 'provider'
         binary.mkdir()
         executable = Path(spec['executable'])
-        info = executable.stat()
-        if not executable.is_absolute() or info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022 or info.st_size > 512 * 1024 * 1024:
-            raise ValueError('native executable is not trusted or exceeds budget')
-        shutil.copyfile(executable, binary / 'cli')
-        (binary / 'cli').chmod(0o555)
+        stage_native_executable(executable, binary / 'cli')
         stage_native_companions(executable, spec['guest_runtime'], binary)
         assets = spec.get('assets', [])
         if len(assets) > 32:
