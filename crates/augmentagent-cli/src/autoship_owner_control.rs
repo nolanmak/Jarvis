@@ -76,7 +76,8 @@ fn retry_checkpoint(tx:&Transaction<'_>,workflow:&str,now:i64,require_retired:bo
     // Both controller paths preserve work after an internal execution refusal.
     // Owner intent only requeues normal revalidation; it grants no approval.
     let original=matches!((checkpoint.next.reason.as_str(),checkpoint.next.action.as_str()),
-        ("adopted_execution_retry","resume_preserved_pr") | ("resume_deferred","resume_preserved_work"));
+        ("adopted_execution_retry","resume_preserved_pr") | ("resume_deferred","resume_preserved_work"))
+        || (super::is_review_hold_reason(&checkpoint.next.reason) && checkpoint.next.action=="resume_preserved_work");
     let pending=checkpoint.next.reason=="owner_execution_retry_pending" && checkpoint.next.action=="reconcile_runtime_retirement"
         && tx.query_row("SELECT EXISTS(SELECT 1 FROM owner_execution_retry WHERE workflow=?1 AND generation=?2 AND binding=?3 AND state IN ('pending','superseded'))",params![workflow,generation,serde_json::to_string(&checkpoint.binding)?],|r|r.get::<_,bool>(0))?;
     if checkpoint.stage!=Stage::Held || (!original && !pending) {return Ok(None);}
@@ -198,7 +199,8 @@ mod tests {
     #[test]
     fn owner_resume_preserves_unrelated_and_mismatched_held_checkpoints() {
         for (reason,action) in [("security-hold","resume_preserved_work"),("owner-hold","resume_preserved_work"),
-            ("resume_deferred","await_owner_approval"),("adopted_execution_retry","resume_preserved_work")] {
+            ("resume_deferred","await_owner_approval"),("adopted_execution_retry","resume_preserved_work"),
+            ("review-recovery-required","await_owner_approval"),("review-recovery-required","resume_preserved_pr")] {
             let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
             let id=store.submit_authorized("request","github:owner",&request(1),1).unwrap().workflow;
             store.register(&id,"candidate",binding(),2).unwrap();
