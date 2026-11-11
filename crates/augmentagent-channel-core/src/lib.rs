@@ -44,9 +44,15 @@ pub mod run_resources;
 pub mod secret_loader;
 pub mod skills;
 pub mod state_dir;
+// #1930 — one storage authority for every writer. The CLI gate, the Autoship
+// capacity paths and the CI cleanup fence share these modules so they admit
+// against the same lock namespace instead of each starting its own.
+// `#[path]` points each module at the file it was extracted into.
+#[path = "storage_ci_holds.rs"]
+pub mod build_storage_ci_holds;
 pub mod storage_checkout;
-pub mod storage_ci_holds;
-pub mod storage_coordination;
+#[path = "storage_coordination.rs"]
+pub mod storage_leases;
 pub mod storage_reservations;
 pub mod timeparse;
 pub mod log_retention;

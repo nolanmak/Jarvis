@@ -72,11 +72,15 @@ normal completion verifies the same kernel scope is quiescent first. A
 resource refusal before admission can release unused storage only when the
 supervisor has reaped its descendants and never received the launch token.
 
-The storage admission lock, its per-user coordination directory, the CI cleanup
-holds and the owned source-checkout release fence live in channel-core's
-`storage_*` modules, so Autoship capacity paths outside the CLI share one lock
-namespace and one cleanup authority instead of starting a second one. The CLI
-keeps its growth-reservation ledger on top of that lock, and every admission
+One shared storage implementation backs all of this. channel-core owns the
+admission lock and the growth-reservation ledger (`storage_reservations`), the
+per-user coordination directory and the physical-directory leases
+(`storage_leases`), the mandatory CI cleanup reconciliation
+(`build_storage_ci_holds`) and the owned source checkouts
+(`storage_checkout`), so Autoship capacity paths outside the CLI share one
+lock namespace and one cleanup authority instead of starting a second one. The
+CLI re-exports those modules rather than redefining them, keeps the disk gate,
+Git export, harness selection and contract validation, and every admission
 still reconciles abandoned holds using the original admission proof. This
 sharing does not enroll native retained sessions or make ephemeral reservation
 files durable across reboot.

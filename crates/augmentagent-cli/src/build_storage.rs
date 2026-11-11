@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub(crate) use augmentagent_channel_core::storage_ci_holds as ci_holds;
+pub(crate) use augmentagent_channel_core::build_storage_ci_holds as ci_holds;
 
 const MARKER: &str = ".augmentagent-target.json";
 const CACHE_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n";

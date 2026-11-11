@@ -94,7 +94,7 @@ fn directory() -> Result<PathBuf> {
     if let Some(path) = TEST_DIRECTORY.with(|slot| slot.borrow().clone()) {
         return Ok(path);
     }
-    let path = crate::storage_coordination::lock_directory()?.join("ci-cleanup");
+    let path = crate::storage_leases::lock_directory()?.join("ci-cleanup");
     match std::fs::DirBuilder::new().mode(0o700).create(&path) {
         Ok(()) => (),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
@@ -392,7 +392,7 @@ pub fn may_cleanup(path: &Path) -> Result<bool> {
 /// Cleanup entry points reconcile abandoned owners themselves, before an old
 /// checkout can prevent the next storage admission from ever being reached.
 pub fn may_cleanup_after_reconcile(path: &Path) -> Result<bool> {
-    let _admission = crate::storage_reservations::AdmissionLock::lock()?;
+    let _admission = crate::storage_reservations::Admission::lock()?;
     may_cleanup(path)
 }
 
@@ -428,7 +428,7 @@ impl Hold {
                 .collect::<Result<_>>()?,
             resource: None,
         };
-        let _admission = crate::storage_reservations::AdmissionLock::lock()?;
+        let _admission = crate::storage_reservations::Admission::lock()?;
         let path = directory()?.join(format!("{}.hold", record.id));
         anyhow::ensure!(!path.try_exists()?, "CI cleanup identity already exists");
         let live = lifetime(&path, true)?;
@@ -580,7 +580,7 @@ mod tests {
             assert!(id.exists());
             assert_eq!(read(&id).unwrap().phase, Phase::Uncertain);
             assert!(reconcile_before_admission().is_err());
-            assert!(crate::storage_reservations::AdmissionLock::lock().is_err());
+            assert!(crate::storage_reservations::Admission::lock().is_err());
             assert!(!may_cleanup(root).unwrap());
             assert!(source.exists());
         });
@@ -615,7 +615,7 @@ mod tests {
                     std::fs::write(root.join("provide-proof"), b"yes").unwrap();
                 }
                 let status=std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact","storage_ci_holds::tests::controller_process_exit_keeps_unknown_holds_and_reconciles_exact_kernel_proof","--nocapture"])
+                    .args(["--exact","build_storage_ci_holds::tests::controller_process_exit_keeps_unknown_holds_and_reconciles_exact_kernel_proof","--nocapture"])
                     .env_clear().env("PATH","/usr/bin:/bin").env(ENV,root).status().unwrap();
                 assert!(status.success());
                 assert_eq!(std::fs::read(root.join("crash-helper-ran")).unwrap(), b"original-hold-published");
