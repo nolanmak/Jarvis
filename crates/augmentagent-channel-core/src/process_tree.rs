@@ -1031,9 +1031,15 @@ mod tests {
         let log=directory.path().join("logs/audit.jsonl");
         let logger=Arc::new(crate::tool_audit::AuditLogger::protected(log.clone(),directory.path().join("anchors/audit.json"),&[]).unwrap());
         let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));let billed=count.clone();
-        logger.set_model_call_observer(Arc::new(move |_|{billed.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
-        let command=Command::new("/usr/bin/true");
+        let mut command=Command::new("/usr/bin/python3");
+        command.args(["-I", "-c", "import json,pathlib,sys; rows=[json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]; assert any(row.get('kind') == 'model_call_admitted' and row.get('accounting_receipt') == 'synthetic-charge-17' for row in rows)"]).arg(&log);
         let (mut child,mut group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        let proceed=group.receipt.with_file_name("launch-continue");
+        logger.set_correlated_model_call_observer(Arc::new(move |_| {
+            assert!(!proceed.exists(), "provider released before accounting");
+            billed.fetch_add(1,Ordering::SeqCst);
+            Ok("synthetic-charge-17".into())
+        })).unwrap();
         // Exercise the real supervisor admission boundary with a disposable
         // controller receipt. This tests correlation, not kernel quiescence.
         let identity=serde_json::json!({"host_sha256":"synthetic-host","boot_id":"synthetic-boot",
@@ -1050,6 +1056,8 @@ mod tests {
             "model admission has no binding to the resource scope whose quiescence will be verified");
         assert_eq!(model["admission_schema_version"],2);
         assert_eq!(model["actual_provider"],resource["provider"]);
+        assert_eq!(model["accounting_receipt"],"synthetic-charge-17");
+        assert_eq!(model["accounting_schema_version"],1);
         assert_eq!(count.load(Ordering::SeqCst),1);
     }
 
@@ -1102,20 +1110,43 @@ mod tests {
 
     #[tokio::test]
     async fn denied_model_admission_never_dispatches_waiting_provider() {
+        for failure in ["callback", "receipt", "audit"] {
         let directory=tempfile::tempdir().unwrap();
         let effect=directory.path().join("provider-effect");
         let mut command=Command::new("/usr/bin/python3");
         command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('executed')"]).arg(&effect);
-        let logger=Arc::new(crate::tool_audit::AuditLogger::new(directory.path().join("audit")));
-        logger.set_model_call_observer(Arc::new(|_|anyhow::bail!("synthetic budget denied"))).unwrap();
+        for name in ["logs", "anchors"] {std::fs::create_dir(directory.path().join(name)).unwrap();}
+        let log=directory.path().join("logs/audit.jsonl");
+        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(log.clone(),directory.path().join("anchors/audit.json"),&[]).unwrap());
+        if failure=="audit" {
+            logger.record_controller(serde_json::json!({"kind":"synthetic-start"})).unwrap();
+            std::fs::remove_file(&log).unwrap();std::fs::create_dir(&log).unwrap();
+        }
+        let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));let observed=count.clone();
+        logger.set_correlated_model_call_observer(Arc::new(move |_| {
+            observed.fetch_add(1,Ordering::SeqCst);
+            match failure {
+                "callback"=>anyhow::bail!("synthetic budget denied"),
+                "receipt"=>Ok(String::new()),
+                _=>Ok("already-committed-charge".into()),
+            }
+        })).unwrap();
         let clean=Arc::new(AtomicBool::new(true));
         let (mut child,group)=spawn_admitted(&command,true,clean.clone(),None,false).unwrap();
         let error=group.admit_model("codex",Some(&logger)).await.unwrap_err();
-        assert!(error.to_string().contains("synthetic budget denied"));
+        if failure=="callback" {assert!(error.to_string().contains("synthetic budget denied"));}
+        if failure=="receipt" {assert!(error.to_string().contains("invalid model accounting receipt"));}
+        assert!(!group.receipt.with_file_name("launch-continue").exists());
         drop(group);
         child.wait().await.unwrap();
         assert!(clean.load(Ordering::SeqCst));
         assert!(!effect.exists());
+        assert_eq!(count.load(Ordering::SeqCst),1,"admission failure must not undo the callback");
+        if log.is_file() {
+            let rows=std::fs::read_to_string(log).unwrap();
+            assert!(!rows.lines().map(|line|serde_json::from_str::<serde_json::Value>(line).unwrap()).any(|row|row["kind"]=="model_call_admitted"));
+        }
+        }
     }
 
     #[tokio::test]
