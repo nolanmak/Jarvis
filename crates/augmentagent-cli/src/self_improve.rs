@@ -2635,7 +2635,11 @@ fn spec_from_scope(scope: Option<&ScopeOutcome>) -> Option<String> {
 }
 
 fn initial_acceptance_inputs<'a>(scope:Option<&'a ScopeOutcome>,owner_request:&'a str)->(&'a str,Vec<String>) {
-    (scope.map(|scope|scope.body.as_str()).unwrap_or(owner_request),
+    // A refusal is diagnostic context, never a substitute owner requirement
+    // (#955). Keep the first-pass build policy, but enroll acceptance against
+    // the original request when no usable implementation spec was produced.
+    let scope=scope.filter(|scope|scope.fixable);
+    (scope.map(|scope|scope.body.as_str()).filter(|body|!body.is_empty()).unwrap_or(owner_request),
         scope.map(|scope|scope.criteria.clone()).unwrap_or_default())
 }
 
