@@ -2634,6 +2634,45 @@ fn spec_from_scope(scope: Option<&ScopeOutcome>) -> Option<String> {
         .filter(|b| !b.is_empty())
 }
 
+fn initial_acceptance_inputs<'a>(scope:Option<&'a ScopeOutcome>,owner_request:&'a str)->(&'a str,Vec<String>) {
+    (scope.map(|scope|scope.body.as_str()).unwrap_or(owner_request),
+        scope.map(|scope|scope.criteria.clone()).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod acceptance_source_tests {
+    use super::*;
+    #[test]
+    fn first_pass_refusal_is_not_an_acceptance_spec_or_requirement() {
+        let scope=parse_scope_output("VERDICT: not-fixable\nCOMPLEXITY: hard\nCRITERIA:\n- Split this into smaller increments before implementation.\n\nRequires a design split; this is a refusal reason.");
+        assert!(!scope.fixable);
+        assert!(!may_label_out(&[]),"the first-pass owner build policy remains unchanged");
+        assert!(spec_from_scope(Some(&scope)).is_none());
+        let owner="Owner request: prevent unchanged rejected contracts from spending another model call; preserve charges and owner pauses.";
+        let (spec,criteria)=initial_acceptance_inputs(Some(&scope),owner);
+        assert_eq!(spec,owner,"refusal replaced the owner request at acceptance registration");
+        assert!(criteria.is_empty(),"a refusal's proposed next action became a product requirement");
+    }
+    #[test]
+    fn fixable_scope_preserves_the_full_independent_criteria() {
+        let scope=parse_scope_output("VERDICT: fixable\nCOMPLEXITY: medium\nCRITERIA:\n- Keep every original charge.\n- Resume only after validated input changes.\n\nImplement the existing dispatch guard.");
+        let (spec,criteria)=initial_acceptance_inputs(Some(&scope),"original owner request");
+        assert_eq!(spec,scope.body);
+        assert_eq!(criteria,scope.criteria);
+        assert_eq!(criteria.len(),2);
+    }
+    #[test]
+    fn absent_or_empty_spec_uses_owner_request_without_dropping_valid_criteria() {
+        let owner="original complete owner request";
+        assert_eq!(initial_acceptance_inputs(None,owner),(owner,vec![]));
+        let scope=parse_scope_output("VERDICT: fixable\nCOMPLEXITY: medium\nCRITERIA:\n- Preserve the original owner pause.");
+        assert!(scope.body.is_empty());
+        let (spec,criteria)=initial_acceptance_inputs(Some(&scope),owner);
+        assert_eq!(spec,owner);
+        assert_eq!(criteria,scope.criteria);
+    }
+}
+
 /// #955 — may a not-fixable scoping verdict label this issue out for good?
 ///
 /// Since #803 the scoper reads the prior-attempts digest, and one failed
@@ -8114,13 +8153,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     // #1012 — written before any code exists, so they are the one target in
     // this pipeline the builder did not also author. Empty when the scoping
     // pass failed or emitted no block, which changes nothing downstream.
-    let mut criteria: Vec<String> = scope
-        .as_ref()
-        .map(|s| s.criteria.clone())
-        .unwrap_or_default();
+    let (acceptance_scope,mut criteria)=initial_acceptance_inputs(scope.as_ref(),&scope_prompt);
 
     let acceptance_control = acceptance::control_directories(&repository, workflow_guard.id())?.workflow_acceptance;
-    let acceptance_scope = scope.as_ref().map(|scope| scope.body.as_str()).unwrap_or(&scope_prompt);
     let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
         issue.number, candidate_base, acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria, &workflow_guard).await {
         Ok(prepared) => prepared,
