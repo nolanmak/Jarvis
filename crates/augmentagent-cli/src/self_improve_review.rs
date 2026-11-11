@@ -14,11 +14,24 @@ impl std::fmt::Display for EvidenceBudget {
     }
 }
 impl std::error::Error for EvidenceBudget {}
+
+/// Only immutable Git ancestry observations can request automatic integration.
+#[derive(Debug)]
+struct MainAdvanced {
+    candidate: String,
+    main: String,
+}
+impl std::fmt::Display for MainAdvanced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "main advanced beyond candidate; integrate current main before review; candidate={}; main={}", self.candidate, self.main)
+    }
+}
+impl std::error::Error for MainAdvanced {}
 /// A budget refusal keeps its meaning however many `context` layers or
 /// `source()` causes the review path wrapped it in, so classify on the whole
 /// chain and not the outer error (#1885: PR #1669 was held as missing reviewer
 /// capacity because of one). Only the typed errors count: an unrelated error
-/// whose message merely reads like a budget is still missing capacity.
+/// whose message merely reads like a budget still requires review recovery.
 /// `anyhow`'s own downcast also reaches a budget attached as a context value.
 fn is_evidence_budget(error: &anyhow::Error) -> bool {
     error.is::<EvidenceBudget>()
@@ -27,10 +40,14 @@ fn is_evidence_budget(error: &anyhow::Error) -> bool {
 }
 
 fn unavailable_from_error(provider: augmentagent_channel_core::ProviderKind, error: anyhow::Error) -> IndependentReview {
+    let advanced = error.downcast_ref::<MainAdvanced>()
+        .or_else(|| error.chain().find_map(|cause| cause.downcast_ref::<MainAdvanced>()));
     IndependentReview::unavailable(if is_evidence_budget(&error) {
         ReviewUnavailable::EvidenceBudget { detail: format!("{error:#}") }
+    } else if let Some(advanced) = advanced {
+        ReviewUnavailable::MainAdvanced { candidate: advanced.candidate.clone(), main: advanced.main.clone(), detail: format!("{error:#}") }
     } else {
-        ReviewUnavailable::NoCapacity { reviewers: vec![provider], detail: format!("aligned review needs recovery: {error:#}") }
+        ReviewUnavailable::RecoveryRequired { detail: format!("aligned review by {} needs recovery: {error:#}", provider.name()) }
     })
 }
 
@@ -439,10 +456,9 @@ async fn candidate_snapshot(worktree: &Path) -> Result<CandidateSnapshot> {
         .trim()
         .to_owned();
     let ancestor = git(&worktree, &["merge-base", &base, &head]).await?;
-    anyhow::ensure!(
-        ancestor.trim() == base,
-        "main advanced beyond candidate; integrate current main before review"
-    );
+    if ancestor.trim() != base {
+        return Err(MainAdvanced { candidate: head, main: base }.into());
+    }
     let diff = git(&worktree, &["diff", "--binary", &base, &head, "--"]).await?;
     let paths = git(
         &worktree,
@@ -1120,6 +1136,39 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_group_is_review_recovery_not_provider_capacity() {
+        for depth in 0..3 {
+            let mut group = evidence_plan::GroupReview::default();
+            assert!(!group.observe(false, vec![]).unwrap());
+            let mut error = group.finish().unwrap_err();
+            for layer in 0..depth {
+                error = error.context(format!("private review context {layer}"));
+            }
+            let review = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex, error);
+            let why = review.why_unavailable.as_ref().unwrap();
+            assert_eq!(why.code(), "review-recovery-required");
+            assert!(!why.permanent());
+            assert!(!why.headline().contains("capacity"));
+            assert!(!why.headline().contains("private review context"));
+            assert!(why.log_line().contains("incomplete group cannot authorize coverage"));
+            let plan = unreviewable_plan(71000, 70994, why, 1, false);
+            assert!(!plan.billed && plan.stand_down.is_none());
+            let comment = plan.wait_comment.unwrap();
+            assert!(comment.contains("No approval or code rejection"));
+            assert!(!comment.contains("reasoner-selftest"));
+        }
+    }
+
+    #[test]
+    fn exhausted_group_is_review_recovery_not_provider_capacity() {
+        let mut group = evidence_plan::GroupReview::default();
+        assert!(!group.observe(false, vec![]).unwrap());
+        let error = group.observe(false, vec![]).unwrap_err();
+        let review = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex, error);
+        assert_eq!(review.why_unavailable.unwrap().code(), "review-recovery-required");
+    }
+
+    #[test]
     fn oversized_review_wire_is_evidence_budget_not_provider_capacity() {
         let binding=aligned::ReviewBinding {head:"a".repeat(40),base:"b".repeat(40),
             environment_id:"environment".into(),contract_hash:"c".repeat(64),evidence_hash:"d".repeat(64)};
@@ -1151,7 +1200,7 @@ mod tests {
             let mut error=anyhow::anyhow!("provider down");
             for layer in 0..depth {error=error.context(format!("review layer {layer}"));}
             let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
-            assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity",
+            assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"review-recovery-required",
                 "an unrelated reviewer failure wrapped in {depth} context layers is not an evidence budget");
         }
     }
@@ -1184,7 +1233,7 @@ mod tests {
         }
         let error=anyhow::Error::new(SourcedFailure(anyhow::anyhow!("provider down").into()));
         let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
-        assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity",
+        assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"review-recovery-required",
             "an unrelated reviewer failure is not an evidence budget whatever reports it");
     }
 
@@ -1211,7 +1260,7 @@ mod tests {
             let mut error=anyhow::anyhow!("provider down");
             for level in 0..depth {error=wrap_review_failure(error,level);}
             let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
-            assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity",
+            assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"review-recovery-required",
                 "an unrelated reviewer failure {depth} chain levels down is not an evidence budget");
         }
     }
@@ -1230,9 +1279,9 @@ mod tests {
 
     /// Text that reads like a budget is not a budget: only the typed errors
     /// are evidence budgets, so a provider failure that happens to render the
-    /// same message is still missing reviewer capacity.
+    /// same message still requires review recovery without claiming a budget.
     #[test]
-    fn budget_lookalike_messages_stay_reviewer_capacity() {
+    fn budget_lookalike_messages_require_review_recovery() {
         let lookalikes=[
             EvidenceBudget("caller evidence".into()).to_string(),
             aligned::RequestBudgetExceeded.to_string()];
@@ -1243,7 +1292,7 @@ mod tests {
                 anyhow::Error::new(SourcedFailure(anyhow::anyhow!(text.clone()).into())).context("review group"),
             ] {
                 let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error);
-                assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"no-reviewer-capacity",
+                assert_eq!(review.why_unavailable.as_ref().unwrap().code(),"review-recovery-required",
                     "an untyped error that only reads like {text:?} is not an evidence budget");
             }
         }
@@ -1371,6 +1420,175 @@ mod tests {
         fixture_git(dir.path(), &["checkout", "--detach", &candidate]);
         let err = candidate_snapshot(dir.path()).await.err().unwrap();
         assert!(err.to_string().contains("integrate current main"));
+    }
+
+    #[tokio::test]
+    async fn main_advance_is_typed_through_context_and_source_wrapping() {
+        for depth in 0..3 {
+            let dir = candidate_fixture();
+            let candidate = fixture_git(dir.path(), &["rev-parse", "HEAD"]);
+            fixture_git(dir.path(), &["checkout", "--detach", "origin/main"]);
+            std::fs::write(dir.path().join("new-main.rs"), "fn shipped() {}\n").unwrap();
+            fixture_git(dir.path(), &["add", "."]);
+            fixture_git(dir.path(), &["commit", "-qm", "main advances"]);
+            let main = fixture_git(dir.path(), &["rev-parse", "HEAD"]);
+            fixture_git(dir.path(), &["update-ref", "refs/remotes/origin/main", &main]);
+            fixture_git(dir.path(), &["checkout", "--detach", &candidate]);
+            let mut error = candidate_snapshot(dir.path()).await.err().unwrap();
+            for layer in 0..depth { error = wrap_review_failure(error, layer); }
+            let review = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex, error);
+            let why = review.why_unavailable.unwrap();
+            assert_eq!(why.code(), "review-main-advanced");
+            assert!(!why.permanent());
+            assert!(why.log_line().contains(&candidate) && why.log_line().contains(&main));
+            assert!(!why.headline().contains(&candidate));
+            let bounded = candidate_snapshot(dir.path()).await.err().unwrap()
+                .context(EvidenceBudget("outer evidence limit".into()));
+            let denial = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex, bounded);
+            assert_eq!(denial.why_unavailable.unwrap().code(), "review-evidence-budget",
+                "main integration cannot override an independently typed evidence limit");
+        }
+        let lookalike = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,
+            anyhow::anyhow!("main advanced beyond candidate; integrate current main before review"));
+        assert_eq!(lookalike.why_unavailable.unwrap().code(), "review-recovery-required");
+    }
+
+    #[tokio::test]
+    async fn main_advance_queues_original_workflow_without_resetting_work_or_charges() {
+        use crate::autoship_workflow::{WorkflowStore, ResourceCharge, Stage};
+        use crate::autoship_workflow::submission::{Request, Target, Milestone};
+        for command in [false, true] {
+            let dir = candidate_fixture();
+            let candidate = fixture_git(dir.path(), &["rev-parse", "HEAD"]);
+            fixture_git(dir.path(), &["checkout", "--detach", "origin/main"]);
+            std::fs::write(dir.path().join("new-main.rs"), "fn shipped() {}\n").unwrap();
+            fixture_git(dir.path(), &["add", "."]);
+            fixture_git(dir.path(), &["commit", "-qm", "main advances"]);
+            fixture_git(dir.path(), &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+            fixture_git(dir.path(), &["checkout", "--detach", &candidate]);
+            let error = candidate_snapshot(dir.path()).await.err().unwrap();
+            let why = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex, error)
+                .why_unavailable.unwrap();
+            let control = tempfile::Builder::new().prefix("main-advance-control-").tempdir_in("/tmp").unwrap();
+            let state = control.path().join("workflow.db");
+            let mut guard = workflow::WorkflowGuard::acquire_fixture(&state, workflow::Start {
+                repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo", source_issue: Some(7),
+                pr: if command { Some(42) } else { None }, branch: "fix/fixture", contract: "original owner contract", environment: "fixture",
+            }).await.unwrap().unwrap();
+            guard.checkpoint(Stage::Review, "verified", "review", 0, &["original-immutable-pin".into()]).await.unwrap();
+            let id = guard.id().to_owned();
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut store = WorkflowStore::open(&state).unwrap();
+            let lease = guard.merge_lease().unwrap();
+            store.attach_pr_in_repo(&lease, "owner/repo", 42, now).unwrap();
+            assert_eq!(id, if command { "owner/repo/pr/42" } else { "owner/repo#7" });
+            store.charge(&lease, "original-paid-work", ResourceCharge {
+                model_calls: 7, tokens: 42, wall_ms: 10,
+            }, now).unwrap();
+            if command {
+                store.submit_authorized("original-command", "github:owner", &Request {
+                    repository: "owner/repo".into(), target: Target::Pr(42), provider: None, until: Milestone::Merged,
+                }, now).unwrap();
+            }
+            let before = store.snapshot(&id).unwrap().unwrap();
+            let allowance = serde_json::to_value(store.merge_allowance(now, 5).unwrap()).unwrap();
+            checkpoint_unavailable_review(&mut guard, &why, now).await.unwrap();
+            let after = store.snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.checkpoint.stage, Stage::Reconcile, "a changed main must not require another owner resume");
+            assert_eq!(after.checkpoint.next.reason, "review_main_changed");
+            assert_eq!(after.checkpoint.next.action, "reconcile_main");
+            assert_eq!(after.checkpoint.next.eligible_at_ms, now + 300_000);
+            assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
+            assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
+            assert_eq!((after.model_calls, after.tokens), (7, 42));
+            assert_eq!(serde_json::to_value(store.merge_allowance(now, 5).unwrap()).unwrap(), allowance);
+            guard.finish().unwrap();
+            if command {
+                assert!(!store.command_queue_due("owner/repo", now + 299_999).unwrap());
+                assert!(store.command_queue_due("owner/repo", now + 300_000).unwrap());
+            } else { assert!(!store.has_command_jobs().unwrap()); }
+            assert_eq!(fixture_git(dir.path(), &["rev-parse", "HEAD"]), candidate);
+            assert!(!store.has_due_main_reconciliation(None, now + 299_999).unwrap());
+            assert!(store.has_due_main_reconciliation(None, now + 300_000).unwrap());
+            assert!(store.has_due_main_reconciliation(Some("owner/repo"), now + 300_000).unwrap());
+            assert!(!store.has_due_main_reconciliation(Some("owner/repo_extra"), now + 300_000).unwrap());
+            let pr = adoption::AdoptedPr { repository: "owner/repo".into(), pr: 42, source_issue: Some(7),
+                branch: "fix/fixture".into(), head: candidate.clone(), base: "main".into(), author: "owner".into(),
+                title: "fixture".into(), body: "original owner contract".into(), dependency: adoption::Dependency::Main };
+            let candidates = [pr];
+            assert!(adoption::episode_retries(&state, &candidates, now + 299_999).unwrap().is_empty());
+            let retries = adoption::episode_retries(&state, &candidates, now + 300_000).unwrap();
+            assert!(retries.contains(&42), "automatic source-issue selection must recognize this dependency wake");
+            let mut ledger = AttemptLedger::default();
+            ledger.mark(1, 7);
+            assert!(adoption::select_linked_with_retries(&candidates, &ledger, 1, &Default::default(), None, 0, &Default::default()).is_none());
+            assert_eq!(adoption::select_linked_with_retries(&candidates, &ledger, 1, &Default::default(), None, 0, &retries).unwrap().0, 42);
+            store.set_owner_pause(&id, "github:owner", 0, true, now).unwrap();
+            assert!(adoption::episode_retries(&state, &candidates, now + 300_000).unwrap().is_empty());
+            assert!(!store.has_due_main_reconciliation(None, now + 300_000).unwrap());
+            store.set_owner_pause(&id, "github:owner", 1, false, now).unwrap();
+            let lease = store.claim_productive(&id, "later-worker", now + 300_000, 100_000).unwrap().unwrap();
+            let mut unrelated = store.snapshot(&id).unwrap().unwrap().checkpoint;
+            unrelated.next.reason = "resume_started".into();
+            store.checkpoint(&lease, &unrelated, now + 300_000).unwrap();
+            store.release(&lease, now + 300_000).unwrap();
+            assert!(adoption::episode_retries(&state, &candidates, now + 300_000).unwrap().is_empty(),
+                "a generic reconcile action cannot bypass the same-day paid-attempt fence");
+            assert!(!store.has_due_main_reconciliation(None, now + 300_000).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn main_advance_does_not_bypass_owner_lease_publication_or_candidate_fences() {
+        use crate::autoship_workflow::{WorkflowStore, ResourceCharge, Stage, OperationKind};
+        for case in ["owner-pause", "stale-lease", "unknown-merge", "stale-candidate"] {
+            let dir = candidate_fixture();
+            let candidate = fixture_git(dir.path(), &["rev-parse", "HEAD"]);
+            fixture_git(dir.path(), &["checkout", "--detach", "origin/main"]);
+            std::fs::write(dir.path().join("new-main.rs"), "fn shipped() {}\n").unwrap();
+            fixture_git(dir.path(), &["add", "."]);
+            fixture_git(dir.path(), &["commit", "-qm", "main advances"]);
+            fixture_git(dir.path(), &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+            fixture_git(dir.path(), &["checkout", "--detach", &candidate]);
+            let error = candidate_snapshot(dir.path()).await.err().unwrap();
+            let why = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex, error)
+                .why_unavailable.unwrap();
+            if case == "stale-candidate" {
+                std::fs::write(dir.path().join("later.rs"), "fn preserved_later_work() {}\n").unwrap();
+                fixture_git(dir.path(), &["add", "."]);
+                fixture_git(dir.path(), &["commit", "-qm", "candidate advances after observation"]);
+            }
+            let expected_head = fixture_git(dir.path(), &["rev-parse", "HEAD"]);
+            let control = tempfile::Builder::new().prefix("main-advance-fences-").tempdir_in("/tmp").unwrap();
+            let state = control.path().join("workflow.db");
+            let mut guard = workflow::WorkflowGuard::acquire_fixture(&state, workflow::Start {
+                repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo", source_issue: Some(7),
+                pr: Some(42), branch: "fix/fixture", contract: "original contract", environment: "fixture",
+            }).await.unwrap().unwrap();
+            guard.transition(Stage::Review, "verified", "review", 0).await.unwrap();
+            let id = guard.id().to_owned();
+            let lease = guard.merge_lease().unwrap();
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut store = WorkflowStore::open(&state).unwrap();
+            store.charge(&lease, "original-work", ResourceCharge {model_calls: 3, tokens: 5, wall_ms: 10}, now).unwrap();
+            match case {
+                "owner-pause" => { store.set_owner_pause(&id, "github:owner", 0, true, now).unwrap(); }
+                "stale-lease" => {
+                    store.release(&lease, now).unwrap();
+                    store.claim_reconciliation(&id, "new-owner", now + 1, 100_000).unwrap().unwrap();
+                }
+                "unknown-merge" => { guard.intent(OperationKind::MergePr).unwrap(); }
+                _ => {}
+            }
+            let before = store.snapshot(&id).unwrap().unwrap();
+            assert!(checkpoint_unavailable_review(&mut guard, &why, now).await.is_err(), "{case}");
+            let after = store.snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.checkpoint, before.checkpoint, "{case}");
+            assert_eq!((after.model_calls, after.tokens), (3, 5), "{case}");
+            assert_eq!(fixture_git(dir.path(), &["rev-parse", "HEAD"]), expected_head, "{case}");
+            if case == "owner-pause" { assert!(store.owner_control(&id).unwrap().unwrap().paused); }
+            if case == "unknown-merge" { assert_eq!(store.pending_operations(&id).unwrap().len(), 1); }
+        }
     }
 
     #[tokio::test]
