@@ -30,9 +30,10 @@ milestones and blockers; do not restart the canceled benchmark campaign.
   matching Rust implementation source and reduced hosted-CI inventory reads.
   These are components, not full failed-result custody or capacity sizing.
 - #2004 added typed main-advance reconciliation and its scheduled wake.
-- #2009 is the next repair for bounded review correction context, truthful
-  review blockers and hosted dependency setup. Its PR records current validation
-  and rollout status; this document does not claim it is deployed.
+- #2009 repaired bounded review correction context, truthful review blockers
+  and hosted dependency setup. The normal updater deployed commit `227d27f1`
+  on November 11; both running service executable hashes matched the release
+  artifact in the 16:14 UTC readback. This is a dated rollout observation.
 - #2016 tracks unchanged acceptance-input waits being reclaimed without useful
   progress. Waiting for changed input must not become repeated paid attempts.
 - #1917 remains the automatic host-capacity epic. Native retained-state storage

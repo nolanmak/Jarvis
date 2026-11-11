@@ -84,6 +84,10 @@ mod tests {
                     let result=apply(&root,&path,"owner/repo/pr/42").await;
                     if matches!(case,"closed"|"merged") {
                         let result=result.unwrap();assert_eq!(result["reconciled"],true);
+                        if case=="closed" {
+                            assert_eq!(result["reason"],"target_closed","CLI status hid terminal retirement behind owner pause");
+                            assert_eq!(result["next_action"],"complete");
+                        }
                         let after=store.snapshot(&id).unwrap().unwrap();
                         assert_eq!(after.checkpoint.stage,if case=="closed" {Stage::Retired}else{Stage::Merged});
                         assert_eq!((after.model_calls,after.tokens),(3,700));
