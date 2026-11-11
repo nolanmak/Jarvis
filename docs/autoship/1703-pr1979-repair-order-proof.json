@@ -3,7 +3,7 @@
   "epic": 1703,
   "issue": 1983,
   "pull_request": 1979,
-  "observed_at_utc": "2026-11-11T01:39:17.367330+00:00",
+  "observed_at_utc": "2026-11-11T01:57:54.586642+00:00",
   "regression": {
     "name": "self_improve::acceptance::repair_gate_tests::repair_scope_is_checked_before_verification_runs",
     "fixture": "Real temporary Git repositories and the production post-repair helper; lazy callback counts verification execution. Allowed edit executes once; unregistered implementation/observer edits execute zero times. An allowed-list deployment path is independently refused by the guard.",
@@ -22,7 +22,128 @@
     "path": "crates/augmentagent-cli/src/self_improve_contract.rs",
     "behavior": "Reuse existing guarded-path and independently registered allowed-path validation immediately before awaiting repaired-candidate verification, and at the existing round-start location.",
     "run": 42940409364,
-    "result": "pending"
+    "result": "hosted exact-head job and individual test/aggregate steps succeeded",
+    "job": 130260584597,
+    "url": "https://github.com/nolanmak/Jarvis/actions/runs/42940409364/job/130260584597",
+    "raw_log": "pending REST API quota reset at 2026-11-11T02:11:59Z; no exact passing count claimed",
+    "check_evidence": {
+      "baseRefOid": "4ebb2b745c62476ad08571dea008307f2235a986",
+      "checks": [
+        {
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/nolanmak/Jarvis/actions/runs/42940409364/job/130260584597",
+          "name": "targeted",
+          "status": "COMPLETED",
+          "steps": {
+            "nodes": [
+              {
+                "conclusion": "SUCCESS",
+                "name": "Set up job",
+                "number": 1
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+                "number": 2
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Run dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
+                "number": 3
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Run Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+                "number": 4
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Plan which crates this change can affect",
+                "number": 5
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Run denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed",
+                "number": 6
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Install PDF fonts and poppler",
+                "number": 7
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Provision the pinned PDF runtime",
+                "number": 8
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Run actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff",
+                "number": 9
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Build exact sidecar used by Rust contract tests",
+                "number": 10
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Targeted crate tests",
+                "number": 11
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Every other applicable Linux check for this head",
+                "number": 12
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Post Run actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff",
+                "number": 21
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Post Run denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed",
+                "number": 22
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Post Run Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+                "number": 23
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Post Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+                "number": 24
+              },
+              {
+                "conclusion": "SUCCESS",
+                "name": "Complete job",
+                "number": 25
+              }
+            ]
+          }
+        }
+      ],
+      "headRefOid": "4bfb6ae88c5cc4452cd47e7a88aed2235955a20a"
+    },
+    "plan": {
+      "mode": "targeted",
+      "reasons": [],
+      "crates": [
+        "augmentagent-cli"
+      ],
+      "affected": [
+        "augmentagent-autonomy",
+        "augmentagent-channel-core",
+        "augmentagent-channel-slack",
+        "augmentagent-cli"
+      ],
+      "changed": [
+        "crates/augmentagent-cli/src/self_improve_contract.rs"
+      ]
+    },
+    "coverage_reason": "The exact base/head planner selects targeted CLI binary and integration tests plus affected autonomy/core/Slack suites. The new regression is an ordinary non-ignored CLI unit test. GitHub reports the planning, Targeted crate tests and Every other applicable Linux check steps individually successful. Raw final-run log and exact counts are not yet downloaded."
   },
   "local_attempt": {
     "command": "scripts/cargo-managed.sh test -p augmentagent-cli repair_scope_is_checked_before_verification_runs",
@@ -33,7 +154,9 @@
     "independent_approval": false,
     "merged": false,
     "deployed": false,
-    "production_acceptance": false
+    "production_acceptance": false,
+    "ready_for_review": true,
+    "native_submission": "not yet submitted; actor authorization uses REST and current core quota is exhausted. Preserve the original intended request ID for first actual submission after recovery."
   },
   "limits": [
     "This addresses validation ordering, not initial harness compilation or independent review source-budget recovery.",
