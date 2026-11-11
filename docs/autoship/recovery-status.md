@@ -65,7 +65,10 @@ does not relax validation or increase the three completed-assessment limit.
 corrections were exhausted, not that an owner decision is missing. The same
 binding cannot make another productive claim, including after a restart or day
 change. Changed request, source or environment bindings can retry through normal
-admission; owner pauses still apply. General reconciliation remains available.
+admission; owner pauses still apply. Admission also binds GitHub’s freshly read
+main SHA and the readiness-policy version, so a retained checkout does not hide
+a real upstream change or policy rollout. Bump the shared readiness policy when
+changing its correction protocol. General reconciliation remains available.
 See #2023 for the observed wrapped-comment failure and regression coverage.
 
 The superseded #1916 documentation branch retains historical design and proof

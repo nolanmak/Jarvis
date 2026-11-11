@@ -207,7 +207,8 @@ pub(super) async fn resume(
     };
     let worktree = workflow::prepare_resume_candidate(repo, &pr.repository, pr.pr, &pr.branch, Some(&pr.head)).await?;
     let request = format!("Pull request #{}: {}\n{}", pr.pr, pr.title, pr.body);
-    let environment = recovery::environment_identity(&worktree).await?;
+    let upstream_main = workflow::remote_main_head(&worktree,&pr.repository).await?;
+    let environment = recovery::environment_identity(&worktree,&upstream_main).await?;
     let Some(mut guard) = workflow::WorkflowGuard::acquire(workflow::Start {
         repo_root: repo,
         worktree: &worktree,

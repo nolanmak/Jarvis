@@ -3,6 +3,7 @@
 use super::*;
 use std::collections::BTreeSet;
 pub(in crate::self_improve) enum Decision { Ready(String), Dependency(String) }
+pub(in crate::self_improve) const POLICY:&str="readiness-grounding-v3";
 const SLOTS: [&str;6]=["trigger","failure","surface","persistence","guards","rollout"];
 #[derive(Clone,Debug,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -206,7 +207,7 @@ async fn assess_source(root:&Path,source:AcceptanceSource,title:&str,body:&str,h
     })).collect() };
     let prompt=format!("Assess codification readiness BEFORE producing a spec. The slots object must have EXACTLY these six keys: {}. No additional keys are allowed. Resolve routine gaps from exact owner/repository evidence. A not-applicable slot MUST use status=resolved with decision explaining why it is not applicable and evidence grounding that conclusion. Never emit a separate not_applicable status. Do not guess a material owner decision. Only genuinely unavailable externally controlled choices use external_decision; neither hard work, missing tests, unseen files nor provider trouble is an external decision. Return ONLY JSON using this complete shape, replacing EVERY placeholder with grounded content:\n{}\nExternal slots instead contain status=external_decision, question, alternatives (2-4), evidence. path=null cites owner text; otherwise exact tracked file path and literal source quote. Do not add slots named resolve, resolve_routine, or other instructions. For evidence, prefer a short exact source substring without indentation or display line numbers. Do not reconstruct whitespace or copy a whole escaped shell command when a short literal substring suffices. Ensure all strings are valid JSON. Owner request:\n{owner}",serde_json::to_string(&SLOTS)?,serde_json::to_string(&shape)?);
     let epoch=amendment::digest(serde_json::to_string(&(source,hash,&base,&current_main,&prompt)).unwrap().as_bytes());
-    let key=|attempt|amendment::digest(format!("readiness-grounding-v3:{epoch}:{attempt}").as_bytes());
+    let key=|attempt|amendment::digest(format!("{POLICY}:{epoch}:{attempt}").as_bytes());
     let read_workflow=&*workflow;
     let result=recover_assessment(&prompt,
         |attempt|workflow.scope_stage_response(&key(attempt)),
