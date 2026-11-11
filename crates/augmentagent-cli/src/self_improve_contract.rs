@@ -1109,9 +1109,9 @@ fn install_candidate_harness(candidate: &Path, prepared: &PreparedAcceptance) ->
 
 fn initial_scope_error(error:anyhow::Error)->anyhow::Error {
     if error.downcast_ref::<crate::autoship_workflow::MissingScopeResponse>().is_some() {
-        initial_repair::Hold::EvidenceUnknown.into()
+        error.context(initial_repair::Hold::EvidenceUnknown)
     } else if scope_authority::completed_exhaustion(&error) {
-        initial_repair::Hold::ContractInvalid.into()
+        error.context(initial_repair::Hold::ContractInvalid)
     } else {error}
 }
 
@@ -1195,7 +1195,21 @@ mod initial_diagnostic_tests {
 
 pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,error:&anyhow::Error)->Result<Option<RunReport>> {
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
+    // Record the safe hold first: loss of private diagnostic storage cannot
+    // make the workflow runnable or publish the underlying source/output.
     workflow.hold_initial_acceptance(hold.reason(),hold.action()).await?;
+    let diagnostic=format!("{error:#}");
+    let key=amendment::digest(&serde_json::to_vec(&(
+        "initial-acceptance-diagnostic-v1",workflow.id(),workflow.binding(),hold.reason(),
+        amendment::digest(diagnostic.as_bytes()),
+    ))?);
+    let record=serde_json::json!({"version":1,"kind":"initial_acceptance_diagnostic",
+        "workflow":workflow.id(),"binding":workflow.binding(),"reason":hold.reason(),"diagnostic":diagnostic});
+    // The immutable writer owns the existing 2 MiB bound and binding/lease
+    // checks. Exact replays create no new row/event; no clock or generation
+    // enters the identity. Failed retention exposes only a fixed safe type.
+    workflow.record_scope_stage_response(&key,&serde_json::to_string(&record)?)
+        .map_err(|_|anyhow::Error::from(initial_repair::Hold::EvidenceUnknown))?;
     Ok(Some(RunReport::held(hold.to_string())))
 }
 
