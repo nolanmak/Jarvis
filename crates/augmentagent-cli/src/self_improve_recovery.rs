@@ -164,15 +164,17 @@ pub(super) async fn commit_candidate_named(worktree: &Path, message: &str) -> Re
     Ok(())
 }
 
-pub(super) async fn environment_identity(worktree: &Path) -> Result<String> {
+pub(super) async fn environment_identity(worktree: &Path, upstream_main:&str) -> Result<String> {
     use sha2::{Digest, Sha256};
     let (ok, compiler, _) = run("rustc", &["--version"], worktree).await?;
     anyhow::ensure!(ok, "verifier compiler identity unavailable");
     let lock = std::fs::read(worktree.join("Cargo.lock"))?;
     Ok(format!(
-        "{};cargo-lock:{:x}",
+        "{};cargo-lock:{:x};upstream-main:{};readiness-policy:{}",
         compiler.trim(),
-        Sha256::digest(lock)
+        Sha256::digest(lock),
+        upstream_main,
+        acceptance::readiness::POLICY
     ))
 }
 
@@ -214,6 +216,21 @@ mod tests {
             &["update-ref", "refs/remotes/origin/main", "HEAD"],
         );
         root
+    }
+    #[tokio::test]
+    async fn retained_candidate_environment_changes_only_when_upstream_input_changes() {
+        let root=repo();
+        std::fs::write(root.path().join("Cargo.lock"),"fixture lock").unwrap();
+        let candidate=git(root.path(),&["rev-parse","HEAD"]);
+        let first=environment_identity(root.path(),&candidate).await.unwrap();
+        assert_eq!(first,environment_identity(root.path(),&candidate).await.unwrap());
+        let upstream=git(root.path(),&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+            "commit-tree","HEAD^{tree}","-p","HEAD","-m","upstream change"]);
+        assert_eq!(candidate,git(root.path(),&["rev-parse","refs/remotes/origin/main"]),"local tracking ref deliberately stays stale");
+        assert_eq!(candidate,git(root.path(),&["rev-parse","HEAD"]),"retained candidate must remain intact");
+        let changed=environment_identity(root.path(),&upstream).await.unwrap();
+        assert_ne!(first,changed,"upstream input must reopen readiness admission without editing the candidate");
+        assert_eq!(changed,environment_identity(root.path(),&upstream).await.unwrap(),"unchanged input remains stable");
     }
     #[tokio::test]
     async fn interruption_preserves_commits_dirty_edits_and_new_files() {

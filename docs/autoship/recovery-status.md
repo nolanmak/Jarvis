@@ -57,6 +57,20 @@ required by branch protection. Keep owner pauses and uncertain operations intact
 Use the supported workflow/controller paths for terminal reconciliation and native
 retirement; never edit production SQLite rows to manufacture completion.
 
+Readiness evidence must quote literal immutable source bytes, including comment
+markers and line breaks when they occur inside a quote. Correction feedback
+preserves bounded previous output and verbatim source excerpts privately; it
+does not relax validation or increase the three completed-assessment limit.
+`readiness_assessment_invalid / await_readiness_input_change` means those
+corrections were exhausted, not that an owner decision is missing. The same
+binding cannot make another productive claim, including after a restart or day
+change. Changed request, source or environment bindings can retry through normal
+admission; owner pauses still apply. Admission also binds GitHub’s freshly read
+main SHA and the readiness-policy version, so a retained checkout does not hide
+a real upstream change or policy rollout. Bump the shared readiness policy when
+changing its correction protocol. General reconciliation remains available.
+See #2023 for the observed wrapped-comment failure and regression coverage.
+
 The superseded #1916 documentation branch retains historical design and proof
 artifacts at commit `799ba04dcfcd51b65f9585f82aa995a2c0bd4dfa`. Each describes
 its own revision and limitations. This short status page replaces that large

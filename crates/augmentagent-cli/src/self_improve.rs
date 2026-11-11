@@ -8083,7 +8083,8 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         .join(format!("{}-issue-{}", lane_from_env().worktree_name(), issue.number));
     recovery::prepare(repo_root, &worktree, &branch).await?;
     let repository = workflow::canonical_repository(repo_root).await?;
-    let environment = recovery::environment_identity(&worktree).await?;
+    let upstream_main = workflow::remote_main_head(&worktree,&repository).await?;
+    let environment = recovery::environment_identity(&worktree,&upstream_main).await?;
     let contract = serde_json::to_string(&(issue.number, &issue.title, &issue.body))?;
     let Some(mut workflow_guard) = workflow::WorkflowGuard::acquire(workflow::Start {
         repo_root, worktree: &worktree, repository: &repository,

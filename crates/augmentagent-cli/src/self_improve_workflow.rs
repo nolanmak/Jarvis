@@ -1300,7 +1300,9 @@ impl WorkflowGuard {
         self.audit_health().await?;
         let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
         let mut checkpoint=store.snapshot(self.id())?.context("initial acceptance workflow missing")?.checkpoint;
-        anyhow::ensure!(checkpoint.binding==self.binding && matches!(checkpoint.stage,Stage::Intake|Stage::Scope),
+        let readiness_reassessment=reason=="readiness_assessment_invalid" && action=="await_readiness_input_change"
+            && checkpoint.stage==Stage::Reconcile && checkpoint.next.reason=="inputs_changed";
+        anyhow::ensure!(checkpoint.binding==self.binding && (matches!(checkpoint.stage,Stage::Intake|Stage::Scope) || readiness_reassessment),
             "initial acceptance hold requires unchanged unenrolled scope");
         if checkpoint.stage==Stage::Scope && checkpoint.next.reason==reason && checkpoint.next.action==action
             && checkpoint.next.eligible_at_ms==0 {return Ok(());}
@@ -3266,54 +3268,60 @@ mod initial_acceptance_hold_tests {
     use super::*;
     #[tokio::test]
     async fn unchanged_initial_acceptance_wait_does_not_claim_again_after_restart_or_day_change() {
-        for (issue,pr) in [(Some(7),None),(Some(7),Some(42)),(None,Some(42))] {
-            let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
-            std::fs::write(repo.path().join("implementation.py"),"def add(a,b): return a-b\n").unwrap();
-            for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","initial"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
-                let output=tokio::process::Command::new("/usr/bin/git").args(args).current_dir(repo.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
-                assert!(output.status.success());
-            }
-            let path=control.path().join("workflow.db");
-            let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",
-                source_issue:issue,pr,branch:"fixture",contract:"unchanged owner criteria",environment:"fixture"};
-            let now=millis();
-            let mut guard=WorkflowGuard::acquire_at(&path,start(),now).await.unwrap().unwrap();
-            guard.hold_initial_acceptance("acceptance_verifier_repair_exhausted","await_acceptance_input_change").await.unwrap();
-            let id=guard.id().to_owned();guard.finish().unwrap();
-            let before=WorkflowStore::open_read_only(&path).unwrap().unwrap();
-            let original=before.snapshot(&id).unwrap().unwrap();
-            let events=before.events(&id).unwrap();drop(before);
-            for offset in [1000,86_400_000,2*86_400_000] {
-                let next=WorkflowGuard::acquire_at(&path,start(),now+offset).await.unwrap();
-                assert!(next.is_none(),"unchanged acceptance-input wait was reclaimed: issue={issue:?}, pr={pr:?}");
+        for (reason,action) in [("acceptance_verifier_repair_exhausted","await_acceptance_input_change"),("readiness_assessment_invalid","await_readiness_input_change")] {
+            for (issue,pr) in [(Some(7),None),(Some(7),Some(42)),(None,Some(42))] {
+                let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
+                std::fs::write(repo.path().join("implementation.py"),"def add(a,b): return a-b\n").unwrap();
+                for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","initial"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
+                    let output=tokio::process::Command::new("/usr/bin/git").args(args).current_dir(repo.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
+                    assert!(output.status.success());
+                }
+                let path=control.path().join("workflow.db");
+                let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",
+                    source_issue:issue,pr,branch:"fixture",contract:"unchanged owner criteria",environment:"fixture"};
+                let now=millis();
+                let mut guard=WorkflowGuard::acquire_at(&path,start(),now).await.unwrap().unwrap();
+                guard.hold_initial_acceptance(reason,action).await.unwrap();
+                let id=guard.id().to_owned();guard.finish().unwrap();
+                let before=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+                let original=before.snapshot(&id).unwrap().unwrap();
+                let events=before.events(&id).unwrap();drop(before);
+                for offset in [1000,86_400_000,2*86_400_000] {
+                    let next=WorkflowGuard::acquire_at(&path,start(),now+offset).await.unwrap();
+                    assert!(next.is_none(),"unchanged acceptance-input wait was reclaimed: issue={issue:?}, pr={pr:?}");
+                    let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+                    let after=store.snapshot(&id).unwrap().unwrap();
+                    assert_eq!(after.attempts,original.attempts);
+                    assert_eq!(after.model_calls,original.model_calls);
+                    assert_eq!(after.tokens,original.tokens);
+                    assert_eq!(after.checkpoint,original.checkpoint);
+                    assert_eq!(store.events(&id).unwrap(),events);
+                }
+                // A real contract revision can re-enter ordinary admission, but
+                // it cannot override the owner's pause or reuse old approval.
+                let mut store=WorkflowStore::open(&path).unwrap();
+                store.set_owner_pause(&id,"github:owner",0,true,now+3*86_400_000).unwrap();
+                let mut revised=start();revised.contract="changed owner criteria";
+                assert!(WorkflowGuard::acquire_at(&path,revised,now+3*86_400_000).await.unwrap().is_none());
+                store.set_owner_pause(&id,"github:owner",1,false,now+3*86_400_000+1).unwrap();
+                drop(store);
+                let mut revised=start();revised.contract="changed owner criteria";
+                let mut changed=WorkflowGuard::acquire_at(&path,revised,now+3*86_400_000+2).await.unwrap().unwrap();
                 let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
                 let after=store.snapshot(&id).unwrap().unwrap();
-                assert_eq!(after.attempts,original.attempts);
+                assert_eq!(after.attempts,original.attempts+1);
+                assert_eq!(after.checkpoint.stage,Stage::Reconcile);
+                assert_eq!(after.checkpoint.next.reason,"inputs_changed");
+                assert_ne!(after.checkpoint.binding.contract,original.checkpoint.binding.contract);
                 assert_eq!(after.model_calls,original.model_calls);
                 assert_eq!(after.tokens,original.tokens);
-                assert_eq!(after.checkpoint,original.checkpoint);
-                assert_eq!(store.events(&id).unwrap(),events);
+                assert!(store.current_review_history(&id).unwrap().is_empty());
+                drop(store);
+                if reason=="readiness_assessment_invalid" {
+                    changed.hold_initial_acceptance(reason,action).await.unwrap();
+                }
+                changed.finish().unwrap();
             }
-            // A real contract revision can re-enter ordinary admission, but
-            // it cannot override the owner's pause or reuse old approval.
-            let mut store=WorkflowStore::open(&path).unwrap();
-            store.set_owner_pause(&id,"github:owner",0,true,now+3*86_400_000).unwrap();
-            let mut revised=start();revised.contract="changed owner criteria";
-            assert!(WorkflowGuard::acquire_at(&path,revised,now+3*86_400_000).await.unwrap().is_none());
-            store.set_owner_pause(&id,"github:owner",1,false,now+3*86_400_000+1).unwrap();
-            drop(store);
-            let mut revised=start();revised.contract="changed owner criteria";
-            let changed=WorkflowGuard::acquire_at(&path,revised,now+3*86_400_000+2).await.unwrap().unwrap();
-            let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
-            let after=store.snapshot(&id).unwrap().unwrap();
-            assert_eq!(after.attempts,original.attempts+1);
-            assert_eq!(after.checkpoint.stage,Stage::Reconcile);
-            assert_eq!(after.checkpoint.next.reason,"inputs_changed");
-            assert_ne!(after.checkpoint.binding.contract,original.checkpoint.binding.contract);
-            assert_eq!(after.model_calls,original.model_calls);
-            assert_eq!(after.tokens,original.tokens);
-            assert!(store.current_review_history(&id).unwrap().is_empty());
-            drop(store);changed.finish().unwrap();
         }
     }
 

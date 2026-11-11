@@ -214,7 +214,7 @@ mod acceptance_input_wait_claim_tests {
     use super::*;
     #[test]
     fn acceptance_input_wait_claim_is_atomic_and_preserves_charges_and_guards() {
-        for reason in ["acceptance_verifier_repair_exhausted","acceptance_contract_invalid"] {
+        for reason in ["acceptance_verifier_repair_exhausted","acceptance_contract_invalid","readiness_assessment_invalid"] {
             for change in ["head","contract","environment"] {
                 let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
                 let mut store=WorkflowStore::open(&path).unwrap();
@@ -225,7 +225,7 @@ mod acceptance_input_wait_claim_tests {
                 store.charge(&setup,"prior-paid-work",ResourceCharge {model_calls:3,tokens:700,wall_ms:5},3).unwrap();
                 let mut checkpoint=store.snapshot(&setup.workflow).unwrap().unwrap().checkpoint;
                 checkpoint.stage=Stage::Scope;
-                checkpoint.next=NextAction {reason:reason.into(),action:"await_acceptance_input_change".into(),eligible_at_ms:0};
+                checkpoint.next=NextAction {reason:reason.into(),action:if reason=="readiness_assessment_invalid" {"await_readiness_input_change"} else {"await_acceptance_input_change"}.into(),eligible_at_ms:0};
                 store.checkpoint(&setup,&checkpoint,4).unwrap();store.release(&setup,5).unwrap();
                 let before=store.snapshot(&setup.workflow).unwrap().unwrap();let events=store.events(&setup.workflow).unwrap();
                 for now in [6,86_400_001,2*86_400_000] {
@@ -815,7 +815,8 @@ impl WorkflowStore {
         let cp: Checkpoint = serde_json::from_str(&raw)?;
         let awaiting_input=cp.stage==Stage::Scope && matches!(
             (cp.next.reason.as_str(),cp.next.action.as_str()),
-            ("acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid","await_acceptance_input_change"));
+            ("acceptance_verifier_repair_exhausted"|"acceptance_contract_invalid","await_acceptance_input_change")|
+            ("readiness_assessment_invalid","await_readiness_input_change"));
         if purpose==ClaimPurpose::Productive && awaiting_input
             && binding.is_none_or(|binding|binding==&cp.binding) {
             return Ok(None);
