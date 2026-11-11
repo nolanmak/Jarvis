@@ -163,6 +163,35 @@ resume can still require runtime retirement reconciliation before execution.
 Acceptance, cleanup, model progress, and a confirmed merge are separate results.
 Preserve unrelated owner pauses and inspect the resulting status.
 
+## Capacity waits in health readback
+
+After verifying the deployed build and worker, run:
+
+```sh
+augmentagent autopr-health --json
+```
+
+`workflow-capacity-blocked` is an ALERT for active durable
+`resource_capacity` / `await_capacity` checkpoints. A running worker, recent
+manual merge or provider-hold warning does not clear it. Owner-paused, held,
+terminal and diagnostic-only workflows are excluded. The count describes the
+persisted wait; available capacity still needs normal worker reconciliation.
+
+`workflow-capacity-unavailable` is an ALERT when the running worker's effective
+configuration or selected workflow store cannot be verified. Health reads the
+worker's private process-bound post-bootstrap receipt and opens that workflow
+store read-only, using the same selected database and daily cap for capacity and
+merge accounting. Missing or stale evidence does not select or create another
+workflow database. Either capacity ALERT makes the command exit 1.
+
+Health observation does not claim, wake or prune workflows or spend shipping
+allowance. Inspect the worker's selected capacity and ownership evidence through
+its configured delegated resource context. A readiness probe from an ordinary
+shell may lack delegation without proving the worker lacks it. Restore supported
+capacity or complete verified ownership recovery; preserve owner holds, retained
+sessions and budgets while the underlying cause is unresolved.
+
+
 ## Observed deployment, 2026-10-26
 
 The normal updater deployed `c17ef74eefea6be6324778fad3522150c356902a`

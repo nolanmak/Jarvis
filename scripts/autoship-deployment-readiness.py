@@ -121,6 +121,33 @@ def service_pid(role):
     output=subprocess.run(['/usr/bin/systemctl','--user','show',ROLES[role],'-p','MainPID','--value'],capture_output=True,text=True,timeout=3)
     return int(output.stdout.strip()) if output.returncode==0 and output.stdout.strip().isdigit() else 0
 
+def workflow_store_configuration(receipts,pid_for=service_pid):
+    """Observe the live worker's post-bootstrap receipt, never initial environ.
+
+    Return only store-resolution inputs; this grants no workflow authority.
+    Missing/stale worker evidence refuses instead of selecting another store.
+    """
+    try:
+        pid=pid_for('worker')
+        if type(pid) is not int or pid<=0:raise Refused('worker-not-running')
+        proc=Path('/proc')/str(pid)
+        if proc.stat().st_uid!=os.getuid():raise Refused('process-owner-mismatch')
+        identity=birth(pid);cwd=(proc/'cwd').resolve(strict=True)
+        raw=private(receipts/'worker.json');value=json.loads(raw)
+        if (value.get('version')!=1 or value.get('role')!='worker' or value.get('pid')!=pid
+                or value.get('birth')!=identity or value.get('boot_id')!=boot()
+                or value.get('dry_run') is not False):raise Refused('worker-receipt-unverified')
+        config=value.get('config')
+        if not isinstance(config,dict) or not set(config)<=KEYS or any(not isinstance(v,str) for v in config.values()):
+            raise Refused('worker-receipt-invalid')
+        if (pid_for('worker')!=pid or birth(pid)!=identity or (proc/'cwd').resolve(strict=True)!=cwd
+                or private(receipts/'worker.json')!=raw):raise Refused('process-changed')
+        return {'cwd':str(cwd),'workflow_db':config.get('AUGMENTAGENT_AUTOPR_WORKFLOW_DB'),
+                'state_home':config.get('XDG_STATE_HOME'),'home':config.get('HOME'),
+                'daily_cap':config.get('AUGMENTAGENT_AUTOPR_DAILY_CAP')}
+    except (OSError,ValueError,subprocess.SubprocessError):
+        raise Refused('worker-configuration-unavailable') from None
+
 def inspect_once(binary, selection, receipts, pid_for):
     report={'status':'deployment-unverified','matches':False,'live_verified':False,'services':{},'worker_running':False,'expected_active':False}
     try:
@@ -223,8 +250,13 @@ def main():
     parser.add_argument('--receipts',type=Path,required=True)
     parser.add_argument('--record',choices=ROLES);parser.add_argument('--pid',type=int)
     parser.add_argument('--activation-needed',action='store_true')
+    parser.add_argument('--workflow-store',action='store_true')
     parser.add_argument('--dry-run',action='store_true');parser.add_argument('--external',action='store_true')
     args=parser.parse_args()
+    if args.workflow_store:
+        try:print(json.dumps(workflow_store_configuration(args.receipts),sort_keys=True));return 0
+        except Exception:
+            print('worker-workflow-store-unavailable');return 1
     if args.activation_needed:
         try:return 10 if activation_needed(args.selection,args.receipts) else 0
         except Exception:return 1

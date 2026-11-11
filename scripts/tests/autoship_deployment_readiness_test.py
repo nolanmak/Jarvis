@@ -16,6 +16,33 @@ def write(path,value):
 
 class DeploymentTests(unittest.TestCase):
     @unittest.skipUnless(Path('/proc/self/stat').exists(),'Linux process-bound evidence')
+    def test_workflow_store_uses_effective_worker_receipt_and_rejects_stale_or_changed_process(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);receipts=root/'receipts';receipts.mkdir(mode=0o700)
+            child=subprocess.Popen([sys.executable,'-I','-c','import time;time.sleep(30)'],cwd=root)
+            self.addCleanup(lambda:child.poll() is None and (child.terminate(),child.wait()))
+            value={'version':1,'role':'worker','pid':child.pid,'birth':birth(child.pid),'boot_id':m.boot(),
+                'dry_run':False,'config':{'HOME':str(root/'worker-home'),'XDG_STATE_HOME':str(root/'worker-state'),
+                    'AUGMENTAGENT_AUTOPR':'1','AUGMENTAGENT_AUTOPR_WORKFLOW_DB':'worker.db','AUGMENTAGENT_AUTOPR_DAILY_CAP':'7'}}
+            path=receipts/'worker.json';write(path,value);before=path.read_bytes()
+            expected={'cwd':str(root),'workflow_db':'worker.db','state_home':str(root/'worker-state'),'home':str(root/'worker-home'),'daily_cap':'7'}
+            self.assertEqual(m.workflow_store_configuration(receipts,lambda role:child.pid),expected)
+            self.assertEqual(path.read_bytes(),before)
+            for fault in ('birth','public','secret','changed-process'):
+                current=json.loads(before)
+                if fault=='birth':current['birth']='stale'
+                if fault=='secret':current['config']['API_KEY']='must-not-output'
+                write(path,current)
+                if fault=='public':path.chmod(0o644)
+                calls=[]
+                def pid_for(role,calls=calls,fault=fault):
+                    calls.append(role)
+                    return 0 if fault=='changed-process' and len(calls)>1 else child.pid
+                with self.subTest(fault=fault),self.assertRaises(m.Refused):m.workflow_store_configuration(receipts,pid_for)
+            child.terminate();child.wait();write(path,value)
+            with self.assertRaises(m.Refused):m.workflow_store_configuration(receipts,lambda role:child.pid)
+
+    @unittest.skipUnless(Path('/proc/self/stat').exists(),'Linux process-bound evidence')
     def test_activation_detects_path_and_content_changes_but_refuses_stale_process_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);receipts=root/'receipts';receipts.mkdir(mode=0o700)
@@ -85,7 +112,7 @@ class DeploymentTests(unittest.TestCase):
                     expected=binary if case!='wrong-binary' else Path('/usr/bin/true')
                     before={str(p):p.read_bytes() for p in receipts.iterdir()}
                     calls=[]
-                    def pid_for(role):
+                    def pid_for(role,calls=calls,case=case):
                         calls.append(role)
                         if case=='changed-policy' and len(calls)==4:write(policy,{'version':1,'providers':{'claude':{},'codex':{}},'changed':True})
                         return 0 if case=='worker-stopped' and role=='worker' else children[role].pid

@@ -11974,7 +11974,7 @@ impl AutoPrLoop {
 
     /// The configured cap, or the default; never 0 (a cap of 0 would make the
     /// loop a silent no-op the owner enabled on purpose).
-    fn cap_from(daily_cap: Option<&str>) -> u32 {
+    pub(crate) fn cap_from(daily_cap: Option<&str>) -> u32 {
         daily_cap
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(Self::DEFAULT_DAILY_CAP)
