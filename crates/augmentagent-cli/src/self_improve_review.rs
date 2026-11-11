@@ -1442,6 +1442,11 @@ mod tests {
             assert!(!why.permanent());
             assert!(why.log_line().contains(&candidate) && why.log_line().contains(&main));
             assert!(!why.headline().contains(&candidate));
+            let bounded = candidate_snapshot(dir.path()).await.err().unwrap()
+                .context(EvidenceBudget("outer evidence limit".into()));
+            let denial = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex, bounded);
+            assert_eq!(denial.why_unavailable.unwrap().code(), "review-evidence-budget",
+                "main integration cannot override an independently typed evidence limit");
         }
         let lookalike = unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,
             anyhow::anyhow!("main advanced beyond candidate; integrate current main before review"));
