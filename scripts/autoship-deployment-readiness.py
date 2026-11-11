@@ -121,7 +121,7 @@ def service_pid(role):
     output=subprocess.run(['/usr/bin/systemctl','--user','show',ROLES[role],'-p','MainPID','--value'],capture_output=True,text=True,timeout=3)
     return int(output.stdout.strip()) if output.returncode==0 and output.stdout.strip().isdigit() else 0
 
-def inspect(binary, selection, receipts, pid_for=service_pid):
+def inspect_once(binary, selection, receipts, pid_for):
     report={'status':'deployment-unverified','matches':False,'live_verified':False,'services':{},'worker_running':False,'expected_active':False}
     try:
         pids={role:pid_for(role) for role in ROLES};report['worker_running']=pids['worker']>0
@@ -148,6 +148,17 @@ def inspect(binary, selection, receipts, pid_for=service_pid):
         report['matches']=len(hashes)==1
         report['status']='configuration-matched' if report['matches'] else 'effective-configuration-mismatch'
     except Exception:report['status']='deployment-inspection-unavailable'
+    return report
+
+def inspect(binary, selection, receipts, pid_for=service_pid):
+    report = inspect_once(binary, selection, receipts, pid_for)
+    if report['status'] == 'effective-configuration-mismatch':
+        daemon = report['services']['daemon']['provider_executable_sha256']
+        worker = report['services']['worker']['provider_executable_sha256']
+        if daemon != worker:
+            # A shared provider executable can change between the two
+            # snapshots. Sample both services again under the caller's deadline.
+            return inspect_once(binary, selection, receipts, pid_for)
     return report
 
 def record(role,pid,receipts,dry_run,external):
