@@ -24,6 +24,7 @@ pub mod inbound;
 mod media;
 pub mod own_posts;
 pub mod types;
+pub mod window;
 
 pub use auth::{SocialApiAuth, AuthError, CONFIG_KEY, ENV_VAR, KEYCHAIN_PLATFORM};
 pub use client::{SocialApiClient, ClientError, DEFAULT_BASE_URL};
