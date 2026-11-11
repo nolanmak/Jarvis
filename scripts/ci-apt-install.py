@@ -28,6 +28,25 @@ def dns_failure(output):
     return not re.search(r'NO_PUBKEY|not signed|signatures? (?:could|couldn|were|could not)|Hash Sum mismatch|Certificate verification failed', output, re.I)
 
 
+def playwright_dependencies(browser, *, run=subprocess.run):
+    if browser != 'chrome':
+        raise ValueError('unsupported browser dependency plan')
+    result = run(['npx', '--no-install', 'playwright', 'install-deps', '--dry-run', browser],
+                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+    output = result.stdout
+    if len(output) > 65536:
+        raise ValueError('Playwright dependency plan exceeds bound')
+    if result.returncode == 0 and output.strip() == 'All system dependencies are installed.':
+        return []
+    match = re.search(r'^Missing system dependencies \(([0-9]+)\):\n((?:  [a-z0-9][a-z0-9+.:-]*\n?)+)\Z', output, re.M)
+    if result.returncode != 1 or not match:
+        raise ValueError('Playwright dependency inventory unavailable or unsupported')
+    packages = match[2].split()
+    if not 0 < len(packages) <= 256 or len(packages) != int(match[1]) or len(set(packages)) != len(packages):
+        raise ValueError('Playwright dependency inventory is inconsistent')
+    return packages
+
+
 def install(packages, *, run=subprocess.run, root=Path('/'), architecture=None, installed=None):
     if not packages or any(not re.fullmatch(r'[a-z0-9][a-z0-9+.\-]*(?::[a-z0-9]+)?', p) for p in packages):
         raise ValueError('expected explicit APT package names')
@@ -96,5 +115,12 @@ def install(packages, *, run=subprocess.run, root=Path('/'), architecture=None, 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('packages', nargs='+')
-    raise SystemExit(install(parser.parse_args().packages))
+    parser.add_argument('packages', nargs='*')
+    parser.add_argument('--playwright-deps', choices=['chrome'])
+    args = parser.parse_args()
+    if args.playwright_deps:
+        if args.packages:
+            parser.error('choose explicit packages or a Playwright dependency plan')
+        packages = playwright_dependencies(args.playwright_deps)
+        raise SystemExit(install(packages) if packages else 0)
+    raise SystemExit(install(args.packages))

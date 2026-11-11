@@ -77,6 +77,25 @@ class AptInstallTests(unittest.TestCase):
         code, calls, _ = self.exercise([(100, "Temporary failure resolving 'archive.ubuntu.com'"), (100, 'E: bad mirror signature')])
         self.assertEqual((code, len(calls)), (100, 2))
 
+    def test_playwright_dependency_plan_is_data_not_a_shell_command(self):
+        cases = [(0, 'All system dependencies are installed.\n', []),
+                 (1, 'Missing system dependencies (2):\n  fonts-ipafont-gothic\n  libnss3\n', ['fonts-ipafont-gothic', 'libnss3'])]
+        for code, output, expected in cases:
+            calls = []
+            def run(args, **kwargs):
+                calls.append(args)
+                return subprocess.CompletedProcess(args, code, output)
+            self.assertEqual(self.module.playwright_dependencies('chrome', run=run), expected)
+            self.assertEqual(calls, [['npx', '--no-install', 'playwright', 'install-deps', '--dry-run', 'chrome']])
+        for output in ['Missing system dependencies (2):\n  libnss3\n',
+                       'Missing system dependencies (1):\n  libnss3; touch /tmp/unsafe\n',
+                       'E: package inventory unavailable\n',
+                       'Missing system dependencies (2):\n  libnss3\n  libnss3\n']:
+            def run(args, **kwargs):
+                return subprocess.CompletedProcess(args, 1, output)
+            with self.subTest(output=output), self.assertRaises(ValueError):
+                self.module.playwright_dependencies('chrome', run=run)
+
 
 if __name__ == '__main__':
     unittest.main()

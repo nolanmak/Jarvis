@@ -47,7 +47,7 @@
       "shell": "bash"
     },
     "computer-use/browser/3": {
-      "body": "npx playwright install --with-deps chrome",
+      "body": "python3 ../../scripts/ci-apt-install.py --playwright-deps chrome\nnpx --no-install playwright install chrome\n",
       "shell": "bash",
       "vm_provisioning": [
         "browser-binary-runtime"
