@@ -703,7 +703,7 @@ impl WorkflowGuard {
         refresh_native_capacity(&mut store,&id,now)?;
         let owner=format!("{}:{}",std::process::id(),uuid::Uuid::new_v4());
         let lease=if owner_turn {store.claim_owner_turn(&id,&owner,now,LEASE_MS)?.map(|turn|turn.lease)}
-            else {store.claim_productive(&id,&owner,now,LEASE_MS)?};
+            else {store.claim_productive_for_binding(&id,&owner,now,LEASE_MS,&binding)?};
         let Some(lease)=lease else {return Ok(None);};
         if let Some(pr) = start.pr {
             store.attach_pr_in_repo(&lease, start.repository, pr, now)?;
@@ -3235,6 +3235,26 @@ mod initial_acceptance_hold_tests {
                 assert_eq!(after.checkpoint,original.checkpoint);
                 assert_eq!(store.events(&id).unwrap(),events);
             }
+            // A real contract revision can re-enter ordinary admission, but
+            // it cannot override the owner's pause or reuse old approval.
+            let mut store=WorkflowStore::open(&path).unwrap();
+            store.set_owner_pause(&id,"github:owner",0,true,now+3*86_400_000).unwrap();
+            let mut revised=start();revised.contract="changed owner criteria";
+            assert!(WorkflowGuard::acquire_at(&path,revised,now+3*86_400_000).await.unwrap().is_none());
+            store.set_owner_pause(&id,"github:owner",1,false,now+3*86_400_000+1).unwrap();
+            drop(store);
+            let mut revised=start();revised.contract="changed owner criteria";
+            let changed=WorkflowGuard::acquire_at(&path,revised,now+3*86_400_000+2).await.unwrap().unwrap();
+            let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+            let after=store.snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.attempts,original.attempts+1);
+            assert_eq!(after.checkpoint.stage,Stage::Reconcile);
+            assert_eq!(after.checkpoint.next.reason,"inputs_changed");
+            assert_ne!(after.checkpoint.binding.contract,original.checkpoint.binding.contract);
+            assert_eq!(after.model_calls,original.model_calls);
+            assert_eq!(after.tokens,original.tokens);
+            assert!(store.current_review_history(&id).unwrap().is_empty());
+            drop(store);changed.finish().unwrap();
         }
     }
 
