@@ -171,18 +171,18 @@ After verifying the deployed build and worker, run:
 augmentagent autopr-health --json
 ```
 
-`workflow-capacity-blocked` is an ALERT for active durable
+`resource-capacity-waiting` or `native-capacity-unobserved` is an ALERT for active durable
 `resource_capacity` / `await_capacity` checkpoints. A running worker, recent
 manual merge or provider-hold warning does not clear it. Owner-paused, held,
 terminal and diagnostic-only workflows are excluded. The count describes the
 persisted wait; available capacity still needs normal worker reconciliation.
 
-`workflow-capacity-unavailable` is an ALERT when the running worker's effective
+`capacity-state-unavailable` is an ALERT when the running worker's effective
 configuration or selected workflow store cannot be verified. Health reads the
 worker's private process-bound post-bootstrap receipt and opens that workflow
 store read-only, using the same selected database and daily cap for capacity and
 merge accounting. Missing or stale evidence does not select or create another
-workflow database. Either capacity ALERT makes the command exit 1.
+workflow database. Capacity ALERTs make the command exit 1. Native retained-state measurements are descriptive storage observations, not host-memory sizing or execution authority.
 
 Health observation does not claim, wake or prune workflows or spend shipping
 allowance. Inspect the worker's selected capacity and ownership evidence through

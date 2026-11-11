@@ -78,6 +78,13 @@ class NativeBootBudgetTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 codec.initrd([], max_bytes=invalid)
 
+    def test_shared_codec_enforces_actual_compressed_output_boundary(self):
+        entries = [('payload', stat.S_IFREG | 0o600, os.urandom(4096), 0, 0)]
+        encoded = codec.initrd(entries, None, None)
+        self.assertEqual(codec.initrd(entries, None, len(encoded)), encoded)
+        with self.assertRaisesRegex(ValueError, 'budget'):
+            codec.initrd(entries, None, len(encoded) - 1)
+
     def test_native_exact_total_boundary_includes_seed_and_helpers(self):
         args = {'seed': [('nested/home', b'home')], 'guest_source': b'g' * 33}
         size = encoded_size(self.entries(**args))
