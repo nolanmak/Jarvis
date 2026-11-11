@@ -12293,6 +12293,50 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn queued_main_dependency_wakes_automatic_worker_without_a_command_job() {
+        use crate::autoship_workflow::{WorkflowStore, Binding, Checkpoint, NextAction, Stage};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for case in ["ready", "other-repository", "generic-reconcile", "delayed", "owner-paused"] {
+            let state = tempfile::tempdir().unwrap();
+            let mut worker = AutoPrLoop::for_tests("/nonexistent".into(), 5, state.path());
+            worker.dry_run = false;
+            worker.command_repository = Some("owner/repo".into());
+            worker.clock = Arc::new(|| chrono::DateTime::from_timestamp_millis(1_000).unwrap());
+            let path = worker.workflow_path.clone();
+            let stop = tokio_util::sync::CancellationToken::new();
+            let timer_stop = stop.clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let submitted = async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let repository = if case == "other-repository" { "owner/repo_extra" } else { "owner/repo" };
+                let id = crate::autoship_workflow::workflow_id(repository, 7).unwrap();
+                let binding = Binding {head: "a".repeat(40), contract: "c".repeat(64), evidence_hash: "e".repeat(64)};
+                let mut store = WorkflowStore::open(&path).unwrap();
+                store.register(&id, "fix/fixture", binding.clone(), 0).unwrap();
+                let lease = store.claim(&id, "original-worker", 0, 1).unwrap().unwrap();
+                store.attach_pr_in_repo(&lease, repository, 42, 0).unwrap();
+                store.checkpoint(&lease, &Checkpoint {stage: Stage::Reconcile, binding, evidence: vec![], next: NextAction {
+                    reason: if case == "generic-reconcile" { "resume_started" } else { "review_main_changed" }.into(),
+                    action: "reconcile_main".into(), eligible_at_ms: if case == "delayed" {2_000} else {1_000},
+                }}, 0).unwrap();
+                store.release(&lease, 0).unwrap();
+                if case == "owner-paused" { store.set_owner_pause(&id, "owner", 0, true, 0).unwrap(); }
+                assert!(!store.has_command_jobs().unwrap());
+                tokio::time::sleep(std::time::Duration::from_secs(26)).await;
+                timer_stop.cancel();
+            };
+            let run = worker.run_with(stop, move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { Ok(RunReport::idle()) }
+            }, || async {0});
+            let (result, ()) = tokio::join!(run, submitted);
+            result.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(case == "ready"), "{case}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn queued_command_wakes_sleeping_worker_without_waiting_for_normal_tick() {
         use super::*;
         use crate::autoship_workflow::{WorkflowStore, submission::{Request,Target,Milestone}};
