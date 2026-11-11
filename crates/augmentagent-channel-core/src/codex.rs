@@ -443,6 +443,9 @@ impl CodexCliReasoner {
         // #1047 — each `turn.completed` restates the thread's running total,
         // so the last one seen is this call's usage. Keep it; never sum.
         let call_started = std::time::Instant::now();
+        let mut unfinished = crate::token_usage::UnfinishedCallGuard::new(
+            self.usage_log.clone(),self.kind,model.as_str(),capability,call_started,
+        );
         let mut observed_usage: Option<crate::token_usage::TokenUsage> = None;
         while let Some(line) = lines.next_line().await? {
             let line = line.trim();
@@ -470,6 +473,7 @@ impl CodexCliReasoner {
             }
             if let Some(usage) = crate::token_usage::codex_turn_usage(&v) {
                 observed_usage = Some(usage);
+                unfinished.observe_usage(usage);
             }
             if kind == Some("item.completed") {
                 if let Some(item) = v.get("item") {
@@ -520,6 +524,7 @@ impl CodexCliReasoner {
             }
         }
 
+        unfinished.finish();
         // #1047 — record what the call cost before its outcome is judged:
         // tokens spent on a turn that ends without an answer are still spent.
         // Best effort, like the Claude path: the logger swallows IO errors.
@@ -1201,7 +1206,8 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
             "server":"jarvis","tool":"Bash","arguments":{"command":"cargo test"},
             "result":{"isError":true,"content":[{"type":"text","text":"JARVIS_READINESS:build_storage_reserve PRIVATE_DIAGNOSTIC"}]},"status":"completed"}});
         let marker = marker.to_string_lossy().replace('\'', "'\\''");
-        let bin=stub(&dir,"fake-codex-tool-capacity",&format!("cat >/dev/null\nprintf '%s\\n' '{}'\nsleep 2\nprintf repeated > '{}'\necho '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"ok\"}}}}'\n",event,marker));
+        let reported = serde_json::json!({"type":"turn.completed","usage":{"input_tokens":9,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}});
+        let bin=stub(&dir,"fake-codex-tool-capacity",&format!("cat >/dev/null\nprintf '%s\\n' '{}' '{}'\nsleep 2\nprintf repeated > '{}'\necho '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"ok\"}}}}'\n",reported,event,marker));
         std::fs::create_dir_all(dir.path().join("logs")).unwrap();
         let logger = std::sync::Arc::new(
             crate::tool_audit::AuditLogger::protected(
@@ -1221,7 +1227,11 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
             .unwrap();
         let mut options = opts();
         options.audit_logger = Some(logger.clone());
-        let error = CodexCliReasoner::with_bin(bin)
+        let usage_path = dir.path().join("usage.jsonl");
+        let mut reasoner = CodexCliReasoner::with_bin(bin);
+        reasoner.usage_log =
+            std::sync::Arc::new(crate::token_usage::UsageLogger::new(usage_path.clone()));
+        let error = reasoner
             .call(&options, "synthetic implementation")
             .await
             .unwrap_err();
@@ -1240,6 +1250,18 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
         );
         assert!(!format!("{error:#}").contains("PRIVATE_DIAGNOSTIC"));
         logger.drain_checked().await.unwrap();
+        let rows: Vec<crate::token_usage::UsageRecord> = std::fs::read_to_string(usage_path)
+            .expect("observed usage must survive early capacity yield")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one reported usage record, no refund or duplicate"
+        );
+        assert_eq!(rows[0].usage.total(), 10);
+        assert_eq!(rows[0].outcome.as_deref(), Some("unfinished"));
     }
 
     #[tokio::test]

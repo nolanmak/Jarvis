@@ -1483,6 +1483,7 @@ impl ClaudeCliReasoner {
             crate::triage_capture::line(&audit_session,&line);
             if let Some(u) = crate::token_usage::parse_usage(&line) {
                 observed_usage = Some(u);
+                unfinished.observe_usage(u);
             }
             tools_ran = tools_ran || line_has_tool_use(&line);
             let mut tool_readiness=None;
