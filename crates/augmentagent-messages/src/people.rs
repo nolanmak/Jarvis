@@ -356,9 +356,11 @@ fn handle_of(q: &str) -> String {
     handles::canonical(q)
 }
 
-/// Candidates for a person reference. Exact matches win over partial ones;
-/// several candidates of the best kind mean the reference is ambiguous and
-/// the caller must not pick one.
+/// Candidates for a person reference. A multi-word exact match wins over
+/// partial ones; a single word also returns its partial matches (#1668), so a
+/// page keyed by a bare first name is one candidate, not the silent winner.
+/// Several candidates mean the reference is ambiguous and the caller must not
+/// pick one.
 pub fn resolve_person(
     c: &Connection,
     query: &str,
