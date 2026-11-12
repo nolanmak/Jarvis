@@ -407,6 +407,18 @@ mod tests {
     }
 
     #[test]
+    fn classifier_and_controller_rust_changes_do_not_reset_verifier_budget_environment() {
+        let (root,_control,prepared)=fixture();let before=environment_id(root.path()).unwrap();
+        let epoch=|environment:&str|amendment::digest(&serde_json::to_vec(&(AcceptanceSource::PullRequest(840),prepared.baseline.registration.baseline_head(),environment)).unwrap());
+        let file=root.path().join("crates/augmentagent-cli/src/self_improve_baseline_witness.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file,"// changed classifier/controller source, no runner/toolchain change\n").unwrap();
+        let after=environment_id(root.path()).unwrap();
+        assert_eq!(after,before,"ordinary controller Rust was confused with actual verifier environment");
+        assert_eq!(epoch(&after),epoch(&before),"classifier change created a fresh amendment spending epoch");
+    }
+
+    #[test]
     fn qualification_preserves_every_criterion_and_exact_original_source() {
         let (root,control,prepared)=fixture();persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
         assert_current(root.path(),control.path(),&prepared).unwrap();

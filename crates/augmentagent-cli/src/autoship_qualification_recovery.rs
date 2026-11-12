@@ -38,7 +38,7 @@ fn key(generation: i64) -> String {
     format!("{:x}", Sha256::digest(format!("original-native-custody-hold-v1:{generation}")))
 }
 
-fn native_hold(checkpoint: &Checkpoint) -> bool {
+pub(super) fn native_hold(checkpoint: &Checkpoint) -> bool {
     checkpoint.stage == Stage::Scope
         && checkpoint.next.reason == "acceptance_verifier_evidence_unknown"
         && checkpoint.next.action == "await_original_evidence_recovery"
