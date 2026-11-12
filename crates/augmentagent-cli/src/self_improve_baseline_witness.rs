@@ -364,6 +364,43 @@ mod tests {
     }
 
     #[test]
+    fn retained_prepared_loader_reads_original_or_orphan_without_rewriting_evidence() {
+        for indexed in [false,true] {
+            let (root,control,prepared)=fixture();let source=AcceptanceSource::PullRequest(840);
+            let file=evidence_path(control.path(),source,prepared.baseline.registration.baseline_head()).unwrap();
+            immutable(control.path(),&file,&serde_json::to_vec(&prepared).unwrap()).unwrap();
+            if indexed {write_manifest(control.path(),&WorkflowManifest::from_prepared(source,&prepared)).unwrap();}
+            let before=std::fs::read_dir(control.path()).unwrap().map(|e|e.unwrap().file_name()).collect::<BTreeSet<_>>();
+            let loaded=retained_prepared(root.path(),control.path(),source).unwrap().expect("free recovery cannot locate retained prepared original evidence");
+            assert_eq!(serde_json::to_vec(&loaded).unwrap(),serde_json::to_vec(&prepared).unwrap());
+            let after=std::fs::read_dir(control.path()).unwrap().map(|e|e.unwrap().file_name()).collect::<BTreeSet<_>>();
+            assert_eq!(after,before,"free inspection wrote a derived manifest or another measurement");
+        }
+    }
+
+    #[test]
+    fn retained_prepared_loader_refuses_corrupt_cross_source_or_worker_owned_evidence() {
+        for fault in ["manifest-source","manifest-contract","manifest-path","proposal","permissions","symlink","worker"] {
+            let (root,control,prepared)=fixture();let source=AcceptanceSource::PullRequest(840);
+            let file=evidence_path(control.path(),source,prepared.baseline.registration.baseline_head()).unwrap();
+            immutable(control.path(),&file,&serde_json::to_vec(&prepared).unwrap()).unwrap();
+            let mut manifest=WorkflowManifest::from_prepared(source,&prepared);
+            if fault=="manifest-source" {manifest.pull_request=Some(841);}
+            if fault=="manifest-contract" {manifest.contract_hash="f".repeat(64);}
+            if fault=="manifest-path" {manifest.evidence_file=Some("../outside.json".into());}
+            write_manifest(control.path(),&manifest).unwrap();
+            if fault=="proposal" {
+                let mut changed=prepared.clone();changed.proposal.contract.criteria[0].requirement="different owner intent".into();
+                std::fs::write(&file,serde_json::to_vec(&changed).unwrap()).unwrap();
+            }
+            if fault=="permissions" {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(&file,std::fs::Permissions::from_mode(0o640)).unwrap();}
+            if fault=="symlink" {let actual=control.path().join("actual.json");std::fs::rename(&file,&actual).unwrap();std::os::unix::fs::symlink(actual,&file).unwrap();}
+            let inspected=if fault=="worker" {root.path()} else {control.path()};
+            assert!(retained_prepared(root.path(),inspected,source).is_err(),"{fault} was treated as recoverable original data");
+        }
+    }
+
+    #[test]
     fn qualification_preserves_every_criterion_and_exact_original_source() {
         let (root,control,prepared)=fixture();persist_scripted(root.path(),control.path(),&prepared,true).unwrap();
         assert_current(root.path(),control.path(),&prepared).unwrap();

@@ -2042,6 +2042,12 @@ fn private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     );
     Ok(serde_json::from_reader(file)?)
 }
+/// Inspect existing prepared evidence only. Free reconsideration may not
+/// install a harness, create a manifest or generate another baseline.
+pub(super) fn retained_prepared(_root:&Path,_control:&Path,_source:AcceptanceSource)->Result<Option<PreparedAcceptance>> {
+    Ok(None)
+}
+
 fn original_manifest(control: &Path, source: AcceptanceSource) -> Result<Option<WorkflowManifest>> {
     let index = control.join(format!("{}-workflow.json", source.key()));
     if index.try_exists()? {
