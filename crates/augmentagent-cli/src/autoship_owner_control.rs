@@ -260,6 +260,92 @@ mod tests {
     fn binding()->Binding {Binding {head:"head".into(),contract:"owner-contract".into(),evidence_hash:"proof".into()}}
     fn request(n:u64)->submission::Request {submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(n),provider:None,until:submission::Milestone::Merged}}
 
+    fn automatic_resume_fixture(path:&Path)->(WorkflowStore,String) {
+        let mut store=WorkflowStore::open(path).unwrap();
+        let id=workflow_id("owner/repo",7).unwrap();
+        store.register(&id,"agent-fix/issue-7",binding(),0).unwrap();
+        let lease=store.claim(&id,"original",0,1).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease,"owner/repo",42,0).unwrap();
+        let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+        checkpoint.stage=Stage::Build;
+        checkpoint.next=NextAction {reason:"acceptance_failed".into(),action:"repair_implementation".into(),eligible_at_ms:1000};
+        store.checkpoint(&lease,&checkpoint,0).unwrap();
+        store.charge(&lease,"original-call",ResourceCharge {model_calls:3,tokens:42,wall_ms:9},0).unwrap();
+        store.release(&lease,0).unwrap();
+        store.set_owner_pause(&id,"github:owner",0,true,10).unwrap();
+        store.set_owner_pause(&id,"github:owner",1,false,20).unwrap();
+        (store,id)
+    }
+
+    #[test]
+    fn automatic_owner_resume_survives_restart_and_is_consumed_only_by_productive_claim() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let (mut store,id)=automatic_resume_fixture(&path);
+        let before=store.snapshot(&id).unwrap().unwrap();
+        assert!(!store.has_due_owner_resume(Some("owner/repo"),999).unwrap());
+        assert!(!store.has_due_owner_resume(Some("other/repo"),1000).unwrap());
+        assert_eq!(store.reserve_owner_resume_turn("owner/repo",1000).unwrap(),Some(id.clone()));
+        assert!(!store.owner_resume_due(&id,1001).unwrap());
+        assert!(store.owner_resume_ready_for_dispatch(&id,1001).unwrap(),"inspection cannot consume accepted owner intent");
+        assert_eq!(store.reserve_owner_resume_turn("owner/repo",1001).unwrap(),None);
+        let after=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!((after.attempts,after.model_calls,after.tokens,after.wall_ms),(before.attempts,3,42,9));
+        assert_eq!(after.checkpoint,before.checkpoint);
+        assert!(!store.has_command_jobs().unwrap());
+        drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();
+        assert!(!store.owner_resume_due(&id,300999).unwrap());
+        assert!(store.owner_resume_due(&id,301000).unwrap());
+        let free=store.claim_reconciliation(&id,"free",301000,1).unwrap().unwrap();
+        store.release(&free,301000).unwrap();
+        assert!(store.owner_resume_ready_for_dispatch(&id,301000).unwrap(),"free inspection must not consume productive intent");
+        let productive=store.claim_productive(&id,"normal-worker",301000,1).unwrap().unwrap();
+        store.release(&productive,301000).unwrap();drop(store);
+        let store=WorkflowStore::open(&path).unwrap();
+        assert!(!store.owner_resume_ready_for_dispatch(&id,86400000).unwrap(),"restart/day rollover resurrected consumed owner intent");
+        assert!(!store.has_due_owner_resume(None,86400000).unwrap());
+        let after=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!((after.model_calls,after.tokens,after.wall_ms),(3,42,9));
+        assert_eq!(store.merge_allowance(86400000,5).unwrap().confirmed,0);
+    }
+
+    #[test]
+    fn automatic_owner_resume_hint_preserves_current_dispatch_guards() {
+        for blocker in ["pause","lease","future","retired","merged","scope-wait","held","binding","revision","operation","owner-message"] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+            let (mut store,id)=automatic_resume_fixture(&path);
+            let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+            match blocker {
+                "pause"=>{store.set_owner_pause(&id,"github:owner",2,true,30).unwrap();},
+                "lease"=>{store.claim(&id,"other-worker",1000,100).unwrap().unwrap();},
+                "future"=>checkpoint.next.eligible_at_ms=1001,
+                "retired"=>checkpoint.stage=Stage::Retired,
+                "merged"=>checkpoint.stage=Stage::Merged,
+                "scope-wait"=>{checkpoint.stage=Stage::Scope;checkpoint.next.reason="acceptance_verifier_repair_exhausted".into();checkpoint.next.action="await_acceptance_input_change".into();},
+                "held"=>checkpoint.stage=Stage::Held,
+                "binding"=>checkpoint.binding.head="new-head".into(),
+                "revision"=>{store.set_owner_pause(&id,"github:owner",2,false,30).unwrap();},
+                "operation"=>{store.conn.execute("INSERT INTO operation VALUES('uncertain',?1,?2,?3,NULL,30)",params![id,serde_json::to_string(&OperationKind::Push).unwrap(),serde_json::to_string(&checkpoint.binding).unwrap()]).unwrap();},
+                "owner-message"=>{
+                    store.submit_authorized("joined-owner-command","github:owner",&request(7),30).unwrap();
+                    store.conn.execute("INSERT INTO discord_control_request(request_id,principal,origin,message_sha256,workflow,response,state,created_at) VALUES('pending-owner','github:owner','{}','fixture',?1,'{}','queued',30)",[&id]).unwrap();
+                    store.conn.execute("INSERT INTO workflow_owner_message VALUES('pending-owner',?1,'preserve original owner input','pending',30)",[&id]).unwrap();
+                },
+                _=>unreachable!(),
+            }
+            // Disposable fixture simulates a concurrent checkpoint transition;
+            // production changes still use the guarded workflow APIs.
+            store.conn.execute("UPDATE workflow SET checkpoint=?2 WHERE id=?1",params![id,serde_json::to_string(&checkpoint).unwrap()]).unwrap();
+            let before=store.snapshot(&id).unwrap().unwrap();
+            assert!(!store.owner_resume_ready_for_dispatch(&id,1000).unwrap(),"{blocker} permitted dispatch");
+            assert!(!store.has_due_owner_resume(None,1000).unwrap(),"{blocker} woke worker");
+            assert_eq!(store.reserve_owner_resume_turn("owner/repo",1000).unwrap(),None,"{blocker} reserved work");
+            let after=store.snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.checkpoint,before.checkpoint,"{blocker} changed retained work");
+            assert_eq!((after.attempts,after.model_calls,after.tokens,after.wall_ms),(before.attempts,3,42,9));
+        }
+    }
+
     #[test]
     fn owner_resume_retries_only_quiescent_internal_execution_failures() {
         for (reason,action) in [("adopted_execution_retry","resume_preserved_pr"),("resume_deferred","resume_preserved_work"),
