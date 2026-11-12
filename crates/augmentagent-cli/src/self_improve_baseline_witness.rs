@@ -320,6 +320,63 @@ mod tests {
         assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
     }
 
+    #[tokio::test]
+    async fn retained_unknown_reenters_existing_repair_without_requerying_witness() {
+        const CHILD:&str="AUTOSHIP_RETAINED_UNKNOWN_CALLER_FIXTURE";
+        if std::env::var_os(CHILD).is_some() {
+            use std::os::unix::fs::PermissionsExt;
+            let (root,control,prepared)=fixture();
+            std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+            persist_scripted_measurement(root.path(),control.path(),&prepared,Measurement::Unknown).unwrap();
+            let current=context(&prepared.proposal,&prepared.baseline).unwrap();
+            let mut judgment=saved_judgment(control.path(),&prepared);
+            let original="e".repeat(64);judgment["context"]=serde_json::json!(original);
+            let raw=judgment.to_string();let input="a".repeat(64);
+            let proof=serde_json::json!({"version":1,"head":prepared.baseline.registration.baseline_head(),"provider":"codex","native_session":"scripted-retained-caller",
+                "supplied_request_hash":amendment::digest(b"scripted selected sources"),"response_hash":amendment::digest(raw.as_bytes()),
+                "purpose":"baseline_witness","scope_context_hash":original,"native_input_hash":input,
+                "scope_request_hash":amendment::digest(qualification_prompt(&original,&prepared).unwrap().as_bytes()),"scope_policy_hash":scope_authority::witness_policy_hash()});
+            let bytes=serde_json::to_vec(&proof).unwrap();let artifact=control.path().join(format!("primary-scope-{}.json",uuid::Uuid::new_v4()));
+            std::fs::write(&artifact,&bytes).unwrap();std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
+            
+            // Only the old native response remains; there is no current-policy artifact.
+            std::fs::remove_file(artifact_path(control.path(),&current)).unwrap();
+            let database=control.path().join("workflow.db");
+            let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original owner request",environment:"fixture"}).await.unwrap().unwrap();
+            let native_control=control_directories(guard.repository(),guard.id()).unwrap().workflow_acceptance;
+            std::fs::create_dir_all(&native_control).unwrap();
+            let retained=native_control.join(artifact.file_name().unwrap());std::fs::rename(&artifact,&retained).unwrap();
+            let provenance=serde_json::to_string(&scope_authority::NativeReplyReference {artifact:retained,artifact_sha256:amendment::digest(&bytes)}).unwrap();
+            let purpose=format!("{}{}",crate::autoship_workflow::BASELINE_NATIVE_PURPOSE_PREFIX,input);
+            guard.bounded_native_calls(purpose.clone(),1,augmentagent_channel_core::native_session::fresh_review_scope(
+                augmentagent_channel_core::ProviderKind::Codex,async {
+                    let session=augmentagent_channel_core::native_session::current_for(augmentagent_channel_core::ProviderKind::Codex)?.unwrap();
+                    let mut native=session.begin(augmentagent_channel_core::ProviderKind::Codex)?;
+                    let receipt=guard.audit_logger().model_call_admitted("codex")?;
+                    native.observe("scripted-retained-caller")?;native.finish()?;
+                    Ok::<_,anyhow::Error>(receipt)
+                })).await.unwrap();
+            let (response_key,proof_key)=crate::autoship_workflow::baseline_native_response_keys(&purpose).unwrap();
+            guard.record_scope_stage_response_pair(&response_key,&raw,&proof_key,&provenance).unwrap();
+            assert!(retained_semantic_judgment(root.path(),&prepared,&guard.baseline_native_custody().unwrap()).unwrap().is_some());
+            let before=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            let error=qualify(root.path(),control.path(),&prepared,&guard).await.unwrap_err();
+            assert!(error.downcast_ref::<BaselineNotRed>().is_some(),"authenticated retained unknown did not enter existing repair: {error:#}");
+            assert!(error.downcast_ref::<initial_repair::Hold>().is_none(),"completed old judgment became missing evidence");
+            let after=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(after.model_calls,before.model_calls,"replayed a completed witness question");
+            assert!(!artifact_path(control.path(),&current).exists(),"negative data became current approval");
+            assert!(guard.bind_acceptance(&prepared,control.path()).is_err());
+            guard.finish().unwrap();return;
+        }
+        let scripts=tempfile::tempdir_in("/tmp").unwrap();
+        let out=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::acceptance::baseline_witness::tests::retained_unknown_reenters_existing_repair_without_requerying_witness","--nocapture"])
+            .env(CHILD,"1").env("AUGMENTAGENT_RUN_RESOURCES","1").env("CODEX_CLI","/bin/false").env("CLAUDE_CLI","/bin/false")
+            .env("XDG_STATE_HOME",scripts.path().join("state")).output().unwrap();
+        assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+    }
+
     #[test]
     fn retained_unknown_requires_exact_original_request_and_authenticated_custody() {
         use crate::autoship_workflow::{NativeScopeCustody,submission::Provider};
