@@ -1468,6 +1468,66 @@ pub(super) async fn prepare_acceptance_for(
 mod workflow_tests {
     use super::*;
     use crate::autoship_contract::{Criterion, PathScope, Verifier, VerifierCommand};
+
+    #[tokio::test]
+    async fn candidate_only_test_markers_cannot_certify_a_production_red_green_transition() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let target = tempfile::tempdir_in("/tmp").unwrap();
+        trusted_git(root.path(), &["init", "-q"]).await.unwrap();
+        std::fs::create_dir(root.path().join("tests")).unwrap();
+        let production = "def warning_visible():\n    return True\n";
+        std::fs::write(root.path().join("behavior.py"), production).unwrap();
+        std::fs::write(root.path().join("tests/README"), "No warning fixture exists on this baseline.\n").unwrap();
+        async fn commit(root: &Path) {
+            trusted_git(root, &["add", "."]).await.unwrap();
+            trusted_git(root, &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture"])
+                .await.unwrap();
+        }
+        commit(root.path()).await;
+        let base = actual_head(root.path()).await.unwrap();
+        let path = "autoship_verifiers/observe.py";
+        // This is the production incident's shape: pinned code observes test
+        // markers, while the tests producing them belong only to the candidate.
+        let observer = "import json, subprocess, sys\nr = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_warning.py'], capture_output=True, text=True)\nprint(json.dumps(['warning-observed' in r.stdout]))\n";
+        let proposal = ContractProposal {
+            contract: AcceptanceContract {
+                schema_version: 1, revision: 1, issue: Some(42), pull_request: None,
+                criteria: vec![Criterion { id: "warning".into(), requirement: "The production warning is visible".into(), verifier_ids: vec!["observe".into()] }],
+                allowed_paths: vec![PathScope::File("behavior.py".into()), PathScope::Directory("tests".into())],
+                verifiers: vec![Verifier { id: "observe".into(),
+                    command: VerifierCommand::BlackBox {
+                        invocation: crate::autoship_contract::BehaviorInvocation::PythonScript { file: path.into(), args: vec![] },
+                        oracle: crate::autoship_contract::OutputOracle::Json { value: serde_json::json!([true]) },
+                    }, pinned_files: vec![path.into()], failure_witness: "warning is absent".into() }],
+            },
+            files: [(path.into(), observer.into())].into(),
+        };
+        install_harness(root.path(), &proposal).unwrap();
+        let registration = RegisteredContract::register(root.path(), proposal.contract.clone(), base.clone(), "fixture-v1".into()).unwrap();
+        let invocation = || proposal.contract.verifiers[0].command.invocation().unwrap();
+        let red = isolated_observation(root.path(), target.path(), invocation(), &test_resource_audit(target.path())).await.unwrap();
+        assert_eq!(red.exit_code, Some(0), "{}", red.stderr);
+        assert_eq!(red.stdout.trim(), "[false]", "the absent fixture must reproduce the reported incident");
+        let baseline = vec![registration.observe(root.path(), "observe", registration.binding(&base).unwrap(), &red).unwrap()];
+
+        std::fs::write(root.path().join("tests/test_warning.py"),
+            "import unittest\nimport behavior\nclass Warning(unittest.TestCase):\n    def test_warning(self):\n        self.assertTrue(behavior.warning_visible())\n        print('warning-observed')\n").unwrap();
+        commit(root.path()).await;
+        let head = actual_head(root.path()).await.unwrap();
+        assert_eq!(
+            trusted_git(root.path(), &["rev-parse", &format!("{base}:behavior.py")]).await.unwrap(),
+            trusted_git(root.path(), &["rev-parse", &format!("{head}:behavior.py")]).await.unwrap(),
+            "production bytes must remain identical across the purported red/green transition",
+        );
+        let green = isolated_observation(root.path(), target.path(), invocation(), &test_resource_audit(target.path())).await.unwrap();
+        assert_eq!(green.exit_code, Some(0), "{}", green.stderr);
+        assert_eq!(green.stdout.trim(), "[true]", "the candidate fixture must actually execute unchanged production");
+        let candidate = vec![registration.observe(root.path(), "observe", registration.binding(&head).unwrap(), &green).unwrap()];
+        assert!(!registration.candidate_passes(&baseline, &candidate, &registration.binding(&head).unwrap()).unwrap(),
+            "missing baseline tests and candidate-only markers certified red/green without any production change");
+    }
+
     #[tokio::test]
     async fn real_baseline_noop_candidate_green_and_harness_tamper() {
         let root = tempfile::tempdir_in("/tmp").unwrap();
