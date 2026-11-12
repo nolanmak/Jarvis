@@ -48,7 +48,9 @@ the shared immutable-source reader additionally permits only admitted regular
 tracked files. Paths never come from provider-supplied filesystem strings.
 Reuse the existing immutable blob stream used by review source delivery, with
 its fixed batches, offsets, UTF-8 and EOF checks. The provider gets no tools.
-Preserve source whitespace exactly. Never read candidate working-tree bytes.
+Preserve source whitespace exactly, including CRLF and absent final newline.
+Numbered excerpt display prefixes are separate from the preserved line bytes;
+do not append a source terminator. Never read candidate working-tree bytes.
 
 D3. Source delivery has a bounded serialized budget from the residual request
 space, at most 384 KiB, and the entire final request remains within 512 KiB.
@@ -67,10 +69,15 @@ Fallback windows are mandatory for every retained selection: a range supplies
 its inclusive 1-based lines through EOF; a needle supplies the first five literal
 matches, each with up to 50 preceding and 99 following lines. Merge overlapping
 lines within a selection and emit ascending numbered lines. Include every
-selection's entry, even an empty search, labeled unread rather than absence.
+unique selection's entry, even an empty search, labeled unread rather than absence.
+Identical repeated requests may share one source entry: the complete authenticated
+selection response remains in the selection identity, so repetition is still bound.
 Never omit a nonempty required window to fit the budget. If the union of required
 windows or its serialized representation exceeds the residual budget, hold
 before admission. Complete-file delivery can replace those windows when it fits.
+Fallback bookkeeping overflow must not reject complete-file delivery that fits;
+record fallback unavailability while retaining the bounded full-file alternative,
+and enforce fallback failure only if complete-file delivery cannot fit.
 
 D4. The independent authority is explicitly both correction proposer and
 author. When evidence justifies an obsolete-verifier correction, construct its

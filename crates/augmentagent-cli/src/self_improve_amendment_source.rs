@@ -121,22 +121,28 @@ struct SourceBuffer<'a> {
     through: usize,
     selected_bytes: usize,
     previous_bytes: usize,
+    partial_overflow: bool,
 }
 impl<'a> SourceBuffer<'a> {
     fn new(request:&'a ReadRequest,budget:usize)->Self {
         Self {request,budget,full:Some(String::new()),pending:String::new(),previous:Default::default(),selected:BTreeMap::new(),
-            line:0,matches:0,through:0,selected_bytes:0,previous_bytes:0}
+            line:0,matches:0,through:0,selected_bytes:0,previous_bytes:0,partial_overflow:false}
+    }
+    fn overflow(&mut self) {
+        self.partial_overflow=true;self.previous.clear();self.selected.clear();self.previous_bytes=0;
     }
     fn retain(&mut self,number:usize,line:String)->Result<()> {
+        if self.partial_overflow {return Ok(());}
         if !self.selected.contains_key(&number) {
-            self.selected_bytes=self.selected_bytes.checked_add(line.len()+32).context("source size overflow")?;
-            ensure!(self.selected_bytes<=self.budget,"original source windows exceed bounded working set");
+            self.selected_bytes=self.selected_bytes.checked_add(line.len()+number.to_string().len()+2).context("source size overflow")?;
+            if self.selected_bytes>self.budget {self.overflow();return Ok(());}
             self.selected.insert(number,line);
         }
         Ok(())
     }
     fn line(&mut self,line:String)->Result<()> {
         self.line+=1;
+        if self.partial_overflow {return Ok(());}
         if let Some(needle)=&self.request.needle {
             if self.matches<5 && line.contains(needle) {
                 self.matches+=1;self.through=self.line.saturating_add(99);
@@ -145,7 +151,7 @@ impl<'a> SourceBuffer<'a> {
             if self.line<=self.through {self.retain(self.line,line.clone())?;}
             self.previous_bytes+=line.len();self.previous.push_back((self.line,line));
             if self.previous.len()>50 {self.previous_bytes-=self.previous.pop_front().unwrap().1.len();}
-            ensure!(self.previous_bytes<=self.budget,"original source context exceeds bounded working set");
+            if self.previous_bytes>self.budget {self.overflow();}
         }else if (self.request.start_line..=self.request.end_line).contains(&self.line) {
             self.retain(self.line,line)?;
         }
@@ -162,11 +168,11 @@ impl<'a> SourceBuffer<'a> {
         }
         Ok(())
     }
-    fn finish(mut self)->Result<(Option<String>,String)> {
+    fn finish(mut self)->Result<(Option<String>,Option<String>)> {
         if !self.pending.is_empty() {let line=std::mem::take(&mut self.pending);self.line(line)?;}
         let mut excerpt=String::new();
-        for (number,line) in self.selected {excerpt.push_str(&format!("{number}: {line}"));if !line.ends_with('\n') {excerpt.push('\n');}}
-        Ok((self.full,excerpt))
+        for (number,line) in self.selected {excerpt.push_str(&format!("{number}: {line}"));}
+        Ok((self.full,(!self.partial_overflow).then_some(excerpt)))
     }
 }
 
@@ -199,12 +205,13 @@ pub(super) async fn read_bounded(
     let mut full = BTreeMap::new();
     let mut partial = BTreeMap::new();
     let mut complete = true;
+    let mut partial_available=true;
     for request in selected.requests {
         let (_, path) = entries.get(request.file_index).context("original source ordinal outside immutable table")?;
         let mut buffer=SourceBuffer::new(&request,budget);
         aligned_review::visit_immutable_source(root,base,path,|chunk|buffer.push(chunk)).await?;
         let (content,excerpt)=buffer.finish()?;
-        partial.insert(format!("{path}:{}-{}:{:?}", request.start_line, request.end_line, request.needle), excerpt);
+        if let Some(excerpt)=excerpt {partial.insert(format!("{path}:{}-{}:{:?}", request.start_line, request.end_line, request.needle), excerpt);}else{partial_available=false;}
         if let Some(content)=content {full.insert((*path).to_owned(),content);}else{complete=false;}
     }
     // Complete files avoid losing a production call below the original search
@@ -213,6 +220,7 @@ pub(super) async fn read_bounded(
     let mut evidence = Evidence { original_base: base.into(), selection_identity: identity,
         coverage: "complete selected original files; selection is data only, not qualification or complete repository coverage", sources: full };
     if !complete || serde_json::to_vec(&evidence)?.len() > budget {
+        ensure!(partial_available,"original source windows exceed bounded working set");
         evidence.sources = partial;
         evidence.coverage = "partial original source excerpts; omitted bytes and empty searches are unread, never proof of absence or qualification";
     }
@@ -287,19 +295,19 @@ mod tests {
         for chunk in complete.as_bytes().chunks(3) {buffer.push(std::str::from_utf8(chunk).unwrap()).unwrap();}
         let (full,partial)=buffer.finish().unwrap();
         assert_eq!(full.as_deref(),Some(complete));
-        assert_eq!(partial,"2: fn first() {}\n3: fn second() {}\n");
+        assert_eq!(partial.as_deref(),Some("2: fn first() {}\n3: fn second() {}\n"));
         let mut buffer=SourceBuffer::new(&request,1024);
         buffer.push(complete).unwrap();
         for _ in 0..1024 {buffer.push("// unrelated later source\n").unwrap();}
         let (full,partial)=buffer.finish().unwrap();
         assert!(full.is_none(),"large files were retained without a bound");
-        assert_eq!(partial,"2: fn first() {}\n3: fn second() {}\n");
+        assert_eq!(partial.as_deref(),Some("2: fn first() {}\n3: fn second() {}\n"));
     }
 
     #[test]
     fn amendment_source_complete_file_wins_over_fallback_window_overhead() {
         let request=ReadRequest {file_index:0,start_line:1,end_line:600,needle:None};
-        let content="x\n".repeat(600);
+        let content="abc\n".repeat(600);
         let evidence=Evidence {original_base:"a".repeat(40),selection_identity:"b".repeat(64),coverage:"complete",sources:BTreeMap::from([("behavior.rs".into(),content.clone())])};
         assert!(serde_json::to_vec(&evidence).unwrap().len()<4096,"complete file fixture must fit the real serialized budget");
         let mut buffer=SourceBuffer::new(&request,4096);
@@ -312,7 +320,7 @@ mod tests {
         let request=ReadRequest {file_index:0,start_line:1,end_line:3,needle:None};
         let mut buffer=SourceBuffer::new(&request,4096);
         buffer.push("first\r\nsecond\r\nfinal  ").unwrap();
-        assert_eq!(buffer.finish().unwrap().1,"1: first\r\n2: second\r\n3: final  ","excerpt invented a source terminator");
+        assert_eq!(buffer.finish().unwrap().1.as_deref(),Some("1: first\r\n2: second\r\n3: final  "),"excerpt invented a source terminator");
     }
 
     #[tokio::test]
@@ -388,16 +396,55 @@ mod tests {
         let number=id.strip_prefix(&format!("{}#",recovery.repository)).unwrap().parse::<u64>().unwrap();
         let source=AcceptanceSource::Issue(number);
         let (prepared,_)=super::super::retained_semantic_source(&recovery.worktree,&control,source,&before.checkpoint.binding,&custody,&store.inspect_verifier_evidence(&id)).unwrap().unwrap();
-        let (_,diagnosis)=baseline_witness::retained_semantic_diagnosis_in(&recovery.worktree,&control,&prepared,&custody).unwrap().unwrap();
-        let diagnosis:serde_json::Value=serde_json::from_str(&diagnosis).unwrap();
+        let (negative_identity,diagnosis_raw)=baseline_witness::retained_semantic_diagnosis_in(&recovery.worktree,&control,&prepared,&custody).unwrap().unwrap();
+        let diagnosis:serde_json::Value=serde_json::from_str(&diagnosis_raw).unwrap();
         let base=prepared.baseline.registration.baseline_head();let context=diagnosis["context"].as_str();
         let key=replay_key(&recovery.worktree,&control,base,&custody,context).unwrap();
         let replay=key.map(|key|store.inspect_verifier_evidence(&id).scope_response(&key).unwrap()).flatten();
         let evidence=read_projected(&recovery.worktree,&control,base,&custody,context,replay.as_deref()).await.unwrap();
+        assert_eq!(id,"nolanmak/jarvis#2014","historical rollout proof is explicitly scoped to the retained ordinary issue");
+        assert_eq!(evidence.sources.len(),8);assert!(evidence.coverage.starts_with("complete selected original files"));
+        let request=crate::autoship_workflow::submission::Request {repository:recovery.repository.clone(),target:crate::autoship_workflow::submission::Target::Issue(number),provider:None,until:crate::autoship_workflow::submission::Milestone::Merged};
+        let targeted::Resolved::Issue(issue)=targeted::resolve_for_recovery(&recovery.worktree,&request).await.unwrap() else {panic!("original issue unavailable")};
+        let current_request=if let Some(pr)=recovery.source_pr {
+            let request=crate::autoship_workflow::submission::Request {target:crate::autoship_workflow::submission::Target::Pr(pr),..request};
+            let targeted::Resolved::Pr(pr)=targeted::resolve_for_recovery(&recovery.worktree,&request).await.unwrap() else {panic!("original source PR unavailable")};
+            format!("{}\n{}\n{}",issue.title,issue.body,pr.body)
+        }else{serde_json::to_string(&(issue.number,&issue.title,&issue.body)).unwrap()};
+        assert_eq!(current_request,recovery.source_request,"protected original owner request changed");
+        let main=workflow::remote_main_head(&recovery.worktree,&recovery.repository).await.unwrap();
+        let head=actual_head(&recovery.worktree).await.unwrap();
+        let (basis,diff)=super::super::contribution_diff(&recovery.worktree,base,&main,&head).await.unwrap();
+        let upstream=trusted_git(&recovery.worktree,&["--no-replace-objects","diff","--name-only","--no-ext-diff","--no-textconv",base,&basis,"--"]).await.unwrap();
+        // Production Git metadata and source remain read-only. Measure current
+        // engine fingerprints in a disposable shared-object clone, never by
+        // adding temporary worktrees to the deployed repository or state root.
+        let scratch=tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(scratch.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        let clone=scratch.path().join("repo");
+        let cloned=Command::new("/usr/bin/git").args(["--no-replace-objects","-c","core.hooksPath=/dev/null","clone","--shared","--no-checkout","--"])
+            .arg(&recovery.worktree).arg(&clone).env_clear().env("PATH","/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null")
+            .output().await.unwrap();assert!(cloned.status.success(),"isolated source clone failed");
+        trusted_git(&clone,&["checkout","--detach",&head]).await.unwrap();
+        let mut environments=super::super::environment_evidence_against_main(&clone,scratch.path(),&prepared,&main).await.unwrap();
+        environments.current_candidate=environment_id(&recovery.worktree).unwrap();
+        let failure=if prepared.proposal.contract.verifiers.iter().any(|verifier|!verifier.command.controller_asserted()) {
+            "legacy in-process verifier requires independent behavioral-oracle migration".to_owned()
+        }else{BaselineNotRed {kind:Some(initial_repair::FailureKind::NotReproduced),detail:"baseline_witness_invalid: authenticated retained measurement is unknown; exact independent diagnosis retained privately".into()}.to_string()};
+        let owner=super::super::authority_request_context(&issue.title,&recovery.source_request,Some((&negative_identity,&diagnosis_raw))).unwrap();
+        let prompt=super::super::authority_base_request(&prepared,super::super::AuthorityFacts {source,request_context:&owner,failure:&failure,canonical_main:&main,
+            scope_base:&basis,head:&head,diff:&diff,upstream_paths:&upstream,environments:&environments,adjudication:None}).unwrap();
+        let evidence=read_bounded(&recovery.worktree,&control,base,&custody,context,replay.as_deref(),super::super::source_budget(&prompt).unwrap()).await.unwrap();
+        assert_eq!(evidence.sources.len(),8);assert!(evidence.coverage.starts_with("complete selected original files"));
         let bytes=serde_json::to_vec(&evidence).unwrap();
-        assert!(!evidence.sources.is_empty());
+        let constructed=super::super::construction_request(&prompt,&evidence).unwrap();
+        let actual_request=super::super::initial_authority_request(&constructed).unwrap();
+        let total=actual_request.len()+super::super::AUTHORITY_SYSTEM.len();
+        assert!(total+super::super::CORRECTION_RESERVE<=super::super::REQUEST_LIMIT);
+        assert_eq!(actual_head(&recovery.worktree).await.unwrap(),head,"production candidate moved during read-only preflight");
         let after=store.snapshot(&id).unwrap().unwrap();
         assert_eq!(after,before,"read-only source reconstruction changed ordinary workflow state");
         println!("Authenticated original immutable source: {} files, {} serialized bytes, coverage={}; evidence_sha256={}; no native calls or workflow writes",evidence.sources.len(),bytes.len(),evidence.coverage,digest(&bytes));
+        println!("Complete historical authority preflight: request_bytes={}, system_bytes={}, total_bytes={}, reserved_correction_bytes={}, limit={}; request_sha256={}",actual_request.len(),super::super::AUTHORITY_SYSTEM.len(),total,super::super::CORRECTION_RESERVE,super::super::REQUEST_LIMIT,digest(actual_request.as_bytes()));
     }
 }
