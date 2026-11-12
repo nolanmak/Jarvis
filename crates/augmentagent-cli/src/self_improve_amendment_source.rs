@@ -296,6 +296,43 @@ mod tests {
         assert_eq!(partial,"2: fn first() {}\n3: fn second() {}\n");
     }
 
+    #[test]
+    fn amendment_source_complete_file_wins_over_fallback_window_overhead() {
+        let request=ReadRequest {file_index:0,start_line:1,end_line:600,needle:None};
+        let content="x\n".repeat(600);
+        let evidence=Evidence {original_base:"a".repeat(40),selection_identity:"b".repeat(64),coverage:"complete",sources:BTreeMap::from([("behavior.rs".into(),content.clone())])};
+        assert!(serde_json::to_vec(&evidence).unwrap().len()<4096,"complete file fixture must fit the real serialized budget");
+        let mut buffer=SourceBuffer::new(&request,4096);
+        buffer.push(&content).expect("fallback bookkeeping rejected a complete file that fits");
+        assert_eq!(buffer.finish().unwrap().0.as_deref(),Some(content.as_str()));
+    }
+
+    #[test]
+    fn amendment_source_excerpts_preserve_crlf_and_absent_final_newline() {
+        let request=ReadRequest {file_index:0,start_line:1,end_line:3,needle:None};
+        let mut buffer=SourceBuffer::new(&request,4096);
+        buffer.push("first\r\nsecond\r\nfinal  ").unwrap();
+        assert_eq!(buffer.finish().unwrap().1,"1: first\r\n2: second\r\n3: final  ","excerpt invented a source terminator");
+    }
+
+    #[tokio::test]
+    async fn amendment_source_and_construction_task_reach_actual_authority_call() {
+        let (root,control,base,custody)=fixture().await;
+        let evidence=read(root.path(),control.path(),&base,&custody,Some(&"a".repeat(64))).await.unwrap();
+        let request=super::construction_request("Original proposal is disputed; retain criteria.",&evidence).unwrap();
+        let expected="c".repeat(64);let calls=std::sync::atomic::AtomicUsize::new(0);
+        let (decision,_)=super::authority_response(root.path(),&base,&expected,&request,|prompt| {
+            calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+            assert!(prompt.contains("Construct a complete executable correction now"),"authority is asked only to classify an unchanged defective proposal");
+            assert!(prompt.contains("pub fn behavior() -> bool { false }"),"actual authority call lacks immutable production source");
+            assert!(prompt.contains(&base));
+            let raw=serde_json::json!({"approved":false,"previous_contract_hash":expected,"approve_environment_transition":false,"reason":"Independent authority legitimately declines the correction","proposal":null}).to_string();
+            async move {Ok((raw,"scripted-independent-authority".into()))}
+        },||panic!("valid completed refusal cannot spend a correction call")).await.unwrap();
+        assert!(!decision.approved);assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),1);
+        assert!(super::construction_request(&"x".repeat(512*1024),&evidence).is_err(),"oversized complete request passed construction preflight");
+    }
+
     #[tokio::test]
     async fn amendment_source_refuses_duplicate_selection_and_unsupported_producer() {
         let (root,control,base,mut custody)=fixture().await;
