@@ -119,6 +119,35 @@ fn disposition(judgment:&Judgment)->Result<()> {
     }
     Ok(())
 }
+/// A negative observation can reopen consideration by the existing independent
+/// authority. It can never be used as a positive qualification receipt.
+pub(super) fn retained_semantic_judgment(root:&Path,prepared:&PreparedAcceptance,
+    custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<String>> {
+    ensure!(prepared.proposal.contract==*prepared.baseline.registration.contract(),"retained semantic contract changed");
+    prepared.baseline.registration.verify_integrity(root)?;
+    ensure!(prepared.baseline.registration.baseline_result(&prepared.baseline.receipts)?==BaselineResult::Reproduced,
+        "retained semantic judgment lacks its original measured baseline");
+    scope_authority::require_retained_native_custody(root,custody)?;
+    for observation in custody.iter().rev() {
+        let Ok(judgment)=serde_json::from_str::<Judgment>(&observation.response) else {continue};
+        if !judgment.verifiers.iter().any(|v|v.measurement==Measurement::Unknown) {continue;}
+        let reply=scope_authority::NativeReply {text:observation.response.clone(),provenance:serde_json::from_str(&observation.provenance)?};
+        let control=reply.provenance.artifact.parent().context("retained semantic proof has no authority directory")?;
+        if scope_authority::verify_witness_reply(control,prepared.baseline.registration.baseline_head(),&judgment.context,&reply).is_err() {continue;}
+        // An old policy context is data, never a current qualification. Bind
+        // its original request to the COMPLETE unchanged proposal and baseline.
+        let proof=private_bytes(&reply.provenance.artifact,64*1024)?;
+        ensure!(amendment::digest(&proof)==reply.provenance.artifact_sha256,"retained semantic proof changed during inspection");
+        let provenance:serde_json::Value=serde_json::from_slice(&proof)?;
+        let request=amendment::digest(qualification_prompt(&judgment.context,prepared)?.as_bytes());
+        if provenance["scope_request_hash"].as_str()!=Some(request.as_str()) {continue;}
+        validate(root,&prepared.proposal,&prepared.baseline,&judgment.context,&observation.response)?;
+        return Ok(Some(amendment::digest(&serde_json::to_vec(&("retained-semantic-judgment-v1",
+            &observation.input,&request,amendment::digest(observation.response.as_bytes()),&reply.provenance))?)));
+    }
+    Ok(None)
+}
+
 fn persist(control:&Path,context:&str,native_control:&Path,reply:&scope_authority::NativeReply)->Result<()> {
     let hash=amendment::digest(reply.text.as_bytes());
     immutable(control,&raw_path(control,context,&hash),reply.text.as_bytes())?;
@@ -289,6 +318,49 @@ mod tests {
             .env(CHILD,&script).env("GH_BIN",&script).env("AUGMENTAGENT_RUN_RESOURCES","1")
             .env("XDG_STATE_HOME",scripts.path().join("state")).output().unwrap();
         assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn retained_unknown_requires_exact_original_request_and_authenticated_custody() {
+        use crate::autoship_workflow::{NativeScopeCustody,submission::Provider};
+        let (root,control,prepared)=fixture();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(control.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        persist_scripted_measurement(root.path(),control.path(),&prepared,Measurement::Unknown).unwrap();
+        let judgment=saved_judgment(control.path(),&prepared);let context=judgment["context"].as_str().unwrap();
+        let raw=judgment.to_string();
+        let proof=serde_json::json!({"version":1,"head":prepared.baseline.registration.baseline_head(),"provider":"codex","native_session":"scripted-negative-source-fixture",
+            "supplied_request_hash":amendment::digest(b"scripted selected sources"),"response_hash":amendment::digest(raw.as_bytes()),
+            "purpose":"baseline_witness","scope_context_hash":context,"native_input_hash":"a".repeat(64),
+            "scope_request_hash":amendment::digest(qualification_prompt(context,&prepared).unwrap().as_bytes()),"scope_policy_hash":scope_authority::witness_policy_hash()});
+        let bytes=serde_json::to_vec(&proof).unwrap();let artifact=control.path().join(format!("primary-scope-{}.json",uuid::Uuid::new_v4()));
+        std::fs::write(&artifact,&bytes).unwrap();std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let observation=NativeScopeCustody {input:"a".repeat(64),response:raw,provider:Provider::Codex,
+            provenance:serde_json::to_string(&scope_authority::NativeReplyReference {artifact:artifact.clone(),artifact_sha256:amendment::digest(&bytes)}).unwrap()};
+        let custody=[observation];
+        assert!(retained_semantic_judgment(root.path(),&prepared,&custody).unwrap().is_some(),"retained authenticated semantic judgment has no supported reconsideration evidence");
+        let mut different=prepared.clone();different.proposal.contract.criteria[0].requirement="A different owner requirement".into();
+        assert!(retained_semantic_judgment(root.path(),&different,&custody).is_err(),"changed original contract must not reuse judgment");
+        std::fs::remove_file(artifact).unwrap();
+        assert!(retained_semantic_judgment(root.path(),&prepared,&custody).is_err(),"missing physical custody cannot authorize reconsideration");
+    }
+
+    #[test]
+    #[ignore = "read-only compatibility proof for explicit retained production state; no model calls or workflow mutation"]
+    fn retained_semantic_judgment_production_compatibility() {
+        let path=PathBuf::from(std::env::var_os("AUTOSHIP_SEMANTIC_PREPARED").expect("explicit original prepared evidence path"));
+        let root=PathBuf::from(std::env::var_os("AUTOSHIP_SEMANTIC_WORKTREE").expect("explicit retained worktree"));
+        let state=PathBuf::from(std::env::var_os("AUTOSHIP_SEMANTIC_STATE").expect("explicit read-only workflow store"));
+        let id=std::env::var("AUTOSHIP_SEMANTIC_WORKFLOW").expect("explicit workflow id");
+        let prepared:PreparedAcceptance=private_json(&path).unwrap();
+        let store=crate::autoship_workflow::WorkflowStore::open_read_only(&state).unwrap().unwrap();
+        let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
+        let custody=store.inspect_baseline_native_custody(&id).unwrap();
+        let identity=retained_semantic_judgment(&root,&prepared,&custody).unwrap().expect("retained production judgment does not satisfy authenticated reconsideration");
+        assert_eq!(identity.len(),64);
+        assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);
+        assert_eq!(store.events(&id).unwrap(),events);
+        println!("Read-only retained semantic compatibility verified; {} original responses, no workflow mutation or model calls",custody.len());
     }
 
     #[test]

@@ -329,6 +329,13 @@ pub struct WorkflowStore {
 }
 
 impl WorkflowStore {
+    /// Inspect already charged original responses without granting a lease or
+    /// model authority. Callers must authenticate custody and current inputs.
+    pub(crate) fn inspect_baseline_native_custody(&self,workflow:&str)->Result<Vec<NativeScopeCustody>> {
+        let tx=self.conn.unchecked_transaction()?;
+        let custody=baseline_native_custody(&tx,workflow)?;
+        tx.commit()?;Ok(custody)
+    }
     pub(crate) fn require_baseline_native_custody(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<()> {
         self.baseline_native_custody(lease,binding,now).map(|_|())
     }
