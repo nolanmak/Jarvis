@@ -339,6 +339,11 @@ impl<'a> OriginalExecution<'a> {
     }
 }
 
+/// Read original data without claiming, replaying, installing or remeasuring.
+pub(super) fn retained_original_prepared(_root:&Path,_source:AcceptanceSource,
+    _binding:&crate::autoship_workflow::Binding,_evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>)
+    ->Result<Vec<PreparedAcceptance>> {Ok(Vec::new())}
+
 /// Execute only the protected original recipe. Qualification and correction
 /// remain ordinary paid pipeline work after this inspection lease is released.
 pub(in crate::self_improve) async fn recover_original_verifier(repo:&Path,control:&Path,workflow:&workflow::WorkflowGuard)->Result<bool> {
@@ -392,6 +397,51 @@ mod tests {
         serde_json::json!({"host_sha256":format!("{:x}",Sha256::digest(std::fs::read("/etc/machine-id").unwrap())),
             "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),
             "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1,"limits":{"memory.max":67108864}})
+    }
+
+    #[tokio::test]
+    async fn unenrolled_original_result_is_read_only_source_without_candidate_harness_or_current_executor() {
+        let (root,control,prepared,guard)=fixture().await;
+        let base=prepared.baseline.registration.baseline_head();let environment=environment_id(root.path()).unwrap();
+        let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,"old executor data").unwrap();
+        original.retain_admission("observe",&gone_scope()).unwrap();OriginalExecution::quiesce_previous(&guard).unwrap();
+        original.retain_result(root.path(),&prepared.baseline).unwrap();
+        let binding=guard.binding().clone();let workflow=guard.id().to_owned();drop(original);guard.finish().unwrap();
+        for path in prepared.proposal.files.keys() {std::fs::remove_file(root.path().join(path)).unwrap();}
+        let path=control.path().join("workflow.db");
+        let store=crate::autoship_workflow::WorkflowStore::open_read_only(&path).unwrap().unwrap();
+        let before=store.snapshot(&workflow).unwrap().unwrap();let events=store.events(&workflow).unwrap();
+        let evidence=store.inspect_verifier_evidence(&workflow);
+        let loaded=retained_original_prepared(root.path(),AcceptanceSource::PullRequest(840),&binding,&evidence).unwrap();
+        assert_eq!(loaded.len(),1,"completed unenrolled data has no read-only recovery producer");
+        assert_eq!(serde_json::to_vec(&loaded[0]).unwrap(),serde_json::to_vec(&prepared).unwrap());
+        assert!(prepared.baseline.registration.verify_integrity(root.path()).is_err(),"source inspection manufactured candidate qualification");
+        assert!(!root.path().join(prepared.proposal.files.keys().next().unwrap()).exists(),"free inspection installed an adapter");
+        assert_eq!(store.snapshot(&workflow).unwrap().unwrap(),before);assert_eq!(store.events(&workflow).unwrap(),events);
+        assert!(retained_original_prepared(root.path(),AcceptanceSource::PullRequest(841),&binding,&evidence).unwrap().is_empty());
+        let mut changed=binding;changed.head="b".repeat(40);
+        assert!(retained_original_prepared(root.path(),AcceptanceSource::PullRequest(840),&changed,&evidence).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unenrolled_original_source_refuses_lost_or_corrupt_protected_custody() {
+        for fault in ["plan","result","admission","quiescence","adapter"] {
+            let (root,control,prepared,guard)=fixture().await;
+            let base=prepared.baseline.registration.baseline_head();let environment=environment_id(root.path()).unwrap();
+            let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,"old executor data").unwrap();
+            original.retain_admission("observe",&gone_scope()).unwrap();OriginalExecution::quiesce_previous(&guard).unwrap();
+            original.retain_result(root.path(),&prepared.baseline).unwrap();
+            let command=command_key(&original.plan,&original.attempt,"observe");
+            let key=match fault {"plan"=>original.plan.clone(),"result"=>result_key(&original.plan,&original.attempt),"admission"=>command.clone(),"quiescence"=>quiet_key(&command),"adapter"=>String::new(),_=>unreachable!()};
+            let binding=guard.binding().clone();let workflow=guard.id().to_owned();drop(original);guard.finish().unwrap();
+            let path=control.path().join("workflow.db");
+            if fault=="adapter" {std::fs::write(root.path().join(prepared.proposal.files.keys().next().unwrap()),"changed adapter").unwrap();}
+            else {let conn=rusqlite::Connection::open(&path).unwrap();conn.execute("DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",rusqlite::params![workflow,key]).unwrap();}
+            let store=crate::autoship_workflow::WorkflowStore::open_read_only(&path).unwrap().unwrap();
+            let before=store.snapshot(&workflow).unwrap().unwrap();let events=store.events(&workflow).unwrap();
+            assert!(retained_original_prepared(root.path(),AcceptanceSource::PullRequest(840),&binding,&store.inspect_verifier_evidence(&workflow)).is_err(),"{fault} was accepted as original source");
+            assert_eq!(store.snapshot(&workflow).unwrap().unwrap(),before);assert_eq!(store.events(&workflow).unwrap(),events);
+        }
     }
 
     #[tokio::test]

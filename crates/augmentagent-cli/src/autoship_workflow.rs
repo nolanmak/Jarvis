@@ -46,7 +46,7 @@ mod qualification_schedule;
 pub(crate) use qualification_schedule::{RecoveryContext,RecoveryCandidate};
 #[path = "autoship_verifier_custody.rs"]
 mod verifier_custody;
-pub(crate) use verifier_custody::VerifierEvidence;
+pub(crate) use verifier_custody::{VerifierEvidence,VerifierEvidenceInspection};
 pub use verification_retry::VerificationDomain;
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
