@@ -32,7 +32,11 @@ production observations because their launcher was pinned.
 
 The controller retains the exact native response and provenance privately.
 Native reasons and source quotations stay in that evidence; general error
-surfaces use fixed classifications. Qualification is an independent native
+surfaces use fixed classifications. The authority directory is checked through
+its effective owner-controlled boundary: ordinary umask-created descendants
+may be group-writable beneath an owner-only state root. Exposed writable paths,
+foreign ownership, candidate/build write roots and changed or missing private
+proof still refuse admission. Qualification is an independent native
 judgment. It grants no implementation changes, final-review approval or merge
 permission.
 
@@ -59,7 +63,10 @@ storage, model accounting and bounded correction/amendment budgets.
 Existing valid baseline evidence can receive a separate qualification receipt.
 An invalid verifier must use the existing independent amendment authority,
 preserving its original base, criteria, observations, expenditure and candidate
-edits. A replacement verifier needs its own original-baseline measurement and
+edits. Qualification failures on enrolled work retain that exact registration,
+binding and evidence while recording their typed private hold. They do not use
+the stricter unenrolled initial-scope mutation. Held attempts report actual
+admitted model calls through the existing accounting path. A replacement verifier needs its own original-baseline measurement and
 qualification. A recovery-only identity binding cannot authorize a builder.
 
 Builder binding checks the canonical workflow source, including issue workflows

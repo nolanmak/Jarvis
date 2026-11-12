@@ -1195,6 +1195,7 @@ mod initial_diagnostic_tests {
 
     #[tokio::test]
     async fn qualified_recovery_holds_an_enrolled_reconcile_checkpoint_without_losing_custody() {
+        for paid in [false,true] {
         let (repo,control,prepared)=baseline_witness::prepared_fixture();
         let path=control.path().join("workflow.db");
         let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
@@ -1203,19 +1204,39 @@ mod initial_diagnostic_tests {
         }).await.unwrap().unwrap();
         guard.bind_acceptance_for_recovery(&prepared).unwrap();
         guard.checkpoint(crate::autoship_workflow::Stage::Reconcile,"resume_started","reconcile_main",0,&["original-enrolled-evidence".into()]).await.unwrap();
+        let accounting=guard.capacity_accounting(true).unwrap();
+        if paid {
+            use augmentagent_channel_core::{native_session,ProviderKind};
+            native_session::fresh_review_scope(ProviderKind::Codex,async {
+                let session=native_session::current_for(ProviderKind::Codex)?.unwrap();
+                let mut native=session.begin(ProviderKind::Codex)?;
+                guard.audit_logger().model_call_admitted("codex")?;
+                native.observe("scripted-original-enrolled-qualification")?;native.finish()?;
+                Ok::<(),anyhow::Error>(())
+            }).await.unwrap();
+        }
         let before=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
         let error=anyhow::Error::from(initial_repair::Hold::EvidenceUnknown).context("PRIVATE_ENROLLED_EVIDENCE_DIAGNOSIS");
-        let report=hold_initial_error(&mut guard,&error).await.expect("enrolled qualification failure must report a deterministic hold, not throw an unenrolled-scope assertion").unwrap();
+        assert!(hold_initial_error(&mut guard,&error).await.is_err(),"the initial-enrollment fence must remain strict");
+        let report=hold_qualification_error(&mut guard,&prepared,&error,&accounting).await.expect("enrolled qualification failure must report a deterministic hold, not throw an unenrolled-scope assertion").unwrap();
         assert_eq!(report.message,initial_repair::Hold::EvidenceUnknown.to_string());
+        assert_eq!(report.billed,paid,"hold lost original actual admission accounting");
+        let events=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().events(guard.id()).unwrap().len();
+        hold_qualification_error(&mut guard,&prepared,&error,&accounting).await.unwrap().unwrap();
+        assert_eq!(crate::autoship_workflow::WorkflowStore::open(&path).unwrap().events(guard.id()).unwrap().len(),events,"identical hold replay fabricated progress");
         let after=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
         assert_eq!(after.checkpoint.binding,before.checkpoint.binding);
         assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
         assert_eq!(after.model_calls,before.model_calls);
         assert_eq!(after.checkpoint.next.reason,"acceptance_verifier_evidence_unknown");
         assert_eq!(after.checkpoint.next.action,"await_original_evidence_recovery");
-        let id=guard.id().to_owned();guard.finish().unwrap();
-        let mut store=crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
-        assert!(store.claim_productive(&id,"unchanged-retry",chrono::Utc::now().timestamp_millis(),1_000).unwrap().is_none(),"unchanged enrolled evidence hold was reclaimed for productive work");
+        let conn=rusqlite::Connection::open(&path).unwrap();
+        let public:String=conn.query_row("SELECT COALESCE(group_concat(payload),'') FROM workflow_progress_event WHERE workflow=?1",[guard.id()],|r|r.get(0)).unwrap();
+        assert!(!public.contains("PRIVATE_ENROLLED_EVIDENCE_DIAGNOSIS"),"private enrolled diagnosis escaped into public progress");
+        assert!(guard.audit_logger().model_call_admitted("codex").is_err(),"held qualification metadata authorized a paid builder");
+        assert_eq!(crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,before.model_calls);
+        guard.finish().unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1285,6 +1306,17 @@ pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,err
     workflow.record_scope_stage_response(&key,&serde_json::to_string(&record)?)
         .map_err(|_|anyhow::Error::from(initial_repair::Hold::EvidenceUnknown))?;
     Ok(Some(RunReport::held(hold.to_string())))
+}
+
+pub(super) async fn hold_qualification_error(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,error:&anyhow::Error,accounting:&workflow::CapacityAccounting)->Result<Option<RunReport>> {
+    let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
+    workflow.hold_enrolled_acceptance(prepared,hold.reason(),hold.action()).await?;
+    let diagnostic=format!("{error:#}");
+    let key=amendment::digest(&serde_json::to_vec(&("enrolled-qualification-diagnostic-v1",workflow.id(),workflow.binding(),hold.reason(),amendment::digest(diagnostic.as_bytes())))?);
+    let record=serde_json::json!({"version":1,"kind":"enrolled_qualification_diagnostic","workflow":workflow.id(),"binding":workflow.binding(),"reason":hold.reason(),"diagnostic":diagnostic});
+    workflow.record_scope_stage_response(&key,&serde_json::to_string(&record)?)
+        .map_err(|_|anyhow::Error::from(initial_repair::Hold::EvidenceUnknown))?;
+    Ok(Some(accounting.retry_report(hold.to_string())?))
 }
 
 async fn initial_baseline_candidates(root:&Path,control:&Path,source:AcceptanceSource,base:&str,scope:&str,

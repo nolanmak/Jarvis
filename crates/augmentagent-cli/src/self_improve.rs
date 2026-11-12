@@ -6759,7 +6759,7 @@ async fn resume_draft_pr(
         if !resumed_criteria.contains(&criterion.requirement) { resumed_criteria.push(criterion.requirement.clone()); }
     }
     if let Err(error)=acceptance::qualify_or_amend(reasoner.as_ref(),crate::autoship_contract::AcceptanceSource::Issue(issue.number),&issue.title,&worktree,&acceptance_control,&mut prepared_acceptance,&mut workflow).await {
-        if let Some(report)=acceptance::hold_initial_error(&mut workflow,&error).await? {return Ok(report);}
+        if let Some(report)=acceptance::hold_qualification_error(&mut workflow,&prepared_acceptance,&error,&capacity_accounting).await? {return Ok(report);}
         return Err(error);
     }
     workflow.bind_acceptance(&prepared_acceptance,&acceptance_control)?;
@@ -8280,7 +8280,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         if !criteria.contains(&criterion.requirement) { criteria.push(criterion.requirement.clone()); }
     }
     if let Err(error)=acceptance::qualify_or_amend(reasoner.as_ref(),crate::autoship_contract::AcceptanceSource::Issue(issue.number),&issue.title,&worktree,&acceptance_control,&mut prepared_acceptance,&mut workflow_guard).await {
-        if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}
+        if let Some(report)=acceptance::hold_qualification_error(&mut workflow_guard,&prepared_acceptance,&error,&capacity_accounting).await? {return Ok(report);}
         return Err(error);
     }
     workflow_guard.bind_acceptance(&prepared_acceptance,&acceptance_control)?;

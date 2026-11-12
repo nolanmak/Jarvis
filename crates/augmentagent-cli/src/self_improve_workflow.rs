@@ -1377,6 +1377,25 @@ impl WorkflowGuard {
         Ok(())
     }
 
+    /// Qualification recovery holds already-enrolled work without turning its
+    /// candidate binding into an unenrolled initial scope or granting a builder.
+    pub(super) async fn hold_enrolled_acceptance(&mut self,prepared:&acceptance::PreparedAcceptance,reason:&str,action:&str)->Result<()> {
+        self.healthy_lease()?;
+        self.validate_acceptance_source(prepared)?;
+        self.audit_health().await?;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
+        let mut checkpoint=store.snapshot(self.id())?.context("enrolled acceptance workflow missing")?.checkpoint;
+        anyhow::ensure!(checkpoint.binding==self.binding && matches!(checkpoint.stage,
+            Stage::Intake|Stage::Scope|Stage::Reconcile|Stage::Build|Stage::Verify|Stage::Review),"enrolled acceptance hold binding/stage changed");
+        *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::RecoveryOnly;
+        if checkpoint.stage==Stage::Scope && checkpoint.next.reason==reason && checkpoint.next.action==action
+            && checkpoint.next.eligible_at_ms==0 {return Ok(());}
+        checkpoint.stage=Stage::Scope;
+        checkpoint.next=crate::autoship_workflow::NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0};
+        store.checkpoint(&self.lease,&checkpoint,millis())?;
+        Ok(())
+    }
+
     /// A fresh issue must not keep spending once an authorized linked PR exists.
     /// PR-bound recovery uses its original independent execution authority.
     pub(super) async fn require_fresh_issue(&self,repo:&Path)->Result<()> {

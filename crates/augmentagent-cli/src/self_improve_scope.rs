@@ -147,8 +147,31 @@ pub(super) fn require_retained_native_custody(root:&Path,observations:&[crate::a
             let reference:NativeReplyReference=serde_json::from_str(&observation.provenance)?;
             let directory=reference.artifact.parent().context("original native proof has no authority directory")?;
             ensure!(directory.is_absolute() && directory.canonicalize()?==directory,"original native authority directory changed");
-            let metadata=directory.metadata()?;
-            ensure!(metadata.is_dir() && metadata.uid()==unsafe{libc::geteuid()} && metadata.mode()&0o022==0,"original native authority directory is writable by another user");
+            // Normal umask-created descendants can be 0775 beneath the
+            // controller's 0700 state root. Access is bounded by that original
+            // owner-only ancestor; the leaf mode alone is not effective access.
+            let owner=unsafe{libc::geteuid()};
+            ensure!(directory.metadata()?.uid()==owner,"original native authority directory has a foreign owner");
+            let mut exposed_writable=false;
+            let mut descendants_owned=true;
+            let mut child_owner=owner;
+            let mut private_boundary=false;
+            for ancestor in directory.ancestors() {
+                let metadata=ancestor.metadata()?;
+                ensure!(metadata.is_dir() && (metadata.uid()==0 || metadata.uid()==owner),"original native authority ancestor has a foreign owner or type");
+                if descendants_owned && metadata.uid()==owner && metadata.mode()&0o077==0 {
+                    private_boundary=true;break;
+                }
+                // A trusted sticky parent protects its owner-owned child from
+                // replacement; it does not excuse writable descendants.
+                if metadata.mode()&0o1000!=0 && (metadata.uid()==0 || metadata.uid()==owner) {
+                    if child_owner==owner && !exposed_writable {private_boundary=true;break;}
+                }
+                exposed_writable|=metadata.mode()&0o022!=0;
+                descendants_owned&=metadata.uid()==owner;
+                child_owner=metadata.uid();
+            }
+            ensure!(private_boundary || !exposed_writable,"original native authority is exposed to another writer");
             for writable in worker_roots(root) {
                 if writable.exists() {ensure!(!directory.starts_with(writable.canonicalize()?),"original native authority overlaps worker storage");}
             }
@@ -773,19 +796,27 @@ mod native_reply_tests {
 
     #[test]
     fn qualified_recovery_accepts_group_writable_descendants_beneath_a_private_boundary() {
-        let candidate=tempfile::tempdir().unwrap();
-        let private=tempfile::tempdir_in("/tmp").unwrap();
-        let control=private.path().join("authority");std::fs::create_dir(&control).unwrap();
-        std::fs::set_permissions(&control,std::fs::Permissions::from_mode(0o775)).unwrap();
-        let input="b".repeat(64);
-        let mut original=reply(&control,Some(CallPurpose::SourceSelection),&"a".repeat(40),"original saved source selection");
-        let mut observed:NativeReplyProvenance=serde_json::from_slice(&std::fs::read(&original.provenance.artifact).unwrap()).unwrap();
-        observed.scope_context_hash=Some("c".repeat(64));observed.native_input_hash=Some(input.clone());
-        let bytes=serde_json::to_vec(&observed).unwrap();std::fs::write(&original.provenance.artifact,&bytes).unwrap();
-        original.provenance.artifact_sha256=amendment::digest(&bytes);
-        let retained=crate::autoship_workflow::NativeScopeCustody {input,response:original.text,
-            provenance:serde_json::to_string(&original.provenance).unwrap(),provider:crate::autoship_workflow::submission::Provider::Codex};
-        require_retained_native_custody(candidate.path(),&[retained]).expect("normal umask descendants remain protected by the original owner-only ancestor");
+        for case in ["private-0775","public-0755","exposed-0775","worker-owned","missing-proof","changed-proof"] {
+            let candidate=tempfile::tempdir().unwrap();
+            let private=tempfile::tempdir_in("/tmp").unwrap();
+            std::fs::set_permissions(private.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+            let control=if matches!(case,"public-0755"|"exposed-0775") {private.path().to_path_buf()}
+                else {let path=private.path().join("authority");std::fs::create_dir(&path).unwrap();path};
+            std::fs::set_permissions(&control,std::fs::Permissions::from_mode(if case=="public-0755" {0o755}else{0o775})).unwrap();
+            let input="b".repeat(64);
+            let mut original=reply(&control,Some(CallPurpose::SourceSelection),&"a".repeat(40),"original saved source selection");
+            let mut observed:NativeReplyProvenance=serde_json::from_slice(&std::fs::read(&original.provenance.artifact).unwrap()).unwrap();
+            observed.scope_context_hash=Some("c".repeat(64));observed.native_input_hash=Some(input.clone());
+            let bytes=serde_json::to_vec(&observed).unwrap();std::fs::write(&original.provenance.artifact,&bytes).unwrap();
+            original.provenance.artifact_sha256=amendment::digest(&bytes);
+            if case=="missing-proof" {std::fs::remove_file(&original.provenance.artifact).unwrap();}
+            if case=="changed-proof" {std::fs::write(&original.provenance.artifact,b"changed original proof").unwrap();}
+            let retained=crate::autoship_workflow::NativeScopeCustody {input,response:original.text,
+                provenance:serde_json::to_string(&original.provenance).unwrap(),provider:crate::autoship_workflow::submission::Provider::Codex};
+            let root=if case=="worker-owned" {private.path()}else{candidate.path()};
+            let result=require_retained_native_custody(root,&[retained]);
+            assert_eq!(result.is_ok(),matches!(case,"private-0775"|"public-0755"),"{case}: {result:?}");
+        }
     }
 
     #[tokio::test]
