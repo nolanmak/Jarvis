@@ -192,8 +192,11 @@ wrapper accounting; exhausted-budget and controller-commit restart fencing.
 The explicit read-only #2014 probe checks both original responses and unchanged
 workflow/events. These checks do not prove an autonomous merge.
 
-Current local validation: full CLI 1,965 pass / zero failures / 36 explicit
-ignored tests; the actual source probe separately passes. Required Linux,
+Recorded pre-integration validation: full CLI 1,965 pass / zero failures / 36
+explicit ignored tests; the actual source probe separately passes. After merging
+main at c5a5a9f0, the full CLI passed 1,971 / zero failures / 37 explicit ignores
+and the read-only source probe passed again. Later main integrations require
+validation of their combined head; consult the PR for current check results. Required Linux,
 privacy and node-release checks and independent repair review must pass on the
 actual final PR head; macOS is informational under existing policy. Take only
 `augmentagent deploy snapshot`, merge normally without rebase/force-push, and let
