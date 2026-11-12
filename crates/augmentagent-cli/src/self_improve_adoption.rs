@@ -173,6 +173,11 @@ pub(super) fn episode_retries(
         let Some(snapshot) = store.snapshot(&id)? else {
             continue;
         };
+        if candidate.source_issue.is_some_and(|issue|crate::autoship_workflow::workflow_id(&candidate.repository,issue).is_ok_and(|expected|expected==id))
+            && store.owner_resume_due(&id,now)? {
+            result.insert(candidate.pr);
+            continue;
+        }
         let main_changed = snapshot.checkpoint.stage == crate::autoship_workflow::Stage::Reconcile
             && snapshot.checkpoint.next.reason == "review_main_changed"
             && snapshot.checkpoint.next.action == "reconcile_main";
@@ -191,6 +196,29 @@ pub(super) fn episode_retries(
         }
     }
     Ok(result)
+}
+
+/// Re-read authorized PR inventory before handing an owner resume into the
+/// existing protected PR execution path. The durable hint grants no authority.
+pub(super) async fn current_owner_resume(repo:&Path,path:&Path,id:&str)->Result<Option<AdoptedPr>> {
+    let repository=workflow::canonical_repository(repo).await?;
+    targeted::authorize_repository(repo,&repository).await?;
+    let raw=complete_repository_inventory(repo,"pr",None,
+        "number,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,author,title,body,closingIssuesReferences").await?;
+    let mut allowed=trusted_authors(repo).await;
+    if let Some(owner)=repository.split('/').next() {allowed.push(owner.into());}
+    let mut candidates=authorized(&serde_json::from_str(&raw)?,&repository,&allowed);
+    policy_hold::filter(repo,&mut candidates,false).await;
+    let Some(store)=WorkflowStore::open_read_only(path)? else{return Ok(None)};
+    if !store.owner_resume_ready_for_dispatch(id,chrono::Utc::now().timestamp_millis())? {return Ok(None);}
+    let expected=store.snapshot(id)?.and_then(|state|state.pr);
+    Ok(candidates.into_iter().find(|candidate| {
+        candidate.ready_for_review() && Some(candidate.pr)==expected
+            && match candidate.source_issue {
+                Some(issue)=>crate::autoship_workflow::workflow_id(&repository,issue).is_ok_and(|source|source==id),
+                None=>crate::autoship_workflow::pr_workflow_id(&repository,candidate.pr).is_ok_and(|source|source==id),
+            }
+    }))
 }
 
 pub(super) async fn policy_reconciliation_retries(

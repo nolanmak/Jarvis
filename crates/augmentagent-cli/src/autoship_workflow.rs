@@ -967,6 +967,7 @@ impl WorkflowStore {
         tx.execute("UPDATE workflow SET owner=?2,generation=?3,lease_until=?4,heartbeat_at=?5,attempts=attempts+1 WHERE id=?1",
             params![workflow, owner, generation, until, now_ms])?;
         event(&tx, workflow, generation, "claimed", owner, now_ms)?;
+        if purpose==ClaimPurpose::Productive {owner_control::consume_dispatch_resume(&tx,workflow,generation,now_ms)?;}
         tx.commit()?;
         Ok(Some(Lease {
             workflow: workflow.into(),

@@ -7868,10 +7868,16 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
     }
 
-    run_selected(repo_root,dry_run,None,targeted::ExecutionMode::Background).await
+    let owner_resume=if !dry_run && crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())?
+        .map(|store|store.has_due_owner_resume(None,chrono::Utc::now().timestamp_millis())).transpose()?.unwrap_or(false) {
+        let repository=workflow::canonical_repository(repo_root).await?;
+        crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
+            .reserve_owner_resume_turn(&repository,chrono::Utc::now().timestamp_millis())?
+    }else{None};
+    run_selected(repo_root,dry_run,None,targeted::ExecutionMode::Background,owner_resume.as_deref()).await
 }
 
-async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted::Resolved>, mode: targeted::ExecutionMode) -> Result<RunReport> {
+async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted::Resolved>, mode: targeted::ExecutionMode, owner_resume:Option<&str>) -> Result<RunReport> {
     anyhow::ensure!(mode != targeted::ExecutionMode::Local || selected.is_some(), "local execution requires an authorized target");
     if !dry_run {
         // Read-only, before lock/state creation, issue selection or model spend.
@@ -7971,6 +7977,15 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             }
         }
     }};
+
+    if red_main_issue.is_none() {
+        if let Some(id)=owner_resume {
+            if let Some(pr)=adoption::current_owner_resume(repo_root,&workflow::path(),id).await? {
+                return targeted::execute_pr(repo_root,pr,dry_run).await.map(|mut report|{report.resumed=true;report});
+            }
+            return Ok(RunReport::held("Owner resume awaits current source, binding or dependency revalidation".into()));
+        }
+    }
 
     // #866 — sitting draft PRs outrank new work: they are mostly-finished
     // diffs that only lack an approving review, and until now the dedup guard
@@ -12198,7 +12213,8 @@ impl AutoPrLoop {
                         if self.command_repository.is_none() {
                             let queued = crate::autoship_workflow::WorkflowStore::open_read_only(&self.workflow_path)
                                 .and_then(|store| store.map(|s| -> Result<bool> {
-                                    Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?)
+                                    Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?
+                                        || s.has_due_owner_resume(None,(self.clock)().timestamp_millis())?)
                                 }).transpose());
                             match queued {
                                 Ok(Some(true)) => {},
@@ -12217,7 +12233,8 @@ impl AutoPrLoop {
                                 let repository = self.command_repository.as_deref().unwrap();
                                 let now = (self.clock)().timestamp_millis();
                                 Ok(store.command_queue_due(repository, now)?
-                                    || store.has_due_main_reconciliation(Some(repository), now)?)
+                                    || store.has_due_main_reconciliation(Some(repository), now)?
+                                    || store.has_due_owner_resume(Some(repository),now)?)
                             })
                                 .transpose().map(|due| due.unwrap_or(false)));
                         match due {

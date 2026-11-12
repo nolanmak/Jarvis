@@ -24,6 +24,48 @@ impl WorkflowStore {
 
     pub fn require_owner_dispatch(&self,workflow:&str)->Result<()> {require_dispatch(&self.conn,workflow)}
 
+    /// A wake/selection hint over existing owner intent. It is not a lease,
+    /// execution request, provider pin, merge ceiling or permission to spend.
+    pub(crate) fn owner_resume_due(&self,workflow:&str,now:i64)->Result<bool> {
+        let Some(request)=due_resume(&self.conn,workflow,now)? else{return Ok(false)};
+        inspection_due(&self.conn,workflow,&request,now)
+    }
+    pub(crate) fn owner_resume_ready_for_dispatch(&self,workflow:&str,now:i64)->Result<bool> {
+        Ok(due_resume(&self.conn,workflow,now)?.is_some())
+    }
+    /// Existing worker scheduling metadata; no workflow claim or policy is
+    /// created. A failed free preflight may be inspected again after five minutes.
+    pub(crate) fn reserve_owner_resume_turn(&mut self,repository:&str,now:i64)->Result<Option<String>> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ids={
+            let mut query=tx.prepare("SELECT w.id FROM workflow w JOIN workflow_owner_control c ON c.workflow=w.id WHERE c.paused=0 AND w.pr IS NOT NULL AND w.lease_until<=?2 AND (instr(w.id,?1||'#')=1 OR instr(w.id,?1||'/pr/')=1) ORDER BY c.updated_at,w.id")?;
+            let rows=query.query_map(params![repository.to_ascii_lowercase(),now],|r|r.get::<_,String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut selected=None;
+        for id in ids {
+            let Some(request)=due_resume(&tx,&id,now)? else{continue};
+            if !inspection_due(&tx,&id,&request,now)? {continue;}
+            let generation:i64=tx.query_row("SELECT generation FROM workflow WHERE id=?1",[&id],|r|r.get(0))?;
+            event(&tx,&id,generation,"owner_dispatch_resume_inspected",&serde_json::to_string(&request)?,now)?;
+            selected=Some(id);break;
+        }
+        tx.commit()?;Ok(selected)
+    }
+
+    pub(crate) fn has_due_owner_resume(&self,repository:Option<&str>,now:i64)->Result<bool> {
+        let exists:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_control')",[],|r|r.get(0))?;
+        if !exists {return Ok(false);}
+        let mut query=self.conn.prepare("SELECT w.id FROM workflow w JOIN workflow_owner_control c ON c.workflow=w.id
+            WHERE c.paused=0 AND w.pr IS NOT NULL AND w.lease_until<=?2
+            AND (?1 IS NULL OR instr(w.id,?1||'#')=1 OR instr(w.id,?1||'/pr/')=1) ORDER BY c.updated_at,w.id")?;
+        for id in query.query_map(params![repository.map(str::to_ascii_lowercase),now],|r|r.get::<_,String>(0))? {
+            if self.owner_resume_due(&id?,now)? {return Ok(true);}
+        }
+        Ok(false)
+    }
+
+
     /// The worker calls this after its normal checked native retirement pass.
     /// A queued owner intent cannot make work runnable until every guard passes.
     pub(crate) fn settle_owner_execution_retries(&mut self,now:i64,limit:usize)->Result<usize> {
@@ -122,8 +164,63 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
             tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",params![workflow,serde_json::to_string(&checkpoint)?,now])?;
             event(tx,workflow,generation,"owner_execution_retry_requested",&serde_json::json!({"principal":principal,"owner_revision":revision,"cleanup_pending":pending}).to_string(),now)?;
         }
+        if !paused && prior.as_ref().is_some_and(|control|control.paused) {
+            let current:Option<(String,i64)>=tx.query_row("SELECT checkpoint,generation FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            if let Some((raw,generation))=current {
+                let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
+                event(tx,workflow,generation,"owner_dispatch_resume_requested",&serde_json::to_string(&DispatchResume {revision,binding:checkpoint.binding})?,now)?;
+            }
+        }
         super::progress::project(tx,workflow,"owner_control_changed",now)?;
         Ok(control)
+}
+
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchResume {revision:i64,binding:Binding}
+
+fn pending_resume(conn:&Connection,workflow:&str)->Result<Option<DispatchResume>> {
+    let Some(control)=read(conn,workflow)?.filter(|control|!control.paused) else {return Ok(None);};
+    let raw:Option<String>=conn.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='owner_dispatch_resume_requested' ORDER BY seq DESC LIMIT 1",[workflow],|r|r.get(0)).optional()?;
+    let Some(raw)=raw else {return Ok(None);};
+    let request:DispatchResume=serde_json::from_str(&raw)?;
+    request.binding.validate()?;
+    if request.revision!=control.revision {return Ok(None);}
+    let consumed:Option<String>=conn.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='owner_dispatch_resume_consumed' ORDER BY seq DESC LIMIT 1",[workflow],|r|r.get(0)).optional()?;
+    if consumed.map(|raw|raw.parse::<i64>()).transpose()?.is_some_and(|revision|revision>=request.revision) {return Ok(None);}
+    Ok(Some(request))
+}
+
+fn inspection_due(conn:&Connection,workflow:&str,request:&DispatchResume,now:i64)->Result<bool> {
+    let row:Option<(String,i64)>=conn.query_row("SELECT payload,at_ms FROM workflow_event WHERE workflow=?1 AND kind='owner_dispatch_resume_inspected' ORDER BY seq DESC LIMIT 1",[workflow],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    if let Some((raw,at))=row {
+        let inspected:DispatchResume=serde_json::from_str(&raw)?;
+        if inspected.revision==request.revision && inspected.binding==request.binding
+            && now<at.checked_add(300_000).context("owner resume inspection time overflow")? {return Ok(false);}
+    }
+    Ok(true)
+}
+
+fn due_resume(conn:&Connection,workflow:&str,now:i64)->Result<Option<DispatchResume>> {
+    let Some(request)=pending_resume(conn,workflow)? else {return Ok(None);};
+    let row:Option<(String,i64,Option<u64>)>=conn.query_row("SELECT checkpoint,lease_until,pr FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let Some((raw,leased,pr))=row else{return Ok(None);};
+    let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
+    if pr.is_none() || leased>now || checkpoint.binding!=request.binding || checkpoint.next.eligible_at_ms>now
+        || !matches!(checkpoint.stage,Stage::Build|Stage::Verify|Stage::Review|Stage::Reconcile)
+        || super::owner_inbox::pending(conn,workflow)?>0 {return Ok(None);}
+    let uncertain:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed'))",[workflow],|r|r.get(0))?;
+    if uncertain {return Ok(None);}
+    Ok(Some(request))
+}
+
+/// Settle owner intent only after the normal productive claim succeeds. A
+/// normal input rebind also consumes an older hint rather than resurrecting it.
+pub(super) fn consume_dispatch_resume(tx:&Transaction<'_>,workflow:&str,generation:i64,now:i64)->Result<()> {
+    if let Some(request)=pending_resume(tx,workflow)? {
+        event(tx,workflow,generation,"owner_dispatch_resume_consumed",&request.revision.to_string(),now)?;
+    }
+    Ok(())
 }
 
 pub(super) fn read(conn:&Connection,workflow:&str)->Result<Option<OwnerControl>> {
