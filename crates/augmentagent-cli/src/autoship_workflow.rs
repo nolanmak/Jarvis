@@ -1396,7 +1396,17 @@ impl WorkflowStore {
 
     fn charge_inner(&mut self, lease: &Lease, receipt_id: &str,
         charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>, bounded:Option<(&str,&Binding,u32)>, admission:Option<(Option<submission::Provider>,bool)>) -> Result<()> {
-        let admission=admission.map(|(provider,reviewer)|serde_json::json!({"receipt":receipt_id,"provider":provider,"reviewer":reviewer}).to_string());
+        let admission=admission.map(|(provider,reviewer)| {
+            let mut attribution=serde_json::json!({"receipt":receipt_id,"provider":provider,"reviewer":reviewer});
+            // Keep the actual charge and its exact bounded input in one fact.
+            // Recovery must not infer this link from adjacent event times, and
+            // an idempotent receipt cannot be reassigned to a different input.
+            // Unbounded calls retain their previous serialized shape.
+            if let Some((purpose,binding,limit))=bounded {
+                attribution["bounded"]=serde_json::json!({"purpose":purpose,"binding":binding,"limit":limit});
+            }
+            attribution.to_string()
+        });
         ensure!(!receipt_id.is_empty(), "charge receipt required");
         let values = (
             i64::try_from(charge.wall_ms)?,
@@ -2614,6 +2624,16 @@ mod tests {
     }
 
     #[test]
+    fn scope_response_pair_malformed_history_is_missing_evidence() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let (mut store,lease)=setup(&path);
+        let raw="a".repeat(64);let proof="b".repeat(64);
+        store.conn.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,?2,'scope_stage_response_recorded','not JSON',31)",params![lease.workflow,lease.generation]).unwrap();
+        assert!(store.scope_stage_response_pair(&lease,&binding(),&raw,&proof,32).unwrap_err().downcast_ref::<MissingScopeResponse>().is_some());
+        assert!(store.record_scope_stage_response_pair(&lease,&binding(),&raw,"response",&proof,"proof",33).unwrap_err().downcast_ref::<MissingScopeResponse>().is_some());
+        assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM scope_stage_response",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    #[test]
     fn expired_controller_cannot_install_or_clear_readiness_dependency() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let (mut store,old)=setup(&path);
         store.set_readiness_dependency(&old,&binding(),"repo",970,Some(("request","base","external_decision","evidence")),30).unwrap();
@@ -2857,6 +2877,31 @@ mod tests {
         assert_eq!(latest.actual_provider_role.as_deref(),Some("workflow"));
         assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,2);
         assert_eq!(store.events(&lease.workflow).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_model_admitted").count(),2);
+    }
+
+    #[test]
+    fn admitted_receipt_retains_exact_bounded_input_attribution() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        let input=binding();
+        store.charge_admitted_model(&lease,"witness-call",30,None,Some(("witness-input",&input,1)),Some(submission::Provider::Codex),true).unwrap();
+        drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let admission:serde_json::Value=store.events(&lease.workflow).unwrap().into_iter()
+            .find(|(_,kind,_,_)|kind=="native_model_admitted")
+            .map(|(_,_,payload,_)|serde_json::from_str(&payload).unwrap()).unwrap();
+        assert_eq!(admission["bounded"],serde_json::json!({"purpose":"witness-input","binding":input,"limit":1}),
+            "the charged receipt must identify its input in the admission transaction");
+        // Exact replay is free; the same charge cannot be attributed to another
+        // input, allowance or unbounded call after a restart.
+        store.charge_admitted_model(&lease,"witness-call",31,None,Some(("witness-input",&input,1)),Some(submission::Provider::Codex),true).unwrap();
+        let mut changed=input.clone();changed.head="different-head".into();
+        for bounded in [Some(("other-input",&input,1)),Some(("witness-input",&changed,1)),Some(("witness-input",&input,2)),None] {
+            assert!(store.charge_admitted_model(&lease,"witness-call",32,None,bounded,Some(submission::Provider::Codex),true).is_err(),
+                "original charge was silently assigned to a different native input");
+        }
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,1);
+        assert_eq!(store.events(&lease.workflow).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_model_admitted").count(),1);
     }
 
     #[test]

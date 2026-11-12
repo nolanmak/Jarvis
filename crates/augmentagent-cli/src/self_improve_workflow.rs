@@ -2983,13 +2983,18 @@ mod tests {
         }, millis()).await.unwrap().unwrap();
         let audit = guard.audit_logger();
         // Script the existing admission boundary; no provider is launched.
-        audit.model_call_admitted("codex").unwrap();
+        guard.bounded_native_calls("original-witness-input".into(),1,async {
+            audit.model_call_admitted("codex")
+        }).await.unwrap();
         let store = WorkflowStore::open(&path).unwrap();
         let admissions: Vec<serde_json::Value> = store.events(guard.id()).unwrap()
             .into_iter().filter(|(_, kind, _, _)| kind == "native_model_admitted")
             .map(|(_, _, payload, _)| serde_json::from_str(&payload).unwrap()).collect();
         assert_eq!(admissions.len(), 1);
         assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls, 1);
+        assert_eq!(admissions[0]["bounded"],serde_json::json!({
+            "purpose":"original-witness-input","binding":guard.binding(),"limit":1
+        }),"the existing admission observer must bind the charged receipt to its native input");
         let receipt = admissions[0]["receipt"].as_str().unwrap();
         assert!(receipt.starts_with("model-call:"));
         let records: Vec<serde_json::Value> = std::fs::read_to_string(audit.path()).unwrap()
