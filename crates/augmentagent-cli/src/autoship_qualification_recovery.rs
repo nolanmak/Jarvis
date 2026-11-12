@@ -83,7 +83,7 @@ impl WorkflowStore {
         tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",params![expected.workflow,raw,now])?;
         event(&tx,&expected.workflow,generation,"checkpoint",&raw,now)?;
         event(&tx,&expected.workflow,generation,"original_semantic_witness_recovered",
-            &serde_json::json!({"version":1,"key":key,"judgment":identity,"policy":policy,"original_generation":generation,"qualification_required":true}).to_string(),now)?;
+            &serde_json::json!({"version":1,"key":key,"judgment":identity,"policy":policy,"original_generation":generation,"binding":checkpoint.binding,"qualification_required":true}).to_string(),now)?;
         tx.commit()?;Ok(true)
     }
 

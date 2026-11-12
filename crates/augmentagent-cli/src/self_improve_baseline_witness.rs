@@ -148,6 +148,20 @@ pub(super) fn retained_semantic_judgment(root:&Path,prepared:&PreparedAcceptance
     Ok(None)
 }
 
+/// Bind source-only inspection to this workflow's existing native authority.
+/// Admission correlation alone must not import a different workflow's proof.
+pub(super) fn retained_semantic_judgment_in(root:&Path,control:&Path,prepared:&PreparedAcceptance,
+    custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<String>> {
+    if custody.is_empty() {return Ok(None);}
+    let expected=control.canonicalize()?;
+    ensure!(expected==control,"retained semantic authority directory changed");
+    for observation in custody {
+        let reference:scope_authority::NativeReplyReference=serde_json::from_str(&observation.provenance)?;
+        ensure!(reference.artifact.parent()==Some(expected.as_path()),"retained semantic proof belongs to another workflow");
+    }
+    retained_semantic_judgment(root,prepared,custody)
+}
+
 fn persist(control:&Path,context:&str,native_control:&Path,reply:&scope_authority::NativeReply)->Result<()> {
     let hash=amendment::digest(reply.text.as_bytes());
     immutable(control,&raw_path(control,context,&hash),reply.text.as_bytes())?;
@@ -186,6 +200,13 @@ pub(super) async fn qualify(root:&Path,control:&Path,prepared:&PreparedAcceptanc
     let expected=context(&prepared.proposal,&prepared.baseline)?;
     std::fs::create_dir_all(control)?;
     if artifact_path(control,&expected).try_exists()? {return assert_current(root,control,prepared);}
+    let retained=workflow.baseline_native_custody().map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
+    let native_control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
+    if retained_semantic_judgment_in(root,&native_control,prepared,&retained)
+        .map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?.is_some() {
+        return Err(BaselineNotRed {kind:Some(initial_repair::FailureKind::NotReproduced),
+            detail:"baseline_witness_invalid: authenticated retained measurement is unknown; exact independent diagnosis retained privately".into()}.into());
+    }
     ensure!(actual_head(root).await?==prepared.baseline.registration.baseline_head(),"qualification must use the original baseline checkout");
     prepared.baseline.registration.verify_integrity(root)?;
     ensure!(environment_id(root)?==prepared.baseline.registration.binding(prepared.baseline.registration.baseline_head())?.environment_id,
@@ -345,8 +366,9 @@ mod tests {
             let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original owner request",environment:"fixture"}).await.unwrap().unwrap();
             let native_control=control_directories(guard.repository(),guard.id()).unwrap().workflow_acceptance;
             std::fs::create_dir_all(&native_control).unwrap();
+            std::fs::set_permissions(&native_control,std::fs::Permissions::from_mode(0o700)).unwrap();
             let retained=native_control.join(artifact.file_name().unwrap());std::fs::rename(&artifact,&retained).unwrap();
-            let provenance=serde_json::to_string(&scope_authority::NativeReplyReference {artifact:retained,artifact_sha256:amendment::digest(&bytes)}).unwrap();
+            let provenance=serde_json::to_string(&scope_authority::NativeReplyReference {artifact:retained.clone(),artifact_sha256:amendment::digest(&bytes)}).unwrap();
             let purpose=format!("{}{}",crate::autoship_workflow::BASELINE_NATIVE_PURPOSE_PREFIX,input);
             guard.bounded_native_calls(purpose.clone(),1,augmentagent_channel_core::native_session::fresh_review_scope(
                 augmentagent_channel_core::ProviderKind::Codex,async {
@@ -367,6 +389,10 @@ mod tests {
             assert_eq!(after.model_calls,before.model_calls,"replayed a completed witness question");
             assert!(!artifact_path(control.path(),&current).exists(),"negative data became current approval");
             assert!(guard.bind_acceptance(&prepared,control.path()).is_err());
+            std::fs::remove_file(&retained).unwrap();
+            let lost=qualify(root.path(),control.path(),&prepared,&guard).await.unwrap_err();
+            assert_eq!(lost.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown),"lost original source became semantic repair admission");
+            assert_eq!(crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,before.model_calls);
             guard.finish().unwrap();return;
         }
         let scripts=tempfile::tempdir_in("/tmp").unwrap();
@@ -396,6 +422,9 @@ mod tests {
             provenance:serde_json::to_string(&scope_authority::NativeReplyReference {artifact:artifact.clone(),artifact_sha256:amendment::digest(&bytes)}).unwrap()};
         let custody=[observation];
         assert!(retained_semantic_judgment(root.path(),&prepared,&custody).unwrap().is_some(),"retained authenticated semantic judgment has no supported reconsideration evidence");
+        assert!(retained_semantic_judgment_in(root.path(),control.path(),&prepared,&custody).unwrap().is_some());
+        let foreign=tempfile::tempdir_in("/tmp").unwrap();
+        assert!(retained_semantic_judgment_in(root.path(),foreign.path(),&prepared,&custody).is_err(),"negative source crossed workflow authority directories");
         let mut different=prepared.clone();different.proposal.contract.criteria[0].requirement="A different owner requirement".into();
         assert!(retained_semantic_judgment(root.path(),&different,&custody).is_err(),"changed original contract must not reuse judgment");
         std::fs::remove_file(artifact).unwrap();
@@ -415,7 +444,7 @@ mod tests {
         let store=crate::autoship_workflow::WorkflowStore::open_read_only(&state).unwrap().unwrap();
         let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
         let custody=store.inspect_baseline_native_custody(&id).unwrap();
-        let identity=retained_semantic_judgment(&root,&prepared,&custody).unwrap().expect("retained production judgment does not satisfy authenticated reconsideration");
+        let identity=inspect_retained_semantic(&root,path.parent().unwrap(),prepared.proposal.contract.source().unwrap(),&custody).unwrap().expect("free controller cannot authenticate retained production judgment");
         assert_eq!(identity.len(),64);
         assert_eq!(store.snapshot(&id).unwrap().unwrap(),before);
         assert_eq!(store.events(&id).unwrap(),events);

@@ -169,6 +169,21 @@ async fn recover(root: &Path, candidate: RecoveryCandidate) -> Result<()> {
             .await?;
         }
     }
+    // A completed semantic Unknown is negative source data. Authenticate it
+    // under the original workflow namespace before queuing normal repair.
+    let source=match issue_number {
+        Some(number)=>crate::autoship_contract::AcceptanceSource::Issue(number),
+        None=>crate::autoship_contract::AcceptanceSource::PullRequest(snapshot.pr.context("semantic recovery source missing")?),
+    };
+    let control=acceptance::control_directories(repository,&snapshot.workflow)?.workflow_acceptance;
+    let mut store=WorkflowStore::open(&workflow::path())?;
+    let owner_revision=store.owner_control(&snapshot.workflow)?.map(|control|control.revision);
+    if store.recover_semantic_qualification(&snapshot,owner_revision,
+        &acceptance::semantic_reconsideration_policy(),chrono::Utc::now().timestamp_millis(),
+        |custody|acceptance::inspect_retained_semantic(&context.worktree,&control,source,custody))? {
+        return Ok(());
+    }
+    drop(store);
     // Physical native custody can be checked without a native allocation,
     // execution claim, model call or any change to the attempt counters.
     if WorkflowStore::open(&workflow::path())?.recover_native_qualification(

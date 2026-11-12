@@ -2042,6 +2042,14 @@ fn private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     );
     Ok(serde_json::from_reader(file)?)
 }
+pub(super) fn semantic_reconsideration_policy()->String {baseline_witness::policy_hash()}
+
+pub(super) fn inspect_retained_semantic(root:&Path,control:&Path,source:AcceptanceSource,
+    custody:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<String>> {
+    let Some(prepared)=retained_prepared(root,control,source)? else{return Ok(None)};
+    baseline_witness::retained_semantic_judgment_in(root,control,&prepared,custody)
+}
+
 /// Inspect existing prepared evidence only. Free reconsideration may not
 /// install a harness, create a manifest or generate another baseline.
 pub(super) fn retained_prepared(root:&Path,control:&Path,source:AcceptanceSource)->Result<Option<PreparedAcceptance>> {
