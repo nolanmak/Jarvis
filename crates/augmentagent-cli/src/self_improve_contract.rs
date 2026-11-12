@@ -2695,7 +2695,9 @@ print('[]')
             trusted_git(root, &["init", "-q"]).await.unwrap();
             std::fs::create_dir(root.join("autoship_verifiers")).unwrap();
             let adapter = "autoship_verifiers/observe.py";
-            std::fs::write(root.join(adapter), "print(0)\n").unwrap();
+            let adapter_body="import json,sys\nfrom pathlib import Path\nsys.path.insert(0,str(Path.cwd()))\nimport behavior\nprint(json.dumps(behavior.READY))\n";
+            std::fs::write(root.join("behavior.py"),"READY = 0\n").unwrap();
+            std::fs::write(root.join(adapter),adapter_body).unwrap();
             trusted_git(root, &["add", "."]).await.unwrap();
             trusted_git(root, &[
                 "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
@@ -2722,14 +2724,18 @@ print('[]')
                         }, pinned_files: vec![adapter.into()],
                         failure_witness: "observed behavior differs".into() }],
                 },
-                files: [(adapter.into(), "print(0)\n".into())].into(),
+                files: [(adapter.into(), adapter_body.into())].into(),
             };
+            let environment=environment_id(root).unwrap();
             let registration = RegisteredContract::register(
-                root, proposal.contract.clone(), base, "fixture-v1".into(),
+                root, proposal.contract.clone(), base.clone(), environment.clone(),
             ).unwrap();
+            let observed=Observation {exit_code:Some(0),stdout:"0\n".into(),stderr:String::new(),interrupted:false,output_complete:true};
+            let receipts=vec![registration.observe(root,"observe",registration.binding(&base).unwrap(),&observed).unwrap()];
             let mut prepared = PreparedAcceptance {
-                proposal, baseline: BaselineEvidence { registration, receipts: vec![] },
+                proposal, baseline: BaselineEvidence { registration, receipts },
             };
+            baseline_witness::persist_scripted(root,control.path(),&prepared,true).unwrap();
             std::fs::create_dir(root.join("src")).unwrap();
             // A source name containing "disk" must not classify a known
             // scope rejection as a storage/infrastructure failure.
@@ -2743,7 +2749,7 @@ print('[]')
             let mut guard = workflow::WorkflowGuard::acquire_fixture(&database, workflow::Start {
                 repo_root: root, worktree: root, repository: "owner/repo",
                 source_issue: Some(42), pr: None, branch: "fixture",
-                contract: prepared.baseline.registration.contract_hash(), environment: "fixture-v1",
+                contract: prepared.baseline.registration.contract_hash(), environment: &environment,
             }).await.unwrap().unwrap();
             guard.checkpoint(Stage::Review, "candidate_ready", "run_verifier", 0, &[])
                 .await.unwrap();

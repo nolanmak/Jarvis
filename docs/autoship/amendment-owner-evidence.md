@@ -111,47 +111,42 @@ criteria, total repair allowance, independent review or merge policy. No new
 queue/allocator. Independent authority may still decline the complete evidence; handle that
 outcome by stage as D3 defines. A qualification hold or continued bounded
 candidate repair is not proof of feature restoration. #1703 remains
-open for end-to-end and unattended acceptance. The implementation and measured
-rollout outcome of this amendment are pending; owner: current repair agent.
+open for end-to-end and unattended acceptance. The current repair agent owns implementation and the measured ordinary outcome;
+track rollout and current acceptance receipts in #2048 and #1703. Component
+validation never closes those live exits.
 
-## Audit and local evidence
+## Audit and regression evidence
 
-Fresh-eyes findings about record ownership, crash continuation and fingerprint
-payload were resolved in D5. The initial 25 mapped seams and new candidate-outcome seam were rechecked:
-all 26 mapped seams hold. The authority
-identity omission found at S3 is corrected: both retained identity and complete
-structured diagnosis reach the actual scripted authority boundary. The private
-free-form reason was also removed from the adjudicated-denial error. All 26
-seams now hold at the specification boundary; independent engineering review
-and exact-head hosted checks remain separate gates.
+Fresh-reader, conversation/source comparison and 28 mapped handoff checks cover
+this amendment. Resolved findings include context ownership across crashes,
+exact evidence identity, stage-specific refusal handling, private error
+propagation and restored qualified builder authority. The full source review
+covers every changed file and all five amendment callers. Engineering review,
+exact-head hosted CI and measured ordinary behavior remain distinct gates.
 
-The authority-boundary regression first failed because the full owner request
-was absent, then passed after delivery was corrected. Two legacy-decline
-regressions separately failed at private-decision eligibility and atomic normal
-selection, then passed with the supported one-use migration. The exact retained
-ordinary #2014 read-only compatibility probe passed in 3.11 seconds: fresh remote
-authorization, complete original request, detached owned candidate, authenticated
-original witness, exact registered contract and completed legacy decline were
-validated without workflow mutation or model calls. This proves eligibility,
-not an independent amendment approval or autonomous merge. Full CLI validation passed: 1,982 tests, zero failures, 39 explicitly ignored
-tests in 282.81 seconds. Exact-head hosted checks, independent engineering
-review, merge and the deployed ordinary outcome are pending.
+Behavior-first regressions reproduce missing owner intent and diagnosis at the
+scripted authority boundary, missing legacy-decline eligibility and normal
+selection, candidate-stage refusal stopping implementation repair, incomplete
+negative-diagnosis selection, lost durable final-budget holds and recovery-only
+builder rejection. The corrections preserve legitimate refusal rather than
+turning independent authority into approval.
 
-Independent engineering review of head 70819c75 completed and found two
-functional issues before merge: a candidate-stage amendment denial incorrectly
-stopped ordinary implementation repair, and diagnosis selection inherited the
-Unknown-only legacy gate, dropping other negative measurement classes. Both
-findings were reproduced by failing tests before correction. Candidate-stage
-refusal/exhaustion now leaves bounded implementation repair available while
-other typed holds propagate. Six independently authenticated measurement/fixture
-cases verify complete negative diagnosis, positive exclusion, namespace and
-tamper rejection, and unchanged Unknown-only legacy recovery. Both regressions
-pass, as does the actual retained #2014 read-only probe (2.41 seconds). A fresh
-reader and all 26 mapped seams were rechecked, including stage-specific refusal
-handling and the existing environment-bound budget. Prior 1,982-test validation
-covers the earlier head. Corrected full CLI validation passed 1,984 tests, zero
-failures, 39 explicit ignores, in 288.06 seconds. Exact-head hosted checks and
-independent re-review remain pending; no merge or rollout is claimed.
+Stateful tests retain nonzero prior charges and reject unchanged claims after
+restart/day change. Six measurement/fixture cases cover every negative class,
+positive exclusion, namespace/tamper rejection and the narrower legacy gate.
+The real model-admission observer accepts revalidated positive qualification and
+rejects negative qualification; those scripted fixture admissions call no real
+provider. Scope-repair fixtures must supply valid original red and positive
+qualification before expecting the Build stage.
+
+Explicit ignored production-compatibility probes require the protected retained
+state and fresh authorization. Actual #2014 read-only probes verified original
+request bytes, owned detached checkout/binding, original witness and completed
+legacy decline without workflow mutation or model calls. These prove eligible
+source compatibility, not independent amendment approval or autonomous merge.
+Current test runs, exact reviewed head, hosted checks, snapshot, deployment and
+ordinary outcome are recorded on PR #2049 and issue #2048, with the broader
+acceptance record on #1703.
 
 ## Complete caller handling after independent source review
 
@@ -173,5 +168,6 @@ admissions in disposable fixtures are not live provider calls or ship evidence.
 | Adjudicated contract | Persist typed custody/input holds before generic retry handling. Existing untyped adjudicated denial and epoch-budget dependency classification remain unchanged. |
 
 These handlers share the original private diagnostic persistence function rather
-than creating another ledger or authority. Corrected caller tests pass; the new
-complete CLI run and final source re-review are pending at this checkpoint.
+than creating another ledger or authority. Their safe returned errors and
+protected original causes have distinct purposes; classification must examine
+the original cause before public-safe propagation.
