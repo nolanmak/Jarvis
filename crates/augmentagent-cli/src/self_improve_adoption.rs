@@ -174,6 +174,10 @@ pub(super) fn episode_retries(
         let Some(snapshot) = store.snapshot(&id)? else {
             continue;
         };
+        if owner_resume_matches(&store,&id,candidate)? && store.owner_resume_due(&id,now)? {
+            result.insert(candidate.pr);
+            continue;
+        }
         let qualification_recovered=recovered.contains(&id) && snapshot.pr==Some(candidate.pr)
             && snapshot.branch==candidate.branch && candidate.ready_for_review()
             && (snapshot.checkpoint.binding.head==candidate.head
@@ -197,6 +201,33 @@ pub(super) fn episode_retries(
         }
     }
     Ok(result)
+}
+
+fn owner_resume_matches(store:&WorkflowStore,id:&str,candidate:&AdoptedPr)->Result<bool> {
+    let identity=candidate.source_issue.is_some_and(|issue|crate::autoship_workflow::workflow_id(&candidate.repository,issue).is_ok_and(|source|source==id))
+        || crate::autoship_workflow::pr_workflow_id(&candidate.repository,candidate.pr).is_ok_and(|source|source==id);
+    Ok(identity && candidate.ready_for_review()
+        && store.snapshot(id)?.is_some_and(|snapshot|snapshot.pr==Some(candidate.pr))
+        && store.resolve_pr(&candidate.repository,candidate.pr)?.as_deref()==Some(id))
+}
+
+/// Re-read authorized PR inventory before handing an owner resume into the
+/// existing protected PR execution path. The durable hint grants no authority.
+pub(super) async fn current_owner_resume(repo:&Path,path:&Path,id:&str)->Result<Option<AdoptedPr>> {
+    let repository=workflow::canonical_repository(repo).await?;
+    targeted::authorize_repository(repo,&repository).await?;
+    let raw=complete_repository_inventory(repo,"pr",None,
+        "number,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,author,title,body,closingIssuesReferences").await?;
+    let mut allowed=trusted_authors(repo).await;
+    if let Some(owner)=repository.split('/').next() {allowed.push(owner.into());}
+    let mut candidates=authorized(&serde_json::from_str(&raw)?,&repository,&allowed);
+    policy_hold::filter(repo,&mut candidates,false).await;
+    let Some(store)=WorkflowStore::open_read_only(path)? else{return Ok(None)};
+    if !store.owner_resume_ready_for_dispatch(id,chrono::Utc::now().timestamp_millis())? {return Ok(None);}
+    for candidate in candidates {
+        if owner_resume_matches(&store,id,&candidate)? {return Ok(Some(candidate));}
+    }
+    Ok(None)
 }
 
 pub(super) async fn policy_reconciliation_retries(
