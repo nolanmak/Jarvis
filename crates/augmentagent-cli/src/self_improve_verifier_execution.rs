@@ -386,20 +386,59 @@ mod tests {
     }
 
     fn captured_fixture(original:&OriginalExecution<'_>,identity:&serde_json::Value,interrupted:bool)->PathBuf {
+        captured_verifier_fixture(original,"observe",identity,interrupted)
+    }
+
+    fn captured_verifier_fixture(original:&OriginalExecution<'_>,verifier:&str,identity:&serde_json::Value,interrupted:bool)->PathBuf {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let capture=original.prepare_capture("observe").unwrap();
-        original.retain_admission_with_capture("observe",identity,Some(capture.clone())).unwrap();
+        let capture=original.prepare_capture(verifier).unwrap();
+        original.retain_admission_with_capture(verifier,identity,Some(capture.clone())).unwrap();
         let write=|name:&str,bytes:&[u8]| {
             let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(capture.path().join(name)).unwrap();
             file.write_all(bytes).unwrap();file.sync_all().unwrap();
         };
         write("stdout",b"false\n");write("stderr",b"");
-        write("result.json",serde_json::json!({"version":1,"command":command_key(&original.plan,&original.attempt,"observe"),
+        write("result.json",serde_json::json!({"version":1,"command":command_key(&original.plan,&original.attempt,verifier),
             "identity":identity,"exit_code":if interrupted {None}else{Some(0)},"interrupted":interrupted,"output_complete":true,
             "terminal_cause":if interrupted {"controller_stopped"}else{"completed"},
             "stdout_bytes":6,"stderr_bytes":0,"stdout_sha256":amendment::digest(b"false\n"),"stderr_sha256":amendment::digest(b"")}).to_string().as_bytes());
         capture.path().to_owned()
+    }
+
+    #[tokio::test]
+    async fn interrupted_peer_reuses_completed_commands_with_original_admission_provenance() {
+        for retained_interrupted_result in [false,true] {
+        let (root,control,mut prepared,guard)=fixture().await;
+        let base=prepared.baseline.registration.baseline_head().to_owned();let environment=environment_id(root.path()).unwrap();
+        let mut second=prepared.proposal.contract.verifiers[0].clone();second.id="second".into();
+        prepared.proposal.contract.verifiers.push(second);prepared.proposal.contract.criteria[0].verifier_ids.push("second".into());
+        let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,&base,&environment,"executor").unwrap();
+        captured_verifier_fixture(&original,"observe",&gone_scope(),false);
+        captured_verifier_fixture(&original,"second",&gone_scope(),true);
+        OriginalExecution::quiesce_previous(&guard).unwrap();
+        let registration=RegisteredContract::register(root.path(),prepared.proposal.contract.clone(),base.clone(),environment.clone()).unwrap();
+        if retained_interrupted_result {
+            let receipts=execute_registered_with_custody(root.path(),&registration,&guard.audit_logger(),Some(&original)).await.unwrap();
+            original.retain_result(root.path(),&BaselineEvidence {registration:registration.clone(),receipts}).unwrap();
+        }
+        let resumed=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,&base,&environment,"executor").unwrap();
+        assert_ne!(resumed.attempt,original.attempt,"interruption did not create a successor attempt");
+        assert_eq!(resumed.captured_observation("observe").unwrap().expect("completed peer was lost and would execute again").stdout,"false\n");
+        assert!(resumed.captured_observation("second").unwrap().is_none());
+        assert!(resumed.prepare_capture("observe").is_err(),"completed peer admitted a new command");
+        assert!(guard.verifier_evidence(&command_key(&resumed.plan,&resumed.attempt,"observe"),"original_verifier_command_admission").unwrap().is_none(),"recovery copied an old admission under a new identity");
+        captured_verifier_fixture(&resumed,"second",&gone_scope(),false);OriginalExecution::quiesce_previous(&guard).unwrap();
+        let receipts=execute_registered_with_custody(root.path(),&registration,&guard.audit_logger(),Some(&resumed)).await.unwrap();
+        let baseline=BaselineEvidence {registration,receipts};resumed.retain_result(root.path(),&baseline).unwrap();
+        let retained=OriginalExecution::retained_result(root.path(),&guard,&prepared.proposal,&base,&environment,"executor").unwrap().unwrap().1;
+        assert_eq!(serde_json::to_vec(&retained).unwrap(),serde_json::to_vec(&baseline).unwrap());
+        let command=command_key(&original.plan,&original.attempt,"observe");
+        let conn=rusqlite::Connection::open(control.path().join("workflow.db")).unwrap();
+        conn.execute("DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",rusqlite::params![guard.id(),command]).unwrap();
+        assert!(OriginalExecution::retained_result(root.path(),&guard,&prepared.proposal,&base,&environment,"executor").is_err(),"cross-attempt result ignored loss of its original admission");
+        drop((original,resumed));guard.finish().unwrap();
+        }
     }
 
     #[tokio::test]
