@@ -238,6 +238,7 @@ pub static PRODUCERS: &[Producer] = &[
     p("imessage_compose_activity_fallback", "crates/augmentagent-approval-discord/src/broker.rs", ".post_flag_notice(", 1, BROKER, "manual-text warning when the card is outside recent history"),
     p("imessage_compose_activity_default", "crates/augmentagent-approval-discord/src/lib.rs", ".post_flag_notice(", 1, BROKER, "manual-text warning on configured approval surfaces"),
     act(p("calendar_rsvp", "crates/augmentagent-cli/src/calendar_rsvp.rs", "send_message(&", 1, BROKER, "calendar RSVP approval card")),
+    act(p("calendar_reschedule", "crates/augmentagent-cli/src/calendar_reschedule.rs", "send_message(&", 1, BROKER, "calendar reschedule approval card")),
     p("calendar_rsvp_layout", "crates/augmentagent-cli/src/calendar_rsvp.rs", "CreateMessage::new(", 1, TRANSPORT, "calendar RSVP receipt fallback"),
     // -- Approval surfaces (#1289) -------------------------------------------
     act(p("approval_broker", "crates/augmentagent-approval-discord/src/broker.rs", "send_message(&", 4, BROKER, "Discord approval broker: cards, flag notices, digests")),

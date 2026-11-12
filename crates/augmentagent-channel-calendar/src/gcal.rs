@@ -165,6 +165,21 @@ pub trait CalendarApi: Send + Sync {
             "RSVP is not supported by this calendar client".into(),
         ))
     }
+
+    /// #2039 — move an event the account organizes to the request's new
+    /// time. Re-reads the event first: refuses if it moved since the card
+    /// was posted, writes nothing if it is already there, and otherwise
+    /// PATCHes only `start`/`end`. Only ever called from the daemon's
+    /// Approve handler.
+    async fn reschedule(
+        &self,
+        req: &crate::reschedule::RescheduleRequest,
+    ) -> Result<crate::reschedule::RescheduleOutcome, CalendarError> {
+        let _ = req;
+        Err(CalendarError::Invalid(
+            "reschedule is not supported by this calendar client".into(),
+        ))
+    }
 }
 
 /// #1456 — the account that created an event is its organizer, so creating
@@ -701,6 +716,44 @@ impl CalendarApi for ComposioCalendarClient {
         Err(CalendarError::Unconfirmed(format!(
             "GOOGLECALENDAR_CREATE_EVENT returned no nonempty event ID (composio log_id {log_id})"
         )))
+    }
+
+    async fn reschedule(
+        &self,
+        req: &crate::reschedule::RescheduleRequest,
+    ) -> Result<crate::reschedule::RescheduleOutcome, CalendarError> {
+        use crate::reschedule::{check_current, confirm, patch_body};
+        if req.event_id.trim().is_empty() || req.calendar_id.trim().is_empty() {
+            return Err(CalendarError::Invalid(
+                "calendar id and event id are required".into(),
+            ));
+        }
+        let path = format!(
+            "calendars/{}/events/{}",
+            path_segment(&req.calendar_id),
+            path_segment(&req.event_id)
+        );
+        let read = self.proxy(&req.entity_id, "GET", &path, &[], None).await?;
+        let current: CalendarEvent = serde_json::from_value(read.clone()).map_err(|e| {
+            CalendarError::Decode(format!(
+                "events.get: {e}: {}",
+                bounded(&read.to_string(), 300)
+            ))
+        })?;
+        if let Some(done) = check_current(req, &current)? {
+            return Ok(done);
+        }
+        let send_updates = if req.notify { "all" } else { "none" };
+        let updated = self
+            .proxy(
+                &req.entity_id,
+                "PATCH",
+                &path,
+                &[("sendUpdates", send_updates)],
+                Some(patch_body(req, &current)),
+            )
+            .await?;
+        confirm(req, &updated)
     }
 
     async fn respond(

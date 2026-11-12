@@ -2241,6 +2241,7 @@ fn should_delete_source(outcome: &ApprovalActionOutcome) -> bool {
         ApprovalActionOutcome::Approved
             | ApprovalActionOutcome::CalendarCreated { .. }
             | ApprovalActionOutcome::CalendarResponded { .. }
+            | ApprovalActionOutcome::CalendarRescheduled { .. }
             | ApprovalActionOutcome::DocumentSigned { .. }
             | ApprovalActionOutcome::ManualSendReady { .. }
             | ApprovalActionOutcome::Skipped

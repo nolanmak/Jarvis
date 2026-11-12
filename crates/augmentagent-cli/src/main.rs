@@ -11,6 +11,7 @@ mod provider_migration_tests;
 mod model_tool;
 mod composio_auth_tool;
 mod calendar_rsvp;
+mod calendar_reschedule;
 mod voice_tool;
 mod phone_runtime;
 mod phone_attention;
@@ -1580,6 +1581,33 @@ enum CalendarOp {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         post: bool,
     },
+    /// #2039 — move an event you organize to a new time. Previews by
+    /// default; `--post true` raises a Discord approval card, and the event
+    /// moves only when the operator clicks Approve. Keeps the current length
+    /// unless `--duration-min` is given. Refuses events you don't organize,
+    /// all-day events, and cancelled events. Moves one occurrence of a
+    /// recurring series, never the whole series.
+    Reschedule {
+        /// Event id from `calendar list-events --json true`
+        #[arg(long)]
+        event_id: String,
+        /// New RFC3339 start with offset, e.g. 2026-07-10T15:00:00-04:00
+        #[arg(long)]
+        start: String,
+        /// New length in minutes (5-480; default: keep the current length)
+        #[arg(long)]
+        duration_min: Option<i64>,
+        /// Account that organizes the event (default: whichever does)
+        #[arg(long)]
+        account: Option<String>,
+        /// Email guests the new time (Google's sendUpdates=all)
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        notify: bool,
+        /// Post the Discord approval card. Without it this prints a
+        /// preview and exits — nothing is written anywhere.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        post: bool,
+    },
     /// #1224 — turn invite auto-accept on/off for one account, or for every
     /// account without its own setting when --account is absent.
     SetAutoAccept {
@@ -2984,7 +3012,7 @@ enum WikiOp {
     ///
     /// - Conversation and memory recall through the memory MCP server (search and read only, no memory writes).
     ///
-    /// - Bash limited to an allowlist: `augmentagent gmail` (every subcommand, including send), `finance` status/transactions/summary, `calendar` list-events/create-event, `loop`, `loops`, `meetup events`, `socialapi` and `linkedin` dm/comment, `linkedin recent-dms`, `repo-docs`, `doc render-pdf/sign/signatures`, `imessage fetch-attachment`, `imessage compose` (a text to a person, as an approval card) and `imessage allowlist`, and `aa-gh issue` create/list/view/comment.
+    /// - Bash limited to an allowlist: `augmentagent gmail` (every subcommand, including send), `finance` status/transactions/summary, `calendar` list-events/create-event/rsvp/reschedule, `loop`, `loops`, `meetup events`, `socialapi` and `linkedin` dm/comment, `linkedin recent-dms`, `repo-docs`, `doc render-pdf/sign/signatures`, `imessage fetch-attachment`, `imessage compose` (a text to a person, as an approval card) and `imessage allowlist`, and `aa-gh issue` create/list/view/comment.
     ///
     /// Some of these act outside the wiki: sending email, filing or commenting on GitHub issues, and changing or stopping loops. Calendar events, social DMs and comments, and iMessage texts are raised as Discord approval cards and happen only when approved.
     Ask {
@@ -5324,6 +5352,25 @@ async fn main() -> Result<()> {
                 series,
                 post,
             } => calendar_rsvp::run_rsvp(store, event_id, response, account, series, post).await,
+            CalendarOp::Reschedule {
+                event_id,
+                start,
+                duration_min,
+                account,
+                notify,
+                post,
+            } => {
+                calendar_reschedule::run_reschedule(
+                    store,
+                    event_id,
+                    start,
+                    duration_min,
+                    account,
+                    notify,
+                    post,
+                )
+                .await
+            }
             CalendarOp::SetAutoAccept { on, account } => {
                 calendar_rsvp::run_set_auto_accept(store, on, account)
             }
@@ -14873,6 +14920,7 @@ impl ApprovalActionHandler for ReplyApprover {
             outcome,
             ApprovalActionOutcome::Approved
                 | ApprovalActionOutcome::CalendarCreated { already_existed: false, .. }
+                | ApprovalActionOutcome::CalendarRescheduled { already_there: false, .. }
                 | ApprovalActionOutcome::DocumentSigned { already_existed: false, .. }
                 | ApprovalActionOutcome::Scheduled { .. }
                 | ApprovalActionOutcome::ManualSendReady { .. }
@@ -15041,6 +15089,11 @@ impl ReplyApprover {
         }
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.approve_socialapi(action_id, action).await;
+        }
+        if action.email.platform == "gcal"
+            && action.email.kind == augmentagent_channel_calendar::RESCHEDULE_CARD_KIND
+        {
+            return self.approve_gcal_reschedule(action_id, action).await;
         }
         if action.email.platform == "gcal" && action.email.kind == calendar_rsvp::RSVP_CARD_KIND {
             return self.approve_gcal_rsvp(action_id, action).await;
