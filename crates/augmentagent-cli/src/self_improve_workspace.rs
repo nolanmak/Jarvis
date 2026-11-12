@@ -91,7 +91,7 @@ fn fingerprint(path: &Path, primary: PathBuf, origin: &str) -> Result<Ownership>
 pub(super) async fn prepare(repo: &Path, lane: &str) -> Result<Controller> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     anyhow::ensure!(
-        matches!(lane, "build" | "resume" | "combined" | "sweep"),
+        matches!(lane, "build" | "resume" | "combined" | "sweep" | "recovery"),
         "invalid controller lane"
     );
     let primary = primary_root(repo).await?;

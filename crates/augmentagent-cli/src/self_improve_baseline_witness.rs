@@ -43,9 +43,12 @@ pub(super) fn policy_hash()->String {
         amendment::digest(include_bytes!("self_improve_verifier_checkout.rs")),scope_authority::witness_policy_hash())).unwrap())
 }
 fn context(proposal:&ContractProposal,baseline:&BaselineEvidence)->Result<String> {
+    context_with_policy(proposal,baseline,&policy_hash())
+}
+fn context_with_policy(proposal:&ContractProposal,baseline:&BaselineEvidence,policy:&str)->Result<String> {
     ensure!(proposal.contract==*baseline.registration.contract(),"witness proposal differs from registration");
     ensure!(baseline.registration.baseline_result(&baseline.receipts)?==BaselineResult::Reproduced,"witness lacks measured baseline red");
-    Ok(amendment::digest(&serde_json::to_vec(&("baseline-measurement-qualification-v1",proposal,baseline,policy_hash()))?))
+    Ok(amendment::digest(&serde_json::to_vec(&("baseline-measurement-qualification-v1",proposal,baseline,policy))?))
 }
 fn artifact_path(control:&Path,context:&str)->PathBuf {control.join(format!("baseline-witness-{context}.json"))}
 fn raw_path(control:&Path,context:&str,hash:&str)->PathBuf {control.join(format!("baseline-witness-{context}-{hash}.response"))}
@@ -142,6 +145,10 @@ pub(super) fn assert_current(root:&Path,control:&Path,prepared:&PreparedAcceptan
     disposition(&checked)
 }
 
+fn qualification_prompt(expected:&str,prepared:&PreparedAcceptance)->Result<String> {
+    Ok(format!("Independently qualify the ORIGINAL behavioral measurement, not candidate code or test success. Context: {expected}. Return only JSON {{\"version\":1,\"context\":\"{expected}\",\"verifiers\":[{{\"verifier_id\":\"exact registered id\",\"criterion_ids\":[\"every criterion assigned to this verifier\"],\"measurement\":\"direct_production\",\"original_fixture_available\":true,\"concrete_input\":\"actual fixed input supplied by pinned adapter\",\"reason\":\"why the measurement demonstrates the original production defect for the exact owner requirements\",\"production_citations\":[{{\"path\":\"original tracked source\",\"start_line\":1,\"end_line\":1,\"quote\":\"exact unnumbered source lines joined by newline\"}}]}}]}}. Cover every verifier once and every associated criterion exactly. Allowed measurement values are direct_production, missing_fixture, test_outcome, setup_failure, unknown.\nOnly direct production observations with original fixtures present may qualify. Child unittest/cargo-test/node-test assertions, discovery, zero selected tests, summaries, success tokens, candidate-added test markers, swallowed setup errors and expected answers hardcoded by the adapter are NOT original production witnesses. Existing tests do not become independent observations merely because their launcher is pinned. If the production behavior already satisfies the requirement, do not certify a marker mismatch as a defect. Boolean/JSON/text production data ARE allowed when actually measured from the original implementation. Cite original production functions that the adapter actually invokes, not new harness files. Preserve every owner requirement and the controller oracle. Unseen/insufficient evidence is unknown; do not infer missing raw details from a preview. Negative/unknown witnesses may use empty citations, but explain their concrete cause. Positive citations: 1-16 per verifier, at most 600 lines each, 512KiB total.\nThe controller validated each COMPLETE measured receipt as successful behavior data differing from its private oracle. output_digest binds the full captured output; diagnostic is ONLY an existing bounded preview, not the full observation or proof by itself. Judge the measurement's actual production path using the entire pinned harness and original source. If the preview and supplied source cannot support attribution to production, return unknown, never infer a qualified witness.\nOriginal proposal including pinned adapters and every criterion: {}\nMeasured original-baseline registration and receipts: {}",serde_json::to_string(&prepared.proposal)?,serde_json::to_string(&prepared.baseline)?))
+}
+
 pub(super) async fn qualify(root:&Path,control:&Path,prepared:&PreparedAcceptance,workflow:&workflow::WorkflowGuard)->Result<()> {
     workflow.validate_acceptance_source(prepared)?;
     let expected=context(&prepared.proposal,&prepared.baseline)?;
@@ -151,7 +158,12 @@ pub(super) async fn qualify(root:&Path,control:&Path,prepared:&PreparedAcceptanc
     prepared.baseline.registration.verify_integrity(root)?;
     ensure!(environment_id(root)?==prepared.baseline.registration.binding(prepared.baseline.registration.baseline_head())?.environment_id,
         "baseline_witness_invalid: environment changed before production witness qualification");
-    let prompt=format!("Independently qualify the ORIGINAL behavioral measurement, not candidate code or test success. Context: {expected}. Return only JSON {{\"version\":1,\"context\":\"{expected}\",\"verifiers\":[{{\"verifier_id\":\"exact registered id\",\"criterion_ids\":[\"every criterion assigned to this verifier\"],\"measurement\":\"direct_production\",\"original_fixture_available\":true,\"concrete_input\":\"actual fixed input supplied by pinned adapter\",\"reason\":\"why the measurement demonstrates the original production defect for the exact owner requirements\",\"production_citations\":[{{\"path\":\"original tracked source\",\"start_line\":1,\"end_line\":1,\"quote\":\"exact unnumbered source lines joined by newline\"}}]}}]}}. Cover every verifier once and every associated criterion exactly. Allowed measurement values are direct_production, missing_fixture, test_outcome, setup_failure, unknown.\nOnly direct production observations with original fixtures present may qualify. Child unittest/cargo-test/node-test assertions, discovery, zero selected tests, summaries, success tokens, candidate-added test markers, swallowed setup errors and expected answers hardcoded by the adapter are NOT original production witnesses. Existing tests do not become independent observations merely because their launcher is pinned. If the production behavior already satisfies the requirement, do not certify a marker mismatch as a defect. Boolean/JSON/text production data ARE allowed when actually measured from the original implementation. Cite original production functions that the adapter actually invokes, not new harness files. Preserve every owner requirement and the controller oracle. Unseen/insufficient evidence is unknown; do not infer missing raw details from a preview. Negative/unknown witnesses may use empty citations, but explain their concrete cause. Positive citations: 1-16 per verifier, at most 600 lines each, 512KiB total.\nThe controller validated each COMPLETE measured receipt as successful behavior data differing from its private oracle. output_digest binds the full captured output; diagnostic is ONLY an existing bounded preview, not the full observation or proof by itself. Judge the measurement's actual production path using the entire pinned harness and original source. If the preview and supplied source cannot support attribution to production, return unknown, never infer a qualified witness.\nOriginal proposal including pinned adapters and every criterion: {}\nMeasured original-baseline registration and receipts: {}",serde_json::to_string(&prepared.proposal)?,serde_json::to_string(&prepared.baseline)?);
+    let prompt=qualification_prompt(&expected,prepared)?;
+    // Frozen controller policy from main 7353e9cd. This reconstructs the exact
+    // original request; it grants reuse of source data, never old approval.
+    let original=context_with_policy(&prepared.proposal,&prepared.baseline,"7a16a5c6b515bdf9e065f955bcc1e436de04a692e29d764bd5f89b3979e1b998")?;
+    scope_authority::prepare_source_recovery(root,workflow,&expected,&prompt,&original,&qualification_prompt(&original,prepared)?).await
+        .map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
     let (judgment,reply)=scope_authority::persistent_witness(root,workflow,&expected,&prompt,|raw|validate(root,&prepared.proposal,&prepared.baseline,&expected,raw)).await.map_err(initial_scope_error)?;
     let native_control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
     persist(control,&expected,&native_control,&reply)?;
@@ -264,23 +276,79 @@ mod tests {
         guard.finish().unwrap();
     }
     #[tokio::test]
+    async fn original_verifier_plan_exists_before_the_executor_can_start() {
+        use rusqlite::OptionalExtension;
+        let (root,control,prepared)=fixture();let database=control.path().join("workflow.db");
+        let guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {
+            repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+            branch:"fixture",contract:"original owner requirements",environment:"fixture",
+        }).await.unwrap().unwrap();
+        let observed=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,|_original|async {
+            let conn=rusqlite::Connection::open(&database).unwrap();
+            let plan:Option<String>=conn.query_row("SELECT response FROM scope_stage_response WHERE json_valid(response) AND json_extract(response,'$.kind')='original_verifier_plan'",[],|r|r.get(0)).optional().unwrap();
+            let plan:serde_json::Value=serde_json::from_str(&plan.expect("original verifier could start without a frozen operation recipe")).unwrap();
+            assert_eq!(plan["proposal"],serde_json::to_value(&prepared.proposal).unwrap());
+            assert_eq!(plan["workflow"],guard.id());
+            assert_eq!(plan["base"],prepared.baseline.registration.baseline_head());
+            Err::<BaselineEvidence,_>(BaselineNotRed {detail:"scripted original infrastructure failure".into(),kind:None}.into())
+        }).await.unwrap_err();
+        assert!(observed.downcast_ref::<BaselineNotRed>().is_some());
+        guard.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_original_verifier_keeps_its_exact_recovery_plan() {
+        use rusqlite::OptionalExtension;
+        let (root,control,prepared)=fixture();let database=control.path().join("workflow.db");
+        let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {
+            repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+            branch:"fixture",contract:"original owner requirements",environment:"fixture",
+        }).await.unwrap().unwrap();
+        let error=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,|_original|async {
+            Err::<BaselineEvidence,_>(BaselineNotRed {detail:"scripted original infrastructure failure".into(),kind:None}.into())
+        }).await.unwrap_err().context(initial_repair::Hold::InfrastructureUnavailable);
+        let conn=rusqlite::Connection::open(&database).unwrap();
+        let before:String=conn.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[guard.id()],|r|r.get(0)).unwrap();
+        conn.execute_batch("CREATE TRIGGER deny_original_hold BEFORE INSERT ON workflow_event WHEN NEW.kind='original_verifier_recovery_held' BEGIN SELECT RAISE(ABORT,'recovery history unavailable'); END;").unwrap();
+        assert!(hold_initial_error(&mut guard,&error).await.is_err());
+        let after:String=conn.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[guard.id()],|r|r.get(0)).unwrap();
+        assert_eq!(after,before,"hold committed without its exact recovery plan");
+        conn.execute_batch("DROP TRIGGER deny_original_hold;").unwrap();
+        hold_initial_error(&mut guard,&error).await.unwrap().unwrap();
+        let plan:String=conn.query_row("SELECT key FROM scope_stage_response WHERE json_valid(response) AND json_extract(response,'$.kind')='original_verifier_plan'",[],|r|r.get(0)).unwrap();
+        let held:Option<String>=conn.query_row("SELECT payload FROM workflow_event WHERE kind='original_verifier_recovery_held' ORDER BY seq DESC LIMIT 1",[],|r|r.get(0)).optional().unwrap();
+        let held:serde_json::Value=serde_json::from_str(&held.expect("the infrastructure hold discarded its exact original operation")).unwrap();
+        assert_eq!(held["plan"],plan);assert_eq!(held["workflow"],guard.id());
+        assert_eq!(held["binding"],serde_json::to_value(guard.binding()).unwrap());
+        // A later semantic unknown must revoke the raw-operation recovery
+        // classification even when the candidate binding has not changed.
+        let semantic=anyhow::Error::from(initial_repair::Hold::EvidenceUnknown);
+        hold_initial_error(&mut guard,&semantic).await.unwrap().unwrap();
+        let latest:String=conn.query_row("SELECT payload FROM workflow_event WHERE kind='original_verifier_recovery_held' ORDER BY seq DESC LIMIT 1",[],|r|r.get(0)).unwrap();
+        let latest:serde_json::Value=serde_json::from_str(&latest).unwrap();
+        assert!(latest["plan"].is_null(),"semantic unknown inherited an older raw-operation recovery plan");
+        assert_eq!(latest["binding"],held["binding"]);
+        guard.finish().unwrap();
+    }
+
+    #[tokio::test]
     async fn original_measurement_survives_restart_without_regeneration_or_lost_file_retry() {
         use std::cell::Cell;
         let (root,control,prepared)=fixture();let database=control.path().join("workflow.db");
         let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original scope",environment:"test"};
         let guard=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
-        let first=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,async {Ok(prepared.baseline.clone())}).await.unwrap();
+        let first=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,|_original|async {Ok(prepared.baseline.clone())}).await.unwrap();
         guard.finish().unwrap();
         let guard=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
         let reexecuted=Cell::new(false);
-        let second=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,async {
+        let second=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,|_original|async {
             reexecuted.set(true);let mut noisy=prepared.baseline.clone();noisy.receipts[0].output_digest="b".repeat(64);Ok(noisy)
         }).await.unwrap();
         assert!(!reexecuted.get(),"a restart reran the original observation before native qualification");
         assert_eq!(serde_json::to_vec(&first).unwrap(),serde_json::to_vec(&second).unwrap());
         let retained=std::fs::read_dir(control.path()).unwrap().map(|e|e.unwrap().path()).find(|p|p.file_name().unwrap().to_string_lossy().starts_with("baseline-measurement-")).unwrap();
         std::fs::remove_file(retained).unwrap();
-        let lost=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,async {
+        let lost=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,|_original|async {
             reexecuted.set(true);Ok(prepared.baseline.clone())
         }).await.unwrap_err();
         assert_eq!(lost.downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown));

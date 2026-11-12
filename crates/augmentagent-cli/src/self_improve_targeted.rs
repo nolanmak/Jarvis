@@ -174,6 +174,14 @@ pub(crate) async fn published_pr_head(repo: &Path, repository: &str, pr: u64) ->
 }
 
 pub(super) async fn resolve(repo: &Path, request: &Request) -> Result<Resolved> {
+    resolve_mode(repo,request,false).await
+}
+
+pub(super) async fn resolve_for_recovery(repo:&Path,request:&Request)->Result<Resolved> {
+    resolve_mode(repo,request,true).await
+}
+
+async fn resolve_mode(repo: &Path, request: &Request,recovery:bool) -> Result<Resolved> {
     let request = request.normalized()?;
     let repository = authorized_repository(repo, &request).await?;
     let mut allowed = trusted_authors(repo).await;
@@ -204,6 +212,7 @@ pub(super) async fn resolve(repo: &Path, request: &Request) -> Result<Resolved> 
                 "issue is closed or its repository/target identity differs"
             );
             let author = value["user"]["login"].as_str().unwrap_or("");
+            anyhow::ensure!(!recovery || !has_label(&value,GAVE_UP_LABEL),"issue excluded from automatic recovery");
             anyhow::ensure!(
                 author_is_trusted(
                     author,
@@ -601,6 +610,11 @@ mod tests {
             };
             assert_eq!(selected.number, 7);
             assert!(selected.author_trusted);
+            assert!(matches!(resolve_for_recovery(&root,&request).await.unwrap(),Resolved::Issue(_)));
+            let mut excluded=issue.clone();excluded["labels"]=serde_json::json!([{"name":GAVE_UP_LABEL}]);
+            scenario(serde_json::json!({"permission":"WRITE","issue":excluded}));
+            assert!(resolve_for_recovery(&root,&request).await.is_err(),"automatic recovery ignored issue exclusion");
+            assert!(resolve(&root,&request).await.is_ok(),"automatic exclusion changed explicit owner admission");
             for invalid in [
                 serde_json::json!({"permission":"READ","issue":issue}),
                 serde_json::json!({"permission":"WRITE","issue":{"number":8,"state":"open"}}),
@@ -608,12 +622,14 @@ mod tests {
             ] {
                 scenario(invalid);
                 assert!(resolve(&root, &request).await.is_err());
+                assert!(resolve_for_recovery(&root,&request).await.is_err());
             }
             let mut untrusted = issue.clone();
             untrusted["user"]["login"] = "stranger".into();
             untrusted["author_association"] = "NONE".into();
             scenario(serde_json::json!({"permission":"WRITE","issue":untrusted}));
             assert!(resolve(&root, &request).await.is_err());
+            assert!(resolve_for_recovery(&root,&request).await.is_err());
             let mut pr_request = request.clone();
             pr_request.target = Target::Pr(42);
             let pr = serde_json::json!({"number":42,"state":"OPEN","url":"https://github.com/owner/repo/pull/42","headRefName":"repair","headRefOid":"a".repeat(40),"baseRefName":"main","isCrossRepository":false,"author":{"login":"owner"},"title":"Repair addition","body":"Fix arithmetic","closingIssuesReferences":[]});
@@ -623,6 +639,7 @@ mod tests {
             };
             assert_eq!(selected.pr, 42);
             assert!(selected.source_issue.is_none());
+            assert!(matches!(resolve_for_recovery(&root,&pr_request).await.unwrap(),Resolved::Pr(_)));
             for key in ["state", "isCrossRepository"] {
                 let mut invalid = pr.clone();
                 invalid[key] = if key == "state" {
@@ -632,6 +649,7 @@ mod tests {
                 };
                 scenario(serde_json::json!({"permission":"WRITE","pr":invalid}));
                 assert!(resolve(&root, &pr_request).await.is_err());
+                assert!(resolve_for_recovery(&root,&pr_request).await.is_err());
             }
             assert!(
                 !root.join("state").exists(),

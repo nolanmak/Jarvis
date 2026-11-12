@@ -165,6 +165,7 @@ pub(super) fn episode_retries(
     now: i64,
 ) -> Result<std::collections::BTreeSet<u64>> {
     let store = WorkflowStore::open(path)?;
+    let recovered=store.due_qualification_recovery(None,now)?;
     let mut result = std::collections::BTreeSet::new();
     for candidate in candidates {
         let Some(id) = store.resolve_pr(&candidate.repository, candidate.pr)? else {
@@ -178,13 +179,18 @@ pub(super) fn episode_retries(
             result.insert(candidate.pr);
             continue;
         }
+        let qualification_recovered=recovered.contains(&id) && snapshot.pr==Some(candidate.pr)
+            && snapshot.branch==candidate.branch && candidate.ready_for_review()
+            && (snapshot.checkpoint.binding.head==candidate.head
+                || store.retained_candidate_head(&candidate.repository,candidate.pr,&candidate.branch,&candidate.head,
+                    &snapshot.checkpoint.binding.head,now)?.as_deref()==Some(snapshot.checkpoint.binding.head.as_str()));
         let main_changed = snapshot.checkpoint.stage == crate::autoship_workflow::Stage::Reconcile
             && snapshot.checkpoint.next.reason == "review_main_changed"
             && snapshot.checkpoint.next.action == "reconcile_main";
         if snapshot.lease_until_ms <= now
             && snapshot.checkpoint.next.eligible_at_ms <= now
             && !store.owner_control(&id)?.is_some_and(|control| control.paused)
-            && (main_changed || matches!(
+            && (main_changed || qualification_recovered || matches!(
                 snapshot.checkpoint.next.action.as_str(),
                 "rescope_remaining_findings"
                     | "complete_review_or_adjudication"
@@ -433,6 +439,33 @@ pub(super) async fn revise(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qualification_recovered_retry_requires_the_same_available_owned_candidate() {
+        for obstruction in ["none","pause","head","branch","dependency","message","mutation"] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let mut store=WorkflowStore::open(&path).unwrap();
+            let mut candidates=authorized(&serde_json::json!([row(9,"fix/issue-7")]),"owner/repo",&["owner".into()]);
+            let candidate=&mut candidates[0];let id="owner/repo#7";
+            let binding=crate::autoship_workflow::Binding {head:candidate.head.clone(),contract:"contract".into(),evidence_hash:"evidence".into()};
+            store.register(id,&candidate.branch,binding.clone(),1).unwrap();let lease=store.claim(id,"original",2,1000).unwrap().unwrap();
+            store.attach_pr_in_repo(&lease,"owner/repo",9,3).unwrap();
+            let mut checkpoint=store.snapshot(id).unwrap().unwrap().checkpoint;checkpoint.stage=crate::autoship_workflow::Stage::Reconcile;
+            checkpoint.next=crate::autoship_workflow::NextAction {reason:"original_verifier_measurement_recovered".into(),action:"qualify_original_measurement".into(),eligible_at_ms:0};
+            store.checkpoint(&lease,&checkpoint,4).unwrap();
+            if obstruction=="mutation" {store.begin_operation(&lease,crate::autoship_workflow::OperationKind::Push,&binding,5).unwrap();}
+            store.release(&lease,6).unwrap();
+            if obstruction=="pause" {store.set_owner_pause(id,"github:owner",0,true,7).unwrap();}
+            if obstruction=="head" {candidate.head="different-head".into();}
+            if obstruction=="branch" {candidate.branch="different-branch".into();}
+            if obstruction=="dependency" {candidate.dependency=Dependency::AwaitParent {pr:8};}
+            // Inbox insertion is exercised by the owner-inbox suite; this
+            // matrix models a due handoff whose action needs that owner input.
+            if obstruction=="message" {
+                let lease=store.claim(id,"owner-input",7,1000).unwrap().unwrap();
+                checkpoint.next.action="await_owner_reply".into();store.checkpoint(&lease,&checkpoint,8).unwrap();store.release(&lease,9).unwrap();
+            }
+            assert_eq!(episode_retries(&path,&candidates,10).unwrap().contains(&9),obstruction=="none","{obstruction}");
+        }
+    }
     fn row(pr: u64, branch: &str) -> serde_json::Value {
         serde_json::json!({"number":pr,"headRefName":branch,"headRefOid":"head-one","baseRefName":"main",
             "isCrossRepository":false,"author":{"login":"owner"},"title":"Fix", "body":"LGTM does not grant approval",
