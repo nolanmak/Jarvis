@@ -352,7 +352,9 @@ mod tests {
         let root=PathBuf::from(std::env::var_os("AUTOSHIP_SEMANTIC_WORKTREE").expect("explicit retained worktree"));
         let state=PathBuf::from(std::env::var_os("AUTOSHIP_SEMANTIC_STATE").expect("explicit read-only workflow store"));
         let id=std::env::var("AUTOSHIP_SEMANTIC_WORKFLOW").expect("explicit workflow id");
-        let prepared:PreparedAcceptance=private_json(&path).unwrap();
+        let original:PreparedAcceptance=private_json(&path).unwrap();
+        let prepared=retained_prepared(&root,path.parent().unwrap(),original.proposal.contract.source().unwrap()).unwrap().expect("original prepared loader could not authenticate retained evidence");
+        assert_eq!(serde_json::to_vec(&prepared).unwrap(),serde_json::to_vec(&original).unwrap());
         let store=crate::autoship_workflow::WorkflowStore::open_read_only(&state).unwrap().unwrap();
         let before=store.snapshot(&id).unwrap().unwrap();let events=store.events(&id).unwrap();
         let custody=store.inspect_baseline_native_custody(&id).unwrap();
@@ -388,7 +390,11 @@ mod tests {
             if fault=="manifest-source" {manifest.pull_request=Some(841);}
             if fault=="manifest-contract" {manifest.contract_hash="f".repeat(64);}
             if fault=="manifest-path" {manifest.evidence_file=Some("../outside.json".into());}
-            write_manifest(control.path(),&manifest).unwrap();
+            if fault=="manifest-source" {
+                // Corrupt this workflow's indexed payload, rather than create
+                // a valid manifest at a different source's normal filename.
+                immutable(control.path(),&control.path().join(format!("{}-workflow.json",source.key())),&serde_json::to_vec(&manifest).unwrap()).unwrap();
+            }else{write_manifest(control.path(),&manifest).unwrap();}
             if fault=="proposal" {
                 let mut changed=prepared.clone();changed.proposal.contract.criteria[0].requirement="different owner intent".into();
                 std::fs::write(&file,serde_json::to_vec(&changed).unwrap()).unwrap();

@@ -2044,8 +2044,45 @@ fn private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 }
 /// Inspect existing prepared evidence only. Free reconsideration may not
 /// install a harness, create a manifest or generate another baseline.
-pub(super) fn retained_prepared(_root:&Path,_control:&Path,_source:AcceptanceSource)->Result<Option<PreparedAcceptance>> {
-    Ok(None)
+pub(super) fn retained_prepared(root:&Path,control:&Path,source:AcceptanceSource)->Result<Option<PreparedAcceptance>> {
+    source.validate()?;
+    if !control.try_exists()? {return Ok(None);}
+    let control=control.canonicalize()?;
+    for writable in worker_roots(root) {
+        if writable.exists() {ensure!(!control.starts_with(writable.canonicalize()?),"retained prepared evidence overlaps worker storage");}
+    }
+    let index=control.join(format!("{}-workflow.json",source.key()));
+    let manifest:Option<WorkflowManifest>=if index.try_exists()? {Some(private_json(&index)?)}else{None};
+    let path=if let Some(manifest)=&manifest {
+        ensure!(manifest.version==1 && manifest.source()?==source && manifest.contract_revision>0
+            && manifest.contract_hash.len()==64 && manifest.contract_hash.bytes().all(|b|b.is_ascii_hexdigit()),"retained prepared manifest identity changed");
+        let original=evidence_path(&control,source,&manifest.original_base)?;
+        if let Some(name)=&manifest.evidence_file {
+            ensure!(name==&format!("{}-revision-{}-{}.json",source.key(),manifest.contract_revision,manifest.contract_hash),"retained prepared evidence path changed");
+            control.join(name)
+        }else{original}
+    }else {
+        let prefix=format!("{}-base-",source.key());let mut found=None;
+        for (count,entry) in std::fs::read_dir(&control)?.enumerate() {
+            ensure!(count<4096,"retained evidence directory exceeds inspection bound");
+            let entry=entry?;let name=entry.file_name();let name=name.to_string_lossy();
+            if name.starts_with(&prefix) && name.ends_with(".json") {
+                ensure!(found.is_none(),"multiple original baselines require bound adjudication");
+                found=Some(entry.path());
+            }
+        }
+        let Some(path)=found else{return Ok(None)};path
+    };
+    let prepared:PreparedAcceptance=private_json(&path)?;
+    let registered=&prepared.baseline.registration;
+    ensure!(registered.contract()==&prepared.proposal.contract && registered.contract().source()?==source
+        && registered.baseline_result(&prepared.baseline.receipts)?==BaselineResult::Reproduced,"retained original prepared evidence changed");
+    if let Some(manifest)=&manifest {
+        ensure!(registered.baseline_head()==manifest.original_base && registered.contract_hash()==manifest.contract_hash
+            && prepared.proposal.contract.revision==manifest.contract_revision,"retained manifest and prepared evidence disagree");
+    }else{ensure!(evidence_path(&control,source,registered.baseline_head())?==path,"retained original filename differs from baseline");}
+    registered.verify_integrity(root)?;
+    Ok(Some(prepared))
 }
 
 fn original_manifest(control: &Path, source: AcceptanceSource) -> Result<Option<WorkflowManifest>> {
