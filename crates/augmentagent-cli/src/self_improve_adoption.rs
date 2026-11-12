@@ -174,8 +174,7 @@ pub(super) fn episode_retries(
         let Some(snapshot) = store.snapshot(&id)? else {
             continue;
         };
-        if candidate.source_issue.is_some_and(|issue|crate::autoship_workflow::workflow_id(&candidate.repository,issue).is_ok_and(|expected|expected==id))
-            && store.owner_resume_due(&id,now)? {
+        if owner_resume_matches(&store,&id,candidate)? && store.owner_resume_due(&id,now)? {
             result.insert(candidate.pr);
             continue;
         }
@@ -204,6 +203,14 @@ pub(super) fn episode_retries(
     Ok(result)
 }
 
+fn owner_resume_matches(store:&WorkflowStore,id:&str,candidate:&AdoptedPr)->Result<bool> {
+    let identity=candidate.source_issue.is_some_and(|issue|crate::autoship_workflow::workflow_id(&candidate.repository,issue).is_ok_and(|source|source==id))
+        || crate::autoship_workflow::pr_workflow_id(&candidate.repository,candidate.pr).is_ok_and(|source|source==id);
+    Ok(identity && candidate.ready_for_review()
+        && store.snapshot(id)?.is_some_and(|snapshot|snapshot.pr==Some(candidate.pr))
+        && store.resolve_pr(&candidate.repository,candidate.pr)?.as_deref()==Some(id))
+}
+
 /// Re-read authorized PR inventory before handing an owner resume into the
 /// existing protected PR execution path. The durable hint grants no authority.
 pub(super) async fn current_owner_resume(repo:&Path,path:&Path,id:&str)->Result<Option<AdoptedPr>> {
@@ -217,14 +224,10 @@ pub(super) async fn current_owner_resume(repo:&Path,path:&Path,id:&str)->Result<
     policy_hold::filter(repo,&mut candidates,false).await;
     let Some(store)=WorkflowStore::open_read_only(path)? else{return Ok(None)};
     if !store.owner_resume_ready_for_dispatch(id,chrono::Utc::now().timestamp_millis())? {return Ok(None);}
-    let expected=store.snapshot(id)?.and_then(|state|state.pr);
-    Ok(candidates.into_iter().find(|candidate| {
-        candidate.ready_for_review() && Some(candidate.pr)==expected
-            && match candidate.source_issue {
-                Some(issue)=>crate::autoship_workflow::workflow_id(&repository,issue).is_ok_and(|source|source==id),
-                None=>crate::autoship_workflow::pr_workflow_id(&repository,candidate.pr).is_ok_and(|source|source==id),
-            }
-    }))
+    for candidate in candidates {
+        if owner_resume_matches(&store,id,&candidate)? {return Ok(Some(candidate));}
+    }
+    Ok(None)
 }
 
 pub(super) async fn policy_reconciliation_retries(

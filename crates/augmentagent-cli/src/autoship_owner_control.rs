@@ -209,9 +209,18 @@ fn due_resume(conn:&Connection,workflow:&str,now:i64)->Result<Option<DispatchRes
     if pr.is_none() || leased>now || checkpoint.binding!=request.binding || checkpoint.next.eligible_at_ms>now
         || !matches!(checkpoint.stage,Stage::Build|Stage::Verify|Stage::Review|Stage::Reconcile)
         || super::owner_inbox::pending(conn,workflow)?>0 {return Ok(None);}
-    let uncertain:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed'))",[workflow],|r|r.get(0))?;
-    if uncertain {return Ok(None);}
+    if uncertain_resume_effect(conn,workflow)? {return Ok(None);}
     Ok(Some(request))
+}
+
+/// Selection is only a hint. Repeat the uncertain-effect fence in the same
+/// transaction that grants a productive lease and consumes accepted intent.
+pub(super) fn dispatch_resume_blocked(conn:&Connection,workflow:&str)->Result<bool> {
+    if pending_resume(conn,workflow)?.is_none() {return Ok(false);}
+    uncertain_resume_effect(conn,workflow)
+}
+fn uncertain_resume_effect(conn:&Connection,workflow:&str)->Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state IN ('reserved','dispatched','confirmed'))",[workflow],|r|r.get(0))?)
 }
 
 /// Settle owner intent only after the normal productive claim succeeds. A

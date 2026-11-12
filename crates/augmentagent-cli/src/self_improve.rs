@@ -7871,7 +7871,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
     }
 
-    let owner_resume=if !dry_run && crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())?
+    let owner_resume=if !dry_run && lane_from_env()!=Lane::Build && crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())?
         .map(|store|store.has_due_owner_resume(None,chrono::Utc::now().timestamp_millis())).transpose()?.unwrap_or(false) {
         let repository=workflow::canonical_repository(repo_root).await?;
         crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
@@ -12228,7 +12228,7 @@ impl AutoPrLoop {
                             let queued = crate::autoship_workflow::WorkflowStore::open_read_only(&self.workflow_path)
                                 .and_then(|store| store.map(|s| -> Result<bool> {
                                     Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?
-                                        || s.has_due_owner_resume(None,(self.clock)().timestamp_millis())?
+                                        || (lane_from_env()!=Lane::Build && s.has_due_owner_resume(None,(self.clock)().timestamp_millis())?)
                                         || s.has_due_qualification_recovery(None,(self.clock)().timestamp_millis())?)
                                 }).transpose());
                             match queued {
@@ -12249,7 +12249,7 @@ impl AutoPrLoop {
                                 let now = (self.clock)().timestamp_millis();
                                 Ok(store.command_queue_due(repository, now)?
                                     || store.has_due_main_reconciliation(Some(repository), now)?
-                                    || store.has_due_owner_resume(Some(repository),now)?
+                                    || (lane_from_env()!=Lane::Build && store.has_due_owner_resume(Some(repository),now)?)
                                     || store.has_due_qualification_recovery(Some(repository),now)?)
                             })
                                 .transpose().map(|due| due.unwrap_or(false)));
