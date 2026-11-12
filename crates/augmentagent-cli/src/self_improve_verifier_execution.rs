@@ -163,6 +163,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_original_verifier_result_reenters_without_executing_again() {
+        for reproduced in [true,false] {
+            let (root,control,prepared,guard)=fixture().await;
+            let base=prepared.baseline.registration.baseline_head();
+            let environment=environment_id(root.path()).unwrap();
+            let executor=amendment::digest(&serde_json::to_vec(&(amendment::digest(include_bytes!("autoship_contract.rs")),amendment::digest(include_bytes!("self_improve_contract.rs")))).unwrap());
+            let original=OriginalExecution::begin(&guard,&prepared.proposal,base,&environment,&executor).unwrap();
+            original.retain_admission("observe",&gone_scope()).unwrap();
+            OriginalExecution::quiesce_previous(&guard).unwrap();
+            let mut baseline=prepared.baseline.clone();
+            if !reproduced {
+                let observed=Observation {exit_code:Some(0),stdout:"true\n".into(),stderr:String::new(),interrupted:false,output_complete:true};
+                baseline.receipts=vec![baseline.registration.observe(root.path(),"observe",baseline.registration.binding(base).unwrap(),&observed).unwrap()];
+            }
+            let raw=serde_json::json!({"version":1,"kind":"original_verifier_result","workflow":guard.id(),"plan":original.plan,"attempt":original.attempt,"baseline":baseline});
+            let key=amendment::digest(&serde_json::to_vec(&("original-verifier-result-v1",&original.plan,&original.attempt)).unwrap());
+            guard.record_verifier_evidence(&key,"original_verifier_result",&raw.to_string()).unwrap();
+            let executed=Cell::new(false);
+            let result=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,|_original|async {
+                executed.set(true);Ok(prepared.baseline.clone())
+            }).await;
+            assert!(!executed.get(),"a retained conclusive original result launched the executor again");
+            if reproduced {assert!(result.is_ok());}
+            else {assert_eq!(result.unwrap_err().downcast_ref::<BaselineNotRed>().unwrap().kind,Some(initial_repair::FailureKind::AlreadyPasses));}
+            assert_eq!(crate::autoship_workflow::WorkflowStore::open(&control.path().join("workflow.db")).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+            drop(original);guard.finish().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn verifier_command_custody_requires_the_frozen_registration_and_adapter() {
         let (root,_control,prepared,guard)=fixture().await;
         let base=prepared.baseline.registration.baseline_head();
