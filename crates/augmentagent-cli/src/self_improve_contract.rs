@@ -22,7 +22,9 @@ mod baseline_witness;
 #[path = "self_improve_verifier_checkout.rs"]
 pub(super) mod verifier_checkout;
 pub(super) use scope_authority::run as scope_original;
-pub(super) use scope_authority::require_retained_native_custody;
+pub(super) fn require_retained_native_custody(root:&Path,observations:&[crate::autoship_workflow::NativeScopeCustody])->Result<()> {
+    scope_authority::require_retained_native_custody(root,observations)
+}
 #[path = "self_improve_readiness.rs"]
 pub(super) mod readiness;
 #[path = "self_improve_adjudicated_contract.rs"]
