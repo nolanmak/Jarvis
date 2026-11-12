@@ -1194,6 +1194,31 @@ mod initial_diagnostic_tests {
     }
 
     #[tokio::test]
+    async fn qualified_recovery_holds_an_enrolled_reconcile_checkpoint_without_losing_custody() {
+        let (repo,control,prepared)=baseline_witness::prepared_fixture();
+        let path=control.path().join("workflow.db");
+        let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+            repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+            branch:"fixture",contract:"original owner requirements",environment:"fixture",
+        }).await.unwrap().unwrap();
+        guard.bind_acceptance_for_recovery(&prepared).unwrap();
+        guard.checkpoint(crate::autoship_workflow::Stage::Reconcile,"resume_started","reconcile_main",0,&["original-enrolled-evidence".into()]).await.unwrap();
+        let before=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        let error=anyhow::Error::from(initial_repair::Hold::EvidenceUnknown).context("PRIVATE_ENROLLED_EVIDENCE_DIAGNOSIS");
+        let report=hold_initial_error(&mut guard,&error).await.expect("enrolled qualification failure must report a deterministic hold, not throw an unenrolled-scope assertion").unwrap();
+        assert_eq!(report.message,initial_repair::Hold::EvidenceUnknown.to_string());
+        let after=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        assert_eq!(after.checkpoint.binding,before.checkpoint.binding);
+        assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+        assert_eq!(after.model_calls,before.model_calls);
+        assert_eq!(after.checkpoint.next.reason,"acceptance_verifier_evidence_unknown");
+        assert_eq!(after.checkpoint.next.action,"await_original_evidence_recovery");
+        let id=guard.id().to_owned();guard.finish().unwrap();
+        let mut store=crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
+        assert!(store.claim_productive(&id,"unchanged-retry",chrono::Utc::now().timestamp_millis(),1_000).unwrap().is_none(),"unchanged enrolled evidence hold was reclaimed for productive work");
+    }
+
+    #[tokio::test]
     async fn initial_private_diagnostics_are_durable_deduplicated_and_absent_from_public_progress() {
         let (_repo,control,mut guard)=fixture().await;
         let private="PRIVATE_DIAGNOSTIC_SENTINEL: original source selection failed";

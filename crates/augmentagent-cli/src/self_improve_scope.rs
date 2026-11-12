@@ -771,6 +771,23 @@ mod native_reply_tests {
         NativeReply {text:text.into(),provenance:NativeReplyReference {artifact,artifact_sha256:amendment::digest(&bytes)}}
     }
 
+    #[test]
+    fn qualified_recovery_accepts_group_writable_descendants_beneath_a_private_boundary() {
+        let candidate=tempfile::tempdir().unwrap();
+        let private=tempfile::tempdir_in("/tmp").unwrap();
+        let control=private.path().join("authority");std::fs::create_dir(&control).unwrap();
+        std::fs::set_permissions(&control,std::fs::Permissions::from_mode(0o775)).unwrap();
+        let input="b".repeat(64);
+        let mut original=reply(&control,Some(CallPurpose::SourceSelection),&"a".repeat(40),"original saved source selection");
+        let mut observed:NativeReplyProvenance=serde_json::from_slice(&std::fs::read(&original.provenance.artifact).unwrap()).unwrap();
+        observed.scope_context_hash=Some("c".repeat(64));observed.native_input_hash=Some(input.clone());
+        let bytes=serde_json::to_vec(&observed).unwrap();std::fs::write(&original.provenance.artifact,&bytes).unwrap();
+        original.provenance.artifact_sha256=amendment::digest(&bytes);
+        let retained=crate::autoship_workflow::NativeScopeCustody {input,response:original.text,
+            provenance:serde_json::to_string(&original.provenance).unwrap(),provider:crate::autoship_workflow::submission::Provider::Codex};
+        require_retained_native_custody(candidate.path(),&[retained]).expect("normal umask descendants remain protected by the original owner-only ancestor");
+    }
+
     #[tokio::test]
     async fn completed_native_witness_recovers_with_no_ready_provider_and_no_second_call() {
         use augmentagent_channel_core::{ProviderKind,native_session};
