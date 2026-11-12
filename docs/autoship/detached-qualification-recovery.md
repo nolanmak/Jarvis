@@ -110,6 +110,12 @@ mismatches; sharing the existing complete predicate corrects them. All 14
 recovery-store tests pass, including unchanged allowance and normal terminal
 reconciliation. Setup errors were excluded from behavioral RED evidence.
 
-Final full checks and the fresh-remote probe after that last correction, exact
-PR-head hosted CI/review, supported snapshot, rollout and ordinary outcome remain
-open. An inspection pass or another bounded hold is not #1703 restoration.
+Final source validation at c9996266: full CLI 1,979 pass / zero failures / 39
+explicit ignores (278.95 seconds). The composed fresh-authorization #2014 probe
+passes (2.55 seconds); original negative-source authentication separately passes
+with both retained responses (0.04 seconds). Both probes preserve workflow/events
+and make no model call or candidate/ref rewrite.
+
+Exact PR-head hosted CI/review, supported snapshot, rollout and ordinary outcome
+remain open. These are source compatibility and component results; an inspection
+pass or another bounded hold is not #1703 restoration.
