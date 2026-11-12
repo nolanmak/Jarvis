@@ -1,5 +1,10 @@
 # Complete owner evidence for verifier amendment (#2048)
 
+The [production-source extension](amendment-production-source.md) adds a separate
+known owner-only-context migration for #2050. The owner-omission migration below
+still rejects every successor context; a complete-source context never reopens
+either migration. Existing cue continuation retains its original policy/key.
+
 The ordinary #2014 / #2027 attempt reached an independent amendment decision
 in generation 9 after #2047 deployed. The authority declined using email-only
 intent inferred from the bug title. The full protected owner request instead

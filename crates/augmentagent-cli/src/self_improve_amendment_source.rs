@@ -109,6 +109,10 @@ fn selection(
     selected.context("original source selection unavailable")
 }
 
+pub(super) fn authenticate(root:&Path,control:&Path,base:&str,custody:&[crate::autoship_workflow::NativeScopeCustody],context:Option<&str>,replay:Option<&str>)->Result<String> {
+    selection(root,control,base,custody,context,replay).map(|(identity,_)|identity)
+}
+
 struct SourceBuffer<'a> {
     request: &'a ReadRequest,
     budget: usize,

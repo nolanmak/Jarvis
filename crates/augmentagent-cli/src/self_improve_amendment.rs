@@ -385,6 +385,10 @@ pub(super) fn legacy_decline_omits_owner_evidence(control:&Path,source:Acceptanc
         Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},
         Err(error)=>return Err(error.into()),
     }
+    retained_decline_matches(control,source,contract,input)
+}
+
+fn retained_decline_matches(control:&Path,source:AcceptanceSource,contract:&str,input:&str)->Result<bool> {
     let prefix=format!("{}-amendment-decision-{input}-",source.key());
     let mut selected=None;
     for entry in std::fs::read_dir(control)? {
@@ -399,7 +403,43 @@ pub(super) fn legacy_decline_omits_owner_evidence(control:&Path,source:Acceptanc
     Ok(selected.is_some())
 }
 
-pub(super) fn decline_omits_source_evidence(_control:&Path,_source:AcceptanceSource,_contract:&str,_input:&str)->Result<bool> {Ok(false)}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerOnlyContext {version:u32,context_sha256:String}
+
+pub(super) fn decline_omits_source_evidence(control:&Path,source:AcceptanceSource,contract:&str,input:&str)->Result<bool> {
+    ensure!(input.len()==64 && input.bytes().all(|byte|byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),"invalid legacy amendment input");
+    let path=control.join(format!("{}-amendment-context-{input}.json",source.key()));
+    let bytes=match baseline_witness::private_bytes(&path,64*1024) {
+        Ok(bytes)=>bytes,
+        Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|error|error.kind()==std::io::ErrorKind::NotFound)=>return Ok(false),
+        Err(error)=>return Err(error),
+    };
+    let Ok(context)=serde_json::from_slice::<OwnerOnlyContext>(&bytes) else {return Ok(false)};
+    if context.version!=1 || context.context_sha256.len()!=64
+        || !context.context_sha256.bytes().all(|byte|byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {return Ok(false);}
+    retained_decline_matches(control,source,contract,input)
+}
+
+fn negative_source_context(raw:&str)->Result<String> {
+    let judgment:serde_json::Value=serde_json::from_str(raw)?;
+    Ok(judgment["context"].as_str().context("authenticated negative source context missing")?.to_owned())
+}
+
+/// Free inspection authenticates the exact source-data projection but runs no
+/// Git or model and grants no execution, amendment approval or budget credit.
+pub(super) fn authenticate_original_source(root:&Path,control:&Path,prepared:&PreparedAcceptance,
+    custody:&[crate::autoship_workflow::NativeScopeCustody],evidence:&crate::autoship_workflow::VerifierEvidenceInspection<'_>,expected_judgment:&str)->Result<()> {
+    let (identity,diagnosis)=baseline_witness::retained_semantic_diagnosis_in(root,control,prepared,custody)?
+        .context("original negative source judgment unavailable")?;
+    ensure!(identity==expected_judgment,"original source projection belongs to another judgment");
+    let context=negative_source_context(&diagnosis)?;
+    let base=prepared.baseline.registration.baseline_head();
+    let key=source_evidence::replay_key(root,control,base,custody,Some(&context))?;
+    let replay=key.map(|key|evidence.scope_response(&key)).transpose()?.flatten();
+    source_evidence::authenticate(root,control,base,custody,Some(&context),replay.as_deref())?;
+    Ok(())
+}
 
 struct AuthorityFacts<'a> {
     source:AcceptanceSource,request_context:&'a str,failure:&'a str,canonical_main:&'a str,
@@ -499,10 +539,7 @@ pub(super) async fn try_amend(
     let prompt=authority_base_request(old,AuthorityFacts {source,request_context:&request_context,failure,
         canonical_main:&canonical_main,scope_base:&scope_base,head:&head,diff:&diff,upstream_paths:&upstream_paths,
         environments:&environments,adjudication}).map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
-    let source_context=negative.as_ref().map(|(_,raw)|->Result<String> {
-        let judgment:serde_json::Value=serde_json::from_str(raw)?;
-        Ok(judgment["context"].as_str().context("authenticated negative source context missing")?.to_owned())
-    }).transpose()?;
+    let source_context=negative.as_ref().map(|(_,raw)|negative_source_context(raw)).transpose()?;
     let key=source_evidence::replay_key(root,&native_control,original_base,&custody,source_context.as_deref())
         .map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown))?;
     let replay=key.map(|key|workflow.scope_stage_response(&key)).transpose()?.flatten();

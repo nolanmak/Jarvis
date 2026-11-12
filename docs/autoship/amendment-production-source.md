@@ -131,7 +131,10 @@ result; never manufacture a completed refusal or new credit.
    context, ambiguous/unsupported producer, bounded windows and oversized input.
    Run an explicit ignored read-only production compatibility probe using actual
    retained #2014 custody; it may read Git and protected state, never write the
-   workflow or make a model call.
+   production repository/workflow or make a model call. Environment fingerprint
+   measurements may use a disposable shared-object Git clone and its temporary
+   worktrees, removed after the probe; they must not add worktrees to production
+   Git metadata or create an unregistered build target.
 2. Reproduce missing source/task delivery at the actual authority request boundary.
    Wire construction, exact evidence fingerprinting and pre-admission bounds;
    preserve valid denial and all downstream original-red/candidate-green gates.
@@ -160,16 +163,15 @@ must say so; the authority can decline. That does not justify claiming restorati
 or retrying unchanged input. The repair owner must diagnose a concrete subsequent
 refusal from evidence before proposing a further bounded change.
 
-Open thread: verify the actual complete request fits with #2014's eight original
-files (330,747 raw bytes), its original proposal and all existing evidence. This
-blocks production rollout and is owned by the repair agent's read-only probe plus
-actual request-boundary test. Component tests do not prove amendment approval or
-an autonomous merge. For this measured historical case the rollout proof must
-supply all eight complete files and record the actual serialized source and final
-request sizes. A partial fallback remains supported generically but does not
-satisfy this particular rollout proof. The first source-only probe correctly
-refused the cross-context source selection; the stored existing projection must
-be authenticated before this probe can pass.
-New repair-PR exclusion must be proven through supported
+The historical rollout gate requires the actual complete request with #2014's
+eight original files, its original proposal and all existing evidence. The repair
+owner's explicit read-only probe and actual request-boundary test must supply all
+eight complete files and record serialized source and final request sizes, using
+the authenticated recorded projection. A partial fallback remains supported
+generically but does not satisfy this particular gate. Store current receipts on
+#2050, not as claims that an old request digest certifies a later input or runtime.
+Component preflight does not prove native amendment approval or an autonomous merge.
+
+Open thread: new repair-PR exclusion must be proven through supported
 controls before publishing a runnable main-based PR; a draft or issue label alone
 does not fence adoption. This blocks publication, not local implementation.
