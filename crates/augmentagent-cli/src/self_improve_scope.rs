@@ -136,16 +136,36 @@ struct SourceReplay {
 fn source_replay_key(epoch:&str,request:&str)->String {
     amendment::digest(&serde_json::to_vec(&("original-source-data-replay-v1",epoch,request)).unwrap())
 }
-fn project_source_replay(control:&Path,workflow:&str,head:&str,current:&NativeScopeContext<'_>,original:&NativeScopeContext<'_>,choose:&str,observations:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<SourceReplay>> {
+async fn project_source_replay(root:&Path,control:&Path,workflow:&str,head:&str,current:&NativeScopeContext<'_>,original:&NativeScopeContext<'_>,choose:&str,files:&[(&str,&str)],observations:&[crate::autoship_workflow::NativeScopeCustody])->Result<Option<SourceReplay>> {
     ensure!(original.policy_hash==PREDEPLOYMENT_SOURCE_POLICY,"unrecognized pre-deployment source policy");
-    for (provider,reply) in completed_native_scopes(control,head,original,CallPurpose::SourceSelection,observations)? {
-        let proof=read_native_reply(control,&reply)?;
-        let input=amendment::digest(&serde_json::to_vec(&("baseline-native-input-v2",workflow,head,provider.name(),CallPurpose::SourceSelection,original.epoch,&original.request_hash,&original.policy_hash,SOURCE_SELECTION_SYSTEM,choose))?);
-        if proof.supplied_request_hash!=amendment::digest(choose.as_bytes()) || proof.native_input_hash.as_deref()!=Some(input.as_str())
-            || !observations.iter().any(|o|o.input==input && o.response==reply.text) {continue;}
-        return Ok(Some(SourceReplay {version:1,current_epoch:current.epoch.into(),current_request:current.request_hash.clone(),
-            original_epoch:original.epoch.into(),original_request:original.request_hash.clone(),original_policy:original.policy_hash.clone(),
-            original_choose:proof.supplied_request_hash,original_input:input,provider:provider.name().into()}));
+    let completed=completed_native_scopes(control,head,original,CallPurpose::SourceSelection,observations)?;
+    let mut providers=Vec::new();
+    for (provider,_) in &completed {
+        if providers.contains(provider) {continue;}
+        providers.push(*provider);
+        let mut request=choose.to_owned();
+        // Match the original bounded two-response protocol, including its
+        // exact Git-derived rejection and previous response for corrections.
+        for _ in 0..2 {
+            let input=amendment::digest(&serde_json::to_vec(&("baseline-native-input-v2",workflow,head,provider.name(),CallPurpose::SourceSelection,original.epoch,&original.request_hash,&original.policy_hash,SOURCE_SELECTION_SYSTEM,&request))?);
+            let request_hash=amendment::digest(request.as_bytes());
+            let mut matched=None;
+            for (actual_provider,reply) in &completed {
+                if actual_provider!=provider {continue;}
+                let proof=read_native_reply(control,reply)?;
+                if proof.supplied_request_hash!=request_hash || proof.native_input_hash.as_deref()!=Some(input.as_str())
+                    || !observations.iter().any(|o|o.input==input && o.response==reply.text) {continue;}
+                ensure!(matched.is_none(),"ambiguous original source-selection response");
+                matched=Some((reply,proof));
+            }
+            let Some((reply,proof))=matched else {break;};
+            match source_evidence(root,head,&reply.text,files).await? {
+                SourceCheck::Accepted(_)=>return Ok(Some(SourceReplay {version:1,current_epoch:current.epoch.into(),current_request:current.request_hash.clone(),
+                    original_epoch:original.epoch.into(),original_request:original.request_hash.clone(),original_policy:original.policy_hash.clone(),
+                    original_choose:proof.supplied_request_hash,original_input:input,provider:provider.name().into()})),
+                SourceCheck::Rejected(problem)=>request=correction_prompt(choose,&problem,&reply.text),
+            }
+        }
     }
     Ok(None)
 }
@@ -191,7 +211,7 @@ pub(super) async fn prepare_source_recovery(root:&Path,workflow:&workflow::Workf
     let index=serde_json::to_string(&entries.iter().enumerate().map(|(i,(_,path))|serde_json::json!([i,path])).collect::<Vec<_>>())?;
     let original=NativeScopeContext {epoch:original_epoch,request_hash:amendment::digest(original_prompt.as_bytes()),policy_hash:PREDEPLOYMENT_SOURCE_POLICY.into()};
     let current=NativeScopeContext {epoch,request_hash:amendment::digest(prompt.as_bytes()),policy_hash:witness_policy_hash()};
-    if let Some(replay)=project_source_replay(&control,workflow.id(),&head,&current,&original,&source_selection_prompt(&index,&head,original_prompt),&saved)? {
+    if let Some(replay)=project_source_replay(root,&control,workflow.id(),&head,&current,&original,&source_selection_prompt(&index,&head,original_prompt),&entries,&saved).await? {
         workflow.record_scope_stage_response(&source_replay_key(epoch,&current.request_hash),&serde_json::to_string(&replay)?)?;
     }
     Ok(())
@@ -1110,6 +1130,11 @@ mod native_reply_tests {
         let choose=source_selection_prompt(r#"[[0,"implementation.py"]]"#,&head,"original qualification");
         let files=vec![("100644 blob","implementation.py")];
         let rejected=r#"{"requests":[{"file_index":999,"start_line":1,"end_line":1,"needle":null}]}"#;
+        // Fixed ABI vectors independently extracted from main 7353e9cd;
+        // fixture generation must not silently follow a changed old recipe.
+        let frozen_choose=source_selection_prompt(r#"[[0,"implementation.py"]]"#,&"a".repeat(40),"original qualification");
+        assert_eq!(amendment::digest(frozen_choose.as_bytes()),"8291e1d311b19c0172452f4816253c84eb65c1d66b047c7368d8d11fd0959c3b");
+        assert_eq!(amendment::digest(correction_prompt(&frozen_choose,"source file_index is outside the controller's tracked-file table",rejected).as_bytes()),"06f7d16c2edf2b25d5daec06737ab732b11cee830a026fdae4fb1b957f7c3149");
         let SourceCheck::Rejected(problem)=source_evidence(repo.path(),&head,rejected,&files).await.unwrap() else {panic!("fixture was not rejected")};
         let corrected=correction_prompt(&choose,&problem,rejected);
         let native=|request:&str,text:&str| {
@@ -1121,11 +1146,14 @@ mod native_reply_tests {
             let bytes=serde_json::to_vec(&proof).unwrap();std::fs::write(&result.provenance.artifact,&bytes).unwrap();result.provenance.artifact_sha256=amendment::digest(&bytes);
             crate::autoship_workflow::NativeScopeCustody {input,response:result.text,provenance:serde_json::to_string(&result.provenance).unwrap(),provider:crate::autoship_workflow::submission::Provider::Codex}
         };
-        let observations=vec![native(&choose,rejected),native(&corrected,r#"{"requests":[{"file_index":0,"start_line":1,"end_line":1,"needle":null}]}"#)];
-        let replay=project_source_replay(control.path(),"owner/repo#7",&head,&current,&old,&choose,&observations).unwrap().unwrap();
+        let accepted=r#"{"requests":[{"file_index":0,"start_line":1,"end_line":1,"needle":null}]}"#;
+        let observations=vec![native(&choose,rejected),native(&correction_prompt(&choose,"an unrelated rejection",rejected),accepted),native(&corrected,accepted)];
+        assert!(project_source_replay(repo.path(),control.path(),"owner/repo#7",&head,&current,&old,&choose,&files,&observations[..2]).await.unwrap().is_none(),"another correction under the same parent request was accepted");
+        assert!(project_source_replay(repo.path(),control.path(),"owner/repo#7",&head,&current,&old,&choose,&files,&observations[1..]).await.unwrap().is_none(),"a correction without its original rejected response was accepted");
+        let replay=project_source_replay(repo.path(),control.path(),"owner/repo#7",&head,&current,&old,&choose,&files,&observations).await.unwrap().unwrap();
         let recovered=recover_source_replay(repo.path(),control.path(),&head,&current,&files,&observations,&replay).await.unwrap();
         assert!(recovered.is_some(),"a completed original correction was discarded, allowing replacement source generation");
-        assert_eq!(replay.original_input,observations[1].input,"the rejected initial response was projected instead of its successful correction");
+        assert_eq!(replay.original_input,observations[2].input,"the rejected initial response or an unrelated correction was projected instead of its successful correction");
     }
 
     #[tokio::test]
@@ -1152,15 +1180,15 @@ mod native_reply_tests {
         let files=vec![("100644 blob","implementation.py")];
         assert!(cached_native_source(repo.path(),control.path(),&head,&current,&files,std::slice::from_ref(&observation)).await.unwrap().is_none(),"old policy must never masquerade as a current native judgment");
         let observations=vec![observation];
-        let replay=project_source_replay(control.path(),"owner/repo#7",&head,&current,&old,&original_choose,&observations).unwrap().expect("exact original source request");
+        let replay=project_source_replay(repo.path(),control.path(),"owner/repo#7",&head,&current,&old,&original_choose,&files,&observations).await.unwrap().expect("exact original source request");
         let recovered=recover_source_replay(repo.path(),control.path(),&head,&current,&files,&observations,&replay).await.unwrap();
         assert!(recovered.is_some(),"pre-deployment original source selection was discarded rather than recovered under its exact request and provenance");
         let other=NativeScopeContext {epoch:&current_epoch,request_hash:amendment::digest(b"another owner request"),policy_hash:witness_policy_hash()};
         assert!(recover_source_replay(repo.path(),control.path(),&head,&other,&files,&observations,&replay).await.is_err());
-        assert!(project_source_replay(control.path(),"other/repo#7",&head,&current,&old,&original_choose,&observations).unwrap().is_none());
-        assert!(project_source_replay(control.path(),"owner/repo#7",&head,&current,&old,"different original request",&observations).unwrap().is_none());
+        assert!(project_source_replay(repo.path(),control.path(),"other/repo#7",&head,&current,&old,&original_choose,&files,&observations).await.unwrap().is_none());
+        assert!(project_source_replay(repo.path(),control.path(),"owner/repo#7",&head,&current,&old,"different original request",&files,&observations).await.unwrap().is_none());
         let unknown=NativeScopeContext {epoch:old.epoch,request_hash:old.request_hash.clone(),policy_hash:"f".repeat(64)};
-        assert!(project_source_replay(control.path(),"owner/repo#7",&head,&current,&unknown,&original_choose,&observations).is_err());
+        assert!(project_source_replay(repo.path(),control.path(),"owner/repo#7",&head,&current,&unknown,&original_choose,&files,&observations).await.is_err());
         assert!(recover_source_replay(repo.path(),control.path(),&head,&current,&files,&[],&replay).await.is_err(),"missing original custody must not trigger replacement generation");
         let copy=||crate::autoship_workflow::NativeScopeCustody {input:observations[0].input.clone(),response:observations[0].response.clone(),provenance:observations[0].provenance.clone(),provider:observations[0].provider};
         let duplicate=vec![copy(),copy()];

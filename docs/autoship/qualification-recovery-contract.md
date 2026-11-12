@@ -53,6 +53,17 @@ native scoper consumes it before generating source selectors; its eventual
 judgment is still a fresh/current-policy response. A correction with a different
 request does not silently inherit an incompatible projection.
 
+The source-data projector follows the original bounded two-response selection
+protocol separately for each provider. It first binds the initial response to
+the exact original native input. If immutable Git validation rejects it, the
+controller reconstructs the exact correction request from that rejection and
+the original response, then matches the retained correction's complete native
+input and provenance. Only an accepted selection is projected. An unrelated
+correction sharing the parent context, or a correction without its original
+rejected response, cannot substitute. Fixed prompt-hash vectors extracted from
+main `7353e9cd` prevent the fixture and implementation silently drifting to a
+different reconstruction recipe.
+
 Tests retain the direct-current-policy rejection and exercise the explicit
 source-data path separately. Required negatives include another workflow,
 another original request, another current request, a witness rather than source
