@@ -2107,14 +2107,26 @@ mod tests {
         let start=||Start {repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",source_issue:None,pr:Some(840),branch:"fixture",contract:"original owner request",environment:"frontend environment"};
         let mut original=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
         original.bind_acceptance_for_recovery(&prepared).unwrap();
-        original.checkpoint(Stage::Reconcile,"original_semantic_witness_recovered","reconsider_verifier",0,&[]).await.unwrap();
+        original.checkpoint(Stage::Scope,"acceptance_verifier_evidence_unknown","await_original_evidence_recovery",0,&[]).await.unwrap();
         let binding=original.binding().clone();let workflow=original.id().to_owned();original.finish().unwrap();
-        let resumed=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        {
+            let mut store=WorkflowStore::open(&state).unwrap();let held=store.snapshot(&workflow).unwrap().unwrap();
+            assert!(store.recover_semantic_qualification(&held,None,&"b".repeat(64),millis(),|_,_|Ok(Some("c".repeat(64)))).unwrap());
+        }
+        let mut resumed=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
         assert_eq!(resumed.binding(),&binding,"semantic recovery lost its original registered binding");
         assert!(matches!(*resumed.acceptance_authority.lock().unwrap(),AcceptanceAuthority::RecoveryOnly),"reconsideration entered with ordinary builder authority");
         assert!(resumed.audit_logger().model_call_admitted("codex").is_err(),"negative qualification metadata admitted a builder");
         let store=WorkflowStore::open(&state).unwrap();assert_eq!(store.snapshot(&workflow).unwrap().unwrap().model_calls,0);
+        drop(store);
+        resumed.checkpoint(Stage::Reconcile,"resume_started","inspect_candidate",0,&[]).await.unwrap();
         resumed.finish().unwrap();
+        let restarted=WorkflowGuard::acquire_fixture(&state,start()).await.unwrap().unwrap();
+        assert_eq!(restarted.binding(),&binding,"crash after resume_started discarded the queued source binding");
+        assert!(matches!(*restarted.acceptance_authority.lock().unwrap(),AcceptanceAuthority::RecoveryOnly),"restart discarded semantic recovery-only authority");
+        assert!(restarted.audit_logger().model_call_admitted("codex").is_err(),"restart admitted a builder from negative source data");
+        assert_eq!(WorkflowStore::open(&state).unwrap().snapshot(&workflow).unwrap().unwrap().model_calls,0);
+        restarted.finish().unwrap();
     }
 
     #[test]
