@@ -27,8 +27,12 @@ A known explicit per-root ceiling remains an additional admission predicate.
 This avoids duplicating the shared retained-byte authority as another default
 pool. Fixed mode retains its existing count semantics.
 
-D2. The shared authority derives aggregate count readback from its current
-retained-byte envelope B: `aggregate_slots = floor(B / S)`. Existing retained
+D2. Aggregate count readback is a forecast for one named proposed operation,
+not an operation-independent capacity number. Bind the forecast to its action
+(create/resume), provider/profile, complete demand revision and observed resource
+identities, including its qualified per-filesystem active-growth peak G. The
+shared authority derives the forecast from that operation's retained-byte
+envelope B: `aggregate_slots = floor(B / S)`. Existing retained
 rows across every registered root on that filesystem consume those slots.
 `aggregate_remaining = max(0, aggregate_slots - retained_rows)` is observation,
 not a reservation or execution grant. Do not add existing retained bytes to B,
@@ -42,7 +46,12 @@ complete demand. It is not raw free space or an unqualified cached policy value.
 is `floor(max(0, F-H-P-D_other-G) / S) * S`: F is current usable physical free
 space, H protected headroom, P other shared claims, D_other unresolved active
 growth excluding retained rows, and G this operation's new active-growth peak.
-Every operand and producer profile must be qualified. These arithmetic rules
+Every operand and producer profile must be qualified. A status request without
+a named operation and qualified complete demand reports aggregate_slots and
+aggregate_remaining as unknown; it may still report measured retained rows and
+explicit overrides. Never substitute G=0 or an arbitrary default profile.
+Different qualified profiles may produce different forecasts and must carry
+their distinct action/profile/demand bindings. These arithmetic rules
 neither establish a physical quota nor discount retained commitments.
 
 D3. A create also checks a known explicit root ceiling C, when present:
@@ -57,8 +66,9 @@ B<S yields zero available slots while remaining configured auto. If the system
 shrinks below current commitments, retain every row and report the deficit;
 never delete state or change a count to make the data fit. Work blocked by an
 explicit count override remains distinguishable from byte or memory pressure.
-Readback must identify a count as derived aggregate observation or explicit
-root override; do not label the derived observation as a configured root limit.
+Readback must identify a count as an operation-bound derived aggregate forecast
+or explicit root override; do not label the derived observation as a configured
+root limit.
 
 D5. Migration preserves known explicit overrides even when their value is 16.
 For ambiguous legacy fields, the authenticated enable-auto operation must bind
@@ -84,6 +94,8 @@ identity, custody, authorization and quota predicates to pass.
 | Case | Inputs | Required result |
 | --- | --- | --- |
 | Large host, absent override | F=79 GiB, H=15 GiB, P=10 GiB, D_other=0, G=2 GiB; 32 retained sessions | B=52 GiB, aggregate_slots=52, remaining=20; no implicit 16-session blocker; a create fits the stated byte/count predicates |
+| No qualified operation | Status has no action/profile/demand binding, or G is unknown | Aggregate slots and remaining are unknown; measured retained rows and explicit overrides may still be shown; no G=0 fallback |
+| Distinct qualified profiles | Same F/H/P/D_other as the large-host case; profile A has G=2 GiB, profile B has G=4 GiB | Separate operation-bound forecasts are 52 and 50 slots; neither is an unlabelled global capacity setting |
 | Shared roots, no copied pool | Same envelope; root A retains 4, root B retains 48 | Aggregate rows=52, remaining=0; A cannot create merely because its own count is small |
 | Explicit root ceiling | Same envelope; A retains 4, C=4 | New create fails the explicit count predicate despite aggregate space; no override is rewritten |
 | Explicit ceiling with room | Same envelope; A retains 4, C=6; global rows=32 | One create passes count predicates, reserves only that session in the existing transaction, and leaves five A rows / 33 global rows |
