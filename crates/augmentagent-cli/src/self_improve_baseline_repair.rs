@@ -73,6 +73,34 @@ fn key(epoch: &str, slot: u32) -> String {
             .as_bytes(),
     )
 }
+
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MeasurementIntent {
+    version:u32,
+    kind:String,
+    epoch:String,
+    slot:u32,
+    proposal_sha256:String,
+    #[serde(deserialize_with="required_prior")]
+    prior_sha256:Option<String>,
+}
+
+fn intent_key(epoch:&str,slot:u32)->String {
+    amendment::digest(&serde_json::to_vec(&("original-baseline-measurement-intent-v1",epoch,slot)).unwrap())
+}
+
+fn decode_intent(raw:&str,epoch:&str,slot:u32,prior:Option<&str>)->Result<MeasurementIntent> {
+    (||->Result<MeasurementIntent> {
+        ensure!(raw.len()<=4096,"measurement intent exceeds bound");
+        let value:MeasurementIntent=serde_json::from_str(raw)?;
+        ensure!(value.version==1 && value.kind=="original_measurement_intent"
+            && value.epoch==epoch && sha(epoch) && value.slot==slot && slot<LIMIT
+            && sha(&value.proposal_sha256) && value.prior_sha256.as_deref()==prior
+            && value.prior_sha256.as_deref().is_none_or(sha),"measurement intent lineage mismatch");
+        Ok(value)
+    })().map_err(|e|e.context(Hold::EvidenceUnknown))
+}
 fn decode(raw: &str, epoch: &str, slot: u32, prior: Option<&str>) -> Result<Failure> {
     let checked = (|| -> Result<Failure> {
         ensure!(raw.len() <= RECORD_LIMIT, "failure record exceeds bound");
@@ -130,18 +158,46 @@ where
             None => gap = true,
         }
     }
+    // Retain only the original input identity, not another copy of a model
+    // response. Recovery must still read the existing original proposal cache.
+    // Validate every intent before invoking any generator or executor.
+    let mut intents=Vec::new();
+    for slot in 0..LIMIT {
+        let intent=match read(&intent_key(epoch,slot))? {
+            Some(raw)=> {
+                if slot as usize>failures.len() {return Err(Hold::EvidenceUnknown.into());}
+                let prior=slot.checked_sub(1).and_then(|s|failures.get(s as usize)).map(|(_,hash)|hash.as_str());
+                let value=decode_intent(&raw,epoch,slot,prior)?;
+                if let Some((failure,_))=failures.get(slot as usize) {
+                    ensure!(value.proposal_sha256==failure.proposal_sha256,Hold::EvidenceUnknown);
+                }
+                Some(value)
+            },
+            None=>None,
+        };
+        intents.push(intent);
+    }
     for slot in 0..LIMIT {
         let cached = (slot as usize) < failures.len();
         let previous = slot
             .checked_sub(1)
             .map(|prior| failures[prior as usize].0.clone());
-        let proposal = generate(slot, cached, previous).await?;
+        let intent=intents[slot as usize].as_ref();
+        let proposal = generate(slot, cached || intent.is_some(), previous).await?;
         let proposal_sha256 = amendment::digest(&serde_json::to_vec(&proposal)?);
+        if let Some(intent)=intent {
+            ensure!(intent.proposal_sha256==proposal_sha256,Hold::EvidenceUnknown);
+        }
         if cached {
             if proposal_sha256 != failures[slot as usize].0.proposal_sha256 {
                 return Err(Hold::EvidenceUnknown.into());
             }
             continue;
+        }
+        if intent.is_none() {
+            let record=MeasurementIntent {version:1,kind:"original_measurement_intent".into(),epoch:epoch.into(),slot,
+                proposal_sha256:proposal_sha256.clone(),prior_sha256:failures.last().map(|(_,hash)|hash.clone())};
+            write(&intent_key(epoch,slot),&serde_json::to_string(&record)?)?;
         }
         match observe(proposal.clone()).await {
             Ok(baseline) => return Ok((proposal, baseline)),
@@ -187,6 +243,97 @@ mod tests {
             kind: Some(FailureKind::UnexpectedFailure),
         }
         .into()
+    }
+
+    fn record_counts(rows:&BTreeMap<String,String>)->(usize,usize) {
+        let failures=rows.values().filter(|raw|serde_json::from_str::<Failure>(raw).is_ok()).count();
+        let intents=rows.values().filter(|raw|serde_json::from_str::<MeasurementIntent>(raw).is_ok()).count();
+        assert_eq!(failures+intents,rows.len(),"unexpected original observation record");
+        (failures,intents)
+    }
+
+    #[tokio::test]
+    async fn original_measurement_intent_is_durable_before_executor() {
+        let records=Mutex::new(BTreeMap::<String,String>::new());
+        let result=run(&"a".repeat(64),
+            |key|Ok(records.lock().unwrap().get(key).cloned()),
+            |key,raw|{records.lock().unwrap().insert(key.into(),raw.into());Ok(())},
+            |_,cached,_|async move {assert!(!cached);Ok(41u32)},
+            |proposal| {
+                assert_eq!(proposal,41);
+                assert_eq!(records.lock().unwrap().len(),1,"original measurement began without its retained input");
+                std::future::ready(Ok::<_,anyhow::Error>("actual scripted observation"))
+            }).await.unwrap();
+        assert_eq!(result,(41,"actual scripted observation"));
+    }
+
+    #[tokio::test]
+    async fn infrastructure_resume_only_reads_the_original_proposal() {
+        let records=Mutex::new(BTreeMap::<String,String>::new());
+        let fresh_proposals=AtomicUsize::new(0);
+        for resume in [false,true] {
+            let result=run(&"a".repeat(64),
+                |key|Ok(records.lock().unwrap().get(key).cloned()),
+                |key,raw|{records.lock().unwrap().insert(key.into(),raw.into());Ok(())},
+                |slot,cached,_| {
+                    assert_eq!(slot,0,"infrastructure failure consumed a semantic correction slot");
+                    if !cached {fresh_proposals.fetch_add(1,Ordering::SeqCst);}
+                    std::future::ready(Ok::<_,anyhow::Error>(41u32))
+                },
+                |proposal|std::future::ready(if resume {assert_eq!(proposal,41);Ok("recovered original measurement")}else {
+                    Err(BaselineNotRed {detail:"original executor infrastructure failure".into(),kind:None}.into())
+                })).await;
+            if resume {assert_eq!(result.unwrap(),(41,"recovered original measurement"));}
+            else {assert_eq!(result.unwrap_err().downcast_ref::<Hold>(),Some(&Hold::InfrastructureUnavailable));}
+        }
+        assert_eq!(fresh_proposals.load(Ordering::SeqCst),1,"infrastructure recovery requested a replacement proposal instead of the original cached result");
+    }
+
+    #[tokio::test]
+    async fn invalid_original_measurement_intents_stop_before_callbacks() {
+        let epoch="a".repeat(64);
+        for fault in ["version","kind","epoch","slot","hash","prior","missing-prior","extra","gap"] {
+            let mut value=serde_json::json!({"version":1,"kind":"original_measurement_intent","epoch":epoch,"slot":0,
+                "proposal_sha256":amendment::digest(&serde_json::to_vec(&41u32).unwrap()),"prior_sha256":null});
+            match fault {
+                "version"=>value["version"]=2.into(),"kind"=>value["kind"]="approval".into(),
+                "epoch"=>value["epoch"]="b".repeat(64).into(),"slot"|"gap"=>value["slot"]=1.into(),
+                "hash"=>value["proposal_sha256"]="not-a-digest".into(),"prior"=>value["prior_sha256"]="b".repeat(64).into(),
+                "missing-prior"=>{value.as_object_mut().unwrap().remove("prior_sha256");},
+                "extra"=>value["approved"]=true.into(),_=>unreachable!(),
+            }
+            let selected=intent_key(&epoch,if fault=="gap" {1}else{0});let raw=value.to_string();
+            let result=run(&epoch,|key|Ok((key==selected).then(||raw.clone())),
+                |_,_|panic!("invalid original intent was overwritten"),
+                |_,_,_|->std::future::Ready<Result<u32>> {panic!("invalid original intent requested a proposal")},
+                |_|->std::future::Ready<Result<()>> {panic!("invalid original intent executed a measurement")}).await;
+            assert_eq!(result.unwrap_err().downcast_ref::<Hold>(),Some(&Hold::EvidenceUnknown),"{fault}");
+        }
+    }
+
+    #[tokio::test]
+    async fn original_measurement_resume_refuses_missing_or_changed_proposal() {
+        let epoch="a".repeat(64);let selected=intent_key(&epoch,0);
+        let raw=serde_json::json!({"version":1,"kind":"original_measurement_intent","epoch":epoch,"slot":0,
+            "proposal_sha256":amendment::digest(&serde_json::to_vec(&41u32).unwrap()),"prior_sha256":null}).to_string();
+        for missing in [true,false] {
+            let result=run(&epoch,|key|Ok((key==selected).then(||raw.clone())),
+                |_,_|panic!("original intent was replaced"),
+                |_,cached,_|std::future::ready({assert!(cached,"missing original result allowed a fresh request");if missing {Err(Hold::EvidenceUnknown.into())}else{Ok(42u32)}}),
+                |_|->std::future::Ready<Result<()>> {panic!("unavailable original proposal allowed execution")}).await;
+            assert_eq!(result.unwrap_err().downcast_ref::<Hold>(),Some(&Hold::EvidenceUnknown));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_measurement_retention_failure_stops_before_correction() {
+        let models=AtomicUsize::new(0);let observations=AtomicUsize::new(0);
+        let result=run(&"a".repeat(64),|_|Ok(None),
+            |_,raw|if serde_json::from_str::<MeasurementIntent>(raw).is_ok() {Ok(())}else{anyhow::bail!("failed measurement retention unavailable")},
+            |slot,_,_| {models.fetch_add(1,Ordering::SeqCst);std::future::ready(Ok(slot))},
+            |_| {observations.fetch_add(1,Ordering::SeqCst);std::future::ready(Err::<(),_>(rejected()))}).await;
+        assert!(result.unwrap_err().to_string().contains("failed measurement retention unavailable"));
+        assert_eq!(models.load(Ordering::SeqCst),1);assert_eq!(observations.load(Ordering::SeqCst),1);
     }
 
     #[tokio::test]
@@ -245,9 +392,9 @@ mod tests {
         assert_eq!(
             observations.load(Ordering::SeqCst),
             4,
-            "positive evidence requires real re-observation"
+            "successful evidence must come from the executor callback"
         );
-        assert_eq!(records.lock().unwrap().len(), 2);
+        assert_eq!(record_counts(&records.lock().unwrap()),(2,3));
     }
 
     #[tokio::test]
@@ -278,7 +425,7 @@ mod tests {
             );
         }
         assert_eq!(calls.load(Ordering::SeqCst), 3);
-        assert_eq!(records.lock().unwrap().len(), 3);
+        assert_eq!(record_counts(&records.lock().unwrap()),(3,3));
     }
 
     #[tokio::test]
@@ -352,7 +499,10 @@ mod tests {
         let result = run(
             &"f".repeat(64),
             |_| Ok(None),
-            |_, _| panic!("infrastructure is not invalid candidate"),
+            |_,raw| {
+                assert!(serde_json::from_str::<MeasurementIntent>(raw).is_ok(),"infrastructure consumed a semantic correction slot");
+                Ok(())
+            },
             |slot, _, _| async move { Ok(slot) },
             |_| async {
                 Err::<(), _>(
@@ -472,7 +622,7 @@ mod tests {
             assert_eq!(
                 store
                     .query_connection(|conn| Ok(conn.query_row(
-                        "SELECT COUNT(*) FROM scope_stage_response",
+                        "SELECT COUNT(*) FROM scope_stage_response WHERE json_extract(response,'$.kind')='unexpected-failure'",
                         [],
                         |row| row.get::<_, u32>(0)
                     )?))
@@ -511,7 +661,7 @@ mod tests {
             );
         }
         assert_eq!(observations.load(Ordering::SeqCst), 6);
-        assert_eq!(rows.lock().unwrap().len(), 6);
+        assert_eq!(record_counts(&rows.lock().unwrap()),(6,6));
         let result = run(
             &"8".repeat(64),
             |_| Ok(Some("{malformed".into())),
@@ -572,8 +722,9 @@ mod tests {
                     .scope_stage_response(&lease, &binding, key, now + 1)
             },
             |key, raw| {
-                if phase == Some("before-failure") {
-                    crash_marker(root, "before-failure");
+                let intent=serde_json::from_str::<MeasurementIntent>(raw).is_ok();
+                if (phase==Some("before-failure") && !intent) || (phase==Some("before-intent") && intent) {
+                    crash_marker(root, phase.unwrap());
                     std::process::exit(73);
                 }
                 store.lock().unwrap().record_scope_stage_response(
@@ -583,8 +734,8 @@ mod tests {
                     raw,
                     now + 1,
                 )?;
-                if phase == Some("after-failure") {
-                    crash_marker(root, "after-failure");
+                if (phase==Some("after-failure") && !intent) || (phase==Some("after-intent") && intent) {
+                    crash_marker(root, phase.unwrap());
                     std::process::exit(73);
                 }
                 Ok(())
@@ -646,6 +797,8 @@ mod tests {
             panic!("fixture did not reach original crash point");
         }
         for phase in [
+            "before-intent",
+            "after-intent",
             "before-failure",
             "after-failure",
             "after-response",

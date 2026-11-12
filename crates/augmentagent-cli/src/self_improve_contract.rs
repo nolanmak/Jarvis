@@ -17,6 +17,9 @@ mod amendment;
 mod scope_authority;
 #[path = "self_improve_baseline_repair.rs"]
 mod initial_repair;
+#[path = "self_improve_verifier_execution.rs"]
+mod verifier_execution;
+pub(super) use verifier_execution::recover_original_verifier;
 #[path = "self_improve_baseline_witness.rs"]
 mod baseline_witness;
 #[path = "self_improve_verifier_checkout.rs"]
@@ -369,7 +372,16 @@ pub(super) async fn register_and_reproduce(
     proposal: ContractProposal,
     audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<BaselineEvidence> {
-    let evidence=register_and_observe(root,proposal,audit).await?;
+    reproduce_observation(register_and_observe(root,proposal,audit).await?)
+}
+
+async fn register_and_reproduce_original(root:&Path,proposal:ContractProposal,audit:Arc<augmentagent_channel_core::AuditLogger>,original:verifier_execution::OriginalExecution<'_>)->Result<BaselineEvidence> {
+    let observed=register_and_observe_with_custody(root,proposal,&audit,Some(&original)).await?;
+    original.retain_result(root,&observed).map_err(|error|error.context(initial_repair::Hold::EvidenceUnknown))?;
+    reproduce_observation(observed)
+}
+
+fn reproduce_observation(evidence:BaselineEvidence)->Result<BaselineEvidence> {
     match evidence.registration.baseline_result(&evidence.receipts)? {
         BaselineResult::Reproduced=>Ok(evidence),
         result=> {
@@ -383,6 +395,10 @@ pub(super) async fn register_and_reproduce(
     }
 }
 async fn register_and_observe(root:&Path,proposal:ContractProposal,audit:&Arc<augmentagent_channel_core::AuditLogger>)->Result<BaselineEvidence> {
+    register_and_observe_with_custody(root,proposal,audit,None).await
+}
+
+async fn register_and_observe_with_custody(root:&Path,proposal:ContractProposal,audit:&Arc<augmentagent_channel_core::AuditLogger>,original:Option<&verifier_execution::OriginalExecution<'_>>)->Result<BaselineEvidence> {
     let status = Command::new("/usr/bin/git")
         .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(root)
@@ -398,7 +414,7 @@ async fn register_and_observe(root:&Path,proposal:ContractProposal,audit:&Arc<au
     install_harness(root, &proposal)?;
     let registration =
         RegisteredContract::register(root, proposal.contract, head, environment_id(root)?)?;
-    let receipts = execute_registered(root, &registration, audit).await?;
+    let receipts = execute_registered_with_custody(root, &registration, audit,original).await?;
     Ok(BaselineEvidence {registration,receipts})
 }
 /// Persist only under controller-owned state outside every admitted worker
@@ -409,7 +425,12 @@ pub(super) fn persist_baseline(
     writable_roots: &[PathBuf],
 ) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    persist_baseline_with_writer(path,evidence,writable_roots,|file,bytes| {file.write_all(bytes)?;Ok(())})
+}
+
+fn persist_baseline_with_writer(path:&Path,evidence:&BaselineEvidence,writable_roots:&[PathBuf],
+    write:impl FnOnce(&mut std::fs::File,&[u8])->Result<()>)->Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let parent = path
         .parent()
         .context("evidence parent missing")?
@@ -421,16 +442,36 @@ pub(super) fn persist_baseline(
         );
     }
     let destination = parent.join(path.file_name().context("evidence filename missing")?);
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(destination)?;
-    file.write_all(&serde_json::to_vec(evidence)?)?;
-    file.sync_all()?;
+    // An interrupted write must never occupy the content-addressed final
+    // name. Recovery may recreate it from the protected original result.
+    let mut file=tempfile::NamedTempFile::new_in(&parent)?;
+    file.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    write(file.as_file_mut(),&serde_json::to_vec(evidence)?)?;
+    file.as_file().sync_all()?;
+    publish_baseline_exclusive(file.path(),&destination)?;
     std::fs::File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+/// The reader requires exactly one link. A link-then-unlink emulation can
+/// strand a published file with two links after process loss or unlink error.
+/// Require the native exclusive rename and fail before publishing otherwise.
+fn publish_baseline_exclusive(source:&Path,destination:&Path)->Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let source=std::ffi::CString::new(source.as_os_str().as_bytes())?;
+    let destination=std::ffi::CString::new(destination.as_os_str().as_bytes())?;
+    #[cfg(target_os="linux")]
+    let result=unsafe {libc::syscall(libc::SYS_renameat2,libc::AT_FDCWD as libc::c_long,source.as_ptr(),
+        libc::AT_FDCWD as libc::c_long,destination.as_ptr(),libc::RENAME_NOREPLACE as libc::c_long)};
+    #[cfg(target_os="macos")]
+    let result=unsafe {libc::renamex_np(source.as_ptr(),destination.as_ptr(),libc::RENAME_EXCL)} as libc::c_long;
+    #[cfg(any(target_os="linux",target_os="macos"))]
+    {
+        if result!=0 {return Err(std::io::Error::last_os_error()).context("atomic exclusive baseline rename failed");}
+        Ok(())
+    }
+    #[cfg(not(any(target_os="linux",target_os="macos")))]
+    bail!("atomic exclusive baseline publication is unavailable on this platform")
 }
 
 /// Install the identical proposal harness in the candidate before building;
@@ -485,10 +526,26 @@ async fn execute_registered(
     registration: &RegisteredContract,
     audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<Vec<VerifierReceipt>> {
+    execute_registered_with_custody(root,registration,audit,None).await
+}
+
+async fn execute_registered_with_custody(root:&Path,registration:&RegisteredContract,audit:&Arc<augmentagent_channel_core::AuditLogger>,original:Option<&verifier_execution::OriginalExecution<'_>>)->Result<Vec<VerifierReceipt>> {
     let root = root.canonicalize()?;
     let head = actual_head(&root).await?;
     let binding = registration.binding(&head)?;
     registration.verify_integrity(&root)?;
+    if let Some(original)=original {original.require_registration(&root,registration)?;}
+    let mut retained=BTreeMap::new();
+    if let Some(original)=original {
+        for verifier in &registration.contract().verifiers {
+            if let Some(observation)=original.captured_observation(&verifier.id)? {
+                retained.insert(verifier.id.clone(),registration.observe(&root,&verifier.id,binding.clone(),&observation)?);
+            }
+        }
+        if retained.len()==registration.contract().verifiers.len() {
+            return Ok(registration.contract().verifiers.iter().map(|v|retained.remove(&v.id).unwrap()).collect());
+        }
+    }
     let target = protected_verifier_target(&root, registration)?;
     // Admission is the same production lease/storage accounting used by gates.
     // Do not recursively invoke cargo-managed.sh while this lease is held.
@@ -496,9 +553,10 @@ async fn execute_registered(
     let committed = verifier_checkout::materialize(&root, &head, registration, &target).await?;
     let mut receipts = Vec::new();
     for verifier in &registration.contract().verifiers {
+        if let Some(receipt)=retained.remove(&verifier.id) {receipts.push(receipt);continue;}
         registration.verify_integrity(&root)?;
         let invocation = verifier.command.invocation()?;
-        let observation = isolated_observation(committed.path(), &target, invocation, audit).await?;
+        let observation = isolated_observation_with_custody(committed.path(), &target, invocation, audit,original.map(|context|(context,verifier.id.as_str()))).await?;
         ensure!(
             actual_head(&root).await? == head,
             "checkout changed while verifying"
@@ -514,6 +572,8 @@ fn protected_verifier_target(root: &Path, registration: &RegisteredContract) -> 
     let key = format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&(
+            "verifier-cache-v2",
+            crate::build_storage::repo_id(root)?,
             registration.contract_hash(),
             &binding.environment_id
         ))?)
@@ -582,15 +642,33 @@ async fn isolated_observation(
     invocation: crate::autoship_contract::Invocation,
     audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<Observation> {
+    isolated_observation_with_custody(root,target,invocation,audit,None).await
+}
+
+struct VerifierRuntime(Option<tempfile::TempDir>);
+impl VerifierRuntime {
+    fn path(&self)->&Path {self.0.as_ref().expect("owned verifier runtime").path()}
+}
+impl Drop for VerifierRuntime {
+    fn drop(&mut self) {
+        if let Some(directory)=self.0.take() {
+            if crate::build_storage::ci_holds::may_cleanup(directory.path()).unwrap_or(false) {drop(directory);}
+            else {let _=directory.keep();tracing::error!("verifier runtime preserved for verified cleanup recovery");}
+        }
+    }
+}
+
+async fn isolated_observation_with_custody(root:&Path,target:&Path,invocation:crate::autoship_contract::Invocation,audit:&Arc<augmentagent_channel_core::AuditLogger>,original:Option<(&verifier_execution::OriginalExecution<'_>,&str)>)->Result<Observation> {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let canonical_target = target.canonicalize()?;
     ensure!(
         !root.starts_with(&canonical_target),
         "build cache cannot contain verifier source"
     );
-    let private = tempfile::Builder::new()
+    let private = VerifierRuntime(Some(tempfile::Builder::new()
         .prefix("autoship-verifier-")
-        .tempdir()?;
+        .tempdir()?));
+    std::fs::set_permissions(private.path(),std::fs::Permissions::from_mode(0o700))?;
     let runtime = private.path().join("runtime");
     std::fs::create_dir(&runtime)?;
     let home = runtime.join("home");
@@ -667,8 +745,26 @@ async fn isolated_observation(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .process_group(0);
-    let (mut child, resources) = augmentagent_channel_core::run_resources::spawn_command(&cmd, Some(audit))?;
-    resources.admit("acceptance_verifier", Some(audit)).await?;
+    let observed=original.is_some() || audit.run_resources_required()
+        || augmentagent_channel_core::run_resources::declared_policy()?.is_some();
+    let mut cleanup=if observed {Some(crate::build_storage::ci_holds::Hold::begin(root,root,private.path(),target,
+        &amendment::digest(&serde_json::to_vec(&(root,target))?))?)}else{None};
+    let capture=original.map(|(context,verifier)|context.capture_path(verifier)).transpose()?;
+    let spawned=if let Some(cleanup)=&cleanup {
+        if let Some(capture)=&capture {augmentagent_channel_core::run_resources::spawn_recorded_command_at(&cmd,Some(audit),cleanup.supervisor(),capture)}
+        else {augmentagent_channel_core::run_resources::spawn_command_at(&cmd,Some(audit),cleanup.supervisor())}
+    } else {augmentagent_channel_core::run_resources::spawn_command(&cmd,Some(audit))};
+    let (mut child,resources)=match spawned {
+        Ok(spawned)=>spawned,
+        Err(error)=>{if let Some(cleanup)=&mut cleanup {cleanup.not_spawned()?;}return Err(error);},
+    };
+    if let Some(cleanup)=&mut cleanup {
+        resources.admit_with_observer("acceptance_verifier",Some(audit),|admission| {
+            cleanup.bind(admission)?;
+            if let Some((context,verifier))=original {context.admitted(verifier,admission)?;}
+            Ok(())
+        }).await?;
+    } else {resources.admit("acceptance_verifier",Some(audit)).await?;}
     drop(child.stdin.take());
     async fn bounded(reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
@@ -692,9 +788,18 @@ async fn isolated_observation(
         )
     })
     .await;
-    resources.record_outcome("acceptance_verifier", Some(audit))?;
+    let resource_outcome=resources.record_outcome("acceptance_verifier", Some(audit));
+    let quiescence=if let Some((context,verifier))=original {
+        resources.verified_quiescence().and_then(|proof|context.quiescent(verifier,&proof))
+    }else {Ok(())};
+    resource_outcome?;
+    quiescence.map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;
+    if let Some(cleanup)=&mut cleanup {cleanup.settle().map_err(|error|error.context(initial_repair::Hold::InfrastructureUnavailable))?;}
     if invocation.program == "cargo" {
         attest_registry(root, &daemon_home.join(".cargo/registry")).await?;
+    }
+    if let Some((context,verifier))=original {
+        return context.captured_observation(verifier)?.context(initial_repair::Hold::EvidenceUnknown);
     }
     match result {
         Ok((status, stdout, stderr)) => Ok(Observation {
@@ -1194,6 +1299,106 @@ mod initial_diagnostic_tests {
     }
 
     #[tokio::test]
+    async fn legacy_resume_captures_request_context_before_an_enrolled_recovery_hold() {
+        let (root,control,prepared)=baseline_witness::prepared_fixture();let database=control.path().join("workflow.db");
+        let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+            branch:"fixture",contract:"unchanged owner request",environment:"frontend environment"};
+        let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
+        guard.transition(crate::autoship_workflow::Stage::Reconcile,"resume_started","reconcile_main",0).await.unwrap();
+        let id=guard.id().to_owned();guard.finish().unwrap();
+        // Reproduce the deployed schema/state: a frontend-bound resumed
+        // candidate whose generation predates execution-context retention.
+        let conn=rusqlite::Connection::open(&database).unwrap();
+        conn.execute_batch("DROP TABLE qualification_execution_context;").unwrap();drop(conn);
+        let before=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+        let mut resumed=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap()
+            .expect("legacy frontend-bound resume was stranded by new metadata requirements");
+        let store=crate::autoship_workflow::WorkflowStore::open(&database).unwrap();
+        let context=store.recovery_context(&id,resumed.binding()).unwrap().expect("resume did not retain original frontend context");
+        assert_eq!(context.source_request,"unchanged owner request");assert_eq!(context.source_pr,Some(840));
+        resumed.bind_acceptance_for_recovery(&prepared).unwrap();
+        resumed.checkpoint(crate::autoship_workflow::Stage::Reconcile,"resume_started","reconcile_main",0,&[]).await.unwrap();
+        let accounting=resumed.capacity_accounting(true).unwrap();
+        hold_qualification_error(&mut resumed,&prepared,&anyhow::Error::from(initial_repair::Hold::EvidenceUnknown),&accounting).await.unwrap().unwrap();
+        resumed.finish().unwrap();
+        let held=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(held.attempts,before.attempts+1);assert_eq!(held.model_calls,before.model_calls);
+        let context=store.recovery_context(&id,&held.checkpoint.binding).unwrap().unwrap();
+        assert_eq!(context.source_request,"unchanged owner request");
+        assert!(context.contract.starts_with("registered:"));
+        assert!(workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().is_none(),"registered metadata manufactured another changed-input attempt");
+        assert_eq!(store.snapshot(&id).unwrap().unwrap(),held);
+    }
+
+    #[tokio::test]
+    async fn registered_qualification_wait_is_not_a_new_owner_request_after_restart() {
+        let (root,control,prepared)=baseline_witness::prepared_fixture();let database=control.path().join("workflow.db");
+        let start=||workflow::Start {repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+            branch:"fixture",contract:"unchanged owner request",environment:"frontend environment"};
+        let mut guard=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap().unwrap();
+        guard.bind_acceptance_for_recovery(&prepared).unwrap();
+        guard.checkpoint(crate::autoship_workflow::Stage::Reconcile,"resume_started","reconcile_main",0,&[]).await.unwrap();
+        let accounting=guard.capacity_accounting(true).unwrap();
+        hold_qualification_error(&mut guard,&prepared,&anyhow::Error::from(initial_repair::Hold::EvidenceUnknown),&accounting).await.unwrap().unwrap();
+        let id=guard.id().to_owned();guard.finish().unwrap();
+        let before=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+        let retry=workflow::WorkflowGuard::acquire_fixture(&database,start()).await.unwrap();
+        assert!(retry.is_none(),"registered metadata made an unchanged owner request look like changed input");
+        let after=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+        assert_eq!(after.attempts,before.attempts);assert_eq!(after.model_calls,before.model_calls);
+        assert_eq!(after.checkpoint,before.checkpoint);
+    }
+
+    #[tokio::test]
+    async fn qualified_recovery_holds_an_enrolled_reconcile_checkpoint_without_losing_custody() {
+        for paid in [false,true] {
+        let (repo,control,prepared)=baseline_witness::prepared_fixture();
+        let path=control.path().join("workflow.db");
+        let mut guard=workflow::WorkflowGuard::acquire_fixture(&path,workflow::Start {
+            repo_root:repo.path(),worktree:repo.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+            branch:"fixture",contract:"original owner requirements",environment:"fixture",
+        }).await.unwrap().unwrap();
+        guard.bind_acceptance_for_recovery(&prepared).unwrap();
+        guard.checkpoint(crate::autoship_workflow::Stage::Reconcile,"resume_started","reconcile_main",0,&["original-enrolled-evidence".into()]).await.unwrap();
+        let accounting=guard.capacity_accounting(true).unwrap();
+        if paid {
+            use augmentagent_channel_core::{native_session,ProviderKind};
+            native_session::fresh_review_scope(ProviderKind::Codex,async {
+                let session=native_session::current_for(ProviderKind::Codex)?.unwrap();
+                let mut native=session.begin(ProviderKind::Codex)?;
+                guard.audit_logger().model_call_admitted("codex")?;
+                native.observe("scripted-original-enrolled-qualification")?;native.finish()?;
+                Ok::<(),anyhow::Error>(())
+            }).await.unwrap();
+        }
+        let before=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        let error=anyhow::Error::from(initial_repair::Hold::EvidenceUnknown).context("PRIVATE_ENROLLED_EVIDENCE_DIAGNOSIS");
+        assert!(hold_initial_error(&mut guard,&error).await.is_err(),"the initial-enrollment fence must remain strict");
+        let report=hold_qualification_error(&mut guard,&prepared,&error,&accounting).await.expect("enrolled qualification failure must report a deterministic hold, not throw an unenrolled-scope assertion").unwrap();
+        assert_eq!(report.message,initial_repair::Hold::EvidenceUnknown.to_string());
+        assert_eq!(report.billed,paid,"hold lost original actual admission accounting");
+        let events=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().events(guard.id()).unwrap().len();
+        hold_qualification_error(&mut guard,&prepared,&error,&accounting).await.unwrap().unwrap();
+        assert_eq!(crate::autoship_workflow::WorkflowStore::open(&path).unwrap().events(guard.id()).unwrap().len(),events,"identical hold replay fabricated progress");
+        let after=crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        assert_eq!(after.checkpoint.binding,before.checkpoint.binding);
+        assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+        assert_eq!(after.model_calls,before.model_calls);
+        assert_eq!(after.checkpoint.next.reason,"acceptance_verifier_evidence_unknown");
+        assert_eq!(after.checkpoint.next.action,"await_original_evidence_recovery");
+        let conn=rusqlite::Connection::open(&path).unwrap();
+        let public:String=conn.query_row("SELECT COALESCE(group_concat(payload),'') FROM workflow_progress_event WHERE workflow=?1",[guard.id()],|r|r.get(0)).unwrap();
+        assert!(!public.contains("PRIVATE_ENROLLED_EVIDENCE_DIAGNOSIS"),"private enrolled diagnosis escaped into public progress");
+        assert!(guard.audit_logger().model_call_admitted("codex").is_err(),"held qualification metadata authorized a paid builder");
+        assert_eq!(crate::autoship_workflow::WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,before.model_calls);
+        let id=guard.id().to_owned();guard.finish().unwrap();
+        assert!(crate::autoship_workflow::WorkflowStore::open(&path).unwrap()
+            .claim_productive(&id,"unchanged-retry",chrono::Utc::now().timestamp_millis(),1_000).unwrap().is_none(),
+            "released enrolled evidence hold admitted another unchanged productive claim");
+        }
+    }
+
+    #[tokio::test]
     async fn initial_private_diagnostics_are_durable_deduplicated_and_absent_from_public_progress() {
         let (_repo,control,mut guard)=fixture().await;
         let private="PRIVATE_DIAGNOSTIC_SENTINEL: original source selection failed";
@@ -1246,7 +1451,8 @@ pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,err
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
     // Record the safe hold first: loss of private diagnostic storage cannot
     // make the workflow runnable or publish the underlying source/output.
-    workflow.hold_initial_acceptance(hold.reason(),hold.action()).await?;
+    let original=error.downcast_ref::<verifier_execution::OriginalExecutionFailed>().map(|failure|failure.plan.as_str());
+    workflow.hold_initial_acceptance_verifier(hold.reason(),hold.action(),native_custody_failure(error),original).await?;
     let diagnostic=format!("{error:#}");
     let key=amendment::digest(&serde_json::to_vec(&(
         "initial-acceptance-diagnostic-v1",workflow.id(),workflow.binding(),hold.reason(),
@@ -1260,6 +1466,29 @@ pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,err
     workflow.record_scope_stage_response(&key,&serde_json::to_string(&record)?)
         .map_err(|_|anyhow::Error::from(initial_repair::Hold::EvidenceUnknown))?;
     Ok(Some(RunReport::held(hold.to_string())))
+}
+
+/// A recovery controller can fail before an executor produces its typed
+/// failure. Retain the original plan in that case; losing it strands the hold.
+pub(super) async fn hold_recovery_error(workflow:&mut workflow::WorkflowGuard,error:&anyhow::Error,plan:&str)->Result<()> {
+    let hold=error.downcast_ref::<initial_repair::Hold>().copied().unwrap_or(initial_repair::Hold::InfrastructureUnavailable);
+    workflow.hold_initial_acceptance_verifier(hold.reason(),hold.action(),false,Some(plan)).await
+}
+
+pub(super) async fn hold_qualification_error(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,error:&anyhow::Error,accounting:&workflow::CapacityAccounting)->Result<Option<RunReport>> {
+    let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
+    workflow.hold_enrolled_acceptance_custody(prepared,hold.reason(),hold.action(),native_custody_failure(error)).await?;
+    let diagnostic=format!("{error:#}");
+    let key=amendment::digest(&serde_json::to_vec(&("enrolled-qualification-diagnostic-v1",workflow.id(),workflow.binding(),hold.reason(),amendment::digest(diagnostic.as_bytes())))?);
+    let record=serde_json::json!({"version":1,"kind":"enrolled_qualification_diagnostic","workflow":workflow.id(),"binding":workflow.binding(),"reason":hold.reason(),"diagnostic":diagnostic});
+    workflow.record_scope_stage_response(&key,&serde_json::to_string(&record)?)
+        .map_err(|_|anyhow::Error::from(initial_repair::Hold::EvidenceUnknown))?;
+    Ok(Some(accounting.retry_report(hold.to_string())?))
+}
+
+fn native_custody_failure(error:&anyhow::Error)->bool {
+    error.downcast_ref::<scope_authority::NativeCustodyUnavailable>().is_some()
+        || error.downcast_ref::<crate::autoship_workflow::NativeScopeOutcomeUnresolved>().is_some()
 }
 
 async fn initial_baseline_candidates(root:&Path,control:&Path,source:AcceptanceSource,base:&str,scope:&str,
@@ -1302,7 +1531,7 @@ async fn initial_baseline_candidates(root:&Path,control:&Path,source:AcceptanceS
             trusted_git(root,&["reset","--hard",base]).await?;
             trusted_git(root,&["clean","-fdx"]).await?;
             let baseline=retain_initial_measurement(root,control,&proposal,workflow,
-                register_and_reproduce(root,proposal.clone(),&workflow.audit_logger())).await?;
+                |original|register_and_reproduce_original(root,proposal.clone(),workflow.audit_logger(),original)).await?;
             let prepared=PreparedAcceptance {proposal,baseline:baseline.clone()};
             baseline_witness::qualify(root,control,&prepared,workflow).await?;
             Ok(baseline)
@@ -1312,10 +1541,10 @@ async fn initial_baseline_candidates(root:&Path,control:&Path,source:AcceptanceS
 /// Retain the actual successful measurement before any qualification model is
 /// admitted. Re-executing after a restart can change stderr/timing digests and
 /// must not turn one original observation into a new paid qualification input.
-async fn retain_initial_measurement<F>(root:&Path,control:&Path,proposal:&ContractProposal,workflow:&workflow::WorkflowGuard,measure:F)->Result<BaselineEvidence>
-where F:std::future::Future<Output=Result<BaselineEvidence>> {
+async fn retain_initial_measurement<'a,F,Fut>(root:&Path,control:&Path,proposal:&ContractProposal,workflow:&'a workflow::WorkflowGuard,measure:F)->Result<BaselineEvidence>
+where F:FnOnce(verifier_execution::OriginalExecution<'a>)->Fut,Fut:std::future::Future<Output=Result<BaselineEvidence>> {
     let base=actual_head(root).await?;let environment=environment_id(root)?;
-    let execution=amendment::digest(&serde_json::to_vec(&(amendment::digest(include_bytes!("autoship_contract.rs")),amendment::digest(include_bytes!("self_improve_contract.rs"))))?);
+    let execution=verifier_executor_id()?;
     let key=amendment::digest(&serde_json::to_vec(&("initial-baseline-measurement-v1",&base,&environment,proposal,&execution))?);
     let path=|hash:&str|control.join(format!("baseline-measurement-{key}-{hash}.json"));
     if let Some(hash)=workflow.scope_stage_response(&key).map_err(initial_scope_error)? {
@@ -1331,15 +1560,42 @@ where F:std::future::Future<Output=Result<BaselineEvidence>> {
             Ok(baseline)
         })().map_err(|e|e.context(initial_repair::Hold::EvidenceUnknown));
     }
-    let baseline=measure.await?;
+    let retained=verifier_execution::OriginalExecution::retained_result(root,workflow,proposal,&base,&environment,&execution)?;
+    let baseline=if let Some((_,retained))=retained {reproduce_observation(retained)?} else {
+        let original=verifier_execution::OriginalExecution::begin(workflow,control,proposal,&base,&environment,&execution)?;
+        measure(original.clone()).await.map_err(|error|original.failed(error))?
+    };
+    let retained=(||->Result<BaselineEvidence> {
     ensure!(baseline.registration.contract()==&proposal.contract && baseline.registration.baseline_head()==base
         && baseline.registration.binding(&base)?.environment_id==environment
         && baseline.registration.baseline_result(&baseline.receipts)?==BaselineResult::Reproduced,"executor returned another baseline measurement");
     let bytes=serde_json::to_vec(&baseline)?;let hash=amendment::digest(&bytes);let file=path(&hash);
-    if file.try_exists()? {ensure!(baseline_witness::private_bytes(&file,4*1024*1024)?==bytes,"retained measurement file changed");}
+    if file.try_exists()? {
+        use std::os::unix::fs::OpenOptionsExt;
+        ensure!(baseline_witness::private_bytes(&file,4*1024*1024)?==bytes,"retained measurement file changed");
+        // A previous publication may have returned after a directory-sync
+        // failure. Establish durability before committing its SQLite index.
+        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(&file)?.sync_all()?;
+        std::fs::File::open(file.parent().context("measurement parent missing")?)?.sync_all()?;
+    }
     else {persist_baseline(&file,&baseline,&worker_roots(root))?;}
     workflow.record_scope_stage_response(&key,&hash)?;
     Ok(baseline)
+    })();
+    retained.map_err(|error|verifier_execution::result_retention_failure(workflow,proposal,&base,&environment,&execution,error))
+}
+
+fn verifier_executor_id()->Result<String> {
+    let sources:&[&[u8]]=&[
+        include_bytes!("autoship_contract.rs"),include_bytes!("self_improve_contract.rs"),
+        include_bytes!("self_improve_verifier_execution.rs"),include_bytes!("self_improve_verifier_capture.rs"),
+        include_bytes!("self_improve_verifier_checkout.rs"),include_bytes!("../../../scripts/codex-command-sandbox.py"),
+        include_bytes!("../../augmentagent-channel-core/src/process_tree.rs"),
+        include_bytes!("../../augmentagent-channel-core/src/run_resources.rs"),
+        include_bytes!("../../../scripts/run-resource-scope.py"),
+        include_bytes!("../../../scripts/provider-supervisor.py"),
+    ];
+    Ok(amendment::digest(&serde_json::to_vec(&sources.iter().map(|source|amendment::digest(source)).collect::<Vec<_>>())?))
 }
 
 /// `base` comes from the workflow's saved pre-builder base, NEVER current
@@ -2762,6 +3018,19 @@ mod control_namespace_tests {
 #[cfg(test)]
 mod verifier_cache_tests {
     use super::*;
+    #[tokio::test]
+    async fn verifier_cache_separates_repositories_and_reuses_their_worktrees() {
+        let (first,control,prepared)=baseline_witness::prepared_fixture();
+        let (second,_other_control,other)=baseline_witness::prepared_fixture();
+        assert_eq!(prepared.baseline.registration.contract_hash(),other.baseline.registration.contract_hash());
+        let target=protected_verifier_target(first.path(),&prepared.baseline.registration).unwrap();
+        assert_ne!(target,protected_verifier_target(second.path(),&other.baseline.registration).unwrap(),"separate repository owners received the same verifier target");
+        let linked=control.path().join("linked");let linked_path=linked.to_str().unwrap();
+        trusted_git(first.path(),&["worktree","add","--detach",linked_path,prepared.baseline.registration.baseline_head()]).await.unwrap();
+        assert_eq!(target,protected_verifier_target(&linked,&prepared.baseline.registration).unwrap(),"a worktree lost its repository's warm verifier cache");
+        trusted_git(first.path(),&["worktree","remove","--force",linked_path]).await.unwrap();
+    }
+
     #[test]
     fn verifier_cache_is_a_distinct_sibling_and_symlink_alias_is_refused() {
         let parent = tempfile::tempdir().unwrap();

@@ -1147,7 +1147,7 @@ mod tests {
     #[test]
     fn workflow_metrics_read_worker_store_and_cap_without_creating_a_fallback_store() {
         use crate::autoship_workflow::{Binding,Stage,WorkflowStore};
-        let root=tempfile::tempdir().unwrap();let path=root.path().join("worker.db");
+        let root=tempfile::tempdir().unwrap();let path=root.path().canonicalize().unwrap().join("worker.db");
         let mut store=WorkflowStore::open(&path).unwrap();
         store.register("owner/repo#1","fix",Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()},10).unwrap();
         let lease=store.claim("owner/repo#1","worker",20,60_000).unwrap().unwrap();
@@ -1166,8 +1166,8 @@ mod tests {
     #[test]
     fn worker_selected_store_supplies_both_allowance_and_capacity_metrics() {
         use crate::autoship_workflow::{Binding,WorkflowStore};
-        let root=tempfile::tempdir().unwrap();let worker=root.path().join("worker.db");
-        let decoy=root.path().join("observer.db");
+        let root=tempfile::tempdir().unwrap();let canonical=root.path().canonicalize().unwrap();let worker=canonical.join("worker.db");
+        let decoy=canonical.join("observer.db");
         let mut store=WorkflowStore::open(&worker).unwrap();
         store.register("owner/repo#1","fix",Binding{head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()},10).unwrap();
         let lease=store.claim("owner/repo#1","worker",20,60_000).unwrap().unwrap();
@@ -1188,7 +1188,7 @@ mod tests {
     fn worker_metric_read_errors_do_not_discard_the_other_observation() {
         use crate::autoship_workflow::{Binding,WorkflowStore};
         for break_capacity in [true,false] {
-            let root=tempfile::tempdir().unwrap();let path=root.path().join("worker.db");
+            let root=tempfile::tempdir().unwrap();let path=root.path().canonicalize().unwrap().join("worker.db");
             let mut store=WorkflowStore::open(&path).unwrap();
             store.register("owner/repo#1","fix",Binding{head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()},10).unwrap();
             let db=rusqlite::Connection::open(&path).unwrap();

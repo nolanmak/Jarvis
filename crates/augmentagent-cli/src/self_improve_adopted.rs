@@ -239,6 +239,7 @@ pub(super) async fn resume(
         &request,
         &environment,
         &mut guard,
+        &capacity_accounting,
     )
     .await;
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
@@ -293,6 +294,7 @@ async fn execute(
     request: &str,
     environment: &str,
     guard: &mut workflow::WorkflowGuard,
+    capacity_accounting:&workflow::CapacityAccounting,
 ) -> Result<RunReport> {
     let source = AcceptanceSource::PullRequest(pr.pr);
     let grounding=match acceptance::readiness::assess_pr(worktree,pr,guard).await? {
@@ -323,7 +325,7 @@ async fn execute(
         },
     };
     if let Err(error)=acceptance::qualify_or_amend(reasoner,source,&pr.title,worktree,&control,&mut prepared,guard).await {
-        if let Some(report)=acceptance::hold_initial_error(guard,&error).await? {return Ok(report);}
+        if let Some(report)=acceptance::hold_qualification_error(guard,&prepared,&error,capacity_accounting).await? {return Ok(report);}
         return Err(error);
     }
     guard.bind_acceptance(&prepared,&control)?;

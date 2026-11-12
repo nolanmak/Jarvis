@@ -88,6 +88,7 @@ pub(super) struct WorkflowGuard {
     worktree: PathBuf,
     contract: String,
     environment: String,
+    source_request:Option<(String,Option<u64>)>,
     binding: Binding,
     heartbeat: tokio_util::sync::CancellationToken,
     lease_failure: Arc<Mutex<Option<String>>>,
@@ -105,6 +106,9 @@ enum AcceptanceAuthority {
     RecoveryOnly,
     Qualified {prepared:acceptance::PreparedAcceptance,control:PathBuf},
 }
+
+#[derive(Clone,Copy,PartialEq,Eq)]
+enum AcquireMode {Productive,OwnerTurn,VerifierRecovery}
 
 fn source_from_workflow(id:&str)->Option<crate::autoship_contract::AcceptanceSource> {
     use crate::autoship_contract::AcceptanceSource;
@@ -479,6 +483,7 @@ impl SweepGuard {
             worktree: PathBuf::new(),
             contract: String::new(),
             environment: String::new(),
+            source_request:None,
             binding,
             heartbeat: tokio_util::sync::CancellationToken::new(),
             lease_failure: Arc::new(Mutex::new(None)),
@@ -675,12 +680,19 @@ impl WorkflowGuard {
     }
 
     pub(super) async fn acquire_owner_turn(start:Start<'_>)->Result<Option<Self>> {
-        Self::acquire_mode_at(&path(),start,millis(),true).await
+        Self::acquire_mode_at(&path(),start,millis(),AcquireMode::OwnerTurn).await
+    }
+    pub(super) async fn acquire_verifier_recovery(start:Start<'_>)->Result<Option<Self>> {
+        Self::acquire_mode_at(&path(),start,millis(),AcquireMode::VerifierRecovery).await
+    }
+    #[cfg(test)]
+    pub(super) async fn acquire_verifier_recovery_fixture(state:&Path,start:Start<'_>)->Result<Option<Self>> {
+        Self::acquire_mode_at(state,start,millis(),AcquireMode::VerifierRecovery).await
     }
     async fn acquire_at(state: &Path, start: Start<'_>, now: i64) -> Result<Option<Self>> {
-        Self::acquire_mode_at(state,start,now,false).await
+        Self::acquire_mode_at(state,start,now,AcquireMode::Productive).await
     }
-    async fn acquire_mode_at(state:&Path,start:Start<'_>,now:i64,owner_turn:bool)->Result<Option<Self>> {
+    async fn acquire_mode_at(state:&Path,start:Start<'_>,now:i64,mode:AcquireMode)->Result<Option<Self>> {
         anyhow::ensure!(
             !start.repository.trim().is_empty(),
             "canonical repository required"
@@ -703,26 +715,51 @@ impl WorkflowGuard {
             )?
         };
         let existing = store.snapshot(&id)?;
+        let context=if let Some(snapshot)=&existing {
+            let relevant=snapshot.checkpoint.stage==Stage::Scope || snapshot.checkpoint.next.reason=="original_native_custody_recovered"
+                || snapshot.checkpoint.next.reason=="original_verifier_measurement_recovered";
+            if relevant {store.recovery_context(&id,&snapshot.checkpoint.binding)?}else{None}
+        }else{None};
+        let context=context.filter(|context|context.source_request==start.contract
+            && context.worktree.canonicalize().ok()==start.worktree.canonicalize().ok()
+            && (context.contract.starts_with("registered:") || context.environment==start.environment));
+        let contract=context.as_ref().map_or(start.contract,|c|c.contract.as_str());
+        let environment=context.as_ref().map_or(start.environment,|c|c.environment.as_str());
         let receipts = existing
             .as_ref()
             .map(|s| s.checkpoint.evidence.clone())
             .unwrap_or_default();
         let mut binding =
-            git_binding(start.worktree, start.contract, start.environment, &receipts).await?;
+            git_binding(start.worktree, contract, environment, &receipts).await?;
         if existing
             .as_ref()
             .is_some_and(|s| s.checkpoint.binding != binding)
         {
-            binding = git_binding(start.worktree, start.contract, start.environment, &[]).await?;
+            binding = git_binding(start.worktree, contract, environment, &[]).await?;
         }
-        if owner_turn {
+        if mode==AcquireMode::OwnerTurn {
             anyhow::ensure!(existing.as_ref().is_some_and(|s|s.checkpoint.binding==binding),"owner turn requires the current owned candidate binding");
+        } else if mode==AcquireMode::VerifierRecovery {
+            if !existing.as_ref().is_some_and(|s|s.checkpoint.binding==binding && s.branch==start.branch
+                && s.checkpoint.stage==Stage::Scope && matches!((s.checkpoint.next.reason.as_str(),s.checkpoint.next.action.as_str()),
+                    ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery")|
+                    ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery"))) {return Ok(None);}
         } else {store.register(&id,start.branch,binding.clone(),now)?;}
-        refresh_native_capacity(&mut store,&id,now)?;
+        if mode!=AcquireMode::VerifierRecovery {refresh_native_capacity(&mut store,&id,now)?;}
         let owner=format!("{}:{}",std::process::id(),uuid::Uuid::new_v4());
-        let lease=if owner_turn {store.claim_owner_turn(&id,&owner,now,LEASE_MS)?.map(|turn|turn.lease)}
-            else {store.claim_productive_for_binding(&id,&owner,now,LEASE_MS,&binding)?};
+        let lease=match mode {
+            AcquireMode::OwnerTurn=>store.claim_owner_turn(&id,&owner,now,LEASE_MS)?.map(|turn|turn.lease),
+            AcquireMode::VerifierRecovery=>store.claim_reconciliation(&id,&owner,now,LEASE_MS)?,
+            AcquireMode::Productive=>store.claim_productive_recovering_custody(&id,&owner,now,LEASE_MS,&binding,start.worktree,acceptance::require_retained_native_custody)?,
+        };
         let Some(lease)=lease else {return Ok(None);};
+        if mode==AcquireMode::VerifierRecovery {
+            match store.original_verifier_recovery_plan(&lease,&binding,now) {
+                Ok(Some(_))=>{},
+                Ok(None)=>{store.release(&lease,now)?;return Ok(None);},
+                Err(error)=>{store.release(&lease,now)?;return Err(error);},
+            }
+        }
         if let Some(pr) = start.pr {
             store.attach_pr_in_repo(&lease, start.repository, pr, now)?;
         }
@@ -750,18 +787,24 @@ impl WorkflowGuard {
         }
         let audit = acquire_audit_generation(state, &mut store, &lease,
             Some(start.worktree), &mut binding, now)?;
-        audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
-            workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
-        })?;
-        store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
+        if mode!=AcquireMode::VerifierRecovery {
+            audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
+                workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
+            })?;
+            store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
+        }
+        let acceptance_authority=if mode==AcquireMode::VerifierRecovery || snapshot.checkpoint.next.reason=="original_native_custody_recovered" {
+            AcceptanceAuthority::RecoveryOnly
+        }else {AcceptanceAuthority::Unbound};
         let guard = Self {
             audit,
             store: Arc::new(Mutex::new(store)),
             lease,
             repository: start.repository.into(),
             worktree: start.worktree.into(),
-            contract: start.contract.into(),
-            environment: start.environment.into(),
+            contract: contract.into(),
+            environment: environment.into(),
+            source_request:Some((start.contract.into(),context.as_ref().map_or(start.pr,|context|context.source_pr))),
             binding,
             heartbeat: tokio_util::sync::CancellationToken::new(),
             lease_failure: Arc::new(Mutex::new(None)),
@@ -769,10 +812,15 @@ impl WorkflowGuard {
             accounted_ms: Arc::new(AtomicU64::new(0)),
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
             released: false,
-            acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
+            acceptance_authority:Arc::new(Mutex::new(acceptance_authority)),
             acceptance_source:source_from_workflow(&id),
         };
         guard.install_model_accounting()?;
+        if let Some(context)=guard.execution_context(&guard.binding)? {
+            let result=guard.store.lock().map_err(|_|anyhow::anyhow!("workflow context lock poisoned"))?
+                .record_recovery_context(&guard.lease,&guard.binding,&context,now);
+            if let Err(error)=result {guard.finish()?;return Err(error);}
+        }
         guard.audit_event("workflow_claimed", serde_json::json!({}))?;
         guard.spawn_renewal();
         let _ = start.repo_root; // Kept explicit: caller owns repository/worktree provenance validation.
@@ -934,7 +982,7 @@ impl WorkflowGuard {
             workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
         })?;
         store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
-        let guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),binding,
+        let guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),source_request:None,binding,
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
             acceptance_source:None,
             heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false };
@@ -1140,14 +1188,14 @@ impl WorkflowGuard {
         self.audit_health().await?;
         let binding =
             git_binding(&self.worktree, &self.contract, &self.environment, evidence).await?;
+        let context=self.execution_context(&binding)?;
         let now = millis();
         let mut store = self
             .store
             .lock()
             .map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?;
-        store.checkpoint(
-            &self.lease,
-            &Checkpoint {
+        let checkpoint=
+            Checkpoint {
                 stage,
                 binding: binding.clone(),
                 evidence: evidence.to_vec(),
@@ -1156,9 +1204,9 @@ impl WorkflowGuard {
                     action: action.into(),
                     eligible_at_ms,
                 },
-            },
-            now,
-        )?;
+            };
+        if let Some(context)=&context {store.checkpoint_with_execution_context(&self.lease,&checkpoint,context,now)?;}
+        else {store.checkpoint(&self.lease,&checkpoint,now)?;}
         charge_elapsed(
             &mut store,
             &self.lease,
@@ -1172,6 +1220,13 @@ impl WorkflowGuard {
             serde_json::json!({"stage":stage,"reason":reason,"next_action":action}),
         )?;
         Ok(())
+    }
+
+    fn execution_context(&self,binding:&Binding)->Result<Option<durable::RecoveryContext>> {
+        let Some((request,pr))=&self.source_request else{return Ok(None)};
+        Ok(Some(durable::RecoveryContext {version:1,workflow:self.id().into(),repository:self.repository.clone(),
+            worktree:self.worktree.canonicalize()?,source_request:request.clone(),source_pr:*pr,
+            contract:self.contract.clone(),environment:self.environment.clone(),binding:binding.clone()}))
     }
 
     /// Check immediately before gh/git side effects. Also pass GitHub the
@@ -1361,6 +1416,14 @@ impl WorkflowGuard {
     }
 
     pub(super) async fn hold_initial_acceptance(&mut self,reason:&str,action:&str)->Result<()> {
+        self.hold_initial_acceptance_custody(reason,action,false).await
+    }
+
+    pub(super) async fn hold_initial_acceptance_custody(&mut self,reason:&str,action:&str,physical:bool)->Result<()> {
+        self.hold_initial_acceptance_verifier(reason,action,physical,None).await
+    }
+
+    pub(super) async fn hold_initial_acceptance_verifier(&mut self,reason:&str,action:&str,physical:bool,plan:Option<&str>)->Result<()> {
         self.healthy_lease()?;
         self.audit_health().await?;
         let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
@@ -1369,11 +1432,30 @@ impl WorkflowGuard {
             && checkpoint.stage==Stage::Reconcile && checkpoint.next.reason=="inputs_changed";
         anyhow::ensure!(checkpoint.binding==self.binding && (matches!(checkpoint.stage,Stage::Intake|Stage::Scope) || readiness_reassessment),
             "initial acceptance hold requires unchanged unenrolled scope");
-        if checkpoint.stage==Stage::Scope && checkpoint.next.reason==reason && checkpoint.next.action==action
-            && checkpoint.next.eligible_at_ms==0 {return Ok(());}
         checkpoint.stage=Stage::Scope;
         checkpoint.next=crate::autoship_workflow::NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0};
-        store.checkpoint(&self.lease,&checkpoint,millis())?;
+        store.checkpoint_verifier_recovery_hold(&self.lease,&checkpoint,millis(),physical,plan)?;
+        Ok(())
+    }
+
+    /// Qualification recovery holds already-enrolled work without turning its
+    /// candidate binding into an unenrolled initial scope or granting a builder.
+    pub(super) async fn hold_enrolled_acceptance(&mut self,prepared:&acceptance::PreparedAcceptance,reason:&str,action:&str)->Result<()> {
+        self.hold_enrolled_acceptance_custody(prepared,reason,action,false).await
+    }
+
+    pub(super) async fn hold_enrolled_acceptance_custody(&mut self,prepared:&acceptance::PreparedAcceptance,reason:&str,action:&str,physical:bool)->Result<()> {
+        self.healthy_lease()?;
+        self.validate_acceptance_source(prepared)?;
+        self.audit_health().await?;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
+        let mut checkpoint=store.snapshot(self.id())?.context("enrolled acceptance workflow missing")?.checkpoint;
+        anyhow::ensure!(checkpoint.binding==self.binding && matches!(checkpoint.stage,
+            Stage::Intake|Stage::Scope|Stage::Reconcile|Stage::Build|Stage::Verify|Stage::Review),"enrolled acceptance hold binding/stage changed");
+        *self.acceptance_authority.lock().map_err(|_|anyhow::anyhow!("baseline qualification lock poisoned"))?=AcceptanceAuthority::RecoveryOnly;
+        checkpoint.stage=Stage::Scope;
+        checkpoint.next=crate::autoship_workflow::NextAction {reason:reason.into(),action:action.into(),eligible_at_ms:0};
+        store.checkpoint_native_custody_hold(&self.lease,&checkpoint,millis(),physical)?;
         Ok(())
     }
 
@@ -1431,6 +1513,36 @@ impl WorkflowGuard {
     }
     pub(super) fn record_scope_stage_response(&self,key:&str,response:&str)->Result<()> {
         self.validate_before_side_effect()?;self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.record_scope_stage_response(&self.lease,&self.binding,key,response,millis())
+    }
+
+    pub(super) fn record_verifier_evidence(&self,key:&str,kind:&str,body:&str)->Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .record_verifier_evidence(&self.lease,&self.binding,key,kind,body,millis())
+    }
+
+    pub(super) fn original_verifier_recovery_plan(&self)->Result<Option<(String,String)>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .original_verifier_recovery_plan(&self.lease,&self.binding,millis())
+    }
+
+    pub(super) async fn complete_original_verifier_recovery(&self,plan:&str,result:&str)->Result<()> {
+        self.validate_before_side_effect()?;self.audit_health().await?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .complete_original_verifier_recovery(&self.lease,&self.binding,plan,result,millis())
+    }
+
+    pub(super) fn verifier_evidence_page(&self,kind:&str,after:i64)->Result<Vec<durable::VerifierEvidence>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .verifier_evidence_page(&self.lease,&self.binding,kind,after,millis())
+    }
+
+    pub(super) fn verifier_evidence(&self,key:&str,kind:&str)->Result<Option<String>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .verifier_evidence(&self.lease,&self.binding,key,kind,millis())
     }
 
     pub(super) fn scope_stage_response_pair(&self,key:&str,provenance_key:&str)->Result<Option<(String,String)>> {
@@ -2108,7 +2220,7 @@ mod tests {
         let id=store.submit_discord_authorized(&origin,&request,&"a".repeat(64),now).unwrap().admission.workflow;
         let binding=git_binding(dir.path(),"C1","rust-a",&[]).await.unwrap();store.register(&id,"candidate",binding,now).unwrap();
         store.enqueue_owner_message(&durable::discord_ingress::DiscordOrigin {message:45,..origin},&id,"Fix the test",None,now).unwrap();drop(store);
-        let guard=WorkflowGuard::acquire_mode_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:None,pr:Some(42),branch:"candidate",contract:"C1",environment:"rust-a"},millis(),true).await.unwrap().unwrap();
+        let guard=WorkflowGuard::acquire_mode_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:None,pr:Some(42),branch:"candidate",contract:"C1",environment:"rust-a"},millis(),AcquireMode::OwnerTurn).await.unwrap().unwrap();
         guard.audit_logger().dispatch_allowed().unwrap();guard.audit_logger().model_call_admitted("codex").unwrap();
         assert!(guard.intent(OperationKind::Push).is_err());assert!(guard.intent(OperationKind::MergePr).is_err());
         let mut store=WorkflowStore::open(&path).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
@@ -3514,7 +3626,12 @@ mod initial_acceptance_hold_tests {
     use super::*;
     #[tokio::test]
     async fn unchanged_initial_acceptance_wait_does_not_claim_again_after_restart_or_day_change() {
-        for (reason,action) in [("acceptance_verifier_repair_exhausted","await_acceptance_input_change"),("readiness_assessment_invalid","await_readiness_input_change")] {
+        for (reason,action) in [
+            ("acceptance_verifier_repair_exhausted","await_acceptance_input_change"),
+            ("readiness_assessment_invalid","await_readiness_input_change"),
+            ("acceptance_verifier_evidence_unknown","await_original_evidence_recovery"),
+            ("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery"),
+        ] {
             for (issue,pr) in [(Some(7),None),(Some(7),Some(42)),(None,Some(42))] {
                 let repo=tempfile::tempdir().unwrap();let control=tempfile::tempdir_in("/tmp").unwrap();
                 std::fs::write(repo.path().join("implementation.py"),"def add(a,b): return a-b\n").unwrap();

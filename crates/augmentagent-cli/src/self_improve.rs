@@ -65,6 +65,8 @@ mod linked_claim_boundaries;
 mod policy_hold;
 #[path = "self_improve_legacy_readmission.rs"]
 mod legacy_readmission;
+#[path = "self_improve_qualification_reconcile.rs"]
+mod qualification_reconcile;
 #[path = "self_improve_slicing.rs"]
 mod slicing;
 
@@ -975,6 +977,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     // reports would never be reached.
     let ledger = AttemptLedger::load(&attempt_ledger_path());
     let today = utc_day_now();
+    let qualification_retries=qualification_reconcile::issue_retries(repo_root).await.unwrap_or_default();
 
     let (human, research): (Vec<_>, Vec<_>) = rest_issue_candidates(&issues)
         .into_iter()
@@ -984,7 +987,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         // retrying it now would almost certainly lose another to the same
         // one. Spend today's remaining budget on DIFFERENT issues; attempts
         // still accumulate across days toward the gave-up label.
-        if ledger.attempted_today(today, iss.number) {
+        if ledger.attempted_today(today, iss.number) && !qualification_retries.contains(&iss.number) {
             info!(issue = iss.number, "skip: already attempted today (#851 ledger)");
             continue;
         }
@@ -6759,7 +6762,7 @@ async fn resume_draft_pr(
         if !resumed_criteria.contains(&criterion.requirement) { resumed_criteria.push(criterion.requirement.clone()); }
     }
     if let Err(error)=acceptance::qualify_or_amend(reasoner.as_ref(),crate::autoship_contract::AcceptanceSource::Issue(issue.number),&issue.title,&worktree,&acceptance_control,&mut prepared_acceptance,&mut workflow).await {
-        if let Some(report)=acceptance::hold_initial_error(&mut workflow,&error).await? {return Ok(report);}
+        if let Some(report)=acceptance::hold_qualification_error(&mut workflow,&prepared_acceptance,&error,&capacity_accounting).await? {return Ok(report);}
         return Err(error);
     }
     workflow.bind_acceptance(&prepared_acceptance,&acceptance_control)?;
@@ -8280,7 +8283,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         if !criteria.contains(&criterion.requirement) { criteria.push(criterion.requirement.clone()); }
     }
     if let Err(error)=acceptance::qualify_or_amend(reasoner.as_ref(),crate::autoship_contract::AcceptanceSource::Issue(issue.number),&issue.title,&worktree,&acceptance_control,&mut prepared_acceptance,&mut workflow_guard).await {
-        if let Some(report)=acceptance::hold_initial_error(&mut workflow_guard,&error).await? {return Ok(report);}
+        if let Some(report)=acceptance::hold_qualification_error(&mut workflow_guard,&prepared_acceptance,&error,&capacity_accounting).await? {return Ok(report);}
         return Err(error);
     }
     workflow_guard.bind_acceptance(&prepared_acceptance,&acceptance_control)?;
@@ -12051,6 +12054,9 @@ impl AutoPrLoop {
             .context("another auto-ship supervisor is already running")?;
         let (root, dry_run) = (self.repo_root.clone(), self.dry_run);
         let sweep_root = root.clone();
+        let recovery_stop=tokio_util::sync::CancellationToken::new();
+        let recovery=qualification_reconcile::run(root.clone(),dry_run,shutdown.clone(),recovery_stop.clone());
+        tokio::pin!(recovery);
         let canary_stop = shutdown.clone();
         // Observability has its own lifetime: slow/unavailable reviewer probes
         // must not delay merge reconciliation or consume a builder attempt.
@@ -12098,7 +12104,15 @@ impl AutoPrLoop {
                 merged
             }
         });
-        tokio::select! { result = shipping => result, result = canary => result }
+        tokio::select! {
+            result = shipping => {
+                recovery_stop.cancel();
+                if let Err(error)=recovery.await {warn!("qualification recovery ended during drain: {error:#}");}
+                result
+            },
+            result = &mut recovery => result,
+            result = canary => result,
+        }
     }
 
     pub fn with_upgrade_watch(mut self, watch: crate::autoship_worker::UpgradeWatch) -> Self {
@@ -12198,7 +12212,8 @@ impl AutoPrLoop {
                         if self.command_repository.is_none() {
                             let queued = crate::autoship_workflow::WorkflowStore::open_read_only(&self.workflow_path)
                                 .and_then(|store| store.map(|s| -> Result<bool> {
-                                    Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?)
+                                    Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?
+                                        || s.has_due_qualification_recovery(None,(self.clock)().timestamp_millis())?)
                                 }).transpose());
                             match queued {
                                 Ok(Some(true)) => {},
@@ -12217,7 +12232,8 @@ impl AutoPrLoop {
                                 let repository = self.command_repository.as_deref().unwrap();
                                 let now = (self.clock)().timestamp_millis();
                                 Ok(store.command_queue_due(repository, now)?
-                                    || store.has_due_main_reconciliation(Some(repository), now)?)
+                                    || store.has_due_main_reconciliation(Some(repository), now)?
+                                    || store.has_due_qualification_recovery(Some(repository),now)?)
                             })
                                 .transpose().map(|due| due.unwrap_or(false)));
                         match due {
@@ -12428,6 +12444,36 @@ mod tests {
             let (result, ()) = tokio::join!(run, submitted);
             result.unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), usize::from(case == "ready"), "{case}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovered_qualification_wakes_the_normal_worker_without_a_command_job() {
+        use super::*;
+        use crate::autoship_workflow::{Binding,Checkpoint,NextAction,Stage,WorkflowStore};
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        for ready in [true,false] {
+            let state=tempfile::tempdir().unwrap();
+            let mut worker=AutoPrLoop::for_tests("/nonexistent".into(),5,state.path());
+            worker.dry_run=false;worker.command_repository=Some("owner/repo".into());
+            let path=worker.workflow_path.clone();
+            let stop=tokio_util::sync::CancellationToken::new();let timer_stop=stop.clone();
+            let calls=Arc::new(AtomicUsize::new(0));let observed=calls.clone();
+            let recovered=async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let now=chrono::Utc::now().timestamp_millis();let mut store=WorkflowStore::open(&path).unwrap();
+                let binding=Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
+                store.register("owner/repo#7","candidate",binding.clone(),now).unwrap();
+                let lease=store.claim("owner/repo#7","fixture",now,1000).unwrap().unwrap();
+                store.checkpoint(&lease,&Checkpoint {stage:Stage::Reconcile,binding,evidence:vec![],next:NextAction {
+                    reason:if ready {"original_verifier_measurement_recovered"}else{"acceptance_verifier_evidence_unknown"}.into(),
+                    action:if ready {"qualify_original_measurement"}else{"await_original_evidence_recovery"}.into(),eligible_at_ms:now,
+                }},now).unwrap();store.release(&lease,now).unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(26)).await;timer_stop.cancel();
+            };
+            let run=worker.run_with(stop,move || {observed.fetch_add(1,Ordering::SeqCst);async {Ok(RunReport::idle())}},||async{0});
+            let (result,())=tokio::join!(run,recovered);result.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst),usize::from(ready),"qualification recovery waited for the regular poll or woke an unresolved hold");
         }
     }
 

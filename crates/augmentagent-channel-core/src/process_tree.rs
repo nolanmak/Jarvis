@@ -595,38 +595,54 @@ const ADMISSION_WAIT_SECS: u64 = 120;
 /// policy explicitly; Command does not expose whether env_clear was selected.
 pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,false,false,false,None,&[],None)
+    spawn_supervised_inner(command,clear_env,clean,journal,false,false,false,None,&[],None,None)
 }
 pub(crate) fn spawn_admitted(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,None,&[],None)
+    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,None,&[],None,None)
+}
+/// Raw command with externally retained supervisor receipts. Its declared
+/// resource policy is unchanged, and no storage descriptors reach the child.
+pub(crate) fn spawn_admitted_at(command:&Command,clean:Arc<AtomicBool>,required_resources:bool,directory:&std::path::Path)
+    ->std::io::Result<(Child,ProcessGroup)> {
+    spawn_supervised_inner(command,true,clean,None,true,required_resources,false,None,&[],Some(directory),None)
+}
+pub(crate) fn spawn_admitted_recorded_at(command:&Command,clean:Arc<AtomicBool>,required_resources:bool,directory:&std::path::Path,capture:&std::path::Path)
+    ->std::io::Result<(Child,ProcessGroup)> {
+    spawn_supervised_inner(command,true,clean,None,true,required_resources,false,None,&[],Some(directory),Some(capture))
 }
 /// #1627 — admitted spawn under the caller's resource tier. `None` keeps the
 /// supervisor's own declaration lookup (the builder tier).
 pub(crate) fn spawn_admitted_with_policy(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool, policy:Option<&serde_json::Value>)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,policy,&[],None)
+    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,policy,&[],None,None)
 }
 /// Controller-only VM startup capability. Native code cannot run before admission.
 pub(crate) fn spawn_admitted_vm(command: &Command, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, policy:&serde_json::Value)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,true,clean,journal,true,true,true,Some(policy),&[],None)
+    spawn_supervised_inner(command,true,clean,journal,true,true,true,Some(policy),&[],None,None)
 }
 pub(crate) fn spawn_admitted_storage(command: &Command, clean: Arc<AtomicBool>, required_resources: bool,
     storage_files: &[std::fs::File], policy: &serde_json::Value) -> std::io::Result<(Child, ProcessGroup)> {
     if storage_files.is_empty() || storage_files.len() > 64 {
         return Err(std::io::Error::other("invalid inherited storage descriptor set"));
     }
-    spawn_supervised_inner(command, true, clean, None, true, required_resources, false, Some(policy), storage_files,None)
+    spawn_supervised_inner(command, true, clean, None, true, required_resources, false, Some(policy), storage_files,None,None)
 }
 pub(crate) fn spawn_admitted_storage_at(command:&Command,clean:Arc<AtomicBool>,required_resources:bool,
     storage_files:&[std::fs::File],policy:&serde_json::Value,directory:&std::path::Path)
     -> std::io::Result<(Child,ProcessGroup)> {
     if storage_files.is_empty() || storage_files.len()>64 {return Err(std::io::Error::other("invalid inherited storage descriptor set"));}
-    spawn_supervised_inner(command,true,clean,None,true,required_resources,false,Some(policy),storage_files,Some(directory))
+    spawn_supervised_inner(command,true,clean,None,true,required_resources,false,Some(policy),storage_files,Some(directory),None)
 }
-fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool, vm_preflight:bool, composed:Option<&serde_json::Value>, storage_files:&[std::fs::File], directory_override:Option<&std::path::Path>)
+fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool, vm_preflight:bool, composed:Option<&serde_json::Value>, storage_files:&[std::fs::File], directory_override:Option<&std::path::Path>,raw_capture:Option<&std::path::Path>)
     -> std::io::Result<(Child, ProcessGroup)> {
+    if let Some(capture)=raw_capture {
+        private_directory(capture)?;
+        let request:serde_json::Value=serde_json::from_slice(&private_read(&capture.join("request.json"))?).map_err(std::io::Error::other)?;
+        if request["version"]!=1 || request["command"].as_str().is_none_or(|key|key.len()!=64 || !key.bytes().all(|b|b.is_ascii_hexdigit()))
+            || request["output_limit"].as_u64().is_none_or(|limit|limit==0 || limit>8*1024*1024) {return Err(std::io::Error::other("invalid raw capture request"));}
+    }
     let original = command.as_std();
     let program = std::path::Path::new(original.get_program());
     let search = original.get_envs().find(|(key, _)| *key == "PATH")
@@ -666,6 +682,8 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
         if let Some(value) = value { supervised.env(key, value); }
         else { supervised.env_remove(key); }
     }
+    supervised.env_remove("JARVIS_RAW_VERIFIER_CAPTURE");
+    if let Some(capture)=raw_capture {supervised.env("JARVIS_RAW_VERIFIER_CAPTURE",capture);}
     supervised.env_remove("JARVIS_SUPERVISOR_VM_PREFLIGHT");
     supervised.env_remove("JARVIS_NATIVE_VM_READY");
     supervised.env_remove("JARVIS_NATIVE_VM_CONTINUE");
