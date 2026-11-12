@@ -1411,6 +1411,13 @@ pub(super) async fn hold_initial_error(workflow:&mut workflow::WorkflowGuard,err
     Ok(Some(RunReport::held(hold.to_string())))
 }
 
+/// A recovery controller can fail before an executor produces its typed
+/// failure. Retain the original plan in that case; losing it strands the hold.
+pub(super) async fn hold_recovery_error(workflow:&mut workflow::WorkflowGuard,error:&anyhow::Error,plan:&str)->Result<()> {
+    let hold=error.downcast_ref::<initial_repair::Hold>().copied().unwrap_or(initial_repair::Hold::InfrastructureUnavailable);
+    workflow.hold_initial_acceptance_verifier(hold.reason(),hold.action(),false,Some(plan)).await
+}
+
 pub(super) async fn hold_qualification_error(workflow:&mut workflow::WorkflowGuard,prepared:&PreparedAcceptance,error:&anyhow::Error,accounting:&workflow::CapacityAccounting)->Result<Option<RunReport>> {
     let Some(hold)=error.downcast_ref::<initial_repair::Hold>().copied() else{return Ok(None)};
     workflow.hold_enrolled_acceptance_custody(prepared,hold.reason(),hold.action(),native_custody_failure(error)).await?;
@@ -1512,8 +1519,15 @@ where F:FnOnce(verifier_execution::OriginalExecution<'a>)->Fut,Fut:std::future::
 }
 
 fn verifier_executor_id()->Result<String> {
-    Ok(amendment::digest(&serde_json::to_vec(&(amendment::digest(include_bytes!("autoship_contract.rs")),amendment::digest(include_bytes!("self_improve_contract.rs")),
-        amendment::digest(include_bytes!("../../../scripts/provider-supervisor.py"))))?))
+    let sources:&[&[u8]]=&[
+        include_bytes!("autoship_contract.rs"),include_bytes!("self_improve_contract.rs"),
+        include_bytes!("self_improve_verifier_execution.rs"),include_bytes!("self_improve_verifier_capture.rs"),
+        include_bytes!("../../augmentagent-channel-core/src/process_tree.rs"),
+        include_bytes!("../../augmentagent-channel-core/src/run_resources.rs"),
+        include_bytes!("../../../scripts/run-resource-scope.py"),
+        include_bytes!("../../../scripts/provider-supervisor.py"),
+    ];
+    Ok(amendment::digest(&serde_json::to_vec(&sources.iter().map(|source|amendment::digest(source)).collect::<Vec<_>>())?))
 }
 
 /// `base` comes from the workflow's saved pre-builder base, NEVER current

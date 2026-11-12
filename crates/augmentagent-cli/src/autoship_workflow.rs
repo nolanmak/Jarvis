@@ -41,6 +41,9 @@ pub(crate) mod tool_capacity;
 mod capacity_retry;
 #[path = "autoship_qualification_recovery.rs"]
 mod qualification_recovery;
+#[path="autoship_qualification_schedule.rs"]
+mod qualification_schedule;
+pub(crate) use qualification_schedule::{RecoveryContext,RecoveryCandidate};
 #[path = "autoship_verifier_custody.rs"]
 mod verifier_custody;
 pub(crate) use verifier_custody::VerifierEvidence;
@@ -1034,18 +1037,22 @@ impl WorkflowStore {
         checkpoint: &Checkpoint,
         now_ms: i64,
     ) -> Result<()> {
-        self.checkpoint_with_custody_cause(lease,checkpoint,now_ms,None,None)
+        self.checkpoint_with_custody_cause(lease,checkpoint,now_ms,None,None,None)
     }
 
     pub(crate) fn checkpoint_native_custody_hold(&mut self,lease:&Lease,checkpoint:&Checkpoint,now:i64,physical:bool)->Result<()> {
-        self.checkpoint_with_custody_cause(lease,checkpoint,now,Some(physical),None)
+        self.checkpoint_with_custody_cause(lease,checkpoint,now,Some(physical),None,None)
     }
 
     pub(crate) fn checkpoint_verifier_recovery_hold(&mut self,lease:&Lease,checkpoint:&Checkpoint,now:i64,physical:bool,plan:Option<&str>)->Result<()> {
-        self.checkpoint_with_custody_cause(lease,checkpoint,now,Some(physical),plan)
+        self.checkpoint_with_custody_cause(lease,checkpoint,now,Some(physical),plan,None)
     }
 
-    fn checkpoint_with_custody_cause(&mut self,lease:&Lease,checkpoint:&Checkpoint,now_ms:i64,physical:Option<bool>,plan:Option<&str>)->Result<()> {
+    pub(crate) fn checkpoint_with_execution_context(&mut self,lease:&Lease,checkpoint:&Checkpoint,context:&RecoveryContext,now:i64)->Result<()> {
+        self.checkpoint_with_custody_cause(lease,checkpoint,now,None,None,Some(context))
+    }
+
+    fn checkpoint_with_custody_cause(&mut self,lease:&Lease,checkpoint:&Checkpoint,now_ms:i64,physical:Option<bool>,plan:Option<&str>,context:Option<&RecoveryContext>)->Result<()> {
         checkpoint.binding.validate()?;
         ensure!(
             !checkpoint.next.reason.is_empty() && !checkpoint.next.action.is_empty(),
@@ -1094,6 +1101,7 @@ impl WorkflowStore {
             qualification_recovery::record(&tx,lease,&checkpoint,physical,now_ms)?;
             verifier_custody::hold(&tx,lease,&checkpoint,plan,now_ms)?;
         }
+        if let Some(context)=context {qualification_schedule::record_context(&tx,lease,&checkpoint,context,now_ms)?;}
         tx.commit()?;
         Ok(())
     }

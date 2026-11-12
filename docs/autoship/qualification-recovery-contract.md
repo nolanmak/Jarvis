@@ -1,9 +1,10 @@
 # Qualification recovery: source data and durable holds
 
-Status: source replay, the unchanged productive-claim fence and original native
-custody recovery are implemented locally for PR #2035. Verifier-infrastructure
-recovery and fair five-minute wake integration remain load-bearing tasks. This
-is not a restoration, full #1952 closure, or permission to merge known defects.
+Status: source replay, the unchanged productive-claim fence, original native
+custody recovery, original-verifier replay and bounded recovery scheduling are
+implemented locally for PR #2035. Final integration validation, legacy-context
+recovery and the remaining producer/exit audit still block rollout. This is not
+a restoration, full #1952 closure, or permission to merge known defects.
 Parent issues: #2034, #1952 and #1703.
 
 ## Decisions and boundaries
@@ -77,8 +78,8 @@ Owner: the normal workflow controller. Trigger: before #2035 can merge.
 
 - The existing productive-claim fence now covers the two recovery holds. A stale
   preview or a new owner message alone cannot replace missing original results.
-- Native custody uses the protected descriptor and atomic claim described
-  below. Infrastructure recovery still needs its operation-specific record.
+- Native custody uses the protected descriptor and atomic transitions described
+  below. Infrastructure uses the original-plan and result records below.
   Preserve the failed binding and append-only history; do not manufacture a
   changed Git input to force a retry.
 - Recover original native results only after their exact original admission,
@@ -99,9 +100,8 @@ Owner: the normal workflow controller. Trigger: before #2035 can merge.
   final merge reconciliation. Inspection does not create productive progress.
 
 The native-custody path below does not complete infrastructure recovery. The
-original-plan executor and result handoff now have component coverage below;
-all-cause producer coverage and fair scheduling
-remain open. They
+original-plan executor, result handoff and scheduling have component coverage
+below; all-cause producer coverage and legacy-context recovery remain open. They
 must be resolved in code and tests; they are not requests for an owner-selected
 limit or a permission gate. Full #1917 host sizing, productive CLI/Discord and
 #1703 live/soak acceptance remain separate requirements.
@@ -123,13 +123,15 @@ response/provenance pairs; and the normal private-file custody validator.
 Owner pause, active lease, pending mutations and uncertain merge dispatch still
 block claiming. Missing or invalid evidence yields no claim and no new attempt.
 
-A positive inspection atomically claims the next lease and changes the next
-action to `original_native_custody_recovered / requalify_original`, preserving
-binding, evidence and accounting. The recovered guard has recovery-only
-authority: normal current-policy qualification is still required before a
-builder can run. If the worker dies after this transaction, the next normal
-claim resumes requalification. If the transaction itself fails, the original
-hold and descriptor remain available; recovery was not consumed.
+A positive inspection changes the next action to
+`original_native_custody_recovered / requalify_original`, preserving binding,
+evidence and accounting. The scheduler's passive transaction grants no lease
+and changes no attempt or generation. The existing productive-claim path can
+also validate custody and claim a lease in one transaction. Both paths produce
+recovery-only authority: normal current-policy qualification is still required
+before a builder can run. If the worker dies after either transaction, the next
+normal claim resumes requalification. If the transaction itself fails, the
+original hold and descriptor remain available; recovery was not consumed.
 
 A semantic unknown never creates recovery authorization. A later semantic
 unknown in the same lease invalidates the latest physical-cause classification;
@@ -167,7 +169,8 @@ existing response, failed-result and unpersisted-success boundaries.
 
 This is input retention, not a replay permit. The original executor and
 inspection-only replay below bind it to the actual measurement. Unknown-result
-settlement and scheduling still block rollout.
+settlement and scheduling are implemented below; their remaining validation
+and legacy-context requirements still block rollout.
 
 ## Implemented unpaid infrastructure-inspection boundary
 
@@ -261,18 +264,64 @@ Verifier cache names now include storage's canonical Git common-directory
 identity. Worktrees share their repository's cache; identical contracts in
 different repositories cannot collide or bypass ownership checks (#2036).
 
-Recovery is not ready for rollout. Bounded fair five-minute wake/selection and
-fresh source authorization remain unfinished. These component tests do not
-prove unattended selection, independent qualification, publication or merging.
+Recovery is not ready for rollout. The scheduling integration below is local;
+these component tests do not prove unattended selection, independent
+qualification, publication or merging.
+
+## Local scheduling integration
+
+The supervisor runs recovery separately from building, merge reconciliation and
+review canaries. A dedicated owned controller checkout refreshes repository
+identity, write permission, source authorship, lifecycle, source issue and PR
+dependency before dispatch. Issue exclusions and workflow owner pauses remain
+effective. Recovery uses only the retained registered candidate worktree and
+its exact branch, head, contract, environment and evidence. An unpublished head
+also needs the existing retained-candidate record and an ancestor check against
+the current published PR head.
+
+Selection keeps at most four inspections in flight and fills vacancies every
+five minutes. Active workflow IDs are excluded even while source lookup runs
+before a workflow lease exists. Its protected
+event records the binding and selection time before remote lookup, so failed
+lookups rotate too. Selection orders by the oldest last-selection time for that
+binding, then workflow ID; each pass examines at most 128 rows. A selection
+event imposes a five-minute cooldown on the same `(head, contract,
+evidence_hash)` tuple across process restarts. It is not an execution lease and
+does not need a separate release; after the cooldown, a still-due idle hold may
+be selected again. Events compare the three binding fields individually;
+serialized JSON object ordering cannot bypass the delay. Selection neither
+claims a productive attempt nor records productive progress. Each inspection
+has a 45-minute bound including source lookups and admission waits, and a raw
+replay still uses current resource/storage admission. Native
+custody inspection allocates no native runtime. Routine upgrades stop new
+selection and drain admitted inspections; operator shutdown retains the
+existing guarded cleanup and durable capture responsibilities.
+
+The private `qualification_execution_context` table preserves the original
+frontend request and its shape separately from registered contract metadata.
+Checkpoint and execution context commit atomically. Public progress does not
+include the request. A restarted productive guard reuses this context only for
+the same owner request and retained worktree. Positive inspection queues the
+existing normal qualification/correction selector; its wake hint does not
+authorize execution. Recovered work may pass the old daily-refusal selection
+filter, but all productive claims, model accounting, current qualification,
+independent review and merge requirements remain mandatory.
+
+Legacy holds written before this context existed need a verified reconstruction
+from their original protected records. The selector currently skips missing or
+invalid context. A new context must not be guessed from current issue prose or
+used to turn registration metadata into a fictitious owner-input change. This
+is a rollout blocker, owned by the workflow controller, including the existing
+#2014 incident.
 
 ## Open threads from the fresh-eyes checkpoint
 
 All entries are owned by the normal workflow-controller implementation and block
 merging #2035 until resolved and tested:
 
-- Native recovery authorization now has exact failed-binding identity,
-  controller-only cause classification, invalidation and transactional claim
-  consumption. Infrastructure needs equivalent operation-specific authority.
+- Native and infrastructure recovery now have operation-specific protected
+  identity and transactional handoff. Complete the producer/exit audit against
+  every infrastructure failure before treating those paths as covered.
 - Original-operation recovery must distinguish inspection, resumption and
   replay. Unknown prior effects must be settled before replay; successful
   cleanup must be positively observed through the existing execution owner.
@@ -285,8 +334,15 @@ merging #2035 until resolved and tested:
 - Native custody restoration returns only to normal current qualification;
   negative/unknown judgments remain governed by that qualifier. Infrastructure
   recovery must likewise supply no positive witness judgment on its own.
-- Recovery inspection needs persisted fair rotation and a termination bound,
-  preserving time for final merge reconciliation when an inspection stalls.
+- Persisted fair rotation, independent scheduling and the termination bound are
+  implemented locally. Finish integration validation and the final seam audit.
+- Reconstruct legacy execution context from protected original records, with
+  positive and negative migration tests; preserve legacy holds until verified.
+- Verify the exact-plan/attempt command permit at the shared raw-dispatch
+  boundary and document the scope of the no-model guarantee for descendants.
+  The store tests prove that inspection leases cannot authorize audited model
+  admissions or publication; they do not independently prove an OS-level
+  restriction on every action of an arbitrary child program.
 
 Pass A checked this document; Pass B confirmed that the no-model requirement,
 unknown-effects custody and paid-admission accounting remain explicit. This

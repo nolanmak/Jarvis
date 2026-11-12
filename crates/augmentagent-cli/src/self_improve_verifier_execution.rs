@@ -93,7 +93,7 @@ impl<'a> OriginalExecution<'a> {
     }
 
     fn settle_previous_results(workflow:&workflow::WorkflowGuard,current_plan:&str)->Result<Option<String>> {
-        let mut cursor=0;let mut unfinished:BTreeMap<(String,String),Vec<(String,capture::Recovered)>>=BTreeMap::new();
+        let mut cursor=0;let mut unfinished:BTreeMap<(String,String),Vec<(String,bool,String)>>=BTreeMap::new();
         loop {
             let rows=workflow.verifier_evidence_page("original_verifier_command_admission",cursor)?;
             if rows.is_empty(){break;}
@@ -111,14 +111,17 @@ impl<'a> OriginalExecution<'a> {
                 }
                 let captured=admitted.capture.as_ref().context("original command result was not retained")?
                     .read(&row.key,&admitted.identity)?.context("original command result is not yet published")?;
-                unfinished.entry((admitted.plan,admitted.attempt)).or_default().push((row.key,captured));
+                // Stream bytes have already been authenticated. Settlement
+                // needs only terminal status and the manifest reference.
+                let interrupted=captured.observation.interrupted || !captured.observation.output_complete;
+                unfinished.entry((admitted.plan,admitted.attempt)).or_default().push((row.key,interrupted,captured.manifest_sha256));
             }
         }
         let mut resume=None;
         for ((plan,attempt),commands) in unfinished {
-            if commands.iter().any(|(_,result)|result.observation.interrupted || !result.observation.output_complete) {
+            if commands.iter().any(|(_,interrupted,_)|*interrupted) {
                 let key=amendment::digest(&serde_json::to_vec(&("original-verifier-attempt-interrupted-v1",&plan,&attempt))?);
-                let references:Vec<_>=commands.iter().map(|(key,result)|serde_json::json!({"command":key,"manifest_sha256":result.manifest_sha256})).collect();
+                let references:Vec<_>=commands.iter().map(|(key,_,manifest)|serde_json::json!({"command":key,"manifest_sha256":manifest})).collect();
                 workflow.record_verifier_evidence(&key,"original_verifier_attempt_interrupted",&serde_json::json!({"version":1,
                     "kind":"original_verifier_attempt_interrupted","workflow":workflow.id(),"plan":plan,"attempt":attempt,"commands":references}).to_string())?;
             } else if plan==current_plan {
@@ -202,12 +205,12 @@ impl<'a> OriginalExecution<'a> {
                         && result_key(&record.plan,&record.attempt)==row.key,"invalid original verifier result identity");
                     if record.plan!=plan {continue;}
                     ensure!(saved.is_some(),"original result lost its input plan");
-                    install_harness(root,proposal)?;
-                    let registered=RegisteredContract::register(root,proposal.contract.clone(),base.into(),environment.into())?;
-                    ensure!(registered==record.baseline.registration,"retained result differs from original registration");
                     record.baseline.registration.baseline_result(&record.baseline.receipts)?;
                     Self::require_result_commands(workflow,&plan,&record.attempt,&record.baseline)?;
                     if record.baseline.receipts.iter().any(|receipt|receipt.result==crate::autoship_contract::CheckResult::InfrastructureFailure) {continue;}
+                    install_harness(root,proposal)?;
+                    let registered=RegisteredContract::register(root,proposal.contract.clone(),base.into(),environment.into())?;
+                    ensure!(registered==record.baseline.registration,"retained result differs from original registration");
                     if let Some((_,previous))=&conclusive {
                         ensure!(serde_json::to_vec(previous)?==serde_json::to_vec(&record.baseline)?,"original operation has conflicting conclusive results");
                     } else {conclusive=Some((row.key,record.baseline));}
@@ -433,6 +436,46 @@ mod tests {
             assert_eq!(retry.err().expect("changed capture authorized execution").downcast_ref::<initial_repair::Hold>(),Some(&initial_repair::Hold::EvidenceUnknown));
             assert_eq!(guard.verifier_evidence_page("original_verifier_attempt",0).unwrap().len(),1);
             drop(original);guard.finish().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn infrastructure_only_result_does_not_install_a_harness_before_retry() {
+        let (root,control,prepared,guard)=fixture().await;
+        let base=prepared.baseline.registration.baseline_head();let environment=environment_id(root.path()).unwrap();let executor=verifier_executor_id().unwrap();
+        let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,base,&environment,&executor).unwrap();
+        original.retain_admission("observe",&gone_scope()).unwrap();OriginalExecution::quiesce_previous(&guard).unwrap();
+        let observation=Observation {exit_code:None,stdout:String::new(),stderr:"interrupted".into(),interrupted:true,output_complete:false};
+        let mut baseline=prepared.baseline.clone();
+        baseline.receipts=vec![baseline.registration.observe(root.path(),"observe",baseline.registration.binding(base).unwrap(),&observation).unwrap()];
+        assert_eq!(baseline.receipts[0].result,crate::autoship_contract::CheckResult::InfrastructureFailure);
+        original.retain_result(root.path(),&baseline).unwrap();drop(original);
+        for file in prepared.proposal.files.keys() {std::fs::remove_file(root.path().join(file)).unwrap();}
+        assert!(OriginalExecution::retained_result(root.path(),&guard,&prepared.proposal,base,&environment,&executor).unwrap().is_none());
+        for file in prepared.proposal.files.keys() {assert!(!root.path().join(file).exists(),"unusable receipt dirtied the new measurement checkout");}
+        guard.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_recovery_plan_releases_the_unpaid_inspection_lease() {
+        for missing in [false,true] {
+            let (root,control,prepared,mut guard)=fixture().await;let database=control.path().join("workflow.db");
+            let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,prepared.baseline.registration.baseline_head(),"fixture","executor").unwrap();
+            let plan=original.plan.clone();drop(original);
+            guard.hold_initial_acceptance_verifier("acceptance_verifier_infrastructure_unavailable","await_verifier_infrastructure_recovery",false,Some(&plan)).await.unwrap();
+            let id=guard.id().to_owned();guard.finish().unwrap();
+            let conn=rusqlite::Connection::open(&database).unwrap();
+            if missing {conn.execute("DELETE FROM scope_stage_response WHERE workflow=?1 AND key=?2",rusqlite::params![id,plan]).unwrap();}
+            else {conn.execute("UPDATE scope_stage_response SET response='corrupt' WHERE workflow=?1 AND key=?2",rusqlite::params![id,plan]).unwrap();}
+            drop(conn);
+            let retry=workflow::WorkflowGuard::acquire_verifier_recovery_fixture(&database,workflow::Start {
+                repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+                branch:"fixture",contract:"original scope",environment:"test",
+            }).await;
+            assert!(retry.is_err(),"invalid evidence was admitted");
+            let after=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+            assert!(after.lease_until_ms<=chrono::Utc::now().timestamp_millis(),"failed validation stranded a ten-minute lease");
+            assert_eq!(after.attempts,1);assert_eq!(after.model_calls,0);
         }
     }
 

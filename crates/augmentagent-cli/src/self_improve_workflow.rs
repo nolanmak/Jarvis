@@ -88,6 +88,7 @@ pub(super) struct WorkflowGuard {
     worktree: PathBuf,
     contract: String,
     environment: String,
+    source_request:Option<(String,Option<u64>)>,
     binding: Binding,
     heartbeat: tokio_util::sync::CancellationToken,
     lease_failure: Arc<Mutex<Option<String>>>,
@@ -482,6 +483,7 @@ impl SweepGuard {
             worktree: PathBuf::new(),
             contract: String::new(),
             environment: String::new(),
+            source_request:None,
             binding,
             heartbeat: tokio_util::sync::CancellationToken::new(),
             lease_failure: Arc::new(Mutex::new(None)),
@@ -713,17 +715,27 @@ impl WorkflowGuard {
             )?
         };
         let existing = store.snapshot(&id)?;
+        let context=if let Some(snapshot)=&existing {
+            let relevant=snapshot.checkpoint.stage==Stage::Scope || snapshot.checkpoint.next.reason=="original_native_custody_recovered"
+                || snapshot.checkpoint.next.reason=="original_verifier_measurement_recovered";
+            if relevant {store.recovery_context(&id,&snapshot.checkpoint.binding)?}else{None}
+        }else{None};
+        let context=context.filter(|context|context.source_request==start.contract
+            && context.worktree.canonicalize().ok()==start.worktree.canonicalize().ok()
+            && (context.contract.starts_with("registered:") || context.environment==start.environment));
+        let contract=context.as_ref().map_or(start.contract,|c|c.contract.as_str());
+        let environment=context.as_ref().map_or(start.environment,|c|c.environment.as_str());
         let receipts = existing
             .as_ref()
             .map(|s| s.checkpoint.evidence.clone())
             .unwrap_or_default();
         let mut binding =
-            git_binding(start.worktree, start.contract, start.environment, &receipts).await?;
+            git_binding(start.worktree, contract, environment, &receipts).await?;
         if existing
             .as_ref()
             .is_some_and(|s| s.checkpoint.binding != binding)
         {
-            binding = git_binding(start.worktree, start.contract, start.environment, &[]).await?;
+            binding = git_binding(start.worktree, contract, environment, &[]).await?;
         }
         if mode==AcquireMode::OwnerTurn {
             anyhow::ensure!(existing.as_ref().is_some_and(|s|s.checkpoint.binding==binding),"owner turn requires the current owned candidate binding");
@@ -741,8 +753,12 @@ impl WorkflowGuard {
             AcquireMode::Productive=>store.claim_productive_recovering_custody(&id,&owner,now,LEASE_MS,&binding,start.worktree,acceptance::require_retained_native_custody)?,
         };
         let Some(lease)=lease else {return Ok(None);};
-        if mode==AcquireMode::VerifierRecovery && store.original_verifier_recovery_plan(&lease,&binding,now)?.is_none() {
-            store.release(&lease,now)?;return Ok(None);
+        if mode==AcquireMode::VerifierRecovery {
+            match store.original_verifier_recovery_plan(&lease,&binding,now) {
+                Ok(Some(_))=>{},
+                Ok(None)=>{store.release(&lease,now)?;return Ok(None);},
+                Err(error)=>{store.release(&lease,now)?;return Err(error);},
+            }
         }
         if let Some(pr) = start.pr {
             store.attach_pr_in_repo(&lease, start.repository, pr, now)?;
@@ -786,8 +802,9 @@ impl WorkflowGuard {
             lease,
             repository: start.repository.into(),
             worktree: start.worktree.into(),
-            contract: start.contract.into(),
-            environment: start.environment.into(),
+            contract: contract.into(),
+            environment: environment.into(),
+            source_request:Some((start.contract.into(),context.as_ref().map_or(start.pr,|context|context.source_pr))),
             binding,
             heartbeat: tokio_util::sync::CancellationToken::new(),
             lease_failure: Arc::new(Mutex::new(None)),
@@ -799,6 +816,11 @@ impl WorkflowGuard {
             acceptance_source:source_from_workflow(&id),
         };
         guard.install_model_accounting()?;
+        if let Some(context)=guard.execution_context(&guard.binding)? {
+            let result=guard.store.lock().map_err(|_|anyhow::anyhow!("workflow context lock poisoned"))?
+                .record_recovery_context(&guard.lease,&guard.binding,&context,now);
+            if let Err(error)=result {guard.finish()?;return Err(error);}
+        }
         guard.audit_event("workflow_claimed", serde_json::json!({}))?;
         guard.spawn_renewal();
         let _ = start.repo_root; // Kept explicit: caller owns repository/worktree provenance validation.
@@ -960,7 +982,7 @@ impl WorkflowGuard {
             workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
         })?;
         store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
-        let guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),binding,
+        let guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),source_request:None,binding,
             acceptance_authority:Arc::new(Mutex::new(AcceptanceAuthority::Unbound)),
             acceptance_source:None,
             heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false };
@@ -1166,14 +1188,14 @@ impl WorkflowGuard {
         self.audit_health().await?;
         let binding =
             git_binding(&self.worktree, &self.contract, &self.environment, evidence).await?;
+        let context=self.execution_context(&binding)?;
         let now = millis();
         let mut store = self
             .store
             .lock()
             .map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?;
-        store.checkpoint(
-            &self.lease,
-            &Checkpoint {
+        let checkpoint=
+            Checkpoint {
                 stage,
                 binding: binding.clone(),
                 evidence: evidence.to_vec(),
@@ -1182,9 +1204,9 @@ impl WorkflowGuard {
                     action: action.into(),
                     eligible_at_ms,
                 },
-            },
-            now,
-        )?;
+            };
+        if let Some(context)=&context {store.checkpoint_with_execution_context(&self.lease,&checkpoint,context,now)?;}
+        else {store.checkpoint(&self.lease,&checkpoint,now)?;}
         charge_elapsed(
             &mut store,
             &self.lease,
@@ -1198,6 +1220,13 @@ impl WorkflowGuard {
             serde_json::json!({"stage":stage,"reason":reason,"next_action":action}),
         )?;
         Ok(())
+    }
+
+    fn execution_context(&self,binding:&Binding)->Result<Option<durable::RecoveryContext>> {
+        let Some((request,pr))=&self.source_request else{return Ok(None)};
+        Ok(Some(durable::RecoveryContext {version:1,workflow:self.id().into(),repository:self.repository.clone(),
+            worktree:self.worktree.canonicalize()?,source_request:request.clone(),source_pr:*pr,
+            contract:self.contract.clone(),environment:self.environment.clone(),binding:binding.clone()}))
     }
 
     /// Check immediately before gh/git side effects. Also pass GitHub the

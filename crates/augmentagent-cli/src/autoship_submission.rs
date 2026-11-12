@@ -260,6 +260,33 @@ impl WorkflowStore {
         Ok(self.conn.query_row(&sql, params![repository.map(str::to_ascii_lowercase), now], |row| row.get(0))?)
     }
 
+    /// A recovery handoff is a wake hint, not execution or qualification
+    /// authority. The normal selector and productive lease recheck all guards.
+    pub fn has_due_qualification_recovery(&self,repository:Option<&str>,now:i64)->Result<bool> {
+        Ok(!self.due_qualification_recovery(repository,now)?.is_empty())
+    }
+
+    pub(crate) fn due_qualification_recovery(&self,repository:Option<&str>,now:i64)->Result<Vec<String>> {
+        let exists:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow')",[],|r|r.get(0))?;
+        if !exists {return Ok(vec![]);}
+        let controls:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_control')",[],|r|r.get(0))?;
+        let mut sql=String::from("SELECT w.id FROM workflow w WHERE w.lease_until<=?2
+            AND json_extract(w.checkpoint,'$.next.eligible_at_ms')<=?2
+            AND json_extract(w.checkpoint,'$.stage')='reconcile'
+            AND ((json_extract(w.checkpoint,'$.next.reason')='original_verifier_measurement_recovered'
+                AND json_extract(w.checkpoint,'$.next.action') IN ('qualify_original_measurement','correct_original_verifier'))
+                OR (json_extract(w.checkpoint,'$.next.reason')='original_native_custody_recovered'
+                AND json_extract(w.checkpoint,'$.next.action')='requalify_original'))
+            AND (?1 IS NULL OR instr(w.id,?1||'#')=1 OR instr(w.id,?1||'/pr/')=1)");
+        if controls {sql.push_str(" AND NOT EXISTS(SELECT 1 FROM workflow_owner_control c WHERE c.workflow=w.id AND c.paused=1)");}
+        let mut query=self.conn.prepare(&sql)?;
+        let rows=query.query_map(params![repository.map(str::to_ascii_lowercase),now],|r|r.get::<_,String>(0))?;
+        let mut ready=Vec::new();
+        for row in rows {let id=row?;if self.pending_operations(&id)?.is_empty() && self.pending_owner_messages(&id)?==0
+            && !self.merge_reconciliation_needed(&id)? {ready.push(id);}}
+        Ok(ready)
+    }
+
     /// Read-only wake-up hint. The selecting transaction and execution leases
     /// must still recheck eligibility; this cannot authorize or reserve work.
     pub fn command_queue_due(&self, repository: &str, now: i64) -> Result<bool> {

@@ -44,6 +44,32 @@ fn native_hold(checkpoint: &Checkpoint) -> bool {
         && checkpoint.next.action == "await_original_evidence_recovery"
 }
 
+pub(super) fn physical_hold(conn:&Connection,workflow:&str,generation:i64,checkpoint:&Checkpoint)->Result<bool> {
+    if !native_hold(checkpoint) {return Ok(false);}
+    let value:Option<String>=conn.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND generation=?2 AND kind='native_custody_hold_classified' ORDER BY seq DESC LIMIT 1",params![workflow,generation],|r|r.get(0)).optional()?;
+    Ok(value.as_deref()==Some(serde_json::json!({"physical":true,"checkpoint":checkpoint}).to_string().as_str()))
+}
+
+impl WorkflowStore {
+    /// Positive read-only restoration queues normal qualification. No lease,
+    /// native runtime, model call or review authority is granted here.
+    pub(crate) fn recover_native_qualification(&mut self,workflow:&str,binding:&Binding,root:&Path,validate:CustodyValidator,now:i64)->Result<bool> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (raw,leased,generation):(String,i64,i64)=tx.query_row("SELECT checkpoint,lease_until,generation FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        let mut checkpoint:Checkpoint=serde_json::from_str(&raw)?;
+        if leased>now || checkpoint.binding!=*binding || checkpoint.next.eligible_at_ms>now
+            || owner_control::read(&tx,workflow)?.is_some_and(|c|c.paused) || super::owner_inbox::pending(&tx,workflow)?>0
+            || !recovered(&tx,workflow,generation,&checkpoint,(root,validate))? {return Ok(false);}
+        checkpoint.stage=Stage::Reconcile;
+        checkpoint.next=NextAction {reason:"original_native_custody_recovered".into(),action:"requalify_original".into(),eligible_at_ms:now};
+        let raw=serde_json::to_string(&checkpoint)?;
+        tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",params![workflow,raw,now])?;
+        event(&tx,workflow,generation,"checkpoint",&raw,now)?;
+        event(&tx,workflow,generation,"original_native_custody_recovered",&serde_json::json!({"descriptor_generation":generation,"qualification_required":true}).to_string(),now)?;
+        tx.commit()?;Ok(true)
+    }
+}
+
 fn admissions(tx: &Transaction<'_>, workflow: &str) -> Result<Option<String>> {
     let mut query = tx.prepare("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='native_model_admitted' ORDER BY seq")?;
     let rows = query.query_map([workflow], |row| row.get::<_, String>(0))?;
@@ -125,6 +151,38 @@ mod tests {
         store.record_scope_stage_response_pair(&lease,&binding,&raw,"original source data",&proof,"scripted private reference",4).unwrap();
         let checkpoint=Checkpoint {stage:Stage::Scope,binding,evidence:vec!["original-receipt".into()],next:NextAction {reason:"acceptance_verifier_evidence_unknown".into(),action:"await_original_evidence_recovery".into(),eligible_at_ms:0}};
         (dir,store,lease,checkpoint)
+    }
+
+    #[test]
+    fn passive_native_recovery_preserves_accounting_and_waits_for_normal_qualification() {
+        let (_dir,mut store,lease,hold)=fixture();
+        store.checkpoint_native_custody_hold(&lease,&hold,5,true).unwrap();store.release(&lease,6).unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert!(store.recover_native_qualification(&lease.workflow,&hold.binding,Path::new("/fixture"),valid,7).unwrap());
+        let after=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert_eq!(after.generation,before.generation);assert_eq!(after.attempts,before.attempts);
+        assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.tokens,before.tokens);
+        assert_eq!(after.lease_until_ms,before.lease_until_ms);assert_eq!(after.checkpoint.binding,hold.binding);
+        assert_eq!(after.checkpoint.evidence,hold.evidence);assert_eq!(after.checkpoint.stage,Stage::Reconcile);
+        assert_eq!(after.checkpoint.next.action,"requalify_original");
+        assert!(!store.recover_native_qualification(&lease.workflow,&hold.binding,Path::new("/fixture"),never,8).unwrap());
+    }
+
+    #[test]
+    fn passive_native_recovery_honors_pause_semantic_holds_and_atomic_handoff() {
+        for obstruction in ["pause","semantic","storage"] {
+            let (_dir,mut store,lease,hold)=fixture();
+            store.checkpoint_native_custody_hold(&lease,&hold,5,true).unwrap();
+            if obstruction=="semantic" {store.checkpoint_native_custody_hold(&lease,&hold,6,false).unwrap();}
+            store.release(&lease,7).unwrap();
+            if obstruction=="pause" {store.set_owner_pause(&lease.workflow,"github:owner",0,true,8).unwrap();}
+            if obstruction=="storage" {store.conn.execute_batch("CREATE TRIGGER refuse_recovery BEFORE INSERT ON workflow_event WHEN NEW.kind='original_native_custody_recovered' BEGIN SELECT RAISE(ABORT,'event store unavailable'); END;").unwrap();}
+            let before=store.snapshot(&lease.workflow).unwrap().unwrap();
+            let result=store.recover_native_qualification(&lease.workflow,&hold.binding,Path::new("/fixture"),
+                if obstruction=="storage" {valid} else {never},9);
+            if obstruction=="storage" {assert!(result.is_err());}else {assert!(!result.unwrap());}
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);
+        }
     }
 
     #[test]

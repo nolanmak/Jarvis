@@ -65,6 +65,8 @@ mod linked_claim_boundaries;
 mod policy_hold;
 #[path = "self_improve_legacy_readmission.rs"]
 mod legacy_readmission;
+#[path = "self_improve_qualification_reconcile.rs"]
+mod qualification_reconcile;
 #[path = "self_improve_slicing.rs"]
 mod slicing;
 
@@ -975,6 +977,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
     // reports would never be reached.
     let ledger = AttemptLedger::load(&attempt_ledger_path());
     let today = utc_day_now();
+    let qualification_retries=qualification_reconcile::issue_retries(repo_root).await.unwrap_or_default();
 
     let (human, research): (Vec<_>, Vec<_>) = rest_issue_candidates(&issues)
         .into_iter()
@@ -984,7 +987,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
         // retrying it now would almost certainly lose another to the same
         // one. Spend today's remaining budget on DIFFERENT issues; attempts
         // still accumulate across days toward the gave-up label.
-        if ledger.attempted_today(today, iss.number) {
+        if ledger.attempted_today(today, iss.number) && !qualification_retries.contains(&iss.number) {
             info!(issue = iss.number, "skip: already attempted today (#851 ledger)");
             continue;
         }
@@ -12051,6 +12054,9 @@ impl AutoPrLoop {
             .context("another auto-ship supervisor is already running")?;
         let (root, dry_run) = (self.repo_root.clone(), self.dry_run);
         let sweep_root = root.clone();
+        let recovery_stop=tokio_util::sync::CancellationToken::new();
+        let recovery=qualification_reconcile::run(root.clone(),dry_run,shutdown.clone(),recovery_stop.clone());
+        tokio::pin!(recovery);
         let canary_stop = shutdown.clone();
         // Observability has its own lifetime: slow/unavailable reviewer probes
         // must not delay merge reconciliation or consume a builder attempt.
@@ -12098,7 +12104,15 @@ impl AutoPrLoop {
                 merged
             }
         });
-        tokio::select! { result = shipping => result, result = canary => result }
+        tokio::select! {
+            result = shipping => {
+                recovery_stop.cancel();
+                if let Err(error)=recovery.await {warn!("qualification recovery ended during drain: {error:#}");}
+                result
+            },
+            result = &mut recovery => result,
+            result = canary => result,
+        }
     }
 
     pub fn with_upgrade_watch(mut self, watch: crate::autoship_worker::UpgradeWatch) -> Self {
@@ -12198,7 +12212,8 @@ impl AutoPrLoop {
                         if self.command_repository.is_none() {
                             let queued = crate::autoship_workflow::WorkflowStore::open_read_only(&self.workflow_path)
                                 .and_then(|store| store.map(|s| -> Result<bool> {
-                                    Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?)
+                                    Ok(s.has_command_jobs()? || s.has_due_main_reconciliation(None, (self.clock)().timestamp_millis())?
+                                        || s.has_due_qualification_recovery(None,(self.clock)().timestamp_millis())?)
                                 }).transpose());
                             match queued {
                                 Ok(Some(true)) => {},
@@ -12217,7 +12232,8 @@ impl AutoPrLoop {
                                 let repository = self.command_repository.as_deref().unwrap();
                                 let now = (self.clock)().timestamp_millis();
                                 Ok(store.command_queue_due(repository, now)?
-                                    || store.has_due_main_reconciliation(Some(repository), now)?)
+                                    || store.has_due_main_reconciliation(Some(repository), now)?
+                                    || store.has_due_qualification_recovery(Some(repository),now)?)
                             })
                                 .transpose().map(|due| due.unwrap_or(false)));
                         match due {
