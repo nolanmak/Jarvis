@@ -51,6 +51,14 @@ pub(super) fn physical_hold(conn:&Connection,workflow:&str,generation:i64,checkp
 }
 
 impl WorkflowStore {
+    /// Queue consideration of authenticated negative source data. This grants
+    /// neither a lease nor positive qualification and never creates a budget.
+    pub(crate) fn recover_semantic_qualification<F>(&mut self,_expected:&Snapshot,_owner_revision:Option<i64>,
+        _policy:&str,_now:i64,_validate:F)->Result<bool>
+    where F:FnOnce(&[NativeScopeCustody])->Result<Option<String>> {
+        Ok(false)
+    }
+
     /// Positive read-only restoration queues normal qualification. No lease,
     /// native runtime, model call or review authority is granted here.
     pub(crate) fn recover_native_qualification(&mut self,workflow:&str,binding:&Binding,root:&Path,validate:CustodyValidator,now:i64)->Result<bool> {
@@ -151,6 +159,60 @@ mod tests {
         store.record_scope_stage_response_pair(&lease,&binding,&raw,"original source data",&proof,"scripted private reference",4).unwrap();
         let checkpoint=Checkpoint {stage:Stage::Scope,binding,evidence:vec!["original-receipt".into()],next:NextAction {reason:"acceptance_verifier_evidence_unknown".into(),action:"await_original_evidence_recovery".into(),eligible_at_ms:0}};
         (dir,store,lease,checkpoint)
+    }
+
+    #[test]
+    fn semantic_reconsideration_is_unpaid_atomic_and_once_across_generations() {
+        let (dir,mut store,lease,hold)=fixture();
+        for _ in 0..4 {assert!(store.admit_epoch_attempt(&lease,"verifier-amend-total","original-epoch",4,4).unwrap());}
+        store.checkpoint_native_custody_hold(&lease,&hold,5,false).unwrap();store.release(&lease,6).unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();
+        let budgets=|store:&WorkflowStore|->Vec<(String,String,u32)> {
+            store.conn.prepare("SELECT purpose,binding,attempts FROM bounded_attempt WHERE workflow=?1 ORDER BY purpose,binding").unwrap()
+                .query_map([&lease.workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        let original_budgets=budgets(&store);let policy="b".repeat(64);let judgment="c".repeat(64);
+        assert!(store.recover_semantic_qualification(&before,None,&policy,7,|custody|{assert_eq!(custody.len(),1);Ok(Some(judgment.clone()))}).unwrap(),"authenticated semantic uncertainty never leaves its unchanged-input hold");
+        let after=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert_eq!((after.generation,after.attempts,after.model_calls,after.tokens,after.wall_ms,after.lease_until_ms),
+            (before.generation,before.attempts,before.model_calls,before.tokens,before.wall_ms,before.lease_until_ms));
+        assert_eq!(after.checkpoint.binding,hold.binding);assert_eq!(after.checkpoint.evidence,hold.evidence);
+        assert_eq!(after.checkpoint.stage,Stage::Reconcile);assert_eq!(after.checkpoint.next.action,"reconsider_verifier");
+        assert_eq!(budgets(&store),original_budgets,"free re-entry rewrote the original repair budgets");
+        assert!(!store.recover_semantic_qualification(&before,None,&policy,8,|_|panic!("stale checkpoint reached semantic inspection")).unwrap());
+        // A later normal attempt must not make this same result new again.
+        let normal=store.claim_productive(&lease.workflow,"normal-repair",9,1000).unwrap().unwrap();
+        assert!(!store.admit_epoch_attempt(&normal,"verifier-amend-total","original-epoch",4,9).unwrap(),"re-entry reset exhausted original budget");
+        store.checkpoint_native_custody_hold(&normal,&hold,10,false).unwrap();store.release(&normal,11).unwrap();
+        drop(store);let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        let repeated=store.snapshot(&lease.workflow).unwrap().unwrap();
+        assert!(!store.recover_semantic_qualification(&repeated,None,&policy,12,|_|Ok(Some(judgment))).unwrap(),"new generation/restart reused the same semantic recovery authority");
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),repeated);
+        assert_eq!(budgets(&store),original_budgets);
+    }
+
+    #[test]
+    fn semantic_reconsideration_keeps_claim_guards_and_rolls_back_partial_handoff() {
+        for obstruction in ["pause","revision","lease","future","binding","operation","no-judgment","storage"] {
+            let (_dir,mut store,lease,mut hold)=fixture();
+            if obstruction=="future" {hold.next.eligible_at_ms=100;}
+            if obstruction=="operation" {store.begin_operation(&lease,OperationKind::Push,&hold.binding,4).unwrap();}
+            store.checkpoint_native_custody_hold(&lease,&hold,5,false).unwrap();
+            if obstruction!="lease" {store.release(&lease,6).unwrap();}
+            let mut expected=store.snapshot(&lease.workflow).unwrap().unwrap();
+            if obstruction=="binding" {expected.checkpoint.binding.head="foreign".into();}
+            if obstruction=="pause" {store.set_owner_pause(&lease.workflow,"github:owner",0,true,7).unwrap();}
+            if obstruction=="revision" {store.set_owner_pause(&lease.workflow,"github:owner",0,false,7).unwrap();}
+            if obstruction=="storage" {store.conn.execute_batch("CREATE TRIGGER refuse_semantic BEFORE INSERT ON workflow_event WHEN NEW.kind='original_semantic_witness_recovered' BEGIN SELECT RAISE(ABORT,'handoff store unavailable'); END;").unwrap();}
+            let before=store.snapshot(&lease.workflow).unwrap().unwrap();let events=store.events(&lease.workflow).unwrap();
+            let result=store.recover_semantic_qualification(&expected,None,&"b".repeat(64),8,|_| {
+                assert!(matches!(obstruction,"storage"|"no-judgment"),"{obstruction} reached semantic validation");
+                Ok(if obstruction=="no-judgment" {None}else{Some("c".repeat(64))})
+            });
+            if obstruction=="storage" {assert!(result.is_err());}else{assert!(!result.unwrap(),"{obstruction} bypassed recovery guard");}
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);
+            assert_eq!(store.events(&lease.workflow).unwrap(),events,"{obstruction} published a partial handoff");
+        }
     }
 
     #[test]
