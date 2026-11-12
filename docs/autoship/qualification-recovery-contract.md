@@ -254,6 +254,19 @@ without consuming a semantic correction slot. Its manifest references remain
 in protected history. Missing or changed evidence stays unknown; no clock,
 checkpoint edit or model replacement manufactures its outcome.
 
+When a completed verifier has an interrupted peer, the successor attempt keeps
+the completed command's original identity. An optional `command_sources` map
+in the protected result binds each reused verifier to its original attempt;
+records without the map retain their existing same-attempt meaning. Both the
+original admission/quiescence and complete private capture/output digest are
+revalidated. A reused verifier cannot create a new capture or command admission.
+No old admission is copied under the successor's identity. Only interrupted or
+never-started peers execute, whether the interrupted aggregate result was
+retained or lost. Multiple completed source attempts for one verifier remain
+unknown rather than selecting an arbitrary observation. The mixed-outcome
+regression covers both aggregate-retention cases and deletion of the original
+admission; it failed before this fix.
+
 Real delegated-service tests cover fresh execution, loss of whole-result
 retention after actual capture, and partial completion of a two-verifier recipe.
 They verify original attempt/receipt preservation and zero model calls. Actual
@@ -369,8 +382,9 @@ All entries are owned by the normal workflow-controller implementation and block
 merging #2035 until resolved and tested:
 
 - Native and infrastructure recovery now have operation-specific protected
-  identity and transactional handoff. Finish validation of the two raw producer
-  fixes identified by the inventory above.
+  identity and transactional handoff. Raw producer regressions and the existing
+  full/delegated suites passed. Finish validation of the mixed completed /
+  interrupted peer fix, then complete hosted checks and the final seam audit.
 - Original-operation recovery must distinguish inspection, resumption and
   replay. Unknown prior effects must be settled before replay; successful
   cleanup must be positively observed through the existing execution owner.

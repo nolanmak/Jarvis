@@ -37,6 +37,8 @@ struct Quiescence {
 struct RecordedResult {
     version:u32,kind:String,workflow:String,plan:String,attempt:String,
     baseline:BaselineEvidence,
+    #[serde(default,skip_serializing_if="BTreeMap::is_empty")]
+    command_sources:BTreeMap<String,String>,
 }
 
 fn result_key(plan:&str,attempt:&str)->String {
@@ -82,13 +84,14 @@ pub(super) struct OriginalExecution<'a> {
     contract:AcceptanceContract,
     files:BTreeMap<String,String>,
     control:PathBuf,
+    command_sources:BTreeMap<String,String>,
 }
 
 impl<'a> OriginalExecution<'a> {
     pub(super) fn begin(workflow:&'a workflow::WorkflowGuard,control:&Path,proposal:&ContractProposal,base:&str,environment:&str,executor:&str)->Result<Self> {
         let (key,body)=plan_input(workflow,proposal,base,environment,executor)?;
         workflow.record_verifier_evidence(&key,"original_verifier_plan",&body)?;
-        let resume=Self::quiesce_previous(workflow).and_then(|_|Self::settle_previous_results(workflow,&key))
+        let (resume,mut command_sources)=Self::quiesce_previous(workflow).and_then(|_|Self::settle_previous_results(workflow,&key))
             .map_err(|error| {
                 let error=if error.downcast_ref::<initial_repair::Hold>().is_some(){error}else{error.context(initial_repair::Hold::EvidenceUnknown)};
                 error.context(OriginalExecutionFailed {plan:key.clone()})
@@ -99,13 +102,15 @@ impl<'a> OriginalExecution<'a> {
             let attempt_key=amendment::digest(&serde_json::to_vec(&("original-verifier-attempt-v1",&key,&attempt))?);
             workflow.record_verifier_evidence(&attempt_key,"original_verifier_attempt",&record.to_string())?;attempt
         };
+        command_sources.retain(|_,source|source!=&attempt);
         Ok(Self {workflow,plan:key,attempt,verifiers:proposal.contract.verifiers.iter().map(|v|v.id.clone()).collect(),
             base:base.into(),environment:environment.into(),contract:proposal.contract.clone(),
-            files:proposal.files.iter().map(|(path,body)|(path.clone(),amendment::digest(body.as_bytes()))).collect(),control:control.canonicalize()?})
+            files:proposal.files.iter().map(|(path,body)|(path.clone(),amendment::digest(body.as_bytes()))).collect(),control:control.canonicalize()?,command_sources})
     }
 
-    fn settle_previous_results(workflow:&workflow::WorkflowGuard,current_plan:&str)->Result<Option<String>> {
+    fn settle_previous_results(workflow:&workflow::WorkflowGuard,current_plan:&str)->Result<(Option<String>,BTreeMap<String,String>)> {
         let mut cursor=0;let mut unfinished:BTreeMap<(String,String),Vec<(String,bool,String)>>=BTreeMap::new();
+        let mut completed=BTreeMap::new();
         loop {
             let rows=workflow.verifier_evidence_page("original_verifier_command_admission",cursor)?;
             if rows.is_empty(){break;}
@@ -117,15 +122,19 @@ impl<'a> OriginalExecution<'a> {
                     ensure!(result.version==1 && result.kind=="original_verifier_result" && result.workflow==workflow.id()
                         && result.plan==admitted.plan && result.attempt==admitted.attempt,"original result identity changed");
                     result.baseline.registration.baseline_result(&result.baseline.receipts)?;
-                    Self::require_result_commands(workflow,&admitted.plan,&admitted.attempt,&result.baseline)?;
+                    Self::require_result_commands(workflow,&admitted.plan,&admitted.attempt,&result.baseline,&result.command_sources)?;
                     ensure!(result.baseline.receipts.iter().any(|r|r.verifier_id==admitted.verifier),"original result omitted an admitted command");
-                    continue;
+                    if !result.baseline.receipts.iter().any(|receipt|receipt.result==crate::autoship_contract::CheckResult::InfrastructureFailure) {continue;}
                 }
                 let captured=admitted.capture.as_ref().context("original command result was not retained")?
                     .read(&row.key,&admitted.identity)?.context("original command result is not yet published")?;
                 // Stream bytes have already been authenticated. Settlement
                 // needs only terminal status and the manifest reference.
                 let interrupted=captured.observation.interrupted || !captured.observation.output_complete;
+                if admitted.plan==current_plan && !interrupted {
+                    let previous=completed.insert(admitted.verifier.clone(),admitted.attempt.clone());
+                    ensure!(previous.is_none_or(|source|source==admitted.attempt),"multiple completed commands for one original verifier");
+                }
                 unfinished.entry((admitted.plan,admitted.attempt)).or_default().push((row.key,interrupted,captured.manifest_sha256));
             }
         }
@@ -140,11 +149,12 @@ impl<'a> OriginalExecution<'a> {
                 ensure!(resume.is_none(),"multiple original attempts have unreconciled results");resume=Some(attempt);
             }
         }
-        Ok(resume)
+        Ok((resume,completed))
     }
 
     fn prepare_capture(&self,verifier:&str)->Result<capture::Capture> {
         ensure!(self.verifiers.iter().any(|id|id==verifier),"capture is not in the original verifier plan");
+        ensure!(!self.command_sources.contains_key(verifier),"completed original verifier cannot admit another command");
         capture::Capture::prepare(&self.control,self.workflow.publication_inputs().1,&command_key(&self.plan,&self.attempt,verifier))
     }
 
@@ -158,10 +168,11 @@ impl<'a> OriginalExecution<'a> {
     }
 
     fn read_captured_observation(&self,verifier:&str)->Result<Option<Observation>> {
-        let key=command_key(&self.plan,&self.attempt,verifier);
+        let attempt=self.command_sources.get(verifier).unwrap_or(&self.attempt);
+        let key=command_key(&self.plan,attempt,verifier);
         let Some(raw)=self.workflow.verifier_evidence(&key,"original_verifier_command_admission")? else {return Ok(None)};
         let admitted:Admission=serde_json::from_str(&raw)?;
-        ensure!(admitted.workflow==self.workflow.id() && admitted.plan==self.plan && admitted.attempt==self.attempt && admitted.verifier==verifier,"original capture belongs to another operation");
+        ensure!(admitted.workflow==self.workflow.id() && admitted.plan==self.plan && admitted.attempt==*attempt && admitted.verifier==verifier,"original capture belongs to another operation");
         let proof=self.workflow.verifier_evidence(&quiet_key(&key),"original_verifier_command_quiescent")?.context("original result has no quiescence proof")?;
         let proof:Quiescence=serde_json::from_str(&proof)?;
         ensure!(proof.version==1 && proof.kind=="original_verifier_command_quiescent" && proof.workflow==self.workflow.id()
@@ -169,6 +180,7 @@ impl<'a> OriginalExecution<'a> {
             && matches!(proof.evidence["verified_state"].as_str(),Some("host_rebooted"|"removed_empty_subtree"|"kernel_empty_subtree_removed")),"original capture quiescence changed");
         let result=admitted.capture.context("original command lacks durable output")?.read(&key,&admitted.identity)?
             .context("original command output unavailable")?;
+        if attempt!=&self.attempt {ensure!(!result.observation.interrupted && result.observation.output_complete,"reused original command is not complete");}
         Ok(Some(result.observation))
     }
 
@@ -178,24 +190,33 @@ impl<'a> OriginalExecution<'a> {
     pub(super) fn retain_result(&self,root:&Path,baseline:&BaselineEvidence)->Result<()> {
         self.require_registration(root,&baseline.registration)?;
         baseline.registration.baseline_result(&baseline.receipts)?;
-        Self::require_result_commands(self.workflow,&self.plan,&self.attempt,baseline)?;
+        Self::require_result_commands(self.workflow,&self.plan,&self.attempt,baseline,&self.command_sources)?;
         let record=RecordedResult {version:1,kind:"original_verifier_result".into(),workflow:self.workflow.id().into(),
-            plan:self.plan.clone(),attempt:self.attempt.clone(),baseline:baseline.clone()};
+            plan:self.plan.clone(),attempt:self.attempt.clone(),baseline:baseline.clone(),command_sources:self.command_sources.clone()};
         self.workflow.record_verifier_evidence(&result_key(&self.plan,&self.attempt),"original_verifier_result",&serde_json::to_string(&record)?)
     }
 
-    fn require_result_commands(workflow:&workflow::WorkflowGuard,plan:&str,attempt:&str,baseline:&BaselineEvidence)->Result<()> {
+    fn require_result_commands(workflow:&workflow::WorkflowGuard,plan:&str,attempt:&str,baseline:&BaselineEvidence,sources:&BTreeMap<String,String>)->Result<()> {
+        ensure!(sources.keys().all(|id|baseline.receipts.iter().any(|receipt|&receipt.verifier_id==id)),"result references an unrelated original verifier");
         for receipt in &baseline.receipts {
-            let key=command_key(plan,attempt,&receipt.verifier_id);
+            let source=sources.get(&receipt.verifier_id).map_or(attempt,String::as_str);
+            if source!=attempt {ensure!(source.len()==64 && source.bytes().all(|byte|byte.is_ascii_hexdigit()),"invalid original command attempt reference");}
+            let key=command_key(plan,source,&receipt.verifier_id);
             let raw=workflow.verifier_evidence(&key,"original_verifier_command_admission")?.context("original result lacks command admission")?;
             let admitted:Admission=serde_json::from_str(&raw)?;
             ensure!(admitted.version==1 && admitted.kind=="original_verifier_command_admission" && admitted.workflow==workflow.id()
-                && admitted.plan==plan && admitted.attempt==attempt && admitted.verifier==receipt.verifier_id,"result belongs to another command");
+                && admitted.plan==plan && admitted.attempt==source && admitted.verifier==receipt.verifier_id,"result belongs to another command");
             let raw_proof=workflow.verifier_evidence(&quiet_key(&key),"original_verifier_command_quiescent")?.context("original result lacks command quiescence")?;
             let proof:Quiescence=serde_json::from_str(&raw_proof)?;
             ensure!(proof.version==1 && proof.kind=="original_verifier_command_quiescent" && proof.workflow==workflow.id()
                 && proof.admission_sha256==amendment::digest(raw.as_bytes()) && proof.evidence["identity"]==admitted.identity
                 && matches!(proof.evidence["verified_state"].as_str(),Some("host_rebooted"|"removed_empty_subtree"|"kernel_empty_subtree_removed")),"result lacks matching kernel quiescence");
+            if source!=attempt {
+                let captured=admitted.capture.context("reused command lacks original capture")?.read(&key,&admitted.identity)?.context("reused command output unavailable")?;
+                ensure!(!captured.observation.interrupted && captured.observation.output_complete
+                    && amendment::digest(format!("{}\n{}",captured.observation.stdout,captured.observation.stderr).as_bytes())==receipt.output_digest,
+                    "reused command differs from its original complete observation");
+            }
         }
         Ok(())
     }
@@ -218,7 +239,7 @@ impl<'a> OriginalExecution<'a> {
                     if record.plan!=plan {continue;}
                     ensure!(saved.is_some(),"original result lost its input plan");
                     record.baseline.registration.baseline_result(&record.baseline.receipts)?;
-                    Self::require_result_commands(workflow,&plan,&record.attempt,&record.baseline)?;
+                    Self::require_result_commands(workflow,&plan,&record.attempt,&record.baseline,&record.command_sources)?;
                     if record.baseline.receipts.iter().any(|receipt|receipt.result==crate::autoship_contract::CheckResult::InfrastructureFailure) {continue;}
                     install_harness(root,proposal)?;
                     let registered=RegisteredContract::register(root,proposal.contract.clone(),base.into(),environment.into())?;
@@ -285,6 +306,7 @@ impl<'a> OriginalExecution<'a> {
 
     fn retain_admission_with_capture(&self,verifier:&str,identity:&serde_json::Value,capture:Option<capture::Capture>)->Result<()> {
         ensure!(self.verifiers.iter().any(|id|id==verifier),"command is not in the original verifier plan");
+        ensure!(!self.command_sources.contains_key(verifier),"completed original verifier cannot admit another command");
         let record=Admission {version:1,kind:"original_verifier_command_admission".into(),workflow:self.workflow.id().into(),
             plan:self.plan.clone(),attempt:self.attempt.clone(),verifier:verifier.into(),identity:identity.clone(),capture};
         let raw=serde_json::to_string(&record)?;
@@ -542,6 +564,60 @@ mod tests {
         let after=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
         assert_eq!(after.checkpoint.next.reason,"original_verifier_measurement_recovered");
         assert_eq!(after.attempts,1);assert_eq!(after.model_calls,0);
+    }
+
+    #[tokio::test]
+    async fn partial_measurement_file_write_leaves_unpublished_data_and_recovers_without_execution() {
+        use std::io::Write;
+        let (root,control,prepared,mut guard)=fixture().await;let database=control.path().join("workflow.db");
+        let base=actual_head(root.path()).await.unwrap();let environment=environment_id(root.path()).unwrap();let executor=verifier_executor_id().unwrap();
+        let original=OriginalExecution::begin(&guard,control.path(),&prepared.proposal,&base,&environment,&executor).unwrap();
+        original.retain_admission("observe",&gone_scope()).unwrap();OriginalExecution::quiesce_previous(&guard).unwrap();
+        original.retain_result(root.path(),&prepared.baseline).unwrap();
+        let key=amendment::digest(&serde_json::to_vec(&("initial-baseline-measurement-v1",&base,&environment,&prepared.proposal,&executor)).unwrap());
+        let hash=amendment::digest(&serde_json::to_vec(&prepared.baseline).unwrap());
+        let file=control.path().join(format!("baseline-measurement-{key}-{hash}.json"));
+        let failure=persist_baseline_with_writer(&file,&prepared.baseline,&worker_roots(root.path()),|file,bytes| {
+            file.write_all(&bytes[..16])?;Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into())
+        }).unwrap_err();
+        assert!(!file.exists(),"partial baseline was published at the final identity and would permanently block recovery");
+        let failure=result_retention_failure(&guard,&prepared.proposal,&base,&environment,&executor,failure);
+        drop(original);hold_initial_error(&mut guard,&failure).await.unwrap().unwrap();
+        let id=guard.id().to_owned();guard.finish().unwrap();
+        let recovery=workflow::WorkflowGuard::acquire_verifier_recovery_fixture(&database,workflow::Start {
+            repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+            branch:"fixture",contract:"original scope",environment:"test",
+        }).await.unwrap().unwrap();
+        assert!(recover_original_verifier(root.path(),control.path(),&recovery).await.unwrap());
+        assert_eq!(recovery.verifier_evidence_page("original_verifier_attempt",0).unwrap().len(),1);
+        assert_eq!(baseline_witness::private_bytes(&file,4*1024*1024).unwrap(),serde_json::to_vec(&prepared.baseline).unwrap());
+        recovery.finish().unwrap();let state=crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(&id).unwrap().unwrap();
+        assert_eq!(state.checkpoint.next.reason,"original_verifier_measurement_recovered");assert_eq!(state.model_calls,0);assert_eq!(state.attempts,1);
+    }
+
+    #[tokio::test]
+    async fn measurement_file_crash_never_publishes_partial_final_name() {
+        use std::io::Write;
+        const CHILD:&str="AUTOSHIP_MEASUREMENT_PUBLICATION_CRASH";
+        if let Some(path)=std::env::var_os(CHILD) {
+            let path=PathBuf::from(path);
+            let evidence:BaselineEvidence=serde_json::from_slice(&std::fs::read(path.with_extension("input")).unwrap()).unwrap();
+            let _=persist_baseline_with_writer(&path,&evidence,&[],|file,bytes| {
+                file.write_all(&bytes[..16])?;std::process::exit(79)
+            });
+            panic!("crash injection did not exit");
+        }
+        let (root,control,prepared)=baseline_witness::prepared_fixture();let file=control.path().join("baseline.json");
+        std::fs::write(file.with_extension("input"),serde_json::to_vec(&prepared.baseline).unwrap()).unwrap();
+        let status=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","self_improve::acceptance::verifier_execution::tests::measurement_file_crash_never_publishes_partial_final_name","--nocapture"])
+            .env(CHILD,&file).status().unwrap();
+        assert_eq!(status.code(),Some(79));
+        assert!(!file.exists(),"process exit published an incomplete final baseline");
+        persist_baseline(&file,&prepared.baseline,&worker_roots(root.path())).unwrap();
+        let bytes=baseline_witness::private_bytes(&file,4*1024*1024).unwrap();assert_eq!(bytes,serde_json::to_vec(&prepared.baseline).unwrap());
+        assert!(persist_baseline(&file,&prepared.baseline,&worker_roots(root.path())).is_err(),"exclusive baseline publication overwrote existing evidence");
+        assert_eq!(baseline_witness::private_bytes(&file,4*1024*1024).unwrap(),bytes);
     }
 
     #[tokio::test]

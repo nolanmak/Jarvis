@@ -425,6 +425,11 @@ pub(super) fn persist_baseline(
     writable_roots: &[PathBuf],
 ) -> Result<()> {
     use std::io::Write;
+    persist_baseline_with_writer(path,evidence,writable_roots,|file,bytes| {file.write_all(bytes)?;Ok(())})
+}
+
+fn persist_baseline_with_writer(path:&Path,evidence:&BaselineEvidence,writable_roots:&[PathBuf],
+    write:impl FnOnce(&mut std::fs::File,&[u8])->Result<()>)->Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let parent = path
         .parent()
@@ -443,7 +448,7 @@ pub(super) fn persist_baseline(
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(destination)?;
-    file.write_all(&serde_json::to_vec(evidence)?)?;
+    write(&mut file,&serde_json::to_vec(evidence)?)?;
     file.sync_all()?;
     std::fs::File::open(parent)?.sync_all()?;
     Ok(())
