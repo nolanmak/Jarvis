@@ -276,6 +276,27 @@ mod tests {
         guard.finish().unwrap();
     }
     #[tokio::test]
+    async fn original_verifier_plan_exists_before_the_executor_can_start() {
+        use rusqlite::OptionalExtension;
+        let (root,control,prepared)=fixture();let database=control.path().join("workflow.db");
+        let guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {
+            repo_root:root.path(),worktree:root.path(),repository:"owner/repo",source_issue:None,pr:Some(840),
+            branch:"fixture",contract:"original owner requirements",environment:"fixture",
+        }).await.unwrap().unwrap();
+        let observed=retain_initial_measurement(root.path(),control.path(),&prepared.proposal,&guard,async {
+            let conn=rusqlite::Connection::open(&database).unwrap();
+            let plan:Option<String>=conn.query_row("SELECT response FROM scope_stage_response WHERE json_valid(response) AND json_extract(response,'$.kind')='original_verifier_plan'",[],|r|r.get(0)).optional().unwrap();
+            let plan:serde_json::Value=serde_json::from_str(&plan.expect("original verifier could start without a frozen operation recipe")).unwrap();
+            assert_eq!(plan["proposal"],serde_json::to_value(&prepared.proposal).unwrap());
+            assert_eq!(plan["workflow"],guard.id());
+            assert_eq!(plan["base"],prepared.baseline.registration.baseline_head());
+            Err::<BaselineEvidence,_>(BaselineNotRed {detail:"scripted original infrastructure failure".into(),kind:None}.into())
+        }).await.unwrap_err();
+        assert!(observed.downcast_ref::<BaselineNotRed>().is_some());
+        guard.finish().unwrap();
+    }
+
+    #[tokio::test]
     async fn original_measurement_survives_restart_without_regeneration_or_lost_file_retry() {
         use std::cell::Cell;
         let (root,control,prepared)=fixture();let database=control.path().join("workflow.db");
