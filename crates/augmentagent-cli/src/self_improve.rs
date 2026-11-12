@@ -12387,6 +12387,68 @@ mod tests {
         assert!(blast_radius_hit_in_diff(&recovered_git(p,&["diff","origin/main","HEAD"]).await).is_some(),"final PR guard lost the original protected change");
     }
 
+    fn owner_resumed_automatic_fixture(path:&Path)->adoption::AdoptedPr {
+        use crate::autoship_workflow::{WorkflowStore,Binding,Checkpoint,NextAction,Stage,ResourceCharge};
+        let repository="owner/repo";
+        let id=crate::autoship_workflow::workflow_id(repository,7).unwrap();
+        let binding=Binding {head:"a".repeat(40),contract:"c".repeat(64),evidence_hash:"e".repeat(64)};
+        let mut store=WorkflowStore::open(path).unwrap();
+        store.register(&id,"agent-fix/issue-7",binding.clone(),0).unwrap();
+        let lease=store.claim(&id,"original-worker",0,1).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease,repository,42,0).unwrap();
+        store.checkpoint(&lease,&Checkpoint {stage:Stage::Build,binding:binding.clone(),evidence:vec!["original-measurement".into()],
+            next:NextAction {reason:"acceptance_failed".into(),action:"repair_implementation".into(),eligible_at_ms:1_000}},0).unwrap();
+        store.charge(&lease,"original-paid-work",ResourceCharge {model_calls:1,..Default::default()},0).unwrap();
+        store.release(&lease,0).unwrap();
+        store.set_owner_pause(&id,"github:owner",0,true,10).unwrap();
+        store.set_owner_pause(&id,"github:owner",1,false,20).unwrap();
+        assert!(!store.has_command_jobs().unwrap(),"resume must not invent an execution request or provider pin");
+        adoption::AdoptedPr {repository:repository.into(),pr:42,source_issue:Some(7),branch:"agent-fix/issue-7".into(),head:binding.head,
+            base:"main".into(),author:"owner".into(),title:"Ordinary production bug".into(),body:"Keep original behavior requirements".into(),dependency:adoption::Dependency::Main}
+    }
+
+    #[test]
+    fn owner_resumed_automatic_draft_survives_the_daily_attempt_filter() {
+        let state=tempfile::tempdir().unwrap();let path=state.path().join("workflow.db");
+        let candidate=owner_resumed_automatic_fixture(&path);
+        let ledger=AttemptLedger {day:0,issues:vec![7]};
+        let candidates=vec![candidate];
+        let retries=adoption::episode_retries(&path,&candidates,1_000).unwrap();
+        let chosen=adoption::select_linked_with_retries(&candidates,&ledger,0,&Default::default(),None,0,&retries);
+        assert_eq!(chosen,Some((42,7,"agent-fix/issue-7".into())),"accepted owner resume remained hidden until the next UTC day");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owner_resumed_automatic_work_wakes_and_hands_off_once_without_a_command_job() {
+        use crate::autoship_workflow::WorkflowStore;
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let state=tempfile::tempdir().unwrap();
+        let mut worker=AutoPrLoop::for_tests("/nonexistent".into(),5,state.path());
+        worker.dry_run=false;worker.command_repository=Some("owner/repo".into());
+        worker.clock=Arc::new(||chrono::DateTime::from_timestamp_millis(1_000).unwrap());
+        let path=worker.workflow_path.clone();
+        let candidate=owner_resumed_automatic_fixture(&path);
+        let ledger=AttemptLedger {day:0,issues:vec![7]};
+        let calls=Arc::new(AtomicUsize::new(0));let observed=calls.clone();
+        let stop=tokio_util::sync::CancellationToken::new();let timer_stop=stop.clone();
+        let run=worker.run_with(stop,move || {
+            let candidates=vec![candidate.clone()];
+            let retries=adoption::episode_retries(&path,&candidates,1_000).unwrap();
+            let chosen=adoption::select_linked_with_retries(&candidates,&ledger,0,&Default::default(),None,0,&retries);
+            assert_eq!(chosen,Some((42,7,"agent-fix/issue-7".into())),"wake failed to hand off the original already-attempted draft");
+            let mut store=WorkflowStore::open(&path).unwrap();
+            let id=crate::autoship_workflow::workflow_id("owner/repo",7).unwrap();
+            let lease=store.claim_productive(&id,"resumed-worker",1_000,1).unwrap().expect("normal productive claim");
+            store.release(&lease,1_000).unwrap();
+            assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,1,"scheduling must not charge another call");
+            observed.fetch_add(1,Ordering::SeqCst);
+            async {Ok(RunReport::idle())}
+        },||async {0});
+        let timer=async move {tokio::time::sleep(std::time::Duration::from_secs(61)).await;timer_stop.cancel();};
+        let (result,())=tokio::join!(run,timer);result.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst),1,"accepted automatic resume did not dispatch once through the fast queue");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn queued_main_dependency_wakes_automatic_worker_without_a_command_job() {
         use crate::autoship_workflow::{WorkflowStore, Binding, Checkpoint, NextAction, Stage};
