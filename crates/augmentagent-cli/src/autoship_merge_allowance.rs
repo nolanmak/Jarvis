@@ -199,6 +199,20 @@ fn validate_external_merge(conn: &Connection, op: &Operation, receipt: &serde_js
     Ok(())
 }
 
+/// One read-only predicate shared by dispatch and unpaid recovery transactions.
+pub(super) fn merge_reconciliation_needed(conn:&Connection,workflow:&str)->Result<bool> {
+    if !has_merge_ledger(conn)? {return Ok(false);}
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM merge_allowance_dispatch d
+        JOIN operation o ON o.id=d.operation JOIN workflow w ON w.id=o.workflow
+        WHERE o.workflow=?1 AND (d.state='dispatched' OR
+            (d.state='confirmed' AND w.pr=d.pr
+             AND json_extract(w.checkpoint,'$.binding.head')=json_extract(o.binding,'$.head')
+             AND json_extract(w.checkpoint,'$.binding.contract')=json_extract(o.binding,'$.contract')
+             AND json_extract(w.checkpoint,'$.binding.evidence_hash')=json_extract(o.binding,'$.evidence_hash')
+             AND (o.receipt IS NULL OR json_extract(w.checkpoint,'$.stage') NOT IN ('merged','retired')))))",
+        [workflow], |row| row.get(0))?)
+}
+
 fn has_merge_ledger(conn:&Connection)->Result<bool> {
     Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='merge_allowance_dispatch')",[],|row|row.get(0))?)
 }
@@ -315,16 +329,7 @@ impl WorkflowStore {
     /// Operation completion alone does not settle autonomous attribution. A
     /// lost response can leave a completed operation with an uncertain ledger.
     pub fn merge_reconciliation_needed(&self, workflow: &str) -> Result<bool> {
-        if !has_merge_ledger(&self.conn)? {return Ok(false);}
-        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM merge_allowance_dispatch d
-            JOIN operation o ON o.id=d.operation JOIN workflow w ON w.id=o.workflow
-            WHERE o.workflow=?1 AND (d.state='dispatched' OR
-                (d.state='confirmed' AND w.pr=d.pr
-                 AND json_extract(w.checkpoint,'$.binding.head')=json_extract(o.binding,'$.head')
-                 AND json_extract(w.checkpoint,'$.binding.contract')=json_extract(o.binding,'$.contract')
-                 AND json_extract(w.checkpoint,'$.binding.evidence_hash')=json_extract(o.binding,'$.evidence_hash')
-                 AND (o.receipt IS NULL OR json_extract(w.checkpoint,'$.stage') NOT IN ('merged','retired')))))",
-            [workflow], |row| row.get(0))?)
+        merge_reconciliation_needed(&self.conn,workflow)
     }
 
     pub fn pending_merge_dispatches(&self, repository: &str) -> Result<Vec<MergeDispatchRecord>> {

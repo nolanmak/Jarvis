@@ -21,7 +21,8 @@ pub(super) fn require_mutation_allowed(conn:&Connection,workflow:&str)->Result<(
 }
 
 pub(super) fn pending_mutation(conn:&Connection,workflow:&str)->Result<bool> {
-    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL) OR EXISTS(SELECT 1 FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.workflow=?1 AND d.state='dispatched')",[workflow],|row|row.get(0))?)
+    let unreceipted:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND receipt IS NULL)",[workflow],|row|row.get(0))?;
+    Ok(unreceipted || super::merge_allowance::merge_reconciliation_needed(conn,workflow)?)
 }
 
 #[derive(Serialize, Deserialize)]

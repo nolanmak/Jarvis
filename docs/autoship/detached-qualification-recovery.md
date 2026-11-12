@@ -37,7 +37,10 @@ publication, approval or merge authority.
 D4. Reuse the existing unpaid inspector, lane lock, semantic transaction, normal
 wake and productive claim. Owner pause/revision, pending inbox, lease,
 publication/merge uncertainty, exact snapshot and original negative-source
-validation remain mandatory. Nothing resets or clones budgets, charges or
+validation remain mandatory. Free reservation and the atomic recovery transaction
+must use the same complete merge-reconciliation predicate as normal dispatch;
+a receipted operation with a confirmed dispatch ledger and matching nonterminal
+checkpoint still needs merge reconciliation. Share that existing predicate rather than copying a narrower query. Nothing resets or clones budgets, charges or
 sessions. Wrong or unavailable evidence holds without a model or candidate
 mutation. No new registry, allocator, command or queue is added.
 
@@ -82,9 +85,10 @@ independent authorities.
    This proves source shape compatibility, not automatic recovery or a merge.
 4. Complete relevant regressions, full CLI and bounded amendment seam audit;
    then required exact-head hosted CI and independent engineering review. Exclude
-   the repair from autoship execution, merge normally, take only a supported
-   deployment snapshot and verify both service executable hashes/selected policy
-   after the ordinary updater deploys it. Manual repair merges count zero.
+   the repair from autoship execution. Successfully take the supported deployment
+   snapshot before the protected normal merge; then let the ordinary updater
+   deploy and verify both service executable hashes/selected policy. If snapshot
+   storage admission refuses, report it to the owner; do not bypass its limits. Manual repair merges count zero.
 5. Observe ordinary #2014 naturally leaving its retained hold, independent
    verifier repair/qualification and the actual review/CI/merge outcome. Do not
    resubmit, alter owner input, edit the candidate or production SQLite to buy
@@ -94,7 +98,18 @@ Current local evidence: the real producer/consumer regression and explicit
 read-only #2014 checkout probe first failed at the symbolic-branch lookup, then
 passed after recognizing the exact detached producer shape. The 17-case matrix
 then exposed two canonical-path alias cases; moving the original component
-checks into the shared path helper corrected both. All four recovery-module
-tests pass (one explicit production probe ignored by default). Final full checks,
-fresh-remote composed probe, seam audit, rollout and ordinary outcome remain
+checks into the shared path helper corrected both. All four checkout-recovery
+tests pass (one explicit production probe ignored by default). Before the final
+merge-fence correction, the full CLI passed 1,978 / zero failures / 39 explicit
+ignores, and the fresh-authorization composed #2014 probe passed in 2.18 seconds.
+
+Fresh eyes found no spec gaps. All 37 seams were checked; two findings were
+resolved and rechecked, so all 37 now hold. Snapshot ordering is corrected above.
+The merge-fence regression reproduced four initial/restoration selection/cue
+mismatches; sharing the existing complete predicate corrects them. All 14
+recovery-store tests pass, including unchanged allowance and normal terminal
+reconciliation. Setup errors were excluded from behavioral RED evidence.
+
+Final full checks and the fresh-remote probe after that last correction, exact
+PR-head hosted CI/review, supported snapshot, rollout and ordinary outcome remain
 open. An inspection pass or another bounded hold is not #1703 restoration.
